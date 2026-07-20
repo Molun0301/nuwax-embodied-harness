@@ -674,6 +674,7 @@ class PlatformGeometryRuntime:
         self._runtime_state_lock = threading.RLock()
         self._mapping_lifecycle_lock = threading.RLock()
         self._mapping_session_context: Optional[Dict[str, object]] = None
+        self._mapping_session_provider_attach_epoch: Optional[int] = None
         self._runtime_phase = "disabled" if not self._is_geometry_profile_enabled() else "preflight"
         self._runtime_message = "平台几何运行时尚未启动。"
         self._runtime_blocked = False
@@ -1665,6 +1666,7 @@ class PlatformGeometryRuntime:
                 if self._attach_geometry_runtime_provider(
                     self._geometry_runtime_subprocess
                 ):
+                    self._replay_active_mapping_session_after_attach()
                     return
                 LOGGER.warning("已有 geometry sidecar 存活，但 gRPC provider 重新连接失败。")
                 return
@@ -1689,7 +1691,91 @@ class PlatformGeometryRuntime:
                     pass
             return
         self._geometry_runtime_subprocess = bridge
-        self._attach_geometry_runtime_provider(bridge)
+        if self._attach_geometry_runtime_provider(bridge):
+            self._replay_active_mapping_session_after_attach()
+
+    def _replay_active_mapping_session_after_attach(self) -> bool:
+        """Restore an active Rust mapping session on the current provider."""
+
+        self._ensure_mapping_lifecycle_fields()
+        try:
+            with self._mapping_lifecycle_lock:
+                context = self._mapping_session_context
+                if not isinstance(context, dict) or not bool(context.get("active")):
+                    return False
+
+                provider = getattr(self, "_remote_provider", None)
+                if not _remote_is_connected(provider):
+                    return False
+                attach_epoch = int(getattr(self, "_provider_attach_epoch", 0))
+                if (
+                    self._mapping_session_provider_attach_epoch == attach_epoch
+                ):
+                    return False
+
+                session_id = str(context.get("session_id") or "").strip()
+                map_name = str(context.get("map_name") or "").strip()
+                map_version_id = str(
+                    context.get("map_version_id") or ""
+                ).strip()
+                if not session_id or not map_name or not map_version_id:
+                    raise RuntimeError(
+                        "ACTIVE mapping context 缺少 session_id/map_name/map_version_id，拒绝隐式创建会话。"
+                    )
+
+                start_rpc = getattr(provider, "start_mapping", None)
+                if not callable(start_rpc):
+                    raise RuntimeError(
+                        "GeometryRuntimeProvider 未实现 StartMapping RPC。"
+                    )
+                response = start_rpc(
+                    session_id=session_id,
+                    map_name=map_name,
+                    map_version_id=map_version_id,
+                )
+                if (
+                    not isinstance(response, dict)
+                    or str(response.get("phase") or "") != "ACTIVE"
+                    or not bool(response.get("active"))
+                    or str(response.get("session_id") or "") != session_id
+                    or str(response.get("map_name") or "") != map_name
+                    or str(response.get("map_version_id") or "")
+                    != map_version_id
+                ):
+                    raise RuntimeError(
+                        "StartMapping 重放未确认匹配的 ACTIVE Rust 会话。"
+                    )
+                if (
+                    provider is not getattr(self, "_remote_provider", None)
+                    or not _remote_is_connected(provider)
+                    or attach_epoch
+                    != int(getattr(self, "_provider_attach_epoch", 0))
+                ):
+                    return False
+
+                self._mapping_session_context = {
+                    **dict(context),
+                    **dict(response),
+                    "session_id": session_id,
+                    "map_name": map_name,
+                    "map_version_id": map_version_id,
+                    "active": True,
+                }
+                self._mapping_session_provider_attach_epoch = attach_epoch
+            self._map_stream_tracker = {}
+            LOGGER.info(
+                "已在重连后的 geometry provider 恢复 ACTIVE mapping session: session_id=%s map=%s version=%s",
+                session_id,
+                map_name,
+                map_version_id,
+            )
+            return True
+        except Exception as exc:
+            recorder = getattr(self, "_record_runtime_diagnostic", None)
+            if callable(recorder):
+                recorder("mapping_session_replay", exc)
+            LOGGER.warning("geometry mapping session 自动恢复失败: %s", exc)
+            return False
 
     def _rollback_geometry_runtime_provider_attach(
         self,
@@ -2199,6 +2285,19 @@ class PlatformGeometryRuntime:
         return False
 
     def _monitor_processes_once(self) -> None:
+        if (
+            bool(getattr(self, "_runtime_started", False))
+            and self._is_geometry_profile_enabled()
+        ):
+            bridge = getattr(self, "_geometry_runtime_subprocess", None)
+            provider = getattr(self, "_remote_provider", None)
+            bridge_alive = bool(bridge is not None and bridge.is_running)
+            if not bridge_alive or not _remote_is_connected(provider):
+                self._start_geometry_runtime_subprocess()
+                provider = getattr(self, "_remote_provider", None)
+            if _remote_is_connected(provider):
+                self._replay_active_mapping_session_after_attach()
+
         for name, process in list(self._managed_processes.items()):
             exit_code = process.poll()
             if exit_code is None or process.is_running():
@@ -5402,6 +5501,9 @@ class PlatformGeometryRuntime:
                                 "map_version_id": version.version_id,
                                 "active": True,
                             }
+                            self._mapping_session_provider_attach_epoch = int(
+                                getattr(self, "_provider_attach_epoch", 0)
+                            )
                     return activation_result
                 return {
                     **activation_payload,
@@ -6485,6 +6587,8 @@ class PlatformGeometryRuntime:
             self._mapping_lifecycle_lock = threading.RLock()
         if not hasattr(self, "_mapping_session_context"):
             self._mapping_session_context = None
+        if not hasattr(self, "_mapping_session_provider_attach_epoch"):
+            self._mapping_session_provider_attach_epoch = None
 
     def start_mapping(
         self,
@@ -6573,6 +6677,11 @@ class PlatformGeometryRuntime:
             }
             # Local state is committed only after Rust confirms ACTIVE.
             self._mapping_session_context = context
+            self._mapping_session_provider_attach_epoch = (
+                int(getattr(self, "_provider_attach_epoch", 0))
+                if provider is getattr(self, "_remote_provider", None)
+                else None
+            )
 
         with self._exploration_loop_lock:
             if new_session_started:

@@ -167,6 +167,8 @@ class PointCloud3DViewer {
     this._lastFrameTime = 0;
     this._allPositions = new Float32Array(0);
     this._hasPointCloudSnapshot = false;
+    this._isLiveCloudMapSnapshot = false;
+    this._pointCloudSourcePoints = null;
     this._displayedPointCount = 0;
     this._initialized = false;
   }
@@ -606,10 +608,15 @@ class PointCloud3DViewer {
   }
 
   _emitPointCount() {
+    const bufferedPoints = Math.floor(this._allPositions.length / 3);
+    const sourcePoints = Number.isFinite(this._pointCloudSourcePoints)
+      ? Math.max(bufferedPoints, Math.floor(this._pointCloudSourcePoints))
+      : bufferedPoints;
     window.dispatchEvent(new CustomEvent('pointcloud3d:point-count', {
       detail: {
         points: this._displayedPointCount,
-        sourcePoints: Math.floor(this._allPositions.length / 3),
+        displayedPoints: this._displayedPointCount,
+        sourcePoints,
         lod: this._lod,
       },
     }));
@@ -660,6 +667,10 @@ class PointCloud3DViewer {
   _rebuildPointCloud() {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const src = this._allPositions;
+    if (this._isLiveCloudMapSnapshot) {
+      this._renderPointCloudPositions(src);
+      return;
+    }
     const totalPts = Math.floor(src.length / 3);
     const configuredStride = Math.max(1, Math.round((LOD_STRIDE[this._lod] || 1) * preset.sampleStride));
     const stride = totalPts <= POINT_SAMPLING_MIN_SOURCE_POINTS ? 1 : configuredStride;
@@ -687,6 +698,8 @@ class PointCloud3DViewer {
       const buf = await resp.arrayBuffer();
       this._allPositions = new Float32Array(buf);
       this._hasPointCloudSnapshot = true;
+      this._isLiveCloudMapSnapshot = false;
+      this._pointCloudSourcePoints = Math.floor(this._allPositions.length / 3);
       this._rebuildPointCloud();
       window.dispatchEvent(new CustomEvent('pointcloud3d:status', {
         detail: { state: 'loaded', points: this._allPositions.length / 3, lod }
@@ -702,12 +715,16 @@ class PointCloud3DViewer {
     merged.set(float32Array, this._allPositions.length);
     this._allPositions = merged;
     this._hasPointCloudSnapshot = true;
+    this._isLiveCloudMapSnapshot = false;
+    this._pointCloudSourcePoints = Math.floor(this._allPositions.length / 3);
     this._rebuildPointCloud();
   }
 
   _replaceCloudMapBuffer(xyzArray, revision) {
     this._lastCloudMapRevision = revision;
     this._hasPointCloudSnapshot = true;
+    this._isLiveCloudMapSnapshot = true;
+    this._pointCloudSourcePoints = Math.floor(xyzArray.length / 3);
 
     // 32MB 上限检查
     if (xyzArray.byteLength > MAX_BUFFER_BYTES) {
@@ -716,7 +733,7 @@ class PointCloud3DViewer {
     }
 
     this._allPositions = xyzArray;
-    this._rebuildPointCloud();
+    this._renderPointCloudPositions(xyzArray);
   }
 
   _ensureRobotMesh() {

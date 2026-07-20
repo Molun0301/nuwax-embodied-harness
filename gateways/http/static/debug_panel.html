@@ -767,7 +767,8 @@ button{font-family:inherit;cursor:pointer}
         pointcloud3dCameraMode: "free",
         pointcloud3dDistance: null,
         pointcloud3dZoomPercent: 100,
-        pointcloud3dVisiblePoints: 0,
+        pointcloud3dSourcePoints: 0,
+        pointcloud3dDisplayedPoints: 0,
         pointcloud3dPointCountKnown: false,
         pointcloud3dReady: false,
         mapRvizView: { center: null, zoom: 1 },
@@ -2290,14 +2291,20 @@ button{font-family:inherit;cursor:pointer}
         const rows = [["地图名称", activeMapName() || "--"]];
         if (is3d) {
           const pointcloud = pointcloudMapSummary();
-          const pointCount = state.pointcloud3dPointCountKnown
-            ? Math.max(0, Math.floor(Number(state.pointcloud3dVisiblePoints) || 0))
+          const sourcePointCount = state.pointcloud3dPointCountKnown
+            ? Math.max(0, Math.floor(Number(state.pointcloud3dSourcePoints) || 0))
+            : null;
+          const displayedPointCount = state.pointcloud3dPointCountKnown
+            ? Math.max(0, Math.floor(Number(state.pointcloud3dDisplayedPoints) || 0))
             : null;
           rows.push(
-            ["点云总数", pointCount === null ? "--" : pointCount.toLocaleString("zh-CN")],
+            ["点云总数", sourcePointCount === null ? "--" : sourcePointCount.toLocaleString("zh-CN")],
             ["坐标系", pointcloud.payload.frame_id || pointcloud.frame.frame_id || pointcloud.metadata.frame_id || "--"],
-            ["显示状态", pointCount === null ? "等待点云" : pointCount > 0 ? "已显示" : "暂无点云"],
+            ["显示状态", displayedPointCount === null ? "等待点云" : displayedPointCount > 0 ? "已显示" : "暂无点云"],
           );
+          if (sourcePointCount !== displayedPointCount) {
+            rows.splice(2, 0, ["显示点数", displayedPointCount === null ? "--" : displayedPointCount.toLocaleString("zh-CN")]);
+          }
         } else {
           const width = Number(grid && grid.width);
           const height = Number(grid && grid.height);
@@ -5933,9 +5940,16 @@ button{font-family:inherit;cursor:pointer}
         els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
       });
       window.addEventListener("pointcloud3d:point-count", (event) => {
-        const points = Number(event.detail && event.detail.points);
-        state.pointcloud3dVisiblePoints = Number.isFinite(points) ? Math.max(0, Math.floor(points)) : 0;
-        state.pointcloud3dPointCountKnown = Number.isFinite(points);
+        const detail = event.detail || {};
+        const displayedPoints = Number(detail.displayedPoints ?? detail.points);
+        const sourcePoints = Number(detail.sourcePoints ?? detail.points);
+        const hasDisplayedPoints = Number.isFinite(displayedPoints);
+        const hasSourcePoints = Number.isFinite(sourcePoints);
+        state.pointcloud3dDisplayedPoints = hasDisplayedPoints ? Math.max(0, Math.floor(displayedPoints)) : 0;
+        state.pointcloud3dSourcePoints = hasSourcePoints
+          ? Math.max(0, Math.floor(sourcePoints))
+          : state.pointcloud3dDisplayedPoints;
+        state.pointcloud3dPointCountKnown = hasDisplayedPoints || hasSourcePoints;
         renderMapSummary();
       });
       els.logLevelFilter.addEventListener("change", () => {
@@ -5987,7 +6001,7 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260719-forbidden-zones"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260720-live-cumulative"></script>
   <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>
     <span data-role="nav-status">未选点</span>

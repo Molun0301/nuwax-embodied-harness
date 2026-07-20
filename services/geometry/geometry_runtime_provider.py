@@ -2474,9 +2474,108 @@ class GeometryRuntimeProvider:
             timestamp_ns=meta.timestamp_ns,
             data=data,
         )
+        revision = int(meta.revision)
         known_cell_count = sum(1 for value in grid.data if value >= 0)
         occupied_cell_count = sum(1 for value in grid.data if value >= 50)
-        revision = int(meta.revision)
+        display_grid = grid
+        display_data = data
+        display_revision = revision
+        display_occupancy_source = "effective_fallback"
+        display_occupancy_fallback_reason = "raw_grid_unavailable"
+        try:
+            raw_payload = self.get_raw_occupancy_grid_data()
+        except Exception:
+            raw_payload = None
+            display_occupancy_fallback_reason = "raw_grid_read_failed"
+            LOGGER.exception(
+                "读取 Web 展示用物理栅格失败，回退到有效栅格。"
+            )
+        if raw_payload is not None:
+            try:
+                raw_data = bytes(raw_payload["data"])
+                raw_revision = int(raw_payload["revision"])
+                raw_grid = self._occupancy_grid_from_components(
+                    width=int(raw_payload["width"]),
+                    height=int(raw_payload["height"]),
+                    resolution=float(raw_payload["resolution"]),
+                    origin_x=float(raw_payload["origin_x"]),
+                    origin_y=float(raw_payload["origin_y"]),
+                    frame_id=str(raw_payload["frame_id"]),
+                    revision=raw_revision,
+                    timestamp_ns=int(raw_payload.get("timestamp_ns") or 0),
+                    data=raw_data,
+                )
+            except Exception:
+                display_occupancy_fallback_reason = "raw_grid_invalid"
+                LOGGER.exception(
+                    "Web 展示用物理栅格无效，回退到有效栅格。"
+                )
+            else:
+                layout_matches = (
+                    raw_revision == revision
+                    and raw_grid.width == grid.width
+                    and raw_grid.height == grid.height
+                    and raw_grid.frame_id == grid.frame_id
+                    and math.isclose(
+                        raw_grid.resolution_m,
+                        grid.resolution_m,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        raw_grid.origin.position.x,
+                        grid.origin.position.x,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        raw_grid.origin.position.y,
+                        grid.origin.position.y,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                )
+                if layout_matches:
+                    display_grid = raw_grid
+                    display_data = raw_data
+                    display_revision = raw_revision
+                    display_occupancy_source = "raw_physical"
+                    display_occupancy_fallback_reason = None
+                else:
+                    display_occupancy_fallback_reason = "raw_grid_layout_mismatch"
+                    LOGGER.warning(
+                        "物理栅格与有效栅格的布局或 revision 不一致，"
+                        "Web 展示回退到有效栅格: effective=%dx%d@%d raw=%dx%d@%d",
+                        grid.width,
+                        grid.height,
+                        revision,
+                        raw_grid.width,
+                        raw_grid.height,
+                        raw_revision,
+                    )
+
+        display_checksum = hashlib.sha256(display_data).hexdigest()
+        display_known_cell_count = sum(
+            1 for value in display_grid.data if value >= 0
+        )
+        display_occupied_cell_count = sum(
+            1 for value in display_grid.data if value >= 50
+        )
+        display_occupancy_metadata = {
+            "checksum": display_checksum,
+            "occupancy_content_hash": display_checksum,
+            "content_hash": display_checksum,
+            "occupancy_content_revision": display_revision,
+            "content_revision": display_revision,
+            "known_cell_count": display_known_cell_count,
+            "occupied_cell_count": display_occupied_cell_count,
+            "occupancy_metrics": {
+                "content_hash": display_checksum,
+                "content_revision": display_revision,
+                "known_cell_count": display_known_cell_count,
+                "occupied_cell_count": display_occupied_cell_count,
+            },
+        }
         metadata = {
             "event_type": "content_update",
             "source_kind": "platform_live_map_provider",
@@ -2534,6 +2633,10 @@ class GeometryRuntimeProvider:
             {
                 "source_name": "geometry_runtime",
                 "occupancy_grid": grid,
+                "display_occupancy_grid": display_grid,
+                "display_occupancy_source": display_occupancy_source,
+                "display_occupancy_fallback_reason": display_occupancy_fallback_reason,
+                "display_occupancy_metadata": display_occupancy_metadata,
                 "cost_map": None,
                 "semantic_map": None,
                 "width": grid.width,

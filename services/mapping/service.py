@@ -110,12 +110,24 @@ class MappingService:
         if str(source_metadata.get("event_type") or "content_update") != "content_update":
             with self._lock:
                 return self._latest_snapshot
+        display_metadata = payload.get("display_occupancy_metadata")
         return self.ingest_external_snapshot(
             source_name=source_name,
             occupancy_grid=payload.get("occupancy_grid"),
             cost_map=payload.get("cost_map"),
             semantic_map=payload.get("semantic_map"),
             metadata=source_metadata,
+            stream_occupancy_grid=payload.get("display_occupancy_grid"),
+            stream_occupancy_source=(
+                str(payload.get("display_occupancy_source") or "").strip() or None
+            ),
+            stream_occupancy_fallback_reason=(
+                str(payload.get("display_occupancy_fallback_reason") or "").strip()
+                or None
+            ),
+            stream_occupancy_metadata=(
+                dict(display_metadata) if isinstance(display_metadata, dict) else None
+            ),
         )
 
     def ingest_external_snapshot(
@@ -128,8 +140,12 @@ class MappingService:
         metadata: Optional[Dict[str, object]] = None,
         version_id_override: Optional[str] = None,
         revision_override: Optional[int] = None,
+        stream_occupancy_grid=None,
+        stream_occupancy_source: Optional[str] = None,
+        stream_occupancy_fallback_reason: Optional[str] = None,
+        stream_occupancy_metadata: Optional[Dict[str, object]] = None,
     ) -> MapSnapshot:
-        """写入来自适配器或外部系统的地图快照。"""
+        """写入地图快照；stream occupancy override 仅用于 Web，不进入状态存储。"""
 
         if occupancy_grid is None and cost_map is None and semantic_map is None:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
@@ -146,6 +162,9 @@ class MappingService:
             if (
                 version_id_override is None
                 and revision_override is None
+                # fail-closed effective grids can stay byte-identical while the
+                # physical display grid advances and still needs a new Web frame.
+                and stream_occupancy_grid is None
                 and self._is_equivalent_to_latest_snapshot(
                     source_name=source_name,
                     occupancy_grid=occupancy_grid,
@@ -187,7 +206,56 @@ class MappingService:
                 **frame_metadata,
             }
             snapshot.metadata.update(frame_metadata)
-            stream_sequence = self._extract_stream_sequence(snapshot.metadata)
+            stream_snapshot = None
+            stream_event_payload = None
+            stream_sequence = None
+            if self._stream_bus is not None:
+                stream_snapshot = snapshot.model_copy(deep=True)
+                stream_event_payload = dict(event_payload)
+                if stream_occupancy_grid is not None:
+                    effective_occupancy_hash = stream_snapshot.metadata.get(
+                        "occupancy_content_hash"
+                    )
+                    stream_grid_copy = getattr(
+                        stream_occupancy_grid,
+                        "model_copy",
+                        None,
+                    )
+                    stream_snapshot.occupancy_grid = (
+                        stream_grid_copy(deep=True)
+                        if callable(stream_grid_copy)
+                        else stream_occupancy_grid
+                    )
+                    display_source = str(
+                        stream_occupancy_source or "display_override"
+                    ).strip()
+                    display_fallback_reason = str(
+                        stream_occupancy_fallback_reason or ""
+                    ).strip() or None
+                    stream_snapshot.metadata.update(
+                        dict(stream_occupancy_metadata or {})
+                    )
+                    display_annotations = {
+                        "occupancy_view": display_source,
+                        "display_occupancy_source": display_source,
+                        "display_occupancy_fallback": bool(
+                            display_fallback_reason
+                            or display_source == "effective_fallback"
+                        ),
+                        "display_occupancy_fallback_reason": display_fallback_reason,
+                        "navigation_occupancy_source": "effective",
+                        "navigation_occupancy_content_hash": effective_occupancy_hash,
+                    }
+                    stream_snapshot.metadata.update(display_annotations)
+                    stream_frame_metadata = self._build_map_frame_metadata(
+                        stream_snapshot
+                    )
+                    stream_snapshot.metadata.update(stream_frame_metadata)
+                    stream_event_payload.update(stream_frame_metadata)
+                    stream_event_payload.update(display_annotations)
+                stream_sequence = self._extract_stream_sequence(
+                    stream_snapshot.metadata
+                )
 
         if self._event_bus is not None:
             self._event_bus.publish(
@@ -199,16 +267,20 @@ class MappingService:
                     payload=dict(event_payload),
                 )
             )
-        if self._stream_bus is not None:
+        if (
+            self._stream_bus is not None
+            and stream_snapshot is not None
+            and stream_event_payload is not None
+        ):
             self._stream_bus.publish(
                 "map.frame",
                 source="mapping_service",
-                payload=snapshot,
-                frame_id=snapshot.frame_id,
+                payload=stream_snapshot,
+                frame_id=stream_snapshot.frame_id,
                 sequence=stream_sequence,
-                revision=str(snapshot.revision),
+                revision=str(stream_snapshot.revision),
                 status="available",
-                metadata=dict(event_payload),
+                metadata=stream_event_payload,
             )
         return snapshot
 

@@ -41,6 +41,7 @@ from contracts.runtime_views import (
 from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
+from core.safety_guard import MotionStopGenerationError
 from core.task_manager import (
     TaskCancelledError,
     TaskSafetyBarrierError,
@@ -51,7 +52,11 @@ from drivers.common import RobotAssemblyBase
 from drivers.common.private_capabilities import PrivateCapabilitySpec
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
-from gateways.motion_guard import GatewayMotionGuard, GatewayMotionGuardError
+from gateways.motion_guard import (
+    GatewayMotionGuard,
+    GatewayMotionGuardError,
+    MotionAdmission,
+)
 from gateways.person_follow import (
     PersonFollowReadiness,
     read_person_follow_readiness,
@@ -379,7 +384,7 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = (
     | _GUARD_ONLY_CAPABILITY_NAMES
     | _PERSON_FOLLOW_CAPABILITY_NAMES
 )
-_SAFE_STOP_BYPASS_CAPABILITY_NAMES = frozenset(
+_MOTION_ADMISSION_BYPASS_CAPABILITY_NAMES = frozenset(
     {
         "stop_all_motion",
         "cancel_task",
@@ -388,13 +393,13 @@ _SAFE_STOP_BYPASS_CAPABILITY_NAMES = frozenset(
         "stop_exploration",
     }
 )
-_SAFE_STOP_GATED_RESOURCE_NAMES = frozenset(
+_MOTION_ADMISSION_RESOURCE_NAMES = frozenset(
     {
         RuntimeResource.BASE_MOTION.value,
         RuntimeResource.NAVIGATION.value,
     }
 )
-_SAFE_STOP_GATED_CAPABILITY_NAMES = frozenset(
+_MOTION_ADMISSION_CAPABILITY_NAMES = frozenset(
     {
         *_MOTION_STACK_CAPABILITY_NAMES,
         *_GUARD_ONLY_CAPABILITY_NAMES,
@@ -808,11 +813,10 @@ class GatewayRuntime:
         self._gateway_capability_names: Tuple[str, ...] = ()
 
         self.capability_registry.bind_robot_capability_matrix(robot.manifest.capability_matrix)
-        providers = getattr(self.robot, "providers", None)
-        bind_safety_guard = getattr(providers, "bind_safety_guard", None)
-        if callable(bind_safety_guard):
-            bind_safety_guard(self.safety_guard)
-        self.safety_guard.register_stop_handler("robot_entry", self._safe_stop_robot)
+        self.safety_guard.register_stop_handler(
+            "robot_entry",
+            self._stop_robot_motion,
+        )
 
         if register_default_capabilities:
             self.register_default_capabilities()
@@ -949,7 +953,7 @@ class GatewayRuntime:
             except Exception as exc:
                 stop_error = exc
                 RUNTIME_LOGGER.exception(
-                    "motion guard safety latch failed during gateway shutdown"
+                    "motion guard global stop was not confirmed during gateway shutdown"
                 )
             self.task_manager.shutdown(wait=True)
             self._stop_runtime_input_bridge()
@@ -1694,12 +1698,29 @@ class GatewayRuntime:
             ),
             _descriptor(
                 "stop_all_motion",
-                "安全停止",
-                "触发全局安全停止，立即停止底盘运动。",
+                "停止所有运动",
+                "停止并确认底盘归零；完成后不会锁定后续运动。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object({"reason": {"type": "string"}}),
-                output_schema=_schema_object({"stopped": {"type": "boolean"}}),
+                input_schema=_schema_object(
+                    {
+                        "reason": {"type": "string"},
+                        "operation_id": {"type": "string"},
+                    }
+                ),
+                output_schema=_schema_object(
+                    {
+                        "stopped": {"type": "boolean"},
+                        "operation_id": {"type": "string"},
+                        "motion_stop_generation": {"type": "integer"},
+                        "handler_results": {"type": "object"},
+                    },
+                    required=(
+                        "stopped",
+                        "operation_id",
+                        "motion_stop_generation",
+                    ),
+                ),
             ),
             _descriptor(
                 "capture_image",
@@ -2794,8 +2815,8 @@ class GatewayRuntime:
             ),
             SkillDescriptor(
                 name="stop_all_motion",
-                display_name="安全停止",
-                description="立即触发全局安全停止。",
+                display_name="停止所有运动",
+                description="停止并确认底盘归零；完成后不会锁定后续运动。",
                 category=SkillCategory.SYSTEM,
                 capability_name="stop_all_motion",
             ),
@@ -3353,8 +3374,6 @@ class GatewayRuntime:
 
         registration = self.capability_registry.get_registration(capability_name)
         descriptor = registration.descriptor
-        self._ensure_safe_stop_allows_capability(descriptor)
-        self._ensure_geometry_runtime_for_invoke(capability_name)
         self._refresh_dynamic_capability_matrix()
         self.capability_registry.assert_supported(
             capability_name,
@@ -3382,6 +3401,15 @@ class GatewayRuntime:
             message=f"能力 {descriptor.name} 调用开始。",
         )
         try:
+            if self._requires_motion_admission(descriptor):
+                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
+                    self._admit_motion_request(
+                        descriptor.name,
+                        request_id=str(context.get("request_id") or ""),
+                    )
+                )
+            else:
+                self._ensure_geometry_runtime_for_invoke(capability_name)
             if descriptor.execution_mode == CapabilityExecutionMode.ASYNC_TASK:
                 result = registration.handler(payload, requested_by=requested_by, request_context=context)
             else:
@@ -5420,6 +5448,10 @@ class GatewayRuntime:
         """Debug 面板 RViz 2D Goal 直通 nuwax-geometry-runtime。"""
 
         pose = self._build_pose_from_arguments(arguments)
+        admission = self._admit_motion_request(
+            "navigate_to_pose",
+            request_id=self._build_runtime_request_id("debug-navigation-goal"),
+        )
         provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
@@ -5438,14 +5470,18 @@ class GatewayRuntime:
                 error_code="goal_pose_publish_unsupported",
                 http_status=503,
             )
-        result_raw = provider.set_navigation_goal(
-            x=float(pose.position.x),
-            y=float(pose.position.y),
-            z=float(pose.position.z),
-            qx=float(pose.orientation.x),
-            qy=float(pose.orientation.y),
-            qz=float(pose.orientation.z),
-            qw=float(pose.orientation.w),
+        result_raw = self._run_with_motion_admission(
+            admission,
+            lambda: provider.set_navigation_goal(
+                x=float(pose.position.x),
+                y=float(pose.position.y),
+                z=float(pose.position.z),
+                qx=float(pose.orientation.x),
+                qy=float(pose.orientation.y),
+                qz=float(pose.orientation.z),
+                qw=float(pose.orientation.w),
+                motion_admission=admission.as_metadata(),
+            ),
         )
         result = {
             "published": bool(result_raw.get("accepted")),
@@ -5676,6 +5712,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "navigate_to_pose",
+        )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="navigate_to_pose",
@@ -5725,6 +5765,7 @@ class GatewayRuntime:
         return self._submit_navigation_task(
             capability_name="navigate_to_pose",
             goal=goal,
+            motion_admission=motion_admission,
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
@@ -5941,6 +5982,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "navigate_to_named_location",
+        )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="navigate_to_named_location",
@@ -6058,6 +6103,7 @@ class GatewayRuntime:
         return self._submit_navigation_task(
             capability_name="navigate_to_named_location",
             goal=goal,
+            motion_admission=motion_admission,
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
@@ -6089,6 +6135,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "find_target",
+        )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="find_target",
@@ -6111,7 +6161,6 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor("find_target")
 
         def runner(context) -> Dict[str, Any]:
-            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.05, stage="search_prepare", message="准备查找目标。")
             finalized = False
             rejected_record_ids: Set[str] = set()
@@ -6177,6 +6226,7 @@ class GatewayRuntime:
                 search_result = self._run_target_navigation_candidates(
                     task_context=context,
                     capability_name="find_target",
+                    motion_admission=motion_admission,
                     map_name=map_name,
                     query=query,
                     camera_id=camera_id,
@@ -6227,24 +6277,27 @@ class GatewayRuntime:
                         }
                     )
 
-        return self.task_manager.submit(
-            "find_target",
-            runner,
-            input_payload={
-                "map_name": map_name,
-                "query": query,
-                "camera_id": camera_id,
-                "poll_interval_sec": poll_interval_sec,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="find_target",
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                "find_target",
+                runner,
+                input_payload={
+                    "map_name": map_name,
+                    "query": query,
+                    "camera_id": camera_id,
+                    "poll_interval_sec": poll_interval_sec,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata=self._build_task_request_metadata(
+                    capability_name="find_target",
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
+                deferred_interrupt=True,
             ),
-            deferred_interrupt=True,
         )
 
     def _handle_explore_area(
@@ -6266,6 +6319,10 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={"unsupported_parameters": removed_fields},
             )
+        motion_admission = self._require_motion_admission(
+            arguments,
+            capability_name,
+        )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name=capability_name,
@@ -6274,7 +6331,7 @@ class GatewayRuntime:
         )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
-        if "frame_id" in arguments or "x" in arguments or "y" in arguments:
+        if "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
         timeout_sec = self._resolve_async_timeout(
@@ -6384,7 +6441,6 @@ class GatewayRuntime:
             boundary_line_segments=boundary_segments,
             metadata=request_metadata,
         )
-        self._ensure_geometry_runtime_for_capability(capability_name)
         task_metadata = self._build_task_request_metadata(
             capability_name=capability_name,
             requested_by=requested_by,
@@ -6409,6 +6465,7 @@ class GatewayRuntime:
         )
         return self._submit_exploration_task(
             request=request,
+            motion_admission=motion_admission,
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
@@ -6424,6 +6481,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "explore_and_find_target",
+        )
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="explore_and_find_target",
@@ -6466,10 +6527,13 @@ class GatewayRuntime:
                 "search_query": query,
             },
         )
+        request = self._exploration_with_motion_admission(
+            request,
+            motion_admission,
+        )
         descriptor = self.capability_registry.get_descriptor("explore_and_find_target")
 
         def runner(context) -> Dict[str, Any]:
-            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.03, stage="search_prepare", message="准备探索并查找目标。")
             finalized = False
             rejected_record_ids: Set[str] = set()
@@ -6641,6 +6705,7 @@ class GatewayRuntime:
                 precheck_navigation = self._run_target_navigation_candidates(
                     task_context=context,
                     capability_name="explore_and_find_target",
+                    motion_admission=motion_admission,
                     map_name=map_name,
                     query=query,
                     camera_id=camera_id,
@@ -6674,14 +6739,20 @@ class GatewayRuntime:
 
                 context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
                 self._ensure_motion_runtime_for_backend_call(
-                    "explore_and_find_target"
+                    "explore_and_find_target",
+                    motion_admission,
                 )
                 register_resource_ownership(
                     "exploration",
                     "request_id",
                     active_request.request_id,
                 )
-                exploration_context = self.navigation_service.start_exploration(active_request)
+                exploration_context = self._run_with_motion_admission(
+                    motion_admission,
+                    lambda: self.navigation_service.start_exploration(
+                        active_request
+                    ),
+                )
                 active_exploration_request_id = active_request.request_id
                 self._attach_perception_to_exploration()
                 perception_attached = True
@@ -6767,6 +6838,7 @@ class GatewayRuntime:
                         navigation_result = self._run_target_navigation_candidates(
                             task_context=context,
                             capability_name="explore_and_find_target",
+                            motion_admission=motion_admission,
                             map_name=map_name,
                             query=query,
                             camera_id=camera_id,
@@ -6802,14 +6874,20 @@ class GatewayRuntime:
                             deep=True,
                         )
                         self._ensure_motion_runtime_for_backend_call(
-                            "explore_and_find_target"
+                            "explore_and_find_target",
+                            motion_admission,
                         )
                         register_resource_ownership(
                             "exploration",
                             "request_id",
                             active_request.request_id,
                         )
-                        exploration_context = self.navigation_service.start_exploration(active_request)
+                        exploration_context = self._run_with_motion_admission(
+                            motion_admission,
+                            lambda: self.navigation_service.start_exploration(
+                                active_request
+                            ),
+                        )
                         active_exploration_request_id = active_request.request_id
                         continue
 
@@ -6855,6 +6933,7 @@ class GatewayRuntime:
                         final_navigation_result = self._run_target_navigation_candidates(
                             task_context=context,
                             capability_name="explore_and_find_target",
+                            motion_admission=motion_admission,
                             map_name=map_name,
                             query=query,
                             camera_id=camera_id,
@@ -6948,33 +7027,36 @@ class GatewayRuntime:
                 ):
                     acknowledge_interrupted_parking()
 
-        return self.task_manager.submit(
-            "explore_and_find_target",
-            runner,
-            input_payload={
-                "request_id": request.request_id,
-                "map_name": map_name,
-                "query": query,
-                "camera_id": camera_id,
-                "center_pose": center_pose.model_dump(mode="json") if center_pose is not None else None,
-                "radius_m": request.radius_m,
-                "strategy": request.strategy,
-                "max_duration_sec": request.max_duration_sec,
-                "poll_interval_sec": poll_interval_sec,
-                "search_refresh_interval_sec": search_refresh_interval_sec,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata={
-                **self._build_task_request_metadata(
-                    capability_name="explore_and_find_target",
-                    requested_by=requested_by,
-                    request_context=request_context,
-                ),
-                "request_id": request.request_id,
-            },
-            deferred_interrupt=True,
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                "explore_and_find_target",
+                runner,
+                input_payload={
+                    "request_id": request.request_id,
+                    "map_name": map_name,
+                    "query": query,
+                    "camera_id": camera_id,
+                    "center_pose": center_pose.model_dump(mode="json") if center_pose is not None else None,
+                    "radius_m": request.radius_m,
+                    "strategy": request.strategy,
+                    "max_duration_sec": request.max_duration_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                    "search_refresh_interval_sec": search_refresh_interval_sec,
+                },
+                requested_by=requested_by,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata={
+                    **self._build_task_request_metadata(
+                        capability_name="explore_and_find_target",
+                        requested_by=requested_by,
+                        request_context=request_context,
+                    ),
+                    "request_id": request.request_id,
+                },
+                deferred_interrupt=True,
+            ),
         )
 
     def _handle_inspect_target(
@@ -6984,6 +7066,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "inspect_target",
+        )
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -6993,7 +7079,6 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor("inspect_target")
 
         def runner(context) -> Dict[str, Any]:
-            self._ensure_safe_stop_allows_capability(descriptor)
             context.update(progress=0.05, stage="inspect_observe", message="开始检查目标。")
             perception_context = self.perception_service.describe_current_scene(
                 camera_id=camera_id,
@@ -7003,9 +7088,9 @@ class GatewayRuntime:
             )
             matched_object = self._find_scene_object(query, perception_context)
             if matched_object is None and auto_navigate:
-                self._ensure_safe_stop_allows_capability(descriptor)
                 self._ensure_motion_runtime_for_backend_call(
-                    "navigate_to_pose"
+                    "navigate_to_pose",
+                    motion_admission,
                 )
                 context.update(progress=0.3, stage="inspect_navigate", message="当前画面未找到目标，尝试导航到命名位置。")
                 tagged_location = self.memory_service.resolve_tagged_location(query)
@@ -7019,9 +7104,9 @@ class GatewayRuntime:
                 else:
                     goal = self.navigation_service.resolve_named_goal(query)
                 context.ensure_active()
-                self._ensure_safe_stop_allows_capability(descriptor)
-                self.navigation_service.navigate_until_complete(
+                self._navigate_until_complete_with_motion_admission(
                     goal,
+                    motion_admission=motion_admission,
                     poll_interval_sec=max(0.02, poll_interval_sec),
                     timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: context.update(
@@ -7065,22 +7150,25 @@ class GatewayRuntime:
                 "semantic_memory": memory_entry,
             }
 
-        return self.task_manager.submit(
-            "inspect_target",
-            runner,
-            input_payload={
-                "query": query,
-                "camera_id": camera_id,
-                "auto_navigate": auto_navigate,
-                "detector_backend": detector_backend,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="inspect_target",
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                "inspect_target",
+                runner,
+                input_payload={
+                    "query": query,
+                    "camera_id": camera_id,
+                    "auto_navigate": auto_navigate,
+                    "detector_backend": detector_backend,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata=self._build_task_request_metadata(
+                    capability_name="inspect_target",
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
             ),
         )
 
@@ -7092,13 +7180,10 @@ class GatewayRuntime:
         request_context: Optional[MetadataDict] = None,
     ):
         person_follow = self._person_follow_readiness()
-        guard_ready = self.motion_guard.is_ready(
-            motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
-        )
         image_ready = self._has_provider(ImageProvider)
-        if not (person_follow.ready and guard_ready and image_ready):
+        if not (person_follow.ready and image_ready):
             raise GatewayError(
-                "Person-follow 可选服务、图像提供器或 motion guard 未就绪。",
+                "Person-follow 可选服务或图像提供器未就绪。",
                 error_code="person_follow_unavailable",
                 http_status=503,
                 jsonrpc_code=-32010,
@@ -7108,9 +7193,12 @@ class GatewayRuntime:
                     "person_follow_reason": person_follow.reason,
                     "person_follow_ready_file": person_follow.ready_file,
                     "image_provider_ready": image_ready,
-                    "motion_guard_ready": guard_ready,
                 },
             )
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "follow_target",
+        )
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -7128,9 +7216,13 @@ class GatewayRuntime:
             )
 
         def runner(context) -> Dict[str, Any]:
-            self._ensure_safe_stop_allows_capability(descriptor)
             try:
-                session = self.motion_guard.acquire_follow_session()
+                session = self._run_with_motion_admission(
+                    motion_admission,
+                    lambda: self.motion_guard.acquire_follow_session(
+                        motion_admission.proof
+                    ),
+                )
                 start_time = time.monotonic()
                 last_seen_time = 0.0
                 last_detection = None
@@ -7195,23 +7287,26 @@ class GatewayRuntime:
                 "last_detection": last_detection,
             }
 
-        return self.task_manager.submit(
-            "follow_target",
-            runner,
-            input_payload={
-                "query": query,
-                "camera_id": camera_id,
-                "duration_sec": duration_sec,
-                "interval_sec": interval_sec,
-                "lost_timeout_sec": lost_timeout_sec,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="follow_target",
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                "follow_target",
+                runner,
+                input_payload={
+                    "query": query,
+                    "camera_id": camera_id,
+                    "duration_sec": duration_sec,
+                    "interval_sec": interval_sec,
+                    "lost_timeout_sec": lost_timeout_sec,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata=self._build_task_request_metadata(
+                    capability_name="follow_target",
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
             ),
         )
 
@@ -7222,6 +7317,10 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
+        motion_admission = self._require_motion_admission(
+            arguments,
+            "relative_move",
+        )
         descriptor = self.capability_registry.get_descriptor("relative_move")
         vx = self._require_float(arguments, "vx")
         vy = self._float(arguments, "vy", 0.0)
@@ -7241,9 +7340,13 @@ class GatewayRuntime:
         timeout_sec = max(timeout_override, duration_sec + 2.0, float(descriptor.timeout_sec or 0))
 
         def runner(context) -> Dict[str, float]:
-            self._ensure_safe_stop_allows_capability(descriptor)
             try:
-                session = self.motion_guard.acquire_relative_session()
+                session = self._run_with_motion_admission(
+                    motion_admission,
+                    lambda: self.motion_guard.acquire_relative_session(
+                        motion_admission.proof
+                    ),
+                )
                 start_time = time.monotonic()
                 try:
                     while True:
@@ -7273,23 +7376,26 @@ class GatewayRuntime:
                 "duration_sec": duration_sec,
             }
 
-        return self.task_manager.submit(
-            "relative_move",
-            runner,
-            input_payload={
-                "vx": vx,
-                "vy": vy,
-                "vyaw": vyaw,
-                "duration_sec": duration_sec,
-                "interval_sec": interval_sec,
-            },
-            requested_by=requested_by,
-            required_resources=[RuntimeResource.BASE_MOTION.value],
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name="relative_move",
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                "relative_move",
+                runner,
+                input_payload={
+                    "vx": vx,
+                    "vy": vy,
+                    "vyaw": vyaw,
+                    "duration_sec": duration_sec,
+                    "interval_sec": interval_sec,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=[RuntimeResource.BASE_MOTION.value],
+                timeout_sec=timeout_sec,
+                metadata=self._build_task_request_metadata(
+                    capability_name="relative_move",
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
             ),
         )
 
@@ -8665,11 +8771,73 @@ class GatewayRuntime:
             "observation_writeback": writeback_result,
         }
 
+    def _navigate_until_complete_with_motion_admission(
+        self,
+        goal: NavigationGoal,
+        *,
+        motion_admission: MotionAdmission,
+        poll_interval_sec: float = 0.2,
+        timeout_sec: Optional[float] = None,
+        on_progress=None,
+    ):
+        """Submit once under the stop barrier, then poll without holding it."""
+
+        admitted_goal = self._goal_with_motion_admission(
+            goal,
+            motion_admission,
+        )
+        self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.navigation_service.set_goal(admitted_goal),
+        )
+        deadline = (
+            None
+            if timeout_sec is None or timeout_sec <= 0
+            else time.monotonic() + float(timeout_sec)
+        )
+        while True:
+            context = self.navigation_service.refresh_navigation()
+            if callable(on_progress):
+                on_progress(context)
+            state = context.navigation_state.status
+            if context.goal_reached:
+                return context
+            if state == NavigationStatus.SUCCEEDED:
+                raise GatewayError(
+                    context.navigation_state.message
+                    or "导航后端报告完成，但平台未确认已到达目标。"
+                )
+            if state == NavigationStatus.FAILED:
+                raise GatewayError(
+                    context.navigation_state.message or "导航执行失败。"
+                )
+            if state == NavigationStatus.CANCELLED:
+                raise GatewayError(
+                    context.navigation_state.message or "导航已取消。"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                try:
+                    self.navigation_service.cancel_goal(
+                        request_id=admitted_goal.goal_id
+                    )
+                except Exception:
+                    RUNTIME_LOGGER.exception(
+                        "导航超时取消失败 goal_id=%s",
+                        admitted_goal.goal_id,
+                    )
+                raise GatewayError(
+                    "导航在 %.1fs 内未达终态，已下发取消。"
+                    % float(timeout_sec),
+                    error_code="navigation_timeout",
+                )
+            time.sleep(max(0.01, poll_interval_sec))
+
     def _run_target_navigation_candidates(
         self,
         *,
         task_context,
         capability_name: str,
+        motion_admission: MotionAdmission,
         map_name: str,
         query: str,
         camera_id: Optional[str],
@@ -8682,7 +8850,6 @@ class GatewayRuntime:
         timeout_sec: Optional[float] = None,
         navigation_state_callback: Optional[Callable[[Optional[str]], None]] = None,
     ) -> Optional[Dict[str, Any]]:
-        self._ensure_safe_stop_allows_capability_name(capability_name)
         self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
@@ -8743,7 +8910,10 @@ class GatewayRuntime:
                 return None
             raise
 
-        self._ensure_motion_runtime_for_backend_call(capability_name)
+        self._ensure_motion_runtime_for_backend_call(
+            capability_name,
+            motion_admission,
+        )
         last_error: Optional[GatewayError] = None
         last_verification = None
         attempted_candidate_ids: List[str] = []
@@ -8830,12 +9000,12 @@ class GatewayRuntime:
                 localization_session_id=current_localization_session_id,
             )
             task_context.ensure_active()
-            self._ensure_safe_stop_allows_capability_name(capability_name)
             if navigation_state_callback is not None:
                 navigation_state_callback(goal.goal_id)
             try:
-                navigation_context = self.navigation_service.navigate_until_complete(
+                navigation_context = self._navigate_until_complete_with_motion_admission(
                     goal,
+                    motion_admission=motion_admission,
                     poll_interval_sec=max(0.02, poll_interval_sec),
                     timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: (
@@ -8914,12 +9084,12 @@ class GatewayRuntime:
                 payload={"query": query, "goal_id": semantic_goal.goal_id},
             )
             task_context.ensure_active()
-            self._ensure_safe_stop_allows_capability_name(capability_name)
             if navigation_state_callback is not None:
                 navigation_state_callback(semantic_goal.goal_id)
             try:
-                navigation_context = self.navigation_service.navigate_until_complete(
+                navigation_context = self._navigate_until_complete_with_motion_admission(
                     semantic_goal,
+                    motion_admission=motion_admission,
                     poll_interval_sec=max(0.02, poll_interval_sec),
                     timeout_sec=timeout_sec,
                     on_progress=lambda nav_context: (
@@ -9239,30 +9409,24 @@ class GatewayRuntime:
         )
         return cancel_path, ack_path
 
-    def _runtime_activation_safe_stop_error(
+    def _runtime_activation_cancelled_error(
         self,
         context: Dict[str, Any],
     ) -> GatewayError:
-        safety_guard = getattr(self, "safety_guard", None)
-        safety_state = (
-            safety_guard.get_safe_stop_state()
-            if safety_guard is not None
-            else {"safe_stop_active": True}
-        )
+        current_generation = self.safety_guard.motion_stop_generation
         return GatewayError(
-            "安全停止已使按需组件激活事务失效。",
-            error_code="safe_stop_active",
-            http_status=423,
-            jsonrpc_code=-32011,
+            "该运动请求已被更新的全局停车操作取消。",
+            error_code="motion_request_cancelled",
+            http_status=409,
+            jsonrpc_code=-32000,
             details={
                 "capability_name": context["capability_name"],
                 "activation_level": context["activation_level"],
                 "request_id": context["request_id"],
-                "request_safety_epoch": context["safety_epoch"],
-                "current_safety_epoch": int(
-                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                "request_motion_stop_generation": context.get(
+                    "motion_stop_generation"
                 ),
-                "safety_state": safety_state,
+                "current_motion_stop_generation": current_generation,
             },
         )
 
@@ -9275,9 +9439,7 @@ class GatewayRuntime:
     ) -> None:
         lock = self._runtime_activation_state_lock()
         with lock:
-            current_epoch = int(
-                getattr(self, "_runtime_activation_safety_epoch", 0)
-            )
+            current_generation = self.safety_guard.motion_stop_generation
             ack_path = Path(context["ack_path"])
             cancel_path = Path(context["cancel_path"])
             try:
@@ -9289,7 +9451,7 @@ class GatewayRuntime:
                         "state": "cancel_requested",
                         "error_code": error_code,
                         "reason": reason,
-                        "safety_epoch": current_epoch,
+                        "motion_stop_generation": current_generation,
                         "cancelled_at": utc_now().isoformat(),
                     },
                 )
@@ -9304,182 +9466,267 @@ class GatewayRuntime:
         self,
         context: Dict[str, Any],
     ) -> None:
-        safety_guard = getattr(self, "safety_guard", None)
-        safety_lock = (
-            getattr(safety_guard, "_lock", None)
-            if context["safe_stop_sensitive"]
-            else None
-        )
-        if safety_lock is not None:
-            safety_lock.acquire()
-        try:
-            lock = self._runtime_activation_state_lock()
-            with lock:
-                current = getattr(self, "_runtime_activation_context", None)
-                current_epoch = int(
-                    getattr(self, "_runtime_activation_safety_epoch", 0)
+        lock = self._runtime_activation_state_lock()
+        with lock:
+            current = getattr(self, "_runtime_activation_context", None)
+            expected_generation = context.get("motion_stop_generation")
+            current_generation = self.safety_guard.motion_stop_generation
+            invalidated = (
+                current is None
+                or current.get("request_id") != context["request_id"]
+                or (
+                    expected_generation is not None
+                    and expected_generation != current_generation
                 )
-                invalidated = (
-                    current is None
-                    or current.get("request_id") != context["request_id"]
-                    or (
-                        context["safe_stop_sensitive"]
-                        and (
-                            bool(
-                                safety_guard is not None
-                                and safety_guard.safe_stop_active
-                            )
-                            or current_epoch != context["safety_epoch"]
-                        )
-                    )
+            )
+            if invalidated:
+                self._cancel_runtime_activation_request(
+                    context,
+                    reason="motion stop invalidated activation before ACK",
+                    error_code="activation_cancelled",
                 )
-                if invalidated:
-                    self._cancel_runtime_activation_request(
-                        context,
-                        reason="safe stop invalidated activation before ACK",
-                        error_code="safe_stop_active",
-                    )
-                    raise self._runtime_activation_safe_stop_error(context)
-                _write_json_file_atomically(
-                    Path(context["ack_path"]),
-                    {
-                        "request_id": context["request_id"],
-                        "state": "acknowledged",
-                        "safety_epoch": context["safety_epoch"],
-                        "acknowledged_at": utc_now().isoformat(),
-                    },
-                )
-        finally:
-            if safety_lock is not None:
-                safety_lock.release()
+                raise self._runtime_activation_cancelled_error(context)
+            _write_json_file_atomically(
+                Path(context["ack_path"]),
+                {
+                    "request_id": context["request_id"],
+                    "state": "acknowledged",
+                    "motion_stop_generation": expected_generation,
+                    "acknowledged_at": utc_now().isoformat(),
+                },
+            )
 
     def _commit_runtime_activation_request(
         self,
         context: Dict[str, Any],
     ) -> None:
-        safety_guard = getattr(self, "safety_guard", None)
-        safety_lock = (
-            getattr(safety_guard, "_lock", None)
-            if context["safe_stop_sensitive"]
-            else None
-        )
-        if safety_lock is not None:
-            safety_lock.acquire()
-        try:
-            lock = self._runtime_activation_state_lock()
-            with lock:
-                current = getattr(self, "_runtime_activation_context", None)
-                current_epoch = int(
-                    getattr(self, "_runtime_activation_safety_epoch", 0)
-                )
-                invalidated = (
-                    current is None
-                    or current.get("request_id") != context["request_id"]
-                    or (
-                        context["safe_stop_sensitive"]
-                        and (
-                            bool(
-                                safety_guard is not None
-                                and safety_guard.safe_stop_active
-                            )
-                            or current_epoch != context["safety_epoch"]
-                        )
-                    )
-                )
-                if invalidated:
-                    self._cancel_runtime_activation_request(
-                        context,
-                        reason="safe stop invalidated activation before commit",
-                        error_code="safe_stop_active",
-                    )
-                    raise self._runtime_activation_safe_stop_error(context)
-                Path(context["request_path"]).unlink(missing_ok=True)
-                Path(context["ack_path"]).unlink(missing_ok=True)
-                Path(context["cancel_path"]).unlink(missing_ok=True)
-                self._runtime_activation_context = None
-        finally:
-            if safety_lock is not None:
-                safety_lock.release()
-
-    def _safe_stop_robot(self, reason: Optional[str]) -> None:
         lock = self._runtime_activation_state_lock()
         with lock:
-            next_epoch = int(
-                getattr(self, "_runtime_activation_safety_epoch", 0)
-            ) + 1
-            self._runtime_activation_safety_epoch = next_epoch
+            current = getattr(self, "_runtime_activation_context", None)
+            expected_generation = context.get("motion_stop_generation")
+            current_generation = self.safety_guard.motion_stop_generation
+            invalidated = (
+                current is None
+                or current.get("request_id") != context["request_id"]
+                or (
+                    expected_generation is not None
+                    and expected_generation != current_generation
+                )
+            )
+            if invalidated:
+                self._cancel_runtime_activation_request(
+                    context,
+                    reason="motion stop invalidated activation before commit",
+                    error_code="activation_cancelled",
+                )
+                raise self._runtime_activation_cancelled_error(context)
+            Path(context["request_path"]).unlink(missing_ok=True)
+            Path(context["ack_path"]).unlink(missing_ok=True)
+            Path(context["cancel_path"]).unlink(missing_ok=True)
+            self._runtime_activation_context = None
+
+    def _cancel_active_motion_tasks(self, reason: str) -> Tuple[str, ...]:
+        cancelled: List[str] = []
+        for status in self.task_manager.list_active_tasks():
+            spec = self.task_manager.get_task_spec(status.task_id)
+            is_motion_task = (
+                spec.capability_name in _MOTION_ADMISSION_CAPABILITY_NAMES
+                or any(
+                    resource in _MOTION_ADMISSION_RESOURCE_NAMES
+                    for resource in spec.required_resources
+                )
+            )
+            if is_motion_task and self.task_manager.cancel_task(
+                status.task_id,
+                message=reason,
+            ):
+                cancelled.append(status.task_id)
+        return tuple(cancelled)
+
+    def _stop_robot_motion(
+        self,
+        reason: Optional[str],
+        operation_id: str,
+    ) -> MetadataDict:
+        stop_reason = reason or "gateway global motion stop"
+        lock = self._runtime_activation_state_lock()
+        with lock:
             activation_context = getattr(
                 self,
                 "_runtime_activation_context",
                 None,
             )
-            if activation_context is not None and activation_context.get(
-                "safe_stop_sensitive"
+            if (
+                activation_context is not None
+                and activation_context.get("motion_stop_generation") is not None
             ):
                 self._cancel_runtime_activation_request(
                     activation_context,
-                    reason=reason or "gateway safety stop",
-                    error_code="safe_stop_active",
+                    reason=stop_reason,
+                    error_code="activation_cancelled",
                 )
-        if not self.motion_guard.started:
-            RUNTIME_LOGGER.info(
-                "motion guard 尚未按需连接；本地门禁已锁存，进行中的组件激活已请求取消。"
-            )
-            return
-        self.motion_guard.latch_safety_stop(reason or "gateway safety stop")
+        cancelled_task_ids = self._cancel_active_motion_tasks(stop_reason)
+        self.motion_guard.start()
+        confirmation = self.motion_guard.stop_all_motion(
+            stop_reason,
+            operation_id=operation_id,
+        )
+        return {
+            "cancelled_task_ids": list(cancelled_task_ids),
+            "cancelled_task_count": len(cancelled_task_ids),
+            "motion_guard": confirmation,
+        }
 
     @staticmethod
-    def _is_safe_stop_gated_capability(
+    def _requires_motion_admission(
         descriptor: CapabilityDescriptor,
     ) -> bool:
-        if descriptor.name in _SAFE_STOP_BYPASS_CAPABILITY_NAMES:
+        if descriptor.name in _MOTION_ADMISSION_BYPASS_CAPABILITY_NAMES:
             return False
-        if descriptor.name in _SAFE_STOP_GATED_CAPABILITY_NAMES:
+        if descriptor.name in _MOTION_ADMISSION_CAPABILITY_NAMES:
             return True
         return any(
-            resource in _SAFE_STOP_GATED_RESOURCE_NAMES
+            resource in _MOTION_ADMISSION_RESOURCE_NAMES
             for resource in descriptor.required_resources
         )
 
-    def _ensure_safe_stop_allows_capability(
-        self,
-        descriptor: CapabilityDescriptor,
-    ) -> None:
-        safety_guard = getattr(self, "safety_guard", None)
-        if safety_guard is None or not safety_guard.safe_stop_active:
-            return
-        if not self._is_safe_stop_gated_capability(descriptor):
-            return
-        state = safety_guard.get_safe_stop_state()
-        raise GatewayError(
-            f"安全停止门禁处于激活状态，能力 {descriptor.name} 在完成受控安全恢复前禁止执行。",
-            error_code="safe_stop_active",
-            http_status=423,
-            jsonrpc_code=-32011,
-            details={
-                "capability_name": descriptor.name,
-                "required_resources": list(descriptor.required_resources),
-                "safety_state": state,
-            },
-        )
+    @staticmethod
+    def _motion_admission_source(capability_name: str) -> int:
+        if capability_name == "follow_target":
+            return motion_guard_pb.GUARD_SOURCE_GATEWAY_FOLLOW
+        if capability_name == "relative_move":
+            return motion_guard_pb.GUARD_SOURCE_GATEWAY_RELATIVE
+        if capability_name in {"execute_sport_command", "switch_control_mode"}:
+            return motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
+        if capability_name in _MOTION_STACK_CAPABILITY_NAMES or capability_name == "inspect_target":
+            return motion_guard_pb.GUARD_SOURCE_NAV
+        return motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
 
-    def _ensure_safe_stop_allows_capability_name(
+    def _admit_motion_request(
         self,
         capability_name: str,
+        *,
+        request_id: str,
+    ) -> MotionAdmission:
+        self._ensure_geometry_runtime_started(capability_name)
+        try:
+            self._ensure_motion_guard_connected(capability_name)
+            stop_generation = self.safety_guard.begin_motion_admission()
+            readiness = self.motion_guard.readiness(
+                self._motion_admission_source(capability_name)
+            )
+            proof = readiness.require_admission_proof()
+        except (GatewayMotionGuardError, MotionGuardError) as exc:
+            raise self._motion_guard_gateway_error(capability_name, exc) from exc
+        admission = MotionAdmission(
+            request_id=request_id or self._build_runtime_request_id("motion"),
+            capability_name=capability_name,
+            generation=proof.generation,
+            boot_nonce=bytes(proof.boot_nonce),
+            motion_stop_generation=stop_generation,
+            guard_motion_stop_generation=proof.motion_stop_generation,
+            admitted_monotonic_ns=time.monotonic_ns(),
+            proof=proof,
+        )
+        self._run_with_motion_admission(admission, lambda: None)
+        return admission
+
+    @staticmethod
+    def _require_motion_admission(
+        arguments: Dict[str, Any],
+        capability_name: str,
+    ) -> MotionAdmission:
+        admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
+        if not isinstance(admission, MotionAdmission):
+            raise RuntimeError(
+                f"{capability_name} requires a request-scoped motion admission"
+            )
+        if admission.capability_name != capability_name:
+            raise RuntimeError(
+                "motion admission capability mismatch: "
+                f"expected={capability_name} actual={admission.capability_name}"
+            )
+        return admission
+
+    def _assert_motion_admission(
+        self,
+        admission: MotionAdmission,
+        capability_name: str,
     ) -> None:
-        safety_guard = getattr(self, "safety_guard", None)
-        if safety_guard is None or not safety_guard.safe_stop_active:
-            return
-        descriptor = self.capability_registry.get_descriptor(capability_name)
-        self._ensure_safe_stop_allows_capability(descriptor)
+        if admission.capability_name != capability_name:
+            raise RuntimeError(
+                "motion admission capability mismatch: "
+                f"expected={capability_name} actual={admission.capability_name}"
+            )
+        with self.safety_guard.motion_submission(
+            admission.motion_stop_generation
+        ):
+            pass
+
+    def _run_with_motion_admission(
+        self,
+        admission: MotionAdmission,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Run one final motion submission atomically against stop-all."""
+
+        try:
+            with self.safety_guard.motion_submission(
+                admission.motion_stop_generation
+            ):
+                return operation()
+        except MotionStopGenerationError as exc:
+            raise GatewayError(
+                "该运动请求已被更新的全局停车操作取消。",
+                error_code="motion_request_cancelled",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "capability_name": admission.capability_name,
+                    "request_id": admission.request_id,
+                    "expected_motion_stop_generation": exc.expected,
+                    "current_motion_stop_generation": exc.current,
+                },
+            ) from exc
+
+    @staticmethod
+    def _goal_with_motion_admission(
+        goal: NavigationGoal,
+        admission: MotionAdmission,
+    ) -> NavigationGoal:
+        return goal.model_copy(
+            update={
+                "metadata": {
+                    **dict(goal.metadata or {}),
+                    "motion_admission": admission.as_metadata(),
+                }
+            },
+            deep=True,
+        )
+
+    @staticmethod
+    def _exploration_with_motion_admission(
+        request: ExploreAreaRequest,
+        admission: MotionAdmission,
+    ) -> ExploreAreaRequest:
+        return request.model_copy(
+            update={
+                "metadata": {
+                    **dict(request.metadata or {}),
+                    "motion_admission": admission.as_metadata(),
+                }
+            },
+            deep=True,
+        )
 
     def _ensure_motion_runtime_for_backend_call(
         self,
         capability_name: str,
+        admission: MotionAdmission,
     ) -> None:
-        """直接调用导航后端前执行安全门禁并按需激活运动栈。"""
+        """按需激活运动栈，仅校验请求级 stop generation。"""
 
-        self._ensure_safe_stop_allows_capability_name(capability_name)
+        self._run_with_motion_admission(admission, lambda: None)
         if getattr(self, "config", None) is None:
             return
         self._ensure_geometry_runtime_for_capability(capability_name)
@@ -9534,6 +9781,7 @@ class GatewayRuntime:
         self,
         *,
         navigation_context: Any = None,
+        motion_admission: Optional[MotionAdmission] = None,
     ) -> MetadataDict:
         if navigation_context is None:
             refresh_navigation = getattr(
@@ -9546,16 +9794,13 @@ class GatewayRuntime:
                     navigation_context = refresh_navigation()
                 except Exception:
                     navigation_context = None
-        try:
-            guard_generation = int(
-                self.motion_guard.readiness(
-                    motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
-                ).generation
-            )
-        except Exception:
-            guard_generation = None
         return {
-            "motion_guard_generation": guard_generation,
+            "motion_guard_generation": (
+                motion_admission.generation
+                if motion_admission is not None
+                else None
+            ),
+            "motion_stop_generation": self.safety_guard.motion_stop_generation,
             "navigation_runtime_generation": self._navigation_runtime_generation(
                 navigation_context
             ),
@@ -9570,6 +9815,7 @@ class GatewayRuntime:
         rollovers: MetadataDict = {}
         for key in (
             "motion_guard_generation",
+            "motion_stop_generation",
             "navigation_runtime_generation",
             "geometry_provider_generation",
         ):
@@ -9610,22 +9856,26 @@ class GatewayRuntime:
             payload=details,
         )
         cancel_confirmed = False
-        latch_confirmed = False
+        stop_confirmed = False
         try:
             self.navigation_service.cancel_goal(request_id=goal_id)
             cancel_confirmed = True
         except Exception as exc:
             details["cancel_error"] = str(exc)
         try:
-            self.motion_guard.latch_safety_stop(
-                "navigation task generation rollover: %s" % goal_id
+            stop_confirmation = self.motion_guard.stop_all_motion(
+                "navigation task generation rollover: %s" % goal_id,
+                operation_id=self._build_runtime_request_id(
+                    "nav_rollover_stop"
+                ),
             )
-            latch_confirmed = True
+            details["zero_ack_id"] = stop_confirmation.zero.zero_ack_id
+            stop_confirmed = True
         except Exception as exc:
-            details["safety_latch_error"] = str(exc)
+            details["motion_stop_error"] = str(exc)
         details["cancel_confirmed"] = cancel_confirmed
-        details["safety_latch_confirmed"] = latch_confirmed
-        if not (cancel_confirmed and latch_confirmed):
+        details["motion_stop_confirmed"] = stop_confirmed
+        if not (cancel_confirmed and stop_confirmed):
             raise TaskSafetyBarrierError(
                 "导航代际切换后无法确认 fail-safe 停车。",
                 details=details,
@@ -9643,6 +9893,7 @@ class GatewayRuntime:
         *,
         capability_name: str,
         goal: NavigationGoal,
+        motion_admission: MotionAdmission,
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
@@ -9650,15 +9901,27 @@ class GatewayRuntime:
         completion_callback=None,
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
+        goal = self._goal_with_motion_admission(goal, motion_admission)
         poll_interval_sec = max(0.02, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
-            self._ensure_geometry_runtime_for_capability(capability_name)
+            self._ensure_motion_runtime_for_backend_call(
+                capability_name,
+                motion_admission,
+            )
             context.ensure_active()
-            self._ensure_safe_stop_allows_capability(descriptor)
-            last_context = self.navigation_service.set_goal(goal)
-            generation_snapshot = self._capture_task_generation_snapshot(
-                navigation_context=last_context
+
+            def submit_goal():
+                last_context = self.navigation_service.set_goal(goal)
+                generation_snapshot = self._capture_task_generation_snapshot(
+                    navigation_context=last_context,
+                    motion_admission=motion_admission,
+                )
+                return last_context, generation_snapshot
+
+            last_context, generation_snapshot = self._run_with_motion_admission(
+                motion_admission,
+                submit_goal,
             )
             self._record_task_generation_snapshot(context, generation_snapshot)
             finalized = False
@@ -9673,7 +9936,8 @@ class GatewayRuntime:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_navigation()
                     current_generations = self._capture_task_generation_snapshot(
-                        navigation_context=last_context
+                        navigation_context=last_context,
+                        motion_admission=motion_admission,
                     )
                     rollovers = self._task_generation_rollovers(
                         generation_snapshot,
@@ -9770,23 +10034,26 @@ class GatewayRuntime:
                     except Exception:
                         pass
 
-        return self.task_manager.submit(
-            capability_name,
-            runner,
-            input_payload={
-                "goal_id": goal.goal_id,
-                "map_name": goal.map_name,
-                "target_name": goal.target_name,
-                "target_pose": goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None,
-                "poll_interval_sec": poll_interval_sec,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=self._build_task_request_metadata(
-                capability_name=capability_name,
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                capability_name,
+                runner,
+                input_payload={
+                    "goal_id": goal.goal_id,
+                    "map_name": goal.map_name,
+                    "target_name": goal.target_name,
+                    "target_pose": goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None,
+                    "poll_interval_sec": poll_interval_sec,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata=self._build_task_request_metadata(
+                    capability_name=capability_name,
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
             ),
         )
 
@@ -10260,6 +10527,7 @@ class GatewayRuntime:
         self,
         *,
         request: ExploreAreaRequest,
+        motion_admission: MotionAdmission,
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
@@ -10268,6 +10536,10 @@ class GatewayRuntime:
         capability_name: str = "explore_area",
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
+        request = self._exploration_with_motion_admission(
+            request,
+            motion_admission,
+        )
         poll_interval_sec = max(0.05, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
@@ -10292,14 +10564,32 @@ class GatewayRuntime:
                     )
                 self._ensure_workspace_memory_library_ready(map_name=request.map_name)
                 context.ensure_active()
-                self._ensure_geometry_runtime_for_capability(capability_name)
+                self._ensure_motion_runtime_for_backend_call(
+                    capability_name,
+                    motion_admission,
+                )
                 context.ensure_active()
-                self._ensure_safe_stop_allows_capability(descriptor)
-                last_context = self.navigation_service.start_exploration(request)
+
+                def start_exploration():
+                    last_context = self.navigation_service.start_exploration(
+                        request
+                    )
+                    generation_snapshot = (
+                        self._capture_task_generation_snapshot(
+                            motion_admission=motion_admission,
+                        )
+                    )
+                    return last_context, generation_snapshot
+
+                last_context, generation_snapshot = (
+                    self._run_with_motion_admission(
+                        motion_admission,
+                        start_exploration,
+                    )
+                )
                 backend_started = True
                 self._attach_perception_to_exploration()
                 perception_attached = True
-                generation_snapshot = self._capture_task_generation_snapshot()
                 self._record_task_generation_snapshot(
                     context,
                     generation_snapshot,
@@ -10323,7 +10613,9 @@ class GatewayRuntime:
                 while True:
                     context.ensure_active()
                     last_context = self.navigation_service.refresh_exploration()
-                    current_generations = self._capture_task_generation_snapshot()
+                    current_generations = self._capture_task_generation_snapshot(
+                        motion_admission=motion_admission,
+                    )
                     rollovers = self._task_generation_rollovers(
                         generation_snapshot,
                         current_generations,
@@ -10341,7 +10633,9 @@ class GatewayRuntime:
                     exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
                     if self._exploration_metadata_indicates_done(exploration_metadata):
                         last_context = self.navigation_service.refresh_exploration()
-                        current_generations = self._capture_task_generation_snapshot()
+                        current_generations = self._capture_task_generation_snapshot(
+                            motion_admission=motion_admission,
+                        )
                         rollovers = self._task_generation_rollovers(
                             generation_snapshot,
                             current_generations,
@@ -10460,29 +10754,32 @@ class GatewayRuntime:
                 if perception_attached:
                     self._detach_perception_from_exploration()
 
-        return self.task_manager.submit(
-            capability_name,
-            runner,
-            input_payload={
-                "request_id": request.request_id,
-                "map_name": request.map_name,
-                "target_name": request.target_name,
-                "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
-                "radius_m": request.radius_m,
-                "strategy": request.strategy,
-                "max_duration_sec": request.max_duration_sec,
-                "poll_interval_sec": poll_interval_sec,
-            },
-            requested_by=requested_by,
-            required_resources=list(descriptor.required_resources),
-            timeout_sec=timeout_sec,
-            metadata=task_metadata
-            or self._build_task_request_metadata(
-                capability_name=capability_name,
+        return self._run_with_motion_admission(
+            motion_admission,
+            lambda: self.task_manager.submit(
+                capability_name,
+                runner,
+                input_payload={
+                    "request_id": request.request_id,
+                    "map_name": request.map_name,
+                    "target_name": request.target_name,
+                    "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
+                    "radius_m": request.radius_m,
+                    "strategy": request.strategy,
+                    "max_duration_sec": request.max_duration_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                },
                 requested_by=requested_by,
-                request_context=request_context,
+                required_resources=list(descriptor.required_resources),
+                timeout_sec=timeout_sec,
+                metadata=task_metadata
+                or self._build_task_request_metadata(
+                    capability_name=capability_name,
+                    requested_by=requested_by,
+                    request_context=request_context,
+                ),
+                deferred_interrupt=True,
             ),
-            deferred_interrupt=True,
         )
 
     def _find_scene_object(self, query: str, perception_context):
@@ -10697,18 +10994,12 @@ class GatewayRuntime:
         )
         cancel_path, ack_path = self._runtime_activation_marker_paths(request_path)
         request_id = uuid.uuid4().hex
-        safe_stop_sensitive = activation_level in {
+        motion_sensitive = activation_level in {
             "guard",
             "motion",
             "person_follow",
         }
         state_lock = self._runtime_activation_state_lock()
-        safety_guard = getattr(self, "safety_guard", None)
-        safety_lock = (
-            getattr(safety_guard, "_lock", None)
-            if safe_stop_sensitive
-            else None
-        )
         context: Dict[str, Any] = {
             "request_id": request_id,
             "capability_name": capability_name,
@@ -10717,27 +11008,22 @@ class GatewayRuntime:
             "result_path": str(result_path),
             "cancel_path": str(cancel_path),
             "ack_path": str(ack_path),
-            "safe_stop_sensitive": safe_stop_sensitive,
-            "safety_epoch": 0,
+            "motion_stop_generation": None,
         }
         request_written = False
         committed = False
         terminal_received = False
 
-        if safety_lock is not None:
-            safety_lock.acquire()
         try:
             with state_lock:
                 result_path.unlink(missing_ok=True)
                 cancel_path.unlink(missing_ok=True)
                 ack_path.unlink(missing_ok=True)
-                context["safety_epoch"] = int(
-                    getattr(self, "_runtime_activation_safety_epoch", 0)
+                context["motion_stop_generation"] = (
+                    self.safety_guard.motion_stop_generation
+                    if motion_sensitive
+                    else None
                 )
-                if safe_stop_sensitive and bool(
-                    safety_guard is not None and safety_guard.safe_stop_active
-                ):
-                    raise self._runtime_activation_safe_stop_error(context)
                 self._runtime_activation_context = context
                 _write_json_file_atomically(
                     request_path,
@@ -10745,7 +11031,9 @@ class GatewayRuntime:
                         "request_id": request_id,
                         "capability_name": capability_name,
                         "activation_level": activation_level,
-                        "safety_epoch": context["safety_epoch"],
+                        "motion_stop_generation": context[
+                            "motion_stop_generation"
+                        ],
                         "requested_at": utc_now().isoformat(),
                     },
                 )
@@ -10773,10 +11061,6 @@ class GatewayRuntime:
                     "request_id": request_id,
                 },
             ) from exc
-        finally:
-            if safety_lock is not None:
-                safety_lock.release()
-
         try:
             timeout_sec = max(
                 1.0,
@@ -10830,8 +11114,8 @@ class GatewayRuntime:
                         payload.get("error_code")
                         or "runtime_activation_cancelled"
                     )
-                    if error_code == "safe_stop_active":
-                        raise self._runtime_activation_safe_stop_error(context)
+                    if error_code == "activation_cancelled":
+                        raise self._runtime_activation_cancelled_error(context)
                     raise GatewayError(
                         str(payload.get("message") or "按需组件激活已取消。"),
                         error_code=error_code,
@@ -10876,16 +11160,10 @@ class GatewayRuntime:
             )
         except Exception as exc:
             if request_written and not committed and not terminal_received:
-                error_code = (
-                    "safe_stop_active"
-                    if isinstance(exc, GatewayError)
-                    and exc.error_code == "safe_stop_active"
-                    else "runtime_activation_cancelled"
-                )
                 self._cancel_runtime_activation_request(
                     context,
                     reason=str(exc),
-                    error_code=error_code,
+                    error_code="activation_cancelled",
                 )
             raise
         finally:
@@ -10903,37 +11181,10 @@ class GatewayRuntime:
                         self._runtime_activation_context = None
 
     def _ensure_motion_guard_connected(self, capability_name: str) -> None:
-        self._ensure_safe_stop_allows_capability_name(capability_name)
         try:
-            readiness = self.motion_guard.start()
+            self.motion_guard.start()
         except GatewayMotionGuardError as exc:
             raise self._motion_guard_gateway_error(capability_name, exc) from exc
-        if self.safety_guard.safe_stop_active:
-            latch = getattr(self.motion_guard, "latch_safety_stop", None)
-            if callable(latch):
-                try:
-                    latch(
-                        self.safety_guard.last_stop_reason
-                        or "gateway safety stop during motion guard activation"
-                    )
-                except Exception:
-                    RUNTIME_LOGGER.exception(
-                        "motion guard 连接期间检测到本地安全停止，但 native latch 失败。"
-                    )
-            self._ensure_safe_stop_allows_capability_name(capability_name)
-        if readiness.ready:
-            return
-        raise GatewayError(
-            "motion guard 尚未解除安全复位门禁：%s" % readiness.reason,
-            error_code="motion_guard_reset_required",
-            http_status=409,
-            jsonrpc_code=-32000,
-            details={
-                "capability_name": capability_name,
-                "reason": readiness.reason,
-                "generation": readiness.generation,
-            },
-        )
 
     def _ensure_geometry_runtime_started(self, capability_name: str) -> None:
         """同步等待平台几何运行时就绪；多个并发调用共享同一个启动事件。"""
@@ -10944,11 +11195,6 @@ class GatewayRuntime:
             "motion",
             "person_follow",
         }
-        requires_guard = activation_level in {
-            "guard",
-            "motion",
-            "person_follow",
-        }
         while True:
             provider_ready = False
             if requires_geometry:
@@ -10956,7 +11202,6 @@ class GatewayRuntime:
             if activation_level == "geometry" and provider_ready:
                 return
             if activation_level == "guard" and self.motion_guard.started:
-                self._ensure_motion_guard_connected(capability_name)
                 return
             with self._geometry_runtime_lock:
                 event = self._geometry_runtime_start_event
@@ -10970,25 +11215,16 @@ class GatewayRuntime:
             if activation_level in {"motion", "person_follow"}:
                 provider_ready, _ = self._geometry_runtime_provider_ready()
                 if provider_ready and self.motion_guard.started:
-                    self._ensure_motion_guard_connected(capability_name)
                     if activation_level == "motion":
                         return
                     if self._person_follow_readiness().ready:
                         return
         if should_start:
             try:
-                if requires_guard:
-                    self._ensure_safe_stop_allows_capability_name(
-                        capability_name
-                    )
                 self._request_geometry_runtime_activation(
                     capability_name,
                     activation_level,
                 )
-                if requires_guard:
-                    self._ensure_safe_stop_allows_capability_name(
-                        capability_name
-                    )
                 if requires_geometry:
                     provider_ready, provider_message = (
                         self._geometry_runtime_provider_ready()
@@ -10998,10 +11234,6 @@ class GatewayRuntime:
                         if runtime_status.get("started"):
                             self._stop_runtime_input_bridge()
                             self.platform_geometry_runtime.stop()
-                        if requires_guard:
-                            self._ensure_safe_stop_allows_capability_name(
-                                capability_name
-                            )
                         self.platform_geometry_runtime.start()
                         provider_ready, provider_message = (
                             self._geometry_runtime_provider_ready()
@@ -11019,8 +11251,6 @@ class GatewayRuntime:
                             )
                         self._mark_geometry_cmd_vel_sink_unavailable()
                         self._start_runtime_input_bridge()
-                if requires_guard:
-                    self._ensure_motion_guard_connected(capability_name)
                 if activation_level == "person_follow":
                     readiness = self._person_follow_readiness()
                     if not readiness.ready:
@@ -11074,7 +11304,6 @@ class GatewayRuntime:
     def _ensure_geometry_runtime_for_capability(self, capability_name: str) -> None:
         """runner 内部的几何运行时启动入口（保留原语义，被 _submit_*_task 复用）。"""
 
-        self._ensure_safe_stop_allows_capability_name(capability_name)
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
         activation_level = _runtime_activation_level(capability_name)

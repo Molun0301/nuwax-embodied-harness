@@ -67,7 +67,6 @@ ROBOT_DEVICE_CAPABILITIES = frozenset(
         "get_joint_states",
         "send_motion_command",
         "stop_all_motion",
-        "request_safe_stop",
         "get_safety_state",
         "get_battery_state",
         "get_low_state",

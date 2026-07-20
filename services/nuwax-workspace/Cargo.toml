@@ -109,8 +109,8 @@ members = [
     # 脱钩 dimos-module / lcm-msgs / pyo3 / numpy,不再做 Python binding。
     "crates/nuwax-nav-mls-planner",
     # ---- W41 (RALPLAN §P0B #14 + L-N0.1): motion-safety-guard 守门进程 ----
-    # R-N14 落地:独占官方 Go2 motion client + 11 RPC freeze + SafetyGate/LeaseState
-    # 正交状态机 + dedup cache + emergency reserve;走 trait 契约路径接 W3 N0。
+    # R-N14 落地:独占官方 Go2 motion client + lease lifecycle + ZeroAck fencing
+    # 状态机 + dedup cache + priority reserve;走 trait 契约路径接 W3 N0。
     "crates/nuwax-motion-safety-guard",
     # ---- W41 (RALPLAN §Phase N0 + GateT + N1): nav-runtime 调度器 ----
     # 20Hz fixed-rate controller + cancel epoch + guard client + p95 35-65ms 测量面。

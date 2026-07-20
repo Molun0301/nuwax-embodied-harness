@@ -20,7 +20,7 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x5e64_bd03_f1d8_bf1a_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x2e12_7676_faa9_fe4c_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
 pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x7dee_e876_8eff_2144_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
@@ -45,7 +45,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 1;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 2;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -110,7 +110,7 @@ pub struct Path {
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {
-    /// Wire schema version. Only version 1 is currently accepted.
+    /// Wire schema version. Only version 2 is currently accepted.
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -132,6 +132,12 @@ pub struct GoalEnvelope {
     pub boundary_frame_id: String,
     /// Optional closed navigation boundary, represented as XYZ points.
     pub boundary_points: Vec<[f64; 3]>,
+    /// Guard generation admitted by the request-level motion check.
+    pub motion_guard_generation: i64,
+    /// Guard boot nonce admitted with `motion_guard_generation`.
+    pub motion_guard_boot_nonce: [u8; 16],
+    /// Global stop generation observed by the request-level motion check.
+    pub motion_stop_generation: i64,
     /// SHA-256 of the canonical fields excluding this digest.
     pub payload_sha256: [u8; 32],
     /// Goal pose.
@@ -141,7 +147,7 @@ pub struct GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal and map revision.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// Wire schema version. Only version 1 is currently accepted.
+    /// Wire schema version. Only version 2 is currently accepted.
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -661,6 +667,9 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     for point in &message.boundary_points {
         encode_f64_array(point, out);
     }
+    out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
+    out.extend_from_slice(&message.motion_guard_boot_nonce);
+    out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     Ok(())
 }
 
@@ -685,6 +694,12 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     for _ in 0..boundary_points_length {
         boundary_points.push(cursor.read_f64_array()?);
     }
+    let motion_guard_generation = cursor.read_i64()?;
+    let motion_guard_boot_nonce = cursor
+        .read_exact(16)?
+        .try_into()
+        .expect("16-byte motion guard boot nonce");
+    let motion_stop_generation = cursor.read_i64()?;
     let payload_sha256 = cursor
         .read_exact(32)?
         .try_into()
@@ -705,6 +720,9 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         source_timestamp_ns,
         boundary_frame_id,
         boundary_points,
+        motion_guard_generation,
+        motion_guard_boot_nonce,
+        motion_stop_generation,
         payload_sha256,
         goal,
     })
@@ -725,6 +743,19 @@ fn validate_goal_envelope_semantics(
     )?;
     if message.producer_runtime_generation <= 0 {
         return Err("producer_runtime_generation must be positive".into());
+    }
+    if message.motion_guard_generation <= 0 {
+        return Err("motion_guard_generation must be positive".into());
+    }
+    if message
+        .motion_guard_boot_nonce
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err("motion_guard_boot_nonce must not be all zero".into());
+    }
+    if message.motion_stop_generation < 0 {
+        return Err("motion_stop_generation must be non-negative".into());
     }
     match message.owner_kind {
         NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
@@ -1828,6 +1859,9 @@ mod tests {
             source_timestamp_ns: 123_000_000_456,
             boundary_frame_id: "map".into(),
             boundary_points: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            motion_guard_generation: 11,
+            motion_guard_boot_nonce: [0x5a; 16],
+            motion_stop_generation: 4,
             goal: pose.clone(),
             ..GoalEnvelope::default()
         };
@@ -1842,6 +1876,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("payload_sha256 mismatch"));
+
+        let mut mutated_proof = goal.clone();
+        mutated_proof.motion_stop_generation += 1;
+        assert!(encode_goal_envelope(&mutated_proof)
+            .unwrap_err()
+            .to_string()
+            .contains("payload_sha256 mismatch"));
+
+        let mut missing_proof = goal.clone();
+        missing_proof.motion_guard_boot_nonce = [0; 16];
+        assert!(seal_goal_envelope(&mut missing_proof)
+            .unwrap_err()
+            .to_string()
+            .contains("must not be all zero"));
 
         let mut public_with_boundary = goal.clone();
         public_with_boundary.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;

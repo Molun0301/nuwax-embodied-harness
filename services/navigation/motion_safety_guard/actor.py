@@ -108,7 +108,7 @@ class GuardActor:
                 return
             if isinstance(item, _FenceCall):
                 try:
-                    self._core.force_safe_fence()
+                    self._core.initialize_zero_fence()
                 except BaseException as exc:
                     item.error = exc
                 finally:

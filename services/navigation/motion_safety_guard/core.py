@@ -16,6 +16,8 @@ from .constants import (
     MAX_COMMAND_DEADLINE_NS,
     OWNER_TIMEOUT_NS,
     WATCHDOG_FENCE_LEAD_NS,
+    ZERO_RETRY_INITIAL_NS,
+    ZERO_RETRY_MAX_NS,
 )
 from .epoch import EpochError, EpochRecord, EpochStore, MAX_GENERATION
 from .go2_actuator import ActuatorBackend, ActuatorError
@@ -51,13 +53,11 @@ class OperationRecord:
     ack: int
     zero_ack_id: str
     zero_applied_ns: int
+    motion_stop_generation: int
+    namespace: str
     acquire: bool = False
 
 
-_GATE_TO_EPOCH = {
-    pb.SAFETY_GATE_RESET_REQUIRED: "ResetRequired",
-    pb.SAFETY_GATE_ARMED: "Armed",
-}
 _LEASE_TO_EPOCH = {
     pb.LEASE_STATE_IDLE: "Idle",
     pb.LEASE_STATE_ACTIVE: "Active",
@@ -99,12 +99,17 @@ _SOURCE_ACTION_POLICY = {
             pb.GUARD_ACTION_SPORT_ACTION,
         }
     ),
-    "ADMIN": frozenset(),
+}
+
+_QUERY_NAMESPACES = {
+    pb.OPERATION_NAMESPACE_ACQUIRE: "acquire",
+    pb.OPERATION_NAMESPACE_LEASE: "lease",
+    pb.OPERATION_NAMESPACE_GLOBAL_STOP: "global_stop",
 }
 
 
 class MotionGuardCore:
-    """Single-threaded arbitration state for all eleven motion-guard RPCs."""
+    """Single-threaded arbitration state for the private motion-guard RPCs."""
 
     def __init__(
         self,
@@ -118,7 +123,7 @@ class MotionGuardCore:
         dedup_capacity: int = DEDUP_CAPACITY_DEFAULT,
     ) -> None:
         if dedup_capacity < 4:
-            raise ValueError("dedup_capacity must reserve normal and emergency entries")
+            raise ValueError("dedup_capacity must reserve normal and priority entries")
         self.epoch = epoch
         self._epoch_store = epoch_store
         self._actuator = actuator
@@ -136,8 +141,8 @@ class MotionGuardCore:
             if self._actuator_configured
             else "ACTUATOR_MANIFEST_MISMATCH_OR_UNCONFIGURED"
         )
-        self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
         self.lease_state = pb.LEASE_STATE_IDLE
+        self._startup_zero_confirmed = bool(epoch.startup_zero_confirmed)
         self._active_lease_id = 0
         self._active_peer_uid = -1
         self._active_source = ""
@@ -145,16 +150,23 @@ class MotionGuardCore:
         self._lease_deadline_ns = 0
         self._owner_deadline_ns = 0
         self._watchdog_deadline_ns = 0
+        self._motion_stop_generation = 0
+        self._zero_retry_not_before_ns = 0
+        self._zero_retry_delay_ns = ZERO_RETRY_INITIAL_NS
         self._state_lock = threading.RLock()
         self._ordinary_capacity = dedup_capacity - max(1, dedup_capacity // 4)
-        self._emergency_capacity = dedup_capacity - self._ordinary_capacity
+        self._priority_capacity = dedup_capacity - self._ordinary_capacity
         self._ordinary_records: Dict[Tuple[object, ...], OperationRecord] = {}
-        self._emergency_records: Dict[Tuple[object, ...], OperationRecord] = {}
+        self._priority_records: Dict[Tuple[object, ...], OperationRecord] = {}
         self._operation_index: Dict[str, List[OperationRecord]] = {}
 
     @property
     def active_lease_id(self) -> int:
         return self._active_lease_id
+
+    @property
+    def motion_stop_generation(self) -> int:
+        return self._motion_stop_generation
 
     @property
     def startup_configured(self) -> bool:
@@ -203,8 +215,8 @@ class MotionGuardCore:
             )
         except EpochError as exc:
             self._clear_lease()
-            self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
-            self.lease_state = pb.LEASE_STATE_IDLE
+            self.lease_state = pb.LEASE_STATE_REVOKING
+            self._startup_zero_confirmed = False
             return self._error_response(
                 request,
                 "EPOCH_DURABILITY_LOST",
@@ -213,9 +225,16 @@ class MotionGuardCore:
 
     def tick(self, now_ns: Optional[int] = None) -> Optional[pb.ZeroAck]:
         with self._state_lock:
+            now = self._monotonic_ns() if now_ns is None else now_ns
+            if (
+                self.lease_state == pb.LEASE_STATE_REVOKING
+                and not self._startup_zero_confirmed
+            ):
+                if now < self._zero_retry_not_before_ns:
+                    return None
+                return self._retry_zero_fence(now)
             if self.lease_state != pb.LEASE_STATE_ACTIVE:
                 return None
-            now = self._monotonic_ns() if now_ns is None else now_ns
             if now < min(self._watchdog_deadline_ns, self._lease_deadline_ns):
                 return None
             self.lease_state = pb.LEASE_STATE_REVOKING
@@ -223,54 +242,51 @@ class MotionGuardCore:
                 zero_ack = self._zero()
                 self._clear_lease()
                 self._commit_epoch(
-                    gate=pb.SAFETY_GATE_ARMED,
                     lease=pb.LEASE_STATE_IDLE,
                     fenced=True,
                     last_zero_ack_id=zero_ack.zero_ack_id,
+                    startup_zero_confirmed=True,
                 )
+                self._reset_zero_retry()
                 return zero_ack
-            except (ActuatorError, EpochError):
-                self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
+            except ActuatorError as exc:
+                self._mark_zero_unconfirmed(exc, now_ns=now)
+                return None
+            except EpochError:
                 self.lease_state = pb.LEASE_STATE_REVOKING
-                try:
-                    self._commit_epoch(
-                        gate=pb.SAFETY_GATE_RESET_REQUIRED,
-                        lease=pb.LEASE_STATE_REVOKING,
-                        fenced=True,
-                    )
-                except EpochError:
-                    pass
+                self._startup_zero_confirmed = False
+                self._schedule_zero_retry(now)
                 return None
 
-    def force_safe_fence(self) -> pb.ZeroAck:
-        """Zero all owned paths and durably return to RESET_REQUIRED/IDLE."""
+    def initialize_zero_fence(self) -> pb.ZeroAck:
+        """Zero all owned paths and make this boot eligible for new leases."""
         with self._state_lock:
-            self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
             self.lease_state = pb.LEASE_STATE_REVOKING
+            self._startup_zero_confirmed = False
             precommit_error: Optional[EpochError] = None
             try:
                 self._commit_epoch(
-                    gate=pb.SAFETY_GATE_RESET_REQUIRED,
                     lease=pb.LEASE_STATE_REVOKING,
                     fenced=True,
+                    startup_zero_confirmed=False,
                 )
             except EpochError as exc:
                 precommit_error = exc
             try:
                 zero_ack = self._zero()
             except ActuatorError as exc:
-                self._fail_zero_or_switch(exc)
+                self._mark_zero_unconfirmed(exc)
                 raise
             self._clear_lease()
-            self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
             if precommit_error is not None:
                 raise precommit_error
             self._commit_epoch(
-                gate=pb.SAFETY_GATE_RESET_REQUIRED,
                 lease=pb.LEASE_STATE_IDLE,
                 fenced=True,
                 last_zero_ack_id=zero_ack.zero_ack_id,
+                startup_zero_confirmed=True,
             )
+            self._reset_zero_retry()
             return zero_ack
 
     def _handle_get_readiness(
@@ -282,14 +298,14 @@ class MotionGuardCore:
         operational = (
             self._epoch_durable
             and self._actuator_configured
-            and self.safety_gate == pb.SAFETY_GATE_ARMED
+            and self._startup_zero_confirmed
         )
         if not self._epoch_durable:
             reason = "EPOCH_NOT_DURABLE"
         elif not self._actuator_configured:
             reason = self._actuator_reason
-        elif self.safety_gate != pb.SAFETY_GATE_ARMED:
-            reason = "RESET_REQUIRED"
+        elif not self._startup_zero_confirmed:
+            reason = "STARTUP_ZERO_UNCONFIRMED"
         else:
             reason = "OK"
         response, outcome = self._response(request)
@@ -300,9 +316,11 @@ class MotionGuardCore:
         outcome.reason = reason
         outcome.generation = self.epoch.generation
         outcome.boot_nonce = self.epoch.boot_nonce_bytes
+        outcome.startup_zero_confirmed = self._startup_zero_confirmed
+        outcome.motion_stop_generation = self._motion_stop_generation
         return response
 
-    def _handle_get_safety_state(
+    def _handle_get_guard_state(
         self,
         request: pb.MotionGuardRequest,
         _peer: PeerCredentials,
@@ -312,55 +330,10 @@ class MotionGuardCore:
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
         outcome.generation = self.epoch.generation
         outcome.boot_nonce = self.epoch.boot_nonce_bytes
-        outcome.reset_generation = self.epoch.reset_generation
         outcome.last_zero_ack_id = self.epoch.last_zero_ack_id
         outcome.fenced = self.epoch.fenced
-        return response
-
-    def _handle_reset_safe_stop(
-        self,
-        request: pb.MotionGuardRequest,
-        peer: PeerCredentials,
-        source: str,
-    ) -> pb.MotionGuardResponse:
-        body = request.reset_safe_stop
-        cached = self._prepare_mutation(
-            request,
-            peer,
-            source,
-            namespace="admin",
-            emergency=True,
-        )
-        if cached is not None:
-            return cached
-        if source != "ADMIN":
-            raise GuardFailure("PERMISSION_DENIED", "ResetSafeStop requires ADMIN source")
-        if not body.confirm_physical_safe or not body.reason.strip() or not body.operator.strip():
-            raise GuardFailure(
-                "INVALID_ARGUMENT",
-                "physical confirmation, reason, and operator are required",
-            )
-        if not self._actuator_configured:
-            raise GuardFailure("MOTION_SINK_NOT_READY", self._actuator_reason)
-        if self.epoch.reset_generation == MAX_GENERATION:
-            raise GuardFailure("RESOURCE_EXHAUSTED", "reset_generation overflow")
-        try:
-            zero_ack = self._zero()
-            self._clear_lease()
-            self._commit_epoch(
-                gate=pb.SAFETY_GATE_ARMED,
-                lease=pb.LEASE_STATE_IDLE,
-                fenced=True,
-                last_zero_ack_id=zero_ack.zero_ack_id,
-                reset_generation=self.epoch.reset_generation + 1,
-            )
-        except ActuatorError as exc:
-            raise GuardFailure(exc.code, exc.message) from exc
-        response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_ZEROED))
-        outcome.zero_ack.CopyFrom(zero_ack)
-        outcome.reset_generation = self.epoch.reset_generation
-        self._remember(request, peer, source, response, emergency=True)
+        outcome.active_lease_id = self._active_lease_id
+        outcome.motion_stop_generation = self._motion_stop_generation
         return response
 
     def _handle_acquire_lease(
@@ -384,40 +357,60 @@ class MotionGuardCore:
                     "acquire operation belongs to a closed lease",
                 )
             return cached
-        if not self._actuator_configured or not self._epoch_durable:
-            raise GuardFailure("MOTION_SINK_NOT_READY", self._actuator_reason)
-        if self.safety_gate != pb.SAFETY_GATE_ARMED:
-            raise GuardFailure("SAFETY_STOP_ACTIVE", "physical reset is required")
-        if self.lease_state != pb.LEASE_STATE_IDLE:
-            raise GuardFailure("RESOURCE_BUSY", "motion resource already has an owner", True)
         envelope = request.acquire_lease.envelope
-        if envelope.sequence != 0:
-            raise GuardFailure("INVALID_ARGUMENT", "AcquireLease sequence must be zero")
-        now = self._monotonic_ns()
-        lease_id = int(self._lease_id_factory())
-        if lease_id <= 0 or lease_id > MAX_GENERATION:
-            raise GuardFailure("INTERNAL", "lease_id factory returned an invalid u64")
-        self._active_lease_id = lease_id
-        self._active_peer_uid = peer.uid
-        self._active_source = source
-        self._last_sequence = 0
-        self._lease_deadline_ns = now + LEASE_ABSOLUTE_NS
-        self._owner_deadline_ns = min(now + OWNER_TIMEOUT_NS, self._lease_deadline_ns)
-        self._watchdog_deadline_ns = max(
-            now,
-            self._owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS,
-        )
-        self._commit_epoch(
-            gate=pb.SAFETY_GATE_ARMED,
-            lease=pb.LEASE_STATE_ACTIVE,
-            fenced=False,
-        )
+        with self._state_lock:
+            if not self._actuator_configured or not self._epoch_durable:
+                raise GuardFailure("MOTION_SINK_NOT_READY", self._actuator_reason)
+            if not self._startup_zero_confirmed:
+                raise GuardFailure(
+                    "MOTION_SINK_NOT_READY",
+                    "startup zero has not been confirmed",
+                    True,
+                )
+            if envelope.motion_stop_generation != self._motion_stop_generation:
+                raise GuardFailure(
+                    "STALE_STOP_GENERATION",
+                    "motion stop generation is stale",
+                )
+            if self.lease_state != pb.LEASE_STATE_IDLE:
+                raise GuardFailure(
+                    "RESOURCE_BUSY",
+                    "motion resource already has an owner",
+                    True,
+                )
+            if envelope.sequence != 0:
+                raise GuardFailure("INVALID_ARGUMENT", "AcquireLease sequence must be zero")
+            now = self._monotonic_ns()
+            lease_id = int(self._lease_id_factory())
+            if lease_id <= 0 or lease_id > MAX_GENERATION:
+                raise GuardFailure("INTERNAL", "lease_id factory returned an invalid u64")
+            self._active_lease_id = lease_id
+            self._active_peer_uid = peer.uid
+            self._active_source = source
+            self._last_sequence = 0
+            self._lease_deadline_ns = now + LEASE_ABSOLUTE_NS
+            self._owner_deadline_ns = min(now + OWNER_TIMEOUT_NS, self._lease_deadline_ns)
+            self._watchdog_deadline_ns = max(
+                now,
+                self._owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS,
+            )
+            self._commit_epoch(
+                lease=pb.LEASE_STATE_ACTIVE,
+                fenced=False,
+            )
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
         outcome.lease_tuple.CopyFrom(self._current_tuple())
         outcome.lease_deadline_monotonic_ns = self._lease_deadline_ns
         outcome.owner_deadline_monotonic_ns = self._owner_deadline_ns
-        self._remember(request, peer, source, response, acquire=True)
+        self._remember(
+            request,
+            peer,
+            source,
+            response,
+            namespace="acquire",
+            acquire=True,
+        )
         return response
 
     def _handle_renew_lease(
@@ -471,7 +464,7 @@ class MotionGuardCore:
             self._actuator.apply_motion(body)
         except ActuatorError as exc:
             if command == "stop":
-                self._fail_zero_or_switch(exc)
+                self._mark_zero_unconfirmed(exc)
             raise GuardFailure(exc.code, exc.message) from exc
         self._ensure_lease_still_active(body.envelope, peer, source)
         response, outcome = self._response(request)
@@ -506,7 +499,7 @@ class MotionGuardCore:
             self._actuator.execute_sport(body.command)
         except ActuatorError as exc:
             if body.command.action == pb.SPORT_ACTION_STOP_MOVE:
-                self._fail_zero_or_switch(exc)
+                self._mark_zero_unconfirmed(exc)
             raise GuardFailure(exc.code, exc.message) from exc
         self._ensure_lease_still_active(body.envelope, peer, source)
         response, outcome = self._response(request)
@@ -534,7 +527,7 @@ class MotionGuardCore:
             peer,
             source,
             namespace="lease",
-            emergency=True,
+            priority=True,
         )
         if cached is not None:
             return cached
@@ -553,7 +546,7 @@ class MotionGuardCore:
             peer,
             source,
             namespace="lease",
-            emergency=True,
+            priority=True,
         )
         if cached is not None:
             return cached
@@ -568,78 +561,82 @@ class MotionGuardCore:
             active_mode = self._actuator.switch_mode(body.command)
             self._clear_lease()
             self._commit_epoch(
-                gate=pb.SAFETY_GATE_ARMED,
                 lease=pb.LEASE_STATE_IDLE,
                 fenced=True,
                 last_zero_ack_id=zero_ack.zero_ack_id,
+                startup_zero_confirmed=True,
             )
         except ActuatorError as exc:
-            self._fail_zero_or_switch(exc)
+            self._mark_zero_unconfirmed(exc)
             raise GuardFailure(exc.code, exc.message) from exc
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED))
         outcome.zero_ack.CopyFrom(zero_ack)
         outcome.active_mode = active_mode
-        self._remember(request, peer, source, response, emergency=True)
+        self._remember(request, peer, source, response, priority=True)
         return response
 
-    def _handle_latch_safety_stop(
+    def _handle_stop_all_motion(
         self,
         request: pb.MotionGuardRequest,
         peer: PeerCredentials,
         source: str,
     ) -> pb.MotionGuardResponse:
-        body = request.latch_safety_stop
-        manual_global_latch = (
-            source == "GATEWAY_MANUAL" and body.envelope.tuple.lease_id == 0
-        )
-        if manual_global_latch and body.envelope.action != pb.GUARD_ACTION_STOP:
+        if source != "GATEWAY_MANUAL":
             raise GuardFailure(
-                "ACTION_NOT_ALLOWED",
-                "GATEWAY_MANUAL global latch requires STOP action",
+                "PERMISSION_DENIED",
+                "StopAllMotion requires the trusted gateway manual source",
             )
-        namespace = (
-            "admin"
-            if source == "ADMIN"
-            else "emergency"
-            if manual_global_latch
-            else "lease"
-        )
-        cached = self._prepare_mutation(
+        body = request.stop_all_motion
+        cached = self._prepare_global_stop(
             request,
             peer,
             source,
-            namespace=namespace,
-            emergency=True,
         )
         if cached is not None:
             return cached
         if not body.reason.strip():
-            raise GuardFailure("INVALID_ARGUMENT", "safe-stop reason is required")
-        if source != "ADMIN" and not manual_global_latch:
-            self._begin_lease_operation(body.envelope, peer, source)
-        self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
-        self.lease_state = pb.LEASE_STATE_REVOKING
-        try:
-            self._commit_epoch(
-                gate=pb.SAFETY_GATE_RESET_REQUIRED,
-                lease=pb.LEASE_STATE_REVOKING,
-                fenced=True,
-            )
-            zero_ack = self._zero()
-            self._clear_lease()
-            self._commit_epoch(
-                gate=pb.SAFETY_GATE_RESET_REQUIRED,
-                lease=pb.LEASE_STATE_IDLE,
-                fenced=True,
-                last_zero_ack_id=zero_ack.zero_ack_id,
-            )
-        except ActuatorError as exc:
-            raise GuardFailure(exc.code, exc.message) from exc
+            raise GuardFailure("INVALID_ARGUMENT", "stop reason is required")
+        with self._state_lock:
+            if self._motion_stop_generation == MAX_GENERATION:
+                raise GuardFailure(
+                    "RESOURCE_EXHAUSTED",
+                    "motion stop generation overflow",
+                )
+            self._motion_stop_generation += 1
+            lease_revoked = self.lease_state == pb.LEASE_STATE_ACTIVE
+            self.lease_state = pb.LEASE_STATE_REVOKING
+            try:
+                zero_ack = self._zero()
+                self._clear_lease()
+                self._commit_epoch(
+                    lease=pb.LEASE_STATE_IDLE,
+                    fenced=True,
+                    last_zero_ack_id=zero_ack.zero_ack_id,
+                    startup_zero_confirmed=True,
+                )
+            except ActuatorError as exc:
+                self._mark_zero_unconfirmed(exc)
+                raise GuardFailure(exc.code, exc.message) from exc
         response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_SAFETY_LATCHED))
+        outcome.result.CopyFrom(
+            self._result(
+                pb.ACK_CODE_RESOURCE_FENCED
+                if lease_revoked
+                else pb.ACK_CODE_ZEROED
+            )
+        )
         outcome.zero_ack.CopyFrom(zero_ack)
-        self._remember(request, peer, source, response, emergency=True)
+        outcome.lease_revoked = lease_revoked
+        outcome.motion_stop_generation = self._motion_stop_generation
+        self._remember(
+            request,
+            peer,
+            source,
+            response,
+            namespace="global_stop",
+            priority=True,
+        )
         return response
 
     def _handle_get_operation_result(
@@ -649,6 +646,14 @@ class MotionGuardCore:
         source: str,
     ) -> pb.MotionGuardResponse:
         operation_id = request.get_operation_result.operation_id
+        namespace = _QUERY_NAMESPACES.get(
+            request.get_operation_result.operation_namespace
+        )
+        if namespace is None:
+            raise GuardFailure(
+                "INVALID_ARGUMENT",
+                "operation_namespace must identify acquire, lease, or global stop",
+            )
         response, outcome = self._response(request)
         outcome.target_operation_id = operation_id
         records = self._operation_index.get(operation_id, ())
@@ -656,8 +661,9 @@ class MotionGuardCore:
             (
                 candidate
                 for candidate in records
-                if source == "ADMIN"
-                or (candidate.peer_uid == peer.uid and candidate.source == source)
+                if candidate.peer_uid == peer.uid
+                and candidate.source == source
+                and candidate.namespace == namespace
             ),
             None,
         )
@@ -678,6 +684,7 @@ class MotionGuardCore:
         if record.zero_ack_id:
             outcome.zero_ack.zero_ack_id = record.zero_ack_id
             outcome.zero_ack.applied_monotonic_ns = record.zero_applied_ns
+        outcome.motion_stop_generation = record.motion_stop_generation
         return response
 
     def _prepare_mutation(
@@ -687,7 +694,7 @@ class MotionGuardCore:
         source: str,
         *,
         namespace: str,
-        emergency: bool = False,
+        priority: bool = False,
     ) -> Optional[pb.MotionGuardResponse]:
         verify_payload_sha256(request)
         envelope = operation_envelope(request)
@@ -697,7 +704,7 @@ class MotionGuardCore:
             raise GuardFailure("INVALID_ARGUMENT", "operation_id is required")
         self._validate_epoch_tuple(envelope, namespace=namespace)
         key = self._dedup_key(envelope, peer, source, namespace)
-        record = self._ordinary_records.get(key) or self._emergency_records.get(key)
+        record = self._ordinary_records.get(key) or self._priority_records.get(key)
         if record is not None:
             if record.payload_sha256 != bytes(envelope.payload_sha256):
                 return self._error_response(
@@ -710,18 +717,47 @@ class MotionGuardCore:
             response.request_id = request.request_id
             return response
         self._validate_deadline(envelope)
-        target = self._emergency_records if emergency else self._ordinary_records
-        capacity = self._emergency_capacity if emergency else self._ordinary_capacity
+        target = self._priority_records if priority else self._ordinary_records
+        capacity = self._priority_capacity if priority else self._ordinary_capacity
         if len(target) >= capacity:
             self._cache_exhausted()
             raise GuardFailure("RESOURCE_EXHAUSTED", "dedup cache is exhausted")
+        return None
+
+    def _prepare_global_stop(
+        self,
+        request: pb.MotionGuardRequest,
+        peer: PeerCredentials,
+        source: str,
+    ) -> Optional[pb.MotionGuardResponse]:
+        verify_payload_sha256(request)
+        envelope = request.stop_all_motion.envelope
+        if not envelope.operation_id:
+            raise GuardFailure("INVALID_ARGUMENT", "operation_id is required")
+        key = self._dedup_key(envelope, peer, source, "global_stop")
+        record = self._ordinary_records.get(key) or self._priority_records.get(key)
+        if record is not None:
+            if record.payload_sha256 != bytes(envelope.payload_sha256):
+                return self._error_response(
+                    request,
+                    "REQUEST_ID_CONFLICT",
+                    "operation_id was reused with a different typed payload",
+                )
+            response = pb.MotionGuardResponse()
+            response.ParseFromString(record.response_bytes)
+            response.request_id = request.request_id
+            return response
+        self._validate_deadline(envelope)
+        if len(self._priority_records) >= self._priority_capacity:
+            self._cache_exhausted()
+            raise GuardFailure("RESOURCE_EXHAUSTED", "priority dedup cache is exhausted")
         return None
 
     def _validate_epoch_tuple(self, envelope: pb.RequestEnvelope, *, namespace: str) -> None:
         token = envelope.tuple
         if token.generation != self.epoch.generation or bytes(token.boot_nonce) != self.epoch.boot_nonce_bytes:
             raise GuardFailure("STALE_EPOCH", "generation or boot nonce is stale")
-        if namespace in {"acquire", "admin", "emergency"} and token.lease_id != 0:
+        if namespace == "acquire" and token.lease_id != 0:
             raise GuardFailure("INVALID_ARGUMENT", f"{namespace} operation requires lease_id=0")
         if namespace == "lease" and token.lease_id == 0:
             raise GuardFailure("OUTCOME_UNKNOWN", "lease-bound operation has no lease_id")
@@ -814,32 +850,72 @@ class MotionGuardCore:
             zero_ack = self._zero()
             self._clear_lease()
             self._commit_epoch(
-                gate=pb.SAFETY_GATE_ARMED,
                 lease=pb.LEASE_STATE_IDLE,
                 fenced=True,
                 last_zero_ack_id=zero_ack.zero_ack_id,
+                startup_zero_confirmed=True,
             )
         except ActuatorError as exc:
-            self._fail_zero_or_switch(exc)
+            self._mark_zero_unconfirmed(exc)
             raise GuardFailure(exc.code, exc.message) from exc
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED))
         outcome.zero_ack.CopyFrom(zero_ack)
-        self._remember(request, peer, source, response, emergency=True)
+        self._remember(request, peer, source, response, priority=True)
         return response
 
-    def _fail_zero_or_switch(self, error: ActuatorError) -> None:
+    def _mark_zero_unconfirmed(
+        self,
+        error: ActuatorError,
+        *,
+        now_ns: Optional[int] = None,
+    ) -> None:
         del error
-        self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
         self.lease_state = pb.LEASE_STATE_REVOKING
+        self._startup_zero_confirmed = False
         try:
             self._commit_epoch(
-                gate=pb.SAFETY_GATE_RESET_REQUIRED,
                 lease=pb.LEASE_STATE_REVOKING,
                 fenced=True,
+                startup_zero_confirmed=False,
             )
         except EpochError:
             pass
+        self._schedule_zero_retry(
+            self._monotonic_ns() if now_ns is None else now_ns
+        )
+
+    def _retry_zero_fence(self, now_ns: int) -> Optional[pb.ZeroAck]:
+        try:
+            zero_ack = self._zero()
+            self._clear_lease()
+            self._commit_epoch(
+                lease=pb.LEASE_STATE_IDLE,
+                fenced=True,
+                last_zero_ack_id=zero_ack.zero_ack_id,
+                startup_zero_confirmed=True,
+            )
+        except ActuatorError as exc:
+            self._mark_zero_unconfirmed(exc, now_ns=now_ns)
+            return None
+        except EpochError:
+            self.lease_state = pb.LEASE_STATE_REVOKING
+            self._startup_zero_confirmed = False
+            self._schedule_zero_retry(now_ns)
+            return None
+        self._reset_zero_retry()
+        return zero_ack
+
+    def _schedule_zero_retry(self, now_ns: int) -> None:
+        self._zero_retry_not_before_ns = now_ns + self._zero_retry_delay_ns
+        self._zero_retry_delay_ns = min(
+            self._zero_retry_delay_ns * 2,
+            ZERO_RETRY_MAX_NS,
+        )
+
+    def _reset_zero_retry(self) -> None:
+        self._zero_retry_not_before_ns = 0
+        self._zero_retry_delay_ns = ZERO_RETRY_INITIAL_NS
 
     def _zero(self) -> pb.ZeroAck:
         self._actuator.zero()
@@ -853,58 +929,50 @@ class MotionGuardCore:
         )
 
     def _cache_exhausted(self) -> None:
-        self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
         self.lease_state = pb.LEASE_STATE_REVOKING
         try:
             zero_ack = self._zero()
             self._clear_lease()
             self._commit_epoch(
-                gate=pb.SAFETY_GATE_RESET_REQUIRED,
                 lease=pb.LEASE_STATE_IDLE,
                 fenced=True,
                 last_zero_ack_id=zero_ack.zero_ack_id,
+                startup_zero_confirmed=True,
             )
-        except (ActuatorError, EpochError):
-            try:
-                self._commit_epoch(
-                    gate=pb.SAFETY_GATE_RESET_REQUIRED,
-                    lease=pb.LEASE_STATE_REVOKING,
-                    fenced=True,
-                )
-            except EpochError:
-                pass
+        except ActuatorError as exc:
+            self._mark_zero_unconfirmed(exc)
+        except EpochError:
+            self._startup_zero_confirmed = False
 
     def _commit_epoch(
         self,
         *,
-        gate: Optional[int] = None,
         lease: Optional[int] = None,
         fenced: Optional[bool] = None,
         last_zero_ack_id: Optional[str] = None,
-        reset_generation: Optional[int] = None,
+        startup_zero_confirmed: Optional[bool] = None,
     ) -> None:
-        next_gate = self.safety_gate if gate is None else gate
         next_lease = self.lease_state if lease is None else lease
         updates: Dict[str, object] = {
-            "safety_gate": _GATE_TO_EPOCH[next_gate],
             "lease_state": _LEASE_TO_EPOCH[next_lease],
         }
         if fenced is not None:
             updates["fenced"] = fenced
         if last_zero_ack_id is not None:
             updates["last_zero_ack_id"] = last_zero_ack_id
-        if reset_generation is not None:
-            updates["reset_generation"] = reset_generation
+        if startup_zero_confirmed is not None:
+            updates["startup_zero_confirmed"] = startup_zero_confirmed
         next_epoch = self.epoch.with_updates(**updates)
         try:
             self._epoch_store.persist(next_epoch)
         except (OSError, EpochError) as exc:
             self._epoch_durable = False
-            self.safety_gate = pb.SAFETY_GATE_RESET_REQUIRED
+            self._startup_zero_confirmed = False
             raise EpochError(f"epoch durable commit failed: {exc}") from exc
+        self._epoch_durable = True
         self.epoch = next_epoch
-        self.safety_gate = next_gate
         self.lease_state = next_lease
+        self._startup_zero_confirmed = next_epoch.startup_zero_confirmed
 
     def _clear_lease(self) -> None:
         self._active_lease_id = 0
@@ -925,26 +993,24 @@ class MotionGuardCore:
 
     def _dedup_key(
         self,
-        envelope: pb.RequestEnvelope,
+        envelope,
         peer: PeerCredentials,
         source: str,
         namespace: str,
     ) -> Tuple[object, ...]:
+        if namespace == "global_stop":
+            return (
+                namespace,
+                peer.uid,
+                source,
+                envelope.operation_id,
+            )
         if namespace == "acquire":
             return (
                 namespace,
                 bytes(envelope.tuple.boot_nonce),
                 peer.uid,
                 source,
-                envelope.operation_id,
-            )
-        if namespace in {"admin", "emergency"}:
-            return (
-                namespace,
-                peer.uid,
-                source,
-                envelope.tuple.generation,
-                bytes(envelope.tuple.boot_nonce),
                 envelope.operation_id,
             )
         return (
@@ -968,7 +1034,7 @@ class MotionGuardCore:
         if envelope is None:
             return None
         key = self._dedup_key(envelope, peer, source, namespace)
-        return self._ordinary_records.get(key) or self._emergency_records.get(key)
+        return self._ordinary_records.get(key) or self._priority_records.get(key)
 
     def _remember(
         self,
@@ -977,27 +1043,13 @@ class MotionGuardCore:
         source: str,
         response: pb.MotionGuardResponse,
         *,
-        emergency: bool = False,
+        namespace: str = "lease",
+        priority: bool = False,
         acquire: bool = False,
     ) -> None:
         envelope = operation_envelope(request)
         if envelope is None:
             return
-        namespace = "acquire" if acquire else (
-            "admin"
-            if request.WhichOneof("operation") in {"reset_safe_stop"}
-            or (
-                request.WhichOneof("operation") == "latch_safety_stop"
-                and source == "ADMIN"
-            )
-            else "emergency"
-            if (
-                request.WhichOneof("operation") == "latch_safety_stop"
-                and source == "GATEWAY_MANUAL"
-                and envelope.tuple.lease_id == 0
-            )
-            else "lease"
-        )
         key = self._dedup_key(envelope, peer, source, namespace)
         outcome_name = response.WhichOneof("outcome")
         outcome = getattr(response, outcome_name)
@@ -1012,7 +1064,7 @@ class MotionGuardCore:
             lease_id=(
                 outcome.lease_tuple.lease_id
                 if acquire
-                else envelope.tuple.lease_id
+                else getattr(getattr(envelope, "tuple", None), "lease_id", 0)
             ),
             response_bytes=response.SerializeToString(deterministic=True),
             ack=result.ack,
@@ -1020,9 +1072,11 @@ class MotionGuardCore:
             zero_applied_ns=(
                 zero_ack.applied_monotonic_ns if zero_ack is not None else 0
             ),
+            motion_stop_generation=getattr(outcome, "motion_stop_generation", 0),
+            namespace=namespace,
             acquire=acquire,
         )
-        target = self._emergency_records if emergency else self._ordinary_records
+        target = self._priority_records if priority else self._ordinary_records
         target[key] = record
         self._operation_index.setdefault(envelope.operation_id, []).append(record)
 
@@ -1065,11 +1119,7 @@ class MotionGuardCore:
         message: str = "",
         retryable: bool = False,
     ) -> pb.GuardResult:
-        result = pb.GuardResult(
-            ack=ack,
-            gate=self.safety_gate,
-            lease=self.lease_state,
-        )
+        result = pb.GuardResult(ack=ack, lease=self.lease_state)
         if code:
             result.error.code = code
             result.error.message = message

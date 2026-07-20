@@ -3,16 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import threading
-from typing import Callable, Optional, Union
+import uuid
+from typing import Callable, Dict, Optional, Union
 
 from core.errors import MotionGuardFacadeError
 from services.navigation.motion_guard_client import (
     CommandConfirmation,
     ModeSwitchConfirmation,
+    MotionAdmissionProof,
     MotionGuardClient,
     MotionGuardError,
     MotionGuardSession,
+    MotionGuardTransportError,
     ReadinessStatus,
+    StopAllMotionConfirmation,
     ZeroConfirmation,
 )
 from services.navigation.motion_safety_guard.constants import DEFAULT_SOCKET_PATH
@@ -33,6 +37,58 @@ class GatewayCommandConfirmation:
     zero: ZeroConfirmation
 
 
+@dataclass(frozen=True)
+class MotionAdmission:
+    """Request-scoped proof created by the sole public readiness check."""
+
+    request_id: str
+    capability_name: str
+    generation: int
+    boot_nonce: bytes
+    motion_stop_generation: int
+    admitted_monotonic_ns: int
+    proof: MotionAdmissionProof
+    guard_motion_stop_generation: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not self.request_id or not self.capability_name:
+            raise ValueError("motion admission identity must be non-empty")
+        if self.generation <= 0 or len(self.boot_nonce) != 16:
+            raise ValueError("motion admission epoch is invalid")
+        if self.motion_stop_generation < 0 or self.admitted_monotonic_ns <= 0:
+            raise ValueError("motion admission local generation is invalid")
+        guard_stop_generation = self.guard_motion_stop_generation
+        if guard_stop_generation is None:
+            guard_stop_generation = self.proof.motion_stop_generation
+            object.__setattr__(
+                self,
+                "guard_motion_stop_generation",
+                guard_stop_generation,
+            )
+        if (
+            guard_stop_generation < 0
+            or guard_stop_generation != self.proof.motion_stop_generation
+        ):
+            raise ValueError("motion admission guard generation is invalid")
+        if (
+            self.proof.generation != self.generation
+            or bytes(self.proof.boot_nonce) != bytes(self.boot_nonce)
+        ):
+            raise ValueError("motion admission proof does not match its epoch")
+
+    def as_metadata(self) -> Dict[str, object]:
+        guard_stop_generation = self.guard_motion_stop_generation
+        assert guard_stop_generation is not None
+        return {
+            "request_id": self.request_id,
+            "capability_name": self.capability_name,
+            "generation": self.generation,
+            "boot_nonce_hex": bytes(self.boot_nonce).hex(),
+            "motion_stop_generation": guard_stop_generation,
+            "admitted_monotonic_ns": self.admitted_monotonic_ns,
+        }
+
+
 class GatewayMotionGuard:
     """Gateway-owned facade over one persistent, fail-closed guard client."""
 
@@ -51,21 +107,29 @@ class GatewayMotionGuard:
     @property
     def started(self) -> bool:
         with self._lock:
-            return self._client is not None
+            return self._client is not None and not self._client.failed
 
     @property
     def last_error(self) -> Optional[BaseException]:
         with self._lock:
             return self._last_error
 
-    def start(self) -> ReadinessStatus:
+    def start(self) -> None:
+        """Open the persistent transport without querying motion readiness."""
+
         with self._lock:
-            if self._client is not None:
-                return self._client.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
+            current = self._client
+            if current is not None and not current.failed:
+                return
+            self._client = None
+            if current is not None:
+                try:
+                    current.close()
+                except MotionGuardError:
+                    pass
             client: Optional[MotionGuardClient] = None
             try:
                 client = self._client_factory(self.socket_path)
-                readiness = client.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
             except MotionGuardError as exc:
                 if client is not None:
                     try:
@@ -78,7 +142,8 @@ class GatewayMotionGuard:
                 ) from exc
             self._client = client
             self._last_error = None
-            return readiness
+
+    connect = start
 
     def close(self) -> None:
         with self._lock:
@@ -104,24 +169,17 @@ class GatewayMotionGuard:
                 f"motion guard readiness failed: {exc}"
             ) from exc
 
-    def is_ready(self, source: int) -> bool:
-        try:
-            return self.readiness(source).ready
-        except GatewayMotionGuardError:
-            return False
+    def acquire_follow_session(
+        self,
+        proof: MotionAdmissionProof,
+    ) -> MotionGuardSession:
+        return self._acquire(pb.GUARD_SOURCE_GATEWAY_FOLLOW, proof)
 
-    def is_reachable(self, source: int) -> bool:
-        try:
-            self.readiness(source)
-            return True
-        except GatewayMotionGuardError:
-            return False
-
-    def acquire_follow_session(self) -> MotionGuardSession:
-        return self._acquire(pb.GUARD_SOURCE_GATEWAY_FOLLOW)
-
-    def acquire_relative_session(self) -> MotionGuardSession:
-        return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE)
+    def acquire_relative_session(
+        self,
+        proof: MotionAdmissionProof,
+    ) -> MotionGuardSession:
+        return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE, proof)
 
     def stop_and_fence(self, session: MotionGuardSession) -> ZeroConfirmation:
         stop_error: Optional[Exception] = None
@@ -138,10 +196,12 @@ class GatewayMotionGuard:
         self,
         action: int,
         *,
+        proof: MotionAdmissionProof,
         enabled: bool = True,
     ) -> GatewayCommandConfirmation:
         return self._one_shot(
             pb.GUARD_SOURCE_GATEWAY_SPORT,
+            proof,
             lambda session: session.execute_sport(action, enabled=enabled),
         )
 
@@ -150,26 +210,46 @@ class GatewayMotionGuard:
         roll_rad: float,
         pitch_rad: float,
         yaw_rad: float,
+        *,
+        proof: MotionAdmissionProof,
     ) -> GatewayCommandConfirmation:
         return self._one_shot(
             pb.GUARD_SOURCE_GATEWAY_MANUAL,
+            proof,
             lambda session: session.set_body_pose(roll_rad, pitch_rad, yaw_rad),
         )
 
-    def set_speed_level(self, level: int) -> GatewayCommandConfirmation:
+    def set_speed_level(
+        self,
+        level: int,
+        *,
+        proof: MotionAdmissionProof,
+    ) -> GatewayCommandConfirmation:
         return self._one_shot(
             pb.GUARD_SOURCE_GATEWAY_MANUAL,
+            proof,
             lambda session: session.set_speed_level(level),
         )
 
-    def set_obstacle_policy(self, enabled: bool) -> GatewayCommandConfirmation:
+    def set_obstacle_policy(
+        self,
+        enabled: bool,
+        *,
+        proof: MotionAdmissionProof,
+    ) -> GatewayCommandConfirmation:
         return self._one_shot(
             pb.GUARD_SOURCE_GATEWAY_MANUAL,
+            proof,
             lambda session: session.set_obstacle_policy(enabled),
         )
 
-    def switch_mode(self, target_mode: int) -> ModeSwitchConfirmation:
-        session = self._acquire(pb.GUARD_SOURCE_GATEWAY_SPORT)
+    def switch_mode(
+        self,
+        target_mode: int,
+        *,
+        proof: MotionAdmissionProof,
+    ) -> ModeSwitchConfirmation:
+        session = self._acquire(pb.GUARD_SOURCE_GATEWAY_SPORT, proof)
         try:
             try:
                 return session.switch_mode(target_mode)
@@ -182,22 +262,74 @@ class GatewayMotionGuard:
                 "motion guard mode switch failed without a verified fence"
             ) from exc
 
-    def latch_safety_stop(self, reason: str) -> ZeroConfirmation:
+    def stop_all_motion(
+        self,
+        reason: str,
+        *,
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
+        operation = (
+            operation_id.strip()
+            if isinstance(operation_id, str) and operation_id.strip()
+            else f"stop-all-motion:{uuid.uuid4()}"
+        )
         client = self._require_client()
         try:
-            return client.latch_gateway_safety_stop(reason)
+            return client.stop_all_motion(reason, operation_id=operation)
+        except MotionGuardTransportError as exc:
+            self._record_error(exc)
+            if not exc.outcome_unknown or (
+                exc.operation_id and exc.operation_id != operation
+            ):
+                raise GatewayMotionGuardError(
+                    "global motion stop did not return a verified zero acknowledgement"
+                ) from exc
+            try:
+                self.start()
+                recovery_client = self._require_client()
+                status = recovery_client.get_operation_result(
+                    pb.GUARD_SOURCE_GATEWAY_MANUAL,
+                    operation,
+                    operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
+                )
+                if not status.resolved:
+                    return recovery_client.stop_all_motion(
+                        reason,
+                        operation_id=operation,
+                    )
+                if status.zero is None or status.target_ack not in {
+                    pb.ACK_CODE_ZEROED,
+                    pb.ACK_CODE_RESOURCE_FENCED,
+                }:
+                    raise MotionGuardError(
+                        "resolved global stop has no valid terminal zero result"
+                    )
+                return StopAllMotionConfirmation(
+                    operation_id=operation,
+                    result=status.result,
+                    zero=status.zero,
+                    lease_revoked=status.target_ack
+                    == pb.ACK_CODE_RESOURCE_FENCED,
+                    motion_stop_generation=status.motion_stop_generation,
+                )
+            except MotionGuardError as recovery_error:
+                self._record_error(recovery_error)
+                raise GatewayMotionGuardError(
+                    "global motion stop outcome could not be recovered"
+                ) from recovery_error
         except MotionGuardError as exc:
             self._record_error(exc)
             raise GatewayMotionGuardError(
-                "gateway safety latch did not return a verified zero acknowledgement"
+                "global motion stop did not return a verified zero acknowledgement"
             ) from exc
 
     def _one_shot(
         self,
         source: int,
+        proof: MotionAdmissionProof,
         operation: Callable[[MotionGuardSession], CommandConfirmation],
     ) -> GatewayCommandConfirmation:
-        session = self._acquire(source)
+        session = self._acquire(source, proof)
         try:
             try:
                 command = operation(session)
@@ -210,10 +342,14 @@ class GatewayMotionGuard:
             ) from exc
         return GatewayCommandConfirmation(command=command, zero=zero)
 
-    def _acquire(self, source: int) -> MotionGuardSession:
+    def _acquire(
+        self,
+        source: int,
+        proof: MotionAdmissionProof,
+    ) -> MotionGuardSession:
         client = self._require_client()
         try:
-            return client.acquire_session(source)
+            return client.acquire_session(source, proof)
         except MotionGuardError as exc:
             self._record_error(exc)
             raise GatewayMotionGuardUnavailable(
@@ -221,6 +357,7 @@ class GatewayMotionGuard:
             ) from exc
 
     def _require_client(self) -> MotionGuardClient:
+        self.start()
         with self._lock:
             client = self._client
         if client is None or client.failed:
@@ -239,4 +376,5 @@ __all__ = [
     "GatewayMotionGuard",
     "GatewayMotionGuardError",
     "GatewayMotionGuardUnavailable",
+    "MotionAdmission",
 ]

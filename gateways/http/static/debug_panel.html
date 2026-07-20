@@ -76,7 +76,6 @@ button{font-family:inherit;cursor:pointer}
 .seg button{border:0;background:transparent;color:var(--muted);font-size:12px;font-weight:620;
   padding:5px 15px;border-radius:var(--pill);transition:.2s}
 .seg button.on{background:var(--surface);color:var(--ink);box-shadow:var(--sh-sm)}
-.estop{margin-left:2px}
 
 /* ===== pills / badges ===== */
 .pill{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:620;
@@ -229,7 +228,6 @@ button{font-family:inherit;cursor:pointer}
 .pill.error{color:var(--bad);background:var(--bad-w)}
 .pill.missing,.pill.unsupported{color:var(--faint);background:var(--inset)}
 .pill.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
-.pill.estop{color:var(--faint);background:var(--inset)}
 
 /* kv: real JS emits <div> pairs (odd=key, even=value), not <dt>/<dd> */
 .kv>div:nth-child(odd){color:var(--muted);white-space:nowrap}
@@ -489,7 +487,7 @@ button{font-family:inherit;cursor:pointer}
       <div class="vstat"><div class="v mono" id="clockNow">--:--:--</div><div class="l">时间</div></div>
       <div class="vstat"><div class="v mono" id="lastReceive">--</div><div class="l">数据接收</div></div>
     </div>
-    <span class="pill idle estop" id="estopStatus">急停 · 只读</span>
+    <span class="pill idle" id="motionStatus">运动可用性 · 只读</span>
     <div class="seg">
       <button class="view-switch-btn active" id="viewSwitchMonitor" type="button" data-view-target="monitor-view">监控</button>
       <button class="view-switch-btn" id="viewSwitchConfig" type="button" data-view-target="config-view">配置</button>
@@ -861,7 +859,7 @@ button{font-family:inherit;cursor:pointer}
         networkLatency: document.getElementById("networkLatency"),
         resourceMetric: document.getElementById("resourceMetric"),
         clockNow: document.getElementById("clockNow"),
-        estopStatus: document.getElementById("estopStatus"),
+        motionStatus: document.getElementById("motionStatus"),
         missionStatus: document.getElementById("missionStatus"),
         taskStatus: document.getElementById("taskStatus"),
         taskSummary: document.getElementById("taskSummary"),
@@ -1656,9 +1654,12 @@ button{font-family:inherit;cursor:pointer}
           ? `${Math.round(rawBattery <= 1 ? rawBattery * 100 : rawBattery)}%`
           : (battery.level !== undefined ? `${battery.level}%` : "--");
         setText(els.batteryMetric, batteryValue);
-        const estopped = safety.is_estopped === true || safety.estopped === true;
-        setPill(els.estopStatus, estopped ? "error" : "available", estopped ? "急停状态：触发" : "急停状态：清除");
-        els.estopStatus.classList.add("estop");
+        const canMove = safety.can_move === true;
+        setPill(
+          els.motionStatus,
+          canMove ? "available" : "error",
+          canMove ? "运动可用" : "运动不可用",
+        );
         if (health.service_health) {
           mergeServiceHealth(health.service_health, "/api/health", "replace");
         } else {

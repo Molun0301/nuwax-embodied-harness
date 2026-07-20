@@ -52,6 +52,13 @@ struct _nuwax_msgs_GoalEnvelope
      * LCM Type: geometry_msgs.Point[boundary_points_length]
      */
     geometry_msgs_Point *boundary_points;
+    int64_t    motion_guard_generation;
+
+    /**
+     * LCM Type: byte[16]
+     */
+    uint8_t    motion_guard_boot_nonce[16];
+    int64_t    motion_stop_generation;
 
     /**
      * LCM Type: byte[32]

@@ -167,6 +167,9 @@ message NavigationGoal {
   string parent_request_id = 6;
   uint64 goal_generation = 7;
   NavigationOwnerKind owner_kind = 8;
+  uint64 motion_guard_generation = 9;
+  bytes motion_guard_boot_nonce = 10;
+  uint64 motion_stop_generation = 11;
 }
 message CancelNavigationRequest {
   string goal_id = 1;
@@ -292,6 +295,9 @@ message ExploreRequest {
   double blacklist_radius_m = 9;
   // A request has one authoritative boundary frame; production accepts map.
   string boundary_frame_id = 10;
+  uint64 motion_guard_generation = 11;
+  bytes motion_guard_boot_nonce = 12;
+  uint64 motion_stop_generation = 13;
 }
 message StopExplorationRequest {
   string request_id = 1;

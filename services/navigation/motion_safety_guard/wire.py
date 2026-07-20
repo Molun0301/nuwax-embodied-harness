@@ -20,7 +20,7 @@ def operation_message(request: pb.MotionGuardRequest) -> Message:
     return getattr(request, operation)
 
 
-def operation_envelope(request: pb.MotionGuardRequest) -> Optional[pb.RequestEnvelope]:
+def operation_envelope(request: pb.MotionGuardRequest) -> Optional[Message]:
     message = operation_message(request)
     if "envelope" not in message.DESCRIPTOR.fields_by_name:
         return None

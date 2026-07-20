@@ -1,10 +1,10 @@
 //! nuwax-motion-safety-guard operation namespace(§P0B #22)
 //!
-//! 对齐 W32 Python 端 `tools/motion_safety_guard/operation_namespace.py`:
-//! - 4 类 `OperationNamespace`:Acquire / LeaseBound / Admin / Query
+//! 对齐 motion-guard v2 operation namespace:
+//! - 4 类 `OperationNamespace`:Acquire / LeaseBound / GlobalStop / Query
 //! - `OperationKey` frozen struct,字段组合:
 //!   peer_uid / source / generation / boot_nonce (128-bit) / lease_id / operation_id / namespace
-//! - 4 类 key builder:Acquire / LeaseBound / Admin / Query
+//! - 4 类 key builder:Acquire / LeaseBound / GlobalStop / Query
 //! - `key_to_canonical` 稳定字符串表达,用于 dedup cache key 与审计日志
 //! - `derive_payload_hash` sha256 截断 32 hex(128-bit)
 
@@ -22,8 +22,8 @@ pub enum OperationNamespace {
     Acquire,
     /// execute / renew / RevokeAndZero,带 lease_id + generation
     LeaseBound,
-    /// LatchSafetyStop / Reset,带 admin peer_uid
-    Admin,
+    /// StopAllMotion,不绑定 lease
+    GlobalStop,
     /// GetOperationResult,只读
     Query,
 }
@@ -34,7 +34,7 @@ impl OperationNamespace {
         match self {
             Self::Acquire => "acquire",
             Self::LeaseBound => "lease_bound",
-            Self::Admin => "admin",
+            Self::GlobalStop => "global_stop",
             Self::Query => "query",
         }
     }
@@ -48,13 +48,13 @@ impl OperationNamespace {
 pub struct OperationKey {
     /// peer UID(整数投影)
     pub peer_uid: u32,
-    /// source 字符串投影(NAV / GATEWAY_* / ADMIN)
+    /// source 字符串投影(NAV / GATEWAY_*)
     pub source: String,
     /// generation
     pub generation: u64,
     /// 128-bit boot nonce
     pub boot_nonce: [u8; BOOT_NONCE_BYTES],
-    /// lease_id;None for Acquire / Admin / Query
+    /// lease_id;None for Acquire / GlobalStop / Query
     pub lease_id: Option<u64>,
     /// operation_id(字符串)
     pub operation_id: String,
@@ -157,10 +157,8 @@ impl LeaseBoundKeyBuilder {
     }
 }
 
-/// Admin key builder:LatchSafetyStop / Reset,`lease_id = None`。
-///
-/// `source` 必须是 `"ADMIN"` 或保留供未来扩展的 admin 子角色。
-pub struct AdminKeyBuilder {
+/// Global stop key builder:StopAllMotion,`lease_id = None`。
+pub struct GlobalStopKeyBuilder {
     peer_uid: u32,
     source: String,
     generation: u64,
@@ -168,7 +166,7 @@ pub struct AdminKeyBuilder {
     op_id: String,
 }
 
-impl AdminKeyBuilder {
+impl GlobalStopKeyBuilder {
     /// 新建 builder。
     pub fn new(
         peer_uid: u32,
@@ -196,7 +194,7 @@ impl AdminKeyBuilder {
             boot_nonce: self.boot_nonce,
             lease_id: None,
             operation_id: self.op_id,
-            namespace: OperationNamespace::Admin,
+            namespace: OperationNamespace::GlobalStop,
         })
     }
 }
@@ -315,7 +313,7 @@ mod tests {
         n
     }
 
-    /// §P0B #22:Acquire/lease-bound/admin/query × boot_nonce × namespace 区分全绿。
+    /// Acquire/lease-bound/global-stop/query × boot_nonce × namespace 区分全绿。
     #[test]
     fn four_namespaces_are_distinct() {
         let n = boot_nonce();
@@ -325,23 +323,23 @@ mod tests {
         let lb1 = LeaseBoundKeyBuilder::new(1000, 1, n, 42, "op-exec")
             .build()
             .unwrap();
-        let ad1 = AdminKeyBuilder::new(999, "ADMIN", 0, n, "op-latch")
+        let stop = GlobalStopKeyBuilder::new(1001, "GATEWAY_MANUAL", 1, n, "op-stop")
             .build()
             .unwrap();
         let q1 = QueryKeyBuilder::new(1000, "op-result", n).build().unwrap();
 
         assert_eq!(k1.namespace, OperationNamespace::Acquire);
         assert_eq!(lb1.namespace, OperationNamespace::LeaseBound);
-        assert_eq!(ad1.namespace, OperationNamespace::Admin);
+        assert_eq!(stop.namespace, OperationNamespace::GlobalStop);
         assert_eq!(q1.namespace, OperationNamespace::Query);
 
         // 四 namespace 必须区分(同 peer_uid / op_id / boot_nonce 视为不同)
         let c1 = key_to_canonical(&k1);
         let clb = key_to_canonical(&lb1);
-        let cad = key_to_canonical(&ad1);
+        let cstop = key_to_canonical(&stop);
         let cq = key_to_canonical(&q1);
         assert_ne!(c1, clb);
-        assert_ne!(c1, cad);
+        assert_ne!(c1, cstop);
         assert_ne!(c1, cq);
     }
 
@@ -393,8 +391,10 @@ mod tests {
         assert_eq!(k1.lease_id, None);
         let lb1 = LeaseBoundKeyBuilder::new(1, 0, n, 42, "x").build().unwrap();
         assert_eq!(lb1.lease_id, Some(42));
-        let ad1 = AdminKeyBuilder::new(1, "ADMIN", 0, n, "x").build().unwrap();
-        assert_eq!(ad1.lease_id, None);
+        let stop = GlobalStopKeyBuilder::new(1, "GATEWAY_MANUAL", 1, n, "x")
+            .build()
+            .unwrap();
+        assert_eq!(stop.lease_id, None);
     }
 
     /// §P0B #23 payload hash 确定性 + 长度 32 hex。

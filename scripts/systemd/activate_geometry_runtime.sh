@@ -16,7 +16,7 @@ LAST_UNIT=""
 ACTIVATION_LEVEL="motion"
 CAPABILITY_NAME="unknown"
 REQUEST_ID=""
-SAFETY_EPOCH="0"
+MOTION_STOP_GENERATION="0"
 STARTED_UNITS=()
 FAILURE_UNIT=""
 FAILURE_UNIT_RESULT=""
@@ -30,12 +30,12 @@ write_result() {
   local temporary="${RESULT_FILE}.$$"
   STATE="${state}" MESSAGE="${message}" STAGE="${LAST_STAGE}" \
     ERROR_CODE="${error_code}" REQUEST_ID="${REQUEST_ID}" \
-    SAFETY_EPOCH="${SAFETY_EPOCH}" ACTIVATION_LEVEL="${ACTIVATION_LEVEL}" \
+    MOTION_STOP_GENERATION="${MOTION_STOP_GENERATION}" ACTIVATION_LEVEL="${ACTIVATION_LEVEL}" \
     CAPABILITY_NAME="${CAPABILITY_NAME}" FAILURE_UNIT="${FAILURE_UNIT}" \
     FAILURE_UNIT_RESULT="${FAILURE_UNIT_RESULT}" \
     FAILURE_UNIT_EXIT_STATUS="${FAILURE_UNIT_EXIT_STATUS}" \
     FAILURE_DIAGNOSTIC="${FAILURE_DIAGNOSTIC}" \
-    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "safety_epoch": int(os.environ["SAFETY_EPOCH"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; optional = {"error_code": os.environ.get("ERROR_CODE", ""), "unit": os.environ.get("FAILURE_UNIT", ""), "unit_result": os.environ.get("FAILURE_UNIT_RESULT", ""), "unit_exit_status": os.environ.get("FAILURE_UNIT_EXIT_STATUS", ""), "diagnostic": os.environ.get("FAILURE_DIAGNOSTIC", "")}; payload.update({key: value for key, value in optional.items() if value}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
+    /usr/bin/python3 -c 'import json, os; payload = {"state": os.environ["STATE"], "stage": os.environ["STAGE"], "message": os.environ["MESSAGE"], "request_id": os.environ["REQUEST_ID"], "motion_stop_generation": int(os.environ["MOTION_STOP_GENERATION"]), "activation_level": os.environ["ACTIVATION_LEVEL"], "capability_name": os.environ["CAPABILITY_NAME"]}; optional = {"error_code": os.environ.get("ERROR_CODE", ""), "unit": os.environ.get("FAILURE_UNIT", ""), "unit_result": os.environ.get("FAILURE_UNIT_RESULT", ""), "unit_exit_status": os.environ.get("FAILURE_UNIT_EXIT_STATUS", ""), "diagnostic": os.environ.get("FAILURE_DIAGNOSTIC", "")}; payload.update({key: value for key, value in optional.items() if value}); print(json.dumps(payload, ensure_ascii=True, sort_keys=True))' \
     > "${temporary}"
   chmod 0644 "${temporary}"
   mv -f "${temporary}" "${RESULT_FILE}"
@@ -100,13 +100,13 @@ cancel_activation() {
   local message="$1"
   trap - ERR INT TERM HUP
   rollback_started_units
-  write_result cancelled "${message}" safe_stop_active || true
+  write_result cancelled "${message}" activation_cancelled || true
   cleanup_protocol_files
   exit 0
 }
 
 read_request() {
-  IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID SAFETY_EPOCH < <(
+  IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID MOTION_STOP_GENERATION < <(
     /usr/bin/python3 - "${REQUEST_FILE}" <<'PY'
 import json
 import pathlib
@@ -121,12 +121,12 @@ request_id = str(payload.get("request_id") or "").strip()
 if not request_id:
     raise SystemExit("missing request_id")
 try:
-    safety_epoch = int(payload.get("safety_epoch", 0))
+    motion_stop_generation = int(payload.get("motion_stop_generation", 0))
 except (TypeError, ValueError):
-    raise SystemExit("invalid safety_epoch")
-if safety_epoch < 0:
-    raise SystemExit("invalid safety_epoch")
-print("%s\t%s\t%s\t%s" % (level, capability, request_id, safety_epoch))
+    raise SystemExit("invalid motion_stop_generation")
+if motion_stop_generation < 0:
+    raise SystemExit("invalid motion_stop_generation")
+print("%s\t%s\t%s\t%s" % (level, capability, request_id, motion_stop_generation))
 PY
   )
 }
@@ -135,7 +135,7 @@ marker_matches_request() {
   local marker_file="$1"
   local marker_kind="$2"
   [[ -f "${marker_file}" ]] || return 1
-  /usr/bin/python3 - "${marker_file}" "${REQUEST_ID}" "${SAFETY_EPOCH}" "${marker_kind}" <<'PY'
+  /usr/bin/python3 - "${marker_file}" "${REQUEST_ID}" "${MOTION_STOP_GENERATION}" "${marker_kind}" <<'PY'
 import json
 import pathlib
 import sys
@@ -144,16 +144,16 @@ payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if str(payload.get("request_id") or "").strip() != sys.argv[2]:
     raise SystemExit(1)
 try:
-    marker_epoch = int(payload.get("safety_epoch", -1))
-    request_epoch = int(sys.argv[3])
+    marker_generation = int(payload.get("motion_stop_generation", -1))
+    request_generation = int(sys.argv[3])
 except (TypeError, ValueError):
     raise SystemExit(1)
 kind = sys.argv[4]
 if kind == "cancel":
-    raise SystemExit(0 if marker_epoch >= request_epoch else 1)
+    raise SystemExit(0 if marker_generation >= request_generation else 1)
 if str(payload.get("state") or "").strip().lower() != "acknowledged":
     raise SystemExit(1)
-raise SystemExit(0 if marker_epoch == request_epoch else 1)
+raise SystemExit(0 if marker_generation == request_generation else 1)
 PY
 }
 
@@ -167,7 +167,7 @@ activation_acknowledged() {
 
 check_cancel() {
   if activation_cancelled; then
-    cancel_activation "safe stop cancelled runtime activation at ${LAST_STAGE}"
+    cancel_activation "motion stop cancelled runtime activation at ${LAST_STAGE}"
   fi
 }
 

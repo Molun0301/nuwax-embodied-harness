@@ -314,7 +314,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("sensor_msgs.PointCloud2", 0xfaf5_9ed0_e142_98ba_u64),
     ("std_msgs.Bool", 0x0f5f_7835_284a_871f_u64),
     ("tf2_msgs.TFMessage", 0x615c_50e1_9d44_91f6_u64),
-    ("nuwax_msgs.GoalEnvelope", 0x2f32_5e81_f8ec_5f8d_u64),
+    ("nuwax_msgs.GoalEnvelope", 0x1709_3b3b_7d54_ff26_u64),
     ("nuwax_msgs.PathEnvelope", 0x3ef7_743b_477f_90a2_u64),
     ("nuwax_msgs.NavigationState", 0x7d8c_8a97_877b_2b09_u64),
     ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),

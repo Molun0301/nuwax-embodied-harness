@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_GoalEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x16319563413d44cfLL
+    uint64_t hash = (uint64_t)0xfe08721cc5a5e468LL
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
@@ -34,6 +34,9 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __geometry_msgs_Point_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __byte_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __geometry_msgs_PoseStamped_hash_recursive(&cp)
         ;
@@ -94,6 +97,15 @@ int __nuwax_msgs_GoalEnvelope_encode_array(void *buf, int offset, int maxlen, co
         thislen = __geometry_msgs_Point_encode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points, p[element].boundary_points_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_guard_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].motion_guard_boot_nonce, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -146,6 +158,12 @@ int __nuwax_msgs_GoalEnvelope_encoded_array_size(const nuwax_msgs_GoalEnvelope *
         size += __int32_t_encoded_array_size(&(p[element].boundary_points_length), 1);
 
         size += __geometry_msgs_Point_encoded_array_size(p[element].boundary_points, p[element].boundary_points_length);
+
+        size += __int64_t_encoded_array_size(&(p[element].motion_guard_generation), 1);
+
+        size += __byte_encoded_array_size(p[element].motion_guard_boot_nonce, 16);
+
+        size += __int64_t_encoded_array_size(&(p[element].motion_stop_generation), 1);
 
         size += __byte_encoded_array_size(p[element].payload_sha256, 32);
 
@@ -203,6 +221,15 @@ int __nuwax_msgs_GoalEnvelope_decode_array(const void *buf, int offset, int maxl
         thislen = __geometry_msgs_Point_decode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points, p[element].boundary_points_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_guard_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].motion_guard_boot_nonce, 16);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -243,6 +270,12 @@ int __nuwax_msgs_GoalEnvelope_decode_array_cleanup(nuwax_msgs_GoalEnvelope *p, i
 
         __geometry_msgs_Point_decode_array_cleanup(p[element].boundary_points, p[element].boundary_points_length);
         if (p[element].boundary_points) free(p[element].boundary_points);
+
+        __int64_t_decode_array_cleanup(&(p[element].motion_guard_generation), 1);
+
+        __byte_decode_array_cleanup(p[element].motion_guard_boot_nonce, 16);
+
+        __int64_t_decode_array_cleanup(&(p[element].motion_stop_generation), 1);
 
         __byte_decode_array_cleanup(p[element].payload_sha256, 32);
 
@@ -302,6 +335,12 @@ int __nuwax_msgs_GoalEnvelope_clone_array(const nuwax_msgs_GoalEnvelope *p, nuwa
 
         q[element].boundary_points = (geometry_msgs_Point*) lcm_malloc(sizeof(geometry_msgs_Point) * q[element].boundary_points_length);
         __geometry_msgs_Point_clone_array(p[element].boundary_points, q[element].boundary_points, p[element].boundary_points_length);
+
+        __int64_t_clone_array(&(p[element].motion_guard_generation), &(q[element].motion_guard_generation), 1);
+
+        __byte_clone_array(p[element].motion_guard_boot_nonce, q[element].motion_guard_boot_nonce, 16);
+
+        __int64_t_clone_array(&(p[element].motion_stop_generation), &(q[element].motion_stop_generation), 1);
 
         __byte_clone_array(p[element].payload_sha256, q[element].payload_sha256, 32);
 

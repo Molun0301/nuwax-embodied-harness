@@ -299,14 +299,6 @@ class RobotStateService:
                     message=safety_state.warning_message or "当前机器人不允许移动。",
                 )
             )
-        if safety_state.is_estopped:
-            diagnostics.append(
-                DiagnosticItem(
-                    component="safety",
-                    level=DiagnosticLevel.ERROR,
-                    message="机器人处于急停状态。",
-                )
-            )
         return diagnostics
 
     def _serialize(self, value):

@@ -1,9 +1,9 @@
-//! nuwax-motion-safety-guard dedup cache + emergency reserve(§P0B #23/#24)
+//! nuwax-motion-safety-guard dedup cache + priority reserve(§P0B #23/#24)
 //!
 //! 对齐 W32 Python 端 `tools/motion_safety_guard/dedup_cache.py`:
-//! - 75% 普通 + 25% emergency reserve 物理隔离
+//! - 75% 普通 + 25% priority reserve 物理隔离
 //! - 普通 `try_add`:满 → RESOURCE_EXHAUSTED(不消耗 reserve)
-//! - `try_emergency`:仅安全路径(LatchSafetyStop / RevokeAndZero / ADMIN)可用
+//! - `try_priority`:仅终止 stop/fence 路径可用
 //! - `add_tombstone`:Acquire tombstone 整个 boot epoch 保留(上限 1M)
 //! - 80% 告警 / 90% 阻止(`CacheHealth` advisory 信号,实际写入仍可成功)
 //!
@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// §P0B #24 emergency reserve 固定占比 25%。
-pub const EMERGENCY_RESERVE_PCT: u64 = 25;
+/// §P0B #24 priority reserve 固定占比 25%。
+pub const PRIORITY_RESERVE_PCT: u64 = 25;
 
 /// §P0B #23 Acquire tombstone 上限(整个 boot epoch 保留)。
 pub const TOMBSTONE_LIMIT: u64 = 1_000_000;
@@ -31,7 +31,7 @@ pub const DEDUP_CAPACITY_DEFAULT: u64 = 1_000_000;
 /// L-N0.1 用 `&'static str` 而非 owned `String` 避免 alloc。
 pub type DedupResult = (bool, &'static str);
 
-/// §P0B #24 cache 健康度快照(advisory 信号,供 LatchSafetyStop 决策使用)。
+/// §P0B #24 cache 健康度快照。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheHealth {
     /// ordinary_used 占用数
@@ -40,12 +40,12 @@ pub struct CacheHealth {
     pub ordinary_capacity: u64,
     /// ordinary_pct = ordinary_used / ordinary_capacity × 100
     pub ordinary_pct: f64,
-    /// emergency_used 占用数
-    pub emergency_used: u64,
-    /// emergency_reserve 容量
-    pub emergency_reserve: u64,
-    /// emergency_pct
-    pub emergency_pct: f64,
+    /// priority_used 占用数
+    pub priority_used: u64,
+    /// priority_reserve 容量
+    pub priority_reserve: u64,
+    /// priority_pct
+    pub priority_pct: f64,
     /// 当前 tombstone 数
     pub tombstones: u64,
     /// tombstone_pct
@@ -56,19 +56,19 @@ pub struct CacheHealth {
     pub block_new_acquire: bool,
 }
 
-/// §P0B #23 + #24 dedup cache + emergency reserve。
+/// §P0B #23 + #24 dedup cache + priority reserve。
 ///
 /// capacity 按 75% 普通 + 25% reserve 分配;**reserve 物理隔离**,普通入边不可达。
 #[derive(Debug)]
 pub struct DedupCache {
     /// 普通 cache 容量 = capacity * 75%
     ordinary_capacity: u64,
-    /// emergency reserve 容量 = capacity - ordinary_capacity
-    emergency_reserve: u64,
+    /// priority reserve 容量 = capacity - ordinary_capacity
+    priority_reserve: u64,
     /// 普通已占用
     ordinary_used: u64,
-    /// emergency 已占用
-    emergency_used: u64,
+    /// priority 已占用
+    priority_used: u64,
     /// key → payload_hash
     entries: HashMap<String, String>,
     /// Acquire tombstone 整个 boot epoch 保留
@@ -86,13 +86,13 @@ impl DedupCache {
     /// capacity 必须为正;非法值 panic(L-N0.1 简化:用 assert 与 Python `ValueError` 对齐)。
     pub fn with_capacity(capacity: u64) -> Self {
         assert!(capacity > 0, "capacity 必须为正,got {capacity}");
-        let ordinary_capacity = capacity * (100 - EMERGENCY_RESERVE_PCT) / 100;
-        let emergency_reserve = capacity - ordinary_capacity;
+        let ordinary_capacity = capacity * (100 - PRIORITY_RESERVE_PCT) / 100;
+        let priority_reserve = capacity - ordinary_capacity;
         Self {
             ordinary_capacity,
-            emergency_reserve,
+            priority_reserve,
             ordinary_used: 0,
-            emergency_used: 0,
+            priority_used: 0,
             entries: HashMap::new(),
             tombstones: HashSet::new(),
         }
@@ -102,8 +102,8 @@ impl DedupCache {
         self.ordinary_used >= self.ordinary_capacity
     }
 
-    fn emergency_full(&self) -> bool {
-        self.emergency_used >= self.emergency_reserve
+    fn priority_full(&self) -> bool {
+        self.priority_used >= self.priority_reserve
     }
 
     /// §P0B #23 普通 cache 添加。
@@ -127,26 +127,26 @@ impl DedupCache {
         (true, "OK")
     }
 
-    /// §P0B #24 emergency reserve 添加,仅安全路径可用。
+    /// §P0B #24 priority reserve 添加,仅终止 stop/fence 路径可用。
     ///
     /// - 同 key 已在(不论哪个 partition):`(true, "CACHE_HIT")`
     /// - 异 key 且 reserve 满:`(false, "RESOURCE_EXHAUSTED")`
-    pub fn try_emergency(&mut self, key: &str, payload_hash: &str) -> DedupResult {
+    pub fn try_priority(&mut self, key: &str, payload_hash: &str) -> DedupResult {
         if self.entries.contains_key(key) {
             return (true, "CACHE_HIT");
         }
-        if self.emergency_full() {
+        if self.priority_full() {
             return (false, "RESOURCE_EXHAUSTED");
         }
         self.entries
             .insert(key.to_string(), payload_hash.to_string());
-        self.emergency_used += 1;
+        self.priority_used += 1;
         (true, "OK")
     }
 
     /// §P0B #23 Acquire tombstone 整个 boot epoch 保留。
     ///
-    /// 满 1M → `TOMBSTONE_EXHAUSTED`(此时 LatchSafetyStop,避免永久停服)。
+    /// 满 1M → `TOMBSTONE_EXHAUSTED`。
     pub fn add_tombstone(&mut self, acquire_key: &str) -> DedupResult {
         if self.tombstones.contains(acquire_key) {
             return (true, "TOMBSTONE_HIT");
@@ -158,15 +158,15 @@ impl DedupCache {
         (true, "OK")
     }
 
-    /// §P0B #24 健康度快照:ordinary/emergency 占比与告警位。
+    /// §P0B #24 健康度快照:ordinary/priority 占比与告警位。
     pub fn get_health(&self) -> CacheHealth {
         let ordinary_pct = if self.ordinary_capacity > 0 {
             self.ordinary_used as f64 / self.ordinary_capacity as f64 * 100.0
         } else {
             0.0
         };
-        let emergency_pct = if self.emergency_reserve > 0 {
-            self.emergency_used as f64 / self.emergency_reserve as f64 * 100.0
+        let priority_pct = if self.priority_reserve > 0 {
+            self.priority_used as f64 / self.priority_reserve as f64 * 100.0
         } else {
             0.0
         };
@@ -175,9 +175,9 @@ impl DedupCache {
             ordinary_used: self.ordinary_used,
             ordinary_capacity: self.ordinary_capacity,
             ordinary_pct: round2(ordinary_pct),
-            emergency_used: self.emergency_used,
-            emergency_reserve: self.emergency_reserve,
-            emergency_pct: round2(emergency_pct),
+            priority_used: self.priority_used,
+            priority_reserve: self.priority_reserve,
+            priority_pct: round2(priority_pct),
             tombstones: self.tombstones.len() as u64,
             tombstone_pct: round2(tombstone_pct),
             alert_planned_restart: ordinary_pct >= PLANNED_RESTART_PCT as f64,
@@ -190,9 +190,9 @@ impl DedupCache {
         self.ordinary_capacity
     }
 
-    /// emergency reserve 容量(诊断用)
-    pub fn emergency_reserve(&self) -> u64 {
-        self.emergency_reserve
+    /// priority reserve 容量(诊断用)
+    pub fn priority_reserve(&self) -> u64 {
+        self.priority_reserve
     }
 
     /// ordinary 已占用
@@ -200,9 +200,9 @@ impl DedupCache {
         self.ordinary_used
     }
 
-    /// emergency 已占用
-    pub fn emergency_used(&self) -> u64 {
-        self.emergency_used
+    /// priority 已占用
+    pub fn priority_used(&self) -> u64 {
+        self.priority_used
     }
 }
 
@@ -226,7 +226,7 @@ mod tests {
     fn default_capacity_partition() {
         let cache = DedupCache::new();
         assert_eq!(cache.ordinary_capacity(), 750_000);
-        assert_eq!(cache.emergency_reserve(), 250_000);
+        assert_eq!(cache.priority_reserve(), 250_000);
     }
 
     /// §P0B #24 小 capacity 测试分配。
@@ -234,7 +234,7 @@ mod tests {
     fn small_capacity_partition() {
         let cache = DedupCache::with_capacity(100);
         assert_eq!(cache.ordinary_capacity(), 75);
-        assert_eq!(cache.emergency_reserve(), 25);
+        assert_eq!(cache.priority_reserve(), 25);
     }
 
     /// §P0B #24 capacity=0 panic。
@@ -253,7 +253,7 @@ mod tests {
         assert!(ok);
         assert_eq!(code, "OK");
         assert_eq!(cache.ordinary_used(), 1);
-        assert_eq!(cache.emergency_used(), 0);
+        assert_eq!(cache.priority_used(), 0);
 
         // 2) 幂等 CACHE_HIT
         let (ok, code) = cache.try_add("k1", "h1");
@@ -285,41 +285,41 @@ mod tests {
         assert_eq!(code, "RESOURCE_EXHAUSTED");
         assert_eq!(cache.ordinary_used(), 75);
         assert_eq!(
-            cache.emergency_used(),
+            cache.priority_used(),
             0,
             "RESOURCE_EXHAUSTED 不应消耗 reserve"
         );
     }
 
-    /// §P0B #24 emergency reserve 物理隔离 + 满后 RESOURCE_EXHAUSTED。
+    /// §P0B #24 priority reserve 物理隔离 + 满后 RESOURCE_EXHAUSTED。
     #[test]
-    fn emergency_reserve_isolation() {
+    fn priority_reserve_isolation() {
         let mut cache = DedupCache::with_capacity(100);
         // 先填满 ordinary
         for i in 0..75 {
             cache.try_add(&format!("k{i}"), &format!("h{i}"));
         }
 
-        // emergency reserve 仍 OK
-        let (ok, code) = cache.try_emergency("emergency-1", "h-em-1");
+        // priority reserve 仍 OK
+        let (ok, code) = cache.try_priority("priority-1", "h-priority-1");
         assert!(ok);
         assert_eq!(code, "OK");
-        assert_eq!(cache.emergency_used(), 1);
-        assert_eq!(cache.ordinary_used(), 75, "emergency 不动 ordinary");
+        assert_eq!(cache.priority_used(), 1);
+        assert_eq!(cache.ordinary_used(), 75, "priority 不动 ordinary");
 
         // CACHE_HIT
-        let (ok, code) = cache.try_emergency("emergency-1", "h-em-1");
+        let (ok, code) = cache.try_priority("priority-1", "h-priority-1");
         assert!(ok);
         assert_eq!(code, "CACHE_HIT");
 
         // 满后 RESOURCE_EXHAUSTED
         let mut cache2 = DedupCache::with_capacity(100);
         for i in 0..25 {
-            let (ok, code) = cache2.try_emergency(&format!("e{i}"), &format!("eh{i}"));
-            assert!(ok, "emergency i={i} 写入失败: {code}");
+            let (ok, code) = cache2.try_priority(&format!("p{i}"), &format!("ph{i}"));
+            assert!(ok, "priority i={i} 写入失败: {code}");
         }
-        assert_eq!(cache2.emergency_used(), 25);
-        let (ok, code) = cache2.try_emergency("e-overflow", "x");
+        assert_eq!(cache2.priority_used(), 25);
+        let (ok, code) = cache2.try_priority("p-overflow", "x");
         assert!(!ok);
         assert_eq!(code, "RESOURCE_EXHAUSTED");
     }
@@ -370,9 +370,9 @@ mod tests {
         assert!(ok, "90% 仅告警,物理未满仍写成功: code={code}");
         assert_eq!(code, "OK");
 
-        // emergency reserve 独立于 ordinary 状态
-        let (ok, _code) = block.try_emergency("emergency-final", "h-em");
-        assert!(ok, "emergency reserve 必须独立于 ordinary 状态");
+        // priority reserve 独立于 ordinary 状态
+        let (ok, _code) = block.try_priority("priority-final", "h-priority");
+        assert!(ok, "priority reserve 必须独立于 ordinary 状态");
     }
 
     /// §P0B #24 物理满后必须拒绝。

@@ -1682,6 +1682,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 goal_generation: 0,
                 map_version_id,
                 map_revision,
+                motion_admission: request.motion_admission,
                 frame_id,
                 target,
             },
@@ -5377,6 +5378,7 @@ mod exploration_lcm_smoke_tests {
                 ExploreStartConfig {
                     map_version_id: "smoke-map-v41".to_string(),
                     map_revision: MAP_REVISION,
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
                     boundary: Some(boundary),
                     ..ExploreStartConfig::default()
                 },

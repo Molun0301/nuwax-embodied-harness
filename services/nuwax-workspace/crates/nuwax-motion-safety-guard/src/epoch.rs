@@ -1,16 +1,9 @@
-//! nuwax-motion-safety-guard epoch.json / provisioned.json schema + UID 期望(§P0B #15/#19)
-//!
-//! 对齐 W32 Python 端:
-//! - `tools/motion_safety_guard/w31_guard_epoch_record.py`(`GuardEpochRecord` v1 + provisioned)
-//! - `tools/motion_safety_guard/uids_provisioning.py`(4 UID + 1 group)
-//!
-//! L-N0.1 简化:仅 schema struct + UID 列表常量;真持久化(atomic write + fsync +
-//! flock + checksum 校验)由后续 P1-P5 lane 接通。
+//! Motion-guard epoch/provisioning schemas shared with the Python authority.
 
 use serde::{Deserialize, Serialize};
 
-/// §P0B #15 GuardEpochRecord v1 schema version。
-pub const SCHEMA_VERSION_EPOCH: u32 = 1;
+/// Current guard epoch schema version.
+pub const SCHEMA_VERSION_EPOCH: u32 = 2;
 
 /// §P0B #15 provisioned.json schema version。
 pub const SCHEMA_VERSION_PROVISIONED: u32 = 1;
@@ -20,22 +13,22 @@ pub const SCHEMA_VERSION_PROVISIONED: u32 = 1;
 /// L-N0.1:仅常量,不实装文件 IO。
 pub const PROVISIONED_PATH: &str = "/var/lib/nuwax/motion-guard/provisioned.json";
 
-/// §P0B #19 严格 4 UID,任何变更触发 breaking-change CI BLOCKING。
-///
-/// 与 Python `EXPECTED_USERS` 1:1 对齐。
-pub const EXPECTED_USERS: [&str; 4] = [
-    "nuwax-motion-guard",
-    "nuwax-motion-admin",
-    "nuwax-navigation",
-    "nuwax-gateway",
-];
+/// Runtime identities authorized by the v2 deployment.
+pub const EXPECTED_USERS: [&str; 3] = ["nuwax-motion-guard", "nuwax-navigation", "nuwax-gateway"];
 
-/// 仅供显式部署迁移器识别；运行时持久化校验绝不接受 legacy tuple。
-pub const LEGACY_EXPECTED_USERS: [&str; 4] = [
-    "nuwax-motion-guard",
-    "nuwax-motion-admin",
-    "nuwax-geometry",
-    "nuwax-gateway",
+pub(crate) const V1_EXPECTED_USER_SETS: [[&str; 4]; 2] = [
+    [
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-navigation",
+        "nuwax-gateway",
+    ],
+    [
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-geometry",
+        "nuwax-gateway",
+    ],
 ];
 
 /// §P0B #19 1 group,允许 nuwax-geometry / nuwax-gateway 调用 guard UDS。
@@ -43,21 +36,7 @@ pub const LEGACY_EXPECTED_USERS: [&str; 4] = [
 /// 与 Python `EXPECTED_GROUPS` 1:1 对齐。
 pub const EXPECTED_GROUPS: [&str; 1] = ["nuwax-motion-clients"];
 
-/// §P0B #15 GuardEpochRecord v1 schema。
-///
-/// 字段对齐 Python `GuardEpochRecord`:
-/// - `schema_version: u32`(默认 1)
-/// - `generation: u64`
-/// - `boot_nonce_hex: String`(32 chars = 128-bit)
-/// - `safety_gate: SafetyGate`
-/// - `lease_state: LeaseState`
-/// - `reset_generation: u64`
-/// - `last_zero_ack_id: String`(u64 或 UUID 字符串)
-/// - `peer_uid_allowlist: Vec<String>`
-/// - `actuator_symbols_sha256: String`(以 "sha256:" 开头)
-/// - `fenced: bool`(initial = true)
-/// - `created_at: String`(ISO8601 UTC)
-/// - `checksum: String`(sha256:hex)
+/// Durable guard epoch schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuardEpochRecord {
     /// schema 版本(必须为 `SCHEMA_VERSION_EPOCH`)
@@ -66,12 +45,8 @@ pub struct GuardEpochRecord {
     pub generation: u64,
     /// boot nonce hex(32 chars = 128-bit);初始为空,首次 boot 后生成
     pub boot_nonce_hex: String,
-    /// 当前 SafetyGate
-    pub safety_gate: crate::state::SafetyGate,
     /// 当前 LeaseState
     pub lease_state: crate::state::LeaseState,
-    /// admin_reset 计数
-    pub reset_generation: u64,
     /// 最近 zero ack id(字符串以兼容 UUID 或 u64)
     pub last_zero_ack_id: String,
     /// peer UID allowlist(必须为 `EXPECTED_USERS` 子集)
@@ -79,8 +54,10 @@ pub struct GuardEpochRecord {
     /// actuator symbols sha256(以 "sha256:" 开头;W31 placeholder 形如
     /// `"sha256:placeholder"`)
     pub actuator_symbols_sha256: String,
-    /// fenced 标志(initial = true;boot 启动后 fenced = false 等 ADMIN_RESET)
+    /// Whether prior actuator ownership is fenced.
     pub fenced: bool,
+    /// Whether this process boot completed its automatic zero handshake.
+    pub startup_zero_confirmed: bool,
     /// 创建时间(ISO8601 UTC)
     pub created_at: String,
     /// sha256(canonical body) checksum
@@ -93,14 +70,13 @@ impl Default for GuardEpochRecord {
             schema_version: SCHEMA_VERSION_EPOCH,
             generation: 0,
             boot_nonce_hex: String::new(),
-            safety_gate: crate::state::SafetyGate::ResetRequired,
             lease_state: crate::state::LeaseState::Idle,
-            reset_generation: 0,
             last_zero_ack_id: String::new(),
             peer_uid_allowlist: EXPECTED_USERS.iter().map(|s| s.to_string()).collect(),
-            actuator_symbols_sha256: "sha256:placeholder".to_string(),
+            actuator_symbols_sha256: format!("sha256:{}", "0".repeat(64)),
             fenced: true,
-            created_at: String::new(),
+            startup_zero_confirmed: false,
+            created_at: "1970-01-01T00:00:00.000Z".to_string(),
             checksum: String::new(),
         }
     }
@@ -121,25 +97,31 @@ impl GuardEpochRecord {
                 self.boot_nonce_hex.len()
             ));
         }
-        if !self.actuator_symbols_sha256.starts_with("sha256:") {
+        let digest = self
+            .actuator_symbols_sha256
+            .strip_prefix("sha256:")
+            .unwrap_or_default();
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             errs.push(format!(
-                "actuator_symbols_sha256 必须以 'sha256:' 开头,got {:?}",
+                "actuator_symbols_sha256 必须是 lowercase SHA-256,got {:?}",
                 self.actuator_symbols_sha256
             ));
         }
         let actual_users: Vec<&str> = self.peer_uid_allowlist.iter().map(String::as_str).collect();
-        if actual_users.as_slice() == LEGACY_EXPECTED_USERS {
-            errs.push(
-                "legacy peer_uid_allowlist requires explicit deployment migration".to_string(),
-            );
-        } else if actual_users.as_slice() != EXPECTED_USERS {
+        if actual_users.as_slice() != EXPECTED_USERS {
             errs.push("peer_uid_allowlist 必须精确匹配 current service identity tuple".to_string());
+        }
+        if self.created_at.trim().is_empty() {
+            errs.push("created_at is required".to_string());
         }
         errs
     }
 
-    /// §P0B #15:boot advance,generation + 1 + 新 nonce;不动 `safety_gate`,
-    /// `lease_state = Idle`,`fenced = false`(等 ADMIN_RESET)。
+    /// Advance the process boot identity before automatic zero initialization.
     ///
     /// L-N0.1 简化:nonce 用确定性 counter(用 generation 衍生),
     /// 避免引入 `rand` 依赖;真 crypto-random nonce 由 P1-P5 lane 接通。
@@ -161,13 +143,15 @@ impl GuardEpochRecord {
             schema_version: SCHEMA_VERSION_EPOCH,
             generation: next_gen,
             boot_nonce_hex: nonce,
-            safety_gate: self.safety_gate,
             lease_state: crate::state::LeaseState::Idle,
-            reset_generation: self.reset_generation,
             last_zero_ack_id: self.last_zero_ack_id.clone(),
-            peer_uid_allowlist: self.peer_uid_allowlist.clone(),
+            peer_uid_allowlist: EXPECTED_USERS
+                .iter()
+                .map(|user| (*user).to_string())
+                .collect(),
             actuator_symbols_sha256: self.actuator_symbols_sha256.clone(),
-            fenced: false,
+            fenced: true,
+            startup_zero_confirmed: false,
             created_at: self.created_at.clone(),
             checksum: String::new(),
         }
@@ -201,16 +185,11 @@ impl Default for ProvisionedRecord {
 mod tests {
     use super::*;
 
-    /// §P0B #19 4 UID + 1 group 锁定。
+    /// Runtime UID tuple excludes the retired administrator identity.
     #[test]
     fn expected_users_groups_frozen() {
-        assert_eq!(EXPECTED_USERS.len(), 4, "service UID 必须 4 项");
-        for u in &[
-            "nuwax-motion-guard",
-            "nuwax-motion-admin",
-            "nuwax-navigation",
-            "nuwax-gateway",
-        ] {
+        assert_eq!(EXPECTED_USERS.len(), 3, "service UID 必须 3 项");
+        for u in &["nuwax-motion-guard", "nuwax-navigation", "nuwax-gateway"] {
             assert!(EXPECTED_USERS.contains(u), "service UID 缺: {u}");
         }
         assert_eq!(EXPECTED_GROUPS.len(), 1);
@@ -223,18 +202,19 @@ mod tests {
         let r = GuardEpochRecord::default();
         assert_eq!(r.generation, 0);
         assert!(r.fenced);
+        assert!(!r.startup_zero_confirmed);
         assert!(r.boot_nonce_hex.is_empty());
-        assert_eq!(r.safety_gate, crate::state::SafetyGate::ResetRequired);
         assert_eq!(r.lease_state, crate::state::LeaseState::Idle);
     }
 
-    /// §P0B #15 boot advance:generation+1, fenced=false, 新 32-char nonce。
+    /// Boot advance rotates the nonce and remains fenced pending startup zero.
     #[test]
     fn boot_advance_updates_generation_and_nonce() {
         let r = GuardEpochRecord::default();
         let advanced = r.boot_advance();
         assert_eq!(advanced.generation, 1);
-        assert!(!advanced.fenced, "boot advance 后必须 fenced=false");
+        assert!(advanced.fenced, "boot advance 后必须保持 fenced=true");
+        assert!(!advanced.startup_zero_confirmed);
         assert_eq!(advanced.boot_nonce_hex.len(), 32);
         assert!(!advanced.boot_nonce_hex.is_empty());
         assert_eq!(advanced.lease_state, crate::state::LeaseState::Idle);
@@ -281,19 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_legacy_or_incomplete_peer_tuple() {
-        let legacy = GuardEpochRecord {
-            peer_uid_allowlist: LEGACY_EXPECTED_USERS
-                .iter()
-                .map(|user| (*user).to_string())
-                .collect(),
-            ..GuardEpochRecord::default()
-        };
-        assert!(legacy
-            .verify()
-            .iter()
-            .any(|error| error.contains("explicit deployment migration")));
-
+    fn verify_rejects_incomplete_peer_tuple() {
         let mut incomplete = GuardEpochRecord::default();
         incomplete.peer_uid_allowlist.pop();
         assert!(incomplete

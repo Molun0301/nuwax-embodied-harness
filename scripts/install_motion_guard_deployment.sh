@@ -54,7 +54,6 @@ SYSTEMD_BACKUP_DIR="${NUWAX_SYSTEMD_BACKUP_DIR:-}"
 PERSON_FOLLOW_AUTOSTART_MODE=""
 SERVICE_IDENTITY_USERS=(
   nuwax-motion-guard
-  nuwax-motion-admin
   nuwax-navigation
   nuwax-geometry
   nuwax-gateway
@@ -469,6 +468,15 @@ check_sources() {
   check_file "${PERSON_FOLLOW_LAUNCHER}"
   check_file "${PERSON_FOLLOW_READY_HELPER}"
   check_file "${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh"
+  grep -qF 'API_VERSION = 2' "${REPO_ROOT}/services/navigation/motion_safety_guard/constants.py" \
+    || fail "motion guard Python API version is not v2"
+  grep -qF 'package nuwax.motion_guard.v2;' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
+    || fail "motion guard proto package is not v2"
+  grep -qF 'startup_zero_confirmed' "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
+    || fail "motion guard v2 proto does not expose startup zero confirmation"
+  ! grep -Eq '^(enum SafetyGate|message (LatchSafetyStop|ResetSafeStop))' \
+    "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
+    || fail "retired motion gate/reset messages remain in the v2 proto"
   validate_sysusers_source
   check_service_uid_collisions "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
@@ -854,13 +862,12 @@ verify_installed() {
   local unit_file=""
   local unit_name=""
   getent passwd nuwax-motion-guard >/dev/null || fail "missing user nuwax-motion-guard"
-  getent passwd nuwax-motion-admin >/dev/null || fail "missing user nuwax-motion-admin"
   getent passwd nuwax-navigation >/dev/null || fail "missing user nuwax-navigation"
   getent passwd nuwax-geometry >/dev/null || fail "missing user nuwax-geometry"
   getent passwd nuwax-gateway >/dev/null || fail "missing user nuwax-gateway"
   check_service_uid_collisions system
   getent group nuwax-motion-clients >/dev/null || fail "missing group nuwax-motion-clients"
-  for user in nuwax-motion-guard nuwax-motion-admin nuwax-navigation nuwax-geometry nuwax-gateway; do
+  for user in nuwax-motion-guard nuwax-navigation nuwax-geometry nuwax-gateway; do
     id -nG "${user}" | tr ' ' '\n' | grep -qx nuwax-motion-clients \
       || fail "${user} is not a member of nuwax-motion-clients"
   done
@@ -1064,14 +1071,6 @@ provision_records() {
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
 }
 
-migrate_peer_allowlist_records() {
-  require_root
-  check_installed_actuator_manifest
-  "${PROVISIONER}" migrate-peer-allowlist \
-    --state-dir "${GUARD_STATE_DIR}" \
-    --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-}
-
 main() {
   case "${ACTION}" in
     check-sources)
@@ -1091,9 +1090,6 @@ main() {
     provision)
       provision_records
       ;;
-    migrate-peer-allowlist)
-      migrate_peer_allowlist_records
-      ;;
     enable)
       enable_stack
       ;;
@@ -1107,7 +1103,7 @@ main() {
       verify_installed
       ;;
     *)
-      echo "usage: $0 [check-sources|snapshot-systemd|restore-systemd|install|provision|migrate-peer-allowlist|enable|start|stop|verify-runtime] [actuator-symbols.json]" >&2
+      echo "usage: $0 [check-sources|snapshot-systemd|restore-systemd|install|provision|enable|start|stop|verify-runtime] [actuator-symbols.json]" >&2
       exit 2
       ;;
   esac

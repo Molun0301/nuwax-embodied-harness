@@ -13,6 +13,9 @@ struct GoalEnvelope {
     string boundary_frame_id;
     int32_t boundary_points_length;
     geometry_msgs.Point boundary_points[boundary_points_length];
+    int64_t motion_guard_generation;
+    byte motion_guard_boot_nonce[16];
+    int64_t motion_stop_generation;
     byte payload_sha256[32];
     geometry_msgs.PoseStamped goal;
 }

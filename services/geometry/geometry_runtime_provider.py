@@ -50,6 +50,48 @@ _NavigationDeliveryToken = Tuple[
     int,
 ]
 _PUBLIC_NAV_OWNER_KIND = int(pb2.NAVIGATION_OWNER_KIND_PUBLIC_NAV)
+_MAX_MOTION_ADMISSION_GENERATION = (1 << 63) - 1
+
+
+def _decode_motion_admission_proof(value: object) -> Tuple[int, bytes, int]:
+    """Decode the request-level proof without querying motion readiness again."""
+
+    if not isinstance(value, dict):
+        raise ValueError("motion_admission metadata is required")
+
+    def require_generation(name: str, *, allow_zero: bool) -> int:
+        raw = value.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError("motion_admission.%s must be an integer" % name)
+        minimum = 0 if allow_zero else 1
+        if raw < minimum or raw > _MAX_MOTION_ADMISSION_GENERATION:
+            raise ValueError(
+                "motion_admission.%s must be in [%d, %d]"
+                % (name, minimum, _MAX_MOTION_ADMISSION_GENERATION)
+            )
+        return raw
+
+    boot_nonce_hex = value.get("boot_nonce_hex")
+    if not isinstance(boot_nonce_hex, str) or len(boot_nonce_hex) != 32:
+        raise ValueError(
+            "motion_admission.boot_nonce_hex must encode exactly 16 bytes"
+        )
+    try:
+        boot_nonce = bytes.fromhex(boot_nonce_hex)
+    except ValueError as exc:
+        raise ValueError(
+            "motion_admission.boot_nonce_hex must be hexadecimal"
+        ) from exc
+    if len(boot_nonce) != 16 or not any(boot_nonce):
+        raise ValueError(
+            "motion_admission.boot_nonce_hex must encode a non-zero 16-byte nonce"
+        )
+
+    return (
+        require_generation("generation", allow_zero=False),
+        boot_nonce,
+        require_generation("motion_stop_generation", allow_zero=True),
+    )
 
 
 class GeometryRuntimeRpcError(RuntimeError):
@@ -2659,8 +2701,19 @@ class GeometryRuntimeProvider:
     #   accepted/goal_id/message → status/goal_id/message
     # - CancelNavigation 接受 CancelNavigationRequest（带 goal_id），返回 NavigationState
     # - NavigationReadiness 仅提供 ready + reason
-    def set_navigation_goal(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
-                            frame_id: str = "map", goal_id: str = "") -> Dict[str, Any]:
+    def set_navigation_goal(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        qx: float,
+        qy: float,
+        qz: float,
+        qw: float,
+        frame_id: str = "map",
+        goal_id: str = "",
+        motion_admission: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Compatibility facade routed through the canonical lease transaction."""
 
         request_goal_id = str(goal_id or "").strip() or (
@@ -2678,6 +2731,7 @@ class GeometryRuntimeProvider:
                     w=float(qw),
                 ),
             ),
+            metadata={"motion_admission": motion_admission},
         )
         accepted = self.set_goal(goal)
         transaction_result = getattr(
@@ -3351,6 +3405,15 @@ class GeometryRuntimeProvider:
         command_token = None
         command_stub = None
         try:
+            (
+                motion_guard_generation,
+                motion_guard_boot_nonce,
+                motion_stop_generation,
+            ) = _decode_motion_admission_proof(
+                dict(getattr(goal, "metadata", {}) or {}).get(
+                    "motion_admission"
+                )
+            )
             proto_pose = pb2.Pose(
                 position=pb2.Vec3(
                     x=float(target_pose.position.x),
@@ -3383,6 +3446,9 @@ class GeometryRuntimeProvider:
                 owner_kind=_PUBLIC_NAV_OWNER_KIND,
                 parent_request_id=canonical_parent_request_id,
                 goal_generation=0,
+                motion_guard_generation=motion_guard_generation,
+                motion_guard_boot_nonce=motion_guard_boot_nonce,
+                motion_stop_generation=motion_stop_generation,
             )
             request_lease = (
                 request_goal_id,
@@ -4017,6 +4083,7 @@ class GeometryRuntimeProvider:
         stop_conditions: Optional[Dict[str, Any]] = None,
         max_navigation_retries: int = 0,
         blacklist_radius_m: float = 0.0,
+        motion_admission: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
 
@@ -4028,6 +4095,11 @@ class GeometryRuntimeProvider:
         if stub is None:
             raise _missing_exploration_stub_error("StartExploration")
         try:
+            (
+                motion_guard_generation,
+                motion_guard_boot_nonce,
+                motion_stop_generation,
+            ) = _decode_motion_admission_proof(motion_admission)
             proto_segments = []
             for start_pose, end_pose in boundary_line_segments or ():
                 for pose in (start_pose, end_pose):
@@ -4056,6 +4128,9 @@ class GeometryRuntimeProvider:
                 boundary_frame_id="map" if proto_segments else "",
                 max_navigation_retries=max(0, int(max_navigation_retries)),
                 blacklist_radius_m=max(0.0, float(blacklist_radius_m)),
+                motion_guard_generation=motion_guard_generation,
+                motion_guard_boot_nonce=motion_guard_boot_nonce,
+                motion_stop_generation=motion_stop_generation,
             )
             raw_stop_conditions = dict(stop_conditions or {})
             recognized_stop_keys = {

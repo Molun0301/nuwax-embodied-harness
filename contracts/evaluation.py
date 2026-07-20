@@ -89,7 +89,6 @@ class SafetyEvaluationMetrics(ContractModel):
     """安全指标。"""
 
     collision_count: int = Field(default=0, ge=0, description="碰撞次数。")
-    emergency_stop_count: int = Field(default=0, ge=0, description="急停次数。")
     official_obstacle_avoidance_trigger_count: int = Field(default=0, ge=0, description="官方避障触发次数。")
     near_miss_count: int = Field(default=0, ge=0, description="近距离风险次数。")
     cancel_count: int = Field(default=0, ge=0, description="取消次数。")
@@ -146,7 +145,6 @@ class EvaluationSliceSummary(ContractModel):
     topk_hit_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="top-k 命中率。")
     wrong_candidate_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="错误候选率。")
     collision_count: int = Field(default=0, ge=0, description="碰撞次数。")
-    emergency_stop_count: int = Field(default=0, ge=0, description="急停次数。")
     cancel_count: int = Field(default=0, ge=0, description="取消次数。")
     timeout_count: int = Field(default=0, ge=0, description="超时次数。")
     memory_write_success_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="记忆写入成功率。")

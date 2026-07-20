@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nuwax_motion_safety_guard::wire::{LeaseTuple, TwistCommand};
 use nuwax_motion_safety_guard::{
-    ClientConfig, MotionGuardClient, MotionGuardClientError, MAX_FRAME_BYTES,
+    ClientConfig, MotionAdmissionProof, MotionGuardClient, MotionGuardClientError, MAX_FRAME_BYTES,
 };
 use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig, StopMessage};
 use nuwax_nav_astar::navigation_map::CostMap2D;
@@ -29,8 +29,6 @@ use tokio::time::{interval_at, Instant, MissedTickBehavior};
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// Maximum scheduler-owned lease renewal interval.
 pub const MAX_RENEW_INTERVAL: Duration = Duration::from_millis(250);
-/// Idle guard readiness heartbeat interval.
-pub const DEFAULT_READINESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Qualified upper bound for one production NAV guard exchange.
 pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 /// Default maximum receipt age for a map-frame pose used by the controller.
@@ -40,8 +38,8 @@ pub const DEFAULT_COSTMAP_TTL: Duration = Duration::from_millis(500);
 /// Hard upper bound from cancel admission to a terminal fence attempt.
 pub const MAX_CANCEL_FENCE_TIMEOUT: Duration = Duration::from_millis(300);
 
-const EMERGENCY_FENCE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(75);
-const EMERGENCY_FENCE_ATTEMPTS: usize = 2;
+const PRIORITY_FENCE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(75);
+const PRIORITY_FENCE_ATTEMPTS: usize = 2;
 
 const INPUT_CAPACITY: usize = 32;
 const URGENT_CAPACITY: usize = 8;
@@ -60,6 +58,17 @@ pub fn production_client_config(socket_path: impl Into<PathBuf>) -> ClientConfig
     }
 }
 
+/// Immutable motion admission carried by one accepted navigation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavMotionAdmission {
+    /// Durable guard generation observed by the request admission layer.
+    pub guard_generation: u64,
+    /// Sixteen-byte boot nonce observed with `guard_generation`.
+    pub guard_boot_nonce: [u8; 16],
+    /// Global motion-stop generation observed by the same admission check.
+    pub motion_stop_generation: u64,
+}
+
 /// One navigation session and the oldest map revision it may consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavSession {
@@ -67,6 +76,8 @@ pub struct NavSession {
     pub session_id: String,
     /// Map revision observed when the goal was accepted.
     pub map_revision: u64,
+    /// Request-level motion admission proof transported with the goal.
+    pub motion_admission: NavMotionAdmission,
 }
 
 /// A planner path with the correlation fields required for safe cutover.
@@ -133,14 +144,10 @@ pub struct SchedulerStatus {
     pub applied_commands: u64,
     /// Last controller command with a correlated APPLIED proof.
     pub last_applied_twist: Option<Twist2>,
-    /// Whether the real guard readiness exchange is currently fresh and usable.
+    /// Whether the scheduler's motion transport is currently usable.
     pub motion_sink_ready: bool,
-    /// Whether the latest guard readiness exchange returned a validated response.
-    pub guard_readiness_observed: bool,
-    /// Guard process generation from the last validated readiness/acquire exchange.
+    /// Guard process generation from the active or most recent acquire exchange.
     pub guard_generation: u64,
-    /// Count of validated guard readiness observations.
-    pub motion_sink_observations: u64,
     /// Whether both planner inputs are within their receipt TTL.
     pub planner_inputs_fresh: bool,
     /// Source timestamp from the most recently consumed map pose.
@@ -173,9 +180,7 @@ impl Default for SchedulerStatus {
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: false,
-            guard_readiness_observed: false,
             guard_generation: 0,
-            motion_sink_observations: 0,
             planner_inputs_fresh: false,
             pose_source_timestamp_ns: 0,
             costmap_source_timestamp_ns: 0,
@@ -255,7 +260,7 @@ pub enum RuntimeError {
     /// APPLIED proof did not correlate to the submitted twist.
     #[error("invalid APPLIED proof: {0}")]
     InvalidApplied(String),
-    /// Fence proof was incomplete or not ARMED + IDLE.
+    /// Fence proof was incomplete or not IDLE.
     #[error("invalid fence proof: {0}")]
     InvalidFence(String),
     /// The scheduler task is no longer accepting requests.
@@ -274,8 +279,6 @@ pub struct MotionPortError {
     pub message: String,
     /// Whether an ambiguous result may have created or retained a lease.
     pub lease_may_be_active: bool,
-    /// Validated guard metadata carried by a negative readiness response.
-    pub readiness_observation: Option<MotionReadinessProof>,
 }
 
 impl MotionPortError {
@@ -285,7 +288,6 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: true,
-            readiness_observation: None,
         }
     }
 
@@ -295,17 +297,6 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: false,
-            readiness_observation: None,
-        }
-    }
-
-    /// Construct a fail-closed error from a validated negative readiness response.
-    #[must_use]
-    pub fn observed_not_ready(message: impl Into<String>, generation: u64) -> Self {
-        Self {
-            message: message.into(),
-            lease_may_be_active: false,
-            readiness_observation: Some(MotionReadinessProof { generation }),
         }
     }
 }
@@ -323,17 +314,6 @@ pub struct LeaseProof {
     pub lease_id: u64,
     /// Guard generation that issued the lease.
     pub guard_generation: u64,
-}
-
-/// Metadata from a validated guard readiness response.
-///
-/// A positive response opens the navigation acceptance gate. A negative response
-/// may carry this proof in [`MotionPortError::readiness_observation`] so component
-/// health remains distinct from motion authorization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MotionReadinessProof {
-    /// Durable guard process generation.
-    pub generation: u64,
 }
 
 /// One planner-consumed occupancy snapshot with immutable source metadata.
@@ -356,17 +336,6 @@ pub struct AppliedProof {
     pub applied_monotonic_ns: u64,
 }
 
-/// Safety-gate state carried by a fence proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FenceGate {
-    /// Guard accepts ordinary leased operation.
-    Armed,
-    /// Guard is disarmed.
-    Disarmed,
-    /// Guard requires an explicit reset.
-    ResetRequired,
-}
-
 /// Lease state carried by a fence proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceLeaseState {
@@ -385,8 +354,6 @@ pub struct FenceProof {
     pub zero_ack_id: String,
     /// Guard-side monotonic zero application timestamp.
     pub applied_monotonic_ns: u64,
-    /// Terminal safety gate.
-    pub gate: FenceGate,
     /// Terminal lease state.
     pub lease: FenceLeaseState,
 }
@@ -394,10 +361,12 @@ pub struct FenceProof {
 /// Mutable motion boundary owned by exactly one scheduler task.
 #[async_trait]
 pub trait NavMotionPort: Send + 'static {
-    /// Query the real guard readiness gate while no lease is active.
-    async fn readiness(&mut self) -> Result<MotionReadinessProof, MotionPortError>;
-    /// Acquire the NAV lease for one session.
-    async fn acquire(&mut self, operation_id: &str) -> Result<LeaseProof, MotionPortError>;
+    /// Acquire the NAV lease directly from the request's admission proof.
+    async fn acquire(
+        &mut self,
+        operation_id: &str,
+        admission: &NavMotionAdmission,
+    ) -> Result<LeaseProof, MotionPortError>;
     /// Renew the active lease.
     async fn renew(&mut self, operation_id: &str) -> Result<(), MotionPortError>;
     /// Submit one twist and return only after APPLIED.
@@ -409,7 +378,7 @@ pub trait NavMotionPort: Send + 'static {
     /// Revoke the lease, apply zero, and return terminal fence proof.
     async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError>;
     /// Preempt an ordinary exchange and fence over an independent priority path.
-    async fn emergency_revoke_and_zero(
+    async fn priority_revoke_and_zero(
         &mut self,
         operation_id: &str,
     ) -> Result<FenceProof, MotionPortError> {
@@ -419,34 +388,22 @@ pub trait NavMotionPort: Send + 'static {
 
 #[async_trait]
 impl NavMotionPort for MotionGuardClient {
-    async fn readiness(&mut self) -> Result<MotionReadinessProof, MotionPortError> {
-        let readiness = self.get_readiness().await?;
-        if !readiness.ready || !readiness.actuator_configured || !readiness.epoch_durable {
-            return Err(MotionPortError::observed_not_ready(
-                format!(
-                    "guard not ready: ready={} actuator_configured={} epoch_durable={} reason={}",
-                    readiness.ready,
-                    readiness.actuator_configured,
-                    readiness.epoch_durable,
-                    readiness.reason,
-                ),
-                readiness.generation,
-            ));
-        }
-        Ok(MotionReadinessProof {
-            generation: readiness.generation,
-        })
-    }
-
-    async fn acquire(&mut self, operation_id: &str) -> Result<LeaseProof, MotionPortError> {
-        let metadata = match self.acquire_lease(operation_id).await {
+    async fn acquire(
+        &mut self,
+        operation_id: &str,
+        admission: &NavMotionAdmission,
+    ) -> Result<LeaseProof, MotionPortError> {
+        let proof = MotionAdmissionProof {
+            generation: admission.guard_generation,
+            boot_nonce: admission.guard_boot_nonce,
+            motion_stop_generation: admission.motion_stop_generation,
+        };
+        let metadata = match self.acquire_lease(operation_id, &proof).await {
             Ok(metadata) => metadata,
             Err(error) => {
                 let definite_no_lease = matches!(
                     &error,
-                    MotionGuardClientError::InvalidInput(_)
-                        | MotionGuardClientError::Remote { .. }
-                        | MotionGuardClientError::NotReady { .. }
+                    MotionGuardClientError::InvalidInput(_) | MotionGuardClientError::Remote { .. }
                 );
                 let message = error.to_string();
                 return Err(if definite_no_lease {
@@ -493,7 +450,6 @@ impl NavMotionPort for MotionGuardClient {
         Ok(FenceProof {
             zero_ack_id: confirmation.zero_ack_id,
             applied_monotonic_ns: confirmation.applied_monotonic_ns,
-            gate: FenceGate::Armed,
             lease: FenceLeaseState::Idle,
         })
     }
@@ -502,7 +458,7 @@ impl NavMotionPort for MotionGuardClient {
 struct ProductionNavMotionPort {
     normal: Option<MotionGuardClient>,
     normal_config: ClientConfig,
-    emergency_config: ClientConfig,
+    priority_config: ClientConfig,
     lease_tuple: Option<LeaseTuple>,
 }
 
@@ -511,12 +467,12 @@ impl ProductionNavMotionPort {
         let normal = MotionGuardClient::connect_with_config(config.clone())
             .await
             .map_err(|error| MotionPortError::definite_no_lease(error.to_string()))?;
-        let mut emergency_config = config.clone();
-        emergency_config.request_timeout = EMERGENCY_FENCE_ATTEMPT_TIMEOUT;
+        let mut priority_config = config.clone();
+        priority_config.request_timeout = PRIORITY_FENCE_ATTEMPT_TIMEOUT;
         Ok(Self {
             normal: Some(normal),
             normal_config: config,
-            emergency_config,
+            priority_config,
             lease_tuple: None,
         })
     }
@@ -535,7 +491,6 @@ impl ProductionNavMotionPort {
         FenceProof {
             zero_ack_id: confirmation.zero_ack_id,
             applied_monotonic_ns: confirmation.applied_monotonic_ns,
-            gate: FenceGate::Armed,
             lease: FenceLeaseState::Idle,
         }
     }
@@ -543,13 +498,14 @@ impl ProductionNavMotionPort {
 
 #[async_trait]
 impl NavMotionPort for ProductionNavMotionPort {
-    async fn readiness(&mut self) -> Result<MotionReadinessProof, MotionPortError> {
-        <MotionGuardClient as NavMotionPort>::readiness(self.normal_client().await?).await
-    }
-
-    async fn acquire(&mut self, operation_id: &str) -> Result<LeaseProof, MotionPortError> {
+    async fn acquire(
+        &mut self,
+        operation_id: &str,
+        admission: &NavMotionAdmission,
+    ) -> Result<LeaseProof, MotionPortError> {
         let client = self.normal_client().await?;
-        let proof = <MotionGuardClient as NavMotionPort>::acquire(client, operation_id).await?;
+        let proof =
+            <MotionGuardClient as NavMotionPort>::acquire(client, operation_id, admission).await?;
         self.lease_tuple = client.active_lease().cloned();
         Ok(proof)
     }
@@ -572,10 +528,10 @@ impl NavMotionPort for ProductionNavMotionPort {
     }
 
     async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError> {
-        self.emergency_revoke_and_zero(operation_id).await
+        self.priority_revoke_and_zero(operation_id).await
     }
 
-    async fn emergency_revoke_and_zero(
+    async fn priority_revoke_and_zero(
         &mut self,
         operation_id: &str,
     ) -> Result<FenceProof, MotionPortError> {
@@ -585,18 +541,18 @@ impl NavMotionPort for ProductionNavMotionPort {
         let lease_tuple = self
             .lease_tuple
             .clone()
-            .ok_or_else(|| MotionPortError::new("emergency fence has no active lease tuple"))?;
-        let emergency_config = self.emergency_config.clone();
+            .ok_or_else(|| MotionPortError::new("priority fence has no active lease tuple"))?;
+        let priority_config = self.priority_config.clone();
         let operation_id = operation_id.to_string();
-        let emergency_request =
-            MotionGuardClient::prepare_emergency_revoke_and_zero(lease_tuple, &operation_id)
+        let priority_request =
+            MotionGuardClient::prepare_priority_revoke_and_zero(lease_tuple, &operation_id)
                 .map_err(|error| MotionPortError::new(error.to_string()))?;
         let fence = tokio::time::timeout(MAX_CANCEL_FENCE_TIMEOUT, async {
             let mut last_error = None;
-            for _ in 0..EMERGENCY_FENCE_ATTEMPTS {
-                match MotionGuardClient::execute_emergency_revoke_and_zero(
-                    emergency_config.clone(),
-                    &emergency_request,
+            for _ in 0..PRIORITY_FENCE_ATTEMPTS {
+                match MotionGuardClient::execute_priority_revoke_and_zero(
+                    priority_config.clone(),
+                    &priority_request,
                 )
                 .await
                 {
@@ -605,11 +561,11 @@ impl NavMotionPort for ProductionNavMotionPort {
                 }
             }
             Err(MotionPortError::new(last_error.unwrap_or_else(|| {
-                "emergency fence exhausted without an attempt".into()
+                "priority fence exhausted without an attempt".into()
             })))
         })
         .await
-        .map_err(|_| MotionPortError::new("emergency fence exceeded 300 ms hard timeout"))??;
+        .map_err(|_| MotionPortError::new("priority fence exceeded 300 ms hard timeout"))??;
         self.lease_tuple = None;
         Ok(Self::fence_proof(fence))
     }
@@ -727,6 +683,11 @@ where
     /// Construct a scheduler without starting a task.
     pub fn new(motion: M, planner: P, config: SchedulerConfig) -> Result<Self, RuntimeError> {
         validate_config(config)?;
+        let status = SchedulerStatus {
+            motion_sink_ready: true,
+            message: "motion scheduler ready".into(),
+            ..SchedulerStatus::default()
+        };
         Ok(Self {
             motion,
             planner,
@@ -740,7 +701,7 @@ where
             pose_receipt: None,
             costmap_receipt: None,
             operation_sequence: 0,
-            status: SchedulerStatus::default(),
+            status,
         })
     }
 
@@ -760,8 +721,6 @@ where
             self.config.renew_interval,
         );
         renew.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut readiness = interval_at(Instant::now(), DEFAULT_READINESS_INTERVAL);
-        readiness.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut input_open = true;
         let mut urgent_open = true;
 
@@ -786,15 +745,13 @@ where
                     }
                 }
 
-                _ = readiness.tick(), if !self.lease_active => {
-                    self.refresh_motion_readiness(&status_tx).await;
-                }
-
                 _ = renew.tick(), if self.should_renew() => {
                     match await_interruptible(urgent_open, &mut urgent_rx, self.renew()).await {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
                             let error = self.fail_closed(&status_tx, error).await;
+                            self.status.motion_sink_ready = false;
+                            self.publish_status(&status_tx);
                             return Err(error);
                         }
                         Interruptible::Urgent(Some(command)) => {
@@ -825,7 +782,11 @@ where
                 _ = tick.tick(), if self.status.phase == SchedulerPhase::Controlling => {
                     match await_interruptible(urgent_open, &mut urgent_rx, self.control_tick(&status_tx)).await {
                         Interruptible::Completed(Ok(())) => {}
-                        Interruptible::Completed(Err(error)) => return Err(error),
+                        Interruptible::Completed(Err(error)) => {
+                            self.status.motion_sink_ready = false;
+                            self.publish_status(&status_tx);
+                            return Err(error);
+                        }
                         Interruptible::Urgent(Some(command)) => {
                             if let Some(result) = self.handle_urgent(&status_tx, command).await {
                                 return result;
@@ -988,11 +949,6 @@ where
         session: NavSession,
     ) -> Result<(), RuntimeError> {
         validate_session(&session)?;
-        if !self.status.motion_sink_ready || self.status.guard_generation == 0 {
-            return Err(RuntimeError::Motion(
-                "motion guard readiness has not been validated".into(),
-            ));
-        }
         if self.lease_active || self.session.is_some() {
             return Err(RuntimeError::Busy(
                 "active session must be fenced before replacement".into(),
@@ -1011,10 +967,8 @@ where
             path_revision: 0,
             applied_commands: 0,
             last_applied_twist: None,
-            motion_sink_ready: self.status.motion_sink_ready,
-            guard_readiness_observed: self.status.guard_readiness_observed,
-            guard_generation: self.status.guard_generation,
-            motion_sink_observations: self.status.motion_sink_observations,
+            motion_sink_ready: true,
+            guard_generation: session.motion_admission.guard_generation,
             planner_inputs_fresh: self.status.planner_inputs_fresh,
             pose_source_timestamp_ns: self.status.pose_source_timestamp_ns,
             costmap_source_timestamp_ns: self.status.costmap_source_timestamp_ns,
@@ -1029,8 +983,15 @@ where
         self.publish_status(status_tx);
 
         let operation_id = self.next_operation_id("acquire")?;
-        match self.motion.acquire(&operation_id).await {
-            Ok(proof) if proof.lease_id != 0 && proof.guard_generation != 0 => {
+        match self
+            .motion
+            .acquire(&operation_id, &session.motion_admission)
+            .await
+        {
+            Ok(proof)
+                if proof.lease_id != 0
+                    && proof.guard_generation == session.motion_admission.guard_generation =>
+            {
                 self.lease_active = true;
                 self.status.motion_sink_ready = true;
                 self.status.guard_generation = proof.guard_generation;
@@ -1041,8 +1002,9 @@ where
             }
             Ok(_) => {
                 self.lease_active = true;
-                let error =
-                    RuntimeError::Motion("guard returned an invalid lease id or generation".into());
+                let error = RuntimeError::Motion(
+                    "guard returned a lease outside the admitted generation".into(),
+                );
                 Err(self.fail_closed(status_tx, error).await)
             }
             Err(error) if error.lease_may_be_active => {
@@ -1217,46 +1179,6 @@ where
         }
     }
 
-    async fn refresh_motion_readiness(&mut self, status_tx: &watch::Sender<SchedulerStatus>) {
-        match self.motion.readiness().await {
-            Ok(proof) if proof.generation != 0 => {
-                self.status.motion_sink_ready = true;
-                self.status.guard_readiness_observed = true;
-                self.status.guard_generation = proof.generation;
-                self.status.motion_sink_observations =
-                    self.status.motion_sink_observations.saturating_add(1);
-                self.status.message = "motion guard readiness validated".into();
-            }
-            Ok(_) => {
-                self.status.motion_sink_ready = false;
-                self.status.guard_readiness_observed = false;
-                self.status.guard_generation = 0;
-                self.status.message = "motion guard returned generation=0".into();
-            }
-            Err(error) => {
-                self.status.motion_sink_ready = false;
-                if let Some(observation) = error
-                    .readiness_observation
-                    .filter(|observation| observation.generation != 0)
-                {
-                    self.status.guard_readiness_observed = true;
-                    self.status.guard_generation = observation.generation;
-                    self.status.motion_sink_observations =
-                        self.status.motion_sink_observations.saturating_add(1);
-                    self.status.message = format!(
-                        "motion guard responded but motion is blocked: {}",
-                        error.message
-                    );
-                } else {
-                    self.status.guard_readiness_observed = false;
-                    self.status.guard_generation = 0;
-                    self.status.message = format!("motion guard not ready: {}", error.message);
-                }
-            }
-        }
-        self.publish_status(status_tx);
-    }
-
     async fn renew(&mut self) -> Result<(), RuntimeError> {
         let operation_id = self.next_operation_id("renew")?;
         self.motion
@@ -1300,7 +1222,7 @@ where
                 self.publish_status(status_tx);
             }
             let operation_id = self.next_operation_id("fence")?;
-            let proof = match self.motion.emergency_revoke_and_zero(&operation_id).await {
+            let proof = match self.motion.priority_revoke_and_zero(&operation_id).await {
                 Ok(proof) => proof,
                 Err(error) => {
                     self.fail_status(status_tx, &error.message);
@@ -1339,7 +1261,7 @@ where
         } else {
             self.status.message = format!("{terminal:?} with no active lease");
         }
-        if phase_after == SchedulerPhase::Failed || terminal == TerminalOutcome::Shutdown {
+        if terminal == TerminalOutcome::Shutdown {
             self.status.motion_sink_ready = false;
         }
         self.publish_status(status_tx);
@@ -1482,8 +1404,8 @@ where
 }
 
 /// Connect the production private-UDS guard client and spawn the qualified
-/// LocalPlanner scheduler. The returned status remains not-ready until the
-/// scheduler's first correlated guard readiness exchange succeeds.
+/// LocalPlanner scheduler. A successful transport connection makes the motion
+/// sink ready; individual sessions still require an admitted guard proof.
 pub async fn spawn_production_scheduler(
     socket_path: impl Into<PathBuf>,
     config: SchedulerConfig,
@@ -1607,6 +1529,23 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
             reason: "must be non-zero".into(),
         });
     }
+    if session.motion_admission.guard_generation == 0 {
+        return Err(RuntimeError::InvalidInput {
+            field: "motion_admission.guard_generation",
+            reason: "must be non-zero".into(),
+        });
+    }
+    if session
+        .motion_admission
+        .guard_boot_nonce
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(RuntimeError::InvalidInput {
+            field: "motion_admission.guard_boot_nonce",
+            reason: "must not be all zero".into(),
+        });
+    }
     Ok(())
 }
 
@@ -1660,10 +1599,10 @@ fn validate_twist(twist: Twist2) -> Result<(), RuntimeError> {
 }
 
 fn validate_fence(proof: &FenceProof) -> Result<(), RuntimeError> {
-    if proof.gate != FenceGate::Armed || proof.lease != FenceLeaseState::Idle {
+    if proof.lease != FenceLeaseState::Idle {
         return Err(RuntimeError::InvalidFence(format!(
-            "expected ARMED+IDLE, got {:?}+{:?}",
-            proof.gate, proof.lease
+            "expected IDLE, got {:?}",
+            proof.lease
         )));
     }
     if proof.zero_ack_id.trim().is_empty() || proof.applied_monotonic_ns == 0 {
@@ -1682,16 +1621,15 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use nuwax_motion_safety_guard::wire::{
-        motion_guard_request, motion_guard_response, AckCode, AcquireLeaseResponse,
-        GetReadinessResponse, GuardResult, LeaseState, LeaseTuple, MotionGuardRequest,
-        MotionGuardResponse, RenewLeaseResponse, RevokeAndZeroResponse, SafetyGate,
-        SubmitMotionCommandResponse, ZeroAck, API_VERSION,
+        motion_guard_request, motion_guard_response, AckCode, AcquireLeaseResponse, GuardResult,
+        LeaseState, LeaseTuple, MotionGuardRequest, MotionGuardResponse, RenewLeaseResponse,
+        RevokeAndZeroResponse, SubmitMotionCommandResponse, ZeroAck, API_VERSION,
     };
     use nuwax_nav_astar::navigation_map::CostMap2D;
     use nuwax_nav_types_messages::{NavFrameId, Point2, Pose3, Timestamp};
@@ -1766,73 +1704,11 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept guard client");
             let mut operations = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..3 {
                 let request = read_guard_request(&mut stream).await;
                 let (operation, response) = scripted_guard_response(&request);
                 operations.push(operation);
                 write_guard_response(&mut stream, response).await;
-            }
-            operations
-        });
-        GuardFixture {
-            path,
-            task: Some(task),
-        }
-    }
-
-    async fn spawn_silent_guard(label: &str) -> GuardFixture {
-        let path = socket_path(label);
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind silent guard UDS");
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept guard client");
-            let _ = read_guard_request(&mut stream).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            vec!["readiness-timeout"]
-        });
-        GuardFixture {
-            path,
-            task: Some(task),
-        }
-    }
-
-    async fn spawn_reset_required_guard(label: &str) -> GuardFixture {
-        let path = socket_path(label);
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind reset-required guard UDS");
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept guard client");
-            let mut operations = Vec::new();
-            while let Some(request) = try_read_guard_request(&mut stream).await {
-                assert!(matches!(
-                    request.operation,
-                    Some(motion_guard_request::Operation::GetReadiness(_))
-                ));
-                operations.push("readiness-reset-required");
-                write_guard_response(
-                    &mut stream,
-                    MotionGuardResponse {
-                        api_version: API_VERSION,
-                        request_id: request.request_id,
-                        outcome: Some(motion_guard_response::Outcome::GetReadiness(
-                            GetReadinessResponse {
-                                result: Some(GuardResult {
-                                    ack: AckCode::Received as i32,
-                                    gate: SafetyGate::ResetRequired as i32,
-                                    lease: LeaseState::Idle as i32,
-                                    error: None,
-                                }),
-                                ready: false,
-                                actuator_configured: true,
-                                epoch_durable: true,
-                                reason: "RESET_REQUIRED".into(),
-                                generation: 9,
-                                boot_nonce: vec![7; 16],
-                            },
-                        )),
-                    },
-                )
-                .await;
             }
             operations
         });
@@ -1901,7 +1777,7 @@ mod tests {
                     if let Some(first_bytes) = seen.get(&operation_id) {
                         assert_eq!(
                             first_bytes, &request_bytes,
-                            "emergency fence retry must replay identical sealed bytes"
+                            "priority fence retry must replay identical sealed bytes"
                         );
                         false
                     } else {
@@ -1978,7 +1854,6 @@ mod tests {
     fn guard_result(ack: AckCode, lease: LeaseState) -> GuardResult {
         GuardResult {
             ack: ack as i32,
-            gate: SafetyGate::Armed as i32,
             lease: lease as i32,
             error: None,
         }
@@ -1988,31 +1863,24 @@ mod tests {
         request: &MotionGuardRequest,
     ) -> (&'static str, MotionGuardResponse) {
         let (operation, outcome) = match request.operation.as_ref().expect("request operation") {
-            motion_guard_request::Operation::GetReadiness(_) => (
-                "readiness",
-                motion_guard_response::Outcome::GetReadiness(GetReadinessResponse {
-                    result: Some(guard_result(AckCode::Received, LeaseState::Idle)),
-                    ready: true,
-                    actuator_configured: true,
-                    epoch_durable: true,
-                    reason: "ready".into(),
-                    generation: 9,
-                    boot_nonce: vec![7; 16],
-                }),
-            ),
-            motion_guard_request::Operation::AcquireLease(_) => (
-                "acquire",
-                motion_guard_response::Outcome::AcquireLease(AcquireLeaseResponse {
-                    result: Some(guard_result(AckCode::Received, LeaseState::Active)),
-                    lease_tuple: Some(LeaseTuple {
-                        generation: 9,
-                        boot_nonce: vec![7; 16],
-                        lease_id: 41,
+            motion_guard_request::Operation::AcquireLease(body) => {
+                let envelope = body.envelope.as_ref().expect("acquire envelope");
+                assert_eq!(envelope.motion_stop_generation, 1);
+                let admitted = envelope.tuple.as_ref().expect("acquire admission tuple");
+                (
+                    "acquire",
+                    motion_guard_response::Outcome::AcquireLease(AcquireLeaseResponse {
+                        result: Some(guard_result(AckCode::Received, LeaseState::Active)),
+                        lease_tuple: Some(LeaseTuple {
+                            generation: admitted.generation,
+                            boot_nonce: admitted.boot_nonce.clone(),
+                            lease_id: 41,
+                        }),
+                        lease_deadline_monotonic_ns: u64::MAX,
+                        owner_deadline_monotonic_ns: u64::MAX - 1,
                     }),
-                    lease_deadline_monotonic_ns: u64::MAX,
-                    owner_deadline_monotonic_ns: u64::MAX - 1,
-                }),
-            ),
+                )
+            }
             motion_guard_request::Operation::RenewLease(_) => (
                 "renew",
                 motion_guard_response::Outcome::RenewLease(RenewLeaseResponse {
@@ -2053,7 +1921,6 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeMotionState {
-        readiness: VecDeque<Result<MotionReadinessProof, MotionPortError>>,
         calls: Vec<String>,
         fail_twist: bool,
     }
@@ -2063,16 +1930,11 @@ mod tests {
 
     #[async_trait]
     impl NavMotionPort for FakeMotion {
-        async fn readiness(&mut self) -> Result<MotionReadinessProof, MotionPortError> {
-            let mut state = self.0.lock().expect("fake motion state");
-            state.calls.push("readiness".into());
-            state
-                .readiness
-                .pop_front()
-                .unwrap_or(Ok(MotionReadinessProof { generation: 7 }))
-        }
-
-        async fn acquire(&mut self, operation_id: &str) -> Result<LeaseProof, MotionPortError> {
+        async fn acquire(
+            &mut self,
+            operation_id: &str,
+            admission: &NavMotionAdmission,
+        ) -> Result<LeaseProof, MotionPortError> {
             self.0
                 .lock()
                 .expect("fake motion state")
@@ -2080,7 +1942,7 @@ mod tests {
                 .push(format!("acquire:{operation_id}"));
             Ok(LeaseProof {
                 lease_id: 11,
-                guard_generation: 7,
+                guard_generation: admission.guard_generation,
             })
         }
 
@@ -2121,7 +1983,6 @@ mod tests {
             Ok(FenceProof {
                 zero_ack_id: "zero-ack".into(),
                 applied_monotonic_ns: 100,
-                gate: FenceGate::Armed,
                 lease: FenceLeaseState::Idle,
             })
         }
@@ -2215,6 +2076,11 @@ mod tests {
         NavSession {
             session_id: session_id.into(),
             map_revision: 3,
+            motion_admission: NavMotionAdmission {
+                guard_generation: 7,
+                guard_boot_nonce: [7; 16],
+                motion_stop_generation: 1,
+            },
         }
     }
 
@@ -2292,29 +2158,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_rejects_session_until_real_guard_readiness() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState {
-            readiness: VecDeque::from([
-                Err(MotionPortError::definite_no_lease("guard unavailable")),
-                Ok(MotionReadinessProof { generation: 7 }),
-            ]),
-            ..FakeMotionState::default()
-        }));
-        let (handle, task) = test_scheduler(FakeMotion(motion_state), FakePlanner::commanding());
+    async fn scheduler_acquires_directly_from_request_admission_without_readiness_query() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) =
+            test_scheduler(FakeMotion(motion_state.clone()), FakePlanner::commanding());
 
-        let first = handle
-            .start_session(session())
-            .await
-            .expect_err("must fail closed");
-        assert!(matches!(first, RuntimeError::Motion(_)));
         let ready = wait_for_sink(&handle).await;
         assert!(ready.motion_sink_ready);
-        assert_eq!(ready.guard_generation, 7);
+        assert_eq!(ready.guard_generation, 0);
 
         handle
             .start_session(session())
             .await
-            .expect("ready guard accepts session");
+            .expect("admitted request accepts session");
+        let calls = motion_state.lock().expect("motion state").calls.clone();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with("acquire:"));
+        assert_eq!(handle.status().guard_generation, 7);
         handle
             .cancel("goal-1")
             .await
@@ -2662,11 +2522,12 @@ mod tests {
                 .await
                 .expect("connect real guard fixture UDS");
 
-        let readiness = NavMotionPort::readiness(&mut client)
-            .await
-            .expect("real readiness proof");
-        assert_eq!(readiness.generation, 9);
-        let lease = NavMotionPort::acquire(&mut client, "nav:uds:acquire")
+        let admission = NavMotionAdmission {
+            guard_generation: 9,
+            guard_boot_nonce: [7; 16],
+            motion_stop_generation: 1,
+        };
+        let lease = NavMotionPort::acquire(&mut client, "nav:uds:acquire", &admission)
             .await
             .expect("real lease proof");
         assert_eq!(lease.lease_id, 41);
@@ -2688,13 +2549,9 @@ mod tests {
             .expect("correlated resource fence");
         assert_eq!(fence.zero_ack_id, "zero-uds-1");
         assert_eq!(fence.applied_monotonic_ns, 102);
-        assert_eq!(fence.gate, FenceGate::Armed);
         assert_eq!(fence.lease, FenceLeaseState::Idle);
 
-        assert_eq!(
-            guard.finish().await,
-            vec!["readiness", "readiness", "acquire", "applied", "fence"]
-        );
+        assert_eq!(guard.finish().await, vec!["acquire", "applied", "fence"]);
     }
 
     async fn collect_real_uds_cancel_latencies(delayed: DelayedOperation) -> Vec<Duration> {
@@ -2773,10 +2630,7 @@ mod tests {
             }
 
             let started = std::time::Instant::now();
-            handle
-                .cancel(&session_id)
-                .await
-                .expect("priority emergency fence");
+            handle.cancel(&session_id).await.expect("priority fence");
             let elapsed = started.elapsed();
             if delayed == DelayedOperation::FenceResponse {
                 let observed =
@@ -2843,97 +2697,5 @@ mod tests {
             "lost-first-fence-response",
             collect_real_uds_cancel_latencies(DelayedOperation::FenceResponse).await,
         );
-    }
-
-    #[tokio::test]
-    async fn production_scheduler_stays_not_ready_after_real_uds_timeout() {
-        let guard = spawn_silent_guard("timeout").await;
-        let (handle, task) = spawn_production_scheduler(
-            guard.path.clone(),
-            SchedulerConfig {
-                tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(20),
-                robot_width_m: 0.3,
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
-            },
-        )
-        .await
-        .expect("connect silent guard fixture UDS");
-
-        tokio::time::sleep(MAX_NAV_REQUEST_TIMEOUT + Duration::from_millis(100)).await;
-        let status = handle.status();
-        assert!(!status.guard_readiness_observed);
-        assert!(!status.motion_sink_ready);
-        assert_eq!(status.motion_sink_observations, 0);
-        assert_eq!(status.guard_generation, 0);
-        let error = handle
-            .start_session(session())
-            .await
-            .expect_err("timed out guard must reject navigation");
-        assert!(matches!(error, RuntimeError::Motion(_)));
-        assert!(!handle.status().motion_sink_ready);
-
-        handle.shutdown().await.expect("shutdown idle scheduler");
-        task.await
-            .expect("scheduler task join")
-            .expect("scheduler task");
-        drop(guard);
-    }
-
-    #[tokio::test]
-    async fn production_scheduler_observes_reset_required_without_opening_motion_gate() {
-        let guard = spawn_reset_required_guard("reset-required").await;
-        let (handle, task) = spawn_production_scheduler(
-            guard.path.clone(),
-            SchedulerConfig {
-                tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(20),
-                robot_width_m: 0.3,
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
-            },
-        )
-        .await
-        .expect("connect reset-required guard fixture UDS");
-
-        let mut updates = handle.subscribe_status();
-        let observed = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let status = updates.borrow().clone();
-                if status.guard_readiness_observed {
-                    break status;
-                }
-                updates.changed().await.expect("scheduler status open");
-            }
-        })
-        .await
-        .expect("validated negative readiness response");
-        assert!(!observed.motion_sink_ready);
-        assert_eq!(observed.guard_generation, 9);
-        assert!(observed.motion_sink_observations >= 1);
-        assert!(observed.message.contains("RESET_REQUIRED"));
-
-        let error = handle
-            .start_session(session())
-            .await
-            .expect_err("RESET_REQUIRED must keep navigation fail closed");
-        assert_eq!(
-            error,
-            RuntimeError::Motion("motion guard readiness has not been validated".into())
-        );
-        assert_eq!(handle.status().phase, SchedulerPhase::Idle);
-        assert!(handle.status().session_id.is_none());
-        assert!(!task.is_finished());
-
-        handle.shutdown().await.expect("shutdown idle scheduler");
-        task.await
-            .expect("scheduler task join")
-            .expect("scheduler task");
-        let guard_operations = guard.finish().await;
-        assert!(!guard_operations.is_empty());
-        assert!(guard_operations
-            .iter()
-            .all(|operation| *operation == "readiness-reset-required"));
     }
 }

@@ -1660,6 +1660,60 @@ fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
     }
 }
 
+/// Immutable proof produced by the request-level motion admission check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MotionAdmissionProof {
+    /// Guard generation observed by the request-level admission check.
+    pub guard_generation: u64,
+    /// Guard boot nonce paired with `guard_generation`.
+    pub guard_boot_nonce: [u8; 16],
+    /// Ordinary global-stop generation observed by the request-level check.
+    pub motion_stop_generation: u64,
+}
+
+impl MotionAdmissionProof {
+    /// Parse and validate a proof received over a variable-length wire format.
+    pub fn try_from_wire(
+        guard_generation: u64,
+        guard_boot_nonce: &[u8],
+        motion_stop_generation: u64,
+    ) -> Result<Self, String> {
+        let guard_boot_nonce: [u8; 16] = guard_boot_nonce
+            .try_into()
+            .map_err(|_| "motion_guard_boot_nonce must contain exactly 16 bytes".to_string())?;
+        let proof = Self {
+            guard_generation,
+            guard_boot_nonce,
+            motion_stop_generation,
+        };
+        proof.validate().map_err(str::to_string)?;
+        Ok(proof)
+    }
+
+    /// Validate that the proof can be transported losslessly in `GoalEnvelope`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.guard_generation == 0 || self.guard_generation > i64::MAX as u64 {
+            return Err("motion_guard_generation must be in [1, i64::MAX]");
+        }
+        if self.guard_boot_nonce.iter().all(|byte| *byte == 0) {
+            return Err("motion_guard_boot_nonce must not be all zero");
+        }
+        if self.motion_stop_generation > i64::MAX as u64 {
+            return Err("motion_stop_generation must not exceed i64::MAX");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn test_motion_admission() -> MotionAdmissionProof {
+    MotionAdmissionProof {
+        guard_generation: 7,
+        guard_boot_nonce: [7; 16],
+        motion_stop_generation: 1,
+    }
+}
+
 /// `set_goal` 的输入(已从 gRPC `NavigationGoal` 提取并归一化)。
 #[derive(Clone)]
 pub struct SetGoalInput {
@@ -1675,6 +1729,8 @@ pub struct SetGoalInput {
     pub map_version_id: String,
     /// Required positive planner-observed map revision.
     pub map_revision: u64,
+    /// Immutable request-level motion admission proof.
+    pub motion_admission: MotionAdmissionProof,
     /// frame_id(`map` 默认)。
     pub frame_id: String,
     /// 目标位姿(在 `frame_id` 坐标系下)。
@@ -1773,6 +1829,19 @@ pub async fn set_goal_with_boundary(
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
                 message: "SET_GOAL_REJECTED[GOAL_BOUNDARY_INVALID]".to_string(),
+                goal_id: input.goal_id,
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            },
+            lease: None,
+            retry_reason: None,
+        };
+    }
+    if let Err(reason) = input.motion_admission.validate() {
+        return SetGoalOutcome {
+            state: NavState {
+                status: NavPhase::Failed.as_str().to_string(),
+                message: format!("SET_GOAL_REJECTED[MOTION_ADMISSION_PROOF_INVALID]: {reason}"),
                 goal_id: input.goal_id,
                 distance_remaining: 0.0,
                 timestamp_ns: now_ns(),
@@ -1924,6 +1993,9 @@ pub async fn set_goal_with_boundary(
         map_version_id: input.map_version_id.clone(),
         map_revision: input.map_revision as i64,
         source_timestamp_ns: input.target.timestamp_ns as i64,
+        motion_guard_generation: input.motion_admission.guard_generation as i64,
+        motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
+        motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
         boundary_frame_id,
         boundary_points,
         goal: schema::PoseStamped {
@@ -2634,6 +2706,7 @@ mod tests {
             goal_generation: 0,
             map_version_id: "map-v1".to_string(),
             map_revision: 1,
+            motion_admission: test_motion_admission(),
             frame_id: "map".to_string(),
             target: PoseState {
                 qw: 1.0,
@@ -2877,6 +2950,26 @@ mod tests {
     fn ensure_goal_id_trims_and_preserves() {
         assert_eq!(ensure_goal_id("  abc  "), "abc");
         assert_eq!(ensure_goal_id("xyz-1"), "xyz-1");
+    }
+
+    #[test]
+    fn motion_admission_wire_validation_is_strict() {
+        assert_eq!(
+            MotionAdmissionProof::try_from_wire(7, &[7; 16], 1).unwrap(),
+            test_motion_admission()
+        );
+        assert!(MotionAdmissionProof::try_from_wire(7, &[7; 15], 1)
+            .unwrap_err()
+            .contains("exactly 16 bytes"));
+        assert!(MotionAdmissionProof::try_from_wire(0, &[7; 16], 1)
+            .unwrap_err()
+            .contains("motion_guard_generation"));
+        assert!(MotionAdmissionProof::try_from_wire(7, &[0; 16], 1)
+            .unwrap_err()
+            .contains("must not be all zero"));
+        assert!(MotionAdmissionProof::try_from_wire(7, &[7; 16], u64::MAX)
+            .unwrap_err()
+            .contains("motion_stop_generation"));
     }
 
     #[test]
@@ -3169,6 +3262,9 @@ mod tests {
         assert_eq!(goal.parent_request_id, "request-stack-owned-goal");
         assert_eq!(goal.map_version_id, "map-v1");
         assert_eq!(goal.map_revision, 1);
+        assert_eq!(goal.motion_guard_generation, 7);
+        assert_eq!(goal.motion_guard_boot_nonce, [7; 16]);
+        assert_eq!(goal.motion_stop_generation, 1);
         assert!(goal.goal_generation > 0);
         assert_ne!(goal.payload_sha256, [0; 32]);
         assert!(

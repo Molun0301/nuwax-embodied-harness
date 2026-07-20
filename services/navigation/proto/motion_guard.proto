@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package nuwax.motion_guard.v1;
+package nuwax.motion_guard.v2;
 
 // Authoritative command/control contract for the private motion-guard UDS.
 // The socket transport is a four-byte big-endian length followed by exactly
@@ -12,13 +12,8 @@ enum AckCode {
   ACK_CODE_APPLIED = 2;
   ACK_CODE_ZEROED = 3;
   ACK_CODE_RESOURCE_FENCED = 4;
-  ACK_CODE_SAFETY_LATCHED = 5;
-}
-
-enum SafetyGate {
-  SAFETY_GATE_UNSPECIFIED = 0;
-  SAFETY_GATE_RESET_REQUIRED = 1;
-  SAFETY_GATE_ARMED = 2;
+  reserved 5;
+  reserved "ACK_CODE_SAFETY_LATCHED";
 }
 
 enum LeaseState {
@@ -36,7 +31,8 @@ enum GuardSource {
   GUARD_SOURCE_GATEWAY_FOLLOW = 3;
   GUARD_SOURCE_GATEWAY_RELATIVE = 4;
   GUARD_SOURCE_GATEWAY_SPORT = 5;
-  GUARD_SOURCE_ADMIN = 6;
+  reserved 6;
+  reserved "GUARD_SOURCE_ADMIN";
 }
 
 enum GuardAction {
@@ -86,6 +82,13 @@ enum ControlMode {
   CONTROL_MODE_LOW_LEVEL = 2;
 }
 
+enum OperationNamespace {
+  OPERATION_NAMESPACE_UNSPECIFIED = 0;
+  OPERATION_NAMESPACE_ACQUIRE = 1;
+  OPERATION_NAMESPACE_LEASE = 2;
+  OPERATION_NAMESPACE_GLOBAL_STOP = 3;
+}
+
 message LeaseTuple {
   uint64 generation = 1;
   bytes boot_nonce = 2; // Exactly 16 bytes.
@@ -101,6 +104,16 @@ message RequestEnvelope {
   uint64 sequence = 6;
   uint64 issued_monotonic_ns = 7;
   uint64 deadline_monotonic_ns = 8;
+  // Guard-owned barrier sampled by readiness and checked atomically on acquire.
+  uint64 motion_stop_generation = 9;
+}
+
+message GlobalStopEnvelope {
+  GuardSource source = 1;
+  string operation_id = 2;
+  bytes payload_sha256 = 3; // Exactly 32 bytes for the typed stop payload.
+  uint64 issued_monotonic_ns = 4;
+  uint64 deadline_monotonic_ns = 5;
 }
 
 message ErrorDetail {
@@ -111,7 +124,8 @@ message ErrorDetail {
 
 message GuardResult {
   AckCode ack = 1;
-  SafetyGate gate = 2;
+  reserved 2;
+  reserved "gate";
   LeaseState lease = 3;
   ErrorDetail error = 4;
 }
@@ -186,8 +200,8 @@ message RevokeAndZeroRequest {
   RequestEnvelope envelope = 1;
 }
 
-message LatchSafetyStopRequest {
-  RequestEnvelope envelope = 1;
+message StopAllMotionRequest {
+  GlobalStopEnvelope envelope = 1;
   string reason = 2;
 }
 
@@ -195,20 +209,14 @@ message GetReadinessRequest {
   GuardSource source = 1;
 }
 
-message GetSafetyStateRequest {
+message GetGuardStateRequest {
   GuardSource source = 1;
-}
-
-message ResetSafeStopRequest {
-  RequestEnvelope envelope = 1;
-  string reason = 2;
-  string operator = 3;
-  bool confirm_physical_safe = 4;
 }
 
 message GetOperationResultRequest {
   GuardSource source = 1;
   string operation_id = 2;
+  OperationNamespace operation_namespace = 3;
 }
 
 message AcquireLeaseResponse {
@@ -247,9 +255,11 @@ message RevokeAndZeroResponse {
   ZeroAck zero_ack = 2;
 }
 
-message LatchSafetyStopResponse {
+message StopAllMotionResponse {
   GuardResult result = 1;
   ZeroAck zero_ack = 2;
+  bool lease_revoked = 3;
+  uint64 motion_stop_generation = 4;
 }
 
 message GetReadinessResponse {
@@ -260,21 +270,18 @@ message GetReadinessResponse {
   string reason = 5;
   uint64 generation = 6;
   bytes boot_nonce = 7;
+  bool startup_zero_confirmed = 8;
+  uint64 motion_stop_generation = 9;
 }
 
-message GetSafetyStateResponse {
+message GetGuardStateResponse {
   GuardResult result = 1;
   uint64 generation = 2;
   bytes boot_nonce = 3;
-  uint64 reset_generation = 4;
-  string last_zero_ack_id = 5;
-  bool fenced = 6;
-}
-
-message ResetSafeStopResponse {
-  GuardResult result = 1;
-  ZeroAck zero_ack = 2;
-  uint64 reset_generation = 3;
+  string last_zero_ack_id = 4;
+  bool fenced = 5;
+  uint64 active_lease_id = 6;
+  uint64 motion_stop_generation = 7;
 }
 
 message GetOperationResultResponse {
@@ -283,6 +290,8 @@ message GetOperationResultResponse {
   AckCode target_ack = 3;
   bool resolved = 4;
   ZeroAck zero_ack = 5;
+  // Exact guard barrier associated with a resolved global-stop operation.
+  uint64 motion_stop_generation = 6;
 }
 
 message MotionGuardRequest {
@@ -295,12 +304,13 @@ message MotionGuardRequest {
     ExecuteSportCommandRequest execute_sport_command = 13;
     RevokeZeroAndSwitchModeRequest revoke_zero_and_switch_mode = 14;
     RevokeAndZeroRequest revoke_and_zero = 15;
-    LatchSafetyStopRequest latch_safety_stop = 16;
     GetReadinessRequest get_readiness = 17;
-    GetSafetyStateRequest get_safety_state = 18;
-    ResetSafeStopRequest reset_safe_stop = 19;
     GetOperationResultRequest get_operation_result = 20;
+    StopAllMotionRequest stop_all_motion = 21;
+    GetGuardStateRequest get_guard_state = 22;
   }
+  reserved 16, 18, 19;
+  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
 }
 
 message MotionGuardResponse {
@@ -313,10 +323,11 @@ message MotionGuardResponse {
     ExecuteSportCommandResponse execute_sport_command = 13;
     RevokeZeroAndSwitchModeResponse revoke_zero_and_switch_mode = 14;
     RevokeAndZeroResponse revoke_and_zero = 15;
-    LatchSafetyStopResponse latch_safety_stop = 16;
     GetReadinessResponse get_readiness = 17;
-    GetSafetyStateResponse get_safety_state = 18;
-    ResetSafeStopResponse reset_safe_stop = 19;
     GetOperationResultResponse get_operation_result = 20;
+    StopAllMotionResponse stop_all_motion = 21;
+    GetGuardStateResponse get_guard_state = 22;
   }
+  reserved 16, 18, 19;
+  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
 }

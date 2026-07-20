@@ -27,7 +27,7 @@ use crate::lcm_runtime::{
 };
 use crate::nav_runtime::{
     cancel as nav_cancel, compute_readiness, ensure_goal_id, readiness_to_reason, set_goal,
-    CancelOutcome, SetGoalInput, SetGoalOutcome,
+    CancelOutcome, MotionAdmissionProof, SetGoalInput, SetGoalOutcome,
 };
 use crate::proto::geometry_runtime_server::GeometryRuntime;
 use crate::proto::*;
@@ -365,6 +365,11 @@ fn explore_config_from_request(
         arbitration,
         map_version_id: request.map_version_id.clone(),
         map_revision: request.map_revision,
+        motion_admission: MotionAdmissionProof::try_from_wire(
+            request.motion_guard_generation,
+            &request.motion_guard_boot_nonce,
+            request.motion_stop_generation,
+        )?,
         boundary,
         stop_conditions,
         max_navigation_retries: request.max_navigation_retries,
@@ -1569,6 +1574,12 @@ impl GeometryRuntime for GeometryRuntimeService {
         } else {
             ng.frame_id.clone()
         };
+        let motion_admission = MotionAdmissionProof::try_from_wire(
+            ng.motion_guard_generation,
+            &ng.motion_guard_boot_nonce,
+            ng.motion_stop_generation,
+        )
+        .map_err(Status::invalid_argument)?;
         let input = SetGoalInput {
             goal_id: goal_id.clone(),
             owner_kind,
@@ -1576,6 +1587,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             goal_generation: ng.goal_generation,
             map_version_id: ng.map_version_id.clone(),
             map_revision,
+            motion_admission,
             frame_id,
             target,
         };
@@ -2813,6 +2825,9 @@ mod lifecycle_tests {
             arbitration: "prefer_wavefront".to_string(),
             map_version_id: map_version_id.to_string(),
             map_revision,
+            motion_guard_generation: 7,
+            motion_guard_boot_nonce: vec![7; 16],
+            motion_stop_generation: 1,
             ..ExploreRequest::default()
         }
     }
@@ -2884,6 +2899,9 @@ mod lifecycle_tests {
                 frame_id: "map".to_string(),
                 goal_id: goal_id.to_string(),
                 map_version_id: "map-v1".to_string(),
+                motion_guard_generation: 7,
+                motion_guard_boot_nonce: vec![7; 16],
+                motion_stop_generation: 1,
                 ..NavigationGoal::default()
             }),
         )
@@ -3148,6 +3166,9 @@ mod lifecycle_tests {
                     &service,
                     Request::new(NavigationGoal {
                         goal_id: "queued-public-after-stop".to_string(),
+                        motion_guard_generation: 7,
+                        motion_guard_boot_nonce: vec![7; 16],
+                        motion_stop_generation: 1,
                         ..NavigationGoal::default()
                     }),
                 )
@@ -3905,6 +3926,9 @@ mod exploration_contract_tests {
             max_navigation_retries: 3,
             blacklist_radius_m: 0.75,
             boundary_frame_id: "map".into(),
+            motion_guard_generation: 7,
+            motion_guard_boot_nonce: vec![7; 16],
+            motion_stop_generation: 1,
         };
 
         let config = explore_config_from_request(&request).expect("valid explore config");
@@ -3912,6 +3936,10 @@ mod exploration_contract_tests {
         assert_eq!(config.map_revision, 7);
         assert_eq!(config.max_navigation_retries, 3);
         assert_eq!(config.blacklist_radius_m, 0.75);
+        assert_eq!(
+            config.motion_admission,
+            crate::nav_runtime::test_motion_admission()
+        );
         assert!(config.boundary.is_some());
         assert_eq!(config.stop_conditions.max_goals, Some(12));
         assert_eq!(config.stop_conditions.no_frontier_timeout_ms, Some(4_000));
@@ -4093,6 +4121,9 @@ mod navigation_feedback_contract_tests {
                 frame_id: "map".to_string(),
                 goal_id: "public-goal".to_string(),
                 map_version_id: "map-v1".to_string(),
+                motion_guard_generation: 7,
+                motion_guard_boot_nonce: vec![7; 16],
+                motion_stop_generation: 1,
                 ..NavigationGoal::default()
             }),
         )

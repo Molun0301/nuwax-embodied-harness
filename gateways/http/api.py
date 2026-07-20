@@ -950,14 +950,22 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         try:
             navigation_goal = _build_navigation_goal(goal)
-            await run_in_threadpool(
-                lambda: runtime._ensure_geometry_runtime_for_capability(
-                    "navigate_to_pose"
+
+            def submit_goal():
+                admission = runtime._admit_motion_request(
+                    "navigate_to_pose",
+                    request_id=goal.goal_id,
                 )
-            )
-            context = await run_in_threadpool(
-                lambda: runtime.navigation_service.set_goal(navigation_goal)
-            )
+                admitted_goal = runtime._goal_with_motion_admission(
+                    navigation_goal,
+                    admission,
+                )
+                return runtime._run_with_motion_admission(
+                    admission,
+                    lambda: runtime.navigation_service.set_goal(admitted_goal),
+                )
+
+            context = await run_in_threadpool(submit_goal)
         except Exception as exc:
             raise as_gateway_error(exc) from exc
         return _navigation_state_payload(context, fallback_goal_id=goal.goal_id)

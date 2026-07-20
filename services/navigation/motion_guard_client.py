@@ -64,7 +64,6 @@ class MotionGuardTimeoutError(MotionGuardTransportError, TimeoutError):
 @dataclass(frozen=True)
 class GuardResultSnapshot:
     ack: int
-    gate: int
     lease: int
     error_code: str = ""
     error_message: str = ""
@@ -110,10 +109,6 @@ class MotionSinkNotReadyError(MotionGuardRemoteError):
     pass
 
 
-class SafetyStopActiveError(MotionGuardRemoteError):
-    pass
-
-
 class ResourceBusyError(MotionGuardRemoteError):
     pass
 
@@ -131,6 +126,10 @@ class StaleEpochError(MotionGuardRemoteError):
 
 
 class StaleSequenceError(MotionGuardRemoteError):
+    pass
+
+
+class StaleStopGenerationError(MotionGuardRemoteError):
     pass
 
 
@@ -156,12 +155,12 @@ _REMOTE_ERRORS: Dict[str, Type[MotionGuardRemoteError]] = {
     "ACTION_NOT_ALLOWED": ActionNotAllowedError,
     "UNSUPPORTED_API_VERSION": UnsupportedApiVersionError,
     "MOTION_SINK_NOT_READY": MotionSinkNotReadyError,
-    "SAFETY_STOP_ACTIVE": SafetyStopActiveError,
     "RESOURCE_BUSY": ResourceBusyError,
     "RESOURCE_EXHAUSTED": ResourceExhaustedError,
     "DEADLINE_EXCEEDED": DeadlineExceededError,
     "STALE_EPOCH": StaleEpochError,
     "STALE_SEQUENCE": StaleSequenceError,
+    "STALE_STOP_GENERATION": StaleStopGenerationError,
     "OUTCOME_UNKNOWN": OutcomeUnknownError,
     "REQUEST_ID_CONFLICT": RequestIdConflictError,
     "EPOCH_DURABILITY_LOST": EpochDurabilityLostError,
@@ -170,24 +169,43 @@ _REMOTE_ERRORS: Dict[str, Type[MotionGuardRemoteError]] = {
 
 
 @dataclass(frozen=True)
+class MotionAdmissionProof:
+    generation: int
+    boot_nonce: bytes
+    motion_stop_generation: int = 0
+
+
+@dataclass(frozen=True)
 class ReadinessStatus:
     result: GuardResultSnapshot
     ready: bool
     actuator_configured: bool
     epoch_durable: bool
+    startup_zero_confirmed: bool
     reason: str
     generation: int
     boot_nonce: bytes
+    motion_stop_generation: int
+
+    def require_admission_proof(self) -> MotionAdmissionProof:
+        if not self.ready:
+            raise MotionGuardNotReadyError(self)
+        return MotionAdmissionProof(
+            generation=self.generation,
+            boot_nonce=bytes(self.boot_nonce),
+            motion_stop_generation=self.motion_stop_generation,
+        )
 
 
 @dataclass(frozen=True)
-class SafetyState:
+class GuardState:
     result: GuardResultSnapshot
     generation: int
     boot_nonce: bytes
-    reset_generation: int
     last_zero_ack_id: str
     fenced: bool
+    active_lease_id: int
+    motion_stop_generation: int
 
 
 @dataclass(frozen=True)
@@ -213,11 +231,12 @@ class ModeSwitchConfirmation:
 
 
 @dataclass(frozen=True)
-class ResetConfirmation:
+class StopAllMotionConfirmation:
     operation_id: str
     result: GuardResultSnapshot
     zero: ZeroConfirmation
-    reset_generation: int
+    lease_revoked: bool
+    motion_stop_generation: int
 
 
 @dataclass(frozen=True)
@@ -227,6 +246,7 @@ class OperationStatus:
     resolved: bool
     target_ack: int
     zero: Optional[ZeroConfirmation]
+    motion_stop_generation: int
 
 
 class MotionGuardNotReadyError(MotionGuardError):
@@ -397,6 +417,7 @@ class MotionGuardClient:
         action: int,
         operation_id: str,
         sequence: int,
+        motion_stop_generation: int = 0,
     ) -> pb.RequestEnvelope:
         now = self._now()
         deadline = now + MAX_COMMAND_DEADLINE_NS
@@ -412,6 +433,19 @@ class MotionGuardClient:
             action=action,
             operation_id=operation_id,
             sequence=sequence,
+            issued_monotonic_ns=now,
+            deadline_monotonic_ns=deadline,
+            motion_stop_generation=motion_stop_generation,
+        )
+
+    def _new_global_stop_envelope(self, operation_id: str) -> pb.GlobalStopEnvelope:
+        now = self._now()
+        deadline = now + MAX_COMMAND_DEADLINE_NS
+        if deadline >= 1 << 64:
+            raise MotionGuardUsageError("monotonic deadline exceeds uint64")
+        return pb.GlobalStopEnvelope(
+            source=pb.GUARD_SOURCE_GATEWAY_MANUAL,
+            operation_id=operation_id,
             issued_monotonic_ns=now,
             deadline_monotonic_ns=deadline,
         )
@@ -526,7 +560,6 @@ class MotionGuardClient:
     def _snapshot(result: pb.GuardResult) -> GuardResultSnapshot:
         return GuardResultSnapshot(
             ack=result.ack,
-            gate=result.gate,
             lease=result.lease,
             error_code=result.error.code,
             error_message=result.error.message,
@@ -570,47 +603,66 @@ class MotionGuardClient:
             ready=outcome.ready,
             actuator_configured=outcome.actuator_configured,
             epoch_durable=outcome.epoch_durable,
+            startup_zero_confirmed=outcome.startup_zero_confirmed,
             reason=outcome.reason,
             generation=outcome.generation,
             boot_nonce=boot_nonce,
+            motion_stop_generation=outcome.motion_stop_generation,
         )
 
-    def get_safety_state(self, source: Union[int, str]) -> SafetyState:
+    def get_guard_state(self, source: Union[int, str]) -> GuardState:
         source_value = normalize_source(source)
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
             request_id=self._new_id("request"),
-            get_safety_state=pb.GetSafetyStateRequest(source=source_value),
+            get_guard_state=pb.GetGuardStateRequest(source=source_value),
         )
         outcome, result = self._exchange(
             request,
-            expected_outcome="get_safety_state",
+            expected_outcome="get_guard_state",
             expected_acks={pb.ACK_CODE_RECEIVED},
         )
         boot_nonce = bytes(outcome.boot_nonce)
         self._validate_epoch(outcome.generation, boot_nonce)
-        return SafetyState(
+        return GuardState(
             result=result,
             generation=outcome.generation,
             boot_nonce=boot_nonce,
-            reset_generation=outcome.reset_generation,
             last_zero_ack_id=outcome.last_zero_ack_id,
             fenced=outcome.fenced,
+            active_lease_id=outcome.active_lease_id,
+            motion_stop_generation=outcome.motion_stop_generation,
         )
 
     def get_operation_result(
         self,
         source: Union[int, str],
         operation_id: str,
+        *,
+        operation_namespace: int,
     ) -> OperationStatus:
         source_value = normalize_source(source)
         target = self._require_text(operation_id, "operation_id")
+        if (
+            isinstance(operation_namespace, bool)
+            or not isinstance(operation_namespace, int)
+            or operation_namespace
+            not in {
+                pb.OPERATION_NAMESPACE_ACQUIRE,
+                pb.OPERATION_NAMESPACE_LEASE,
+                pb.OPERATION_NAMESPACE_GLOBAL_STOP,
+            }
+        ):
+            raise MotionGuardUsageError(
+                "operation_namespace must identify acquire, lease, or global stop"
+            )
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
             request_id=self._new_id("request"),
             get_operation_result=pb.GetOperationResultRequest(
                 source=source_value,
                 operation_id=target,
+                operation_namespace=operation_namespace,
             ),
         )
         outcome, result = self._exchange(
@@ -626,6 +678,15 @@ class MotionGuardClient:
                 self._raise_protocol("resolved operation result has no terminal ack")
             if result.ack != outcome.target_ack:
                 self._raise_protocol("operation result ack fields disagree")
+            if operation_namespace == pb.OPERATION_NAMESPACE_GLOBAL_STOP and (
+                outcome.target_ack
+                not in {pb.ACK_CODE_ZEROED, pb.ACK_CODE_RESOURCE_FENCED}
+                or not outcome.HasField("zero_ack")
+                or outcome.motion_stop_generation == 0
+            ):
+                self._raise_protocol(
+                    "resolved global stop has no terminal zero and generation proof"
+                )
         elif (
             result.error_code != "OUTCOME_UNKNOWN"
             or outcome.target_ack != pb.ACK_CODE_UNSPECIFIED
@@ -640,28 +701,26 @@ class MotionGuardClient:
             resolved=outcome.resolved,
             target_ack=outcome.target_ack,
             zero=zero,
+            motion_stop_generation=outcome.motion_stop_generation,
         )
 
     def acquire_session(
         self,
         source: Union[int, str],
+        proof: MotionAdmissionProof,
         *,
         operation_id: Optional[str] = None,
         renew_interval_seconds: float = RENEW_INTERVAL_NS / 1_000_000_000,
     ) -> MotionGuardSession:
         source_value = normalize_source(source)
-        if source_value == pb.GUARD_SOURCE_ADMIN:
-            raise MotionGuardUsageError("ADMIN cannot acquire a motion lease")
+        generation, boot_nonce, stop_generation = self._validate_admission_proof(proof)
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise MotionGuardSessionClosedError("motion guard client is closing")
-        readiness = self.get_readiness(source_value)
-        if not readiness.ready:
-            raise MotionGuardNotReadyError(readiness)
         operation = self._operation_id_value(operation_id, "acquire")
         epoch_tuple = pb.LeaseTuple(
-            generation=readiness.generation,
-            boot_nonce=readiness.boot_nonce,
+            generation=generation,
+            boot_nonce=boot_nonce,
             lease_id=0,
         )
         request = pb.MotionGuardRequest(
@@ -674,6 +733,7 @@ class MotionGuardClient:
                     action=pb.GUARD_ACTION_UNSPECIFIED,
                     operation_id=operation,
                     sequence=0,
+                    motion_stop_generation=stop_generation,
                 )
             ),
         )
@@ -686,8 +746,8 @@ class MotionGuardClient:
         lease_tuple = pb.LeaseTuple()
         lease_tuple.CopyFrom(outcome.lease_tuple)
         if (
-            lease_tuple.generation != readiness.generation
-            or bytes(lease_tuple.boot_nonce) != readiness.boot_nonce
+            lease_tuple.generation != generation
+            or bytes(lease_tuple.boot_nonce) != boot_nonce
             or lease_tuple.lease_id == 0
         ):
             self._raise_protocol("AcquireLease returned an invalid lease tuple")
@@ -713,87 +773,45 @@ class MotionGuardClient:
 
     session = acquire_session
 
-    def reset_safe_stop(
+    def stop_all_motion(
         self,
-        *,
-        physical_confirm: bool,
         reason: str,
-        operator: str,
+        *,
         operation_id: Optional[str] = None,
-    ) -> ResetConfirmation:
-        if physical_confirm is not True:
-            raise MotionGuardUsageError("physical_confirm=True is required")
+    ) -> StopAllMotionConfirmation:
         reason_value = self._require_text(reason, "reason")
-        operator_value = self._require_text(operator, "operator")
-        readiness = self.get_readiness(pb.GUARD_SOURCE_ADMIN)
-        operation = self._operation_id_value(operation_id, "admin-reset")
+        operation = self._operation_id_value(operation_id, "stop-all-motion")
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
             request_id=self._new_id("request"),
-            reset_safe_stop=pb.ResetSafeStopRequest(
-                envelope=self._new_envelope(
-                    lease_tuple=pb.LeaseTuple(
-                        generation=readiness.generation,
-                        boot_nonce=readiness.boot_nonce,
-                        lease_id=0,
-                    ),
-                    source=pb.GUARD_SOURCE_ADMIN,
-                    action=pb.GUARD_ACTION_UNSPECIFIED,
-                    operation_id=operation,
-                    sequence=0,
-                ),
+            stop_all_motion=pb.StopAllMotionRequest(
+                envelope=self._new_global_stop_envelope(operation),
                 reason=reason_value,
-                operator=operator_value,
-                confirm_physical_safe=True,
             ),
         )
         seal_request(request)
         outcome, result = self._exchange(
             request,
-            expected_outcome="reset_safe_stop",
-            expected_acks={pb.ACK_CODE_ZEROED},
+            expected_outcome="stop_all_motion",
+            expected_acks={pb.ACK_CODE_ZEROED, pb.ACK_CODE_RESOURCE_FENCED},
         )
-        return ResetConfirmation(
+        lease_revoked = bool(outcome.lease_revoked)
+        expected_ack = (
+            pb.ACK_CODE_RESOURCE_FENCED if lease_revoked else pb.ACK_CODE_ZEROED
+        )
+        if result.ack != expected_ack:
+            self._raise_protocol(
+                "StopAllMotion ack does not match lease_revoked correlation"
+            )
+        if outcome.motion_stop_generation == 0:
+            self._raise_protocol("StopAllMotion returned no stop generation proof")
+        return StopAllMotionConfirmation(
             operation_id=operation,
             result=result,
             zero=self._zero_confirmation(outcome.zero_ack),
-            reset_generation=outcome.reset_generation,
+            lease_revoked=lease_revoked,
+            motion_stop_generation=outcome.motion_stop_generation,
         )
-
-    def latch_gateway_safety_stop(
-        self,
-        reason: str,
-        *,
-        operation_id: Optional[str] = None,
-    ) -> ZeroConfirmation:
-        reason_value = self._require_text(reason, "reason")
-        readiness = self.get_readiness(pb.GUARD_SOURCE_GATEWAY_MANUAL)
-        operation = self._operation_id_value(operation_id, "gateway-safe-stop")
-        request = pb.MotionGuardRequest(
-            api_version=API_VERSION,
-            request_id=self._new_id("request"),
-            latch_safety_stop=pb.LatchSafetyStopRequest(
-                envelope=self._new_envelope(
-                    lease_tuple=pb.LeaseTuple(
-                        generation=readiness.generation,
-                        boot_nonce=readiness.boot_nonce,
-                        lease_id=0,
-                    ),
-                    source=pb.GUARD_SOURCE_GATEWAY_MANUAL,
-                    action=pb.GUARD_ACTION_STOP,
-                    operation_id=operation,
-                    sequence=0,
-                ),
-                reason=reason_value,
-            ),
-        )
-        seal_request(request)
-        outcome, _result = self._exchange(
-            request,
-            expected_outcome="latch_safety_stop",
-            expected_acks={pb.ACK_CODE_SAFETY_LATCHED},
-        )
-        return self._zero_confirmation(outcome.zero_ack)
 
     def _operation_id_value(self, value: Optional[str], label: str) -> str:
         if value is None:
@@ -809,6 +827,33 @@ class MotionGuardClient:
     def _validate_epoch(self, generation: int, boot_nonce: bytes) -> None:
         if generation <= 0 or len(boot_nonce) != _BOOT_NONCE_BYTES:
             self._raise_protocol("response contains an invalid boot epoch tuple")
+
+    @staticmethod
+    def _validate_admission_proof(
+        proof: MotionAdmissionProof,
+    ) -> Tuple[int, bytes, int]:
+        if not isinstance(proof, MotionAdmissionProof):
+            raise MotionGuardUsageError("proof must be a MotionAdmissionProof")
+        if isinstance(proof.generation, bool) or not isinstance(proof.generation, int):
+            raise MotionGuardUsageError("proof generation must be a positive integer")
+        if proof.generation <= 0:
+            raise MotionGuardUsageError("proof generation must be positive")
+        if not isinstance(proof.boot_nonce, bytes):
+            raise MotionGuardUsageError("proof boot_nonce must be bytes")
+        boot_nonce = bytes(proof.boot_nonce)
+        if len(boot_nonce) != _BOOT_NONCE_BYTES:
+            raise MotionGuardUsageError("proof boot_nonce must be exactly 16 bytes")
+        stop_generation = proof.motion_stop_generation
+        if (
+            isinstance(stop_generation, bool)
+            or not isinstance(stop_generation, int)
+            or stop_generation < 0
+            or stop_generation >= 1 << 64
+        ):
+            raise MotionGuardUsageError(
+                "proof motion_stop_generation must be a non-negative uint64"
+            )
+        return proof.generation, boot_nonce, stop_generation
 
     def _zero_confirmation(self, zero_ack: pb.ZeroAck) -> ZeroConfirmation:
         if not zero_ack.zero_ack_id or zero_ack.applied_monotonic_ns <= 0:
@@ -1191,46 +1236,6 @@ class MotionGuardSession:
 
     mode = switch_mode
 
-    def latch_safety_stop(
-        self,
-        reason: str,
-        *,
-        operation_id: Optional[str] = None,
-    ) -> ZeroConfirmation:
-        reason_value = self._client._require_text(reason, "reason")
-        self._stop_and_join_renewal()
-        with self._lock:
-            self._assert_operational()
-            envelope, _operation = self._next_envelope(
-                action=pb.GUARD_ACTION_STOP,
-                label="latch-safe-stop",
-                operation_id=operation_id,
-            )
-            request = pb.MotionGuardRequest(
-                api_version=API_VERSION,
-                request_id=self._client._new_id("request"),
-                latch_safety_stop=pb.LatchSafetyStopRequest(
-                    envelope=envelope,
-                    reason=reason_value,
-                ),
-            )
-            seal_request(request)
-            try:
-                outcome, _result = self._client._exchange(
-                    request,
-                    expected_outcome="latch_safety_stop",
-                    expected_acks={pb.ACK_CODE_SAFETY_LATCHED},
-                )
-                zero = self._client._zero_confirmation(outcome.zero_ack)
-            except MotionGuardError as exc:
-                self._failure = exc
-                raise MotionGuardFenceError(
-                    "safe-stop latch did not return a verified zero acknowledgement",
-                    cause=exc,
-                ) from exc
-            self._mark_fenced(zero)
-            return zero
-
     def revoke_and_zero(
         self,
         *,
@@ -1328,9 +1333,11 @@ __all__ = [
     "CommandConfirmation",
     "DeadlineExceededError",
     "EpochDurabilityLostError",
+    "GuardState",
     "GuardResultSnapshot",
     "InvalidArgumentError",
     "ModeSwitchConfirmation",
+    "MotionAdmissionProof",
     "MotionGuardClient",
     "MotionGuardError",
     "MotionGuardFenceError",
@@ -1349,13 +1356,12 @@ __all__ = [
     "PermissionDeniedError",
     "ReadinessStatus",
     "RequestIdConflictError",
-    "ResetConfirmation",
     "ResourceBusyError",
     "ResourceExhaustedError",
-    "SafetyState",
-    "SafetyStopActiveError",
+    "StopAllMotionConfirmation",
     "StaleEpochError",
     "StaleSequenceError",
+    "StaleStopGenerationError",
     "UnsupportedApiVersionError",
     "ZeroConfirmation",
     "normalize_source",

@@ -8384,6 +8384,7 @@ class PlatformGeometryProviderBundle(
         stop_conditions = {}
         max_navigation_retries = 0
         blacklist_radius_m = 0.0
+        motion_admission = None
         if request is not None:
             request_id = str(getattr(request, "request_id", "") or "")
             if not request_id:
@@ -8391,6 +8392,7 @@ class PlatformGeometryProviderBundle(
             strategy = str(getattr(request, "strategy", "") or "wavefront").strip()
             stop_conditions = dict(getattr(request, "stop_conditions", {}) or {})
             request_metadata = dict(getattr(request, "metadata", {}) or {})
+            motion_admission = request_metadata.get("motion_admission")
             arbitration = str(
                 request_metadata.get("arbitration")
                 or stop_conditions.get("arbitration")
@@ -8504,6 +8506,7 @@ class PlatformGeometryProviderBundle(
                 stop_conditions=stop_conditions,
                 max_navigation_retries=max_navigation_retries,
                 blacklist_radius_m=blacklist_radius_m,
+                motion_admission=motion_admission,
             )
         except GeometryRuntimeRpcError:
             retain_uncertain_start(

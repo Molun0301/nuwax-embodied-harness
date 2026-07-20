@@ -20,7 +20,6 @@ class PeerCredentials:
 
 SOURCE_ALLOWLIST_BY_USER: Mapping[str, FrozenSet[str]] = {
     "nuwax-motion-guard": frozenset(),
-    "nuwax-motion-admin": frozenset({"ADMIN"}),
     "nuwax-navigation": frozenset({"NAV"}),
     "nuwax-gateway": frozenset(
         {
@@ -33,7 +32,6 @@ SOURCE_ALLOWLIST_BY_USER: Mapping[str, FrozenSet[str]] = {
 }
 SERVICE_IDENTITY_USERS = (
     "nuwax-motion-guard",
-    "nuwax-motion-admin",
     "nuwax-navigation",
     "nuwax-geometry",
     "nuwax-gateway",

@@ -22,10 +22,11 @@ use crate::constants::{
 use crate::crypto::sha256;
 use crate::wire::{
     motion_guard_request, motion_guard_response, submit_motion_command_request, AckCode,
-    AcquireLeaseRequest, AcquireLeaseResponse, GetReadinessRequest, GuardAction, GuardResult,
-    GuardSource, LeaseState, LeaseTuple, MotionGuardRequest, MotionGuardResponse,
-    RenewLeaseRequest, RenewLeaseResponse, RequestEnvelope, RevokeAndZeroRequest, SafetyGate,
-    StopCommand, SubmitMotionCommandRequest, TwistCommand, ZeroAck, API_VERSION,
+    AcquireLeaseRequest, AcquireLeaseResponse, GetReadinessRequest, GlobalStopEnvelope,
+    GuardAction, GuardResult, GuardSource, LeaseState, LeaseTuple, MotionGuardRequest,
+    MotionGuardResponse, RenewLeaseRequest, RenewLeaseResponse, RequestEnvelope,
+    RevokeAndZeroRequest, StopAllMotionRequest, StopCommand, SubmitMotionCommandRequest,
+    TwistCommand, ZeroAck, API_VERSION,
 };
 
 const BOOT_NONCE_BYTES: usize = 16;
@@ -68,6 +69,21 @@ pub struct ReadinessStatus {
     pub generation: u64,
     /// Sixteen-byte boot nonce.
     pub boot_nonce: Vec<u8>,
+    /// Whether the automatic startup zero handshake completed.
+    pub startup_zero_confirmed: bool,
+    /// Guard-owned global-stop barrier sampled with this readiness result.
+    pub motion_stop_generation: u64,
+}
+
+/// Immutable request-level proof authorizing one direct lease acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionAdmissionProof {
+    /// Durable guard generation observed by the request admission layer.
+    pub generation: u64,
+    /// Sixteen-byte guard boot nonce observed with `generation`.
+    pub boot_nonce: [u8; BOOT_NONCE_BYTES],
+    /// Guard-owned global-stop barrier observed by request admission.
+    pub motion_stop_generation: u64,
 }
 
 /// Lease acquisition result and the required renewal cadence.
@@ -112,9 +128,18 @@ pub struct ZeroConfirmation {
     pub applied_monotonic_ns: u64,
 }
 
-/// One sealed emergency fence request that may be replayed byte-for-byte.
+/// Result of an ordinary global stop operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalStopConfirmation {
+    /// Correlated proof that the actuator accepted zero.
+    pub zero: ZeroConfirmation,
+    /// Whether an active lease was revoked by this stop.
+    pub lease_revoked: bool,
+}
+
+/// One sealed priority fence request that may be replayed byte-for-byte.
 #[derive(Debug, Clone)]
-pub struct EmergencyFenceRequest {
+pub struct PriorityFenceRequest {
     request: MotionGuardRequest,
 }
 
@@ -147,12 +172,6 @@ pub enum MotionGuardClientError {
         retryable: bool,
         /// Mutation operation id, or an empty string for readiness.
         operation_id: String,
-    },
-    /// Readiness was correlated but did not permit lease acquisition.
-    #[error("motion guard is not ready: {reason}")]
-    NotReady {
-        /// Guard diagnostic reason.
-        reason: String,
     },
     /// A prior timeout, EOF, framing error, or protocol mismatch poisoned the stream.
     #[error("motion-guard client is poisoned after: {reason}")]
@@ -206,30 +225,30 @@ impl MotionGuardClient {
 
     /// Fence one known NAV lease over a fresh, independent UDS connection.
     ///
-    /// This is the emergency path used when the scheduler drops an in-flight
+    /// This is the priority path used when the scheduler drops an in-flight
     /// ordinary exchange. `u64::MAX` is reserved for this terminal operation,
     /// so any delayed ordinary request is either ordered before the fence or
     /// rejected as stale after it. The guard actor remains the single actuator
     /// serialization owner.
-    pub async fn emergency_revoke_and_zero_with_lease(
+    pub async fn priority_revoke_and_zero_with_lease(
         config: ClientConfig,
         lease_tuple: LeaseTuple,
         operation_id: &str,
     ) -> Result<ZeroConfirmation, MotionGuardClientError> {
-        let request = Self::prepare_emergency_revoke_and_zero(lease_tuple, operation_id)?;
-        Self::execute_emergency_revoke_and_zero(config, &request).await
+        let request = Self::prepare_priority_revoke_and_zero(lease_tuple, operation_id)?;
+        Self::execute_priority_revoke_and_zero(config, &request).await
     }
 
     /// Seal one terminal request for byte-identical retries on fresh streams.
-    pub fn prepare_emergency_revoke_and_zero(
+    pub fn prepare_priority_revoke_and_zero(
         lease_tuple: LeaseTuple,
         operation_id: &str,
-    ) -> Result<EmergencyFenceRequest, MotionGuardClientError> {
+    ) -> Result<PriorityFenceRequest, MotionGuardClientError> {
         validate_epoch(lease_tuple.generation, &lease_tuple.boot_nonce)
             .map_err(MotionGuardClientError::InvalidInput)?;
         if lease_tuple.lease_id == 0 {
             return Err(MotionGuardClientError::InvalidInput(
-                "emergency fence requires a non-zero lease id".into(),
+                "priority fence requires a non-zero lease id".into(),
             ));
         }
         let operation_id = validate_operation_id(operation_id)?;
@@ -248,6 +267,7 @@ impl MotionGuardClient {
             sequence: u64::MAX,
             issued_monotonic_ns: issued,
             deadline_monotonic_ns: deadline,
+            motion_stop_generation: 0,
         };
         let mut request = MotionGuardRequest {
             api_version: API_VERSION,
@@ -259,13 +279,13 @@ impl MotionGuardClient {
             )),
         };
         seal_request(&mut request)?;
-        Ok(EmergencyFenceRequest { request })
+        Ok(PriorityFenceRequest { request })
     }
 
-    /// Execute a previously sealed emergency fence over one fresh connection.
-    pub async fn execute_emergency_revoke_and_zero(
+    /// Execute a previously sealed priority fence over one fresh connection.
+    pub async fn execute_priority_revoke_and_zero(
         config: ClientConfig,
-        request: &EmergencyFenceRequest,
+        request: &PriorityFenceRequest,
     ) -> Result<ZeroConfirmation, MotionGuardClientError> {
         let mut client = Self::connect_with_config(config).await?;
         let outcome = client
@@ -335,13 +355,76 @@ impl MotionGuardClient {
             reason: response.reason,
             generation: response.generation,
             boot_nonce: response.boot_nonce,
+            startup_zero_confirmed: response.startup_zero_confirmed,
+            motion_stop_generation: response.motion_stop_generation,
         })
     }
 
-    /// Checks NAV readiness and acquires a source-scoped lease at sequence zero.
+    /// Applies an ordinary global stop without changing future admission policy.
+    pub async fn stop_all_motion(
+        &mut self,
+        operation_id: &str,
+        reason: &str,
+    ) -> Result<GlobalStopConfirmation, MotionGuardClientError> {
+        self.ensure_usable()?;
+        let operation_id = validate_operation_id(operation_id)?;
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(MotionGuardClientError::InvalidInput(
+                "global stop reason must not be empty".into(),
+            ));
+        }
+        let issued = monotonic_ns()?;
+        let deadline = issued
+            .checked_add(u64::from(COMMAND_DEADLINE_MS) * NANOS_PER_MILLISECOND)
+            .ok_or_else(|| {
+                MotionGuardClientError::InvalidInput("monotonic deadline overflow".into())
+            })?;
+        let mut request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::StopAllMotion(
+                StopAllMotionRequest {
+                    envelope: Some(GlobalStopEnvelope {
+                        source: GuardSource::GatewayManual as i32,
+                        operation_id,
+                        payload_sha256: Vec::new(),
+                        issued_monotonic_ns: issued,
+                        deadline_monotonic_ns: deadline,
+                    }),
+                    reason: reason.to_string(),
+                },
+            )),
+        };
+        seal_request(&mut request)?;
+        let outcome = self
+            .exchange_allowing_acks(
+                request,
+                OutcomeKind::StopAllMotion,
+                &[AckCode::Zeroed, AckCode::ResourceFenced],
+            )
+            .await?;
+        let motion_guard_response::Outcome::StopAllMotion(response) = outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+        let zero = response
+            .zero_ack
+            .ok_or_else(|| "global stop response has no ZeroAck".to_string())
+            .and_then(validate_zero_ack)
+            .or_else(|message| self.protocol_error(message))?;
+        self.lease_tuple = None;
+        self.sequence = 0;
+        Ok(GlobalStopConfirmation {
+            zero,
+            lease_revoked: response.lease_revoked,
+        })
+    }
+
+    /// Acquires a source-scoped lease directly from a request-level admission proof.
     pub async fn acquire_lease(
         &mut self,
         operation_id: &str,
+        proof: &MotionAdmissionProof,
     ) -> Result<LeaseMetadata, MotionGuardClientError> {
         self.ensure_usable()?;
         if self.lease_tuple.is_some() {
@@ -350,19 +433,16 @@ impl MotionGuardClient {
             ));
         }
         let operation_id = validate_operation_id(operation_id)?;
-        let readiness = self.get_readiness().await?;
-        if !readiness.ready || !readiness.actuator_configured || !readiness.epoch_durable {
-            return Err(MotionGuardClientError::NotReady {
-                reason: readiness.reason,
-            });
-        }
+        validate_epoch(proof.generation, &proof.boot_nonce)
+            .map_err(MotionGuardClientError::InvalidInput)?;
         let epoch_tuple = LeaseTuple {
-            generation: readiness.generation,
-            boot_nonce: readiness.boot_nonce.clone(),
+            generation: proof.generation,
+            boot_nonce: proof.boot_nonce.to_vec(),
             lease_id: 0,
         };
-        let envelope =
+        let mut envelope =
             self.new_envelope(epoch_tuple, GuardAction::Unspecified, &operation_id, 0)?;
+        envelope.motion_stop_generation = proof.motion_stop_generation;
         let mut request = MotionGuardRequest {
             api_version: API_VERSION,
             request_id: new_request_id(),
@@ -379,7 +459,7 @@ impl MotionGuardClient {
         let motion_guard_response::Outcome::AcquireLease(response) = outcome else {
             unreachable!("exchange already correlated the outcome")
         };
-        let metadata = self.validate_acquire(response, &readiness)?;
+        let metadata = self.validate_acquire(response, proof)?;
         self.sequence = 0;
         self.lease_tuple = Some(metadata.lease_tuple.clone());
         Ok(metadata)
@@ -523,14 +603,14 @@ impl MotionGuardClient {
     fn validate_acquire(
         &mut self,
         response: AcquireLeaseResponse,
-        readiness: &ReadinessStatus,
+        proof: &MotionAdmissionProof,
     ) -> Result<LeaseMetadata, MotionGuardClientError> {
         let tuple = response
             .lease_tuple
             .ok_or_else(|| "AcquireLease response has no lease tuple".to_string())
             .or_else(|message| self.protocol_error(message))?;
-        if tuple.generation != readiness.generation
-            || tuple.boot_nonce != readiness.boot_nonce
+        if tuple.generation != proof.generation
+            || tuple.boot_nonce.as_slice() != proof.boot_nonce
             || tuple.lease_id == 0
         {
             return self.protocol_error("AcquireLease response has an invalid lease tuple");
@@ -602,6 +682,7 @@ impl MotionGuardClient {
             sequence,
             issued_monotonic_ns: issued,
             deadline_monotonic_ns: deadline,
+            motion_stop_generation: 0,
         })
     }
 
@@ -610,6 +691,16 @@ impl MotionGuardClient {
         request: MotionGuardRequest,
         expected_outcome: OutcomeKind,
         expected_ack: AckCode,
+    ) -> Result<motion_guard_response::Outcome, MotionGuardClientError> {
+        self.exchange_allowing_acks(request, expected_outcome, &[expected_ack])
+            .await
+    }
+
+    async fn exchange_allowing_acks(
+        &mut self,
+        request: MotionGuardRequest,
+        expected_outcome: OutcomeKind,
+        expected_acks: &[AckCode],
     ) -> Result<motion_guard_response::Outcome, MotionGuardClientError> {
         self.ensure_usable()?;
         if request.api_version != API_VERSION || request.request_id.is_empty() {
@@ -700,9 +791,9 @@ impl MotionGuardClient {
                 operation_id,
             });
         }
-        if ack != expected_ack {
+        if !expected_acks.contains(&ack) {
             return self.protocol_error(format!(
-                "response ack {ack:?} does not match {expected_ack:?}"
+                "response ack {ack:?} is not one of {expected_acks:?}"
             ));
         }
         validate_success_state(expected_outcome, result)
@@ -747,6 +838,7 @@ enum OutcomeKind {
     RenewLease,
     SubmitMotionCommand,
     RevokeAndZero,
+    StopAllMotion,
     GetReadiness,
 }
 
@@ -759,6 +851,7 @@ impl OutcomeKind {
                 Some(Self::SubmitMotionCommand)
             }
             motion_guard_request::Operation::RevokeAndZero(_) => Some(Self::RevokeAndZero),
+            motion_guard_request::Operation::StopAllMotion(_) => Some(Self::StopAllMotion),
             motion_guard_request::Operation::GetReadiness(_) => Some(Self::GetReadiness),
             _ => None,
         }
@@ -772,6 +865,7 @@ impl OutcomeKind {
                 Some(Self::SubmitMotionCommand)
             }
             motion_guard_response::Outcome::RevokeAndZero(_) => Some(Self::RevokeAndZero),
+            motion_guard_response::Outcome::StopAllMotion(_) => Some(Self::StopAllMotion),
             motion_guard_response::Outcome::GetReadiness(_) => Some(Self::GetReadiness),
             _ => None,
         }
@@ -808,8 +902,11 @@ fn validate_operation_id(operation_id: &str) -> Result<String, MotionGuardClient
 }
 
 fn validate_epoch(generation: u64, boot_nonce: &[u8]) -> Result<(), String> {
-    if generation == 0 || boot_nonce.len() != BOOT_NONCE_BYTES {
-        return Err("readiness response contains an invalid boot epoch".into());
+    if generation == 0
+        || boot_nonce.len() != BOOT_NONCE_BYTES
+        || boot_nonce.iter().all(|byte| *byte == 0)
+    {
+        return Err("motion admission proof contains an invalid boot epoch".into());
     }
     Ok(())
 }
@@ -845,21 +942,19 @@ fn validate_zero_ack(zero: ZeroAck) -> Result<ZeroConfirmation, String> {
 }
 
 fn validate_success_state(kind: OutcomeKind, result: &GuardResult) -> Result<(), String> {
-    let gate = SafetyGate::try_from(result.gate)
-        .map_err(|_| format!("response contains unknown safety gate {}", result.gate))?;
     let lease = LeaseState::try_from(result.lease)
         .map_err(|_| format!("response contains unknown lease state {}", result.lease))?;
     let expected = match kind {
         OutcomeKind::AcquireLease | OutcomeKind::RenewLease | OutcomeKind::SubmitMotionCommand => {
-            Some((SafetyGate::Armed, LeaseState::Active))
+            Some(LeaseState::Active)
         }
-        OutcomeKind::RevokeAndZero => Some((SafetyGate::Armed, LeaseState::Idle)),
+        OutcomeKind::RevokeAndZero | OutcomeKind::StopAllMotion => Some(LeaseState::Idle),
         OutcomeKind::GetReadiness => None,
     };
-    if let Some((expected_gate, expected_lease)) = expected {
-        if gate != expected_gate || lease != expected_lease {
+    if let Some(expected_lease) = expected {
+        if lease != expected_lease {
             return Err(format!(
-                "response terminal state {gate:?}+{lease:?} does not match {expected_gate:?}+{expected_lease:?}"
+                "response lease state {lease:?} does not match {expected_lease:?}"
             ));
         }
     }
@@ -927,14 +1022,29 @@ async fn exchange_frame(
 }
 
 fn request_operation_id(request: &MotionGuardRequest) -> Option<String> {
-    let envelope = match request.operation.as_ref()? {
-        motion_guard_request::Operation::AcquireLease(body) => body.envelope.as_ref(),
-        motion_guard_request::Operation::RenewLease(body) => body.envelope.as_ref(),
-        motion_guard_request::Operation::SubmitMotionCommand(body) => body.envelope.as_ref(),
-        motion_guard_request::Operation::RevokeAndZero(body) => body.envelope.as_ref(),
+    match request.operation.as_ref()? {
+        motion_guard_request::Operation::AcquireLease(body) => body
+            .envelope
+            .as_ref()
+            .map(|value| value.operation_id.clone()),
+        motion_guard_request::Operation::RenewLease(body) => body
+            .envelope
+            .as_ref()
+            .map(|value| value.operation_id.clone()),
+        motion_guard_request::Operation::SubmitMotionCommand(body) => body
+            .envelope
+            .as_ref()
+            .map(|value| value.operation_id.clone()),
+        motion_guard_request::Operation::RevokeAndZero(body) => body
+            .envelope
+            .as_ref()
+            .map(|value| value.operation_id.clone()),
+        motion_guard_request::Operation::StopAllMotion(body) => body
+            .envelope
+            .as_ref()
+            .map(|value| value.operation_id.clone()),
         _ => None,
-    }?;
-    Some(envelope.operation_id.clone())
+    }
 }
 
 fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResult> {
@@ -943,6 +1053,7 @@ fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResu
         motion_guard_response::Outcome::RenewLease(body) => body.result.as_ref(),
         motion_guard_response::Outcome::SubmitMotionCommand(body) => body.result.as_ref(),
         motion_guard_response::Outcome::RevokeAndZero(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::StopAllMotion(body) => body.result.as_ref(),
         motion_guard_response::Outcome::GetReadiness(body) => body.result.as_ref(),
         _ => None,
     }
@@ -950,10 +1061,18 @@ fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResu
 
 fn seal_request(request: &mut MotionGuardRequest) -> Result<(), MotionGuardClientError> {
     let payload = canonical_payload(request)?;
-    let envelope = operation_envelope_mut(request).ok_or_else(|| {
-        MotionGuardClientError::InvalidInput("mutation request has no envelope".into())
-    })?;
-    envelope.payload_sha256 = sha256(&payload).to_vec();
+    let digest = sha256(&payload).to_vec();
+    if let Some(motion_guard_request::Operation::StopAllMotion(body)) = request.operation.as_mut() {
+        let envelope = body.envelope.as_mut().ok_or_else(|| {
+            MotionGuardClientError::InvalidInput("global stop request has no envelope".into())
+        })?;
+        envelope.payload_sha256 = digest;
+    } else {
+        let envelope = operation_envelope_mut(request).ok_or_else(|| {
+            MotionGuardClientError::InvalidInput("mutation request has no envelope".into())
+        })?;
+        envelope.payload_sha256 = digest;
+    }
     Ok(())
 }
 
@@ -969,6 +1088,9 @@ fn canonical_payload(request: &MotionGuardRequest) -> Result<Vec<u8>, MotionGuar
             Ok(encode_without_envelope(body.clone()))
         }
         Some(motion_guard_request::Operation::RevokeAndZero(body)) => {
+            Ok(encode_without_envelope(body.clone()))
+        }
+        Some(motion_guard_request::Operation::StopAllMotion(body)) => {
             Ok(encode_without_envelope(body.clone()))
         }
         _ => Err(MotionGuardClientError::InvalidInput(
@@ -1000,6 +1122,12 @@ impl EnvelopeMessage for SubmitMotionCommandRequest {
 }
 
 impl EnvelopeMessage for RevokeAndZeroRequest {
+    fn clear_envelope(&mut self) {
+        self.envelope = None;
+    }
+}
+
+impl EnvelopeMessage for StopAllMotionRequest {
     fn clear_envelope(&mut self) {
         self.envelope = None;
     }

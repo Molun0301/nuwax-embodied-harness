@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import pwd
 import stat
-import subprocess
 import sys
 import tempfile
 import uuid
@@ -18,6 +17,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 PROVISION_FIELDS = ("instance_id", "schema_version")
 EPOCH_FIELDS = (
+    "schema_version",
+    "generation",
+    "boot_nonce_hex",
+    "lease_state",
+    "last_zero_ack_id",
+    "peer_uid_allowlist",
+    "actuator_symbols_sha256",
+    "fenced",
+    "startup_zero_confirmed",
+    "created_at",
+)
+V1_EPOCH_FIELDS = (
     "schema_version",
     "generation",
     "boot_nonce_hex",
@@ -32,26 +43,30 @@ EPOCH_FIELDS = (
 )
 PEER_UID_ALLOWLIST = (
     "nuwax-motion-guard",
-    "nuwax-motion-admin",
     "nuwax-navigation",
     "nuwax-gateway",
 )
 SERVICE_IDENTITY_USERS = (
     "nuwax-motion-guard",
-    "nuwax-motion-admin",
     "nuwax-navigation",
     "nuwax-geometry",
     "nuwax-gateway",
 )
-LEGACY_PEER_UID_ALLOWLIST = (
-    "nuwax-motion-guard",
-    "nuwax-motion-admin",
-    "nuwax-geometry",
-    "nuwax-gateway",
+V1_PEER_UID_ALLOWLISTS = (
+    (
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-navigation",
+        "nuwax-gateway",
+    ),
+    (
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-geometry",
+        "nuwax-gateway",
+    ),
 )
 MAX_GENERATION = (1 << 64) - 1
-GUARD_SYSTEMD_UNIT = "nuwax-motion-safety-guard.service"
-MIGRATION_COMMAND = "scripts/install_motion_guard_deployment.sh migrate-peer-allowlist"
 
 
 def _compact_json(value: Dict[str, Any]) -> str:
@@ -84,16 +99,15 @@ def build_initial_epoch_record(
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("actuator_symbols_sha256 must contain 64 lowercase hex chars")
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generation": 0,
         "boot_nonce_hex": "",
-        "safety_gate": "ResetRequired",
         "lease_state": "Idle",
-        "reset_generation": 0,
         "last_zero_ack_id": "",
         "peer_uid_allowlist": list(PEER_UID_ALLOWLIST),
         "actuator_symbols_sha256": actuator_symbols_sha256,
         "fenced": True,
+        "startup_zero_confirmed": False,
         "created_at": created_at,
     }
     return _seal(body)
@@ -130,6 +144,18 @@ def _load_record(path: Path, fields: Iterable[str]) -> Dict[str, Any]:
         raise ValueError(f"record is not an object: {path}")
     _validate_record(record, fields)
     return record
+
+
+def _load_epoch_record(path: Path) -> Dict[str, Any]:
+    preview = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(preview, dict):
+        raise ValueError(f"record is not an object: {path}")
+    schema_version = preview.get("schema_version")
+    if schema_version == 1:
+        return _load_record(path, V1_EPOCH_FIELDS)
+    if schema_version == 2:
+        return _load_record(path, EPOCH_FIELDS)
+    raise ValueError("unsupported durable record schema version")
 
 
 def _write_new_record(
@@ -250,10 +276,9 @@ def _validate_epoch_semantics(
     epoch: Dict[str, Any],
     expected_peer_uid_allowlist: Tuple[str, ...],
 ) -> None:
-    if epoch.get("schema_version") != 1:
+    if epoch.get("schema_version") != 2:
         raise ValueError("unsupported durable record schema version")
     _require_u64(epoch, "generation")
-    _require_u64(epoch, "reset_generation")
     boot_nonce_hex = epoch.get("boot_nonce_hex")
     if not isinstance(boot_nonce_hex, str):
         raise ValueError("epoch boot_nonce_hex must be a string")
@@ -264,8 +289,6 @@ def _validate_epoch_semantics(
             raise ValueError("epoch boot_nonce_hex is not hexadecimal") from exc
         if len(nonce) != 16:
             raise ValueError("epoch boot_nonce_hex must be exactly 128 bits")
-    if epoch.get("safety_gate") not in {"ResetRequired", "Armed"}:
-        raise ValueError("epoch safety_gate is invalid")
     if epoch.get("lease_state") not in {"Idle", "Active", "Pausing", "Revoking"}:
         raise ValueError("epoch lease_state is invalid")
     if not isinstance(epoch.get("last_zero_ack_id"), str):
@@ -280,16 +303,31 @@ def _validate_epoch_semantics(
         raise ValueError("epoch actuator_symbols_sha256 is invalid")
     if not isinstance(epoch.get("fenced"), bool):
         raise ValueError("epoch fenced must be a boolean")
+    if not isinstance(epoch.get("startup_zero_confirmed"), bool):
+        raise ValueError("epoch startup_zero_confirmed must be a boolean")
     if not isinstance(epoch.get("created_at"), str) or not epoch["created_at"]:
         raise ValueError("epoch created_at is required")
 
 
-def _require_current_peer_allowlist(epoch: Dict[str, Any]) -> None:
-    actual = tuple(epoch.get("peer_uid_allowlist", ()))
-    if actual == LEGACY_PEER_UID_ALLOWLIST:
-        raise ValueError(f"legacy epoch peer_uid_allowlist requires explicit migration; run {MIGRATION_COMMAND}")
-    if actual != PEER_UID_ALLOWLIST:
-        raise ValueError("epoch peer_uid_allowlist drift")
+def _validate_v1_epoch_for_guard_migration(epoch: Dict[str, Any]) -> None:
+    if epoch.get("schema_version") != 1:
+        raise ValueError("epoch is not a v1 migration input")
+    _require_u64(epoch, "generation")
+    _require_u64(epoch, "reset_generation")
+    if tuple(epoch.get("peer_uid_allowlist", ())) not in V1_PEER_UID_ALLOWLISTS:
+        raise ValueError("epoch v1 peer_uid_allowlist drift")
+    if epoch.get("lease_state") not in {"Idle", "Active", "Pausing", "Revoking"}:
+        raise ValueError("epoch v1 lease_state is invalid")
+    if not isinstance(epoch.get("last_zero_ack_id"), str):
+        raise ValueError("epoch v1 last_zero_ack_id must be a string")
+    actuator_digest = epoch.get("actuator_symbols_sha256")
+    if not isinstance(actuator_digest, str) or not actuator_digest.startswith("sha256:"):
+        raise ValueError("epoch v1 actuator_symbols_sha256 is invalid")
+    digest = actuator_digest[len("sha256:") :]
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("epoch v1 actuator_symbols_sha256 is invalid")
+    if not isinstance(epoch.get("fenced"), bool):
+        raise ValueError("epoch v1 fenced must be a boolean")
 
 
 def _verify_path_metadata(
@@ -320,12 +358,12 @@ def _load_verified_records(
     provision_path = state_dir / "provisioned.json"
     epoch_path = state_dir / "epoch.json"
     provisioned = _load_record(provision_path, PROVISION_FIELDS)
-    epoch = _load_record(epoch_path, EPOCH_FIELDS)
+    epoch = _load_epoch_record(epoch_path)
 
     instance_id = str(uuid.UUID(provisioned["instance_id"]))
     if instance_id != provisioned["instance_id"] or uuid.UUID(instance_id).version != 4:
         raise ValueError("provisioned.instance_id is not a canonical UUIDv4")
-    if provisioned["schema_version"] != 1 or epoch["schema_version"] != 1:
+    if provisioned["schema_version"] != 1:
         raise ValueError("unsupported durable record schema version")
     if manifest is not None and epoch["actuator_symbols_sha256"] != _manifest_digest(manifest):
         raise ValueError("epoch actuator hash does not match supplied manifest")
@@ -334,47 +372,6 @@ def _load_verified_records(
     _verify_path_metadata(provision_path, uid=uid, gid=gid, mode=0o400)
     _verify_path_metadata(epoch_path, uid=uid, gid=gid, mode=0o600)
     return uid, gid, provisioned, epoch
-
-
-def _guard_systemd_state() -> Dict[str, str]:
-    result = subprocess.run(
-        [
-            "systemctl",
-            "show",
-            GUARD_SYSTEMD_UNIT,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=MainPID",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "systemctl show failed"
-        raise ValueError(f"cannot inspect {GUARD_SYSTEMD_UNIT}: {detail}")
-    state: Dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            state[key] = value
-    if set(state) != {"LoadState", "ActiveState", "MainPID"}:
-        raise ValueError(f"incomplete systemd state for {GUARD_SYSTEMD_UNIT}")
-    return state
-
-
-def _require_guard_stopped_for_migration() -> None:
-    state = _guard_systemd_state()
-    if state["LoadState"] != "loaded":
-        raise ValueError(f"{GUARD_SYSTEMD_UNIT} must be loaded before migration")
-    if state["ActiveState"] not in {"inactive", "failed"}:
-        raise ValueError(f"{GUARD_SYSTEMD_UNIT} must be inactive or failed before migration")
-    try:
-        main_pid = int(state["MainPID"])
-    except ValueError as exc:
-        raise ValueError(f"{GUARD_SYSTEMD_UNIT} MainPID is invalid") from exc
-    if main_pid != 0:
-        raise ValueError(f"{GUARD_SYSTEMD_UNIT} MainPID must be 0 before migration")
 
 
 def provision(state_dir: Path, manifest: Path, owner: str) -> None:
@@ -392,9 +389,11 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
         _write_new_record(provision_path, record, 0o400, uid, gid)
 
     if epoch_path.exists():
-        epoch = _load_record(epoch_path, EPOCH_FIELDS)
-        _require_current_peer_allowlist(epoch)
-        _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
+        epoch = _load_epoch_record(epoch_path)
+        if epoch["schema_version"] == 1:
+            _validate_v1_epoch_for_guard_migration(epoch)
+        else:
+            _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
         if epoch["actuator_symbols_sha256"] != actuator_digest:
             raise ValueError("existing epoch actuator_symbols_sha256 does not match supplied manifest")
     else:
@@ -402,55 +401,23 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
         epoch = build_initial_epoch_record(actuator_digest, created_at)
         _write_new_record(epoch_path, epoch, 0o600, uid, gid)
 
-    verify(state_dir, manifest, owner)
+    _verify_path_metadata(state_dir, uid=uid, gid=gid, mode=0o700, directory=True)
+    _verify_path_metadata(provision_path, uid=uid, gid=gid, mode=0o400)
+    _verify_path_metadata(epoch_path, uid=uid, gid=gid, mode=0o600)
 
 
 def verify(state_dir: Path, manifest: Optional[Path], owner: str) -> None:
     validate_service_identity_uids()
     _, _, _, epoch = _load_verified_records(state_dir, manifest, owner)
-    _require_current_peer_allowlist(epoch)
+    if epoch.get("schema_version") != 2:
+        raise ValueError("epoch v1 has not yet been migrated by motion guard startup")
     _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
-
-
-def migrate_peer_allowlist(state_dir: Path, manifest: Path, owner: str) -> None:
-    validate_service_identity_uids()
-    uid, gid, _, epoch = _load_verified_records(state_dir, manifest, owner)
-    actual_allowlist = tuple(epoch.get("peer_uid_allowlist", ()))
-    if actual_allowlist == PEER_UID_ALLOWLIST:
-        raise ValueError("epoch peer_uid_allowlist is already current; migration refused")
-    if actual_allowlist != LEGACY_PEER_UID_ALLOWLIST:
-        raise ValueError("unexpected epoch peer_uid_allowlist; migration refused")
-    _validate_epoch_semantics(epoch, LEGACY_PEER_UID_ALLOWLIST)
-    _require_guard_stopped_for_migration()
-    if epoch["fenced"] is not True:
-        raise ValueError("epoch must be fenced before peer allowlist migration")
-    generation = _require_u64(epoch, "generation")
-    if generation == MAX_GENERATION:
-        raise ValueError("epoch generation overflow; migration refused")
-
-    migrated_body = {field: epoch[field] for field in EPOCH_FIELDS}
-    migrated_body.update(
-        {
-            "generation": generation + 1,
-            "boot_nonce_hex": "",
-            "safety_gate": "ResetRequired",
-            "lease_state": "Idle",
-            "peer_uid_allowlist": list(PEER_UID_ALLOWLIST),
-            "fenced": True,
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        }
-    )
-    migrated = _seal(migrated_body)
-    _validate_record(migrated, EPOCH_FIELDS)
-    _validate_epoch_semantics(migrated, PEER_UID_ALLOWLIST)
-    _replace_record(state_dir / "epoch.json", migrated, 0o600, uid, gid)
-    verify(state_dir, manifest, owner)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Provision NuwaX motion guard durable records")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("provision", "verify", "migrate-peer-allowlist"):
+    for command in ("provision", "verify"):
         child = subparsers.add_parser(command)
         child.add_argument(
             "--state-dir",
@@ -465,17 +432,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command in {"provision", "migrate-peer-allowlist"}:
+        if args.command == "provision":
             if args.actuator_symbols_file is None:
                 raise ValueError(f"{args.command} requires --actuator-symbols-file")
         if args.command == "provision":
             provision(args.state_dir, args.actuator_symbols_file, args.owner)
-        elif args.command == "migrate-peer-allowlist":
-            migrate_peer_allowlist(
-                args.state_dir,
-                args.actuator_symbols_file,
-                args.owner,
-            )
         else:
             verify(args.state_dir, args.actuator_symbols_file, args.owner)
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as error:

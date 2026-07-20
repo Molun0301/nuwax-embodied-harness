@@ -42,10 +42,6 @@ class Go2ProviderBundle(
     assembly: "Go2RobotAssembly"
     provider_name: str = "go2_default_bundle"
     provider_version: str = "0.1.0"
-    safety_guard: Optional[object] = None
-
-    def bind_safety_guard(self, safety_guard: object) -> None:
-        self.safety_guard = safety_guard
 
     def is_available(self) -> bool:
         return self.assembly.high_level_initialized
@@ -64,7 +60,6 @@ class Go2ProviderBundle(
                 "high_level_initialized": self.assembly.high_level_initialized,
                 "device_data_plane": "sensor_only",
             },
-            "safe_stop": self._get_safe_stop_state(),
             "default_sensors": list(self.assembly.manifest.default_sensors),
             "default_audio_backends": list(self.assembly.manifest.default_audio_backends),
         }
@@ -199,24 +194,13 @@ class Go2ProviderBundle(
             unsubscriber(subscription_id)
 
     def get_safety_state(self) -> SafetyState:
-        safe_stop_state = self._get_safe_stop_state()
-        is_estopped = bool(safe_stop_state.get("is_estopped", False))
+        motion_available = bool(self.assembly.high_level_initialized)
         return SafetyState(
-            is_estopped=is_estopped,
-            motors_enabled=False,
-            can_move=False,
+            motors_enabled=motion_available,
+            can_move=motion_available,
             warning_message=(
-                str(safe_stop_state.get("last_stop_reason") or "安全停止门禁处于激活状态。")
-                if is_estopped
-                else "设备提供器仅报告传感状态，运动授权由 motion safety guard 决定。"
+                None
+                if motion_available
+                else "高层运动执行器尚未初始化。"
             ),
         )
-
-    def _get_safe_stop_state(self) -> Dict[str, object]:
-        if self.safety_guard is None:
-            return {}
-        state_getter = getattr(self.safety_guard, "get_safe_stop_state", None)
-        if not callable(state_getter):
-            return {}
-        state = state_getter()
-        return dict(state) if isinstance(state, dict) else {}

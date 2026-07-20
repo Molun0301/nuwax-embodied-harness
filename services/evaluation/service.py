@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
 import math
 import time
 from typing import Deque, Dict, Iterable, List, Optional, Sequence
@@ -488,13 +487,11 @@ class EvaluationService:
         )
 
     def _safety_metrics(self, status_text: str, safety_snapshot: MetadataDict) -> SafetyEvaluationMetrics:
-        safe_stop = safety_snapshot.get("safe_stop") if isinstance(safety_snapshot.get("safe_stop"), dict) else {}
         obstacle = safety_snapshot.get("official_obstacle_avoidance") if isinstance(safety_snapshot.get("official_obstacle_avoidance"), dict) else {}
         terminal = safety_snapshot.get("terminal_feedback") if isinstance(safety_snapshot.get("terminal_feedback"), dict) else {}
         recoveries = int(terminal.get("number_of_recoveries") or 0) if isinstance(terminal, dict) else 0
         return SafetyEvaluationMetrics(
             collision_count=int(safety_snapshot.get("collision_count") or terminal.get("collision_count") or 0),
-            emergency_stop_count=1 if bool(safe_stop.get("safe_stop_active") or safe_stop.get("is_estopped")) else 0,
             official_obstacle_avoidance_trigger_count=1 if bool(obstacle.get("obstacle_avoidance_enabled") and recoveries > 0) else 0,
             near_miss_count=int(safety_snapshot.get("near_miss_count") or safety_snapshot.get("near_distance_risk_count") or 0),
             cancel_count=1 if status_text == "cancelled" else 0,
@@ -629,7 +626,6 @@ class EvaluationService:
             topk_hit_rate=self._bool_mean([item.topk_hit for item in retrieval_metrics]),
             wrong_candidate_rate=self._mean([item.wrong_candidate_rate for item in retrieval_metrics]),
             collision_count=sum(item.collision_count for item in safety_metrics),
-            emergency_stop_count=sum(item.emergency_stop_count for item in safety_metrics),
             cancel_count=sum(item.cancel_count for item in safety_metrics),
             timeout_count=sum(item.timeout_count for item in safety_metrics),
             memory_write_success_rate=self._mean([item.new_observation_write_success_rate for item in memory_metrics]),

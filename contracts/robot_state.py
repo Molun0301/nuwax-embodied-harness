@@ -59,9 +59,8 @@ class BatteryState(ContractModel):
 class SafetyState(ContractModel):
     """安全状态。"""
 
-    is_estopped: bool = Field(default=False, description="是否触发急停。")
     motors_enabled: bool = Field(default=True, description="电机是否上电。")
-    can_move: bool = Field(default=True, description="当前是否允许移动。")
+    can_move: bool = Field(default=True, description="运动执行链当前是否客观可用。")
     warning_message: Optional[str] = Field(default=None, description="最新安全告警。")
 
 

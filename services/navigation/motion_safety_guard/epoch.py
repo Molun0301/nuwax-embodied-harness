@@ -30,6 +30,18 @@ EPOCH_FIELDS = (
     "schema_version",
     "generation",
     "boot_nonce_hex",
+    "lease_state",
+    "last_zero_ack_id",
+    "peer_uid_allowlist",
+    "actuator_symbols_sha256",
+    "fenced",
+    "startup_zero_confirmed",
+    "created_at",
+)
+V1_EPOCH_FIELDS = (
+    "schema_version",
+    "generation",
+    "boot_nonce_hex",
     "safety_gate",
     "lease_state",
     "reset_generation",
@@ -41,15 +53,22 @@ EPOCH_FIELDS = (
 )
 EXPECTED_USERS = (
     "nuwax-motion-guard",
-    "nuwax-motion-admin",
     "nuwax-navigation",
     "nuwax-gateway",
 )
-LEGACY_EXPECTED_USERS = (
-    "nuwax-motion-guard",
-    "nuwax-motion-admin",
-    "nuwax-geometry",
-    "nuwax-gateway",
+V1_EXPECTED_USER_SETS = (
+    (
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-navigation",
+        "nuwax-gateway",
+    ),
+    (
+        "nuwax-motion-guard",
+        "nuwax-motion-admin",
+        "nuwax-geometry",
+        "nuwax-gateway",
+    ),
 )
 
 
@@ -137,13 +156,12 @@ class EpochRecord:
     schema_version: int
     generation: int
     boot_nonce_hex: str
-    safety_gate: str
     lease_state: str
-    reset_generation: int
     last_zero_ack_id: str
     peer_uid_allowlist: Tuple[str, ...]
     actuator_symbols_sha256: str
     fenced: bool
+    startup_zero_confirmed: bool
     created_at: str
     checksum: str = ""
 
@@ -159,13 +177,12 @@ class EpochRecord:
             "schema_version": EPOCH_SCHEMA_VERSION,
             "generation": generation,
             "boot_nonce_hex": "",
-            "safety_gate": "ResetRequired",
             "lease_state": "Idle",
-            "reset_generation": 0,
             "last_zero_ack_id": "",
             "peer_uid_allowlist": EXPECTED_USERS,
             "actuator_symbols_sha256": actuator_symbols_sha256,
             "fenced": True,
+            "startup_zero_confirmed": False,
             "created_at": created_at,
         }
         cls._validate_fields(raw, allow_empty_nonce=True)
@@ -184,19 +201,44 @@ class EpochRecord:
                 "schema_version": int(document["schema_version"]),
                 "generation": int(document["generation"]),
                 "boot_nonce_hex": str(document["boot_nonce_hex"]),
-                "safety_gate": str(document["safety_gate"]),
                 "lease_state": str(document["lease_state"]),
-                "reset_generation": int(document["reset_generation"]),
                 "last_zero_ack_id": str(document["last_zero_ack_id"]),
                 "peer_uid_allowlist": tuple(document["peer_uid_allowlist"]),
                 "actuator_symbols_sha256": str(document["actuator_symbols_sha256"]),
                 "fenced": bool(document["fenced"]),
+                "startup_zero_confirmed": document["startup_zero_confirmed"],
                 "created_at": str(document["created_at"]),
             }
         except (KeyError, TypeError, ValueError) as exc:
             raise EpochError("invalid epoch record") from exc
         cls._validate_fields(raw, allow_empty_nonce=allow_empty_nonce)
         return cls(checksum=str(document["checksum"]), **raw)
+
+    @classmethod
+    def from_v1_document(cls, document: Mapping[str, Any]) -> "EpochRecord":
+        _verify_checksum(document, fields=V1_EPOCH_FIELDS, label="epoch v1")
+        try:
+            users = tuple(document["peer_uid_allowlist"])
+            if users not in V1_EXPECTED_USER_SETS:
+                raise EpochError("epoch v1 peer_uid_allowlist drift")
+            raw = {
+                "schema_version": EPOCH_SCHEMA_VERSION,
+                "generation": int(document["generation"]),
+                "boot_nonce_hex": str(document["boot_nonce_hex"]),
+                "lease_state": str(document["lease_state"]),
+                "last_zero_ack_id": str(document["last_zero_ack_id"]),
+                "peer_uid_allowlist": EXPECTED_USERS,
+                "actuator_symbols_sha256": str(
+                    document["actuator_symbols_sha256"]
+                ),
+                "fenced": bool(document["fenced"]),
+                "startup_zero_confirmed": False,
+                "created_at": str(document["created_at"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EpochError("invalid epoch v1 record") from exc
+        cls._validate_fields(raw, allow_empty_nonce=True)
+        return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
 
     @staticmethod
     def _validate_fields(
@@ -209,9 +251,6 @@ class EpochRecord:
         generation = int(raw["generation"])
         if generation < 0 or generation > MAX_GENERATION:
             raise EpochError("generation is outside u64 range")
-        reset_generation = int(raw["reset_generation"])
-        if reset_generation < 0 or reset_generation > MAX_GENERATION:
-            raise EpochError("reset_generation is outside u64 range")
         nonce = str(raw["boot_nonce_hex"])
         if nonce or not allow_empty_nonce:
             try:
@@ -220,16 +259,9 @@ class EpochRecord:
                 raise EpochError("boot_nonce_hex is not valid hexadecimal") from exc
             if len(nonce_bytes) != 16:
                 raise EpochError("boot_nonce_hex must be exactly 128 bits")
-        if raw["safety_gate"] not in {"ResetRequired", "Armed"}:
-            raise EpochError("invalid safety_gate")
         if raw["lease_state"] not in {"Idle", "Active", "Pausing", "Revoking"}:
             raise EpochError("invalid lease_state")
         peer_uid_allowlist = tuple(raw["peer_uid_allowlist"])
-        if peer_uid_allowlist == LEGACY_EXPECTED_USERS:
-            raise EpochError(
-                "legacy peer_uid_allowlist requires explicit migration; "
-                "run install_motion_guard_deployment.sh migrate-peer-allowlist"
-            )
         if peer_uid_allowlist != EXPECTED_USERS:
             raise EpochError("peer_uid_allowlist drift")
         digest = str(raw["actuator_symbols_sha256"])
@@ -239,6 +271,8 @@ class EpochRecord:
             raise EpochError("actuator_symbols_sha256 is invalid")
         if not isinstance(raw["fenced"], bool):
             raise EpochError("fenced must be a boolean")
+        if not isinstance(raw["startup_zero_confirmed"], bool):
+            raise EpochError("startup_zero_confirmed must be a boolean")
         if not str(raw["created_at"]):
             raise EpochError("created_at is required")
 
@@ -257,13 +291,12 @@ class EpochRecord:
             "schema_version": self.schema_version,
             "generation": self.generation,
             "boot_nonce_hex": self.boot_nonce_hex,
-            "safety_gate": self.safety_gate,
             "lease_state": self.lease_state,
-            "reset_generation": self.reset_generation,
             "last_zero_ack_id": self.last_zero_ack_id,
             "peer_uid_allowlist": list(self.peer_uid_allowlist),
             "actuator_symbols_sha256": self.actuator_symbols_sha256,
             "fenced": self.fenced,
+            "startup_zero_confirmed": self.startup_zero_confirmed,
             "created_at": self.created_at,
             "checksum": self.checksum,
         }
@@ -357,6 +390,15 @@ class EpochStore:
             expected_mode=0o600,
             label="epoch",
         )
+        if document.get("schema_version") == 1:
+            backup_path = self.epoch_path.with_name(
+                self.epoch_path.name + ".v1.bak"
+            )
+            if not backup_path.exists():
+                atomic_write_record(backup_path, document, mode=0o600)
+            migrated = EpochRecord.from_v1_document(document)
+            self.persist(migrated)
+            return migrated
         return EpochRecord.from_document(document)
 
     def persist(self, record: EpochRecord) -> None:
@@ -371,9 +413,9 @@ class EpochStore:
         advanced = previous.with_updates(
             generation=previous.generation + 1,
             boot_nonce_hex=secrets.token_hex(16),
-            safety_gate="ResetRequired",
             lease_state="Idle",
             fenced=True,
+            startup_zero_confirmed=False,
             created_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         )
         self.persist(advanced)

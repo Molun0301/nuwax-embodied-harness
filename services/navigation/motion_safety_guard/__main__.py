@@ -66,7 +66,7 @@ def run() -> None:
         )
         if not core.startup_configured:
             raise RuntimeError(core.startup_reason)
-        core.force_safe_fence()
+        core.initialize_zero_fence()
         socket_gid = grp.getgrnam(client_group).gr_gid
         server = MotionGuardUnixServer(
             socket_path=socket_path,

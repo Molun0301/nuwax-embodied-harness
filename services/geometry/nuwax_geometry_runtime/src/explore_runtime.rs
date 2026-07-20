@@ -31,6 +31,8 @@ use parking_lot::{Mutex as SyncMutex, RwLock};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::nav_runtime::MotionAdmissionProof;
+
 pub const STATUS_IDLE: &str = "IDLE";
 pub const STATUS_ACCEPTED: &str = "ACCEPTED";
 pub const STATUS_REJECTED: &str = "REJECTED";
@@ -142,6 +144,7 @@ pub struct ExploreStartConfig {
     pub arbitration: String,
     pub map_version_id: String,
     pub map_revision: u64,
+    pub motion_admission: MotionAdmissionProof,
     pub boundary: Option<ExplorationBoundary>,
     pub stop_conditions: ExploreStopConditions,
     pub max_navigation_retries: u32,
@@ -155,6 +158,7 @@ impl Default for ExploreStartConfig {
             arbitration: POLICY_PREFER_WAVEFRONT.to_string(),
             map_version_id: String::new(),
             map_revision: 0,
+            motion_admission: MotionAdmissionProof::default(),
             boundary: None,
             stop_conditions: ExploreStopConditions::default(),
             max_navigation_retries: 1,
@@ -185,6 +189,9 @@ impl ExploreStartConfig {
         if !self.blacklist_radius_m.is_finite() || self.blacklist_radius_m < 0.0 {
             return Err("blacklist_radius_m must be finite and non-negative".to_string());
         }
+        self.motion_admission
+            .validate()
+            .map_err(|reason| format!("motion admission proof invalid: {reason}"))?;
         if self
             .stop_conditions
             .max_coverage_pct
@@ -226,6 +233,7 @@ pub struct ChildNavigationRequest {
     pub request_id: String,
     pub map_version_id: String,
     pub map_revision: u64,
+    pub motion_admission: MotionAdmissionProof,
     pub frontier_goal_id: String,
     pub goal: NavigationGoal,
     pub boundary: Option<ExplorationBoundary>,
@@ -633,11 +641,13 @@ impl ExploreRuntimeHandle {
         self.inner.lock().await.arbitration
     }
 
+    #[cfg(test)]
     pub async fn start(&self, request_id: &str, arbitration: &str) -> ExploreRuntimeSnapshot {
         self.start_with_config(
             request_id,
             ExploreStartConfig {
                 arbitration: arbitration.to_string(),
+                motion_admission: crate::nav_runtime::test_motion_admission(),
                 ..ExploreStartConfig::default()
             },
         )
@@ -1207,6 +1217,7 @@ impl ExploreRuntimeHandle {
                     request_id: child_request_id,
                     map_version_id: config.map_version_id,
                     map_revision: costmap.map_revision,
+                    motion_admission: config.motion_admission,
                     frontier_goal_id: goal.id.clone(),
                     goal: navigation_goal,
                     boundary: config.boundary,
@@ -2827,6 +2838,7 @@ mod tests {
                 "req-pinned",
                 ExploreStartConfig {
                     map_revision: 1,
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
                     stop_conditions: ExploreStopConditions {
                         stop_on_map_revision_change: true,
                         ..ExploreStopConditions::default()
@@ -2874,6 +2886,7 @@ mod tests {
                 "req-boundary",
                 ExploreStartConfig {
                     boundary: Some(boundary.clone()),
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
                     ..ExploreStartConfig::default()
                 },
             )
@@ -2885,6 +2898,10 @@ mod tests {
         let submitted = sink.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         assert_eq!(submitted[0].boundary.as_ref(), Some(&boundary));
+        assert_eq!(
+            submitted[0].motion_admission,
+            crate::nav_runtime::test_motion_admission()
+        );
     }
 
     #[tokio::test]
@@ -3071,6 +3088,7 @@ mod tests {
             .start_with_config(
                 "req-max-goals",
                 ExploreStartConfig {
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
                     stop_conditions: ExploreStopConditions {
                         max_goals: Some(1),
                         ..ExploreStopConditions::default()
@@ -3117,6 +3135,7 @@ mod tests {
             .start_with_config(
                 "req-max-goals-failed",
                 ExploreStartConfig {
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
                     stop_conditions: ExploreStopConditions {
                         max_goals: Some(1),
                         ..ExploreStopConditions::default()

@@ -12,6 +12,7 @@ capture_image 归属见 §4 决策（本批暂不下放，归后续感知批 / �
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, Optional
 
 from core.errors import GatewayError
@@ -45,13 +46,30 @@ def handle_stop_all_motion(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """触发安全停止，停止机器人全部运动。
+    """普通全局停车；成功必须包含关联的 zero/fence 证明。
 
     迁移自 GatewayRuntime._handle_stop_all_motion；self.safety_guard→ctx.safety_guard。
     """
 
-    reason = payload.get("reason") or f"{requested_by or 'unknown'} 请求安全停止。"
-    ctx.safety_guard.stop_all_motion(reason)
-    return {"stopped": True, "reason": reason}
-
-
+    reason = payload.get("reason") or f"{requested_by or 'unknown'} 请求停止所有运动。"
+    operation_id = str(payload.get("operation_id") or "").strip() or (
+        f"stop-all-motion:{uuid.uuid4()}"
+    )
+    try:
+        result = ctx.safety_guard.stop_all_motion(
+            reason,
+            operation_id=operation_id,
+        )
+    except Exception as exc:
+        raise GatewayError(
+            "已取消本地运动任务，但未能确认机器人完成全局停车。",
+            error_code="MOTION_STOP_UNCONFIRMED",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "reason": reason,
+                "operation_id": operation_id,
+                "error": str(exc),
+            },
+        ) from exc
+    return ctx.serialize(result)

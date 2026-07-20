@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import uuid
 
 from contracts.base import MetadataDict, utc_now
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from core.event_bus import EventBus
 from core.resource_lock import ResourceLockManager, RuntimeResource
 
-StopHandler = Callable[[Optional[str]], None]
+StopHandler = Callable[[Optional[str], str], Any]
+
+_STOP_RESULT_CACHE_LIMIT = 128
+
+
+class MotionStopGenerationError(RuntimeError):
+    """A pre-stop request attempted to submit motion after a newer stop."""
+
+    def __init__(self, expected: int, current: int) -> None:
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            "motion request was cancelled by stop generation rollover "
+            f"(expected={expected}, current={current})"
+        )
 
 
 @dataclass
@@ -25,7 +43,7 @@ class WatchdogRegistration:
 
 
 class SafetyGuard:
-    """全局安全保护器。"""
+    """无锁存的全局停车协调器与看门狗。"""
 
     def __init__(
         self,
@@ -37,43 +55,35 @@ class SafetyGuard:
         self._resource_lock_manager = resource_lock_manager
         self._stop_handlers: Dict[str, StopHandler] = {}
         self._watchdogs: Dict[str, WatchdogRegistration] = {}
-        self._last_stop_reason: Optional[str] = None
-        self._safe_stop_active = False
-        self._safe_stop_triggered_at: Optional[datetime] = None
-        self._safe_stop_recovered_at: Optional[datetime] = None
+        self._motion_stop_generation = 0
+        self._successful_stop_results: OrderedDict[str, MetadataDict] = OrderedDict()
+        self._stop_execution_lock = threading.RLock()
         self._lock = threading.RLock()
 
     @property
-    def last_stop_reason(self) -> Optional[str]:
-        """最近一次停机原因。"""
+    def motion_stop_generation(self) -> int:
+        """返回用于取消旧运动请求的本地单调代次。"""
 
         with self._lock:
-            return self._last_stop_reason
+            return self._motion_stop_generation
 
-    @property
-    def safe_stop_active(self) -> bool:
-        """安全停止门禁是否处于激活状态。"""
+    def begin_motion_admission(self) -> int:
+        """Wait for an in-flight stop, then snapshot the admission generation."""
 
-        with self._lock:
-            return self._safe_stop_active
+        with self._stop_execution_lock:
+            with self._lock:
+                return self._motion_stop_generation
 
-    @property
-    def is_estopped(self) -> bool:
-        """是否处于急停禁行状态。"""
+    @contextmanager
+    def motion_submission(self, expected_generation: int) -> Iterator[None]:
+        """Serialize the final pre-submit check against ordinary stop-all."""
 
-        return self.safe_stop_active
-
-    def get_safe_stop_state(self) -> MetadataDict:
-        """导出安全停止状态快照。"""
-
-        with self._lock:
-            return {
-                "safe_stop_active": self._safe_stop_active,
-                "is_estopped": self._safe_stop_active,
-                "last_stop_reason": self._last_stop_reason,
-                "triggered_at": self._safe_stop_triggered_at.isoformat() if self._safe_stop_triggered_at else None,
-                "recovered_at": self._safe_stop_recovered_at.isoformat() if self._safe_stop_recovered_at else None,
-            }
+        with self._stop_execution_lock:
+            with self._lock:
+                current = self._motion_stop_generation
+            if expected_generation != current:
+                raise MotionStopGenerationError(expected_generation, current)
+            yield
 
     def register_stop_handler(self, name: str, handler: StopHandler) -> None:
         """注册安全停机处理器。"""
@@ -131,59 +141,89 @@ class SafetyGuard:
             self.stop_all_motion(f"watchdog 超时: {names}")
         return tuple(stale)
 
-    def stop_all_motion(self, reason: Optional[str] = None) -> None:
-        """执行全局安全停机并保持急停门禁。"""
+    def stop_all_motion(
+        self,
+        reason: Optional[str] = None,
+        *,
+        operation_id: Optional[str] = None,
+    ) -> MetadataDict:
+        """执行一次普通全局停车，不改变后续请求的运动资格。"""
 
-        with self._lock:
-            handlers = tuple(self._stop_handlers.items())
-            self._last_stop_reason = reason
-            self._safe_stop_active = True
-            self._safe_stop_triggered_at = utc_now()
-            self._safe_stop_recovered_at = None
-            state = self.get_safe_stop_state()
+        correlated_operation_id = str(operation_id or uuid.uuid4().hex).strip()
+        if not correlated_operation_id:
+            correlated_operation_id = uuid.uuid4().hex
 
-        for _, handler in handlers:
-            handler(reason)
+        result: Optional[MetadataDict] = None
+        stop_error: Optional[Exception] = None
+        stop_traceback = None
+        stop_generation = -1
+        with self._stop_execution_lock:
+            cached = self._successful_stop_results.get(correlated_operation_id)
+            if cached is not None:
+                self._successful_stop_results.move_to_end(correlated_operation_id)
+                return deepcopy(cached)
 
-        if self._resource_lock_manager is not None:
-            self._resource_lock_manager.force_release(
-                [RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value]
-            )
+            with self._lock:
+                handlers = tuple(self._stop_handlers.items())
+                self._motion_stop_generation += 1
+                stop_generation = self._motion_stop_generation
 
-        if self._event_bus is not None:
-            self._event_bus.publish(
-                self._event_bus.build_event(
-                    "safety.stop_triggered",
-                    category=RuntimeEventCategory.SAFETY,
-                    source="safety_guard",
-                    severity=RuntimeEventSeverity.WARNING,
-                    message=reason or "触发全局安全停机。",
-                    payload=state,
+            handler_results: Dict[str, Any] = {}
+            try:
+                for name, handler in handlers:
+                    handler_results[name] = handler(reason, correlated_operation_id)
+
+                if self._resource_lock_manager is not None:
+                    self._resource_lock_manager.force_release(
+                        [
+                            RuntimeResource.BASE_MOTION.value,
+                            RuntimeResource.NAVIGATION.value,
+                        ]
+                    )
+
+                result = {
+                    "stopped": True,
+                    "reason": reason,
+                    "operation_id": correlated_operation_id,
+                    "motion_stop_generation": stop_generation,
+                    "handler_results": handler_results,
+                }
+                self._successful_stop_results[correlated_operation_id] = deepcopy(result)
+                while len(self._successful_stop_results) > _STOP_RESULT_CACHE_LIMIT:
+                    self._successful_stop_results.popitem(last=False)
+            except Exception as exc:
+                stop_error = exc
+                stop_traceback = exc.__traceback__
+
+        if stop_error is not None:
+            if self._event_bus is not None:
+                self._event_bus.publish(
+                    self._event_bus.build_event(
+                        "motion.stop_unconfirmed",
+                        category=RuntimeEventCategory.SAFETY,
+                        source="safety_guard",
+                        severity=RuntimeEventSeverity.ERROR,
+                        message=reason or "全局停车未取得确认。",
+                        payload={
+                            "operation_id": correlated_operation_id,
+                            "motion_stop_generation": stop_generation,
+                            "error": str(stop_error),
+                        },
+                    )
                 )
-            )
+            raise stop_error.with_traceback(stop_traceback)
 
-    def clear_safe_stop(self, reason: Optional[str] = None) -> MetadataDict:
-        """显式恢复安全停止门禁。"""
-
-        with self._lock:
-            self._safe_stop_active = False
-            self._safe_stop_recovered_at = utc_now()
-            state = self.get_safe_stop_state()
+        assert result is not None
 
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
-                    "safety.stop_recovered",
+                    "motion.stop_completed",
                     category=RuntimeEventCategory.SAFETY,
                     source="safety_guard",
                     severity=RuntimeEventSeverity.INFO,
-                    message=reason or "安全停止门禁已显式恢复。",
-                    payload=state,
+                    message=reason or "全局停车已确认。",
+                    payload=result,
                 )
             )
-        return state
-
-    def restore_safe_stop(self, reason: Optional[str] = None) -> MetadataDict:
-        """恢复安全停止门禁的兼容入口。"""
-
-        return self.clear_safe_stop(reason)
+        return deepcopy(result)

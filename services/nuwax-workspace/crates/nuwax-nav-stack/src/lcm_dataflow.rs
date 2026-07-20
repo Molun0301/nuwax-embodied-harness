@@ -62,8 +62,6 @@ use crate::runner::InProcessNode;
 
 const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(feature = "guard-runtime")]
-const MOTION_GUARD_READY_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(feature = "patrolling")]
 const PLANNER_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -715,37 +713,6 @@ fn schema_pose_is_finite_and_normalized(pose: &schema::Pose) -> bool {
 }
 
 #[cfg(feature = "guard-runtime")]
-async fn wait_for_guard_scheduler_readiness(
-    status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
-    timeout: Duration,
-) -> NavStackResult<()> {
-    match tokio::time::timeout(timeout, async {
-        loop {
-            if status.borrow().guard_readiness_observed {
-                return Ok::<(), NavStackError>(());
-            }
-            status.changed().await.map_err(|_| {
-                NavStackError::Internal("guard scheduler stopped before readiness".into())
-            })?;
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            let last_status = status.borrow();
-            Err(NavStackError::Internal(format!(
-                "motion guard readiness timed out: {} (observed={}, generation={}, observations={})",
-                last_status.message,
-                last_status.guard_readiness_observed,
-                last_status.guard_generation,
-                last_status.motion_sink_observations,
-            )))
-        }
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
 async fn run_guarded_nav_scheduler(
     node: ModuleNode,
     shutdown: oneshot::Receiver<()>,
@@ -765,8 +732,7 @@ async fn run_guarded_nav_scheduler(
     )
     .await
     .map_err(|error| module_error("guarded_nav_scheduler.connect", error))?;
-    let mut status = scheduler.subscribe_status();
-    wait_for_guard_scheduler_readiness(&mut status, MOTION_GUARD_READY_TIMEOUT).await?;
+    let status = scheduler.subscribe_status();
     signal_ready(ready)?;
 
     let loop_result = run_guarded_nav_loop(
@@ -1453,6 +1419,13 @@ async fn activate_guarded_goal(
         .start_session(nuwax_nav_runtime::NavSession {
             session_id: goal_envelope.session_id.clone(),
             map_revision: envelope_map_revision,
+            motion_admission: nuwax_nav_runtime::NavMotionAdmission {
+                guard_generation: u64::try_from(goal_envelope.motion_guard_generation)
+                    .expect("validated positive motion_guard_generation"),
+                guard_boot_nonce: goal_envelope.motion_guard_boot_nonce,
+                motion_stop_generation: u64::try_from(goal_envelope.motion_stop_generation)
+                    .expect("validated non-negative motion_stop_generation"),
+            },
         })
         .await
     {
@@ -4680,6 +4653,9 @@ fn planner_test_goal(
             [0.0, 5.0, 0.0],
             [0.0, 0.0, 0.0],
         ],
+        motion_guard_generation: 7,
+        motion_guard_boot_nonce: [7; 16],
+        motion_stop_generation: 1,
         goal: schema::PoseStamped {
             header: schema::Header {
                 seq: i32::try_from(goal_generation).expect("test generation fits i32"),
@@ -5349,37 +5325,6 @@ mod guarded_tests {
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
 
-    #[tokio::test]
-    async fn guarded_component_accepts_observed_reset_required() {
-        let (_status_tx, mut status_rx) =
-            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus {
-                guard_readiness_observed: true,
-                motion_sink_ready: false,
-                guard_generation: 9,
-                motion_sink_observations: 1,
-                message: "motion guard responded but motion is blocked: RESET_REQUIRED".into(),
-                ..nuwax_nav_runtime::SchedulerStatus::default()
-            });
-
-        wait_for_guard_scheduler_readiness(&mut status_rx, Duration::from_millis(5))
-            .await
-            .expect("validated negative guard response makes the component available");
-    }
-
-    #[tokio::test]
-    async fn guarded_component_rejects_unobserved_guard_timeout() {
-        let (_status_tx, mut status_rx) =
-            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
-
-        let error = wait_for_guard_scheduler_readiness(&mut status_rx, Duration::from_millis(1))
-            .await
-            .expect_err("unobserved guard must keep component startup fail closed");
-        let message = error.to_string();
-        assert!(message.contains("observed=false"));
-        assert!(message.contains("generation=0"));
-        assert!(message.contains("observations=0"));
-    }
-
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
             session_id: session_id.into(),
@@ -5398,6 +5343,9 @@ mod guarded_tests {
             map_version_id: "map-v1".into(),
             map_revision: 11,
             source_timestamp_ns: 1_000_000_000,
+            motion_guard_generation: 7,
+            motion_guard_boot_nonce: [7; 16],
+            motion_stop_generation: 1,
             goal: schema::PoseStamped {
                 header: schema::Header {
                     stamp_sec: 1,
@@ -5504,32 +5452,10 @@ mod guarded_tests {
     struct RecordingMotion(Arc<Mutex<Vec<String>>>);
 
     impl nuwax_nav_runtime::NavMotionPort for RecordingMotion {
-        fn readiness<'life0, 'async_trait>(
-            &'life0 mut self,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            nuwax_nav_runtime::MotionReadinessProof,
-                            nuwax_nav_runtime::MotionPortError,
-                        >,
-                    > + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                self.0.lock().unwrap().push("readiness".into());
-                Ok(nuwax_nav_runtime::MotionReadinessProof { generation: 7 })
-            })
-        }
-
-        fn acquire<'life0, 'life1, 'async_trait>(
+        fn acquire<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 mut self,
             operation_id: &'life1 str,
+            admission: &'life2 nuwax_nav_runtime::NavMotionAdmission,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -5544,6 +5470,7 @@ mod guarded_tests {
         where
             'life0: 'async_trait,
             'life1: 'async_trait,
+            'life2: 'async_trait,
             Self: 'async_trait,
         {
             Box::pin(async move {
@@ -5553,7 +5480,7 @@ mod guarded_tests {
                     .push(format!("acquire:{operation_id}"));
                 Ok(nuwax_nav_runtime::LeaseProof {
                     lease_id: 11,
-                    guard_generation: 7,
+                    guard_generation: admission.guard_generation,
                 })
             })
         }
@@ -5632,7 +5559,6 @@ mod guarded_tests {
                 Ok(nuwax_nav_runtime::FenceProof {
                     zero_ack_id: "zero-pending-goal".into(),
                     applied_monotonic_ns: 100,
-                    gate: nuwax_nav_runtime::FenceGate::Armed,
                     lease: nuwax_nav_runtime::FenceLeaseState::Idle,
                 })
             })
@@ -6548,6 +6474,11 @@ mod guarded_tests {
             .start_session(nuwax_nav_runtime::NavSession {
                 session_id: "session-a".into(),
                 map_revision: 11,
+                motion_admission: nuwax_nav_runtime::NavMotionAdmission {
+                    guard_generation: 7,
+                    guard_boot_nonce: [7; 16],
+                    motion_stop_generation: 1,
+                },
             })
             .await
             .expect("map-a session");

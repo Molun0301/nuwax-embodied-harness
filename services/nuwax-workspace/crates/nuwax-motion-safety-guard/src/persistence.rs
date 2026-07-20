@@ -11,8 +11,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::crypto::{constant_time_eq, sha256_hex};
-use crate::epoch::{GuardEpochRecord, ProvisionedRecord, SCHEMA_VERSION_PROVISIONED};
-use crate::state::{LeaseState, SafetyGate};
+use crate::epoch::{
+    GuardEpochRecord, ProvisionedRecord, EXPECTED_USERS, SCHEMA_VERSION_EPOCH,
+    SCHEMA_VERSION_PROVISIONED, V1_EXPECTED_USER_SETS,
+};
+use crate::state::LeaseState;
 
 const STATE_FILE_LIMIT: u64 = 64 * 1024;
 const CHECKSUM_PREFIX: &str = "sha256:";
@@ -36,7 +39,37 @@ struct EpochBody<'a> {
     schema_version: u32,
     generation: u64,
     boot_nonce_hex: &'a str,
-    safety_gate: SafetyGate,
+    lease_state: LeaseState,
+    last_zero_ack_id: &'a str,
+    peer_uid_allowlist: &'a [String],
+    actuator_symbols_sha256: &'a str,
+    fenced: bool,
+    startup_zero_confirmed: bool,
+    created_at: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredEpochRecord {
+    schema_version: u32,
+    generation: u64,
+    boot_nonce_hex: String,
+    lease_state: LeaseState,
+    last_zero_ack_id: String,
+    peer_uid_allowlist: Vec<String>,
+    actuator_symbols_sha256: String,
+    fenced: bool,
+    startup_zero_confirmed: bool,
+    created_at: String,
+    checksum: String,
+}
+
+#[derive(Debug, Serialize)]
+struct V1EpochBody<'a> {
+    schema_version: u32,
+    generation: u64,
+    boot_nonce_hex: &'a str,
+    safety_gate: &'a str,
     lease_state: LeaseState,
     reset_generation: u64,
     last_zero_ack_id: &'a str,
@@ -46,13 +79,13 @@ struct EpochBody<'a> {
     created_at: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredEpochRecord {
+struct StoredV1EpochRecord {
     schema_version: u32,
     generation: u64,
     boot_nonce_hex: String,
-    safety_gate: SafetyGate,
+    safety_gate: String,
     lease_state: LeaseState,
     reset_generation: u64,
     last_zero_ack_id: String,
@@ -79,13 +112,12 @@ impl From<StoredEpochRecord> for GuardEpochRecord {
             schema_version: value.schema_version,
             generation: value.generation,
             boot_nonce_hex: value.boot_nonce_hex,
-            safety_gate: value.safety_gate,
             lease_state: value.lease_state,
-            reset_generation: value.reset_generation,
             last_zero_ack_id: value.last_zero_ack_id,
             peer_uid_allowlist: value.peer_uid_allowlist,
             actuator_symbols_sha256: value.actuator_symbols_sha256,
             fenced: value.fenced,
+            startup_zero_confirmed: value.startup_zero_confirmed,
             created_at: value.created_at,
             checksum: value.checksum,
         }
@@ -157,7 +189,7 @@ pub struct EpochStore {
 
 impl EpochStore {
     /// Loads provisioning/epoch records and commits generation+1 before use.
-    /// Any failure returns a volatile RESET_REQUIRED record and a disabled store.
+    /// Any failure returns a fenced, unavailable record and a disabled store.
     #[must_use]
     pub fn boot(epoch_path: impl Into<PathBuf>, provisioned_path: impl Into<PathBuf>) -> BootEpoch {
         let epoch_path = epoch_path.into();
@@ -238,9 +270,9 @@ fn boot_durable(
         .checked_add(1)
         .ok_or(PersistenceError::GenerationOverflow)?;
     record.boot_nonce_hex = nonce_hex();
-    record.safety_gate = SafetyGate::ResetRequired;
     record.lease_state = LeaseState::Idle;
     record.fenced = true;
+    record.startup_zero_confirmed = false;
     record.created_at = now_rfc3339();
     record.checksum = epoch_checksum(&record)?;
     atomic_write_json(epoch_path, &record, 0o600)?;
@@ -268,37 +300,134 @@ fn load_provisioned(path: &Path) -> Result<ProvisionedRecord, PersistenceError> 
 
 fn load_epoch(path: &Path) -> Result<GuardEpochRecord, PersistenceError> {
     let raw = read_private_file(path)?;
-    let stored: StoredEpochRecord =
+    let document: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|source| PersistenceError::InvalidJson {
             path: path.to_path_buf(),
             source,
         })?;
-    let record = GuardEpochRecord::from(stored);
+    let schema_version = document
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid_record(path, "epoch schema_version is missing"))?;
+    let record = match schema_version {
+        1 => migrate_v1_epoch(path, document)?,
+        version if version == u64::from(SCHEMA_VERSION_EPOCH) => {
+            let stored: StoredEpochRecord = serde_json::from_value(document).map_err(|source| {
+                PersistenceError::InvalidJson {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            GuardEpochRecord::from(stored)
+        }
+        _ => return Err(invalid_record(path, "unsupported epoch schema_version")),
+    };
+    validate_epoch_record(path, &record)?;
+    Ok(record)
+}
+
+fn migrate_v1_epoch(
+    path: &Path,
+    document: serde_json::Value,
+) -> Result<GuardEpochRecord, PersistenceError> {
+    let stored: StoredV1EpochRecord =
+        serde_json::from_value(document).map_err(|source| PersistenceError::InvalidJson {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if stored.schema_version != 1 {
+        return Err(invalid_record(path, "epoch v1 schema_version drift"));
+    }
+    if !matches!(stored.safety_gate.as_str(), "ResetRequired" | "Armed") {
+        return Err(invalid_record(path, "epoch v1 safety_gate drift"));
+    }
+    let users: Vec<&str> = stored
+        .peer_uid_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if !V1_EXPECTED_USER_SETS
+        .iter()
+        .any(|expected| users.as_slice() == expected)
+    {
+        return Err(invalid_record(path, "epoch v1 peer_uid_allowlist drift"));
+    }
+    let expected = v1_epoch_checksum(&stored)?;
+    verify_checksum(path, &stored.checksum, &expected)?;
+    validate_epoch_common(
+        path,
+        stored.generation,
+        &stored.boot_nonce_hex,
+        &stored.actuator_symbols_sha256,
+    )?;
+
+    let backup_name = format!(
+        "{}.v1.bak",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("epoch.json")
+    );
+    let backup_path = path.with_file_name(backup_name);
+    if !backup_path.exists() {
+        atomic_write_json(&backup_path, &stored, 0o600)?;
+    }
+
+    let mut record = GuardEpochRecord {
+        schema_version: SCHEMA_VERSION_EPOCH,
+        generation: stored.generation,
+        boot_nonce_hex: stored.boot_nonce_hex,
+        lease_state: stored.lease_state,
+        last_zero_ack_id: stored.last_zero_ack_id,
+        peer_uid_allowlist: EXPECTED_USERS
+            .iter()
+            .map(|user| (*user).to_string())
+            .collect(),
+        actuator_symbols_sha256: stored.actuator_symbols_sha256,
+        fenced: stored.fenced,
+        startup_zero_confirmed: false,
+        created_at: stored.created_at,
+        checksum: String::new(),
+    };
     let errors = record.verify();
     if !errors.is_empty() {
         return Err(invalid_record(path, errors.join("; ")));
     }
-    if record.boot_nonce_hex.len() != 32 && record.generation != 0 {
+    record.checksum = epoch_checksum(&record)?;
+    atomic_write_json(path, &record, 0o600)?;
+    Ok(record)
+}
+
+fn validate_epoch_record(path: &Path, record: &GuardEpochRecord) -> Result<(), PersistenceError> {
+    let errors = record.verify();
+    if !errors.is_empty() {
+        return Err(invalid_record(path, errors.join("; ")));
+    }
+    validate_epoch_common(
+        path,
+        record.generation,
+        &record.boot_nonce_hex,
+        &record.actuator_symbols_sha256,
+    )?;
+    let expected = epoch_checksum(record)?;
+    verify_checksum(path, &record.checksum, &expected)
+}
+
+fn validate_epoch_common(
+    path: &Path,
+    generation: u64,
+    boot_nonce_hex: &str,
+    actuator_symbols_sha256: &str,
+) -> Result<(), PersistenceError> {
+    if boot_nonce_hex.len() != 32 && generation != 0 {
         return Err(invalid_record(
             path,
             "non-initial epoch requires a 16-byte nonce",
         ));
     }
-    if !record
-        .boot_nonce_hex
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if !boot_nonce_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid_record(path, "boot_nonce_hex is not hexadecimal"));
     }
-    validate_sha256(
-        path,
-        &record.actuator_symbols_sha256,
-        "actuator_symbols_sha256",
-    )?;
-    let expected = epoch_checksum(&record)?;
-    verify_checksum(path, &record.checksum, &expected)?;
-    Ok(record)
+    validate_sha256(path, actuator_symbols_sha256, "actuator_symbols_sha256")
 }
 
 fn provisioned_checksum(record: &ProvisionedRecord) -> Result<String, PersistenceError> {
@@ -314,7 +443,23 @@ fn epoch_checksum(record: &GuardEpochRecord) -> Result<String, PersistenceError>
         schema_version: record.schema_version,
         generation: record.generation,
         boot_nonce_hex: &record.boot_nonce_hex,
-        safety_gate: record.safety_gate,
+        lease_state: record.lease_state,
+        last_zero_ack_id: &record.last_zero_ack_id,
+        peer_uid_allowlist: &record.peer_uid_allowlist,
+        actuator_symbols_sha256: &record.actuator_symbols_sha256,
+        fenced: record.fenced,
+        startup_zero_confirmed: record.startup_zero_confirmed,
+        created_at: &record.created_at,
+    };
+    checksum_body(&body, Path::new("epoch.json"))
+}
+
+fn v1_epoch_checksum(record: &StoredV1EpochRecord) -> Result<String, PersistenceError> {
+    let body = V1EpochBody {
+        schema_version: record.schema_version,
+        generation: record.generation,
+        boot_nonce_hex: &record.boot_nonce_hex,
+        safety_gate: &record.safety_gate,
         lease_state: record.lease_state,
         reset_generation: record.reset_generation,
         last_zero_ack_id: &record.last_zero_ack_id,
@@ -323,7 +468,7 @@ fn epoch_checksum(record: &GuardEpochRecord) -> Result<String, PersistenceError>
         fenced: record.fenced,
         created_at: &record.created_at,
     };
-    checksum_body(&body, Path::new("epoch.json"))
+    checksum_body(&body, Path::new("epoch-v1.json"))
 }
 
 fn checksum_body<T: Serialize>(body: &T, path: &Path) -> Result<String, PersistenceError> {
@@ -516,9 +661,9 @@ mod tests {
         assert!(boot.store.is_durable(), "{}", boot.store.status());
         assert_eq!(boot.record.generation, 1);
         assert_eq!(boot.record.boot_nonce_hex.len(), 32);
-        assert_eq!(boot.record.safety_gate, SafetyGate::ResetRequired);
         assert_eq!(boot.record.lease_state, LeaseState::Idle);
         assert!(boot.record.fenced);
+        assert!(!boot.record.startup_zero_confirmed);
 
         let persisted = load_epoch(&epoch_path).unwrap();
         assert_eq!(persisted.generation, 1);
@@ -535,9 +680,9 @@ mod tests {
 
         let boot = EpochStore::boot(&epoch_path, &provisioned_path);
         assert!(!boot.store.is_durable());
-        assert_eq!(boot.record.safety_gate, SafetyGate::ResetRequired);
         assert_eq!(boot.record.lease_state, LeaseState::Idle);
         assert!(boot.record.fenced);
+        assert!(!boot.record.startup_zero_confirmed);
         assert_eq!(fs::read(&epoch_path).unwrap(), before);
     }
 
@@ -549,8 +694,72 @@ mod tests {
             directory.path().join("provisioned.json"),
         );
         assert!(!boot.store.is_durable());
-        assert_eq!(boot.record.safety_gate, SafetyGate::ResetRequired);
+        assert_eq!(boot.record.lease_state, LeaseState::Idle);
+        assert!(boot.record.fenced);
+        assert!(!boot.record.startup_zero_confirmed);
         assert!(boot.store.status().contains("missing"));
+    }
+
+    #[test]
+    fn valid_v1_epoch_is_backed_up_migrated_and_boot_advanced() {
+        let directory = tempfile::tempdir().unwrap();
+        let provisioned_path = directory.path().join("provisioned.json");
+        let epoch_path = directory.path().join("epoch.json");
+        let backup_path = directory.path().join("epoch.json.v1.bak");
+
+        let mut provisioned = ProvisionedRecord {
+            instance_id: Uuid::new_v4().to_string(),
+            schema_version: SCHEMA_VERSION_PROVISIONED,
+            checksum: String::new(),
+        };
+        provisioned.checksum = provisioned_checksum(&provisioned).unwrap();
+        write_private(
+            &provisioned_path,
+            &serde_json::to_vec_pretty(&provisioned).unwrap(),
+            0o400,
+        );
+
+        let mut epoch = StoredV1EpochRecord {
+            schema_version: 1,
+            generation: 7,
+            boot_nonce_hex: "0123456789abcdef0123456789abcdef".to_string(),
+            safety_gate: "ResetRequired".to_string(),
+            lease_state: LeaseState::Idle,
+            reset_generation: 3,
+            last_zero_ack_id: "zero:v1".to_string(),
+            peer_uid_allowlist: V1_EXPECTED_USER_SETS[0]
+                .iter()
+                .map(|user| (*user).to_string())
+                .collect(),
+            actuator_symbols_sha256: format!("sha256:{}", "b".repeat(64)),
+            fenced: true,
+            created_at: "2026-07-20T00:00:00.000Z".to_string(),
+            checksum: String::new(),
+        };
+        epoch.checksum = v1_epoch_checksum(&epoch).unwrap();
+        let original = serde_json::to_vec_pretty(&epoch).unwrap();
+        write_private(&epoch_path, &original, 0o600);
+
+        let boot = EpochStore::boot(&epoch_path, &provisioned_path);
+        assert!(boot.store.is_durable(), "{}", boot.store.status());
+        assert_eq!(boot.record.schema_version, SCHEMA_VERSION_EPOCH);
+        assert_eq!(boot.record.generation, 8);
+        assert_eq!(boot.record.peer_uid_allowlist, EXPECTED_USERS);
+        assert!(!boot
+            .record
+            .peer_uid_allowlist
+            .iter()
+            .any(|user| user == "nuwax-motion-admin"));
+        assert_eq!(boot.record.lease_state, LeaseState::Idle);
+        assert!(boot.record.fenced);
+        assert!(!boot.record.startup_zero_confirmed);
+        assert_eq!(
+            fs::read(&backup_path).unwrap(),
+            [original, b"\n".to_vec()].concat()
+        );
+
+        let migrated = load_epoch(&epoch_path).unwrap();
+        assert_eq!(migrated, boot.record);
     }
 
     #[test]
@@ -572,7 +781,7 @@ mod tests {
         };
         assert_eq!(
             epoch_checksum(&epoch).unwrap(),
-            "sha256:45fc4d3040276e09d8b9176009ccae8c499e7a6cd44cc06c52074f14142f683c"
+            "sha256:3a492797dd841744236af1d7e0ecc0f562a538baa6f7169a1423edc02e09da0d"
         );
     }
 }

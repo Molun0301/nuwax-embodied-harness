@@ -3,9 +3,9 @@
 #![allow(missing_docs)]
 
 /// Version carried by every accepted request and response.
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 
-include!(concat!(env!("OUT_DIR"), "/nuwax.motion_guard.v1.rs"));
+include!(concat!(env!("OUT_DIR"), "/nuwax.motion_guard.v2.rs"));
 
 #[cfg(test)]
 mod tests {
@@ -33,6 +33,7 @@ mod tests {
                         sequence: 8,
                         issued_monotonic_ns: 1_000_000,
                         deadline_monotonic_ns: 1_300_000,
+                        motion_stop_generation: 0,
                     }),
                     command: Some(submit_motion_command_request::Command::Twist(
                         TwistCommand {
@@ -70,7 +71,6 @@ mod tests {
                 RevokeAndZeroResponse {
                     result: Some(GuardResult {
                         ack: AckCode::ResourceFenced as i32,
-                        gate: SafetyGate::Armed as i32,
                         lease: LeaseState::Idle as i32,
                         error: None,
                     }),
@@ -91,6 +91,35 @@ mod tests {
     }
 
     #[test]
+    fn typed_global_stop_roundtrips_without_a_lease_tuple() {
+        let request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: "request-stop".to_string(),
+            operation: Some(motion_guard_request::Operation::StopAllMotion(
+                StopAllMotionRequest {
+                    envelope: Some(GlobalStopEnvelope {
+                        source: GuardSource::GatewayManual as i32,
+                        operation_id: "operation-stop".to_string(),
+                        payload_sha256: vec![5; 32],
+                        issued_monotonic_ns: 10,
+                        deadline_monotonic_ns: 20,
+                    }),
+                    reason: "operator requested stop".to_string(),
+                },
+            )),
+        };
+
+        let decoded = MotionGuardRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        let motion_guard_request::Operation::StopAllMotion(stop) = decoded.operation.unwrap()
+        else {
+            panic!("wrong request oneof variant");
+        };
+        let envelope = stop.envelope.unwrap();
+        assert_eq!(envelope.source, GuardSource::GatewayManual as i32);
+        assert_eq!(envelope.operation_id, "operation-stop");
+    }
+
+    #[test]
     fn schema_contains_no_opaque_actuator_payloads() {
         let schema = include_str!("../../../../navigation/proto/motion_guard.proto");
         assert!(!schema.contains("bytes command"));
@@ -106,5 +135,24 @@ mod tests {
         ] {
             assert!(schema.contains(&format!("message {message}")));
         }
+    }
+
+    #[test]
+    fn rust_wire_contract_is_v2_without_retired_gate_operations() {
+        let schema = include_str!("../../../../navigation/proto/motion_guard.proto");
+        assert_eq!(API_VERSION, 2);
+        assert!(schema.contains("package nuwax.motion_guard.v2;"));
+        for retired_declaration in [
+            "enum SafetyGate",
+            "message LatchSafetyStopRequest",
+            "message LatchSafetyStopResponse",
+            "message ResetSafeStopRequest",
+            "message ResetSafeStopResponse",
+        ] {
+            assert!(!schema.contains(retired_declaration));
+        }
+        assert!(!schema.contains("GUARD_SOURCE_ADMIN ="));
+        assert!(schema.contains("StopAllMotionRequest stop_all_motion = 21;"));
+        assert!(schema.contains("GetGuardStateRequest get_guard_state = 22;"));
     }
 }

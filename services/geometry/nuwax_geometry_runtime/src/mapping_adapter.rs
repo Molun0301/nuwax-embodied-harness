@@ -771,11 +771,16 @@ impl MappingAdapter {
 
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
         match self.forbidden_zones_path.as_deref() {
-            Some(path) => {
-                crate::forbidden_zones::load_for_map(path, &self.lifecycle.map_version_id)
-            }
+            Some(path) => crate::forbidden_zones::load_for_map_binding(
+                path,
+                &self.lifecycle.map_name,
+                &self.lifecycle.map_version_id,
+            ),
             None => crate::forbidden_zones::LoadedForbiddenZones {
-                signature: format!("disabled:{}", self.lifecycle.map_version_id),
+                signature: format!(
+                    "disabled:{}:{}",
+                    self.lifecycle.map_name, self.lifecycle.map_version_id
+                ),
                 generation: 0,
                 zones: Vec::new(),
                 status: crate::forbidden_zones::ZoneLoadStatus::Empty,

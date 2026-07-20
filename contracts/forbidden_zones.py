@@ -144,9 +144,18 @@ class ForbiddenZone(ContractModel):
 
 
 class ForbiddenZoneMapEntry(ContractModel):
-    """单个地图版本的禁行区快照。"""
+    """单个地图资产的禁行区快照。"""
 
-    map_version_id: str = Field(min_length=1, max_length=256, description="地图版本标识。")
+    map_name: str = Field(
+        default="",
+        max_length=256,
+        description="地图资产主键；空串仅用于读取旧版版本键文档。",
+    )
+    map_version_id: str = Field(
+        default="",
+        max_length=256,
+        description="当前运行时地图版本；不参与禁行区归属或持久化键选择。",
+    )
     generation: int = Field(default=0, ge=0, description="该地图禁行区的递增代次。")
     signature: str = Field(
         default="",
@@ -163,10 +172,12 @@ class ForbiddenZoneMapEntry(ContractModel):
     @field_validator("map_version_id")
     @classmethod
     def _validate_map_version_id(cls, value: str) -> str:
-        resolved = str(value or "").strip()
-        if not resolved:
-            raise ValueError("map_version_id 不能为空。")
-        return resolved
+        return str(value or "").strip()
+
+    @field_validator("map_name")
+    @classmethod
+    def _validate_map_name(cls, value: str) -> str:
+        return str(value or "").strip()
 
     @field_validator("signature")
     @classmethod
@@ -183,6 +194,8 @@ class ForbiddenZoneMapEntry(ContractModel):
 
     @model_validator(mode="after")
     def _validate_unique_zone_ids(self) -> "ForbiddenZoneMapEntry":
+        if not self.map_name and not self.map_version_id:
+            raise ValueError("map_name 不能为空。")
         _ensure_unique_zone_ids(self.zones)
         return self
 
@@ -196,17 +209,28 @@ class ForbiddenZonesEnvelope(ContractModel):
     @model_validator(mode="after")
     def _validate_map_keys(self) -> "ForbiddenZonesEnvelope":
         for key, entry in self.maps.items():
-            if str(key).strip() != entry.map_version_id:
+            resolved_key = str(key).strip()
+            expected_key = entry.map_name or entry.map_version_id
+            if resolved_key != expected_key:
                 raise ValueError(
-                    f"maps 键 {key!r} 与 map_version_id {entry.map_version_id!r} 不一致。"
+                    f"maps 键 {key!r} 与地图归属键 {expected_key!r} 不一致。"
                 )
         return self
 
 
 class ReplaceForbiddenZonesRequest(ContractModel):
-    """整体替换单个地图版本禁行区的请求。"""
+    """整体替换单个地图资产禁行区的请求。"""
 
-    map_version_id: str = Field(min_length=1, max_length=256)
+    map_name: str = Field(
+        default="",
+        max_length=256,
+        description="地图资产主键；空串仅用于兼容旧版版本键调用。",
+    )
+    map_version_id: str = Field(
+        default="",
+        max_length=256,
+        description="当前运行时地图版本；不参与禁行区归属。",
+    )
     expected_generation: Optional[int] = Field(
         default=None,
         ge=0,
@@ -217,13 +241,17 @@ class ReplaceForbiddenZonesRequest(ContractModel):
     @field_validator("map_version_id")
     @classmethod
     def _validate_map_version_id(cls, value: str) -> str:
-        resolved = str(value or "").strip()
-        if not resolved:
-            raise ValueError("map_version_id 不能为空。")
-        return resolved
+        return str(value or "").strip()
+
+    @field_validator("map_name")
+    @classmethod
+    def _validate_map_name(cls, value: str) -> str:
+        return str(value or "").strip()
 
     @model_validator(mode="after")
     def _validate_unique_zone_ids(self) -> "ReplaceForbiddenZonesRequest":
+        if not self.map_name and not self.map_version_id:
+            raise ValueError("map_name 不能为空。")
         _ensure_unique_zone_ids(self.zones)
         return self
 

@@ -94,30 +94,32 @@ function normalizeForbiddenZone(value) {
   };
 }
 
-function forbiddenZoneEntry(value, preferredMapVersionId = null) {
+function forbiddenZoneEntry(value, preferredMapName = null) {
   let root = value;
   for (let index = 0; index < 3; index += 1) {
-    if (!root || typeof root !== 'object' || root.maps || root.zones || root.map_version_id) break;
+    if (!root || typeof root !== 'object' || root.maps || root.zones || root.map_name || root.map_version_id) break;
     const next = root.data || root.result || root.payload;
     if (!next || next === root) break;
     root = next;
   }
   if (!root || typeof root !== 'object') return null;
   let entry = root;
-  let mapVersionId = String(root.map_version_id || '').trim() || null;
+  let mapName = String(root.map_name || '').trim() || null;
   if (root.maps && typeof root.maps === 'object') {
     const keys = Object.keys(root.maps);
-    const preferred = String(preferredMapVersionId || '').trim();
+    const preferred = String(preferredMapName || '').trim();
     const key = preferred
-      ? Object.prototype.hasOwnProperty.call(root.maps, preferred) ? preferred : null
+      ? Object.prototype.hasOwnProperty.call(root.maps, preferred)
+        ? preferred
+        : keys.find((candidate) => String(root.maps[candidate] && root.maps[candidate].map_name || '').trim() === preferred) || null
       : keys.length === 1 ? keys[0] : null;
     if (!key) return null;
     entry = root.maps[key] || {};
-    mapVersionId = String(entry.map_version_id || key).trim() || null;
+    mapName = String(entry.map_name || key).trim() || null;
   }
   if (!Array.isArray(entry.zones)) return null;
   return {
-    mapVersionId,
+    mapName,
     generation: Math.max(0, Number(entry.generation) || 0),
     zones: entry.zones.map(normalizeForbiddenZone).filter(Boolean),
   };
@@ -149,7 +151,7 @@ class PointCloud3DViewer {
     this._robotPose = null;
     this._frontiers = [];
     this._forbiddenZones = [];
-    this._forbiddenZoneMapVersionId = null;
+    this._forbiddenZoneMapName = null;
     this._forbiddenZoneGeneration = 0;
     this._trajectory = [];
     this._navigationPath = [];
@@ -1357,19 +1359,21 @@ class PointCloud3DViewer {
     this._requestRender();
   }
 
-  updateForbiddenZones(envelope) {
-    const preferredMapVersionId = typeof window.__nuwaxMapVersionId === 'function'
-      ? window.__nuwaxMapVersionId()
-      : this._forbiddenZoneMapVersionId;
-    const entry = forbiddenZoneEntry(envelope, preferredMapVersionId);
+  updateForbiddenZones(envelope, allowMapSwitch = false) {
+    const preferredMapName = allowMapSwitch ? null : this._forbiddenZoneMapName;
+    const entry = forbiddenZoneEntry(envelope, preferredMapName);
     if (!entry) return false;
-    const preferred = String(preferredMapVersionId || '').trim();
-    if (preferred && entry.mapVersionId && entry.mapVersionId !== preferred) return false;
     if (
-      entry.mapVersionId === this._forbiddenZoneMapVersionId
+      this._forbiddenZoneMapName
+      && entry.mapName
+      && entry.mapName !== this._forbiddenZoneMapName
+      && !allowMapSwitch
+    ) return false;
+    if (
+      entry.mapName === this._forbiddenZoneMapName
       && entry.generation <= this._forbiddenZoneGeneration
     ) return false;
-    this._forbiddenZoneMapVersionId = entry.mapVersionId || preferred || null;
+    this._forbiddenZoneMapName = entry.mapName || this._forbiddenZoneMapName;
     this._forbiddenZoneGeneration = entry.generation;
     this._forbiddenZones = entry.zones.slice();
     this._rebuildForbiddenZones();
@@ -1455,7 +1459,7 @@ class PointCloud3DViewer {
     this._frontierGroup = null;
     this._forbiddenZoneGroup = null;
     this._forbiddenZones = [];
-    this._forbiddenZoneMapVersionId = null;
+    this._forbiddenZoneMapName = null;
     this._forbiddenZoneGeneration = 0;
     this._semanticGroup = null;
     this._trajectoryLine = null;
@@ -1591,7 +1595,7 @@ window.addEventListener('pointcloud3d:semantic-visibility', (e) => {
 });
 
 window.addEventListener('forbidden-zones:updated', (e) => {
-  window.pointcloud3d.updateForbiddenZones(e.detail || {});
+  window.pointcloud3d.updateForbiddenZones(e.detail || {}, true);
 });
 
 window.addEventListener('stream:navigation.forbidden_zones', (e) => {

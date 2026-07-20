@@ -911,12 +911,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.get("/api/navigation/forbidden-zones")
     async def api_navigation_forbidden_zones_get(
         request: Request,
+        map_name: Optional[str] = None,
         map_version_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         try:
             envelope = await run_in_threadpool(
                 runtime.navigation_service.list_forbidden_zones,
+                map_name=map_name,
                 map_version_id=map_version_id,
             )
         except Exception as exc:
@@ -932,6 +934,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         try:
             envelope = await run_in_threadpool(
                 runtime.navigation_service.replace_forbidden_zones,
+                map_name=body.map_name,
                 map_version_id=body.map_version_id,
                 zones=body.zones,
                 expected_generation=body.expected_generation,

@@ -338,11 +338,10 @@ class MapWorkspaceService:
         forbidden_zone_entry = None
         if persistence_map_version_id:
             forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
-                persistence_map_version_id
+                persistence_map_version_id,
+                map_name=resolved_name,
             )
-            forbidden_zone_entry = forbidden_zone_envelope.maps.get(
-                persistence_map_version_id
-            )
+            forbidden_zone_entry = forbidden_zone_envelope.maps.get(resolved_name)
         enabled_forbidden_zones = tuple(
             zone
             for zone in getattr(forbidden_zone_entry, "zones", ())
@@ -739,6 +738,14 @@ class MapWorkspaceService:
             delete_result = self._memory_service.delete_memory_library(library_name=resolved_name)
             deleted_memory_library = bool(delete_result.get("deleted", False))
         deleted = self._repository.delete_map_asset(resolved_name)
+        deleted_forbidden_zones = False
+        if deleted:
+            deleted_zone_envelope = (
+                self._navigation_service.delete_forbidden_zones_for_map(
+                    map_name=resolved_name,
+                )
+            )
+            deleted_forbidden_zones = bool(deleted_zone_envelope.maps)
         self._state_store.write(
             StateNamespace.MAP,
             "map_catalog_delete_result",
@@ -747,6 +754,7 @@ class MapWorkspaceService:
                 "deleted": deleted,
                 "was_active": was_active,
                 "deleted_memory_library": deleted_memory_library,
+                "deleted_forbidden_zones": deleted_forbidden_zones,
             },
             source="map_workspace_service",
             metadata={"kind": "map_delete_result"},
@@ -758,6 +766,7 @@ class MapWorkspaceService:
                 "map_name": resolved_name,
                 "deleted": deleted,
                 "deleted_memory_library": deleted_memory_library,
+                "deleted_forbidden_zones": deleted_forbidden_zones,
                 "was_active": was_active,
             },
         )
@@ -766,6 +775,7 @@ class MapWorkspaceService:
             "deleted": deleted,
             "was_active": was_active,
             "deleted_memory_library": deleted_memory_library,
+            "deleted_forbidden_zones": deleted_forbidden_zones,
         }
 
     def _build_workspace(self, asset: MapAsset, *, refresh_localization: bool = True) -> MapWorkspace:
@@ -1114,6 +1124,10 @@ class MapWorkspaceService:
             prepared_version=prepared_version,
             runtime_metadata=runtime_metadata,
             require_backend_switch=require_backend_switch,
+        )
+        self._navigation_service.load_forbidden_zones_for_map(
+            map_name=prepared_version.map_name,
+            map_version_id=prepared_version.version_id,
         )
         if (
             require_backend_switch

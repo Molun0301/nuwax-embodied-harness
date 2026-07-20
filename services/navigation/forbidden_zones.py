@@ -25,7 +25,7 @@ FORBIDDEN_ZONES_PATH_ENV = "NUWAX_FORBIDDEN_ZONES_PATH"
 
 
 class ForbiddenZoneStore:
-    """按地图版本保存禁行区，并通过同目录原子替换保证文件完整性。"""
+    """按地图名称保存禁行区，并通过同目录原子替换保证文件完整性。"""
 
     def __init__(
         self,
@@ -50,30 +50,79 @@ class ForbiddenZoneStore:
         with self._lock:
             return self._load_unlocked()
 
-    def list_for_map(self, map_version_id: str) -> ForbiddenZonesEnvelope:
-        request = ReplaceForbiddenZonesRequest(map_version_id=map_version_id, zones=[])
+    def list_for_map(
+        self,
+        map_version_id: str = "",
+        *,
+        map_name: Optional[str] = None,
+    ) -> ForbiddenZonesEnvelope:
+        request = ReplaceForbiddenZonesRequest(
+            map_name=str(map_name or ""),
+            map_version_id=map_version_id,
+            zones=[],
+        )
         with self._lock:
             document = self._load_unlocked()
-            entry = document.maps.get(request.map_version_id)
+            maps = dict(document.maps)
+            storage_key = request.map_name or request.map_version_id
+            entry = maps.get(storage_key)
+            if entry is None and request.map_name:
+                legacy_key, legacy_entry = self._find_legacy_entry(
+                    maps,
+                    request.map_version_id,
+                )
+                if legacy_entry is not None:
+                    entry = legacy_entry.model_copy(
+                        update={
+                            "map_name": request.map_name,
+                            "map_version_id": "",
+                        },
+                        deep=True,
+                    )
+                    maps.pop(legacy_key, None)
+                    maps[storage_key] = entry
+                    self._write_unlocked(ForbiddenZonesEnvelope(maps=maps))
             if entry is None:
-                entry = ForbiddenZoneMapEntry(map_version_id=request.map_version_id)
-            return ForbiddenZonesEnvelope(maps={request.map_version_id: entry})
+                entry = ForbiddenZoneMapEntry(
+                    map_name=request.map_name,
+                    map_version_id=request.map_version_id,
+                )
+            projected_entry = entry.model_copy(
+                update={
+                    "map_name": request.map_name or entry.map_name,
+                    "map_version_id": request.map_version_id or entry.map_version_id,
+                },
+                deep=True,
+            )
+            return ForbiddenZonesEnvelope(maps={storage_key: projected_entry})
 
     def replace(
         self,
         *,
-        map_version_id: str,
+        map_name: Optional[str] = None,
+        map_version_id: str = "",
         zones: Sequence[ForbiddenZone],
         expected_generation: Optional[int] = None,
     ) -> ForbiddenZonesEnvelope:
         request = ReplaceForbiddenZonesRequest(
+            map_name=str(map_name or ""),
             map_version_id=map_version_id,
             expected_generation=expected_generation,
             zones=list(zones),
         )
         with self._lock:
             document = self._load_unlocked()
-            previous = document.maps.get(request.map_version_id)
+            maps = dict(document.maps)
+            storage_key = request.map_name or request.map_version_id
+            previous = maps.get(storage_key)
+            legacy_key = None
+            if previous is None and request.map_name:
+                legacy_key, legacy_entry = self._find_legacy_entry(
+                    maps,
+                    request.map_version_id,
+                )
+                if legacy_entry is not None:
+                    previous = legacy_entry
             current_generation = previous.generation if previous is not None else 0
             if (
                 request.expected_generation is not None
@@ -84,23 +133,76 @@ class ForbiddenZoneStore:
                     error_code="forbidden_zones_generation_conflict",
                     http_status=409,
                     details={
-                        "map_version_id": request.map_version_id,
+                        "map_name": request.map_name or None,
                         "expected_generation": request.expected_generation,
                         "current_generation": current_generation,
                     },
                 )
             entry = ForbiddenZoneMapEntry(
-                map_version_id=request.map_version_id,
+                map_name=request.map_name,
+                map_version_id="" if request.map_name else request.map_version_id,
                 generation=current_generation + 1,
                 signature=self._signature_factory(),
                 updated_at=utc_now(),
                 zones=request.zones,
             )
-            maps = dict(document.maps)
-            maps[request.map_version_id] = entry
+            if legacy_key is not None and legacy_key != storage_key:
+                maps.pop(legacy_key, None)
+            maps[storage_key] = entry
             updated_document = ForbiddenZonesEnvelope(maps=maps)
             self._write_unlocked(updated_document)
-            return ForbiddenZonesEnvelope(maps={request.map_version_id: entry})
+            projected_entry = entry.model_copy(
+                update={"map_version_id": request.map_version_id},
+                deep=True,
+            )
+            return ForbiddenZonesEnvelope(maps={storage_key: projected_entry})
+
+    def delete_for_map(self, map_name: str) -> ForbiddenZonesEnvelope:
+        """删除与地图资产绑定的禁行区，并返回供实时流清屏的墓碑。"""
+
+        resolved_map_name = str(map_name or "").strip()
+        if not resolved_map_name:
+            raise GatewayError(
+                "map_name 不能为空。",
+                error_code="map_name_required",
+                http_status=400,
+            )
+        with self._lock:
+            document = self._load_unlocked()
+            maps = dict(document.maps)
+            previous = maps.pop(resolved_map_name, None)
+            if previous is None:
+                return ForbiddenZonesEnvelope()
+            self._write_unlocked(ForbiddenZonesEnvelope(maps=maps))
+            tombstone = previous.model_copy(
+                update={
+                    "generation": previous.generation + 1,
+                    "signature": "",
+                    "updated_at": utc_now(),
+                    "zones": [],
+                },
+                deep=True,
+            )
+            return ForbiddenZonesEnvelope(
+                maps={resolved_map_name: tombstone}
+            )
+
+    @staticmethod
+    def _find_legacy_entry(
+        maps: dict[str, ForbiddenZoneMapEntry],
+        map_version_id: str,
+    ) -> tuple[Optional[str], Optional[ForbiddenZoneMapEntry]]:
+        exact = maps.get(map_version_id) if map_version_id else None
+        if exact is not None and not exact.map_name:
+            return map_version_id, exact
+        candidates = [
+            (key, entry)
+            for key, entry in maps.items()
+            if not entry.map_name
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None, None
 
     def _load_unlocked(self) -> ForbiddenZonesEnvelope:
         if not self._path.exists():

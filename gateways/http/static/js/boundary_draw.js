@@ -1,6 +1,6 @@
 // Navigation forbidden-zone editor and persistent 2D overlay.
 // The backend owns the canonical document; this module only replaces the zone
-// list for the active map_version_id through /api/navigation/forbidden-zones.
+// list for the active map through /api/navigation/forbidden-zones.
 
 (function () {
   'use strict';
@@ -49,9 +49,10 @@
     customHover: null,
     draft: null,
     zones: [],
-    mapVersionId: null,
-    observedMapVersionId: null,
-    mapVersionInitialized: false,
+    mapName: null,
+    observedMapName: null,
+    mapNameInitialized: false,
+    runtimeMapVersionId: null,
     generation: 0,
     signature: null,
     updatedAt: null,
@@ -156,7 +157,7 @@
     let current = raw;
     for (let index = 0; index < 3; index += 1) {
       if (!current || typeof current !== 'object') break;
-      if (current.maps || current.zones || current.map_version_id) break;
+      if (current.maps || current.zones || current.map_name || current.map_version_id) break;
       const next = current.data || current.result || current.payload;
       if (!next || next === current) break;
       current = next;
@@ -164,22 +165,27 @@
     return current && typeof current === 'object' ? current : {};
   }
 
-  function entryFromEnvelope(raw, preferredMapVersionId) {
+  function entryFromEnvelope(raw, preferredMapName) {
     const root = unwrapEnvelope(raw);
     let entry = root;
+    let mapName = String(root.map_name || '').trim() || null;
     let mapVersionId = String(root.map_version_id || '').trim() || null;
     if (root.maps && typeof root.maps === 'object') {
       const keys = Object.keys(root.maps);
-      const preferred = String(preferredMapVersionId || '').trim();
+      const preferred = String(preferredMapName || '').trim();
       const selectedKey = preferred
-        ? Object.prototype.hasOwnProperty.call(root.maps, preferred) ? preferred : null
+        ? Object.prototype.hasOwnProperty.call(root.maps, preferred)
+          ? preferred
+          : keys.find((key) => String(root.maps[key] && root.maps[key].map_name || '').trim() === preferred) || null
         : keys.length === 1 ? keys[0] : null;
       if (!selectedKey) return null;
       entry = root.maps[selectedKey] || {};
-      mapVersionId = String(entry.map_version_id || selectedKey).trim() || null;
+      mapName = String(entry.map_name || selectedKey).trim() || null;
+      mapVersionId = String(entry.map_version_id || '').trim() || null;
     }
     if (!entry || !Array.isArray(entry.zones)) return null;
     return {
+      mapName,
       mapVersionId,
       generation: Math.max(0, Number(entry.generation) || 0),
       signature: String(entry.signature || '').trim() || null,
@@ -190,9 +196,10 @@
 
   function currentEnvelope() {
     const maps = {};
-    if (state.mapVersionId) {
-      maps[state.mapVersionId] = {
-        map_version_id: state.mapVersionId,
+    if (state.mapName) {
+      maps[state.mapName] = {
+        map_name: state.mapName,
+        map_version_id: state.runtimeMapVersionId || '',
         generation: state.generation,
         signature: state.signature || '',
         updated_at: state.updatedAt,
@@ -202,7 +209,9 @@
     return { schema_version: 1, maps };
   }
 
-  function currentMapVersionId() {
+  function currentRuntimeMapVersionId() {
+    const conflict = currentMapVersionConflict();
+    if (conflict) return conflict.active;
     if (typeof window.__nuwaxMapVersionId !== 'function') return null;
     const value = window.__nuwaxMapVersionId();
     const resolved = String(value === null || value === undefined ? '' : value).trim();
@@ -217,6 +226,55 @@
     return rendered && active && rendered !== active ? { rendered, active } : null;
   }
 
+  function firstNonBlank() {
+    for (const value of arguments) {
+      const text = String(value === null || value === undefined ? '' : value).trim();
+      if (text) return text;
+    }
+    return null;
+  }
+
+  function mapNameFromPayload(raw) {
+    const queue = [{ value: raw, depth: 0 }];
+    const visited = new Set();
+    while (queue.length) {
+      const item = queue.shift();
+      const value = item.value;
+      if (!value || typeof value !== 'object' || visited.has(value)) continue;
+      visited.add(value);
+      const resolved = firstNonBlank(
+        value.map_name,
+        value.active_map_name,
+        value.seed_map_name,
+        value.active_workspace && (value.active_workspace.active_map_name || value.active_workspace.map_name),
+        value.localization_session && value.localization_session.map_name,
+      );
+      if (resolved) return resolved;
+      if (item.depth >= 4) continue;
+      for (const key of [
+        'payload', 'data', 'result', 'metadata', 'diagnostics', 'map_snapshot',
+        'runtime_governance', 'current_request', 'exploration_request', 'current_goal',
+      ]) {
+        if (value[key] && typeof value[key] === 'object') {
+          queue.push({ value: value[key], depth: item.depth + 1 });
+        }
+      }
+    }
+    return null;
+  }
+
+  function currentMapName(raw) {
+    const observed = mapNameFromPayload(raw);
+    if (observed) return observed;
+    if (typeof window.__nuwaxActiveMapName !== 'function') return null;
+    return firstNonBlank(window.__nuwaxActiveMapName());
+  }
+
+  function syncRuntimeMapVersion() {
+    const resolved = currentRuntimeMapVersionId();
+    if (resolved) state.runtimeMapVersionId = resolved;
+  }
+
   function setStatus(message, stateName) {
     if (!state.statusEl) return;
     state.statusEl.textContent = message;
@@ -229,8 +287,8 @@
 
   function refreshStatus() {
     if (state.busy) return;
-    const version = state.mapVersionId || '未绑定地图';
-    setStatus(version + ' · ' + state.zones.length + ' 个 · G' + state.generation, state.mapVersionId ? 'ready' : 'warning');
+    const mapName = state.mapName || '未绑定地图';
+    setStatus(mapName + ' · ' + state.zones.length + ' 个 · G' + state.generation, state.mapName ? 'ready' : 'warning');
   }
 
   function setBusy(busy, message) {
@@ -251,7 +309,8 @@
 
   function applyEntry(entry) {
     if (!entry) return false;
-    state.mapVersionId = entry.mapVersionId || state.mapVersionId;
+    state.mapName = entry.mapName || state.mapName;
+    state.runtimeMapVersionId = entry.mapVersionId || state.runtimeMapVersionId;
     state.generation = entry.generation;
     state.signature = entry.signature;
     state.updatedAt = entry.updatedAt;
@@ -288,12 +347,13 @@
     return body || {};
   }
 
-  async function loadZones(mapVersionId) {
+  async function loadZones(mapName) {
     const serial = ++state.requestSerial;
-    const requestedMapVersionId = String(mapVersionId || '').trim() || null;
-    const preservingCurrentSnapshot = requestedMapVersionId === state.mapVersionId;
-    state.mapVersionId = requestedMapVersionId;
+    const requestedMapName = String(mapName || '').trim() || null;
+    const preservingCurrentSnapshot = requestedMapName === null || requestedMapName === state.mapName;
+    if (requestedMapName) state.mapName = requestedMapName;
     if (!preservingCurrentSnapshot) {
+      state.runtimeMapVersionId = null;
       state.generation = 0;
       state.signature = null;
       state.updatedAt = null;
@@ -303,20 +363,21 @@
     renderList();
     redrawOverlay();
     if (!preservingCurrentSnapshot) emitZonesUpdated();
-    setBusy(true, requestedMapVersionId ? '加载 ' + requestedMapVersionId : '解析当前地图版本');
-    const url = requestedMapVersionId
-      ? API_URL + '?map_version_id=' + encodeURIComponent(requestedMapVersionId)
+    setBusy(true, requestedMapName ? '加载 ' + requestedMapName : '解析当前地图');
+    const url = requestedMapName
+      ? API_URL + '?map_name=' + encodeURIComponent(requestedMapName)
       : API_URL;
     try {
       const raw = await fetchJson(url, { headers: { Accept: 'application/json' } });
       if (serial !== state.requestSerial) return;
-      const entry = entryFromEnvelope(raw, requestedMapVersionId);
+      const entry = entryFromEnvelope(raw, requestedMapName);
       if (!entry) throw new Error('服务端未返回禁行区地图条目');
-      if (requestedMapVersionId && entry.mapVersionId !== requestedMapVersionId) {
-        throw new Error('服务端返回了错误的 map_version_id');
+      if (requestedMapName && entry.mapName !== requestedMapName) {
+        throw new Error('服务端返回了错误的 map_name');
       }
       applyEntry(entry);
-      setStatus(entry.mapVersionId + ' · ' + entry.zones.length + ' 个 · G' + entry.generation, 'ready');
+      syncRuntimeMapVersion();
+      setStatus(entry.mapName + ' · ' + entry.zones.length + ' 个 · G' + entry.generation, 'ready');
     } catch (error) {
       if (serial !== state.requestSerial) return;
       const suffix = preservingCurrentSnapshot
@@ -329,26 +390,28 @@
   }
 
   async function replaceZones(nextZones, successMessage) {
-    if (!state.mapVersionId) {
-      setStatus('当前没有可写入的 map_version_id', 'error');
+    if (!state.mapName) {
+      setStatus('当前没有可写入的地图', 'error');
       return false;
     }
     const serial = ++state.requestSerial;
-    const mapVersionId = state.mapVersionId;
+    const mapName = state.mapName;
+    syncRuntimeMapVersion();
     setBusy(true, '保存 ' + nextZones.length + ' 个禁行区');
     try {
       const raw = await fetchJson(API_URL, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
-          map_version_id: mapVersionId,
+          map_name: mapName,
+          map_version_id: state.runtimeMapVersionId || '',
           expected_generation: state.generation,
           zones: nextZones.map(canonicalZone),
         }),
       });
-      if (serial !== state.requestSerial || state.mapVersionId !== mapVersionId) return false;
-      const entry = entryFromEnvelope(raw, mapVersionId);
-      if (!entry || entry.mapVersionId !== mapVersionId) {
+      if (serial !== state.requestSerial || state.mapName !== mapName) return false;
+      const entry = entryFromEnvelope(raw, mapName);
+      if (!entry || entry.mapName !== mapName) {
         throw new Error('服务端保存响应缺少当前地图的禁行区条目');
       }
       if (entry.generation < state.generation) {
@@ -360,9 +423,9 @@
       return true;
     } catch (error) {
       if (serial === state.requestSerial) {
-        if (error && error.status === 409 && state.mapVersionId === mapVersionId) {
+        if (error && error.status === 409 && state.mapName === mapName) {
           setStatus('禁行区已被其他编辑器更新，正在重新加载', 'error');
-          await loadZones(mapVersionId);
+          await loadZones(mapName);
         } else {
           setStatus(errorMessage(error, '禁行区保存失败'), 'error');
         }
@@ -373,35 +436,12 @@
     }
   }
 
-  function syncMapVersion(force) {
-    const conflict = currentMapVersionConflict();
-    if (conflict) {
-      const conflictKey = 'conflict:' + conflict.rendered + ':' + conflict.active;
-      if (!force && state.mapVersionInitialized && state.observedMapVersionId === conflictKey) return;
-      state.mapVersionInitialized = true;
-      state.observedMapVersionId = conflictKey;
-      state.requestSerial += 1;
-      state.mapVersionId = null;
-      state.generation = 0;
-      state.signature = null;
-      state.updatedAt = null;
-      state.zones = [];
-      clearDraft();
-      renderList();
-      redrawOverlay();
-      emitZonesUpdated();
-      setBusy(false);
-      setStatus(
-        '显示地图 ' + conflict.rendered + ' 与活动地图 ' + conflict.active + ' 不一致，已禁用禁行区编辑',
-        'error',
-      );
-      return;
-    }
-    const resolved = currentMapVersionId();
-    if (!force && state.mapVersionInitialized && resolved === state.observedMapVersionId) return;
-    state.mapVersionInitialized = true;
-    state.observedMapVersionId = resolved;
-    if (!force && resolved && resolved === state.mapVersionId) return;
+  function syncMapName(force, raw) {
+    const resolved = currentMapName(raw);
+    if (!force && (!resolved || (state.mapNameInitialized && resolved === state.observedMapName))) return;
+    state.mapNameInitialized = true;
+    state.observedMapName = resolved;
+    if (!force && resolved === state.mapName) return;
     void loadZones(resolved);
   }
 
@@ -894,7 +934,7 @@
     if (!state.zones.length) {
       const empty = document.createElement('li');
       empty.className = 'forbidden-zone-empty';
-      empty.textContent = '当前地图版本暂无禁行区。';
+      empty.textContent = '当前地图暂无禁行区。';
       state.listEl.appendChild(empty);
       return;
     }
@@ -989,18 +1029,23 @@
   }
 
   function onDrawTick() {
-    syncMapVersion(false);
+    syncRuntimeMapVersion();
     syncMapView();
     redrawOverlay();
   }
 
   function onForbiddenZonesStream(event) {
-    const preferred = currentMapVersionId() || state.mapVersionId;
+    const preferred = state.mapName || state.observedMapName;
     const entry = entryFromEnvelope(event.detail, preferred);
     if (!entry) return;
-    if (preferred && entry.mapVersionId && entry.mapVersionId !== preferred) return;
-    if (entry.mapVersionId === state.mapVersionId && entry.generation <= state.generation) return;
+    if (preferred && entry.mapName && entry.mapName !== preferred) return;
+    if (entry.mapName === state.mapName && entry.generation <= state.generation) return;
     applyEntry(entry);
+  }
+
+  function onMapContextStream(event) {
+    syncRuntimeMapVersion();
+    syncMapName(false, event.detail);
   }
 
   function onKeyDown(event) {
@@ -1061,15 +1106,15 @@
       onDrawTick();
     };
     window.addEventListener('stream:navigation.forbidden_zones', onForbiddenZonesStream);
-    window.addEventListener('stream:map.frame', function () { syncMapVersion(false); });
-    window.addEventListener('stream:map.heartbeat', function () { syncMapVersion(false); });
-    window.addEventListener('stream:runtime.governance', function () { syncMapVersion(false); });
-    window.addEventListener('stream:pointcloud_map.meta', function () { syncMapVersion(false); });
+    window.addEventListener('stream:map.frame', onMapContextStream);
+    window.addEventListener('stream:map.heartbeat', onMapContextStream);
+    window.addEventListener('stream:runtime.governance', onMapContextStream);
+    window.addEventListener('stream:pointcloud_map.meta', onMapContextStream);
 
     syncShapeUi();
     renderList();
     syncMapView();
-    syncMapVersion(true);
+    syncMapName(true);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
@@ -1079,7 +1124,7 @@
     clearDraft,
     getEnvelope: currentEnvelope,
     getZones: function () { return state.zones.map(canonicalZone); },
-    reload: function () { syncMapVersion(true); },
+    reload: function () { syncMapName(true); },
     setDrawing: setEditing,
   };
 })();

@@ -264,12 +264,37 @@ class SaveResult:
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
+_POINTCLOUD3D_COLOR_KEYS = frozenset({
+    "NUWAX_GATEWAY_POINTCLOUD3D_COLOR",
+    "NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR",
+    "NUWAX_GATEWAY_POINTCLOUD3D_STRUCTURE_COLOR",
+    "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR",
+})
+_POINTCLOUD3D_HEIGHT_COLORS_KEY = "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS"
+
+
+def _normalize_hex_color(value: str) -> Optional[str]:
+    candidate = value.strip().lower()
+    if len(candidate) != 7 or not candidate.startswith("#"):
+        return None
+    try:
+        int(candidate[1:], 16)
+    except ValueError:
+        return None
+    return candidate
 
 
 def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key in _POINTCLOUD3D_COLOR_KEYS:
+        return _normalize_hex_color(v)
+    if key == _POINTCLOUD3D_HEIGHT_COLORS_KEY:
+        colors = [_normalize_hex_color(item) for item in v.split(",") if item.strip()]
+        if len(colors) != 5 or any(color is None for color in colors):
+            return None
+        return ",".join(color for color in colors if color is not None)
     if typ == "bool":
         low = v.lower()
         if low in _TRUE:
@@ -284,9 +309,14 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
             return None
     if typ == "float":
         try:
-            return str(float(v))
+            number = float(v)
         except ValueError:
             return None
+        if key == "NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M" and not 0.01 <= number <= 2.0:
+            return None
+        if key == "NUWAX_GATEWAY_POINTCLOUD3D_SIZE" and not 0.1 <= number <= 20.0:
+            return None
+        return str(number)
     # str / csv：原样（csv 不强校验分隔，交由 settings 解析）
     return v
 
@@ -414,6 +444,5 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         _IO_LOGGER.info("配置写回 %s: %d 项, 备份=%s", target_file, len(confirmed), backups[target_file] or "无")
 
     return SaveResult(written=written, skipped=skipped, rejected=rejected, backups=backups)
-
 
 

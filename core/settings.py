@@ -150,6 +150,40 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
     return tuple(items)
 
 
+_DEFAULT_POINTCLOUD3D_HEIGHT_COLORS: Tuple[str, ...] = (
+    "#38bdf8",
+    "#22d3ee",
+    "#4ade80",
+    "#facc15",
+    "#fb7185",
+)
+_DEFAULT_POINTCLOUD3D_COLOR = "#cbd5e1"
+_DEFAULT_POINTCLOUD3D_GROUND_COLOR = "#38bdf8"
+_DEFAULT_POINTCLOUD3D_STRUCTURE_COLOR = "#f8fafc"
+_DEFAULT_POINTCLOUD3D_OBJECT_COLOR = "#fbbf24"
+
+
+def _normalize_hex_color(value: str, default: str) -> str:
+    candidate = str(value or "").strip()
+    if len(candidate) == 7 and candidate.startswith("#"):
+        try:
+            int(candidate[1:], 16)
+        except ValueError:
+            pass
+        else:
+            return candidate.lower()
+    return default
+
+
+def _normalize_hex_colors(
+    values: Tuple[str, ...],
+    defaults: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    if len(values) != len(defaults):
+        return defaults
+    return tuple(_normalize_hex_color(value, default) for value, default in zip(values, defaults))
+
+
 # Phase 0 收敛（env-only 启动契约）：`ExternalGeometryStackConfig.args` 字段
 # 保留以兼容旧 diagnostics contract，但运行时硬编码为空元组——启动脚本与
 # systemd 都已不再向 nuwax-geometry-runtime binary 传 CLI args。Rust main.rs
@@ -612,6 +646,19 @@ class RobotDriverConfig:
 
 
 @dataclass
+class PointCloud3DDisplayConfig:
+    """3D 点云浏览器的显示配置。"""
+
+    spacing_m: float = 0.1
+    size: float = 1.35
+    color: str = _DEFAULT_POINTCLOUD3D_COLOR
+    height_colors: Tuple[str, ...] = _DEFAULT_POINTCLOUD3D_HEIGHT_COLORS
+    ground_color: str = _DEFAULT_POINTCLOUD3D_GROUND_COLOR
+    structure_color: str = _DEFAULT_POINTCLOUD3D_STRUCTURE_COLOR
+    object_color: str = _DEFAULT_POINTCLOUD3D_OBJECT_COLOR
+
+
+@dataclass
 class GatewayServerConfig:
     """宿主机网关配置。"""
 
@@ -633,6 +680,7 @@ class GatewayServerConfig:
         "nuwax-go2-video-streamer",
     )
     telemetry_include_process_tree: bool = True
+    pointcloud3d: PointCloud3DDisplayConfig = field(default_factory=PointCloud3DDisplayConfig)
 
 
 @dataclass
@@ -1009,6 +1057,39 @@ def load_config() -> NuwaxRobotBridgeConfig:
     gateway_host = _cfg_str("NUWAX_GATEWAY_HOST", "0.0.0.0")
     gateway_port = _cfg_int("NUWAX_GATEWAY_PORT", 8766)
     default_public_base_url = f"http://host.docker.internal:{gateway_port}"
+    pointcloud3d = PointCloud3DDisplayConfig(
+        spacing_m=max(
+            0.01,
+            min(2.0, _cfg_float("NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M", 0.1)),
+        ),
+        size=max(
+            0.1,
+            min(20.0, _cfg_float("NUWAX_GATEWAY_POINTCLOUD3D_SIZE", 1.35)),
+        ),
+        color=_normalize_hex_color(
+            _cfg_str("NUWAX_GATEWAY_POINTCLOUD3D_COLOR", "#cbd5e1"),
+            _DEFAULT_POINTCLOUD3D_COLOR,
+        ),
+        height_colors=_normalize_hex_colors(
+            _cfg_csv(
+                "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS",
+                ("#38bdf8", "#22d3ee", "#4ade80", "#facc15", "#fb7185"),
+            ),
+            _DEFAULT_POINTCLOUD3D_HEIGHT_COLORS,
+        ),
+        ground_color=_normalize_hex_color(
+            _cfg_str("NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR", "#38bdf8"),
+            _DEFAULT_POINTCLOUD3D_GROUND_COLOR,
+        ),
+        structure_color=_normalize_hex_color(
+            _cfg_str("NUWAX_GATEWAY_POINTCLOUD3D_STRUCTURE_COLOR", "#f8fafc"),
+            _DEFAULT_POINTCLOUD3D_STRUCTURE_COLOR,
+        ),
+        object_color=_normalize_hex_color(
+            _cfg_str("NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR", "#fbbf24"),
+            _DEFAULT_POINTCLOUD3D_OBJECT_COLOR,
+        ),
+    )
     gateway = GatewayServerConfig(
         host=gateway_host,
         port=gateway_port,
@@ -1033,6 +1114,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         telemetry_include_process_tree=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_INCLUDE_PROCESS_TREE", True),
+        pointcloud3d=pointcloud3d,
     )
 
     relay = RelayServerConfig(

@@ -17,25 +17,132 @@ const COLORS = {
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
 const DEFAULT_POINT_STYLE = 'height';
-const POINT_STYLE_PRESETS = Object.freeze({
-  height: Object.freeze({ label: '高度', sampleStride: 2, liveSpacingM: 0.1, heightGradientScale: 2, blueBandHeightM: 0.4, size: 1.35, sizeAttenuation: false, colorMode: 'height' }),
-  singleFloor: Object.freeze({ label: '单层', sampleStride: 1, liveSpacingM: 0.08, size: 1.35, sizeAttenuation: false, colorMode: 'singleFloor', floorFilter: 'story' }),
-  ground: Object.freeze({ label: '地面', sampleStride: 1, liveSpacingM: 0.08, size: 1.55, sizeAttenuation: false, colorMode: 'ground', floorFilter: 'ground' }),
-  structure: Object.freeze({ label: '结构', sampleStride: 1, liveSpacingM: 0.08, size: 1.35, sizeAttenuation: false, colorMode: 'structure', floorFilter: 'story' }),
-  mono: Object.freeze({ label: '单色', sampleStride: 3, size: 1.1, sizeAttenuation: false, colorMode: 'mono' }),
+const DEFAULT_POINTCLOUD3D_CONFIG = Object.freeze({
+  spacingM: 0.1,
+  size: 1.35,
+  color: '#cbd5e1',
+  heightColors: Object.freeze(['#38bdf8', '#22d3ee', '#4ade80', '#facc15', '#fb7185']),
+  groundColor: '#38bdf8',
+  structureColor: '#f8fafc',
+  objectColor: '#fbbf24',
 });
-const HEIGHT_COLOR_STOPS = Object.freeze([
-  [56, 189, 248],
-  [34, 211, 238],
-  [74, 222, 128],
-  [250, 204, 21],
-  [251, 113, 133],
-]);
+
+function normalizePointCloudNumber(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= minimum && number <= maximum ? number : fallback;
+}
+
+function normalizePointCloudHexColor(value, fallback) {
+  const color = String(value || '').trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(color) ? color : fallback;
+}
+
+function pointCloudHexToRgb(value) {
+  const hex = value.slice(1);
+  return [
+    Number.parseInt(hex.slice(0, 2), 16),
+    Number.parseInt(hex.slice(2, 4), 16),
+    Number.parseInt(hex.slice(4, 6), 16),
+  ];
+}
+
+function normalizePointCloud3DConfig(rawConfig) {
+  const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
+  const rawHeightColors = config.heightColors ?? config.height_colors;
+  const heightColors = Array.isArray(rawHeightColors)
+    && rawHeightColors.length === DEFAULT_POINTCLOUD3D_CONFIG.heightColors.length
+    ? rawHeightColors.map((color, index) => normalizePointCloudHexColor(
+      color,
+      DEFAULT_POINTCLOUD3D_CONFIG.heightColors[index],
+    ))
+    : [...DEFAULT_POINTCLOUD3D_CONFIG.heightColors];
+  return Object.freeze({
+    spacingM: normalizePointCloudNumber(
+      config.spacingM ?? config.spacing_m,
+      DEFAULT_POINTCLOUD3D_CONFIG.spacingM,
+      0.01,
+      2,
+    ),
+    size: normalizePointCloudNumber(
+      config.size,
+      DEFAULT_POINTCLOUD3D_CONFIG.size,
+      0.1,
+      20,
+    ),
+    color: normalizePointCloudHexColor(config.color, DEFAULT_POINTCLOUD3D_CONFIG.color),
+    heightColors: Object.freeze(heightColors),
+    groundColor: normalizePointCloudHexColor(
+      config.groundColor ?? config.ground_color,
+      DEFAULT_POINTCLOUD3D_CONFIG.groundColor,
+    ),
+    structureColor: normalizePointCloudHexColor(
+      config.structureColor ?? config.structure_color,
+      DEFAULT_POINTCLOUD3D_CONFIG.structureColor,
+    ),
+    objectColor: normalizePointCloudHexColor(
+      config.objectColor ?? config.object_color,
+      DEFAULT_POINTCLOUD3D_CONFIG.objectColor,
+    ),
+  });
+}
+
+const POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(
+  typeof window === 'undefined' ? null : window.__NUWAX_POINTCLOUD3D_CONFIG__,
+);
+const POINT_STYLE_PRESETS = Object.freeze({
+  height: Object.freeze({
+    label: '高度',
+    sampleStride: 2,
+    liveSpacingM: POINTCLOUD3D_CONFIG.spacingM,
+    heightGradientScale: 2,
+    blueBandHeightM: 0.4,
+    size: POINTCLOUD3D_CONFIG.size,
+    sizeAttenuation: false,
+    colorMode: 'height',
+  }),
+  singleFloor: Object.freeze({
+    label: '单层',
+    sampleStride: 1,
+    liveSpacingM: POINTCLOUD3D_CONFIG.spacingM * 0.8,
+    size: POINTCLOUD3D_CONFIG.size,
+    sizeAttenuation: false,
+    colorMode: 'singleFloor',
+    floorFilter: 'story',
+  }),
+  ground: Object.freeze({
+    label: '地面',
+    sampleStride: 1,
+    liveSpacingM: POINTCLOUD3D_CONFIG.spacingM * 0.8,
+    size: POINTCLOUD3D_CONFIG.size * (1.55 / 1.35),
+    sizeAttenuation: false,
+    colorMode: 'ground',
+    floorFilter: 'ground',
+  }),
+  structure: Object.freeze({
+    label: '结构',
+    sampleStride: 1,
+    liveSpacingM: POINTCLOUD3D_CONFIG.spacingM * 0.8,
+    size: POINTCLOUD3D_CONFIG.size,
+    sizeAttenuation: false,
+    colorMode: 'structure',
+    floorFilter: 'story',
+  }),
+  mono: Object.freeze({
+    label: '单色',
+    sampleStride: 3,
+    size: POINTCLOUD3D_CONFIG.size * (1.1 / 1.35),
+    sizeAttenuation: false,
+    colorMode: 'mono',
+  }),
+});
+const HEIGHT_COLOR_STOPS = Object.freeze(
+  POINTCLOUD3D_CONFIG.heightColors.map((color) => Object.freeze(pointCloudHexToRgb(color))),
+);
 const FLOOR_COLORS = Object.freeze({
-  ground: Object.freeze([56, 189, 248]),
-  context: Object.freeze([203, 213, 225]),
-  structure: Object.freeze([248, 250, 252]),
-  object: Object.freeze([251, 191, 36]),
+  ground: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.groundColor)),
+  context: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.color)),
+  structure: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor)),
+  object: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.objectColor)),
 });
 const FLOOR_BIN_SIZE_M = 0.08;
 const FLOOR_BAND_HALF_M = 0.12;
@@ -171,6 +278,7 @@ class PointCloud3DViewer {
     this._semanticFallbackMaterial = null;
     this._lod = 'preview';
     this._pointStyle = DEFAULT_POINT_STYLE;
+    this._displayConfig = POINTCLOUD3D_CONFIG;
     this._needsRender = false;
     this._rafId = null;
     this._lastFrameTime = 0;

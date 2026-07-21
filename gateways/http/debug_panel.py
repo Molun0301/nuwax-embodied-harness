@@ -110,7 +110,8 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     async def debug_page(request: Request) -> HTMLResponse:
         access_manager.authenticate_local_debug_page(request)
         # 个人机器狗：网关不鉴权，前端无需注入访问令牌（保留空串占位，沿用现有 fetch 逻辑）。
-        return HTMLResponse(_render_debug_page(""))
+        pointcloud3d_config = getattr(getattr(runtime.config, "gateway", None), "pointcloud3d", None)
+        return HTMLResponse(_render_debug_page("", pointcloud3d_config))
 
     @router.get("/api/debug/overview")
     @router.get("/api/debug/snapshot")
@@ -227,18 +228,31 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     return router
 
 
-def _render_debug_page(access_token: str) -> str:
+def _render_debug_page(access_token: str, pointcloud3d_config: Any = None) -> str:
     """Serve the debug panel from the standalone static HTML file.
 
     The page markup/styles/script live in ``static/debug_panel.html`` so the
     file is the single source of truth: open it directly in a browser to
     preview exactly what production serves. The only server-side step is
-    injecting the access token into the quoted ``"__DEBUG_ACCESS_TOKEN__"``
-    placeholder (kept quoted so the raw file is valid JS when previewed).
+    injecting runtime values into quoted placeholders (kept quoted so the raw
+    file remains valid JS when previewed directly).
     """
     debug_access_token = json.dumps(access_token)
+    pointcloud3d_payload = (
+        to_jsonable(pointcloud3d_config)
+        if pointcloud3d_config is not None
+        else {}
+    )
+    pointcloud3d_json = json.dumps(
+        pointcloud3d_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
     html = _DEBUG_PANEL_HTML_PATH.read_text(encoding="utf-8")
-    return html.replace('"__DEBUG_ACCESS_TOKEN__"', debug_access_token)
+    return (
+        html.replace('"__DEBUG_ACCESS_TOKEN__"', debug_access_token)
+        .replace('"__POINTCLOUD3D_CONFIG__"', pointcloud3d_json)
+    )
 
 
 def _envelope(

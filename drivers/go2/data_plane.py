@@ -638,6 +638,12 @@ class Go2DirectDdsBridge:
             gyroscope.append(0.0)
         while len(accelerometer) < 3:
             accelerometer.append(0.0)
+        angular_velocity = [float(value) for value in gyroscope[:3]]
+        gyro_deadband_rps = float(self.config.direct_dds.gyro_deadband_rps)
+        angular_velocity = [
+            0.0 if abs(value) <= gyro_deadband_rps else value
+            for value in angular_velocity
+        ]
         expected_imu_frame = str(getattr(self.config, "expected_imu_frame", "") or "").strip()
         if not expected_imu_frame:
             raise ValueError(
@@ -647,7 +653,11 @@ class Go2DirectDdsBridge:
         return IMUState(
             frame_id=expected_imu_frame,
             orientation=quaternion,
-            angular_velocity_rad_s=Vector3(x=float(gyroscope[0]), y=float(gyroscope[1]), z=float(gyroscope[2])),
+            angular_velocity_rad_s=Vector3(
+                x=angular_velocity[0],
+                y=angular_velocity[1],
+                z=angular_velocity[2],
+            ),
             linear_acceleration_m_s2=Vector3(
                 x=float(accelerometer[0]),
                 y=float(accelerometer[1]),

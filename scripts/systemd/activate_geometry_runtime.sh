@@ -120,10 +120,16 @@ capability = str(payload.get("capability_name") or "unknown").strip() or "unknow
 request_id = str(payload.get("request_id") or "").strip()
 if not request_id:
     raise SystemExit("missing request_id")
-try:
-    motion_stop_generation = int(payload.get("motion_stop_generation", 0))
-except (TypeError, ValueError):
-    raise SystemExit("invalid motion_stop_generation")
+raw_motion_stop_generation = payload.get("motion_stop_generation")
+if raw_motion_stop_generation is None:
+    if level != "geometry":
+        raise SystemExit("invalid motion_stop_generation")
+    motion_stop_generation = 0
+else:
+    try:
+        motion_stop_generation = int(raw_motion_stop_generation)
+    except (TypeError, ValueError):
+        raise SystemExit("invalid motion_stop_generation")
 if motion_stop_generation < 0:
     raise SystemExit("invalid motion_stop_generation")
 print("%s\t%s\t%s\t%s" % (level, capability, request_id, motion_stop_generation))
@@ -143,8 +149,11 @@ import sys
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if str(payload.get("request_id") or "").strip() != sys.argv[2]:
     raise SystemExit(1)
+raw_marker_generation = payload.get("motion_stop_generation")
 try:
-    marker_generation = int(payload.get("motion_stop_generation", -1))
+    marker_generation = (
+        0 if raw_marker_generation is None else int(raw_marker_generation)
+    )
     request_generation = int(sys.argv[3])
 except (TypeError, ValueError):
     raise SystemExit(1)

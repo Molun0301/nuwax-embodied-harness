@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -69,6 +70,12 @@ def _cfg_float(name: str, default: float) -> float:
     return float(value.strip())
 
 
+def _require_nonnegative_finite(name: str, value: float) -> float:
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
 def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
     value = _raw_value(name, "")
     if not value.strip():
@@ -115,6 +122,7 @@ class Go2DirectDdsConfig:
     point_cloud_xyz_registered_to_odom: bool = False
     read_timeout_sec: float = 0.5
     max_points_per_scan: int = 1200
+    gyro_deadband_rps: float = 0.003490658503988659
 
 
 @dataclass
@@ -127,6 +135,7 @@ class Go2OfficialControlConfig:
     client_timeout_sec: float = 3.0
     max_linear_velocity_mps: float = 0.35
     max_yaw_rate_rps: float = 0.8
+    yaw_rate_deadband_rps: float = 0.003490658503988659
     obstacle_avoidance_default_enabled: bool = False
 
 
@@ -173,6 +182,10 @@ def load_go2_data_plane_config(
             ),
             read_timeout_sec=max(0.05, _cfg_float("GO2_DIRECT_DDS_READ_TIMEOUT_SEC", 0.5)),
             max_points_per_scan=max(50, _cfg_int("GO2_DIRECT_DDS_MAX_POINTS_PER_SCAN", 1200)),
+            gyro_deadband_rps=_require_nonnegative_finite(
+                "GO2_IMU_GYRO_DEADBAND_RPS",
+                _cfg_float("GO2_IMU_GYRO_DEADBAND_RPS", 0.003490658503988659),
+            ),
         ),
         official=Go2OfficialControlConfig(
             enabled=_cfg_bool("GO2_OFFICIAL_BACKEND_ENABLED", True),
@@ -181,6 +194,13 @@ def load_go2_data_plane_config(
             client_timeout_sec=max(0.5, _cfg_float("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", 3.0)),
             max_linear_velocity_mps=max(0.05, _cfg_float("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", 0.35)),
             max_yaw_rate_rps=max(0.1, _cfg_float("GO2_OFFICIAL_MAX_YAW_RATE_RPS", 0.8)),
+            yaw_rate_deadband_rps=_require_nonnegative_finite(
+                "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",
+                _cfg_float(
+                    "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",
+                    0.003490658503988659,
+                ),
+            ),
             obstacle_avoidance_default_enabled=_cfg_bool(
                 "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
                 False,

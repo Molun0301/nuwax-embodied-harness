@@ -9619,7 +9619,9 @@ class GatewayRuntime:
         if capability_name in {"execute_sport_command", "switch_control_mode"}:
             return motion_guard_pb.GUARD_SOURCE_GATEWAY_SPORT
         if capability_name in _MOTION_STACK_CAPABILITY_NAMES or capability_name == "inspect_target":
-            return motion_guard_pb.GUARD_SOURCE_NAV
+            # The Gateway owns the public readiness query; the nav-stack later
+            # claims NAV when it atomically acquires the execution lease.
+            return motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
         return motion_guard_pb.GUARD_SOURCE_GATEWAY_MANUAL
 
     def _admit_motion_request(

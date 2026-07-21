@@ -256,7 +256,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
                        "NUWAX_NAVIGATION_HISTORY", "NUWAX_OBSERVATION_HISTORY", "DASHSCOPE")),
     ("go2_video", ("GO2_VIDEO_STREAM",)),
     ("go2_official", ("GO2_OFFICIAL",)),
-    ("go2_input", ("GO2_DATA_PLANE", "GO2_DIRECT_DDS", "GO2_DDS")),
+    ("go2_input", ("GO2_DATA_PLANE", "GO2_DIRECT_DDS", "GO2_DDS", "GO2_IMU")),
     ("robot", ("NUWAX_ACTIVE_ROBOT", "GO2_SDK", "GO2_LOW_LEVEL", "GO2_NETWORK", "GO2_")),
     ("lcm_typed_channel", ("NUWAX_LCM_CHANNEL_",)),
     ("runtime_channel",   ("NUWAX_GEOMETRY_RUNTIME_", "NUWAX_GEOMETRY_RUNTIME_PROCESS", "NUWAX_GEOMETRY_RUNTIME_LOG")),
@@ -658,6 +658,7 @@ _ZH_NAMES: Dict[str, str] = {
     "GO2_DIRECT_DDS_POINT_CLOUD_TOPIC": "Go2 DDS 点云话题",
     "GO2_DIRECT_DDS_POSE_TOPIC": "Go2 姿态 DDS 话题",
     "GO2_DIRECT_DDS_READ_TIMEOUT_SEC": "Go2 DDS 读取超时（秒）",
+    "GO2_IMU_GYRO_DEADBAND_RPS": "Go2 IMU 陀螺仪死区（弧度/秒）",
 
     # Go2 数据面·官方控制
     "GO2_OFFICIAL_BACKEND_ENABLED": "启用 Go2 官方控制后端",
@@ -665,6 +666,7 @@ _ZH_NAMES: Dict[str, str] = {
     "GO2_OFFICIAL_CLIENT_TIMEOUT_SEC": "Go2 官方客户端超时（秒）",
     "GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS": "Go2 官方最大线速度（米/秒）",
     "GO2_OFFICIAL_MAX_YAW_RATE_RPS": "Go2 官方最大偏航角速度（弧度/秒）",
+    "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS": "Go2 官方偏航角速度死区（弧度/秒）",
     "GO2_OFFICIAL_SERVICES_AUTO_START": "自动启动 Go2 官方服务",
     "GO2_OFFICIAL_SERVICE_NAMES": "Go2 官方服务名称",
     "GO2_OBSTACLE_GRID_LIVE_CLOUD_ENABLED": "启用 Go2 实时障碍点云栅格",

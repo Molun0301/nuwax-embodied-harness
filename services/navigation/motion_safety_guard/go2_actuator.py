@@ -162,6 +162,7 @@ class Go2Actuator:
         timeout_seconds: float,
         max_linear_velocity_mps: float = 0.35,
         max_yaw_rate_rps: float = 0.8,
+        yaw_rate_deadband_rps: float = 0.003490658503988659,
         max_body_pose_rad: float = 0.5,
     ) -> None:
         safety_limits = {
@@ -180,12 +181,22 @@ class Go2Actuator:
                 "ACTUATOR_CONFIG_INVALID",
                 "safety limits must be finite and positive: " + ", ".join(invalid),
             )
+        if (
+            not math.isfinite(yaw_rate_deadband_rps)
+            or yaw_rate_deadband_rps < 0.0
+            or yaw_rate_deadband_rps >= max_yaw_rate_rps
+        ):
+            raise ActuatorError(
+                "ACTUATOR_CONFIG_INVALID",
+                "yaw_rate_deadband_rps must be finite, non-negative, and less than max_yaw_rate_rps",
+            )
         self._factories = factories
         self._manifest_hash = actuator_symbols_sha256
         self._dds_iface = dds_iface or None
         self._timeout_seconds = timeout_seconds
         self._max_linear_velocity_mps = max_linear_velocity_mps
         self._max_yaw_rate_rps = max_yaw_rate_rps
+        self._yaw_rate_deadband_rps = yaw_rate_deadband_rps
         self._max_body_pose_rad = max_body_pose_rad
         self._obstacle_remote_enabled = False
         self._obstacle_policy_enabled = False
@@ -239,16 +250,48 @@ class Go2Actuator:
                 "NUWAX_ACTUATOR_SYMBOLS_FILE is required",
             )
         manifest_path = Path(manifest_value).expanduser().resolve()
-        timeout = float(os.environ.get("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
-        if not math.isfinite(timeout) or timeout <= 0.0:
+        try:
+            timeout = float(os.environ.get("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
+            max_linear = float(
+                os.environ.get("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35")
+            )
+            max_yaw = float(os.environ.get("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+            yaw_deadband = float(
+                os.environ.get(
+                    "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",
+                    "0.003490658503988659",
+                )
+            )
+        except ValueError as exc:
             raise ActuatorError(
                 "ACTUATOR_CONFIG_INVALID",
-                "GO2_OFFICIAL_CLIENT_TIMEOUT_SEC must be finite and positive",
+                "Go2 actuator numeric settings must contain valid numbers",
+            ) from exc
+        positive_limits = {
+            "GO2_OFFICIAL_CLIENT_TIMEOUT_SEC": timeout,
+            "GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS": max_linear,
+            "GO2_OFFICIAL_MAX_YAW_RATE_RPS": max_yaw,
+        }
+        invalid = [
+            name
+            for name, value in positive_limits.items()
+            if not math.isfinite(value) or value <= 0.0
+        ]
+        if invalid:
+            raise ActuatorError(
+                "ACTUATOR_CONFIG_INVALID",
+                "Go2 actuator limits must be finite and positive: " + ", ".join(invalid),
             )
-        max_linear = float(
-            os.environ.get("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35")
-        )
-        max_yaw = float(os.environ.get("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+        if (
+            not math.isfinite(yaw_deadband)
+            or yaw_deadband < 0.0
+            or yaw_deadband >= max_yaw
+        ):
+            raise ActuatorError(
+                "ACTUATOR_CONFIG_INVALID",
+                "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS must be finite, non-negative, "
+                "and less than GO2_OFFICIAL_MAX_YAW_RATE_RPS",
+            )
         iface = (
             os.environ.get("GO2_DATA_PLANE_DDS_IFACE", "").strip()
             or os.environ.get("GO2_DDS_IFACE", "").strip()
@@ -261,6 +304,7 @@ class Go2Actuator:
             timeout_seconds=min(timeout, MAX_PRODUCTION_SDK_TIMEOUT_SECONDS),
             max_linear_velocity_mps=max_linear,
             max_yaw_rate_rps=max_yaw,
+            yaw_rate_deadband_rps=yaw_deadband,
         )
 
     @property
@@ -296,9 +340,14 @@ class Go2Actuator:
                     "INVALID_ARGUMENT",
                     "twist yaw rate exceeds configured limit",
                 )
+            move_values = (
+                values[0],
+                values[1],
+                0.0 if abs(values[2]) <= self._yaw_rate_deadband_rps else values[2],
+            )
             client = self._obstacle if self._obstacle_policy_enabled else self._sport
             _require_success(
-                client.Move(*values),
+                client.Move(*move_values),
                 f"{client.__class__.__name__}.Move",
             )
             return

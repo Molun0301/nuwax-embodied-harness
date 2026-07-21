@@ -7,15 +7,17 @@ IMU/点云观测与只读 RobotState 服务状态。
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import logging
+import math
 from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple
 
 import numpy as np
 
@@ -41,6 +43,128 @@ _POINT_FIELD_DTYPES = {
     7: (np.dtype("<f4"), PointFieldDataType.FLOAT32),
     8: (np.dtype("<f8"), PointFieldDataType.FLOAT64),
 }
+
+_STATIONARY_YAW_RATE_FILTER_TAU_SEC = 0.5
+_MAX_STATIONARY_YAW_SAMPLE_GAP_SEC = 1.0
+_GO2_UTLIDAR_FRAME = "utlidar_lidar"
+_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M = (0.28945, 0.0, -0.046825)
+_GO2_BODY_FROM_UTLIDAR_PITCH_RAD = 2.8782025850555556
+_POINT_CLOUD_POSE_HISTORY_SIZE = 256
+_MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
+
+
+@dataclass(frozen=True)
+class _TimedPoseSnapshot:
+    generation: int
+    received_at_monotonic: float
+    pose: Pose
+    yaw_stabilization_offset_rad: float
+    stationary_yaw_locked: bool
+
+
+def _normalize_angle_radians(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def _quaternion_yaw_radians(quaternion: Quaternion) -> float:
+    return math.atan2(
+        2.0
+        * (
+            (float(quaternion.w) * float(quaternion.z))
+            + (float(quaternion.x) * float(quaternion.y))
+        ),
+        1.0
+        - 2.0
+        * (
+            (float(quaternion.y) * float(quaternion.y))
+            + (float(quaternion.z) * float(quaternion.z))
+        ),
+    )
+
+
+def _rotate_quaternion_world_yaw(
+    quaternion: Quaternion,
+    yaw_offset_rad: float,
+) -> Quaternion:
+    half_offset = 0.5 * float(yaw_offset_rad)
+    cosine = math.cos(half_offset)
+    sine = math.sin(half_offset)
+    return Quaternion(
+        x=(cosine * float(quaternion.x)) - (sine * float(quaternion.y)),
+        y=(sine * float(quaternion.x)) + (cosine * float(quaternion.y)),
+        z=(cosine * float(quaternion.z)) + (sine * float(quaternion.w)),
+        w=(cosine * float(quaternion.w)) - (sine * float(quaternion.z)),
+    )
+
+
+def _rotate_registered_xyz_about_pose(
+    points_xyz: np.ndarray,
+    yaw_offset_rad: float,
+    origin_x: float,
+    origin_y: float,
+) -> np.ndarray:
+    if abs(float(yaw_offset_rad)) <= 1e-12:
+        return points_xyz
+    cosine = math.cos(float(yaw_offset_rad))
+    sine = math.sin(float(yaw_offset_rad))
+    relative_x = points_xyz[:, 0].astype(np.float64) - float(origin_x)
+    relative_y = points_xyz[:, 1].astype(np.float64) - float(origin_y)
+    rotated = np.array(points_xyz, dtype=np.float32, copy=True, order="C")
+    rotated[:, 0] = float(origin_x) + (cosine * relative_x) - (sine * relative_y)
+    rotated[:, 1] = float(origin_y) + (sine * relative_x) + (cosine * relative_y)
+    return rotated
+
+
+def _quaternion_rotation_matrix(quaternion: Quaternion) -> np.ndarray:
+    x = float(quaternion.x)
+    y = float(quaternion.y)
+    z = float(quaternion.z)
+    w = float(quaternion.w)
+    norm_squared = (x * x) + (y * y) + (z * z) + (w * w)
+    if norm_squared <= 1e-12:
+        raise ValueError("位姿四元数模长为零")
+    scale = 2.0 / norm_squared
+    return np.asarray(
+        [
+            [1.0 - (scale * ((y * y) + (z * z))), scale * ((x * y) - (z * w)), scale * ((x * z) + (y * w))],
+            [scale * ((x * y) + (z * w)), 1.0 - (scale * ((x * x) + (z * z))), scale * ((y * z) - (x * w))],
+            [scale * ((x * z) - (y * w)), scale * ((y * z) + (x * w)), 1.0 - (scale * ((x * x) + (y * y)))],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _transform_utlidar_xyz_to_odom(
+    points_xyz: np.ndarray,
+    pose: Pose,
+) -> np.ndarray:
+    # Go2 URDF: base_link <- utlidar_lidar.
+    cosine = math.cos(_GO2_BODY_FROM_UTLIDAR_PITCH_RAD)
+    sine = math.sin(_GO2_BODY_FROM_UTLIDAR_PITCH_RAD)
+    body_from_lidar_rotation = np.asarray(
+        [
+            [cosine, 0.0, sine],
+            [0.0, 1.0, 0.0],
+            [-sine, 0.0, cosine],
+        ],
+        dtype=np.float64,
+    )
+    body_from_lidar_translation = np.asarray(
+        _GO2_BODY_FROM_UTLIDAR_TRANSLATION_M,
+        dtype=np.float64,
+    )
+    odom_from_body_rotation = _quaternion_rotation_matrix(pose.orientation)
+    odom_from_body_translation = np.asarray(
+        [pose.position.x, pose.position.y, pose.position.z],
+        dtype=np.float64,
+    )
+    points_in_body = (
+        np.asarray(points_xyz, dtype=np.float64) @ body_from_lidar_rotation.T
+    ) + body_from_lidar_translation
+    points_in_odom = (
+        points_in_body @ odom_from_body_rotation.T
+    ) + odom_from_body_translation
+    return np.ascontiguousarray(points_in_odom, dtype=np.float32)
 
 
 def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
@@ -312,6 +436,22 @@ class Go2DirectDdsBridge:
                 "point_cloud_bridge_topic": self._point_cloud_bridge_topic,
                 "point_cloud_bridge_last_error": self._point_cloud_bridge_last_error,
                 "point_cloud_bridge_last_error_at_monotonic": self._point_cloud_bridge_last_error_at,
+                "stationary_yaw_locked": bool(
+                    getattr(self, "_stationary_yaw_locked", False)
+                ),
+                "orientation_yaw_rate_rps": float(
+                    getattr(self, "_stationary_yaw_rate_rps", 0.0)
+                ),
+                "yaw_stabilization_offset_rad": float(
+                    getattr(self, "_stationary_yaw_offset_rad", 0.0)
+                ),
+                "point_cloud_yaw_stabilization_applied": bool(
+                    point_cloud_active
+                    and self._latest_local_point_cloud.metadata.get(
+                        "yaw_stabilization_applied",
+                        False,
+                    )
+                ),
             }
 
     def _record_point_cloud_bridge_error(
@@ -346,7 +486,107 @@ class Go2DirectDdsBridge:
         self._latest_imu_source_topic = ""
         self._direct_pose_ready = False
         self._direct_imu_ready = False
+        self._reset_stationary_yaw_filter_locked()
         self._invalidate_point_cloud_locked(message)
+
+    def _reset_stationary_yaw_filter_locked(self) -> None:
+        self._stationary_yaw_last_raw_rad: Optional[float] = None
+        self._stationary_yaw_last_sample_at: Optional[float] = None
+        self._stationary_yaw_rate_rps = 0.0
+        self._stationary_yaw_output_rad: Optional[float] = None
+        self._stationary_yaw_offset_rad = 0.0
+        self._stationary_yaw_locked = False
+        pose_history = getattr(self, "_pose_history", None)
+        if pose_history is None:
+            self._pose_history: Deque[_TimedPoseSnapshot] = deque(
+                maxlen=_POINT_CLOUD_POSE_HISTORY_SIZE
+            )
+        else:
+            pose_history.clear()
+
+    def _nearest_pose_snapshot_locked(
+        self,
+        *,
+        generation: int,
+        received_at_monotonic: float,
+    ) -> Tuple[Optional[_TimedPoseSnapshot], Optional[float]]:
+        pose_history = getattr(self, "_pose_history", ())
+        candidates = (
+            snapshot
+            for snapshot in pose_history
+            if snapshot.generation == generation
+        )
+        nearest = min(
+            candidates,
+            key=lambda snapshot: abs(
+                snapshot.received_at_monotonic - received_at_monotonic
+            ),
+            default=None,
+        )
+        if nearest is None:
+            return None, None
+        return nearest, abs(nearest.received_at_monotonic - received_at_monotonic)
+
+    def _stabilize_stationary_yaw_locked(
+        self,
+        message: object,
+        orientation: Quaternion,
+    ) -> Quaternion:
+        raw_yaw = _quaternion_yaw_radians(orientation)
+        sample_at = time.monotonic()
+        last_raw_yaw = getattr(self, "_stationary_yaw_last_raw_rad", None)
+        last_sample_at = getattr(self, "_stationary_yaw_last_sample_at", None)
+        filtered_rate = float(getattr(self, "_stationary_yaw_rate_rps", 0.0))
+        contiguous_sample = last_raw_yaw is not None and last_sample_at is not None
+        if contiguous_sample:
+            elapsed = sample_at - last_sample_at
+            contiguous_sample = 0.0 < elapsed <= _MAX_STATIONARY_YAW_SAMPLE_GAP_SEC
+            if contiguous_sample:
+                raw_rate = _normalize_angle_radians(raw_yaw - last_raw_yaw) / elapsed
+                alpha = 1.0 - math.exp(
+                    -elapsed / _STATIONARY_YAW_RATE_FILTER_TAU_SEC
+                )
+                filtered_rate += alpha * (raw_rate - filtered_rate)
+            else:
+                filtered_rate = 0.0
+
+        self._stationary_yaw_last_raw_rad = raw_yaw
+        self._stationary_yaw_last_sample_at = sample_at
+        self._stationary_yaw_rate_rps = filtered_rate
+
+        deadband_rps = float(self.config.direct_dds.gyro_deadband_rps)
+        try:
+            robot_idle = int(getattr(message, "mode")) == 0 and int(
+                getattr(message, "gait_type")
+            ) == 0
+        except (AttributeError, TypeError, ValueError):
+            robot_idle = False
+
+        if deadband_rps <= 0.0 or not contiguous_sample:
+            self._stationary_yaw_output_rad = raw_yaw
+            self._stationary_yaw_offset_rad = 0.0
+            self._stationary_yaw_locked = False
+            return orientation
+
+        output_yaw = getattr(self, "_stationary_yaw_output_rad", None)
+        if robot_idle and abs(filtered_rate) <= deadband_rps:
+            if output_yaw is None:
+                output_yaw = raw_yaw
+            self._stationary_yaw_offset_rad = _normalize_angle_radians(
+                output_yaw - raw_yaw
+            )
+            self._stationary_yaw_locked = True
+        else:
+            output_yaw = _normalize_angle_radians(
+                raw_yaw + float(getattr(self, "_stationary_yaw_offset_rad", 0.0))
+            )
+            self._stationary_yaw_locked = False
+
+        self._stationary_yaw_output_rad = output_yaw
+        return _rotate_quaternion_world_yaw(
+            orientation,
+            _normalize_angle_radians(output_yaw - raw_yaw),
+        )
 
     def _is_generation_active_locked(
         self,
@@ -588,6 +828,40 @@ class Go2DirectDdsBridge:
             with self._lock:
                 if not self._is_generation_active_locked(generation):
                     return
+                stabilized_orientation = self._stabilize_stationary_yaw_locked(
+                    message,
+                    pose.orientation,
+                )
+                pose = pose.model_copy(
+                    update={"orientation": stabilized_orientation},
+                    deep=False,
+                )
+                imu_state = imu_state.model_copy(
+                    update={"orientation": stabilized_orientation},
+                    deep=False,
+                )
+                pose_history = getattr(self, "_pose_history", None)
+                if pose_history is None:
+                    pose_history = deque(maxlen=_POINT_CLOUD_POSE_HISTORY_SIZE)
+                    self._pose_history = pose_history
+                pose_history.append(
+                    _TimedPoseSnapshot(
+                        generation=generation,
+                        received_at_monotonic=float(
+                            self._stationary_yaw_last_sample_at
+                        ),
+                        pose=pose.model_copy(deep=False),
+                        yaw_stabilization_offset_rad=float(
+                            self._stationary_yaw_offset_rad
+                        ),
+                        stationary_yaw_locked=bool(self._stationary_yaw_locked),
+                    )
+                )
+                metadata["stationary_yaw_locked"] = self._stationary_yaw_locked
+                metadata["orientation_yaw_rate_rps"] = self._stationary_yaw_rate_rps
+                metadata["yaw_stabilization_offset_rad"] = (
+                    self._stationary_yaw_offset_rad
+                )
                 self._latest_pose_from_dds = pose
                 self._latest_imu_state_from_dds = imu_state
                 self._latest_pose_generation = generation
@@ -745,6 +1019,18 @@ class Go2DirectDdsBridge:
         if not source_frame:
             reject("PointCloud2 header.frame_id 为空")
             return
+        upstream_registered_to_odom = bool(
+            getattr(
+                self.config.direct_dds,
+                "point_cloud_xyz_registered_to_odom",
+                False,
+            )
+        )
+        point_cloud_received_at = (
+            time.monotonic()
+            if source_frame == _GO2_UTLIDAR_FRAME
+            else None
+        )
 
         stamp = getattr(header, "stamp", None)
         if stamp is None:
@@ -879,21 +1165,108 @@ class Go2DirectDdsBridge:
             reject(f"PointCloud2 ndarray 解析失败：{exc}")
             return
 
-        registered_to_odom = bool(
-            getattr(
-                self.config.direct_dds,
-                "point_cloud_xyz_registered_to_odom",
-                False,
-            )
-        )
+        registered_to_odom = False
         frame_id = source_frame
         registered_frame = ""
-        if registered_to_odom:
+        registration_assertion = "absent"
+        driver_sensor_to_odom_applied = False
+        pose_sample_skew_sec: Optional[float] = None
+        yaw_stabilization_applied = False
+        yaw_stabilization_offset_rad = 0.0
+        yaw_stabilization_origin_xy = [0.0, 0.0]
+        stationary_yaw_locked = False
+        if source_frame == _GO2_UTLIDAR_FRAME:
+            with self._lock:
+                if not self._is_generation_active_locked(generation):
+                    return
+                pose_snapshot, pose_sample_skew_sec = (
+                    self._nearest_pose_snapshot_locked(
+                        generation=generation,
+                        received_at_monotonic=float(point_cloud_received_at),
+                    )
+                )
+            if (
+                pose_snapshot is not None
+                and pose_sample_skew_sec is not None
+                and pose_sample_skew_sec <= _MAX_POINT_CLOUD_POSE_SKEW_SEC
+            ):
+                registered_frame = str(
+                    getattr(self.config, "expected_odom_frame", "") or ""
+                ).strip()
+                if not registered_frame:
+                    reject("点云 driver 注册需要 expected_odom_frame，但配置为空")
+                    return
+                try:
+                    xyz_array = _transform_utlidar_xyz_to_odom(
+                        xyz_array,
+                        pose_snapshot.pose,
+                    )
+                except (TypeError, ValueError) as exc:
+                    reject(f"utlidar_lidar 到 odom 坐标变换失败：{exc}")
+                    return
+                registered_to_odom = True
+                registration_assertion = "driver_sensor_to_odom"
+                driver_sensor_to_odom_applied = True
+                frame_id = registered_frame
+                yaw_stabilization_offset_rad = (
+                    pose_snapshot.yaw_stabilization_offset_rad
+                )
+                stationary_yaw_locked = pose_snapshot.stationary_yaw_locked
+                yaw_stabilization_applied = (
+                    abs(yaw_stabilization_offset_rad) > 1e-12
+                )
+                yaw_stabilization_origin_xy = [
+                    float(pose_snapshot.pose.position.x),
+                    float(pose_snapshot.pose.position.y),
+                ]
+        elif upstream_registered_to_odom:
             registered_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
             if not registered_frame:
                 reject("点云声明已注册到 odom，但 expected_odom_frame 为空")
                 return
+            registered_to_odom = True
+            registration_assertion = "explicit_config"
             frame_id = registered_frame
+            with self._lock:
+                if not self._is_generation_active_locked(generation):
+                    return
+                pose_history = getattr(self, "_pose_history", ())
+                pose_snapshot = next(
+                    (
+                        snapshot
+                        for snapshot in reversed(pose_history)
+                        if snapshot.generation == generation
+                    ),
+                    None,
+                )
+                if pose_snapshot is not None:
+                    yaw_stabilization_offset_rad = (
+                        pose_snapshot.yaw_stabilization_offset_rad
+                    )
+                    stationary_yaw_locked = pose_snapshot.stationary_yaw_locked
+                else:
+                    yaw_stabilization_offset_rad = float(
+                        getattr(self, "_stationary_yaw_offset_rad", 0.0)
+                    )
+                    stationary_yaw_locked = bool(
+                        getattr(self, "_stationary_yaw_locked", False)
+                    )
+            if abs(yaw_stabilization_offset_rad) > 1e-12:
+                if pose_snapshot is None:
+                    reject(
+                        "点云需要偏航稳定补偿，但当前 lifecycle 没有同代 odom 位姿"
+                    )
+                    return
+                origin_x = float(pose_snapshot.pose.position.x)
+                origin_y = float(pose_snapshot.pose.position.y)
+                xyz_array = _rotate_registered_xyz_about_pose(
+                    xyz_array,
+                    yaw_stabilization_offset_rad,
+                    origin_x,
+                    origin_y,
+                )
+                yaw_stabilization_applied = True
+                yaw_stabilization_origin_xy = [origin_x, origin_y]
 
         try:
             point_cloud = PointCloudFrame(
@@ -933,8 +1306,26 @@ class Go2DirectDdsBridge:
                         for name in ("x", "y", "z")
                     ],
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
-                    "registration_assertion": ("explicit_config" if registered_to_odom else "absent"),
+                    "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
+                    "registration_assertion": registration_assertion,
                     "registered_frame": registered_frame,
+                    "driver_sensor_to_odom_applied": driver_sensor_to_odom_applied,
+                    "pose_sample_skew_sec": pose_sample_skew_sec,
+                    "max_pose_sample_skew_sec": _MAX_POINT_CLOUD_POSE_SKEW_SEC,
+                    "body_from_sensor_translation_m": (
+                        list(_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M)
+                        if driver_sensor_to_odom_applied
+                        else []
+                    ),
+                    "body_from_sensor_rpy_rad": (
+                        [0.0, _GO2_BODY_FROM_UTLIDAR_PITCH_RAD, 0.0]
+                        if driver_sensor_to_odom_applied
+                        else []
+                    ),
+                    "yaw_stabilization_applied": yaw_stabilization_applied,
+                    "yaw_stabilization_offset_rad": yaw_stabilization_offset_rad,
+                    "yaw_stabilization_origin_xy": yaw_stabilization_origin_xy,
+                    "stationary_yaw_locked": stationary_yaw_locked,
                     "source": "go2_direct_dds_pointcloud",
                 },
             )

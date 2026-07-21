@@ -495,13 +495,13 @@ button{font-family:inherit;cursor:pointer}
       <div><div class="nm" id="robotName">nuwax bridge</div><div class="md" id="robotModel">型号 --</div></div>
     </div>
     <div class="vstats">
-      <div class="vstat"><div class="v" id="connectionText">连接中</div><div class="l">网关</div></div>
+      <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
       <div class="vstat"><div class="v" id="runtimeMode">--</div><div class="l">运行模式</div></div>
       <div class="vstat"><div class="v" id="batteryMetric">--</div><div class="l">电池</div></div>
       <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
       <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">运存</div></div>
       <div class="vstat"><div class="v mono" id="clockNow">--:--:--</div><div class="l">时间</div></div>
-      <div class="vstat"><div class="v mono" id="lastReceive">--</div><div class="l">数据接收</div></div>
+      <div class="vstat"><div class="v mono" id="lastReceive">--</div><div class="l">接收延迟</div></div>
     </div>
     <span class="pill idle" id="motionStatus">运动可用性 · 只读</span>
     <div class="seg">
@@ -1243,7 +1243,6 @@ button{font-family:inherit;cursor:pointer}
       function updateOverview(envelope) {
         const data = envelope && envelope.data ? envelope.data : {};
         state.latestOverview = data;
-        if (!state.streamSocket || state.streamSocket.readyState !== WebSocket.OPEN) setText(els.connectionText, "在线");
         for (const name of overviewNames) {
           // perception_nms 卡片由 video.detections 流（updatePerceptionNmsCard）驱动，
           // 不走通用 overview envelope，避免被 missing 覆盖。
@@ -1580,6 +1579,10 @@ button{font-family:inherit;cursor:pointer}
         const entries = Array.isArray(summary.entries) ? summary.entries : [];
         const status = summary.status || worstStatus(entries);
         const attention = serviceHealthAttentionCount(summary);
+        const gatewayService = entries.find((entry) => entry.service_id === "gateway_web")
+          || entries.find((entry) => entry.service_id === "gateway_web_fallback")
+          || entries.find((entry) => entry.display_name === "网关 Web 服务");
+        setText(els.connectionText, displayStatus(gatewayService ? gatewayService.status : "missing"));
         setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
         for (const entry of entries) appendServiceHealthCard(entry, {
           source: summary.source,
@@ -4807,7 +4810,6 @@ button{font-family:inherit;cursor:pointer}
         socket.binaryType = "arraybuffer";
         state.streamSocket = socket;
         socket.addEventListener("open", () => {
-          setText(els.connectionText, "实时流");
           const wasReconnect = state.streamReconnectAttempt > 0;
           state.streamReconnectAttempt = 0;
           state.streamReconnectDelayMs = 1000;
@@ -4824,21 +4826,18 @@ button{font-family:inherit;cursor:pointer}
           }
           const message = JSON.parse(event.data);
           if (message.type === "keepalive") {
-            setText(els.connectionText, "实时流");
             if (typeof message.cursor === "number") state.latestStreamCursor = message.cursor;
             return;
           }
           if (message.type === "stream.replay") {
             if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
             if (message.resync_required || message.replay_gap) {
-              setText(els.connectionText, "流已降级，正在对账");
               loadInitialTasks();
             }
             return;
           }
           if (message.type === "stream.gap") {
             if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
-            setText(els.connectionText, `流丢帧 ${Number(message.dropped_count || 0)} 条，正在对账`);
             loadInitialTasks();
             return;
           }
@@ -4850,19 +4849,26 @@ button{font-family:inherit;cursor:pointer}
           scheduleStreamReconnect();
         });
         socket.addEventListener("error", () => {
-          setText(els.connectionText, "流异常");
           showPanelError("logs", "实时数据流连接异常，正在重连。");
         });
       }
       function scheduleStreamReconnect() {
         const delayMs = Math.min(30000, Math.max(1000, state.streamReconnectDelayMs));
-        setText(els.connectionText, `重连中（${Math.ceil(delayMs / 1000)} 秒）`);
         if (state.streamReconnectTimer) return;
         state.streamReconnectTimer = window.setTimeout(() => {
           state.streamReconnectTimer = null;
           connectStreams();
         }, delayMs);
         state.streamReconnectDelayMs = Math.min(30000, delayMs * 2);
+      }
+      function updateReceiveLatency(frame) {
+        const sentAtMs = Date.parse(frame && frame.timestamp ? frame.timestamp : "");
+        if (!Number.isFinite(sentAtMs)) {
+          setText(els.lastReceive, "--");
+          return;
+        }
+        const latencyMs = Math.max(0, Date.now() - sentAtMs);
+        setText(els.lastReceive, `${Math.round(latencyMs)} ms`);
       }
       function handleStreamFrame(frame) {
         state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
@@ -4873,8 +4879,7 @@ button{font-family:inherit;cursor:pointer}
         } else {
           state.pendingStreamFrames[frame.topic] = frame;
         }
-        els.lastReceive.textContent = nowText();
-        setText(els.connectionText, "实时流");
+        updateReceiveLatency(frame);
         scheduleStreamFlush();
       }
       function scheduleStreamFlush() {

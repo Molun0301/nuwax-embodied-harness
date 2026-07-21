@@ -255,12 +255,11 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
         .iter()
         .map(|point| point.y)
         .fold(f64::NEG_INFINITY, f64::max);
-    let origin_x = min_x - 1.0;
-    let origin_y = min_y - 1.0;
-    let padded_max_x = max_x + 1.0;
-    let padded_max_y = max_y + 1.0;
-    let width = auto_grid_dimension(origin_x, padded_max_x, resolution)?;
-    let height = auto_grid_dimension(origin_y, padded_max_y, resolution)?;
+    // Keep the auto-bounds origin on the resolution lattice.  Without this
+    // quantization, millimetre-level edge noise changes the cell phase and
+    // reprojects the entire map on every frame.
+    let (origin_x, width) = auto_grid_axis_bounds(min_x - 1.0, max_x + 1.0, resolution)?;
+    let (origin_y, height) = auto_grid_axis_bounds(min_y - 1.0, max_y + 1.0, resolution)?;
     if u64::from(width) * u64::from(height) > u64::from(u32::MAX) {
         return Err(MappingError::InvalidConfig(
             "auto-bounds grid exceeds occupancy storage capacity",
@@ -280,10 +279,22 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
     Ok(grid)
 }
 
-fn auto_grid_dimension(minimum: f64, maximum: f64, resolution: f64) -> Result<u32, MappingError> {
-    let cells = ((maximum - minimum) / resolution).ceil();
-    if !minimum.is_finite()
-        || !maximum.is_finite()
+fn auto_grid_axis_bounds(
+    minimum: f64,
+    maximum: f64,
+    resolution: f64,
+) -> Result<(f64, u32), MappingError> {
+    if !minimum.is_finite() || !maximum.is_finite() || !resolution.is_finite() || resolution <= 0.0
+    {
+        return Err(MappingError::InvalidConfig(
+            "auto-bounds dimension is not representable",
+        ));
+    }
+    let min_cell = (minimum / resolution).floor();
+    let max_cell = (maximum / resolution).ceil();
+    let cells = max_cell - min_cell;
+    if !min_cell.is_finite()
+        || !max_cell.is_finite()
         || !cells.is_finite()
         || cells < 1.0
         || cells > f64::from(u32::MAX)
@@ -292,7 +303,7 @@ fn auto_grid_dimension(minimum: f64, maximum: f64, resolution: f64) -> Result<u3
             "auto-bounds dimension is not representable",
         ));
     }
-    Ok(cells as u32)
+    Ok((min_cell * resolution, cells as u32))
 }
 
 fn reflect_index(mut index: i32, length: usize) -> usize {
@@ -643,6 +654,7 @@ impl PointCloudOccupancyBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost_mapper::SimplePointCloud2;
 
     fn small_grid() -> CostMap2D {
         make_costmap2d(11, 11, 0.1)
@@ -655,5 +667,67 @@ mod tests {
         assert_eq!(g.metadata.height, 11);
         // make_costmap2d 默认全 255（UNKNOWN）
         assert_eq!(g.get(0, 0), Some(255));
+    }
+
+    #[test]
+    fn auto_bounds_origin_is_aligned_to_resolution_lattice() {
+        let resolution = 0.05;
+        let cloud = SimplePointCloud2::with_metadata(
+            vec![
+                Point3::new(-5.027_830_739, -6.992_968_040, 0.0),
+                Point3::new(6.401_233_101, 2.145_098_701, 0.5),
+            ],
+            Point3::origin(),
+            "map",
+            123.0,
+        );
+
+        let grid = build_occupancy_auto(
+            &cloud,
+            resolution,
+            &PointCloudOccConfig {
+                algo: PointCloudOccAlgo::General,
+                ..PointCloudOccConfig::default()
+            },
+        )
+        .expect("valid aligned auto bounds");
+
+        for origin in [grid.origin[0], grid.origin[1]] {
+            let lattice_index = origin / resolution;
+            assert!(
+                (lattice_index - lattice_index.round()).abs() < 1.0e-9,
+                "origin={origin} resolution={resolution}"
+            );
+        }
+    }
+
+    #[test]
+    fn subcell_edge_noise_does_not_shift_auto_bounds_lattice() {
+        let resolution = 0.05;
+        let config = PointCloudOccConfig {
+            algo: PointCloudOccAlgo::General,
+            ..PointCloudOccConfig::default()
+        };
+        let build = |minimum: f64, maximum: f64| {
+            let cloud = SimplePointCloud2::with_metadata(
+                vec![
+                    Point3::new(minimum, minimum, 0.0),
+                    Point3::new(maximum, maximum, 0.5),
+                ],
+                Point3::origin(),
+                "map",
+                1.0,
+            );
+            build_occupancy_auto(&cloud, resolution, &config).expect("valid auto bounds")
+        };
+
+        let first = build(-0.021, 0.421);
+        let jittered = build(-0.022, 0.422);
+
+        assert_eq!(first.origin, jittered.origin);
+        assert_eq!(
+            (first.width, first.height),
+            (jittered.width, jittered.height)
+        );
     }
 }

@@ -173,6 +173,252 @@ impl PointCloud2Like for BorrowedPointCloud<'_> {
     }
 }
 
+/// Occupancy values below this threshold are treated as traversable for the
+/// purpose of temporal cell hysteresis.  This is the same threshold used by
+/// navigation and the debug map renderer; values are still retained verbatim
+/// when a cell is first accepted or after a confirmed state change.
+const OCCUPANCY_OBSTACLE_THRESHOLD: i8 = 65;
+const OCCUPANCY_CHANGE_CONFIRMATIONS: u8 = 3;
+
+/// Persistent 2D occupancy state independent from the bounded point-cloud
+/// window.  The point-cloud window is useful for accumulating new geometry,
+/// but it must not be the source of truth for already published cells because
+/// it intentionally evicts old points.
+#[derive(Debug, Clone)]
+struct PersistentOccupancyGrid {
+    grid: OccupancyGrid,
+    pending_values: Vec<i8>,
+    pending_counts: Vec<u8>,
+}
+
+impl PersistentOccupancyGrid {
+    fn from_grid(grid: OccupancyGrid) -> Result<Self, String> {
+        validate_checkpoint_grid(&grid, grid.frame_id.trim().trim_start_matches('/'))?;
+        let cell_count = grid.data.len();
+        Ok(Self {
+            grid,
+            pending_values: vec![-1; cell_count],
+            pending_counts: vec![0; cell_count],
+        })
+    }
+
+    /// Merge a rolling-window view and a latest-frame view.
+    ///
+    /// The rolling view can only add cells that were previously unknown.  A
+    /// latest-frame observation is allowed to change a known cell, but only
+    /// after several consecutive observations disagree with its current
+    /// traversability class.  Unknown cells never erase accumulated state.
+    fn merge(
+        &mut self,
+        accumulated: &OccupancyGrid,
+        latest: &OccupancyGrid,
+    ) -> Result<bool, String> {
+        self.validate_compatible(accumulated)?;
+        self.validate_compatible(latest)?;
+
+        let mut changed = self.expand_to_include(accumulated)?;
+        // Latest-frame bounds are normally contained in the accumulated view,
+        // but expanding for both keeps this helper correct for direct callers.
+        changed |= self.expand_to_include(latest)?;
+
+        for row in 0..accumulated.height {
+            for col in 0..accumulated.width {
+                let incoming = accumulated.data[accumulated.index(row, col)];
+                if incoming < 0 {
+                    continue;
+                }
+                let target = self.project_cell(accumulated, row, col)?;
+                if self.grid.data[target] < 0 {
+                    self.grid.data[target] = incoming;
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    changed = true;
+                }
+            }
+        }
+
+        // A pending contradiction is valid only while the corresponding cell
+        // is observed in every latest frame.  The mask also prevents a stale
+        // pending clear from surviving an occlusion or a missed scan.
+        let mut observed = vec![false; self.grid.data.len()];
+        for row in 0..latest.height {
+            for col in 0..latest.width {
+                let incoming = latest.data[latest.index(row, col)];
+                if incoming < 0 {
+                    continue;
+                }
+                let target = self.project_cell(latest, row, col)?;
+                observed[target] = true;
+                let existing = self.grid.data[target];
+                if existing < 0 {
+                    self.grid.data[target] = incoming;
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    changed = true;
+                    continue;
+                }
+
+                if occupancy_class(existing) == occupancy_class(incoming) {
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    continue;
+                }
+
+                let count = if self.pending_counts[target] > 0
+                    && occupancy_class(self.pending_values[target]) == occupancy_class(incoming)
+                {
+                    self.pending_counts[target].saturating_add(1)
+                } else {
+                    1
+                };
+                self.pending_values[target] = incoming;
+                self.pending_counts[target] = count;
+                if count >= OCCUPANCY_CHANGE_CONFIRMATIONS {
+                    self.grid.data[target] = incoming;
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    changed = true;
+                }
+            }
+        }
+
+        for (index, is_observed) in observed.iter().enumerate() {
+            if !*is_observed {
+                self.pending_values[index] = -1;
+                self.pending_counts[index] = 0;
+            }
+        }
+        self.grid.ts = self.grid.ts.max(accumulated.ts).max(latest.ts);
+        Ok(changed)
+    }
+
+    fn validate_compatible(&self, incoming: &OccupancyGrid) -> Result<(), String> {
+        validate_checkpoint_grid(incoming, self.grid.frame_id.trim().trim_start_matches('/'))?;
+        if normalize_frame_id(&incoming.frame_id) != normalize_frame_id(&self.grid.frame_id) {
+            return Err("persistent/live frames differ".to_string());
+        }
+        let tolerance = self.grid.resolution.abs().max(1.0) * 1e-6;
+        if (incoming.resolution - self.grid.resolution).abs() > tolerance {
+            return Err("persistent/live resolutions differ".to_string());
+        }
+        if incoming.origin_orientation != self.grid.origin_orientation {
+            return Err("persistent/live origin orientations differ".to_string());
+        }
+        Ok(())
+    }
+
+    fn expand_to_include(&mut self, incoming: &OccupancyGrid) -> Result<bool, String> {
+        let resolution = self.grid.resolution;
+        let relative_min_col =
+            snap_grid_index((incoming.origin[0] - self.grid.origin[0]) / resolution);
+        let relative_min_row =
+            snap_grid_index((incoming.origin[1] - self.grid.origin[1]) / resolution);
+        let relative_max_col = snap_grid_index(
+            (incoming.origin[0] + incoming.width as f64 * incoming.resolution
+                - self.grid.origin[0])
+                / resolution,
+        );
+        let relative_max_row = snap_grid_index(
+            (incoming.origin[1] + incoming.height as f64 * incoming.resolution
+                - self.grid.origin[1])
+                / resolution,
+        );
+        let min_col = checked_grid_index(relative_min_col.min(0.0).floor())?;
+        let min_row = checked_grid_index(relative_min_row.min(0.0).floor())?;
+        let max_col = checked_grid_index(relative_max_col.max(self.grid.width as f64).ceil())?;
+        let max_row = checked_grid_index(relative_max_row.max(self.grid.height as f64).ceil())?;
+        let width = max_col
+            .checked_sub(min_col)
+            .ok_or_else(|| "persistent grid width underflow".to_string())?;
+        let height = max_row
+            .checked_sub(min_row)
+            .ok_or_else(|| "persistent grid height underflow".to_string())?;
+        if width <= 0 || height <= 0 || width > i64::from(u32::MAX) || height > i64::from(u32::MAX)
+        {
+            return Err("persistent grid dimensions are invalid".to_string());
+        }
+        let width = width as u32;
+        let height = height as u32;
+        if u64::from(width) * u64::from(height) > u64::from(u32::MAX) {
+            return Err("persistent grid exceeds occupancy storage capacity".to_string());
+        }
+        let cell_count = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| "persistent grid dimensions overflow".to_string())?;
+
+        if min_col == 0 && min_row == 0 && width == self.grid.width && height == self.grid.height {
+            return Ok(false);
+        }
+
+        let mut expanded =
+            OccupancyGrid::with_frame(width, height, self.grid.resolution, &self.grid.frame_id);
+        expanded.origin = [
+            self.grid.origin[0] + min_col as f64 * resolution,
+            self.grid.origin[1] + min_row as f64 * resolution,
+            self.grid.origin[2],
+        ];
+        expanded.origin_orientation = self.grid.origin_orientation;
+        expanded.ts = self.grid.ts.max(incoming.ts);
+        let mut pending_values = vec![-1; cell_count];
+        let mut pending_counts = vec![0; cell_count];
+
+        for row in 0..self.grid.height {
+            for col in 0..self.grid.width {
+                let target_row = i64::from(row) - min_row;
+                let target_col = i64::from(col) - min_col;
+                let target_index = (target_row as u32 * width + target_col as u32) as usize;
+                let source_index = self.grid.index(row, col);
+                expanded.data[target_index] = self.grid.data[source_index];
+                pending_values[target_index] = self.pending_values[source_index];
+                pending_counts[target_index] = self.pending_counts[source_index];
+            }
+        }
+        self.grid = expanded;
+        self.pending_values = pending_values;
+        self.pending_counts = pending_counts;
+        Ok(true)
+    }
+
+    fn project_cell(&self, source: &OccupancyGrid, row: u32, col: u32) -> Result<usize, String> {
+        let world_x = source.origin[0] + (col as f64 + 0.5) * source.resolution;
+        let world_y = source.origin[1] + (row as f64 + 0.5) * source.resolution;
+        let target_col = checked_grid_index(
+            snap_grid_index((world_x - self.grid.origin[0]) / self.grid.resolution).floor(),
+        )?;
+        let target_row = checked_grid_index(
+            snap_grid_index((world_y - self.grid.origin[1]) / self.grid.resolution).floor(),
+        )?;
+        if target_col < 0
+            || target_row < 0
+            || target_col >= i64::from(self.grid.width)
+            || target_row >= i64::from(self.grid.height)
+        {
+            return Err("persistent/live cell projects outside persistent grid".to_string());
+        }
+        Ok(self.grid.index(target_row as u32, target_col as u32))
+    }
+}
+
+fn occupancy_class(value: i8) -> u8 {
+    u8::from(value >= OCCUPANCY_OBSTACLE_THRESHOLD)
+}
+
+fn snap_grid_index(value: f64) -> f64 {
+    let rounded = value.round();
+    if (value - rounded).abs() <= 1.0e-6 {
+        rounded
+    } else {
+        value
+    }
+}
+
+fn checked_grid_index(value: f64) -> Result<i64, String> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err("grid coordinate is not representable".to_string());
+    }
+    Ok(value as i64)
+}
+
 // ============================================================================
 // 配置
 // ============================================================================
@@ -454,7 +700,14 @@ pub struct MappingAdapter {
     global_frame_established: bool,
     transformed_points: Vec<Point3<f64>>,
     latest_accepted_map_points: Vec<Point3<f64>>,
-    checkpoint_grid: Option<OccupancyGrid>,
+    /// Number of newest points in `session` belonging to the last accepted
+    /// frame.  It lets the occupancy builder obtain a latest-frame view from
+    /// the rolling window without cloning the high-rate cloud payload.
+    latest_accepted_point_count: usize,
+    /// Stable 2D map state.  Unlike `session`, this grid never rolls old cells
+    /// out merely because the bounded point budget is full.
+    persistent_grid: Option<PersistentOccupancyGrid>,
+    checkpoint_installed: bool,
     /// Optional production-only shared forbidden-zone document.
     forbidden_zones_path: Option<PathBuf>,
     /// Last physical occupancy grid before virtual forbidden zones are applied.
@@ -580,7 +833,9 @@ impl MappingAdapter {
             global_frame_established: false,
             transformed_points: Vec::new(),
             latest_accepted_map_points: Vec::new(),
-            checkpoint_grid: None,
+            latest_accepted_point_count: 0,
+            persistent_grid: None,
+            checkpoint_installed: false,
             forbidden_zones_path: None,
             raw_map: None,
             forbidden_zone_signature: String::new(),
@@ -716,6 +971,7 @@ impl MappingAdapter {
             return Err("mapping session must be active before checkpoint install".to_string());
         }
         validate_checkpoint_grid(&checkpoint, &self.map_frame_id)?;
+        let persistent_grid = PersistentOccupancyGrid::from_grid(checkpoint.clone())?;
         let next_revision = self
             .reserve_next_revision(revision_floor.max(self.revision).max(self.global_revision))?;
         let timestamp_ns = if checkpoint.ts.is_finite() && checkpoint.ts > 0.0 {
@@ -739,7 +995,8 @@ impl MappingAdapter {
         };
         let loaded = self.load_forbidden_zones();
         let map = self.compose_forbidden_zones(&raw_map, &loaded)?;
-        self.checkpoint_grid = Some(checkpoint);
+        self.checkpoint_installed = true;
+        self.persistent_grid = Some(persistent_grid);
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
@@ -750,7 +1007,7 @@ impl MappingAdapter {
     }
 
     pub fn has_checkpoint(&self) -> bool {
-        self.checkpoint_grid.is_some() && self.is_active() && self.current_revision() > 0
+        self.checkpoint_installed && self.is_active() && self.current_revision() > 0
     }
 
     pub fn snapshot(&self) -> MappingSessionSnapshot {
@@ -898,6 +1155,7 @@ impl MappingAdapter {
             .as_nanos() as u64;
         let stats = self.session.feed_unstamped(points);
         if stats.accepted > 0 {
+            self.latest_accepted_point_count = stats.accepted;
             self.pointcloud_count = self.pointcloud_count.saturating_add(1);
             self.has_data = true;
             self.latest_pointcloud_source_frame_id = self.map_frame_id.clone();
@@ -931,6 +1189,7 @@ impl MappingAdapter {
         source_timestamp_ns: u64,
     ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
         self.latest_accepted_map_points.clear();
+        self.latest_accepted_point_count = 0;
         let source_frame_id = normalize_frame_id(frame_id);
         if !self.is_active() {
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
@@ -993,6 +1252,7 @@ impl MappingAdapter {
             self.session
                 .feed_pointcloud(map_points, dedup_xy, point_step, message_timestamp_ns)?;
         if stats.accepted > 0 {
+            self.latest_accepted_point_count = stats.accepted;
             let accepted_start = map_points.len().saturating_sub(stats.accepted);
             self.latest_accepted_map_points
                 .extend_from_slice(&map_points[accepted_start..]);
@@ -1197,21 +1457,42 @@ impl MappingAdapter {
         Ok((mapper, occupancy))
     }
 
-    fn build_maps_zero_copy(&mut self) -> Result<(CostMapper, OccupancyGrid), MappingError> {
+    fn build_maps_zero_copy(
+        &mut self,
+    ) -> Result<(CostMapper, OccupancyGrid, OccupancyGrid), MappingError> {
         let origin = self.last_sensor_origin;
         let frame_id = self.latest_pointcloud_frame_id.clone();
         let timestamp = self.latest_pointcloud_timestamp_ns as f64 / 1_000_000_000.0;
         let occupancy_config = self.cost_mapper.config().config.clone();
         let resolution = self.config.resolution;
+        let latest_count = self.latest_accepted_point_count;
+        let points = self.session.make_contiguous_points();
         let cloud = BorrowedPointCloud {
-            points: self.session.make_contiguous_points(),
+            points,
             sensor_origin: nalgebra::point![origin[0], origin[1], origin[2]],
             frame_id: &frame_id,
             timestamp,
         };
         let (mapper, occupancy, _costmap) =
             CostMapper::from_pointcloud_auto(&cloud, &occupancy_config, resolution)?;
-        Ok((mapper, occupancy))
+        let latest_count = latest_count.min(points.len());
+        let latest_grid = if latest_count == 0 {
+            let mut unknown = occupancy.clone();
+            unknown.data.fill(-1);
+            unknown
+        } else {
+            let latest_start = points.len() - latest_count;
+            let latest_cloud = BorrowedPointCloud {
+                points: &points[latest_start..],
+                sensor_origin: nalgebra::point![origin[0], origin[1], origin[2]],
+                frame_id: &frame_id,
+                timestamp,
+            };
+            let (_latest_mapper, latest_grid, _latest_costmap) =
+                CostMapper::from_pointcloud_auto(&latest_cloud, &occupancy_config, resolution)?;
+            latest_grid
+        };
+        Ok((mapper, occupancy, latest_grid))
     }
 
     fn should_rebuild(&self) -> bool {
@@ -1277,7 +1558,7 @@ impl MappingAdapter {
         let built_generation = self.session.generation();
         let built_point_count = self.session.current_size();
         let built_received_at_ns = self.latest_pointcloud_received_at_ns;
-        let (mapper, live_grid) = match self.build_maps_zero_copy() {
+        let (mapper, live_grid, latest_grid) = match self.build_maps_zero_copy() {
             Ok(result) => result,
             Err(error) => {
                 warn!("mapping_adapter: auto-bounds occupancy 构建失败: {error}");
@@ -1285,16 +1566,21 @@ impl MappingAdapter {
             }
         };
         self.cost_mapper = mapper;
-        let grid = match self.checkpoint_grid.as_ref() {
-            Some(checkpoint) => match merge_checkpoint_grid(checkpoint, &live_grid) {
-                Ok(merged) => merged,
+        let mut next_persistent = match self.persistent_grid.clone() {
+            Some(persistent) => persistent,
+            None => match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
+                Ok(persistent) => persistent,
                 Err(error) => {
-                    warn!("mapping_adapter: checkpoint/live occupancy 合并失败: {error}");
+                    warn!("mapping_adapter: persistent occupancy initialization failed: {error}");
                     return false;
                 }
             },
-            None => live_grid,
         };
+        if let Err(error) = next_persistent.merge(&live_grid, &latest_grid) {
+            warn!("mapping_adapter: persistent/live occupancy merge failed: {error}");
+            return false;
+        };
+        let grid = next_persistent.grid.clone();
         if let Ok(mut s) = state.try_write() {
             let revision_floor = s.map.revision.max(self.revision).max(self.global_revision);
             let next_revision = match self.reserve_next_revision(revision_floor) {
@@ -1325,6 +1611,7 @@ impl MappingAdapter {
                     return false;
                 }
             };
+            self.persistent_grid = Some(next_persistent);
             self.record_forbidden_zone_application(&loaded, next_revision);
             self.global_revision = next_revision;
             self.revision = next_revision;
@@ -1371,7 +1658,9 @@ impl MappingAdapter {
         self.global_frame_established = false;
         self.transformed_points.clear();
         self.latest_accepted_map_points.clear();
-        self.checkpoint_grid = None;
+        self.latest_accepted_point_count = 0;
+        self.persistent_grid = None;
+        self.checkpoint_installed = false;
         self.raw_map = None;
         self.forbidden_zone_signature.clear();
         self.forbidden_zone_generation = 0;
@@ -1754,6 +2043,90 @@ mod tests {
         );
     }
 
+    fn grid_cell_at_world(grid: &OccupancyGrid, x: f64, y: f64) -> i8 {
+        let col = snap_grid_index((x - grid.origin[0]) / grid.resolution).floor() as i64;
+        let row = snap_grid_index((y - grid.origin[1]) / grid.resolution).floor() as i64;
+        assert!(col >= 0 && col < i64::from(grid.width));
+        assert!(row >= 0 && row < i64::from(grid.height));
+        grid.data[grid.index(row as u32, col as u32)]
+    }
+
+    fn map_cell_at_world(map: &MapState, x: f64, y: f64) -> i8 {
+        let resolution = f64::from(map.resolution);
+        let col = snap_grid_index((x - map.origin_x) / resolution).floor() as i64;
+        let row = snap_grid_index((y - map.origin_y) / resolution).floor() as i64;
+        assert!(col >= 0 && col < i64::from(map.width));
+        assert!(row >= 0 && row < i64::from(map.height));
+        map.data[(row as u32 * map.width + col as u32) as usize]
+    }
+
+    fn observed_grid(origin: (f64, f64), width: u32, height: u32, value: i8) -> OccupancyGrid {
+        let mut grid = OccupancyGrid::with_frame(width, height, 1.0, "map");
+        grid.origin = [origin.0, origin.1, 0.0];
+        grid.data.fill(value);
+        grid
+    }
+
+    #[test]
+    fn persistent_grid_keeps_old_world_cells_and_expands_for_new_cells() {
+        let mut seed = observed_grid((0.0, 0.0), 2, 1, -1);
+        seed.data = vec![100, 0];
+        let mut persistent =
+            PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
+        let accumulated = observed_grid((1.0, 0.0), 2, 1, 0);
+        let latest = accumulated.clone();
+
+        assert!(persistent
+            .merge(&accumulated, &latest)
+            .expect("merge extending live grid"));
+
+        assert_eq!(persistent.grid.origin, [0.0, 0.0, 0.0]);
+        assert_eq!((persistent.grid.width, persistent.grid.height), (3, 1));
+        assert_eq!(grid_cell_at_world(&persistent.grid, 0.5, 0.5), 100);
+        assert_eq!(grid_cell_at_world(&persistent.grid, 2.5, 0.5), 0);
+    }
+
+    #[test]
+    fn persistent_grid_ignores_unknown_and_single_frame_contradictions() {
+        let seed = observed_grid((0.0, 0.0), 1, 1, 100);
+        let mut persistent =
+            PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
+        let unknown = observed_grid((0.0, 0.0), 1, 1, -1);
+        let free = observed_grid((0.0, 0.0), 1, 1, 0);
+
+        assert!(!persistent
+            .merge(&unknown, &unknown)
+            .expect("unknown does not erase known cell"));
+        assert_eq!(persistent.grid.data, vec![100]);
+        assert!(!persistent
+            .merge(&free, &free)
+            .expect("first contradiction is pending"));
+        assert_eq!(persistent.grid.data, vec![100]);
+        assert!(!persistent
+            .merge(&free, &free)
+            .expect("second contradiction is pending"));
+        assert_eq!(persistent.grid.data, vec![100]);
+    }
+
+    #[test]
+    fn persistent_grid_clears_moving_obstacle_after_confirmed_free_observations() {
+        let seed = observed_grid((0.0, 0.0), 1, 1, 100);
+        let mut persistent =
+            PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
+        let free = observed_grid((0.0, 0.0), 1, 1, 0);
+
+        for _ in 1..OCCUPANCY_CHANGE_CONFIRMATIONS {
+            assert!(!persistent
+                .merge(&free, &free)
+                .expect("contradictory observation stays pending"));
+            assert_eq!(persistent.grid.data, vec![100]);
+        }
+        assert!(persistent
+            .merge(&free, &free)
+            .expect("confirmed free observation clears obstacle"));
+        assert_eq!(persistent.grid.data, vec![0]);
+    }
+
     #[test]
     fn adapter_default_state_is_empty() {
         let a = MappingAdapter::new(sample_config());
@@ -1869,6 +2242,57 @@ mod tests {
         assert_eq!(state.map.frame_id, "map");
         assert_eq!(state.map.timestamp_ns, source_timestamp_ns);
         assert_eq!(state.map.data, GENERAL_GOLDEN);
+    }
+
+    #[test]
+    fn published_grid_survives_window_eviction_expands_and_clears_after_confirmation() {
+        let mut config = sample_config();
+        config.resolution = 1.0;
+        config.occupancy_algo = CostAlgoSelector::General;
+        let mut adapter = active_adapter(config);
+        adapter.session = MappingSession::with_capacity(1);
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let feed = |adapter: &mut MappingAdapter, point: Point3<f64>, timestamp_ns: u64| {
+            adapter
+                .feed_pointcloud_session(
+                    &[point],
+                    (0.0, 0.0),
+                    12,
+                    timestamp_ns,
+                    "map",
+                    timestamp_ns,
+                )
+                .expect("accepted mapping frame");
+        };
+
+        feed(&mut adapter, Point3::new(0.0, 0.0, 0.5), 1_000_000_000);
+        assert!(adapter.build_and_publish(&state, None));
+        assert_eq!(
+            map_cell_at_world(&state.try_read().expect("first map").map, 0.5, 0.5),
+            100
+        );
+
+        // Capacity one evicts the obstacle point.  Its published cell must
+        // remain while a newly explored world region is appended.
+        feed(&mut adapter, Point3::new(3.0, 0.0, 0.0), 2_100_000_000);
+        assert!(adapter.build_and_publish(&state, None));
+        {
+            let shared = state.try_read().expect("expanded map");
+            assert_eq!(map_cell_at_world(&shared.map, 0.5, 0.5), 100);
+            assert_eq!(map_cell_at_world(&shared.map, 3.5, 0.5), 0);
+        }
+
+        for observation in 0..OCCUPANCY_CHANGE_CONFIRMATIONS {
+            let timestamp_ns = 3_200_000_000 + u64::from(observation) * 1_100_000_000;
+            feed(&mut adapter, Point3::new(0.0, 0.0, 0.0), timestamp_ns);
+            assert!(adapter.build_and_publish(&state, None));
+            let value = map_cell_at_world(&state.try_read().expect("confirmed map").map, 0.5, 0.5);
+            if observation + 1 < OCCUPANCY_CHANGE_CONFIRMATIONS {
+                assert_eq!(value, 100, "single-frame clears must be suppressed");
+            } else {
+                assert_eq!(value, 0, "confirmed free observations clear the obstacle");
+            }
+        }
     }
 
     #[test]

@@ -369,9 +369,10 @@ button{font-family:inherit;cursor:pointer}
 .map-point-style:hover{background:var(--inset)}
 .map-point-style select{min-width:48px;padding:0 15px 0 0;border:0;outline:0;background:transparent;color:inherit;
   font:inherit;cursor:pointer}
-.map-point-style[data-point-style="clarity"] .sw{background:#38bdf8}
 .map-point-style[data-point-style="height"] .sw{background:#4ade80}
-.map-point-style[data-point-style="layers"] .sw{background:#f472b6}
+.map-point-style[data-point-style="singleFloor"] .sw{background:#38bdf8}
+.map-point-style[data-point-style="ground"] .sw{background:#0ea5a4}
+.map-point-style[data-point-style="structure"] .sw{background:#fbbf24}
 .map-point-style[data-point-style="mono"] .sw{background:#e2e8f0}
 .map-overlay-panel{border-radius:var(--r)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -520,9 +521,10 @@ button{font-family:inherit;cursor:pointer}
                     <label class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
-                        <option value="clarity">清晰</option>
                         <option value="height" selected>高度</option>
-                        <option value="layers">分层</option>
+                        <option value="singleFloor">单层</option>
+                        <option value="ground">地面</option>
+                        <option value="structure">结构</option>
                         <option value="mono">单色</option>
                       </select>
                     </label>
@@ -6002,7 +6004,7 @@ button{font-family:inherit;cursor:pointer}
       updateMapPoseHud();
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260720-map-bound-zones"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260721-floor-structure-styles"></script>
   <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
   <div id="navigation-container" data-role="v2-navigation" hidden>
     <span data-role="nav-status">未选点</span>

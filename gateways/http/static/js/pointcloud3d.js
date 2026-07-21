@@ -18,9 +18,10 @@ const COLORS = {
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
 const DEFAULT_POINT_STYLE = 'height';
 const POINT_STYLE_PRESETS = Object.freeze({
-  clarity: Object.freeze({ label: '清晰', sampleStride: 4, liveSpacingM: 0.1, size: 1.35, sizeAttenuation: false, colorMode: 'position' }),
   height: Object.freeze({ label: '高度', sampleStride: 2, liveSpacingM: 0.1, heightGradientScale: 2, blueBandHeightM: 0.4, size: 1.35, sizeAttenuation: false, colorMode: 'height' }),
-  layers: Object.freeze({ label: '分层', sampleStride: 2, size: 0.07, sizeAttenuation: true, colorMode: 'layers' }),
+  singleFloor: Object.freeze({ label: '单层', sampleStride: 1, liveSpacingM: 0.08, size: 1.35, sizeAttenuation: false, colorMode: 'singleFloor', floorFilter: 'story' }),
+  ground: Object.freeze({ label: '地面', sampleStride: 1, liveSpacingM: 0.08, size: 1.55, sizeAttenuation: false, colorMode: 'ground', floorFilter: 'ground' }),
+  structure: Object.freeze({ label: '结构', sampleStride: 1, liveSpacingM: 0.08, size: 1.35, sizeAttenuation: false, colorMode: 'structure', floorFilter: 'story' }),
   mono: Object.freeze({ label: '单色', sampleStride: 3, size: 1.1, sizeAttenuation: false, colorMode: 'mono' }),
 });
 const HEIGHT_COLOR_STOPS = Object.freeze([
@@ -30,14 +31,20 @@ const HEIGHT_COLOR_STOPS = Object.freeze([
   [250, 204, 21],
   [251, 113, 133],
 ]);
-const LAYER_COLORS = Object.freeze([
-  [56, 189, 248],
-  [250, 204, 21],
-  [244, 114, 182],
-  [74, 222, 128],
-  [192, 132, 252],
-  [248, 250, 252],
-]);
+const FLOOR_COLORS = Object.freeze({
+  ground: Object.freeze([56, 189, 248]),
+  context: Object.freeze([203, 213, 225]),
+  structure: Object.freeze([248, 250, 252]),
+  object: Object.freeze([251, 191, 36]),
+});
+const FLOOR_BIN_SIZE_M = 0.08;
+const FLOOR_BAND_HALF_M = 0.12;
+const FLOOR_MIN_SEPARATION_M = 1.5;
+const FLOOR_DEFAULT_STORY_HEIGHT_M = 2.8;
+const FLOOR_CEILING_GAP_M = 0.2;
+const FLOOR_ANALYSIS_MAX_POINTS = 200_000;
+const STRUCTURE_COLUMN_SIZE_M = 0.18;
+const STRUCTURE_MIN_VERTICAL_SPAN_M = 0.45;
 const POINT_SAMPLING_MIN_SOURCE_POINTS = 4096;
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const MAX_POINTS = Math.floor(MAX_BUFFER_BYTES / (3 * 4));
@@ -570,7 +577,141 @@ class PointCloud3DViewer {
     return colors;
   }
 
-  _pointCloudColors(positions, measurement) {
+  _floorLevels(positions, measurement) {
+    if (this._floorLevelSource === positions && this._floorLevelCache) {
+      return this._floorLevelCache;
+    }
+
+    // A smoothed Z histogram is the browser-only fallback for XYZ clouds without classifications.
+    const histogram = new Map();
+    const pointCount = Math.floor(positions.length / 3);
+    const analysisStride = Math.max(1, Math.ceil(pointCount / FLOOR_ANALYSIS_MAX_POINTS));
+    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += analysisStride) {
+      const z = positions[pointIndex * 3 + 2];
+      if (!Number.isFinite(z)) continue;
+      const bin = Math.round(z / FLOOR_BIN_SIZE_M);
+      histogram.set(bin, (histogram.get(bin) || 0) + 1);
+    }
+
+    const scores = new Map();
+    let maxScore = 0;
+    for (const [bin, count] of histogram) {
+      const score = count
+        + 0.65 * ((histogram.get(bin - 1) || 0) + (histogram.get(bin + 1) || 0))
+        + 0.25 * ((histogram.get(bin - 2) || 0) + (histogram.get(bin + 2) || 0));
+      scores.set(bin, score);
+      if (score > maxScore) maxScore = score;
+    }
+
+    const minimumScore = Math.max(3, maxScore * 0.12);
+    const peaks = [...scores.entries()]
+      .filter(([bin, score]) => (
+        score >= minimumScore
+        && score >= (scores.get(bin - 1) || 0)
+        && score >= (scores.get(bin + 1) || 0)
+      ))
+      .sort((left, right) => right[1] - left[1]);
+    const selected = [];
+    for (const [bin, score] of peaks) {
+      let weightedZ = 0;
+      let weight = 0;
+      for (let neighbour = -1; neighbour <= 1; neighbour += 1) {
+        const count = histogram.get(bin + neighbour) || 0;
+        weightedZ += (bin + neighbour) * FLOOR_BIN_SIZE_M * count;
+        weight += count;
+      }
+      const z = weight ? weightedZ / weight : bin * FLOOR_BIN_SIZE_M;
+      if (selected.some((candidate) => Math.abs(candidate.z - z) < FLOOR_MIN_SEPARATION_M)) continue;
+      selected.push({ z, score });
+    }
+
+    const levels = selected.length
+      ? selected.map((candidate) => candidate.z).sort((left, right) => left - right)
+      : [measurement.zMin];
+    this._floorLevelSource = positions;
+    this._floorLevelCache = Object.freeze(levels);
+    return this._floorLevelCache;
+  }
+
+  _selectFloorLevel(levels, robotZ = this._robotPose?.z) {
+    if (!levels.length) return null;
+    const height = Number(robotZ);
+    if (!Number.isFinite(height)) return levels[0];
+    const belowRobot = levels.filter((level) => level <= height + 0.45);
+    const candidates = belowRobot.length ? belowRobot : levels;
+    return candidates.reduce((closest, level) => (
+      Math.abs(level - height) < Math.abs(closest - height) ? level : closest
+    ));
+  }
+
+  _activeFloorContext(positions, measurement) {
+    const levels = this._floorLevels(positions, measurement);
+    const floorZ = this._selectFloorLevel(levels);
+    if (!Number.isFinite(floorZ)) return null;
+    const floorIndex = levels.indexOf(floorZ);
+    const nextFloorZ = floorIndex >= 0 ? levels[floorIndex + 1] : null;
+    const fallbackTop = Math.min(
+      measurement.zMax + FLOOR_BAND_HALF_M,
+      floorZ + FLOOR_DEFAULT_STORY_HEIGHT_M,
+    );
+    const storyMax = Math.max(
+      floorZ + FLOOR_BAND_HALF_M,
+      Number.isFinite(nextFloorZ) ? nextFloorZ - FLOOR_CEILING_GAP_M : fallbackTop,
+    );
+    return {
+      floorZ,
+      levels,
+      groundMin: floorZ - FLOOR_BAND_HALF_M,
+      groundMax: floorZ + FLOOR_BAND_HALF_M,
+      storyMax,
+    };
+  }
+
+  _filterPointCloudForFloor(positions, floorContext, filterMode) {
+    if (!floorContext) return positions;
+    const upper = filterMode === 'ground' ? floorContext.groundMax : floorContext.storyMax;
+    const filtered = new Float32Array(positions.length);
+    let writeOffset = 0;
+    for (let offset = 0; offset < positions.length; offset += 3) {
+      const x = positions[offset];
+      const y = positions[offset + 1];
+      const z = positions[offset + 2];
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      if (z < floorContext.groundMin || z > upper) continue;
+      filtered[writeOffset] = x;
+      filtered[writeOffset + 1] = y;
+      filtered[writeOffset + 2] = z;
+      writeOffset += 3;
+    }
+    return filtered.subarray(0, writeOffset);
+  }
+
+  _pointColumnKey(x, y) {
+    return `${Math.floor(x / STRUCTURE_COLUMN_SIZE_M)},${Math.floor(y / STRUCTURE_COLUMN_SIZE_M)}`;
+  }
+
+  _verticalStructureColumns(positions, floorContext) {
+    const columns = new Map();
+    for (let offset = 0; offset < positions.length; offset += 3) {
+      const z = positions[offset + 2];
+      if (z <= floorContext.groundMax) continue;
+      const key = this._pointColumnKey(positions[offset], positions[offset + 1]);
+      const span = columns.get(key);
+      if (span) {
+        if (z < span.min) span.min = z;
+        if (z > span.max) span.max = z;
+      } else {
+        columns.set(key, { min: z, max: z });
+      }
+    }
+    return new Set(
+      [...columns.entries()]
+        .filter(([, span]) => span.max - span.min >= STRUCTURE_MIN_VERTICAL_SPAN_M)
+        .map(([key]) => key),
+    );
+  }
+
+  _pointCloudColors(positions, measurement, floorContext = null) {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     if (preset.colorMode === 'height') {
       return this._colorByHeight(
@@ -584,33 +725,23 @@ class PointCloud3DViewer {
 
     const count = Math.floor(positions.length / 3);
     const colors = new Uint8Array(count * 3);
-    const xRange = measurement.xMax - measurement.xMin || 1;
-    const yRange = measurement.yMax - measurement.yMin || 1;
-    const zRange = measurement.zMax - measurement.zMin || 1;
+    const verticalColumns = preset.colorMode === 'structure' && floorContext
+      ? this._verticalStructureColumns(positions, floorContext)
+      : null;
     for (let i = 0; i < count; i++) {
       const offset = i * 3;
+      let color = FLOOR_COLORS.context;
       if (preset.colorMode === 'mono') {
-        colors[offset] = 226;
-        colors[offset + 1] = 232;
-        colors[offset + 2] = 240;
-        continue;
+        color = FLOOR_COLORS.context;
+      } else if (floorContext && positions[offset + 2] <= floorContext.groundMax) {
+        color = FLOOR_COLORS.ground;
+      } else if (preset.colorMode === 'structure' && floorContext) {
+        const column = this._pointColumnKey(positions[offset], positions[offset + 1]);
+        color = verticalColumns.has(column) ? FLOOR_COLORS.structure : FLOOR_COLORS.object;
       }
-
-      const z = THREE.MathUtils.clamp((positions[offset + 2] - measurement.zMin) / zRange, 0, 1);
-      if (preset.colorMode === 'layers') {
-        const band = Math.min(Math.floor(z * LAYER_COLORS.length), LAYER_COLORS.length - 1);
-        const color = LAYER_COLORS[band];
-        colors[offset] = color[0];
-        colors[offset + 1] = color[1];
-        colors[offset + 2] = color[2];
-        continue;
-      }
-
-      const x = THREE.MathUtils.clamp((positions[offset] - measurement.xMin) / xRange, 0, 1);
-      const y = THREE.MathUtils.clamp((positions[offset + 1] - measurement.yMin) / yRange, 0, 1);
-      colors[offset] = Math.round(72 + x * 183);
-      colors[offset + 1] = Math.round(88 + y * 167);
-      colors[offset + 2] = Math.round(112 + z * 143);
+      colors[offset] = color[0];
+      colors[offset + 1] = color[1];
+      colors[offset + 2] = color[2];
     }
     return colors;
   }
@@ -638,7 +769,7 @@ class PointCloud3DViewer {
     }));
   }
 
-  _renderPointCloudPositions(positions, sourceMeasurement = null) {
+  _renderPointCloudPositions(positions, sourceMeasurement = null, floorContext = null) {
     if (!this._scene) return;
     const previousBounds = this._pointCloudBounds;
     this._disposePointsMesh();
@@ -655,7 +786,7 @@ class PointCloud3DViewer {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setAttribute('color', new THREE.Uint8BufferAttribute(
-      this._pointCloudColors(positions, measurement),
+      this._pointCloudColors(positions, measurement, floorContext),
       3,
       true,
     ));
@@ -683,15 +814,32 @@ class PointCloud3DViewer {
   _rebuildPointCloud() {
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     const src = this._allPositions;
-    if (this._isLiveCloudMapSnapshot) {
-      const measurement = src.length ? this._measurePointCloud(src) : null;
-      const positions = preset.liveSpacingM
-        ? this._spatiallySamplePointCloud(src, preset.liveSpacingM)
-        : src;
-      this._renderPointCloudPositions(positions, measurement);
+    if (this._floorLevelSource && this._floorLevelSource !== src) {
+      this._floorLevelSource = null;
+      this._floorLevelCache = null;
+    }
+    if (!src.length) {
+      this._activeFloorZ = null;
+      this._renderPointCloudPositions(new Float32Array(0));
       return;
     }
-    const totalPts = Math.floor(src.length / 3);
+    const sourceMeasurement = this._measurePointCloud(src);
+    const floorContext = preset.floorFilter
+      ? this._activeFloorContext(src, sourceMeasurement)
+      : null;
+    const visibleSource = floorContext
+      ? this._filterPointCloudForFloor(src, floorContext, preset.floorFilter)
+      : src;
+    const measurement = visibleSource.length ? this._measurePointCloud(visibleSource) : null;
+    this._activeFloorZ = floorContext?.floorZ ?? null;
+    if (this._isLiveCloudMapSnapshot) {
+      const positions = preset.liveSpacingM
+        ? this._spatiallySamplePointCloud(visibleSource, preset.liveSpacingM)
+        : visibleSource;
+      this._renderPointCloudPositions(positions, measurement, floorContext);
+      return;
+    }
+    const totalPts = Math.floor(visibleSource.length / 3);
     const configuredStride = Math.max(1, Math.round((LOD_STRIDE[this._lod] || 1) * preset.sampleStride));
     const stride = totalPts <= POINT_SAMPLING_MIN_SOURCE_POINTS ? 1 : configuredStride;
     const sampledCount = Math.min(Math.ceil(totalPts / stride), MAX_POINTS);
@@ -700,14 +848,13 @@ class PointCloud3DViewer {
       return;
     }
 
-    const measurement = this._measurePointCloud(src);
     const pos = new Float32Array(sampledCount * 3);
     for (let i = 0, j = 0; i < sampledCount; i++, j += stride) {
-      pos[i * 3] = src[j * 3];
-      pos[i * 3 + 1] = src[j * 3 + 1];
-      pos[i * 3 + 2] = src[j * 3 + 2];
+      pos[i * 3] = visibleSource[j * 3];
+      pos[i * 3 + 1] = visibleSource[j * 3 + 1];
+      pos[i * 3 + 2] = visibleSource[j * 3 + 2];
     }
-    this._renderPointCloudPositions(pos, measurement);
+    this._renderPointCloudPositions(pos, measurement, floorContext);
   }
 
   _spatiallySamplePointCloud(positions, spacingM) {
@@ -872,6 +1019,14 @@ class PointCloud3DViewer {
     const previousFollowTarget = this._lastFollowTarget?.clone() || null;
     this._robotPose = pose;
 
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
+    if (preset.floorFilter && this._floorLevelSource === this._allPositions) {
+      const nextFloorZ = this._selectFloorLevel(this._floorLevelCache || [], pose.z);
+      if (Number.isFinite(nextFloorZ) && Math.abs(nextFloorZ - this._activeFloorZ) > 1e-6) {
+        this._rebuildPointCloud();
+      }
+    }
+
     this._ensureRobotMesh();
     if (this._robotMesh) {
       this._robotMesh.visible = true;
@@ -899,6 +1054,13 @@ class PointCloud3DViewer {
     this._robotPose = null;
     this._lastFollowTarget = null;
     if (this._robotMesh) this._robotMesh.visible = false;
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
+    if (preset.floorFilter && this._floorLevelSource === this._allPositions) {
+      const nextFloorZ = this._selectFloorLevel(this._floorLevelCache || []);
+      if (Number.isFinite(nextFloorZ) && Math.abs(nextFloorZ - this._activeFloorZ) > 1e-6) {
+        this._rebuildPointCloud();
+      }
+    }
     this._emitCameraState();
     this._requestRender();
   }

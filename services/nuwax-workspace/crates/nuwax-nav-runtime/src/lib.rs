@@ -35,6 +35,8 @@ pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DEFAULT_POSE_TTL: Duration = Duration::from_millis(200);
 /// Default maximum receipt age for the planner-consumed occupancy costmap.
 pub const DEFAULT_COSTMAP_TTL: Duration = Duration::from_millis(500);
+/// Maximum time a leased session may wait for its first correlated path.
+pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard upper bound from cancel admission to a terminal fence attempt.
 pub const MAX_CANCEL_FENCE_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -192,6 +194,8 @@ pub struct SchedulerConfig {
     pub tick_interval: Duration,
     /// Idle/awaiting-path lease renewal interval.
     pub renew_interval: Duration,
+    /// Maximum time from lease acquisition to the first correlated path.
+    pub path_wait_timeout: Duration,
     /// Collision footprint width passed to the local planner.
     pub robot_width_m: f64,
     /// Maximum monotonic receipt age for map-frame pose input.
@@ -205,6 +209,7 @@ impl Default for SchedulerConfig {
         Self {
             tick_interval: DEFAULT_TICK_INTERVAL,
             renew_interval: MAX_RENEW_INTERVAL,
+            path_wait_timeout: DEFAULT_PATH_WAIT_TIMEOUT,
             robot_width_m: 0.3,
             pose_ttl: DEFAULT_POSE_TTL,
             costmap_ttl: DEFAULT_COSTMAP_TTL,
@@ -649,6 +654,7 @@ pub struct NavScheduler<M, P> {
     current_path_revision: u64,
     current_payload_hash: Option<[u8; 32]>,
     current_path: Option<Path2D>,
+    path_wait_started_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
     costmap_receipt: Option<PlannerInputReceipt>,
     operation_sequence: u64,
@@ -683,6 +689,7 @@ where
             current_path_revision: 0,
             current_payload_hash: None,
             current_path: None,
+            path_wait_started_at: None,
             pose_receipt: None,
             costmap_receipt: None,
             operation_sequence: 0,
@@ -764,8 +771,11 @@ where
                     }
                 }
 
-                _ = tick.tick(), if self.status.phase == SchedulerPhase::Controlling => {
-                    match await_interruptible(urgent_open, &mut urgent_rx, self.control_tick(&status_tx)).await {
+                _ = tick.tick(), if matches!(
+                    self.status.phase,
+                    SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
+                ) => {
+                    match await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
                             self.status.motion_sink_ready = false;
@@ -924,6 +934,7 @@ where
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
+        self.path_wait_started_at = None;
         self.status = SchedulerStatus {
             phase: SchedulerPhase::Acquiring,
             session_id: Some(session.session_id.clone()),
@@ -957,6 +968,7 @@ where
                 self.lease_active = true;
                 self.status.motion_sink_ready = true;
                 self.status.guard_generation = proof.guard_generation;
+                self.path_wait_started_at = Some(Instant::now());
                 self.status.phase = SchedulerPhase::AwaitingPath;
                 self.status.message = "NAV lease active; awaiting versioned path".into();
                 self.publish_status(status_tx);
@@ -1042,6 +1054,7 @@ where
         self.current_path_revision = path.path_revision;
         self.current_payload_hash = Some(path.payload_hash);
         self.current_path = Some(path.path);
+        self.path_wait_started_at = None;
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
         self.status.message = "versioned path accepted".into();
@@ -1130,6 +1143,36 @@ where
         }
     }
 
+    async fn session_tick(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
+        if self.status.phase == SchedulerPhase::Controlling {
+            return self.control_tick(status_tx).await;
+        }
+        if self.status.phase != SchedulerPhase::AwaitingPath {
+            return Ok(());
+        }
+        let Some(started_at) = self.path_wait_started_at else {
+            let error = RuntimeError::Planner("awaiting path without a deadline".into());
+            return Err(self.fail_closed(status_tx, error).await);
+        };
+        if Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
+            return Ok(());
+        }
+        self.status.message = format!(
+            "planner path timeout after {}ms; fencing",
+            self.config.path_wait_timeout.as_millis(),
+        );
+        self.publish_status(status_tx);
+        self.finish_terminal(
+            status_tx,
+            TerminalOutcome::PlannerFailed,
+            SchedulerPhase::Failed,
+        )
+        .await
+    }
+
     async fn renew(&mut self) -> Result<(), RuntimeError> {
         let operation_id = self.next_operation_id("renew")?;
         self.motion
@@ -1198,6 +1241,7 @@ where
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
+        self.path_wait_started_at = None;
         self.status.phase = phase_after;
         self.status.session_id = None;
         self.status.path_revision = 0;
@@ -1400,6 +1444,12 @@ fn validate_config(config: SchedulerConfig) -> Result<(), RuntimeError> {
         return Err(RuntimeError::InvalidInput {
             field: "renew_interval",
             reason: format!("must be in 1..={}ms", MAX_RENEW_INTERVAL.as_millis()),
+        });
+    }
+    if config.path_wait_timeout.is_zero() {
+        return Err(RuntimeError::InvalidInput {
+            field: "path_wait_timeout",
+            reason: "must be positive".into(),
         });
     }
     if !config.robot_width_m.is_finite() || config.robot_width_m <= 0.0 {
@@ -2006,6 +2056,7 @@ mod tests {
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(20),
+                path_wait_timeout: Duration::from_secs(1),
                 robot_width_m: 0.3,
                 pose_ttl,
                 costmap_ttl,
@@ -2280,6 +2331,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_first_path_fences_and_allows_the_next_session() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let planner = FakePlanner::commanding();
+        let planner_state = planner.state.clone();
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::clone(&motion_state)),
+            planner,
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(5),
+                renew_interval: Duration::from_millis(20),
+                path_wait_timeout: Duration::from_millis(30),
+                robot_width_m: 0.3,
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+            },
+        )
+        .expect("scheduler with path deadline");
+        let (handle, task) = spawn_scheduler(scheduler);
+        wait_for_sink(&handle).await;
+
+        handle
+            .start_session(session_for("missing-path"))
+            .await
+            .expect("first session");
+        let terminal = wait_for_terminal(&handle, TerminalOutcome::PlannerFailed).await;
+        assert_eq!(terminal.phase, SchedulerPhase::Failed);
+        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert!(motion_state
+            .lock()
+            .expect("motion")
+            .calls
+            .iter()
+            .any(|call| call.starts_with("fence:")));
+        assert!(!task.is_finished(), "path timeout must not stop the owner");
+
+        planner_state.lock().expect("planner").step = PlannerStep::Succeeded;
+        handle
+            .update_odometry(map_pose_at(2))
+            .await
+            .expect("retry pose");
+        handle
+            .update_costmap(costmap_at(2_000_000_000))
+            .await
+            .expect("retry costmap");
+        handle
+            .start_session(session_for("after-timeout"))
+            .await
+            .expect("session after path timeout");
+        handle
+            .submit_path(path_for("after-timeout", 1))
+            .await
+            .expect("path after timeout");
+        wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
+
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("task result");
+    }
+
+    #[tokio::test]
     async fn exploration_second_frontier_runs_after_first_child_terminal() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
@@ -2514,6 +2625,7 @@ mod tests {
                 } else {
                     Duration::from_millis(250)
                 },
+                path_wait_timeout: Duration::from_secs(5),
                 robot_width_m: 0.3,
                 pose_ttl: Duration::from_secs(5),
                 costmap_ttl: Duration::from_secs(5),

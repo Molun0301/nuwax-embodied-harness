@@ -691,10 +691,21 @@ fn decode_guarded_costmap_input(payload: &[u8]) -> OwnerInputResult<GuardedCostm
             Ok(timestamp) => timestamp,
             Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
         };
-    let costmap = match decode_astar_costmap(payload) {
+    let mut costmap = match decode_astar_costmap(payload) {
         Ok(costmap) => costmap,
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
+    // The simple global planner can route to frontier goals through unknown
+    // space. Keep the guarded local controller on the same occupancy policy so
+    // UNKNOWN cells do not turn a valid exploration path into an immediate hold.
+    use nuwax_nav_astar::navigation_map::{FREE, UNKNOWN};
+    for y in 0..costmap.height() {
+        for x in 0..costmap.width() {
+            if costmap.get(x, y) == UNKNOWN {
+                costmap.set(x, y, FREE);
+            }
+        }
+    }
     Ok(OwnerInput::Accepted(GuardedCostmapInput {
         observation: nuwax_nav_runtime::CostmapObservation {
             costmap,
@@ -5409,6 +5420,7 @@ mod guarded_tests {
                 nuwax_nav_runtime::SchedulerConfig {
                     tick_interval: Duration::from_millis(5),
                     renew_interval: Duration::from_millis(100),
+                    path_wait_timeout: Duration::from_secs(5),
                     robot_width_m: 0.3,
                     pose_ttl: Duration::from_secs(5),
                     costmap_ttl: Duration::from_secs(5),
@@ -6212,6 +6224,7 @@ mod guarded_tests {
             nuwax_nav_runtime::SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(100),
+                path_wait_timeout: Duration::from_secs(5),
                 robot_width_m: 0.3,
                 pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
@@ -6543,6 +6556,64 @@ mod guarded_tests {
         };
         commit_guarded_costmap_telemetry(&mut telemetry, &input);
         assert_eq!(telemetry.map_frame, "map");
+    }
+
+    #[test]
+    fn guarded_controller_moves_along_a_path_through_unknown_cells() {
+        use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig};
+        use nuwax_nav_astar::navigation_map::{FREE, OCCUPIED};
+
+        let width = 60_usize;
+        let height = 20_usize;
+        let mut data = vec![-1; width * height];
+        data[width * height - 1] = 100;
+        let grid_body = schema::encode_occupancy_grid_body(&schema::OccupancyGrid {
+            header: schema::Header {
+                stamp_sec: 9,
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            info: schema::MapMetaData {
+                resolution: 0.1,
+                width: width as i32,
+                height: height as i32,
+                origin: schema::Pose {
+                    orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    ..schema::Pose::default()
+                },
+                ..schema::MapMetaData::default()
+            },
+            data,
+        })
+        .expect("encode unknown exploration costmap");
+        let input = match decode_guarded_costmap_input(&grid_body).expect("decode costmap") {
+            OwnerInput::Accepted(input) => input,
+            OwnerInput::Rejected(reason) => panic!("unknown costmap rejected: {reason}"),
+        };
+        assert_eq!(input.observation.costmap.get(10, 5), FREE);
+        assert_eq!(
+            input.observation.costmap.get(width - 1, height - 1),
+            OCCUPIED
+        );
+
+        let mut planner = LocalPlanner::with_config(LocalPlannerConfig::default_config());
+        planner.update_costmap(input.observation.costmap);
+        planner.handle_odom(PoseStamped::from_pose(
+            Pose3 {
+                position: Point3::new(0.5, 0.5, 0.0),
+                ..Pose3::default()
+            },
+            NavFrameId::Map,
+        ));
+        planner.start_planning(Path2D::stamped(
+            NavFrameId::Map,
+            Timestamp::from_unix(9, 0),
+            vec![Point2::new(1.0, 0.5), Point2::new(2.0, 0.5)],
+        ));
+
+        let (twist, stop) = planner.step(0.3);
+        assert_eq!(stop, None);
+        assert_ne!(twist, Twist2::ZERO);
     }
 
     #[test]

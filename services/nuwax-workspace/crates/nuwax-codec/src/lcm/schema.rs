@@ -953,7 +953,7 @@ fn validate_navigation_identity(
     owner_kind: i32,
     parent_request_id: &str,
     goal_generation: i64,
-    map_revision: i64,
+    _map_revision: i64,
     source_timestamp_ns: i64,
 ) -> Result<(), String> {
     if schema_version != NAVIGATION_ENVELOPE_SCHEMA_VERSION {
@@ -976,9 +976,9 @@ fn validate_navigation_identity(
     if goal_generation <= 0 {
         return Err("goal_generation must be positive".into());
     }
-    if map_revision <= 0 {
-        return Err("map_revision must be positive".into());
-    }
+    // `map_version_id` and `map_revision` remain serialized for wire
+    // compatibility, but they are deliberately not part of navigation
+    // admission. Freshness is established by frame/timestamp observations.
     if source_timestamp_ns <= 0 {
         return Err("source_timestamp_ns must be positive".into());
     }

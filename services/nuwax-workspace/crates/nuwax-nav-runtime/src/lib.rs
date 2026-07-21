@@ -2,8 +2,8 @@
 //!
 //! This crate deliberately stops at the process-neutral scheduling boundary.
 //! It owns one mutable motion port, serializes lease renewal and commands, and
-//! accepts only versioned paths. Production LCM wiring remains disabled until
-//! the goal/path envelope can carry the same session and revision fields.
+//! accepts only lease-correlated paths. Map sequence fields may still be
+//! carried by compatibility transports, but they do not participate in motion.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -69,12 +69,12 @@ pub struct NavMotionAdmission {
     pub motion_stop_generation: u64,
 }
 
-/// One navigation session and the oldest map revision it may consume.
+/// One navigation session and its request-level motion admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavSession {
     /// Stable goal/session identifier.
     pub session_id: String,
-    /// Map revision observed when the goal was accepted.
+    /// Compatibility telemetry; ignored by scheduler admission and control.
     pub map_revision: u64,
     /// Request-level motion admission proof transported with the goal.
     pub motion_admission: NavMotionAdmission,
@@ -85,9 +85,9 @@ pub struct NavSession {
 pub struct VersionedPath {
     /// Goal/session identifier copied from the versioned goal envelope.
     pub session_id: String,
-    /// Map revision used to produce this path.
+    /// Compatibility telemetry; ignored by scheduler admission and control.
     pub map_revision: u64,
-    /// Monotonic path revision within a map revision.
+    /// Monotonic path revision within the active navigation session.
     pub path_revision: u64,
     /// Canonical payload digest supplied by the versioned codec.
     pub payload_hash: [u8; 32],
@@ -321,7 +321,7 @@ pub struct LeaseProof {
 pub struct CostmapObservation {
     /// Decoded controller costmap.
     pub costmap: CostMap2D,
-    /// Positive map revision carried by the occupancy frame.
+    /// Compatibility telemetry carried by the occupancy frame.
     pub map_revision: u64,
     /// Positive source timestamp carried by the occupancy frame.
     pub source_timestamp_ns: i64,
@@ -658,7 +658,6 @@ pub struct NavScheduler<M, P> {
     config: SchedulerConfig,
     session: Option<NavSession>,
     lease_active: bool,
-    current_map_revision: u64,
     current_path_revision: u64,
     current_payload_hash: Option<[u8; 32]>,
     current_path: Option<Path2D>,
@@ -672,7 +671,6 @@ pub struct NavScheduler<M, P> {
 struct PlannerInputReceipt {
     source_timestamp_ns: i64,
     received_at: Instant,
-    revision: u64,
 }
 
 impl<M, P> NavScheduler<M, P>
@@ -694,7 +692,6 @@ where
             config,
             session: None,
             lease_active: false,
-            current_map_revision: 0,
             current_path_revision: 0,
             current_payload_hash: None,
             current_path: None,
@@ -861,7 +858,6 @@ where
         self.pose_receipt = Some(PlannerInputReceipt {
             source_timestamp_ns,
             received_at: Instant::now(),
-            revision: 0,
         });
         self.refresh_input_status(Instant::now());
         self.status.message = "fresh map pose consumed".into();
@@ -874,33 +870,17 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         observation: CostmapObservation,
     ) -> Result<(), RuntimeError> {
-        if observation.map_revision == 0 {
-            return Err(RuntimeError::InvalidInput {
-                field: "costmap.map_revision",
-                reason: "must be positive".into(),
-            });
-        }
         validate_source_timestamp(
             "costmap.source_timestamp_ns",
             observation.source_timestamp_ns,
             self.costmap_receipt,
         )?;
-        if self
-            .costmap_receipt
-            .is_some_and(|receipt| observation.map_revision < receipt.revision)
-        {
-            return Err(RuntimeError::StaleInput(format!(
-                "costmap revision {} is older than {}",
-                observation.map_revision,
-                self.costmap_receipt.map_or(0, |receipt| receipt.revision),
-            )));
-        }
         self.planner.update_costmap(observation.costmap);
         self.costmap_receipt = Some(PlannerInputReceipt {
             source_timestamp_ns: observation.source_timestamp_ns,
             received_at: Instant::now(),
-            revision: observation.map_revision,
         });
+        self.status.planner_costmap_revision = observation.map_revision;
         self.refresh_input_status(Instant::now());
         self.status.message = "fresh occupancy costmap consumed".into();
         self.publish_status(status_tx);
@@ -916,8 +896,6 @@ where
             .map_or(0, |receipt| receipt.source_timestamp_ns);
         self.status.pose_receipt_age_ms = receipt_age_ms(self.pose_receipt, now);
         self.status.costmap_receipt_age_ms = receipt_age_ms(self.costmap_receipt, now);
-        self.status.planner_costmap_revision =
-            self.costmap_receipt.map_or(0, |receipt| receipt.revision);
         self.status.planner_inputs_fresh = self
             .pose_receipt
             .is_some_and(|receipt| now.duration_since(receipt.received_at) <= self.config.pose_ttl)
@@ -956,7 +934,6 @@ where
         }
         self.planner.stop();
         self.session = Some(session.clone());
-        self.current_map_revision = session.map_revision;
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
@@ -1015,7 +992,6 @@ where
             Err(error) => {
                 self.planner.stop();
                 self.session = None;
-                self.current_map_revision = 0;
                 self.current_path_revision = 0;
                 self.current_payload_hash = None;
                 self.current_path = None;
@@ -1054,44 +1030,36 @@ where
                 path.session_id, session.session_id
             )));
         }
-        if path.map_revision < session.map_revision || path.map_revision < self.current_map_revision
-        {
-            return Err(path_rejected("map revision is stale"));
+        if path.path_revision < self.current_path_revision {
+            return Err(path_rejected("path revision is stale"));
         }
-
-        if path.map_revision == self.current_map_revision {
-            if path.path_revision < self.current_path_revision {
-                return Err(path_rejected("path revision is stale"));
+        if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
+            let immutable = self.current_payload_hash == Some(path.payload_hash)
+                && self.current_path.as_ref() == Some(&path.path);
+            if immutable {
+                return Ok(());
             }
-            if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
-                let immutable = self.current_payload_hash == Some(path.payload_hash)
-                    && self.current_path.as_ref() == Some(&path.path);
-                if immutable {
-                    return Ok(());
-                }
-                let error = RuntimeError::PathMutation {
-                    reason: format!(
-                        "session={} map_revision={} path_revision={} changed payload",
-                        path.session_id, path.map_revision, path.path_revision
-                    ),
-                };
-                self.finish_terminal(
-                    status_tx,
-                    TerminalOutcome::SafetyFailed,
-                    SchedulerPhase::Failed,
-                )
-                .await?;
-                return Err(error);
-            }
+            let error = RuntimeError::PathMutation {
+                reason: format!(
+                    "session={} path_revision={} changed payload",
+                    path.session_id, path.path_revision
+                ),
+            };
+            self.finish_terminal(
+                status_tx,
+                TerminalOutcome::SafetyFailed,
+                SchedulerPhase::Failed,
+            )
+            .await?;
+            return Err(error);
         }
 
         self.planner.replace_path(path.path.clone());
-        self.current_map_revision = path.map_revision;
         self.current_path_revision = path.path_revision;
         self.current_payload_hash = Some(path.payload_hash);
         self.current_path = Some(path.path);
         self.status.phase = SchedulerPhase::Controlling;
-        self.status.map_revision = self.current_map_revision;
+        self.status.map_revision = path.map_revision;
         self.status.path_revision = self.current_path_revision;
         self.status.message = "versioned path accepted".into();
         self.publish_status(status_tx);
@@ -1244,7 +1212,6 @@ where
 
         self.planner.stop();
         self.session = None;
-        self.current_map_revision = 0;
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
@@ -1523,12 +1490,6 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
             reason: "must not be empty".into(),
         });
     }
-    if session.map_revision == 0 {
-        return Err(RuntimeError::InvalidInput {
-            field: "map_revision",
-            reason: "must be non-zero".into(),
-        });
-    }
     if session.motion_admission.guard_generation == 0 {
         return Err(RuntimeError::InvalidInput {
             field: "motion_admission.guard_generation",
@@ -1556,10 +1517,10 @@ fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
             reason: "must not be empty".into(),
         });
     }
-    if path.map_revision == 0 || path.path_revision == 0 {
+    if path.path_revision == 0 {
         return Err(RuntimeError::InvalidInput {
             field: "path.revision",
-            reason: "map and path revisions must be non-zero".into(),
+            reason: "path revision must be non-zero".into(),
         });
     }
     if path.payload_hash == [0; 32] {

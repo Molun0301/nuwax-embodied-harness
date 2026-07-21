@@ -1967,25 +1967,12 @@ impl GeometryRuntime for GeometryRuntimeService {
                 "StartExploration requires an ACTIVE mapping session",
             ));
         }
-        let requested_version = config.map_version_id.trim();
-        if !requested_version.is_empty() && requested_version != mapping.map_version_id {
-            return Err(Status::failed_precondition(format!(
-                "StartExploration map_version_id mismatch: requested={} active={}",
-                requested_version, mapping.map_version_id
-            )));
+        // Map version/sequence are compatibility metadata only. Exploration
+        // consumes the latest valid map-frame costmap by timestamp/freshness;
+        // never reject or stop a run because those counters changed.
+        if config.map_version_id.is_empty() {
+            config.map_version_id = mapping.map_version_id.clone();
         }
-        config.map_version_id = mapping.map_version_id.clone();
-        if config.map_revision > mapping.revision
-            || (config.stop_conditions.stop_on_map_revision_change
-                && config.map_revision > 0
-                && config.map_revision != mapping.revision)
-        {
-            return Err(Status::failed_precondition(format!(
-                "StartExploration map_revision mismatch: requested={} active={}",
-                config.map_revision, mapping.revision
-            )));
-        }
-        config.map_revision = mapping.revision;
         if let Some(active_navigation) = self.bridge.nav.active_goal_lease().await {
             return Err(Status::failed_precondition(format!(
                 "StartExploration cannot replace active navigation ownership: goal_id={} parent_request_id={}",
@@ -3277,7 +3264,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn start_exploration_requires_exact_active_mapping_identity() {
+    async fn start_exploration_requires_active_mapping_but_ignores_map_metadata() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -3302,39 +3289,18 @@ mod lifecycle_tests {
         .expect("activate exact test map")
         .into_inner();
         let current_revision = activated.revision;
-        let wrong_version = GeometryRuntime::start_exploration(
-            &service,
-            Request::new(exploration_request("wrong-version", "mapver_other", 0)),
-        )
-        .await
-        .expect_err("wrong map version must reject exploration");
-        assert_eq!(wrong_version.code(), tonic::Code::FailedPrecondition);
-
-        let mut wrong_revision =
-            exploration_request("wrong-revision", "mapver_exact", current_revision + 1);
-        wrong_revision.stop_conditions = Some(ExplorationStopConditions {
+        let mut metadata_ignored =
+            exploration_request("metadata-ignored", "mapver_other", current_revision + 1);
+        metadata_ignored.stop_conditions = Some(ExplorationStopConditions {
             stop_on_map_revision_change: true,
             ..ExplorationStopConditions::default()
         });
-        let revision_error =
-            GeometryRuntime::start_exploration(&service, Request::new(wrong_revision))
-                .await
-                .expect_err("mismatched pinned revision must reject exploration");
-        assert_eq!(revision_error.code(), tonic::Code::FailedPrecondition);
-
-        let accepted = GeometryRuntime::start_exploration(
-            &service,
-            Request::new(exploration_request(
-                "exact-mapping",
-                "mapver_exact",
-                current_revision,
-            )),
-        )
-        .await
-        .expect("exact active mapping identity")
-        .into_inner();
+        let accepted = GeometryRuntime::start_exploration(&service, Request::new(metadata_ignored))
+            .await
+            .expect("map version and sequence must not gate exploration")
+            .into_inner();
         assert_eq!(accepted.status, STATUS_ACCEPTED);
-        assert_eq!(accepted.request_id, "exact-mapping");
+        assert_eq!(accepted.request_id, "metadata-ignored");
     }
 
     #[tokio::test]
@@ -4216,7 +4182,7 @@ mod navigation_feedback_contract_tests {
         assert!(goal.goal_generation > 0);
         assert!(goal.producer_runtime_generation > 0);
         assert_eq!(goal.goal_payload_sha256.len(), 32);
-        assert_eq!(goal.map_version_id, "map-v1");
+        assert!(goal.map_version_id.is_empty());
 
         let wrong_producer_runtime_generation = if goal.producer_runtime_generation == 1 {
             2

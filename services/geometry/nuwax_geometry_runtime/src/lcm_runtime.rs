@@ -1648,7 +1648,6 @@ fn classify_exploration_submit_rejection(
     use crate::nav_runtime::{NavigationReadinessCode, SetGoalRetryReason};
 
     let retryable = match retry_reason {
-        Some(SetGoalRetryReason::MapRevisionMismatch) => true,
         Some(SetGoalRetryReason::NavigationNotReady(code)) => matches!(
             code,
             NavigationReadinessCode::MotionSinkUnobserved
@@ -1760,7 +1759,12 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             .active_goal_lease()
             .await
             .filter(|lease| {
-                exploration_child_lease(lease) == *expected
+                let projected = exploration_child_lease(lease);
+                projected.session_id == expected.session_id
+                    && projected.owner_kind == expected.owner_kind
+                    && projected.parent_request_id == expected.parent_request_id
+                    && projected.goal_generation == expected.goal_generation
+                    && projected.goal_payload_sha256 == expected.goal_payload_sha256
                     && lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
             })
             .ok_or_else(|| "exploration child does not own the active goal lease".to_string())?;
@@ -1788,7 +1792,13 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 .as_ref()
                 .map(exploration_child_lease)
                 .ok_or_else(|| "navigation cancel tracker lost the child lease".to_string())?;
-            if cancel.generation == 0 || cancel_lease != *expected {
+            if cancel.generation == 0
+                || cancel_lease.session_id != expected.session_id
+                || cancel_lease.owner_kind != expected.owner_kind
+                || cancel_lease.parent_request_id != expected.parent_request_id
+                || cancel_lease.goal_generation != expected.goal_generation
+                || cancel_lease.goal_payload_sha256 != expected.goal_payload_sha256
+            {
                 return Err("navigation cancel tracker returned a mismatched ticket".to_string());
             }
             Ok(crate::explore_runtime::ChildNavigationCancelTicket {
@@ -1839,7 +1849,6 @@ fn normalize_pending_cancel_zero_ack_path_identity(
         && lease.owner_kind == feedback.owner_kind
         && lease.parent_request_id == feedback.parent_request_id
         && lease.goal_generation == feedback.goal_generation
-        && lease.map_revision == feedback.planner_map_revision
         && lease.goal_payload_sha256 == feedback.goal_payload_sha256;
     if !authoritative_path_is_sealed || !cancellation_identity_matches {
         return;
@@ -1906,9 +1915,6 @@ async fn apply_typed_navigation_feedback(
                 goal_generation_matches = expected.is_some_and(|lease| {
                     lease.goal_generation == update.feedback.goal_generation
                 }),
-                map_revision_matches = expected.is_some_and(|lease| {
-                    lease.map_revision == update.feedback.planner_map_revision
-                }),
                 goal_hash_matches = expected.is_some_and(|lease| {
                     lease.goal_payload_sha256 == update.feedback.goal_payload_sha256
                 }),
@@ -1920,9 +1926,7 @@ async fn apply_typed_navigation_feedback(
     let planner_observation = if update.feedback.runtime_generation > 0 {
         let map_frame = normalize_frame(&update.feedback.planner_map_frame);
         let pose_frame = normalize_frame(&update.feedback.planner_pose_frame);
-        let ready = update.feedback.planner_map_revision > 0
-            && !map_frame.is_empty()
-            && map_frame == pose_frame;
+        let ready = !map_frame.is_empty() && map_frame == pose_frame;
         Some(crate::nav_runtime::PlannerInputObservation {
             generation: update.feedback.runtime_generation,
             map_revision: update.feedback.planner_map_revision,
@@ -1930,8 +1934,7 @@ async fn apply_typed_navigation_feedback(
             pose_frame,
             ready,
         })
-    } else if update.feedback.planner_map_revision > 0
-        || !update.feedback.planner_map_frame.is_empty()
+    } else if !update.feedback.planner_map_frame.is_empty()
         || !update.feedback.planner_pose_frame.is_empty()
     {
         warn!("planner feedback missing positive runtime_generation; fail closed");
@@ -1940,12 +1943,14 @@ async fn apply_typed_navigation_feedback(
         None
     };
 
+    let idle_motion_sink_ready =
+        update.state.goal_id.is_empty() && update.feedback.guard_generation == 0;
     let motion_sink_observation = if update.feedback.guard_generation > 0 {
         Some(crate::nav_runtime::MotionSinkObservation {
             generation: update.feedback.guard_generation,
             ready: update.feedback.sink_ready,
         })
-    } else if update.feedback.sink_ready {
+    } else if update.feedback.sink_ready && !idle_motion_sink_ready {
         warn!("sink_ready=true missing positive guard_generation; fail closed");
         None
     } else {
@@ -1977,6 +1982,10 @@ async fn apply_typed_navigation_feedback(
         if let Some(observation) = motion_sink_observation {
             if let Err(error) = nav.observe_motion_sink(observation) {
                 warn!(?error, "typed motion-sink observation rejected");
+            }
+        } else if idle_motion_sink_ready {
+            if let Err(error) = nav.observe_idle_motion_sink(update.feedback.sink_ready) {
+                warn!(?error, "idle motion-sink observation rejected");
             }
         }
         nav.observe_unowned_stack_heartbeat(update.state)
@@ -4406,6 +4415,38 @@ mod typed_navigation_feedback_tests {
     }
 
     #[tokio::test]
+    async fn idle_transport_heartbeat_opens_readiness_without_guard_generation() {
+        let handle = build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle
+            .nav
+            .observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                generation: 3,
+                map_frame: "map".into(),
+                odom_frame: "odom".into(),
+                base_frame: "base_link".into(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("TF observation");
+        let mut heartbeat = feedback_update("");
+        heartbeat.feedback.guard_generation = 0;
+
+        let update = apply_typed_navigation_feedback(&handle.nav, heartbeat)
+            .await
+            .expect("unowned heartbeat");
+
+        assert_eq!(update.state.status, "IDLE");
+        let readiness = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
+        assert!(readiness.ready, "{}", readiness.reason);
+        assert!(readiness.motion_sink_observed);
+        assert!(readiness.motion_sink_fresh);
+        assert!(readiness.cmd_vel_sink_ready);
+        assert_eq!(readiness.motion_sink_generation, 0);
+    }
+
+    #[tokio::test]
     async fn unowned_heartbeat_cannot_mutate_or_impersonate_an_active_goal() {
         for status in ["IDLE", "FAILED", "CANCELLED", "SUCCEEDED"] {
             let handle = build_handle_for_tests()
@@ -5253,13 +5294,6 @@ mod exploration_lcm_smoke_tests {
             ChildNavigationSubmitError::RetryableReadiness(_)
         ));
         assert!(matches!(
-            classify_exploration_submit_rejection(
-                Some(SetGoalRetryReason::MapRevisionMismatch),
-                "planner revision is catching up".to_string(),
-            ),
-            ChildNavigationSubmitError::RetryableReadiness(_)
-        ));
-        assert!(matches!(
             classify_exploration_submit_rejection(None, "invalid boundary".to_string(),),
             ChildNavigationSubmitError::Rejected(_)
         ));
@@ -5511,8 +5545,8 @@ mod exploration_lcm_smoke_tests {
         assert_eq!(goal.session_id, lease.session_id);
         assert_eq!(goal.goal_generation, lease.goal_generation as i64);
         assert!(goal.goal_generation > 0);
-        assert_eq!(goal.map_version_id, "smoke-map-v41");
-        assert_eq!(goal.map_revision, MAP_REVISION as i64);
+        assert!(goal.map_version_id.is_empty());
+        assert_eq!(goal.map_revision, 0);
         assert_eq!(goal.payload_sha256, lease.goal_payload_sha256);
         assert_eq!(
             goal.payload_sha256,

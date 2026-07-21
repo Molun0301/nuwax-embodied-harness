@@ -252,7 +252,11 @@ pub struct ChildNavigationLease {
 
 impl ChildNavigationLease {
     fn matches(&self, other: &Self) -> bool {
-        self == other
+        self.session_id == other.session_id
+            && self.owner_kind == other.owner_kind
+            && self.parent_request_id == other.parent_request_id
+            && self.goal_generation == other.goal_generation
+            && self.goal_payload_sha256 == other.goal_payload_sha256
     }
 }
 
@@ -453,7 +457,6 @@ pub struct ExploreRuntimeInner {
     no_frontier_since_ns: Option<u64>,
     frontiers: Vec<FrontierGoal>,
     frontier_revision: u64,
-    frontier_map_revision: u64,
 }
 
 impl ExploreRuntimeInner {
@@ -482,7 +485,6 @@ impl ExploreRuntimeInner {
             no_frontier_since_ns: None,
             frontiers: Vec::new(),
             frontier_revision: 0,
-            frontier_map_revision: 0,
         }
     }
 
@@ -516,11 +518,10 @@ impl ExploreRuntimeInner {
 
     fn update_frontiers(&mut self, frontiers: Vec<FrontierGoal>) -> Option<FrontierSnapshot> {
         let map_revision = self.map_revision();
-        if self.frontiers == frontiers && self.frontier_map_revision == map_revision {
+        if self.frontiers == frontiers {
             return None;
         }
         self.frontiers = frontiers;
-        self.frontier_map_revision = map_revision;
         self.frontier_revision = self.frontier_revision.saturating_add(1);
         Some(FrontierSnapshot {
             frontiers: self.frontiers.clone(),
@@ -720,22 +721,6 @@ impl ExploreRuntimeHandle {
         }
 
         if let Some(costmap) = guard.costmap_input.as_ref() {
-            if !config.map_version_id.is_empty()
-                && !costmap.map_version_id.is_empty()
-                && config.map_version_id != costmap.map_version_id
-            {
-                let snapshot = ExploreRuntimeSnapshot {
-                    status: STATUS_REJECTED,
-                    message: format!(
-                        "requested map_version_id={} does not match active costmap version={}",
-                        config.map_version_id, costmap.map_version_id
-                    ),
-                    request_id: request_id.to_string(),
-                    ..guard.snapshot(STATUS_REJECTED, "map version mismatch")
-                };
-                drop(guard);
-                return self.store_snapshot(snapshot);
-            }
             if config.map_version_id.is_empty() {
                 config.map_version_id = costmap.map_version_id.clone();
             }
@@ -1152,25 +1137,6 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         }
-        if let Some(config) = guard.active_config.as_ref() {
-            let version_mismatch = !config.map_version_id.is_empty()
-                && !costmap.map_version_id.is_empty()
-                && config.map_version_id != costmap.map_version_id;
-            let revision_mismatch = config.map_revision > 0
-                && costmap.map_revision != config.map_revision
-                && config.stop_conditions.stop_on_map_revision_change;
-            if version_mismatch || revision_mismatch {
-                drop(guard);
-                return self
-                    .finish_session(
-                        None,
-                        ExplorationStopReason::MapRevisionChanged,
-                        "pinned map version/revision changed during exploration".to_string(),
-                    )
-                    .await;
-            }
-        }
-
         if let Some(mut request) = guard.pending_child_dispatch.take() {
             request.map_revision = costmap.map_revision;
             if request.map_version_id.is_empty() {
@@ -1309,8 +1275,6 @@ impl ExploreRuntimeHandle {
         };
         let proposed_request_id = request.request_id.clone();
         let expected_parent_request_id = request.parent_request_id.clone();
-        let expected_map_version_id = request.map_version_id.clone();
-        let expected_map_revision = request.map_revision;
         let frontier_goal_id = request.frontier_goal_id.clone();
         let ticket = match sink.submit(request.clone()).await {
             Ok(ticket) => ticket,
@@ -1323,8 +1287,6 @@ impl ExploreRuntimeHandle {
         };
         if ticket.lease.session_id != proposed_request_id
             || ticket.lease.parent_request_id != expected_parent_request_id
-            || ticket.lease.map_version_id != expected_map_version_id
-            || ticket.lease.map_revision != expected_map_revision
             || ticket.lease.owner_kind == 0
             || ticket.lease.goal_generation == 0
             || ticket.lease.goal_payload_sha256 == [0; 32]
@@ -1630,36 +1592,13 @@ impl ExploreRuntimeHandle {
     ) -> Result<bool, String> {
         validate_costmap_snapshot(&snapshot)?;
         let mut guard = self.inner.lock().await;
-        if let Some(current) = guard.costmap_input.as_ref() {
-            if current.map_version_id == snapshot.map_version_id {
-                if snapshot.map_revision < current.map_revision {
-                    return Err(format!(
-                        "out-of-order costmap revision: current={}, received={}",
-                        current.map_revision, snapshot.map_revision
-                    ));
-                }
-                if snapshot.map_revision == current.map_revision {
-                    return Ok(false);
-                }
-            }
+        if guard.costmap_input.as_ref() == Some(&snapshot) {
+            return Ok(false);
         }
 
-        let mut pending_action = None;
         if let Some(config) = guard.active_config.as_mut() {
             if config.map_version_id.is_empty() {
                 config.map_version_id = snapshot.map_version_id.clone();
-            }
-            let version_changed = !config.map_version_id.is_empty()
-                && !snapshot.map_version_id.is_empty()
-                && config.map_version_id != snapshot.map_version_id;
-            let explicit_revision_pin_changed = config.stop_conditions.stop_on_map_revision_change
-                && config.map_revision > 0
-                && config.map_revision != snapshot.map_revision;
-            if version_changed || explicit_revision_pin_changed {
-                pending_action = Some(PendingChildAction {
-                    reason: ExplorationStopReason::MapRevisionChanged,
-                    message: "pinned map version/revision changed during exploration".to_string(),
-                });
             }
         }
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
@@ -1676,9 +1615,6 @@ impl ExploreRuntimeHandle {
         *self.readiness_cache.lock() = readiness;
         self.publish_frontiers(frontier_update);
 
-        if let Some(action) = pending_action {
-            self.begin_child_action(None, action).await;
-        }
         Ok(true)
     }
 
@@ -1822,9 +1758,6 @@ fn validate_costmap_snapshot(snapshot: &ExploreCostmapSnapshot) -> Result<(), St
             "global exploration requires map-frame costmap; received frame={}",
             snapshot.frame_id
         ));
-    }
-    if snapshot.map_revision == 0 {
-        return Err("map_revision must be greater than zero".to_string());
     }
     if snapshot.grid.width == 0 || snapshot.grid.height == 0 {
         return Err("costmap dimensions must be non-zero".to_string());
@@ -2254,7 +2187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_costmap_input_is_frame_and_revision_guarded() {
+    async fn explicit_costmap_input_requires_map_frame_but_ignores_sequence() {
         let (handle, _) = configured_handle();
         let mut odom = frontier_costmap(1);
         odom.frame_id = "odom".to_string();
@@ -2266,9 +2199,9 @@ mod tests {
         assert!(handle
             .ingest_costmap_snapshot(frontier_costmap(1))
             .await
-            .is_err());
+            .unwrap());
         assert!(!handle
-            .ingest_costmap_snapshot(frontier_costmap(2))
+            .ingest_costmap_snapshot(frontier_costmap(1))
             .await
             .unwrap());
     }
@@ -2827,7 +2760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_revision_pin_stops_only_after_zeroed_proof() {
+    async fn explicit_revision_pin_does_not_stop_on_costmap_sequence_change() {
         let (handle, _) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -2854,7 +2787,9 @@ mod tests {
             .ingest_costmap_snapshot(frontier_costmap(2))
             .await
             .unwrap();
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
+        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+        assert_eq!(handle.stop("req-pinned").await.status, STATUS_STOPPING);
         let stopped = handle
             .report_navigation_result(
                 &active.child_task_id,
@@ -2862,8 +2797,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(stopped.status, STATUS_FAILED);
-        assert_eq!(stopped.last_stop_reason, "map_revision_changed");
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert_eq!(stopped.last_stop_reason, "user_cancelled");
         assert!(stopped.child_task_id.is_empty());
     }
 

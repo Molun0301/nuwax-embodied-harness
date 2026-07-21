@@ -36,6 +36,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -167,15 +168,15 @@ pub struct GoalLease {
     pub goal_generation: u64,
     /// Geometry runtime generation that sealed the goal.
     pub producer_runtime_generation: u64,
-    /// Optional pinned map version.
+    /// Compatibility map-version telemetry; not part of lease identity.
     pub map_version_id: String,
-    /// Pinned occupancy revision.
+    /// Compatibility map-sequence telemetry; not part of lease identity.
     pub map_revision: u64,
     /// Canonical sealed goal digest.
     pub goal_payload_sha256: [u8; 32],
-    /// Latest accepted planner path revision.
+    /// Last scheduler-confirmed planner path revision.
     pub path_revision: u64,
-    /// Canonical latest path digest, zero before a path is accepted.
+    /// Canonical scheduler-confirmed path digest, zero before confirmation.
     pub path_payload_sha256: [u8; 32],
 }
 
@@ -199,7 +200,7 @@ pub struct ActiveGoal {
     pub target: PoseState,
     /// 收到 `set_goal` 的本地墙钟(ns),给 `timestamp_ns` 字段用。
     pub accepted_at_ns: u64,
-    /// Immutable owner/map/hash identity used by goal/path/cancel CAS.
+    /// Immutable owner/hash identity used by goal/path/cancel CAS.
     pub lease: GoalLease,
 }
 
@@ -214,6 +215,10 @@ pub struct NavRuntimeSlot {
     pub message: String,
     /// 当前 active goal。
     pub goal: Option<ActiveGoal>,
+    /// Goal incarnation associated with the pending planner path candidates.
+    path_candidate_goal: Option<GoalLease>,
+    /// Published planner paths awaiting scheduler confirmation.
+    path_candidates: VecDeque<(u64, [u8; 32])>,
     /// Highest goal generation ever reserved by this runtime.
     pub last_goal_generation: u64,
     /// module graph 模块节点 ID 列表(diagnostics 暴露)。
@@ -229,6 +234,8 @@ impl NavRuntimeSlot {
             phase: NavPhase::Idle,
             message: "空闲".into(),
             goal: None,
+            path_candidate_goal: None,
+            path_candidates: VecDeque::new(),
             last_goal_generation: 0,
             module_nodes: Vec::new(),
             profile,
@@ -261,6 +268,7 @@ const DEFAULT_TF_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_PLANNER_INPUT_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_MOTION_SINK_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_PATH_CANDIDATES: usize = 4096;
 
 /// One complete transform-chain observation produced by the real TF consumer.
 ///
@@ -573,8 +581,8 @@ impl NavRuntimeState {
             .map(|goal| goal.lease.clone())
     }
 
-    /// Accept one validated PathEnvelope only when it exactly matches the active
-    /// goal lease and advances the path revision monotonically.
+    /// Validate and retain planner output without replacing a path already
+    /// confirmed by the scheduler.
     pub async fn observe_path_envelope(
         &self,
         path: &schema::PathEnvelope,
@@ -582,27 +590,22 @@ impl NavRuntimeState {
         schema::validate_path_envelope(path).map_err(|error| error.to_string())?;
         let path_goal_generation = u64::try_from(path.goal_generation)
             .map_err(|_| "PathEnvelope goal_generation is invalid".to_string())?;
-        let path_map_revision = u64::try_from(path.map_revision)
-            .map_err(|_| "PathEnvelope map_revision is invalid".to_string())?;
         let path_revision = u64::try_from(path.path_revision)
             .map_err(|_| "PathEnvelope path_revision is invalid".to_string())?;
         let mut slot = self.inner.write().await;
-        let active = slot
+        let confirmed = slot
             .goal
-            .as_mut()
+            .as_ref()
+            .map(|active| active.lease.clone())
             .ok_or_else(|| "PATH_LEASE_REJECTED: no active goal lease".to_string())?;
-        let lease = &mut active.lease;
-        if path.session_id != lease.session_id
-            || path.owner_kind != lease.owner_kind
-            || path.parent_request_id != lease.parent_request_id
-            || path_goal_generation != lease.goal_generation
-            || path.map_version_id != lease.map_version_id
-            || path_map_revision != lease.map_revision
-            || path.goal_payload_sha256 != lease.goal_payload_sha256
+        if path.session_id != confirmed.session_id
+            || path.owner_kind != confirmed.owner_kind
+            || path.parent_request_id != confirmed.parent_request_id
+            || path_goal_generation != confirmed.goal_generation
+            || path.goal_payload_sha256 != confirmed.goal_payload_sha256
         {
             return Err(
-                "PATH_LEASE_REJECTED: identity/map/goal hash does not match active lease"
-                    .to_string(),
+                "PATH_LEASE_REJECTED: identity/goal hash does not match active lease".to_string(),
             );
         }
         let cancel = self
@@ -610,23 +613,58 @@ impl NavRuntimeState {
             .lock()
             .map_err(|_| "PATH_LEASE_REJECTED: cancel state unavailable".to_string())?;
         let cancel_freezes_lease =
-            cancel.phase == CancelPhase::Pending && cancel.lease.as_ref() == Some(lease);
+            cancel.phase != CancelPhase::Idle && cancel.lease.as_ref() == Some(&confirmed);
         drop(cancel);
         if cancel_freezes_lease {
             return Err("PATH_LEASE_REJECTED[CANCEL_PENDING]: active lease is frozen".to_string());
         }
-        if path_revision < lease.path_revision {
+
+        let candidate_goal_matches =
+            slot.path_candidate_goal
+                .as_ref()
+                .is_some_and(|candidate_goal| {
+                    candidate_goal.identity_matches(&confirmed)
+                        && candidate_goal.producer_runtime_generation
+                            == confirmed.producer_runtime_generation
+                        && candidate_goal.goal_payload_sha256 == confirmed.goal_payload_sha256
+                });
+        if !candidate_goal_matches {
+            slot.path_candidate_goal = Some(confirmed.clone());
+            slot.path_candidates.clear();
+        }
+        let (latest_revision, latest_hash) = slot
+            .path_candidates
+            .back()
+            .copied()
+            .unwrap_or((confirmed.path_revision, confirmed.path_payload_sha256));
+        if path_revision < latest_revision {
             return Err("PATH_LEASE_REJECTED: stale path revision".to_string());
         }
-        if path_revision == lease.path_revision {
-            if path.path_payload_sha256 == lease.path_payload_sha256 {
-                return Ok(lease.clone());
+        if path_revision == latest_revision {
+            if path.path_payload_sha256 == latest_hash {
+                let mut observed = confirmed;
+                observed.path_revision = latest_revision;
+                observed.path_payload_sha256 = latest_hash;
+                return Ok(observed);
             }
             return Err("PATH_LEASE_REJECTED: conflicting path hash at same revision".to_string());
         }
-        lease.path_revision = path_revision;
-        lease.path_payload_sha256 = path.path_payload_sha256;
-        Ok(lease.clone())
+
+        let mut observed = confirmed.clone();
+        observed.path_revision = path_revision;
+        observed.path_payload_sha256 = path.path_payload_sha256;
+        if confirmed.path_revision == 0 {
+            slot.goal.as_mut().expect("active goal checked above").lease = observed.clone();
+            slot.path_candidate_goal = Some(observed.clone());
+            slot.path_candidates.clear();
+        } else {
+            if slot.path_candidates.len() == MAX_PENDING_PATH_CANDIDATES {
+                slot.path_candidates.pop_front();
+            }
+            slot.path_candidates
+                .push_back((path_revision, path.path_payload_sha256));
+        }
+        Ok(observed)
     }
 
     /// Correlate a typed NavigationState with either the active or retained
@@ -638,7 +676,7 @@ impl NavRuntimeState {
         owner_kind: i32,
         parent_request_id: &str,
         goal_generation: u64,
-        planner_map_revision: u64,
+        _planner_map_revision: u64,
         path_revision: u64,
         goal_payload_sha256: [u8; 32],
         path_payload_sha256: [u8; 32],
@@ -646,47 +684,108 @@ impl NavRuntimeState {
         if session_id.is_empty() {
             return Ok(None);
         }
-        let lease = if let Some(lease) = self.active_goal_lease().await {
-            lease
-        } else {
-            self.cancel
+        let mismatched_fields = |lease: &GoalLease| {
+            let mut fields = Vec::new();
+            if session_id != lease.session_id {
+                fields.push("session_id");
+            }
+            if owner_kind != lease.owner_kind {
+                fields.push("owner_kind");
+            }
+            if parent_request_id != lease.parent_request_id {
+                fields.push("parent_request_id");
+            }
+            if goal_generation != lease.goal_generation {
+                fields.push("goal_generation");
+            }
+            if goal_payload_sha256 != lease.goal_payload_sha256 {
+                fields.push("goal_payload_sha256");
+            }
+            if path_revision != lease.path_revision {
+                fields.push("path_revision");
+            }
+            if path_payload_sha256 != lease.path_payload_sha256 {
+                fields.push("path_payload_sha256");
+            }
+            fields
+        };
+        let rejection = |lease: &GoalLease| {
+            format!(
+                "NAV_STATE_LEASE_REJECTED: mismatched fields: {}",
+                mismatched_fields(lease).join(",")
+            )
+        };
+
+        let mut slot = self.inner.write().await;
+        let Some(confirmed) = slot.goal.as_ref().map(|active| active.lease.clone()) else {
+            drop(slot);
+            let retained = self
+                .cancel
                 .lock()
                 .ok()
                 .and_then(|cancel| cancel.lease.clone())
-                .ok_or_else(|| "NAV_STATE_LEASE_REJECTED: no matching lease".to_string())?
+                .ok_or_else(|| "NAV_STATE_LEASE_REJECTED: no matching lease".to_string())?;
+            let fields = mismatched_fields(&retained);
+            return if fields.is_empty() {
+                Ok(Some(retained))
+            } else {
+                Err(format!(
+                    "NAV_STATE_LEASE_REJECTED: mismatched fields: {}",
+                    fields.join(",")
+                ))
+            };
         };
-        let mut mismatched_fields = Vec::new();
-        if session_id != lease.session_id {
-            mismatched_fields.push("session_id");
+        let goal_identity_matches = session_id == confirmed.session_id
+            && owner_kind == confirmed.owner_kind
+            && parent_request_id == confirmed.parent_request_id
+            && goal_generation == confirmed.goal_generation
+            && goal_payload_sha256 == confirmed.goal_payload_sha256;
+        let confirmed_path_matches = path_revision == confirmed.path_revision
+            && path_payload_sha256 == confirmed.path_payload_sha256;
+        if goal_identity_matches && confirmed_path_matches {
+            return Ok(Some(confirmed));
         }
-        if owner_kind != lease.owner_kind {
-            mismatched_fields.push("owner_kind");
+        if !goal_identity_matches {
+            return Err(rejection(&confirmed));
         }
-        if parent_request_id != lease.parent_request_id {
-            mismatched_fields.push("parent_request_id");
+
+        let cancel = self
+            .cancel
+            .lock()
+            .map_err(|_| "NAV_STATE_LEASE_REJECTED: cancel state unavailable".to_string())?;
+        let cancel_freezes_lease =
+            cancel.phase != CancelPhase::Idle && cancel.lease.as_ref() == Some(&confirmed);
+        drop(cancel);
+        if !cancel_freezes_lease {
+            let candidate_goal_matches =
+                slot.path_candidate_goal
+                    .as_ref()
+                    .is_some_and(|candidate_goal| {
+                        candidate_goal.identity_matches(&confirmed)
+                            && candidate_goal.producer_runtime_generation
+                                == confirmed.producer_runtime_generation
+                            && candidate_goal.goal_payload_sha256 == confirmed.goal_payload_sha256
+                    });
+            let candidate_matches = candidate_goal_matches
+                && slot.path_candidates.iter().any(|(revision, hash)| {
+                    *revision == path_revision && *hash == path_payload_sha256
+                });
+            if candidate_matches {
+                let mut promoted = confirmed;
+                promoted.path_revision = path_revision;
+                promoted.path_payload_sha256 = path_payload_sha256;
+                slot.goal.as_mut().expect("active goal checked above").lease = promoted.clone();
+                while slot
+                    .path_candidates
+                    .front()
+                    .is_some_and(|(revision, _)| *revision <= path_revision)
+                {
+                    slot.path_candidates.pop_front();
+                }
+                return Ok(Some(promoted));
+            }
         }
-        if goal_generation != lease.goal_generation {
-            mismatched_fields.push("goal_generation");
-        }
-        if planner_map_revision != lease.map_revision {
-            mismatched_fields.push("planner_map_revision");
-        }
-        if goal_payload_sha256 != lease.goal_payload_sha256 {
-            mismatched_fields.push("goal_payload_sha256");
-        }
-        if path_revision != lease.path_revision {
-            mismatched_fields.push("path_revision");
-        }
-        if path_payload_sha256 != lease.path_payload_sha256 {
-            mismatched_fields.push("path_payload_sha256");
-        }
-        if !mismatched_fields.is_empty() {
-            return Err(format!(
-                "NAV_STATE_LEASE_REJECTED: mismatched fields: {}",
-                mismatched_fields.join(",")
-            ));
-        }
-        Ok(Some(lease))
+        Err(rejection(&confirmed))
     }
 
     /// 当前 profile(用于 diagnostics 暴露)。
@@ -938,6 +1037,24 @@ impl NavRuntimeState {
         Ok(())
     }
 
+    /// Record an unowned scheduler heartbeat after its guard transport connected.
+    ///
+    /// Idle heartbeats do not own a guard lease, so they intentionally carry no
+    /// guard generation. Goal admission still requires a positive request proof,
+    /// and every owned navigation update still requires a positive generation.
+    pub(crate) fn observe_idle_motion_sink(&self, ready: bool) -> Result<(), ObservationError> {
+        let mut runtime = self
+            .runtime_observations
+            .lock()
+            .map_err(|_| ObservationError::StateUnavailable)?;
+        runtime.motion_sink.value = Some(MotionSinkObservation {
+            generation: 0,
+            ready,
+        });
+        runtime.motion_sink.observed_at = Some(Instant::now());
+        Ok(())
+    }
+
     /// Synchronous coarse gate used by process diagnostics.
     pub fn execution_chain_is_live(&self) -> bool {
         let snapshot = self.runtime_observation_snapshot();
@@ -952,7 +1069,6 @@ impl NavRuntimeState {
             && snapshot.planner_fresh
             && snapshot.planner_ready
             && snapshot.planner_frame_matches
-            && snapshot.map_revision > 0
             && snapshot.motion_sink_fresh
             && snapshot.motion_sink_ready
     }
@@ -1506,7 +1622,7 @@ pub async fn compute_readiness(
     let observations = state.runtime_observation_snapshot();
     let lcm_backend = handle.lcm_backend_available;
     let tf = observations.tf_fresh && observations.tf_complete;
-    let costmap = observations.planner_fresh && observations.map_revision > 0;
+    let costmap = observations.planner_observed && observations.planner_fresh;
     let cmd_vel_sink_ready = observations.motion_sink_fresh && observations.motion_sink_ready;
     let planner = profile_supported
         && stack_health.fresh
@@ -1554,9 +1670,6 @@ pub async fn compute_readiness(
     } else {
         if !observations.planner_frame_matches {
             blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
-        }
-        if observations.map_revision == 0 {
-            blockers.push(NavigationReadinessCode::CostmapUnavailable);
         }
         if !observations.planner_ready {
             blockers.push(NavigationReadinessCode::PlannerNotReady);
@@ -1725,9 +1838,9 @@ pub struct SetGoalInput {
     pub parent_request_id: String,
     /// Requested CAS generation; zero asks the runtime to allocate one.
     pub goal_generation: u64,
-    /// Optional pinned map version.
+    /// Compatibility map-version telemetry; ignored by navigation execution.
     pub map_version_id: String,
-    /// Required positive planner-observed map revision.
+    /// Compatibility map-sequence telemetry; ignored by navigation execution.
     pub map_revision: u64,
     /// Immutable request-level motion admission proof.
     pub motion_admission: MotionAdmissionProof,
@@ -1742,8 +1855,6 @@ pub struct SetGoalInput {
 pub enum SetGoalRetryReason {
     /// A typed navigation readiness blocker rejected admission.
     NavigationNotReady(NavigationReadinessCode),
-    /// The exploration goal and planner have observed different map revisions.
-    MapRevisionMismatch,
 }
 
 /// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED)`,
@@ -1852,9 +1963,7 @@ pub async fn set_goal_with_boundary(
     }
     if input.goal_id.is_empty()
         || input.parent_request_id.is_empty()
-        || input.map_revision == 0
         || input.goal_generation > i64::MAX as u64
-        || input.map_revision > i64::MAX as u64
         || input.target.timestamp_ns > i64::MAX as u64
         || !matches!(
             input.owner_kind,
@@ -1865,7 +1974,7 @@ pub async fn set_goal_with_boundary(
         return SetGoalOutcome {
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
-                message: "SET_GOAL_REJECTED[GOAL_LEASE_INVALID]: incomplete owner/map identity"
+                message: "SET_GOAL_REJECTED[GOAL_LEASE_INVALID]: incomplete owner identity"
                     .to_string(),
                 goal_id: input.goal_id,
                 distance_remaining: 0.0,
@@ -1913,23 +2022,6 @@ pub async fn set_goal_with_boundary(
             retry_reason: None,
         };
     }
-    if input.map_revision != detail.costmap_revision {
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: format!(
-                    "SET_GOAL_REJECTED[GOAL_MAP_REVISION_MISMATCH]: goal={} planner={}",
-                    input.map_revision, detail.costmap_revision
-                ),
-                goal_id: input.goal_id,
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            },
-            lease: None,
-            retry_reason: Some(SetGoalRetryReason::MapRevisionMismatch),
-        };
-    }
-
     let goal_generation = match state.reserve_goal_generation(input.goal_generation) {
         Ok(generation) => generation,
         Err(()) => {
@@ -1949,7 +2041,6 @@ pub async fn set_goal_with_boundary(
     let producer_runtime_generation = state.producer_runtime_generation();
     if goal_generation > i64::MAX as u64
         || producer_runtime_generation > i64::MAX as u64
-        || input.map_revision > i64::MAX as u64
         || input.target.timestamp_ns > i64::MAX as u64
     {
         return SetGoalOutcome {
@@ -1990,8 +2081,8 @@ pub async fn set_goal_with_boundary(
         parent_request_id: input.parent_request_id.clone(),
         goal_generation: goal_generation as i64,
         producer_runtime_generation: producer_runtime_generation as i64,
-        map_version_id: input.map_version_id.clone(),
-        map_revision: input.map_revision as i64,
+        map_version_id: String::new(),
+        map_revision: 0,
         source_timestamp_ns: input.target.timestamp_ns as i64,
         motion_guard_generation: input.motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
@@ -2036,8 +2127,8 @@ pub async fn set_goal_with_boundary(
         parent_request_id: envelope.parent_request_id.clone(),
         goal_generation,
         producer_runtime_generation,
-        map_version_id: envelope.map_version_id.clone(),
-        map_revision: input.map_revision,
+        map_version_id: String::new(),
+        map_revision: 0,
         goal_payload_sha256: envelope.payload_sha256,
         path_revision: 0,
         path_payload_sha256: [0; 32],
@@ -3260,8 +3351,8 @@ mod tests {
         assert_eq!(goal.session_id, "stack-owned-goal");
         assert_eq!(goal.owner_kind, schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV);
         assert_eq!(goal.parent_request_id, "request-stack-owned-goal");
-        assert_eq!(goal.map_version_id, "map-v1");
-        assert_eq!(goal.map_revision, 1);
+        assert!(goal.map_version_id.is_empty());
+        assert_eq!(goal.map_revision, 0);
         assert_eq!(goal.motion_guard_generation, 7);
         assert_eq!(goal.motion_guard_boot_nonce, [7; 16]);
         assert_eq!(goal.motion_stop_generation, 1);
@@ -3595,7 +3686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_envelope_requires_exact_lease_hash_and_monotonic_revision() {
+    async fn path_envelope_requires_exact_lease_hash_and_monotonic_path_revision() {
         let state = NavRuntimeState::from_env();
         let lease = test_lease("path-goal", 5);
         {
@@ -3643,7 +3734,145 @@ mod tests {
             .observe_path_envelope(&wrong_goal)
             .await
             .unwrap_err()
-            .contains("identity/map/goal hash"));
+            .contains("identity/goal hash"));
+    }
+
+    #[tokio::test]
+    async fn latest_published_path_does_not_invalidate_confirmed_navigation_state() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("confirmed-path", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+
+        let first_path = sealed_path(&lease, 1, 1.0);
+        let confirmed = state
+            .observe_path_envelope(&first_path)
+            .await
+            .expect("first path establishes the initial confirmed lease");
+        let second_path = sealed_path(&lease, 2, 2.0);
+        let candidate = state
+            .observe_path_envelope(&second_path)
+            .await
+            .expect("newer planner output is retained as a candidate");
+        assert_eq!(candidate.path_revision, 2);
+        assert_eq!(
+            state.active_goal_lease().await.as_ref(),
+            Some(&confirmed),
+            "planner publication alone must not replace the scheduler-confirmed lease"
+        );
+
+        let correlated = state
+            .correlate_navigation_state(
+                &confirmed.session_id,
+                confirmed.owner_kind,
+                &confirmed.parent_request_id,
+                confirmed.goal_generation,
+                confirmed.map_revision,
+                confirmed.path_revision,
+                confirmed.goal_payload_sha256,
+                confirmed.path_payload_sha256,
+            )
+            .await
+            .expect("the last confirmed scheduler state remains valid")
+            .expect("active lease");
+        assert_eq!(correlated, confirmed);
+    }
+
+    #[tokio::test]
+    async fn navigation_state_promotes_only_an_observed_path_candidate() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("candidate-path", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+
+        let first_path = sealed_path(&lease, 1, 1.0);
+        let confirmed = state.observe_path_envelope(&first_path).await.unwrap();
+        let second_path = sealed_path(&lease, 2, 2.0);
+        assert!(state
+            .correlate_navigation_state(
+                &confirmed.session_id,
+                confirmed.owner_kind,
+                &confirmed.parent_request_id,
+                confirmed.goal_generation,
+                confirmed.map_revision,
+                2,
+                confirmed.goal_payload_sha256,
+                second_path.path_payload_sha256,
+            )
+            .await
+            .expect_err("NavState cannot authorize a path Geometry has not observed yet")
+            .contains("path_revision"));
+
+        let candidate = state.observe_path_envelope(&second_path).await.unwrap();
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&confirmed));
+        let promoted = state
+            .correlate_navigation_state(
+                &candidate.session_id,
+                candidate.owner_kind,
+                &candidate.parent_request_id,
+                candidate.goal_generation,
+                candidate.map_revision,
+                candidate.path_revision,
+                candidate.goal_payload_sha256,
+                candidate.path_payload_sha256,
+            )
+            .await
+            .expect("scheduler acknowledgement promotes an observed candidate")
+            .expect("active lease");
+        assert_eq!(promoted, candidate);
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&candidate));
+    }
+
+    #[tokio::test]
+    async fn cancel_captures_confirmed_path_and_freezes_candidate_promotion() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("cancel-confirmed-path", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+
+        let confirmed = state
+            .observe_path_envelope(&sealed_path(&lease, 1, 1.0))
+            .await
+            .unwrap();
+        state
+            .observe_path_envelope(&sealed_path(&lease, 2, 2.0))
+            .await
+            .expect("newer planner path candidate");
+
+        let CancelStart::Publish {
+            lease: cancel_lease,
+            ..
+        } = state.begin_cancel(&cancel_input(&confirmed)).await
+        else {
+            panic!("cancel must capture the confirmed lease");
+        };
+        assert_eq!(cancel_lease, confirmed);
+        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&confirmed));
+
+        let rejected = state
+            .correlate_navigation_state(
+                &lease.session_id,
+                lease.owner_kind,
+                &lease.parent_request_id,
+                lease.goal_generation,
+                lease.map_revision,
+                2,
+                lease.goal_payload_sha256,
+                sealed_path(&lease, 2, 2.0).path_payload_sha256,
+            )
+            .await
+            .expect_err("pending cancel freezes the confirmed path lease");
+        assert!(rejected.contains("path_revision"));
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&confirmed));
     }
 
     #[tokio::test]
@@ -3789,7 +4018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn navigation_state_rejection_names_the_mismatched_lease_field() {
+    async fn navigation_state_ignores_map_revision_but_names_real_lease_mismatch() {
         let state = NavRuntimeState::from_env();
         let lease = test_lease("diagnostic-goal", 1);
         {
@@ -3798,7 +4027,7 @@ mod tests {
             slot.goal = Some(test_active_goal_with_lease(lease.clone()));
         }
 
-        let error = state
+        let correlated = state
             .correlate_navigation_state(
                 &lease.session_id,
                 lease.owner_kind,
@@ -3810,10 +4039,26 @@ mod tests {
                 lease.path_payload_sha256,
             )
             .await
-            .expect_err("zero map revision must not match an owned navigation state");
+            .expect("map revision is not a lease identity field")
+            .expect("active lease");
+        assert_eq!(correlated, lease);
+
+        let error = state
+            .correlate_navigation_state(
+                &lease.session_id,
+                schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                &lease.parent_request_id,
+                lease.goal_generation,
+                0,
+                lease.path_revision,
+                lease.goal_payload_sha256,
+                lease.path_payload_sha256,
+            )
+            .await
+            .expect_err("wrong owner must not match an owned navigation state");
         assert_eq!(
             error,
-            "NAV_STATE_LEASE_REJECTED: mismatched fields: planner_map_revision"
+            "NAV_STATE_LEASE_REJECTED: mismatched fields: owner_kind"
         );
     }
 

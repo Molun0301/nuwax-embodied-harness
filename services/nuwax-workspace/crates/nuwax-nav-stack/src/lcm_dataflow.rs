@@ -803,7 +803,6 @@ async fn run_guarded_nav_loop(
             changed = status.changed() => {
                 changed.map_err(|_| NavStackError::Internal("guard scheduler status stream closed".into()))?;
                 let snapshot = status.borrow().clone();
-                clear_terminal_active_session(&mut active_session, &snapshot);
                 if snapshot.applied_commands > applied_commands {
                     if let Some(twist) = snapshot.last_applied_twist {
                         publish_twist2(transport, &node.outputs[0], twist).await?;
@@ -822,10 +821,15 @@ async fn run_guarded_nav_loop(
                 publish_guarded_nav_state(
                     transport,
                     &node.outputs[1],
-                    snapshot,
+                    snapshot.clone(),
                     &telemetry,
                     None,
                 ).await?;
+                clear_terminal_session_after_publication(
+                    &mut active_session,
+                    &mut telemetry,
+                    &snapshot,
+                );
             }
             message = poses.next() => {
                 let frame = required_frame(message, "guarded_nav_scheduler.map_pose")?;
@@ -860,13 +864,19 @@ async fn run_guarded_nav_loop(
                     )
                     .await?;
                 }
+                let snapshot = scheduler.status();
                 publish_guarded_nav_state(
                     transport,
                     &node.outputs[1],
-                    scheduler.status(),
+                    snapshot.clone(),
                     &telemetry,
-                    Some(scheduler.status().planner_inputs_fresh),
+                    Some(snapshot.planner_inputs_fresh),
                 ).await?;
+                clear_terminal_session_after_publication(
+                    &mut active_session,
+                    &mut telemetry,
+                    &snapshot,
+                );
             }
             message = costmaps.next() => {
                 let frame = required_frame(message, "guarded_nav_scheduler.costmap")?;
@@ -903,13 +913,19 @@ async fn run_guarded_nav_loop(
                     )
                     .await?;
                 }
+                let snapshot = scheduler.status();
                 publish_guarded_nav_state(
                     transport,
                     &node.outputs[1],
-                    scheduler.status(),
+                    snapshot.clone(),
                     &telemetry,
-                    Some(scheduler.status().planner_inputs_fresh),
+                    Some(snapshot.planner_inputs_fresh),
                 ).await?;
+                clear_terminal_session_after_publication(
+                    &mut active_session,
+                    &mut telemetry,
+                    &snapshot,
+                );
             }
             message = goals.next() => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
@@ -1079,7 +1095,12 @@ async fn run_guarded_nav_loop(
                                 "path",
                                 &reason,
                             ).await?;
-                            clear_terminal_active_session(&mut active_session, &scheduler.status());
+                            let snapshot = scheduler.status();
+                            clear_terminal_session_after_publication(
+                                &mut active_session,
+                                &mut telemetry,
+                                &snapshot,
+                            );
                         }
                         OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                     }
@@ -1148,22 +1169,32 @@ async fn run_guarded_nav_loop(
                                     "cancel",
                                     &reason,
                                 ).await?;
-                                clear_terminal_active_session(&mut active_session, &scheduler.status());
+                                let snapshot = scheduler.status();
+                                clear_terminal_session_after_publication(
+                                    &mut active_session,
+                                    &mut telemetry,
+                                    &snapshot,
+                                );
                                 continue;
                             }
                             OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                         }
                     }
                     telemetry = candidate_telemetry;
-                    active_session = None;
                     publish_bool(transport, &node.outputs[3], true).await?;
+                    let snapshot = scheduler.status();
                     publish_guarded_nav_state(
                         transport,
                         &node.outputs[1],
-                        scheduler.status(),
+                        snapshot.clone(),
                         &telemetry,
                         None,
                     ).await?;
+                    clear_terminal_session_after_publication(
+                        &mut active_session,
+                        &mut telemetry,
+                        &snapshot,
+                    );
                 } else {
                     publish_guarded_rejection(
                         transport,
@@ -1194,15 +1225,7 @@ async fn fence_guarded_active_session(
         scheduler.cancel(&session_id).await?;
     }
     *active_session = None;
-    telemetry.public_session_id.clear();
-    telemetry.owner_kind = 0;
-    telemetry.parent_request_id.clear();
-    telemetry.goal_generation = 0;
-    telemetry.goal_payload_sha256 = [0; 32];
-    telemetry.path_revision = 0;
-    telemetry.path_payload_sha256 = [0; 32];
-    telemetry.initial_distance = 0.0;
-    telemetry.progress = 0.0;
+    clear_guarded_session_telemetry(telemetry);
     Ok(())
 }
 
@@ -1227,7 +1250,8 @@ async fn preempt_guarded_active_session(
                     &reason,
                 )
                 .await?;
-                clear_terminal_active_session(active_session, &scheduler.status());
+                let snapshot = scheduler.status();
+                clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
                 Ok(active_session.is_none())
             }
             OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
@@ -1412,6 +1436,34 @@ fn clear_terminal_active_session(
 }
 
 #[cfg(feature = "guard-runtime")]
+fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
+    telemetry.public_session_id.clear();
+    telemetry.owner_kind = 0;
+    telemetry.parent_request_id.clear();
+    telemetry.goal_generation = 0;
+    telemetry.cancel_generation = 0;
+    telemetry.goal = [0.0; 3];
+    telemetry.goal_payload_sha256 = [0; 32];
+    telemetry.path_revision = 0;
+    telemetry.path_payload_sha256 = [0; 32];
+    telemetry.initial_distance = 0.0;
+    telemetry.progress = 0.0;
+}
+
+#[cfg(feature = "guard-runtime")]
+fn clear_terminal_session_after_publication(
+    active_session: &mut Option<schema::GoalEnvelope>,
+    telemetry: &mut GuardedNavTelemetry,
+    status: &nuwax_nav_runtime::SchedulerStatus,
+) -> bool {
+    if !clear_terminal_active_session(active_session, status) {
+        return false;
+    }
+    clear_guarded_session_telemetry(telemetry);
+    true
+}
+
+#[cfg(feature = "guard-runtime")]
 fn scheduler_session_is_active(
     status: &nuwax_nav_runtime::SchedulerStatus,
     session_id: &str,
@@ -1495,25 +1547,51 @@ async fn publish_guarded_nav_state(
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
 ) -> NavStackResult<()> {
+    let message = build_guarded_navigation_state(
+        &status,
+        telemetry,
+        planner_observation,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    );
+    let body = schema::encode_navigation_state_body(&message)
+        .map_err(|error| NavStackError::Internal(format!("NavigationState encode: {error}")))?;
+    publish_body(transport, channel, "nuwax_msgs.NavigationState", body).await
+}
+
+#[cfg(feature = "guard-runtime")]
+fn build_guarded_navigation_state(
+    status: &nuwax_nav_runtime::SchedulerStatus,
+    telemetry: &GuardedNavTelemetry,
+    planner_observation: Option<bool>,
+    now: Duration,
+) -> schema::NavigationState {
     use nuwax_nav_runtime::{SchedulerPhase, TerminalOutcome};
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let state = match (status.phase, status.last_terminal) {
-        (_, Some(TerminalOutcome::Succeeded)) => 3,
-        (_, Some(TerminalOutcome::Cancelled | TerminalOutcome::Shutdown)) => 0,
-        (SchedulerPhase::Failed, _) => 4,
-        (SchedulerPhase::Controlling, _) => 2,
-        (SchedulerPhase::Acquiring | SchedulerPhase::AwaitingPath, _) => 1,
-        _ => 0,
+    let has_public_session = !telemetry.public_session_id.is_empty();
+    let state = if !has_public_session {
+        0
+    } else {
+        match (status.phase, status.last_terminal) {
+            (_, Some(TerminalOutcome::Succeeded)) => 3,
+            (_, Some(TerminalOutcome::Cancelled | TerminalOutcome::Shutdown)) => 0,
+            (SchedulerPhase::Failed, _) => 4,
+            (SchedulerPhase::Controlling, _) => 2,
+            (SchedulerPhase::Acquiring | SchedulerPhase::AwaitingPath, _) => 1,
+            _ => 0,
+        }
     };
-    let message = match status.last_terminal {
-        Some(TerminalOutcome::Cancelled) => format!("CANCELLED: {}", status.message),
-        _ => status.message,
+    let message = if !has_public_session {
+        "IDLE: guard client heartbeat".to_string()
+    } else {
+        match status.last_terminal {
+            Some(TerminalOutcome::Cancelled) => format!("CANCELLED: {}", status.message),
+            _ => status.message.clone(),
+        }
     };
     let include_planner_fields = planner_observation == Some(true);
-    let body = schema::encode_navigation_state_body(&schema::NavigationState {
+    schema::NavigationState {
         session_id: telemetry.public_session_id.clone(),
         robot_frame: "base_link".into(),
         stamp_sec: now.as_secs().min(i64::MAX as u64) as i64,
@@ -1525,7 +1603,11 @@ async fn publish_guarded_nav_state(
         message,
         runtime_generation: planner_observation
             .map_or(0, |_| saturating_i64(telemetry.runtime_generation)),
-        guard_generation: saturating_i64(status.guard_generation),
+        guard_generation: if has_public_session {
+            saturating_i64(status.guard_generation)
+        } else {
+            0
+        },
         sink_ready: i8::from(status.motion_sink_ready),
         planner_map_revision: 0,
         planner_map_frame: if include_planner_fields {
@@ -1539,17 +1621,23 @@ async fn publish_guarded_nav_state(
             String::new()
         },
         cancel_generation: saturating_i64(telemetry.cancel_generation),
-        zero_ack_id: status.last_zero_ack_id.unwrap_or_default(),
-        zero_applied_monotonic_ns: saturating_i64(status.last_fence_monotonic_ns),
+        zero_ack_id: if has_public_session {
+            status.last_zero_ack_id.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+        zero_applied_monotonic_ns: if has_public_session {
+            saturating_i64(status.last_fence_monotonic_ns)
+        } else {
+            0
+        },
         owner_kind: telemetry.owner_kind,
         parent_request_id: telemetry.parent_request_id.clone(),
         goal_generation: telemetry.goal_generation,
         path_revision: telemetry.path_revision,
         goal_payload_sha256: telemetry.goal_payload_sha256,
         path_payload_sha256: telemetry.path_payload_sha256,
-    })
-    .map_err(|error| NavStackError::Internal(format!("NavigationState encode: {error}")))?;
-    publish_body(transport, channel, "nuwax_msgs.NavigationState", body).await
+    }
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -5804,6 +5892,78 @@ mod guarded_tests {
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
         assert!(scheduler_session_is_active(&next, "goal-b"));
+    }
+
+    #[test]
+    fn terminal_publication_transitions_to_unowned_guard_heartbeat() {
+        let mut active = Some(active_goal("goal-a"));
+        let terminal = nuwax_nav_runtime::SchedulerStatus {
+            phase: SchedulerPhase::Idle,
+            motion_sink_ready: true,
+            guard_generation: 98,
+            last_terminal: Some(TerminalOutcome::Cancelled),
+            last_zero_ack_id: Some("zero-ack-a".into()),
+            last_fence_monotonic_ns: 123,
+            message: "verified fence".into(),
+            ..nuwax_nav_runtime::SchedulerStatus::default()
+        };
+        let mut telemetry = GuardedNavTelemetry {
+            runtime_generation: 42,
+            public_session_id: "goal-a".into(),
+            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            parent_request_id: "explore-a".into(),
+            goal_generation: 1,
+            cancel_generation: 2,
+            map_frame: "map".into(),
+            pose_frame: "map".into(),
+            goal: [1.0, 2.0, 0.0],
+            current: [0.5, 0.25, 0.0],
+            initial_distance: 3.0,
+            progress: 0.5,
+            path_revision: 3,
+            goal_payload_sha256: [0x11; 32],
+            path_payload_sha256: [0x22; 32],
+        };
+
+        let terminal_message =
+            build_guarded_navigation_state(&terminal, &telemetry, None, Duration::from_secs(1));
+        assert_eq!(terminal_message.session_id, "goal-a");
+        assert_eq!(terminal_message.guard_generation, 98);
+        assert_eq!(terminal_message.cancel_generation, 2);
+        assert_eq!(terminal_message.zero_ack_id, "zero-ack-a");
+        assert_eq!(terminal_message.zero_applied_monotonic_ns, 123);
+
+        assert!(clear_terminal_session_after_publication(
+            &mut active,
+            &mut telemetry,
+            &terminal,
+        ));
+        assert!(active.is_none());
+
+        let heartbeat = build_guarded_navigation_state(
+            &terminal,
+            &telemetry,
+            Some(true),
+            Duration::from_secs(2),
+        );
+        assert!(heartbeat.session_id.is_empty());
+        assert_eq!(heartbeat.state, 0);
+        assert_eq!(heartbeat.message, "IDLE: guard client heartbeat");
+        assert_eq!(heartbeat.guard_generation, 0);
+        assert_eq!(heartbeat.sink_ready, 1);
+        assert_eq!(heartbeat.cancel_generation, 0);
+        assert!(heartbeat.zero_ack_id.is_empty());
+        assert_eq!(heartbeat.zero_applied_monotonic_ns, 0);
+        assert_eq!(heartbeat.owner_kind, 0);
+        assert!(heartbeat.parent_request_id.is_empty());
+        assert_eq!(heartbeat.goal_generation, 0);
+        assert_eq!(heartbeat.path_revision, 0);
+        assert_eq!(heartbeat.goal_payload_sha256, [0; 32]);
+        assert_eq!(heartbeat.path_payload_sha256, [0; 32]);
+        assert_eq!(heartbeat.runtime_generation, 42);
+        assert_eq!(heartbeat.planner_map_frame, "map");
+        assert_eq!(heartbeat.planner_pose_frame, "map");
+        assert_eq!(heartbeat.current, [0.5, 0.25, 0.0]);
     }
 
     #[test]

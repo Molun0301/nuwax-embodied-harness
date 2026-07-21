@@ -698,7 +698,6 @@ fn decode_guarded_costmap_input(payload: &[u8]) -> OwnerInputResult<GuardedCostm
     Ok(OwnerInput::Accepted(GuardedCostmapInput {
         observation: nuwax_nav_runtime::CostmapObservation {
             costmap,
-            map_revision: 0,
             source_timestamp_ns,
         },
         map_frame: grid.header.frame_id,
@@ -1078,7 +1077,6 @@ async fn run_guarded_nav_loop(
                 }
                 let result = scheduler.submit_path(nuwax_nav_runtime::VersionedPath {
                     session_id: path_envelope.session_id.clone(),
-                    map_revision: 0,
                     path_revision: u64::try_from(path_envelope.path_revision)
                         .expect("validated positive path revision"),
                     payload_hash: path_envelope.path_payload_sha256,
@@ -1381,7 +1379,6 @@ async fn activate_guarded_goal(
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
             session_id: goal_envelope.session_id.clone(),
-            map_revision: 0,
             motion_admission: nuwax_nav_runtime::NavMotionAdmission {
                 guard_generation: u64::try_from(goal_envelope.motion_guard_generation)
                     .expect("validated positive motion_guard_generation"),
@@ -1609,7 +1606,6 @@ fn build_guarded_navigation_state(
             0
         },
         sink_ready: i8::from(status.motion_sink_ready),
-        planner_map_revision: 0,
         planner_map_frame: if include_planner_fields {
             telemetry.map_frame.clone()
         } else {
@@ -3002,6 +2998,11 @@ struct SimpleOutputPublication<'a> {
 }
 
 #[cfg(feature = "simple-2d")]
+fn simple_hold_path_is_executable(reason: nuwax_nav_simple_planner::module::HoldReason) -> bool {
+    reason != nuwax_nav_simple_planner::module::HoldReason::PlanningFailed
+}
+
+#[cfg(feature = "simple-2d")]
 async fn publish_simple_output(
     transport: &LcmTransport,
     node: &ModuleNode,
@@ -3045,6 +3046,10 @@ async fn publish_simple_output(
             if *publication.published_path_is_boundary_safe && point_is_safe {
                 publish_point(transport, &node.outputs[0], &waypoint).await?;
             }
+            Ok(())
+        }
+        ModuleOutput::SafetyHold { reason, .. } if !simple_hold_path_is_executable(reason) => {
+            *publication.published_path_is_boundary_safe = false;
             Ok(())
         }
         ModuleOutput::SafetyHold { waypoint, path, .. } => {
@@ -4160,9 +4165,7 @@ fn decode_simple_occupancy_with_boundary(
                 grid.info.origin.position[0] + (x as f64 + 0.5) * resolution,
                 grid.info.origin.position[1] + (y as f64 + 0.5) * resolution,
             );
-            if !(0..50).contains(&value)
-                || boundary.is_some_and(|boundary| !boundary.contains(center))
-            {
+            if value >= 50 || boundary.is_some_and(|boundary| !boundary.contains(center)) {
                 points.push(Point3::new(center.x, center.y, 0.0));
             }
         }
@@ -4344,10 +4347,6 @@ fn build_versioned_path_envelope(
         parent_request_id: publication.goal.parent_request_id.clone(),
         goal_generation: publication.goal.goal_generation,
         planner_runtime_generation: publication.planner_runtime_generation,
-        // Kept on the wire for compatibility; navigation no longer makes
-        // admission or control decisions from map version/sequence fields.
-        map_version_id: String::new(),
-        map_revision: 0,
         path_revision: publication.path_revision,
         source_timestamp_ns,
         goal_payload_sha256: publication.goal.payload_sha256,
@@ -4515,12 +4514,7 @@ fn prefixed(fingerprint: [u8; 8], body: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(all(test, any(feature = "simple-2d", feature = "replanning-astar")))]
-fn planner_test_goal(
-    session_id: &str,
-    goal_generation: i64,
-    map_version_id: &str,
-    map_revision: i64,
-) -> schema::GoalEnvelope {
+fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
     let mut goal = schema::GoalEnvelope {
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: session_id.into(),
@@ -4528,8 +4522,6 @@ fn planner_test_goal(
         parent_request_id: "explore-parent".into(),
         goal_generation,
         producer_runtime_generation: 17,
-        map_version_id: map_version_id.into(),
-        map_revision,
         source_timestamp_ns: goal_generation * 1_000_000_000,
         boundary_frame_id: "map".into(),
         boundary_points: vec![
@@ -4593,15 +4585,8 @@ mod planner_goal_buffer_tests {
     }
 
     impl GeometryProducerFixture {
-        fn goal(
-            &self,
-            session_id: &str,
-            goal_generation: i64,
-            map_version_id: &str,
-            map_revision: i64,
-        ) -> schema::GoalEnvelope {
-            let mut goal =
-                planner_test_goal(session_id, goal_generation, map_version_id, map_revision);
+        fn goal(&self, session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
+            let mut goal = planner_test_goal(session_id, goal_generation);
             goal.producer_runtime_generation = self.producer_runtime_generation;
             goal.payload_sha256 = [0; 32];
             schema::seal_goal_envelope(&mut goal).expect("seal producer fixture goal");
@@ -4610,14 +4595,14 @@ mod planner_goal_buffer_tests {
     }
 
     #[test]
-    fn retained_nav_owner_accepts_new_map_after_geometry_producer_restart() {
+    fn retained_nav_owner_accepts_new_goal_after_geometry_producer_restart() {
         let mut nav_owner = PlannerGoalBuffer::default();
         let first_goal = {
             let first_geometry = GeometryProducerFixture {
                 producer_runtime_generation: 41,
             };
             assert!(nav_owner.observe_costmap().is_none());
-            let first_goal = first_geometry.goal("before-restart", 7, "map-a", 100);
+            let first_goal = first_geometry.goal("before-restart", 7);
             let ready_first = match nav_owner.observe_goal(first_goal.clone()) {
                 PlannerGoalIngress::Ready(goal) => *goal,
                 outcome => panic!("first producer goal must be ready: {outcome:?}"),
@@ -4632,7 +4617,7 @@ mod planner_goal_buffer_tests {
         let restarted_geometry = GeometryProducerFixture {
             producer_runtime_generation: 42,
         };
-        let restarted_goal = restarted_geometry.goal("after-restart", 1, "map-b", 101);
+        let restarted_goal = restarted_geometry.goal("after-restart", 1);
         let ready_restarted = match nav_owner.observe_goal(restarted_goal.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => panic!("restarted producer goal must activate: {outcome:?}"),
@@ -4648,21 +4633,21 @@ mod planner_goal_buffer_tests {
     }
 
     #[test]
-    fn map_version_and_sequence_never_gate_the_newest_goal_lease() {
+    fn goal_generation_orders_the_newest_goal_lease() {
         let mut buffer = PlannerGoalBuffer::default();
         assert!(buffer.observe_costmap().is_none());
 
-        let first = planner_test_goal("goal-1", 1, "map-a", 12);
+        let first = planner_test_goal("goal-1", 1);
         let ready_first = match buffer.observe_goal(first.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => panic!("first lease must use the observed costmap: {outcome:?}"),
         };
         assert!(buffer.mark_applied(&ready_first));
 
-        let second = planner_test_goal("goal-2", 2, "other-map", -7);
+        let second = planner_test_goal("goal-2", 2);
         let ready_second = match buffer.observe_goal(second.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("map metadata must not buffer a newer lease: {outcome:?}"),
+            outcome => panic!("newer goal generation must not be buffered: {outcome:?}"),
         };
         assert!(!buffer.has_applied_goal());
         assert!(buffer.mark_applied(&ready_second));
@@ -4675,7 +4660,7 @@ mod planner_goal_buffer_tests {
         assert!(buffer.has_applied_goal());
 
         let mut cold = PlannerGoalBuffer::default();
-        let pending = planner_test_goal("pending", 1, "map-a", 11);
+        let pending = planner_test_goal("pending", 1);
         assert!(matches!(
             cold.observe_goal(pending.clone()),
             PlannerGoalIngress::Buffered
@@ -4690,7 +4675,7 @@ mod planner_goal_buffer_tests {
     fn applied_goal_remains_active_when_the_costmap_updates() {
         let mut buffer = PlannerGoalBuffer::default();
         assert!(buffer.observe_costmap().is_none());
-        let goal = planner_test_goal("active-goal", 1, "map-a", 20);
+        let goal = planner_test_goal("active-goal", 1);
         let ready = match buffer.observe_goal(goal) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => panic!("goal must be ready: {outcome:?}"),
@@ -4816,9 +4801,75 @@ mod simple_tests {
 
         let cloud = decode_simple_occupancy(&body).expect("decode persistent occupancy");
         assert_eq!(cloud.frame_id, NavFrameId::Map);
-        assert_eq!(cloud.points.len(), 2);
-        assert_eq!(cloud.points[0], Point3::new(-0.25, -1.75, 0.0));
-        assert_eq!(cloud.points[1], Point3::new(-0.75, -1.25, 0.0));
+        assert_eq!(cloud.points, vec![Point3::new(-0.75, -1.25, 0.0)]);
+    }
+
+    #[test]
+    fn planning_failure_diagnostic_path_is_not_executable() {
+        use nuwax_nav_simple_planner::module::HoldReason;
+
+        assert!(!simple_hold_path_is_executable(HoldReason::PlanningFailed));
+        assert!(simple_hold_path_is_executable(HoldReason::StopRequested));
+        assert!(simple_hold_path_is_executable(HoldReason::GoalReached));
+        assert!(simple_hold_path_is_executable(HoldReason::LifecycleStopped));
+    }
+
+    #[test]
+    fn simple_planner_can_leave_a_free_island_through_unknown_cells() {
+        let mut data = vec![-1; 25];
+        data[12] = 0;
+        let body = schema::encode_occupancy_grid_body(&schema::OccupancyGrid {
+            header: schema::Header {
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            info: schema::MapMetaData {
+                resolution: 1.0,
+                width: 5,
+                height: 5,
+                origin: schema::Pose {
+                    orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    ..schema::Pose::default()
+                },
+                ..schema::MapMetaData::default()
+            },
+            data,
+        })
+        .expect("encode frontier-style occupancy fixture");
+        let cloud = decode_simple_occupancy(&body).expect("decode unknown cells as traversable");
+        assert!(cloud.points.is_empty());
+
+        let mut planner =
+            SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
+                cell_size: 1.0,
+                inflation_radius: 0.0,
+                ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
+            })
+            .expect("frontier planner config");
+        Module::start(&mut planner).expect("start simple planner");
+        Module::on_terrain_map_ext(&mut planner, cloud).expect("frontier occupancy");
+        Module::on_odometry(
+            &mut planner,
+            PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(2.5, 2.5, 0.0),
+                    ..Pose3::default()
+                },
+                NavFrameId::Map,
+            ),
+        )
+        .expect("map pose");
+        Module::on_goal(
+            &mut planner,
+            PointStamped::from_xyz(NavFrameId::Map, 4.5, 2.5, 0.0),
+        )
+        .expect("frontier goal");
+
+        let ModuleOutput::Plan { path, .. } = Module::tick(&mut planner).expect("planner tick")
+        else {
+            panic!("unknown cells must not isolate a reachable frontier goal");
+        };
+        assert!(path.points.len() >= 3);
     }
 
     #[test]
@@ -4862,7 +4913,7 @@ mod simple_tests {
 
     #[test]
     fn simple_goal_arriving_before_costmap_is_applied_once_with_full_envelope() {
-        let goal = planner_test_goal("simple-goal", 4, "map-a", 21);
+        let goal = planner_test_goal("simple-goal", 4);
         let expected_hash = goal.payload_sha256;
         let expected_boundary = goal.boundary_points.clone();
         let mut buffer = PlannerGoalBuffer::default();
@@ -4929,7 +4980,7 @@ mod simple_tests {
             decode_simple_occupancy(&planner_test_grid_body(12)).expect("map 12"),
         )
         .expect("apply map 12");
-        let goal_12 = planner_test_goal("simple-12", 1, "map-a", 12);
+        let goal_12 = planner_test_goal("simple-12", 1);
         let ready_12 = match buffer.observe_goal(goal_12.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => panic!("goal 12 must be ready, got {outcome:?}"),
@@ -4948,10 +4999,10 @@ mod simple_tests {
         let mut published_path_is_boundary_safe = true;
         assert!(published_path_is_boundary_safe);
 
-        let goal_13 = planner_test_goal("simple-13", 2, "map-b", 13);
+        let goal_13 = planner_test_goal("simple-13", 2);
         let ready_13 = match buffer.observe_goal(goal_13.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("new lease must ignore map metadata: {outcome:?}"),
+            outcome => panic!("newer lease must be ready: {outcome:?}"),
         };
         assert!(!buffer.has_applied_goal(), "superseded path must be gated");
         assert!(
@@ -4987,7 +5038,10 @@ mod simple_tests {
         assert!(buffer.mark_applied(&applied_13));
         active_goal = Some(applied_13);
         active_boundary = boundary_13;
-        assert_eq!(active_goal.as_ref().map(|goal| goal.map_revision), Some(13));
+        assert_eq!(
+            active_goal.as_ref().map(|goal| goal.session_id.as_str()),
+            Some("simple-13")
+        );
         assert!(active_boundary.is_some());
         assert!(buffer.has_applied_goal());
         let path = match Module::tick(&mut planner).expect("simple map-b tick") {
@@ -5007,8 +5061,6 @@ mod simple_tests {
         )
         .expect("build map-b PathEnvelope")
         .expect("map-b path stays inside boundary");
-        assert!(envelope.map_version_id.is_empty());
-        assert_eq!(envelope.map_revision, 0);
         assert_eq!(
             envelope.goal_payload_sha256,
             active_goal.as_ref().unwrap().payload_sha256
@@ -5093,8 +5145,6 @@ mod guarded_tests {
             parent_request_id: "public-api-request-1".into(),
             goal_generation: 3,
             producer_runtime_generation: 7,
-            map_version_id: "map-v1".into(),
-            map_revision: 11,
             source_timestamp_ns: 1_000_000_000,
             motion_guard_generation: 7,
             motion_guard_boot_nonce: [7; 16],
@@ -5124,8 +5174,6 @@ mod guarded_tests {
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
             planner_runtime_generation: 9,
-            map_version_id: goal.map_version_id.clone(),
-            map_revision: goal.map_revision,
             path_revision: 1,
             source_timestamp_ns: 2_000_000_000,
             goal_payload_sha256: goal.payload_sha256,
@@ -5153,15 +5201,11 @@ mod guarded_tests {
     fn rollover_goal(
         previous: &schema::GoalEnvelope,
         session_id: &str,
-        map_version_id: &str,
-        map_revision: i64,
         producer_runtime_generation: i64,
         goal_generation: i64,
     ) -> schema::GoalEnvelope {
         let mut goal = previous.clone();
         goal.session_id = session_id.into();
-        goal.map_version_id = map_version_id.into();
-        goal.map_revision = map_revision;
         goal.producer_runtime_generation = producer_runtime_generation;
         goal.goal_generation = goal_generation;
         goal.source_timestamp_ns = goal.source_timestamp_ns.saturating_add(1_000_000_000);
@@ -5735,7 +5779,7 @@ mod guarded_tests {
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
@@ -5756,7 +5800,7 @@ mod guarded_tests {
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
 
         harness.send_costmap(12);
         harness.wait_for_costmap(12).await;
@@ -5766,13 +5810,13 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn guarded_new_goal_does_not_wait_for_matching_costmap_sequence() {
+    async fn guarded_new_goal_uses_available_fresh_inputs() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
         finish_map_a_after_verified_zero(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
@@ -5795,7 +5839,7 @@ mod guarded_tests {
 
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
         harness.shutdown().await;
@@ -5809,8 +5853,6 @@ mod guarded_tests {
         let conflicting = rollover_goal(
             &goal_a,
             "conflicting-session",
-            "map-v3",
-            13,
             goal_a.producer_runtime_generation,
             goal_a.goal_generation,
         );
@@ -5825,7 +5867,7 @@ mod guarded_tests {
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
 
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 13, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_zero().await;
         harness.wait_for_session("session-b").await;
@@ -5833,10 +5875,10 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn guarded_goal_replacement_waits_for_zero_not_map_metadata() {
+    async fn guarded_goal_replacement_waits_for_zero() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_zero().await;
@@ -5988,16 +6030,10 @@ mod guarded_tests {
     }
 
     #[test]
-    fn path_and_cancel_match_active_goal_identity_without_map_metadata() {
+    fn path_and_cancel_match_active_goal_identity() {
         let goal = sealed_goal("public-goal-1");
         let path = sealed_path(&goal);
         validate_path_goal_correlation(&path, &goal).expect("correlated path");
-
-        let mut different_map_metadata = path.clone();
-        different_map_metadata.map_version_id = "unrelated-map".into();
-        different_map_metadata.map_revision = -99;
-        validate_path_goal_correlation(&different_map_metadata, &goal)
-            .expect("map metadata must not affect path correlation");
 
         let mut foreign_path = path.clone();
         foreign_path.goal_payload_sha256[0] ^= 0xff;
@@ -6028,8 +6064,6 @@ mod guarded_tests {
 
         let mut goal_b = goal_a.clone();
         goal_b.producer_runtime_generation = 42;
-        goal_b.map_version_id = "map-v2".into();
-        goal_b.map_revision = 12;
         goal_b.source_timestamp_ns += 1_000_000_000;
         goal_b.payload_sha256 = [0; 32];
         schema::seal_goal_envelope(&mut goal_b).expect("seal producer 42 goal");
@@ -6072,8 +6106,6 @@ mod guarded_tests {
 
         let mut goal_b = goal_a.clone();
         goal_b.producer_runtime_generation = 42;
-        goal_b.map_version_id = "map-v2".into();
-        goal_b.map_revision = 12;
         goal_b.source_timestamp_ns += 1_000_000_000;
         goal_b.payload_sha256 = [0; 32];
         schema::seal_goal_envelope(&mut goal_b).expect("seal producer 42 goal");
@@ -6136,7 +6168,7 @@ mod guarded_tests {
     }
 
     #[test]
-    fn guarded_owner_orders_leases_without_map_metadata() {
+    fn guarded_owner_orders_leases_by_producer_and_goal_generation() {
         let goal_a = sealed_goal("session-a");
         let mut goal_buffer = PlannerGoalBuffer::default();
         assert!(goal_buffer.observe_costmap().is_none());
@@ -6146,10 +6178,10 @@ mod guarded_tests {
         };
         assert!(goal_buffer.mark_applied(&ready_a));
 
-        let goal_b = rollover_goal(&goal_a, "session-b", "different-map", -12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         let ready_b = match goal_buffer.observe_goal(goal_b.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("newer lease must ignore map metadata: {outcome:?}"),
+            outcome => panic!("newer lease must be ready: {outcome:?}"),
         };
         assert!(!goal_buffer.has_applied_goal());
         assert!(matches!(
@@ -6161,10 +6193,10 @@ mod guarded_tests {
             .expect("new lease path remains correlated");
         assert!(goal_buffer.observe_costmap().is_none());
 
-        let goal_a_again = rollover_goal(&goal_b, "session-a2", "", 0, 9, 1);
+        let goal_a_again = rollover_goal(&goal_b, "session-a2", 9, 1);
         let ready_a_again = match goal_buffer.observe_goal(goal_a_again.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("new lease with empty map metadata must activate: {outcome:?}"),
+            outcome => panic!("new producer lease must activate: {outcome:?}"),
         };
         assert!(!goal_buffer.has_applied_goal());
         assert_eq!(ready_a_again, goal_a_again);
@@ -6172,7 +6204,7 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn guarded_new_goal_fences_active_motion_without_costmap_sequence_gate() {
+    async fn guarded_new_goal_fences_active_motion() {
         let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let scheduler = nuwax_nav_runtime::NavScheduler::new(
             RecordingMotion(Arc::clone(&motion_calls)),
@@ -6205,7 +6237,6 @@ mod guarded_tests {
         handle
             .update_costmap(nuwax_nav_runtime::CostmapObservation {
                 costmap: nuwax_nav_astar::navigation_map::CostMap2D::new_all_free("map", 4, 4, 0.1),
-                map_revision: 11,
                 source_timestamp_ns: 1_000_000_000,
             })
             .await
@@ -6213,7 +6244,6 @@ mod guarded_tests {
         handle
             .start_session(nuwax_nav_runtime::NavSession {
                 session_id: "session-a".into(),
-                map_revision: 11,
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
                     guard_generation: 7,
                     guard_boot_nonce: [7; 16],
@@ -6225,7 +6255,6 @@ mod guarded_tests {
         handle
             .submit_path(nuwax_nav_runtime::VersionedPath {
                 session_id: "session-a".into(),
-                map_revision: 11,
                 path_revision: 1,
                 payload_hash: [0x11; 32],
                 path: Path2D::stamped(
@@ -6253,7 +6282,7 @@ mod guarded_tests {
         .expect("map-a APPLIED command");
 
         let goal_a = sealed_goal("session-a");
-        let goal_b = rollover_goal(&goal_a, "session-b", "map-v2", 12, 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         let mut goal_buffer = PlannerGoalBuffer::default();
         assert!(goal_buffer.observe_costmap().is_none());
         let ready_a = match goal_buffer.observe_goal(goal_a.clone()) {
@@ -6264,7 +6293,7 @@ mod guarded_tests {
         let ready_b = match goal_buffer.observe_goal(goal_b.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => {
-                panic!("new goal must not wait for a matching costmap sequence: {outcome:?}")
+                panic!("new goal must be ready with fresh planner inputs: {outcome:?}")
             }
         };
         assert_eq!(ready_b, goal_b);
@@ -6512,7 +6541,6 @@ mod guarded_tests {
             OwnerInput::Accepted(input) => input,
             OwnerInput::Rejected(reason) => panic!("valid costmap rejected: {reason}"),
         };
-        assert_eq!(input.observation.map_revision, 0);
         commit_guarded_costmap_telemetry(&mut telemetry, &input);
         assert_eq!(telemetry.map_frame, "map");
     }
@@ -6608,7 +6636,7 @@ mod tests {
         .await
         .expect("A* owner readiness timeout");
 
-        let goal = planner_test_goal("astar-cold-22", 1, "map-v22", 22);
+        let goal = planner_test_goal("astar-cold-22", 1);
         publish_body(
             &transport,
             &node.inputs[2],
@@ -6659,8 +6687,6 @@ mod tests {
             .expect("path transport error");
         let path = schema::decode_path_envelope_body(&frame.payload).expect("decode path envelope");
         assert_eq!(path.session_id, goal.session_id);
-        assert!(path.map_version_id.is_empty());
-        assert_eq!(path.map_revision, 0);
         assert_eq!(path.path_revision, 1);
         assert_eq!(path.goal_payload_sha256, goal.payload_sha256);
 
@@ -6749,7 +6775,7 @@ mod tests {
     fn astar_goal_arriving_before_costmap_is_applied_once_with_full_envelope() {
         use nuwax_nav_astar::module::{Module, NavigationInterface, ReplanningAStarPlannerModule};
 
-        let goal = planner_test_goal("astar-goal", 5, "map-a", 22);
+        let goal = planner_test_goal("astar-goal", 5);
         let expected_hash = goal.payload_sha256;
         let expected_boundary = goal.boundary_points.clone();
         let mut buffer = PlannerGoalBuffer::default();
@@ -6820,7 +6846,7 @@ mod tests {
             decode_astar_costmap(&planner_test_grid_body(12)).expect("map 12"),
         )
         .expect("apply map 12");
-        let goal_12 = planner_test_goal("astar-12", 1, "map-a", 12);
+        let goal_12 = planner_test_goal("astar-12", 1);
         let ready_12 = match buffer.observe_goal(goal_12.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
             outcome => panic!("goal 12 must be ready, got {outcome:?}"),
@@ -6837,10 +6863,10 @@ mod tests {
         let mut active_boundary = boundary_12;
         let mut path_revision = 5_i64;
 
-        let goal_13 = planner_test_goal("astar-13", 2, "map-b", 13);
+        let goal_13 = planner_test_goal("astar-13", 2);
         let ready_13 = match buffer.observe_goal(goal_13.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("new lease must ignore map metadata: {outcome:?}"),
+            outcome => panic!("newer lease must be ready: {outcome:?}"),
         };
         assert!(!buffer.has_applied_goal(), "superseded path must be gated");
         assert!(
@@ -6873,7 +6899,10 @@ mod tests {
         assert!(buffer.mark_applied(&applied_13));
         active_goal = Some(applied_13);
         active_boundary = boundary_13;
-        assert_eq!(active_goal.as_ref().map(|goal| goal.map_revision), Some(13));
+        assert_eq!(
+            active_goal.as_ref().map(|goal| goal.session_id.as_str()),
+            Some("astar-13")
+        );
         assert!(active_boundary.is_some());
         assert!(buffer.has_applied_goal());
         let update = match Module::tick(&mut planner).expect("A* map-b tick") {
@@ -6893,8 +6922,6 @@ mod tests {
         )
         .expect("build A* map-b PathEnvelope")
         .expect("A* map-b path stays inside boundary");
-        assert!(envelope.map_version_id.is_empty());
-        assert_eq!(envelope.map_revision, 0);
         assert_eq!(
             envelope.goal_payload_sha256,
             active_goal.as_ref().unwrap().payload_sha256

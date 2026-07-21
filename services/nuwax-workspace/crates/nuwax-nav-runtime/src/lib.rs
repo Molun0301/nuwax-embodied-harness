@@ -74,8 +74,6 @@ pub struct NavMotionAdmission {
 pub struct NavSession {
     /// Stable goal/session identifier.
     pub session_id: String,
-    /// Compatibility telemetry; ignored by scheduler admission and control.
-    pub map_revision: u64,
     /// Request-level motion admission proof transported with the goal.
     pub motion_admission: NavMotionAdmission,
 }
@@ -85,8 +83,6 @@ pub struct NavSession {
 pub struct VersionedPath {
     /// Goal/session identifier copied from the versioned goal envelope.
     pub session_id: String,
-    /// Compatibility telemetry; ignored by scheduler admission and control.
-    pub map_revision: u64,
     /// Monotonic path revision within the active navigation session.
     pub path_revision: u64,
     /// Canonical payload digest supplied by the versioned codec.
@@ -136,8 +132,6 @@ pub struct SchedulerStatus {
     pub phase: SchedulerPhase,
     /// Active session, if any.
     pub session_id: Option<String>,
-    /// Latest accepted map revision.
-    pub map_revision: u64,
     /// Latest accepted path revision.
     pub path_revision: u64,
     /// Commands whose correlated APPLIED proof was validated.
@@ -158,8 +152,6 @@ pub struct SchedulerStatus {
     pub pose_receipt_age_ms: u64,
     /// Monotonic receipt age of the latest occupancy snapshot.
     pub costmap_receipt_age_ms: u64,
-    /// Revision carried by the latest consumed occupancy snapshot.
-    pub planner_costmap_revision: u64,
     /// Most recent verified terminal outcome.
     pub last_terminal: Option<TerminalOutcome>,
     /// Most recent verified guard ZeroAck identifier.
@@ -175,7 +167,6 @@ impl Default for SchedulerStatus {
         Self {
             phase: SchedulerPhase::Idle,
             session_id: None,
-            map_revision: 0,
             path_revision: 0,
             applied_commands: 0,
             last_applied_twist: None,
@@ -186,7 +177,6 @@ impl Default for SchedulerStatus {
             costmap_source_timestamp_ns: 0,
             pose_receipt_age_ms: u64::MAX,
             costmap_receipt_age_ms: u64::MAX,
-            planner_costmap_revision: 0,
             last_terminal: None,
             last_zero_ack_id: None,
             last_fence_monotonic_ns: 0,
@@ -321,8 +311,6 @@ pub struct LeaseProof {
 pub struct CostmapObservation {
     /// Decoded controller costmap.
     pub costmap: CostMap2D,
-    /// Compatibility telemetry carried by the occupancy frame.
-    pub map_revision: u64,
     /// Positive source timestamp carried by the occupancy frame.
     pub source_timestamp_ns: i64,
 }
@@ -880,7 +868,6 @@ where
             source_timestamp_ns: observation.source_timestamp_ns,
             received_at: Instant::now(),
         });
-        self.status.planner_costmap_revision = observation.map_revision;
         self.refresh_input_status(Instant::now());
         self.status.message = "fresh occupancy costmap consumed".into();
         self.publish_status(status_tx);
@@ -940,7 +927,6 @@ where
         self.status = SchedulerStatus {
             phase: SchedulerPhase::Acquiring,
             session_id: Some(session.session_id.clone()),
-            map_revision: session.map_revision,
             path_revision: 0,
             applied_commands: 0,
             last_applied_twist: None,
@@ -951,7 +937,6 @@ where
             costmap_source_timestamp_ns: self.status.costmap_source_timestamp_ns,
             pose_receipt_age_ms: self.status.pose_receipt_age_ms,
             costmap_receipt_age_ms: self.status.costmap_receipt_age_ms,
-            planner_costmap_revision: self.status.planner_costmap_revision,
             last_terminal: None,
             last_zero_ack_id: None,
             last_fence_monotonic_ns: 0,
@@ -997,7 +982,6 @@ where
                 self.current_path = None;
                 self.status.phase = SchedulerPhase::Failed;
                 self.status.session_id = None;
-                self.status.map_revision = 0;
                 self.status.path_revision = 0;
                 self.status.motion_sink_ready = false;
                 self.status.message = error.message.clone();
@@ -1059,7 +1043,6 @@ where
         self.current_payload_hash = Some(path.payload_hash);
         self.current_path = Some(path.path);
         self.status.phase = SchedulerPhase::Controlling;
-        self.status.map_revision = path.map_revision;
         self.status.path_revision = self.current_path_revision;
         self.status.message = "versioned path accepted".into();
         self.publish_status(status_tx);
@@ -1217,7 +1200,6 @@ where
         self.current_path = None;
         self.status.phase = phase_after;
         self.status.session_id = None;
-        self.status.map_revision = 0;
         self.status.path_revision = 0;
         self.status.last_terminal = Some(terminal);
         if let Some(proof) = verified_fence {
@@ -2036,7 +2018,6 @@ mod tests {
     fn session_for(session_id: &str) -> NavSession {
         NavSession {
             session_id: session_id.into(),
-            map_revision: 3,
             motion_admission: NavMotionAdmission {
                 guard_generation: 7,
                 guard_boot_nonce: [7; 16],
@@ -2052,7 +2033,6 @@ mod tests {
     fn path_for(session_id: &str, path_revision: u64) -> VersionedPath {
         VersionedPath {
             session_id: session_id.into(),
-            map_revision: 3,
             path_revision,
             payload_hash: [u8::try_from(path_revision).unwrap_or(u8::MAX); 32],
             path: Path2D::stamped(
@@ -2080,7 +2060,6 @@ mod tests {
     fn costmap_at(source_timestamp_ns: i64) -> CostmapObservation {
         CostmapObservation {
             costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
-            map_revision: 3,
             source_timestamp_ns,
         }
     }
@@ -2158,7 +2137,6 @@ mod tests {
         handle
             .update_costmap(CostmapObservation {
                 costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
-                map_revision: 3,
                 source_timestamp_ns: 1_000_000_000,
             })
             .await
@@ -2446,7 +2424,6 @@ mod tests {
         handle
             .update_costmap(CostmapObservation {
                 costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
-                map_revision: 3,
                 source_timestamp_ns: 1_000_000_000,
             })
             .await

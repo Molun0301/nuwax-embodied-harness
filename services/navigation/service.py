@@ -28,6 +28,12 @@ from .state_machine import (
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.navigation.service")
 
+_EXPLORATION_MAP_IDENTITY_KEYS = {
+    "map_version_id",
+    "map_revision",
+    "stop_on_map_revision_change",
+}
+
 
 @dataclass(frozen=True)
 class _ForbiddenZoneRuntimeAck:
@@ -75,6 +81,29 @@ def _is_complete_exploration_terminal(
         }
         and metadata.get("exploration_terminal") is True
         and not str(metadata.get("child_task_id") or "").strip()
+    )
+
+
+def _without_exploration_map_identity(
+    request: Optional[ExploreAreaRequest],
+) -> Optional[ExploreAreaRequest]:
+    if request is None:
+        return None
+    metadata = dict(request.metadata)
+    stop_conditions = dict(request.stop_conditions)
+    for key in _EXPLORATION_MAP_IDENTITY_KEYS:
+        metadata.pop(key, None)
+        stop_conditions.pop(key, None)
+    if metadata == dict(request.metadata) and stop_conditions == dict(
+        request.stop_conditions
+    ):
+        return request
+    return request.model_copy(
+        update={
+            "metadata": metadata,
+            "stop_conditions": stop_conditions,
+        },
+        deep=True,
     )
 
 
@@ -1738,7 +1767,9 @@ class NavigationService:
     ) -> ExplorationContext:
         with self._lock:
             previous_context = self._latest_exploration_context
-            current_request = self._current_explore_request
+            current_request = _without_exploration_map_identity(
+                self._current_explore_request
+            )
             idle_without_request = bool(
                 exploration_state.status == ExplorationStatus.IDLE
                 and current_request is None
@@ -1783,6 +1814,12 @@ class NavigationService:
                 **dict(exploration_state.metadata),
                 **runtime_metadata,
             }
+            runtime_metadata.pop("map_version_id", None)
+            runtime_metadata.pop("map_revision", None)
+            runtime_metadata.pop("stop_on_map_revision_change", None)
+            merged_metadata.pop("map_version_id", None)
+            merged_metadata.pop("map_revision", None)
+            merged_metadata.pop("stop_on_map_revision_change", None)
             if idle_without_request:
                 merged_metadata.pop("waiting_for", None)
                 merged_metadata.pop("failure_code", None)
@@ -1842,8 +1879,6 @@ class NavigationService:
                         "selected_source": exploration_metadata.get("selected_source"),
                         "last_stop_reason": exploration_metadata.get("last_stop_reason"),
                         "child_task_id": exploration_metadata.get("child_task_id"),
-                        "map_version_id": exploration_metadata.get("map_version_id"),
-                        "map_revision": exploration_metadata.get("map_revision"),
                         "state_source": exploration_metadata.get("state_source"),
                         "geometry_session_mode": geometry_session_mode or "explore",
                         "status_text": exploration_metadata.get("status_text"),
@@ -1871,7 +1906,6 @@ class NavigationService:
                             "exploration_status": exploration_status,
                             "exploration_terminal": bool(exploration_metadata.get("exploration_terminal")),
                             "revision": exploration_metadata.get("revision"),
-                            "map_revision": exploration_metadata.get("map_revision"),
                         },
                     )
                 elif geometry_session_mode != "explore" and self._frontier_stream_has_active_geometry():
@@ -1893,6 +1927,7 @@ class NavigationService:
     def start_exploration(self, request: ExploreAreaRequest) -> ExplorationContext:
         """启动探索任务。"""
 
+        request = _without_exploration_map_identity(request) or request
         self._ensure_forbidden_zone_motion_start_allowed()
         provider = self._get_exploration_provider()
         request_id = str(request.request_id or "").strip()

@@ -521,7 +521,6 @@ def _exploration_stop_conditions_schema() -> Dict[str, object]:
             "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
             "max_duration_ms": {"type": "integer", "minimum": 1},
             "max_goals": {"type": "integer", "minimum": 1},
-            "stop_on_map_revision_change": {"type": "boolean", "default": False},
         }
     )
 
@@ -2521,7 +2520,7 @@ class GatewayRuntime:
                 "explore_area_v2",
                 "探索区域（边界约束）",
                 "通过 nuwax-geometry-runtime 启动带有手划边界、停止条件、子导航重试/黑名单"
-                "和地图 revision 约束的 wavefront 探索。",
+                "的 wavefront 探索。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -2530,8 +2529,6 @@ class GatewayRuntime:
                         "frame_id": {"type": "string", "default": "map"},
                         "strategy": {"type": "string", "default": "wavefront"},
                         "arbitration": {"type": "string", "default": "prefer_wavefront"},
-                        "map_version_id": {"type": "string"},
-                        "map_revision": {"type": "integer", "minimum": 0},
                         "boundary_line_segments": {
                             "type": "array",
                             "items": {
@@ -4918,7 +4915,6 @@ class GatewayRuntime:
             "exploration_script",
             "exploration_command",
             "exploration_database_path",
-            "exploration_version_id",
         )
         launch_plan = {key: metadata[key] for key in launch_keys if key in metadata}
         if launch_plan:
@@ -5075,8 +5071,6 @@ class GatewayRuntime:
                 "selected_source",
                 "last_stop_reason",
                 "child_task_id",
-                "map_version_id",
-                "map_revision",
                 "state_source",
                 "runtime_ready",
                 "elapsed_time_sec",
@@ -5084,7 +5078,6 @@ class GatewayRuntime:
                 "explorer_status_text",
                 "frontier_count",
                 "exploration_database_path",
-                "exploration_version_id",
                 "exploration_command",
                 "exploration_script",
                 "exploration_launch_mode",
@@ -6338,7 +6331,7 @@ class GatewayRuntime:
             arguments,
             capability_name,
         )
-        map_name, workspace = self._resolve_map_workspace_for_request(
+        map_name, _ = self._resolve_map_workspace_for_request(
             arguments,
             capability_name=capability_name,
             requested_by=requested_by,
@@ -6366,30 +6359,6 @@ class GatewayRuntime:
             stop_conditions=stop_conditions,
             poll_interval_sec=poll_interval_sec,
         )
-        raw_map_revision = arguments.get("map_revision")
-        if raw_map_revision is None:
-            raw_map_revision = getattr(
-                getattr(workspace, "latest_map_snapshot", None), "revision", 0
-            )
-        try:
-            if isinstance(raw_map_revision, bool):
-                raise ValueError
-            map_revision = int(raw_map_revision or 0)
-        except (TypeError, ValueError) as exc:
-            raise GatewayError(
-                "参数 map_revision 必须为非负整数。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            ) from exc
-        if map_revision < 0:
-            raise GatewayError(
-                "参数 map_revision 必须为非负整数。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-
         raw_retries = arguments.get("max_navigation_retries", 1)
         try:
             if isinstance(raw_retries, bool):
@@ -6426,11 +6395,6 @@ class GatewayRuntime:
                 http_status=422,
                 jsonrpc_code=-32602,
             )
-        map_version_id = str(
-            arguments.get("map_version_id")
-            or getattr(getattr(workspace, "map_asset", None), "latest_version_id", "")
-            or ""
-        ).strip()
         strategy = str(arguments.get("strategy") or "wavefront").strip()
         request_metadata: MetadataDict = {
             "requested_by": requested_by or "unknown",
@@ -6439,8 +6403,6 @@ class GatewayRuntime:
                 or stop_conditions.get("arbitration")
                 or "prefer_wavefront"
             ).strip(),
-            "map_version_id": map_version_id,
-            "map_revision": map_revision,
             "max_navigation_retries": max_navigation_retries,
             "blacklist_radius_m": blacklist_radius_m,
         }
@@ -6468,10 +6430,8 @@ class GatewayRuntime:
                 "exploration_script": None,
                 "exploration_command": None,
                 "exploration_database_path": None,
-                "exploration_version_id": map_version_id or None,
                 "request_id": request.request_id,
                 "strategy": strategy,
-                "map_revision": map_revision,
                 "boundary_segment_count": len(boundary_segments),
                 "boundary_dispatch_ready": True,
                 "max_navigation_retries": max_navigation_retries,
@@ -8310,20 +8270,7 @@ class GatewayRuntime:
                 )
             stop_conditions[key] = number
 
-        if "stop_on_map_revision_change" in raw_conditions:
-            value = raw_conditions.get("stop_on_map_revision_change")
-            if not isinstance(value, bool):
-                raise GatewayError(
-                    "参数 stop_conditions.stop_on_map_revision_change 必须为布尔值。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
-            stop_conditions["stop_on_map_revision_change"] = value
-
-        supported_keys = set(validators) | set(integer_validators) | {
-            "stop_on_map_revision_change"
-        }
+        supported_keys = set(validators) | set(integer_validators)
         unsupported = sorted(
             str(key) for key in raw_conditions if key not in supported_keys
         )
@@ -11392,8 +11339,6 @@ class GatewayRuntime:
             "selected_source": exploration_metadata.get("selected_source"),
             "last_stop_reason": exploration_metadata.get("last_stop_reason"),
             "child_task_id": exploration_metadata.get("child_task_id"),
-            "map_version_id": exploration_metadata.get("map_version_id"),
-            "map_revision": exploration_metadata.get("map_revision"),
             "state_source": exploration_metadata.get("state_source"),
             "runtime_ready": exploration_metadata.get("runtime_ready"),
             "waiting_for": exploration_metadata.get("waiting_for"),

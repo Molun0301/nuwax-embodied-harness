@@ -20,9 +20,9 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x2e12_7676_faa9_fe4c_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x271f_9f3c_54c5_8999_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x7dee_e876_8eff_2144_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x9002_62a4_798f_7a6d_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
@@ -35,7 +35,7 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0xfb19_152f_0ef6_5612_u64.to_be_bytes();
+pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x402e_9704_f8d2_5156_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -45,7 +45,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 2;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 3;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -110,7 +110,7 @@ pub struct Path {
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {
-    /// Wire schema version. Only version 2 is currently accepted.
+    /// Wire schema version. Only version 3 is currently accepted.
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -122,10 +122,6 @@ pub struct GoalEnvelope {
     pub goal_generation: i64,
     /// Geometry runtime generation that produced the envelope.
     pub producer_runtime_generation: i64,
-    /// Workspace map version identifier, when one is pinned.
-    pub map_version_id: String,
-    /// Occupancy revision observed when the goal was accepted.
-    pub map_revision: i64,
     /// Source timestamp in nanoseconds.
     pub source_timestamp_ns: i64,
     /// Authoritative frame for all boundary points.
@@ -144,10 +140,10 @@ pub struct GoalEnvelope {
     pub goal: PoseStamped,
 }
 
-/// Planner output correlated to exactly one versioned goal and map revision.
+/// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// Wire schema version. Only version 2 is currently accepted.
+    /// Wire schema version. Only version 3 is currently accepted.
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -159,10 +155,6 @@ pub struct PathEnvelope {
     pub goal_generation: i64,
     /// Planner runtime generation that produced the path.
     pub planner_runtime_generation: i64,
-    /// Map version used by the planner.
-    pub map_version_id: String,
-    /// Map revision used by the planner.
-    pub map_revision: i64,
     /// Monotonic path revision within the goal generation.
     pub path_revision: i64,
     /// Source timestamp in nanoseconds.
@@ -257,8 +249,6 @@ pub struct NavigationState {
     pub guard_generation: i64,
     /// Typed sink readiness flag (`0` false, nonzero true).
     pub sink_ready: i8,
-    /// Occupancy revision consumed by the planner.
-    pub planner_map_revision: i64,
     /// Planner map frame.
     pub planner_map_frame: String,
     /// Planner pose frame.
@@ -659,8 +649,6 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     encode_string(&message.parent_request_id, out)?;
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
     out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
-    encode_string(&message.map_version_id, out)?;
-    out.extend_from_slice(&message.map_revision.to_be_bytes());
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     encode_string(&message.boundary_frame_id, out)?;
     out.extend_from_slice(&boundary_points_length.to_be_bytes());
@@ -680,8 +668,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let parent_request_id = cursor.read_string()?;
     let goal_generation = cursor.read_i64()?;
     let producer_runtime_generation = cursor.read_i64()?;
-    let map_version_id = cursor.read_string()?;
-    let map_revision = cursor.read_i64()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let boundary_frame_id = cursor.read_string()?;
     let boundary_points_length = cursor.read_nonnegative_len("boundary_points_length")?;
@@ -715,8 +701,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         parent_request_id,
         goal_generation,
         producer_runtime_generation,
-        map_version_id,
-        map_revision,
         source_timestamp_ns,
         boundary_frame_id,
         boundary_points,
@@ -738,7 +722,6 @@ fn validate_goal_envelope_semantics(
         message.owner_kind,
         &message.parent_request_id,
         message.goal_generation,
-        message.map_revision,
         message.source_timestamp_ns,
     )?;
     if message.producer_runtime_generation <= 0 {
@@ -857,8 +840,6 @@ fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> Cod
     encode_string(&message.parent_request_id, out)?;
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
-    encode_string(&message.map_version_id, out)?;
-    out.extend_from_slice(&message.map_revision.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     out.extend_from_slice(&message.goal_payload_sha256);
@@ -872,8 +853,6 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
     let parent_request_id = cursor.read_string()?;
     let goal_generation = cursor.read_i64()?;
     let planner_runtime_generation = cursor.read_i64()?;
-    let map_version_id = cursor.read_string()?;
-    let map_revision = cursor.read_i64()?;
     let path_revision = cursor.read_i64()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let goal_payload_sha256 = cursor
@@ -892,8 +871,6 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
         parent_request_id,
         goal_generation,
         planner_runtime_generation,
-        map_version_id,
-        map_revision,
         path_revision,
         source_timestamp_ns,
         goal_payload_sha256,
@@ -912,7 +889,6 @@ fn validate_path_envelope_semantics(
         message.owner_kind,
         &message.parent_request_id,
         message.goal_generation,
-        message.map_revision,
         message.source_timestamp_ns,
     )?;
     if message.planner_runtime_generation <= 0 {
@@ -953,7 +929,6 @@ fn validate_navigation_identity(
     owner_kind: i32,
     parent_request_id: &str,
     goal_generation: i64,
-    _map_revision: i64,
     source_timestamp_ns: i64,
 ) -> Result<(), String> {
     if schema_version != NAVIGATION_ENVELOPE_SCHEMA_VERSION {
@@ -976,9 +951,6 @@ fn validate_navigation_identity(
     if goal_generation <= 0 {
         return Err("goal_generation must be positive".into());
     }
-    // `map_version_id` and `map_revision` remain serialized for wire
-    // compatibility, but they are deliberately not part of navigation
-    // admission. Freshness is established by frame/timestamp observations.
     if source_timestamp_ns <= 0 {
         return Err("source_timestamp_ns must be positive".into());
     }
@@ -1307,7 +1279,6 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     out.extend_from_slice(&message.runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.guard_generation.to_be_bytes());
     out.push(message.sink_ready as u8);
-    out.extend_from_slice(&message.planner_map_revision.to_be_bytes());
     encode_string(&message.planner_map_frame, &mut out)?;
     encode_string(&message.planner_pose_frame, &mut out)?;
     out.extend_from_slice(&message.cancel_generation.to_be_bytes());
@@ -1353,7 +1324,6 @@ fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigati
         runtime_generation: cursor.read_i64()?,
         guard_generation: cursor.read_i64()?,
         sink_ready: cursor.read_u8()? as i8,
-        planner_map_revision: cursor.read_i64()?,
         planner_map_frame: cursor.read_string()?,
         planner_pose_frame: cursor.read_string()?,
         cancel_generation: cursor.read_i64()?,
@@ -1854,8 +1824,6 @@ mod tests {
             parent_request_id: "explore-1".into(),
             goal_generation: 2,
             producer_runtime_generation: 7,
-            map_version_id: "map-v1".into(),
-            map_revision: 42,
             source_timestamp_ns: 123_000_000_456,
             boundary_frame_id: "map".into(),
             boundary_points: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
@@ -1905,8 +1873,6 @@ mod tests {
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
             planner_runtime_generation: 8,
-            map_version_id: goal.map_version_id.clone(),
-            map_revision: goal.map_revision,
             path_revision: 1,
             source_timestamp_ns: 124_000_000_000,
             goal_payload_sha256: goal.payload_sha256,
@@ -1921,9 +1887,9 @@ mod tests {
         assert_eq!(&encoded[..8], &PATH_ENVELOPE_FINGERPRINT);
         assert_eq!(decode_path_envelope(&encoded).unwrap(), path);
 
-        let mut stale_map = path.clone();
-        stale_map.map_revision -= 1;
-        assert!(encode_path_envelope(&stale_map)
+        let mut mutated_path = path.clone();
+        mutated_path.source_timestamp_ns += 1;
+        assert!(encode_path_envelope(&mutated_path)
             .unwrap_err()
             .to_string()
             .contains("payload_sha256 mismatch"));
@@ -2125,7 +2091,6 @@ mod tests {
             runtime_generation: 7,
             guard_generation: 11,
             sink_ready: 1,
-            planner_map_revision: 42,
             planner_map_frame: "map".into(),
             planner_pose_frame: "map".into(),
             cancel_generation: 3,

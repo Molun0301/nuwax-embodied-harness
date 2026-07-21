@@ -222,8 +222,6 @@ _MCP_STANDALONE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "frame_id": {"type": "string", "default": "map"},
             "strategy": {"type": "string", "default": "wavefront"},
             "arbitration": {"type": "string", "default": "prefer_wavefront"},
-            "map_version_id": {"type": "string"},
-            "map_revision": {"type": "integer", "minimum": 0},
             "stop_conditions": {
                 "type": "object",
                 "properties": {
@@ -235,7 +233,6 @@ _MCP_STANDALONE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                     "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
                     "max_duration_ms": {"type": "integer", "minimum": 1},
                     "max_goals": {"type": "integer", "minimum": 1},
-                    "stop_on_map_revision_change": {"type": "boolean"},
                 },
                 "additionalProperties": False,
             },

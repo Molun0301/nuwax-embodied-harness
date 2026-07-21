@@ -302,7 +302,6 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     }
     let runtime_generation = u64::try_from(message.runtime_generation).ok()?;
     let guard_generation = u64::try_from(message.guard_generation).ok()?;
-    let planner_map_revision = u64::try_from(message.planner_map_revision).ok()?;
     let cancel_generation = u64::try_from(message.cancel_generation).ok()?;
     let zero_applied_monotonic_ns = u64::try_from(message.zero_applied_monotonic_ns).ok()?;
     let goal_generation = u64::try_from(message.goal_generation).ok()?;
@@ -351,7 +350,6 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
             runtime_generation,
             guard_generation,
             sink_ready,
-            planner_map_revision,
             planner_map_frame: message.planner_map_frame,
             planner_pose_frame: message.planner_pose_frame,
             cancel_generation,
@@ -544,7 +542,6 @@ mod tests {
             runtime_generation: 7,
             guard_generation: 11,
             sink_ready: 1,
-            planner_map_revision: 42,
             planner_map_frame: "map".into(),
             planner_pose_frame: "map".into(),
             cancel_generation: 0,
@@ -566,7 +563,6 @@ mod tests {
         assert_eq!(nav.feedback.runtime_generation, 7);
         assert_eq!(nav.feedback.guard_generation, 11);
         assert!(nav.feedback.sink_ready);
-        assert_eq!(nav.feedback.planner_map_revision, 42);
         assert_eq!(nav.feedback.planner_map_frame, "map");
         assert_eq!(nav.feedback.planner_pose_frame, "map");
         assert_eq!(
@@ -637,7 +633,6 @@ mod tests {
             runtime_generation: 9,
             guard_generation: 12,
             sink_ready: 1,
-            planner_map_revision: 5,
             planner_map_frame: "map".into(),
             planner_pose_frame: "map".into(),
             cancel_generation: 3,

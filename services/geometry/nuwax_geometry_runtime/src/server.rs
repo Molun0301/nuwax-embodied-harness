@@ -306,8 +306,6 @@ fn exploration_state_from_snapshot(
         revision: snapshot.revision,
         timestamp_ns: now_ns(),
         child_task_id: snapshot.child_task_id,
-        map_version_id: snapshot.map_version_id,
-        map_revision: snapshot.map_revision,
     }
 }
 
@@ -347,7 +345,6 @@ fn explore_config_from_request(
             no_frontier_timeout_ms: conditions.no_frontier_timeout_ms,
             max_duration_ms: conditions.max_duration_ms,
             max_goals: conditions.max_goals,
-            stop_on_map_revision_change: conditions.stop_on_map_revision_change,
         })
         .unwrap_or_default();
     let arbitration = if request.arbitration.trim().is_empty() {
@@ -363,8 +360,6 @@ fn explore_config_from_request(
             request.strategy.clone()
         },
         arbitration,
-        map_version_id: request.map_version_id.clone(),
-        map_revision: request.map_revision,
         motion_admission: MotionAdmissionProof::try_from_wire(
             request.motion_guard_generation,
             &request.motion_guard_boot_nonce,
@@ -739,7 +734,6 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         runtime_generation: feedback.runtime_generation,
         guard_generation: feedback.guard_generation,
         sink_ready: feedback.sink_ready,
-        planner_map_revision: feedback.planner_map_revision,
         planner_map_frame: feedback.planner_map_frame,
         planner_pose_frame: feedback.planner_pose_frame,
         zero_ack_id: feedback.zero_ack_id,
@@ -750,7 +744,6 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         path_revision: feedback.path_revision,
         goal_payload_sha256: feedback.goal_payload_sha256.to_vec(),
         path_payload_sha256: feedback.path_payload_sha256.to_vec(),
-        map_version_id: feedback.map_version_id,
         producer_runtime_generation,
     }
 }
@@ -1597,11 +1590,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         } else {
             ng.parent_request_id.trim().to_string()
         };
-        let map_revision = if ng.map_revision == 0 {
-            self.bridge.state.read().await.map.revision
-        } else {
-            ng.map_revision
-        };
         let frame_id = if ng.frame_id.is_empty() {
             "map".to_string()
         } else {
@@ -1618,8 +1606,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             owner_kind,
             parent_request_id,
             goal_generation: ng.goal_generation,
-            map_version_id: ng.map_version_id.clone(),
-            map_revision,
             motion_admission,
             frame_id,
             target,
@@ -1796,7 +1782,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             "source_count": snapshot.source_count,
             "frontier_source_ready": snapshot.frontier_source_ready,
             "costmap_input_ready": snapshot.costmap_input_ready,
-            "costmap_input_revision": snapshot.costmap_input_revision,
             "active_source": snapshot.active_source,
             "arbitration": snapshot.arbitration,
         }))
@@ -1869,8 +1854,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(FrontierList {
             frontiers,
             revision: s.frontiers_revision,
-            map_revision: self.bridge.explore.frontier_snapshot().map_revision,
-            map_version_id: self.bridge.explore.snapshot().map_version_id,
         }))
     }
 
@@ -1883,15 +1866,12 @@ impl GeometryRuntime for GeometryRuntimeService {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut broadcast_rx = self.bridge.frontiers_tx.subscribe();
         let state_handle = self.bridge.state.clone();
-        let explore = self.bridge.explore.clone();
         tokio::spawn(async move {
             while let Ok(entries) = broadcast_rx.recv().await {
                 let revision = {
                     let s = state_handle.read().await;
                     s.frontiers_revision
                 };
-                let frontier_snapshot = explore.frontier_snapshot();
-                let map_version_id = explore.snapshot().map_version_id;
                 let frontiers = entries
                     .iter()
                     .map(|f| Frontier {
@@ -1918,8 +1898,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                     .send(Ok(FrontierList {
                         frontiers,
                         revision,
-                        map_revision: frontier_snapshot.map_revision,
-                        map_version_id,
                     }))
                     .await
                     .is_err()
@@ -1952,7 +1930,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         req: Request<ExploreRequest>,
     ) -> Result<Response<ExplorationState>, Status> {
         let r = req.get_ref();
-        let mut config = explore_config_from_request(r).map_err(Status::invalid_argument)?;
+        let config = explore_config_from_request(r).map_err(Status::invalid_argument)?;
         let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
         self.ensure_running_admission("StartExploration").await?;
         let adapter = self
@@ -1966,12 +1944,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             return Err(Status::failed_precondition(
                 "StartExploration requires an ACTIVE mapping session",
             ));
-        }
-        // Map version/sequence are compatibility metadata only. Exploration
-        // consumes the latest valid map-frame costmap by timestamp/freshness;
-        // never reject or stop a run because those counters changed.
-        if config.map_version_id.is_empty() {
-            config.map_version_id = mapping.map_version_id.clone();
         }
         if let Some(active_navigation) = self.bridge.nav.active_goal_lease().await {
             return Err(Status::failed_precondition(format!(
@@ -2776,8 +2748,6 @@ mod lifecycle_tests {
                 owner_kind: 2,
                 parent_request_id: request.parent_request_id,
                 goal_generation: 1,
-                map_version_id: request.map_version_id,
-                map_revision: request.map_revision,
                 goal_payload_sha256: [7; 32],
             };
             *self
@@ -2835,7 +2805,7 @@ mod lifecycle_tests {
         adapter.current_revision()
     }
 
-    fn frontier_costmap(revision: u64) -> ExploreCostmapSnapshot {
+    fn frontier_costmap(_fixture: u64) -> ExploreCostmapSnapshot {
         let mut grid = OccupancyGrid2D {
             resolution: 0.5,
             origin: Point2 { x: 0.0, y: 0.0 },
@@ -2851,8 +2821,6 @@ mod lifecycle_tests {
         ExploreCostmapSnapshot {
             grid,
             frame_id: "map".to_string(),
-            map_version_id: "mapver_000201".to_string(),
-            map_revision: revision,
         }
     }
 
@@ -2878,17 +2846,11 @@ mod lifecycle_tests {
         }
     }
 
-    fn exploration_request(
-        request_id: &str,
-        map_version_id: &str,
-        map_revision: u64,
-    ) -> ExploreRequest {
+    fn exploration_request(request_id: &str) -> ExploreRequest {
         ExploreRequest {
             request_id: request_id.to_string(),
             strategy: "wavefront".to_string(),
             arbitration: "prefer_wavefront".to_string(),
-            map_version_id: map_version_id.to_string(),
-            map_revision,
             motion_guard_generation: 7,
             motion_guard_boot_nonce: vec![7; 16],
             motion_stop_generation: 1,
@@ -2962,7 +2924,6 @@ mod lifecycle_tests {
                 }),
                 frame_id: "map".to_string(),
                 goal_id: goal_id.to_string(),
-                map_version_id: "map-v1".to_string(),
                 motion_guard_generation: 7,
                 motion_guard_boot_nonce: vec![7; 16],
                 motion_stop_generation: 1,
@@ -3214,11 +3175,7 @@ mod lifecycle_tests {
             tokio::spawn(async move {
                 GeometryRuntime::start_exploration(
                     &service,
-                    Request::new(exploration_request(
-                        "queued-after-stop",
-                        "mapver_stop_admission",
-                        0,
-                    )),
+                    Request::new(exploration_request("queued-after-stop")),
                 )
                 .await
             })
@@ -3264,7 +3221,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn start_exploration_requires_active_mapping_but_ignores_map_metadata() {
+    async fn start_exploration_requires_active_mapping() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -3275,7 +3232,7 @@ mod lifecycle_tests {
 
         let inactive = GeometryRuntime::start_exploration(
             &service,
-            Request::new(exploration_request("inactive-map", "mapver_exact", 0)),
+            Request::new(exploration_request("inactive-map")),
         )
         .await
         .expect_err("inactive mapping must reject exploration");
@@ -3288,19 +3245,16 @@ mod lifecycle_tests {
         .await
         .expect("activate exact test map")
         .into_inner();
-        let current_revision = activated.revision;
-        let mut metadata_ignored =
-            exploration_request("metadata-ignored", "mapver_other", current_revision + 1);
-        metadata_ignored.stop_conditions = Some(ExplorationStopConditions {
-            stop_on_map_revision_change: true,
-            ..ExplorationStopConditions::default()
-        });
-        let accepted = GeometryRuntime::start_exploration(&service, Request::new(metadata_ignored))
-            .await
-            .expect("map version and sequence must not gate exploration")
-            .into_inner();
+        assert!(activated.revision > 0);
+        let accepted = GeometryRuntime::start_exploration(
+            &service,
+            Request::new(exploration_request("active-map")),
+        )
+        .await
+        .expect("active mapping must admit exploration")
+        .into_inner();
         assert_eq!(accepted.status, STATUS_ACCEPTED);
-        assert_eq!(accepted.request_id, "metadata-ignored");
+        assert_eq!(accepted.request_id, "active-map");
     }
 
     #[tokio::test]
@@ -3319,7 +3273,7 @@ mod lifecycle_tests {
             tokio::spawn(async move {
                 GeometryRuntime::start_exploration(
                     &service,
-                    Request::new(exploration_request("barrier-explore", "mapver_barrier", 0)),
+                    Request::new(exploration_request("barrier-explore")),
                 )
                 .await
             })
@@ -3932,13 +3886,11 @@ mod exploration_contract_tests {
     use super::*;
 
     #[test]
-    fn start_request_parses_boundary_stop_conditions_and_map_pin() {
+    fn start_request_parses_boundary_and_stop_conditions() {
         let request = ExploreRequest {
             strategy: "wavefront".into(),
             arbitration: "prefer_wavefront".into(),
-            map_version_id: "map-v7".into(),
             request_id: "explore-1".into(),
-            map_revision: 7,
             boundary_line_segments: vec![
                 ExplorationBoundarySegment {
                     start_x: 0.0,
@@ -3964,7 +3916,6 @@ mod exploration_contract_tests {
                 no_frontier_timeout_ms: Some(4_000),
                 max_duration_ms: Some(60_000),
                 max_goals: Some(12),
-                stop_on_map_revision_change: true,
             }),
             max_navigation_retries: 3,
             blacklist_radius_m: 0.75,
@@ -3975,8 +3926,6 @@ mod exploration_contract_tests {
         };
 
         let config = explore_config_from_request(&request).expect("valid explore config");
-        assert_eq!(config.map_version_id, "map-v7");
-        assert_eq!(config.map_revision, 7);
         assert_eq!(config.max_navigation_retries, 3);
         assert_eq!(config.blacklist_radius_m, 0.75);
         assert_eq!(
@@ -3989,7 +3938,7 @@ mod exploration_contract_tests {
     }
 
     #[test]
-    fn exploration_state_preserves_child_and_map_fields() {
+    fn exploration_state_preserves_child_identity() {
         let proto =
             exploration_state_from_snapshot(crate::explore_runtime::ExploreRuntimeSnapshot {
                 status: crate::explore_runtime::STATUS_ACTIVE,
@@ -4000,12 +3949,8 @@ mod exploration_contract_tests {
                 frontier_count: 2,
                 revision: 8,
                 child_task_id: "child-3".into(),
-                map_version_id: "map-v7".into(),
-                map_revision: 7,
             });
         assert_eq!(proto.child_task_id, "child-3");
-        assert_eq!(proto.map_version_id, "map-v7");
-        assert_eq!(proto.map_revision, 7);
     }
 }
 
@@ -4033,7 +3978,6 @@ mod navigation_feedback_contract_tests {
                 runtime_generation: 7,
                 guard_generation: 11,
                 sink_ready: true,
-                planner_map_revision: 42,
                 planner_map_frame: "map".into(),
                 planner_pose_frame: "map".into(),
                 zero_ack_id: "zero-3".into(),
@@ -4044,7 +3988,6 @@ mod navigation_feedback_contract_tests {
                 path_revision: 2,
                 goal_payload_sha256: [7; 32],
                 path_payload_sha256: [8; 32],
-                map_version_id: "map-v1".into(),
             },
         });
 
@@ -4055,7 +3998,6 @@ mod navigation_feedback_contract_tests {
         assert_eq!(proto.runtime_generation, 7);
         assert_eq!(proto.guard_generation, 11);
         assert!(proto.sink_ready);
-        assert_eq!(proto.planner_map_revision, 42);
         assert_eq!(proto.planner_map_frame, "map");
         assert_eq!(proto.planner_pose_frame, "map");
         assert_eq!(proto.zero_ack_id, "zero-3");
@@ -4069,7 +4011,6 @@ mod navigation_feedback_contract_tests {
         assert_eq!(proto.path_revision, 2);
         assert_eq!(proto.goal_payload_sha256, vec![7; 32]);
         assert_eq!(proto.path_payload_sha256, vec![8; 32]);
-        assert_eq!(proto.map_version_id, "map-v1");
         assert_eq!(proto.producer_runtime_generation, 41);
     }
 
@@ -4163,7 +4104,6 @@ mod navigation_feedback_contract_tests {
                 }),
                 frame_id: "map".to_string(),
                 goal_id: "public-goal".to_string(),
-                map_version_id: "map-v1".to_string(),
                 motion_guard_generation: 7,
                 motion_guard_boot_nonce: vec![7; 16],
                 motion_stop_generation: 1,
@@ -4182,7 +4122,6 @@ mod navigation_feedback_contract_tests {
         assert!(goal.goal_generation > 0);
         assert!(goal.producer_runtime_generation > 0);
         assert_eq!(goal.goal_payload_sha256.len(), 32);
-        assert!(goal.map_version_id.is_empty());
 
         let wrong_producer_runtime_generation = if goal.producer_runtime_generation == 1 {
             2

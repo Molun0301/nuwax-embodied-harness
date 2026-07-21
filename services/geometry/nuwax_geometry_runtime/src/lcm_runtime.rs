@@ -135,7 +135,6 @@ pub struct NavigationFeedback {
     pub runtime_generation: u64,
     pub guard_generation: u64,
     pub sink_ready: bool,
-    pub planner_map_revision: u64,
     pub planner_map_frame: String,
     pub planner_pose_frame: String,
     pub zero_ack_id: String,
@@ -146,7 +145,6 @@ pub struct NavigationFeedback {
     pub path_revision: u64,
     pub goal_payload_sha256: [u8; 32],
     pub path_payload_sha256: [u8; 32],
-    pub map_version_id: String,
 }
 
 #[derive(Clone)]
@@ -187,7 +185,6 @@ impl NavigationUpdate {
                     .as_ref()
                     .map_or_else(String::new, |lease| lease.parent_request_id.clone()),
                 goal_generation: lease.as_ref().map_or(0, |lease| lease.goal_generation),
-                planner_map_revision: lease.as_ref().map_or(0, |lease| lease.map_revision),
                 path_revision: lease.as_ref().map_or(0, |lease| lease.path_revision),
                 goal_payload_sha256: lease
                     .as_ref()
@@ -195,9 +192,6 @@ impl NavigationUpdate {
                 path_payload_sha256: lease
                     .as_ref()
                     .map_or([0; 32], |lease| lease.path_payload_sha256),
-                map_version_id: lease
-                    .as_ref()
-                    .map_or_else(String::new, |lease| lease.map_version_id.clone()),
                 ..NavigationFeedback::default()
             },
         }
@@ -540,8 +534,6 @@ fn exploration_costmap_from_revision(
             cells,
         ),
         frame_id: "map".to_string(),
-        map_version_id: event.map_version_id.clone(),
-        map_revision: event.revision,
     })
 }
 
@@ -1586,8 +1578,6 @@ fn exploration_child_lease(
         owner_kind: lease.owner_kind,
         parent_request_id: lease.parent_request_id.clone(),
         goal_generation: lease.goal_generation,
-        map_version_id: lease.map_version_id.clone(),
-        map_revision: lease.map_revision,
         goal_payload_sha256: lease.goal_payload_sha256,
     }
 }
@@ -1684,8 +1674,6 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
     > {
         let child_request_id = request.request_id.clone();
         let parent_request_id = request.parent_request_id.clone();
-        let map_version_id = request.map_version_id.clone();
-        let map_revision = request.map_revision;
         let target = request.goal.target;
         let frame_id = target.frame_id.as_str().to_string();
         let pose = target.pose;
@@ -1721,8 +1709,6 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
                 parent_request_id,
                 goal_generation: 0,
-                map_version_id,
-                map_revision,
                 motion_admission: request.motion_admission,
                 frame_id,
                 target,
@@ -1869,7 +1855,6 @@ async fn apply_typed_navigation_feedback(
             update.feedback.owner_kind,
             &update.feedback.parent_request_id,
             update.feedback.goal_generation,
-            update.feedback.planner_map_revision,
             update.feedback.path_revision,
             update.feedback.goal_payload_sha256,
             update.feedback.path_payload_sha256,
@@ -1877,7 +1862,6 @@ async fn apply_typed_navigation_feedback(
         .await
     {
         Ok(Some(lease)) => {
-            update.feedback.map_version_id = lease.map_version_id.clone();
             update.producer_runtime_generation = lease.producer_runtime_generation;
             Some(lease)
         }
@@ -1929,7 +1913,7 @@ async fn apply_typed_navigation_feedback(
         let ready = !map_frame.is_empty() && map_frame == pose_frame;
         Some(crate::nav_runtime::PlannerInputObservation {
             generation: update.feedback.runtime_generation,
-            map_revision: update.feedback.planner_map_revision,
+            map_revision: 0,
             map_frame,
             pose_frame,
             ready,
@@ -2084,8 +2068,6 @@ fn exploration_navigation_terminal_result(
             owner_kind: update.feedback.owner_kind,
             parent_request_id: update.feedback.parent_request_id.clone(),
             goal_generation: update.feedback.goal_generation,
-            map_version_id: update.feedback.map_version_id.clone(),
-            map_revision: update.feedback.planner_map_revision,
             goal_payload_sha256: update.feedback.goal_payload_sha256,
         },
     };
@@ -4062,8 +4044,6 @@ mod mapping_feed_tests {
 
         let costmap =
             exploration_costmap_from_revision(&event).expect("map-frame exploration snapshot");
-        assert_eq!(costmap.map_revision, 9);
-        assert_eq!(costmap.map_version_id, "mapver_000001");
         assert_eq!(
             costmap.grid.cells[0],
             nuwax_nav_types_messages::grid::OccupancyCell::Unknown
@@ -4247,8 +4227,6 @@ mod exploration_adapter_tests {
                 owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
                 parent_request_id: "explore-1".to_string(),
                 goal_generation: 7,
-                planner_map_revision: 3,
-                map_version_id: "map-v1".to_string(),
                 goal_payload_sha256: [9; 32],
                 ..NavigationFeedback::default()
             },
@@ -4270,7 +4248,6 @@ mod exploration_adapter_tests {
         assert_eq!(proof.cancel_generation, 11);
         assert_eq!(proof.zero_ack_id, "zero-11");
         assert_eq!(proof.lease.parent_request_id, "explore-1");
-        assert_eq!(proof.lease.map_revision, 3);
 
         let mut timed_out = exploration_update("FAILED");
         timed_out.feedback.cancel_phase = "TIMED_OUT".to_string();
@@ -4298,8 +4275,6 @@ mod typed_navigation_feedback_tests {
             parent_request_id: format!("request-{goal_id}"),
             goal_generation: 1,
             producer_runtime_generation: 1,
-            map_version_id: "map-v1".to_string(),
-            map_revision: 42,
             goal_payload_sha256: [7; 32],
             path_revision: 0,
             path_payload_sha256: [0; 32],
@@ -4323,7 +4298,6 @@ mod typed_navigation_feedback_tests {
                 runtime_generation: 7,
                 guard_generation: 11,
                 sink_ready: true,
-                planner_map_revision: 42,
                 planner_map_frame: "map".into(),
                 planner_pose_frame: "map".into(),
                 owner_kind: lease.as_ref().map_or(0, |lease| lease.owner_kind),
@@ -4334,9 +4308,6 @@ mod typed_navigation_feedback_tests {
                 goal_payload_sha256: lease
                     .as_ref()
                     .map_or([0; 32], |lease| lease.goal_payload_sha256),
-                map_version_id: lease
-                    .as_ref()
-                    .map_or_else(String::new, |lease| lease.map_version_id.clone()),
                 ..NavigationFeedback::default()
             },
         }
@@ -4387,7 +4358,7 @@ mod typed_navigation_feedback_tests {
     }
 
     #[tokio::test]
-    async fn typed_feedback_drives_real_planner_and_motion_observations() {
+    async fn typed_feedback_drives_planner_and_motion_observations_without_map_sequence() {
         let handle = build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
@@ -4411,7 +4382,7 @@ mod typed_navigation_feedback_tests {
         assert!(readiness.ready, "{}", readiness.reason);
         assert_eq!(readiness.planner_generation, 7);
         assert_eq!(readiness.motion_sink_generation, 11);
-        assert_eq!(readiness.costmap_revision, 42);
+        assert_eq!(readiness.costmap_revision, 0);
     }
 
     #[tokio::test]
@@ -4846,7 +4817,6 @@ mod typed_navigation_feedback_tests {
                 stale_a.feedback.owner_kind,
                 &stale_a.feedback.parent_request_id,
                 stale_a.feedback.goal_generation,
-                stale_a.feedback.planner_map_revision,
                 stale_a.feedback.path_revision,
                 stale_a.feedback.goal_payload_sha256,
                 stale_a.feedback.path_payload_sha256,
@@ -4874,7 +4844,7 @@ mod typed_navigation_feedback_tests {
 
         let stale_planner = crate::nav_runtime::PlannerInputObservation {
             generation: stale_a.feedback.runtime_generation,
-            map_revision: stale_a.feedback.planner_map_revision,
+            map_revision: baseline.costmap_revision,
             map_frame: stale_a.feedback.planner_map_frame.clone(),
             pose_frame: stale_a.feedback.planner_pose_frame.clone(),
             ready: false,
@@ -4973,8 +4943,6 @@ mod typed_navigation_feedback_tests {
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation as i64,
             planner_runtime_generation: 1,
-            map_version_id: lease.map_version_id.clone(),
-            map_revision: lease.map_revision as i64,
             path_revision: 1,
             source_timestamp_ns: 10,
             goal_payload_sha256: lease.goal_payload_sha256,
@@ -5258,7 +5226,7 @@ mod exploration_lcm_smoke_tests {
     use nuwax_exploration::ExplorationBoundary;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
-    fn smoke_costmap(map_revision: u64) -> ExploreCostmapSnapshot {
+    fn smoke_costmap(_fixture: u64) -> ExploreCostmapSnapshot {
         let mut grid = OccupancyGrid2D {
             resolution: 0.5,
             origin: Point2 { x: 0.0, y: 0.0 },
@@ -5274,8 +5242,6 @@ mod exploration_lcm_smoke_tests {
         ExploreCostmapSnapshot {
             grid,
             frame_id: "map".to_string(),
-            map_version_id: "smoke-map-v41".to_string(),
-            map_revision,
         }
     }
 
@@ -5452,8 +5418,6 @@ mod exploration_lcm_smoke_tests {
             .start_with_config(
                 PARENT_REQUEST,
                 ExploreStartConfig {
-                    map_version_id: "smoke-map-v41".to_string(),
-                    map_revision: MAP_REVISION,
                     motion_admission: crate::nav_runtime::test_motion_admission(),
                     boundary: Some(boundary),
                     ..ExploreStartConfig::default()
@@ -5464,7 +5428,6 @@ mod exploration_lcm_smoke_tests {
         let active = explore.tick((2.0, 2.0)).await;
         assert_eq!(active.status, "ACTIVE", "{}", active.message);
         let frontier_snapshot = explore.frontier_snapshot();
-        assert_eq!(frontier_snapshot.map_revision, MAP_REVISION);
         assert!(!frontier_snapshot.frontiers.is_empty());
 
         let frontier_frame = tokio::time::timeout(Duration::from_secs(3), async {
@@ -5545,8 +5508,6 @@ mod exploration_lcm_smoke_tests {
         assert_eq!(goal.session_id, lease.session_id);
         assert_eq!(goal.goal_generation, lease.goal_generation as i64);
         assert!(goal.goal_generation > 0);
-        assert!(goal.map_version_id.is_empty());
-        assert_eq!(goal.map_revision, 0);
         assert_eq!(goal.payload_sha256, lease.goal_payload_sha256);
         assert_eq!(
             goal.payload_sha256,

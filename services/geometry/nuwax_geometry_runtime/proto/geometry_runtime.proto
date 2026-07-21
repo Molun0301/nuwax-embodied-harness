@@ -164,11 +164,11 @@ enum NavigationOwnerKind {
 }
 
 message NavigationGoal {
+  reserved 4, 5;
+  reserved "map_revision", "map_version_id";
   Pose pose = 1;
   string frame_id = 2;
   string goal_id = 3;
-  uint64 map_revision = 4;
-  string map_version_id = 5;
   string parent_request_id = 6;
   uint64 goal_generation = 7;
   NavigationOwnerKind owner_kind = 8;
@@ -184,6 +184,8 @@ message CancelNavigationRequest {
   uint64 producer_runtime_generation = 5;
 }
 message NavigationState {
+  reserved 13, 24;
+  reserved "planner_map_revision", "map_version_id";
   string status = 1;
   string message = 2;
   string goal_id = 3;
@@ -196,7 +198,6 @@ message NavigationState {
   uint64 runtime_generation = 10;
   uint64 guard_generation = 11;
   bool sink_ready = 12;
-  uint64 planner_map_revision = 13;
   string planner_map_frame = 14;
   string planner_pose_frame = 15;
   string zero_ack_id = 16;
@@ -207,7 +208,6 @@ message NavigationState {
   uint64 path_revision = 21;
   bytes goal_payload_sha256 = 22;
   bytes path_payload_sha256 = 23;
-  string map_version_id = 24;
   uint64 producer_runtime_generation = 25;
 }
 message NavigationReadiness {
@@ -240,8 +240,7 @@ message ExplorationReadiness {
   bool ready = 1;
   string message = 2;  // JSON: {backend_available, controller_active,
                         //      source_count, frontier_source_ready,
-                        //      costmap_input_ready, costmap_input_revision,
-                        //      active_source, arbitration}
+                        //      costmap_input_ready, active_source, arbitration}
 }
 
 // === legacy cmd_vel sink readiness compatibility ===
@@ -262,10 +261,10 @@ message Frontier {
   float heading = 3;
 }
 message FrontierList {
+  reserved 3, 4;
+  reserved "map_revision", "map_version_id";
   repeated Frontier frontiers = 1;
   uint64 revision = 2;       // frontier snapshot revision
-  uint64 map_revision = 3;   // costmap revision used to produce this snapshot
-  string map_version_id = 4;
 }
 
 message ExplorationBoundarySegment {
@@ -276,11 +275,12 @@ message ExplorationBoundarySegment {
 }
 
 message ExplorationStopConditions {
+  reserved 5;
+  reserved "stop_on_map_revision_change";
   optional double max_coverage_pct = 1;
   optional uint64 no_frontier_timeout_ms = 2;
   optional uint64 max_duration_ms = 3;
   optional uint32 max_goals = 4;
-  bool stop_on_map_revision_change = 5;
 }
 
 // 探索启动/停止/状态/诊断 — Phase 5 additive
@@ -288,11 +288,11 @@ message ExplorationStopConditions {
 // strategy 取值:`"wavefront"` / `"tare"` / `"highest_score"` / `"first_available"`
 // （与 dimos `ExplorationArbitrationPolicy` enum 字符串名一致）。
 message ExploreRequest {
+  reserved 3, 5;
+  reserved "map_version_id", "map_revision";
   string strategy = 1;
   string arbitration = 2;
-  string map_version_id = 3;
   string request_id = 4;
-  uint64 map_revision = 5;
   // Ordered, continuous, closed polygon edges. The server validates topology.
   repeated ExplorationBoundarySegment boundary_line_segments = 6;
   ExplorationStopConditions stop_conditions = 7;
@@ -308,6 +308,8 @@ message StopExplorationRequest {
   string request_id = 1;
 }
 message ExplorationState {
+  reserved 10, 11;
+  reserved "map_version_id", "map_revision";
   string status = 1;
   string message = 2;
   string request_id = 3;
@@ -317,8 +319,6 @@ message ExplorationState {
   uint64 revision = 7;
   uint64 timestamp_ns = 8;
   string child_task_id = 9;
-  string map_version_id = 10;
-  uint64 map_revision = 11;
 }
 message ExplorationSourceDiag {
   string source_name = 1;

@@ -17,7 +17,6 @@ struct NavigationState {
     int64_t runtime_generation;
     int64_t guard_generation;
     int8_t sink_ready;
-    int64_t planner_map_revision;
     string planner_map_frame;
     string planner_pose_frame;
     int64_t cancel_generation;

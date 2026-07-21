@@ -86,7 +86,7 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
         ExplorationStopReason::NoFrontierTimeout => "no_frontier_timeout",
         ExplorationStopReason::DurationExceeded => "duration_exceeded",
         ExplorationStopReason::MaxGoalsReached => "max_goals_reached",
-        ExplorationStopReason::MapRevisionChanged => "map_revision_changed",
+        _ => "unsupported_stop_reason",
     }
 }
 
@@ -135,15 +135,12 @@ pub struct ExploreStopConditions {
     pub no_frontier_timeout_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
     pub max_goals: Option<u32>,
-    pub stop_on_map_revision_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExploreStartConfig {
     pub strategy: String,
     pub arbitration: String,
-    pub map_version_id: String,
-    pub map_revision: u64,
     pub motion_admission: MotionAdmissionProof,
     pub boundary: Option<ExplorationBoundary>,
     pub stop_conditions: ExploreStopConditions,
@@ -156,8 +153,6 @@ impl Default for ExploreStartConfig {
         Self {
             strategy: "wavefront".to_string(),
             arbitration: POLICY_PREFER_WAVEFRONT.to_string(),
-            map_version_id: String::new(),
-            map_revision: 0,
             motion_admission: MotionAdmissionProof::default(),
             boundary: None,
             stop_conditions: ExploreStopConditions::default(),
@@ -207,8 +202,6 @@ impl ExploreStartConfig {
 pub struct ExploreCostmapSnapshot {
     pub grid: OccupancyGrid2D,
     pub frame_id: String,
-    pub map_version_id: String,
-    pub map_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,15 +217,12 @@ pub struct ExploreRobotPose {
 pub struct FrontierSnapshot {
     pub frontiers: Vec<FrontierGoal>,
     pub revision: u64,
-    pub map_revision: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ChildNavigationRequest {
     pub parent_request_id: String,
     pub request_id: String,
-    pub map_version_id: String,
-    pub map_revision: u64,
     pub motion_admission: MotionAdmissionProof,
     pub frontier_goal_id: String,
     pub goal: NavigationGoal,
@@ -245,8 +235,6 @@ pub struct ChildNavigationLease {
     pub owner_kind: i32,
     pub parent_request_id: String,
     pub goal_generation: u64,
-    pub map_version_id: String,
-    pub map_revision: u64,
     pub goal_payload_sha256: [u8; 32],
 }
 
@@ -393,8 +381,6 @@ pub struct ExploreRuntimeSnapshot {
     pub frontier_count: u32,
     pub revision: u64,
     pub child_task_id: String,
-    pub map_version_id: String,
-    pub map_revision: u64,
 }
 
 impl Default for ExploreRuntimeSnapshot {
@@ -408,8 +394,6 @@ impl Default for ExploreRuntimeSnapshot {
             frontier_count: 0,
             revision: 0,
             child_task_id: String::new(),
-            map_version_id: String::new(),
-            map_revision: 0,
         }
     }
 }
@@ -492,32 +476,11 @@ impl ExploreRuntimeInner {
         self.controller.add_source(source);
     }
 
-    fn map_revision(&self) -> u64 {
-        self.costmap_input
-            .as_ref()
-            .map(|snapshot| snapshot.map_revision)
-            .unwrap_or(0)
-    }
-
     fn session_in_progress(&self) -> bool {
         self.controller.is_active() || self.pending_child_cancellation.is_some()
     }
 
-    fn map_version_id(&self) -> String {
-        self.active_config
-            .as_ref()
-            .map(|config| config.map_version_id.clone())
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                self.costmap_input
-                    .as_ref()
-                    .map(|snapshot| snapshot.map_version_id.clone())
-            })
-            .unwrap_or_default()
-    }
-
     fn update_frontiers(&mut self, frontiers: Vec<FrontierGoal>) -> Option<FrontierSnapshot> {
-        let map_revision = self.map_revision();
         if self.frontiers == frontiers {
             return None;
         }
@@ -526,7 +489,6 @@ impl ExploreRuntimeInner {
         Some(FrontierSnapshot {
             frontiers: self.frontiers.clone(),
             revision: self.frontier_revision,
-            map_revision,
         })
     }
 
@@ -544,8 +506,6 @@ impl ExploreRuntimeInner {
                 .as_ref()
                 .map(|child| child.request_id.clone())
                 .unwrap_or_default(),
-            map_version_id: self.map_version_id(),
-            map_revision: self.map_revision(),
         }
     }
 }
@@ -595,7 +555,6 @@ impl ExploreRuntimeHandle {
                 source_count: 1,
                 frontier_source_ready: false,
                 costmap_input_ready: false,
-                costmap_input_revision: 0,
                 navigation_sink_ready: false,
                 active_source: "wavefront".to_string(),
                 arbitration: POLICY_PREFER_WAVEFRONT.to_string(),
@@ -658,7 +617,7 @@ impl ExploreRuntimeHandle {
     pub async fn start_with_config(
         &self,
         request_id: &str,
-        mut config: ExploreStartConfig,
+        config: ExploreStartConfig,
     ) -> ExploreRuntimeSnapshot {
         {
             let guard = self.inner.lock().await;
@@ -675,8 +634,6 @@ impl ExploreRuntimeHandle {
                     frontier_count: guard.frontiers.len() as u32,
                     revision: guard.frontier_revision,
                     child_task_id: String::new(),
-                    map_version_id: guard.map_version_id(),
-                    map_revision: guard.map_revision(),
                 };
             }
         }
@@ -713,17 +670,9 @@ impl ExploreRuntimeHandle {
                 frontier_count: guard.frontiers.len() as u32,
                 revision: guard.frontier_revision,
                 child_task_id: String::new(),
-                map_version_id: guard.map_version_id(),
-                map_revision: guard.map_revision(),
             };
             drop(guard);
             return snapshot;
-        }
-
-        if let Some(costmap) = guard.costmap_input.as_ref() {
-            if config.map_version_id.is_empty() {
-                config.map_version_id = costmap.map_version_id.clone();
-            }
         }
 
         let mut controller = build_controller(policy, &config);
@@ -760,9 +709,8 @@ impl ExploreRuntimeHandle {
         let snapshot = guard.snapshot(
             STATUS_ACCEPTED,
             format!(
-                "exploration accepted (source=wavefront, arbitration={}, map_revision={})",
-                arbitration_policy_str(policy),
-                config.map_revision
+                "exploration accepted (source=wavefront, arbitration={})",
+                arbitration_policy_str(policy)
             ),
         );
         let backend_available = self.readiness_cache.lock().backend_available;
@@ -1057,7 +1005,7 @@ impl ExploreRuntimeHandle {
             return self
                 .finish_session(
                     None,
-                    ExplorationStopReason::MapRevisionChanged,
+                    ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!(
                         "global exploration requires map-frame pose; received frame={}",
                         pose.frame_id
@@ -1129,7 +1077,7 @@ impl ExploreRuntimeHandle {
             return self
                 .finish_session(
                     None,
-                    ExplorationStopReason::MapRevisionChanged,
+                    ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!(
                         "global exploration requires map-frame costmap; received frame={}",
                         costmap.frame_id
@@ -1137,11 +1085,7 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         }
-        if let Some(mut request) = guard.pending_child_dispatch.take() {
-            request.map_revision = costmap.map_revision;
-            if request.map_version_id.is_empty() {
-                request.map_version_id = costmap.map_version_id.clone();
-            }
+        if let Some(request) = guard.pending_child_dispatch.take() {
             let snapshot = guard.snapshot(
                 STATUS_PENDING,
                 format!(
@@ -1181,8 +1125,6 @@ impl ExploreRuntimeHandle {
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),
                     request_id: child_request_id,
-                    map_version_id: config.map_version_id,
-                    map_revision: costmap.map_revision,
                     motion_admission: config.motion_admission,
                     frontier_goal_id: goal.id.clone(),
                     goal: navigation_goal,
@@ -1572,15 +1514,9 @@ impl ExploreRuntimeHandle {
     }
 
     pub async fn ingest_costmap(&self, costmap: OccupancyGrid2D) -> bool {
-        let next_revision = {
-            let guard = self.inner.lock().await;
-            guard.map_revision().saturating_add(1).max(1)
-        };
         self.ingest_costmap_snapshot(ExploreCostmapSnapshot {
             grid: costmap,
             frame_id: "map".to_string(),
-            map_version_id: String::new(),
-            map_revision: next_revision,
         })
         .await
         .unwrap_or(false)
@@ -1596,11 +1532,6 @@ impl ExploreRuntimeHandle {
             return Ok(false);
         }
 
-        if let Some(config) = guard.active_config.as_mut() {
-            if config.map_version_id.is_empty() {
-                config.map_version_id = snapshot.map_version_id.clone();
-            }
-        }
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(snapshot);
         let current_frontiers = guard.frontiers.clone();
@@ -1709,7 +1640,6 @@ impl ExploreRuntimeHandle {
             source_count,
             frontier_source_ready,
             costmap_input_ready,
-            costmap_input_revision: guard.map_revision(),
             navigation_sink_ready,
             active_source: guard
                 .controller
@@ -1913,7 +1843,6 @@ pub struct ExplorationReadinessDetail {
     pub source_count: usize,
     pub frontier_source_ready: bool,
     pub costmap_input_ready: bool,
-    pub costmap_input_revision: u64,
     pub navigation_sink_ready: bool,
     pub active_source: String,
     pub arbitration: String,
@@ -1979,8 +1908,6 @@ mod tests {
                 owner_kind: 2,
                 parent_request_id: request.parent_request_id.clone(),
                 goal_generation: self.next_goal_generation.fetch_add(1, Ordering::SeqCst) + 1,
-                map_version_id: request.map_version_id.clone(),
-                map_revision: request.map_revision,
                 goal_payload_sha256: [7; 32],
             };
             Ok(ChildNavigationTicket { lease })
@@ -2033,7 +1960,7 @@ mod tests {
         }
     }
 
-    fn frontier_costmap(revision: u64) -> ExploreCostmapSnapshot {
+    fn frontier_costmap(_fixture: u64) -> ExploreCostmapSnapshot {
         let mut grid = OccupancyGrid2D {
             resolution: 0.5,
             origin: nuwax_nav_types_messages::geometry::Point2 { x: 0.0, y: 0.0 },
@@ -2049,12 +1976,10 @@ mod tests {
         ExploreCostmapSnapshot {
             grid,
             frame_id: "map".to_string(),
-            map_version_id: "map-v1".to_string(),
-            map_revision: revision,
         }
     }
 
-    fn occupied_costmap(revision: u64) -> ExploreCostmapSnapshot {
+    fn occupied_costmap(_fixture: u64) -> ExploreCostmapSnapshot {
         ExploreCostmapSnapshot {
             grid: OccupancyGrid2D {
                 resolution: 0.5,
@@ -2064,8 +1989,6 @@ mod tests {
                 cells: vec![OccupancyCell::Occupied; 64],
             },
             frame_id: "map".to_string(),
-            map_version_id: "map-v1".to_string(),
-            map_revision: revision,
         }
     }
 
@@ -2187,17 +2110,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_costmap_input_requires_map_frame_but_ignores_sequence() {
+    async fn explicit_costmap_input_requires_map_frame() {
         let (handle, _) = configured_handle();
         let mut odom = frontier_costmap(1);
         odom.frame_id = "odom".to_string();
         assert!(handle.ingest_costmap_snapshot(odom).await.is_err());
         assert!(handle
             .ingest_costmap_snapshot(frontier_costmap(2))
-            .await
-            .unwrap());
-        assert!(handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
             .await
             .unwrap());
         assert!(!handle
@@ -2276,10 +2195,9 @@ mod tests {
             assert!(submitted
                 .iter()
                 .all(|request| request.request_id == submitted[0].request_id));
-            assert_eq!(submitted[0].map_revision, 1);
-            assert!(submitted[1..]
+            assert!(submitted
                 .iter()
-                .all(|request| request.map_revision == 2));
+                .all(|request| request.parent_request_id == "req-readiness"));
         }
 
         let diagnostics = handle.diagnostics().await;
@@ -2760,7 +2678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_revision_pin_does_not_stop_on_costmap_sequence_change() {
+    async fn costmap_refresh_does_not_stop_active_exploration() {
         let (handle, _) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -2768,14 +2686,9 @@ mod tests {
             .unwrap();
         handle
             .start_with_config(
-                "req-pinned",
+                "req-refresh",
                 ExploreStartConfig {
-                    map_revision: 1,
                     motion_admission: crate::nav_runtime::test_motion_admission(),
-                    stop_conditions: ExploreStopConditions {
-                        stop_on_map_revision_change: true,
-                        ..ExploreStopConditions::default()
-                    },
                     ..ExploreStartConfig::default()
                 },
             )
@@ -2789,7 +2702,7 @@ mod tests {
             .unwrap();
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
         assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
-        assert_eq!(handle.stop("req-pinned").await.status, STATUS_STOPPING);
+        assert_eq!(handle.stop("req-refresh").await.status, STATUS_STOPPING);
         let stopped = handle
             .report_navigation_result(
                 &active.child_task_id,
@@ -2971,11 +2884,11 @@ mod tests {
         let readiness = handle.readiness(true).await;
         assert!(readiness.ready, "{}", readiness.reason);
         assert!(readiness.navigation_sink_ready);
-        assert_eq!(readiness.costmap_input_revision, 1);
+        assert!(readiness.costmap_input_ready);
     }
 
     #[tokio::test]
-    async fn default_unpinned_session_keeps_active_child_across_revision_changes() {
+    async fn costmap_refresh_keeps_active_child_and_next_goal_progresses() {
         let (handle, sink) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -2990,10 +2903,8 @@ mod tests {
             .unwrap();
         let snapshot = handle.tick((2.0, 2.0)).await;
         assert_eq!(snapshot.status, STATUS_ACTIVE);
-        assert_eq!(snapshot.map_revision, 2);
         assert_eq!(snapshot.child_task_id, active.child_task_id);
         assert!(sink.cancelled.lock().unwrap().is_empty());
-        assert_eq!(active_child_lease(&handle).await.map_revision, 1);
 
         let completed = handle
             .report_navigation_result(
@@ -3009,7 +2920,6 @@ mod tests {
         let next = handle.tick((2.0, 2.0)).await;
         assert_eq!(next.status, STATUS_ACTIVE);
         assert_ne!(next.child_task_id, active.child_task_id);
-        assert_eq!(active_child_lease(&handle).await.map_revision, 2);
     }
 
     #[tokio::test]
@@ -3112,7 +3022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revision_change_during_submit_keeps_dispatched_child_active() {
+    async fn costmap_refresh_during_submit_keeps_dispatched_child_active() {
         let (handle, sink) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -3139,14 +3049,12 @@ mod tests {
         assert_eq!(active.status, STATUS_ACTIVE);
         let current = handle.tick((2.0, 2.0)).await;
         assert_eq!(current.status, STATUS_ACTIVE);
-        assert_eq!(current.map_revision, 2);
         assert_eq!(current.child_task_id, active.child_task_id);
         assert!(sink.cancelled.lock().unwrap().is_empty());
-        assert_eq!(active_child_lease(&handle).await.map_revision, 1);
     }
 
     #[tokio::test]
-    async fn user_stop_after_revision_update_cancels_active_child() {
+    async fn user_stop_after_costmap_update_cancels_active_child() {
         let (handle, _) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))

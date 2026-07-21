@@ -46,7 +46,6 @@ struct _nuwax_msgs_NavigationState
     int64_t    runtime_generation;
     int64_t    guard_generation;
     int8_t     sink_ready;
-    int64_t    planner_map_revision;
 
     /**
      * LCM Type: string

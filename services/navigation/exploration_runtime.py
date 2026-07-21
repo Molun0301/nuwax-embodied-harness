@@ -41,7 +41,6 @@ class FrontierTarget:
     navigation_goal: NavigationGoal
     arrived: bool = False
     scanned: bool = False
-    map_revision: Optional[str] = None
     costmap_revision: Optional[str] = None
     pose_revision: Optional[str] = None
     created_at: datetime = field(default_factory=utc_now)
@@ -68,7 +67,6 @@ class ExplorationRuntimeState:
     waiting_for: Optional[str] = None
     failure_code: Optional[str] = None
     frontier_freshness: Dict[str, Any] = field(default_factory=dict)
-    map_revision: Optional[str] = None
     costmap_revision: Optional[str] = None
     pose_revision: Optional[str] = None
     start_time: datetime = field(default_factory=utc_now)
@@ -121,21 +119,37 @@ class PlatformExplorationRuntime:
 
         if self._running or not self.is_exploration_available():
             return False
+        request_metadata = dict(request.metadata)
+        stop_conditions = dict(request.stop_conditions)
+        for key in (
+            "map_version_id",
+            "map_revision",
+            "stop_on_map_revision_change",
+        ):
+            request_metadata.pop(key, None)
+            stop_conditions.pop(key, None)
+        runtime_request = request.model_copy(
+            update={
+                "metadata": request_metadata,
+                "stop_conditions": stop_conditions,
+            },
+            deep=True,
+        )
         start_hook = getattr(self._frontier_explorer, "start_exploration", None)
         if callable(start_hook):
             start_hook()
         self._current_state = ExplorationRuntimeState(
-            request_id=request.request_id,
-            request=request.model_copy(deep=True),
+            request_id=runtime_request.request_id,
+            request=runtime_request,
             phase=ExplorationRuntimePhase.PLANNING,
             metadata={
-                "map_name": request.map_name,
-                "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
-                "radius_m": request.radius_m,
-                "target_name": request.target_name,
-                "max_duration_sec": request.max_duration_sec,
-                "stop_conditions": dict(request.stop_conditions),
-                **dict(request.metadata),
+                "map_name": runtime_request.map_name,
+                "center_pose": runtime_request.center_pose.model_dump(mode="json") if runtime_request.center_pose is not None else None,
+                "radius_m": runtime_request.radius_m,
+                "target_name": runtime_request.target_name,
+                "max_duration_sec": runtime_request.max_duration_sec,
+                "stop_conditions": dict(runtime_request.stop_conditions),
+                **dict(runtime_request.metadata),
             },
         )
         self._running = True
@@ -235,7 +249,6 @@ class PlatformExplorationRuntime:
             "waiting_for": state.waiting_for,
             "failure_code": state.failure_code,
             "frontier_freshness": dict(state.frontier_freshness),
-            "map_revision": state.map_revision,
             "costmap_revision": state.costmap_revision,
             "pose_revision": state.pose_revision,
             "hit_stop_trigger": state.hit_stop_trigger,
@@ -416,7 +429,7 @@ class PlatformExplorationRuntime:
                 return
 
         LOGGER.info(
-            "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s map_revision=%s costmap_revision=%s pose_revision=%s attempted=%d",
+            "frontier 规划请求 request_id=%s current=(%.3f, %.3f, %.3f) frame=%s center=(%.3f, %.3f, %.3f) radius_m=%s costmap_revision=%s pose_revision=%s attempted=%d",
             state.request_id,
             float(current_pose.position.x),
             float(current_pose.position.y),
@@ -426,7 +439,6 @@ class PlatformExplorationRuntime:
             float(center_pose.position.y),
             float(center_pose.position.z),
             None if state.request.radius_m is None else float(state.request.radius_m),
-            state.map_revision,
             state.costmap_revision,
             state.pose_revision,
             len(attempted_poses),
@@ -484,13 +496,11 @@ class PlatformExplorationRuntime:
             "fresh": True,
             "frontier_revision": frontier_revision,
             "computed_at": utc_now().isoformat(),
-            "map_revision": state.map_revision,
             "costmap_revision": state.costmap_revision,
             "pose_revision": state.pose_revision,
         }
         state.current_target = FrontierTarget(
             frontier=best_frontier,
-            map_revision=state.map_revision,
             costmap_revision=state.costmap_revision,
             pose_revision=state.pose_revision,
             navigation_goal=NavigationGoal(
@@ -506,7 +516,6 @@ class PlatformExplorationRuntime:
                     "frontier_score": best_frontier.score,
                     "frontier_cluster_size": best_frontier.cluster_size,
                     "frontier_revision": frontier_revision,
-                    "map_revision": state.map_revision,
                     "costmap_revision": state.costmap_revision,
                     "pose_revision": state.pose_revision,
                     "frontier_computed_at": state.frontier_freshness.get("computed_at"),
@@ -842,7 +851,6 @@ class PlatformExplorationRuntime:
                 "fresh": not target.stale,
                 "stale": target.stale,
                 "stale_reason": target.stale_reason,
-                "map_revision": target.map_revision,
                 "costmap_revision": target.costmap_revision,
                 "pose_revision": target.pose_revision,
                 "computed_at": target.created_at.isoformat(),
@@ -852,8 +860,11 @@ class PlatformExplorationRuntime:
     def _apply_runtime_metadata(self, state: ExplorationRuntimeState, metadata: Optional[Dict[str, Any]]) -> None:
         if not isinstance(metadata, dict):
             return
-        state.metadata.update(dict(metadata))
-        state.map_revision = _string_or_none(metadata.get("map_revision")) or state.map_revision
+        runtime_metadata = dict(metadata)
+        runtime_metadata.pop("map_version_id", None)
+        runtime_metadata.pop("map_revision", None)
+        runtime_metadata.pop("stop_on_map_revision_change", None)
+        state.metadata.update(runtime_metadata)
         state.costmap_revision = _string_or_none(metadata.get("costmap_revision")) or state.costmap_revision
         state.pose_revision = _string_or_none(metadata.get("pose_revision")) or state.pose_revision
         frontier_freshness = metadata.get("frontier_freshness")
@@ -861,8 +872,7 @@ class PlatformExplorationRuntime:
             state.frontier_freshness.update(frontier_freshness)
 
     def _frontier_revision(self, state: ExplorationRuntimeState) -> str:
-        return "map=%s|costmap=%s|pose=%s|round=%d" % (
-            state.map_revision or "unknown",
+        return "costmap=%s|pose=%s|round=%d" % (
             state.costmap_revision or "unknown",
             state.pose_revision or "unknown",
             state.completed_frontiers + len(state.rejected_frontiers),

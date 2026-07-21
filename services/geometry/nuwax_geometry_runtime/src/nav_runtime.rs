@@ -168,10 +168,6 @@ pub struct GoalLease {
     pub goal_generation: u64,
     /// Geometry runtime generation that sealed the goal.
     pub producer_runtime_generation: u64,
-    /// Compatibility map-version telemetry; not part of lease identity.
-    pub map_version_id: String,
-    /// Compatibility map-sequence telemetry; not part of lease identity.
-    pub map_revision: u64,
     /// Canonical sealed goal digest.
     pub goal_payload_sha256: [u8; 32],
     /// Last scheduler-confirmed planner path revision.
@@ -676,7 +672,6 @@ impl NavRuntimeState {
         owner_kind: i32,
         parent_request_id: &str,
         goal_generation: u64,
-        _planner_map_revision: u64,
         path_revision: u64,
         goal_payload_sha256: [u8; 32],
         path_payload_sha256: [u8; 32],
@@ -1838,10 +1833,6 @@ pub struct SetGoalInput {
     pub parent_request_id: String,
     /// Requested CAS generation; zero asks the runtime to allocate one.
     pub goal_generation: u64,
-    /// Compatibility map-version telemetry; ignored by navigation execution.
-    pub map_version_id: String,
-    /// Compatibility map-sequence telemetry; ignored by navigation execution.
-    pub map_revision: u64,
     /// Immutable request-level motion admission proof.
     pub motion_admission: MotionAdmissionProof,
     /// frame_id(`map` 默认)。
@@ -2081,8 +2072,6 @@ pub async fn set_goal_with_boundary(
         parent_request_id: input.parent_request_id.clone(),
         goal_generation: goal_generation as i64,
         producer_runtime_generation: producer_runtime_generation as i64,
-        map_version_id: String::new(),
-        map_revision: 0,
         source_timestamp_ns: input.target.timestamp_ns as i64,
         motion_guard_generation: input.motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
@@ -2127,8 +2116,6 @@ pub async fn set_goal_with_boundary(
         parent_request_id: envelope.parent_request_id.clone(),
         goal_generation,
         producer_runtime_generation,
-        map_version_id: String::new(),
-        map_revision: 0,
         goal_payload_sha256: envelope.payload_sha256,
         path_revision: 0,
         path_payload_sha256: [0; 32],
@@ -2795,8 +2782,6 @@ mod tests {
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             parent_request_id: format!("request-{goal_id}"),
             goal_generation: 0,
-            map_version_id: "map-v1".to_string(),
-            map_revision: 1,
             motion_admission: test_motion_admission(),
             frame_id: "map".to_string(),
             target: PoseState {
@@ -2815,8 +2800,6 @@ mod tests {
             parent_request_id: format!("request-{goal_id}"),
             goal_generation: generation,
             producer_runtime_generation: 1,
-            map_version_id: "map-v1".to_string(),
-            map_revision: 1,
             goal_payload_sha256: [generation as u8; 32],
             path_revision: 0,
             path_payload_sha256: [0; 32],
@@ -2876,8 +2859,6 @@ mod tests {
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation as i64,
             planner_runtime_generation: 1,
-            map_version_id: lease.map_version_id.clone(),
-            map_revision: lease.map_revision as i64,
             path_revision: path_revision as i64,
             source_timestamp_ns: now_ns() as i64,
             goal_payload_sha256: lease.goal_payload_sha256,
@@ -3351,8 +3332,6 @@ mod tests {
         assert_eq!(goal.session_id, "stack-owned-goal");
         assert_eq!(goal.owner_kind, schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV);
         assert_eq!(goal.parent_request_id, "request-stack-owned-goal");
-        assert!(goal.map_version_id.is_empty());
-        assert_eq!(goal.map_revision, 0);
         assert_eq!(goal.motion_guard_generation, 7);
         assert_eq!(goal.motion_guard_boot_nonce, [7; 16]);
         assert_eq!(goal.motion_stop_generation, 1);
@@ -3770,7 +3749,6 @@ mod tests {
                 confirmed.owner_kind,
                 &confirmed.parent_request_id,
                 confirmed.goal_generation,
-                confirmed.map_revision,
                 confirmed.path_revision,
                 confirmed.goal_payload_sha256,
                 confirmed.path_payload_sha256,
@@ -3800,7 +3778,6 @@ mod tests {
                 confirmed.owner_kind,
                 &confirmed.parent_request_id,
                 confirmed.goal_generation,
-                confirmed.map_revision,
                 2,
                 confirmed.goal_payload_sha256,
                 second_path.path_payload_sha256,
@@ -3817,7 +3794,6 @@ mod tests {
                 candidate.owner_kind,
                 &candidate.parent_request_id,
                 candidate.goal_generation,
-                candidate.map_revision,
                 candidate.path_revision,
                 candidate.goal_payload_sha256,
                 candidate.path_payload_sha256,
@@ -3864,7 +3840,6 @@ mod tests {
                 lease.owner_kind,
                 &lease.parent_request_id,
                 lease.goal_generation,
-                lease.map_revision,
                 2,
                 lease.goal_payload_sha256,
                 sealed_path(&lease, 2, 2.0).path_payload_sha256,
@@ -3992,7 +3967,6 @@ mod tests {
                 lease.owner_kind,
                 &lease.parent_request_id,
                 lease.goal_generation,
-                lease.map_revision,
                 lease.path_revision,
                 lease.goal_payload_sha256,
                 lease.path_payload_sha256,
@@ -4018,7 +3992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn navigation_state_ignores_map_revision_but_names_real_lease_mismatch() {
+    async fn navigation_state_names_real_lease_mismatch() {
         let state = NavRuntimeState::from_env();
         let lease = test_lease("diagnostic-goal", 1);
         {
@@ -4033,13 +4007,12 @@ mod tests {
                 lease.owner_kind,
                 &lease.parent_request_id,
                 lease.goal_generation,
-                0,
                 lease.path_revision,
                 lease.goal_payload_sha256,
                 lease.path_payload_sha256,
             )
             .await
-            .expect("map revision is not a lease identity field")
+            .expect("matching lease identity must correlate")
             .expect("active lease");
         assert_eq!(correlated, lease);
 
@@ -4049,7 +4022,6 @@ mod tests {
                 schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
                 &lease.parent_request_id,
                 lease.goal_generation,
-                0,
                 lease.path_revision,
                 lease.goal_payload_sha256,
                 lease.path_payload_sha256,
@@ -4104,7 +4076,6 @@ mod tests {
                 updated.owner_kind,
                 &updated.parent_request_id,
                 updated.goal_generation,
-                updated.map_revision,
                 updated.path_revision,
                 updated.goal_payload_sha256,
                 updated.path_payload_sha256,

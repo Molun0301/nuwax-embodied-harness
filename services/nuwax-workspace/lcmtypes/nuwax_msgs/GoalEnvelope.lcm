@@ -7,8 +7,6 @@ struct GoalEnvelope {
     string parent_request_id;
     int64_t goal_generation;
     int64_t producer_runtime_generation;
-    string map_version_id;
-    int64_t map_revision;
     int64_t source_timestamp_ns;
     string boundary_frame_id;
     int32_t boundary_points_length;

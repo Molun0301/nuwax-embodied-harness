@@ -574,7 +574,7 @@ _NAV_READINESS_FIELDS = (
 
 
 def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
-    """Project frozen NavigationState fields 6..17 without parsing message text."""
+    """Project typed NavigationState fields without parsing message text."""
 
     return {
         "raw_status": str(getattr(update, "status", "") or ""),
@@ -596,7 +596,6 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
         "runtime_generation": int(getattr(update, "runtime_generation", 0) or 0),
         "guard_generation": int(getattr(update, "guard_generation", 0) or 0),
         "sink_ready": bool(getattr(update, "sink_ready", False)),
-        "planner_map_revision": int(getattr(update, "planner_map_revision", 0) or 0),
         "planner_map_frame": str(getattr(update, "planner_map_frame", "") or ""),
         "planner_pose_frame": str(getattr(update, "planner_pose_frame", "") or ""),
         "zero_ack_id": str(getattr(update, "zero_ack_id", "") or ""),
@@ -749,8 +748,6 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "revision": int(resp.revision),
         "timestamp_ns": int(resp.timestamp_ns),
         "child_task_id": str(getattr(resp, "child_task_id", "") or ""),
-        "map_version_id": str(getattr(resp, "map_version_id", "") or ""),
-        "map_revision": int(getattr(resp, "map_revision", 0) or 0),
     }
 
 
@@ -4039,8 +4036,6 @@ class GeometryRuntimeProvider:
         request_id: str = "",
         strategy: str = "wavefront",
         arbitration: str = "prefer_wavefront",
-        map_version_id: str = "",
-        map_revision: int = 0,
         boundary_line_segments=None,
         stop_conditions: Optional[Dict[str, Any]] = None,
         max_navigation_retries: int = 0,
@@ -4049,8 +4044,8 @@ class GeometryRuntimeProvider:
     ) -> Dict[str, Any]:
         """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
 
-        完整编码 map pin、顺序边界、typed stop conditions、重试与 blacklist
-        参数。stub 未就绪或 RPC 异常时抛出带 gRPC 细节的 typed error。
+        完整编码顺序边界、typed stop conditions、重试与 blacklist 参数。
+        stub 未就绪或 RPC 异常时抛出带 gRPC 细节的 typed error。
         """
         self._raise_if_stopping("start_exploration")
         stub = self._stub
@@ -4083,9 +4078,7 @@ class GeometryRuntimeProvider:
             req = pb2.ExploreRequest(
                 strategy=strategy,
                 arbitration=arbitration,
-                map_version_id=map_version_id,
                 request_id=request_id,
-                map_revision=max(0, int(map_revision)),
                 boundary_line_segments=proto_segments,
                 boundary_frame_id="map" if proto_segments else "",
                 max_navigation_retries=max(0, int(max_navigation_retries)),
@@ -4100,7 +4093,6 @@ class GeometryRuntimeProvider:
                 "no_frontier_timeout_ms",
                 "max_duration_ms",
                 "max_goals",
-                "stop_on_map_revision_change",
             }
             if any(
                 key in raw_stop_conditions and raw_stop_conditions[key] is not None
@@ -4122,10 +4114,6 @@ class GeometryRuntimeProvider:
                 if raw_stop_conditions.get("max_goals") is not None:
                     proto_stop_conditions.max_goals = max(
                         0, int(raw_stop_conditions["max_goals"])
-                    )
-                if "stop_on_map_revision_change" in raw_stop_conditions:
-                    proto_stop_conditions.stop_on_map_revision_change = bool(
-                        raw_stop_conditions["stop_on_map_revision_change"]
                     )
                 req.stop_conditions.CopyFrom(proto_stop_conditions)
             resp = stub.StartExploration(req, timeout=_read_deadline_sec())
@@ -4179,8 +4167,6 @@ class GeometryRuntimeProvider:
             state.get("frontier_count"),
             state.get("revision"),
             state.get("child_task_id"),
-            state.get("map_version_id"),
-            state.get("map_revision"),
         )
 
     def _ensure_exploration_poll_worker(self) -> None:

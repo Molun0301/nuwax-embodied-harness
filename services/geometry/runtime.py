@@ -1257,18 +1257,12 @@ class PlatformGeometryRuntime:
 
         stop_conditions = dict(request.stop_conditions or {})
         request_metadata = dict(request.metadata or {})
-        active_version = getattr(self, "_active_map_version", None)
-        version_id = str(
-            request_metadata.get("map_version_id")
-            or (active_version.version_id if active_version is not None else "")
-        ).strip() or None
         return {
             "exploration_launch_mode": "nuwax_geometry_runtime",
             "exploration_transport": "grpc",
             "exploration_script": None,
             "exploration_command": None,
             "exploration_database_path": None,
-            "exploration_version_id": version_id,
             "request_id": request.request_id,
             "strategy": str(request.strategy or "wavefront"),
             "arbitration": str(
@@ -6185,8 +6179,6 @@ class PlatformGeometryRuntime:
                     request_id=request_id,
                     strategy="wavefront",
                     metadata={
-                        "map_version_id": state.metadata.get("map_version_id"),
-                        "map_revision": state.metadata.get("map_revision"),
                         "child_task_id": state.metadata.get("child_task_id"),
                         "recovered_from_native_state": True,
                     },
@@ -6212,15 +6204,18 @@ class PlatformGeometryRuntime:
                 },
                 deep=True,
             )
+            mapping_context = getattr(self, "_mapping_session_context", None)
+            mapping_version_id = (
+                str(mapping_context.get("map_version_id") or "").strip() or None
+                if isinstance(mapping_context, dict)
+                else None
+            )
             committed = _commit_remote_exploration_state_locked(
                 self,
                 state,
                 request_id=request_id,
                 request=recovered_request,
-                map_version_id=(
-                    str(state.metadata.get("map_version_id") or "").strip()
-                    or None
-                ),
+                map_version_id=mapping_version_id,
             )
             if not committed:
                 LOGGER.info("忽略无法原子提交的 geometry exploration update。")
@@ -7012,7 +7007,6 @@ class PlatformGeometryRuntime:
             started_at = self._external_exploration_started_at_iso
             deadline = self._external_exploration_deadline_monotonic
             database_path = self._external_exploration_database_path
-            exploration_version_id = self._external_exploration_version_id
         remaining = None
         if deadline is not None:
             remaining = max(0.0, deadline - time.monotonic())
@@ -7022,7 +7016,6 @@ class PlatformGeometryRuntime:
             "exploration_script": str(self._external_script_path()),
             "exploration_process_name": self._external_process_name(),
             "exploration_database_path": database_path,
-            "exploration_version_id": exploration_version_id,
             "exploration_launch_mode": "explore",
             "started_at": started_at,
             "elapsed_time_sec": elapsed,
@@ -8370,16 +8363,14 @@ class PlatformGeometryProviderBundle(
     def _start_exploration_via_remote(self, request, remote) -> bool:
         """把 request 翻译成 gRPC facade 的 start_exploration 调用。
 
-        request 是 platform 侧的 `ExploreAreaRequest` 契约；gRPC facade 接收完整
-        map pin、边界、停止条件、重试和 blacklist 参数。确定性的 translation
-        失败返回 False；StartExploration RPC 结果不确定时保留 request ownership
-        并抛出 typed error，供上层执行 correlated stop barrier。
+        request 是 platform 侧的 `ExploreAreaRequest` 契约；gRPC facade 接收边界、
+        停止条件、重试和 blacklist 参数。确定性的 translation 失败返回 False；
+        StartExploration RPC 结果不确定时保留 request ownership 并抛出 typed error，
+        供上层执行 correlated stop barrier。
         """
         request_id = ""
         strategy = "wavefront"
         arbitration = "prefer_wavefront"
-        map_version_id = ""
-        map_revision = 0
         boundary_line_segments = []
         stop_conditions = {}
         max_navigation_retries = 0
@@ -8392,22 +8383,26 @@ class PlatformGeometryProviderBundle(
             strategy = str(getattr(request, "strategy", "") or "wavefront").strip()
             stop_conditions = dict(getattr(request, "stop_conditions", {}) or {})
             request_metadata = dict(getattr(request, "metadata", {}) or {})
+            for key in (
+                "map_version_id",
+                "map_revision",
+                "stop_on_map_revision_change",
+            ):
+                request_metadata.pop(key, None)
+                stop_conditions.pop(key, None)
+            request = request.model_copy(
+                update={
+                    "metadata": request_metadata,
+                    "stop_conditions": stop_conditions,
+                },
+                deep=True,
+            )
             motion_admission = request_metadata.get("motion_admission")
             arbitration = str(
                 request_metadata.get("arbitration")
                 or stop_conditions.get("arbitration")
                 or "prefer_wavefront"
             ).strip()
-            map_version_id = str(
-                request_metadata.get("map_version_id")
-                or stop_conditions.get("map_version_id")
-                or ""
-            ).strip()
-            map_revision = int(
-                getattr(request, "map_revision", None)
-                or request_metadata.get("map_revision")
-                or 0
-            )
             boundary_line_segments = list(
                 getattr(request, "boundary_line_segments", ()) or ()
             )
@@ -8456,15 +8451,12 @@ class PlatformGeometryProviderBundle(
                     if request is not None
                     else None
                 ),
-                map_version_id=map_version_id or None,
             )
-            map_version_id = str(
+            mapping_version_id = str(
                 mapping_state.get("mapping_version_id") or ""
             ).strip()
-            if not map_version_id:
+            if not mapping_version_id:
                 raise RuntimeError("探索启动前未获得 ACTIVE mapping version。")
-            if map_revision <= 0:
-                map_revision = int(mapping_state.get("revision") or 0)
         except Exception:
             LOGGER.exception("Bundle.start_exploration 前置 mapping 准备失败。")
             return False
@@ -8482,8 +8474,6 @@ class PlatformGeometryProviderBundle(
                     "backend_ownership_unknown": True,
                     "exploration_terminal": False,
                     "request_id": request_id,
-                    "map_version_id": map_version_id or None,
-                    "map_revision": map_revision,
                 },
             )
             with lock:
@@ -8492,7 +8482,7 @@ class PlatformGeometryProviderBundle(
                     uncertain_state,
                     request_id=request_id,
                     request=request,
-                    map_version_id=map_version_id,
+                    map_version_id=mapping_version_id,
                 )
 
         try:
@@ -8500,8 +8490,6 @@ class PlatformGeometryProviderBundle(
                 request_id=request_id,
                 strategy=strategy,
                 arbitration=arbitration,
-                map_version_id=map_version_id,
-                map_revision=map_revision,
                 boundary_line_segments=boundary_line_segments,
                 stop_conditions=stop_conditions,
                 max_navigation_retries=max_navigation_retries,
@@ -8577,13 +8565,11 @@ class PlatformGeometryProviderBundle(
                             "backend_ownership_unknown": True,
                             "exploration_terminal": False,
                             "request_id": request_id,
-                            "map_version_id": map_version_id or None,
-                            "map_revision": map_revision,
                         },
                     ),
                     request_id=request_id,
                     request=request,
-                    map_version_id=map_version_id,
+                    map_version_id=mapping_version_id,
                 )
                 raise GeometryRuntimeRpcError(
                     rpc_name="StartExploration",
@@ -8598,7 +8584,7 @@ class PlatformGeometryProviderBundle(
                     state,
                     request_id=request_id,
                     request=request,
-                    map_version_id=map_version_id,
+                    map_version_id=mapping_version_id,
                 ):
                     if ownership_pending:
                         raise GeometryRuntimeRpcError(
@@ -8891,11 +8877,6 @@ class PlatformGeometryProviderBundle(
             timestamp_ns = int(timestamp_ns) if timestamp_ns is not None else 0
         except (TypeError, ValueError):
             timestamp_ns = 0
-        try:
-            map_revision = state.get("map_revision")
-            map_revision = int(map_revision) if map_revision is not None else 0
-        except (TypeError, ValueError):
-            map_revision = 0
         message = str(state.get("message") or "") or None
         child_task_id = str(state.get("child_task_id") or "").strip()
         terminal = status_enum in {
@@ -8917,8 +8898,6 @@ class PlatformGeometryProviderBundle(
             "last_stop_reason": stop_reason or None,
             "request_id": state.get("request_id") or None,
             "child_task_id": child_task_id or None,
-            "map_version_id": state.get("map_version_id") or None,
-            "map_revision": map_revision,
             "revision": revision,
             "timestamp_ns": timestamp_ns,
         }

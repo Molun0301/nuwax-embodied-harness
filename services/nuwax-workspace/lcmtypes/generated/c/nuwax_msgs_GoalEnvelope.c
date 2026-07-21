@@ -21,14 +21,12 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_GoalEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xfe08721cc5a5e468LL
+    uint64_t hash = (uint64_t)0x7a8f067f72b3aa0eLL
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
@@ -77,12 +75,6 @@ int __nuwax_msgs_GoalEnvelope_encode_array(void *buf, int offset, int maxlen, co
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_version_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
@@ -147,10 +139,6 @@ int __nuwax_msgs_GoalEnvelope_encoded_array_size(const nuwax_msgs_GoalEnvelope *
 
         size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
 
-        size += __string_encoded_array_size(&(p[element].map_version_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].map_revision), 1);
-
         size += __int64_t_encoded_array_size(&(p[element].source_timestamp_ns), 1);
 
         size += __string_encoded_array_size(&(p[element].boundary_frame_id), 1);
@@ -202,12 +190,6 @@ int __nuwax_msgs_GoalEnvelope_decode_array(const void *buf, int offset, int maxl
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_version_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -257,10 +239,6 @@ int __nuwax_msgs_GoalEnvelope_decode_array_cleanup(nuwax_msgs_GoalEnvelope *p, i
         __int64_t_decode_array_cleanup(&(p[element].goal_generation), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
-
-        __string_decode_array_cleanup(&(p[element].map_version_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].map_revision), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].source_timestamp_ns), 1);
 
@@ -322,10 +300,6 @@ int __nuwax_msgs_GoalEnvelope_clone_array(const nuwax_msgs_GoalEnvelope *p, nuwa
         __int64_t_clone_array(&(p[element].goal_generation), &(q[element].goal_generation), 1);
 
         __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
-
-        __string_clone_array(&(p[element].map_version_id), &(q[element].map_version_id), 1);
-
-        __int64_t_clone_array(&(p[element].map_revision), &(q[element].map_revision), 1);
 
         __int64_t_clone_array(&(p[element].source_timestamp_ns), &(q[element].source_timestamp_ns), 1);
 

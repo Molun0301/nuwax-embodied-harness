@@ -34,12 +34,6 @@ struct _nuwax_msgs_GoalEnvelope
     char*      parent_request_id;
     int64_t    goal_generation;
     int64_t    producer_runtime_generation;
-
-    /**
-     * LCM Type: string
-     */
-    char*      map_version_id;
-    int64_t    map_revision;
     int64_t    source_timestamp_ns;
 
     /**

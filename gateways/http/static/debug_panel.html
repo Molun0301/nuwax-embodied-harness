@@ -389,6 +389,7 @@ button{font-family:inherit;cursor:pointer}
 .map-point-style[data-point-style="structure"] .sw{background:var(--pointcloud3d-structure-color,#fbbf24)}
 .map-point-style[data-point-style="mono"] .sw{background:var(--pointcloud3d-color,#e2e8f0)}
 .map-overlay-panel{border-radius:var(--r)}
+.forbidden-zone-panel{border-radius:var(--r)}
 .map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
 .legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:52%}
@@ -2285,6 +2286,7 @@ button{font-family:inherit;cursor:pointer}
           navigationGoal.map_name,
         );
       }
+      window.__nuwaxActiveMapName = activeMapName;
       function formatPoseMetric(value) {
         const number = Number(value);
         return Number.isFinite(number) ? `${number.toFixed(2)} m` : "--";

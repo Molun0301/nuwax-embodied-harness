@@ -497,7 +497,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/config/save")
     async def api_config_save(request: Request) -> Dict[str, Any]:
-        """批量写回配置项到 .env（按 target_file 路由，原子写 + 备份）。重启后生效。"""
+        """批量写回配置项到对应 env 文件（原子写 + 备份）。重启后生效。"""
 
         access_manager.authenticate_http(request)
         payload = await request.json()
@@ -514,7 +514,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "rejected": result.rejected,
             "backups": {k: bool(v) for k, v in result.backups.items()},
             "restart_required": bool(result.written),
-            "effect_note": "已写入 .env，需重启网关生效（非热重载）。",
+            "effect_note": "已写入配置文件，需重启网关生效（非热重载）。",
         }
 
 

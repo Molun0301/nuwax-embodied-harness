@@ -323,6 +323,10 @@ button{font-family:inherit;cursor:pointer}
 .config-row .cfield{display:flex;flex-direction:column;gap:3px}
 .config-row .cfield input,.config-row .cfield select{width:100%;min-height:31px;border:1px solid var(--line);
   border-radius:var(--r-sm);background:var(--inset);color:var(--ink);padding:5px 10px;font:inherit;font-size:12px;outline:none;transition:.18s}
+.config-color-control{display:grid;grid-template-columns:minmax(0,1fr) 38px;gap:6px;align-items:stretch}
+.config-row .cfield .config-color-picker{width:38px;min-width:38px;height:31px;padding:2px;cursor:pointer}
+.config-palette-pickers{display:grid;grid-template-columns:repeat(5,minmax(32px,1fr));gap:6px;min-width:0}
+.config-row .cfield .config-palette-pickers .config-color-picker{width:100%;min-width:0}
 .config-row .cfield input:focus,.config-row .cfield select:focus{border-color:var(--ring);background:var(--surface);box-shadow:0 0 0 3px var(--line-2)}
 .config-row.changed .cfield input,.config-row.changed .cfield select{border-color:var(--robot);box-shadow:0 0 0 3px var(--warn-w)}
 .config-row.invalid .cfield input{border-color:var(--bad)}
@@ -330,6 +334,16 @@ button{font-family:inherit;cursor:pointer}
 .config-badge{font-size:9px;font-weight:600;padding:1px 6px;border-radius:var(--pill);background:var(--inset-2);color:var(--muted)}
 .config-badge.adv{background:var(--warn-w);color:var(--warn)}
 .config-badge.sec{background:var(--bad-w);color:var(--bad)}
+@media(max-width:1200px){
+  .cfg{grid-template-columns:minmax(0,1fr)}
+  .cfg-nav{display:none}
+}
+@media(max-width:760px){
+  .config-toolbar .field{flex-basis:100%;min-width:0}
+  .config-sections{padding-right:8px;padding-left:8px}
+  .config-grid{grid-template-columns:minmax(0,1fr);padding-right:10px;padding-left:10px}
+  .config-row label .ckey{overflow-wrap:anywhere}
+}
 
 /* ===== workspace = mockup .main + .hero/.rail/.dock, with swap ===== */
 .mission-layout,.mission-content{height:100%;min-height:0}
@@ -695,8 +709,8 @@ button{font-family:inherit;cursor:pointer}
             <button id="configReload" class="btn" type="button">重载</button>
             <button id="configSave" class="btn primary" type="button">保存改动</button>
           </div>
-          <div id="configEffectNote" class="muted small" style="padding:0 16px">保存后写入 .env，需重启网关生效（非热重载）。</div>
-          <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入 .env。建议仅在回环 / 内网环境暴露。</div>
+          <div id="configEffectNote" class="muted small" style="padding:0 16px">仅保存已修改项；保存后需重启网关生效。</div>
+          <div id="configAuthNote" class="config-auth-note">⚠ 网关当前不鉴权：任何可访问本页面者都能保存配置并写入对应配置文件。建议仅在回环 / 内网环境暴露。</div>
           <div id="configDirty" class="muted small" style="padding:0 16px"></div>
           <div id="configSections" class="config-sections"></div>
         </div>
@@ -5187,10 +5201,35 @@ button{font-family:inherit;cursor:pointer}
         state.overviewRenderTimer = window.setTimeout(render, Math.max(0, OVERVIEW_RENDER_INTERVAL_MS - elapsed));
       }
       const configState = { loaded: false, fields: new Map(), dirty: new Map(), lastSchema: null };
+      const CONFIG_SINGLE_COLOR_KEYS = new Set([
+        "NUWAX_GATEWAY_POINTCLOUD3D_COLOR",
+        "NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR",
+        "NUWAX_GATEWAY_POINTCLOUD3D_STRUCTURE_COLOR",
+        "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR",
+      ]);
+      const CONFIG_HEIGHT_COLORS_KEY = "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS";
+      const CONFIG_HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
       function configEscape(text) {
         return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => (
           { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
         ));
+      }
+      function configHexColor(value) {
+        const candidate = String(value == null ? "" : value).trim();
+        return CONFIG_HEX_COLOR_PATTERN.test(candidate) ? candidate.toLowerCase() : null;
+      }
+      function configPaletteColors(value) {
+        const colors = String(value == null ? "" : value).split(",").map((item) => configHexColor(item));
+        return colors.length === 5 && colors.every(Boolean) ? colors : null;
+      }
+      function createConfigColorPicker(value, label) {
+        const picker = document.createElement("input");
+        picker.type = "color";
+        picker.className = "config-color-picker";
+        picker.value = configHexColor(value) || "#000000";
+        picker.setAttribute("aria-label", label);
+        picker.title = label;
+        return picker;
       }
       async function loadConfigSchema() {
         const status = document.getElementById("configStatus");
@@ -5349,9 +5388,54 @@ button{font-family:inherit;cursor:pointer}
           input.value = configState.dirty.get(f.key);
           row.classList.add("changed");
         }
-        input.addEventListener("input", () => onConfigInput(f.key, input, row));
-        input.addEventListener("change", () => onConfigInput(f.key, input, row));
-        cell.appendChild(input);
+        let singleColorPicker = null;
+        let palettePickers = [];
+        if (CONFIG_SINGLE_COLOR_KEYS.has(f.key)) {
+          const control = document.createElement("div");
+          control.className = "config-color-control";
+          singleColorPicker = createConfigColorPicker(input.value, f.zh_name + "色盘");
+          control.append(input, singleColorPicker);
+          cell.appendChild(control);
+        } else {
+          cell.appendChild(input);
+        }
+        if (f.key === CONFIG_HEIGHT_COLORS_KEY) {
+          const pickerGroup = document.createElement("div");
+          pickerGroup.className = "config-palette-pickers";
+          const initialColors = configPaletteColors(input.value) || configPaletteColors(f.value) || [];
+          palettePickers = Array.from({ length: 5 }, (_unused, index) => {
+            const labelText = "高度颜色第" + (index + 1) + "档";
+            const picker = createConfigColorPicker(initialColors[index], labelText);
+            pickerGroup.appendChild(picker);
+            return picker;
+          });
+          cell.appendChild(pickerGroup);
+        }
+        const handleTextInput = () => {
+          const color = configHexColor(input.value);
+          if (singleColorPicker && color) singleColorPicker.value = color;
+          const colors = configPaletteColors(input.value);
+          if (colors) palettePickers.forEach((picker, index) => { picker.value = colors[index]; });
+          onConfigInput(f.key, input, row);
+        };
+        input.addEventListener("input", handleTextInput);
+        input.addEventListener("change", handleTextInput);
+        if (singleColorPicker) {
+          const applySingleColor = () => {
+            input.value = singleColorPicker.value.toLowerCase();
+            handleTextInput();
+          };
+          singleColorPicker.addEventListener("input", applySingleColor);
+          singleColorPicker.addEventListener("change", applySingleColor);
+        }
+        for (const picker of palettePickers) {
+          const applyPalette = () => {
+            input.value = palettePickers.map((item) => item.value.toLowerCase()).join(",");
+            handleTextInput();
+          };
+          picker.addEventListener("input", applyPalette);
+          picker.addEventListener("change", applyPalette);
+        }
         const err = document.createElement("div");
         err.className = "config-err";
         err.id = "cfgerr__" + f.key;
@@ -5369,19 +5453,12 @@ button{font-family:inherit;cursor:pointer}
       function updateConfigDirty() {
         const el = document.getElementById("configDirty");
         const n = configState.dirty.size;
-        el.textContent = n ? ("待保存改动：" + n + " 项") : "无未保存改动；点击保存会补齐缺失默认配置。";
+        el.textContent = n ? ("待保存改动：" + n + " 项") : "无未保存改动。";
       }
       function collectConfigSaveUpdates() {
         const updates = {};
-        const schema = configState.lastSchema || {};
-        for (const section of (schema.sections || [])) {
-          for (const f of (section.fields || [])) {
-            if (configState.dirty.has(f.key)) {
-              updates[f.key] = configState.dirty.get(f.key);
-            } else if (!f.sensitive) {
-              updates[f.key] = f.value == null ? "" : String(f.value);
-            }
-          }
+        for (const [key, value] of configState.dirty) {
+          updates[key] = value;
         }
         return updates;
       }
@@ -5418,7 +5495,7 @@ button{font-family:inherit;cursor:pointer}
           } else {
             const written = result.written || {};
             const writtenCount = Object.values(written).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
-            note.textContent = writtenCount ? "已保存并补齐配置，重启网关后生效。" : "配置已是最新，无需写入。";
+            note.textContent = writtenCount ? "已保存配置，重启网关后生效。" : "配置已是最新，无需写入。";
             setPill(status, "available", "配置");
           }
           await loadConfigSchema();

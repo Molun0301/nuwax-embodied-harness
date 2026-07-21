@@ -44,6 +44,8 @@ trim_whitespace() {
 
 load_env_file() {
   local target="$1"
+  local allowed_prefix="${2:-}"
+  local override_existing="${3:-false}"
   local raw_line=""
   local line=""
   local key=""
@@ -61,6 +63,9 @@ load_env_file() {
     if [[ -z "${key}" ]]; then
       continue
     fi
+    if [[ -n "${allowed_prefix}" && "${key}" != "${allowed_prefix}"* ]]; then
+      continue
+    fi
     if [[ ${#value} -ge 2 ]]; then
       if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
         value="${value:1:${#value}-2}"
@@ -68,10 +73,18 @@ load_env_file() {
         value="${value:1:${#value}-2}"
       fi
     fi
-    if [[ -z "${!key+x}" ]]; then
+    if [[ "${override_existing}" == "true" || -z "${!key+x}" ]]; then
       export "${key}=${value}"
     fi
   done < "${target}"
+}
+
+default_gateway_web_config_env_file() {
+  if [[ -n "${STATE_DIRECTORY:-}" ]]; then
+    printf '%s/%s' "${STATE_DIRECTORY%%:*}" pointcloud3d.env
+    return
+  fi
+  printf '%s' "${REPO_ROOT}/.env"
 }
 
 is_truthy() {
@@ -999,6 +1012,12 @@ fi
 GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
 if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
   load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
+fi
+GATEWAY_WEB_CONFIG_ENV_FILE="${NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE:-$(default_gateway_web_config_env_file)}"
+export NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE="${GATEWAY_WEB_CONFIG_ENV_FILE}"
+if [[ -f "${GATEWAY_WEB_CONFIG_ENV_FILE}" ]]; then
+  # Web 覆盖文件只能影响无安全敏感性的点云显示项。
+  load_env_file "${GATEWAY_WEB_CONFIG_ENV_FILE}" "NUWAX_GATEWAY_POINTCLOUD3D_" true
 fi
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"

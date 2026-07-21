@@ -17,7 +17,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     import fcntl  # POSIX 文件锁；Windows 无此模块时降级为无锁。
@@ -30,13 +30,39 @@ _IO_LOGGER = logging.getLogger("nuwax_robot_bridge.config_io")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CORE_ENV = _REPO_ROOT / ".env"
 _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
+_POINTCLOUD3D_KEY_PREFIX = "NUWAX_GATEWAY_POINTCLOUD3D_"
+_POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
+_POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
 
 _SENSITIVE_MASK = "********"
 _EFFECTIVE_VALUES_LOCK = threading.RLock()
 
 
+def _pointcloud3d_env_path() -> Path:
+    """返回 Web 可写的点云显示配置文件路径。"""
+
+    explicit = os.environ.get("NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    for state_directory in os.environ.get("STATE_DIRECTORY", "").split(":"):
+        if state_directory.strip():
+            return Path(state_directory.strip()) / _POINTCLOUD3D_ENV_FILENAME
+
+    # 本地开发没有 systemd StateDirectory，继续沿用仓库 .env。
+    return _CORE_ENV
+
+
 def _target_path(target_file: str) -> Path:
+    if target_file == _POINTCLOUD3D_TARGET:
+        return _pointcloud3d_env_path()
     return _GO2_ENV if target_file == R.TARGET_GO2 else _CORE_ENV
+
+
+def _save_target(key: str, registry_target: str) -> str:
+    if key.startswith(_POINTCLOUD3D_KEY_PREFIX):
+        return _POINTCLOUD3D_TARGET
+    return registry_target
 
 
 def _strip_quotes(value: str) -> str:
@@ -64,8 +90,12 @@ def _read_env_values(path: Path) -> Dict[str, str]:
 
 
 def _current_value(key: str) -> str:
-    """当前生效值：os.environ 优先，其次 core .env，再次 go2 data_plane.env。"""
+    """当前值：点云覆盖优先，其次进程环境、core .env 和 go2 env。"""
 
+    if key.startswith(_POINTCLOUD3D_KEY_PREFIX):
+        pointcloud3d = _read_env_values(_pointcloud3d_env_path())
+        if key in pointcloud3d:
+            return pointcloud3d[key]
     if key in os.environ:
         return os.environ[key]
     core = _read_env_values(_CORE_ENV)
@@ -211,9 +241,15 @@ def build_schema() -> Dict[str, object]:
 
     core_vals = _read_env_values(_CORE_ENV)
     go2_vals = _read_env_values(_GO2_ENV)
-    effective_vals = _collect_effective_values(core_vals, go2_vals)
+    pointcloud3d_vals = _read_env_values(_pointcloud3d_env_path())
+    effective_core_vals = dict(core_vals)
+    effective_core_vals.update(pointcloud3d_vals)
+    effective_vals = _collect_effective_values(effective_core_vals, go2_vals)
 
     def explicit_value(key: str, target_file: str) -> Optional[str]:
+        if key.startswith(_POINTCLOUD3D_KEY_PREFIX) and key in pointcloud3d_vals:
+            # 保存后尚未重启时，覆盖文件必须优先于进程中的旧环境值回显。
+            return pointcloud3d_vals[key]
         if key in os.environ:
             return os.environ[key]
         src = go2_vals if target_file == R.TARGET_GO2 else core_vals
@@ -237,7 +273,7 @@ def build_schema() -> Dict[str, object]:
             "type": f.type,
             "advanced": f.advanced,
             "sensitive": f.sensitive,
-            "target_file": f.target_file,
+            "target_file": _save_target(f.key, f.target_file),
             "default_repr": f.default_repr,
             "alias_of": f.alias_of,
             "choices": list(f.choices),
@@ -250,7 +286,7 @@ def build_schema() -> Dict[str, object]:
     return {
         "sections": ordered,
         "field_count": len(R.build_registry()),
-        "effect_note": "保存后写入 .env，需重启网关生效；保存时会补齐缺失的默认配置项。",
+        "effect_note": "仅保存已修改项；保存后需重启网关生效。",
     }
 
 
@@ -395,7 +431,7 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
     规则：
     - 未知键 / 类型非法 → rejected，不写。
     - 敏感键值等于脱敏掩码或为空串（未改动）→ skipped，不覆盖原密钥。
-    - 其余按 target_file 路由到 core .env 或 go2 data_plane.env，原子写回。
+    - 点云显示项写入网关可写覆盖文件；其余按 registry target_file 原子写回。
     """
 
     written: Dict[str, List[str]] = {}
@@ -419,7 +455,8 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         if field.choices and normalized not in field.choices:
             rejected[key] = f"值必须是以下之一：{', '.join(field.choices)}"
             continue
-        per_target.setdefault(field.target_file, {})[key] = normalized
+        target_file = _save_target(key, field.target_file)
+        per_target.setdefault(target_file, {})[key] = normalized
 
     backups: Dict[str, str] = {}
     for target_file, kv in per_target.items():
@@ -444,5 +481,3 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         _IO_LOGGER.info("配置写回 %s: %d 项, 备份=%s", target_file, len(confirmed), backups[target_file] or "无")
 
     return SaveResult(written=written, skipped=skipped, rejected=rejected, backups=backups)
-
-

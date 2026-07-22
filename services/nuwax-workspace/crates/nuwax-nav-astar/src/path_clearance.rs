@@ -118,26 +118,25 @@ impl PathClearance {
         let start_idx = self.pose_index.min(n.saturating_sub(1));
         let mut remaining = self.path_lookup_distance;
 
-        // 累加距离推进
+        // 累加距离推进；超过前瞻距离的路径点不能进入 mask。
         let mut idx = start_idx;
-        while idx + 1 < n && remaining > 0.0 {
+        loop {
             let p = &points[idx];
             let (cx, cy) = costmap.world_to_cell(*p);
             if costmap.in_bounds(cx, cy) {
                 self.stamp_disk(&mut mask, width, height, cx, cy, radius_cells, r2);
             }
+
+            if idx + 1 >= n {
+                break;
+            }
             let next = &points[idx + 1];
             let seg_len = ((next.x - p.x).powi(2) + (next.y - p.y).powi(2)).sqrt();
+            if seg_len > remaining {
+                break;
+            }
             remaining -= seg_len;
             idx += 1;
-        }
-        // 终点
-        if idx < n {
-            let p = &points[n - 1];
-            let (cx, cy) = costmap.world_to_cell(*p);
-            if costmap.in_bounds(cx, cy) {
-                self.stamp_disk(&mut mask, width, height, cx, cy, radius_cells, r2);
-            }
         }
 
         self.last_costmap_shape = Some(shape);
@@ -239,6 +238,18 @@ mod tests {
         let mut pc = PathClearance::new(path, 0.3, 2.0);
         pc.update_costmap(cm);
         pc.update_pose_index(0);
+        assert!(!pc.is_obstacle_ahead());
+    }
+
+    #[test]
+    fn mask_does_not_include_a_far_endpoint_on_a_two_point_path() {
+        let mut cm = CostMap2D::new_all_free("map", 60, 10, 0.1);
+        cm.set(50, 0, OCCUPIED);
+        let path = make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(5.0, 0.0)]);
+        let mut pc = PathClearance::new(path, 0.1, 2.0);
+        pc.update_costmap(cm);
+        pc.update_pose_index(0);
+
         assert!(!pc.is_obstacle_ahead());
     }
 }

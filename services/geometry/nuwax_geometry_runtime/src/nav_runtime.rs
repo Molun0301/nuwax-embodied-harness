@@ -649,17 +649,11 @@ impl NavRuntimeState {
         let mut observed = confirmed.clone();
         observed.path_revision = path_revision;
         observed.path_payload_sha256 = path.path_payload_sha256;
-        if confirmed.path_revision == 0 {
-            slot.goal.as_mut().expect("active goal checked above").lease = observed.clone();
-            slot.path_candidate_goal = Some(observed.clone());
-            slot.path_candidates.clear();
-        } else {
-            if slot.path_candidates.len() == MAX_PENDING_PATH_CANDIDATES {
-                slot.path_candidates.pop_front();
-            }
-            slot.path_candidates
-                .push_back((path_revision, path.path_payload_sha256));
+        if slot.path_candidates.len() == MAX_PENDING_PATH_CANDIDATES {
+            slot.path_candidates.pop_front();
         }
+        slot.path_candidates
+            .push_back((path_revision, path.path_payload_sha256));
         Ok(observed)
     }
 
@@ -2278,13 +2272,91 @@ pub async fn cancel(
         }
         CancelStart::ExistingPending {
             lease,
+            generation,
             goal_id,
-            message,
             ..
-        } => cancel_outcome_with_phase(NavPhase::CancelPending, goal_id, message, Some(lease)),
+        } => {
+            let retry_result = publish_cancel_frame(handle, &lease, generation).await;
+            finish_existing_cancel_retry(state, lease, goal_id, generation, retry_result).await
+        }
         CancelStart::Rejected { goal_id, message } => {
             cancel_outcome_with_phase(NavPhase::Failed, goal_id, message, None)
         }
+    }
+}
+
+async fn finish_existing_cancel_retry(
+    state: &NavRuntimeState,
+    lease: GoalLease,
+    goal_id: String,
+    cancel_generation: u64,
+    retry_result: Result<(), String>,
+) -> CancelOutcome {
+    let slot = state.inner.read().await;
+    let Ok(cancel) = state.cancel.lock() else {
+        return cancel_outcome_with_phase(
+            NavPhase::Failed,
+            goal_id,
+            "CANCEL_STATE_UNAVAILABLE".to_string(),
+            Some(lease),
+        );
+    };
+    let tracker_matches = cancel.generation == cancel_generation
+        && cancel.goal_id == goal_id
+        && cancel.lease.as_ref() == Some(&lease);
+    if !tracker_matches {
+        return cancel_outcome_with_phase(
+            NavPhase::Failed,
+            goal_id,
+            "CANCEL_RETRY_SUPERSEDED".to_string(),
+            Some(lease),
+        );
+    }
+
+    match cancel.phase {
+        CancelPhase::Pending => {
+            let active_lease_matches = slot
+                .goal
+                .as_ref()
+                .is_some_and(|active| active.lease == lease);
+            if !active_lease_matches {
+                return cancel_outcome_with_phase(
+                    NavPhase::Failed,
+                    goal_id,
+                    "CANCEL_RETRY_SUPERSEDED".to_string(),
+                    Some(lease),
+                );
+            }
+            let message = match retry_result {
+                Ok(()) => "CANCEL_PENDING_RETRY_PUBLISHED".to_string(),
+                Err(error) => {
+                    warn!(
+                        "pending cancel retry publish failed; original transaction remains pending: {}",
+                        error
+                    );
+                    format!("{}; retry publish failed: {error}", cancel.message)
+                }
+            };
+            cancel_outcome_with_phase(NavPhase::CancelPending, goal_id, message, Some(lease))
+        }
+        CancelPhase::Zeroed => cancel_outcome_with_phase(
+            NavPhase::Cancelled,
+            goal_id,
+            cancel.message.clone(),
+            Some(lease),
+        ),
+        CancelPhase::Failed | CancelPhase::TimedOut => cancel_outcome_with_phase(
+            NavPhase::Failed,
+            goal_id,
+            cancel.message.clone(),
+            Some(lease),
+        ),
+        CancelPhase::Idle => cancel_outcome_with_phase(
+            NavPhase::Failed,
+            goal_id,
+            "CANCEL_RETRY_SUPERSEDED".to_string(),
+            Some(lease),
+        ),
     }
 }
 
@@ -2724,6 +2796,20 @@ mod tests {
                 .expect("published frames")
                 .iter()
                 .map(|frame| frame.topic.fqn(frame.msg_type.fqn()))
+                .collect()
+        }
+
+        fn published_cancel_generations(&self) -> Vec<i64> {
+            self.frames
+                .lock()
+                .expect("published frames")
+                .iter()
+                .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.CancelNavigation")
+                .map(|frame| {
+                    schema::decode_cancel_navigation_body(&frame.payload)
+                        .expect("published CancelNavigation")
+                        .cancel_generation
+                })
                 .collect()
         }
 
@@ -3717,7 +3803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_published_path_does_not_invalidate_confirmed_navigation_state() {
+    async fn initial_path_remains_candidate_until_exact_navigation_state_promotes_it() {
         let state = NavRuntimeState::from_env();
         let lease = test_lease("confirmed-path", 1);
         {
@@ -3727,36 +3813,80 @@ mod tests {
         }
 
         let first_path = sealed_path(&lease, 1, 1.0);
-        let confirmed = state
+        let candidate = state
             .observe_path_envelope(&first_path)
             .await
-            .expect("first path establishes the initial confirmed lease");
-        let second_path = sealed_path(&lease, 2, 2.0);
-        let candidate = state
-            .observe_path_envelope(&second_path)
-            .await
-            .expect("newer planner output is retained as a candidate");
-        assert_eq!(candidate.path_revision, 2);
+            .expect("first path is retained as a candidate");
         assert_eq!(
             state.active_goal_lease().await.as_ref(),
-            Some(&confirmed),
-            "planner publication alone must not replace the scheduler-confirmed lease"
+            Some(&lease),
+            "revision 1 publication alone must not replace the pre-path confirmed lease"
         );
 
-        let correlated = state
+        let pre_path = state
             .correlate_navigation_state(
-                &confirmed.session_id,
-                confirmed.owner_kind,
-                &confirmed.parent_request_id,
-                confirmed.goal_generation,
-                confirmed.path_revision,
-                confirmed.goal_payload_sha256,
-                confirmed.path_payload_sha256,
+                &lease.session_id,
+                lease.owner_kind,
+                &lease.parent_request_id,
+                lease.goal_generation,
+                lease.path_revision,
+                lease.goal_payload_sha256,
+                lease.path_payload_sha256,
             )
             .await
-            .expect("the last confirmed scheduler state remains valid")
+            .expect("path-first publication must preserve zero/zero state correlation")
             .expect("active lease");
-        assert_eq!(correlated, confirmed);
+        assert_eq!(pre_path, lease);
+
+        let promoted = state
+            .correlate_navigation_state(
+                &candidate.session_id,
+                candidate.owner_kind,
+                &candidate.parent_request_id,
+                candidate.goal_generation,
+                candidate.path_revision,
+                candidate.goal_payload_sha256,
+                candidate.path_payload_sha256,
+            )
+            .await
+            .expect("exact scheduler state promotes revision 1")
+            .expect("active lease");
+        assert_eq!(promoted, candidate);
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&candidate));
+    }
+
+    #[tokio::test]
+    async fn pre_path_state_then_initial_path_preserves_confirmed_lease() {
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("state-first", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Planning;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+
+        assert_eq!(
+            state
+                .correlate_navigation_state(
+                    &lease.session_id,
+                    lease.owner_kind,
+                    &lease.parent_request_id,
+                    lease.goal_generation,
+                    0,
+                    lease.goal_payload_sha256,
+                    [0; 32],
+                )
+                .await
+                .expect("state-first zero/zero correlation")
+                .as_ref(),
+            Some(&lease)
+        );
+        let candidate = state
+            .observe_path_envelope(&sealed_path(&lease, 1, 1.0))
+            .await
+            .expect("initial path candidate");
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+        assert_eq!(candidate.path_revision, 1);
     }
 
     #[tokio::test]
@@ -3770,16 +3900,16 @@ mod tests {
         }
 
         let first_path = sealed_path(&lease, 1, 1.0);
-        let confirmed = state.observe_path_envelope(&first_path).await.unwrap();
+        let first_candidate = state.observe_path_envelope(&first_path).await.unwrap();
         let second_path = sealed_path(&lease, 2, 2.0);
         assert!(state
             .correlate_navigation_state(
-                &confirmed.session_id,
-                confirmed.owner_kind,
-                &confirmed.parent_request_id,
-                confirmed.goal_generation,
+                &lease.session_id,
+                lease.owner_kind,
+                &lease.parent_request_id,
+                lease.goal_generation,
                 2,
-                confirmed.goal_payload_sha256,
+                lease.goal_payload_sha256,
                 second_path.path_payload_sha256,
             )
             .await
@@ -3787,7 +3917,21 @@ mod tests {
             .contains("path_revision"));
 
         let candidate = state.observe_path_envelope(&second_path).await.unwrap();
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&confirmed));
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+        let first_promoted = state
+            .correlate_navigation_state(
+                &first_candidate.session_id,
+                first_candidate.owner_kind,
+                &first_candidate.parent_request_id,
+                first_candidate.goal_generation,
+                first_candidate.path_revision,
+                first_candidate.goal_payload_sha256,
+                first_candidate.path_payload_sha256,
+            )
+            .await
+            .expect("revision 1 remains independently promotable")
+            .expect("active lease");
+        assert_eq!(first_promoted, first_candidate);
         let promoted = state
             .correlate_navigation_state(
                 &candidate.session_id,
@@ -3815,7 +3959,7 @@ mod tests {
             slot.goal = Some(test_active_goal_with_lease(lease.clone()));
         }
 
-        let confirmed = state
+        let candidate = state
             .observe_path_envelope(&sealed_path(&lease, 1, 1.0))
             .await
             .unwrap();
@@ -3827,12 +3971,12 @@ mod tests {
         let CancelStart::Publish {
             lease: cancel_lease,
             ..
-        } = state.begin_cancel(&cancel_input(&confirmed)).await
+        } = state.begin_cancel(&cancel_input(&lease)).await
         else {
             panic!("cancel must capture the confirmed lease");
         };
-        assert_eq!(cancel_lease, confirmed);
-        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&confirmed));
+        assert_eq!(cancel_lease, lease);
+        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&lease));
 
         let rejected = state
             .correlate_navigation_state(
@@ -3847,7 +3991,8 @@ mod tests {
             .await
             .expect_err("pending cancel freezes the confirmed path lease");
         assert!(rejected.contains("path_revision"));
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&confirmed));
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
+        assert_eq!(candidate.path_revision, 1);
     }
 
     #[tokio::test]
@@ -3926,7 +4071,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_first_freezes_path_lease_and_keeps_retry_and_zero_correlated() {
-        let (handle, backend) = make_blocking_handle([None]).await;
+        let (handle, backend) = make_blocking_handle([None, None]).await;
         let state = NavRuntimeState::from_env();
         let lease = test_lease("cancel-first", 1);
         {
@@ -3951,15 +4096,18 @@ mod tests {
         assert!(rejected_path.contains("CANCEL_PENDING"));
         assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
 
-        let retry = tokio::time::timeout(
-            Duration::from_millis(100),
-            cancel(&handle, &state, cancel_input(&lease)),
-        )
-        .await
-        .expect("the exact retry must reuse the frozen pending lease");
-        assert_eq!(retry.state.status, "PENDING");
+        let retry_handle = handle.clone();
+        let retry_state = state.clone();
+        let retry_lease = lease.clone();
+        let retry = tokio::spawn(async move {
+            cancel(&retry_handle, &retry_state, cancel_input(&retry_lease)).await
+        });
+        backend.wait_for_publish_count(2).await;
         assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(
+            backend.published_cancel_generations(),
+            vec![pending.generation as i64, pending.generation as i64]
+        );
 
         let correlated = state
             .correlate_navigation_state(
@@ -3988,7 +4136,11 @@ mod tests {
             .await;
         assert_eq!(zeroed.state.status, "CANCELLED");
         backend.release_one();
+        backend.release_one();
         assert_eq!(first.await.expect("first cancel").state.status, "CANCELLED");
+        let retry_outcome = retry.await.expect("retry cancel");
+        assert_eq!(retry_outcome.state.status, "CANCELLED");
+        assert_eq!(retry_outcome.lease.as_ref(), Some(&lease));
     }
 
     #[tokio::test]
@@ -4035,8 +4187,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_first_is_atomically_captured_by_cancel_and_exact_retry() {
-        let (handle, backend) = make_blocking_handle([None]).await;
+    async fn path_first_cancel_captures_confirmed_pre_path_lease_and_exact_retry() {
+        let (handle, backend) = make_blocking_handle([None, None]).await;
         let state = NavRuntimeState::from_env();
         let lease = test_lease("path-first", 1);
         {
@@ -4044,48 +4196,103 @@ mod tests {
             slot.phase = NavPhase::Running;
             slot.goal = Some(test_active_goal_with_lease(lease.clone()));
         }
-        let updated = state
+        let candidate = state
             .observe_path_envelope(&sealed_path(&lease, 1, 2.0))
             .await
-            .expect("path wins before cancel");
-        assert_eq!(updated.path_revision, 1);
+            .expect("path is retained before cancel");
+        assert_eq!(candidate.path_revision, 1);
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
 
         let first_handle = handle.clone();
         let first_state = state.clone();
-        let first_lease = updated.clone();
+        let first_lease = lease.clone();
         let first = tokio::spawn(async move {
             cancel(&first_handle, &first_state, cancel_input(&first_lease)).await
         });
         backend.wait_for_publish_count(1).await;
         let pending = state.cancel_snapshot();
-        assert_eq!(pending.lease.as_ref(), Some(&updated));
+        assert_eq!(pending.lease.as_ref(), Some(&lease));
 
-        let retry = tokio::time::timeout(
-            Duration::from_millis(100),
-            cancel(&handle, &state, cancel_input(&updated)),
-        )
-        .await
-        .expect("path-first exact retry");
-        assert_eq!(retry.state.status, "PENDING");
+        let retry_handle = handle.clone();
+        let retry_state = state.clone();
+        let retry_lease = lease.clone();
+        let retry = tokio::spawn(async move {
+            cancel(&retry_handle, &retry_state, cancel_input(&retry_lease)).await
+        });
+        backend.wait_for_publish_count(2).await;
         assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(
+            backend.published_cancel_generations(),
+            vec![pending.generation as i64, pending.generation as i64]
+        );
 
         let correlated = state
             .correlate_navigation_state(
-                &updated.session_id,
-                updated.owner_kind,
-                &updated.parent_request_id,
-                updated.goal_generation,
-                updated.path_revision,
-                updated.goal_payload_sha256,
-                updated.path_payload_sha256,
+                &lease.session_id,
+                lease.owner_kind,
+                &lease.parent_request_id,
+                lease.goal_generation,
+                lease.path_revision,
+                lease.goal_payload_sha256,
+                lease.path_payload_sha256,
             )
             .await
-            .expect("updated path lease correlation")
+            .expect("confirmed pre-path lease correlation")
             .expect("active lease");
-        assert_eq!(correlated, updated);
+        assert_eq!(correlated, lease);
+        let zeroed = state
+            .observe_cancel_ack(MotionSinkCancelAck {
+                cancel_generation: pending.generation,
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                status: MotionSinkCancelAckStatus::Zeroed,
+                message: "path-first retry zeroed".into(),
+            })
+            .await;
+        assert_eq!(zeroed.state.status, "CANCELLED");
         backend.release_one();
-        assert_eq!(first.await.expect("first cancel").state.status, "PENDING");
+        backend.release_one();
+        assert_eq!(first.await.expect("first cancel").state.status, "CANCELLED");
+        let retry_outcome = retry.await.expect("retry cancel");
+        assert_eq!(retry_outcome.state.status, "CANCELLED");
+        assert_eq!(retry_outcome.lease.as_ref(), Some(&lease));
+    }
+
+    #[tokio::test]
+    async fn candidate_from_replaced_goal_cannot_promote_replacement_lease() {
+        let state = NavRuntimeState::from_env();
+        let lease_a = test_lease("candidate-a", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Planning;
+            slot.goal = Some(test_active_goal_with_lease(lease_a.clone()));
+        }
+        let candidate_a = state
+            .observe_path_envelope(&sealed_path(&lease_a, 1, 1.0))
+            .await
+            .expect("candidate A");
+
+        let lease_b = test_lease("replacement-b", 2);
+        {
+            let mut slot = state.inner.write().await;
+            slot.goal = Some(test_active_goal_with_lease(lease_b.clone()));
+        }
+        let error = state
+            .correlate_navigation_state(
+                &candidate_a.session_id,
+                candidate_a.owner_kind,
+                &candidate_a.parent_request_id,
+                candidate_a.goal_generation,
+                candidate_a.path_revision,
+                candidate_a.goal_payload_sha256,
+                candidate_a.path_payload_sha256,
+            )
+            .await
+            .expect_err("stale candidate A must not promote replacement B");
+        assert!(error.contains("session_id"));
+        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease_b));
     }
 
     #[tokio::test]
@@ -4156,7 +4363,7 @@ mod tests {
         );
 
         drop(slot_guard);
-        for _ in 0..4 {
+        for _ in 0..3 {
             backend.release_one();
         }
         let ((path_result, retry, second_retry, ack), first_outcome) =
@@ -4171,12 +4378,15 @@ mod tests {
         assert!(path_result
             .expect_err("the queued path must observe the pending freeze")
             .contains("CANCEL_PENDING"));
-        assert_eq!(retry.state.status, "PENDING");
+        assert_eq!(retry.state.status, "CANCELLED");
         assert_eq!(retry.lease.as_ref(), Some(&lease));
-        assert_eq!(second_retry.state.status, "PENDING");
+        assert_eq!(second_retry.state.status, "CANCELLED");
         assert_eq!(second_retry.lease.as_ref(), Some(&lease));
         assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(
+            backend.published_cancel_generations(),
+            vec![pending.generation as i64; 3]
+        );
 
         assert_eq!(ack.state.status, "CANCELLED");
         assert!(state.active_goal_lease().await.is_none());
@@ -4185,7 +4395,7 @@ mod tests {
         assert_eq!(terminal.phase, CancelPhase::Zeroed);
 
         assert_eq!(first_outcome.state.status, "CANCELLED");
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(backend.publish_count(), 3);
     }
 
     #[tokio::test]
@@ -4739,8 +4949,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_pending_cancel_retry_reuses_generation_and_publishes_once() {
-        let (handle, backend) = make_blocking_handle([None]).await;
+    async fn exact_pending_cancel_retry_republishes_the_same_generation() {
+        let (handle, backend) = make_blocking_handle([None, None]).await;
         let state = NavRuntimeState::from_env();
         let lease = test_lease("retry-goal", 1);
         {
@@ -4758,19 +4968,36 @@ mod tests {
         let first_snapshot = state.cancel_snapshot();
         assert_eq!(first_snapshot.phase, CancelPhase::Pending);
 
-        let retry = tokio::time::timeout(
-            Duration::from_millis(100),
-            cancel(&handle, &state, cancel_input(&lease)),
-        )
-        .await
-        .expect("an exact pending retry must not wait on a second publish");
-        assert_eq!(retry.state.status, "PENDING");
-        assert_eq!(retry.lease.as_ref(), Some(&lease));
+        let retry_handle = handle.clone();
+        let retry_state = state.clone();
+        let retry_lease = lease.clone();
+        let retry = tokio::spawn(async move {
+            cancel(&retry_handle, &retry_state, cancel_input(&retry_lease)).await
+        });
+        backend.wait_for_publish_count(2).await;
         assert_eq!(
             state.cancel_snapshot().generation,
             first_snapshot.generation
         );
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(
+            backend.published_cancel_generations(),
+            vec![
+                first_snapshot.generation as i64,
+                first_snapshot.generation as i64
+            ]
+        );
+
+        backend.release_one();
+        backend.release_one();
+        let first_outcome = first.await.expect("first cancel task");
+        let retry_outcome = retry.await.expect("retry cancel task");
+        assert_eq!(first_outcome.state.status, "PENDING");
+        assert_eq!(retry_outcome.state.status, "PENDING");
+        assert_eq!(
+            retry_outcome.state.message,
+            "CANCEL_PENDING_RETRY_PUBLISHED"
+        );
+        assert_eq!(retry_outcome.lease.as_ref(), Some(&lease));
 
         let zeroed = state
             .observe_cancel_ack(MotionSinkCancelAck {
@@ -4785,16 +5012,55 @@ mod tests {
             .await;
         assert_eq!(zeroed.state.status, "CANCELLED");
         assert!(state.active_goal_lease().await.is_none());
-
-        backend.release_one();
-        let first_outcome = first.await.expect("first cancel task");
-        assert_eq!(first_outcome.state.status, "CANCELLED");
         assert_eq!(
             state.cancel_snapshot().generation,
             first_snapshot.generation
         );
         assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(backend.publish_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_cancel_retry_reports_the_current_terminal_phase() {
+        for (cancel_phase, nav_phase, expected_status) in [
+            (CancelPhase::Zeroed, NavPhase::Cancelled, "CANCELLED"),
+            (CancelPhase::Failed, NavPhase::Failed, "FAILED"),
+            (CancelPhase::TimedOut, NavPhase::Failed, "FAILED"),
+        ] {
+            let state = NavRuntimeState::from_env();
+            let lease = test_lease("completed-retry", 1);
+            let generation = 7;
+            {
+                let mut slot = state.inner.write().await;
+                slot.phase = nav_phase;
+                slot.goal = (cancel_phase != CancelPhase::Zeroed)
+                    .then(|| test_active_goal_with_lease(lease.clone()));
+            }
+            {
+                let mut cancel = state.cancel.lock().expect("cancel tracker");
+                *cancel = CancelTracker {
+                    generation,
+                    goal_id: lease.session_id.clone(),
+                    lease: Some(lease.clone()),
+                    phase: cancel_phase,
+                    requested_at: Some(Instant::now()),
+                    stack_terminal_observed: true,
+                    message: format!("terminal {cancel_phase:?}"),
+                };
+            }
+
+            let outcome = finish_existing_cancel_retry(
+                &state,
+                lease.clone(),
+                lease.session_id.clone(),
+                generation,
+                Ok(()),
+            )
+            .await;
+            assert_eq!(outcome.state.status, expected_status);
+            assert_eq!(outcome.state.message, format!("terminal {cancel_phase:?}"));
+            assert_eq!(outcome.lease.as_ref(), Some(&lease));
+        }
     }
 
     #[tokio::test]

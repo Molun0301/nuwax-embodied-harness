@@ -394,14 +394,14 @@ fn map_pose_input_error<T>(
 fn ingest_map_pose_tf(
     adapter: &mut crate::map_pose::MapPoseAdapter,
     payload: &[u8],
-) -> OwnerInputResult<()> {
+) -> OwnerInputResult<Option<crate::map_pose::MapPoseObservation>> {
     let message = match schema::decode_tf_message_body(payload) {
         Ok(message) => message,
         Err(error) => return Ok(OwnerInput::Rejected(format!("TFMessage decode: {error}"))),
     };
-    match adapter.observe_tf(&message) {
-        Ok(true) => Ok(OwnerInput::Accepted(())),
-        Ok(false) => Ok(OwnerInput::Rejected(
+    match adapter.observe_tf_message(&message) {
+        Ok(observed) if observed.accepted => Ok(OwnerInput::Accepted(observed.map_pose)),
+        Ok(_) => Ok(OwnerInput::Rejected(
             "TFMessage has no newer canonical map->odom transform".into(),
         )),
         Err(error) => map_pose_input_error("map_pose_adapter.tf", error),
@@ -468,6 +468,24 @@ async fn publish_map_pose_observation(
 }
 
 #[cfg(feature = "guard-runtime")]
+fn discard_pending_odometry_through(
+    pending_odometry: &mut Option<Box<schema::Odometry>>,
+    observed: &crate::map_pose::MapPoseObservation,
+) -> NavStackResult<()> {
+    let Some(pending) = pending_odometry.as_ref() else {
+        return Ok(());
+    };
+    let pending_timestamp =
+        lcm_header_timestamp_ns(&pending.header, "map_pose_adapter.pending_odometry")?;
+    let observed_timestamp =
+        lcm_header_timestamp_ns(&observed.pose.header, "map_pose_adapter.atomic_tf")?;
+    if pending_timestamp <= observed_timestamp {
+        *pending_odometry = None;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn run_map_pose_adapter(
     node: ModuleNode,
     mut shutdown: oneshot::Receiver<()>,
@@ -492,7 +510,15 @@ async fn run_map_pose_adapter(
             message = transforms.next() => {
                 let frame = required_frame(message, "map_pose_adapter.tf")?;
                 match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
-                    OwnerInput::Accepted(()) => {
+                    OwnerInput::Accepted(Some(observed)) => {
+                        discard_pending_odometry_through(&mut pending_odometry, &observed)?;
+                        publish_map_pose_observation(
+                            &transport,
+                            &node.outputs[0],
+                            observed,
+                        ).await?;
+                    }
+                    OwnerInput::Accepted(None) => {
                         if let Some(odometry) = pending_odometry.take() {
                             match transform_map_pose_odometry(&adapter, *odometry)? {
                                 MapPoseOdometryIngress::Accepted(observed) => {
@@ -585,6 +611,48 @@ struct GuardedNavTelemetry {
     path_revision: i64,
     goal_payload_sha256: [u8; 32],
     path_payload_sha256: [u8; 32],
+}
+
+#[cfg(feature = "guard-runtime")]
+#[derive(Clone)]
+struct GuardedCancelTerminal {
+    goal: schema::GoalEnvelope,
+    cancel_generation: u64,
+    status: nuwax_nav_runtime::SchedulerStatus,
+    telemetry: GuardedNavTelemetry,
+}
+
+#[cfg(feature = "guard-runtime")]
+#[derive(Clone)]
+struct GuardedCancelGenerationWatermark {
+    goal: schema::GoalEnvelope,
+    generation: u64,
+}
+
+#[cfg(feature = "guard-runtime")]
+fn observe_guarded_cancel_generation(
+    watermark: &mut Option<GuardedCancelGenerationWatermark>,
+    goal: &schema::GoalEnvelope,
+    generation: u64,
+) -> Result<(), String> {
+    if let Some(observed) = watermark.as_mut().filter(|observed| {
+        planner_goal_identity_matches(&observed.goal, goal)
+            && observed.goal.payload_sha256 == goal.payload_sha256
+    }) {
+        if generation < observed.generation {
+            return Err(format!(
+                "stale cancel generation {generation}; highest observed generation is {}",
+                observed.generation
+            ));
+        }
+        observed.generation = observed.generation.max(generation);
+        return Ok(());
+    }
+    *watermark = Some(GuardedCancelGenerationWatermark {
+        goal: goal.clone(),
+        generation,
+    });
+    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -797,6 +865,11 @@ async fn run_guarded_nav_loop(
     let mut applied_commands = 0_u64;
     let mut last_zero_ack_id: Option<String> = None;
     let mut diagnostics = InputDiagnosticLimiter::default();
+    let mut last_cancel_terminal: Option<GuardedCancelTerminal> = None;
+    // This watermark rejects generation rollback but never grants replay or
+    // reacquisition eligibility; those remain owned by the active, pending,
+    // and terminal goal records.
+    let mut cancel_generation_watermark: Option<GuardedCancelGenerationWatermark> = None;
     let initial_status = status.borrow().clone();
     publish_guarded_nav_state(
         transport,
@@ -967,8 +1040,12 @@ async fn run_guarded_nav_loop(
                     continue;
                 }
                 let goal_envelope = match goal_buffer.observe_goal(goal_envelope) {
-                    PlannerGoalIngress::Ready(goal) => *goal,
+                    PlannerGoalIngress::Ready(goal) => {
+                        last_cancel_terminal = None;
+                        *goal
+                    }
                     PlannerGoalIngress::Buffered => {
+                        last_cancel_terminal = None;
                         if preempt_guarded_active_session(
                             node,
                             transport,
@@ -1154,6 +1231,8 @@ async fn run_guarded_nav_loop(
                 candidate_telemetry.owner_kind = cancel.owner_kind;
                 candidate_telemetry.parent_request_id = cancel.parent_request_id.clone();
                 candidate_telemetry.goal_generation = cancel.goal_generation;
+                candidate_telemetry.path_revision = 0;
+                candidate_telemetry.path_payload_sha256 = [0; 32];
                 if let Some(active_goal) = active_session.clone() {
                     if let Err(reason) = validate_cancel_goal_correlation(&cancel, &active_goal) {
                         publish_guarded_rejection(
@@ -1166,7 +1245,22 @@ async fn run_guarded_nav_loop(
                         ).await?;
                         continue;
                     }
-                    let session_id = active_goal.session_id;
+                    if let Err(reason) = observe_guarded_cancel_generation(
+                        &mut cancel_generation_watermark,
+                        &active_goal,
+                        cancel_generation,
+                    ) {
+                        publish_guarded_rejection(
+                            transport,
+                            &node.outputs[1],
+                            scheduler.status(),
+                            &telemetry,
+                            "cancel",
+                            &reason,
+                        ).await?;
+                        continue;
+                    }
+                    let session_id = active_goal.session_id.clone();
                     if let Err(error) = scheduler.cancel(&session_id).await {
                         match runtime_input_error::<()>("guarded_nav_scheduler.cancel", error)? {
                             OwnerInput::Rejected(reason) => {
@@ -1199,20 +1293,218 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         None,
                     ).await?;
+                    goal_buffer.clear_pending_goal_for(&active_goal);
+                    last_cancel_terminal = goal_buffer.is_newest_goal(&active_goal).then(|| {
+                        GuardedCancelTerminal {
+                            goal: active_goal,
+                            cancel_generation,
+                            status: snapshot.clone(),
+                            telemetry: telemetry.clone(),
+                        }
+                    });
                     clear_terminal_session_after_publication(
                         &mut active_session,
                         &mut telemetry,
                         &snapshot,
                     );
                 } else {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "cancel",
-                        "no active scheduler session",
-                    ).await?;
+                    let buffered_goal = match goal_buffer.cancelled_pending_goal(&cancel) {
+                        Ok(goal) => goal,
+                        Err(reason) => {
+                            publish_guarded_rejection(
+                                transport,
+                                &node.outputs[1],
+                                scheduler.status(),
+                                &telemetry,
+                                "cancel",
+                                &reason,
+                            ).await?;
+                            continue;
+                        }
+                    };
+                    let (goal_to_fence, goal_was_pending) = if let Some(buffered_goal) = buffered_goal {
+                        if let Err(reason) = observe_guarded_cancel_generation(
+                            &mut cancel_generation_watermark,
+                            &buffered_goal,
+                            cancel_generation,
+                        ) {
+                            publish_guarded_rejection(
+                                transport,
+                                &node.outputs[1],
+                                scheduler.status(),
+                                &telemetry,
+                                "cancel",
+                                &reason,
+                            ).await?;
+                            continue;
+                        }
+                        (Some(*buffered_goal), true)
+                    } else if let Some(terminal) = last_cancel_terminal.as_ref() {
+                        if let Err(reason) = validate_cancel_goal_correlation(&cancel, &terminal.goal)
+                        {
+                            publish_guarded_rejection(
+                                transport,
+                                &node.outputs[1],
+                                scheduler.status(),
+                                &telemetry,
+                                "cancel",
+                                &reason,
+                            ).await?;
+                            continue;
+                        }
+                        if cancel_generation < terminal.cancel_generation {
+                            publish_guarded_rejection(
+                                transport,
+                                &node.outputs[1],
+                                scheduler.status(),
+                                &telemetry,
+                                "cancel",
+                                &format!(
+                                    "stale cancel generation {cancel_generation}; latest terminal generation is {}",
+                                    terminal.cancel_generation
+                                ),
+                            ).await?;
+                            continue;
+                        }
+                        if let Err(reason) = observe_guarded_cancel_generation(
+                            &mut cancel_generation_watermark,
+                            &terminal.goal,
+                            cancel_generation,
+                        ) {
+                            publish_guarded_rejection(
+                                transport,
+                                &node.outputs[1],
+                                scheduler.status(),
+                                &telemetry,
+                                "cancel",
+                                &reason,
+                            ).await?;
+                            continue;
+                        }
+                        if cancel_generation == terminal.cancel_generation {
+                            publish_bool(transport, &node.outputs[3], true).await?;
+                            publish_guarded_nav_state(
+                                transport,
+                                &node.outputs[1],
+                                terminal.status.clone(),
+                                &terminal.telemetry,
+                                None,
+                            ).await?;
+                            continue;
+                        }
+                        (Some(terminal.goal.clone()), false)
+                    } else {
+                        (None, false)
+                    };
+                    if let Some(buffered_goal) = goal_to_fence {
+                        let buffered_telemetry = guarded_buffered_cancel_telemetry(
+                            &telemetry,
+                            &buffered_goal,
+                            cancel_generation,
+                        );
+                        let session_id = buffered_goal.session_id.clone();
+                        let session = nuwax_nav_runtime::NavSession {
+                            session_id: session_id.clone(),
+                            motion_admission: nuwax_nav_runtime::NavMotionAdmission {
+                                guard_generation: u64::try_from(
+                                    buffered_goal.motion_guard_generation,
+                                )
+                                .expect("validated positive motion_guard_generation"),
+                                guard_boot_nonce: buffered_goal.motion_guard_boot_nonce,
+                                motion_stop_generation: u64::try_from(
+                                    buffered_goal.motion_stop_generation,
+                                )
+                                .expect("validated non-negative motion_stop_generation"),
+                            },
+                        };
+                        if let Err(error) = scheduler.start_session(session).await {
+                            match runtime_input_error::<()>(
+                                "guarded_nav_scheduler.buffered_cancel_acquire",
+                                error,
+                            )? {
+                                OwnerInput::Rejected(reason) => {
+                                    publish_guarded_rejection(
+                                        transport,
+                                        &node.outputs[1],
+                                        scheduler.status(),
+                                        &buffered_telemetry,
+                                        "cancel",
+                                        &reason,
+                                    ).await?;
+                                    continue;
+                                }
+                                OwnerInput::Accepted(()) => {
+                                    unreachable!("error classifier accepted an error")
+                                }
+                            }
+                        }
+                        if goal_was_pending
+                            && !goal_buffer.clear_pending_goal_for(&buffered_goal)
+                        {
+                            return Err(NavStackError::Internal(
+                                "guarded scheduler acquired a superseded buffered cancellation goal"
+                                    .into(),
+                            ));
+                        }
+                        active_session = Some(buffered_goal.clone());
+                        telemetry = buffered_telemetry;
+                        if let Err(error) = scheduler.cancel(&session_id).await {
+                            match runtime_input_error::<()>(
+                                "guarded_nav_scheduler.buffered_cancel",
+                                error,
+                            )? {
+                                OwnerInput::Rejected(reason) => {
+                                    publish_guarded_rejection(
+                                        transport,
+                                        &node.outputs[1],
+                                        scheduler.status(),
+                                        &telemetry,
+                                        "cancel",
+                                        &reason,
+                                    ).await?;
+                                    let snapshot = scheduler.status();
+                                    clear_terminal_session_after_publication(
+                                        &mut active_session,
+                                        &mut telemetry,
+                                        &snapshot,
+                                    );
+                                    continue;
+                                }
+                                OwnerInput::Accepted(()) => {
+                                    unreachable!("error classifier accepted an error")
+                                }
+                            }
+                        }
+                        publish_bool(transport, &node.outputs[3], true).await?;
+                        let snapshot = scheduler.status();
+                        publish_guarded_nav_state(
+                            transport,
+                            &node.outputs[1],
+                            snapshot.clone(),
+                            &telemetry,
+                            None,
+                        ).await?;
+                        last_cancel_terminal = Some(GuardedCancelTerminal {
+                            goal: buffered_goal,
+                            cancel_generation,
+                            status: snapshot.clone(),
+                            telemetry: telemetry.clone(),
+                        });
+                        clear_terminal_session_after_publication(
+                            &mut active_session,
+                            &mut telemetry,
+                            &snapshot,
+                        );
+                    } else {
+                        publish_guarded_rejection(
+                            transport,
+                            &node.outputs[1],
+                            scheduler.status(),
+                            &telemetry,
+                            "cancel",
+                            "no active or buffered scheduler session",
+                        ).await?;
+                    }
                 }
             }
         }
@@ -1523,6 +1815,33 @@ fn validate_cancel_goal_correlation(
     Ok(())
 }
 
+#[cfg(feature = "guard-runtime")]
+fn guarded_buffered_cancel_telemetry(
+    telemetry: &GuardedNavTelemetry,
+    goal: &schema::GoalEnvelope,
+    cancel_generation: u64,
+) -> GuardedNavTelemetry {
+    let goal_pose =
+        pose_from_schema(&goal.goal).expect("buffered goal pose was validated on ingress");
+    let mut candidate = telemetry.clone();
+    candidate.public_session_id = goal.session_id.clone();
+    candidate.owner_kind = goal.owner_kind;
+    candidate.parent_request_id = goal.parent_request_id.clone();
+    candidate.goal_generation = goal.goal_generation;
+    candidate.cancel_generation = cancel_generation;
+    candidate.goal = [
+        goal_pose.pose.position.x,
+        goal_pose.pose.position.y,
+        goal_pose.pose.orientation.yaw(),
+    ];
+    candidate.goal_payload_sha256 = goal.payload_sha256;
+    candidate.path_revision = 0;
+    candidate.path_payload_sha256 = [0; 32];
+    candidate.initial_distance = distance_2d(candidate.goal, candidate.current);
+    candidate.progress = 0.0;
+    candidate
+}
+
 #[cfg(any(feature = "guard-runtime", feature = "click-goal"))]
 fn lcm_header_timestamp_ns(header: &schema::Header, component: &str) -> NavStackResult<i64> {
     if header.stamp_sec < 0 || !(0..1_000_000_000).contains(&header.stamp_nsec) {
@@ -1651,14 +1970,23 @@ fn build_guarded_navigation_state(
 async fn publish_guarded_rejection(
     transport: &LcmTransport,
     channel: &str,
-    mut status: nuwax_nav_runtime::SchedulerStatus,
+    status: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &GuardedNavTelemetry,
     input: &str,
     reason: &str,
 ) -> NavStackResult<()> {
-    status.phase = nuwax_nav_runtime::SchedulerPhase::Failed;
-    status.message = format!("REJECTED {input}: {reason}");
+    let status = guarded_rejection_status(status, input, reason);
     publish_guarded_nav_state(transport, channel, status, telemetry, None).await
+}
+
+#[cfg(feature = "guard-runtime")]
+fn guarded_rejection_status(
+    mut status: nuwax_nav_runtime::SchedulerStatus,
+    input: &str,
+    reason: &str,
+) -> nuwax_nav_runtime::SchedulerStatus {
+    status.message = format!("REJECTED {input}: {reason}");
+    status
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -2403,10 +2731,7 @@ impl PlannerGoalBuffer {
     }
 
     fn mark_applied(&mut self, goal: &schema::GoalEnvelope) -> bool {
-        let is_current = self.newest_goal.as_ref().is_some_and(|newest| {
-            planner_goal_identity_matches(goal, newest)
-                && goal.payload_sha256 == newest.payload_sha256
-        });
+        let is_current = self.is_newest_goal(goal);
         if is_current {
             self.active_goal_sha256 = Some(goal.payload_sha256);
             if self.pending_goal.as_ref().is_some_and(|pending| {
@@ -2417,6 +2742,13 @@ impl PlannerGoalBuffer {
             }
         }
         is_current
+    }
+
+    fn is_newest_goal(&self, goal: &schema::GoalEnvelope) -> bool {
+        self.newest_goal.as_ref().is_some_and(|newest| {
+            planner_goal_identity_matches(goal, newest)
+                && goal.payload_sha256 == newest.payload_sha256
+        })
     }
 
     fn defer_ready_goal(&mut self, goal: schema::GoalEnvelope) -> bool {
@@ -2441,6 +2773,29 @@ impl PlannerGoalBuffer {
 
     fn has_applied_goal(&self) -> bool {
         self.active_goal_sha256.is_some()
+    }
+
+    fn cancelled_pending_goal(
+        &self,
+        cancel: &schema::CancelNavigation,
+    ) -> Result<Option<Box<schema::GoalEnvelope>>, String> {
+        let Some(pending) = self.pending_goal.as_ref() else {
+            return Ok(None);
+        };
+        validate_cancel_goal_correlation(cancel, pending)?;
+        Ok(Some(Box::new(pending.clone())))
+    }
+
+    fn clear_pending_goal_for(&mut self, goal: &schema::GoalEnvelope) -> bool {
+        let matches = self.pending_goal.as_ref().is_some_and(|pending| {
+            planner_goal_identity_matches(pending, goal)
+                && pending.payload_sha256 == goal.payload_sha256
+        });
+        if matches {
+            self.pending_goal = None;
+            self.active_goal_sha256 = None;
+        }
+        matches
     }
 }
 
@@ -5396,6 +5751,7 @@ mod guarded_tests {
         paths: GuardedTestSender,
         costmaps: GuardedTestSender,
         cancels: GuardedTestSender,
+        states: LcmFrameStream,
         shutdown: Option<oneshot::Sender<()>>,
         loop_task: JoinHandle<NavStackResult<()>>,
         scheduler: NavSchedulerHandle,
@@ -5455,10 +5811,14 @@ mod guarded_tests {
                 format!("/test/guarded/{loop_id}/reached"),
                 format!("/test/guarded/{loop_id}/cancelled"),
             ];
+            let states = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.NavigationState")
+                .await
+                .expect("guarded state test stream");
+            let loop_transport = transport.clone();
             let loop_task = tokio::spawn(async move {
                 run_guarded_nav_loop(
                     &node,
-                    &transport,
+                    &loop_transport,
                     &loop_scheduler,
                     shutdown_rx,
                     goal_stream,
@@ -5477,6 +5837,7 @@ mod guarded_tests {
                 paths,
                 costmaps,
                 cancels,
+                states,
                 shutdown: Some(shutdown),
                 loop_task,
                 scheduler,
@@ -5544,17 +5905,47 @@ mod guarded_tests {
             send_guarded_test_body(
                 &self.cancels,
                 "nuwax_msgs.CancelNavigation",
-                schema::encode_cancel_navigation_body(&schema::CancelNavigation {
-                    session_id: goal.session_id.clone(),
-                    reason: 1,
-                    cancel_generation,
-                    owner_kind: goal.owner_kind,
-                    parent_request_id: goal.parent_request_id.clone(),
-                    goal_generation: goal.goal_generation,
-                    producer_runtime_generation: goal.producer_runtime_generation,
-                })
-                .expect("encode guarded test cancellation"),
+                Self::cancel_body(goal, cancel_generation),
             );
+        }
+
+        async fn send_cancel_and_wait_dequeued(
+            &self,
+            goal: &schema::GoalEnvelope,
+            cancel_generation: i64,
+        ) {
+            let dequeued = send_guarded_test_body_observed(
+                &self.cancels,
+                "nuwax_msgs.CancelNavigation",
+                Self::cancel_body(goal, cancel_generation),
+            );
+            tokio::time::timeout(Duration::from_secs(1), dequeued)
+                .await
+                .expect("guarded cancellation was not dequeued")
+                .expect("guarded cancellation dequeue receipt was dropped");
+            assert!(!self.loop_task.is_finished(), "guarded loop exited early");
+        }
+
+        fn cancel_body(goal: &schema::GoalEnvelope, cancel_generation: i64) -> Vec<u8> {
+            schema::encode_cancel_navigation_body(&schema::CancelNavigation {
+                session_id: goal.session_id.clone(),
+                reason: 1,
+                cancel_generation,
+                owner_kind: goal.owner_kind,
+                parent_request_id: goal.parent_request_id.clone(),
+                goal_generation: goal.goal_generation,
+                producer_runtime_generation: goal.producer_runtime_generation,
+            })
+            .expect("encode guarded test cancellation")
+        }
+
+        fn motion_call_count(&self, prefix: &str) -> usize {
+            self.motion_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with(prefix))
+                .count()
         }
 
         async fn wait_for_session(&self, session_id: &str) {
@@ -5624,6 +6015,37 @@ mod guarded_tests {
                     self.motion_calls.lock().unwrap().clone()
                 )
             });
+        }
+
+        async fn wait_for_correlated_zero(
+            &mut self,
+            goal: &schema::GoalEnvelope,
+            cancel_generation: i64,
+        ) -> schema::NavigationState {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let frame = self
+                        .states
+                        .next()
+                        .await
+                        .expect("guarded state stream open")
+                        .expect("guarded state transport frame");
+                    let state = schema::decode_navigation_state_body(&frame.payload)
+                        .expect("guarded NavigationState body");
+                    if state.session_id == goal.session_id
+                        && state.owner_kind == goal.owner_kind
+                        && state.parent_request_id == goal.parent_request_id
+                        && state.goal_generation == goal.goal_generation
+                        && state.cancel_generation == cancel_generation
+                        && !state.zero_ack_id.is_empty()
+                        && state.zero_applied_monotonic_ns > 0
+                    {
+                        return state;
+                    }
+                }
+            })
+            .await
+            .expect("correlated ZEROED NavigationState")
         }
 
         async fn assert_no_session(&self) {
@@ -5735,6 +6157,203 @@ mod guarded_tests {
             harness.wait_for_session("cold-order-goal").await;
             harness.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn guarded_cancel_acquires_and_fences_a_buffered_goal() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal = sealed_goal("buffered-cancel-goal");
+        harness.send_goal_and_wait_dequeued(&goal).await;
+        harness.assert_no_session().await;
+
+        harness.send_cancel(&goal, 1);
+        harness.wait_for_zero().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().last_terminal
+                != Some(nuwax_nav_runtime::TerminalOutcome::Cancelled)
+            {
+                assert!(
+                    !harness.loop_task.is_finished(),
+                    "guarded loop exited early"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("buffered goal cancellation did not become terminal");
+        let terminal = harness.wait_for_correlated_zero(&goal, 1).await;
+        assert_eq!(terminal.path_revision, 0);
+        assert_eq!(terminal.path_payload_sha256, [0; 32]);
+        assert!(harness.scheduler.status().session_id.is_none());
+        assert!(harness
+            .motion_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("acquire:")));
+
+        let motion_call_count = harness.motion_calls.lock().unwrap().len();
+        harness.send_cancel(&goal, 1);
+        let replay = harness.wait_for_correlated_zero(&goal, 1).await;
+        assert_eq!(replay.zero_ack_id, terminal.zero_ack_id);
+        assert_eq!(
+            replay.zero_applied_monotonic_ns,
+            terminal.zero_applied_monotonic_ns
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            harness.motion_calls.lock().unwrap().len(),
+            motion_call_count,
+            "exact cancel retry must replay proof without reacquiring motion"
+        );
+
+        harness.send_pose(1);
+        harness.wait_for_pose(1).await;
+        harness.send_costmap(11);
+        harness.wait_for_costmap(11).await;
+        harness.assert_no_session().await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_new_cancel_generation_reacquires_before_exact_replay() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal = sealed_goal("buffered-cancel-new-generation");
+        harness.send_goal_and_wait_dequeued(&goal).await;
+
+        harness.send_cancel(&goal, 1);
+        let first = harness.wait_for_correlated_zero(&goal, 1).await;
+        assert_eq!(harness.motion_call_count("acquire:"), 1);
+        assert_eq!(harness.motion_call_count("zero:"), 1);
+
+        harness.send_cancel(&goal, 2);
+        let second = harness.wait_for_correlated_zero(&goal, 2).await;
+        assert_eq!(harness.motion_call_count("acquire:"), 2);
+        assert_eq!(harness.motion_call_count("zero:"), 2);
+
+        harness.send_cancel(&goal, 2);
+        let replay = harness.wait_for_correlated_zero(&goal, 2).await;
+        assert_eq!(replay.zero_ack_id, second.zero_ack_id);
+        assert_eq!(
+            replay.zero_applied_monotonic_ns,
+            second.zero_applied_monotonic_ns
+        );
+        assert_eq!(harness.motion_call_count("acquire:"), 2);
+        assert_eq!(harness.motion_call_count("zero:"), 2);
+
+        harness.send_cancel_and_wait_dequeued(&goal, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.motion_call_count("acquire:"), 2);
+        assert_eq!(harness.motion_call_count("zero:"), 2);
+        assert!(!first.zero_ack_id.is_empty());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_busy_buffered_cancel_retains_the_goal_for_retry() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let buffered_goal = sealed_goal("buffered-cancel-busy-retry");
+        let blocker = sealed_goal("direct-scheduler-blocker");
+        harness
+            .scheduler
+            .start_session(nuwax_nav_runtime::NavSession {
+                session_id: blocker.session_id.clone(),
+                motion_admission: nuwax_nav_runtime::NavMotionAdmission {
+                    guard_generation: u64::try_from(blocker.motion_guard_generation)
+                        .expect("positive blocker guard generation"),
+                    guard_boot_nonce: blocker.motion_guard_boot_nonce,
+                    motion_stop_generation: u64::try_from(blocker.motion_stop_generation)
+                        .expect("non-negative blocker stop generation"),
+                },
+            })
+            .await
+            .expect("install direct scheduler blocker");
+        harness.send_goal_and_wait_dequeued(&buffered_goal).await;
+
+        harness
+            .send_cancel_and_wait_dequeued(&buffered_goal, 2)
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            harness.scheduler.status().session_id.as_deref(),
+            Some(blocker.session_id.as_str())
+        );
+        assert_eq!(harness.motion_call_count("acquire:"), 1);
+        assert_eq!(harness.motion_call_count("zero:"), 0);
+
+        harness
+            .scheduler
+            .cancel(&blocker.session_id)
+            .await
+            .expect("remove direct scheduler blocker");
+        harness
+            .send_cancel_and_wait_dequeued(&buffered_goal, 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.motion_call_count("acquire:"), 1);
+        assert_eq!(harness.motion_call_count("zero:"), 1);
+
+        harness.send_cancel(&buffered_goal, 2);
+        let terminal = harness.wait_for_correlated_zero(&buffered_goal, 2).await;
+        assert!(!terminal.zero_ack_id.is_empty());
+        assert_eq!(harness.motion_call_count("acquire:"), 2);
+        assert_eq!(harness.motion_call_count("zero:"), 2);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_replacement_clears_cancel_reacquire_eligibility() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal_a = sealed_goal("cancelled-before-replacement");
+        harness.send_goal_and_wait_dequeued(&goal_a).await;
+        harness.send_cancel(&goal_a, 1);
+        harness.wait_for_correlated_zero(&goal_a, 1).await;
+
+        let goal_b = rollover_goal(
+            &goal_a,
+            "buffered-replacement",
+            goal_a.producer_runtime_generation,
+            goal_a.goal_generation + 1,
+        );
+        harness.send_goal_and_wait_dequeued(&goal_b).await;
+        let acquire_count = harness.motion_call_count("acquire:");
+        let zero_count = harness.motion_call_count("zero:");
+
+        harness.send_cancel_and_wait_dequeued(&goal_a, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(harness.motion_call_count("acquire:"), acquire_count);
+        assert_eq!(harness.motion_call_count("zero:"), zero_count);
+
+        harness.send_cancel(&goal_b, 1);
+        harness.wait_for_correlated_zero(&goal_b, 1).await;
+        assert_eq!(harness.motion_call_count("acquire:"), acquire_count + 1);
+        assert_eq!(harness.motion_call_count("zero:"), zero_count + 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_active_cancel_projects_pre_path_sentinel_with_zero_proof() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+        harness.send_path(&sealed_path(&goal));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().path_revision != 1 {
+                assert!(
+                    !harness.loop_task.is_finished(),
+                    "guarded loop exited early"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("active path was not accepted");
+
+        harness.send_cancel(&goal, 2);
+        harness.wait_for_zero().await;
+        let terminal = harness.wait_for_correlated_zero(&goal, 2).await;
+        assert_eq!(terminal.path_revision, 0);
+        assert_eq!(terminal.path_payload_sha256, [0; 32]);
+        harness.shutdown().await;
     }
 
     async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::GoalEnvelope {
@@ -5946,6 +6565,26 @@ mod guarded_tests {
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
         assert!(scheduler_session_is_active(&next, "goal-b"));
+    }
+
+    #[test]
+    fn guarded_input_rejection_preserves_the_real_scheduler_phase() {
+        let status = nuwax_nav_runtime::SchedulerStatus {
+            phase: SchedulerPhase::AwaitingPath,
+            session_id: Some("goal-a".into()),
+            ..nuwax_nav_runtime::SchedulerStatus::default()
+        };
+        let rejected = guarded_rejection_status(status, "path", "out-of-order candidate");
+        assert_eq!(rejected.phase, SchedulerPhase::AwaitingPath);
+        assert_eq!(rejected.message, "REJECTED path: out-of-order candidate");
+
+        let telemetry = GuardedNavTelemetry {
+            public_session_id: "goal-a".into(),
+            ..GuardedNavTelemetry::default()
+        };
+        let published =
+            build_guarded_navigation_state(&rejected, &telemetry, None, Duration::from_secs(1));
+        assert_eq!(published.state, 1, "rejection must not fabricate FAILED");
     }
 
     #[test]
@@ -6377,7 +7016,7 @@ mod guarded_tests {
         let tf_body = schema::encode_tf_message_body(&tf).expect("encode TF");
         assert!(matches!(
             ingest_map_pose_tf(&mut adapter, &tf_body).expect("valid TF input"),
-            OwnerInput::Accepted(())
+            OwnerInput::Accepted(None)
         ));
         assert!(matches!(
             ingest_map_pose_tf(&mut adapter, &tf_body).expect("duplicate TF is external"),
@@ -6462,7 +7101,7 @@ mod guarded_tests {
         .expect("encode TF");
         assert!(matches!(
             ingest_map_pose_tf(&mut adapter, &tf_body).expect("matching TF"),
-            OwnerInput::Accepted(())
+            OwnerInput::Accepted(None)
         ));
 
         let observed = match transform_map_pose_odometry(&adapter, *pending)
@@ -6475,6 +7114,159 @@ mod guarded_tests {
             MapPoseOdometryIngress::Rejected(reason) => {
                 panic!("aligned odometry rejected: {reason}")
             }
+        };
+        assert_eq!(observed.pose.header.frame_id, "map");
+        assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn map_pose_owner_keeps_newer_pending_odometry_after_older_atomic_tf() {
+        let mut adapter =
+            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let pending_odometry = schema::Odometry {
+            header: schema::Header {
+                stamp_sec: 8,
+                frame_id: "odom".into(),
+                ..schema::Header::default()
+            },
+            child_frame_id: "base_link".into(),
+            pose: schema::Pose {
+                position: [5.0, 6.0, 0.0],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+            ..schema::Odometry::default()
+        };
+        let mut pending = match transform_map_pose_odometry(&adapter, pending_odometry)
+            .expect("odometry before TF is retryable")
+        {
+            MapPoseOdometryIngress::AwaitingTransform(odometry, _) => Some(odometry),
+            MapPoseOdometryIngress::Accepted(_) => panic!("odometry unexpectedly accepted"),
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("retryable odometry rejected: {reason}")
+            }
+        };
+
+        let atomic_tf = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "map".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "odom".into(),
+                    transform: schema::Transform {
+                        translation: [1.0, 2.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "odom".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "base_link".into(),
+                    transform: schema::Transform {
+                        translation: [3.0, 4.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+        })
+        .expect("encode atomic TF");
+        let atomic = match ingest_map_pose_tf(&mut adapter, &atomic_tf).expect("atomic TF input") {
+            OwnerInput::Accepted(Some(observed)) => observed,
+            OwnerInput::Accepted(None) => panic!("coherent TF did not produce a map pose"),
+            OwnerInput::Rejected(reason) => panic!("coherent TF rejected: {reason}"),
+        };
+        assert_eq!(atomic.pose.header.stamp_sec, 7);
+        assert_eq!(atomic.pose.pose.position, [4.0, 6.0, 0.0]);
+        discard_pending_odometry_through(&mut pending, &atomic)
+            .expect("compare atomic pose with pending odometry");
+        assert_eq!(
+            pending.as_ref().map(|odometry| odometry.header.stamp_sec),
+            Some(8),
+            "newer odometry must remain available for a later aligned transform"
+        );
+
+        let aligned_tf = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![schema::TransformStamped {
+                header: schema::Header {
+                    stamp_sec: 8,
+                    frame_id: "map".into(),
+                    ..schema::Header::default()
+                },
+                child_frame_id: "odom".into(),
+                transform: schema::Transform {
+                    translation: [2.0, 3.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+            }],
+        })
+        .expect("encode aligned TF");
+        assert!(matches!(
+            ingest_map_pose_tf(&mut adapter, &aligned_tf).expect("aligned TF input"),
+            OwnerInput::Accepted(None)
+        ));
+        let observed = match transform_map_pose_odometry(
+            &adapter,
+            *pending.take().expect("newer odometry retained"),
+        )
+        .expect("retry retained odometry")
+        {
+            MapPoseOdometryIngress::Accepted(observed) => observed,
+            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
+                panic!("aligned odometry still waiting: {reason}")
+            }
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("aligned odometry rejected: {reason}")
+            }
+        };
+        assert_eq!(observed.pose.header.stamp_sec, 8);
+        assert_eq!(observed.pose.pose.position, [7.0, 9.0, 0.0]);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn map_pose_owner_accepts_a_coherent_tf_chain_without_odometry_join() {
+        let mut adapter =
+            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let tf_body = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "map".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "odom".into(),
+                    transform: schema::Transform {
+                        translation: [1.0, 2.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "odom".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "base_link".into(),
+                    transform: schema::Transform {
+                        translation: [3.0, 4.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+        })
+        .expect("encode coherent TF");
+
+        let observed = match ingest_map_pose_tf(&mut adapter, &tf_body).expect("coherent TF input")
+        {
+            OwnerInput::Accepted(Some(observed)) => observed,
+            OwnerInput::Accepted(None) => panic!("coherent TF did not produce map pose"),
+            OwnerInput::Rejected(reason) => panic!("coherent TF rejected: {reason}"),
         };
         assert_eq!(observed.pose.header.frame_id, "map");
         assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);

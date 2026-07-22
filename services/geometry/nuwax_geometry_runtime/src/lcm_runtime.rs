@@ -1868,7 +1868,12 @@ async fn apply_typed_navigation_feedback(
         Ok(None) => None,
         Err(error) => {
             let cancel = nav.cancel_snapshot();
-            let expected = cancel.lease.as_ref();
+            let active = nav.active_goal_lease().await;
+            let (expected, expected_lease_source) = match (active.as_ref(), cancel.lease.as_ref()) {
+                (Some(active), _) => (Some(active), "active"),
+                (None, Some(cancel)) => (Some(cancel), "cancel"),
+                (None, None) => (None, "none"),
+            };
             let zero_ack_present = !update.feedback.zero_ack_id.trim().is_empty();
             let complete_zero_proof = update.feedback.cancel_generation > 0
                 && zero_ack_present
@@ -1877,6 +1882,7 @@ async fn apply_typed_navigation_feedback(
                 %error,
                 session_id = %update.state.goal_id,
                 received_path_revision = update.feedback.path_revision,
+                expected_lease_source,
                 expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
                 received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
                 expected_path_hash_zero = expected
@@ -4267,6 +4273,41 @@ mod exploration_adapter_tests {
 #[cfg(test)]
 mod typed_navigation_feedback_tests {
     use super::*;
+    use std::io::Write;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log mutex").clone())
+                .expect("tracing output is UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log mutex")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
 
     fn test_lease(goal_id: &str) -> crate::nav_runtime::GoalLease {
         crate::nav_runtime::GoalLease {
@@ -4765,6 +4806,48 @@ mod typed_navigation_feedback_tests {
             .is_none());
     }
 
+    #[test]
+    fn rejection_diagnostics_report_the_active_lease_identity() {
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        let mut lease = test_lease("goal-diagnostic-source");
+        lease.path_revision = 7;
+        lease.path_payload_sha256 = [8; 32];
+        futures::executor::block_on(async {
+            let inner = nav.inner();
+            let mut slot = inner.write().await;
+            slot.phase = crate::nav_runtime::NavPhase::Running;
+            slot.goal = Some(crate::nav_runtime::ActiveGoal {
+                id: lease.session_id.clone(),
+                frame_id: "map".to_string(),
+                target: PoseState::default(),
+                accepted_at_ns: 1,
+                lease: lease.clone(),
+            });
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(captured.clone())
+            .finish();
+        let rejected = tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(apply_typed_navigation_feedback(
+                &nav,
+                feedback_update(&lease.session_id),
+            ))
+        });
+
+        assert!(rejected.is_none());
+        let output = captured.snapshot();
+        assert!(output.contains("typed navigation state rejected"));
+        assert!(output.contains("expected_lease_source=\"active\""));
+        assert!(output.contains("expected_path_revision=7"));
+        assert!(output.contains("expected_path_hash_zero=false"));
+        assert!(output.contains("path_hash_matches=false"));
+    }
+
     #[tokio::test]
     async fn correlated_a_terminal_cannot_mutate_replacement_b_incarnation() {
         let handle = build_handle_for_tests()
@@ -4974,16 +5057,27 @@ mod typed_navigation_feedback_tests {
             ))
             .await
             .expect("publish PathEnvelope");
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            nav.active_goal_lease().await.as_ref(),
+            Some(&lease),
+            "PathEnvelope publication must remain a candidate"
+        );
+
+        let mut state = feedback_update(&lease.session_id);
+        state.feedback.path_revision = 1;
+        state.feedback.path_payload_sha256 = path.path_payload_sha256;
+        let promoted = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if nav.active_goal_lease().await.unwrap().path_revision == 1 {
-                    break;
+                if let Some(promoted) = apply_typed_navigation_feedback(&nav, state.clone()).await {
+                    break promoted;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("PathEnvelope consumer must update the lease");
+        .expect("exact NavigationState must promote the observed candidate");
+        assert_eq!(promoted.feedback.path_revision, 1);
         assert_eq!(
             nav.active_goal_lease().await.unwrap().path_payload_sha256,
             path.path_payload_sha256

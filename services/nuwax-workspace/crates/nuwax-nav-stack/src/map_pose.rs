@@ -15,6 +15,14 @@ pub(crate) struct MapPoseObservation {
     pub(crate) pose_frame: String,
 }
 
+/// Result of consuming one TF message. A coherent canonical chain can carry a
+/// map pose directly; a map->odom-only update remains available to raw odometry.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MapPoseTfObservation {
+    pub(crate) accepted: bool,
+    pub(crate) map_pose: Option<MapPoseObservation>,
+}
+
 /// Fail-closed map-pose adapter errors.
 #[derive(Debug, Error, Clone, PartialEq)]
 pub(crate) enum MapPoseError {
@@ -112,20 +120,43 @@ impl MapPoseAdapter {
     }
 
     /// Observe the latest real map->odom transform. Returns whether one was accepted.
+    #[cfg(test)]
     pub(crate) fn observe_tf(&mut self, message: &schema::TfMessage) -> Result<bool, MapPoseError> {
         self.observe_tf_at(message, Instant::now())
     }
 
+    /// Observe canonical TF and return an atomic map pose when the same message
+    /// contains a source-aligned map->odom->base chain.
+    pub(crate) fn observe_tf_message(
+        &mut self,
+        message: &schema::TfMessage,
+    ) -> Result<MapPoseTfObservation, MapPoseError> {
+        self.observe_tf_message_at(message, Instant::now())
+    }
+
+    #[cfg(test)]
     fn observe_tf_at(
         &mut self,
         message: &schema::TfMessage,
         received_at: Instant,
     ) -> Result<bool, MapPoseError> {
+        self.observe_tf_message_at(message, received_at)
+            .map(|observed| observed.accepted)
+    }
+
+    fn observe_tf_message_at(
+        &mut self,
+        message: &schema::TfMessage,
+        received_at: Instant,
+    ) -> Result<MapPoseTfObservation, MapPoseError> {
         let Some(transform) = message.transforms.iter().rev().find(|transform| {
             transform.header.frame_id == self.map_frame
                 && transform.child_frame_id == self.odom_frame
         }) else {
-            return Ok(false);
+            return Ok(MapPoseTfObservation {
+                accepted: false,
+                map_pose: None,
+            });
         };
         validate_translation(transform.transform.translation, "map_to_odom")?;
         let rotation_xyzw =
@@ -135,16 +166,79 @@ impl MapPoseAdapter {
             .map_to_odom
             .is_some_and(|cached| source_timestamp_ns <= cached.source_timestamp_ns)
         {
-            return Ok(false);
+            return Ok(MapPoseTfObservation {
+                accepted: false,
+                map_pose: None,
+            });
         }
-        self.map_to_odom = Some(RigidTransform {
+        let map_to_odom = RigidTransform {
             translation: transform.transform.translation,
             rotation_xyzw,
             source_timestamp_ns,
             received_at,
-        });
-        self.generation = self.generation.saturating_add(1).max(1);
-        Ok(true)
+        };
+        let generation = self.generation.saturating_add(1).max(1);
+        let map_pose = message
+            .transforms
+            .iter()
+            .rev()
+            .find(|transform| {
+                transform.header.frame_id == self.odom_frame
+                    && transform.child_frame_id == self.base_frame
+            })
+            .map(|odom_to_base| {
+                validate_translation(odom_to_base.transform.translation, "odom_to_base")?;
+                let odom_rotation = normalize_quaternion(
+                    odom_to_base.transform.rotation_xyzw,
+                    "odom_to_base.rotation",
+                )?;
+                let odom_timestamp_ns =
+                    header_timestamp_ns(&odom_to_base.header, "odom_to_base.header")?;
+                if odom_timestamp_ns != source_timestamp_ns {
+                    let skew_ns = i128::from(odom_timestamp_ns)
+                        .saturating_sub(i128::from(source_timestamp_ns))
+                        .unsigned_abs();
+                    return Err(MapPoseError::MisalignedTransform {
+                        skew_ms: skew_ns / 1_000_000,
+                        max_ms: 0,
+                    });
+                }
+                let rotated = rotate_vector(
+                    map_to_odom.rotation_xyzw,
+                    odom_to_base.transform.translation,
+                );
+                let position = [
+                    map_to_odom.translation[0] + rotated[0],
+                    map_to_odom.translation[1] + rotated[1],
+                    map_to_odom.translation[2] + rotated[2],
+                ];
+                let orientation_xyzw = normalize_quaternion(
+                    multiply_quaternion(map_to_odom.rotation_xyzw, odom_rotation),
+                    "map_pose.rotation",
+                )?;
+                let mut header = odom_to_base.header.clone();
+                header.frame_id = self.map_frame.clone();
+                header.seq = i32::try_from(generation).unwrap_or(i32::MAX);
+                Ok(MapPoseObservation {
+                    pose: schema::PoseStamped {
+                        header,
+                        pose: schema::Pose {
+                            position,
+                            orientation_xyzw,
+                        },
+                    },
+                    generation,
+                    map_frame: self.map_frame.clone(),
+                    pose_frame: self.map_frame.clone(),
+                })
+            })
+            .transpose()?;
+        self.map_to_odom = Some(map_to_odom);
+        self.generation = generation;
+        Ok(MapPoseTfObservation {
+            accepted: true,
+            map_pose,
+        })
     }
 
     /// Transform odom->base into map->base. Missing TF is a normal waiting state.
@@ -340,6 +434,23 @@ mod tests {
         }
     }
 
+    fn coherent_tf_chain(map_x: f64, map_y: f64, odom_x: f64, odom_y: f64) -> schema::TfMessage {
+        let mut message = map_to_odom(map_x, map_y);
+        message.transforms.push(schema::TransformStamped {
+            header: schema::Header {
+                stamp_sec: 1,
+                frame_id: "odom".into(),
+                ..schema::Header::default()
+            },
+            child_frame_id: "base_link".into(),
+            transform: schema::Transform {
+                translation: [odom_x, odom_y, 0.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        });
+        message
+    }
+
     #[test]
     fn raw_odom_waits_for_real_transform_without_crashing_or_relabelling() {
         let adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
@@ -433,5 +544,51 @@ mod tests {
             .transform_odometry_at(&delayed_odom, now)
             .expect_err("source-time skew must fail closed");
         assert!(matches!(error, MapPoseError::MisalignedTransform { .. }));
+    }
+
+    #[test]
+    fn coherent_tf_message_produces_map_pose_without_cross_topic_join() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let observed = adapter
+            .observe_tf_message(&coherent_tf_chain(10.0, -2.0, 1.5, 3.0))
+            .expect("coherent TF chain");
+
+        assert!(observed.accepted);
+        let map_pose = observed.map_pose.expect("atomic map pose");
+        assert_eq!(map_pose.pose.header.frame_id, "map");
+        assert_eq!(map_pose.pose.pose.position, [11.5, 1.0, 0.0]);
+        assert_eq!(map_pose.generation, 1);
+    }
+
+    #[test]
+    fn atomic_tf_chain_requires_identical_source_timestamps() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let mut message = coherent_tf_chain(10.0, -2.0, 1.5, 3.0);
+        message.transforms[1].header.stamp_nsec = 1;
+
+        let error = adapter
+            .observe_tf_message(&message)
+            .expect_err("mixed-source TF chain must fail closed");
+        assert!(matches!(error, MapPoseError::MisalignedTransform { .. }));
+        assert!(adapter
+            .transform_odometry(&odometry("odom", "base_link", 1.5, 3.0))
+            .expect("raw odometry remains a waiting input")
+            .is_none());
+    }
+
+    #[test]
+    fn incomplete_tf_chain_keeps_raw_odometry_fallback() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let observed = adapter
+            .observe_tf_message(&map_to_odom(10.0, -2.0))
+            .expect("map-to-odom TF");
+
+        assert!(observed.accepted);
+        assert!(observed.map_pose.is_none());
+        let fallback = adapter
+            .transform_odometry(&odometry("odom", "base_link", 1.5, 3.0))
+            .expect("aligned raw odometry")
+            .expect("fallback map pose");
+        assert_eq!(fallback.pose.pose.position, [11.5, 1.0, 0.0]);
     }
 }

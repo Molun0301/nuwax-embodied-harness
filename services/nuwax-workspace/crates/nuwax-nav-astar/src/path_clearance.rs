@@ -11,7 +11,7 @@
 //! 与 Python `make_path_mask` 的真实实现相比，本阶段使用等效几何：圆盘 mask + 路径段 clip。
 //! 复杂 `make_path_mask`（涉及 rasterize / rotation）放在后续 PR 与 mapping 协作完成。
 
-use crate::helpers::Path2D;
+use crate::helpers::{Path2D, Point2};
 use crate::navigation_map::{CostMap2D, OCCUPIED};
 // 注：本文件不直接调用 make_* helpers; Path2D 由调用方提供(make_path2d 构造)
 
@@ -107,8 +107,20 @@ impl PathClearance {
         let width = costmap.width();
         let height = costmap.height();
         let mut mask = vec![false; width * height];
-        let radius_cells = ((self.robot_width * 0.5) / costmap.resolution()).ceil() as i32;
-        let r2 = radius_cells * radius_cells;
+        // Bound the radius to a representable integer. `stamp_disk` clips its
+        // iteration to the map, so a very small map resolution cannot turn a
+        // malformed but finite input into an unbounded loop.
+        let radius_value = (self.robot_width * 0.5) / costmap.resolution();
+        let radius_cells = if !radius_value.is_finite() {
+            if radius_value.is_sign_positive() {
+                i32::MAX
+            } else {
+                0
+            }
+        } else {
+            radius_value.ceil().clamp(0.0, f64::from(i32::MAX)) as i32
+        };
+        let r2 = i128::from(radius_cells) * i128::from(radius_cells);
 
         let points = &self.path.points;
         if points.is_empty() {
@@ -118,31 +130,180 @@ impl PathClearance {
         let start_idx = self.pose_index.min(n.saturating_sub(1));
         let mut remaining = self.path_lookup_distance;
 
-        // 累加距离推进；超过前瞻距离的路径点不能进入 mask。
+        // 累加距离推进；最后一段裁剪到前瞻边界后再连续栅格化。
         let mut idx = start_idx;
-        loop {
+        while idx + 1 < n && remaining > 0.0 {
             let p = &points[idx];
-            let (cx, cy) = costmap.world_to_cell(*p);
-            if costmap.in_bounds(cx, cy) {
-                self.stamp_disk(&mut mask, width, height, cx, cy, radius_cells, r2);
-            }
+            let next = &points[idx + 1];
+            let seg_len = (next.x - p.x).hypot(next.y - p.y);
 
-            if idx + 1 >= n {
+            if !seg_len.is_finite() {
+                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
                 break;
             }
-            let next = &points[idx + 1];
-            let seg_len = ((next.x - p.x).powi(2) + (next.y - p.y).powi(2)).sqrt();
-            if seg_len > remaining {
+
+            if seg_len <= f64::EPSILON {
+                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
+                idx += 1;
+                continue;
+            }
+
+            let drawn_len = seg_len.min(remaining);
+            let ratio = drawn_len / seg_len;
+            let clipped_end =
+                Point2::new(p.x + (next.x - p.x) * ratio, p.y + (next.y - p.y) * ratio);
+            if !clipped_end.x.is_finite() || !clipped_end.y.is_finite() {
+                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
+                break;
+            }
+            self.stamp_line(&mut mask, costmap, p, &clipped_end, radius_cells, r2);
+
+            if seg_len >= remaining {
                 break;
             }
             remaining -= seg_len;
             idx += 1;
         }
 
+        if start_idx + 1 >= n || self.path_lookup_distance <= 0.0 {
+            let p = &points[start_idx];
+            self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
+        }
+
         self.last_costmap_shape = Some(shape);
         self.last_pose_index = self.pose_index;
         self.last_mask = Some(mask.clone());
         mask
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stamp_line(
+        &self,
+        mask: &mut [bool],
+        costmap: &CostMap2D,
+        start: &Point2,
+        end: &Point2,
+        radius: i32,
+        r2: i128,
+    ) {
+        let Some((start_x, start_y, end_x, end_y)) =
+            Self::clip_cell_segment(costmap, start, end, radius)
+        else {
+            return;
+        };
+        // Degenerate map metadata can produce a footprint wider than the
+        // entire map. Once the centerline touches the expanded bounds, mark
+        // the map conservatively instead of rasterizing billions of cells.
+        let radius_cells = usize::try_from(radius.max(0)).unwrap_or(usize::MAX);
+        if radius_cells > costmap.width().max(costmap.height()) {
+            mask.fill(true);
+            return;
+        }
+        let (mut x, mut y) = (i64::from(start_x), i64::from(start_y));
+        let (end_x, end_y) = (i64::from(end_x), i64::from(end_y));
+        let dx = (end_x - x).abs();
+        let step_x = if x < end_x { 1 } else { -1 };
+        let dy = -(end_y - y).abs();
+        let step_y = if y < end_y { 1 } else { -1 };
+        let mut error = dx + dy;
+
+        loop {
+            if let (Ok(cx), Ok(cy)) = (i32::try_from(x), i32::try_from(y)) {
+                self.stamp_disk(mask, costmap.width(), costmap.height(), cx, cy, radius, r2);
+            }
+            if x == end_x && y == end_y {
+                break;
+            }
+            let twice_error = 2 * error;
+            if twice_error >= dy {
+                error += dy;
+                x += step_x;
+            }
+            if twice_error <= dx {
+                error += dx;
+                y += step_y;
+            }
+        }
+    }
+
+    /// Convert a world-space segment to cells and clip it before Bresenham.
+    /// Without this bound, a finite path far outside the map could require
+    /// billions of iterations before reaching the first in-bounds cell.
+    fn clip_cell_segment(
+        costmap: &CostMap2D,
+        start: &Point2,
+        end: &Point2,
+        radius: i32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if !start.x.is_finite()
+            || !start.y.is_finite()
+            || !end.x.is_finite()
+            || !end.y.is_finite()
+            || costmap.width() == 0
+            || costmap.height() == 0
+        {
+            return None;
+        }
+
+        let (start_x, start_y) = costmap.world_to_cell(*start);
+        let (end_x, end_y) = costmap.world_to_cell(*end);
+        let max_x = i32::try_from(costmap.width() - 1).ok()?;
+        let max_y = i32::try_from(costmap.height() - 1).ok()?;
+
+        // Liang-Barsky clipping in cell coordinates keeps the subsequent
+        // integer rasterization bounded by the map plus robot footprint.
+        let x0 = f64::from(start_x);
+        let y0 = f64::from(start_y);
+        let dx = f64::from(end_x) - x0;
+        let dy = f64::from(end_y) - y0;
+        let radius = f64::from(radius.max(0));
+        let min_x = -radius;
+        let min_y = -radius;
+        let max_x_bound = f64::from(max_x) + radius;
+        let max_y_bound = f64::from(max_y) + radius;
+        let mut t_min: f64 = 0.0;
+        let mut t_max: f64 = 1.0;
+
+        for (p, q) in [
+            (-dx, x0 - min_x),
+            (dx, max_x_bound - x0),
+            (-dy, y0 - min_y),
+            (dy, max_y_bound - y0),
+        ] {
+            if p.abs() <= f64::EPSILON {
+                if q < 0.0 {
+                    return None;
+                }
+                continue;
+            }
+            let ratio = q / p;
+            if p < 0.0 {
+                if ratio > t_max {
+                    return None;
+                }
+                t_min = t_min.max(ratio);
+            } else {
+                if ratio < t_min {
+                    return None;
+                }
+                t_max = t_max.min(ratio);
+            }
+        }
+
+        if t_min > t_max {
+            return None;
+        }
+        let clamp_cell = |value: f64| {
+            value
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
+        Some((
+            clamp_cell(x0 + dx * t_min),
+            clamp_cell(y0 + dy * t_min),
+            clamp_cell(x0 + dx * t_max),
+            clamp_cell(y0 + dy * t_max),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)] // 函数为内联热路径,分组会增加栈分配
@@ -154,18 +315,29 @@ impl PathClearance {
         cx: i32,
         cy: i32,
         radius: i32,
-        r2: i32,
+        r2: i128,
     ) {
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy > r2 {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let radius = i64::from(radius.max(0));
+        let cx = i64::from(cx);
+        let cy = i64::from(cy);
+        let max_x = i64::try_from(width - 1).unwrap_or(i64::MAX);
+        let max_y = i64::try_from(height - 1).unwrap_or(i64::MAX);
+        let min_x = (cx - radius).max(0).min(max_x);
+        let max_x = (cx + radius).max(0).min(max_x);
+        let min_y = (cy - radius).max(0).min(max_y);
+        let max_y = (cy + radius).max(0).min(max_y);
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x - cx;
+                let dy = y - cy;
+                if i128::from(dx) * i128::from(dx) + i128::from(dy) * i128::from(dy) > r2 {
                     continue;
                 }
-                let nx = cx + dx;
-                let ny = cy + dy;
-                if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
-                    mask[ny as usize * width + nx as usize] = true;
-                }
+                mask[y as usize * width + x as usize] = true;
             }
         }
     }
@@ -192,7 +364,7 @@ impl PathClearance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{make_path2d, Point2};
+    use crate::helpers::make_path2d;
     use crate::navigation_map::CostMap2D;
 
     fn path_through_straight_line() -> Path2D {
@@ -242,14 +414,103 @@ mod tests {
     }
 
     #[test]
-    fn mask_does_not_include_a_far_endpoint_on_a_two_point_path() {
+    fn sparse_segment_mask_stops_at_the_lookup_cutoff() {
         let mut cm = CostMap2D::new_all_free("map", 60, 10, 0.1);
         cm.set(50, 0, OCCUPIED);
         let path = make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(5.0, 0.0)]);
-        let mut pc = PathClearance::new(path, 0.1, 2.0);
+        let mut pc = PathClearance::new(path, 0.0, 2.0);
         pc.update_costmap(cm);
         pc.update_pose_index(0);
 
+        let mask = pc.compute_mask();
+        assert!(mask[10], "a 1m obstacle must be inside the lookahead mask");
+        assert!(mask[20], "the exact 2m cutoff must remain inside the mask");
+        assert!(!mask[50], "the 5m endpoint must remain outside the mask");
         assert!(!pc.is_obstacle_ahead());
+    }
+
+    #[test]
+    fn rasterization_clips_a_far_segment_to_the_costmap() {
+        let cm = CostMap2D::new_all_free("map", 10, 3, 1.0);
+        let path = make_path2d(vec![
+            Point2::new(-1_000_000_000.0, 1.5),
+            Point2::new(1_000_000_000.0, 1.5),
+        ]);
+        let mut pc = PathClearance::new(path, 0.0, 2_000_000_000.0);
+        pc.update_costmap(cm);
+
+        let mask = pc.compute_mask();
+        assert!((0..10).all(|x| mask[10 + x]));
+        assert_eq!(mask.iter().filter(|marked| **marked).count(), 10);
+    }
+
+    #[test]
+    fn footprint_detects_a_path_centerline_just_outside_the_map() {
+        let cm = CostMap2D::new_all_free("map", 5, 5, 1.0);
+        let path = make_path2d(vec![Point2::new(-1.0, 0.0), Point2::new(-1.0, 4.0)]);
+        let mut pc = PathClearance::new(path, 2.0, 4.0);
+        pc.update_costmap(cm);
+
+        let mask = pc.compute_mask();
+        assert!(
+            (0..5).all(|y| mask[y * 5]),
+            "footprint must reach map column 0"
+        );
+
+        let far_cm = CostMap2D::new_all_free("map", 5, 5, 1.0);
+        let far_path = make_path2d(vec![Point2::new(-2.0, 0.0), Point2::new(-2.0, 4.0)]);
+        let mut far_pc = PathClearance::new(far_path, 2.0, 4.0);
+        far_pc.update_costmap(far_cm);
+        assert!(!far_pc.compute_mask().iter().any(|marked| *marked));
+    }
+
+    #[test]
+    fn rasterization_handles_negative_origin_and_repeated_points() {
+        let mut cm = CostMap2D::new_all_free("map", 5, 3, 1.0);
+        cm.set_origin(Point2::new(-5.0, -5.0));
+        let path = make_path2d(vec![
+            Point2::new(-10.0, -4.5),
+            Point2::new(-10.0, -4.5),
+            Point2::new(-2.0, -4.5),
+        ]);
+        let mut pc = PathClearance::new(path, 0.0, 8.0);
+        pc.update_costmap(cm);
+
+        let mask = pc.compute_mask();
+        assert!((0..=3).all(|x| mask[x]));
+        assert_eq!(mask.iter().filter(|marked| **marked).count(), 4);
+    }
+
+    #[test]
+    fn mask_keeps_the_current_cell_at_the_last_path_index() {
+        let cm = CostMap2D::new_all_free("map", 5, 1, 1.0);
+        let path = make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)]);
+        let mut pc = PathClearance::new(path, 0.0, 2.0);
+        pc.update_costmap(cm);
+        pc.update_pose_index(1);
+
+        let mask = pc.compute_mask();
+        assert!(mask[4]);
+        assert_eq!(mask.iter().filter(|marked| **marked).count(), 1);
+    }
+
+    #[test]
+    fn invalid_length_and_tiny_resolution_remain_bounded() {
+        let cm = CostMap2D::new_all_free("map", 3, 3, f64::MIN_POSITIVE);
+        let path = make_path2d(vec![
+            Point2::new(-f64::MAX, 0.0),
+            Point2::new(f64::MAX, 0.0),
+        ]);
+        let mut pc = PathClearance::new(path, 0.1, 2.0);
+        pc.update_costmap(cm);
+
+        let mask = pc.compute_mask();
+        assert!(!mask.iter().any(|marked| *marked));
+
+        let tiny_cm = CostMap2D::new_all_free("map", 3, 3, f64::MIN_POSITIVE);
+        let tiny_path = make_path2d(vec![Point2::new(0.0, 0.0)]);
+        let mut tiny_pc = PathClearance::new(tiny_path, 0.1, 2.0);
+        tiny_pc.update_costmap(tiny_cm);
+        assert!(tiny_pc.compute_mask().iter().all(|marked| *marked));
     }
 }

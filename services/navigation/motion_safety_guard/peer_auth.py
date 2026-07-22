@@ -21,6 +21,7 @@ class PeerCredentials:
 SOURCE_ALLOWLIST_BY_USER: Mapping[str, FrozenSet[str]] = {
     "nuwax-motion-guard": frozenset(),
     "nuwax-navigation": frozenset({"NAV"}),
+    "nuwax-geometry": frozenset(),
     "nuwax-gateway": frozenset(
         {
             "GATEWAY_MANUAL",
@@ -30,6 +31,9 @@ SOURCE_ALLOWLIST_BY_USER: Mapping[str, FrozenSet[str]] = {
         }
     ),
 }
+RECOVERY_VERIFIER_OPERATIONS = frozenset(
+    {"get_guard_state", "get_operation_result"}
+)
 SERVICE_IDENTITY_USERS = (
     "nuwax-motion-guard",
     "nuwax-navigation",
@@ -89,12 +93,16 @@ class PeerAuthorizer:
         source_allowlist_by_uid: Mapping[int, FrozenSet[str]],
         *,
         service_uid_by_user: Optional[Mapping[str, int]] = None,
+        recovery_verifier_uids: FrozenSet[int] = frozenset(),
     ) -> None:
         if service_uid_by_user is not None:
             validate_service_identity_uids(service_uid_by_user)
         self._source_allowlist_by_uid = {
             int(uid): frozenset(sources) for uid, sources in source_allowlist_by_uid.items()
         }
+        self._recovery_verifier_uids = frozenset(
+            int(uid) for uid in recovery_verifier_uids
+        )
 
     @classmethod
     def from_system_identities(cls) -> "PeerAuthorizer":
@@ -105,9 +113,12 @@ class PeerAuthorizer:
                 for username, sources in SOURCE_ALLOWLIST_BY_USER.items()
             },
             service_uid_by_user=service_uid_by_user,
+            recovery_verifier_uids=frozenset(
+                {service_uid_by_user["nuwax-geometry"]}
+            ),
         )
 
-    def authorize(self, uid: int, source: str) -> None:
+    def authorize(self, uid: int, source: str, *, operation: str = "") -> None:
         allowed_sources = self._source_allowlist_by_uid.get(int(uid))
         if allowed_sources is None:
             raise AuthorizationError(f"peer UID {uid} is not authorized")
@@ -116,5 +127,15 @@ class PeerAuthorizer:
         normalized = source_name[len(prefix) :] if source_name.startswith(prefix) else source_name
         if not normalized or normalized in {"UNSPECIFIED", "UNKNOWN"}:
             raise AuthorizationError("claimed source is unspecified")
-        if normalized not in allowed_sources:
-            raise AuthorizationError(f"peer UID {uid} is not authorized for source {normalized}")
+        if normalized in allowed_sources:
+            return
+        if (
+            int(uid) in self._recovery_verifier_uids
+            and normalized == "GATEWAY_MANUAL"
+            and operation in RECOVERY_VERIFIER_OPERATIONS
+        ):
+            return
+        raise AuthorizationError(f"peer UID {uid} is not authorized for source {normalized}")
+
+    def is_recovery_verifier(self, uid: int) -> bool:
+        return int(uid) in self._recovery_verifier_uids

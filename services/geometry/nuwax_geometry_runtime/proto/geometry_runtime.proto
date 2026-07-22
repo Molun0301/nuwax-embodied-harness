@@ -307,6 +307,32 @@ message ExploreRequest {
 message StopExplorationRequest {
   string request_id = 1;
 }
+message ExplorationChildLease {
+  string session_id = 1;
+  NavigationOwnerKind owner_kind = 2;
+  string parent_request_id = 3;
+  uint64 goal_generation = 4;
+  uint64 producer_runtime_generation = 5;
+  bytes goal_payload_sha256 = 6;
+}
+message ExplorationRecoveryGuardProof {
+  string stop_operation_id = 1;
+  uint64 guard_generation = 2;
+  bytes guard_boot_nonce = 3;
+  uint64 motion_stop_generation = 4;
+  string zero_ack_id = 5;
+  uint64 zero_applied_monotonic_ns = 6;
+  bytes recovery_fence_token = 7;
+  string recovery_correlation = 8;
+}
+message RecoverExplorationAfterNavigationRolloverRequest {
+  string request_id = 1;
+  uint64 exploration_generation = 2;
+  ExplorationChildLease child_lease = 3;
+  uint64 expected_navigation_runtime_generation = 4;
+  uint64 observed_navigation_runtime_generation = 5;
+  ExplorationRecoveryGuardProof guard_proof = 6;
+}
 message ExplorationState {
   reserved 10, 11;
   reserved "map_version_id", "map_revision";
@@ -319,6 +345,9 @@ message ExplorationState {
   uint64 revision = 7;
   uint64 timestamp_ns = 8;
   string child_task_id = 9;
+  uint64 exploration_generation = 12;
+  ExplorationChildLease child_lease = 13;
+  bool rollover_recovery_eligible = 14;
 }
 message ExplorationSourceDiag {
   string source_name = 1;
@@ -415,6 +444,7 @@ service GeometryRuntime {
   //   "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
   rpc StartExploration(ExploreRequest) returns (ExplorationState);
   rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
+  rpc RecoverExplorationAfterNavigationRollover(RecoverExplorationAfterNavigationRolloverRequest) returns (ExplorationState);
   rpc GetExplorationState(Empty) returns (ExplorationState);
   rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
 

@@ -138,6 +138,7 @@ impl LoadedForbiddenZones {
     }
 }
 
+#[cfg(test)]
 pub fn load_for_map(path: &Path, map_version_id: &str) -> LoadedForbiddenZones {
     load_for_map_binding(path, "", map_version_id)
 }
@@ -216,7 +217,11 @@ pub fn load_for_map_binding(
     let Some((storage_key, zone_set)) = selected else {
         return LoadedForbiddenZones::empty(format!(
             "absent:{}:{map_version_id}",
-            if map_name.is_empty() { "legacy" } else { map_name }
+            if map_name.is_empty() {
+                "legacy"
+            } else {
+                map_name
+            }
         ));
     };
     let stored_map_name = zone_set.map_name.trim();

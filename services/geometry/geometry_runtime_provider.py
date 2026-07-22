@@ -31,6 +31,7 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provide
 
 _DEFAULT_GRPC_MESSAGE_LIMIT_BYTES = 128 * 1024 * 1024
 _OCCUPANCY_SCHEMA_VERSION = 1
+_ROLLOVER_RECOVERY_DEADLINE_SEC = 4.0
 
 _MappingIdentity = Tuple[str, str, int]
 _NavigationStreamToken = Tuple[int, int, int]
@@ -738,6 +739,19 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
     PENDING / STOPPING / ACTIVE / SUCCEEDED / CANCELLED / FAILED。失败时上游
     RPC 层已经处理，这里只做字段拷贝，不二次推进状态。
     """
+    child_lease = None
+    if resp.HasField("child_lease"):
+        lease = resp.child_lease
+        child_lease = {
+            "session_id": str(lease.session_id or ""),
+            "owner_kind": int(lease.owner_kind),
+            "parent_request_id": str(lease.parent_request_id or ""),
+            "goal_generation": int(lease.goal_generation),
+            "producer_runtime_generation": int(
+                lease.producer_runtime_generation
+            ),
+            "goal_payload_sha256": bytes(lease.goal_payload_sha256),
+        }
     return {
         "status": resp.status,
         "message": resp.message,
@@ -748,6 +762,9 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "revision": int(resp.revision),
         "timestamp_ns": int(resp.timestamp_ns),
         "child_task_id": str(getattr(resp, "child_task_id", "") or ""),
+        "exploration_generation": int(resp.exploration_generation),
+        "child_lease": child_lease,
+        "rollover_recovery_eligible": bool(resp.rollover_recovery_eligible),
     }
 
 
@@ -4137,6 +4154,88 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as e:
             raise _exploration_rpc_error("StopExploration", e) from e
 
+    def recover_exploration_after_navigation_rollover(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, Any],
+        expected_navigation_runtime_generation: int,
+        observed_navigation_runtime_generation: int,
+        guard_proof: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Release retained exploration-child ownership after a nav rollover."""
+
+        self._raise_if_stopping("recover_exploration_after_navigation_rollover")
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error(
+                "RecoverExplorationAfterNavigationRollover"
+            )
+        try:
+            req = pb2.RecoverExplorationAfterNavigationRolloverRequest(
+                request_id=str(request_id or ""),
+                exploration_generation=int(exploration_generation),
+                child_lease=pb2.ExplorationChildLease(
+                    session_id=str(child_lease.get("session_id") or ""),
+                    owner_kind=int(child_lease.get("owner_kind") or 0),
+                    parent_request_id=str(
+                        child_lease.get("parent_request_id") or ""
+                    ),
+                    goal_generation=int(
+                        child_lease.get("goal_generation") or 0
+                    ),
+                    producer_runtime_generation=int(
+                        child_lease.get("producer_runtime_generation") or 0
+                    ),
+                    goal_payload_sha256=bytes(
+                        child_lease.get("goal_payload_sha256") or b""
+                    ),
+                ),
+                expected_navigation_runtime_generation=int(
+                    expected_navigation_runtime_generation
+                ),
+                observed_navigation_runtime_generation=int(
+                    observed_navigation_runtime_generation
+                ),
+                guard_proof=pb2.ExplorationRecoveryGuardProof(
+                    stop_operation_id=str(
+                        guard_proof.get("stop_operation_id") or ""
+                    ),
+                    guard_generation=int(
+                        guard_proof.get("guard_generation") or 0
+                    ),
+                    guard_boot_nonce=bytes(
+                        guard_proof.get("guard_boot_nonce") or b""
+                    ),
+                    motion_stop_generation=int(
+                        guard_proof.get("motion_stop_generation") or 0
+                    ),
+                    zero_ack_id=str(guard_proof.get("zero_ack_id") or ""),
+                    zero_applied_monotonic_ns=int(
+                        guard_proof.get("zero_applied_monotonic_ns") or 0
+                    ),
+                    recovery_fence_token=bytes(
+                        guard_proof.get("recovery_fence_token") or b""
+                    ),
+                    recovery_correlation=str(
+                        guard_proof.get("recovery_correlation") or ""
+                    ),
+                ),
+            )
+            resp = stub.RecoverExplorationAfterNavigationRollover(
+                req,
+                timeout=max(
+                    _read_deadline_sec(),
+                    _ROLLOVER_RECOVERY_DEADLINE_SEC,
+                ),
+            )
+            return _exploration_state_to_dict(resp)
+        except grpc.RpcError as e:
+            raise _exploration_rpc_error(
+                "RecoverExplorationAfterNavigationRollover", e
+            ) from e
+
     def get_exploration_state(self) -> Dict[str, Any]:
         """读取当前 exploration scheduler 的只读快照。
 
@@ -4167,6 +4266,9 @@ class GeometryRuntimeProvider:
             state.get("frontier_count"),
             state.get("revision"),
             state.get("child_task_id"),
+            state.get("exploration_generation"),
+            state.get("child_lease"),
+            state.get("rollover_recovery_eligible"),
         )
 
     def _ensure_exploration_poll_worker(self) -> None:

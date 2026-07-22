@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
+use nuwax_codec::lcm::schema;
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
 use nuwax_exploration::wavefront_adapter::WavefrontGoalSourceAdapter;
 use nuwax_exploration::{
@@ -235,15 +236,17 @@ pub struct ChildNavigationLease {
     pub owner_kind: i32,
     pub parent_request_id: String,
     pub goal_generation: u64,
+    pub producer_runtime_generation: u64,
     pub goal_payload_sha256: [u8; 32],
 }
 
 impl ChildNavigationLease {
-    fn matches(&self, other: &Self) -> bool {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
         self.session_id == other.session_id
             && self.owner_kind == other.owner_kind
             && self.parent_request_id == other.parent_request_id
             && self.goal_generation == other.goal_generation
+            && self.producer_runtime_generation == other.producer_runtime_generation
             && self.goal_payload_sha256 == other.goal_payload_sha256
     }
 }
@@ -381,6 +384,9 @@ pub struct ExploreRuntimeSnapshot {
     pub frontier_count: u32,
     pub revision: u64,
     pub child_task_id: String,
+    pub exploration_generation: u64,
+    pub child_lease: Option<ChildNavigationLease>,
+    pub rollover_recovery_eligible: bool,
 }
 
 impl Default for ExploreRuntimeSnapshot {
@@ -394,6 +400,43 @@ impl Default for ExploreRuntimeSnapshot {
             frontier_count: 0,
             revision: 0,
             child_task_id: String::new(),
+            exploration_generation: 0,
+            child_lease: None,
+            rollover_recovery_eligible: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplorationRecoveryGuardProof {
+    pub stop_operation_id: String,
+    pub recovery_correlation: String,
+    pub motion_admission: MotionAdmissionProof,
+    pub zero_ack_id: String,
+    pub zero_applied_monotonic_ns: u64,
+    pub recovery_fence_token: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplorationRolloverRecoveryRequest {
+    pub request_id: String,
+    pub exploration_generation: u64,
+    pub child_lease: ChildNavigationLease,
+    pub expected_navigation_runtime_generation: u64,
+    pub observed_navigation_runtime_generation: u64,
+    pub guard_proof: ExplorationRecoveryGuardProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplorationRecoveryError {
+    InvalidArgument(String),
+    FailedPrecondition(String),
+}
+
+impl ExplorationRecoveryError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidArgument(message) | Self::FailedPrecondition(message) => message,
         }
     }
 }
@@ -420,6 +463,12 @@ struct PendingChildCancellation {
     early_terminals: Vec<ChildNavigationResult>,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedRolloverRecovery {
+    request: ExplorationRolloverRecoveryRequest,
+    snapshot: ExploreRuntimeSnapshot,
+}
+
 pub struct ExploreRuntimeInner {
     controller: ExplorationController,
     arbitration: ExplorationArbitrationPolicy,
@@ -434,6 +483,8 @@ pub struct ExploreRuntimeInner {
     active_child: Option<ActiveChildNavigation>,
     pending_child_dispatch: Option<ChildNavigationRequest>,
     pending_child_cancellation: Option<PendingChildCancellation>,
+    completed_rollover_recovery: Option<CompletedRolloverRecovery>,
+    session_generation: u64,
     generation: u64,
     child_sequence: u64,
     reached_goals: u32,
@@ -462,6 +513,8 @@ impl ExploreRuntimeInner {
             active_child: None,
             pending_child_dispatch: None,
             pending_child_cancellation: None,
+            completed_rollover_recovery: None,
+            session_generation: 0,
             generation: 0,
             child_sequence: 0,
             reached_goals: 0,
@@ -493,6 +546,13 @@ impl ExploreRuntimeInner {
     }
 
     fn snapshot(&self, status: &'static str, message: impl Into<String>) -> ExploreRuntimeSnapshot {
+        let child_lease = self.active_child.as_ref().map(|child| child.lease.clone());
+        let rollover_recovery_eligible = !self.controller.is_active()
+            && child_lease.is_some()
+            && self
+                .pending_child_cancellation
+                .as_ref()
+                .is_some_and(|pending| pending.failure.is_some() && !pending.dispatch_in_flight);
         ExploreRuntimeSnapshot {
             status,
             message: message.into(),
@@ -506,6 +566,9 @@ impl ExploreRuntimeInner {
                 .as_ref()
                 .map(|child| child.request_id.clone())
                 .unwrap_or_default(),
+            exploration_generation: self.session_generation,
+            child_lease,
+            rollover_recovery_eligible,
         }
     }
 }
@@ -634,6 +697,9 @@ impl ExploreRuntimeHandle {
                     frontier_count: guard.frontiers.len() as u32,
                     revision: guard.frontier_revision,
                     child_task_id: String::new(),
+                    exploration_generation: guard.session_generation,
+                    child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
+                    rollover_recovery_eligible: false,
                 };
             }
         }
@@ -670,6 +736,9 @@ impl ExploreRuntimeHandle {
                 frontier_count: guard.frontiers.len() as u32,
                 revision: guard.frontier_revision,
                 child_task_id: String::new(),
+                exploration_generation: guard.session_generation,
+                child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
+                rollover_recovery_eligible: false,
             };
             drop(guard);
             return snapshot;
@@ -700,6 +769,8 @@ impl ExploreRuntimeHandle {
         guard.active_child = None;
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
+        guard.completed_rollover_recovery = None;
+        guard.session_generation = generation;
         guard.generation = generation;
         guard.child_sequence = 0;
         guard.reached_goals = 0;
@@ -732,6 +803,142 @@ impl ExploreRuntimeHandle {
             "exploration cancelled by caller".to_string(),
         )
         .await
+    }
+
+    fn validate_rollover_recovery_request(
+        request: &ExplorationRolloverRecoveryRequest,
+    ) -> Result<(), ExplorationRecoveryError> {
+        let request_id = request.request_id.trim();
+        if request_id.is_empty()
+            || request.exploration_generation == 0
+            || request.child_lease.session_id.trim().is_empty()
+            || request.child_lease.parent_request_id.trim() != request_id
+            || request.child_lease.goal_generation == 0
+            || request.child_lease.producer_runtime_generation == 0
+            || request.child_lease.goal_payload_sha256 == [0; 32]
+            || request.expected_navigation_runtime_generation == 0
+            || request.observed_navigation_runtime_generation
+                <= request.expected_navigation_runtime_generation
+        {
+            return Err(ExplorationRecoveryError::InvalidArgument(
+                "incomplete exploration rollover recovery identity".to_string(),
+            ));
+        }
+        if request.guard_proof.stop_operation_id.trim().is_empty()
+            || request.guard_proof.recovery_correlation.trim().is_empty()
+            || request.guard_proof.motion_admission.validate().is_err()
+            || request.guard_proof.motion_admission.motion_stop_generation == 0
+            || request.guard_proof.zero_ack_id.trim().is_empty()
+            || request.guard_proof.zero_applied_monotonic_ns == 0
+            || request.guard_proof.recovery_fence_token.len() != 32
+            || request
+                .guard_proof
+                .recovery_fence_token
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(ExplorationRecoveryError::InvalidArgument(
+                "incomplete motion guard recovery fence proof".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn replay_completed_rollover_recovery(
+        &self,
+        request: &ExplorationRolloverRecoveryRequest,
+    ) -> Result<Option<ExploreRuntimeSnapshot>, ExplorationRecoveryError> {
+        Self::validate_rollover_recovery_request(request)?;
+
+        let guard = self.inner.lock().await;
+        let Some(completed) = guard.completed_rollover_recovery.as_ref() else {
+            return Ok(None);
+        };
+        if completed.request == *request {
+            return Ok(Some(completed.snapshot.clone()));
+        }
+        Err(ExplorationRecoveryError::FailedPrecondition(
+            "rollover recovery proof does not match the completed transition".to_string(),
+        ))
+    }
+
+    pub async fn recover_after_navigation_rollover(
+        &self,
+        request: ExplorationRolloverRecoveryRequest,
+    ) -> Result<ExploreRuntimeSnapshot, ExplorationRecoveryError> {
+        Self::validate_rollover_recovery_request(&request)?;
+        let request_id = request.request_id.trim();
+
+        let mut guard = self.inner.lock().await;
+        if let Some(completed) = guard.completed_rollover_recovery.as_ref() {
+            if completed.request == request {
+                return Ok(completed.snapshot.clone());
+            }
+            return Err(ExplorationRecoveryError::FailedPrecondition(
+                "rollover recovery proof does not match the completed transition".to_string(),
+            ));
+        }
+        if guard.last_request_id != request_id {
+            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
+                "exploration recovery request_id mismatch: active={} received={}",
+                guard.last_request_id, request_id
+            )));
+        }
+        if guard.session_generation != request.exploration_generation {
+            return Err(ExplorationRecoveryError::FailedPrecondition(format!(
+                "exploration recovery generation mismatch: active={} received={}",
+                guard.session_generation, request.exploration_generation
+            )));
+        }
+        let active_child = guard.active_child.as_ref().ok_or_else(|| {
+            ExplorationRecoveryError::FailedPrecondition(
+                "exploration recovery has no retained child ownership".to_string(),
+            )
+        })?;
+        if !active_child.lease.matches(&request.child_lease) {
+            return Err(ExplorationRecoveryError::FailedPrecondition(
+                "exploration recovery child lease does not match retained ownership".to_string(),
+            ));
+        }
+        let cancel_failed = guard
+            .pending_child_cancellation
+            .as_ref()
+            .is_some_and(|pending| pending.failure.is_some() && !pending.dispatch_in_flight);
+        if guard.controller.is_active() || !cancel_failed {
+            return Err(ExplorationRecoveryError::FailedPrecondition(
+                "exploration recovery requires a stopped controller and failed child cancellation"
+                    .to_string(),
+            ));
+        }
+
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        guard.generation = generation;
+        guard.pending_child_dispatch = None;
+        guard.pending_child_cancellation = None;
+        guard.active_child = None;
+        guard.no_frontier_since_ns = None;
+        guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
+        guard.last_stop_reason = "runtime_rollover_aborted_safe".to_string();
+        let frontier_update = guard.update_frontiers(Vec::new());
+        let snapshot = guard.snapshot(
+            STATUS_FAILED,
+            "RUNTIME_ROLLOVER_ABORTED_SAFE: global stop and durable guard fence released orphaned child ownership",
+        );
+        guard.completed_rollover_recovery = Some(CompletedRolloverRecovery {
+            request,
+            snapshot: snapshot.clone(),
+        });
+        let backend_available = self.readiness_cache.lock().backend_available;
+        let readiness = Self::compute_readiness_locked(
+            &guard,
+            backend_available,
+            self.navigation_sink.read().is_some(),
+        );
+        drop(guard);
+        *self.readiness_cache.lock() = readiness;
+        self.publish_frontiers(frontier_update);
+        Ok(self.store_snapshot(snapshot))
     }
 
     async fn finish_session(
@@ -1229,8 +1436,9 @@ impl ExploreRuntimeHandle {
         };
         if ticket.lease.session_id != proposed_request_id
             || ticket.lease.parent_request_id != expected_parent_request_id
-            || ticket.lease.owner_kind == 0
+            || ticket.lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
             || ticket.lease.goal_generation == 0
+            || ticket.lease.producer_runtime_generation == 0
             || ticket.lease.goal_payload_sha256 == [0; 32]
         {
             drop(guard);
@@ -1880,6 +2088,7 @@ mod tests {
         submit_errors: StdMutex<VecDeque<ChildNavigationSubmitError>>,
         cancelled: StdMutex<Vec<String>>,
         cancel_error: StdMutex<Option<String>>,
+        lease_override: StdMutex<Option<ChildNavigationLease>>,
         next_goal_generation: AtomicU64,
         next_cancel_generation: AtomicU64,
         submit_entered: tokio::sync::Notify,
@@ -1903,13 +2112,19 @@ mod tests {
             if let Some(error) = self.submit_errors.lock().unwrap().pop_front() {
                 return Err(error);
             }
-            let lease = ChildNavigationLease {
-                session_id: request.request_id.clone(),
-                owner_kind: 2,
-                parent_request_id: request.parent_request_id.clone(),
-                goal_generation: self.next_goal_generation.fetch_add(1, Ordering::SeqCst) + 1,
-                goal_payload_sha256: [7; 32],
-            };
+            let lease = self
+                .lease_override
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ChildNavigationLease {
+                    session_id: request.request_id.clone(),
+                    owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                    parent_request_id: request.parent_request_id.clone(),
+                    goal_generation: self.next_goal_generation.fetch_add(1, Ordering::SeqCst) + 1,
+                    producer_runtime_generation: 11,
+                    goal_payload_sha256: [7; 32],
+                });
             Ok(ChildNavigationTicket { lease })
         }
 
@@ -2026,6 +2241,26 @@ mod tests {
             cancel_generation,
             zero_ack_id: format!("zero-{cancel_generation}"),
             zero_applied_monotonic_ns: now_monotonic_nanos(),
+        }
+    }
+
+    fn rollover_recovery_request(
+        snapshot: &ExploreRuntimeSnapshot,
+    ) -> ExplorationRolloverRecoveryRequest {
+        ExplorationRolloverRecoveryRequest {
+            request_id: snapshot.request_id.clone(),
+            exploration_generation: snapshot.exploration_generation,
+            child_lease: snapshot.child_lease.clone().expect("retained child lease"),
+            expected_navigation_runtime_generation: 41,
+            observed_navigation_runtime_generation: 42,
+            guard_proof: ExplorationRecoveryGuardProof {
+                stop_operation_id: "exploration-rollover-stop:fixture".to_string(),
+                recovery_correlation: "exploration-rollover:fixture".to_string(),
+                motion_admission: crate::nav_runtime::test_motion_admission(),
+                zero_ack_id: "global-zero-fixture".to_string(),
+                zero_applied_monotonic_ns: now_monotonic_nanos(),
+                recovery_fence_token: vec![9; 32],
+            },
         }
     }
 
@@ -2234,6 +2469,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_dispatch_rejects_nonrecoverable_lease_identity() {
+        for invalid_lease in [
+            ChildNavigationLease {
+                session_id: "invalid-owner".to_string(),
+                owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                parent_request_id: "req-invalid-lease".to_string(),
+                goal_generation: 1,
+                producer_runtime_generation: 11,
+                goal_payload_sha256: [7; 32],
+            },
+            ChildNavigationLease {
+                session_id: "invalid-generation".to_string(),
+                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                parent_request_id: "req-invalid-lease".to_string(),
+                goal_generation: 1,
+                producer_runtime_generation: 0,
+                goal_payload_sha256: [7; 32],
+            },
+        ] {
+            let (handle, sink) = configured_handle();
+            *sink.lease_override.lock().unwrap() = Some(invalid_lease);
+            handle
+                .ingest_costmap_snapshot(frontier_costmap(1))
+                .await
+                .unwrap();
+            handle.start("req-invalid-lease", "prefer_wavefront").await;
+
+            let rejected = handle.tick((2.0, 2.0)).await;
+            assert_eq!(rejected.status, STATUS_PENDING);
+            assert!(rejected.child_task_id.is_empty());
+            assert!(rejected
+                .message
+                .contains("child navigation dispatch failed"));
+        }
+    }
+
+    #[tokio::test]
     async fn stop_retains_child_until_correlated_zeroed_proof() {
         let (handle, sink) = configured_handle();
         handle
@@ -2341,6 +2613,9 @@ mod tests {
         let mut wrong = lease.clone();
         wrong.goal_generation += 1;
         wrong_leases.push(wrong);
+        let mut wrong = lease.clone();
+        wrong.producer_runtime_generation += 1;
+        wrong_leases.push(wrong);
         for wrong in wrong_leases {
             assert!(handle
                 .report_navigation_result(
@@ -2389,6 +2664,108 @@ mod tests {
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
         assert_eq!(failed.child_task_id, active.child_task_id);
         assert!(handle.is_active().await);
+        assert!(handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn nav_runtime_rollover_requires_durable_guard_fence_before_releasing_child() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle
+            .start("req-rollover-recovery", "prefer_wavefront")
+            .await;
+        handle.tick((2.0, 2.0)).await;
+        *sink.cancel_error.lock().unwrap() = Some("old runtime lost child".to_string());
+
+        let retained = handle.stop("req-rollover-recovery").await;
+        assert_eq!(retained.status, STATUS_FAILED);
+        assert!(retained.rollover_recovery_eligible);
+        assert!(!retained.child_task_id.is_empty());
+        assert!(handle.blocks_mapping_mutation().await);
+
+        let mut incomplete = rollover_recovery_request(&retained);
+        incomplete.guard_proof.recovery_fence_token.clear();
+        assert!(matches!(
+            handle.recover_after_navigation_rollover(incomplete).await,
+            Err(ExplorationRecoveryError::InvalidArgument(_))
+        ));
+        assert_eq!(handle.snapshot().child_task_id, retained.child_task_id);
+
+        let request = rollover_recovery_request(&retained);
+        let recovered = handle
+            .recover_after_navigation_rollover(request.clone())
+            .await
+            .expect("exact durable recovery proof");
+        assert_eq!(recovered.status, STATUS_FAILED);
+        assert_eq!(recovered.last_stop_reason, "runtime_rollover_aborted_safe");
+        assert!(recovered.child_task_id.is_empty());
+        assert!(!recovered.rollover_recovery_eligible);
+        assert!(!handle.blocks_mapping_mutation().await);
+
+        let replay = handle
+            .replay_completed_rollover_recovery(&request)
+            .await
+            .expect("exact replay probe is idempotent")
+            .expect("completed recovery snapshot");
+        assert_eq!(replay.request_id, recovered.request_id);
+        assert_eq!(replay.last_stop_reason, recovered.last_stop_reason);
+
+        let mut conflicting = request;
+        conflicting
+            .guard_proof
+            .recovery_correlation
+            .push_str(":other");
+        assert!(matches!(
+            handle
+                .replay_completed_rollover_recovery(&conflicting)
+                .await,
+            Err(ExplorationRecoveryError::FailedPrecondition(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rollover_recovery_rejects_wrong_child_and_nonfailed_cancellation() {
+        let (handle, _sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-rollover-wrong", "prefer_wavefront").await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+
+        let stopping = handle.stop("req-rollover-wrong").await;
+        assert_eq!(stopping.status, STATUS_STOPPING);
+        assert!(!stopping.rollover_recovery_eligible);
+        assert!(matches!(
+            handle
+                .recover_after_navigation_rollover(rollover_recovery_request(&stopping))
+                .await,
+            Err(ExplorationRecoveryError::FailedPrecondition(_))
+        ));
+
+        let failed = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::CancelFailed {
+                    proof: terminal_proof(&lease),
+                    cancel_generation: 1,
+                    reason: "new runtime has no old child".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(failed.rollover_recovery_eligible);
+        let mut wrong = rollover_recovery_request(&failed);
+        wrong.child_lease.goal_generation += 1;
+        assert!(matches!(
+            handle.recover_after_navigation_rollover(wrong).await,
+            Err(ExplorationRecoveryError::FailedPrecondition(_))
+        ));
+        assert_eq!(handle.snapshot().child_task_id, failed.child_task_id);
         assert!(handle.blocks_mapping_mutation().await);
     }
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
 import secrets
 import threading
 import time
@@ -55,6 +57,8 @@ class OperationRecord:
     zero_applied_ns: int
     motion_stop_generation: int
     namespace: str
+    recovery_fence_token: bytes = b""
+    recovery_fence_held: bool = False
     acquire: bool = False
 
 
@@ -194,7 +198,11 @@ class MotionGuardCore:
             )
         try:
             source = request_source_name(request)
-            self._authorizer.authorize(peer.uid, source)
+            self._authorizer.authorize(
+                peer.uid,
+                source,
+                operation=operation,
+            )
             if request.api_version != API_VERSION:
                 raise GuardFailure(
                     "UNSUPPORTED_API_VERSION",
@@ -295,30 +303,36 @@ class MotionGuardCore:
         _peer: PeerCredentials,
         _source: str,
     ) -> pb.MotionGuardResponse:
-        operational = (
-            self._epoch_durable
-            and self._actuator_configured
-            and self._startup_zero_confirmed
-        )
-        if not self._epoch_durable:
-            reason = "EPOCH_NOT_DURABLE"
-        elif not self._actuator_configured:
-            reason = self._actuator_reason
-        elif not self._startup_zero_confirmed:
-            reason = "STARTUP_ZERO_UNCONFIRMED"
-        else:
-            reason = "OK"
-        response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
-        outcome.ready = operational
-        outcome.actuator_configured = self._actuator_configured
-        outcome.epoch_durable = self._epoch_durable
-        outcome.reason = reason
-        outcome.generation = self.epoch.generation
-        outcome.boot_nonce = self.epoch.boot_nonce_bytes
-        outcome.startup_zero_confirmed = self._startup_zero_confirmed
-        outcome.motion_stop_generation = self._motion_stop_generation
-        return response
+        with self._state_lock:
+            recovery_fenced = bool(self.epoch.recovery_fence_token_hex)
+            operational = (
+                self._epoch_durable
+                and self._actuator_configured
+                and self._startup_zero_confirmed
+                and not recovery_fenced
+            )
+            if not self._epoch_durable:
+                reason = "EPOCH_NOT_DURABLE"
+            elif not self._actuator_configured:
+                reason = self._actuator_reason
+            elif not self._startup_zero_confirmed:
+                reason = "STARTUP_ZERO_UNCONFIRMED"
+            elif recovery_fenced:
+                reason = "RECOVERY_FENCED"
+            else:
+                reason = "OK"
+            response, outcome = self._response(request)
+            outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
+            outcome.ready = operational
+            outcome.actuator_configured = self._actuator_configured
+            outcome.epoch_durable = self._epoch_durable
+            outcome.reason = reason
+            outcome.generation = self.epoch.generation
+            outcome.boot_nonce = self.epoch.boot_nonce_bytes
+            outcome.startup_zero_confirmed = self._startup_zero_confirmed
+            outcome.motion_stop_generation = self._motion_stop_generation
+            outcome.recovery_fence_held = recovery_fenced
+            return response
 
     def _handle_get_guard_state(
         self,
@@ -326,15 +340,23 @@ class MotionGuardCore:
         _peer: PeerCredentials,
         _source: str,
     ) -> pb.MotionGuardResponse:
-        response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
-        outcome.generation = self.epoch.generation
-        outcome.boot_nonce = self.epoch.boot_nonce_bytes
-        outcome.last_zero_ack_id = self.epoch.last_zero_ack_id
-        outcome.fenced = self.epoch.fenced
-        outcome.active_lease_id = self._active_lease_id
-        outcome.motion_stop_generation = self._motion_stop_generation
-        return response
+        with self._state_lock:
+            response, outcome = self._response(request)
+            outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
+            outcome.generation = self.epoch.generation
+            outcome.boot_nonce = self.epoch.boot_nonce_bytes
+            outcome.last_zero_ack_id = self.epoch.last_zero_ack_id
+            outcome.fenced = self.epoch.fenced
+            outcome.active_lease_id = self._active_lease_id
+            outcome.motion_stop_generation = self._motion_stop_generation
+            token = bytes.fromhex(self.epoch.recovery_fence_token_hex)
+            outcome.recovery_fence_held = bool(token)
+            if token:
+                outcome.recovery_fence_token_sha256 = hashlib.sha256(token).digest()
+                outcome.recovery_fence_correlation_sha256 = bytes.fromhex(
+                    self.epoch.recovery_fence_correlation_sha256
+                )
+            return response
 
     def _handle_acquire_lease(
         self,
@@ -342,6 +364,12 @@ class MotionGuardCore:
         peer: PeerCredentials,
         source: str,
     ) -> pb.MotionGuardResponse:
+        with self._state_lock:
+            if self.epoch.recovery_fence_token_hex:
+                raise GuardFailure(
+                    "RECOVERY_FENCED",
+                    "motion recovery fence is held",
+                )
         cached = self._prepare_mutation(
             request,
             peer,
@@ -359,6 +387,11 @@ class MotionGuardCore:
             return cached
         envelope = request.acquire_lease.envelope
         with self._state_lock:
+            if self.epoch.recovery_fence_token_hex:
+                raise GuardFailure(
+                    "RECOVERY_FENCED",
+                    "motion recovery fence is held",
+                )
             if not self._actuator_configured or not self._epoch_durable:
                 raise GuardFailure("MOTION_SINK_NOT_READY", self._actuator_reason)
             if not self._startup_zero_confirmed:
@@ -597,7 +630,48 @@ class MotionGuardCore:
             return cached
         if not body.reason.strip():
             raise GuardFailure("INVALID_ARGUMENT", "stop reason is required")
+        if body.mode not in {
+            pb.GLOBAL_STOP_MODE_ORDINARY,
+            pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE,
+            pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE,
+        }:
+            raise GuardFailure("INVALID_ARGUMENT", "unknown global stop mode")
+        correlation = body.recovery_correlation.strip()
+        if body.mode != pb.GLOBAL_STOP_MODE_ORDINARY and not correlation:
+            raise GuardFailure(
+                "INVALID_ARGUMENT",
+                "recovery correlation is required for recovery fence operations",
+            )
+        correlation_sha256 = hashlib.sha256(correlation.encode("utf-8")).hexdigest()
         with self._state_lock:
+            held_token_hex = self.epoch.recovery_fence_token_hex
+            held_correlation_sha256 = (
+                self.epoch.recovery_fence_correlation_sha256
+            )
+            if body.mode == pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE:
+                if held_token_hex and not hmac.compare_digest(
+                    held_correlation_sha256, correlation_sha256
+                ):
+                    raise GuardFailure(
+                        "RESOURCE_BUSY",
+                        "a recovery fence is already held by another correlation",
+                    )
+            elif body.mode == pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE:
+                supplied_token = bytes(body.recovery_fence_token)
+                if not held_token_hex:
+                    raise GuardFailure(
+                        "OUTCOME_UNKNOWN",
+                        "no recovery fence is currently held",
+                    )
+                if len(supplied_token) != 32 or not hmac.compare_digest(
+                    supplied_token, bytes.fromhex(held_token_hex)
+                ) or not hmac.compare_digest(
+                    correlation_sha256, held_correlation_sha256
+                ):
+                    raise GuardFailure(
+                        "PERMISSION_DENIED",
+                        "recovery fence token or correlation does not match",
+                    )
             if self._motion_stop_generation == MAX_GENERATION:
                 raise GuardFailure(
                     "RESOURCE_EXHAUSTED",
@@ -609,11 +683,25 @@ class MotionGuardCore:
             try:
                 zero_ack = self._zero()
                 self._clear_lease()
+                recovery_updates: Dict[str, object] = {}
+                if body.mode == pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE:
+                    recovery_updates = {
+                        "recovery_fence_token_hex": (
+                            held_token_hex or secrets.token_hex(32)
+                        ),
+                        "recovery_fence_correlation_sha256": correlation_sha256,
+                    }
+                elif body.mode == pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE:
+                    recovery_updates = {
+                        "recovery_fence_token_hex": "",
+                        "recovery_fence_correlation_sha256": "",
+                    }
                 self._commit_epoch(
                     lease=pb.LEASE_STATE_IDLE,
                     fenced=True,
                     last_zero_ack_id=zero_ack.zero_ack_id,
                     startup_zero_confirmed=True,
+                    **recovery_updates,
                 )
             except ActuatorError as exc:
                 self._mark_zero_unconfirmed(exc)
@@ -629,6 +717,11 @@ class MotionGuardCore:
         outcome.zero_ack.CopyFrom(zero_ack)
         outcome.lease_revoked = lease_revoked
         outcome.motion_stop_generation = self._motion_stop_generation
+        outcome.recovery_fence_held = bool(self.epoch.recovery_fence_token_hex)
+        if body.mode == pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE:
+            outcome.recovery_fence_token = bytes.fromhex(
+                self.epoch.recovery_fence_token_hex
+            )
         self._remember(
             request,
             peer,
@@ -657,11 +750,19 @@ class MotionGuardCore:
         response, outcome = self._response(request)
         outcome.target_operation_id = operation_id
         records = self._operation_index.get(operation_id, ())
+        recovery_verifier = bool(
+            namespace == "global_stop"
+            and source == "GATEWAY_MANUAL"
+            and self._authorizer.is_recovery_verifier(peer.uid)
+        )
         record = next(
             (
                 candidate
                 for candidate in records
-                if candidate.peer_uid == peer.uid
+                if (
+                    candidate.peer_uid == peer.uid
+                    or recovery_verifier
+                )
                 and candidate.source == source
                 and candidate.namespace == namespace
             ),
@@ -685,6 +786,8 @@ class MotionGuardCore:
             outcome.zero_ack.zero_ack_id = record.zero_ack_id
             outcome.zero_ack.applied_monotonic_ns = record.zero_applied_ns
         outcome.motion_stop_generation = record.motion_stop_generation
+        outcome.recovery_fence_token = record.recovery_fence_token
+        outcome.recovery_fence_held = record.recovery_fence_held
         return response
 
     def _prepare_mutation(
@@ -951,6 +1054,8 @@ class MotionGuardCore:
         fenced: Optional[bool] = None,
         last_zero_ack_id: Optional[str] = None,
         startup_zero_confirmed: Optional[bool] = None,
+        recovery_fence_token_hex: Optional[str] = None,
+        recovery_fence_correlation_sha256: Optional[str] = None,
     ) -> None:
         next_lease = self.lease_state if lease is None else lease
         updates: Dict[str, object] = {
@@ -962,6 +1067,12 @@ class MotionGuardCore:
             updates["last_zero_ack_id"] = last_zero_ack_id
         if startup_zero_confirmed is not None:
             updates["startup_zero_confirmed"] = startup_zero_confirmed
+        if recovery_fence_token_hex is not None:
+            updates["recovery_fence_token_hex"] = recovery_fence_token_hex
+        if recovery_fence_correlation_sha256 is not None:
+            updates["recovery_fence_correlation_sha256"] = (
+                recovery_fence_correlation_sha256
+            )
         next_epoch = self.epoch.with_updates(**updates)
         try:
             self._epoch_store.persist(next_epoch)
@@ -1074,6 +1185,12 @@ class MotionGuardCore:
             ),
             motion_stop_generation=getattr(outcome, "motion_stop_generation", 0),
             namespace=namespace,
+            recovery_fence_token=bytes(
+                getattr(outcome, "recovery_fence_token", b"")
+            ),
+            recovery_fence_held=bool(
+                getattr(outcome, "recovery_fence_held", False)
+            ),
             acquire=acquire,
         )
         target = self._priority_records if priority else self._ordinary_records

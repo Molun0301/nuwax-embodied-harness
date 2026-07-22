@@ -12,7 +12,6 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlencode
 import uuid
 
 from contracts.artifacts import ArtifactRetentionPolicy
@@ -28,8 +27,6 @@ from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.geometry import Pose, Quaternion, Twist, Vector3
-from contracts.memory import MemoryPayloadFilter
-from contracts.spatial_memory import SceneSpaceReviewStatus
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import (
@@ -38,9 +35,8 @@ from contracts.runtime_views import (
     ServiceHealthStatus,
     ServiceHealthSummary,
 )
-from contracts.image import ImageFrame
 from contracts.streams import StreamPayloadKind
-from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, StreamBus, TaskManager
+from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateStore, StreamBus, TaskManager
 from core.safety_guard import MotionStopGenerationError
 from core.task_manager import (
     TaskCancelledError,
@@ -171,7 +167,6 @@ class _ShmVideoFrameSource:
         # __SHM_FRAME_SOURCE_PLACEHOLDER__
         try:
             from contracts.image import ImageFrame, ImageEncoding
-            from contracts.base import utc_now
             resolved_camera_id = str(camera_id or "front_camera")
             camera_info = self._resolve_camera_info(resolved_camera_id)
             # 内参可用时用其真实分辨率与 frame_id；不可用时回退为实机推流实测
@@ -5460,7 +5455,8 @@ class GatewayRuntime:
             "navigate_to_pose",
             request_id=self._build_runtime_request_id("debug-navigation-goal"),
         )
-        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
+        runtime = self.platform_geometry_runtime
+        provider = getattr(runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "GeometryRuntimeProvider 未初始化；请确认 nuwax-geometry-runtime 已启动且平台几何 profile 已启用。",
@@ -5468,7 +5464,7 @@ class GatewayRuntime:
                 http_status=503,
             )
         try:
-            self.platform_geometry_runtime._cancel_platform_exploration_navigation()
+            runtime._cancel_platform_exploration_navigation()
         except Exception:
             RUNTIME_LOGGER.debug("debug_navigation_goal 取消平台探索在途目标失败。", exc_info=True)
         # RViz /goal_pose 直通 nuwax-geometry-runtime.SetNavigationGoal。
@@ -5553,7 +5549,8 @@ class GatewayRuntime:
         """Debug 面板 RViz Publish Point：发布 /clicked_point，不触发导航。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
+        runtime = self.platform_geometry_runtime
+        provider = getattr(runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "GeometryRuntimeProvider 未初始化；请确认几何运行时已启动且 profile 已启用。",
@@ -5617,7 +5614,8 @@ class GatewayRuntime:
         """Debug 面板 RViz 2D Pose Estimate 直通重定位接口。"""
 
         pose = self._build_pose_from_arguments(arguments)
-        provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
+        runtime = self.platform_geometry_runtime
+        provider = getattr(runtime, "_remote_provider", None)
         if provider is None:
             raise GatewayError(
                 "GeometryRuntimeProvider 未初始化；请确认几何运行时已启动且 profile 已启用。",
@@ -5662,7 +5660,7 @@ class GatewayRuntime:
                 http_status=503,
                 details=result,
             )
-        geometry_runtime = self.platform_geometry_runtime
+        geometry_runtime = runtime
         if geometry_runtime is not None:
             try:
                 clear_hint = getattr(geometry_runtime, "clear_debug_initial_pose_hint", None)
@@ -10340,6 +10338,7 @@ class GatewayRuntime:
         request_id: str,
         poll_interval_sec: float,
         acknowledge_interrupt: bool = True,
+        allow_rollover_recovery: bool = False,
     ) -> Any:
         if context is not None:
             context.update(
@@ -10394,6 +10393,55 @@ class GatewayRuntime:
                 retained_failed_child = bool(
                     status == ExplorationStatus.FAILED.value and child_task_id
                 )
+                if retained_failed_child and allow_rollover_recovery:
+                    child_lease = metadata.get("child_lease")
+                    if not isinstance(child_lease, dict):
+                        child_lease = {}
+                    try:
+                        exploration_generation = int(
+                            metadata.get("exploration_generation") or 0
+                        )
+                        child_owner_kind = int(
+                            child_lease.get("owner_kind") or 0
+                        )
+                        child_goal_generation = int(
+                            child_lease.get("goal_generation") or 0
+                        )
+                        child_producer_generation = int(
+                            child_lease.get("producer_runtime_generation") or 0
+                        )
+                    except (TypeError, ValueError):
+                        exploration_generation = 0
+                        child_owner_kind = 0
+                        child_goal_generation = 0
+                        child_producer_generation = 0
+                    child_payload_sha256 = child_lease.get("goal_payload_sha256")
+                    if not isinstance(child_payload_sha256, (bytes, bytearray)):
+                        child_payload_sha256 = b""
+                    complete_rollover_identity = bool(
+                        metadata.get("rollover_recovery_eligible") is True
+                        and exploration_generation > 0
+                        and str(child_lease.get("session_id") or "").strip()
+                        == child_task_id
+                        and str(
+                            child_lease.get("parent_request_id") or ""
+                        ).strip()
+                        == request_id
+                        and child_owner_kind > 0
+                        and child_goal_generation > 0
+                        and child_producer_generation > 0
+                        and len(child_payload_sha256) == 32
+                        and any(child_payload_sha256)
+                    )
+                    if complete_rollover_identity:
+                        return last_context
+                    raise self._exploration_parking_error(
+                        request_id=request_id,
+                        reason=(
+                            "StopExploration rollover recovery identity 不完整"
+                        ),
+                        exploration_context=last_context,
+                    )
                 if (
                     not retained_failed_child
                     and metadata.get("exploration_terminal") is not True
@@ -10473,17 +10521,306 @@ class GatewayRuntime:
             message="探索任务检测到 runtime generation rollover。",
             payload=details,
         )
+        navigation_rollover = rollovers.get("navigation_runtime_generation")
+        navigation_only = bool(
+            navigation_rollover
+            and set(rollovers) == {"navigation_runtime_generation"}
+        )
+        try:
+            expected_navigation_generation = int(
+                dict(navigation_rollover or {}).get("expected") or 0
+            )
+            observed_navigation_generation = int(
+                dict(navigation_rollover or {}).get("current") or 0
+            )
+        except (TypeError, ValueError):
+            expected_navigation_generation = 0
+            observed_navigation_generation = 0
+        forward_navigation_rollover = bool(
+            navigation_only
+            and expected_navigation_generation > 0
+            and observed_navigation_generation > expected_navigation_generation
+        )
         terminal_context = self._stop_exploration_with_safety_barrier(
             context,
             request_id=request_id,
             poll_interval_sec=poll_interval_sec,
             acknowledge_interrupt=False,
+            allow_rollover_recovery=forward_navigation_rollover,
         )
         terminal_state = getattr(terminal_context, "exploration_state", None)
         raw_status = getattr(terminal_state, "status", None)
-        details["safe_terminal_status"] = str(
+        safe_terminal_status = str(
             getattr(raw_status, "value", raw_status) or ""
         ).lower()
+        details["safe_terminal_status"] = safe_terminal_status
+        terminal_metadata = dict(getattr(terminal_state, "metadata", {}) or {})
+
+        if forward_navigation_rollover and terminal_metadata.get(
+            "rollover_recovery_eligible"
+        ) is True:
+            child_lease = terminal_metadata.get("child_lease")
+            if not isinstance(child_lease, dict):
+                child_lease = {}
+            try:
+                exploration_generation = int(
+                    terminal_metadata.get("exploration_generation") or 0
+                )
+                child_owner_kind = int(child_lease.get("owner_kind") or 0)
+                child_goal_generation = int(
+                    child_lease.get("goal_generation") or 0
+                )
+                child_producer_generation = int(
+                    child_lease.get("producer_runtime_generation") or 0
+                )
+            except (TypeError, ValueError):
+                exploration_generation = 0
+                child_owner_kind = 0
+                child_goal_generation = 0
+                child_producer_generation = 0
+            child_session_id = str(child_lease.get("session_id") or "").strip()
+            child_parent_request_id = str(
+                child_lease.get("parent_request_id") or ""
+            ).strip()
+            child_payload_sha256 = child_lease.get("goal_payload_sha256")
+            if not isinstance(child_payload_sha256, (bytes, bytearray)):
+                child_payload_sha256 = b""
+            complete_identity = bool(
+                safe_terminal_status == ExplorationStatus.FAILED.value
+                and self._exploration_state_request_id(terminal_context) == request_id
+                and exploration_generation > 0
+                and str(terminal_metadata.get("child_task_id") or "").strip()
+                == child_session_id
+                and child_parent_request_id == request_id
+                and child_owner_kind > 0
+                and child_goal_generation > 0
+                and child_producer_generation > 0
+                and len(child_payload_sha256) == 32
+                and any(child_payload_sha256)
+            )
+            if not complete_identity:
+                details["rollover_recovery_identity_complete"] = False
+                raise TaskSafetyBarrierError(
+                    "导航 runtime 代际切换后的探索 ownership 身份不完整。",
+                    details=details,
+                )
+
+            recovery_identity = "\0".join(
+                (
+                    request_id,
+                    str(exploration_generation),
+                    child_session_id,
+                    str(child_goal_generation),
+                    str(expected_navigation_generation),
+                    str(observed_navigation_generation),
+                )
+            )
+            recovery_key = uuid.uuid5(uuid.NAMESPACE_URL, recovery_identity).hex
+            correlation_id = "exploration-rollover:%s" % recovery_key
+            hold_operation_id = "exploration-rollover-hold:%s" % recovery_key
+            release_operation_id = "exploration-rollover-release:%s" % recovery_key
+            details.update(
+                {
+                    "rollover_recovery_identity_complete": True,
+                    "recovery_correlation_id": correlation_id,
+                    "recovery_hold_operation_id": hold_operation_id,
+                    "recovery_release_operation_id": release_operation_id,
+                }
+            )
+
+            try:
+                hold_confirmation = self.motion_guard.hold_recovery_fence(
+                    reason="exploration navigation runtime generation rollover",
+                    correlation_id=correlation_id,
+                    operation_id=hold_operation_id,
+                )
+            except Exception as exc:
+                details["recovery_fence_hold_error"] = str(exc)
+                raise TaskSafetyBarrierError(
+                    "导航 runtime 代际切换后无法确认 durable recovery fence。",
+                    details=details,
+                ) from exc
+
+            hold_zero = getattr(hold_confirmation, "zero", None)
+            recovery_fence_token = bytes(
+                getattr(hold_confirmation, "recovery_fence_token", b"") or b""
+            )
+            guard_generation = int(
+                getattr(hold_confirmation, "generation", 0) or 0
+            )
+            guard_boot_nonce = bytes(
+                getattr(hold_confirmation, "boot_nonce", b"") or b""
+            )
+            hold_motion_stop_generation = int(
+                getattr(hold_confirmation, "motion_stop_generation", 0) or 0
+            )
+            hold_zero_ack_id = str(
+                getattr(hold_zero, "zero_ack_id", "") or ""
+            ).strip()
+            hold_zero_applied_ns = int(
+                getattr(hold_zero, "applied_monotonic_ns", 0) or 0
+            )
+            valid_hold = bool(
+                getattr(hold_confirmation, "operation_id", "")
+                == hold_operation_id
+                and getattr(hold_confirmation, "recovery_fence_held", False)
+                is True
+                and len(recovery_fence_token) == 32
+                and any(recovery_fence_token)
+                and guard_generation > 0
+                and len(guard_boot_nonce) == 16
+                and hold_motion_stop_generation > 0
+                and hold_zero_ack_id
+                and hold_zero_applied_ns > 0
+            )
+            if not valid_hold:
+                details["recovery_fence_hold_confirmed"] = False
+                raise TaskSafetyBarrierError(
+                    "durable recovery fence 返回的零速或 fence proof 不完整。",
+                    details=details,
+                )
+            details.update(
+                {
+                    "recovery_fence_hold_confirmed": True,
+                    "recovery_hold_zero_ack_id": hold_zero_ack_id,
+                    "recovery_hold_motion_stop_generation": (
+                        hold_motion_stop_generation
+                    ),
+                    "recovery_guard_generation": guard_generation,
+                }
+            )
+
+            guard_proof = {
+                "stop_operation_id": hold_operation_id,
+                "guard_generation": guard_generation,
+                "guard_boot_nonce": guard_boot_nonce,
+                "motion_stop_generation": hold_motion_stop_generation,
+                "zero_ack_id": hold_zero_ack_id,
+                "zero_applied_monotonic_ns": hold_zero_applied_ns,
+                "recovery_fence_token": recovery_fence_token,
+                "recovery_correlation": correlation_id,
+            }
+            try:
+                recovered_context = self.navigation_service.recover_exploration_after_navigation_rollover(
+                    request_id=request_id,
+                    exploration_generation=exploration_generation,
+                    child_lease=dict(child_lease),
+                    expected_navigation_runtime_generation=(
+                        expected_navigation_generation
+                    ),
+                    observed_navigation_runtime_generation=(
+                        observed_navigation_generation
+                    ),
+                    guard_proof=guard_proof,
+                )
+            except Exception as exc:
+                details["rollover_recovery_error"] = str(exc)
+                raise TaskSafetyBarrierError(
+                    "探索 rollover recovery 结果不确定，durable fence 保持生效。",
+                    details=details,
+                ) from exc
+
+            recovered_state = getattr(recovered_context, "exploration_state", None)
+            recovered_raw_status = getattr(recovered_state, "status", None)
+            recovered_status = str(
+                getattr(recovered_raw_status, "value", recovered_raw_status) or ""
+            ).lower()
+            recovered_metadata = dict(
+                getattr(recovered_state, "metadata", {}) or {}
+            )
+            recovery_verified = bool(
+                recovered_status == ExplorationStatus.FAILED.value
+                and self._exploration_state_request_id(recovered_context) == request_id
+                and recovered_metadata.get("exploration_terminal") is True
+                and not str(recovered_metadata.get("child_task_id") or "").strip()
+                and recovered_metadata.get("last_stop_reason")
+                == "runtime_rollover_aborted_safe"
+            )
+            if not recovery_verified:
+                details["rollover_recovery_terminal_verified"] = False
+                raise TaskSafetyBarrierError(
+                    "探索 rollover recovery 未返回 exact failed terminal。",
+                    details=details,
+                )
+            details["rollover_recovery_terminal_verified"] = True
+
+            try:
+                release_confirmation = self.motion_guard.release_recovery_fence(
+                    reason="exploration navigation runtime rollover recovered",
+                    correlation_id=correlation_id,
+                    recovery_fence_token=recovery_fence_token,
+                    operation_id=release_operation_id,
+                )
+            except Exception as exc:
+                details["recovery_fence_release_error"] = str(exc)
+                raise TaskSafetyBarrierError(
+                    "探索 rollover recovery 已完成，但无法确认 recovery fence 释放。",
+                    details=details,
+                ) from exc
+            release_zero = getattr(release_confirmation, "zero", None)
+            release_zero_ack_id = str(
+                getattr(release_zero, "zero_ack_id", "") or ""
+            ).strip()
+            release_zero_applied_ns = int(
+                getattr(release_zero, "applied_monotonic_ns", 0) or 0
+            )
+            release_motion_stop_generation = int(
+                getattr(release_confirmation, "motion_stop_generation", 0) or 0
+            )
+            release_guard_generation = int(
+                getattr(release_confirmation, "generation", 0) or 0
+            )
+            release_guard_boot_nonce = bytes(
+                getattr(release_confirmation, "boot_nonce", b"") or b""
+            )
+            valid_release = bool(
+                getattr(release_confirmation, "operation_id", "")
+                == release_operation_id
+                and getattr(release_confirmation, "recovery_fence_held", True)
+                is False
+                and not bytes(
+                    getattr(
+                        release_confirmation,
+                        "recovery_fence_token",
+                        b"",
+                    )
+                    or b""
+                )
+                and release_motion_stop_generation
+                > hold_motion_stop_generation
+                and release_guard_generation == guard_generation
+                and release_guard_boot_nonce == guard_boot_nonce
+                and release_zero_ack_id
+                and release_zero_applied_ns > 0
+            )
+            if not valid_release:
+                details["recovery_fence_release_confirmed"] = False
+                raise TaskSafetyBarrierError(
+                    "recovery fence 释放未返回第二次 exact zero proof。",
+                    details=details,
+                )
+            details.update(
+                {
+                    "safe_terminal_status": recovered_status,
+                    "safe_terminal_reason": "runtime_rollover_aborted_safe",
+                    "recovery_fence_release_confirmed": True,
+                    "recovery_release_zero_ack_id": release_zero_ack_id,
+                    "recovery_release_motion_stop_generation": (
+                        release_motion_stop_generation
+                    ),
+                    "safety_disposition": "ABORTED_SAFE",
+                }
+            )
+        elif forward_navigation_rollover and str(
+            terminal_metadata.get("child_task_id") or ""
+        ).strip():
+            details["rollover_recovery_eligible"] = terminal_metadata.get(
+                "rollover_recovery_eligible"
+            )
+            raise TaskSafetyBarrierError(
+                "导航 runtime 代际切换后仍保留未知 child ownership。",
+                details=details,
+            )
         raise GatewayError(
             "探索 runtime generation 已切换，旧任务已安全停止。",
             error_code="task_generation_rollover",

@@ -799,6 +799,50 @@ fn schema_pose_is_finite_and_normalized(pose: &schema::Pose) -> bool {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn guarded_scheduler_result(
+    scheduler_exited_first: bool,
+    loop_result: NavStackResult<()>,
+    shutdown_result: NavStackResult<()>,
+    task_result: NavStackResult<()>,
+) -> NavStackResult<()> {
+    if scheduler_exited_first && task_result.is_err() {
+        return task_result;
+    }
+    loop_result?;
+    shutdown_result?;
+    task_result
+}
+
+#[cfg(feature = "guard-runtime")]
+async fn coordinate_guarded_scheduler<LoopFuture, TaskFuture, Shutdown, ShutdownFuture>(
+    loop_future: LoopFuture,
+    task_future: TaskFuture,
+    shutdown: Shutdown,
+) -> NavStackResult<()>
+where
+    LoopFuture: Future<Output = NavStackResult<()>>,
+    TaskFuture: Future<Output = NavStackResult<()>>,
+    Shutdown: FnOnce() -> ShutdownFuture,
+    ShutdownFuture: Future<Output = NavStackResult<()>>,
+{
+    tokio::pin!(loop_future);
+    tokio::pin!(task_future);
+
+    tokio::select! {
+        biased;
+        task_result = &mut task_future => {
+            let loop_result = loop_future.await;
+            guarded_scheduler_result(true, loop_result, Ok(()), task_result)
+        }
+        loop_result = &mut loop_future => {
+            let shutdown_result = shutdown().await;
+            let task_result = task_future.await;
+            guarded_scheduler_result(false, loop_result, shutdown_result, task_result)
+        }
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn run_guarded_nav_scheduler(
     node: ModuleNode,
     shutdown: oneshot::Receiver<()>,
@@ -821,25 +865,21 @@ async fn run_guarded_nav_scheduler(
     let status = scheduler.subscribe_status();
     signal_ready(ready)?;
 
-    let loop_result = run_guarded_nav_loop(
+    let loop_future = run_guarded_nav_loop(
         &node, &transport, &scheduler, shutdown, goals, poses, paths, costmaps, cancels, status,
-    )
-    .await;
-    let shutdown_result = if task.is_finished() {
-        Ok(())
-    } else {
+    );
+    let task_future = async move {
+        task.await
+            .map_err(|error| NavStackError::Internal(format!("guard scheduler join: {error}")))?
+            .map_err(|error| module_error("guarded_nav_scheduler.task", error))
+    };
+    coordinate_guarded_scheduler(loop_future, task_future, || async {
         scheduler
             .shutdown()
             .await
             .map_err(|error| module_error("guarded_nav_scheduler.shutdown", error))
-    };
-    let task_result = task
-        .await
-        .map_err(|error| NavStackError::Internal(format!("guard scheduler join: {error}")))?
-        .map_err(|error| module_error("guarded_nav_scheduler.task", error));
-    loop_result?;
-    shutdown_result?;
-    task_result
+    })
+    .await
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -7406,6 +7446,117 @@ mod guarded_tests {
         let (twist, stop) = planner.step(0.3);
         assert_eq!(stop, None);
         assert_ne!(twist, Twist2::ZERO);
+    }
+
+    #[test]
+    fn scheduler_task_error_wins_when_scheduler_exits_first() {
+        let result = guarded_scheduler_result(
+            true,
+            Err(NavStackError::Internal(
+                "guard scheduler status stream closed".into(),
+            )),
+            Ok(()),
+            Err(NavStackError::Internal("motion guard root cause".into())),
+        );
+
+        assert!(result
+            .expect_err("fatal scheduler task must fail")
+            .to_string()
+            .contains("motion guard root cause"));
+    }
+
+    #[test]
+    fn scheduler_loop_error_survives_normal_task_and_shutdown() {
+        let result = guarded_scheduler_result(
+            true,
+            Err(NavStackError::Internal("original loop error".into())),
+            Ok(()),
+            Ok(()),
+        );
+
+        assert!(result
+            .expect_err("loop failure must survive")
+            .to_string()
+            .contains("original loop error"));
+    }
+
+    #[test]
+    fn scheduler_loop_error_wins_when_loop_exits_first() {
+        let result = guarded_scheduler_result(
+            false,
+            Err(NavStackError::Internal("original loop error".into())),
+            Ok(()),
+            Err(NavStackError::Internal("later task error".into())),
+        );
+
+        assert!(result
+            .expect_err("first loop failure must survive")
+            .to_string()
+            .contains("original loop error"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_task_completion_is_recorded_before_loop_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (release_loop, loop_released) = oneshot::channel();
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+
+        let result = coordinate_guarded_scheduler(
+            async {
+                loop_released.await.expect("task releases loop cleanup");
+                Err(NavStackError::Internal(
+                    "guard scheduler status stream closed".into(),
+                ))
+            },
+            async {
+                release_loop.send(()).expect("loop cleanup receiver alive");
+                Err(NavStackError::Internal("motion guard root cause".into()))
+            },
+            move || async move {
+                shutdown_observer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result
+            .expect_err("scheduler task failure must win")
+            .to_string()
+            .contains("motion guard root cause"));
+        assert!(!shutdown_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn scheduler_loop_completion_triggers_shutdown_and_stays_primary() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (release_task, task_released) = oneshot::channel();
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+
+        let result = coordinate_guarded_scheduler(
+            async {
+                release_task.send(()).expect("task receiver alive");
+                Err(NavStackError::Internal("original loop error".into()))
+            },
+            async {
+                task_released.await.expect("loop releases task cleanup");
+                Err(NavStackError::Internal("later task error".into()))
+            },
+            move || async move {
+                shutdown_observer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result
+            .expect_err("first loop failure must survive")
+            .to_string()
+            .contains("original loop error"));
+        assert!(shutdown_called.load(Ordering::SeqCst));
     }
 
     #[test]

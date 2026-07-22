@@ -19,14 +19,15 @@ use crate::constants::{
     COMMAND_DEADLINE_MS, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_UDS_PATH, MAX_FRAME_BYTES,
     RENEW_INTERVAL_MS,
 };
-use crate::crypto::sha256;
+use crate::crypto::{constant_time_eq, sha256};
 use crate::wire::{
     motion_guard_request, motion_guard_response, submit_motion_command_request, AckCode,
-    AcquireLeaseRequest, AcquireLeaseResponse, GetReadinessRequest, GlobalStopEnvelope,
-    GuardAction, GuardResult, GuardSource, LeaseState, LeaseTuple, MotionGuardRequest,
-    MotionGuardResponse, RenewLeaseRequest, RenewLeaseResponse, RequestEnvelope,
-    RevokeAndZeroRequest, StopAllMotionRequest, StopCommand, SubmitMotionCommandRequest,
-    TwistCommand, ZeroAck, API_VERSION,
+    AcquireLeaseRequest, AcquireLeaseResponse, GetGuardStateRequest, GetGuardStateResponse,
+    GetOperationResultRequest, GetOperationResultResponse, GetReadinessRequest, GlobalStopEnvelope,
+    GlobalStopMode, GuardAction, GuardResult, GuardSource, LeaseState, LeaseTuple,
+    MotionGuardRequest, MotionGuardResponse, OperationNamespace, RenewLeaseRequest,
+    RenewLeaseResponse, RequestEnvelope, RevokeAndZeroRequest, StopAllMotionRequest, StopCommand,
+    SubmitMotionCommandRequest, TwistCommand, ZeroAck, API_VERSION,
 };
 
 const BOOT_NONCE_BYTES: usize = 16;
@@ -135,6 +136,25 @@ pub struct GlobalStopConfirmation {
     pub zero: ZeroConfirmation,
     /// Whether an active lease was revoked by this stop.
     pub lease_revoked: bool,
+}
+
+/// Exact proof that one durable recovery fence is currently held by the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRecoveryFenceProof {
+    /// Idempotency key of the completed hold operation.
+    pub operation_id: String,
+    /// Stable correlation shared by hold, Geometry recovery, and release.
+    pub recovery_correlation: String,
+    /// Guard boot generation returned with the durable state proof.
+    pub generation: u64,
+    /// Exact sixteen-byte guard boot nonce.
+    pub boot_nonce: [u8; BOOT_NONCE_BYTES],
+    /// Guard-owned global-stop generation produced by the hold operation.
+    pub motion_stop_generation: u64,
+    /// Correlated actuator zero acknowledgement produced by the hold operation.
+    pub zero: ZeroConfirmation,
+    /// Secret 256-bit recovery-fence token returned only by the hold operation.
+    pub recovery_fence_token: [u8; 32],
 }
 
 /// One sealed priority fence request that may be replayed byte-for-byte.
@@ -360,6 +380,59 @@ impl MotionGuardClient {
         })
     }
 
+    /// Verifies that a correlated global-stop operation still owns the durable recovery fence.
+    ///
+    /// The operation journal is checked first and the current guard state second, so a concurrent
+    /// release or a guard reboot makes verification fail closed before Geometry mutates ownership.
+    pub async fn verify_held_recovery_fence(
+        &mut self,
+        proof: &HeldRecoveryFenceProof,
+    ) -> Result<(), MotionGuardClientError> {
+        validate_held_recovery_fence_proof(proof).map_err(MotionGuardClientError::InvalidInput)?;
+
+        let operation_request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::GetOperationResult(
+                GetOperationResultRequest {
+                    source: GuardSource::GatewayManual as i32,
+                    operation_id: proof.operation_id.trim().to_string(),
+                    operation_namespace: OperationNamespace::GlobalStop as i32,
+                },
+            )),
+        };
+        let operation_outcome = self
+            .exchange_allowing_acks(
+                operation_request,
+                OutcomeKind::GetOperationResult,
+                &[AckCode::Zeroed, AckCode::ResourceFenced],
+            )
+            .await?;
+        let motion_guard_response::Outcome::GetOperationResult(operation) = operation_outcome
+        else {
+            unreachable!("exchange already correlated the outcome")
+        };
+
+        let state_request = MotionGuardRequest {
+            api_version: API_VERSION,
+            request_id: new_request_id(),
+            operation: Some(motion_guard_request::Operation::GetGuardState(
+                GetGuardStateRequest {
+                    source: GuardSource::GatewayManual as i32,
+                },
+            )),
+        };
+        let state_outcome = self
+            .exchange(state_request, OutcomeKind::GetGuardState, AckCode::Received)
+            .await?;
+        let motion_guard_response::Outcome::GetGuardState(state) = state_outcome else {
+            unreachable!("exchange already correlated the outcome")
+        };
+
+        validate_held_recovery_fence_responses(proof, &operation, &state)
+            .or_else(|message| self.protocol_error(message))
+    }
+
     /// Applies an ordinary global stop without changing future admission policy.
     pub async fn stop_all_motion(
         &mut self,
@@ -393,6 +466,9 @@ impl MotionGuardClient {
                         deadline_monotonic_ns: deadline,
                     }),
                     reason: reason.to_string(),
+                    mode: GlobalStopMode::Ordinary as i32,
+                    recovery_correlation: String::new(),
+                    recovery_fence_token: Vec::new(),
                 },
             )),
         };
@@ -840,6 +916,8 @@ enum OutcomeKind {
     RevokeAndZero,
     StopAllMotion,
     GetReadiness,
+    GetOperationResult,
+    GetGuardState,
 }
 
 impl OutcomeKind {
@@ -853,7 +931,12 @@ impl OutcomeKind {
             motion_guard_request::Operation::RevokeAndZero(_) => Some(Self::RevokeAndZero),
             motion_guard_request::Operation::StopAllMotion(_) => Some(Self::StopAllMotion),
             motion_guard_request::Operation::GetReadiness(_) => Some(Self::GetReadiness),
-            _ => None,
+            motion_guard_request::Operation::GetOperationResult(_) => {
+                Some(Self::GetOperationResult)
+            }
+            motion_guard_request::Operation::GetGuardState(_) => Some(Self::GetGuardState),
+            motion_guard_request::Operation::ExecuteSportCommand(_)
+            | motion_guard_request::Operation::RevokeZeroAndSwitchMode(_) => None,
         }
     }
 
@@ -867,7 +950,10 @@ impl OutcomeKind {
             motion_guard_response::Outcome::RevokeAndZero(_) => Some(Self::RevokeAndZero),
             motion_guard_response::Outcome::StopAllMotion(_) => Some(Self::StopAllMotion),
             motion_guard_response::Outcome::GetReadiness(_) => Some(Self::GetReadiness),
-            _ => None,
+            motion_guard_response::Outcome::GetOperationResult(_) => Some(Self::GetOperationResult),
+            motion_guard_response::Outcome::GetGuardState(_) => Some(Self::GetGuardState),
+            motion_guard_response::Outcome::ExecuteSportCommand(_)
+            | motion_guard_response::Outcome::RevokeZeroAndSwitchMode(_) => None,
         }
     }
 }
@@ -941,6 +1027,77 @@ fn validate_zero_ack(zero: ZeroAck) -> Result<ZeroConfirmation, String> {
     })
 }
 
+fn validate_held_recovery_fence_proof(proof: &HeldRecoveryFenceProof) -> Result<(), String> {
+    validate_operation_id(&proof.operation_id).map_err(|error| error.to_string())?;
+    if proof.recovery_correlation.trim().is_empty() {
+        return Err("recovery fence correlation must not be empty".into());
+    }
+    validate_epoch(proof.generation, &proof.boot_nonce)?;
+    if proof.motion_stop_generation == 0
+        || proof.zero.zero_ack_id.trim().is_empty()
+        || proof.zero.applied_monotonic_ns == 0
+        || proof.recovery_fence_token.iter().all(|byte| *byte == 0)
+    {
+        return Err("recovery fence proof is incomplete".into());
+    }
+    Ok(())
+}
+
+fn validate_held_recovery_fence_responses(
+    proof: &HeldRecoveryFenceProof,
+    operation: &GetOperationResultResponse,
+    state: &GetGuardStateResponse,
+) -> Result<(), String> {
+    if !operation.resolved || operation.target_operation_id != proof.operation_id.trim() {
+        return Err("recovery fence hold operation is not resolved".into());
+    }
+    let target_ack = AckCode::try_from(operation.target_ack)
+        .map_err(|_| "recovery fence hold has an unknown terminal ack".to_string())?;
+    if !matches!(target_ack, AckCode::Zeroed | AckCode::ResourceFenced) {
+        return Err("recovery fence hold has no terminal zero ack".into());
+    }
+    let operation_zero = operation
+        .zero_ack
+        .as_ref()
+        .ok_or_else(|| "recovery fence hold operation has no ZeroAck".to_string())?;
+    if operation_zero.zero_ack_id != proof.zero.zero_ack_id
+        || operation_zero.applied_monotonic_ns != proof.zero.applied_monotonic_ns
+        || operation.motion_stop_generation != proof.motion_stop_generation
+        || !operation.recovery_fence_held
+        || !constant_time_eq(&operation.recovery_fence_token, &proof.recovery_fence_token)
+    {
+        return Err("recovery fence hold operation does not match the supplied proof".into());
+    }
+
+    validate_epoch(state.generation, &state.boot_nonce)?;
+    let state_lease = state
+        .result
+        .as_ref()
+        .and_then(|result| LeaseState::try_from(result.lease).ok());
+    if state.generation != proof.generation
+        || state.boot_nonce.as_slice() != proof.boot_nonce
+        || state.motion_stop_generation != proof.motion_stop_generation
+        || state.last_zero_ack_id != proof.zero.zero_ack_id
+        || !state.fenced
+        || state.active_lease_id != 0
+        || state_lease != Some(LeaseState::Idle)
+        || !state.recovery_fence_held
+    {
+        return Err("current guard state does not hold the supplied recovery fence".into());
+    }
+    let token_sha256 = sha256(&proof.recovery_fence_token);
+    let correlation_sha256 = sha256(proof.recovery_correlation.trim().as_bytes());
+    if !constant_time_eq(&state.recovery_fence_token_sha256, &token_sha256)
+        || !constant_time_eq(
+            &state.recovery_fence_correlation_sha256,
+            &correlation_sha256,
+        )
+    {
+        return Err("current guard state hashes do not match the recovery fence".into());
+    }
+    Ok(())
+}
+
 fn validate_success_state(kind: OutcomeKind, result: &GuardResult) -> Result<(), String> {
     let lease = LeaseState::try_from(result.lease)
         .map_err(|_| format!("response contains unknown lease state {}", result.lease))?;
@@ -949,7 +1106,9 @@ fn validate_success_state(kind: OutcomeKind, result: &GuardResult) -> Result<(),
             Some(LeaseState::Active)
         }
         OutcomeKind::RevokeAndZero | OutcomeKind::StopAllMotion => Some(LeaseState::Idle),
-        OutcomeKind::GetReadiness => None,
+        OutcomeKind::GetReadiness
+        | OutcomeKind::GetOperationResult
+        | OutcomeKind::GetGuardState => None,
     };
     if let Some(expected_lease) = expected {
         if lease != expected_lease {
@@ -1043,6 +1202,9 @@ fn request_operation_id(request: &MotionGuardRequest) -> Option<String> {
             .envelope
             .as_ref()
             .map(|value| value.operation_id.clone()),
+        motion_guard_request::Operation::GetOperationResult(body) => {
+            Some(body.operation_id.clone())
+        }
         _ => None,
     }
 }
@@ -1055,7 +1217,10 @@ fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResu
         motion_guard_response::Outcome::RevokeAndZero(body) => body.result.as_ref(),
         motion_guard_response::Outcome::StopAllMotion(body) => body.result.as_ref(),
         motion_guard_response::Outcome::GetReadiness(body) => body.result.as_ref(),
-        _ => None,
+        motion_guard_response::Outcome::GetOperationResult(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::GetGuardState(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::ExecuteSportCommand(_)
+        | motion_guard_response::Outcome::RevokeZeroAndSwitchMode(_) => None,
     }
 }
 
@@ -1145,5 +1310,88 @@ fn operation_envelope_mut(request: &mut MotionGuardRequest) -> Option<&mut Reque
         motion_guard_request::Operation::SubmitMotionCommand(body) => body.envelope.as_mut(),
         motion_guard_request::Operation::RevokeAndZero(body) => body.envelope.as_mut(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held_proof() -> HeldRecoveryFenceProof {
+        HeldRecoveryFenceProof {
+            operation_id: "hold:exploration-17".into(),
+            recovery_correlation: "exploration-rollover:17".into(),
+            generation: 9,
+            boot_nonce: [7; BOOT_NONCE_BYTES],
+            motion_stop_generation: 11,
+            zero: ZeroConfirmation {
+                zero_ack_id: "zero-hold-17".into(),
+                applied_monotonic_ns: 13,
+            },
+            recovery_fence_token: [5; 32],
+        }
+    }
+
+    fn held_responses(
+        proof: &HeldRecoveryFenceProof,
+    ) -> (GetOperationResultResponse, GetGuardStateResponse) {
+        let operation = GetOperationResultResponse {
+            result: Some(GuardResult {
+                ack: AckCode::Zeroed as i32,
+                lease: LeaseState::Idle as i32,
+                error: None,
+            }),
+            target_operation_id: proof.operation_id.clone(),
+            target_ack: AckCode::Zeroed as i32,
+            resolved: true,
+            zero_ack: Some(ZeroAck {
+                zero_ack_id: proof.zero.zero_ack_id.clone(),
+                applied_monotonic_ns: proof.zero.applied_monotonic_ns,
+            }),
+            motion_stop_generation: proof.motion_stop_generation,
+            recovery_fence_token: proof.recovery_fence_token.to_vec(),
+            recovery_fence_held: true,
+        };
+        let state = GetGuardStateResponse {
+            result: Some(GuardResult {
+                ack: AckCode::Received as i32,
+                lease: LeaseState::Idle as i32,
+                error: None,
+            }),
+            generation: proof.generation,
+            boot_nonce: proof.boot_nonce.to_vec(),
+            last_zero_ack_id: proof.zero.zero_ack_id.clone(),
+            fenced: true,
+            active_lease_id: 0,
+            motion_stop_generation: proof.motion_stop_generation,
+            recovery_fence_held: true,
+            recovery_fence_token_sha256: sha256(&proof.recovery_fence_token).to_vec(),
+            recovery_fence_correlation_sha256: sha256(proof.recovery_correlation.as_bytes())
+                .to_vec(),
+        };
+        (operation, state)
+    }
+
+    #[test]
+    fn held_recovery_fence_requires_exact_operation_and_live_state() {
+        let proof = held_proof();
+        let (operation, state) = held_responses(&proof);
+        validate_held_recovery_fence_responses(&proof, &operation, &state).unwrap();
+
+        let mut wrong_operation = operation.clone();
+        wrong_operation.recovery_fence_token[0] ^= 1;
+        assert!(validate_held_recovery_fence_responses(&proof, &wrong_operation, &state).is_err());
+
+        let mut released_state = state.clone();
+        released_state.recovery_fence_held = false;
+        assert!(
+            validate_held_recovery_fence_responses(&proof, &operation, &released_state).is_err()
+        );
+
+        let mut wrong_correlation = state;
+        wrong_correlation.recovery_fence_correlation_sha256 = sha256(b"other").to_vec();
+        assert!(
+            validate_held_recovery_fence_responses(&proof, &operation, &wrong_correlation).is_err()
+        );
     }
 }

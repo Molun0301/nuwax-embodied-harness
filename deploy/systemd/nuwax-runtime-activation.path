@@ -3,6 +3,7 @@ Description=NuwaX on-demand navigation and geometry activation request watcher
 
 [Path]
 PathExists=/run/nuwax/gateway/geometry.request
+PathChanged=/run/nuwax/gateway/geometry.request
 Unit=nuwax-runtime-activation.service
 
 [Install]

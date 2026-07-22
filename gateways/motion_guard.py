@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
 import os
 import threading
 import uuid
@@ -268,14 +270,57 @@ class GatewayMotionGuard:
         *,
         operation_id: Optional[str] = None,
     ) -> StopAllMotionConfirmation:
+        return self._global_stop_with_recovery(
+            "stop_all_motion",
+            reason,
+            operation_id=operation_id,
+        )
+
+    def hold_recovery_fence(
+        self,
+        *,
+        reason: str,
+        correlation_id: str,
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
+        return self._global_stop_with_recovery(
+            "hold_recovery_fence",
+            reason,
+            correlation_id,
+            operation_id=operation_id,
+        )
+
+    def release_recovery_fence(
+        self,
+        *,
+        reason: str,
+        correlation_id: str,
+        recovery_fence_token: bytes,
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
+        return self._global_stop_with_recovery(
+            "release_recovery_fence",
+            reason,
+            correlation_id,
+            recovery_fence_token,
+            operation_id=operation_id,
+        )
+
+    def _global_stop_with_recovery(
+        self,
+        method_name: str,
+        *args: object,
+        operation_id: Optional[str],
+    ) -> StopAllMotionConfirmation:
         operation = (
             operation_id.strip()
             if isinstance(operation_id, str) and operation_id.strip()
-            else f"stop-all-motion:{uuid.uuid4()}"
+            else f"{method_name.replace('_', '-')}:{uuid.uuid4()}"
         )
         client = self._require_client()
         try:
-            return client.stop_all_motion(reason, operation_id=operation)
+            method = getattr(client, method_name)
+            return method(*args, operation_id=operation)
         except MotionGuardTransportError as exc:
             self._record_error(exc)
             if not exc.outcome_unknown or (
@@ -293,16 +338,52 @@ class GatewayMotionGuard:
                     operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
                 )
                 if not status.resolved:
-                    return recovery_client.stop_all_motion(
-                        reason,
-                        operation_id=operation,
-                    )
+                    recovery_method = getattr(recovery_client, method_name)
+                    return recovery_method(*args, operation_id=operation)
                 if status.zero is None or status.target_ack not in {
                     pb.ACK_CODE_ZEROED,
                     pb.ACK_CODE_RESOURCE_FENCED,
                 }:
                     raise MotionGuardError(
                         "resolved global stop has no valid terminal zero result"
+                    )
+                state = recovery_client.get_guard_state(
+                    pb.GUARD_SOURCE_GATEWAY_MANUAL
+                )
+                if state.motion_stop_generation != status.motion_stop_generation:
+                    raise MotionGuardError(
+                        "resolved global stop does not match durable guard state"
+                    )
+                token = status.recovery_fence_token
+                held = status.recovery_fence_held
+                if state.recovery_fence_held != held:
+                    raise MotionGuardError(
+                        "resolved global stop recovery state is not durable"
+                    )
+                if method_name == "hold_recovery_fence":
+                    correlation_id = str(args[1]).strip()
+                    if (
+                        not held
+                        or len(token) != 32
+                        or not hmac.compare_digest(
+                            state.recovery_fence_token_sha256,
+                            hashlib.sha256(token).digest(),
+                        )
+                        or not hmac.compare_digest(
+                            state.recovery_fence_correlation_sha256,
+                            hashlib.sha256(
+                                correlation_id.encode("utf-8")
+                            ).digest(),
+                        )
+                    ):
+                        raise MotionGuardError(
+                            "resolved recovery fence hold lacks durable state proof"
+                        )
+                elif method_name == "release_recovery_fence" and (
+                    held or state.recovery_fence_held
+                ):
+                    raise MotionGuardError(
+                        "resolved recovery fence release did not clear durable state"
                     )
                 return StopAllMotionConfirmation(
                     operation_id=operation,
@@ -311,6 +392,10 @@ class GatewayMotionGuard:
                     lease_revoked=status.target_ack
                     == pb.ACK_CODE_RESOURCE_FENCED,
                     motion_stop_generation=status.motion_stop_generation,
+                    recovery_fence_token=status.recovery_fence_token,
+                    recovery_fence_held=status.recovery_fence_held,
+                    generation=state.generation,
+                    boot_nonce=state.boot_nonce,
                 )
             except MotionGuardError as recovery_error:
                 self._record_error(recovery_error)

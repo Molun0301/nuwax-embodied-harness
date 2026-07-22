@@ -36,7 +36,15 @@ EPOCH_FIELDS = (
     "actuator_symbols_sha256",
     "fenced",
     "startup_zero_confirmed",
+    "recovery_fence_token_hex",
+    "recovery_fence_correlation_sha256",
     "created_at",
+)
+V2_EPOCH_FIELDS = tuple(
+    field
+    for field in EPOCH_FIELDS
+    if field
+    not in {"recovery_fence_token_hex", "recovery_fence_correlation_sha256"}
 )
 V1_EPOCH_FIELDS = (
     "schema_version",
@@ -52,6 +60,12 @@ V1_EPOCH_FIELDS = (
     "created_at",
 )
 EXPECTED_USERS = (
+    "nuwax-motion-guard",
+    "nuwax-navigation",
+    "nuwax-geometry",
+    "nuwax-gateway",
+)
+V2_EXPECTED_USERS = (
     "nuwax-motion-guard",
     "nuwax-navigation",
     "nuwax-gateway",
@@ -162,6 +176,8 @@ class EpochRecord:
     actuator_symbols_sha256: str
     fenced: bool
     startup_zero_confirmed: bool
+    recovery_fence_token_hex: str
+    recovery_fence_correlation_sha256: str
     created_at: str
     checksum: str = ""
 
@@ -183,6 +199,8 @@ class EpochRecord:
             "actuator_symbols_sha256": actuator_symbols_sha256,
             "fenced": True,
             "startup_zero_confirmed": False,
+            "recovery_fence_token_hex": "",
+            "recovery_fence_correlation_sha256": "",
             "created_at": created_at,
         }
         cls._validate_fields(raw, allow_empty_nonce=True)
@@ -207,6 +225,12 @@ class EpochRecord:
                 "actuator_symbols_sha256": str(document["actuator_symbols_sha256"]),
                 "fenced": bool(document["fenced"]),
                 "startup_zero_confirmed": document["startup_zero_confirmed"],
+                "recovery_fence_token_hex": str(
+                    document["recovery_fence_token_hex"]
+                ),
+                "recovery_fence_correlation_sha256": str(
+                    document["recovery_fence_correlation_sha256"]
+                ),
                 "created_at": str(document["created_at"]),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -233,10 +257,31 @@ class EpochRecord:
                 ),
                 "fenced": bool(document["fenced"]),
                 "startup_zero_confirmed": False,
+                "recovery_fence_token_hex": "",
+                "recovery_fence_correlation_sha256": "",
                 "created_at": str(document["created_at"]),
             }
         except (KeyError, TypeError, ValueError) as exc:
             raise EpochError("invalid epoch v1 record") from exc
+        cls._validate_fields(raw, allow_empty_nonce=True)
+        return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
+
+    @classmethod
+    def from_v2_document(cls, document: Mapping[str, Any]) -> "EpochRecord":
+        _verify_checksum(document, fields=V2_EPOCH_FIELDS, label="epoch v2")
+        if tuple(document.get("peer_uid_allowlist", ())) != V2_EXPECTED_USERS:
+            raise EpochError("epoch v2 peer_uid_allowlist drift")
+        raw = {
+            field: document[field]
+            for field in V2_EPOCH_FIELDS
+            if field != "schema_version"
+        }
+        raw.update(
+            schema_version=EPOCH_SCHEMA_VERSION,
+            peer_uid_allowlist=EXPECTED_USERS,
+            recovery_fence_token_hex="",
+            recovery_fence_correlation_sha256="",
+        )
         cls._validate_fields(raw, allow_empty_nonce=True)
         return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
 
@@ -273,6 +318,22 @@ class EpochRecord:
             raise EpochError("fenced must be a boolean")
         if not isinstance(raw["startup_zero_confirmed"], bool):
             raise EpochError("startup_zero_confirmed must be a boolean")
+        token_hex = str(raw["recovery_fence_token_hex"])
+        correlation_sha256 = str(raw["recovery_fence_correlation_sha256"])
+        if bool(token_hex) != bool(correlation_sha256):
+            raise EpochError("recovery fence token and correlation must be paired")
+        if token_hex:
+            try:
+                token = bytes.fromhex(token_hex)
+            except ValueError as exc:
+                raise EpochError("recovery_fence_token_hex is not hexadecimal") from exc
+            if len(token) != 32:
+                raise EpochError("recovery_fence_token_hex must be exactly 256 bits")
+            if len(correlation_sha256) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in correlation_sha256
+            ):
+                raise EpochError("recovery_fence_correlation_sha256 is invalid")
         if not str(raw["created_at"]):
             raise EpochError("created_at is required")
 
@@ -297,6 +358,8 @@ class EpochRecord:
             "actuator_symbols_sha256": self.actuator_symbols_sha256,
             "fenced": self.fenced,
             "startup_zero_confirmed": self.startup_zero_confirmed,
+            "recovery_fence_token_hex": self.recovery_fence_token_hex,
+            "recovery_fence_correlation_sha256": self.recovery_fence_correlation_sha256,
             "created_at": self.created_at,
             "checksum": self.checksum,
         }
@@ -390,14 +453,27 @@ class EpochStore:
             expected_mode=0o600,
             label="epoch",
         )
-        if document.get("schema_version") == 1:
+        schema_version = document.get("schema_version")
+        if schema_version in {1, 2}:
+            migrated = (
+                EpochRecord.from_v1_document(document)
+                if schema_version == 1
+                else EpochRecord.from_v2_document(document)
+            )
             backup_path = self.epoch_path.with_name(
-                self.epoch_path.name + ".v1.bak"
+                self.epoch_path.name + f".v{schema_version}.bak"
             )
             if not backup_path.exists():
                 atomic_write_record(backup_path, document, mode=0o600)
-            migrated = EpochRecord.from_v1_document(document)
-            self.persist(migrated)
+            EpochRecord.from_document(
+                migrated.to_document(),
+                allow_empty_nonce=True,
+            )
+            atomic_write_record(
+                self.epoch_path,
+                migrated.to_document(),
+                mode=0o600,
+            )
             return migrated
         return EpochRecord.from_document(document)
 

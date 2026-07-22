@@ -4671,6 +4671,7 @@ class PlatformGeometryRuntime:
     def _locate_runtime_backend_state_for_materialize(self, target_path: Path) -> Optional[Path]:
         """定位可拷贝到版本目录的运行中 .db，避免误用其它地图版本或 active 版本路径。"""
 
+        resolved_target = target_path.expanduser().resolve(strict=False)
         configured_root = Path(str(self.config.mapping.database_root or "").strip()).expanduser()
         candidates: List[Path] = []
         if configured_root.suffix == ".db":
@@ -5179,7 +5180,7 @@ class PlatformGeometryRuntime:
         try:
             return bool(provider.is_mapping_ready())
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            LOGGER.debug(
                 "_is_nuwax_mapping_active: provider.is_mapping_ready 失败,降级为 False: %s",
                 exc,
             )
@@ -5193,7 +5194,7 @@ class PlatformGeometryRuntime:
         try:
             return str(provider.get_lcm_backend_name())
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            LOGGER.debug(
                 "_mapping_lcm_backend_name: provider.get_lcm_backend_name 失败,降级为 <unknown>: %s",
                 exc,
             )
@@ -5963,9 +5964,6 @@ class PlatformGeometryRuntime:
             "_provider_attach_lock",
             self._runtime_state_lock,
         )
-        delivery_tickets = ()
-        remote_subscription_id = None
-        provider = None
         with provider_attach_lock:
             with self._exploration_loop_lock:
                 subscription_id = self._next_exploration_subscription_id
@@ -6352,13 +6350,6 @@ class PlatformGeometryRuntime:
                         self,
                         "_external_exploration_terminal_state",
                         None,
-                    )
-                    existing_id = str(
-                        getattr(existing_terminal, "current_request_id", "")
-                        or ""
-                    ).strip()
-                    existing_metadata = dict(
-                        getattr(existing_terminal, "metadata", {}) or {}
                     )
                     if (
                         not current_id
@@ -7370,12 +7361,10 @@ class PlatformGeometryRuntime:
         reasons: List[str] = []
         observer = self._external_debug_observer
         # 主路径：/rtabmap/info topic；缺失时降级到 DB SQLite fallback
-        triggered_by_topic = False
         if observer is not None:
             state = observer.loop_closure_state
             threshold = self._resolve_loop_closure_threshold()
             if state.loop_closure_count >= threshold and state.source in {"topic", "db_sqlite"}:
-                triggered_by_topic = True
                 if "mapping:loop_closed" not in reasons:
                     reasons.append("mapping:loop_closed")
         else:
@@ -7383,7 +7372,6 @@ class PlatformGeometryRuntime:
             count = self._read_loop_closure_count_from_db_with_fallback()
             threshold = self._resolve_loop_closure_threshold()
             if count >= threshold and count > 0:
-                triggered_by_topic = True
                 if "mapping:loop_closed" not in reasons:
                     reasons.append("mapping:loop_closed")
 
@@ -8726,6 +8714,95 @@ class PlatformGeometryProviderBundle(
             self.runtime._notify_exploration_update(state)
         return committed
 
+    def recover_exploration_after_navigation_rollover(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, Any],
+        expected_navigation_runtime_generation: int,
+        observed_navigation_runtime_generation: int,
+        guard_proof: Dict[str, Any],
+    ) -> bool:
+        """Commit the exact safe-abort response for a retained child lease."""
+
+        correlated_id = str(request_id or "").strip()
+        expected_lease = dict(child_lease or {})
+        expected_runtime_generation = int(expected_navigation_runtime_generation)
+        observed_runtime_generation = int(observed_navigation_runtime_generation)
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if (
+            not correlated_id
+            or lock is None
+            or int(exploration_generation) <= 0
+            or str(expected_lease.get("parent_request_id") or "").strip()
+            != correlated_id
+            or int(expected_lease.get("producer_runtime_generation") or 0) <= 0
+            or observed_runtime_generation <= expected_runtime_generation
+        ):
+            return False
+        with lock:
+            current = getattr(self.runtime, "_external_exploration_request", None)
+            current_id = str(getattr(current, "request_id", "") or "").strip()
+            remote = self._resolve_remote_exploration_provider()
+            remote_token = (
+                _capture_remote_operation_token_locked(self.runtime, remote)
+                if remote is not None
+                else None
+            )
+            if current_id != correlated_id or remote_token is None:
+                return False
+        try:
+            result = remote.recover_exploration_after_navigation_rollover(
+                request_id=correlated_id,
+                exploration_generation=int(exploration_generation),
+                child_lease=expected_lease,
+                expected_navigation_runtime_generation=expected_runtime_generation,
+                observed_navigation_runtime_generation=observed_runtime_generation,
+                guard_proof=dict(guard_proof or {}),
+            )
+        except GeometryRuntimeRpcError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Bundle rollover recovery gRPC failed for request_id=%s.",
+                correlated_id,
+            )
+            return False
+        if not isinstance(result, dict):
+            return False
+        exact_response = bool(
+            str(result.get("request_id") or "").strip() == correlated_id
+            and int(result.get("exploration_generation") or 0)
+            == int(exploration_generation)
+            and str(result.get("status") or "").strip().lower() == "failed"
+            and str(result.get("last_stop_reason") or "").strip()
+            == "runtime_rollover_aborted_safe"
+            and not str(result.get("child_task_id") or "").strip()
+            and result.get("child_lease") is None
+            and result.get("rollover_recovery_eligible") is False
+        )
+        if not exact_response:
+            return False
+        state = self._wrap_remote_exploration_state(result)
+        with lock:
+            if not _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            ):
+                return False
+            current = getattr(self.runtime, "_external_exploration_request", None)
+            if str(getattr(current, "request_id", "") or "").strip() != correlated_id:
+                return False
+            committed = _commit_remote_exploration_state_locked(
+                self.runtime,
+                state,
+                request_id=correlated_id,
+            )
+        if committed:
+            self.runtime._notify_exploration_update(state)
+        return committed
+
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
@@ -8900,6 +8977,13 @@ class PlatformGeometryProviderBundle(
             "child_task_id": child_task_id or None,
             "revision": revision,
             "timestamp_ns": timestamp_ns,
+            "exploration_generation": int(
+                state.get("exploration_generation") or 0
+            ),
+            "child_lease": state.get("child_lease"),
+            "rollover_recovery_eligible": bool(
+                state.get("rollover_recovery_eligible", False)
+            ),
         }
         timestamp = (
             datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)

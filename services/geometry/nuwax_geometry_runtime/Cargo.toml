@@ -37,6 +37,7 @@ nuwax-nav-types-messages = { path = "../../nuwax-workspace/crates/nuwax-nav-type
 nuwax-nav-simple-planner = { path = "../../nuwax-workspace/crates/nuwax-nav-simple-planner" }
 nuwax-nav-astar = { path = "../../nuwax-workspace/crates/nuwax-nav-astar" }
 nuwax-nav-terrain-map-ext = { path = "../../nuwax-workspace/crates/nuwax-nav-terrain-map-ext" }
+nuwax-motion-safety-guard = { path = "../../nuwax-workspace/crates/nuwax-motion-safety-guard" }
 # Phase 4 nav_runtime:serde 用于 NavigationReadinessDetail JSON 序列化
 uuid = { version = "1", features = ["v4"] }
 nuwax-exploration = { path = "../../nuwax-workspace/crates/nuwax-exploration", default-features = false, features = ["wavefront", "runtime"] }

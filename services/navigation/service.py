@@ -2056,6 +2056,51 @@ class NavigationService:
             self._current_explore_request = None
         return context
 
+    def recover_exploration_after_navigation_rollover(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, object],
+        expected_navigation_runtime_generation: int,
+        observed_navigation_runtime_generation: int,
+        guard_proof: Dict[str, object],
+    ) -> ExplorationContext:
+        """Forward one correlated retained-child recovery and refresh context."""
+
+        provider = self._get_exploration_provider()
+        recovery = getattr(
+            provider,
+            "recover_exploration_after_navigation_rollover",
+            None,
+        )
+        if not callable(recovery):
+            raise GatewayError(
+                "探索后端不支持 navigation rollover recovery。",
+                error_code="exploration_rollover_recovery_unsupported",
+                http_status=501,
+            )
+        accepted = recovery(
+            request_id=str(request_id or "").strip(),
+            exploration_generation=int(exploration_generation),
+            child_lease=dict(child_lease or {}),
+            expected_navigation_runtime_generation=int(
+                expected_navigation_runtime_generation
+            ),
+            observed_navigation_runtime_generation=int(
+                observed_navigation_runtime_generation
+            ),
+            guard_proof=dict(guard_proof or {}),
+        )
+        if not accepted:
+            raise GatewayError(
+                "探索后端拒绝 navigation rollover recovery。",
+                error_code="exploration_rollover_recovery_rejected",
+                http_status=409,
+                details={"request_id": str(request_id or "").strip()},
+            )
+        return self.refresh_exploration()
+
     def sync_exploration_after_task(self) -> ExplorationContext:
         """探索任务自然结束后的轻量同步：不杀 go2.sh，不标 CANCELLED。"""
 

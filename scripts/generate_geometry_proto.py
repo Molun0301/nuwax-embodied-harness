@@ -28,6 +28,13 @@ GENERATED_FILES = ("geometry_runtime_pb2.py", "geometry_runtime_pb2_grpc.py")
 GRPC_TOOLS_VERSION = "1.70.0"
 ABSOLUTE_PB2_IMPORT = "import geometry_runtime_pb2 as geometry__runtime__pb2"
 RELATIVE_PB2_IMPORT = "from . import geometry_runtime_pb2 as geometry__runtime__pb2"
+UNUSED_WARNINGS_IMPORT = "import warnings\n"
+STATIC_RUNTIME_MESSAGE = (
+    "+ f' but the generated code in geometry_runtime_pb2_grpc.py depends on'"
+)
+LINTED_STATIC_RUNTIME_MESSAGE = (
+    "+ ' but the generated code in geometry_runtime_pb2_grpc.py depends on'"
+)
 
 
 def _require_codegen_version() -> None:
@@ -60,8 +67,18 @@ def _generate(output_dir: Path) -> None:
         raise RuntimeError(
             "generated gRPC module did not contain the expected unique pb2 import"
         )
+    if source.count(UNUSED_WARNINGS_IMPORT) != 1:
+        raise RuntimeError(
+            "generated gRPC module did not contain the expected warnings import"
+        )
+    if source.count(STATIC_RUNTIME_MESSAGE) != 1:
+        raise RuntimeError(
+            "generated gRPC module did not contain the expected static runtime message"
+        )
     grpc_module.write_text(
-        source.replace(ABSOLUTE_PB2_IMPORT, RELATIVE_PB2_IMPORT),
+        source.replace(ABSOLUTE_PB2_IMPORT, RELATIVE_PB2_IMPORT)
+        .replace(UNUSED_WARNINGS_IMPORT, "")
+        .replace(STATIC_RUNTIME_MESSAGE, LINTED_STATIC_RUNTIME_MESSAGE),
         encoding="utf-8",
     )
 

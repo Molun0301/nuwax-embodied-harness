@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current guard epoch schema version.
-pub const SCHEMA_VERSION_EPOCH: u32 = 2;
+pub const SCHEMA_VERSION_EPOCH: u32 = 3;
 
 /// §P0B #15 provisioned.json schema version。
 pub const SCHEMA_VERSION_PROVISIONED: u32 = 1;
@@ -14,7 +14,12 @@ pub const SCHEMA_VERSION_PROVISIONED: u32 = 1;
 pub const PROVISIONED_PATH: &str = "/var/lib/nuwax/motion-guard/provisioned.json";
 
 /// Runtime identities authorized by the v2 deployment.
-pub const EXPECTED_USERS: [&str; 3] = ["nuwax-motion-guard", "nuwax-navigation", "nuwax-gateway"];
+pub const EXPECTED_USERS: [&str; 4] = [
+    "nuwax-motion-guard",
+    "nuwax-navigation",
+    "nuwax-geometry",
+    "nuwax-gateway",
+];
 
 pub(crate) const V1_EXPECTED_USER_SETS: [[&str; 4]; 2] = [
     [
@@ -58,6 +63,10 @@ pub struct GuardEpochRecord {
     pub fenced: bool,
     /// Whether this process boot completed its automatic zero handshake.
     pub startup_zero_confirmed: bool,
+    /// Opaque 256-bit recovery fence token, hex encoded; empty when no latch is held.
+    pub recovery_fence_token_hex: String,
+    /// SHA-256 of the recovery correlation; paired with `recovery_fence_token_hex`.
+    pub recovery_fence_correlation_sha256: String,
     /// 创建时间(ISO8601 UTC)
     pub created_at: String,
     /// sha256(canonical body) checksum
@@ -76,6 +85,8 @@ impl Default for GuardEpochRecord {
             actuator_symbols_sha256: format!("sha256:{}", "0".repeat(64)),
             fenced: true,
             startup_zero_confirmed: false,
+            recovery_fence_token_hex: String::new(),
+            recovery_fence_correlation_sha256: String::new(),
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             checksum: String::new(),
         }
@@ -115,6 +126,29 @@ impl GuardEpochRecord {
         if actual_users.as_slice() != EXPECTED_USERS {
             errs.push("peer_uid_allowlist 必须精确匹配 current service identity tuple".to_string());
         }
+        let token_present = !self.recovery_fence_token_hex.is_empty();
+        let correlation_present = !self.recovery_fence_correlation_sha256.is_empty();
+        if token_present != correlation_present {
+            errs.push("recovery fence token and correlation must be paired".to_string());
+        }
+        if token_present
+            && (self.recovery_fence_token_hex.len() != 64
+                || !self
+                    .recovery_fence_token_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
+        {
+            errs.push("recovery_fence_token_hex must be exactly 256-bit hexadecimal".to_string());
+        }
+        if correlation_present
+            && (self.recovery_fence_correlation_sha256.len() != 64
+                || !self
+                    .recovery_fence_correlation_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            errs.push("recovery_fence_correlation_sha256 must be lowercase SHA-256".to_string());
+        }
         if self.created_at.trim().is_empty() {
             errs.push("created_at is required".to_string());
         }
@@ -152,6 +186,8 @@ impl GuardEpochRecord {
             actuator_symbols_sha256: self.actuator_symbols_sha256.clone(),
             fenced: true,
             startup_zero_confirmed: false,
+            recovery_fence_token_hex: self.recovery_fence_token_hex.clone(),
+            recovery_fence_correlation_sha256: self.recovery_fence_correlation_sha256.clone(),
             created_at: self.created_at.clone(),
             checksum: String::new(),
         }
@@ -188,8 +224,13 @@ mod tests {
     /// Runtime UID tuple excludes the retired administrator identity.
     #[test]
     fn expected_users_groups_frozen() {
-        assert_eq!(EXPECTED_USERS.len(), 3, "service UID 必须 3 项");
-        for u in &["nuwax-motion-guard", "nuwax-navigation", "nuwax-gateway"] {
+        assert_eq!(EXPECTED_USERS.len(), 4, "service UID 必须 4 项");
+        for u in &[
+            "nuwax-motion-guard",
+            "nuwax-navigation",
+            "nuwax-geometry",
+            "nuwax-gateway",
+        ] {
             assert!(EXPECTED_USERS.contains(u), "service UID 缺: {u}");
         }
         assert_eq!(EXPECTED_GROUPS.len(), 1);
@@ -268,6 +309,27 @@ mod tests {
             .verify()
             .iter()
             .any(|error| error.contains("精确匹配")));
+    }
+
+    #[test]
+    fn verify_requires_paired_valid_recovery_fence_fields() {
+        let mut record = GuardEpochRecord {
+            recovery_fence_token_hex: "ab".repeat(32),
+            ..GuardEpochRecord::default()
+        };
+        assert!(record
+            .verify()
+            .iter()
+            .any(|error| error.contains("must be paired")));
+
+        record.recovery_fence_correlation_sha256 = "CD".repeat(32);
+        assert!(record
+            .verify()
+            .iter()
+            .any(|error| error.contains("lowercase SHA-256")));
+
+        record.recovery_fence_correlation_sha256 = "cd".repeat(32);
+        assert!(record.verify().is_empty());
     }
 
     /// §P0B #15 verify:缺 sha256: 前缀应被拒。

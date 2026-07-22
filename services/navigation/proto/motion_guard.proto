@@ -89,6 +89,12 @@ enum OperationNamespace {
   OPERATION_NAMESPACE_GLOBAL_STOP = 3;
 }
 
+enum GlobalStopMode {
+  GLOBAL_STOP_MODE_ORDINARY = 0;
+  GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE = 1;
+  GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE = 2;
+}
+
 message LeaseTuple {
   uint64 generation = 1;
   bytes boot_nonce = 2; // Exactly 16 bytes.
@@ -203,6 +209,9 @@ message RevokeAndZeroRequest {
 message StopAllMotionRequest {
   GlobalStopEnvelope envelope = 1;
   string reason = 2;
+  GlobalStopMode mode = 3;
+  string recovery_correlation = 4;
+  bytes recovery_fence_token = 5;
 }
 
 message GetReadinessRequest {
@@ -260,6 +269,8 @@ message StopAllMotionResponse {
   ZeroAck zero_ack = 2;
   bool lease_revoked = 3;
   uint64 motion_stop_generation = 4;
+  bytes recovery_fence_token = 5;
+  bool recovery_fence_held = 6;
 }
 
 message GetReadinessResponse {
@@ -272,6 +283,7 @@ message GetReadinessResponse {
   bytes boot_nonce = 7;
   bool startup_zero_confirmed = 8;
   uint64 motion_stop_generation = 9;
+  bool recovery_fence_held = 10;
 }
 
 message GetGuardStateResponse {
@@ -282,6 +294,9 @@ message GetGuardStateResponse {
   bool fenced = 5;
   uint64 active_lease_id = 6;
   uint64 motion_stop_generation = 7;
+  bool recovery_fence_held = 8;
+  bytes recovery_fence_token_sha256 = 9;
+  bytes recovery_fence_correlation_sha256 = 10;
 }
 
 message GetOperationResultResponse {
@@ -292,6 +307,8 @@ message GetOperationResultResponse {
   ZeroAck zero_ack = 5;
   // Exact guard barrier associated with a resolved global-stop operation.
   uint64 motion_stop_generation = 6;
+  bytes recovery_fence_token = 7;
+  bool recovery_fence_held = 8;
 }
 
 message MotionGuardRequest {

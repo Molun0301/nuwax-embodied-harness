@@ -105,6 +105,9 @@ mod tests {
                         deadline_monotonic_ns: 20,
                     }),
                     reason: "operator requested stop".to_string(),
+                    mode: GlobalStopMode::Ordinary as i32,
+                    recovery_correlation: String::new(),
+                    recovery_fence_token: Vec::new(),
                 },
             )),
         };

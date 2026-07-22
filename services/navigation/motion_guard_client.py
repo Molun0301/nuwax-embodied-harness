@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
 import os
 import socket
 import threading
@@ -109,6 +111,10 @@ class MotionSinkNotReadyError(MotionGuardRemoteError):
     pass
 
 
+class RecoveryFencedError(MotionGuardRemoteError):
+    pass
+
+
 class ResourceBusyError(MotionGuardRemoteError):
     pass
 
@@ -155,6 +161,7 @@ _REMOTE_ERRORS: Dict[str, Type[MotionGuardRemoteError]] = {
     "ACTION_NOT_ALLOWED": ActionNotAllowedError,
     "UNSUPPORTED_API_VERSION": UnsupportedApiVersionError,
     "MOTION_SINK_NOT_READY": MotionSinkNotReadyError,
+    "RECOVERY_FENCED": RecoveryFencedError,
     "RESOURCE_BUSY": ResourceBusyError,
     "RESOURCE_EXHAUSTED": ResourceExhaustedError,
     "DEADLINE_EXCEEDED": DeadlineExceededError,
@@ -186,6 +193,7 @@ class ReadinessStatus:
     generation: int
     boot_nonce: bytes
     motion_stop_generation: int
+    recovery_fence_held: bool = False
 
     def require_admission_proof(self) -> MotionAdmissionProof:
         if not self.ready:
@@ -206,6 +214,9 @@ class GuardState:
     fenced: bool
     active_lease_id: int
     motion_stop_generation: int
+    recovery_fence_held: bool = False
+    recovery_fence_token_sha256: bytes = b""
+    recovery_fence_correlation_sha256: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -237,6 +248,10 @@ class StopAllMotionConfirmation:
     zero: ZeroConfirmation
     lease_revoked: bool
     motion_stop_generation: int
+    recovery_fence_token: bytes = b""
+    recovery_fence_held: bool = False
+    generation: int = 0
+    boot_nonce: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -247,6 +262,8 @@ class OperationStatus:
     target_ack: int
     zero: Optional[ZeroConfirmation]
     motion_stop_generation: int
+    recovery_fence_token: bytes = b""
+    recovery_fence_held: bool = False
 
 
 class MotionGuardNotReadyError(MotionGuardError):
@@ -608,6 +625,7 @@ class MotionGuardClient:
             generation=outcome.generation,
             boot_nonce=boot_nonce,
             motion_stop_generation=outcome.motion_stop_generation,
+            recovery_fence_held=outcome.recovery_fence_held,
         )
 
     def get_guard_state(self, source: Union[int, str]) -> GuardState:
@@ -632,6 +650,13 @@ class MotionGuardClient:
             fenced=outcome.fenced,
             active_lease_id=outcome.active_lease_id,
             motion_stop_generation=outcome.motion_stop_generation,
+            recovery_fence_held=outcome.recovery_fence_held,
+            recovery_fence_token_sha256=bytes(
+                outcome.recovery_fence_token_sha256
+            ),
+            recovery_fence_correlation_sha256=bytes(
+                outcome.recovery_fence_correlation_sha256
+            ),
         )
 
     def get_operation_result(
@@ -702,6 +727,8 @@ class MotionGuardClient:
             target_ack=outcome.target_ack,
             zero=zero,
             motion_stop_generation=outcome.motion_stop_generation,
+            recovery_fence_token=bytes(outcome.recovery_fence_token),
+            recovery_fence_held=outcome.recovery_fence_held,
         )
 
     def acquire_session(
@@ -779,7 +806,63 @@ class MotionGuardClient:
         *,
         operation_id: Optional[str] = None,
     ) -> StopAllMotionConfirmation:
+        return self._global_stop(
+            reason,
+            mode=pb.GLOBAL_STOP_MODE_ORDINARY,
+            operation_id=operation_id,
+        )
+
+    def hold_recovery_fence(
+        self,
+        reason: str,
+        recovery_correlation: str,
+        *,
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
+        return self._global_stop(
+            reason,
+            mode=pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE,
+            recovery_correlation=recovery_correlation,
+            operation_id=operation_id,
+        )
+
+    def release_recovery_fence(
+        self,
+        reason: str,
+        recovery_correlation: str,
+        recovery_fence_token: bytes,
+        *,
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
+        if not isinstance(recovery_fence_token, bytes) or len(
+            recovery_fence_token
+        ) != 32:
+            raise MotionGuardUsageError(
+                "recovery_fence_token must be exactly 32 bytes"
+            )
+        return self._global_stop(
+            reason,
+            mode=pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE,
+            recovery_correlation=recovery_correlation,
+            recovery_fence_token=recovery_fence_token,
+            operation_id=operation_id,
+        )
+
+    def _global_stop(
+        self,
+        reason: str,
+        *,
+        mode: int,
+        recovery_correlation: str = "",
+        recovery_fence_token: bytes = b"",
+        operation_id: Optional[str] = None,
+    ) -> StopAllMotionConfirmation:
         reason_value = self._require_text(reason, "reason")
+        correlation_value = (
+            self._require_text(recovery_correlation, "recovery_correlation")
+            if mode != pb.GLOBAL_STOP_MODE_ORDINARY
+            else ""
+        )
         operation = self._operation_id_value(operation_id, "stop-all-motion")
         request = pb.MotionGuardRequest(
             api_version=API_VERSION,
@@ -787,6 +870,9 @@ class MotionGuardClient:
             stop_all_motion=pb.StopAllMotionRequest(
                 envelope=self._new_global_stop_envelope(operation),
                 reason=reason_value,
+                mode=mode,
+                recovery_correlation=correlation_value,
+                recovery_fence_token=recovery_fence_token,
             ),
         )
         seal_request(request)
@@ -805,12 +891,51 @@ class MotionGuardClient:
             )
         if outcome.motion_stop_generation == 0:
             self._raise_protocol("StopAllMotion returned no stop generation proof")
+        token = bytes(outcome.recovery_fence_token)
+        held = bool(outcome.recovery_fence_held)
+        if mode == pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE and (
+            not held or len(token) != 32
+        ):
+            self._raise_protocol("recovery fence hold returned no durable token")
+        if mode == pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE and (held or token):
+            self._raise_protocol("recovery fence release did not clear the fence")
+        try:
+            state = self.get_guard_state(pb.GUARD_SOURCE_GATEWAY_MANUAL)
+        except MotionGuardTransportError as exc:
+            raise MotionGuardTransportError(
+                "global stop completed but guard-state proof is uncertain",
+                operation_id=operation,
+                outcome_unknown=True,
+            ) from exc
+        if state.motion_stop_generation != outcome.motion_stop_generation:
+            self._raise_protocol(
+                "global stop and guard-state stop generations do not correlate"
+            )
+        if state.recovery_fence_held != held:
+            self._raise_protocol(
+                "global stop and guard-state recovery fence state disagree"
+            )
+        if mode == pb.GLOBAL_STOP_MODE_HOLD_RECOVERY_FENCE:
+            if not hmac.compare_digest(
+                state.recovery_fence_token_sha256,
+                hashlib.sha256(token).digest(),
+            ) or not hmac.compare_digest(
+                state.recovery_fence_correlation_sha256,
+                hashlib.sha256(correlation_value.encode("utf-8")).digest(),
+            ):
+                self._raise_protocol(
+                    "recovery fence token or correlation lacks durable state proof"
+                )
         return StopAllMotionConfirmation(
             operation_id=operation,
             result=result,
             zero=self._zero_confirmation(outcome.zero_ack),
             lease_revoked=lease_revoked,
             motion_stop_generation=outcome.motion_stop_generation,
+            recovery_fence_token=token,
+            recovery_fence_held=held,
+            generation=state.generation,
+            boot_nonce=state.boot_nonce,
         )
 
     def _operation_id_value(self, value: Optional[str], label: str) -> str:
@@ -1355,6 +1480,7 @@ __all__ = [
     "OutcomeUnknownError",
     "PermissionDeniedError",
     "ReadinessStatus",
+    "RecoveryFencedError",
     "RequestIdConflictError",
     "ResourceBusyError",
     "ResourceExhaustedError",

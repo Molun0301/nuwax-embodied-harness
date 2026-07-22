@@ -26,7 +26,14 @@ EPOCH_FIELDS = (
     "actuator_symbols_sha256",
     "fenced",
     "startup_zero_confirmed",
+    "recovery_fence_token_hex",
+    "recovery_fence_correlation_sha256",
     "created_at",
+)
+V2_EPOCH_FIELDS = tuple(
+    field
+    for field in EPOCH_FIELDS
+    if field not in {"recovery_fence_token_hex", "recovery_fence_correlation_sha256"}
 )
 V1_EPOCH_FIELDS = (
     "schema_version",
@@ -42,6 +49,12 @@ V1_EPOCH_FIELDS = (
     "created_at",
 )
 PEER_UID_ALLOWLIST = (
+    "nuwax-motion-guard",
+    "nuwax-navigation",
+    "nuwax-geometry",
+    "nuwax-gateway",
+)
+V2_PEER_UID_ALLOWLIST = (
     "nuwax-motion-guard",
     "nuwax-navigation",
     "nuwax-gateway",
@@ -99,7 +112,7 @@ def build_initial_epoch_record(
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("actuator_symbols_sha256 must contain 64 lowercase hex chars")
     body = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generation": 0,
         "boot_nonce_hex": "",
         "lease_state": "Idle",
@@ -108,6 +121,8 @@ def build_initial_epoch_record(
         "actuator_symbols_sha256": actuator_symbols_sha256,
         "fenced": True,
         "startup_zero_confirmed": False,
+        "recovery_fence_token_hex": "",
+        "recovery_fence_correlation_sha256": "",
         "created_at": created_at,
     }
     return _seal(body)
@@ -154,6 +169,8 @@ def _load_epoch_record(path: Path) -> Dict[str, Any]:
     if schema_version == 1:
         return _load_record(path, V1_EPOCH_FIELDS)
     if schema_version == 2:
+        return _load_record(path, V2_EPOCH_FIELDS)
+    if schema_version == 3:
         return _load_record(path, EPOCH_FIELDS)
     raise ValueError("unsupported durable record schema version")
 
@@ -276,7 +293,7 @@ def _validate_epoch_semantics(
     epoch: Dict[str, Any],
     expected_peer_uid_allowlist: Tuple[str, ...],
 ) -> None:
-    if epoch.get("schema_version") != 2:
+    if epoch.get("schema_version") != 3:
         raise ValueError("unsupported durable record schema version")
     _require_u64(epoch, "generation")
     boot_nonce_hex = epoch.get("boot_nonce_hex")
@@ -305,6 +322,23 @@ def _validate_epoch_semantics(
         raise ValueError("epoch fenced must be a boolean")
     if not isinstance(epoch.get("startup_zero_confirmed"), bool):
         raise ValueError("epoch startup_zero_confirmed must be a boolean")
+    token_hex = epoch.get("recovery_fence_token_hex")
+    correlation_sha256 = epoch.get("recovery_fence_correlation_sha256")
+    if not isinstance(token_hex, str) or not isinstance(correlation_sha256, str):
+        raise ValueError("epoch recovery fence fields must be strings")
+    if bool(token_hex) != bool(correlation_sha256):
+        raise ValueError("epoch recovery fence token and correlation must be paired")
+    if token_hex:
+        try:
+            token = bytes.fromhex(token_hex)
+        except ValueError as exc:
+            raise ValueError("epoch recovery_fence_token_hex is not hexadecimal") from exc
+        if len(token) != 32:
+            raise ValueError("epoch recovery_fence_token_hex must be exactly 256 bits")
+        if len(correlation_sha256) != 64 or any(
+            ch not in "0123456789abcdef" for ch in correlation_sha256
+        ):
+            raise ValueError("epoch recovery_fence_correlation_sha256 is invalid")
     if not isinstance(epoch.get("created_at"), str) or not epoch["created_at"]:
         raise ValueError("epoch created_at is required")
 
@@ -328,6 +362,40 @@ def _validate_v1_epoch_for_guard_migration(epoch: Dict[str, Any]) -> None:
         raise ValueError("epoch v1 actuator_symbols_sha256 is invalid")
     if not isinstance(epoch.get("fenced"), bool):
         raise ValueError("epoch v1 fenced must be a boolean")
+
+
+def _validate_v2_epoch_for_guard_migration(epoch: Dict[str, Any]) -> None:
+    if epoch.get("schema_version") != 2:
+        raise ValueError("epoch is not a v2 migration input")
+    _require_u64(epoch, "generation")
+    boot_nonce_hex = epoch.get("boot_nonce_hex")
+    if not isinstance(boot_nonce_hex, str):
+        raise ValueError("epoch v2 boot_nonce_hex must be a string")
+    if boot_nonce_hex:
+        try:
+            nonce = bytes.fromhex(boot_nonce_hex)
+        except ValueError as exc:
+            raise ValueError("epoch v2 boot_nonce_hex is not hexadecimal") from exc
+        if len(nonce) != 16:
+            raise ValueError("epoch v2 boot_nonce_hex must be exactly 128 bits")
+    if tuple(epoch.get("peer_uid_allowlist", ())) != V2_PEER_UID_ALLOWLIST:
+        raise ValueError("epoch v2 peer_uid_allowlist drift")
+    if epoch.get("lease_state") not in {"Idle", "Active", "Pausing", "Revoking"}:
+        raise ValueError("epoch v2 lease_state is invalid")
+    if not isinstance(epoch.get("last_zero_ack_id"), str):
+        raise ValueError("epoch v2 last_zero_ack_id must be a string")
+    actuator_digest = epoch.get("actuator_symbols_sha256")
+    if not isinstance(actuator_digest, str) or not actuator_digest.startswith("sha256:"):
+        raise ValueError("epoch v2 actuator_symbols_sha256 is invalid")
+    digest = actuator_digest[len("sha256:") :]
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("epoch v2 actuator_symbols_sha256 is invalid")
+    if not isinstance(epoch.get("fenced"), bool):
+        raise ValueError("epoch v2 fenced must be a boolean")
+    if not isinstance(epoch.get("startup_zero_confirmed"), bool):
+        raise ValueError("epoch v2 startup_zero_confirmed must be a boolean")
+    if not isinstance(epoch.get("created_at"), str) or not epoch["created_at"]:
+        raise ValueError("epoch v2 created_at is required")
 
 
 def _verify_path_metadata(
@@ -392,6 +460,8 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
         epoch = _load_epoch_record(epoch_path)
         if epoch["schema_version"] == 1:
             _validate_v1_epoch_for_guard_migration(epoch)
+        elif epoch["schema_version"] == 2:
+            _validate_v2_epoch_for_guard_migration(epoch)
         else:
             _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
         if epoch["actuator_symbols_sha256"] != actuator_digest:
@@ -409,8 +479,8 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
 def verify(state_dir: Path, manifest: Optional[Path], owner: str) -> None:
     validate_service_identity_uids()
     _, _, _, epoch = _load_verified_records(state_dir, manifest, owner)
-    if epoch.get("schema_version") != 2:
-        raise ValueError("epoch v1 has not yet been migrated by motion guard startup")
+    if epoch.get("schema_version") != 3:
+        raise ValueError("epoch has not yet been migrated by motion guard startup")
     _validate_epoch_semantics(epoch, PEER_UID_ALLOWLIST)
 
 

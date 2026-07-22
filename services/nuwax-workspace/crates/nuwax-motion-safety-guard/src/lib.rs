@@ -56,9 +56,9 @@ pub mod wire;
 pub use actuator::{ActuatorBackend, ActuatorError, UnavailableActuatorBackend};
 pub use cache::{CacheHealth, DedupCache, DedupResult};
 pub use client::{
-    ClientConfig, CommandConfirmation, GlobalStopConfirmation, LeaseMetadata, MotionAdmissionProof,
-    MotionGuardClient, MotionGuardClientError, PriorityFenceRequest, ReadinessStatus,
-    RenewalMetadata, ZeroConfirmation,
+    ClientConfig, CommandConfirmation, GlobalStopConfirmation, HeldRecoveryFenceProof,
+    LeaseMetadata, MotionAdmissionProof, MotionGuardClient, MotionGuardClientError,
+    PriorityFenceRequest, ReadinessStatus, RenewalMetadata, ZeroConfirmation,
 };
 pub use constants::{
     COMMAND_DEADLINE_MS, DEFAULT_EPOCH_PATH, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_UDS_PATH,

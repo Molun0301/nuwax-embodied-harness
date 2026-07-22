@@ -1180,6 +1180,7 @@ dependencies = [
  "nuwax-exploration",
  "nuwax-explore-wavefront",
  "nuwax-mapping",
+ "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-simple-planner",
  "nuwax-nav-stack",

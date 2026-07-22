@@ -1578,6 +1578,7 @@ fn exploration_child_lease(
         owner_kind: lease.owner_kind,
         parent_request_id: lease.parent_request_id.clone(),
         goal_generation: lease.goal_generation,
+        producer_runtime_generation: lease.producer_runtime_generation,
         goal_payload_sha256: lease.goal_payload_sha256,
     }
 }
@@ -1746,11 +1747,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             .await
             .filter(|lease| {
                 let projected = exploration_child_lease(lease);
-                projected.session_id == expected.session_id
-                    && projected.owner_kind == expected.owner_kind
-                    && projected.parent_request_id == expected.parent_request_id
-                    && projected.goal_generation == expected.goal_generation
-                    && projected.goal_payload_sha256 == expected.goal_payload_sha256
+                projected.matches(expected)
                     && lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
             })
             .ok_or_else(|| "exploration child does not own the active goal lease".to_string())?;
@@ -1778,13 +1775,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 .as_ref()
                 .map(exploration_child_lease)
                 .ok_or_else(|| "navigation cancel tracker lost the child lease".to_string())?;
-            if cancel.generation == 0
-                || cancel_lease.session_id != expected.session_id
-                || cancel_lease.owner_kind != expected.owner_kind
-                || cancel_lease.parent_request_id != expected.parent_request_id
-                || cancel_lease.goal_generation != expected.goal_generation
-                || cancel_lease.goal_payload_sha256 != expected.goal_payload_sha256
-            {
+            if cancel.generation == 0 || !cancel_lease.matches(expected) {
                 return Err("navigation cancel tracker returned a mismatched ticket".to_string());
             }
             Ok(crate::explore_runtime::ChildNavigationCancelTicket {
@@ -2074,6 +2065,7 @@ fn exploration_navigation_terminal_result(
             owner_kind: update.feedback.owner_kind,
             parent_request_id: update.feedback.parent_request_id.clone(),
             goal_generation: update.feedback.goal_generation,
+            producer_runtime_generation: update.producer_runtime_generation,
             goal_payload_sha256: update.feedback.goal_payload_sha256,
         },
     };

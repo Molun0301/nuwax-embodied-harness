@@ -34,6 +34,9 @@ use crate::proto::*;
 use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedServiceState};
 use crate::typed_codec;
 use nuwax_exploration::{BoundarySegment, ExplorationBoundary};
+use nuwax_motion_safety_guard::{
+    HeldRecoveryFenceProof, MotionGuardClient, ZeroConfirmation, DEFAULT_UDS_PATH,
+};
 use nuwax_nav_types_messages::geometry::Point2;
 
 #[derive(Clone)]
@@ -296,6 +299,14 @@ fn validate_cloud_checkpoint_metadata(checkpoint: &CloudMapCheckpoint) -> Result
 fn exploration_state_from_snapshot(
     snapshot: crate::explore_runtime::ExploreRuntimeSnapshot,
 ) -> ExplorationState {
+    let child_lease = snapshot.child_lease.map(|lease| ExplorationChildLease {
+        session_id: lease.session_id,
+        owner_kind: lease.owner_kind,
+        parent_request_id: lease.parent_request_id,
+        goal_generation: lease.goal_generation,
+        producer_runtime_generation: lease.producer_runtime_generation,
+        goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
+    });
     ExplorationState {
         status: snapshot.status.to_string(),
         message: snapshot.message,
@@ -306,6 +317,9 @@ fn exploration_state_from_snapshot(
         revision: snapshot.revision,
         timestamp_ns: now_ns(),
         child_task_id: snapshot.child_task_id,
+        exploration_generation: snapshot.exploration_generation,
+        child_lease,
+        rollover_recovery_eligible: snapshot.rollover_recovery_eligible,
     }
 }
 
@@ -1968,6 +1982,137 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
 
+    async fn recover_exploration_after_navigation_rollover(
+        &self,
+        req: Request<RecoverExplorationAfterNavigationRolloverRequest>,
+    ) -> Result<Response<ExplorationState>, Status> {
+        let r = req.into_inner();
+        if r.observed_navigation_runtime_generation <= r.expected_navigation_runtime_generation {
+            return Err(Status::invalid_argument(
+                "observed navigation runtime generation must advance",
+            ));
+        }
+        let child = r
+            .child_lease
+            .ok_or_else(|| Status::invalid_argument("child_lease is required"))?;
+        let goal_payload_sha256: [u8; 32] = child
+            .goal_payload_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                Status::invalid_argument("child goal_payload_sha256 must contain 32 bytes")
+            })?;
+        let guard = r
+            .guard_proof
+            .ok_or_else(|| Status::invalid_argument("guard_proof is required"))?;
+        let motion_admission = MotionAdmissionProof::try_from_wire(
+            guard.guard_generation,
+            &guard.guard_boot_nonce,
+            guard.motion_stop_generation,
+        )
+        .map_err(Status::invalid_argument)?;
+        let request = crate::explore_runtime::ExplorationRolloverRecoveryRequest {
+            request_id: r.request_id,
+            exploration_generation: r.exploration_generation,
+            child_lease: crate::explore_runtime::ChildNavigationLease {
+                session_id: child.session_id,
+                owner_kind: child.owner_kind,
+                parent_request_id: child.parent_request_id,
+                goal_generation: child.goal_generation,
+                producer_runtime_generation: child.producer_runtime_generation,
+                goal_payload_sha256,
+            },
+            expected_navigation_runtime_generation: r.expected_navigation_runtime_generation,
+            observed_navigation_runtime_generation: r.observed_navigation_runtime_generation,
+            guard_proof: crate::explore_runtime::ExplorationRecoveryGuardProof {
+                stop_operation_id: guard.stop_operation_id.clone(),
+                recovery_correlation: guard.recovery_correlation.clone(),
+                motion_admission,
+                zero_ack_id: guard.zero_ack_id.clone(),
+                zero_applied_monotonic_ns: guard.zero_applied_monotonic_ns,
+                recovery_fence_token: guard.recovery_fence_token.clone(),
+            },
+        };
+        if let Some(snapshot) = self
+            .bridge
+            .explore
+            .replay_completed_rollover_recovery(&request)
+            .await
+            .map_err(|error| match error {
+                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
+                    Status::invalid_argument(message)
+                }
+                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
+                    Status::failed_precondition(message)
+                }
+            })?
+        {
+            return Ok(Response::new(exploration_state_from_snapshot(snapshot)));
+        }
+
+        let readiness = compute_readiness(&self.bridge, &self.bridge.nav).await;
+        if readiness.planner_generation != request.observed_navigation_runtime_generation {
+            return Err(Status::failed_precondition(format!(
+                "navigation runtime generation mismatch: current={} observed={}",
+                readiness.planner_generation, request.observed_navigation_runtime_generation
+            )));
+        }
+
+        let recovery_fence_token: [u8; 32] = guard
+            .recovery_fence_token
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                Status::invalid_argument("recovery_fence_token must contain exactly 32 bytes")
+            })?;
+        let held_proof = HeldRecoveryFenceProof {
+            operation_id: guard.stop_operation_id,
+            recovery_correlation: guard.recovery_correlation,
+            generation: motion_admission.guard_generation,
+            boot_nonce: motion_admission.guard_boot_nonce,
+            motion_stop_generation: motion_admission.motion_stop_generation,
+            zero: ZeroConfirmation {
+                zero_ack_id: guard.zero_ack_id,
+                applied_monotonic_ns: guard.zero_applied_monotonic_ns,
+            },
+            recovery_fence_token,
+        };
+        let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_UDS_PATH.to_string());
+        let mut guard_client = MotionGuardClient::connect(&socket_path)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "motion guard recovery fence verification unavailable: {error}"
+                ))
+            })?;
+        guard_client
+            .verify_held_recovery_fence(&held_proof)
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "motion guard recovery fence verification failed: {error}"
+                ))
+            })?;
+        let snapshot = self
+            .bridge
+            .explore
+            .recover_after_navigation_rollover(request)
+            .await
+            .map_err(|error| match error {
+                crate::explore_runtime::ExplorationRecoveryError::InvalidArgument(message) => {
+                    Status::invalid_argument(message)
+                }
+                crate::explore_runtime::ExplorationRecoveryError::FailedPrecondition(message) => {
+                    Status::failed_precondition(message)
+                }
+            })?;
+        Ok(Response::new(exploration_state_from_snapshot(snapshot)))
+    }
+
     async fn get_exploration_state(
         &self,
         _req: Request<Empty>,
@@ -2727,6 +2872,8 @@ mod lifecycle_tests {
         cancel_error: StdMutex<Option<String>>,
     }
 
+    static MOTION_GUARD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     impl LifecycleExploreSink {
         fn last_lease(&self) -> ChildNavigationLease {
             self.last_lease
@@ -2748,6 +2895,7 @@ mod lifecycle_tests {
                 owner_kind: 2,
                 parent_request_id: request.parent_request_id,
                 goal_generation: 1,
+                producer_runtime_generation: 1,
                 goal_payload_sha256: [7; 32],
             };
             *self
@@ -2961,6 +3109,77 @@ mod lifecycle_tests {
         (active.child_task_id, lease)
     }
 
+    fn rollover_recovery_proto_request(
+        snapshot: &crate::explore_runtime::ExploreRuntimeSnapshot,
+    ) -> RecoverExplorationAfterNavigationRolloverRequest {
+        let lease = snapshot
+            .child_lease
+            .as_ref()
+            .expect("retained exploration child lease");
+        RecoverExplorationAfterNavigationRolloverRequest {
+            request_id: snapshot.request_id.clone(),
+            exploration_generation: snapshot.exploration_generation,
+            child_lease: Some(ExplorationChildLease {
+                session_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+                goal_payload_sha256: lease.goal_payload_sha256.to_vec(),
+            }),
+            expected_navigation_runtime_generation: 41,
+            observed_navigation_runtime_generation: 42,
+            guard_proof: Some(crate::proto::ExplorationRecoveryGuardProof {
+                stop_operation_id: "hold:geometry-rollover-test".to_string(),
+                guard_generation: 7,
+                guard_boot_nonce: vec![7; 16],
+                motion_stop_generation: 9,
+                zero_ack_id: "zero:geometry-rollover-test".to_string(),
+                zero_applied_monotonic_ns: now_monotonic_nanos(),
+                recovery_fence_token: vec![9; 32],
+                recovery_correlation: "geometry-rollover:test".to_string(),
+            }),
+        }
+    }
+
+    fn rollover_recovery_internal_request(
+        request: &RecoverExplorationAfterNavigationRolloverRequest,
+    ) -> crate::explore_runtime::ExplorationRolloverRecoveryRequest {
+        let child = request.child_lease.as_ref().expect("child lease");
+        let guard = request.guard_proof.as_ref().expect("guard proof");
+        crate::explore_runtime::ExplorationRolloverRecoveryRequest {
+            request_id: request.request_id.clone(),
+            exploration_generation: request.exploration_generation,
+            child_lease: ChildNavigationLease {
+                session_id: child.session_id.clone(),
+                owner_kind: child.owner_kind,
+                parent_request_id: child.parent_request_id.clone(),
+                goal_generation: child.goal_generation,
+                producer_runtime_generation: child.producer_runtime_generation,
+                goal_payload_sha256: child
+                    .goal_payload_sha256
+                    .as_slice()
+                    .try_into()
+                    .expect("32-byte goal hash"),
+            },
+            expected_navigation_runtime_generation: request.expected_navigation_runtime_generation,
+            observed_navigation_runtime_generation: request.observed_navigation_runtime_generation,
+            guard_proof: crate::explore_runtime::ExplorationRecoveryGuardProof {
+                stop_operation_id: guard.stop_operation_id.clone(),
+                recovery_correlation: guard.recovery_correlation.clone(),
+                motion_admission: MotionAdmissionProof::try_from_wire(
+                    guard.guard_generation,
+                    &guard.guard_boot_nonce,
+                    guard.motion_stop_generation,
+                )
+                .expect("motion admission"),
+                zero_ack_id: guard.zero_ack_id.clone(),
+                zero_applied_monotonic_ns: guard.zero_applied_monotonic_ns,
+                recovery_fence_token: guard.recovery_fence_token.clone(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn process_stop_waits_for_exploration_zero_before_listener_shutdown() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
@@ -3054,6 +3273,94 @@ mod lifecycle_tests {
                 .is_err(),
             "failed process Stop must not request listener shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn rollover_recovery_keeps_child_when_guard_verification_is_unavailable() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let sink = Arc::new(LifecycleExploreSink::default());
+        start_active_exploration(&handle, sink.clone(), "guard-proof-unavailable").await;
+        *sink
+            .cancel_error
+            .lock()
+            .expect("lifecycle exploration sink lock") = Some("old runtime lost child".to_string());
+        let retained = handle.explore.stop("guard-proof-unavailable").await;
+        assert_eq!(retained.status, STATUS_FAILED);
+        assert!(retained.rollover_recovery_eligible);
+        handle
+            .nav
+            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+                generation: 42,
+                map_revision: 1,
+                map_frame: "map".to_string(),
+                pose_frame: "map".to_string(),
+                ready: true,
+            })
+            .expect("planner generation");
+        let service = GeometryRuntimeService::new(handle.clone());
+        let request = rollover_recovery_proto_request(&retained);
+
+        let _env_lock = MOTION_GUARD_SOCKET_ENV_LOCK.lock().await;
+        let previous_socket = std::env::var_os("NUWAX_MOTION_GUARD_SOCKET");
+        let missing_socket = std::env::temp_dir().join(format!(
+            "nuwax-motion-guard-missing-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", &missing_socket);
+        let result = GeometryRuntime::recover_exploration_after_navigation_rollover(
+            &service,
+            Request::new(request),
+        )
+        .await;
+        if let Some(value) = previous_socket {
+            std::env::set_var("NUWAX_MOTION_GUARD_SOCKET", value);
+        } else {
+            std::env::remove_var("NUWAX_MOTION_GUARD_SOCKET");
+        }
+
+        let error = result.expect_err("unverified recovery fence must fail closed");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            handle.explore.snapshot().child_task_id,
+            retained.child_task_id
+        );
+        assert!(handle.explore.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn exact_rollover_replay_precedes_planner_and_guard_checks() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let sink = Arc::new(LifecycleExploreSink::default());
+        start_active_exploration(&handle, sink.clone(), "exact-rollover-replay").await;
+        *sink
+            .cancel_error
+            .lock()
+            .expect("lifecycle exploration sink lock") = Some("old runtime lost child".to_string());
+        let retained = handle.explore.stop("exact-rollover-replay").await;
+        let proto_request = rollover_recovery_proto_request(&retained);
+        let internal_request = rollover_recovery_internal_request(&proto_request);
+        let committed = handle
+            .explore
+            .recover_after_navigation_rollover(internal_request)
+            .await
+            .expect("seed completed recovery");
+        let service = GeometryRuntimeService::new(handle);
+
+        let replay = GeometryRuntime::recover_exploration_after_navigation_rollover(
+            &service,
+            Request::new(proto_request),
+        )
+        .await
+        .expect("exact replay must not require live planner or guard")
+        .into_inner();
+
+        assert_eq!(replay.status, committed.status);
+        assert_eq!(replay.last_stop_reason, "runtime_rollover_aborted_safe");
+        assert!(replay.child_lease.is_none());
     }
 
     #[tokio::test]
@@ -3949,8 +4256,23 @@ mod exploration_contract_tests {
                 frontier_count: 2,
                 revision: 8,
                 child_task_id: "child-3".into(),
+                exploration_generation: 12,
+                child_lease: Some(crate::explore_runtime::ChildNavigationLease {
+                    session_id: "child-3".into(),
+                    owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                    parent_request_id: "parent".into(),
+                    goal_generation: 4,
+                    producer_runtime_generation: 5,
+                    goal_payload_sha256: [7; 32],
+                }),
+                rollover_recovery_eligible: true,
             });
         assert_eq!(proto.child_task_id, "child-3");
+        assert_eq!(proto.exploration_generation, 12);
+        assert!(proto.rollover_recovery_eligible);
+        let child = proto.child_lease.expect("child lease");
+        assert_eq!(child.producer_runtime_generation, 5);
+        assert_eq!(child.goal_payload_sha256, vec![7; 32]);
     }
 }
 

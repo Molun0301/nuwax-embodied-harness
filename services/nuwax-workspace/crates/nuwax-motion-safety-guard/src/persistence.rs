@@ -19,6 +19,7 @@ use crate::state::LeaseState;
 
 const STATE_FILE_LIMIT: u64 = 64 * 1024;
 const CHECKSUM_PREFIX: &str = "sha256:";
+const V2_EXPECTED_USERS: [&str; 3] = ["nuwax-motion-guard", "nuwax-navigation", "nuwax-gateway"];
 
 #[derive(Debug, Serialize)]
 struct ProvisionedBody<'a> {
@@ -45,12 +46,46 @@ struct EpochBody<'a> {
     actuator_symbols_sha256: &'a str,
     fenced: bool,
     startup_zero_confirmed: bool,
+    recovery_fence_token_hex: &'a str,
+    recovery_fence_correlation_sha256: &'a str,
     created_at: &'a str,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredEpochRecord {
+    schema_version: u32,
+    generation: u64,
+    boot_nonce_hex: String,
+    lease_state: LeaseState,
+    last_zero_ack_id: String,
+    peer_uid_allowlist: Vec<String>,
+    actuator_symbols_sha256: String,
+    fenced: bool,
+    startup_zero_confirmed: bool,
+    recovery_fence_token_hex: String,
+    recovery_fence_correlation_sha256: String,
+    created_at: String,
+    checksum: String,
+}
+
+#[derive(Debug, Serialize)]
+struct V2EpochBody<'a> {
+    schema_version: u32,
+    generation: u64,
+    boot_nonce_hex: &'a str,
+    lease_state: LeaseState,
+    last_zero_ack_id: &'a str,
+    peer_uid_allowlist: &'a [String],
+    actuator_symbols_sha256: &'a str,
+    fenced: bool,
+    startup_zero_confirmed: bool,
+    created_at: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredV2EpochRecord {
     schema_version: u32,
     generation: u64,
     boot_nonce_hex: String,
@@ -118,6 +153,8 @@ impl From<StoredEpochRecord> for GuardEpochRecord {
             actuator_symbols_sha256: value.actuator_symbols_sha256,
             fenced: value.fenced,
             startup_zero_confirmed: value.startup_zero_confirmed,
+            recovery_fence_token_hex: value.recovery_fence_token_hex,
+            recovery_fence_correlation_sha256: value.recovery_fence_correlation_sha256,
             created_at: value.created_at,
             checksum: value.checksum,
         }
@@ -311,6 +348,7 @@ fn load_epoch(path: &Path) -> Result<GuardEpochRecord, PersistenceError> {
         .ok_or_else(|| invalid_record(path, "epoch schema_version is missing"))?;
     let record = match schema_version {
         1 => migrate_v1_epoch(path, document)?,
+        2 => migrate_v2_epoch(path, document)?,
         version if version == u64::from(SCHEMA_VERSION_EPOCH) => {
             let stored: StoredEpochRecord = serde_json::from_value(document).map_err(|source| {
                 PersistenceError::InvalidJson {
@@ -385,6 +423,75 @@ fn migrate_v1_epoch(
         actuator_symbols_sha256: stored.actuator_symbols_sha256,
         fenced: stored.fenced,
         startup_zero_confirmed: false,
+        recovery_fence_token_hex: String::new(),
+        recovery_fence_correlation_sha256: String::new(),
+        created_at: stored.created_at,
+        checksum: String::new(),
+    };
+    let errors = record.verify();
+    if !errors.is_empty() {
+        return Err(invalid_record(path, errors.join("; ")));
+    }
+    record.checksum = epoch_checksum(&record)?;
+    atomic_write_json(path, &record, 0o600)?;
+    Ok(record)
+}
+
+fn migrate_v2_epoch(
+    path: &Path,
+    document: serde_json::Value,
+) -> Result<GuardEpochRecord, PersistenceError> {
+    let stored: StoredV2EpochRecord =
+        serde_json::from_value(document).map_err(|source| PersistenceError::InvalidJson {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if stored.schema_version != 2 {
+        return Err(invalid_record(path, "epoch v2 schema_version drift"));
+    }
+    let expected = v2_epoch_checksum(&stored)?;
+    verify_checksum(path, &stored.checksum, &expected)?;
+    let users: Vec<&str> = stored
+        .peer_uid_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if users.as_slice() != V2_EXPECTED_USERS {
+        return Err(invalid_record(path, "epoch v2 peer_uid_allowlist drift"));
+    }
+    validate_epoch_common(
+        path,
+        stored.generation,
+        &stored.boot_nonce_hex,
+        &stored.actuator_symbols_sha256,
+    )?;
+
+    let backup_name = format!(
+        "{}.v2.bak",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("epoch.json")
+    );
+    let backup_path = path.with_file_name(backup_name);
+    if !backup_path.exists() {
+        atomic_write_json(&backup_path, &stored, 0o600)?;
+    }
+
+    let mut record = GuardEpochRecord {
+        schema_version: SCHEMA_VERSION_EPOCH,
+        generation: stored.generation,
+        boot_nonce_hex: stored.boot_nonce_hex,
+        lease_state: stored.lease_state,
+        last_zero_ack_id: stored.last_zero_ack_id,
+        peer_uid_allowlist: EXPECTED_USERS
+            .iter()
+            .map(|user| (*user).to_string())
+            .collect(),
+        actuator_symbols_sha256: stored.actuator_symbols_sha256,
+        fenced: stored.fenced,
+        startup_zero_confirmed: stored.startup_zero_confirmed,
+        recovery_fence_token_hex: String::new(),
+        recovery_fence_correlation_sha256: String::new(),
         created_at: stored.created_at,
         checksum: String::new(),
     };
@@ -449,9 +556,27 @@ fn epoch_checksum(record: &GuardEpochRecord) -> Result<String, PersistenceError>
         actuator_symbols_sha256: &record.actuator_symbols_sha256,
         fenced: record.fenced,
         startup_zero_confirmed: record.startup_zero_confirmed,
+        recovery_fence_token_hex: &record.recovery_fence_token_hex,
+        recovery_fence_correlation_sha256: &record.recovery_fence_correlation_sha256,
         created_at: &record.created_at,
     };
     checksum_body(&body, Path::new("epoch.json"))
+}
+
+fn v2_epoch_checksum(record: &StoredV2EpochRecord) -> Result<String, PersistenceError> {
+    let body = V2EpochBody {
+        schema_version: record.schema_version,
+        generation: record.generation,
+        boot_nonce_hex: &record.boot_nonce_hex,
+        lease_state: record.lease_state,
+        last_zero_ack_id: &record.last_zero_ack_id,
+        peer_uid_allowlist: &record.peer_uid_allowlist,
+        actuator_symbols_sha256: &record.actuator_symbols_sha256,
+        fenced: record.fenced,
+        startup_zero_confirmed: record.startup_zero_confirmed,
+        created_at: &record.created_at,
+    };
+    checksum_body(&body, Path::new("epoch-v2.json"))
 }
 
 fn v1_epoch_checksum(record: &StoredV1EpochRecord) -> Result<String, PersistenceError> {
@@ -763,6 +888,118 @@ mod tests {
     }
 
     #[test]
+    fn valid_v2_epoch_is_backed_up_migrated_and_boot_advanced() {
+        let directory = tempfile::tempdir().unwrap();
+        let provisioned_path = directory.path().join("provisioned.json");
+        let epoch_path = directory.path().join("epoch.json");
+        let backup_path = directory.path().join("epoch.json.v2.bak");
+
+        let mut provisioned = ProvisionedRecord {
+            instance_id: Uuid::new_v4().to_string(),
+            schema_version: SCHEMA_VERSION_PROVISIONED,
+            checksum: String::new(),
+        };
+        provisioned.checksum = provisioned_checksum(&provisioned).unwrap();
+        write_private(
+            &provisioned_path,
+            &serde_json::to_vec_pretty(&provisioned).unwrap(),
+            0o400,
+        );
+
+        let mut epoch = StoredV2EpochRecord {
+            schema_version: 2,
+            generation: 9,
+            boot_nonce_hex: "0123456789abcdef0123456789abcdef".to_string(),
+            lease_state: LeaseState::Active,
+            last_zero_ack_id: "zero:v2".to_string(),
+            peer_uid_allowlist: vec![
+                "nuwax-motion-guard".to_string(),
+                "nuwax-navigation".to_string(),
+                "nuwax-gateway".to_string(),
+            ],
+            actuator_symbols_sha256: format!("sha256:{}", "b".repeat(64)),
+            fenced: false,
+            startup_zero_confirmed: true,
+            created_at: "2026-07-20T00:00:00.000Z".to_string(),
+            checksum: String::new(),
+        };
+        epoch.checksum = v2_epoch_checksum(&epoch).unwrap();
+        let original = serde_json::to_vec_pretty(&epoch).unwrap();
+        write_private(&epoch_path, &original, 0o600);
+
+        let boot = EpochStore::boot(&epoch_path, &provisioned_path);
+        assert!(boot.store.is_durable(), "{}", boot.store.status());
+        assert_eq!(boot.record.schema_version, SCHEMA_VERSION_EPOCH);
+        assert_eq!(boot.record.generation, 10);
+        assert_eq!(boot.record.peer_uid_allowlist, EXPECTED_USERS);
+        assert!(boot.record.recovery_fence_token_hex.is_empty());
+        assert!(boot.record.recovery_fence_correlation_sha256.is_empty());
+        assert_eq!(boot.record.lease_state, LeaseState::Idle);
+        assert!(boot.record.fenced);
+        assert!(!boot.record.startup_zero_confirmed);
+        assert_eq!(
+            fs::read(&backup_path).unwrap(),
+            [original, b"\n".to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn v2_epoch_with_allowlist_drift_fails_closed_without_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch_path, provisioned_path) = write_valid_initial_state(directory.path());
+        let backup_path = directory.path().join("epoch.json.v2.bak");
+        let mut epoch = StoredV2EpochRecord {
+            schema_version: 2,
+            generation: 9,
+            boot_nonce_hex: "0123456789abcdef0123456789abcdef".to_string(),
+            lease_state: LeaseState::Idle,
+            last_zero_ack_id: "zero:v2".to_string(),
+            peer_uid_allowlist: vec![
+                "nuwax-motion-guard".to_string(),
+                "nuwax-navigation".to_string(),
+                "attacker-controlled".to_string(),
+            ],
+            actuator_symbols_sha256: format!("sha256:{}", "a".repeat(64)),
+            fenced: true,
+            startup_zero_confirmed: false,
+            created_at: "2026-07-20T00:00:00.000Z".to_string(),
+            checksum: String::new(),
+        };
+        epoch.checksum = v2_epoch_checksum(&epoch).unwrap();
+        let original = serde_json::to_vec_pretty(&epoch).unwrap();
+        write_private(&epoch_path, &original, 0o600);
+
+        let boot = EpochStore::boot(&epoch_path, &provisioned_path);
+        assert!(!boot.store.is_durable());
+        assert!(boot.store.status().contains("peer_uid_allowlist drift"));
+        assert_eq!(fs::read(&epoch_path).unwrap(), original);
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn boot_preserves_held_recovery_fence_latch() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch_path, provisioned_path) = write_valid_initial_state(directory.path());
+        let mut held = load_epoch(&epoch_path).unwrap();
+        held.recovery_fence_token_hex = "ab".repeat(32);
+        held.recovery_fence_correlation_sha256 = "cd".repeat(32);
+        held.checksum = epoch_checksum(&held).unwrap();
+        write_private(
+            &epoch_path,
+            &serde_json::to_vec_pretty(&held).unwrap(),
+            0o600,
+        );
+
+        let boot = EpochStore::boot(&epoch_path, &provisioned_path);
+        assert!(boot.store.is_durable(), "{}", boot.store.status());
+        assert_eq!(boot.record.recovery_fence_token_hex, "ab".repeat(32));
+        assert_eq!(
+            boot.record.recovery_fence_correlation_sha256,
+            "cd".repeat(32)
+        );
+    }
+
+    #[test]
     fn checksum_canonical_body_golden() {
         let record = ProvisionedRecord {
             instance_id: "00000000-0000-4000-8000-000000000000".to_string(),
@@ -781,7 +1018,7 @@ mod tests {
         };
         assert_eq!(
             epoch_checksum(&epoch).unwrap(),
-            "sha256:3a492797dd841744236af1d7e0ecc0f562a538baa6f7169a1423edc02e09da0d"
+            "sha256:f3d46f707688627fc6030cdf481936f691876243eb2f65b4a28d39b3cf3a46a7"
         );
     }
 }

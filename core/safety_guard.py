@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import threading
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+)
 import uuid
 
 from contracts.base import MetadataDict, utc_now
@@ -16,7 +26,7 @@ from core.resource_lock import ResourceLockManager, RuntimeResource
 
 StopHandler = Callable[[Optional[str], str], Any]
 MotionResourceQuarantineProvider = Callable[
-    [], AbstractContextManager[Iterable[str]]
+    [], ContextManager[Iterable[str]]
 ]
 
 _STOP_RESULT_CACHE_LIMIT = 128

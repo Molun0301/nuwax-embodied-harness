@@ -669,7 +669,7 @@ secure_runtime_data_permissions() {
     find "${directory}" -xdev -type d -exec chmod 0750 {} +
     find "${directory}" -xdev -type f -exec chmod 0640 {} +
   done
-  chown nuwax-geometry:nuwax-motion-clients /var/lib/nuwax_robot_bridge
+  chown root:nuwax-motion-clients /var/lib/nuwax_robot_bridge
   chmod 2770 /var/lib/nuwax_robot_bridge
   [[ -f /tmp/cdds.LOG && ! -L /tmp/cdds.LOG ]] \
     || fail "/tmp/cdds.LOG must be a regular non-symlink created by systemd-tmpfiles"
@@ -892,6 +892,7 @@ check_service_access() {
   runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/drivers/go2/video_streamer.py" \
     || fail "nuwax-gateway cannot read the Go2 video streamer"
   check_identity_write_access nuwax-geometry /var/lib/nuwax_robot_bridge
+  check_identity_write_access nuwax-gateway /var/lib/nuwax_robot_bridge
   for directory in "${GATEWAY_WRITE_DIRS[@]}"; do
     check_identity_write_access nuwax-gateway "${directory}"
   done

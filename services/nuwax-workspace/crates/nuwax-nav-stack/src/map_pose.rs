@@ -5,6 +5,85 @@ use thiserror::Error;
 
 const DEFAULT_TF_TTL: Duration = Duration::from_millis(250);
 const DEFAULT_TF_ALIGNMENT_TOLERANCE: Duration = Duration::from_millis(200);
+const BASE_FRAME_ALIASES: &[&str] = &[
+    "base",
+    "base_link",
+    "base_footprint",
+    "body",
+    "go2_base_link",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameRole {
+    Map,
+    Odom,
+    World,
+    Base,
+    Other,
+}
+
+fn validated_frame_tokens(frame_id: &str) -> Option<Vec<&str>> {
+    let frame_id = frame_id.trim();
+    if frame_id.is_empty() {
+        return None;
+    }
+    let tokens: Vec<_> = frame_id.split('/').collect();
+    tokens
+        .iter()
+        .all(|token| {
+            let mut chars = token.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+        .then_some(tokens)
+}
+
+fn is_base_frame_leaf(leaf: &str) -> bool {
+    BASE_FRAME_ALIASES.contains(&leaf)
+        || leaf.ends_with("_base_link")
+        || leaf.ends_with("_base_footprint")
+}
+
+fn infer_frame_role(leaf: &str) -> FrameRole {
+    match leaf {
+        "map" => FrameRole::Map,
+        "odom" | "odom_combined" => FrameRole::Odom,
+        "world" => FrameRole::World,
+        _ if is_base_frame_leaf(leaf) => FrameRole::Base,
+        _ => FrameRole::Other,
+    }
+}
+
+fn frame_ids_semantically_equal(left: &str, right: &str) -> bool {
+    let (Some(left_tokens), Some(right_tokens)) =
+        (validated_frame_tokens(left), validated_frame_tokens(right))
+    else {
+        return false;
+    };
+    if left_tokens == right_tokens {
+        return true;
+    }
+    let (Some(left_leaf), Some(right_leaf)) = (left_tokens.last(), right_tokens.last()) else {
+        return false;
+    };
+    let left_role = infer_frame_role(left_leaf);
+    let right_role = infer_frame_role(right_leaf);
+    if left_role != right_role {
+        return false;
+    }
+    if left_tokens.len() > 1
+        && right_tokens.len() > 1
+        && left_tokens[..left_tokens.len() - 1] != right_tokens[..right_tokens.len() - 1]
+    {
+        return false;
+    }
+    matches!(
+        left_role,
+        FrameRole::Map | FrameRole::Odom | FrameRole::World | FrameRole::Base
+    )
+}
 
 /// One real map-pose observation produced by composing map->odom with odometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,18 +166,21 @@ impl MapPoseAdapter {
         tf_ttl: Duration,
         alignment_tolerance: Duration,
     ) -> Result<Self, MapPoseError> {
-        let map_frame = map_frame.into();
-        let odom_frame = odom_frame.into();
-        let base_frame = base_frame.into();
-        if map_frame.trim().is_empty()
-            || odom_frame.trim().is_empty()
-            || base_frame.trim().is_empty()
+        let map_frame = map_frame.into().trim().to_string();
+        let odom_frame = odom_frame.into().trim().to_string();
+        let base_frame = base_frame.into().trim().to_string();
+        if validated_frame_tokens(&map_frame).is_none()
+            || validated_frame_tokens(&odom_frame).is_none()
+            || validated_frame_tokens(&base_frame).is_none()
         {
             return Err(MapPoseError::InvalidConfig(
-                "map, odom, and base frames must be non-empty".into(),
+                "map, odom, and base frames must be valid frame IDs".into(),
             ));
         }
-        if map_frame == odom_frame || odom_frame == base_frame || map_frame == base_frame {
+        if frame_ids_semantically_equal(&map_frame, &odom_frame)
+            || frame_ids_semantically_equal(&odom_frame, &base_frame)
+            || frame_ids_semantically_equal(&map_frame, &base_frame)
+        {
             return Err(MapPoseError::InvalidConfig(
                 "map, odom, and base frames must be distinct".into(),
             ));
@@ -150,8 +232,8 @@ impl MapPoseAdapter {
         received_at: Instant,
     ) -> Result<MapPoseTfObservation, MapPoseError> {
         let Some(transform) = message.transforms.iter().rev().find(|transform| {
-            transform.header.frame_id == self.map_frame
-                && transform.child_frame_id == self.odom_frame
+            frame_ids_semantically_equal(&transform.header.frame_id, &self.map_frame)
+                && frame_ids_semantically_equal(&transform.child_frame_id, &self.odom_frame)
         }) else {
             return Ok(MapPoseTfObservation {
                 accepted: false,
@@ -183,8 +265,8 @@ impl MapPoseAdapter {
             .iter()
             .rev()
             .find(|transform| {
-                transform.header.frame_id == self.odom_frame
-                    && transform.child_frame_id == self.base_frame
+                frame_ids_semantically_equal(&transform.header.frame_id, &self.odom_frame)
+                    && frame_ids_semantically_equal(&transform.child_frame_id, &self.base_frame)
             })
             .map(|odom_to_base| {
                 validate_translation(odom_to_base.transform.translation, "odom_to_base")?;
@@ -254,7 +336,7 @@ impl MapPoseAdapter {
         odometry: &schema::Odometry,
         now: Instant,
     ) -> Result<Option<MapPoseObservation>, MapPoseError> {
-        if odometry.child_frame_id != self.base_frame {
+        if !frame_ids_semantically_equal(&odometry.child_frame_id, &self.base_frame) {
             return Err(MapPoseError::FrameMismatch {
                 field: "odometry.child_frame_id",
                 expected: self.base_frame.clone(),
@@ -266,7 +348,7 @@ impl MapPoseAdapter {
             normalize_quaternion(odometry.pose.orientation_xyzw, "odometry.pose.rotation")?;
         let odometry_timestamp_ns = header_timestamp_ns(&odometry.header, "odometry.header")?;
 
-        if odometry.header.frame_id == self.map_frame {
+        if frame_ids_semantically_equal(&odometry.header.frame_id, &self.map_frame) {
             let mut header = odometry.header.clone();
             header.seq = i32::try_from(self.generation.max(1)).unwrap_or(i32::MAX);
             return Ok(Some(MapPoseObservation {
@@ -282,7 +364,7 @@ impl MapPoseAdapter {
                 pose_frame: self.map_frame.clone(),
             }));
         }
-        if odometry.header.frame_id != self.odom_frame {
+        if !frame_ids_semantically_equal(&odometry.header.frame_id, &self.odom_frame) {
             return Err(MapPoseError::FrameMismatch {
                 field: "odometry.header.frame_id",
                 expected: self.odom_frame.clone(),
@@ -483,6 +565,104 @@ mod tests {
             .transform_odometry(&odometry("camera", "base_link", 1.0, 2.0))
             .expect_err("foreign frame must fail closed");
         assert!(matches!(error, MapPoseError::FrameMismatch { .. }));
+    }
+
+    #[test]
+    fn base_frame_aliases_are_accepted_but_foreign_namespaces_are_rejected() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "robot/base_link").expect("adapter");
+        adapter.observe_tf(&map_to_odom(0.0, 0.0)).expect("TF");
+
+        assert!(adapter
+            .transform_odometry(&odometry("odom", "base_footprint", 1.0, 2.0))
+            .expect("unnamespaced base alias")
+            .is_some());
+        assert!(adapter
+            .transform_odometry(&odometry("odom", "robot/body", 1.0, 2.0))
+            .expect("same-namespace base alias")
+            .is_some());
+
+        let error = adapter
+            .transform_odometry(&odometry("odom", "other/base_footprint", 1.0, 2.0))
+            .expect_err("foreign namespace must fail closed");
+        assert!(matches!(error, MapPoseError::FrameMismatch { .. }));
+        let error = adapter
+            .transform_odometry(&odometry("odom", "camera", 1.0, 2.0))
+            .expect_err("foreign frame role must fail closed");
+        assert!(matches!(error, MapPoseError::FrameMismatch { .. }));
+    }
+
+    #[test]
+    fn coherent_tf_chain_accepts_semantic_base_alias() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_footprint").expect("adapter");
+        let observed = adapter
+            .observe_tf_message(&coherent_tf_chain(10.0, -2.0, 1.5, 3.0))
+            .expect("base_link is a base_footprint alias");
+
+        assert!(observed.map_pose.is_some());
+    }
+
+    #[test]
+    fn frame_semantics_match_python_contract_parity_matrix() {
+        let cases = [
+            ("map", "world/go2/map", true),
+            ("world/go2/map", "world/other_robot/map", false),
+            ("odom", "odom_combined", true),
+            ("robot/odom", "robot/odom_combined", true),
+            ("robot/odom", "other/odom_combined", false),
+            ("world", "robot/world", true),
+            ("body", "world/go2/body", true),
+            ("robot/chassis_base_link", "robot/base_footprint", true),
+            ("robot/chassis_base_link", "other/base_link", false),
+            ("map", "odom", false),
+            ("camera", "robot/camera", false),
+            ("camera", "camera", true),
+        ];
+
+        for (left, right, expected) in cases {
+            assert_eq!(
+                frame_ids_semantically_equal(left, right),
+                expected,
+                "semantic comparison mismatch for {left:?} and {right:?}"
+            );
+            assert_eq!(
+                frame_ids_semantically_equal(right, left),
+                expected,
+                "semantic comparison must be symmetric for {left:?} and {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_semantics_fail_closed_for_invalid_ids() {
+        assert!(!frame_ids_semantically_equal("/base_link", "base_link"));
+        assert!(!frame_ids_semantically_equal("base-link", "base_link"));
+    }
+
+    #[test]
+    fn scoped_map_and_odom_aliases_are_accepted_across_tf_and_odometry() {
+        let mut adapter =
+            MapPoseAdapter::new("robot/map", "robot/odom_combined", "base_link").expect("adapter");
+
+        let observed = adapter
+            .observe_tf_message(&coherent_tf_chain(10.0, -2.0, 1.5, 3.0))
+            .expect("unscoped TF chain is semantically compatible");
+        let map_pose = observed.map_pose.expect("atomic map pose");
+        assert_eq!(map_pose.pose.header.frame_id, "robot/map");
+
+        let fallback = adapter
+            .transform_odometry(&odometry("odom", "base_footprint", 1.5, 3.0))
+            .expect("odom alias is semantically compatible")
+            .expect("fallback map pose");
+        assert_eq!(fallback.pose.header.frame_id, "robot/map");
+    }
+
+    #[test]
+    fn semantically_duplicate_configured_frames_are_rejected() {
+        let error = match MapPoseAdapter::new("map", "robot/map", "base_link") {
+            Ok(_) => panic!("semantic aliases cannot describe distinct chain roles"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MapPoseError::InvalidConfig(_)));
     }
 
     #[test]

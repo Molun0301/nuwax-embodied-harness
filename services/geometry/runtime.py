@@ -129,6 +129,108 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
 
+_LIVE_MAP_SNAPSHOT_MAX_ATTEMPTS = 2
+
+
+@dataclass(frozen=True)
+class _ValidatedLiveMapCache:
+    backend: object
+    mapping_identity: Tuple[object, ...]
+    live_occupancy: object
+    live_cost_map: object
+    occupancy_descriptor: Dict[str, object]
+    cost_map_descriptor: Dict[str, object]
+    live_status: Dict[str, object]
+    mapping_context: Dict[str, object]
+    seed_version: Optional[MapVersion]
+
+
+def _mapping_context_snapshot_token(context: object) -> Tuple[object, ...]:
+    if not isinstance(context, dict):
+        return (None, None, 0, None, None)
+    try:
+        session_generation = int(context.get("session_generation") or 0)
+    except (TypeError, ValueError):
+        session_generation = 0
+    return (
+        str(context.get("session_id") or "").strip() or None,
+        str(context.get("map_version_id") or "").strip() or None,
+        session_generation,
+        context.get("revision"),
+        context.get("active"),
+    )
+
+
+def _live_map_layer_descriptor(layer: object) -> Dict[str, object]:
+    if layer is None:
+        return {"revision": 0, "content_hash": None, "mapping_identity": None}
+    metadata = getattr(layer, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    map_id = str(getattr(layer, "map_id", "") or "").strip()
+    revision = 0
+    for candidate in (
+        getattr(layer, "content_revision", None),
+        getattr(layer, "revision", None),
+        metadata.get("content_revision"),
+        metadata.get("revision"),
+    ):
+        try:
+            revision = int(candidate or 0)
+        except (TypeError, ValueError):
+            continue
+        if revision > 0:
+            break
+    if revision <= 0:
+        revision_match = re.search(r"(?:^|[:/_-])(\d+)$", map_id)
+        if revision_match is not None:
+            revision = int(revision_match.group(1))
+
+    content_hash = str(
+        metadata.get("content_hash")
+        or getattr(layer, "content_hash", "")
+        or ""
+    ).strip()
+    if not content_hash and revision > 0:
+        content_hash = "revision:%d:%s" % (revision, map_id)
+    if not content_hash:
+        hasher = hashlib.sha256()
+        for value in (
+            map_id,
+            getattr(layer, "timestamp", None),
+            getattr(layer, "frame_id", None),
+            getattr(layer, "width", None),
+            getattr(layer, "height", None),
+            getattr(layer, "resolution_m", None),
+        ):
+            hasher.update(str(value or "").encode("utf-8"))
+            hasher.update(b"\0")
+        for value in getattr(layer, "data", ()) or ():
+            hasher.update(str(value).encode("ascii", errors="backslashreplace"))
+            hasher.update(b"\0")
+        content_hash = hasher.hexdigest()
+    if revision <= 0:
+        revision = max(1, int(content_hash[:15], 16))
+
+    mapping_identity = _mapping_context_snapshot_token(
+        {
+            "session_id": metadata.get("mapping_session_id")
+            or metadata.get("session_id"),
+            "map_version_id": metadata.get("map_version_id"),
+            "session_generation": metadata.get("session_generation"),
+            "revision": metadata.get("mapping_revision"),
+            "active": metadata.get("mapping_active"),
+        }
+    )
+    if not mapping_identity[0] or not mapping_identity[1] or mapping_identity[2] <= 0:
+        mapping_identity = None
+    else:
+        mapping_identity = mapping_identity[:3]
+    return {
+        "revision": revision,
+        "content_hash": content_hash,
+        "mapping_identity": mapping_identity,
+    }
+
 _LIVE_MAPPING_DIAGNOSTICS_TTL_SEC = 0.5
 _EXTERNAL_EXPLORATION_LOG_SCAN_MIN_INTERVAL_SEC = 2.0
 
@@ -4376,14 +4478,115 @@ class PlatformGeometryRuntime:
         """返回当前平台几何运行时对外暴露的地图快照。"""
 
         version = self._active_map_version
-        live_occupancy = self._read_live_map_layer("occupancy_grid")
-        live_cost_map = self._read_live_map_layer("cost_map")
-        live_available = live_occupancy is not None or live_cost_map is not None
-        if live_available:
+        for _attempt in range(_LIVE_MAP_SNAPSHOT_MAX_ATTEMPTS):
+            mapping_context_before = self.get_mapping_session_context()
+            backend = self._resolve_mapping_backend()
+            live_occupancy = None
+            live_cost_map = None
+            if backend is not None:
+                occupancy_reader = getattr(backend, "get_occupancy_grid", None)
+                if callable(occupancy_reader):
+                    live_occupancy = occupancy_reader()
+                cost_map_reader = getattr(backend, "get_cost_map", None)
+                if callable(cost_map_reader):
+                    live_cost_map = cost_map_reader()
+            live_status = self._clone_metadata(
+                self._geometry_runtime_status_stub("live_map_provider")
+            )
+            mapping_context_after = self.get_mapping_session_context()
+            mapping_identity = _mapping_context_snapshot_token(
+                mapping_context_after
+            )
+            mapping_identity_complete = bool(
+                mapping_identity[0]
+                and mapping_identity[1]
+                and mapping_identity[2] > 0
+            )
+            mapping_cache_identity = (
+                *mapping_identity[:3],
+                mapping_identity[4],
+            )
+            occupancy_descriptor = _live_map_layer_descriptor(live_occupancy)
+            cost_map_descriptor = _live_map_layer_descriptor(live_cost_map)
+            layer_identities = {
+                descriptor["mapping_identity"]
+                for descriptor in (occupancy_descriptor, cost_map_descriptor)
+                if descriptor["mapping_identity"] is not None
+            }
+            if (
+                backend is not self._resolve_mapping_backend()
+                or _mapping_context_snapshot_token(mapping_context_before)
+                != mapping_identity
+                or any(
+                    layer_identity != mapping_identity[:3]
+                    for layer_identity in layer_identities
+                )
+            ):
+                continue
+            if live_occupancy is not None or live_cost_map is not None:
+                snapshot = self._build_live_map_snapshot(
+                    live_occupancy=live_occupancy,
+                    live_cost_map=live_cost_map,
+                    occupancy_descriptor=occupancy_descriptor,
+                    cost_map_descriptor=cost_map_descriptor,
+                    live_status=live_status,
+                    mapping_context=mapping_context_after,
+                    seed_version=version,
+                )
+                if mapping_identity_complete:
+                    validated_cache = _ValidatedLiveMapCache(
+                        backend=backend,
+                        mapping_identity=mapping_cache_identity,
+                        live_occupancy=live_occupancy,
+                        live_cost_map=live_cost_map,
+                        occupancy_descriptor=occupancy_descriptor,
+                        cost_map_descriptor=cost_map_descriptor,
+                        live_status=live_status,
+                        mapping_context=mapping_context_after or {},
+                        seed_version=version,
+                    )
+                    cache_lock = getattr(self, "_runtime_state_lock", None)
+                    if cache_lock is None:
+                        self._last_validated_live_map_cache = validated_cache
+                    else:
+                        with cache_lock:
+                            self._last_validated_live_map_cache = validated_cache
+                return snapshot
+            break
+        current_mapping_identity = _mapping_context_snapshot_token(
+            self.get_mapping_session_context()
+        )
+        current_mapping_cache_identity = (
+            *current_mapping_identity[:3],
+            current_mapping_identity[4],
+        )
+        current_backend = self._resolve_mapping_backend()
+        cache_lock = getattr(self, "_runtime_state_lock", None)
+        if cache_lock is None:
+            validated_cache = getattr(
+                self, "_last_validated_live_map_cache", None
+            )
+        else:
+            with cache_lock:
+                validated_cache = getattr(
+                    self, "_last_validated_live_map_cache", None
+                )
+        if (
+            isinstance(validated_cache, _ValidatedLiveMapCache)
+            and current_mapping_identity[0]
+            and current_mapping_identity[1]
+            and current_mapping_identity[2] > 0
+            and validated_cache.mapping_identity == current_mapping_cache_identity
+            and validated_cache.backend is current_backend
+        ):
             return self._build_live_map_snapshot(
-                live_occupancy=live_occupancy,
-                live_cost_map=live_cost_map,
-                seed_version=version,
+                live_occupancy=validated_cache.live_occupancy,
+                live_cost_map=validated_cache.live_cost_map,
+                occupancy_descriptor=validated_cache.occupancy_descriptor,
+                cost_map_descriptor=validated_cache.cost_map_descriptor,
+                live_status=validated_cache.live_status,
+                mapping_context=validated_cache.mapping_context,
+                seed_version=validated_cache.seed_version,
             )
         if version is None:
             return None
@@ -4425,23 +4628,70 @@ class PlatformGeometryRuntime:
         grid = reader()
         return self._clone_contract(grid) if grid is not None else None
 
-    def _build_live_map_snapshot(self, *, live_occupancy, live_cost_map, seed_version: Optional[MapVersion]) -> MapSnapshot:
-        live_status = self._clone_metadata(self._geometry_runtime_status_stub("live_map_provider"))
-        update_sequence = live_status.get("update_sequence")
-        occupancy_sequence = int(live_status.get("occupancy_sequence") or live_status.get("occupancy_message_count") or 0)
-        cost_map_sequence = int(live_status.get("cost_map_sequence") or live_status.get("cost_map_message_count") or 0)
-        message_count = max(int(live_status.get("message_count") or 0), occupancy_sequence + cost_map_sequence)
-        occupancy_content_revision = int(live_status.get("occupancy_revision") or 0)
-        cost_map_content_revision = int(live_status.get("cost_map_revision") or 0)
+    def _build_live_map_snapshot(
+        self,
+        *,
+        live_occupancy,
+        live_cost_map,
+        occupancy_descriptor: Dict[str, object],
+        cost_map_descriptor: Dict[str, object],
+        live_status: Dict[str, object],
+        mapping_context: Optional[Dict[str, object]],
+        seed_version: Optional[MapVersion],
+    ) -> MapSnapshot:
+        live_status = self._clone_metadata(live_status)
+        mapping_context = self._clone_metadata(mapping_context or {})
+        occupancy_content_revision = int(occupancy_descriptor["revision"] or 0)
+        cost_map_content_revision = int(cost_map_descriptor["revision"] or 0)
+        occupancy_sequence = occupancy_content_revision
+        cost_map_sequence = cost_map_content_revision
+        update_sequence = max(occupancy_sequence, cost_map_sequence)
+        message_count = int(live_occupancy is not None) + int(
+            live_cost_map is not None
+        )
         content_revision = occupancy_content_revision + cost_map_content_revision
         try:
             live_revision = max(1, int(content_revision or 1))
         except (TypeError, ValueError):
             live_revision = 1
-        occupancy_metrics = self._clone_metadata(live_status.get("occupancy_metrics") or {})
-        cost_map_metrics = self._clone_metadata(live_status.get("cost_map_metrics") or {})
-        occupancy_content_hash = occupancy_metrics.get("content_hash")
-        cost_map_content_hash = cost_map_metrics.get("content_hash")
+        occupancy_content_hash = occupancy_descriptor["content_hash"]
+        cost_map_content_hash = cost_map_descriptor["content_hash"]
+        occupancy_metrics = {
+            "content_hash": occupancy_content_hash,
+            "content_revision": occupancy_content_revision,
+        }
+        cost_map_metrics = {
+            "content_hash": cost_map_content_hash,
+            "content_revision": cost_map_content_revision,
+        }
+        live_status = {
+            key: live_status.get(key)
+            for key in (
+                "provider",
+                "provider_key",
+                "provider_name",
+                "status",
+                "geometry_runtime_connected",
+                "started",
+                "occupancy_topic",
+                "cost_map_topic",
+            )
+            if key in live_status
+        }
+        live_status.update({
+            "occupancy_grid_ready": live_occupancy is not None,
+            "occupancy_has_publisher": live_occupancy is not None,
+            "update_sequence": update_sequence,
+            "occupancy_sequence": occupancy_sequence,
+            "cost_map_sequence": cost_map_sequence,
+            "message_count": message_count,
+            "occupancy_message_count": int(live_occupancy is not None),
+            "cost_map_message_count": int(live_cost_map is not None),
+            "occupancy_revision": occupancy_content_revision,
+            "cost_map_revision": cost_map_content_revision,
+            "occupancy_metrics": occupancy_metrics,
+            "cost_map_metrics": cost_map_metrics,
+        })
         seed = "|".join(str(part or "") for part in (
             live_status.get("provider_name"),
             live_status.get("occupancy_topic"),
@@ -4469,8 +4719,29 @@ class PlatformGeometryRuntime:
             "occupancy_metrics": occupancy_metrics,
             "cost_map_metrics": cost_map_metrics,
             "live_map_provider": live_status,
-            "live_mapping_diagnostics": self.get_live_mapping_diagnostics(),
         }
+        mapping_session_id = str(mapping_context.get("session_id") or "").strip()
+        mapping_map_version_id = str(
+            mapping_context.get("map_version_id") or ""
+        ).strip()
+        try:
+            mapping_session_generation = int(
+                mapping_context.get("session_generation") or 0
+            )
+        except (TypeError, ValueError):
+            mapping_session_generation = 0
+        if (
+            mapping_session_id
+            and mapping_map_version_id
+            and mapping_session_generation > 0
+        ):
+            metadata.update(
+                {
+                    "mapping_session_id": mapping_session_id,
+                    "map_version_id": mapping_map_version_id,
+                    "session_generation": mapping_session_generation,
+                }
+            )
         if seed_version is not None:
             metadata.update({
                 "map_name": seed_version.map_name,

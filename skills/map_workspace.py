@@ -253,30 +253,20 @@ class MapWorkspaceService:
         平台侧决定定位是否就绪，不依赖 Go2 数据面自报状态。
         """
 
-        active_map_name = self._repository.get_active_map_name()
-        latest_map_snapshot = self._mapping_service.get_latest_snapshot()
-        if not active_map_name or latest_map_snapshot is None:
+        coherent_binding = self._read_coherent_active_map_snapshot()
+        if coherent_binding is None:
             self._localization_service.clear_latest_snapshot()
             self._localization_service.clear_active_session(reason="map_snapshot_missing")
             return None
+        active_map_name, latest_map_snapshot = coherent_binding
         frame_id = self._resolve_map_frame_id(latest_map_snapshot)
-        if refresh:
-            return self._localization_service.refresh_active_session(
-                map_name=active_map_name,
-                map_version_id=latest_map_snapshot.version_id,
-                frame_id=frame_id,
-                metadata={
-                    **dict(metadata or {}),
-                    "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
-                },
-                force_relocalize=force_relocalize,
-                geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
-            )
         return self._ensure_localization_session_for_snapshot(
             active_map_name=active_map_name,
             latest_map_snapshot=latest_map_snapshot,
             frame_id=frame_id,
             metadata=metadata,
+            refresh=refresh,
+            force_relocalize=force_relocalize,
         )
 
     def list_map_versions(self, *, map_name: str, limit: Optional[int] = None) -> Tuple[MapVersion, ...]:
@@ -317,14 +307,8 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         pinned_version_id = version_id_override or self._geometry_runtime.get_exploration_pinned_version_id()
-        snapshot_map_version_id = str(
-            snapshot.metadata.get("map_version_id") or ""
-        ).strip()
-        if (
-            pinned_version_id
-            and snapshot_map_version_id
-            and snapshot_map_version_id != pinned_version_id
-        ):
+        snapshot_map_version_id = str(snapshot.metadata.get("map_version_id") or "").strip()
+        if pinned_version_id and snapshot_map_version_id and snapshot_map_version_id != pinned_version_id:
             raise GatewayError(
                 "当前地图流属于版本 %s，与 ACTIVE 建图会话版本 %s 不一致。"
                 % (snapshot_map_version_id, pinned_version_id),
@@ -332,9 +316,7 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        persistence_map_version_id = str(
-            pinned_version_id or snapshot_map_version_id or snapshot.version_id
-        ).strip()
+        persistence_map_version_id = str(pinned_version_id or snapshot_map_version_id or snapshot.version_id).strip()
         forbidden_zone_entry = None
         if persistence_map_version_id:
             forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
@@ -343,9 +325,7 @@ class MapWorkspaceService:
             )
             forbidden_zone_entry = forbidden_zone_envelope.maps.get(resolved_name)
         enabled_forbidden_zones = tuple(
-            zone
-            for zone in getattr(forbidden_zone_entry, "zones", ())
-            if bool(getattr(zone, "enabled", False))
+            zone for zone in getattr(forbidden_zone_entry, "zones", ()) if bool(getattr(zone, "enabled", False))
         )
         raw_reader = getattr(self._geometry_runtime, "get_raw_occupancy_grid", None)
         raw_occupancy = raw_reader() if callable(raw_reader) else None
@@ -379,9 +359,7 @@ class MapWorkspaceService:
                     "metadata": {
                         **dict(snapshot.metadata),
                         "saved_occupancy_layer": "physical_raw",
-                        "forbidden_zone_generation": getattr(
-                            forbidden_zone_entry, "generation", 0
-                        ),
+                        "forbidden_zone_generation": getattr(forbidden_zone_entry, "generation", 0),
                     },
                 },
                 deep=True,
@@ -393,10 +371,15 @@ class MapWorkspaceService:
             metadata={
                 "reason": str(reason or "").strip(),
                 "snapshot_kind": snapshot.metadata.get("map_snapshot_kind"),
-                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready") or snapshot.metadata.get("backend_streaming_ready"),
+                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready")
+                or snapshot.metadata.get("backend_streaming_ready"),
                 "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
-                "backend_session_id": snapshot.metadata.get("backend_session_id") or snapshot.metadata.get("mapping_session_id") or snapshot.metadata.get("session_id"),
-                "backend_run_id": snapshot.metadata.get("backend_run_id") or snapshot.metadata.get("mapping_run_id") or snapshot.metadata.get("run_id"),
+                "backend_session_id": snapshot.metadata.get("backend_session_id")
+                or snapshot.metadata.get("mapping_session_id")
+                or snapshot.metadata.get("session_id"),
+                "backend_run_id": snapshot.metadata.get("backend_run_id")
+                or snapshot.metadata.get("mapping_run_id")
+                or snapshot.metadata.get("run_id"),
                 "mapping_database_path": snapshot.metadata.get("mapping_database_path"),
                 "update_sequence": snapshot.metadata.get("update_sequence"),
                 "content_revision": snapshot.metadata.get("content_revision"),
@@ -404,9 +387,7 @@ class MapWorkspaceService:
                 "exploration_pinned_version_id": pinned_version_id,
                 "mapping_session_id": snapshot.metadata.get("mapping_session_id")
                 or snapshot.metadata.get("session_id"),
-                "mapping_session_generation": snapshot.metadata.get(
-                    "session_generation"
-                ),
+                "mapping_session_generation": snapshot.metadata.get("session_generation"),
                 "mapping_map_version_id": snapshot_map_version_id or pinned_version_id,
                 **dict(metadata or {}),
             },
@@ -414,9 +395,10 @@ class MapWorkspaceService:
         version = self._version_repository.save_existing_map_version(
             self._geometry_runtime.prepare_map_version_assets(version)
         )
-        finalize_exploration_save = str(reason or "").strip().startswith("explore") or str(
-            (metadata or {}).get("source") or ""
-        ).strip() == "task_finalize"
+        finalize_exploration_save = (
+            str(reason or "").strip().startswith("explore")
+            or str((metadata or {}).get("source") or "").strip() == "task_finalize"
+        )
         if pinned_version_id and finalize_exploration_save:
             self._geometry_runtime.clear_exploration_pinned_version_context()
         asset = self._repository.get_map_asset(resolved_name)
@@ -526,8 +508,9 @@ class MapWorkspaceService:
                 _geometry_runtime._on_external_geometry_session_mode_changed("localization")
             except Exception:
                 import logging
+
                 logging.getLogger(__name__).debug(
-                    "load_map_version 触发 _on_external_geometry_session_mode_changed(\"localization\") 失败。",
+                    'load_map_version 触发 _on_external_geometry_session_mode_changed("localization") 失败。',
                     exc_info=True,
                 )
         asset = self._repository.get_map_asset(resolved_name)
@@ -688,7 +671,9 @@ class MapWorkspaceService:
             update={
                 "active": False,
                 "status": MapAssetStatus.READY if asset.latest_version_id else MapAssetStatus.CREATED,
-                "updated_at": datetime.now(asset.updated_at.tzinfo) if asset.updated_at.tzinfo is not None else datetime.utcnow(),
+                "updated_at": datetime.now(asset.updated_at.tzinfo)
+                if asset.updated_at.tzinfo is not None
+                else datetime.utcnow(),
             },
             deep=True,
         )
@@ -740,10 +725,8 @@ class MapWorkspaceService:
         deleted = self._repository.delete_map_asset(resolved_name)
         deleted_forbidden_zones = False
         if deleted:
-            deleted_zone_envelope = (
-                self._navigation_service.delete_forbidden_zones_for_map(
-                    map_name=resolved_name,
-                )
+            deleted_zone_envelope = self._navigation_service.delete_forbidden_zones_for_map(
+                map_name=resolved_name,
             )
             deleted_forbidden_zones = bool(deleted_zone_envelope.maps)
         self._state_store.write(
@@ -779,18 +762,28 @@ class MapWorkspaceService:
         }
 
     def _build_workspace(self, asset: MapAsset, *, refresh_localization: bool = True) -> MapWorkspace:
-        latest_map_snapshot = self._mapping_service.get_latest_snapshot() if asset.active else None
-        active_localization_session = (
-            self._ensure_active_localization_session_binding(refresh=refresh_localization) if asset.active else None
-        )
+        latest_map_snapshot = None
+        active_localization_session = None
+        if asset.active:
+            coherent_binding = self._read_coherent_active_map_snapshot()
+            if coherent_binding is not None:
+                active_map_name, coherent_snapshot = coherent_binding
+                if active_map_name == asset.map_name:
+                    binding_result = []
+                    active_localization_session = self._ensure_localization_session_for_snapshot(
+                        active_map_name=active_map_name,
+                        latest_map_snapshot=coherent_snapshot,
+                        frame_id=self._resolve_map_frame_id(coherent_snapshot),
+                        metadata=None,
+                        refresh=refresh_localization,
+                        _binding_result=binding_result,
+                    )
+                    latest_map_snapshot = binding_result[-1][1]
         latest_localization_snapshot = self._localization_service.get_latest_snapshot() if asset.active else None
         runtime_readiness = self._active_runtime_readiness() if asset.active else {}
         live_map_loaded = bool(
             latest_map_snapshot is not None
-            and (
-                runtime_readiness.get("map_loaded", True)
-                or self._checkpoint_map_displayable(latest_map_snapshot)
-            )
+            and (runtime_readiness.get("map_loaded", True) or self._checkpoint_map_displayable(latest_map_snapshot))
         )
         live_localization_ready = bool(
             active_localization_session is not None
@@ -807,7 +800,9 @@ class MapWorkspaceService:
             map_loaded=live_map_loaded,
             localization_ready=live_localization_ready,
             active_localization_session=active_localization_session,
-            mapping_runtime_enabled=bool(runtime_readiness.get("runtime_enabled", self._mapping_service.is_available())),
+            mapping_runtime_enabled=bool(
+                runtime_readiness.get("runtime_enabled", self._mapping_service.is_available())
+            ),
             latest_map_snapshot=latest_map_snapshot if live_map_loaded else None,
             latest_localization_snapshot=latest_localization_snapshot if live_localization_ready else None,
             latest_memory_summary=memory_summary,
@@ -828,12 +823,23 @@ class MapWorkspaceService:
         return workspace
 
     def _sync_asset(self, asset: MapAsset, *, is_active: bool, refresh_localization: bool = True) -> MapAsset:
-        latest_map_snapshot = self._mapping_service.get_latest_snapshot() if is_active else None
-        active_localization_session = (
-            self._ensure_active_localization_session_binding(refresh=refresh_localization)
-            if is_active and self._repository.get_active_map_name() == asset.map_name
-            else None
-        )
+        latest_map_snapshot = None
+        active_localization_session = None
+        if is_active:
+            coherent_binding = self._read_coherent_active_map_snapshot()
+            if coherent_binding is not None:
+                active_map_name, coherent_snapshot = coherent_binding
+                if active_map_name == asset.map_name:
+                    binding_result = []
+                    active_localization_session = self._ensure_localization_session_for_snapshot(
+                        active_map_name=active_map_name,
+                        latest_map_snapshot=coherent_snapshot,
+                        frame_id=self._resolve_map_frame_id(coherent_snapshot),
+                        metadata=None,
+                        refresh=refresh_localization,
+                        _binding_result=binding_result,
+                    )
+                    latest_map_snapshot = binding_result[-1][1]
         # —— speed-up-list-maps-summary ——
         # 非活跃资产不调 get_summary()（其内部 list_memory_libraries 会逐行反序列化
         # 8 张记忆表 payload，×8 资产 ≈8s 是 list_maps 实测 13s 的根因）。非活跃资产的
@@ -842,10 +848,7 @@ class MapWorkspaceService:
         runtime_readiness = self._active_runtime_readiness() if is_active else {}
         live_map_loaded = bool(
             latest_map_snapshot is not None
-            and (
-                runtime_readiness.get("map_loaded", True)
-                or self._checkpoint_map_displayable(latest_map_snapshot)
-            )
+            and (runtime_readiness.get("map_loaded", True) or self._checkpoint_map_displayable(latest_map_snapshot))
         )
         frame_id = asset.frame_id
         if live_map_loaded and latest_map_snapshot is not None:
@@ -873,7 +876,11 @@ class MapWorkspaceService:
                     localization_ready=localization_ready,
                     memory_active=memory_active,
                 ),
-                "updated_at": asset.updated_at if latest_map_snapshot is None and asset.active == is_active else datetime.now(asset.updated_at.tzinfo) if asset.updated_at.tzinfo is not None else datetime.utcnow(),
+                "updated_at": asset.updated_at
+                if latest_map_snapshot is None and asset.active == is_active
+                else datetime.now(asset.updated_at.tzinfo)
+                if asset.updated_at.tzinfo is not None
+                else datetime.utcnow(),
             },
             deep=True,
         )
@@ -996,10 +1003,13 @@ class MapWorkspaceService:
             "quality_metrics": quality_metrics,
             "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             "snapshot_kind": latest_map_snapshot.metadata.get("map_snapshot_kind"),
-            "source_mode": latest_map_snapshot.metadata.get("source_mode") or latest_map_snapshot.metadata.get("map_version_source_mode"),
-            "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready") or latest_map_snapshot.metadata.get("live_streaming_ready"),
+            "source_mode": latest_map_snapshot.metadata.get("source_mode")
+            or latest_map_snapshot.metadata.get("map_version_source_mode"),
+            "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready")
+            or latest_map_snapshot.metadata.get("live_streaming_ready"),
             "checkpoint_ready": latest_map_snapshot.metadata.get("checkpoint_ready"),
-            "session_id": latest_map_snapshot.metadata.get("mapping_session_id") or latest_map_snapshot.metadata.get("session_id"),
+            "session_id": latest_map_snapshot.metadata.get("mapping_session_id")
+            or latest_map_snapshot.metadata.get("session_id"),
             "run_id": latest_map_snapshot.metadata.get("mapping_run_id") or latest_map_snapshot.metadata.get("run_id"),
             "database": latest_map_snapshot.metadata.get("database"),
             "pcd": latest_map_snapshot.metadata.get("pcd"),
@@ -1046,11 +1056,7 @@ class MapWorkspaceService:
     ) -> None:
         """定位模式加载版本后先展示离线 checkpoint，live /map_obstacles 不替换显示层。"""
 
-        occupancy_grid = (
-            prepared_version.snapshot.occupancy_grid
-            if prepared_version.snapshot is not None
-            else None
-        )
+        occupancy_grid = prepared_version.snapshot.occupancy_grid if prepared_version.snapshot is not None else None
         cost_map = prepared_version.snapshot.cost_map if prepared_version.snapshot is not None else None
         semantic_map = prepared_version.snapshot.semantic_map if prepared_version.snapshot is not None else None
         if occupancy_grid is None and runtime_snapshot is not None:
@@ -1134,7 +1140,11 @@ class MapWorkspaceService:
             and activation_result.get("backend_switch_applied") is True
             and str(activation_result.get("backend_mode") or "") == "mapping_localization"
         ):
-            navigation_map = activation_result.get("navigation_map") if isinstance(activation_result.get("navigation_map"), dict) else {}
+            navigation_map = (
+                activation_result.get("navigation_map")
+                if isinstance(activation_result.get("navigation_map"), dict)
+                else {}
+            )
             if not bool(navigation_map.get("used_for_static_map")):
                 # 定位模式 live /map_obstacles 可能数十秒后才首帧；先 ingest 版本 checkpoint 供 Debug/MCP 立即可见。
                 self._ingest_localization_checkpoint_snapshot(
@@ -1213,7 +1223,8 @@ class MapWorkspaceService:
         database_metrics = database if isinstance(database, dict) else {}
         self._geometry_runtime.clear_active_map_version(reason="backend_switch_not_applied")
         raise GatewayError(
-            "平台地图版本 %s 只恢复了平台快照，当前几何后端未确认版本切换，拒绝伪装成已切换可定位。" % prepared_version.version_id,
+            "平台地图版本 %s 只恢复了平台快照，当前几何后端未确认版本切换，拒绝伪装成已切换可定位。"
+            % prepared_version.version_id,
             error_code="map_version_backend_switch_unavailable",
             http_status=409,
             jsonrpc_code=-32000,
@@ -1303,10 +1314,10 @@ class MapWorkspaceService:
         metadata: Optional[Dict[str, object]] = None,
         refresh: bool = True,
     ) -> Optional[LocalizationSession]:
-        active_map_name = self._repository.get_active_map_name()
-        latest_map_snapshot = self._mapping_service.get_latest_snapshot()
-        if not active_map_name or latest_map_snapshot is None:
+        coherent_binding = self._read_coherent_active_map_snapshot()
+        if coherent_binding is None:
             return None
+        active_map_name, latest_map_snapshot = coherent_binding
         frame_id = self._resolve_map_frame_id(latest_map_snapshot)
         return self._ensure_localization_session_for_snapshot(
             active_map_name=active_map_name,
@@ -1324,30 +1335,149 @@ class MapWorkspaceService:
         frame_id: Optional[str],
         metadata: Optional[Dict[str, object]],
         refresh: bool = True,
+        force_relocalize: bool = False,
+        _compare_attempts_remaining: int = 3,
+        _binding_result: Optional[list] = None,
     ) -> LocalizationSession:
+        snapshot_metadata = dict(latest_map_snapshot.metadata)
         session_metadata = {
             **dict(metadata or {}),
-            "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
+            "geometry_diagnostics": snapshot_metadata.get("geometry_diagnostics"),
         }
+        live_identity = self._live_mapping_identity(latest_map_snapshot)
+        session_map_version_id = latest_map_snapshot.version_id
+        if live_identity is not None:
+            mapping_session_id, session_map_version_id, session_generation = live_identity
+            session_metadata.update(
+                {
+                    "mapping_session_id": mapping_session_id,
+                    "map_version_id": session_map_version_id,
+                    "session_generation": session_generation,
+                    "content_revision": snapshot_metadata.get("content_revision"),
+                }
+            )
         geometry_asset = self._resolve_geometry_asset_summary(latest_map_snapshot)
-        if refresh:
-            try:
-                return self._localization_service.refresh_active_session(
-                    map_name=active_map_name,
-                    map_version_id=latest_map_snapshot.version_id,
-                    frame_id=frame_id,
-                    metadata=session_metadata,
-                    geometry_asset=geometry_asset,
-                )
-            except GatewayError:
-                pass
-        return self._localization_service.ensure_active_session(
+        desired_key = self._localization_snapshot_binding_key(latest_map_snapshot)
+        if desired_key is None:
+            raise GatewayError(
+                "地图快照缺少稳定定位身份，请重试。",
+                error_code="localization_session_compare_conflict",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        existing, mutation_epoch = self._localization_service.get_active_session_token()
+        existing_identity = (
+            self._live_mapping_identity_from_metadata(existing.metadata)
+            if existing is not None
+            else None
+        )
+        matched, committed = self._localization_service.compare_and_set_active_session(
+            expected_session_id=existing.session_id if existing is not None else None,
+            expected_live_mapping_identity=existing_identity,
+            expected_mutation_epoch=mutation_epoch,
             map_name=active_map_name,
-            map_version_id=latest_map_snapshot.version_id,
+            map_version_id=session_map_version_id,
             frame_id=frame_id,
             metadata=session_metadata,
+            refresh=refresh,
+            force_relocalize=force_relocalize,
             geometry_asset=geometry_asset,
         )
+        coherent_binding = self._read_coherent_active_map_snapshot()
+        if coherent_binding is not None:
+            latest_active_map_name, latest_snapshot = coherent_binding
+            latest_key = self._localization_snapshot_binding_key(latest_snapshot)
+            if (
+                matched
+                and committed is not None
+                and latest_active_map_name == active_map_name
+                and latest_key == desired_key
+            ):
+                if _binding_result is not None:
+                    _binding_result.append((active_map_name, latest_map_snapshot, committed))
+                return committed
+            if _compare_attempts_remaining > 1 and latest_key is not None:
+                return self._ensure_localization_session_for_snapshot(
+                    active_map_name=latest_active_map_name,
+                    latest_map_snapshot=latest_snapshot,
+                    frame_id=self._resolve_map_frame_id(latest_snapshot),
+                    metadata=metadata,
+                    refresh=refresh,
+                    force_relocalize=force_relocalize,
+                    _compare_attempts_remaining=_compare_attempts_remaining - 1,
+                    _binding_result=_binding_result,
+                )
+        raise GatewayError(
+            "地图定位会话在绑定期间持续切换，请重试。",
+            error_code="localization_session_compare_conflict",
+            http_status=409,
+            jsonrpc_code=-32000,
+        )
+
+    def _localization_snapshot_binding_key(self, snapshot):
+        live_identity = self._live_mapping_identity(snapshot)
+        if live_identity is not None:
+            return ("live",) + live_identity
+        metadata = dict(getattr(snapshot, "metadata", {}) or {})
+        if metadata.get("map_snapshot_kind") == "live_streaming":
+            return None
+        version_id = str(getattr(snapshot, "version_id", "") or "").strip()
+        return ("snapshot", version_id) if version_id else None
+
+    def _read_coherent_active_map_snapshot(self):
+        """Read an active-map/snapshot pair that stayed coherent across capture."""
+
+        observed_incoherence = False
+        for _attempt in range(3):
+            active_before = self._repository.get_active_map_name()
+            snapshot = self._mapping_service.get_latest_snapshot()
+            active_after = self._repository.get_active_map_name()
+            if active_before != active_after:
+                observed_incoherence = True
+                continue
+            if not active_after or snapshot is None:
+                return None
+            snapshot_metadata = dict(getattr(snapshot, "metadata", {}) or {})
+            snapshot_map_name = str(
+                getattr(snapshot, "map_name", None)
+                or snapshot_metadata.get("map_name")
+                or snapshot_metadata.get("active_map_name")
+                or ""
+            ).strip()
+            if snapshot_map_name and snapshot_map_name != active_after:
+                observed_incoherence = True
+                continue
+            return active_after, snapshot
+        if observed_incoherence:
+            raise GatewayError(
+                "激活地图与地图快照在读取期间发生切换，请重试。",
+                error_code="localization_session_compare_conflict",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        return None
+
+    def _live_mapping_identity(self, latest_map_snapshot) -> Optional[Tuple[str, str, int]]:
+        if not self._is_live_streaming_snapshot(latest_map_snapshot):
+            return None
+        return self._live_mapping_identity_from_metadata(dict(getattr(latest_map_snapshot, "metadata", {}) or {}))
+
+    @staticmethod
+    def _live_mapping_identity_from_metadata(
+        metadata: Dict[str, object],
+    ) -> Optional[Tuple[str, str, int]]:
+        mapping_session_id = str(metadata.get("mapping_session_id") or "").strip()
+        map_version_id = str(metadata.get("map_version_id") or "").strip()
+        session_generation = metadata.get("session_generation")
+        if not mapping_session_id or not map_version_id or session_generation is None:
+            return None
+        try:
+            resolved_generation = int(session_generation)
+        except (TypeError, ValueError):
+            return None
+        if resolved_generation <= 0:
+            return None
+        return mapping_session_id, map_version_id, resolved_generation
 
     def _is_live_streaming_snapshot(self, latest_map_snapshot) -> bool:
         metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})

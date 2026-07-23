@@ -1013,7 +1013,11 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
     # 当前帧真实存在的 base 节点串（按语义角色匹配，取第一个角色为 base 的 frame）。
     live_base_frame = next((f for f in present_frames if infer_frame_role(f) == "base"), None)
     if live_base_frame is None:
-        configured_base = _normalize_frame(os.environ.get("NUWAX_GEOMETRY_BASE_FRAME", ""))
+        configured_base = _normalize_frame(os.environ.get("NUWAX_BASE_FRAME", ""))
+        if not configured_base:
+            configured_base = _normalize_frame(
+                os.environ.get("NUWAX_GEOMETRY_BASE_FRAME", "")
+            )
         if configured_base and configured_base in present_frames:
             live_base_frame = configured_base
 
@@ -2494,12 +2498,25 @@ class GeometryRuntimeProvider:
         }
 
     # === Localization ===
-    def get_current_pose(self) -> Optional[Pose]:
+    def get_current_pose(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[Pose]:
         self._raise_if_stopping("get_current_pose")
         if not self._stub:
             return None
+        reader = getattr(self._stub, "GetCurrentPose", None)
+        if not callable(reader):
+            return None
+        timeout = _pose_deadline_sec()
+        if deadline_monotonic is not None:
+            remaining = float(deadline_monotonic) - time.monotonic()
+            if remaining <= 0:
+                return None
+            timeout = min(timeout, remaining)
         try:
-            resp = self._stub.GetCurrentPose(pb2.PoseRequest(), timeout=_pose_deadline_sec())
+            resp = reader(pb2.PoseRequest(), timeout=timeout)
             return _build_pose(resp)
         except grpc.RpcError as e:
             _log_rpc_error("GetCurrentPose", e)
@@ -4397,9 +4414,11 @@ class GeometryRuntimeProvider:
         _exploration_rpc_timeout(deadline_monotonic, "GetNavigationState")
         if deadline_monotonic is None:
             self._ensure_nav_state_stream()
-        return self._build_navigation_state_snapshot(
+        state = self._build_navigation_state_snapshot(
             deadline_monotonic=deadline_monotonic,
         )
+        pose = self.get_current_pose(deadline_monotonic=deadline_monotonic)
+        return state.model_copy(update={"current_pose": pose})
 
     def subscribe_navigation_updates(
         self,

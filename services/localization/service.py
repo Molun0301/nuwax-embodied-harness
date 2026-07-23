@@ -49,10 +49,16 @@ class LocalizationService:
         self._event_bus = event_bus
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
+        self._session_publication_lock = threading.Lock()
+        self._session_publication_queue = deque()
+        self._session_publication_draining = False
+        self._session_publication_drainer_token = None
+        self._session_event_read_view = threading.local()
         self._history: Deque[LocalizationSnapshot] = deque(maxlen=max(1, history_limit))
         self._session_history: Deque[LocalizationSession] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[LocalizationSnapshot] = None
         self._active_session: Optional[LocalizationSession] = None
+        self._session_mutation_epoch = 0
         # 平台定位状态机
         self._state_machine: LocalizationStateMachine = state_machine or create_localization_state_machine()
         self._last_diagnostics: Optional[LocalizationDiagnostics] = None
@@ -180,7 +186,6 @@ class LocalizationService:
                     },
                     deep=True,
                 )
-                self._set_active_session_locked(updated)
                 published_session = updated
             else:
                 session = LocalizationSession(
@@ -188,7 +193,9 @@ class LocalizationService:
                     map_name=str(map_name or "").strip(),
                     map_version_id=str(map_version_id or "").strip(),
                     frame_id=str(frame_id or "").strip() or None,
-                    status=LocalizationSessionStatus.FAILED if asset_failure else LocalizationSessionStatus.LOCALIZING,
+                    status=LocalizationSessionStatus.FAILED
+                    if asset_failure
+                    else LocalizationSessionStatus.LOCALIZING,
                     source_name="platform_localization_runtime",
                     pose_available=False,
                     geometry_asset=resolved_geometry_asset,
@@ -199,10 +206,10 @@ class LocalizationService:
                     },
                 )
                 self._latest_snapshot = None
-                self._set_active_session_locked(session)
                 published_session = session
-        # 锁外发布
-        self._publish_session(published_session)
+            self._set_active_session_locked(published_session)
+            should_drain = self._enqueue_session_publication_locked(session=published_session)
+        self._drain_session_publications_if_owner(should_drain)
         return published_session
 
     def refresh_active_session(
@@ -238,6 +245,8 @@ class LocalizationService:
             metadata=metadata,
             geometry_asset=geometry_asset,
         )
+        with self._lock:
+            refresh_epoch = self._session_mutation_epoch
 
         provider = self._get_localization_provider()
         provider_name = provider.provider_name
@@ -251,14 +260,25 @@ class LocalizationService:
             # 写回前必须校验 active session 仍是本次刷新开始时绑定的同一会话（以 session_id 为身份令牌）。
             # 若已被清空或切换，则丢弃本次刷新结果（不驱动共享状态机、不写回、不发布），避免旧会话被刷新线程重新写回。
             active = self._active_session
-            if active is None or active.session_id != session.session_id:
+            if (
+                active is None
+                or active.session_id != session.session_id
+                or self._session_mutation_epoch != refresh_epoch
+            ):
                 LOGGER.warning(
                     "丢弃过期定位刷新：active session 在 provider IO 期间已被清空或切换"
                     "（refresh_session_id=%s, current_session_id=%s）。",
                     session.session_id,
                     active.session_id if active is not None else None,
                 )
-                return session
+                if active is None:
+                    raise GatewayError(
+                        "定位会话在刷新期间已被清除，请重试。",
+                        error_code="localization_session_compare_conflict",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                    )
+                return active
 
             # 构建定位诊断信息
             diagnostics = self._build_localization_diagnostics(
@@ -370,19 +390,383 @@ class LocalizationService:
                 deep=True,
             )
             self._set_active_session_locked(updated)
-            snapshot_source_name = snapshot.source_name
+            committed_epoch = self._session_mutation_epoch
+            should_drain = self._enqueue_session_publication_locked(
+                session=updated,
+                snapshot_publication=(
+                    snapshot,
+                    usable_pose,
+                    snapshot_frame_tree,
+                    snapshot_trajectory,
+                    snapshot_history_size,
+                ),
+            )
 
-        # 锁外发布快照与会话
-        self._publish_snapshot(
-            snapshot,
-            source_name=snapshot_source_name,
+        self._drain_session_publications_if_owner(should_drain)
+        with self._lock:
+            current = self._active_session
+            matched = current is updated and self._session_mutation_epoch == committed_epoch
+        if matched:
+            return updated
+        if current is None:
+            raise GatewayError(
+                "定位会话在发布前已被清除，请重试。",
+                error_code="localization_session_compare_conflict",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        return current
+
+    def compare_and_set_active_session(
+        self,
+        *,
+        expected_session_id: Optional[str],
+        expected_live_mapping_identity: Optional[Tuple[str, str, int]],
+        expected_mutation_epoch: int,
+        map_name: str,
+        map_version_id: str,
+        frame_id: Optional[str] = None,
+        metadata: Optional[Dict[str, object]] = None,
+        refresh: bool = True,
+        force_relocalize: bool = False,
+        geometry_asset: Optional[Dict[str, object]] = None,
+    ) -> Tuple[bool, Optional[LocalizationSession]]:
+        """Conditionally install or refresh a binding without exposing the service lock.
+
+        The expected session token and stable live-mapping identity are checked both
+        before provider IO and at commit. A replacement is installed in the same
+        critical section that retires the old binding.
+        """
+
+        with self._lock:
+            current = self._active_session
+            if not self._session_matches_expectation_locked(
+                current,
+                expected_session_id=expected_session_id,
+                expected_live_mapping_identity=expected_live_mapping_identity,
+                expected_mutation_epoch=expected_mutation_epoch,
+            ):
+                return False, current
+
+        provider = None
+        current_pose = None
+        frame_tree = None
+        if refresh:
+            provider = self._get_localization_provider()
+            current_pose, frame_tree = self._capture_provider_data(provider)
+
+        resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
+        asset_failure = self._resolve_geometry_asset_failure(resolved_geometry_asset)
+        resolved_map_name = str(map_name or "").strip()
+        resolved_map_version_id = str(map_version_id or "").strip()
+        resolved_frame_id = str(frame_id or "").strip() or None
+        publication = None
+        with self._lock:
+            current = self._active_session
+            if not self._session_matches_expectation_locked(
+                current,
+                expected_session_id=expected_session_id,
+                expected_live_mapping_identity=expected_live_mapping_identity,
+                expected_mutation_epoch=expected_mutation_epoch,
+            ):
+                return False, current
+
+            can_reuse = bool(
+                current is not None
+                and current.status != LocalizationSessionStatus.FAILED
+                and current.map_name == resolved_map_name
+                and current.map_version_id == resolved_map_version_id
+                and self._frame_ids_match(current.frame_id, resolved_frame_id)
+                and self._live_mapping_identity(current.metadata)
+                == self._live_mapping_identity(metadata)
+            )
+            if can_reuse:
+                session = current
+            else:
+                session = LocalizationSession(
+                    session_id=self._build_session_id(
+                        map_name=resolved_map_name,
+                        map_version_id=resolved_map_version_id,
+                    ),
+                    map_name=resolved_map_name,
+                    map_version_id=resolved_map_version_id,
+                    frame_id=resolved_frame_id,
+                    status=LocalizationSessionStatus.FAILED
+                    if asset_failure
+                    else LocalizationSessionStatus.LOCALIZING,
+                    source_name="platform_localization_runtime",
+                    pose_available=False,
+                    geometry_asset=resolved_geometry_asset,
+                    last_error=asset_failure,
+                    metadata={
+                        **dict(metadata or {}),
+                        "geometry_asset_summary": resolved_geometry_asset,
+                    },
+                )
+                self._latest_snapshot = None
+                self._state_machine.reset()
+                self._last_diagnostics = None
+
+            if not refresh:
+                self._set_active_session_locked(session)
+                publication = (None, session)
+            else:
+                publication = self._refresh_session_from_provider_locked(
+                    session=session,
+                    provider=provider,
+                    current_pose=current_pose,
+                    frame_tree=frame_tree,
+                    metadata=metadata,
+                    force_relocalize=force_relocalize,
+                )
+            committed_epoch = self._session_mutation_epoch
+            snapshot_publication, committed_session = publication
+            should_drain = self._enqueue_session_publication_locked(
+                session=committed_session,
+                snapshot_publication=snapshot_publication,
+            )
+
+        self._drain_session_publications_if_owner(should_drain)
+        with self._lock:
+            current = self._active_session
+            matched = current is committed_session and self._session_mutation_epoch == committed_epoch
+        return (True, committed_session) if matched else (False, current)
+
+    def compare_and_clear_active_session(
+        self,
+        *,
+        expected_session_id: Optional[str],
+        expected_live_mapping_identity: Optional[Tuple[str, str, int]],
+        expected_mutation_epoch: int,
+        reason: str = "",
+    ) -> Tuple[bool, Optional[LocalizationSession]]:
+        """Clear only the exact observed binding and mutation generation."""
+
+        with self._lock:
+            current = self._active_session
+            if not self._session_matches_expectation_locked(
+                current,
+                expected_session_id=expected_session_id,
+                expected_live_mapping_identity=expected_live_mapping_identity,
+                expected_mutation_epoch=expected_mutation_epoch,
+            ):
+                return False, current
+            self._active_session = None
+            self._session_mutation_epoch += 1
+            self._state_machine.reset()
+            self._last_diagnostics = None
+            should_drain = self._enqueue_session_publication_locked(clear_reason=reason)
+        self._drain_session_publications_if_owner(should_drain)
+        return True, None
+
+    def _refresh_session_from_provider_locked(
+        self,
+        *,
+        session: LocalizationSession,
+        provider: LocalizationProvider,
+        current_pose,
+        frame_tree,
+        metadata: Optional[Dict[str, object]],
+        force_relocalize: bool,
+    ):
+        """Apply already-captured provider data while the caller owns ``_lock``."""
+
+        diagnostics = self._build_localization_diagnostics(
+            provider=provider,
+            current_pose=current_pose,
+            session_frame_id=session.frame_id,
+        )
+        self._last_diagnostics = diagnostics
+        if force_relocalize or self._state_machine.current_state == "idle":
+            self._state_machine.start()
+        self._state_machine.check_timeouts()
+
+        if current_pose is not None:
+            pose_available = True
+            tracking_quality = diagnostics.tracking_quality
+            if session.frame_id and not frame_ids_semantically_equal(current_pose.frame_id, session.frame_id):
+                pose_available = False
+                diagnostics.last_error = "坐标系不匹配：%s vs %s" % (current_pose.frame_id, session.frame_id)
+                tracking_quality = 0.0
+            self._state_machine.pose_received(
+                pose_available=pose_available,
+                tracking_quality=tracking_quality,
+                backend_state=diagnostics.backend_state,
+            )
+        else:
+            self._state_machine.pose_received(
+                pose_available=False,
+                tracking_quality=0.0,
+                backend_state=diagnostics.backend_state,
+            )
+        self._state_machine.check_timeouts()
+        machine_state = self._state_machine.current_state
+        session_status = self._map_machine_state_to_session_status(machine_state)
+        asset_failure = self._resolve_geometry_asset_failure(session.geometry_asset)
+        if asset_failure:
+            session_status = LocalizationSessionStatus.FAILED
+        relocalization_candidates = self._build_relocalization_candidates(
+            diagnostics=diagnostics,
+            current_pose=current_pose,
+            geometry_asset=session.geometry_asset,
+            session_status=session_status,
+        )
+        last_relocalization = relocalization_candidates[-1] if relocalization_candidates else None
+        last_error = asset_failure or self._build_session_last_error(
+            diagnostics=diagnostics,
+            session_status=session_status,
+        )
+        usable_pose = current_pose if session_status == LocalizationSessionStatus.READY else None
+        snapshot_frame_tree = frame_tree if usable_pose is not None else None
+        snapshot = LocalizationSnapshot(
+            source_name="platform_localization:%s" % session.map_name,
             current_pose=usable_pose,
             frame_tree=snapshot_frame_tree,
-            trajectory_poses=snapshot_trajectory,
-            history_size=snapshot_history_size,
+            metadata={
+                "source_kind": "platform_localization_session",
+                "map_name": session.map_name,
+                "platform_map_version_id": session.map_version_id,
+                "localization_session_id": session.session_id,
+                "provider_name": provider.provider_name,
+                "machine_state": machine_state,
+                "diagnostics": diagnostics.model_dump(mode="json"),
+                "relocalization_candidates": [item.model_dump(mode="json") for item in relocalization_candidates],
+                "last_relocalization": last_relocalization.model_dump(mode="json")
+                if last_relocalization is not None
+                else None,
+                "geometry_asset_summary": session.geometry_asset,
+                "force_relocalize": force_relocalize,
+                **dict(metadata or {}),
+            },
         )
-        self._publish_session(updated)
-        return updated
+        trajectory, history_size = self._record_snapshot_locked(snapshot)
+        updated = session.model_copy(
+            update={
+                "status": session_status,
+                "source_name": provider.provider_name,
+                "pose_available": session_status == LocalizationSessionStatus.READY,
+                "relocalization_candidates": relocalization_candidates,
+                "last_relocalization": last_relocalization,
+                "last_localized_at": utc_now()
+                if session_status == LocalizationSessionStatus.READY
+                else session.last_localized_at,
+                "last_error": last_error,
+                "metadata": {
+                    **dict(session.metadata),
+                    "machine_state": machine_state,
+                    "asset_failure": asset_failure,
+                    **dict(snapshot.metadata),
+                },
+            },
+            deep=True,
+        )
+        self._set_active_session_locked(updated)
+        return (snapshot, usable_pose, snapshot_frame_tree, trajectory, history_size), updated
+
+    def _session_matches_expectation_locked(
+        self,
+        session: Optional[LocalizationSession],
+        *,
+        expected_session_id: Optional[str],
+        expected_live_mapping_identity: Optional[Tuple[str, str, int]],
+        expected_mutation_epoch: int,
+    ) -> bool:
+        if self._session_mutation_epoch != expected_mutation_epoch:
+            return False
+        if session is None:
+            return expected_session_id is None and expected_live_mapping_identity is None
+        return (
+            session.session_id == expected_session_id
+            and self._live_mapping_identity(session.metadata) == expected_live_mapping_identity
+        )
+
+    def _enqueue_session_publication_locked(
+        self,
+        *,
+        session: Optional[LocalizationSession] = None,
+        snapshot_publication=None,
+        clear_reason: Optional[str] = None,
+    ) -> Optional[object]:
+        """Queue one immutable publication record while the caller owns ``_lock``."""
+
+        event = (
+            self._session_mutation_epoch,
+            session,
+            snapshot_publication,
+            clear_reason,
+        )
+        with self._session_publication_lock:
+            self._session_publication_queue.append(event)
+            if self._session_publication_draining:
+                return None
+            self._session_publication_draining = True
+            token = object()
+            self._session_publication_drainer_token = token
+            return token
+
+    def _drain_session_publications_if_owner(self, drainer_token) -> None:
+        if drainer_token is None:
+            return
+        try:
+            while True:
+                with self._session_publication_lock:
+                    if not self._session_publication_queue:
+                        if self._session_publication_drainer_token is drainer_token:
+                            self._session_publication_draining = False
+                            self._session_publication_drainer_token = None
+                        return
+                    event = self._session_publication_queue.popleft()
+                try:
+                    _epoch, session, snapshot_publication, clear_reason = event
+                    if session is not None:
+                        self._session_event_read_view.active = session
+                        self._session_event_read_view.enabled = True
+                    if snapshot_publication is not None:
+                        snapshot, usable_pose, snapshot_frame_tree, trajectory, history_size = snapshot_publication
+                        self._publish_snapshot(
+                            snapshot,
+                            source_name=snapshot.source_name,
+                            current_pose=usable_pose,
+                            frame_tree=snapshot_frame_tree,
+                            trajectory_poses=trajectory,
+                            history_size=history_size,
+                        )
+                    if session is not None:
+                        self._publish_session(session)
+                    else:
+                        self._publish_cleared_session(reason=clear_reason or "")
+                except Exception:
+                    LOGGER.exception("定位会话排队发布失败；继续处理后续状态变更。")
+                finally:
+                    self._session_event_read_view.enabled = False
+                    self._session_event_read_view.active = None
+        finally:
+            with self._session_publication_lock:
+                if self._session_publication_drainer_token is drainer_token:
+                    self._session_publication_draining = False
+                    self._session_publication_drainer_token = None
+
+    @staticmethod
+    def _live_mapping_identity(metadata: Optional[Dict[str, object]]) -> Optional[Tuple[str, str, int]]:
+        values = dict(metadata or {})
+        session_id = str(values.get("mapping_session_id") or "").strip()
+        map_version_id = str(values.get("map_version_id") or "").strip()
+        generation = values.get("session_generation")
+        if not session_id or not map_version_id or generation is None:
+            return None
+        try:
+            resolved_generation = int(generation)
+        except (TypeError, ValueError):
+            return None
+        if resolved_generation <= 0:
+            return None
+        return session_id, map_version_id, resolved_generation
+
+    @staticmethod
+    def _frame_ids_match(current: Optional[str], requested: Optional[str]) -> bool:
+        return current == requested or bool(
+            current and requested and frame_ids_semantically_equal(current, requested)
+        )
 
     def relocalize_active_session(
         self,
@@ -820,31 +1204,48 @@ class LocalizationService:
     ) -> Optional[LocalizationSession]:
         """刷新当前已存在的平台定位会话。"""
 
-        with self._lock:
-            session = self._active_session
+        session, mutation_epoch = self.get_active_session_token()
         if session is None:
             return None
-        return self.refresh_active_session(
+        matched, current = self.compare_and_set_active_session(
+            expected_session_id=session.session_id,
+            expected_live_mapping_identity=self._live_mapping_identity(session.metadata),
+            expected_mutation_epoch=mutation_epoch,
             map_name=session.map_name,
             map_version_id=session.map_version_id,
             frame_id=session.frame_id,
-            metadata=metadata,
+            metadata={**dict(session.metadata), **dict(metadata or {})},
+            refresh=True,
             geometry_asset=session.geometry_asset,
         )
+        return current if matched else self.get_active_session()
 
     def get_active_session(self) -> Optional[LocalizationSession]:
         """返回当前激活的平台定位会话。"""
 
+        if getattr(self._session_event_read_view, "enabled", False):
+            return self._session_event_read_view.active
         with self._lock:
             return self._active_session
+
+    def get_active_session_token(self) -> Tuple[Optional[LocalizationSession], int]:
+        """Return the active binding and its opaque mutation token atomically."""
+
+        with self._lock:
+            return self._active_session, self._session_mutation_epoch
 
     def clear_active_session(self, *, reason: str = "") -> None:
         """清空当前激活的平台定位会话。"""
 
         with self._lock:
             self._active_session = None
+            self._session_mutation_epoch += 1
             self._state_machine.reset()
             self._last_diagnostics = None
+            should_drain = self._enqueue_session_publication_locked(clear_reason=reason)
+        self._drain_session_publications_if_owner(should_drain)
+
+    def _publish_cleared_session(self, *, reason: str) -> None:
         self._state_store.write(
             StateNamespace.LOCALIZATION,
             "active_session",
@@ -1017,13 +1418,15 @@ class LocalizationService:
 
         with self._lock:
             self._set_active_session_locked(session)
-        self._publish_session(session)
+            should_drain = self._enqueue_session_publication_locked(session=session)
+        self._drain_session_publications_if_owner(should_drain)
         return session
 
     def _set_active_session_locked(self, session: LocalizationSession) -> LocalizationSession:
         """在持锁状态下记录激活会话。调用方必须已持有 self._lock，且需在锁外调用 _publish_session。"""
 
         self._active_session = session
+        self._session_mutation_epoch += 1
         self._session_history.append(session)
         return session
 

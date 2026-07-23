@@ -856,6 +856,86 @@ fn normalize_frame(f: &str) -> String {
     f.trim().trim_start_matches('/').to_string()
 }
 
+const BASE_FRAME_ALIASES: &[&str] = &[
+    "base",
+    "base_link",
+    "base_footprint",
+    "body",
+    "go2_base_link",
+];
+
+fn validated_frame_tokens(frame_id: &str) -> Option<Vec<&str>> {
+    let frame_id = frame_id.trim();
+    if frame_id.is_empty() {
+        return None;
+    }
+    let tokens: Vec<_> = frame_id.split('/').collect();
+    tokens
+        .iter()
+        .all(|token| {
+            let mut chars = token.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+        .then_some(tokens)
+}
+
+fn is_base_frame_leaf(leaf: &str) -> bool {
+    BASE_FRAME_ALIASES.contains(&leaf)
+        || leaf.ends_with("_base_link")
+        || leaf.ends_with("_base_footprint")
+}
+
+fn base_frame_ids_semantically_equal(left: &str, right: &str) -> bool {
+    let (Some(left_tokens), Some(right_tokens)) =
+        (validated_frame_tokens(left), validated_frame_tokens(right))
+    else {
+        return false;
+    };
+    if left_tokens == right_tokens {
+        return true;
+    }
+    let (Some(left_leaf), Some(right_leaf)) = (left_tokens.last(), right_tokens.last()) else {
+        return false;
+    };
+    if !is_base_frame_leaf(left_leaf) || !is_base_frame_leaf(right_leaf) {
+        return false;
+    }
+    if left_tokens.len() > 1
+        && right_tokens.len() > 1
+        && left_tokens[..left_tokens.len() - 1] != right_tokens[..right_tokens.len() - 1]
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_base_frame_alias(preferred: Option<&str>, legacy: Option<&str>) -> String {
+    preferred
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        .or_else(|| {
+            legacy.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        })
+        .unwrap_or_else(|| "base_link".to_string())
+}
+
+fn semantic_base_candidates(transforms: &[TransformEntry], configured: &str) -> Vec<String> {
+    let mut candidates = vec![configured.to_string()];
+    for entry in transforms {
+        for frame in [&entry.parent, &entry.child] {
+            if base_frame_ids_semantically_equal(frame, configured) {
+                let frame = frame.trim().to_string();
+                if !candidates.contains(&frame) {
+                    candidates.push(frame);
+                }
+            }
+        }
+    }
+    candidates
+}
+
 fn resolve_transform(transforms: &[TransformEntry], source: &str, target: &str) -> Option<Mat4> {
     let source = normalize_frame(source);
     let target = normalize_frame(target);
@@ -2825,19 +2905,15 @@ pub fn spawn_geometry_runtime(
     let odom_frame = std::env::var("NUWAX_GEOMETRY_ODOM_FRAME")
         .or_else(|_| std::env::var("NUWAX_ODOM_FRAME"))
         .unwrap_or_else(|_| "odom".into());
-    let base_frame = std::env::var("NUWAX_GEOMETRY_BASE_FRAME")
-        .or_else(|_| std::env::var("NUWAX_BASE_FRAME"))
-        .unwrap_or_else(|_| "base_link".into());
-    let base_candidates: Vec<String> =
-        if base_frame == "base_link" || base_frame == "base_footprint" {
-            vec!["base_link".into(), "base_footprint".into()]
-        } else {
-            vec![
-                base_frame.clone(),
-                "base_link".into(),
-                "base_footprint".into(),
-            ]
-        };
+    let base_frame = resolve_base_frame_alias(
+        std::env::var("NUWAX_BASE_FRAME").ok().as_deref(),
+        std::env::var("NUWAX_GEOMETRY_BASE_FRAME").ok().as_deref(),
+    );
+    if validated_frame_tokens(&base_frame).is_none() {
+        error!(frame = %base_frame, "configured base frame is not a valid frame ID");
+        return Err(RealLcmBackendUnavailable);
+    }
+    let base_candidates = vec![base_frame.clone()];
 
     // Mapping exists for the process lifetime but starts inactive. The
     // StartMapping RPC is the only production transition that opens ingestion.
@@ -2925,7 +3001,12 @@ pub fn spawn_geometry_runtime(
                 s.transforms
                     .retain(|t| t.stamp_ns == 0 || t.stamp_ns >= cutoff);
             }
-            let base_refs: Vec<&str> = base_candidates_owned.iter().map(|s| s.as_str()).collect();
+            let resolved_base_candidates =
+                semantic_base_candidates(&s.transforms, &base_candidates_owned[0]);
+            let base_refs: Vec<&str> = resolved_base_candidates
+                .iter()
+                .map(String::as_str)
+                .collect();
             if let Some((x, y, z, qx, qy, qz, qw, _base)) =
                 resolve_map_pose_tree(&s.tf_tree, &map_frame_owned, &base_refs)
             {
@@ -2943,7 +3024,7 @@ pub fn spawn_geometry_runtime(
             }
             let map_to_odom =
                 resolve_transform(&s.transforms, &odom_frame_owned, &map_frame_owned).is_some();
-            let odom_to_base = base_candidates_owned
+            let odom_to_base = resolved_base_candidates
                 .iter()
                 .any(|base| resolve_transform(&s.transforms, base, &odom_frame_owned).is_some());
             drop(s);
@@ -3243,6 +3324,15 @@ fn update_mapping_cloud_map_if_current(
     })
 }
 
+fn mapping_feed_should_wait_for_active_session(
+    mapping: &parking_lot::Mutex<MappingAdapter>,
+) -> bool {
+    mapping
+        .try_lock()
+        .map(|adapter| !adapter.is_active())
+        .unwrap_or(false)
+}
+
 /// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
 ///
 /// MappingAdapter 是 occupancy revision 的唯一 writer；`/map/occupancy` 仅为
@@ -3278,6 +3368,7 @@ fn spawn_mapping_feed_tasks(
         let mapping_odom = mapping_arc.clone();
         let transform_cache = mapping_odom.lock().map_odom_transform_cache();
         let state_odom = state.clone();
+        let mapping_lifecycle_lock_odom = mapping_lifecycle_lock.clone();
         let (tf_topic, tf_msg_type) = tf_binding;
         tokio::spawn(async move {
             let mut stream = transport_odom
@@ -3295,6 +3386,10 @@ fn spawn_mapping_feed_tasks(
                     warn!("mapping_feed /odom payload decode failed");
                     continue;
                 };
+                let _lifecycle_guard = mapping_lifecycle_lock_odom.lock().await;
+                if mapping_feed_should_wait_for_active_session(mapping_odom.as_ref()) {
+                    continue;
+                }
                 let observation = canonical_mapping_observation_for_odom(
                     mapping_odom.as_ref(),
                     transform_cache.as_ref(),
@@ -3315,8 +3410,15 @@ fn spawn_mapping_feed_tasks(
                     observation.tf_payload,
                     pose.timestamp_ns,
                 );
-                if let Err(error) = transport_odom.publish(tf_frame).await {
-                    warn!(%error, "canonical mapping TF publish failed");
+                match tokio::time::timeout(
+                    MAP_FANOUT_SINK_TIMEOUT,
+                    transport_odom.publish(tf_frame),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!(%error, "canonical mapping TF publish failed"),
+                    Err(_) => warn!("canonical mapping TF publish timed out"),
                 }
             }
         });
@@ -3401,24 +3503,31 @@ fn spawn_mapping_feed_tasks(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
-            let (ingest_outcome, current_session) = {
+            let ingest = {
                 let mut adapter = mapping_lidar.lock();
-                let outcome = ingest_mapping_points(
-                    &mut adapter,
-                    &points,
-                    parsed.point_step,
-                    now_ns,
-                    &parsed.frame_id,
-                    parsed.timestamp_ns,
-                    &state_lidar,
-                    &map_revision_lidar,
-                );
-                let snapshot = adapter.snapshot();
-                (outcome, snapshot)
+                if !adapter.is_active() {
+                    None
+                } else {
+                    let outcome = ingest_mapping_points(
+                        &mut adapter,
+                        &points,
+                        parsed.point_step,
+                        now_ns,
+                        &parsed.frame_id,
+                        parsed.timestamp_ns,
+                        &state_lidar,
+                        &map_revision_lidar,
+                    );
+                    Some(outcome)
+                }
+            };
+            let Some(ingest_outcome) = ingest else {
+                continue;
             };
             match ingest_outcome {
                 Ok(outcome) => {
+                    let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
+                    let current_session = mapping_lidar.lock().snapshot();
                     let Some(update) = update_mapping_cloud_map_if_current(
                         &outcome,
                         &current_session,
@@ -3627,6 +3736,60 @@ mod tf_tree_tests {
         invalid.rw = 0.0;
         assert!(entry_to_transform(&invalid).is_none());
     }
+
+    #[test]
+    fn semantic_base_candidates_accept_aliases_and_reject_foreign_namespaces() {
+        let mut unnamespaced = entry(1, 0.0);
+        unnamespaced.parent = "odom".into();
+        unnamespaced.child = "base_footprint".into();
+        let mut same_namespace = entry(2, 0.0);
+        same_namespace.parent = "odom".into();
+        same_namespace.child = "robot/body".into();
+        let mut foreign_namespace = entry(3, 0.0);
+        foreign_namespace.parent = "odom".into();
+        foreign_namespace.child = "other/base_link".into();
+        let mut foreign_role = entry(4, 0.0);
+        foreign_role.parent = "odom".into();
+        foreign_role.child = "camera".into();
+
+        let candidates = semantic_base_candidates(
+            &[
+                unnamespaced,
+                same_namespace,
+                foreign_namespace,
+                foreign_role,
+            ],
+            "robot/base_link",
+        );
+        assert_eq!(
+            candidates,
+            vec!["robot/base_link", "base_footprint", "robot/body"]
+        );
+    }
+
+    #[test]
+    fn base_frame_contract_handles_suffixes_validation_and_env_precedence() {
+        assert!(base_frame_ids_semantically_equal(
+            "robot/chassis_base_link",
+            "robot/base_footprint"
+        ));
+        assert!(!base_frame_ids_semantically_equal(
+            "robot/chassis_base_link",
+            "other/base_link"
+        ));
+        assert!(!base_frame_ids_semantically_equal(
+            "/base_link",
+            "base_link"
+        ));
+        assert_eq!(
+            resolve_base_frame_alias(Some(" body "), Some("base_footprint")),
+            "body"
+        );
+        assert_eq!(
+            resolve_base_frame_alias(Some(" "), Some(" base_footprint ")),
+            "base_footprint"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3634,6 +3797,89 @@ mod mapping_feed_tests {
     use super::*;
     use crate::mapping_adapter::MappingReadiness;
     use nalgebra::Point3;
+    use nuwax_protocol::RawLcmFrame;
+    use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
+
+    #[derive(Clone)]
+    struct MappingFeedRecordingBackend {
+        odom_topic: LcmTopic,
+        odom_sender: tokio::sync::mpsc::UnboundedSender<TransportResult<RawLcmFrame>>,
+        odom_receiver: Arc<
+            std::sync::Mutex<
+                Option<tokio::sync::mpsc::UnboundedReceiver<TransportResult<RawLcmFrame>>>,
+            >,
+        >,
+        odom_subscribed: Arc<tokio::sync::Notify>,
+        frame_published: Arc<tokio::sync::Notify>,
+        publish_started: Arc<tokio::sync::Notify>,
+        block_publish: Arc<std::sync::atomic::AtomicBool>,
+        published: Arc<std::sync::Mutex<Vec<RawLcmFrame>>>,
+    }
+
+    impl MappingFeedRecordingBackend {
+        fn new(odom_topic: LcmTopic) -> Self {
+            let (odom_sender, odom_receiver) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                odom_topic,
+                odom_sender,
+                odom_receiver: Arc::new(std::sync::Mutex::new(Some(odom_receiver))),
+                odom_subscribed: Arc::new(tokio::sync::Notify::new()),
+                frame_published: Arc::new(tokio::sync::Notify::new()),
+                publish_started: Arc::new(tokio::sync::Notify::new()),
+                block_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                published: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn published_count(&self) -> usize {
+            self.published.lock().expect("published frames").len()
+        }
+
+        fn block_publication(&self) {
+            self.block_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl LcmBackend for MappingFeedRecordingBackend {
+        async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+            self.publish_started.notify_one();
+            if self
+                .block_publish
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                std::future::pending::<()>().await;
+            }
+            self.published.lock().expect("published frames").push(frame);
+            self.frame_published.notify_one();
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            topic: LcmTopic,
+            _msg_type: Option<LcmMessageType>,
+        ) -> LcmFrameStream {
+            if topic != self.odom_topic {
+                return Box::pin(futures::stream::empty());
+            }
+            let receiver = self
+                .odom_receiver
+                .lock()
+                .expect("odom receiver")
+                .take()
+                .expect("single odom subscription");
+            self.odom_subscribed.notify_one();
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                receiver,
+            ))
+        }
+
+        fn name(&self) -> &str {
+            "mapping-feed-recording"
+        }
+    }
 
     fn mapping_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
@@ -3657,6 +3903,33 @@ mod mapping_feed_tests {
 
     fn shared_active_mapping_adapter() -> Arc<parking_lot::Mutex<MappingAdapter>> {
         Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
+    }
+
+    #[test]
+    fn mapping_feed_waits_only_when_inactive_state_is_observable() {
+        let mapping = Arc::new(parking_lot::Mutex::new(MappingAdapter::new_with_frames(
+            mapping_config(),
+            "map",
+            "odom",
+        )));
+        assert!(mapping_feed_should_wait_for_active_session(
+            mapping.as_ref()
+        ));
+
+        mapping
+            .lock()
+            .start_session("test-session", "test-map", "mapver_000001")
+            .expect("active mapping test session");
+        assert!(!mapping_feed_should_wait_for_active_session(
+            mapping.as_ref()
+        ));
+
+        let guard = mapping.lock();
+        assert!(guard.is_active());
+        assert!(
+            !mapping_feed_should_wait_for_active_session(mapping.as_ref()),
+            "lock contention must keep the existing cached-transform path available"
+        );
     }
 
     fn map_revision_event(map: MapState) -> MapRevisionEvent {
@@ -3809,6 +4082,53 @@ mod mapping_feed_tests {
         assert!(!replay.occupancy_committed);
     }
 
+    #[tokio::test]
+    async fn stop_between_lidar_ingest_and_cloud_commit_rejects_old_generation() {
+        let mut adapter = active_mapping_adapter();
+        adapter
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
+            .expect("establish odom anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let outcome = ingest_mapping_points(
+            &mut adapter,
+            &[Point3::new(1.0, 2.0, 0.0)],
+            12,
+            1_750_000_000_000_000_000,
+            "odom",
+            1_234_567_890_123_456_789,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("LiDAR ingest before stop");
+        assert!(outcome.occupancy_committed);
+        adapter
+            .stop_session("test-session")
+            .expect("stop between ingest and cloud commit");
+
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-cloudmap-stop-fence-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+        let lifecycle_lock = tokio::sync::Mutex::new(());
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let stopped_session = adapter.snapshot();
+        assert!(!stopped_session.active);
+        assert!(
+            update_mapping_cloud_map_if_current(&outcome, &stopped_session, &writer).is_none(),
+            "post-stop LiDAR outcome must not commit cloud SHM or notify"
+        );
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn mapping_feed_rejects_unknown_pose_and_cloud_frames() {
         let mut adapter = active_mapping_adapter();
@@ -3908,6 +4228,219 @@ mod mapping_feed_tests {
             .transforms
             .iter()
             .all(|entry| entry.stamp_ns == pose.timestamp_ns));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn active_lidar_adapter_contention_publishes_cached_odom_promptly() {
+        let mapping = shared_active_mapping_adapter();
+        mapping
+            .lock()
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.25, "odom")
+            .expect("anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let odom_topic = LcmTopic::new("/test/mapping/cached-odom").expect("odom topic");
+        let odom_type = LcmMessageType::new("nav_msgs.Odometry").expect("odom type");
+        let tf_topic = LcmTopic::new("/test/mapping/cached-tf").expect("TF topic");
+        let tf_type = LcmMessageType::new("tf2_msgs.TFMessage").expect("TF type");
+        let backend = MappingFeedRecordingBackend::new(odom_topic.clone());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let (cloud_map_tx, _) = broadcast::channel(4);
+
+        spawn_mapping_feed_tasks(
+            transport,
+            state.clone(),
+            mapping.clone(),
+            map_revision_tx,
+            Some((odom_topic.clone(), odom_type.clone())),
+            (tf_topic, tf_type),
+            "base_link".into(),
+            Arc::new(parking_lot::Mutex::new(None)),
+            cloud_map_tx,
+            lifecycle_lock,
+        );
+        tokio::time::timeout(Duration::from_secs(1), backend.odom_subscribed.notified())
+            .await
+            .expect("odom subscriber startup");
+
+        // This is the same exclusive adapter guard held by an in-flight LiDAR ingest.
+        let adapter_guard = mapping.lock();
+        assert!(adapter_guard.is_active());
+        let pose = PoseState {
+            x: 2.0,
+            y: 3.0,
+            qz: (0.25_f64 * 0.5).sin(),
+            qw: (0.25_f64 * 0.5).cos(),
+            frame_id: "odom".into(),
+            timestamp_ns: 12_345_678_904,
+            ..PoseState::default()
+        };
+        backend
+            .odom_sender
+            .send(Ok(crate::typed_codec::build_typed_frame(
+                odom_topic,
+                odom_type,
+                crate::typed_codec::encode_odometry_payload(&pose, "base_link")
+                    .expect("encode odometry"),
+                pose.timestamp_ns,
+            )))
+            .expect("inject odometry");
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.frame_published.notified(),
+        )
+        .await
+        .expect("cached odometry TF publication must not wait for LiDAR adapter release");
+        assert_eq!(backend.published_count(), 1);
+        let shared = state.read().await;
+        assert_eq!(shared.pose.timestamp_ns, pose.timestamp_ns);
+        assert_eq!(shared.latest_transform_entries().len(), 2);
+        drop(shared);
+        drop(adapter_guard);
+    }
+
+    #[tokio::test]
+    async fn blocked_tf_publish_times_out_and_releases_lifecycle_fence() {
+        let mapping = shared_active_mapping_adapter();
+        mapping
+            .lock()
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.25, "odom")
+            .expect("anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let odom_topic = LcmTopic::new("/test/mapping/blocked-odom").expect("odom topic");
+        let odom_type = LcmMessageType::new("nav_msgs.Odometry").expect("odom type");
+        let tf_topic = LcmTopic::new("/test/mapping/blocked-tf").expect("TF topic");
+        let tf_type = LcmMessageType::new("tf2_msgs.TFMessage").expect("TF type");
+        let backend = MappingFeedRecordingBackend::new(odom_topic.clone());
+        backend.block_publication();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let (cloud_map_tx, _) = broadcast::channel(4);
+
+        spawn_mapping_feed_tasks(
+            transport,
+            state,
+            mapping,
+            map_revision_tx,
+            Some((odom_topic.clone(), odom_type.clone())),
+            (tf_topic, tf_type),
+            "base_link".into(),
+            Arc::new(parking_lot::Mutex::new(None)),
+            cloud_map_tx,
+            lifecycle_lock.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), backend.odom_subscribed.notified())
+            .await
+            .expect("odom subscriber startup");
+        let pose = PoseState {
+            x: 2.0,
+            y: 3.0,
+            qz: (0.25_f64 * 0.5).sin(),
+            qw: (0.25_f64 * 0.5).cos(),
+            frame_id: "odom".into(),
+            timestamp_ns: 12_345_678_905,
+            ..PoseState::default()
+        };
+        backend
+            .odom_sender
+            .send(Ok(crate::typed_codec::build_typed_frame(
+                odom_topic,
+                odom_type,
+                crate::typed_codec::encode_odometry_payload(&pose, "base_link")
+                    .expect("encode odometry"),
+                pose.timestamp_ns,
+            )))
+            .expect("inject odometry");
+        tokio::time::timeout(Duration::from_secs(1), backend.publish_started.notified())
+            .await
+            .expect("blocked TF publication started");
+        assert!(lifecycle_lock.try_lock().is_err());
+
+        let lifecycle_guard = tokio::time::timeout(
+            MAP_FANOUT_SINK_TIMEOUT + Duration::from_secs(1),
+            lifecycle_lock.lock(),
+        )
+        .await
+        .expect("lifecycle fence must release after TF publish timeout");
+        assert_eq!(backend.published_count(), 0);
+        drop(lifecycle_guard);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stopped_session_cannot_publish_cached_odom_during_lock_contention() {
+        let mapping = shared_active_mapping_adapter();
+        mapping
+            .lock()
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.25, "odom")
+            .expect("anchor");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let odom_topic = LcmTopic::new("/test/mapping/odom").expect("odom topic");
+        let odom_type = LcmMessageType::new("nav_msgs.Odometry").expect("odom type");
+        let tf_topic = LcmTopic::new("/test/mapping/tf").expect("TF topic");
+        let tf_type = LcmMessageType::new("tf2_msgs.TFMessage").expect("TF type");
+        let backend = MappingFeedRecordingBackend::new(odom_topic.clone());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let (cloud_map_tx, _) = broadcast::channel(4);
+
+        spawn_mapping_feed_tasks(
+            transport,
+            state.clone(),
+            mapping.clone(),
+            map_revision_tx,
+            Some((odom_topic.clone(), odom_type.clone())),
+            (tf_topic, tf_type),
+            "base_link".into(),
+            Arc::new(parking_lot::Mutex::new(None)),
+            cloud_map_tx,
+            lifecycle_lock.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), backend.odom_subscribed.notified())
+            .await
+            .expect("odom subscriber startup");
+
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let mut adapter_guard = mapping.lock();
+        adapter_guard
+            .stop_session("test-session")
+            .expect("stop active mapping session");
+        let pose = PoseState {
+            x: 2.0,
+            y: 3.0,
+            qz: (0.25_f64 * 0.5).sin(),
+            qw: (0.25_f64 * 0.5).cos(),
+            frame_id: "odom".into(),
+            timestamp_ns: 12_345_678_903,
+            ..PoseState::default()
+        };
+        backend
+            .odom_sender
+            .send(Ok(crate::typed_codec::build_typed_frame(
+                odom_topic,
+                odom_type,
+                crate::typed_codec::encode_odometry_payload(&pose, "base_link")
+                    .expect("encode odometry"),
+                pose.timestamp_ns,
+            )))
+            .expect("inject odometry");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend.published_count(), 0);
+        assert_eq!(state.read().await.pose.timestamp_ns, 0);
+
+        drop(adapter_guard);
+        drop(lifecycle_guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend.published_count(), 0);
+        let shared = state.read().await;
+        assert_eq!(shared.pose.timestamp_ns, 0);
+        assert!(shared.latest_transform_entries().is_empty());
     }
 
     #[tokio::test]

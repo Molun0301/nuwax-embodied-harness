@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import multiprocessing as mp
 import time
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -20,37 +21,32 @@ def _worker_loop(
     predict_kwargs: Dict[str, Any],
 ) -> None:
     """Worker 进程主循环：加载模型，等待推理请求，返回结果。"""
-    import os
-
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
     try:
+        import os
+
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         from ultralytics import YOLO
-    except ImportError:
-        response_queue.put(("error", "ultralytics 未安装"))
+
+        # spawn 子进程不继承主进程的 torchvision NMS 回退。
+        try:
+            from services.perception.detectors import _ensure_torchvision_nms_fallback
+
+            _ensure_torchvision_nms_fallback()
+        except Exception as exc:  # noqa: BLE001 — 回退安装失败不致命。
+            logger.warning("YOLO worker torchvision NMS 回退安装失败，忽略：%s", exc)
+
+        model = YOLO(model_source)
+        try:
+            warmup_imgsz = int(predict_kwargs.get("imgsz", 640) or 640)
+            warmup = getattr(model, "warmup", None)
+            if callable(warmup):
+                warmup(imgsz=(1, 3, warmup_imgsz, warmup_imgsz))
+        except Exception as exc:  # noqa: BLE001 — warmup 失败不影响推理。
+            logger.warning("YOLO worker warmup 失败，忽略：%s", exc)
+    except Exception as exc:  # noqa: BLE001 — 启动失败必须立即回传父进程。
+        response_queue.put(("startup_error", "bootstrap", type(exc).__name__, str(exc)))
         return
 
-    # vis-three-fixes worker NMS 修复：worker 是 spawn 子进程，不继承主进程对
-    # torchvision.ops.nms 的 monkeypatch。若 torchvision C++ NMS 算子本机不可用
-    # （PyTorch/torchvision 版本不匹配），子进程首次 predict 会因 "Couldn't load custom
-    # C++ ops" 抛错 → worker.predict 返回 None → 永久回退主线程，GIL 无法释放、worker 形同虚设。
-    # 故在子进程内显式安装与主线程一致的纯 torch NMS 回退。
-    try:
-        from services.perception.detectors import _ensure_torchvision_nms_fallback
-
-        _ensure_torchvision_nms_fallback()
-    except Exception as exc:  # noqa: BLE001 — 回退安装失败不致命，继续尝试原生推理。
-        logger.warning("YOLO worker torchvision NMS 回退安装失败，忽略：%s", exc)
-
-    model = YOLO(model_source)
-    # vis-three-fixes 任务 3.7：第一次 predict 前 warmup，消除首帧 GPU kernel cache 构建阻塞。
-    try:
-        warmup_imgsz = int(predict_kwargs.get("imgsz", 640) or 640)
-        warmup = getattr(model, "warmup", None)
-        if callable(warmup):
-            warmup(imgsz=(1, 3, warmup_imgsz, warmup_imgsz))
-    except Exception as exc:  # noqa: BLE001 — warmup 失败不影响推理，仅丢失首帧加速。
-        logger.warning("YOLO worker warmup 失败，忽略：%s", exc)
     response_queue.put(("ready", None))  # 通知主进程模型已加载
 
     while True:
@@ -154,22 +150,54 @@ class YoloInferenceWorker:
         self._ready: bool = False
         # vis-three-fixes 任务 3.8：最近一次 worker 推理往返耗时（毫秒），供观测透传。
         self._last_inference_ms: Optional[float] = None
+        self._atexit_registered: bool = False
 
     def start(self) -> bool:
         """启动 worker 进程，阻塞等待模型加载完成。"""
-        self._request_queue = mp.Queue(maxsize=2)
-        self._response_queue = mp.Queue(maxsize=2)
-        self._process = mp.Process(
-            target=_worker_loop,
-            args=(
+        if any(
+            resource is not None
+            for resource in (
+                self._process,
                 self._request_queue,
                 self._response_queue,
-                self._model_source,
-                self._predict_kwargs,
-            ),
-            daemon=True,
-        )
-        self._process.start()
+                self._shm,
+            )
+        ):
+            self.stop()
+            if any(
+                resource is not None
+                for resource in (
+                    self._process,
+                    self._request_queue,
+                    self._response_queue,
+                    self._shm,
+                )
+            ):
+                logger.error("YOLO worker 旧资源仍被占用，拒绝启动新进程")
+                return False
+        try:
+            # Gateway 已有 gRPC/HTTP 线程；统一使用 spawn context，避免在多线程
+            # 父进程中 fork，同时确保 Queue/Process 不混用不同 context。
+            resource_tracker.ensure_running()
+            context = mp.get_context("spawn")
+            self._request_queue = context.Queue(maxsize=2)
+            self._response_queue = context.Queue(maxsize=2)
+            self._process = context.Process(
+                target=_worker_loop,
+                args=(
+                    self._request_queue,
+                    self._response_queue,
+                    self._model_source,
+                    self._predict_kwargs,
+                ),
+                daemon=True,
+            )
+            self._process.start()
+        except Exception as exc:
+            logger.error("启动 YOLO worker 进程失败: %s", exc)
+            self.stop()
+            return False
+        self._register_atexit_cleanup()
 
         # 等待模型加载（最多 120 秒）
         try:
@@ -178,10 +206,20 @@ class YoloInferenceWorker:
                 self._ready = True
                 logger.info("YOLO 推理 worker 进程已就绪 pid=%d", self._process.pid)
                 return True
-            logger.error("YOLO 推理 worker 启动失败: %s", msg)
+            if msg[0] == "startup_error" and len(msg) >= 4:
+                logger.error(
+                    "YOLO 推理 worker 启动失败 stage=%s error=%s: %s",
+                    msg[1],
+                    msg[2],
+                    msg[3],
+                )
+            else:
+                logger.error("YOLO 推理 worker 启动失败: %s", msg)
+            self.stop()
             return False
         except Exception as exc:
             logger.error("等待 YOLO worker 就绪超时: %s", exc)
+            self.stop()
             return False
 
     def predict(
@@ -247,24 +285,111 @@ class YoloInferenceWorker:
 
     def stop(self) -> None:
         """停止 worker 进程并释放共享内存。"""
-        if self._request_queue is not None:
-            try:
-                self._request_queue.put(None, timeout=2.0)
-            except Exception:
-                pass
-        if self._process is not None:
-            self._process.join(timeout=5.0)
-            if self._process.is_alive():
-                self._process.terminate()
-            self._process = None
-        if self._shm is not None:
-            try:
-                self._shm.close()
-                self._shm.unlink()
-            except Exception:
-                pass
-            self._shm = None
+        request_queue = self._request_queue
+        response_queue = self._response_queue
+        process = self._process
+        shm = self._shm
         self._ready = False
+
+        if request_queue is not None:
+            try:
+                request_queue.put(None, timeout=2.0)
+            except Exception as exc:
+                logger.warning("发送 YOLO worker 关闭信号失败: %s", exc)
+        if process is not None:
+            try:
+                process.join(timeout=5.0)
+            except Exception as exc:
+                logger.warning("等待 YOLO worker 进程退出失败: %s", exc)
+            try:
+                process_alive = process.is_alive()
+            except Exception as exc:
+                logger.warning("确认 YOLO worker 进程状态失败: %s", exc)
+                process_alive = True
+            if process_alive:
+                try:
+                    process.terminate()
+                except Exception as exc:
+                    logger.warning("终止 YOLO worker 进程失败: %s", exc)
+                try:
+                    process.join(timeout=1.0)
+                except Exception as exc:
+                    logger.warning("等待已终止 YOLO worker 进程失败: %s", exc)
+            try:
+                process_alive = process.is_alive()
+            except Exception as exc:
+                logger.warning("确认 YOLO worker 进程状态失败: %s", exc)
+                process_alive = True
+            if process_alive:
+                try:
+                    process.kill()
+                except Exception as exc:
+                    logger.warning("强制终止 YOLO worker 进程失败: %s", exc)
+                try:
+                    process.join(timeout=1.0)
+                except Exception as exc:
+                    logger.warning("等待已强制终止 YOLO worker 进程失败: %s", exc)
+            try:
+                process_exited = not process.is_alive()
+            except Exception as exc:
+                logger.warning("确认 YOLO worker 进程状态失败: %s", exc)
+                process_exited = False
+            if not process_exited:
+                logger.error("YOLO worker 进程拒绝退出，保留资源以便后续重试")
+                return
+            try:
+                process.close()
+            except Exception as exc:
+                logger.warning("关闭 YOLO worker 进程句柄失败: %s", exc)
+        self._process = None
+
+        if shm is not None:
+            try:
+                shm.close()
+            except Exception as exc:
+                logger.warning("关闭 YOLO worker 共享内存失败 name=%s: %s", shm.name, exc)
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.warning("删除 YOLO worker 共享内存失败 name=%s: %s", shm.name, exc)
+        self._shm = None
+        self._shm_size = 0
+
+        for queue_name, queue in (
+            ("request", request_queue),
+            ("response", response_queue),
+        ):
+            if queue is None:
+                continue
+            try:
+                queue.close()
+                queue.join_thread()
+            except Exception as exc:
+                logger.warning("关闭 YOLO worker %s queue 失败: %s", queue_name, exc)
+        self._request_queue = None
+        self._response_queue = None
+        self._unregister_atexit_cleanup()
+
+    def _register_atexit_cleanup(self) -> None:
+        if self._atexit_registered:
+            return
+        atexit.register(self.stop)
+        self._atexit_registered = True
+
+    def _unregister_atexit_cleanup(self) -> None:
+        if not self._atexit_registered:
+            return
+        atexit.unregister(self.stop)
+        self._atexit_registered = False
+
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            # 析构和解释器退出阶段只能做 best-effort 清理。
+            pass
 
     @property
     def is_ready(self) -> bool:

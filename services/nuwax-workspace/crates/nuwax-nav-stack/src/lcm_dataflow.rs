@@ -526,7 +526,7 @@ async fn run_map_pose_adapter(
     let mut adapter = crate::map_pose::MapPoseAdapter::new(
         configured_frame("NUWAX_GEOMETRY_MAP_FRAME", "map")?,
         configured_frame("NUWAX_GEOMETRY_ODOM_FRAME", "odom")?,
-        configured_frame("NUWAX_GEOMETRY_BASE_FRAME", "base_link")?,
+        configured_frame_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link")?,
     )
     .map_err(|error| module_error("map_pose_adapter", error))?;
     let mut diagnostics = InputDiagnosticLimiter::default();
@@ -615,6 +615,35 @@ fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+#[cfg(feature = "guard-runtime")]
+fn configured_frame_alias(
+    preferred_key: &str,
+    legacy_key: &str,
+    fallback: &str,
+) -> NavStackResult<String> {
+    let preferred = std::env::var(preferred_key).ok();
+    let legacy = std::env::var(legacy_key).ok();
+    resolve_frame_alias(preferred.as_deref(), legacy.as_deref(), fallback).ok_or_else(|| {
+        NavStackError::InvalidConfig(format!(
+            "{preferred_key}, {legacy_key}, and fallback frame must not all be empty"
+        ))
+    })
+}
+
+#[cfg(feature = "guard-runtime")]
+fn resolve_frame_alias(
+    preferred: Option<&str>,
+    legacy: Option<&str>,
+    fallback: &str,
+) -> Option<String> {
+    preferred
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        .or_else(|| {
+            legacy.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        })
+        .or_else(|| (!fallback.trim().is_empty()).then(|| fallback.trim().to_string()))
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -5571,6 +5600,22 @@ mod guarded_tests {
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn canonical_base_frame_value_precedes_legacy_alias() {
+        assert_eq!(
+            resolve_frame_alias(Some(" body "), Some("base_footprint"), "base_link"),
+            Some("body".to_string())
+        );
+        assert_eq!(
+            resolve_frame_alias(Some("  "), Some(" base_footprint "), "base_link"),
+            Some("base_footprint".to_string())
+        );
+        assert_eq!(
+            resolve_frame_alias(None, None, " base_link "),
+            Some("base_link".to_string())
+        );
+    }
 
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {

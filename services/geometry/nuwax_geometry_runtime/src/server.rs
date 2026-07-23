@@ -55,11 +55,18 @@ const STOP_EXPLORATION_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
 const STOP_EXPLORATION_SAFETY_POLL: Duration = Duration::from_millis(20);
 
 fn configured_base_frame() -> String {
-    std::env::var("NUWAX_GEOMETRY_BASE_FRAME")
-        .or_else(|_| std::env::var("NUWAX_BASE_FRAME"))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    resolve_base_frame_alias(
+        std::env::var("NUWAX_BASE_FRAME").ok().as_deref(),
+        std::env::var("NUWAX_GEOMETRY_BASE_FRAME").ok().as_deref(),
+    )
+}
+
+fn resolve_base_frame_alias(preferred: Option<&str>, legacy: Option<&str>) -> String {
+    preferred
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        .or_else(|| {
+            legacy.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+        })
         .unwrap_or_else(|| "base_link".to_string())
 }
 
@@ -269,6 +276,75 @@ fn decode_checkpoint_grid(
     grid.ts = meta.timestamp_ns as f64 / 1_000_000_000.0;
     grid.data = data;
     Ok(grid)
+}
+
+enum OccupancyGridValidationError {
+    NotReady,
+    InvalidMetadata(&'static str),
+    DimensionsOverflow,
+    PayloadSizeMismatch { expected: usize, actual: usize },
+}
+
+impl OccupancyGridValidationError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::NotReady => Status::failed_precondition("occupancy grid is not ready"),
+            Self::InvalidMetadata(reason) => {
+                Status::internal(format!("occupancy grid metadata is invalid: {reason}"))
+            }
+            Self::DimensionsOverflow => Status::internal("occupancy grid dimensions overflow"),
+            Self::PayloadSizeMismatch { expected, actual } => Status::internal(format!(
+                "occupancy grid payload size mismatch: expected={expected} actual={actual}"
+            )),
+        }
+    }
+}
+
+fn validate_occupancy_grid(
+    map: &crate::lcm_runtime::MapState,
+) -> Result<(), OccupancyGridValidationError> {
+    if map.revision == 0 {
+        return Err(OccupancyGridValidationError::NotReady);
+    }
+    if map.width == 0 || map.height == 0 {
+        return Err(OccupancyGridValidationError::InvalidMetadata(
+            "dimensions must be nonzero",
+        ));
+    }
+    if !map.resolution.is_finite() || map.resolution <= 0.0 {
+        return Err(OccupancyGridValidationError::InvalidMetadata(
+            "resolution must be finite and positive",
+        ));
+    }
+    if map.frame_id.trim().is_empty() {
+        return Err(OccupancyGridValidationError::InvalidMetadata(
+            "frame_id must not be empty",
+        ));
+    }
+
+    let expected_len = (map.width as usize)
+        .checked_mul(map.height as usize)
+        .ok_or(OccupancyGridValidationError::DimensionsOverflow)?;
+    if map.data.len() != expected_len {
+        return Err(OccupancyGridValidationError::PayloadSizeMismatch {
+            expected: expected_len,
+            actual: map.data.len(),
+        });
+    }
+    Ok(())
+}
+
+fn occupancy_grid_meta(map: &crate::lcm_runtime::MapState) -> OccupancyGridMeta {
+    OccupancyGridMeta {
+        width: map.width,
+        height: map.height,
+        resolution: map.resolution,
+        origin_x: map.origin_x,
+        origin_y: map.origin_y,
+        frame_id: map.frame_id.clone(),
+        revision: map.revision,
+        timestamp_ns: map.timestamp_ns,
+    }
 }
 
 fn validate_cloud_checkpoint_metadata(checkpoint: &CloudMapCheckpoint) -> Result<(), String> {
@@ -1414,16 +1490,8 @@ impl GeometryRuntime for GeometryRuntimeService {
         _req: Request<Empty>,
     ) -> Result<Response<OccupancyGridMeta>, Status> {
         let s = self.bridge.state.read().await;
-        Ok(Response::new(OccupancyGridMeta {
-            width: s.map.width,
-            height: s.map.height,
-            resolution: s.map.resolution,
-            origin_x: s.map.origin_x,
-            origin_y: s.map.origin_y,
-            frame_id: s.map.frame_id.clone(),
-            revision: s.map.revision,
-            timestamp_ns: s.map.timestamp_ns,
-        }))
+        validate_occupancy_grid(&s.map).map_err(OccupancyGridValidationError::into_status)?;
+        Ok(Response::new(occupancy_grid_meta(&s.map)))
     }
 
     async fn get_occupancy_grid_data(
@@ -1432,19 +1500,8 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<OccupancyGridData>, Status> {
         let (meta, raw_data) = {
             let s = self.bridge.state.read().await;
-            (
-                OccupancyGridMeta {
-                    width: s.map.width,
-                    height: s.map.height,
-                    resolution: s.map.resolution,
-                    origin_x: s.map.origin_x,
-                    origin_y: s.map.origin_y,
-                    frame_id: s.map.frame_id.clone(),
-                    revision: s.map.revision,
-                    timestamp_ns: s.map.timestamp_ns,
-                },
-                s.map.data.clone(),
-            )
+            validate_occupancy_grid(&s.map).map_err(OccupancyGridValidationError::into_status)?;
+            (occupancy_grid_meta(&s.map), s.map.data.clone())
         };
         Ok(Response::new(OccupancyGridData {
             meta: Some(meta),
@@ -1465,17 +1522,9 @@ impl GeometryRuntime for GeometryRuntimeService {
             .lock()
             .raw_map_snapshot()
             .ok_or_else(|| Status::failed_precondition("physical occupancy grid is unavailable"))?;
+        validate_occupancy_grid(&raw_map).map_err(OccupancyGridValidationError::into_status)?;
         Ok(Response::new(OccupancyGridData {
-            meta: Some(OccupancyGridMeta {
-                width: raw_map.width,
-                height: raw_map.height,
-                resolution: raw_map.resolution,
-                origin_x: raw_map.origin_x,
-                origin_y: raw_map.origin_y,
-                frame_id: raw_map.frame_id,
-                revision: raw_map.revision,
-                timestamp_ns: raw_map.timestamp_ns,
-            }),
+            meta: Some(occupancy_grid_meta(&raw_map)),
             data: raw_map.data.iter().map(|&value| value as u8).collect(),
         }))
     }
@@ -2486,6 +2535,109 @@ impl GeometryRuntime for GeometryRuntimeService {
                     message: format!("LCM publish failed: {}", e),
                 }))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod base_frame_config_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_base_frame_value_precedes_legacy_alias() {
+        assert_eq!(
+            resolve_base_frame_alias(Some(" body "), Some("base_footprint")),
+            "body"
+        );
+        assert_eq!(
+            resolve_base_frame_alias(Some(" "), Some(" base_footprint ")),
+            "base_footprint"
+        );
+        assert_eq!(resolve_base_frame_alias(None, None), "base_link");
+    }
+}
+
+#[cfg(test)]
+mod occupancy_rpc_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_grid_is_reported_as_not_ready_by_all_occupancy_getters() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle);
+
+        let meta_error = GeometryRuntime::get_occupancy_grid(&service, Request::new(Empty {}))
+            .await
+            .expect_err("empty occupancy metadata must not be returned");
+        let data_error = GeometryRuntime::get_occupancy_grid_data(&service, Request::new(Empty {}))
+            .await
+            .expect_err("empty occupancy payload must not be returned");
+        let raw_error =
+            GeometryRuntime::get_raw_occupancy_grid_data(&service, Request::new(Empty {}))
+                .await
+                .expect_err("missing physical occupancy must not be returned");
+
+        assert_eq!(meta_error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(data_error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(raw_error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn malformed_ready_grid_preserves_payload_integrity_error() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        handle.state.write().await.map = crate::lcm_runtime::MapState {
+            width: 2,
+            height: 2,
+            resolution: 0.05,
+            frame_id: "map".into(),
+            revision: 1,
+            data: vec![0, 100, -1],
+            ..crate::lcm_runtime::MapState::default()
+        };
+        let service = GeometryRuntimeService::new(handle);
+
+        let error = GeometryRuntime::get_occupancy_grid_data(&service, Request::new(Empty {}))
+            .await
+            .expect_err("mismatched occupancy payload must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("payload size mismatch"));
+    }
+
+    #[tokio::test]
+    async fn committed_invalid_grid_metadata_is_reported_as_integrity_error() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let service = GeometryRuntimeService::new(handle);
+
+        for (width, height, resolution, frame_id, expected_reason) in [
+            (0, 1, 0.05, "map", "dimensions"),
+            (1, 0, 0.05, "map", "dimensions"),
+            (1, 1, f32::NAN, "map", "resolution"),
+            (1, 1, 0.0, "map", "resolution"),
+            (1, 1, 0.05, "  ", "frame_id"),
+        ] {
+            service.bridge.state.write().await.map = crate::lcm_runtime::MapState {
+                width,
+                height,
+                resolution,
+                frame_id: frame_id.into(),
+                revision: 1,
+                data: vec![0],
+                ..crate::lcm_runtime::MapState::default()
+            };
+
+            let error = GeometryRuntime::get_occupancy_grid(&service, Request::new(Empty {}))
+                .await
+                .expect_err("committed invalid occupancy metadata must not be returned");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error.message().contains(expected_reason));
         }
     }
 }

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
 import logging
 import threading
 from threading import Timer
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from time import monotonic
+from typing import Dict, Iterator, List, Optional, Tuple, Any, Callable
 
 from contracts.base import MetadataDict, utc_now
 from contracts.naming import build_event_id, build_task_id
@@ -102,9 +103,12 @@ class TaskRecord:
     events: List[TaskEvent] = field(default_factory=list)
     future: Optional[Future[Any]] = None
     timeout_timer: Optional[Timer] = None
+    timeout_deadline_monotonic: Optional[float] = None
+    execution_started: bool = False
     result: Any = None
     error: Optional[str] = None
     error_payload: Optional[MetadataDict] = None
+    interrupt_cause: Optional[str] = None
     cancel_requested: bool = False
     timeout_triggered: bool = False
     deferred_interrupt: bool = False
@@ -114,6 +118,8 @@ class TaskRecord:
     completion_proof: Optional[MetadataDict] = None
     resource_quarantined: bool = False
     resource_quarantine_release_proof: Optional[MetadataDict] = None
+    resource_release_claimed: bool = False
+    resources_released: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,13 +151,37 @@ class TaskExecutionContext:
 
         return self.manager.is_timed_out(self.task_id)
 
+    def timeout_deadline_monotonic(self) -> Optional[float]:
+        """返回 timeout Timer 对应的单调时钟截止点。"""
+
+        with self.manager._lock:
+            return self.manager._records[self.task_id].timeout_deadline_monotonic
+
+    def timeout_remaining_sec(self) -> Optional[float]:
+        """返回截止点前的剩余秒数；无 timeout 时返回 None。"""
+
+        deadline = self.timeout_deadline_monotonic()
+        if deadline is None:
+            return None
+        return max(0.0, deadline - monotonic())
+
     def ensure_active(self) -> None:
         """确保任务仍可继续执行。"""
 
-        if self.is_timed_out():
+        with self.manager._lock:
+            record = self.manager._records[self.task_id]
+            if record.completion_committed:
+                return
+            if record.timeout_triggered:
+                timeout_due = True
+            elif record.cancel_requested:
+                raise TaskCancelledError(f"任务 {self.task_id} 已取消。")
+            else:
+                deadline = record.timeout_deadline_monotonic
+                timeout_due = deadline is not None and monotonic() >= deadline
+        if timeout_due:
+            self.manager._handle_timeout(self.task_id)
             raise TaskTimeoutError(f"任务 {self.task_id} 已超时。")
-        if self.is_cancel_requested():
-            raise TaskCancelledError(f"任务 {self.task_id} 已取消。")
 
     def publish_event(self, event_type: str, *, message: Optional[str] = None, payload: Optional[MetadataDict] = None) -> TaskEvent:
         """发布附加任务事件。"""
@@ -208,6 +238,11 @@ class TaskManager:
     ) -> TaskSpec:
         """提交一个异步任务。"""
 
+        timeout_deadline_monotonic = (
+            monotonic() + float(timeout_sec)
+            if timeout_sec is not None
+            else None
+        )
         task_id = build_task_id(capability_name)
         metadata_payload = self._build_task_metadata(
             task_id=task_id,
@@ -234,17 +269,73 @@ class TaskManager:
         record = TaskRecord(
             spec=spec,
             status=status,
+            timeout_deadline_monotonic=timeout_deadline_monotonic,
             deferred_interrupt=bool(deferred_interrupt),
         )
         acquired_resources = False
         future: Optional[Future[Any]] = None
         timer: Optional[Timer] = None
+        accepted_publication = None
         start_gate = threading.Event()
         start_aborted = threading.Event()
 
         def gated_runner() -> Any:
             start_gate.wait()
             if start_aborted.is_set():
+                return None
+            timeout_due = False
+            started_event: Optional[TaskEvent] = None
+            started_publication = None
+            with self._lock:
+                current = self._records.get(task_id)
+                if current is None or current.status.state in _TERMINAL_STATES:
+                    return None
+                if current.interrupt_cause is not None:
+                    return None
+                deadline = current.timeout_deadline_monotonic
+                if deadline is not None and monotonic() >= deadline:
+                    timeout_due = True
+                else:
+                    now = utc_now()
+                    current.status = current.status.model_copy(
+                        update={
+                            "state": TaskState.RUNNING,
+                            "started_at": current.status.started_at or now,
+                            "updated_at": now,
+                            "stage": "running",
+                            "message": "任务开始执行。",
+                        }
+                    )
+                    started_event = self._record_task_event(
+                        task_id,
+                        "task.started",
+                        state=TaskState.RUNNING,
+                        message="任务开始执行。",
+                    )
+                    started_publication = self._prepare_task_event_dispatch(
+                        started_event
+                    )
+            if timeout_due:
+                self._handle_timeout(task_id)
+                return None
+            assert started_event is not None
+            self._dispatch_task_event(
+                started_event,
+                publication=started_publication,
+            )
+            with self._lock:
+                current = self._records.get(task_id)
+                if current is None or current.status.state in _TERMINAL_STATES:
+                    return None
+                if current.interrupt_cause is not None:
+                    return None
+                deadline = current.timeout_deadline_monotonic
+                if deadline is not None and monotonic() >= deadline:
+                    timeout_due = True
+                else:
+                    current.execution_started = True
+            if timeout_due:
+                self._handle_timeout(task_id)
                 return None
             return self._run_task(task_id, runner)
 
@@ -264,30 +355,62 @@ class TaskManager:
             with self._lock:
                 record.future = future
 
-            self._append_task_event(task_id, "task.accepted", state=TaskState.ACCEPTED, message="任务已接受。")
+            with self._lock:
+                accepted_event = self._record_task_event(
+                    task_id,
+                    "task.accepted",
+                    state=TaskState.ACCEPTED,
+                    message="任务已接受。",
+                )
+                accepted_publication = self._prepare_task_event_dispatch(
+                    accepted_event
+                )
 
-            if timeout_sec is not None:
-                timer = Timer(timeout_sec, self._handle_timeout, args=(task_id,))
+            if timeout_deadline_monotonic is not None:
+                remaining_sec = timeout_deadline_monotonic - monotonic()
+                timer = Timer(
+                    max(0.0, remaining_sec),
+                    self._handle_timeout,
+                    args=(task_id,),
+                )
                 timer.daemon = True
                 with self._lock:
                     record.timeout_timer = timer
                 timer.start()
 
+            self._dispatch_task_event(
+                accepted_event,
+                publication=accepted_publication,
+            )
+
             start_gate.set()
             return spec
-        except Exception:
+        except BaseException:
+            if accepted_publication is not None and self._event_bus is not None:
+                self._event_bus.abandon_prepared(accepted_publication)
             start_aborted.set()
             start_gate.set()
             if future is not None:
                 future.cancel()
             if timer is not None:
                 timer.cancel()
-            with self._lock:
-                self._records.pop(task_id, None)
-                if task_id in self._history_order:
-                    self._history_order.remove(task_id)
-            if acquired_resources and self._resource_lock_manager is not None:
-                self._resource_lock_manager.release(task_id)
+            cleanup_succeeded = not acquired_resources
+            if acquired_resources:
+                try:
+                    cleanup_succeeded = self._release_resources(task_id)
+                except Exception:
+                    cleanup_succeeded = False
+                if not cleanup_succeeded:
+                    with self._lock:
+                        current = self._records.get(task_id)
+                        cleanup_succeeded = bool(
+                            current is not None and current.resources_released
+                        )
+            if cleanup_succeeded:
+                with self._lock:
+                    self._records.pop(task_id, None)
+                    if task_id in self._history_order:
+                        self._history_order.remove(task_id)
             raise
 
     def get_task_status(self, task_id: str) -> TaskStatus:
@@ -447,6 +570,23 @@ class TaskManager:
                 if record.resource_quarantined
             )
 
+    @contextmanager
+    def motion_resource_quarantine_snapshot(self) -> Iterator[Tuple[str, ...]]:
+        """在隔离状态协调锁内提供稳定的 task-id 快照。"""
+
+        with self._lock:
+            yield tuple(
+                task_id
+                for task_id, record in self._records.items()
+                if record.resource_quarantined
+                or (
+                    record.deferred_interrupt
+                    and record.execution_started
+                    and not record.completion_committed
+                    and not record.resources_released
+                )
+            )
+
     def release_resource_quarantine(
         self,
         task_id: str,
@@ -512,10 +652,14 @@ class TaskManager:
                     raise ValueError(f"隔离任务与释放证明的 {key} 不匹配。")
             state = record.status.state
 
-        self._release_resources(task_id)
         with self._lock:
             record = self._records[task_id]
             if not record.resource_quarantined:
+                return False
+            if not self._release_resources(
+                task_id,
+                release_quarantined=True,
+            ):
                 return False
             record.resource_quarantined = False
             record.resource_quarantine_release_proof = release_proof
@@ -608,15 +752,31 @@ class TaskManager:
     def cancel_task(self, task_id: str, message: Optional[str] = None) -> bool:
         """取消任务。"""
 
+        timeout_due = False
         with self._lock:
             record = self._records[task_id]
             if record.status.state in _TERMINAL_STATES or record.completion_committed:
                 return False
-            record.cancel_requested = True
-            future = record.future
-            deferred_interrupt = record.deferred_interrupt
+            if record.interrupt_cause == "cancel":
+                return True
+            if record.interrupt_cause == "timeout":
+                return False
+            deadline = record.timeout_deadline_monotonic
+            if deadline is not None and monotonic() >= deadline:
+                timeout_due = True
+            else:
+                record.interrupt_cause = "cancel"
+                record.cancel_requested = True
+                future = record.future
+                execution_started = record.execution_started
+                deferred_interrupt = record.deferred_interrupt
+        if timeout_due:
+            self._handle_timeout(task_id)
+            return False
 
-        cancelled_before_start = future is None or future.cancel()
+        cancelled_before_start = (
+            not execution_started or future is None or future.cancel()
+        )
         if (
             deferred_interrupt
             and future is not None
@@ -715,11 +875,16 @@ class TaskManager:
                     if record.resource_quarantined
                 )
             for task_id in quarantined_task_ids:
-                self._release_resources(task_id)
                 with self._lock:
                     record = self._records.get(task_id)
-                    if record is not None:
+                    released = self._release_resources(
+                        task_id,
+                        release_quarantined=True,
+                    )
+                    if record is not None and released:
                         record.resource_quarantined = False
+                    else:
+                        continue
                 self._append_task_event(
                     task_id,
                     "task.resource_quarantine_released",
@@ -789,7 +954,6 @@ class TaskManager:
         return None
 
     def _run_task(self, task_id: str, runner: TaskRunner) -> Any:
-        self._set_running(task_id)
         context = TaskExecutionContext(manager=self, task_id=task_id)
         result: Any = None
         try:
@@ -925,7 +1089,7 @@ class TaskManager:
             with self._lock:
                 resource_quarantined = self._records[task_id].resource_quarantined
             if not resource_quarantined:
-                self._release_resources(task_id)
+                self._try_release_resources(task_id)
             self._cancel_timer(task_id)
 
     def _fail_safety_barrier(
@@ -1137,7 +1301,7 @@ class TaskManager:
             self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
         finally:
             if release_resources:
-                self._release_resources(task_id)
+                self._try_release_resources(task_id)
             self._cancel_timer(task_id)
 
     def _extract_error_payload(self, exc: Exception) -> Optional[MetadataDict]:
@@ -1178,6 +1342,47 @@ class TaskManager:
             self._event_bus.publish_task_event(event)
         return event
 
+    def _record_task_event(
+        self,
+        task_id: str,
+        event_type: str,
+        *,
+        state: Optional[TaskState] = None,
+        message: Optional[str] = None,
+        payload: Optional[MetadataDict] = None,
+    ) -> TaskEvent:
+        """Record an event before a deadline-sensitive external dispatch."""
+
+        with self._lock:
+            record = self._records[task_id]
+            event = TaskEvent(
+                event_id=build_event_id(event_type),
+                event_type=event_type,
+                task_id=task_id,
+                state=state,
+                message=message,
+                payload=self._build_task_event_payload(record.spec, payload),
+            )
+            record.events.append(event)
+            return event
+
+    def _prepare_task_event_dispatch(self, event: TaskEvent):
+        if self._event_bus is None:
+            return None
+        return self._event_bus.prepare_task_event(event)
+
+    def _dispatch_task_event(self, event: TaskEvent, *, publication=None) -> None:
+        if self._event_bus is None:
+            return
+        if publication is None:
+            self._event_bus.publish_task_event(event)
+            return
+        try:
+            self._event_bus.dispatch_prepared(publication)
+        except BaseException:
+            self._event_bus.abandon_prepared(publication)
+            raise
+
     def _handle_timeout(self, task_id: str) -> None:
         with self._lock:
             record = self._records.get(task_id)
@@ -1185,12 +1390,19 @@ class TaskManager:
                 return
             if record.status.state in _TERMINAL_STATES or record.completion_committed:
                 return
+            if record.interrupt_cause is not None:
+                return
+            record.interrupt_cause = "timeout"
             record.timeout_triggered = True
             future = record.future
+            execution_started = record.execution_started
             deferred_interrupt = record.deferred_interrupt
-        cancelled_before_start = future is None or future.cancel()
+        cancelled_before_start = (
+            not execution_started or future is None or future.cancel()
+        )
         if (
             deferred_interrupt
+            and execution_started
             and future is not None
             and not cancelled_before_start
             and not future.done()
@@ -1210,14 +1422,45 @@ class TaskManager:
             release_resources=can_release_resources,
         )
 
-    def _release_resources(self, task_id: str) -> None:
-        if self._resource_lock_manager is None:
-            return
+    def _release_resources(
+        self,
+        task_id: str,
+        *,
+        release_quarantined: bool = False,
+    ) -> bool:
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is not None:
+                if record.resource_quarantined and not release_quarantined:
+                    return False
+                if record.resource_release_claimed:
+                    return False
+                record.resource_release_claimed = True
+            try:
+                if self._resource_lock_manager is not None:
+                    self._resource_lock_manager.release(task_id)
+            except Exception as exc:
+                if record is not None:
+                    record.resource_release_claimed = False
+                self._log_cleanup_failure("release_resources", task_id, exc)
+                raise
+            if record is not None:
+                record.resources_released = True
+            return True
+
+    def _try_release_resources(
+        self,
+        task_id: str,
+        *,
+        release_quarantined: bool = False,
+    ) -> bool:
         try:
-            self._resource_lock_manager.release(task_id)
-        except Exception as exc:
-            self._log_cleanup_failure("release_resources", task_id, exc)
-            raise
+            return self._release_resources(
+                task_id,
+                release_quarantined=release_quarantined,
+            )
+        except Exception:
+            return False
 
     def _cancel_timer(self, task_id: str) -> None:
         try:

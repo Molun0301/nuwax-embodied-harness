@@ -52,6 +52,12 @@ class EventSubscription:
     async_dispatch: bool = False
 
 
+@dataclass(frozen=True)
+class PreparedEventPublication:
+    stored_event: RuntimeEvent
+    subscriptions: Tuple[EventSubscription, ...]
+
+
 class EventBus:
     """支持游标续播的内存事件总线。"""
 
@@ -62,6 +68,11 @@ class EventBus:
         self._next_cursor = 1
         self._next_subscription_seq = 1
         self._lock = threading.RLock()
+        self._dispatch_condition = threading.Condition(self._lock)
+        self._prepared_publications: Dict[int, PreparedEventPublication] = {}
+        self._publication_states: Dict[int, str] = {}
+        self._next_dispatch_cursor = 1
+        self._dispatch_owner_thread_id: Optional[int] = None
 
         # 异步分发队列及消费者线程
         self._async_queue: collections.deque = collections.deque(maxlen=10000)
@@ -111,35 +122,153 @@ class EventBus:
     def publish(self, event: RuntimeEvent) -> RuntimeEvent:
         """发布一条运行时事件。"""
 
+        return self.dispatch_prepared(self.prepare(event))
+
+    def prepare(self, event: RuntimeEvent) -> PreparedEventPublication:
+        """Store an event and reserve its cursor without dispatching callbacks."""
+
         with self._lock:
             stored_event = event.model_copy(update={"cursor": self._next_cursor})
             self._next_cursor += 1
             self._events.append(stored_event)
             if len(self._events) > self._retention_limit:
                 self._events = self._events[-self._retention_limit :]
-            subscriptions = tuple(self._subscriptions.values())
+            publication = PreparedEventPublication(
+                stored_event=stored_event,
+                subscriptions=tuple(self._subscriptions.values()),
+            )
+            cursor = stored_event.cursor
+            assert cursor is not None
+            self._prepared_publications[cursor] = publication
+            self._publication_states[cursor] = "reserved"
+            return publication
 
-        failures: List[Tuple[EventSubscription, Exception]] = []
-        for subscription in subscriptions:
+    def dispatch_prepared(
+        self,
+        publication: PreparedEventPublication,
+    ) -> RuntimeEvent:
+        """Dispatch one event that has already obtained its public cursor."""
+
+        stored_event = publication.stored_event
+        cursor = stored_event.cursor
+        if cursor is None:
+            raise ValueError("Prepared publication is missing its cursor.")
+        current_thread_id = threading.get_ident()
+        while True:
+            with self._dispatch_condition:
+                if cursor < self._next_dispatch_cursor:
+                    return stored_event
+                registered = self._prepared_publications.get(cursor)
+                if registered is not publication:
+                    raise ValueError("Prepared publication does not belong to this EventBus.")
+                state = self._publication_states.get(cursor)
+                if state == "discarded":
+                    raise RuntimeError("Prepared publication was discarded.")
+                if state == "reserved":
+                    self._publication_states[cursor] = "queued"
+                if self._dispatch_owner_thread_id == current_thread_id:
+                    # Reentrant publishes are drained after every subscriber for
+                    # the current cursor has returned.
+                    return stored_event
+                if (
+                    self._dispatch_owner_thread_id is None
+                    and self._publication_states.get(self._next_dispatch_cursor)
+                    == "queued"
+                ):
+                    self._dispatch_owner_thread_id = current_thread_id
+                    break
+                self._dispatch_condition.wait()
+
+        self._drain_prepared_publications(current_thread_id)
+        with self._dispatch_condition:
+            while cursor >= self._next_dispatch_cursor:
+                self._dispatch_condition.wait()
+        return stored_event
+
+    def abandon_prepared(self, publication: PreparedEventPublication) -> bool:
+        """Discard an undispatched reservation without blocking later cursors."""
+
+        cursor = publication.stored_event.cursor
+        if cursor is None:
+            return False
+        with self._dispatch_condition:
+            if cursor < self._next_dispatch_cursor:
+                return False
+            if self._prepared_publications.get(cursor) is not publication:
+                raise ValueError("Prepared publication does not belong to this EventBus.")
+            if self._publication_states.get(cursor) not in {"reserved", "queued"}:
+                return False
+            self._publication_states[cursor] = "discarded"
+            self._advance_discarded_publications_locked()
+            self._dispatch_condition.notify_all()
+            return True
+
+    def _drain_prepared_publications(self, owner_thread_id: int) -> None:
+        pending_error: Optional[BaseException] = None
+        try:
+            while True:
+                with self._dispatch_condition:
+                    self._advance_discarded_publications_locked()
+                    cursor = self._next_dispatch_cursor
+                    if self._publication_states.get(cursor) != "queued":
+                        break
+                    publication = self._prepared_publications[cursor]
+                    self._publication_states[cursor] = "dispatching"
+
+                try:
+                    failures = self._deliver_publication(publication)
+                    if failures:
+                        self._record_subscription_failures(
+                            publication.stored_event,
+                            failures,
+                        )
+                except BaseException as exc:
+                    if pending_error is None:
+                        pending_error = exc
+                finally:
+                    with self._dispatch_condition:
+                        self._prepared_publications.pop(cursor, None)
+                        self._publication_states.pop(cursor, None)
+                        self._next_dispatch_cursor += 1
+                        self._dispatch_condition.notify_all()
+        finally:
+            with self._dispatch_condition:
+                if self._dispatch_owner_thread_id == owner_thread_id:
+                    self._dispatch_owner_thread_id = None
+                self._dispatch_condition.notify_all()
+        if pending_error is not None:
+            raise pending_error
+
+    def _advance_discarded_publications_locked(self) -> None:
+        while self._publication_states.get(self._next_dispatch_cursor) == "discarded":
+            cursor = self._next_dispatch_cursor
+            self._prepared_publications.pop(cursor, None)
+            self._publication_states.pop(cursor, None)
+            self._next_dispatch_cursor += 1
+
+    def _deliver_publication(
+        self,
+        publication: PreparedEventPublication,
+    ) -> List[Tuple[EventSubscription, BaseException]]:
+        stored_event = publication.stored_event
+        failures: List[Tuple[EventSubscription, BaseException]] = []
+        for subscription in publication.subscriptions:
             if not self._matches(subscription, stored_event):
                 continue
             if subscription.async_dispatch:
-                self._async_queue.append((subscription.callback, stored_event))
+                self._async_queue.append((subscription, stored_event))
                 self._async_event.set()
             else:
                 try:
                     subscription.callback(stored_event)
-                except Exception as exc:
+                except BaseException as exc:
                     failures.append((subscription, exc))
-        if failures:
-            self._record_subscription_failures(stored_event, failures)
-
-        return stored_event
+        return failures
 
     def _record_subscription_failures(
         self,
         event: RuntimeEvent,
-        failures: Iterable[Tuple[EventSubscription, Exception]],
+        failures: Iterable[Tuple[EventSubscription, BaseException]],
     ) -> None:
         for subscription, exc in failures:
             diagnostic = self.build_event(
@@ -163,16 +292,23 @@ class EventBus:
                     "failed_event_cursor": event.cursor,
                 },
             )
+            prepared = self.prepare(diagnostic)
+            publication = PreparedEventPublication(
+                stored_event=prepared.stored_event,
+                subscriptions=(),
+            )
+            cursor = publication.stored_event.cursor
+            assert cursor is not None
             with self._lock:
-                stored_diagnostic = diagnostic.model_copy(update={"cursor": self._next_cursor})
-                self._next_cursor += 1
-                self._events.append(stored_diagnostic)
-                if len(self._events) > self._retention_limit:
-                    self._events = self._events[-self._retention_limit :]
+                self._prepared_publications[cursor] = publication
+            self.dispatch_prepared(publication)
 
-    def publish_task_event(self, task_event: TaskEvent, *, source: str = "task_manager") -> RuntimeEvent:
-        """把任务事件转换为统一运行时事件并发布。"""
-
+    def _build_task_runtime_event(
+        self,
+        task_event: TaskEvent,
+        *,
+        source: str,
+    ) -> RuntimeEvent:
         payload = dict(task_event.payload)
         severity = {
             "task.failed": RuntimeEventSeverity.ERROR,
@@ -193,17 +329,34 @@ class EventBus:
             value = payload.get(key)
             if _has_metadata_value(value):
                 metadata[key] = value
-        return self.publish(
-            self.build_event(
-                task_event.event_type,
-                category=RuntimeEventCategory.TASK,
-                source=source,
-                task_id=task_event.task_id,
-                severity=severity,
-                message=task_event.message,
-                payload=payload,
-                metadata=metadata,
-            )
+        return self.build_event(
+            task_event.event_type,
+            category=RuntimeEventCategory.TASK,
+            source=source,
+            task_id=task_event.task_id,
+            severity=severity,
+            message=task_event.message,
+            payload=payload,
+            metadata=metadata,
+        )
+
+    def prepare_task_event(
+        self,
+        task_event: TaskEvent,
+        *,
+        source: str = "task_manager",
+    ) -> PreparedEventPublication:
+        """Store a task event before deadline-sensitive callback dispatch."""
+
+        return self.prepare(
+            self._build_task_runtime_event(task_event, source=source)
+        )
+
+    def publish_task_event(self, task_event: TaskEvent, *, source: str = "task_manager") -> RuntimeEvent:
+        """把任务事件转换为统一运行时事件并发布。"""
+
+        return self.dispatch_prepared(
+            self.prepare_task_event(task_event, source=source)
         )
 
     def subscribe(
@@ -279,17 +432,28 @@ class EventBus:
             self._async_event.clear()
             while self._async_queue:
                 try:
-                    callback, event = self._async_queue.popleft()
+                    subscription, event = self._async_queue.popleft()
                 except IndexError:
                     break
                 try:
-                    callback(event)
-                except Exception as exc:
+                    subscription.callback(event)
+                except BaseException as exc:
                     _logger.warning(
                         "异步事件回调执行异常: %s — %s",
                         exc.__class__.__name__,
                         exc,
                     )
+                    try:
+                        self._record_subscription_failures(
+                            event,
+                            ((subscription, exc),),
+                        )
+                    except BaseException as diagnostic_exc:
+                        _logger.warning(
+                            "异步事件失败诊断记录异常: %s — %s",
+                            diagnostic_exc.__class__.__name__,
+                            diagnostic_exc,
+                        )
 
     def shutdown(self) -> None:
         """停止后台消费者线程并清空队列。"""

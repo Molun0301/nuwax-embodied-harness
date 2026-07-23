@@ -53,6 +53,70 @@ const GRPC_MESSAGE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 pub mod proto {
     tonic::include_proto!("nuwax.geometry");
+
+    impl std::fmt::Debug for ExplorationRecoveryGuardProof {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ExplorationRecoveryGuardProof([REDACTED])")
+        }
+    }
+
+    impl std::fmt::Debug for RecoverExplorationAfterNavigationRolloverRequest {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("RecoverExplorationAfterNavigationRolloverRequest([REDACTED])")
+        }
+    }
+
+    impl std::fmt::Debug for ReconcileExplorationAfterGlobalStopRequest {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ReconcileExplorationAfterGlobalStopRequest([REDACTED])")
+        }
+    }
+
+    #[cfg(test)]
+    mod security_tests {
+        use super::*;
+
+        #[test]
+        fn generated_recovery_wire_debug_is_redacted() {
+            let token = vec![0x5a; 32];
+            let proof = ExplorationRecoveryGuardProof {
+                recovery_fence_token: token,
+                ..ExplorationRecoveryGuardProof::default()
+            };
+            let rollover = RecoverExplorationAfterNavigationRolloverRequest {
+                guard_proof: Some(proof.clone()),
+                ..RecoverExplorationAfterNavigationRolloverRequest::default()
+            };
+            let reconciliation = ReconcileExplorationAfterGlobalStopRequest {
+                held_guard_proof: Some(proof.clone()),
+                ..ReconcileExplorationAfterGlobalStopRequest::default()
+            };
+
+            for rendered in [
+                format!("{proof:?}"),
+                format!("{rollover:?}"),
+                format!("{reconciliation:?}"),
+            ] {
+                assert!(rendered.contains("[REDACTED]"));
+                assert!(!rendered.contains("90, 90, 90"));
+                assert!(!rendered.contains(&"5a".repeat(32)));
+            }
+        }
+
+        #[test]
+        fn generated_recovery_wire_types_disable_automatic_debug() {
+            let generated = include_str!(concat!(env!("OUT_DIR"), "/nuwax.geometry.rs"));
+            for type_name in [
+                "ExplorationRecoveryGuardProof",
+                "RecoverExplorationAfterNavigationRolloverRequest",
+                "ReconcileExplorationAfterGlobalStopRequest",
+            ] {
+                assert!(
+                    generated.contains(&format!("#[prost(skip_debug)]\npub struct {type_name}"))
+                );
+            }
+        }
+    }
 }
 
 fn incoming_until_shutdown(

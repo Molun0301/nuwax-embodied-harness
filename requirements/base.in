@@ -23,4 +23,6 @@ onnxslim==0.1.93
 ultralytics==8.4.33
 psutil==7.2.2
 
-# `lcm` Python 模块由 Ubuntu 的 python3-lcm 提供，不从 PyPI 安装。
+# Focal/aarch64 does not provide python3-lcm; build the pinned binding in the
+# release venv against the system liblcm-dev package.
+lcm==1.5.2

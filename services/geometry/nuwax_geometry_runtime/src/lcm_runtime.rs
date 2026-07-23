@@ -46,6 +46,7 @@ use crate::pointcloud::CloudMapShmWriter;
 use crate::sequence_state::{sequence_state_path_from_env, SequenceStateStore};
 
 const MAP_FANOUT_SINK_TIMEOUT: Duration = Duration::from_secs(2);
+const EXPLORATION_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 // Phase 4 (channel registry) + Phase 7 (readiness cache): 统一在这里导入,
 // 避免每个函数 body 内部重复 `use crate::channel_registry::...`。
@@ -1630,6 +1631,62 @@ impl ExploreNavigationBridge {
         let update = NavigationUpdate::from_local(state, &self.nav, lease).await;
         let _ = self.nav_state_tx.send(update);
     }
+
+    fn spawn_correlated_cancel_retry(
+        &self,
+        lease: crate::nav_runtime::GoalLease,
+        cancel_generation: u64,
+    ) {
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EXPLORATION_CANCEL_RETRY_INTERVAL).await;
+                let pending = bridge.nav.cancel_snapshot();
+                if pending.phase != crate::nav_runtime::CancelPhase::Pending
+                    || pending.generation != cancel_generation
+                    || pending.lease.as_ref() != Some(&lease)
+                {
+                    return;
+                }
+
+                let facade = bridge.facade_handle();
+                let outcome = crate::nav_runtime::cancel(
+                    &facade,
+                    &bridge.nav,
+                    crate::nav_runtime::CancelGoalInput {
+                        goal_id: lease.session_id.clone(),
+                        owner_kind: lease.owner_kind,
+                        parent_request_id: lease.parent_request_id.clone(),
+                        goal_generation: lease.goal_generation,
+                        producer_runtime_generation: lease.producer_runtime_generation,
+                    },
+                )
+                .await;
+                let current = bridge.nav.cancel_snapshot();
+                if current.generation != cancel_generation
+                    || current.lease.as_ref() != Some(&lease)
+                    || current.phase != crate::nav_runtime::CancelPhase::Pending
+                {
+                    return;
+                }
+                if outcome.state.message == "CANCEL_PENDING_RETRY_PUBLISHED" {
+                    info!(
+                        session_id = %lease.session_id,
+                        cancel_generation,
+                        "exploration child cancellation exact retry published"
+                    );
+                } else {
+                    warn!(
+                        session_id = %lease.session_id,
+                        cancel_generation,
+                        status = %outcome.state.status,
+                        message = %outcome.state.message,
+                        "exploration child cancellation exact retry did not publish"
+                    );
+                }
+            }
+        });
+    }
 }
 
 fn classify_exploration_submit_rejection(
@@ -1778,6 +1835,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             if cancel.generation == 0 || !cancel_lease.matches(expected) {
                 return Err("navigation cancel tracker returned a mismatched ticket".to_string());
             }
+            self.spawn_correlated_cancel_retry(lease, cancel.generation);
             Ok(crate::explore_runtime::ChildNavigationCancelTicket {
                 lease: cancel_lease,
                 cancel_generation: cancel.generation,
@@ -2554,6 +2612,13 @@ pub fn spawn_geometry_runtime(
         }
     };
     let explore_runtime = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+    if let Err(error) = explore_runtime.restore_latest_durable_reconciliation_snapshot() {
+        error!(
+            reason = error.message(),
+            "exploration ownership journal startup recovery failed closed"
+        );
+        return Err(RealLcmBackendUnavailable);
+    }
     let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 按 NUWAX_LCM_BACKEND 选择真实 backend。强制模式下启动失败直接退出。
@@ -5114,6 +5179,332 @@ mod real_lcm_startup_tests {
             result,
             Err(RealLcmStartupError::Optional("invalid provider"))
         );
+    }
+}
+
+#[cfg(test)]
+mod exploration_cancel_retry_tests {
+    use super::*;
+    use futures::stream;
+    use nuwax_protocol::RawLcmFrame;
+    use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        frames: Arc<Mutex<Vec<RawLcmFrame>>>,
+    }
+
+    #[async_trait]
+    impl LcmBackend for RecordingBackend {
+        async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+            self.frames.lock().expect("recording backend").push(frame);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _topic: LcmTopic,
+            _msg_type: Option<LcmMessageType>,
+        ) -> LcmFrameStream {
+            Box::pin(stream::empty())
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    impl RecordingBackend {
+        fn cancel_count(&self) -> usize {
+            self.frames
+                .lock()
+                .expect("recording backend")
+                .iter()
+                .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.CancelNavigation")
+                .count()
+        }
+
+        fn decoded_cancels(&self) -> Vec<schema::CancelNavigation> {
+            self.frames
+                .lock()
+                .expect("recording backend")
+                .iter()
+                .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.CancelNavigation")
+                .map(|frame| {
+                    schema::decode_cancel_navigation_body(&frame.payload)
+                        .expect("decode CancelNavigation")
+                })
+                .collect()
+        }
+    }
+
+    fn goal_input(goal_id: &str) -> crate::nav_runtime::SetGoalInput {
+        crate::nav_runtime::SetGoalInput {
+            goal_id: goal_id.to_string(),
+            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            parent_request_id: "exploration-retry-parent".to_string(),
+            goal_generation: 0,
+            motion_admission: crate::nav_runtime::test_motion_admission(),
+            frame_id: "map".to_string(),
+            target: PoseState {
+                x: 1.0,
+                y: 2.0,
+                ..PoseState::default()
+            },
+        }
+    }
+
+    async fn start_cancel(
+        goal_id: &str,
+    ) -> (
+        ExploreNavigationBridge,
+        RecordingBackend,
+        crate::nav_runtime::GoalLease,
+        crate::explore_runtime::ChildNavigationCancelTicket,
+    ) {
+        let backend = RecordingBackend::default();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let nav = crate::nav_runtime::NavRuntimeState::from_env();
+        nav.observe_stack_state(NavState {
+            status: "IDLE".to_string(),
+            message: "retry test heartbeat".to_string(),
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            ..NavState::default()
+        })
+        .await;
+        nav.observe_tf_chain(crate::nav_runtime::TfChainObservation {
+            generation: 1,
+            map_frame: "map".to_string(),
+            odom_frame: "odom".to_string(),
+            base_frame: "base_link".to_string(),
+            map_to_odom: true,
+            odom_to_base: true,
+        })
+        .expect("TF observation");
+        nav.observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+            generation: 1,
+            map_revision: 1,
+            map_frame: "map".to_string(),
+            pose_frame: "map".to_string(),
+            ready: true,
+        })
+        .expect("planner observation");
+        nav.observe_motion_sink(crate::nav_runtime::MotionSinkObservation {
+            generation: 1,
+            ready: true,
+        })
+        .expect("motion sink observation");
+
+        let (cloud_map_tx, _) = broadcast::channel(4);
+        let (nav_state_tx, _) = broadcast::channel(4);
+        let (frontiers_tx, _) = broadcast::channel(4);
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let (map_revision_latest_tx, _) = watch::channel(None);
+        let bridge = ExploreNavigationBridge {
+            state: Arc::new(RwLock::new(SharedState::default())),
+            cloud_map_tx,
+            nav_state_tx,
+            frontiers_tx,
+            map_revision_tx,
+            map_revision_latest_tx,
+            transport,
+            transport_backend_name: "real-lcm",
+            lcm_backend_available: true,
+            cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            nav: nav.clone(),
+            runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        };
+        let outcome =
+            crate::nav_runtime::set_goal(&bridge.facade_handle(), &nav, goal_input(goal_id)).await;
+        assert_eq!(
+            outcome.state.status, "ACCEPTED",
+            "{}",
+            outcome.state.message
+        );
+        let lease = outcome.lease.expect("accepted goal lease");
+        let expected = exploration_child_lease(&lease);
+        let ticket = crate::explore_runtime::ExploreNavigationSink::cancel(&bridge, &expected)
+            .await
+            .expect("exploration cancellation ticket");
+        (bridge, backend, lease, ticket)
+    }
+
+    async fn wait_for_cancel_count(backend: &RecordingBackend, expected_minimum: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if backend.cancel_count() >= expected_minimum {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exact cancellation retry was not published");
+    }
+
+    fn assert_exact_cancels(
+        backend: &RecordingBackend,
+        lease: &crate::nav_runtime::GoalLease,
+        cancel_generation: u64,
+    ) {
+        for cancel in backend.decoded_cancels() {
+            assert_eq!(cancel.session_id, lease.session_id);
+            assert_eq!(cancel.owner_kind, lease.owner_kind);
+            assert_eq!(cancel.parent_request_id, lease.parent_request_id);
+            assert_eq!(cancel.goal_generation, lease.goal_generation as i64);
+            assert_eq!(
+                cancel.producer_runtime_generation,
+                lease.producer_runtime_generation as i64
+            );
+            assert_eq!(cancel.cancel_generation, cancel_generation as i64);
+        }
+    }
+
+    async fn assert_retry_stopped(backend: &RecordingBackend) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let settled_count = backend.cancel_count();
+        tokio::time::sleep(EXPLORATION_CANCEL_RETRY_INTERVAL + Duration::from_millis(100)).await;
+        assert_eq!(backend.cancel_count(), settled_count);
+    }
+
+    #[tokio::test]
+    async fn exploration_cancel_retries_exact_transaction_until_zeroed() {
+        let (bridge, backend, lease, ticket) = start_cancel("retry-until-zeroed").await;
+        wait_for_cancel_count(&backend, 3).await;
+        assert_exact_cancels(&backend, &lease, ticket.cancel_generation);
+
+        let zeroed = bridge
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: ticket.cancel_generation,
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: "retry test zeroed".to_string(),
+            })
+            .await;
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert_retry_stopped(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn exploration_cancel_retry_stops_after_failed_ack() {
+        let (bridge, backend, lease, ticket) = start_cancel("retry-until-failed").await;
+        wait_for_cancel_count(&backend, 2).await;
+        let failed = bridge
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: ticket.cancel_generation,
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Failed,
+                message: "retry test failed".to_string(),
+            })
+            .await;
+        assert_eq!(failed.state.status, "FAILED");
+        assert_retry_stopped(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn exploration_cancel_retry_stops_after_existing_timeout() {
+        let (bridge, backend, _lease, _ticket) = start_cancel("retry-until-timeout").await;
+        wait_for_cancel_count(&backend, 2).await;
+        bridge.nav.expire_cancel_for_test();
+
+        let timed_out = bridge
+            .nav
+            .poll_cancel_timeout()
+            .await
+            .expect("pending cancellation should reach its existing timeout");
+        assert_eq!(timed_out.state.status, "FAILED");
+        assert_eq!(timed_out.state.message, "CANCEL_ZERO_ACK_TIMEOUT");
+        assert_retry_stopped(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn exploration_cancel_retry_stays_stopped_when_next_goal_replaces_zeroed_lease() {
+        let (bridge, backend, lease, ticket) = start_cancel("retry-before-replacement").await;
+        wait_for_cancel_count(&backend, 2).await;
+        let blocked_replacement = crate::nav_runtime::set_goal(
+            &bridge.facade_handle(),
+            &bridge.nav,
+            goal_input("blocked-replacement-child"),
+        )
+        .await;
+        assert_eq!(blocked_replacement.state.status, "FAILED");
+        assert!(blocked_replacement
+            .state
+            .message
+            .contains("GOAL_LEASE_BUSY"));
+        wait_for_cancel_count(&backend, 3).await;
+
+        let zeroed = bridge
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: ticket.cancel_generation,
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: "replacement fence zeroed".to_string(),
+            })
+            .await;
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        bridge
+            .nav
+            .observe_stack_state(NavState {
+                status: "IDLE".to_string(),
+                message: "replacement heartbeat".to_string(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..NavState::default()
+            })
+            .await;
+        bridge
+            .nav
+            .observe_tf_chain(crate::nav_runtime::TfChainObservation {
+                generation: 2,
+                map_frame: "map".to_string(),
+                odom_frame: "odom".to_string(),
+                base_frame: "base_link".to_string(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("replacement TF observation");
+        bridge
+            .nav
+            .observe_planner_input(crate::nav_runtime::PlannerInputObservation {
+                generation: 2,
+                map_revision: 2,
+                map_frame: "map".to_string(),
+                pose_frame: "map".to_string(),
+                ready: true,
+            })
+            .expect("replacement planner observation");
+        bridge
+            .nav
+            .observe_motion_sink(crate::nav_runtime::MotionSinkObservation {
+                generation: 2,
+                ready: true,
+            })
+            .expect("replacement motion sink observation");
+        let replacement = crate::nav_runtime::set_goal(
+            &bridge.facade_handle(),
+            &bridge.nav,
+            goal_input("replacement-child"),
+        )
+        .await;
+        assert_eq!(
+            replacement.state.status, "ACCEPTED",
+            "{}",
+            replacement.state.message
+        );
+        assert_retry_stopped(&backend).await;
     }
 }
 

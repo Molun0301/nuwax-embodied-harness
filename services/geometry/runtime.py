@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -51,11 +52,74 @@ from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
 from services.geometry.geometry_runtime_provider import (
     GeometryRuntimeProvider,
     GeometryRuntimeRpcError,
+    _exploration_child_lease_fingerprint,
 )
 from services.geometry.loop_closure_state import read_loop_closure_from_db
 
 from contracts.naming import build_safe_dir_segment
 from services.localization.frame_tree_ops import resolve_frame_transform
+
+
+def _exploration_deadline_remaining(
+    deadline_monotonic: Optional[float],
+    rpc_name: str,
+) -> Optional[float]:
+    if deadline_monotonic is None:
+        return None
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        error = GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration deadline exhausted",
+        )
+        error.exploration_rpc_dispatched = False
+        raise error
+    return remaining
+
+
+@contextmanager
+def _exploration_deadline_lock(lock, deadline_monotonic, rpc_name):
+    remaining = _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+    if remaining is None:
+        with lock:
+            yield
+        return
+    if not lock.acquire(timeout=remaining):
+        raise GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration lock deadline exhausted",
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _exploration_post_rpc_lock(lock, deadline_monotonic, rpc_name):
+    deadline_exhausted = False
+    if deadline_monotonic is None:
+        with lock:
+            yield deadline_exhausted
+        return
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        deadline_exhausted = True
+        acquired = lock.acquire(blocking=False)
+    else:
+        acquired = lock.acquire(timeout=remaining)
+    if not acquired:
+        raise GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration lock deadline exhausted",
+        )
+    try:
+        yield deadline_exhausted
+    finally:
+        lock.release()
 
 # 与 core.settings._normalize_lcm_backend 保持一致，只允许生产后端。
 _CANONICAL_LCM_BACKENDS: FrozenSet[str] = frozenset({"real-lcm"})
@@ -201,6 +265,7 @@ def _is_complete_exploration_terminal(
         and status in terminal_statuses
         and metadata.get("exploration_terminal") is True
         and not _exploration_state_child_task_id(state)
+        and metadata.get("child_lease") is None
     )
 
 
@@ -229,7 +294,33 @@ def _restore_mapping_session_mode_locked(runtime: object) -> None:
         )
 
 
+def _remote_exploration_owner_lock(runtime: object):
+    return getattr(
+        runtime,
+        "_remote_exploration_ownership_lock",
+        getattr(runtime, "_exploration_loop_lock"),
+    )
+
+
 def _commit_remote_exploration_state_locked(
+    runtime: object,
+    state: ExplorationState,
+    *,
+    request_id: str,
+    request: Optional[ExploreAreaRequest] = None,
+    map_version_id: Optional[str] = None,
+) -> bool:
+    with _remote_exploration_owner_lock(runtime):
+        return _commit_remote_exploration_state_under_owner_lock(
+            runtime,
+            state,
+            request_id=request_id,
+            request=request,
+            map_version_id=map_version_id,
+        )
+
+
+def _commit_remote_exploration_state_under_owner_lock(
     runtime: object,
     state: ExplorationState,
     *,
@@ -713,6 +804,7 @@ class PlatformGeometryRuntime:
         self._remote_exploration_subscription_id: Optional[int] = None
         self._next_exploration_subscription_id = 1
         self._external_exploration_request: Optional[ExploreAreaRequest] = None
+        self._remote_exploration_ownership_lock = threading.RLock()
         self._external_exploration_started_at_monotonic: Optional[float] = None
         self._external_exploration_started_at_iso: Optional[str] = None
         self._external_exploration_deadline_monotonic: Optional[float] = None
@@ -1056,12 +1148,35 @@ class PlatformGeometryRuntime:
             return None
         return provider
 
-    def probe_geometry_runtime_health(self) -> Tuple[bool, str]:
+    def probe_geometry_runtime_health(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Tuple[bool, str]:
         """Run a live, side-effect-free GetStatus probe against the provider."""
 
-        if self.get_geometry_runtime_provider() is None:
-            return False, "GeometryRuntimeProvider 未连接"
-        return self._probe_geometry_runtime_health()
+        if deadline_monotonic is None:
+            if self.get_geometry_runtime_provider() is None:
+                return False, "GeometryRuntimeProvider 未连接"
+        else:
+            with _exploration_deadline_lock(
+                self._runtime_state_lock,
+                deadline_monotonic,
+                "GetStatus",
+            ):
+                provider = self._remote_provider
+            connected = getattr(provider, "is_connected", False)
+            if callable(connected):
+                connected = connected()
+            if provider is None or not bool(connected):
+                raise GeometryRuntimeRpcError(
+                    rpc_name="GetStatus",
+                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    grpc_details="GeometryRuntimeProvider is disconnected",
+                )
+        return self._probe_geometry_runtime_health(
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def notify_cmd_vel_sink_ready(
         self,
@@ -2378,7 +2493,11 @@ class PlatformGeometryRuntime:
             "nuwax-geometry-runtime gRPC HealthCheck、地图 streaming 与 TF 链均已就绪。",
         )
 
-    def _probe_geometry_runtime_health(self) -> Tuple[bool, str]:
+    def _probe_geometry_runtime_health(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Tuple[bool, str]:
         """探测 nuwax-geometry-runtime gRPC HealthCheck.healthy 与 GetStatus 状态。
 
         返回 (ok, message)：
@@ -2389,7 +2508,16 @@ class PlatformGeometryRuntime:
         if provider is None:
             return False, "GeometryRuntimeProvider 未连接"
         try:
-            status = provider.get_status()
+            if deadline_monotonic is None:
+                status = provider.get_status()
+            else:
+                status = provider.get_status(
+                    deadline_monotonic=deadline_monotonic,
+                )
+        except GeometryRuntimeRpcError:
+            if deadline_monotonic is not None:
+                raise
+            return False, "GetStatus RPC 失败"
         except Exception as exc:  # pragma: no cover - gRPC 健康探测容错
             return False, "GetStatus RPC 失败：%s" % exc
         if not isinstance(status, dict):
@@ -2800,7 +2928,7 @@ class PlatformGeometryRuntime:
     def _build_navigation_status(self) -> Dict[str, object]:
         """返回当前导航后端的诊断状态。"""
         remote = getattr(self, "_remote_provider", None)
-        if remote is not None and getattr(remote, "is_connected", False):
+        if remote is not None and _remote_is_connected(remote):
             try:
                 readiness = remote.get_navigation_readiness()
             except Exception as exc:  # pragma: no cover - 防御性兜底
@@ -4514,7 +4642,7 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return None
         remote = getattr(self, "_remote_provider", None)
-        if remote is not None and getattr(remote, "is_connected", False):
+        if remote is not None and _remote_is_connected(remote):
             return remote
         return None
 
@@ -4524,7 +4652,7 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return None
         remote = getattr(self, "_remote_provider", None)
-        if remote is not None and getattr(remote, "is_connected", False):
+        if remote is not None and _remote_is_connected(remote):
             return remote
         return None
 
@@ -6581,18 +6709,35 @@ class PlatformGeometryRuntime:
         *,
         map_name: Optional[str] = None,
         map_version_id: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, object]:
         """Start or idempotently confirm one native Rust mapping session."""
 
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StartMapping",
+        )
         if not self._is_geometry_profile_enabled():
             raise RuntimeError("平台几何运行时或 mapping profile 已禁用。")
         if not self._runtime_started:
+            if deadline_monotonic is not None:
+                raise GeometryRuntimeRpcError(
+                    rpc_name="StartMapping",
+                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    grpc_details="geometry runtime is not started",
+                )
             self.start()
         provider = self._remote_provider
-        if provider is None or not bool(getattr(provider, "is_connected", False)):
+        if provider is None or not _remote_is_connected(provider):
+            if deadline_monotonic is not None:
+                raise GeometryRuntimeRpcError(
+                    rpc_name="StartMapping",
+                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    grpc_details="geometry runtime provider is disconnected",
+                )
             self._start_geometry_runtime_subprocess()
             provider = self._remote_provider
-        if provider is None or not bool(getattr(provider, "is_connected", False)):
+        if provider is None or not _remote_is_connected(provider):
             raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法启动建图。")
 
         active_version = getattr(self, "_active_map_version", None)
@@ -6603,7 +6748,11 @@ class PlatformGeometryRuntime:
             raise RuntimeError("启动建图必须提供 map_name。")
 
         self._ensure_mapping_lifecycle_fields()
-        with self._mapping_lifecycle_lock:
+        with _exploration_deadline_lock(
+            self._mapping_lifecycle_lock,
+            deadline_monotonic,
+            "StartMapping",
+        ):
             current = self._mapping_session_context
             new_session_started = not (
                 isinstance(current, dict) and bool(current.get("active"))
@@ -6645,6 +6794,11 @@ class PlatformGeometryRuntime:
                 session_id=session_id,
                 map_name=resolved_map_name,
                 map_version_id=provisional_version,
+                **(
+                    {"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None
+                    else {}
+                ),
             )
             if (
                 not isinstance(response, dict)
@@ -6669,7 +6823,11 @@ class PlatformGeometryRuntime:
                 else None
             )
 
-        with self._exploration_loop_lock:
+        with _exploration_deadline_lock(
+            self._exploration_loop_lock,
+            deadline_monotonic,
+            "StartMapping",
+        ):
             if new_session_started:
                 self._external_geometry_session_mode = "mapping"
                 self._external_exploration_terminal_state = None
@@ -6678,7 +6836,11 @@ class PlatformGeometryRuntime:
         if new_session_started:
             self._map_stream_tracker = {}
         diagnostics_reader = getattr(provider, "get_mapping_diagnostics", None)
-        diagnostics = diagnostics_reader() if callable(diagnostics_reader) else None
+        diagnostics = (
+            diagnostics_reader()
+            if deadline_monotonic is None and callable(diagnostics_reader)
+            else None
+        )
         return {
             "mapping_launch_mode": "nuwax_geometry_runtime",
             "mapping_transport": "grpc_lcm",
@@ -7106,7 +7268,11 @@ class PlatformGeometryRuntime:
             except Exception:
                 pass
 
-    def get_platform_exploration_state(self) -> ExplorationState:
+    def get_platform_exploration_state(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> ExplorationState:
         """读取 native exploration runtime 的权威快照。
 
         该入口只做 gRPC snapshot -> 平台契约转换，不推进任务、不触发 fanout。
@@ -7118,7 +7284,11 @@ class PlatformGeometryRuntime:
             if lock is None:
                 current = getattr(self, "_external_exploration_request", None)
             else:
-                with lock:
+                with _exploration_deadline_lock(
+                    lock,
+                    deadline_monotonic,
+                    "GetExplorationState",
+                ):
                     current = getattr(self, "_external_exploration_request", None)
             return str(getattr(current, "request_id", "") or "").strip()
 
@@ -7127,7 +7297,11 @@ class PlatformGeometryRuntime:
             if lock is None:
                 cached = getattr(self, "_external_exploration_terminal_state", None)
             else:
-                with lock:
+                with _exploration_deadline_lock(
+                    lock,
+                    deadline_monotonic,
+                    "GetExplorationState",
+                ):
                     cached = getattr(
                         self,
                         "_external_exploration_terminal_state",
@@ -7180,6 +7354,10 @@ class PlatformGeometryRuntime:
                 },
             )
 
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "GetExplorationState",
+        )
         if not self._is_geometry_profile_enabled():
             return unavailable(
                 "platform_geometry profile 已禁用。",
@@ -7193,7 +7371,11 @@ class PlatformGeometryRuntime:
                 "provider_unavailable",
             )
 
-        with self._exploration_loop_lock:
+        with _exploration_deadline_lock(
+            self._exploration_loop_lock,
+            deadline_monotonic,
+            "GetExplorationState",
+        ):
             remote_token = _capture_remote_operation_token_locked(self, backend)
         if remote_token is None:
             return unavailable(
@@ -7202,7 +7384,16 @@ class PlatformGeometryRuntime:
             )
 
         try:
-            payload = backend.get_exploration_state()
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "GetExplorationState",
+            )
+            if deadline_monotonic is None:
+                payload = backend.get_exploration_state()
+            else:
+                payload = backend.get_exploration_state(
+                    deadline_monotonic=deadline_monotonic,
+                )
         except GeometryRuntimeRpcError:
             if active_request_id():
                 raise
@@ -7232,7 +7423,11 @@ class PlatformGeometryRuntime:
             )
 
         state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(payload)
-        with self._exploration_loop_lock:
+        with _exploration_deadline_lock(
+            self._exploration_loop_lock,
+            deadline_monotonic,
+            "GetExplorationState",
+        ):
             if not _remote_operation_token_is_current_locked(self, remote_token):
                 return unavailable(
                     "读取探索状态期间 GeometryRuntimeProvider 连接代际已切换。",
@@ -7241,7 +7436,10 @@ class PlatformGeometryRuntime:
             current_request = self._external_exploration_request
 
         metadata = dict(state.metadata)
-        if hasattr(self, "_external_debug_frontier_payload"):
+        if (
+            deadline_monotonic is None
+            and hasattr(self, "_external_debug_frontier_payload")
+        ):
             frontier_metadata, _ = self._external_debug_frontier_metadata()
             metadata = {**frontier_metadata, **metadata}
 
@@ -8122,7 +8320,13 @@ class PlatformGeometryProviderBundle(
         # semantic layer 仅来自已激活平台版本，不合成远端空层。
         return None
 
-    def set_goal(self, goal):
+    def set_goal(
+        self,
+        goal,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ):
+        _exploration_deadline_remaining(deadline_monotonic, "SetNavigationGoal")
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
@@ -8139,9 +8343,20 @@ class PlatformGeometryProviderBundle(
                 float(target_pose.position.z),
                 target_pose.frame_id,
             )
-        return self._call_navigation_backend(backend, "set_goal", goal)
+        if deadline_monotonic is None:
+            return self._call_navigation_backend(backend, "set_goal", goal)
+        setter = getattr(backend, "set_goal", None)
+        if not callable(setter):
+            return False
+        return setter(goal, deadline_monotonic=deadline_monotonic)
 
-    def cancel_goal(self, request_id: Optional[str] = None) -> bool:
+    def cancel_goal(
+        self,
+        request_id: Optional[str] = None,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        _exploration_deadline_remaining(deadline_monotonic, "CancelNavigation")
         exact_goal_id = str(request_id or "").strip()
         if not exact_goal_id:
             LOGGER.warning("拒绝缺少 exact goal_id 的导航取消请求。")
@@ -8155,7 +8370,12 @@ class PlatformGeometryProviderBundle(
         if not callable(state_getter):
             return False
         try:
-            state = state_getter()
+            if deadline_monotonic is None:
+                state = state_getter()
+            else:
+                state = state_getter(deadline_monotonic=deadline_monotonic)
+        except GeometryRuntimeRpcError:
+            raise
         except Exception:
             LOGGER.exception("导航取消前读取 backend exact goal 失败。")
             return False
@@ -8187,13 +8407,26 @@ class PlatformGeometryProviderBundle(
                 active_status or None,
             )
             return False
-        return self._call_navigation_backend(
-            backend,
-            "cancel_goal",
+        if deadline_monotonic is None:
+            return self._call_navigation_backend(
+                backend,
+                "cancel_goal",
+                request_id=exact_goal_id,
+            )
+        canceller = getattr(backend, "cancel_goal", None)
+        if not callable(canceller):
+            return False
+        return canceller(
             request_id=exact_goal_id,
+            deadline_monotonic=deadline_monotonic,
         )
 
-    def cancel_navigation(self, *, request_id: Optional[str] = None) -> bool:
+    def cancel_navigation(
+        self,
+        *,
+        request_id: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """扩展的导航取消入口（5.5 task）。
 
         `request_id` 必须是当前 ACTIVE 的 exact goal 标识；缺失或与后端状态不匹配时
@@ -8204,7 +8437,10 @@ class PlatformGeometryProviderBundle(
 
         if not self._is_geometry_profile_enabled():
             return False
-        return self.cancel_goal(request_id=str(request_id or "").strip() or None)
+        return self.cancel_goal(
+            request_id=str(request_id or "").strip() or None,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def navigate(self, goal, timeout_sec: Optional[int] = None) -> str:
         """V2 非阻塞提交；成功返回 request/goal id，拒绝返回空串。"""
@@ -8240,13 +8476,18 @@ class PlatformGeometryProviderBundle(
             return False
         return self.runtime.unsubscribe_navigation_updates(subscription_id)
 
-    def get_navigation_state(self):
+    def get_navigation_state(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ):
         """扩展的导航状态读取入口（5.5 task）。
 
         - 优先走 backend.get_navigation_state()；
         - 在 metadata 中标记实际的 geometry runtime gRPC transport。
         """
 
+        _exploration_deadline_remaining(deadline_monotonic, "GetNavigationState")
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             from contracts.navigation import NavigationState, NavigationStatus
@@ -8279,7 +8520,10 @@ class PlatformGeometryProviderBundle(
                     "unimplemented": True,
                 },
             )
-        state = getter()
+        if deadline_monotonic is None:
+            state = getter()
+        else:
+            state = getter(deadline_monotonic=deadline_monotonic)
         # 复用现有 metadata，补充实际 transport 标记；不破坏 schema。
         metadata = dict(getattr(state, "metadata", {}) or {})
         metadata.setdefault("navigation_transport", "geometry_runtime_grpc")
@@ -8341,14 +8585,17 @@ class PlatformGeometryProviderBundle(
         remote = getattr(self.runtime, "_remote_provider", None)
         if remote is None:
             return None
-        try:
-            if not bool(remote.is_connected):
-                return None
-        except Exception:
+        if not _remote_is_connected(remote):
             return None
         return remote
 
-    def _start_exploration_via_remote(self, request, remote) -> bool:
+    def _start_exploration_via_remote(
+        self,
+        request,
+        remote,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """把 request 翻译成 gRPC facade 的 start_exploration 调用。
 
         request 是 platform 侧的 `ExploreAreaRequest` 契约；gRPC facade 接收边界、
@@ -8415,42 +8662,69 @@ class PlatformGeometryProviderBundle(
         lock = getattr(self.runtime, "_exploration_loop_lock", None)
         if lock is None:
             return False
-        with lock:
-            remote_token = _capture_remote_operation_token_locked(
-                self.runtime,
-                remote,
-            )
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
-            current_id = str(
-                getattr(current, "request_id", "") or ""
-            ).strip()
-            if remote_token is None or (
-                current_id and current_id != request_id
-            ):
-                return False
+        owner_lock = _remote_exploration_owner_lock(self.runtime)
         try:
+            with _exploration_deadline_lock(
+                lock,
+                deadline_monotonic,
+                "StartExploration",
+            ):
+                remote_token = _capture_remote_operation_token_locked(
+                    self.runtime,
+                    remote,
+                )
+                current = getattr(
+                    self.runtime,
+                    "_external_exploration_request",
+                    None,
+                )
+                current_id = str(
+                    getattr(current, "request_id", "") or ""
+                ).strip()
+                if remote_token is None or (
+                    current_id and current_id != request_id
+                ):
+                    return False
+        except GeometryRuntimeRpcError as exc:
+            exc.exploration_rpc_dispatched = False
+            raise
+        try:
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
             mapping_state = self.runtime.start_mapping(
                 map_name=(
                     str(getattr(request, "map_name", "") or "").strip() or None
                     if request is not None
                     else None
                 ),
+                deadline_monotonic=deadline_monotonic,
             )
             mapping_version_id = str(
                 mapping_state.get("mapping_version_id") or ""
             ).strip()
             if not mapping_version_id:
                 raise RuntimeError("探索启动前未获得 ACTIVE mapping version。")
-        except Exception:
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
+        except GeometryRuntimeRpcError as exc:
+            exc.exploration_rpc_dispatched = False
+            raise
+        except Exception as exc:
             LOGGER.exception("Bundle.start_exploration 前置 mapping 准备失败。")
-            return False
+            error = GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details=str(exc) or "StartExploration preflight failed",
+            )
+            error.exploration_rpc_dispatched = False
+            raise error from exc
 
-        def retain_uncertain_start(message: str) -> None:
-            uncertain_state = ExplorationState(
+        def uncertain_start_state(message: str) -> ExplorationState:
+            return ExplorationState(
                 current_request_id=request_id,
                 status=ExplorationStatus.ACCEPTED,
                 strategy=strategy,
@@ -8464,16 +8738,67 @@ class PlatformGeometryProviderBundle(
                     "request_id": request_id,
                 },
             )
-            with lock:
-                _commit_remote_exploration_state_locked(
-                    self.runtime,
-                    uncertain_state,
-                    request_id=request_id,
-                    request=request,
-                    map_version_id=mapping_version_id,
-                )
+
+        precommit_snapshot = {}
+
+        def restore_precommit_snapshot_locked() -> None:
+            for attribute, (present, value) in precommit_snapshot.items():
+                if present:
+                    setattr(self.runtime, attribute, value)
+                elif hasattr(self.runtime, attribute):
+                    delattr(self.runtime, attribute)
 
         try:
+            with _exploration_deadline_lock(
+                lock,
+                deadline_monotonic,
+                "StartExploration",
+            ):
+                if not _remote_operation_token_is_current_locked(
+                    self.runtime,
+                    remote_token,
+                ):
+                    raise GeometryRuntimeRpcError(
+                        rpc_name="StartExploration",
+                        grpc_code=grpc.StatusCode.UNAVAILABLE,
+                        grpc_details="provider generation changed before StartExploration",
+                    )
+                with owner_lock:
+                    for attribute in (
+                        "_external_exploration_request",
+                        "_external_exploration_terminal_state",
+                        "_external_geometry_session_mode",
+                        "_external_exploration_version_id",
+                    ):
+                        precommit_snapshot[attribute] = (
+                            hasattr(self.runtime, attribute),
+                            getattr(self.runtime, attribute, None),
+                        )
+                    if not _commit_remote_exploration_state_locked(
+                        self.runtime,
+                        uncertain_start_state(
+                            "StartExploration 调用中，保留 exact ownership。"
+                        ),
+                        request_id=request_id,
+                        request=request,
+                        map_version_id=mapping_version_id,
+                    ):
+                        raise GeometryRuntimeRpcError(
+                            rpc_name="StartExploration",
+                            grpc_code=grpc.StatusCode.UNKNOWN,
+                            grpc_details=(
+                                "failed to retain exact ownership before StartExploration"
+                            ),
+                        )
+        except GeometryRuntimeRpcError as exc:
+            exc.exploration_rpc_dispatched = False
+            raise
+
+        try:
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
             result = remote.start_exploration(
                 request_id=request_id,
                 strategy=strategy,
@@ -8483,25 +8808,47 @@ class PlatformGeometryProviderBundle(
                 max_navigation_retries=max_navigation_retries,
                 blacklist_radius_m=blacklist_radius_m,
                 motion_admission=motion_admission,
+                **(
+                    {"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None
+                    else {}
+                ),
             )
-        except GeometryRuntimeRpcError:
-            retain_uncertain_start(
-                "StartExploration RPC 结果不确定，等待 correlated stop 证明。"
-            )
+        except GeometryRuntimeRpcError as exc:
+            if getattr(exc, "exploration_rpc_dispatched", True) is False:
+                with owner_lock:
+                    current = getattr(
+                        self.runtime,
+                        "_external_exploration_request",
+                        None,
+                    )
+                    current_id = str(
+                        getattr(current, "request_id", "") or ""
+                    ).strip()
+                    if current_id == request_id:
+                        restore_precommit_snapshot_locked()
             raise
-        except Exception:
-            LOGGER.exception("Bundle.start_exploration gRPC 失败。")
-            return False
+        except Exception as exc:
+            LOGGER.exception("Bundle.start_exploration gRPC 结果不确定。")
+            raise GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details=str(exc) or "unexpected StartExploration failure",
+            ) from exc
         if not isinstance(result, dict):
-            retain_uncertain_start(
-                "StartExploration 返回体无效，等待 correlated stop 证明。"
-            )
             raise GeometryRuntimeRpcError(
                 rpc_name="StartExploration",
                 grpc_code=grpc.StatusCode.UNKNOWN,
                 grpc_details="StartExploration returned an invalid response payload",
             )
-        state = self._wrap_remote_exploration_state(result)
+        try:
+            state = self._wrap_remote_exploration_state(result)
+        except Exception as exc:
+            raise GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details=str(exc) or "invalid StartExploration response",
+            ) from exc
         raw_status = str(result.get("status") or "").strip().lower()
         retained_child = bool(_exploration_state_child_task_id(state))
         accepted = raw_status not in {
@@ -8520,16 +8867,55 @@ class PlatformGeometryProviderBundle(
         )
         ownership_pending = not terminal and accepted
         if not raw_status and not retained_child:
-            retain_uncertain_start(
-                "StartExploration 缺少状态，等待 correlated stop 证明。"
-            )
             raise GeometryRuntimeRpcError(
                 rpc_name="StartExploration",
                 grpc_code=grpc.StatusCode.UNKNOWN,
                 grpc_details="StartExploration response omitted status",
             )
+        if raw_status in {"idle", "rejected", "unimplemented"}:
+            with owner_lock:
+                if not _remote_operation_token_is_current_locked(
+                    self.runtime,
+                    remote_token,
+                ):
+                    raise GeometryRuntimeRpcError(
+                        rpc_name="StartExploration",
+                        grpc_code=grpc.StatusCode.UNAVAILABLE,
+                        grpc_details=(
+                            "provider generation changed after definitive "
+                            "StartExploration response"
+                        ),
+                    )
+                current = getattr(
+                    self.runtime,
+                    "_external_exploration_request",
+                    None,
+                )
+                current_id = str(
+                    getattr(current, "request_id", "") or ""
+                ).strip()
+                if current_id == request_id:
+                    restore_precommit_snapshot_locked()
+            if deadline_monotonic is None:
+                notifier = getattr(self.runtime, "_notify_exploration_update", None)
+                if callable(notifier):
+                    try:
+                        notifier(state)
+                    except Exception:
+                        LOGGER.exception(
+                            "StartExploration 明确拒绝已回滚，但本地 fanout 失败。"
+                        )
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
+            return False
         notify_state = False
-        with lock:
+        with _exploration_post_rpc_lock(
+            owner_lock,
+            deadline_monotonic,
+            "StartExploration",
+        ) as deadline_exhausted:
             if not _remote_operation_token_is_current_locked(
                 self.runtime,
                 remote_token,
@@ -8585,7 +8971,7 @@ class PlatformGeometryProviderBundle(
                         )
                     return False
             notify_state = True
-        if notify_state:
+        if notify_state and deadline_monotonic is None:
             notifier = getattr(
                 self.runtime,
                 "_notify_exploration_update",
@@ -8598,26 +8984,72 @@ class PlatformGeometryProviderBundle(
                     LOGGER.exception(
                         "StartExploration 状态已提交，但本地 fanout 失败。"
                     )
+        if deadline_exhausted:
+            raise GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc_details=(
+                    "StartExploration response committed after cooperative deadline"
+                ),
+            )
         return accepted
 
-    def start_exploration(self, request) -> bool:
+    def start_exploration(
+        self,
+        request,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StartExploration",
+        )
         if not self._is_geometry_profile_enabled():
             return False
         remote = self._resolve_remote_exploration_provider()
         if remote is None:
             LOGGER.error("Bundle.start_exploration: GeometryRuntimeProvider 未连接。")
             return False
-        return self._start_exploration_via_remote(request, remote)
+        try:
+            return self._start_exploration_via_remote(
+                request,
+                remote,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except GeometryRuntimeRpcError:
+            raise
+        except Exception as exc:
+            error = GeometryRuntimeRpcError(
+                rpc_name="StartExploration",
+                grpc_code=grpc.StatusCode.UNKNOWN,
+                grpc_details=str(exc) or "StartExploration translation failed",
+            )
+            error.exploration_rpc_dispatched = False
+            raise error from exc
 
-    def stop_exploration(self, request_id: Optional[str] = None) -> bool:
+    def stop_exploration(
+        self,
+        request_id: Optional[str] = None,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StopExploration",
+        )
         if not self._is_geometry_profile_enabled():
             return False
         requested_id = str(request_id or "").strip()
         lock = getattr(self.runtime, "_exploration_loop_lock", None)
         if lock is None:
             return False
+        owner_lock = _remote_exploration_owner_lock(self.runtime)
         committed = False
-        with lock:
+        with _exploration_deadline_lock(
+            lock,
+            deadline_monotonic,
+            "StopExploration",
+        ):
             current = getattr(
                 self.runtime,
                 "_external_exploration_request",
@@ -8656,7 +9088,18 @@ class PlatformGeometryProviderBundle(
             LOGGER.error("native remote 不可用，拒绝 correlated StopExploration。")
             return False
         try:
-            result = remote.stop_exploration(request_id=correlated_id)
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StopExploration",
+            )
+            result = remote.stop_exploration(
+                request_id=correlated_id,
+                **(
+                    {"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None
+                    else {}
+                ),
+            )
         except GeometryRuntimeRpcError:
             LOGGER.exception(
                 "Bundle.stop_exploration gRPC 异常；correlated stop 结果不确定。"
@@ -8676,7 +9119,11 @@ class PlatformGeometryProviderBundle(
             "rejected",
             "unimplemented",
         }
-        with lock:
+        with _exploration_post_rpc_lock(
+            owner_lock,
+            deadline_monotonic,
+            "StopExploration",
+        ) as deadline_exhausted:
             if not _remote_operation_token_is_current_locked(
                 self.runtime,
                 remote_token,
@@ -8710,8 +9157,16 @@ class PlatformGeometryProviderBundle(
                 state,
                 request_id=correlated_id,
             )
-        if committed:
+        if committed and deadline_monotonic is None:
             self.runtime._notify_exploration_update(state)
+        if deadline_exhausted:
+            raise GeometryRuntimeRpcError(
+                rpc_name="StopExploration",
+                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc_details=(
+                    "StopExploration response committed after cooperative deadline"
+                ),
+            )
         return committed
 
     def recover_exploration_after_navigation_rollover(
@@ -8803,6 +9258,255 @@ class PlatformGeometryProviderBundle(
             self.runtime._notify_exploration_update(state)
         return committed
 
+    def reconcile_exploration_after_global_stop(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, Any],
+        cancel_generation: int,
+        recovery_correlation: str,
+        admission_guard_generation: int,
+        admission_guard_boot_nonce: bytes,
+        admission_motion_stop_generation: int,
+        held_guard_proof: Dict[str, Any],
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Commit only an exact durable global-stop ownership receipt."""
+
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "ReconcileExplorationAfterGlobalStop",
+        )
+        if not self._is_geometry_profile_enabled():
+            return False
+        correlated_id = str(request_id or "").strip()
+        expected_lease = dict(child_lease or {})
+        expected_generation = int(exploration_generation)
+        expected_cancel_generation = int(cancel_generation)
+        expected_correlation = str(recovery_correlation or "").strip()
+        expected_fingerprint = _exploration_child_lease_fingerprint(
+            expected_lease
+        )
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if (
+            not correlated_id
+            or lock is None
+            or expected_generation <= 0
+            or expected_cancel_generation <= 0
+            or not expected_correlation
+            or not expected_fingerprint
+            or str(expected_lease.get("parent_request_id") or "").strip()
+            != correlated_id
+        ):
+            return False
+        with _exploration_deadline_lock(
+            lock,
+            deadline_monotonic,
+            "ReconcileExplorationAfterGlobalStop",
+        ):
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            current_id = str(
+                getattr(current, "request_id", "") or ""
+            ).strip()
+            remote = self._resolve_remote_exploration_provider()
+            remote_token = (
+                _capture_remote_operation_token_locked(self.runtime, remote)
+                if remote is not None
+                else None
+            )
+            if current_id != correlated_id or remote_token is None:
+                return False
+        try:
+            result = remote.reconcile_exploration_after_global_stop(
+                request_id=correlated_id,
+                exploration_generation=expected_generation,
+                child_lease=expected_lease,
+                cancel_generation=expected_cancel_generation,
+                recovery_correlation=expected_correlation,
+                admission_guard_generation=int(admission_guard_generation),
+                admission_guard_boot_nonce=bytes(
+                    admission_guard_boot_nonce or b""
+                ),
+                admission_motion_stop_generation=int(
+                    admission_motion_stop_generation
+                ),
+                held_guard_proof=dict(held_guard_proof or {}),
+                **(
+                    {"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None
+                    else {}
+                ),
+            )
+        except GeometryRuntimeRpcError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Bundle global-stop reconciliation gRPC failed for request_id=%s.",
+                correlated_id,
+            )
+            return False
+        if not isinstance(result, dict):
+            return False
+        receipt = result.get("ownership_reconciliation_receipt")
+        global_stop = result.get("global_stop_reconciliation")
+        terminal_profile = (
+            str(result.get("last_stop_reason") or "").strip(),
+            str(receipt.get("cause") or "") if isinstance(receipt, dict) else "",
+            (
+                str(receipt.get("commit_disposition") or "")
+                if isinstance(receipt, dict)
+                else ""
+            ),
+        )
+        exact_response = bool(
+            str(result.get("request_id") or "").strip() == correlated_id
+            and int(result.get("exploration_generation") or 0)
+            == expected_generation
+            and str(result.get("status") or "").strip().lower() == "failed"
+            and not str(result.get("child_task_id") or "").strip()
+            and result.get("child_lease") is None
+            and result.get("rollover_recovery_eligible") is False
+            and isinstance(global_stop, dict)
+            and global_stop.get("eligible") is False
+            and isinstance(receipt, dict)
+            and str(receipt.get("recovery_correlation") or "")
+            == expected_correlation
+            and str(receipt.get("parent_request_id") or "")
+            == correlated_id
+            and int(receipt.get("exploration_generation") or 0)
+            == expected_generation
+            and str(receipt.get("child_lease_fingerprint") or "")
+            == expected_fingerprint
+            and int(receipt.get("cancel_generation") or 0)
+            == expected_cancel_generation
+            and terminal_profile
+            in (
+                (
+                    "global_stop_reconciled_safe",
+                    "ordinary_global_stop",
+                    "global_stop_reconciled_child_ownership",
+                ),
+                (
+                    "child_cancel_failed",
+                    "late_exact_child_zeroed",
+                    "exact_child_zeroed_released_ownership",
+                ),
+            )
+        )
+        if not exact_response:
+            return False
+        state = self._wrap_remote_exploration_state(result)
+        owner_lock = _remote_exploration_owner_lock(self.runtime)
+        with _exploration_post_rpc_lock(
+            owner_lock,
+            deadline_monotonic,
+            "ReconcileExplorationAfterGlobalStop",
+        ) as deadline_exhausted:
+            if not _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            ):
+                return False
+            current = getattr(
+                self.runtime,
+                "_external_exploration_request",
+                None,
+            )
+            if (
+                str(getattr(current, "request_id", "") or "").strip()
+                != correlated_id
+            ):
+                return False
+            committed = _commit_remote_exploration_state_under_owner_lock(
+                self.runtime,
+                state,
+                request_id=correlated_id,
+            )
+        if committed and deadline_monotonic is None:
+            self.runtime._notify_exploration_update(state)
+        if deadline_exhausted:
+            raise GeometryRuntimeRpcError(
+                rpc_name="ReconcileExplorationAfterGlobalStop",
+                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc_details=(
+                    "reconciliation response committed after cooperative deadline"
+                ),
+            )
+        return committed
+
+    def acknowledge_exploration_ownership_reconciliation(
+        self,
+        *,
+        recovery_correlation: str,
+        child_lease_fingerprint: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Acknowledge a receipt without coupling it to reconciliation commit."""
+
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "AcknowledgeExplorationOwnershipReconciliation",
+        )
+        if not self._is_geometry_profile_enabled():
+            return False
+        correlation = str(recovery_correlation or "").strip()
+        fingerprint = str(child_lease_fingerprint or "").strip()
+        lock = getattr(self.runtime, "_exploration_loop_lock", None)
+        if not correlation or len(fingerprint) != 64 or lock is None:
+            return False
+        with _exploration_deadline_lock(
+            lock,
+            deadline_monotonic,
+            "AcknowledgeExplorationOwnershipReconciliation",
+        ):
+            remote = self._resolve_remote_exploration_provider()
+            remote_token = (
+                _capture_remote_operation_token_locked(self.runtime, remote)
+                if remote is not None
+                else None
+            )
+        if remote_token is None:
+            return False
+        try:
+            acknowledged = remote.acknowledge_exploration_ownership_reconciliation(
+                recovery_correlation=correlation,
+                child_lease_fingerprint=fingerprint,
+                **(
+                    {"deadline_monotonic": deadline_monotonic}
+                    if deadline_monotonic is not None
+                    else {}
+                ),
+            )
+        except GeometryRuntimeRpcError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Bundle ownership reconciliation ack gRPC failed for correlation=%s.",
+                correlation,
+            )
+            return False
+        with _exploration_post_rpc_lock(
+            lock,
+            deadline_monotonic,
+            "AcknowledgeExplorationOwnershipReconciliation",
+        ) as deadline_exhausted:
+            current = _remote_operation_token_is_current_locked(
+                self.runtime,
+                remote_token,
+            )
+        if deadline_exhausted:
+            raise GeometryRuntimeRpcError(
+                rpc_name="AcknowledgeExplorationOwnershipReconciliation",
+                grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc_details="ack response arrived after cooperative deadline",
+            )
+        return bool(current and acknowledged)
+
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
@@ -8893,10 +9597,16 @@ class PlatformGeometryProviderBundle(
             return False
         return self.runtime.unsubscribe_exploration_updates(subscription_id)
 
-    def get_exploration_state(self):
+    def get_exploration_state(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ):
         """通过 runtime 的统一公开入口读取 native exploration 快照。"""
 
-        return self.runtime.get_platform_exploration_state()
+        return self.runtime.get_platform_exploration_state(
+            deadline_monotonic=deadline_monotonic,
+        )
 
     @staticmethod
     def _wrap_remote_exploration_state(state: Dict[str, object]):
@@ -8960,7 +9670,7 @@ class PlatformGeometryProviderBundle(
             ExplorationStatus.SUCCEEDED,
             ExplorationStatus.FAILED,
             ExplorationStatus.CANCELLED,
-        } and not child_task_id
+        } and not child_task_id and state.get("child_lease") is None
         metadata = {
             "provider": "geometry_runtime",
             "gRPC_facade": True,
@@ -8983,6 +9693,12 @@ class PlatformGeometryProviderBundle(
             "child_lease": state.get("child_lease"),
             "rollover_recovery_eligible": bool(
                 state.get("rollover_recovery_eligible", False)
+            ),
+            "global_stop_reconciliation": state.get(
+                "global_stop_reconciliation"
+            ),
+            "ownership_reconciliation_receipt": state.get(
+                "ownership_reconciliation_receipt"
             ),
         }
         timestamp = (

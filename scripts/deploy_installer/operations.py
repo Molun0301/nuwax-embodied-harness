@@ -3643,6 +3643,29 @@ def _service_activation_contract(profile) -> Tuple[FrozenSet[str], FrozenSet[str
     return always_on, on_demand
 
 
+_ALWAYS_ON_UNIT_FILE_STATES = frozenset({"enabled"})
+_ON_DEMAND_UNIT_FILE_STATES = frozenset({"disabled", "static", "indirect"})
+
+
+def _unit_file_state(service: str) -> str:
+    result = subprocess.run(
+        ("systemctl", "show", "-p", "UnitFileState", "--value", service),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise DeploymentError(
+            f"cannot read UnitFileState for {service}: rc={result.returncode}: {detail}"
+        )
+    state = result.stdout.strip()
+    if not state:
+        raise DeploymentError(f"cannot read UnitFileState for {service}: state=<empty>")
+    return state
+
+
 def enable_and_start(context: "ExecutionContext") -> None:
     script = _require_file(_deployment_script(context), "release systemd installer")
     env = _deployment_env(context)
@@ -3656,14 +3679,7 @@ def enable_and_start(context: "ExecutionContext") -> None:
     ):
         all_ready = True
         for service in context.profile.services:
-            enabled = (
-                subprocess.run(
-                    ("systemctl", "is-enabled", "--quiet", service),
-                    check=False,
-                    timeout=30,
-                ).returncode
-                == 0
-            )
+            unit_file_state = _unit_file_state(service)
             active = (
                 subprocess.run(
                     ("systemctl", "is-active", "--quiet", service),
@@ -3673,9 +3689,15 @@ def enable_and_start(context: "ExecutionContext") -> None:
                 == 0
             )
             if service in always_on_services:
-                all_ready = all_ready and enabled and active
+                all_ready = (
+                    all_ready
+                    and unit_file_state in _ALWAYS_ON_UNIT_FILE_STATES
+                    and active
+                )
             elif service in on_demand_services:
-                all_ready = all_ready and not enabled
+                all_ready = (
+                    all_ready and unit_file_state in _ON_DEMAND_UNIT_FILE_STATES
+                )
             else:
                 all_ready = False
         if all_ready:

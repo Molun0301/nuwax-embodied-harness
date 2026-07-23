@@ -72,4 +72,26 @@ def handle_stop_all_motion(
                 "error": str(exc),
             },
         ) from exc
+    if result.get("completed") is not True:
+        evidence = dict(result.get("resource_release_evidence") or {})
+        raise GatewayError(
+            "机器人已归零，但运动 ownership 收敛仍待确认。",
+            error_code="MOTION_STOP_RECONCILIATION_PENDING",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "reason": reason,
+                "operation_id": operation_id,
+                "motion_stop_generation": result.get(
+                    "motion_stop_generation"
+                ),
+                "reconciliation_pending": True,
+                "resource_release_deferred": bool(
+                    result.get("resource_release_deferred")
+                ),
+                "pending_handlers": list(
+                    evidence.get("pending_handlers") or ()
+                ),
+            },
+        )
     return ctx.serialize(result)

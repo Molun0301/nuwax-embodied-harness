@@ -4,6 +4,7 @@
 //! not reconnect after an ambiguous transport or protocol failure and it does
 //! not spawn a renewal task; the NAV runtime remains the only scheduler owner.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -139,7 +140,7 @@ pub struct GlobalStopConfirmation {
 }
 
 /// Exact proof that one durable recovery fence is currently held by the guard.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HeldRecoveryFenceProof {
     /// Idempotency key of the completed hold operation.
     pub operation_id: String,
@@ -155,6 +156,21 @@ pub struct HeldRecoveryFenceProof {
     pub zero: ZeroConfirmation,
     /// Secret 256-bit recovery-fence token returned only by the hold operation.
     pub recovery_fence_token: [u8; 32],
+}
+
+impl fmt::Debug for HeldRecoveryFenceProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldRecoveryFenceProof")
+            .field("operation_id", &self.operation_id)
+            .field("recovery_correlation", &self.recovery_correlation)
+            .field("generation", &self.generation)
+            .field("boot_nonce", &self.boot_nonce)
+            .field("motion_stop_generation", &self.motion_stop_generation)
+            .field("zero", &self.zero)
+            .field("recovery_fence_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// One sealed priority fence request that may be replayed byte-for-byte.
@@ -1393,5 +1409,14 @@ mod tests {
         assert!(
             validate_held_recovery_fence_responses(&proof, &operation, &wrong_correlation).is_err()
         );
+    }
+
+    #[test]
+    fn held_recovery_fence_debug_redacts_secret_token() {
+        let proof = held_proof();
+        let rendered = format!("{proof:?}");
+        assert!(rendered.contains("recovery_fence_token: \"[REDACTED]\""));
+        assert!(!rendered.contains("5, 5, 5"));
+        assert!(!rendered.contains(&"05".repeat(32)));
     }
 }

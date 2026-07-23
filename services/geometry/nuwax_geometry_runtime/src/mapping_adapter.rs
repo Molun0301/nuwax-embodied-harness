@@ -2335,7 +2335,7 @@ mod tests {
         assert_eq!(initial_ack.generation, 1);
         assert_eq!(initial_ack.signature, "a".repeat(64));
         assert_eq!(initial_ack.applied_revision, effective.revision);
-        assert!(effective.data.iter().any(|value| *value == 100));
+        assert!(effective.data.contains(&100));
         assert!(adapter
             .raw_map_snapshot()
             .expect("raw map")

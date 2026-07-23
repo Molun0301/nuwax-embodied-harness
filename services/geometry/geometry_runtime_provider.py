@@ -5,6 +5,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -51,6 +52,9 @@ _NavigationDeliveryToken = Tuple[
     int,
 ]
 _PUBLIC_NAV_OWNER_KIND = int(pb2.NAVIGATION_OWNER_KIND_PUBLIC_NAV)
+_EXPLORATION_CHILD_NAV_OWNER_KIND = int(
+    pb2.NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+)
 _MAX_MOTION_ADMISSION_GENERATION = (1 << 63) - 1
 
 
@@ -459,6 +463,70 @@ def _missing_exploration_stub_error(rpc_name: str) -> GeometryRuntimeRpcError:
     )
 
 
+def _exploration_rpc_timeout(
+    deadline_monotonic: Optional[float],
+    rpc_name: str,
+) -> float:
+    timeout = _read_deadline_sec()
+    if deadline_monotonic is None:
+        return timeout
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        error = GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration deadline exhausted",
+        )
+        error.exploration_rpc_dispatched = False
+        raise error
+    return min(timeout, remaining)
+
+
+@contextmanager
+def _cooperative_deadline_lock(lock, deadline_monotonic, rpc_name):
+    if deadline_monotonic is None:
+        with lock:
+            yield
+        return
+    timeout = _exploration_rpc_timeout(deadline_monotonic, rpc_name)
+    if not lock.acquire(timeout=timeout):
+        error = GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative lock deadline exhausted",
+        )
+        error.exploration_rpc_dispatched = False
+        raise error
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _cooperative_post_rpc_lock(lock, deadline_monotonic, rpc_name):
+    if deadline_monotonic is None:
+        with lock:
+            yield
+        return
+    remaining = float(deadline_monotonic) - time.monotonic()
+    acquired = (
+        lock.acquire(blocking=False)
+        if remaining <= 0
+        else lock.acquire(timeout=remaining)
+    )
+    if not acquired:
+        raise GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="post-RPC cooperative lock deadline exhausted",
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 # --- NavigationState.status 字符串语义映射（round-4 HIGH 3 同步） ---
 # Rust proto SetNavigationGoal / CancelNavigation / SubscribeNavigationState
 # 全部返回/推送 NavigationState，没有 Rust 端 NavigationAck.accepted / CancelResult.success
@@ -635,6 +703,27 @@ def _is_canonical_public_navigation_lease(
     )
 
 
+def _is_canonical_exploration_child_navigation_lease(
+    lease: _NavigationLease,
+) -> bool:
+    (
+        goal_id,
+        owner_kind,
+        parent_request_id,
+        goal_generation,
+        producer_runtime_generation,
+    ) = lease
+    prefix = "%s.nav." % parent_request_id
+    return bool(
+        owner_kind == _EXPLORATION_CHILD_NAV_OWNER_KIND
+        and parent_request_id
+        and goal_id.startswith(prefix)
+        and goal_id[len(prefix) :]
+        and goal_generation > 0
+        and producer_runtime_generation > 0
+    )
+
+
 def _parse_navigation_readiness_reason(ready: bool, reason: str) -> Dict[str, Any]:
     """从 gRPC `NavigationReadiness.reason` 提取细分字段。
 
@@ -732,6 +821,46 @@ def _normalize_frame(frame_id: str) -> str:
     return str(frame_id or "").strip().lstrip("/")
 
 
+def _exploration_child_lease_fingerprint(lease: Dict[str, object]) -> str:
+    """Mirror Rust's canonical non-secret child lease fingerprint."""
+
+    try:
+        owner_kind = int(lease.get("owner_kind") or 0)
+        goal_generation = int(lease.get("goal_generation") or 0)
+        producer_generation = int(
+            lease.get("producer_runtime_generation") or 0
+        )
+        payload_sha256 = bytes(lease.get("goal_payload_sha256") or b"")
+        if (
+            owner_kind <= 0
+            or goal_generation <= 0
+            or producer_generation <= 0
+            or len(payload_sha256) != 32
+        ):
+            return ""
+
+        canonical = bytearray()
+
+        def append_field(value: bytes) -> None:
+            canonical.extend(len(value).to_bytes(8, "big", signed=False))
+            canonical.extend(value)
+
+        append_field(b"exploration-child-lease-v1")
+        append_field(str(lease.get("session_id") or "").encode("utf-8"))
+        canonical.extend(owner_kind.to_bytes(4, "big", signed=True))
+        append_field(
+            str(lease.get("parent_request_id") or "").encode("utf-8")
+        )
+        canonical.extend(goal_generation.to_bytes(8, "big", signed=False))
+        canonical.extend(
+            producer_generation.to_bytes(8, "big", signed=False)
+        )
+        canonical.extend(payload_sha256)
+        return hashlib.sha256(canonical).hexdigest()
+    except (OverflowError, TypeError, ValueError):
+        return ""
+
+
 def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
     """把 proto `ExplorationState` 转成 dict(给 `GeometryRuntimeProvider` 对外契约用)。
 
@@ -752,6 +881,41 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
             ),
             "goal_payload_sha256": bytes(lease.goal_payload_sha256),
         }
+    global_stop_reconciliation = None
+    if resp.HasField("global_stop_reconciliation"):
+        reconciliation = resp.global_stop_reconciliation
+        global_stop_reconciliation = {
+            "eligible": bool(reconciliation.eligible),
+            "cancel_generation": int(reconciliation.cancel_generation),
+            "recovery_correlation": str(
+                reconciliation.recovery_correlation or ""
+            ),
+            "admission_guard_generation": int(
+                reconciliation.admission_guard_generation
+            ),
+            "admission_guard_boot_nonce": bytes(
+                reconciliation.admission_guard_boot_nonce
+            ),
+            "admission_motion_stop_generation": int(
+                reconciliation.admission_motion_stop_generation
+            ),
+        }
+    ownership_reconciliation_receipt = None
+    if resp.HasField("ownership_reconciliation_receipt"):
+        receipt = resp.ownership_reconciliation_receipt
+        ownership_reconciliation_receipt = {
+            "cause": str(receipt.cause or ""),
+            "recovery_correlation": str(
+                receipt.recovery_correlation or ""
+            ),
+            "parent_request_id": str(receipt.parent_request_id or ""),
+            "exploration_generation": int(receipt.exploration_generation),
+            "child_lease_fingerprint": str(
+                receipt.child_lease_fingerprint or ""
+            ),
+            "cancel_generation": int(receipt.cancel_generation),
+            "commit_disposition": str(receipt.commit_disposition or ""),
+        }
     return {
         "status": resp.status,
         "message": resp.message,
@@ -765,6 +929,10 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "exploration_generation": int(resp.exploration_generation),
         "child_lease": child_lease,
         "rollover_recovery_eligible": bool(resp.rollover_recovery_eligible),
+        "global_stop_reconciliation": global_stop_reconciliation,
+        "ownership_reconciliation_receipt": (
+            ownership_reconciliation_receipt
+        ),
     }
 
 
@@ -968,6 +1136,8 @@ class GeometryRuntimeProvider:
         self._last_nav_current_pose: Optional[Pose] = None
         self._last_nav_timestamp_ns: int = 0
         self._last_nav_metadata: Dict[str, Any] = {}
+        self._nav_exploration_overlay: Optional[pb2.NavigationState] = None
+        self._nav_exploration_overlay_terminal = False
         self._nav_stream_started = False
         self._nav_stream_thread: Optional[threading.Thread] = None
         self._navigation_update_subscribers: Dict[int, Callable[[NavigationState], None]] = {}
@@ -1462,6 +1632,8 @@ class GeometryRuntimeProvider:
                         self._last_nav_current_pose = None
                         self._last_nav_timestamp_ns = 0
                         self._last_nav_metadata = {}
+                        self._nav_exploration_overlay = None
+                        self._nav_exploration_overlay_terminal = False
                     self._nav_connection_transition_inflight = False
             if stream_call is not None:
                 _cancel_stream_call(
@@ -1687,10 +1859,23 @@ class GeometryRuntimeProvider:
             raise ValueError("mapping identity is incomplete")
         return identity
 
-    def _begin_mapping_transition(self) -> int:
-        with self._map_delivery_lock:
+    def _begin_mapping_transition(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> int:
+        _exploration_rpc_timeout(deadline_monotonic, "StartMapping")
+        with _cooperative_deadline_lock(
+            self._map_delivery_lock,
+            deadline_monotonic,
+            "StartMapping",
+        ):
             self._raise_if_map_delivery_reentry_locked("StartMapping")
-            with self._map_state_lock:
+            with _cooperative_deadline_lock(
+                self._map_state_lock,
+                deadline_monotonic,
+                "StartMapping",
+            ):
                 if self._stopping:
                     raise RuntimeError("provider is disconnecting")
                 if self._mapping_transition_inflight:
@@ -1699,7 +1884,16 @@ class GeometryRuntimeProvider:
                 self._mapping_transition_inflight = True
                 transition_epoch = self._mapping_transition_epoch
             self._invalidate_map_delivery_tickets_locked()
-        self._wait_for_map_deliveries()
+        try:
+            self._wait_for_map_deliveries(
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception:
+            self._finish_mapping_transition(
+                transition_epoch,
+                deadline_monotonic=deadline_monotonic,
+            )
+            raise
         return transition_epoch
 
     def _finish_mapping_transition(
@@ -1707,9 +1901,18 @@ class GeometryRuntimeProvider:
         transition_epoch: int,
         *,
         identity: Optional[_MappingIdentity] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> bool:
-        with self._map_delivery_lock:
-            with self._map_state_lock:
+        with _cooperative_post_rpc_lock(
+            self._map_delivery_lock,
+            deadline_monotonic,
+            "StartMapping",
+        ):
+            with _cooperative_post_rpc_lock(
+                self._map_state_lock,
+                deadline_monotonic,
+                "StartMapping",
+            ):
                 if (
                     self._stopping
                     or transition_epoch != self._mapping_transition_epoch
@@ -1783,14 +1986,25 @@ class GeometryRuntimeProvider:
                 ticket.invalidated = True
             self._map_delivery_condition.notify_all()
 
-    def _wait_for_map_deliveries(self) -> None:
+    def _wait_for_map_deliveries(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
         thread_id = threading.get_ident()
         with self._map_delivery_condition:
             while any(
                 ticket.owner_thread_id != thread_id
                 for ticket in self._map_delivery_tickets.values()
             ):
-                self._map_delivery_condition.wait()
+                if deadline_monotonic is None:
+                    self._map_delivery_condition.wait()
+                else:
+                    timeout = _exploration_rpc_timeout(
+                        deadline_monotonic,
+                        "StartMapping",
+                    )
+                    self._map_delivery_condition.wait(timeout=timeout)
 
     def _map_delivery_token_locked(self):
         return (
@@ -1813,20 +2027,28 @@ class GeometryRuntimeProvider:
         session_id: str,
         map_name: str,
         map_version_id: str,
+        deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("start_mapping")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
         stub = self._stub
-        transition_epoch = self._begin_mapping_transition()
+        _exploration_rpc_timeout(deadline_monotonic, "StartMapping")
+        transition_epoch = self._begin_mapping_transition(
+            deadline_monotonic=deadline_monotonic,
+        )
         try:
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "StartMapping",
+            )
             response = stub.StartMapping(
                 pb2.StartMappingRequest(
                     session_id=str(session_id or "").strip(),
                     map_name=str(map_name or "").strip(),
                     map_version_id=str(map_version_id or "").strip(),
                 ),
-                timeout=_read_deadline_sec(),
+                timeout=rpc_timeout,
             )
             payload = self._mapping_state_payload(response)
             if (
@@ -1841,11 +2063,15 @@ class GeometryRuntimeProvider:
                 raise RuntimeError("StartMapping 未返回匹配的 ACTIVE 会话。")
             identity = self._mapping_identity_from_payload(payload)
         except Exception:
-            self._finish_mapping_transition(transition_epoch)
+            self._finish_mapping_transition(
+                transition_epoch,
+                deadline_monotonic=deadline_monotonic,
+            )
             raise
         if not self._finish_mapping_transition(
             transition_epoch,
             identity=identity,
+            deadline_monotonic=deadline_monotonic,
         ):
             raise RuntimeError(
                 "StartMapping 完成时 mapping transition 已被断连或新代际取代。"
@@ -2689,6 +2915,7 @@ class GeometryRuntimeProvider:
         frame_id: str = "map",
         goal_id: str = "",
         motion_admission: Optional[Dict[str, Any]] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Compatibility facade routed through the canonical lease transaction."""
 
@@ -2709,7 +2936,10 @@ class GeometryRuntimeProvider:
             ),
             metadata={"motion_admission": motion_admission},
         )
-        accepted = self.set_goal(goal)
+        accepted = self.set_goal(
+            goal,
+            deadline_monotonic=deadline_monotonic,
+        )
         transaction_result = getattr(
             self._nav_set_transaction_context,
             "result",
@@ -2733,12 +2963,24 @@ class GeometryRuntimeProvider:
             ),
         }
 
-    def cancel_navigation(self, goal_id: str = "") -> bool:
+    def cancel_navigation(
+        self,
+        goal_id: str = "",
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """兼容 facade；复用正式 provider 的 active exact-goal 栅栏。"""
 
-        return self.cancel_goal(goal_id)
+        return self.cancel_goal(
+            goal_id,
+            deadline_monotonic=deadline_monotonic,
+        )
 
-    def get_navigation_readiness(self) -> Dict[str, Any]:
+    def get_navigation_readiness(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """从 gRPC `GetNavigationReadiness` 返回结构化就绪度。
 
         冻结字段 3..9 直接从 protobuf 读取；`reason` 内嵌 JSON 只作为旧服务端
@@ -2757,8 +2999,12 @@ class GeometryRuntimeProvider:
         if not self._stub:
             return _nav_readiness_disconnected_dict()
         try:
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "GetNavigationReadiness",
+            )
             resp = self._stub.GetNavigationReadiness(
-                pb2.Empty(), timeout=_read_deadline_sec()
+                pb2.Empty(), timeout=rpc_timeout
             )
             readiness = _parse_navigation_readiness_reason(
                 bool(resp.ready), str(resp.reason)
@@ -2800,6 +3046,11 @@ class GeometryRuntimeProvider:
             return readiness
         except grpc.RpcError as e:
             _log_rpc_error("GetNavigationReadiness", e)
+            if deadline_monotonic is not None:
+                raise _exploration_rpc_error(
+                    "GetNavigationReadiness",
+                    e,
+                ) from e
             return _nav_readiness_disconnected_dict(message="gRPC 错误")
 
     # === NavigationProvider 协议 shim ===
@@ -3054,6 +3305,68 @@ class GeometryRuntimeProvider:
             ):
                 return False
             with self._nav_state_lock:
+                if _is_canonical_exploration_child_navigation_lease(
+                    incoming_lease
+                ):
+                    current_overlay = self._nav_exploration_overlay
+                    if current_overlay is not None:
+                        current_overlay_lease = _navigation_lease_from_message(
+                            current_overlay
+                        )
+                        current_order = (
+                            current_overlay_lease[4],
+                            current_overlay_lease[3],
+                        )
+                        incoming_order = (incoming_lease[4], incoming_lease[3])
+                        if incoming_lease == current_overlay_lease:
+                            overlay_disconnected_placeholder = bool(
+                                getattr(current_overlay, "reason_code", "")
+                                == "NAVIGATION_STREAM_DISCONNECTED"
+                            )
+                            if (
+                                not overlay_disconnected_placeholder
+                                and not _navigation_status_can_follow(
+                                    getattr(current_overlay, "status", ""),
+                                    status,
+                                )
+                            ):
+                                return False
+                        elif incoming_order <= current_order:
+                            return False
+                    overlay = pb2.NavigationState()
+                    overlay.CopyFrom(update)
+                    self._nav_exploration_overlay = overlay
+                    self._nav_exploration_overlay_terminal = (
+                        normalized_status in _NAV_TERMINAL_STATUS
+                    )
+                    return True
+
+                if incoming_lease == ("", 0, "", 0, 0) and normalized_status == "idle":
+                    if self._nav_exploration_overlay is not None:
+                        if not self._nav_exploration_overlay_terminal:
+                            return False
+                        self._nav_exploration_overlay = None
+                        self._nav_exploration_overlay_terminal = False
+                        self._last_nav_goal_id = None
+                        self._last_nav_owner_kind = 0
+                        self._last_nav_parent_request_id = ""
+                        self._last_nav_goal_generation = 0
+                        self._last_nav_producer_runtime_generation = 0
+                        self._last_nav_goal_command_generation = (
+                            self._nav_command_generation
+                        )
+                        self._last_nav_status = status
+                        self._last_nav_message = message
+                        self._last_nav_distance_remaining = (
+                            float(distance) if distance is not None else None
+                        )
+                        self._last_nav_current_pose = None
+                        self._last_nav_timestamp_ns = ts_ns
+                        self._last_nav_metadata = (
+                            _navigation_state_typed_metadata(update)
+                        )
+                        return True
+
                 current_lease = self._current_navigation_lease_locked()
                 current_goal_id = current_lease[0] or None
                 lease_is_exact = bool(
@@ -3157,6 +3470,25 @@ class GeometryRuntimeProvider:
             ):
                 return False
             with self._nav_state_lock:
+                current_overlay = self._nav_exploration_overlay
+                if current_overlay is not None:
+                    if self._nav_exploration_overlay_terminal:
+                        return False
+                    disconnected_overlay = pb2.NavigationState()
+                    disconnected_overlay.CopyFrom(current_overlay)
+                    disconnected_overlay.status = "failed"
+                    disconnected_overlay.message = (
+                        "导航状态流断开，正在重连：%s"
+                        % (error or "unknown")
+                    )
+                    disconnected_overlay.timestamp_ns = time.time_ns()
+                    disconnected_overlay.reason_code = (
+                        "NAVIGATION_STREAM_DISCONNECTED"
+                    )
+                    self._nav_exploration_overlay = disconnected_overlay
+                    self._nav_exploration_overlay_terminal = False
+                    return True
+
                 current_status = self._nav_status_to_enum(
                     self._last_nav_status
                 )
@@ -3228,7 +3560,13 @@ class GeometryRuntimeProvider:
         }
         return mapping.get(normalized, NavigationStatus.IDLE)
 
-    def _build_navigation_state_snapshot(self, *, include_readiness: bool = True) -> NavigationState:
+    def _build_navigation_state_snapshot(
+        self,
+        *,
+        include_readiness: bool = True,
+        include_exploration_overlay: bool = True,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationState:
         """合成 NavigationState 契约（按本地缓存 + readiness，不假装 ready）。
 
         - 未收到任何 SubscribeNavigationState 帧：返回 IDLE；
@@ -3236,14 +3574,36 @@ class GeometryRuntimeProvider:
         - 缓存的 current_goal_id 与最近一次 set_goal 的 goal_id 不一致：以缓存为准
           （流是 Rust 侧权威来源）。
         """
-        with self._nav_state_lock:
-            raw_status = self._last_nav_status
-            goal_id = self._last_nav_goal_id
-            message = self._last_nav_message
-            distance = self._last_nav_distance_remaining
-            pose = self._last_nav_current_pose
-            timestamp_ns = self._last_nav_timestamp_ns
-            typed_metadata = dict(self._last_nav_metadata)
+        with _cooperative_deadline_lock(
+            self._nav_state_lock,
+            deadline_monotonic,
+            "GetNavigationState",
+        ):
+            overlay = (
+                self._nav_exploration_overlay
+                if include_exploration_overlay
+                else None
+            )
+            if overlay is not None:
+                raw_status = str(getattr(overlay, "status", "") or "")
+                goal_id = str(getattr(overlay, "goal_id", "") or "") or None
+                message = str(getattr(overlay, "message", "") or "") or None
+                distance = float(
+                    getattr(overlay, "distance_remaining", 0.0) or 0.0
+                )
+                pose = None
+                timestamp_ns = int(
+                    getattr(overlay, "timestamp_ns", 0) or 0
+                )
+                typed_metadata = _navigation_state_typed_metadata(overlay)
+            else:
+                raw_status = self._last_nav_status
+                goal_id = self._last_nav_goal_id
+                message = self._last_nav_message
+                distance = self._last_nav_distance_remaining
+                pose = self._last_nav_current_pose
+                timestamp_ns = self._last_nav_timestamp_ns
+                typed_metadata = dict(self._last_nav_metadata)
 
         timestamp = (
             datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)
@@ -3273,7 +3633,12 @@ class GeometryRuntimeProvider:
         metadata.setdefault("raw_status", raw_status)
         if include_readiness:
             try:
-                readiness = self.get_navigation_readiness()
+                if deadline_monotonic is None:
+                    readiness = self.get_navigation_readiness()
+                else:
+                    readiness = self.get_navigation_readiness(
+                        deadline_monotonic=deadline_monotonic,
+                    )
                 if readiness:
                     metadata["readiness"] = dict(readiness)
                     if not bool(readiness.get("ready")):
@@ -3282,6 +3647,9 @@ class GeometryRuntimeProvider:
                             message = "%s | %s" % (message, hint)
                         else:
                             message = str(hint)
+            except GeometryRuntimeRpcError:
+                if deadline_monotonic is not None:
+                    raise
             except Exception:  # pragma: no cover - readiness 失败不影响主流程
                 pass
 
@@ -3300,7 +3668,12 @@ class GeometryRuntimeProvider:
             metadata=metadata,
         )
 
-    def set_goal(self, goal) -> bool:
+    def set_goal(
+        self,
+        goal,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """NavigationProvider 协议 shim：下发导航目标到 nuwax-nav-stack。
 
         参数：
@@ -3315,7 +3688,11 @@ class GeometryRuntimeProvider:
         transaction_context = self._nav_set_transaction_context
         if getattr(transaction_context, "active", False):
             raise RuntimeError("reentrant_set_goal")
-        with self._nav_notification_condition:
+        with _cooperative_deadline_lock(
+            self._nav_notification_condition,
+            deadline_monotonic,
+            "SetNavigationGoal",
+        ):
             if (
                 self._nav_pending_notification_tickets
                 or self._nav_active_notification_count > 0
@@ -3327,10 +3704,18 @@ class GeometryRuntimeProvider:
         transaction_context.notification = None
         transaction_context.active = True
         try:
-            with self._nav_set_transaction_lock:
+            with _cooperative_deadline_lock(
+                self._nav_set_transaction_lock,
+                deadline_monotonic,
+                "SetNavigationGoal",
+            ):
                 # A caller may have waited behind a Set that just committed a
                 # synchronous callback ticket. Do not enter a callback cycle.
-                with self._nav_notification_condition:
+                with _cooperative_deadline_lock(
+                    self._nav_notification_condition,
+                    deadline_monotonic,
+                    "SetNavigationGoal",
+                ):
                     if (
                         self._nav_pending_notification_tickets
                         or self._nav_active_notification_count > 0
@@ -3338,10 +3723,13 @@ class GeometryRuntimeProvider:
                         raise RuntimeError(
                             "navigation_notification_in_progress"
                         )
-                accepted = self._set_goal_transaction(goal)
+                accepted = self._set_goal_transaction(
+                    goal,
+                    deadline_monotonic=deadline_monotonic,
+                )
                 notification = transaction_context.notification
 
-            if notification is not None:
+            if notification is not None and deadline_monotonic is None:
                 try:
                     self._notify_navigation_subscribers(notification)
                 except Exception:  # pragma: no cover - defensive fanout fence
@@ -3351,7 +3739,7 @@ class GeometryRuntimeProvider:
                     LOGGER.exception(
                         "SetNavigationGoal 已提交，但通知投递异常。"
                     )
-            if accepted:
+            if accepted and deadline_monotonic is None:
                 try:
                     self._ensure_nav_state_stream()
                 except Exception:
@@ -3363,7 +3751,12 @@ class GeometryRuntimeProvider:
             transaction_context.notification = None
             transaction_context.active = False
 
-    def _set_goal_transaction(self, goal) -> bool:
+    def _set_goal_transaction(
+        self,
+        goal,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """Execute one SetGoal transaction while the Set-only gate is held."""
 
         self._raise_if_stopping("set_goal")
@@ -3454,9 +3847,13 @@ class GeometryRuntimeProvider:
                     self._nav_inflight_command_token = command_token
                     self._nav_completed_cancel_command_token = None
                 self._cancel_pending_navigation_notifications_locked()
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "SetNavigationGoal",
+            )
             resp = command_stub.SetNavigationGoal(
                 proto_goal,
-                timeout=_read_deadline_sec(),
+                timeout=rpc_timeout,
             )
             # Rust SetNavigationGoal 返回 NavigationState（非 NavigationAck）；
             # accepted 语义由 status 字符串反推（accepted/planning/running → True）
@@ -3571,7 +3968,8 @@ class GeometryRuntimeProvider:
                         )
                     try:
                         state = self._build_navigation_state_snapshot(
-                            include_readiness=False
+                            include_readiness=False,
+                            include_exploration_overlay=False,
                         )
                         notification = self._begin_navigation_notification(
                             state
@@ -3619,8 +4017,10 @@ class GeometryRuntimeProvider:
                                     command_generation
                                 )
             _log_rpc_error("SetNavigationGoal", exc)
+            if deadline_monotonic is not None:
+                raise _exploration_rpc_error("SetNavigationGoal", exc) from exc
             return False
-        except Exception:  # pragma: no cover - 防御性兜底
+        except Exception as exc:  # pragma: no cover - 防御性兜底
             if command_generation is not None:
                 with self._nav_delivery_lock:
                     with self._nav_command_lock:
@@ -3644,9 +4044,16 @@ class GeometryRuntimeProvider:
                                     command_generation
                                 )
             LOGGER.exception("GeometryRuntimeProvider.set_goal 异常。")
+            if isinstance(exc, GeometryRuntimeRpcError):
+                raise
             return False
 
-    def cancel_goal(self, request_id: Optional[str] = None) -> bool:
+    def cancel_goal(
+        self,
+        request_id: Optional[str] = None,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """NavigationProvider 协议 shim：定向取消当前 exact goal。"""
         self._raise_if_stopping("cancel_goal")
         exact_goal_id = str(request_id or "").strip()
@@ -3659,8 +4066,16 @@ class GeometryRuntimeProvider:
         command_stub = None
         command_token = None
         command_generation = None
-        with self._nav_delivery_lock:
-            with self._nav_command_lock:
+        with _cooperative_deadline_lock(
+            self._nav_delivery_lock,
+            deadline_monotonic,
+            "CancelNavigation",
+        ):
+            with _cooperative_deadline_lock(
+                self._nav_command_lock,
+                deadline_monotonic,
+                "CancelNavigation",
+            ):
                 if (
                     self._nav_connection_transition_inflight
                     or not self._connected
@@ -3725,9 +4140,13 @@ class GeometryRuntimeProvider:
                 goal_generation=active_lease[3],
                 producer_runtime_generation=active_lease[4],
             )
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "CancelNavigation",
+            )
             resp = command_stub.CancelNavigation(
                 req,
-                timeout=_read_deadline_sec(),
+                timeout=rpc_timeout,
             )
             raw_status = getattr(resp, "status", "") or ""
             terminal = _status_means_cancelled(raw_status)
@@ -3839,7 +4258,8 @@ class GeometryRuntimeProvider:
                         return False
                 if success:
                     state = self._build_navigation_state_snapshot(
-                        include_readiness=False
+                        include_readiness=False,
+                        include_exploration_overlay=False,
                     )
                     notification = self._begin_navigation_notification(state)
             if notification is not None:
@@ -3897,8 +4317,10 @@ class GeometryRuntimeProvider:
                                 command_generation
                             )
             _log_rpc_error("CancelNavigation", exc)
+            if deadline_monotonic is not None:
+                raise _exploration_rpc_error("CancelNavigation", exc) from exc
             return terminal_already_committed
-        except Exception:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover
             terminal_already_committed = False
             with self._nav_delivery_lock:
                 with self._nav_command_lock:
@@ -3950,6 +4372,8 @@ class GeometryRuntimeProvider:
                                 command_generation
                             )
             LOGGER.exception("GeometryRuntimeProvider.cancel_goal 异常。")
+            if isinstance(exc, GeometryRuntimeRpcError):
+                raise
             return terminal_already_committed
 
     def is_goal_reached(self) -> bool:
@@ -3960,14 +4384,22 @@ class GeometryRuntimeProvider:
         with self._nav_state_lock:
             return _status_means_succeeded(self._last_nav_status)
 
-    def get_navigation_state(self) -> NavigationState:
+    def get_navigation_state(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationState:
         """NavigationProvider 协议 shim：返回 NavigationState 契约实例。
 
         第一次调用前若无 set_goal/get_navigation_state 触发，状态为 IDLE；订阅流启动后
         Rust 端推送会持续覆盖本地缓存。
         """
-        self._ensure_nav_state_stream()
-        return self._build_navigation_state_snapshot()
+        _exploration_rpc_timeout(deadline_monotonic, "GetNavigationState")
+        if deadline_monotonic is None:
+            self._ensure_nav_state_stream()
+        return self._build_navigation_state_snapshot(
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def subscribe_navigation_updates(
         self,
@@ -4058,6 +4490,7 @@ class GeometryRuntimeProvider:
         max_navigation_retries: int = 0,
         blacklist_radius_m: float = 0.0,
         motion_admission: Optional[Dict[str, Any]] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
         """启动探索(走 Rust `nuwax_exploration::ExplorationController`)。
 
@@ -4133,12 +4566,21 @@ class GeometryRuntimeProvider:
                         0, int(raw_stop_conditions["max_goals"])
                     )
                 req.stop_conditions.CopyFrom(proto_stop_conditions)
-            resp = stub.StartExploration(req, timeout=_read_deadline_sec())
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "StartExploration",
+            )
+            resp = stub.StartExploration(req, timeout=rpc_timeout)
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
             raise _exploration_rpc_error("StartExploration", e) from e
 
-    def stop_exploration(self, *, request_id: str = "") -> Dict[str, Any]:
+    def stop_exploration(
+        self,
+        *,
+        request_id: str = "",
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """停止探索。
 
         返回 ExplorationState 字典；失败时抛出带 gRPC 细节的 typed error。
@@ -4149,7 +4591,11 @@ class GeometryRuntimeProvider:
             raise _missing_exploration_stub_error("StopExploration")
         try:
             req = pb2.StopExplorationRequest(request_id=request_id)
-            resp = stub.StopExploration(req, timeout=_read_deadline_sec())
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "StopExploration",
+            )
+            resp = stub.StopExploration(req, timeout=rpc_timeout)
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
             raise _exploration_rpc_error("StopExploration", e) from e
@@ -4236,7 +4682,143 @@ class GeometryRuntimeProvider:
                 "RecoverExplorationAfterNavigationRollover", e
             ) from e
 
-    def get_exploration_state(self) -> Dict[str, Any]:
+    def reconcile_exploration_after_global_stop(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, Any],
+        cancel_generation: int,
+        recovery_correlation: str,
+        admission_guard_generation: int,
+        admission_guard_boot_nonce: bytes,
+        admission_motion_stop_generation: int,
+        held_guard_proof: Dict[str, Any],
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Reconcile one exact retained child after an ordinary global stop."""
+
+        self._raise_if_stopping("reconcile_exploration_after_global_stop")
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error(
+                "ReconcileExplorationAfterGlobalStop"
+            )
+        try:
+            request = pb2.ReconcileExplorationAfterGlobalStopRequest(
+                request_id=str(request_id or ""),
+                exploration_generation=int(exploration_generation),
+                child_lease=pb2.ExplorationChildLease(
+                    session_id=str(child_lease.get("session_id") or ""),
+                    owner_kind=int(child_lease.get("owner_kind") or 0),
+                    parent_request_id=str(
+                        child_lease.get("parent_request_id") or ""
+                    ),
+                    goal_generation=int(
+                        child_lease.get("goal_generation") or 0
+                    ),
+                    producer_runtime_generation=int(
+                        child_lease.get("producer_runtime_generation") or 0
+                    ),
+                    goal_payload_sha256=bytes(
+                        child_lease.get("goal_payload_sha256") or b""
+                    ),
+                ),
+                cancel_generation=int(cancel_generation),
+                recovery_correlation=str(recovery_correlation or ""),
+                admission_guard_generation=int(admission_guard_generation),
+                admission_guard_boot_nonce=bytes(
+                    admission_guard_boot_nonce or b""
+                ),
+                admission_motion_stop_generation=int(
+                    admission_motion_stop_generation
+                ),
+                held_guard_proof=pb2.ExplorationRecoveryGuardProof(
+                    stop_operation_id=str(
+                        held_guard_proof.get("stop_operation_id") or ""
+                    ),
+                    guard_generation=int(
+                        held_guard_proof.get("guard_generation") or 0
+                    ),
+                    guard_boot_nonce=bytes(
+                        held_guard_proof.get("guard_boot_nonce") or b""
+                    ),
+                    motion_stop_generation=int(
+                        held_guard_proof.get("motion_stop_generation") or 0
+                    ),
+                    zero_ack_id=str(
+                        held_guard_proof.get("zero_ack_id") or ""
+                    ),
+                    zero_applied_monotonic_ns=int(
+                        held_guard_proof.get("zero_applied_monotonic_ns") or 0
+                    ),
+                    recovery_fence_token=bytes(
+                        held_guard_proof.get("recovery_fence_token") or b""
+                    ),
+                    recovery_correlation=str(
+                        held_guard_proof.get("recovery_correlation") or ""
+                    ),
+                ),
+            )
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "ReconcileExplorationAfterGlobalStop",
+            )
+            response = stub.ReconcileExplorationAfterGlobalStop(
+                request,
+                timeout=rpc_timeout,
+            )
+            return _exploration_state_to_dict(response)
+        except grpc.RpcError as exc:
+            raise _exploration_rpc_error(
+                "ReconcileExplorationAfterGlobalStop",
+                exc,
+            ) from exc
+
+    def acknowledge_exploration_ownership_reconciliation(
+        self,
+        *,
+        recovery_correlation: str,
+        child_lease_fingerprint: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Acknowledge one durable ownership receipt after external release."""
+
+        self._raise_if_stopping(
+            "acknowledge_exploration_ownership_reconciliation"
+        )
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error(
+                "AcknowledgeExplorationOwnershipReconciliation"
+            )
+        try:
+            request = pb2.AcknowledgeExplorationOwnershipReconciliationRequest(
+                recovery_correlation=str(recovery_correlation or ""),
+                child_lease_fingerprint=str(
+                    child_lease_fingerprint or ""
+                ),
+            )
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "AcknowledgeExplorationOwnershipReconciliation",
+            )
+            response = stub.AcknowledgeExplorationOwnershipReconciliation(
+                request,
+                timeout=rpc_timeout,
+            )
+            return bool(response.acknowledged)
+        except grpc.RpcError as exc:
+            raise _exploration_rpc_error(
+                "AcknowledgeExplorationOwnershipReconciliation",
+                exc,
+            ) from exc
+
+    def get_exploration_state(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """读取当前 exploration scheduler 的只读快照。
 
         返回 ExplorationState 字典；失败时抛出带 gRPC 细节的 typed error。
@@ -4246,9 +4828,11 @@ class GeometryRuntimeProvider:
         if stub is None:
             raise _missing_exploration_stub_error("GetExplorationState")
         try:
-            resp = stub.GetExplorationState(
-                pb2.Empty(), timeout=_read_deadline_sec()
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "GetExplorationState",
             )
+            resp = stub.GetExplorationState(pb2.Empty(), timeout=rpc_timeout)
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
             raise _exploration_rpc_error("GetExplorationState", e) from e
@@ -4269,6 +4853,8 @@ class GeometryRuntimeProvider:
             state.get("exploration_generation"),
             state.get("child_lease"),
             state.get("rollover_recovery_eligible"),
+            state.get("global_stop_reconciliation"),
+            state.get("ownership_reconciliation_receipt"),
         )
 
     def _ensure_exploration_poll_worker(self) -> None:
@@ -4570,15 +5156,31 @@ class GeometryRuntimeProvider:
             _log_rpc_error("PublishPointCloud", e)
             return False
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[str, Any]:
         self._raise_if_stopping("get_status")
         if not self._stub:
+            if deadline_monotonic is not None:
+                raise GeometryRuntimeRpcError(
+                    rpc_name="GetStatus",
+                    grpc_code=grpc.StatusCode.UNAVAILABLE,
+                    grpc_details="geometry runtime gRPC stub is unavailable",
+                )
             return {"phase": "disconnected", "rss_kb": 0}
         try:
-            resp = self._stub.GetStatus(pb2.Empty(), timeout=_read_deadline_sec())
+            rpc_timeout = _exploration_rpc_timeout(
+                deadline_monotonic,
+                "GetStatus",
+            )
+            resp = self._stub.GetStatus(pb2.Empty(), timeout=rpc_timeout)
             return {"phase": resp.phase, "message": resp.message, "rss_kb": resp.rss_kb}
         except grpc.RpcError as e:
             _log_rpc_error("GetStatus", e)
+            if deadline_monotonic is not None:
+                raise GeometryRuntimeRpcError.from_rpc_error("GetStatus", e) from e
             return {"phase": "error", "rss_kb": 0}
 
     def notify_cmd_vel_sink_ready(

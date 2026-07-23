@@ -333,6 +333,41 @@ message RecoverExplorationAfterNavigationRolloverRequest {
   uint64 observed_navigation_runtime_generation = 5;
   ExplorationRecoveryGuardProof guard_proof = 6;
 }
+message ReconcileExplorationAfterGlobalStopRequest {
+  string request_id = 1;
+  uint64 exploration_generation = 2;
+  ExplorationChildLease child_lease = 3;
+  uint64 cancel_generation = 4;
+  string recovery_correlation = 5;
+  uint64 admission_guard_generation = 6;
+  bytes admission_guard_boot_nonce = 7;
+  uint64 admission_motion_stop_generation = 8;
+  ExplorationRecoveryGuardProof held_guard_proof = 9;
+}
+message ExplorationGlobalStopReconciliation {
+  bool eligible = 1;
+  uint64 cancel_generation = 2;
+  string recovery_correlation = 3;
+  uint64 admission_guard_generation = 4;
+  bytes admission_guard_boot_nonce = 5;
+  uint64 admission_motion_stop_generation = 6;
+}
+message ExplorationOwnershipReconciliationReceipt {
+  string cause = 1;
+  string recovery_correlation = 2;
+  string parent_request_id = 3;
+  uint64 exploration_generation = 4;
+  string child_lease_fingerprint = 5;
+  uint64 cancel_generation = 6;
+  string commit_disposition = 7;
+}
+message AcknowledgeExplorationOwnershipReconciliationRequest {
+  string recovery_correlation = 1;
+  string child_lease_fingerprint = 2;
+}
+message AcknowledgeExplorationOwnershipReconciliationResult {
+  bool acknowledged = 1;
+}
 message ExplorationState {
   reserved 10, 11;
   reserved "map_version_id", "map_revision";
@@ -348,6 +383,8 @@ message ExplorationState {
   uint64 exploration_generation = 12;
   ExplorationChildLease child_lease = 13;
   bool rollover_recovery_eligible = 14;
+  ExplorationGlobalStopReconciliation global_stop_reconciliation = 15;
+  ExplorationOwnershipReconciliationReceipt ownership_reconciliation_receipt = 16;
 }
 message ExplorationSourceDiag {
   string source_name = 1;
@@ -445,6 +482,8 @@ service GeometryRuntime {
   rpc StartExploration(ExploreRequest) returns (ExplorationState);
   rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
   rpc RecoverExplorationAfterNavigationRollover(RecoverExplorationAfterNavigationRolloverRequest) returns (ExplorationState);
+  rpc ReconcileExplorationAfterGlobalStop(ReconcileExplorationAfterGlobalStopRequest) returns (ExplorationState);
+  rpc AcknowledgeExplorationOwnershipReconciliation(AcknowledgeExplorationOwnershipReconciliationRequest) returns (AcknowledgeExplorationOwnershipReconciliationResult);
   rpc GetExplorationState(Empty) returns (ExplorationState);
   rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
 

@@ -97,6 +97,13 @@ _RUNTIME_ONLY_CORE_KEYS: Tuple[_RawKey, ...] = (
         TARGET_CORE,
     ),
     _RawKey("NUWAX_NAV_STACK_START_TIMEOUT_SEC", "int", "15", None, TARGET_CORE),
+    _RawKey(
+        "NUWAX_FORBIDDEN_ZONES_PATH",
+        "str",
+        repr("runtime_data/navigation/forbidden_zones.json"),
+        None,
+        TARGET_CORE,
+    ),
     _RawKey("NUWAX_VIDEO_SHM_PATH", "str", repr("/tmp/nuwax_video.shm"), None, TARGET_CORE),
     _RawKey("NUWAX_VIDEO_UDS_PATH", "str", repr("/tmp/nuwax_video.sock"), None, TARGET_CORE),
     _RawKey(
@@ -715,7 +722,7 @@ def _validate_zh_name_coverage(raw: Dict[str, _RawKey]) -> None:
     """校验显式中文名与 settings 中实际配置 key 的覆盖关系。
 
     - ``missing``（raw 中有但 _ZH_NAMES 中没有）= 严格 fail，面板会出现机械英文标签。
-    - ``stale``（_ZH_NAMES 中有但 raw 中没有）= 仅 warning。多版本/多环境漂移时
+    - ``stale``（_ZH_NAMES 中有但 raw 中没有）= 容许。多版本/多环境漂移时
       settings.py 的 _cfg_* 引用可能与本仓库不同步（例如 _ZH_NAMES 已经为
       ``NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC`` 备好中文名，但本地 settings.py
       暂未引用），此时不应让本地 Web 面板因孤儿映射直接 500。
@@ -725,7 +732,6 @@ def _validate_zh_name_coverage(raw: Dict[str, _RawKey]) -> None:
     actual_keys = set(raw)
     mapped_keys = set(_ZH_NAMES)
     missing = sorted(actual_keys - mapped_keys)
-    stale = sorted(mapped_keys - actual_keys)
     empty = sorted(key for key, name in _ZH_NAMES.items() if not name.strip())
     if not missing and not empty:
         return

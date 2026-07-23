@@ -16,6 +16,8 @@ SupplementaryGroups=nuwax-motion-clients
 WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/geometry
 RuntimeDirectoryMode=0750
+StateDirectory=nuwax/geometry-runtime
+StateDirectoryMode=0700
 UMask=0007
 Environment=PYTHONUNBUFFERED=1
 Environment="NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL=/go2/lidar/points#sensor_msgs.PointCloud2"
@@ -38,10 +40,11 @@ Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
 Environment=NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap
 Environment=NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap
 Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json
+Environment=NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH=/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json
 ExecStartPre=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
 ExecStartPre=/usr/bin/rm -f /tmp/nuwax_cloudmap.mmap /tmp/nuwax_occupancy.mmap
 ExecStartPre=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready /run/nuwax/geometry/nuwax_geometry_runtime.ready.runtime
-ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL=/go2/lidar/points#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL=/cloud_map#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/start_geometry_runtime.sh
+ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH=/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL=/go2/lidar/points#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL=/cloud_map#sensor_msgs.PointCloud2" "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/start_geometry_runtime.sh
 ExecStartPost=/usr/bin/env NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_geometry_runtime_ready.sh wait
 ExecStopPost=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready /run/nuwax/geometry/nuwax_geometry_runtime.ready.runtime
 StandardOutput=journal
@@ -49,7 +52,7 @@ StandardError=journal
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
-ReadWritePaths=/run/nuwax/geometry /tmp /var/lib/nuwax_robot_bridge
+ReadWritePaths=/run/nuwax/geometry /tmp /var/lib/nuwax/geometry-runtime /var/lib/nuwax_robot_bridge
 # Phase 8 §13.2 修正:不再把 real-lcm fail-fast code(4) 当 SuccessExitStatus。
 # 启动期缺 liblcm / 缺 udpm multicast 应被 systemd 视为真实失败并触发
 # Restart=on-failure,只有 exit 0 算 success。

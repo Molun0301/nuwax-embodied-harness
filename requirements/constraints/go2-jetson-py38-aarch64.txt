@@ -19,6 +19,7 @@ onnx==1.17.0
 onnxslim==0.1.93
 ultralytics==8.4.33
 psutil==7.2.2
+lcm==1.5.2
 unitree-sdk2py==1.0.1
 cyclonedds==0.10.2
 

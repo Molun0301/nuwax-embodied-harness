@@ -457,14 +457,43 @@ fn ingest_map_pose_odometry(
 }
 
 #[cfg(feature = "guard-runtime")]
+fn fence_map_pose_source_timestamp(
+    last_published_timestamp_ns: Option<i64>,
+    observed: &crate::map_pose::MapPoseObservation,
+) -> OwnerInputResult<i64> {
+    let candidate_timestamp_ns =
+        lcm_header_timestamp_ns(&observed.pose.header, "map_pose_adapter.output")?;
+    if let Some(published_timestamp_ns) = last_published_timestamp_ns {
+        if candidate_timestamp_ns <= published_timestamp_ns {
+            return Ok(OwnerInput::Rejected(format!(
+                "map_pose_adapter.output timestamp {candidate_timestamp_ns} is duplicate or older than the last published timestamp {published_timestamp_ns}"
+            )));
+        }
+    }
+    Ok(OwnerInput::Accepted(candidate_timestamp_ns))
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn publish_map_pose_observation(
     transport: &LcmTransport,
     channel: &str,
+    last_published_timestamp_ns: &mut Option<i64>,
+    diagnostics: &mut InputDiagnosticLimiter,
     observed: crate::map_pose::MapPoseObservation,
 ) -> NavStackResult<()> {
+    let candidate_timestamp_ns =
+        match fence_map_pose_source_timestamp(*last_published_timestamp_ns, &observed)? {
+            OwnerInput::Accepted(timestamp_ns) => timestamp_ns,
+            OwnerInput::Rejected(reason) => {
+                diagnostics.reject("map_pose_adapter.output", &reason);
+                return Ok(());
+            }
+        };
     let body = schema::encode_pose_stamped_body(&observed.pose)
         .map_err(|error| NavStackError::Internal(format!("map pose encode: {error}")))?;
-    publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await
+    publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await?;
+    *last_published_timestamp_ns = Some(candidate_timestamp_ns);
+    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -502,6 +531,7 @@ async fn run_map_pose_adapter(
     .map_err(|error| module_error("map_pose_adapter", error))?;
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut pending_odometry: Option<Box<schema::Odometry>> = None;
+    let mut last_published_timestamp_ns = None;
     signal_ready(ready)?;
 
     loop {
@@ -515,6 +545,8 @@ async fn run_map_pose_adapter(
                         publish_map_pose_observation(
                             &transport,
                             &node.outputs[0],
+                            &mut last_published_timestamp_ns,
+                            &mut diagnostics,
                             observed,
                         ).await?;
                     }
@@ -525,6 +557,8 @@ async fn run_map_pose_adapter(
                                     publish_map_pose_observation(
                                         &transport,
                                         &node.outputs[0],
+                                        &mut last_published_timestamp_ns,
+                                        &mut diagnostics,
                                         observed,
                                     ).await?;
                                 }
@@ -551,6 +585,8 @@ async fn run_map_pose_adapter(
                         publish_map_pose_observation(
                             &transport,
                             &node.outputs[0],
+                            &mut last_published_timestamp_ns,
+                            &mut diagnostics,
                             observed,
                         ).await?;
                     }
@@ -6396,6 +6432,29 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn guarded_active_cancel_same_generation_replays_terminal_without_refencing() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+
+        harness.send_cancel(&goal, 3);
+        harness.wait_for_zero().await;
+        let terminal = harness.wait_for_correlated_zero(&goal, 3).await;
+        let acquire_count = harness.motion_call_count("acquire:");
+        let zero_count = harness.motion_call_count("zero:");
+
+        harness.send_cancel(&goal, 3);
+        let replay = harness.wait_for_correlated_zero(&goal, 3).await;
+        assert_eq!(replay.zero_ack_id, terminal.zero_ack_id);
+        assert_eq!(
+            replay.zero_applied_monotonic_ns,
+            terminal.zero_applied_monotonic_ns
+        );
+        assert_eq!(harness.motion_call_count("acquire:"), acquire_count);
+        assert_eq!(harness.motion_call_count("zero:"), zero_count);
+        harness.shutdown().await;
+    }
+
     async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::GoalEnvelope {
         let goal_a = sealed_goal("session-a");
         harness.send_pose(1);
@@ -7094,6 +7153,101 @@ mod guarded_tests {
         };
         assert_eq!(observed.pose.header.frame_id, "map");
         assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn map_pose_output_fence_accepts_only_strictly_newer_source_timestamps() {
+        let mut adapter =
+            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let atomic_tf = schema::encode_tf_message_body(&schema::TfMessage {
+            transforms: vec![
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "map".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "odom".into(),
+                    transform: schema::Transform {
+                        translation: [1.0, 2.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                schema::TransformStamped {
+                    header: schema::Header {
+                        stamp_sec: 7,
+                        frame_id: "odom".into(),
+                        ..schema::Header::default()
+                    },
+                    child_frame_id: "base_link".into(),
+                    transform: schema::Transform {
+                        translation: [3.0, 4.0, 0.0],
+                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+        })
+        .expect("encode atomic TF");
+        let tf_observation =
+            match ingest_map_pose_tf(&mut adapter, &atomic_tf).expect("coherent TF observation") {
+                OwnerInput::Accepted(Some(observed)) => observed,
+                OwnerInput::Accepted(None) => panic!("coherent TF did not produce a map pose"),
+                OwnerInput::Rejected(reason) => panic!("coherent TF rejected: {reason}"),
+            };
+        let odometry = schema::Odometry {
+            header: schema::Header {
+                stamp_sec: 7,
+                frame_id: "odom".into(),
+                ..schema::Header::default()
+            },
+            child_frame_id: "base_link".into(),
+            pose: schema::Pose {
+                position: [3.0, 4.0, 0.0],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+            ..schema::Odometry::default()
+        };
+        let odometry_body = schema::encode_odometry_body(&odometry).expect("encode odometry");
+        let odometry_observation = match ingest_map_pose_odometry(&adapter, &odometry_body)
+            .expect("aligned odometry observation")
+        {
+            MapPoseOdometryIngress::Accepted(observed) => observed,
+            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
+                panic!("aligned odometry still waiting: {reason}")
+            }
+            MapPoseOdometryIngress::Rejected(reason) => {
+                panic!("aligned odometry rejected: {reason}")
+            }
+        };
+
+        let last_published_timestamp_ns =
+            match fence_map_pose_source_timestamp(None, &tf_observation)
+                .expect("first observation timestamp")
+            {
+                OwnerInput::Accepted(timestamp_ns) => Some(timestamp_ns),
+                OwnerInput::Rejected(reason) => panic!("first observation rejected: {reason}"),
+            };
+        assert!(matches!(
+            fence_map_pose_source_timestamp(last_published_timestamp_ns, &odometry_observation)
+                .expect("duplicate timestamp is recoverable"),
+            OwnerInput::Rejected(_)
+        ));
+
+        let mut older_observation = odometry_observation.clone();
+        older_observation.pose.header.stamp_sec = 6;
+        assert!(matches!(
+            fence_map_pose_source_timestamp(last_published_timestamp_ns, &older_observation)
+                .expect("older timestamp is recoverable"),
+            OwnerInput::Rejected(_)
+        ));
+
+        let mut newer_observation = odometry_observation;
+        newer_observation.pose.header.stamp_sec = 8;
+        assert!(matches!(
+            fence_map_pose_source_timestamp(last_published_timestamp_ns, &newer_observation)
+                .expect("newer timestamp"),
+            OwnerInput::Accepted(8_000_000_000)
+        ));
     }
 
     #[test]

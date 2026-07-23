@@ -72,12 +72,7 @@
         "required": true
       }
     ],
-    "system_modules": [
-      {
-        "import_module": "lcm",
-        "package": "python3-lcm"
-      }
-    ]
+    "system_modules": []
   },
   "system_packages": [
     "ca-certificates",
@@ -95,8 +90,7 @@
     "python3-pip",
     "python3-venv",
     "python3-dev",
-    "liblcm-dev",
-    "python3-lcm"
+    "liblcm-dev"
   ],
   "rust": {
     "toolchain": "1.88.0",

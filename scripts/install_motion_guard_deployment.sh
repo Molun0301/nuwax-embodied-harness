@@ -93,6 +93,61 @@ check_file() {
   [[ -f "$1" ]] || fail "missing deployment artifact: $1"
 }
 
+systemd_unit_file_state() {
+  local unit_name="$1"
+  local state=""
+  local rc=0
+  if state="$(systemctl show -p UnitFileState --value "${unit_name}")"; then
+    :
+  else
+    rc=$?
+    fail "cannot read UnitFileState for ${unit_name}: state=${state:-<empty>} rc=${rc}"
+  fi
+  [[ -n "${state}" ]] \
+    || fail "cannot read UnitFileState for ${unit_name}: state=<empty> rc=0"
+  printf '%s\n' "${state}"
+}
+
+require_always_on_unit_file_state() {
+  local unit_name="$1"
+  local state=""
+  state="$(systemd_unit_file_state "${unit_name}")"
+  case "${state}" in
+    enabled) ;;
+    *) fail "${unit_name} has UnitFileState=${state}; expected enabled" ;;
+  esac
+}
+
+require_on_demand_unit_file_state() {
+  local unit_name="$1"
+  local state=""
+  state="$(systemd_unit_file_state "${unit_name}")"
+  case "${state}" in
+    disabled|static|indirect) ;;
+    *) fail "${unit_name} has UnitFileState=${state}; expected one of disabled/static/indirect" ;;
+  esac
+}
+
+apply_systemd_tmpfiles() {
+  local config_path="$1"
+  local systemd_version="unknown"
+  local version_output=""
+  local rc=0
+  if version_output="$(systemd-tmpfiles --version 2>&1)"; then
+    systemd_version="${version_output%%$'\n'*}"
+  fi
+  printf 'applying systemd-tmpfiles: config=%s systemd_version=%s\n' \
+    "${config_path}" "${systemd_version}" >&2
+  if systemd-tmpfiles --create "${config_path}"; then
+    return 0
+  else
+    rc=$?
+    printf 'ERROR: systemd-tmpfiles failed: config=%s systemd_version=%s rc=%s\n' \
+      "${config_path}" "${systemd_version}" "${rc}" >&2
+    return "${rc}"
+  fi
+}
+
 check_service_uid_collisions() {
   local source="${1:-system}"
   local passwd_file=""
@@ -900,23 +955,19 @@ verify_installed() {
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_record "${GUARD_STATE_DIR}/provisioned.json" 400
   check_record "${GUARD_STATE_DIR}/epoch.json" 600
-  systemctl is-enabled --quiet nuwax-host-gateway.service \
-    || fail "nuwax-host-gateway.service is not enabled"
+  require_always_on_unit_file_state nuwax-host-gateway.service
   systemctl is-active --quiet nuwax-host-gateway.service \
     || fail "nuwax-host-gateway.service is not active"
-  systemctl is-enabled --quiet nuwax-runtime-activation.path \
-    || fail "nuwax-runtime-activation.path is not enabled"
+  require_always_on_unit_file_state nuwax-runtime-activation.path
   systemctl is-active --quiet nuwax-runtime-activation.path \
     || fail "nuwax-runtime-activation.path is not active"
-  systemctl is-enabled --quiet nuwax-go2-video-streamer.service \
-    || fail "nuwax-go2-video-streamer.service is not enabled"
+  require_always_on_unit_file_state nuwax-go2-video-streamer.service
   systemctl is-active --quiet nuwax-go2-video-streamer.service \
     || fail "nuwax-go2-video-streamer.service is not active"
   for unit_name in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
                    nuwax-geometry-runtime.service nuwax-person-follow.service \
                    nuwax-runtime-activation.service; do
-    ! systemctl is-enabled --quiet "${unit_name}" \
-      || fail "${unit_name} must not be enabled for eager boot startup"
+    require_on_demand_unit_file_state "${unit_name}"
   done
 
   if systemctl is-active --quiet nuwax-motion-safety-guard.service; then
@@ -987,7 +1038,7 @@ install_sources() {
   check_service_uid_collisions system
   ensure_gateway_device_groups
   secure_runtime_config_permissions
-  systemd-tmpfiles --create /usr/lib/tmpfiles.d/nuwax-motion.conf
+  apply_systemd_tmpfiles /usr/lib/tmpfiles.d/nuwax-motion.conf
   secure_runtime_data_permissions
   bash "${LCM_PREFLIGHT}"
   check_service_access

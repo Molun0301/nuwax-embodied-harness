@@ -11,6 +11,7 @@ from typing import Callable, Dict, Optional, Union
 from core.errors import MotionGuardFacadeError
 from services.navigation.motion_guard_client import (
     CommandConfirmation,
+    GuardState,
     ModeSwitchConfirmation,
     MotionAdmissionProof,
     MotionGuardClient,
@@ -169,6 +170,18 @@ class GatewayMotionGuard:
             self._record_error(exc)
             raise GatewayMotionGuardUnavailable(
                 f"motion guard readiness failed: {exc}"
+            ) from exc
+
+    def guard_state(self) -> GuardState:
+        """Return the durable Gateway-manual guard state for recovery routing."""
+
+        client = self._require_client()
+        try:
+            return client.get_guard_state(pb.GUARD_SOURCE_GATEWAY_MANUAL)
+        except MotionGuardError as exc:
+            self._record_error(exc)
+            raise GatewayMotionGuardUnavailable(
+                f"motion guard state query failed: {exc}"
             ) from exc
 
     def acquire_follow_session(

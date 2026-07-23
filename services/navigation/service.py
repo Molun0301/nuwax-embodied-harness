@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
 import threading
 import time
+
+import grpc
 
 from contracts.events import RuntimeEventCategory
 from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonesEnvelope
@@ -17,6 +20,10 @@ from core.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
+from services.geometry.geometry_runtime_provider import (
+    GeometryRuntimeRpcError,
+    _exploration_child_lease_fingerprint,
+)
 from typing import Deque, Dict, Optional, Sequence, Tuple
 
 from .forbidden_zones import ForbiddenZoneStore
@@ -33,6 +40,45 @@ _EXPLORATION_MAP_IDENTITY_KEYS = {
     "map_revision",
     "stop_on_map_revision_change",
 }
+
+
+def _exploration_deadline_remaining(
+    deadline_monotonic: Optional[float],
+    rpc_name: str,
+) -> Optional[float]:
+    if deadline_monotonic is None:
+        return None
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        raise GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration deadline exhausted",
+        )
+    return remaining
+
+
+@contextmanager
+def _exploration_deadline_lock(lock, deadline_monotonic, rpc_name):
+    remaining = _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+    if remaining is None:
+        with lock:
+            yield
+        return
+    if not lock.acquire(timeout=remaining):
+        raise GeometryRuntimeRpcError(
+            rpc_name=rpc_name,
+            grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc_details="cooperative exploration lock deadline exhausted",
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _exploration_owner_lock(service):
+    return getattr(service, "_exploration_ownership_lock", service._lock)
 
 
 @dataclass(frozen=True)
@@ -81,6 +127,7 @@ def _is_complete_exploration_terminal(
         }
         and metadata.get("exploration_terminal") is True
         and not str(metadata.get("child_task_id") or "").strip()
+        and metadata.get("child_lease") is None
     )
 
 
@@ -158,6 +205,7 @@ class NavigationService:
         self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
         self._lock = threading.RLock()
+        self._exploration_ownership_lock = threading.RLock()
         self._navigation_update_subscription_id: Optional[int] = None
         self._exploration_update_subscription_id: Optional[int] = None
         # 定位会话刷新节流：避免 *_until_complete 高频轮询每轮触发完整定位刷新副作用链（P0-3）
@@ -1004,6 +1052,8 @@ class NavigationService:
 
     def _read_forbidden_zone_runtime_ack(
         self,
+        *,
+        deadline_monotonic: Optional[float] = None,
     ) -> Optional[_ForbiddenZoneRuntimeAck]:
         owner = getattr(self, "_provider_owner", None)
         provider = getattr(owner, "providers", None)
@@ -1011,7 +1061,14 @@ class NavigationService:
         if not callable(readiness_reader):
             return None
         try:
-            readiness = readiness_reader()
+            if deadline_monotonic is None:
+                readiness = readiness_reader()
+            else:
+                readiness = readiness_reader(
+                    deadline_monotonic=deadline_monotonic,
+                )
+        except GeometryRuntimeRpcError:
+            raise
         except Exception:
             LOGGER.exception("读取禁行区 runtime acknowledgement 失败。")
             return None
@@ -1086,9 +1143,17 @@ class NavigationService:
                 return observed_ack
             time.sleep(poll_interval_sec)
 
-    def _ensure_forbidden_zone_motion_start_allowed(self) -> None:
+    def _ensure_forbidden_zone_motion_start_allowed(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
         state_lock = self._forbidden_zone_state_lock()
-        with state_lock:
+        with _exploration_deadline_lock(
+            state_lock,
+            deadline_monotonic,
+            "ForbiddenZoneMotionAdmission",
+        ):
             if getattr(self, "_forbidden_zone_update_active", False):
                 self._raise_forbidden_zone_motion_start_blocked_locked()
             required_generation = getattr(
@@ -1104,8 +1169,14 @@ class NavigationService:
         if required_generation is None or not required_map_version_id:
             return
 
-        observed_ack = self._read_forbidden_zone_runtime_ack()
-        with state_lock:
+        observed_ack = self._read_forbidden_zone_runtime_ack(
+            deadline_monotonic=deadline_monotonic,
+        )
+        with _exploration_deadline_lock(
+            state_lock,
+            deadline_monotonic,
+            "ForbiddenZoneMotionAdmission",
+        ):
             if getattr(self, "_forbidden_zone_update_active", False):
                 self._raise_forbidden_zone_motion_start_blocked_locked()
             current_required_generation = getattr(
@@ -1372,18 +1443,33 @@ class NavigationService:
             return bool(availability_checker())
         return True
 
-    def refresh_navigation(self) -> NavigationContext:
+    def refresh_navigation(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationContext:
         """刷新导航上下文，使用平台导航状态机管理状态转移。
 
         主链：NavigationGoal -> 平台当前导航后端 -> 平台 NavigationContext
         后端只负责执行反馈，不负责平台任务定义。
         """
 
+        _exploration_deadline_remaining(deadline_monotonic, "GetNavigationState")
         provider = self._find_navigation_provider()
         if provider is None:
             raise GatewayError("当前平台几何运行时未提供导航后端。")
-        navigation_state = provider.get_navigation_state()
-        return self._ingest_navigation_state(provider, navigation_state)
+        if deadline_monotonic is None:
+            navigation_state = provider.get_navigation_state()
+        else:
+            navigation_state = provider.get_navigation_state(
+                deadline_monotonic=deadline_monotonic,
+            )
+        return self._ingest_navigation_state(
+            provider,
+            navigation_state,
+            lightweight=deadline_monotonic is not None,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def _handle_provider_navigation_update(self, navigation_state) -> None:
         provider = self._find_navigation_provider()
@@ -1394,10 +1480,39 @@ class NavigationService:
         except Exception:
             return
 
-    def _ingest_navigation_state(self, provider: NavigationProvider, navigation_state) -> NavigationContext:
-        with self._lock:
+    def _ingest_navigation_state(
+        self,
+        provider: NavigationProvider,
+        navigation_state,
+        *,
+        lightweight: bool = False,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationContext:
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "GetNavigationState",
+        ):
             previous_context = self._latest_navigation_context
             current_goal = self._current_goal
+            if lightweight:
+                goal_reached = bool(navigation_state.goal_reached)
+                context = NavigationContext(
+                    current_goal=current_goal,
+                    navigation_state=navigation_state,
+                    backend_name=provider.provider_name,
+                    goal_reached=goal_reached,
+                    metadata={"provider_version": provider.provider_version},
+                )
+                self._latest_navigation_context = context
+                self._navigation_history.append(context)
+                if navigation_state.status in {
+                    NavigationStatus.SUCCEEDED,
+                    NavigationStatus.FAILED,
+                    NavigationStatus.CANCELLED,
+                }:
+                    self._current_goal = None
+                return context
             reuse_terminal_state = (
                 previous_context is not None
                 and previous_context.navigation_state.status
@@ -1503,14 +1618,29 @@ class NavigationService:
                 self._current_goal = None
             return context
 
-    def set_goal(self, goal: NavigationGoal) -> NavigationContext:
+    def set_goal(
+        self,
+        goal: NavigationGoal,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationContext:
         """提交导航目标，使用平台状态机管理目标接受流程。
 
         主链：NavigationGoal -> 平台状态机 ACCEPTED -> 当前导航后端执行 -> 平台 NavigationContext
         """
 
-        self._ensure_forbidden_zone_motion_start_allowed()
-        provider = self._get_navigation_provider()
+        if deadline_monotonic is None:
+            self._ensure_forbidden_zone_motion_start_allowed()
+        else:
+            self._ensure_forbidden_zone_motion_start_allowed(
+                deadline_monotonic=deadline_monotonic,
+            )
+        if deadline_monotonic is None:
+            provider = self._get_navigation_provider()
+        else:
+            provider = self._get_navigation_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
         if goal.target_pose is not None:
             LOGGER.info(
                 "导航服务接收目标 goal_id=%s provider=%s target=(%.3f, %.3f, %.3f) frame=%s map_name=%s target_name=%s metadata=%s",
@@ -1533,20 +1663,47 @@ class NavigationService:
                 goal.target_name,
                 dict(goal.metadata),
             )
-        with self._lock:
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "SetNavigationGoal",
+        ):
             self._raise_forbidden_zone_motion_start_blocked_locked()
             self._current_goal = goal
             self._state_machine.set_goal(goal.goal_id, message="平台导航目标已接受。")
         LOGGER.debug("导航服务转发目标 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
-        accepted = provider.set_goal(goal)
+        if deadline_monotonic is None:
+            accepted = provider.set_goal(goal)
+        else:
+            accepted = provider.set_goal(
+                goal,
+                deadline_monotonic=deadline_monotonic,
+            )
         if not accepted:
-            message = self._navigation_provider_error_message(provider, default="导航后端拒绝目标 %s。" % goal.goal_id)
-            with self._lock:
+            default_message = "导航后端拒绝目标 %s。" % goal.goal_id
+            message = (
+                self._navigation_provider_error_message(
+                    provider,
+                    default=default_message,
+                )
+                if deadline_monotonic is None
+                else default_message
+            )
+            with _exploration_deadline_lock(
+                self._lock,
+                deadline_monotonic,
+                "SetNavigationGoal",
+            ):
                 self._current_goal = None
                 self._state_machine.fail(message)
             raise GatewayError(message)
         LOGGER.info("导航服务目标已被后端接收 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
-        context = self.refresh_navigation()
+        if deadline_monotonic is None:
+            context = self.refresh_navigation()
+        else:
+            context = self.refresh_navigation(
+                deadline_monotonic=deadline_monotonic,
+            )
         if context.navigation_state.status == NavigationStatus.IDLE:
             context = context.model_copy(
                 update={
@@ -1562,10 +1719,16 @@ class NavigationService:
                 deep=True,
             )
             self._latest_navigation_context = context
-        self._publish_navigation_event("navigation.goal_set", f"导航目标 {goal.goal_id} 已提交。", goal_id=goal.goal_id)
+        if deadline_monotonic is None:
+            self._publish_navigation_event("navigation.goal_set", f"导航目标 {goal.goal_id} 已提交。", goal_id=goal.goal_id)
         return context
 
-    def cancel_goal(self, request_id: Optional[str] = None) -> NavigationContext:
+    def cancel_goal(
+        self,
+        request_id: Optional[str] = None,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationContext:
         """仅取消与后端当前 ACTIVE 状态匹配的 exact goal。"""
 
         exact_goal_id = str(request_id or "").strip()
@@ -1575,9 +1738,21 @@ class NavigationService:
                 error_code="navigation_goal_identity_unavailable",
                 http_status=409,
             )
-        provider = self._get_navigation_provider()
+        if deadline_monotonic is None:
+            provider = self._get_navigation_provider()
+        else:
+            provider = self._get_navigation_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
         try:
-            provider_state = provider.get_navigation_state()
+            if deadline_monotonic is None:
+                provider_state = provider.get_navigation_state()
+            else:
+                provider_state = provider.get_navigation_state(
+                    deadline_monotonic=deadline_monotonic,
+                )
+        except GeometryRuntimeRpcError:
+            raise
         except Exception as exc:
             raise GatewayError(
                 "导航取消前无法读取后端 exact goal 状态。",
@@ -1597,7 +1772,11 @@ class NavigationService:
             )
             or ""
         ).strip()
-        with self._lock:
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "CancelNavigation",
+        ):
             local_goal_id = str(
                 getattr(self._current_goal, "goal_id", "") or ""
             ).strip()
@@ -1624,18 +1803,33 @@ class NavigationService:
                     "active_status": backend_status or None,
                 },
             )
-        accepted = provider.cancel_goal(request_id=exact_goal_id)
+        if deadline_monotonic is None:
+            accepted = provider.cancel_goal(request_id=exact_goal_id)
+        else:
+            accepted = provider.cancel_goal(
+                request_id=exact_goal_id,
+                deadline_monotonic=deadline_monotonic,
+            )
         if not accepted:
-            message = self._navigation_provider_error_message(
-                provider,
-                default="导航后端拒绝取消当前目标。",
+            message = (
+                self._navigation_provider_error_message(
+                    provider,
+                    default="导航后端拒绝取消当前目标。",
+                )
+                if deadline_monotonic is None
+                else "导航后端拒绝取消当前目标。"
             )
             raise GatewayError(
                 message,
                 error_code="navigation_cancel_rejected",
                 http_status=409,
             )
-        context = self.refresh_navigation()
+        if deadline_monotonic is None:
+            context = self.refresh_navigation()
+        else:
+            context = self.refresh_navigation(
+                deadline_monotonic=deadline_monotonic,
+            )
         if context.navigation_state.status == NavigationStatus.IDLE and self._current_goal is not None:
             context = context.model_copy(
                 update={
@@ -1651,11 +1845,12 @@ class NavigationService:
                 deep=True,
             )
             self._latest_navigation_context = context
-        self._publish_navigation_event(
-            "navigation.goal_cancelled",
-            "导航目标已取消。",
-            goal_id=exact_goal_id,
-        )
+        if deadline_monotonic is None:
+            self._publish_navigation_event(
+                "navigation.goal_cancelled",
+                "导航目标已取消。",
+                goal_id=exact_goal_id,
+            )
         return context
 
     def get_navigation_diagnostics(self) -> Optional[NavigationDiagnostics]:
@@ -1736,12 +1931,35 @@ class NavigationService:
             )
         raise GatewayError(f"未在语义地图中找到命名位置：{target_name}")
 
-    def refresh_exploration(self) -> ExplorationContext:
+    def refresh_exploration(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> ExplorationContext:
         """刷新探索上下文。"""
 
-        provider = self._get_exploration_provider()
-        exploration_state = provider.get_exploration_state()
-        return self._ingest_exploration_state(provider, exploration_state)
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "GetExplorationState",
+        )
+        if deadline_monotonic is None:
+            provider = self._get_exploration_provider()
+        else:
+            provider = self._get_exploration_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
+        if deadline_monotonic is None:
+            exploration_state = provider.get_exploration_state()
+        else:
+            exploration_state = provider.get_exploration_state(
+                deadline_monotonic=deadline_monotonic,
+            )
+        return self._ingest_exploration_state(
+            provider,
+            exploration_state,
+            lightweight=deadline_monotonic is not None,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def _handle_provider_exploration_update(self, exploration_state) -> None:
         provider = self._find_exploration_provider()
@@ -1764,12 +1982,22 @@ class NavigationService:
         exploration_state,
         *,
         lightweight: bool = False,
+        deadline_monotonic: Optional[float] = None,
     ) -> ExplorationContext:
-        with self._lock:
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "GetExplorationState",
+        ):
             previous_context = self._latest_exploration_context
-            current_request = _without_exploration_map_identity(
-                self._current_explore_request
-            )
+            with _exploration_deadline_lock(
+                _exploration_owner_lock(self),
+                deadline_monotonic,
+                "GetExplorationState",
+            ):
+                current_request = _without_exploration_map_identity(
+                    self._current_explore_request
+                )
             idle_without_request = bool(
                 exploration_state.status == ExplorationStatus.IDLE
                 and current_request is None
@@ -1840,6 +2068,23 @@ class NavigationService:
             )
             self._latest_exploration_context = context
             self._exploration_history.append(context)
+            context_request_id = str(
+                getattr(context.current_request, "request_id", "") or ""
+            ).strip()
+            if _is_complete_exploration_terminal(
+                context.exploration_state,
+                request_id=context_request_id,
+            ):
+                with _exploration_deadline_lock(
+                    _exploration_owner_lock(self),
+                    deadline_monotonic,
+                    "GetExplorationState",
+                ):
+                    self._current_explore_request = None
+                    if self._pending_explore_request_id == context_request_id:
+                        self._pending_explore_request_id = None
+            if lightweight:
+                return context
             self._state_store.write(
                 StateNamespace.NAVIGATION,
                 "exploration",
@@ -1914,59 +2159,143 @@ class NavigationService:
                         reason="geometry_session_not_explore",
                     )
                 self._publish_external_exploration_navigation_overlay(context)
-            context_request_id = str(
-                getattr(context.current_request, "request_id", "") or ""
-            ).strip()
-            if _is_complete_exploration_terminal(
-                context.exploration_state,
-                request_id=context_request_id,
-            ):
-                self._current_explore_request = None
             return context
 
-    def start_exploration(self, request: ExploreAreaRequest) -> ExplorationContext:
+    def start_exploration(
+        self,
+        request: ExploreAreaRequest,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> ExplorationContext:
         """启动探索任务。"""
 
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StartExploration",
+        )
         request = _without_exploration_map_identity(request) or request
-        self._ensure_forbidden_zone_motion_start_allowed()
-        provider = self._get_exploration_provider()
+        if deadline_monotonic is None:
+            self._ensure_forbidden_zone_motion_start_allowed()
+        else:
+            self._ensure_forbidden_zone_motion_start_allowed(
+                deadline_monotonic=deadline_monotonic,
+            )
+        if deadline_monotonic is None:
+            provider = self._get_exploration_provider()
+        else:
+            provider = self._get_exploration_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
         request_id = str(request.request_id or "").strip()
-        with self._lock:
-            self._raise_forbidden_zone_motion_start_blocked_locked()
-            current_id = str(
-                getattr(self._current_explore_request, "request_id", "") or ""
-            ).strip()
-            if (current_id and current_id != request_id) or (
-                self._pending_explore_request_id
-                and self._pending_explore_request_id != request_id
+        registered_new_owner = False
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "StartExploration",
+        ):
+            with _exploration_deadline_lock(
+                _exploration_owner_lock(self),
+                deadline_monotonic,
+                "StartExploration",
             ):
-                raise GatewayError("已有其它探索请求正在启动或运行。")
-            self._pending_explore_request_id = request_id
+                self._raise_forbidden_zone_motion_start_blocked_locked()
+                current_id = str(
+                    getattr(self._current_explore_request, "request_id", "") or ""
+                ).strip()
+                if (current_id and current_id != request_id) or (
+                    self._pending_explore_request_id
+                    and self._pending_explore_request_id != request_id
+                ):
+                    raise GatewayError("已有其它探索请求正在启动或运行。")
+                registered_new_owner = not bool(current_id)
+                self._pending_explore_request_id = request_id
+                self._current_explore_request = request
         try:
-            accepted = provider.start_exploration(request)
-        except Exception:
-            with self._lock:
-                if self._pending_explore_request_id == request_id:
-                    self._pending_explore_request_id = None
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
+            if deadline_monotonic is None:
+                accepted = provider.start_exploration(request)
+            else:
+                accepted = provider.start_exploration(
+                    request,
+                    deadline_monotonic=deadline_monotonic,
+                )
+        except Exception as exc:
+            if getattr(exc, "exploration_rpc_dispatched", True) is False:
+                with _exploration_deadline_lock(
+                    _exploration_owner_lock(self),
+                    deadline_monotonic,
+                    "StartExploration",
+                ):
+                    if self._pending_explore_request_id == request_id:
+                        self._pending_explore_request_id = None
+                    current_id = str(
+                        getattr(
+                            self._current_explore_request,
+                            "request_id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    if registered_new_owner and current_id == request_id:
+                        self._current_explore_request = None
             raise
         if not accepted:
             message = f"探索后端拒绝请求 {request.request_id}。"
             try:
-                exploration_state = provider.get_exploration_state()
+                if deadline_monotonic is None:
+                    exploration_state = provider.get_exploration_state()
+                else:
+                    exploration_state = provider.get_exploration_state(
+                        deadline_monotonic=deadline_monotonic,
+                    )
             except Exception:
                 exploration_state = None
             if exploration_state is not None and exploration_state.message:
                 message = exploration_state.message
-            with self._lock:
+            with _exploration_deadline_lock(
+                _exploration_owner_lock(self),
+                deadline_monotonic,
+                "StartExploration",
+            ):
                 if self._pending_explore_request_id == request_id:
                     self._pending_explore_request_id = None
+                current_id = str(
+                    getattr(self._current_explore_request, "request_id", "") or ""
+                ).strip()
+                if registered_new_owner and current_id == request_id:
+                    self._current_explore_request = None
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartExploration",
+            )
             raise GatewayError(message)
-        with self._lock:
-            if self._pending_explore_request_id != request_id:
-                raise GatewayError("探索启动确认与本地 pending request 不匹配。")
-            self._pending_explore_request_id = None
-            self._current_explore_request = request
-        context = self.refresh_exploration()
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "StartExploration",
+        ):
+            with _exploration_deadline_lock(
+                _exploration_owner_lock(self),
+                deadline_monotonic,
+                "StartExploration",
+            ):
+                if self._pending_explore_request_id != request_id:
+                    raise GatewayError("探索启动确认与本地 pending request 不匹配。")
+                current_id = str(
+                    getattr(self._current_explore_request, "request_id", "") or ""
+                ).strip()
+                if current_id != request_id:
+                    raise GatewayError("探索启动确认与本地 current request 不匹配。")
+                self._pending_explore_request_id = None
+        if deadline_monotonic is None:
+            context = self.refresh_exploration()
+        else:
+            context = self.refresh_exploration(
+                deadline_monotonic=deadline_monotonic,
+            )
         if context.exploration_state.status == ExplorationStatus.IDLE:
             context = context.model_copy(
                 update={
@@ -1988,14 +2317,35 @@ class NavigationService:
     def stop_exploration(
         self,
         request_id: Optional[str] = None,
+        *,
+        deadline_monotonic: Optional[float] = None,
     ) -> ExplorationContext:
         """停止当前探索任务。"""
 
-        provider = self._get_exploration_provider()
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StopExploration",
+        )
         correlated_request_id = str(request_id or "").strip()
-        previous_request = self._current_explore_request
-        if previous_request is None and self._latest_exploration_context is not None:
-            previous_request = self._latest_exploration_context.current_request
+        with _exploration_deadline_lock(
+            self._lock,
+            deadline_monotonic,
+            "StopExploration",
+        ):
+            with _exploration_deadline_lock(
+                _exploration_owner_lock(self),
+                deadline_monotonic,
+                "StopExploration",
+            ):
+                previous_request = self._current_explore_request
+                if previous_request is None and self._latest_exploration_context is not None:
+                    previous_request = self._latest_exploration_context.current_request
+        if deadline_monotonic is None:
+            provider = self._get_exploration_provider()
+        else:
+            provider = self._get_exploration_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
         if (
             correlated_request_id
             and previous_request is not None
@@ -2013,7 +2363,12 @@ class NavigationService:
         if correlated_request_id:
             try:
                 accepted = provider.stop_exploration(
-                    request_id=correlated_request_id
+                    request_id=correlated_request_id,
+                    **(
+                        {"deadline_monotonic": deadline_monotonic}
+                        if deadline_monotonic is not None
+                        else {}
+                    ),
                 )
             except TypeError as exc:
                 raise GatewayError(
@@ -2023,10 +2378,20 @@ class NavigationService:
                     details={"request_id": correlated_request_id},
                 ) from exc
         else:
-            accepted = provider.stop_exploration()
+            if deadline_monotonic is None:
+                accepted = provider.stop_exploration()
+            else:
+                accepted = provider.stop_exploration(
+                    deadline_monotonic=deadline_monotonic,
+                )
         if not accepted:
             raise GatewayError("探索后端拒绝停止当前任务。")
-        context = self.refresh_exploration()
+        if deadline_monotonic is None:
+            context = self.refresh_exploration()
+        else:
+            context = self.refresh_exploration(
+                deadline_monotonic=deadline_monotonic,
+            )
 
         if previous_request is not None and context.current_request is None:
             state_updates = {}
@@ -2100,6 +2465,185 @@ class NavigationService:
                 details={"request_id": str(request_id or "").strip()},
             )
         return self.refresh_exploration()
+
+    def reconcile_exploration_after_global_stop(
+        self,
+        *,
+        request_id: str,
+        exploration_generation: int,
+        child_lease: Dict[str, object],
+        cancel_generation: int,
+        recovery_correlation: str,
+        admission_guard_generation: int,
+        admission_guard_boot_nonce: bytes,
+        admission_motion_stop_generation: int,
+        held_guard_proof: Dict[str, object],
+        deadline_monotonic: Optional[float] = None,
+    ) -> ExplorationContext:
+        """Reconcile one retained child, then require an exact fresh snapshot."""
+
+        rpc_name = "ReconcileExplorationAfterGlobalStop"
+        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+        if deadline_monotonic is None:
+            provider = self._get_exploration_provider()
+        else:
+            provider = self._get_exploration_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
+        reconcile = getattr(
+            provider,
+            "reconcile_exploration_after_global_stop",
+            None,
+        )
+        if not callable(reconcile):
+            raise GatewayError(
+                "探索后端不支持 global-stop ownership reconciliation。",
+                error_code="exploration_global_stop_reconciliation_unsupported",
+                http_status=501,
+            )
+        correlated_id = str(request_id or "").strip()
+        expected_generation = int(exploration_generation)
+        expected_cancel_generation = int(cancel_generation)
+        expected_correlation = str(recovery_correlation or "").strip()
+        expected_fingerprint = _exploration_child_lease_fingerprint(
+            dict(child_lease or {})
+        )
+        accepted = reconcile(
+            request_id=correlated_id,
+            exploration_generation=expected_generation,
+            child_lease=dict(child_lease or {}),
+            cancel_generation=expected_cancel_generation,
+            recovery_correlation=expected_correlation,
+            admission_guard_generation=int(admission_guard_generation),
+            admission_guard_boot_nonce=bytes(
+                admission_guard_boot_nonce or b""
+            ),
+            admission_motion_stop_generation=int(
+                admission_motion_stop_generation
+            ),
+            held_guard_proof=dict(held_guard_proof or {}),
+            **(
+                {"deadline_monotonic": deadline_monotonic}
+                if deadline_monotonic is not None
+                else {}
+            ),
+        )
+        if not accepted:
+            raise GatewayError(
+                "探索后端拒绝 global-stop ownership reconciliation。",
+                error_code="exploration_global_stop_reconciliation_rejected",
+                http_status=409,
+                details={"request_id": correlated_id},
+            )
+        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+        if deadline_monotonic is None:
+            context = self.refresh_exploration()
+        else:
+            context = self.refresh_exploration(
+                deadline_monotonic=deadline_monotonic,
+            )
+        state = context.exploration_state
+        metadata = dict(getattr(state, "metadata", {}) or {})
+        receipt = metadata.get("ownership_reconciliation_receipt")
+        terminal_profile = (
+            str(metadata.get("last_stop_reason") or ""),
+            str(receipt.get("cause") or "") if isinstance(receipt, dict) else "",
+            (
+                str(receipt.get("commit_disposition") or "")
+                if isinstance(receipt, dict)
+                else ""
+            ),
+        )
+        exact_refresh = bool(
+            str(getattr(state, "current_request_id", "") or "").strip()
+            == correlated_id
+            and state.status == ExplorationStatus.FAILED
+            and metadata.get("exploration_terminal") is True
+            and not str(metadata.get("child_task_id") or "").strip()
+            and metadata.get("child_lease") is None
+            and int(metadata.get("exploration_generation") or 0)
+            == expected_generation
+            and isinstance(receipt, dict)
+            and str(receipt.get("recovery_correlation") or "")
+            == expected_correlation
+            and str(receipt.get("parent_request_id") or "")
+            == correlated_id
+            and int(receipt.get("exploration_generation") or 0)
+            == expected_generation
+            and expected_fingerprint
+            and str(receipt.get("child_lease_fingerprint") or "")
+            == expected_fingerprint
+            and int(receipt.get("cancel_generation") or 0)
+            == expected_cancel_generation
+            and terminal_profile
+            in (
+                (
+                    "global_stop_reconciled_safe",
+                    "ordinary_global_stop",
+                    "global_stop_reconciled_child_ownership",
+                ),
+                (
+                    "child_cancel_failed",
+                    "late_exact_child_zeroed",
+                    "exact_child_zeroed_released_ownership",
+                ),
+            )
+        )
+        if not exact_refresh:
+            raise GatewayError(
+                "global-stop reconciliation 后未获得 exact terminal refresh。",
+                error_code="exploration_global_stop_refresh_unconfirmed",
+                http_status=409,
+                details={"request_id": correlated_id},
+            )
+        return context
+
+    def acknowledge_exploration_ownership_reconciliation(
+        self,
+        *,
+        recovery_correlation: str,
+        child_lease_fingerprint: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Explicitly acknowledge a durable receipt after outer release steps."""
+
+        rpc_name = "AcknowledgeExplorationOwnershipReconciliation"
+        _exploration_deadline_remaining(deadline_monotonic, rpc_name)
+        if deadline_monotonic is None:
+            provider = self._get_exploration_provider()
+        else:
+            provider = self._get_exploration_provider(
+                deadline_monotonic=deadline_monotonic,
+            )
+        acknowledge = getattr(
+            provider,
+            "acknowledge_exploration_ownership_reconciliation",
+            None,
+        )
+        if not callable(acknowledge):
+            raise GatewayError(
+                "探索后端不支持 ownership reconciliation ack。",
+                error_code="exploration_ownership_reconciliation_ack_unsupported",
+                http_status=501,
+            )
+        acknowledged = acknowledge(
+            recovery_correlation=str(recovery_correlation or "").strip(),
+            child_lease_fingerprint=str(
+                child_lease_fingerprint or ""
+            ).strip(),
+            **(
+                {"deadline_monotonic": deadline_monotonic}
+                if deadline_monotonic is not None
+                else {}
+            ),
+        )
+        if not acknowledged:
+            raise GatewayError(
+                "ownership reconciliation ack 未确认。",
+                error_code="exploration_ownership_reconciliation_ack_unconfirmed",
+                http_status=409,
+            )
+        return True
 
     def sync_exploration_after_task(self) -> ExplorationContext:
         """探索任务自然结束后的轻量同步：不杀 go2.sh，不标 CANCELLED。"""
@@ -2441,10 +2985,20 @@ class NavigationService:
             )
         )
 
-    def _get_navigation_provider(self) -> NavigationProvider:
+    def _get_navigation_provider(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> NavigationProvider:
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "NavigationProviderResolution",
+        )
         provider = self._find_navigation_provider()
         if provider is None:
             raise GatewayError("当前平台几何运行时未提供导航后端。")
+        if deadline_monotonic is not None:
+            return provider
         if not provider.is_available():
             raise GatewayError(self._navigation_provider_error_message(provider, default="当前导航后端暂不可用。"))
         availability_checker = getattr(provider, "is_navigation_available", None)
@@ -2513,11 +3067,28 @@ class NavigationService:
             except (TypeError, ValueError):
                 self._exploration_update_subscription_id = None
 
-    def _get_exploration_provider(self) -> ExplorationProvider:
+    def _get_exploration_provider(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> ExplorationProvider:
         # v1.1 改造：GatewayError 追加 details={"capability", ...} hint，
         # 让前端 / debug_panel / start_gateway.sh log scrubber 能直接拿到
         # runtime_status（或 provider_available / exploration_available）而无需
         # 再翻 runtime context；上游错误体字段兼容（details dict 可增 key）。
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "ExplorationProviderResolution",
+        )
+        provider = self._find_exploration_provider()
+        if deadline_monotonic is not None:
+            if provider is None:
+                raise GatewayError(
+                    "当前平台几何运行时未提供探索后端。",
+                    details={"capability": "exploration"},
+                )
+            return provider
+
         runtime_status: Dict[str, object] = {}
         owner = getattr(self, "_provider_owner", None)
         if owner is not None:
@@ -2528,7 +3099,6 @@ class NavigationService:
                 except Exception:
                     # runtime_status 取不到不影响主错误抛出；降级为空 dict 即可
                     runtime_status = {}
-        provider = self._find_exploration_provider()
         if provider is None:
             raise GatewayError(
                 "当前平台几何运行时未提供探索后端（runtime phase=%s, message=%s）。"

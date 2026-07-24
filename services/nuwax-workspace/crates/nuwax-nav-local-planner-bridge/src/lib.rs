@@ -8,6 +8,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Auditable candidate-trajectory selection core.
+pub mod core;
 pub mod spec;
 
 pub use spec::{

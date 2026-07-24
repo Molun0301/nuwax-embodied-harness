@@ -27,3 +27,7 @@ tempfile = "3"
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
+
+[[bin]]
+name = "nuwax-tare-core"
+path = "src/bin/nuwax-tare-core.rs"

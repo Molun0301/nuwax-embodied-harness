@@ -11,6 +11,7 @@ description = "2D bbox visual servoing + 3D detection navigation（TF trait）"
 # Foundation 共享类型 — 接入后允许跨 crate 共享 BoundingBox2D / Twist / PoseStamped 协议语义
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
+nuwax-nav-visual-query = { path = "../nuwax-nav-visual-query" }
 
 nuwax-numeric = { path = "../nuwax-numeric" }
 nuwax-tf = { path = "../nuwax-tf" }

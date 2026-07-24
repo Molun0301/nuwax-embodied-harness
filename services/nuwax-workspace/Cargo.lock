@@ -1462,6 +1462,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-lio-backends"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nuwax-mapping"
 version = "0.1.0"
 dependencies = [
@@ -1690,7 +1698,6 @@ name = "nuwax-nav-native-runner"
 version = "0.1.0"
 dependencies = [
  "nuwax-nav-base",
- "nuwax-nav-test-fixtures",
  "nuwax-nav-types-messages",
  "pretty_assertions",
  "serde",
@@ -1753,9 +1760,10 @@ dependencies = [
 name = "nuwax-nav-record"
 version = "0.1.0"
 dependencies = [
+ "nuwax-codec",
+ "nuwax-core",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
- "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
 ]
@@ -1813,6 +1821,7 @@ dependencies = [
  "nuwax-nav-runtime",
  "nuwax-nav-simple-planner",
  "nuwax-nav-terrain-map-ext",
+ "nuwax-nav-test-fixtures",
  "nuwax-nav-types-messages",
  "nuwax-nav-visual-query",
  "nuwax-nav-visual-servoing",
@@ -1894,6 +1903,7 @@ dependencies = [
  "nuwax-codec",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
+ "nuwax-nav-visual-query",
  "nuwax-numeric",
  "nuwax-protocol",
  "nuwax-tf",

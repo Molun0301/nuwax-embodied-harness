@@ -9,6 +9,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Auditable standalone visibility-graph fallback core.
+pub mod core;
 pub mod spec;
 
 pub use spec::{

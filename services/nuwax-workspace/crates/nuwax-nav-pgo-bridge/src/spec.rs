@@ -133,8 +133,8 @@ pub struct PgoBridgeConfig {
 impl Default for PgoBridgeConfig {
     fn default() -> Self {
         Self {
-            executable: PathBuf::from("result/bin/pgo"),
-            cwd: Some(PathBuf::from("cpp")),
+            executable: crate::native_executable(),
+            cwd: None,
             env: BTreeMap::new(),
             build_command: None,
             restart_policy: PgoRestartPolicy::Never,

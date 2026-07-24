@@ -47,6 +47,8 @@ use crate::sequence_state::{sequence_state_path_from_env, SequenceStateStore};
 
 const MAP_FANOUT_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 const EXPLORATION_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const GLOBAL_MAP_CHANNEL: &str = "/global_map";
+const POINT_CLOUD2_MESSAGE_TYPE: &str = "sensor_msgs.PointCloud2";
 
 // Phase 4 (channel registry) + Phase 7 (readiness cache): 统一在这里导入,
 // 避免每个函数 body 内部重复 `use crate::channel_registry::...`。
@@ -60,17 +62,37 @@ use crate::channel_registry::ChannelKey;
 // 状态定义
 // ============================================================================
 
-/// Phase 1 fail-fast 错误：上游 dimos `nuwax-lcm-sys`/`nuwax-lcm` 尚不存在
-///（`nuwax-transport/real-lcm` feature 仍为空桩），所以 `real-lcm` backend
-/// 启动期直接拒绝且不做降级。错误码 `LCM_BACKEND_UNAVAILABLE`
-/// 必须在 stderr 中可见供 start 脚本与运维 grep 识别。
-#[derive(Debug, Error)]
-#[error(
-    "LCM_BACKEND_UNAVAILABLE: NUWAX_LCM_BACKEND=real-lcm 不可用 —— 上游 dimos \
-     nuwax-transport/real-lcm feature 仍为空桩 (Rust LCM binding 未实装 + \
-     fingerprint 未切 MurmurHash64A)。详见 feedback_phase1.md。"
-)]
-pub struct RealLcmBackendUnavailable;
+/// Geometry runtime 启动失败。保留稳定错误码供启动脚本识别，同时携带
+/// transport、持久化或配置阶段的真实失败原因，避免把所有错误误报为缺 liblcm。
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("LCM_BACKEND_UNAVAILABLE: category={category}: {detail}")]
+pub struct RealLcmBackendUnavailable {
+    category: &'static str,
+    detail: String,
+}
+
+impl RealLcmBackendUnavailable {
+    fn transport(detail: impl Into<String>) -> Self {
+        Self {
+            category: "transport",
+            detail: detail.into(),
+        }
+    }
+
+    fn persistence(detail: impl Into<String>) -> Self {
+        Self {
+            category: "persistence",
+            detail: detail.into(),
+        }
+    }
+
+    fn configuration(detail: impl Into<String>) -> Self {
+        Self {
+            category: "configuration",
+            detail: detail.into(),
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct PoseState {
@@ -1527,7 +1549,8 @@ pub(crate) struct LcmBackendUnsupported {
 
 /// 读 `NUWAX_REAL_LCM_REQUIRED`：true/false/1/0/yes/no/on/off (大小写不敏感)。
 ///
-/// - `true` + liblcm 不可用 → 启动期进程直接 exit 1 + `LCM_BACKEND_UNAVAILABLE`。
+/// - `true` + liblcm 不可用 → 返回带原始原因的 `LCM_BACKEND_UNAVAILABLE`，
+///   由二进制入口统一决定退出码。
 /// - `true` + liblcm OK → 启动 real-lcm backend 正常。
 /// - 默认 false；与 `core/settings.py::REAL_LCM_REQUIRED` 语义保持对齐。
 pub fn real_lcm_required_from_env() -> bool {
@@ -1540,7 +1563,7 @@ pub fn real_lcm_required_from_env() -> bool {
 
 /// `LcmTransport::new_real` 的启动结果分类。
 ///
-/// `NUWAX_REAL_LCM_REQUIRED` 只决定创建失败后的退出策略，不能跳过真实 backend
+/// `NUWAX_REAL_LCM_REQUIRED` 只分类创建失败，不能跳过真实 backend
 /// 的创建尝试。将这一步保留为纯逻辑，既避免 required=true 被误写成前置退出，
 /// 也便于在不终止测试进程的情况下锁定生产启动语义。
 #[derive(Debug, PartialEq, Eq)]
@@ -2647,8 +2670,7 @@ fn spawn_frontier_fanout(
 ///
 /// backend 固定为 `LcmBackendKind::Real`。启动期调用
 /// `LcmTransport::new_real(&lcm_url)`；若 liblcm 不可用或启动失败，
-/// → fail-fast 返回 [`RealLcmBackendUnavailable`] 或 `process::exit(1)`
-/// （当 `NUWAX_REAL_LCM_REQUIRED=true` 时）。
+/// → fail-fast 返回 [`RealLcmBackendUnavailable`]；二进制入口统一输出错误并退出。
 ///
 /// # Args
 ///
@@ -2678,7 +2700,10 @@ pub fn spawn_geometry_runtime(
         Ok(store) => Arc::new(store),
         Err(error) => {
             error!(path = %sequence_state_path.display(), %error, "geometry sequence state startup failed closed");
-            return Err(RealLcmBackendUnavailable);
+            return Err(RealLcmBackendUnavailable::persistence(format!(
+                "geometry sequence state startup failed closed: path={} error={error}",
+                sequence_state_path.display()
+            )));
         }
     };
     let state = Arc::new(RwLock::new(SharedState::default()));
@@ -2688,7 +2713,10 @@ pub fn spawn_geometry_runtime(
         Ok(runtime) => runtime,
         Err(error) => {
             error!(path = %sequence_state_path.display(), %error, "GoalEnvelope producer epoch reservation failed closed");
-            return Err(RealLcmBackendUnavailable);
+            return Err(RealLcmBackendUnavailable::persistence(format!(
+                "GoalEnvelope producer epoch reservation failed closed: path={} error={error}",
+                sequence_state_path.display()
+            )));
         }
     };
     let explore_runtime = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
@@ -2697,11 +2725,14 @@ pub fn spawn_geometry_runtime(
             reason = error.message(),
             "exploration ownership journal startup recovery failed closed"
         );
-        return Err(RealLcmBackendUnavailable);
+        return Err(RealLcmBackendUnavailable::persistence(format!(
+            "exploration ownership journal startup recovery failed closed: {}",
+            error.message()
+        )));
     }
     let runtime_observation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // 按 NUWAX_LCM_BACKEND 选择真实 backend。强制模式下启动失败直接退出。
+    // 按 NUWAX_LCM_BACKEND 选择真实 backend。启动失败统一返回给 binary 入口分类退出。
     let real_lcm_required = real_lcm_required_from_env();
     let (transport, backend_available): (LcmTransport, bool) = {
         let lcm_url = std::env::var("NUWAX_LCM_URL")
@@ -2718,31 +2749,25 @@ pub fn spawn_geometry_runtime(
                     (t, true)
                 }
                 Err(RealLcmStartupError::Required(e)) => {
-                    eprintln!(
-                        "LCM_BACKEND_UNAVAILABLE: LcmTransport::new_real({}) 失败: {} \
-                         —— NUWAX_REAL_LCM_REQUIRED=true，按生产意图立即硬退出 \
-                         (exit code = 1)。请确认 liblcm-dev 已安装 \
-                         (apt-get install liblcm-dev) 且 provider URL 合法。",
-                        lcm_url, e
-                    );
-                    std::process::exit(1);
+                    return Err(RealLcmBackendUnavailable::transport(format!(
+                        "LcmTransport::new_real({lcm_url}) failed while \
+                         NUWAX_REAL_LCM_REQUIRED=true: {e}"
+                    )));
                 }
                 Err(RealLcmStartupError::Optional(e)) => {
-                    // 不允许降级，直接 fail-fast。
-                    eprintln!(
-                        "LCM_BACKEND_UNAVAILABLE: LcmTransport::new_real({}) 失败: {} \
-                         —— 请确认 liblcm-dev 已安装 (apt-get install liblcm-dev) \
-                         且 provider URL 合法。",
-                        lcm_url, e
-                    );
-                    return Err(RealLcmBackendUnavailable);
+                    // 不允许降级；把 transport 的原始错误交给二进制入口输出。
+                    return Err(RealLcmBackendUnavailable::transport(format!(
+                        "LcmTransport::new_real({lcm_url}) failed: {e}"
+                    )));
                 }
             }
         }
         #[cfg(not(feature = "real-lcm-bridge"))]
         {
             let _ = lcm_url;
-            return Err(RealLcmBackendUnavailable);
+            return Err(RealLcmBackendUnavailable::transport(
+                "binary built without real-lcm-bridge feature",
+            ));
         }
     };
     info!(
@@ -2762,7 +2787,9 @@ pub fn spawn_geometry_runtime(
             Ok(binding) => binding,
             Err(e) => {
                 error!("lcm_runtime::spawn: occupancy channel 解析失败: {}", e);
-                return Err(RealLcmBackendUnavailable);
+                return Err(RealLcmBackendUnavailable::configuration(format!(
+                    "occupancy channel binding rejected: {e}"
+                )));
             }
         };
     let (tf_topic, tf_msg_type) =
@@ -2770,7 +2797,9 @@ pub fn spawn_geometry_runtime(
             Ok(binding) => binding,
             Err(e) => {
                 error!("lcm_runtime::spawn: tf channel 解析失败: {}", e);
-                return Err(RealLcmBackendUnavailable);
+                return Err(RealLcmBackendUnavailable::configuration(format!(
+                    "tf channel binding rejected: {e}"
+                )));
             }
         };
     // Legacy `/cloud_map` is diagnostics-only. MappingSession is the sole
@@ -2832,13 +2861,17 @@ pub fn spawn_geometry_runtime(
     };
     if let Err(error) = crate::nav_runtime::goal_envelope_binding() {
         error!(%error, "versioned goal channel binding rejected");
-        return Err(RealLcmBackendUnavailable);
+        return Err(RealLcmBackendUnavailable::configuration(format!(
+            "versioned goal channel binding rejected: {error}"
+        )));
     }
     let path_binding = match crate::nav_runtime::path_envelope_binding() {
         Ok(binding) => binding,
         Err(error) => {
             error!(%error, "versioned path channel binding rejected");
-            return Err(RealLcmBackendUnavailable);
+            return Err(RealLcmBackendUnavailable::configuration(format!(
+                "versioned path channel binding rejected: {error}"
+            )));
         }
     };
     // Phase 1:打印 channel registry 让运维和 healthcheck 都能看到本进程
@@ -2911,7 +2944,9 @@ pub fn spawn_geometry_runtime(
     );
     if validated_frame_tokens(&base_frame).is_none() {
         error!(frame = %base_frame, "configured base frame is not a valid frame ID");
-        return Err(RealLcmBackendUnavailable);
+        return Err(RealLcmBackendUnavailable::configuration(format!(
+            "configured base frame is not a valid frame ID: {base_frame}"
+        )));
     }
     let base_candidates = vec![base_frame.clone()];
 
@@ -3260,6 +3295,13 @@ struct MappingIngestOutcome {
     accepted_map_points: Vec<nalgebra::Point3<f64>>,
     occupancy_committed: bool,
     session_generation: u64,
+    source_timestamp_ns: u64,
+}
+
+struct CommittedMappingCloudMap {
+    notification: CloudMapNotification,
+    source_timestamp_ns: u64,
+    xyz_f32_le: Vec<u8>,
 }
 
 fn ingest_mapping_points(
@@ -3286,6 +3328,7 @@ fn ingest_mapping_points(
             accepted_map_points: Vec::new(),
             occupancy_committed: false,
             session_generation: adapter.snapshot().session_generation,
+            source_timestamp_ns,
         });
     }
     let accepted_map_points = adapter.take_latest_accepted_map_points();
@@ -3295,6 +3338,7 @@ fn ingest_mapping_points(
         accepted_map_points,
         occupancy_committed,
         session_generation,
+        source_timestamp_ns,
     })
 }
 
@@ -3302,7 +3346,7 @@ fn update_mapping_cloud_map_if_current(
     outcome: &MappingIngestOutcome,
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
-) -> Option<CloudMapNotification> {
+) -> Option<CommittedMappingCloudMap> {
     if !current_session.active || current_session.session_generation != outcome.session_generation {
         return None;
     }
@@ -3315,13 +3359,44 @@ fn update_mapping_cloud_map_if_current(
     {
         return None;
     }
-    let (revision, point_count, voxel_size) = writer.commit_accumulated()?;
-    Some(CloudMapNotification {
-        revision,
-        point_count,
-        voxel_size,
-        session_generation: outcome.session_generation,
+    let committed = writer.commit_accumulated_snapshot()?;
+    Some(CommittedMappingCloudMap {
+        notification: CloudMapNotification {
+            revision: committed.revision,
+            point_count: committed.point_count,
+            voxel_size: committed.voxel_size,
+            session_generation: outcome.session_generation,
+        },
+        source_timestamp_ns: outcome.source_timestamp_ns,
+        xyz_f32_le: committed.xyz_f32_le,
     })
+}
+
+async fn publish_committed_global_map(
+    transport: &LcmTransport,
+    committed: &CommittedMappingCloudMap,
+) -> Result<(), String> {
+    let payload = crate::typed_codec::encode_global_map_pointcloud_payload(
+        &committed.xyz_f32_le,
+        committed.notification.revision,
+        committed.source_timestamp_ns,
+    )
+    .map_err(|error| format!("global-map PointCloud2 encode failed: {error}"))?;
+    let topic = LcmTopic::new(GLOBAL_MAP_CHANNEL)
+        .map_err(|error| format!("canonical global-map topic invalid: {error}"))?;
+    let message_type = LcmMessageType::new(POINT_CLOUD2_MESSAGE_TYPE)
+        .map_err(|error| format!("canonical PointCloud2 type invalid: {error}"))?;
+    let frame = crate::typed_codec::build_typed_frame(
+        topic,
+        message_type,
+        payload,
+        committed.notification.revision,
+    );
+    match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, transport.publish(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("global-map typed publish failed: {error}")),
+        Err(_) => Err("global-map typed publish timed out".to_string()),
+    }
 }
 
 fn mapping_feed_should_wait_for_active_session(
@@ -3528,13 +3603,24 @@ fn spawn_mapping_feed_tasks(
                 Ok(outcome) => {
                     let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
                     let current_session = mapping_lidar.lock().snapshot();
-                    let Some(update) = update_mapping_cloud_map_if_current(
+                    let Some(committed) = update_mapping_cloud_map_if_current(
                         &outcome,
                         &current_session,
                         &cloud_map_writer,
                     ) else {
                         continue;
                     };
+                    if let Err(error) =
+                        publish_committed_global_map(&transport_lidar, &committed).await
+                    {
+                        warn!(
+                            %error,
+                            revision = committed.notification.revision,
+                            session_generation = committed.notification.session_generation,
+                            "committed cloud-map revision was not delivered to typed /global_map"
+                        );
+                    }
+                    let update = committed.notification;
                     {
                         let mut shared = state_lidar.write().await;
                         shared.cloud_map_revision = update.revision;
@@ -4012,11 +4098,128 @@ mod mapping_feed_tests {
         let current_session = adapter.snapshot();
         let update = update_mapping_cloud_map_if_current(&outcome, &current_session, &writer)
             .expect("cloud map update from mapping session");
-        assert_eq!(update.revision, 1);
-        assert_eq!(update.point_count, 2);
+        assert_eq!(update.notification.revision, 1);
+        assert_eq!(update.notification.point_count, 2);
+        assert_eq!(update.source_timestamp_ns, 1_234_567_890_123_456_789);
+        assert_eq!(update.xyz_f32_le.len(), 24);
         let mut stale_session = current_session;
         stale_session.session_generation += 1;
         assert!(update_mapping_cloud_map_if_current(&outcome, &stale_session, &writer).is_none());
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn committed_cumulative_map_reaches_person_follow_decoder_once_per_revision() {
+        use nuwax_nav_visual_servoing::person_follow::PackedPointCloud;
+
+        let mut adapter = active_mapping_adapter();
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (map_revision_tx, _) = broadcast::channel(4);
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-global-map-lcm-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/odom").expect("dummy odom topic"),
+        );
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+
+        for (index, point) in [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 2.0, 3.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let timestamp_ns = 1_700_000_000_000_000_000 + index as u64 * 3_000_000_000;
+            let outcome = ingest_mapping_points(
+                &mut adapter,
+                &[point],
+                12,
+                timestamp_ns,
+                "map",
+                timestamp_ns,
+                &state,
+                &map_revision_tx,
+            )
+            .expect("accepted canonical map frame");
+            assert!(outcome.occupancy_committed);
+            let committed =
+                update_mapping_cloud_map_if_current(&outcome, &adapter.snapshot(), &writer)
+                    .expect("committed cumulative cloud map");
+            publish_committed_global_map(&transport, &committed)
+                .await
+                .expect("typed global-map publish");
+        }
+
+        let published = backend.published.lock().expect("published frames").clone();
+        assert_eq!(published.len(), 2, "one typed frame per committed revision");
+        let latest = published.last().expect("latest global-map frame");
+        assert_eq!(latest.topic.channel(), GLOBAL_MAP_CHANNEL);
+        assert_eq!(latest.msg_type.fqn(), POINT_CLOUD2_MESSAGE_TYPE);
+        assert_eq!(latest.header.seqno, 2);
+        let mut encoded = Vec::with_capacity(8 + latest.payload.len());
+        encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
+        encoded.extend_from_slice(&latest.payload);
+        let cloud = schema::decode_point_cloud2(&encoded).expect("typed PointCloud2 body");
+        assert_eq!(cloud.header.frame_id, "map");
+        assert_eq!(cloud.header.seq, 2);
+        assert_eq!(
+            cloud.width, 2,
+            "second revision is cumulative, not latest-only"
+        );
+        assert_eq!(cloud.point_step, 12);
+        assert_eq!(cloud.row_step, 24);
+        let decoded =
+            PackedPointCloud::from_lcm(&cloud).expect("person-follow decoder accepts map");
+        assert_eq!(decoded.frame_id(), "map");
+        assert_eq!(decoded.xyz().len(), 2);
+
+        let replay_timestamp = 1_700_000_003_000_000_000;
+        let replay = ingest_mapping_points(
+            &mut adapter,
+            &[Point3::new(1.0, 2.0, 3.0)],
+            12,
+            replay_timestamp + 1,
+            "map",
+            replay_timestamp,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("dedup replay is a non-error rejection");
+        assert!(replay.accepted_map_points.is_empty());
+        assert!(
+            update_mapping_cloud_map_if_current(&replay, &adapter.snapshot(), &writer).is_none()
+        );
+
+        let pending = ingest_mapping_points(
+            &mut adapter,
+            &[Point3::new(4.0, 5.0, 6.0)],
+            12,
+            replay_timestamp + 3_000_000_000,
+            "map",
+            replay_timestamp + 3_000_000_000,
+            &state,
+            &map_revision_tx,
+        )
+        .expect("accepted before stop");
+        adapter
+            .stop_session("test-session")
+            .expect("stop active session");
+        assert!(
+            update_mapping_cloud_map_if_current(&pending, &adapter.snapshot(), &writer).is_none()
+        );
+        assert_eq!(
+            backend.published_count(),
+            2,
+            "replayed/stopped frames publish nothing"
+        );
+
         drop(writer);
         let _ = std::fs::remove_file(path);
     }
@@ -5695,7 +5898,7 @@ mod real_lcm_startup_tests {
     }
 
     #[test]
-    fn required_backend_classifies_actual_creation_failure_for_hard_exit() {
+    fn required_backend_classifies_actual_creation_failure_for_main() {
         let result = attempt_real_lcm_startup(true, || Err::<(), _>("liblcm unavailable"));
 
         assert_eq!(

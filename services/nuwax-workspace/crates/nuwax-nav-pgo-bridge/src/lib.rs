@@ -1,11 +1,10 @@
-//! PGO (Pose Graph Optimization) C++ native bridge
+//! PGO (Pose Graph Optimization) C++ core and native bridge.
 //!
-//! 仅包装 `result/bin/pgo` 进程，不重写 GTSAM iSAM2 / PCL ICP 算法。
-//! 端口表按方案 §4.5：In `registered_scan`/`odometry`，Out `corrected_odometry`/`global_map`/`pgo_tf`。
-//!
-//! **Rust 额外行为**：本 crate 订阅 `pgo_tf`，并通过 `nuwax-tf` 发布 map->odom 变换。
-//! 转换逻辑独立为 [`tf_helper::odometry_to_transform_stamped`] 与 [`tf_helper::apply_pgo_tf_to_tree`]，
-//! 不藏在 runner 内，可以独立单元测试。
+//! `native/pgo` contains the migrated source responsibility and builds a real weighted
+//! pose-graph optimizer. The executable exposes a deterministic batch contract for
+//! verification and a signal-aware lifecycle mode for the runner. It deliberately does
+//! not publish canonical map-to-odom corrections: runtime arbitration remains external,
+//! so this optional core cannot double-write TF with the Rust mapping PGO owner.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -27,6 +26,12 @@ use std::time::Duration;
 use nuwax_nav_base::error::NavResult;
 use nuwax_nav_base::native::NativeProcessDiagnostics;
 use nuwax_nav_native_runner::{NativeBuildPolicy, NativeBuildSpec, NativeRunner};
+
+/// Return the CMake-built native PGO artifact embedded in this crate build.
+#[must_use]
+pub fn native_executable() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("NUWAX_PGO_NATIVE_BIN"))
+}
 
 /// PGO bridge 错误。
 #[derive(Debug, thiserror::Error)]

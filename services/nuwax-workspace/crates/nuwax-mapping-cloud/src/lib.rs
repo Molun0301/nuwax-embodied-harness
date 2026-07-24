@@ -23,12 +23,19 @@ use thiserror::Error;
 #[cfg(feature = "cloud-enabled")]
 pub mod coords;
 #[cfg(feature = "cloud-enabled")]
+pub mod current_location;
+#[cfg(feature = "cloud-enabled")]
 pub mod google_maps;
 #[cfg(feature = "cloud-enabled")]
 pub mod osm;
 
 #[cfg(feature = "cloud-enabled")]
 pub use coords::{web_mercator_to_wgs84, wgs84_to_tile, wgs84_to_web_mercator};
+#[cfg(feature = "cloud-enabled")]
+pub use current_location::{
+    CurrentLocationConfig, CurrentLocationMap, MapImage, MapImageQuery, MapPixelMatch,
+    MapPositionMatch,
+};
 #[cfg(feature = "cloud-enabled")]
 pub use google_maps::{
     geocode, places_nearby, CloudError, CloudMode, GeocodeComponents, GeocodeResult,

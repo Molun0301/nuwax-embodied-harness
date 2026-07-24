@@ -1,12 +1,15 @@
 //! Production module ports, transport fanout, lifecycle ownership, and introspection.
 
 use crate::{Module, ModuleError, ModuleResult};
+use futures::FutureExt;
 use std::any::{type_name, Any, TypeId};
 use std::collections::{BTreeMap, HashMap};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
 
 type PortCallback<T> = Arc<dyn Fn(T) + Send + Sync + 'static>;
 
@@ -827,6 +830,134 @@ pub struct ManagedModule<M: Module> {
     bindings: Mutex<Vec<StopHandle>>,
 }
 
+/// Owned async dispatcher implementing Dimos' per-handler LATEST backpressure policy.
+///
+/// Handler calls are serialized. While one call is running, intermediate queued values
+/// are overwritten and only the most recent pending value is processed next. Dropping
+/// or shutting down the dispatcher cancels its owned task.
+pub struct LatestDispatcher<T> {
+    values: watch::Sender<Option<T>>,
+    cancel: watch::Sender<bool>,
+    task: Mutex<Option<JoinHandle<ModuleResult<()>>>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl<T> LatestDispatcher<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    /// Spawns one owned dispatcher task on the current Tokio runtime.
+    #[must_use]
+    pub fn spawn<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ModuleResult<()>> + Send + 'static,
+    {
+        let (values, mut value_rx) = watch::channel(None);
+        let (cancel, mut cancel_rx) = watch::channel(false);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_task = Arc::clone(&stopped);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow() {
+                            break;
+                        }
+                    }
+                    changed = value_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let Some(value) = value_rx.borrow_and_update().clone() else {
+                            continue;
+                        };
+                        let handler_future = match catch_unwind(AssertUnwindSafe(|| handler(value))) {
+                            Ok(future) => future,
+                            Err(_) => {
+                                stopped_task.store(true, Ordering::Release);
+                                return Err(ModuleError::Other("dispatcher handler panicked".into()));
+                            }
+                        };
+                        let result = tokio::select! {
+                            changed = cancel_rx.changed() => {
+                                if changed.is_err() || *cancel_rx.borrow() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            result = AssertUnwindSafe(handler_future).catch_unwind() => result,
+                        };
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                stopped_task.store(true, Ordering::Release);
+                                return Err(error);
+                            }
+                            Err(_) => {
+                                stopped_task.store(true, Ordering::Release);
+                                return Err(ModuleError::Other("dispatcher handler panicked".into()));
+                            }
+                        }
+                    }
+                }
+            }
+            stopped_task.store(true, Ordering::Release);
+            Ok(())
+        });
+        Self {
+            values,
+            cancel,
+            task: Mutex::new(Some(task)),
+            stopped,
+        }
+    }
+
+    /// Schedules a value, replacing any pending unprocessed value.
+    ///
+    /// # Errors
+    /// Returns `AlreadyStopped` after shutdown or handler failure.
+    pub fn dispatch(&self, value: T) -> ModuleResult<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(ModuleError::AlreadyStopped);
+        }
+        self.values.send_replace(Some(value));
+        Ok(())
+    }
+
+    /// Returns whether shutdown or a handler failure has stopped the task.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Cancels any in-flight handler and joins the owned task.
+    ///
+    /// Handler errors are returned to the lifecycle owner instead of being detached.
+    /// Repeated calls after a successful join are no-ops.
+    pub async fn shutdown(&self) -> ModuleResult<()> {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.cancel.send(true);
+        let task = lock_unpoisoned(&self.task).take();
+        match task {
+            Some(task) => task
+                .await
+                .map_err(|error| ModuleError::Other(format!("dispatcher task failed: {error}")))?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T> Drop for LatestDispatcher<T> {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.cancel.send(true);
+        if let Some(task) = lock_unpoisoned(&self.task).take() {
+            task.abort();
+        }
+    }
+}
+
 impl<M: Module> ManagedModule<M> {
     /// Construct a managed module from an implementation and its registered ports.
     #[must_use]
@@ -979,4 +1110,35 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn latest_dispatcher_stops_after_handler_panic() {
+        let dispatcher = LatestDispatcher::spawn(|_: u32| async {
+            panic!("handler panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        dispatcher.dispatch(1).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dispatcher.is_stopped() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            dispatcher.dispatch(2),
+            Err(ModuleError::AlreadyStopped)
+        ));
+        assert!(matches!(
+            dispatcher.shutdown().await,
+            Err(ModuleError::Other(message)) if message == "dispatcher handler panicked"
+        ));
+    }
 }

@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 pub mod diagnostics;
+pub mod dimos;
 pub mod frames;
 pub mod geometry;
 pub mod goal;
@@ -33,6 +34,7 @@ pub mod sensors;
 pub mod visual;
 
 pub use diagnostics::*;
+pub use dimos::*;
 pub use frames::*;
 pub use geometry::*;
 pub use goal::*;

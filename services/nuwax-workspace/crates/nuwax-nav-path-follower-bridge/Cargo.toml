@@ -21,3 +21,7 @@ pretty_assertions = { workspace = true }
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
 tokio = { workspace = true }
+
+[[bin]]
+name = "nuwax-path-follower-core"
+path = "src/bin/nuwax-path-follower-core.rs"

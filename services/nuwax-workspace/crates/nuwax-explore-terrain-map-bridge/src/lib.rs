@@ -9,9 +9,12 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod adapter;
 mod profile;
 
+pub use adapter::ExplorationTerrainMapAdapter;
 pub use nuwax_nav_terrain_map_ext::{
-    PointCloud, TerrainMapExtConfig, TerrainMapExtProcessor, TimedPointCloud,
+    Odometry, Point3, PointCloud, TerrainMapExtConfig, TerrainMapExtProcessor, TimedPointCloud,
+    Timestamp,
 };
 pub use profile::ExplorationTerrainMapExtProfile;

@@ -27,6 +27,7 @@ members = [
     "crates/nuwax-mapping",
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",
+    "crates/nuwax-lio-backends",
     # nuwax-mapping-raytracing: 源码已从原 dimos-voxel-ray-tracing 1:1 迁移
     # （2066 行 4 文件）。v4 评审后将 main.rs / python.rs 移至 migration/ 作为
     # 阶段 0 资产（dimos-module / lcm-msgs / pyo3 / numpy 上游 crate 适配 shim 完成后回拷启用），

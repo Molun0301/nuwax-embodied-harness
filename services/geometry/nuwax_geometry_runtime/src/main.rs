@@ -330,14 +330,10 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind) -> ExitCode {
     ) {
         Ok(b) => b,
         Err(e) => {
-            // real-lcm 启动失败时直接 fail-fast(exit code = 4)。
-            // 错误信息在 stderr 输出 "LCM_BACKEND_UNAVAILABLE" 关键字,
-            // 供 start 脚本与 smoke test grep 识别。
+            // 启动失败时直接 fail-fast(exit code = 4)。错误保留稳定关键字，
+            // 同时携带 transport、持久化或配置阶段的真实原因。
             error!("{}", e);
-            eprintln!(
-                "LCM_BACKEND_UNAVAILABLE: real-lcm backend requested but liblcm 1.3~1.5 \
-                       missing (apt-get install liblcm-dev). Process will exit."
-            );
+            eprintln!("{e}");
             return ExitCode::from(4);
         }
     };

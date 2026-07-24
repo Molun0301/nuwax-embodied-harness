@@ -1186,6 +1186,7 @@ dependencies = [
  "nuwax-nav-stack",
  "nuwax-nav-terrain-map-ext",
  "nuwax-nav-types-messages",
+ "nuwax-nav-visual-servoing",
  "nuwax-protocol",
  "nuwax-rpc",
  "nuwax-tf",
@@ -1388,6 +1389,32 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "nuwax-nav-visual-query"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-numeric",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "nuwax-nav-visual-servoing"
+version = "0.1.0"
+dependencies = [
+ "nuwax-codec",
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-nav-visual-query",
+ "nuwax-numeric",
+ "nuwax-tf",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

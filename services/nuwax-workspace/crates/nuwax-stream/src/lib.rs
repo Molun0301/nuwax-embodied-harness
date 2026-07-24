@@ -289,18 +289,15 @@ impl<T: Clone + Send + 'static> Subject<T> {
     /// 向所有订阅者推送一条消息(对应 RxPy `on_next`)
     ///
     /// # Errors
-    /// - 当无活跃订阅者时返回 `StreamError::NoSubscribers`
     /// - 当 subject 已 Completed/Error 时返回 `StreamError::Terminated`
     pub fn push(&self, value: T) -> Result<(), StreamError> {
         let terminal = lock_unpoisoned(&self.inner.terminal);
         if terminal.is_some() {
             return Err(StreamError::Terminated);
         }
-        self.inner
-            .tx
-            .send(SubjectSignal::Next(value))
-            .map(|_| ())
-            .map_err(|_| StreamError::NoSubscribers)
+        // Rx Subject treats on_next without observers as a successful no-op.
+        let _ = self.inner.tx.send(SubjectSignal::Next(value));
+        Ok(())
     }
 
     /// 订阅 —— 返回 `Stream<Item = T>`
@@ -335,7 +332,7 @@ impl<T: Clone + Send + 'static> Subject<T> {
     /// `Subject::connect` 内部使用 —— 直接向底 `broadcast::Sender` 推一条
     ///
     /// # Errors
-    /// 当无活跃订阅者时返回 `StreamError::NoSubscribers`
+    /// 当 subject 已终止时返回 `StreamError::Terminated`。
     pub(crate) fn push_internal(&self, value: T) -> Result<(), StreamError> {
         self.push(value)
     }
@@ -447,7 +444,7 @@ impl<U: Clone + Send + 'static> Subject<SubjectEvent<U>> {
     /// 推送一个 `Next` 事件
     ///
     /// # Errors
-    /// 当无活跃订阅者或 subject 已终止时返回错误。
+    /// 当 subject 已终止时返回 `StreamError::Terminated`。
     pub fn push_next(&self, value: U) -> Result<(), StreamError> {
         self.push(SubjectEvent::Next(value))
     }
@@ -568,9 +565,6 @@ impl<T: Clone + Send + 'static> std::ops::Deref for ConnectedSubject<T> {
 /// 流错误
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamError {
-    /// 无活跃订阅者
-    #[error("no active subscribers")]
-    NoSubscribers,
     /// 上游抛错(对应 RxPy `on_error`)
     #[error("upstream error: {0}")]
     Upstream(String),
@@ -670,9 +664,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subject_no_subscribers() {
+    async fn subject_without_subscribers_is_a_successful_noop() {
         let subject = Subject::<u32>::new(16);
-        assert!(subject.push(1).is_err());
+        assert_eq!(subject.push(1), Ok(()));
     }
 
     #[test]

@@ -72,6 +72,15 @@ pub struct CloudMapShmWriter {
     max_points: usize,
 }
 
+/// One successfully committed cumulative cloud-map revision and the exact
+/// canonical map-frame voxel snapshot available to typed transport sinks.
+pub(crate) struct CommittedCloudMapSnapshot {
+    pub revision: u64,
+    pub point_count: u32,
+    pub voxel_size: f32,
+    pub xyz_f32_le: Vec<u8>,
+}
+
 impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -138,6 +147,27 @@ impl CloudMapShmWriter {
     /// updates between map revisions.
     pub fn commit_accumulated(&mut self) -> Option<(u64, u32, f32)> {
         self.publish_snapshot(false)
+    }
+
+    /// Commit the cumulative voxel map and expose a deterministic packed XYZ
+    /// snapshot for the corresponding typed `/global_map` publication.
+    pub(crate) fn commit_accumulated_snapshot(&mut self) -> Option<CommittedCloudMapSnapshot> {
+        let (revision, point_count, voxel_size) = self.commit_accumulated()?;
+        let mut keys = self.voxels.iter().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut xyz_f32_le = Vec::with_capacity(keys.len() * CM_POINT_SIZE_BYTES);
+        for key in keys {
+            for coordinate in voxel_center_f32(key, voxel_size) {
+                xyz_f32_le.extend_from_slice(&coordinate.to_le_bytes());
+            }
+        }
+        debug_assert_eq!(xyz_f32_le.len() / CM_POINT_SIZE_BYTES, point_count as usize);
+        Some(CommittedCloudMapSnapshot {
+            revision,
+            point_count,
+            voxel_size,
+            xyz_f32_le,
+        })
     }
 
     /// Fence a newly started mapping session from the prior session's 3D map.

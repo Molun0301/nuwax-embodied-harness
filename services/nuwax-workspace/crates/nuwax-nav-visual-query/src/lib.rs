@@ -12,6 +12,13 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Production perception worker configuration and preflight.
+pub mod perception;
+/// Stateful visual-query session lifecycle.
+pub mod session;
+/// Configurable local-process model backend.
+pub mod subprocess;
+
 // Foundation 协议面：BoundingBox2D / ImageEncoding 等强类型
 pub use nuwax_nav_types_messages::BoundingBox2D;
 pub use nuwax_nav_types_messages::ImageEncoding;

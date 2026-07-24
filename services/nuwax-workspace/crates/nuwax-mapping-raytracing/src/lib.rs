@@ -14,4 +14,7 @@
 //!
 //! 后续启用方式见 `Cargo.toml` features 段注释。
 
+pub mod binding;
+pub mod debug;
+pub mod transformer;
 pub mod voxel_ray_tracer;

@@ -65,6 +65,9 @@ async-trait = "0.1"
 # `nuwax-mapping::OccupancyGrid.origin` (nalgebra::Isometry3) 跨 crate 类型错配。
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 
+[dev-dependencies]
+nuwax-nav-visual-servoing = { path = "../../nuwax-workspace/crates/nuwax-nav-visual-servoing" }
+
 # Phase 4 `[features]`(2026-07-07 codex rework lane-2):
 #   - `real-lcm-bridge`: runtime binary 的二次断言开关,
 #     当显式传 `--features real-lcm-bridge` 时,

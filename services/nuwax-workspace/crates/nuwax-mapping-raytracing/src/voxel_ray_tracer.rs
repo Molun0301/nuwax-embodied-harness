@@ -5,18 +5,27 @@ use ahash::{AHashMap, AHashSet};
 use arrayvec::ArrayVec;
 use nalgebra::{Matrix3, Vector3};
 use rayon::prelude::*;
+use thiserror::Error;
 use validator::{Validate, ValidationError};
 
 pub type VoxelKey = (i32, i32, i32);
 pub type VoxelHealth = i32;
 
+/// Smallest supported voxel edge. Finer grids make otherwise small rays
+/// unreasonably expensive and exceed the precision useful to this `f32` map.
+pub const MIN_VOXEL_SIZE_METERS: f32 = 0.001;
+/// Deterministic upper bound for one 3-D DDA traversal.
+pub const MAX_STEPS_PER_RAY: u64 = 200_000;
+/// Deterministic upper bound for all DDA traversals in one JSON request.
+pub const MAX_REQUEST_RAY_STEPS: u64 = 50_000_000;
+
 #[derive(Validate)]
-#[validate(schema(function = "validate_health_range"))]
+#[validate(schema(function = "validate_config_limits"))]
 // 注：原 `dimos_module::native_config` 过程宏在 1:1 源码中存在，它为 `dimos-module` 框架
 // 提供运行时反射支持。本 crate 作为 nuwax standalone 库不需要该反射元数据，
 // 因此移除该属性（功能等价于"无反射元数据"）。阶段 0 完成兼容 shim 后可重新引入。
 pub struct Config {
-    #[validate(range(exclusive_min = 0.0))]
+    #[validate(range(min = 0.001))]
     pub voxel_size: f32,
     #[validate(range(min = 0.0))]
     pub max_range: f32,
@@ -48,11 +57,47 @@ pub struct Config {
     pub region_percentile: f32,
 }
 
-fn validate_health_range(cfg: &Config) -> Result<(), ValidationError> {
+fn validate_config_limits(cfg: &Config) -> Result<(), ValidationError> {
     if cfg.min_health >= cfg.max_health {
         return Err(ValidationError::new("min_health_lt_max_health"));
     }
+    if cfg.max_range > 0.0
+        && conservative_ray_step_bound(
+            f64::from(cfg.max_range),
+            f64::from(cfg.shadow_depth),
+            f64::from(cfg.voxel_size),
+        )
+        .is_none_or(|steps| steps > MAX_STEPS_PER_RAY)
+    {
+        return Err(ValidationError::new("ray_step_budget"));
+    }
     Ok(())
+}
+
+/// Conservative number of voxel crossings for a ray of `range_m`, including
+/// its shadow extension. The `sqrt(3)` factor bounds the L1 displacement after
+/// any rigid rotation, while DDA advances at most one axis per iteration.
+pub fn conservative_ray_step_bound(
+    range_m: f64,
+    shadow_depth: f64,
+    voxel_size: f64,
+) -> Option<u64> {
+    if !range_m.is_finite()
+        || !shadow_depth.is_finite()
+        || !voxel_size.is_finite()
+        || range_m < 0.0
+        || shadow_depth < 0.0
+        || voxel_size < f64::from(MIN_VOXEL_SIZE_METERS)
+    {
+        return None;
+    }
+    let path_m = range_m + shadow_depth;
+    let steps = (path_m * 3.0_f64.sqrt() / voxel_size).ceil() + 3.0;
+    if !steps.is_finite() || steps > u64::MAX as f64 {
+        None
+    } else {
+        Some(steps as u64)
+    }
 }
 
 #[derive(Default)]
@@ -442,7 +487,54 @@ fn live_voxels(points: &[(f32, f32, f32)], voxel_size: f32) -> AHashSet<VoxelKey
     out
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum UpdateMapError {
+    #[error("invalid ray-tracing configuration: {0}")]
+    InvalidConfig(String),
+    #[error("ray origin contains a non-finite value")]
+    NonFiniteOrigin,
+    #[error("point at index {index} contains a non-finite value")]
+    NonFinitePoint { index: usize },
+    #[error("ray origin is outside the supported voxel coordinate range")]
+    OriginVoxelRange,
+    #[error(
+        "point at index {index} or its shadow traversal is outside the supported voxel coordinate range"
+    )]
+    RayVoxelRange { index: usize },
+    #[error(
+        "point at index {index} requires {steps} steps, exceeding the {MAX_STEPS_PER_RAY}-step per-ray limit"
+    )]
+    RayStepBudget { index: usize, steps: u64 },
+}
+
+/// Backward-compatible infallible update entry point.
+///
+/// Invalid inputs panic instead of being partially applied or silently
+/// truncated. New callers should use [`try_update_map`] to handle rejection.
 pub fn update_map(
+    map: &mut VoxelMap,
+    origin: (f32, f32, f32),
+    points: &[(f32, f32, f32)],
+    cfg: &Config,
+) -> AHashSet<VoxelKey> {
+    try_update_map(map, origin, points, cfg).expect("invalid input passed to update_map")
+}
+
+/// Validate and apply one map update without partially mutating `map` on error.
+pub fn try_update_map(
+    map: &mut VoxelMap,
+    origin: (f32, f32, f32),
+    points: &[(f32, f32, f32)],
+    cfg: &Config,
+) -> Result<AHashSet<VoxelKey>, UpdateMapError> {
+    validate_update_inputs(origin, points, cfg)?;
+    Ok(update_map_prevalidated(map, origin, points, cfg))
+}
+
+/// Apply an update whose configuration, work budget, and coordinate range were
+/// already validated. Multi-runtime comparisons use this only after every
+/// variant accepts the frame.
+pub(crate) fn update_map_prevalidated(
     map: &mut VoxelMap,
     origin: (f32, f32, f32),
     points: &[(f32, f32, f32)],
@@ -527,6 +619,104 @@ pub fn update_map(
     refresh_voxels(map, &hits, &removed, cfg.voxel_size);
 
     hits
+}
+
+pub(crate) fn validate_update_inputs(
+    origin: (f32, f32, f32),
+    points: &[(f32, f32, f32)],
+    cfg: &Config,
+) -> Result<(), UpdateMapError> {
+    cfg.validate()
+        .map_err(|error| UpdateMapError::InvalidConfig(error.to_string()))?;
+    let config_values = [
+        cfg.voxel_size,
+        cfg.max_range,
+        cfg.shadow_depth,
+        cfg.grace_depth,
+        cfg.graze_cos,
+        cfg.region_percentile,
+    ];
+    if !config_values.into_iter().all(f32::is_finite) {
+        return Err(UpdateMapError::InvalidConfig(
+            "all floating-point fields must be finite".to_owned(),
+        ));
+    }
+    if ![origin.0, origin.1, origin.2]
+        .into_iter()
+        .all(f32::is_finite)
+    {
+        return Err(UpdateMapError::NonFiniteOrigin);
+    }
+    let inv = 1.0_f32 / cfg.voxel_size;
+    if !voxel_point_is_safe(origin, inv) {
+        return Err(UpdateMapError::OriginVoxelRange);
+    }
+
+    for (index, point) in points.iter().copied().enumerate() {
+        if ![point.0, point.1, point.2].into_iter().all(f32::is_finite) {
+            return Err(UpdateMapError::NonFinitePoint { index });
+        }
+        if !voxel_point_is_safe(point, inv) {
+            return Err(UpdateMapError::RayVoxelRange { index });
+        }
+        if index % cfg.ray_subsample as usize != 0 {
+            continue;
+        }
+        let range = f64::from(point.0 - origin.0)
+            .hypot(f64::from(point.1 - origin.1))
+            .hypot(f64::from(point.2 - origin.2));
+        if cfg.max_range > 0.0 && range > f64::from(cfg.max_range) {
+            continue;
+        }
+        if !shadow_traversal_is_safe(origin, point, cfg) {
+            return Err(UpdateMapError::RayVoxelRange { index });
+        }
+        let steps = conservative_ray_step_bound(
+            range,
+            f64::from(cfg.shadow_depth),
+            f64::from(cfg.voxel_size),
+        )
+        .ok_or_else(|| {
+            UpdateMapError::InvalidConfig("ray work estimate is not finite".to_owned())
+        })?;
+        if steps > MAX_STEPS_PER_RAY {
+            return Err(UpdateMapError::RayStepBudget { index, steps });
+        }
+    }
+    Ok(())
+}
+
+const VOXEL_INDEX_GUARD_CELLS: f64 = 2.0;
+
+fn voxel_point_is_safe(point: (f32, f32, f32), inv: f32) -> bool {
+    let min = f64::from(i32::MIN) + VOXEL_INDEX_GUARD_CELLS;
+    let max = f64::from(i32::MAX) - VOXEL_INDEX_GUARD_CELLS;
+    [point.0, point.1, point.2].into_iter().all(|value| {
+        let scaled = (value * inv).floor();
+        scaled.is_finite() && (min..=max).contains(&f64::from(scaled))
+    })
+}
+
+fn shadow_traversal_is_safe(origin: (f32, f32, f32), point: (f32, f32, f32), cfg: &Config) -> bool {
+    let delta = [
+        f64::from(point.0) - f64::from(origin.0),
+        f64::from(point.1) - f64::from(origin.1),
+        f64::from(point.2) - f64::from(origin.2),
+    ];
+    let range = delta[0].hypot(delta[1]).hypot(delta[2]);
+    if range <= f64::EPSILON {
+        return true;
+    }
+
+    let guard_distance = f64::from(cfg.shadow_depth) + 2.0 * f64::from(cfg.voxel_size);
+    let point = [f64::from(point.0), f64::from(point.1), f64::from(point.2)];
+    let min = f64::from(i32::MIN) + VOXEL_INDEX_GUARD_CELLS;
+    let max = f64::from(i32::MAX) - VOXEL_INDEX_GUARD_CELLS;
+    point.into_iter().zip(delta).all(|(value, direction)| {
+        let extended = value + direction / range * guard_distance;
+        let index = (extended / f64::from(cfg.voxel_size)).floor();
+        index.is_finite() && (min..=max).contains(&index)
+    })
 }
 
 #[inline]
@@ -617,7 +807,7 @@ fn find_misses_along_ray(
     let ray_unit = Vector3::new(dx, dy, dz) / ray_len.max(f32::EPSILON);
 
     let mut past_endpoint = false;
-    loop {
+    for _ in 0..MAX_STEPS_PER_RAY {
         let t_enter = tx.min(ty).min(tz);
         if t_enter > t_max {
             return;
@@ -671,6 +861,9 @@ fn find_misses_along_ray(
             }
         }
     }
+    // Reaching the defensive cap preserves all unvisited voxels. Validated
+    // configurations cannot reach this branch, but direct library misuse must
+    // still fail closed instead of spinning indefinitely.
 }
 
 #[cfg(test)]
@@ -692,6 +885,37 @@ mod tests {
             global_emit_every: 1,
             region_percentile: 95.0,
         }
+    }
+
+    #[test]
+    fn config_rejects_unbounded_voxel_and_ray_settings() {
+        let mut cfg = basic_config();
+        cfg.voxel_size = MIN_VOXEL_SIZE_METERS / 10.0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = basic_config();
+        cfg.voxel_size = MIN_VOXEL_SIZE_METERS;
+        cfg.max_range = 1_000.0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = basic_config();
+        cfg.max_range = 0.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn conservative_step_bound_covers_axis_and_diagonal_rays() {
+        let axis = conservative_ray_step_bound(50.0, 0.2, 0.1).unwrap();
+        assert_eq!(axis, 873);
+        assert!(axis > ((50.0_f32 + 0.2) / 0.1).ceil() as u64);
+
+        let at_limit = conservative_ray_step_bound(
+            (MAX_STEPS_PER_RAY as f64 - 11.0) * f64::from(MIN_VOXEL_SIZE_METERS) / 3.0_f64.sqrt(),
+            0.0,
+            f64::from(MIN_VOXEL_SIZE_METERS),
+        )
+        .unwrap();
+        assert!(at_limit <= MAX_STEPS_PER_RAY);
     }
 
     #[test]

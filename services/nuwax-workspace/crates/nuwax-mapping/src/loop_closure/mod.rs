@@ -4,6 +4,7 @@
 //! - 位姿图数据结构 + 二元边模型 + Levenberg-Marquardt 回退
 //! - 自动回环检测基于 kiddo KD-tree 距离阈值
 
+pub mod coordinator;
 pub mod eval;
 pub mod optimizer;
 pub mod pgo;
@@ -11,6 +12,10 @@ pub mod pgo_auto;
 pub mod se3;
 pub mod utils;
 
+pub use coordinator::{
+    CorrectionKeyframe, CorrectionTimeline, LoopClosureCoordinator, LoopClosurePipelineConfig,
+    LoopClosurePipelineError, LoopClosureRecord, ProcessFrameResult,
+};
 pub use eval::EvalLoopClosure;
 pub use optimizer::{GaussNewtonOptimizer, LevenbergMarquardt, OptimizerConfig};
 pub use pgo::{PoseEdge, PoseGraph, PoseNode};

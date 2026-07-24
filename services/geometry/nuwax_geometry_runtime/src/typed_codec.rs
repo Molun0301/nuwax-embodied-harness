@@ -79,6 +79,32 @@ pub fn encode_odometry_payload(pose: &PoseState, child_frame_id: &str) -> CodecR
 ///
 /// 字节布局:`u32 point_step + raw_point_cloud_bytes`。
 pub fn encode_pointcloud_payload(points: &[u8], point_step: u32) -> CodecResult<Vec<u8>> {
+    encode_pointcloud_payload_with_header(points, point_step, 0, 0)
+}
+
+/// Encode a committed cumulative map snapshot for the canonical typed
+/// `/global_map#sensor_msgs.PointCloud2` transport boundary.
+pub fn encode_global_map_pointcloud_payload(
+    xyz_f32_le: &[u8],
+    revision: u64,
+    timestamp_ns: u64,
+) -> CodecResult<Vec<u8>> {
+    let sequence = i32::try_from(revision)
+        .map_err(|_| CodecError::LcmEncode("cloud-map revision exceeds int32".into()))?;
+    if sequence <= 0 {
+        return Err(CodecError::LcmEncode(
+            "cloud-map revision must be positive".into(),
+        ));
+    }
+    encode_pointcloud_payload_with_header(xyz_f32_le, 12, sequence, timestamp_ns)
+}
+
+fn encode_pointcloud_payload_with_header(
+    points: &[u8],
+    point_step: u32,
+    sequence: i32,
+    timestamp_ns: u64,
+) -> CodecResult<Vec<u8>> {
     if point_step < 12 || points.len() % point_step as usize != 0 {
         return Err(CodecError::LcmEncode(format!(
             "point cloud data length {} is not aligned to point_step {}",
@@ -88,10 +114,14 @@ pub fn encode_pointcloud_payload(points: &[u8], point_step: u32) -> CodecResult<
     }
     let width = i32::try_from(points.len() / point_step as usize)
         .map_err(|_| CodecError::LcmEncode("point cloud width exceeds int32".into()))?;
+    let stamp_sec = i32::try_from(timestamp_ns / 1_000_000_000)
+        .map_err(|_| CodecError::LcmEncode("point cloud timestamp seconds exceed int32".into()))?;
     schema::encode_point_cloud2_body(&schema::PointCloud2 {
         header: schema::Header {
+            seq: sequence,
+            stamp_sec,
+            stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
             frame_id: "map".to_string(),
-            ..schema::Header::default()
         },
         height: 1,
         width,

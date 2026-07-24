@@ -33,6 +33,15 @@ scripts/ci/*
 /tests/
 /requirements/README.md
 **/tests/
+**/integration-tests/
+**/benches/
+**/test_*.py
+**/*_test.py
+**/tests.cpp
+**/fixtures/
+**/goldens/
+**/recordings/
+*.md
 
 # 本轮本地 release gate 与格式说明不入库。
 .github/workflows/release-gates.yml
@@ -111,6 +120,36 @@ services/nuwax-workspace/.omc/
 services/nuwax-workspace/.omx/
 services/nuwax-workspace/*.lock.tmp
 
-忽略构建产物
-*/bin/*
-bin/*
+# === 通用构建、测试与分析产物 ===
+# `src/bin/` 是真实可执行源码，不能按目录名 `bin` 泛化忽略。
+**/target/
+**/build/
+**/dist/
+**/out/
+**/CMakeFiles/
+**/cmake-build-*/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_*
+.coverage
+coverage/
+htmlcov/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.rrd
+*.snap

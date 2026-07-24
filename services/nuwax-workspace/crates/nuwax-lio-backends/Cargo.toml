@@ -1,0 +1,21 @@
+[package]
+name = "nuwax-lio-backends"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Mutually exclusive FastLIO2 and Point-LIO estimator backends"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "nuwax-fastlio2-backend"
+path = "src/bin/fastlio2.rs"
+
+[[bin]]
+name = "nuwax-pointlio-backend"
+path = "src/bin/pointlio.rs"

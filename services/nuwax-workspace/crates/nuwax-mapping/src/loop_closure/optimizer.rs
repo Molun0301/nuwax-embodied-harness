@@ -12,9 +12,12 @@
 //! 信息矩阵一致进入 cost、Hessian 与 gradient，更新为 `pose * se3_exp(delta)`。
 //! ISAM2 / gtsam 完整集成因 aarch64 无 prebuilt 留待 P3。
 
-use super::pgo::{PoseEdge, PoseGraph, PoseNode};
+use super::pgo::PoseGraph;
 use super::se3::{linearize_edge, se3_exp_from_vector6, se3_log_to_vector6};
 use nalgebra::{DMatrix, DVector, Isometry3, Matrix6, Vector6};
+
+#[cfg(test)]
+use super::pgo::PoseEdge;
 
 /// 构造加权正规方程 `H = J^T Omega J`、`g = J^T Omega e`。
 fn linearize_graph(graph: &PoseGraph) -> (f64, DMatrix<f64>, DVector<f64>) {
@@ -111,7 +114,7 @@ fn add_vector6_block(destination: &mut DVector<f64>, offset: usize, block: &Vect
     }
 }
 
-fn graph_cost(graph: &PoseGraph) -> f64 {
+pub(crate) fn graph_cost(graph: &PoseGraph) -> f64 {
     graph
         .edges
         .iter()
@@ -125,6 +128,11 @@ fn graph_cost(graph: &PoseGraph) -> f64 {
         .sum()
 }
 
+pub(crate) fn cost_strictly_improved(initial: f64, candidate: f64) -> bool {
+    let minimum_improvement = 64.0 * f64::EPSILON * (1.0 + initial.abs());
+    initial.is_finite() && candidate.is_finite() && initial - candidate > minimum_improvement
+}
+
 /// 优化器配置
 #[derive(Debug, Clone, Copy)]
 pub struct OptimizerConfig {
@@ -136,6 +144,47 @@ pub struct OptimizerConfig {
     pub initial_lambda: f64,
     /// LM 阻尼系数缩放因子
     pub lambda_scale: f64,
+}
+
+impl OptimizerConfig {
+    pub(crate) fn is_valid(self) -> bool {
+        self.max_iterations > 0
+            && self.gradient_tolerance.is_finite()
+            && self.gradient_tolerance >= 0.0
+            && self.initial_lambda.is_finite()
+            && self.initial_lambda > 0.0
+            && self.lambda_scale.is_finite()
+            && self.lambda_scale > 1.0
+    }
+}
+
+fn graph_is_finite(graph: &PoseGraph) -> bool {
+    graph.nodes.values().all(|node| {
+        node.pose
+            .translation
+            .vector
+            .iter()
+            .all(|value| value.is_finite())
+            && node
+                .pose
+                .rotation
+                .coords
+                .iter()
+                .all(|value| value.is_finite())
+    }) && graph.edges.iter().all(|edge| {
+        edge.measurement
+            .translation
+            .vector
+            .iter()
+            .all(|value| value.is_finite())
+            && edge
+                .measurement
+                .rotation
+                .coords
+                .iter()
+                .all(|value| value.is_finite())
+            && edge.information.iter().all(|value| value.is_finite())
+    })
 }
 
 impl Default for OptimizerConfig {
@@ -166,13 +215,24 @@ impl GaussNewtonOptimizer {
     /// `graph` 会被原地修改（节点 pose 被更新）。
     /// Returns 最终的 total cost。
     pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
+        if !self.config.is_valid() || !graph_is_finite(graph) {
+            return f64::NAN;
+        }
         if graph.num_nodes() == 0 || graph.num_edges() == 0 {
             return 0.0;
         }
+        let original = graph.clone();
 
         for _ in 0..self.config.max_iterations {
             let (cost, normal, gradient) = self.linearize(graph);
 
+            if !cost.is_finite()
+                || normal.iter().any(|value| !value.is_finite())
+                || gradient.iter().any(|value| !value.is_finite())
+            {
+                *graph = original;
+                return f64::NAN;
+            }
             if gradient.norm() < self.config.gradient_tolerance {
                 return cost;
             }
@@ -181,8 +241,15 @@ impl GaussNewtonOptimizer {
             let neg_gradient: DVector<f64> = -&gradient;
             let delta = match Self::solve_linear(&normal, &neg_gradient) {
                 Some(d) => d,
-                None => return cost, // 奇异 → 终止
+                None => {
+                    *graph = original;
+                    return f64::NAN;
+                }
             };
+            if delta.iter().any(|value| !value.is_finite()) {
+                *graph = original;
+                return f64::NAN;
+            }
 
             // 更新每个节点（P2: 用 SE(3) right perturbation）
             // 用 node.id 索引 delta（与 linearize() 的 `edge.from as usize * 6` 对齐），
@@ -202,8 +269,23 @@ impl GaussNewtonOptimizer {
                 );
                 node.pose *= se3_exp_from_vector6(&d);
             }
+            if !graph_is_finite(graph) {
+                *graph = original;
+                return f64::NAN;
+            }
+            let candidate_cost = graph_cost(graph);
+            if !cost_strictly_improved(cost, candidate_cost) {
+                *graph = original;
+                return f64::NAN;
+            }
         }
-        graph_cost(graph)
+        let cost = graph_cost(graph);
+        if cost.is_finite() {
+            cost
+        } else {
+            *graph = original;
+            f64::NAN
+        }
     }
 
     /// 线性化：返回 `(cost, J^T Omega J, J^T Omega e)`。
@@ -238,10 +320,22 @@ impl LevenbergMarquardt {
 
     /// 优化（与 Gauss-Newton 类似但带阻尼项 lambda * I）
     pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
+        if !self.config.is_valid() || !graph_is_finite(graph) {
+            return f64::NAN;
+        }
+        let original = graph.clone();
         let mut lambda = self.config.initial_lambda;
+        let mut solved_system = false;
         for _ in 0..self.config.max_iterations {
             let (cost, mut normal, gradient) = self.linearize(graph);
 
+            if !cost.is_finite()
+                || normal.iter().any(|value| !value.is_finite())
+                || gradient.iter().any(|value| !value.is_finite())
+            {
+                *graph = original;
+                return f64::NAN;
+            }
             if gradient.norm() < self.config.gradient_tolerance {
                 return cost;
             }
@@ -260,6 +354,11 @@ impl LevenbergMarquardt {
                     continue;
                 }
             };
+            if delta.iter().any(|value| !value.is_finite()) {
+                *graph = original;
+                return f64::NAN;
+            }
+            solved_system = true;
 
             // 试探更新（P2: SE(3) right perturbation）
             // 用 node.id 索引 delta，与 linearize() 对齐（避免 HashMap 迭代顺序错位）
@@ -285,7 +384,10 @@ impl LevenbergMarquardt {
             }
 
             let new_cost = self.compute_cost(graph);
-            if new_cost < cost {
+            if !new_cost.is_finite() || !graph_is_finite(graph) {
+                *graph = original;
+                return f64::NAN;
+            } else if new_cost < cost {
                 if cost - new_cost < self.config.gradient_tolerance {
                     return new_cost;
                 }
@@ -300,7 +402,17 @@ impl LevenbergMarquardt {
                 lambda *= self.config.lambda_scale;
             }
         }
-        self.compute_cost(graph)
+        if !solved_system {
+            *graph = original;
+            return f64::NAN;
+        }
+        let cost = self.compute_cost(graph);
+        if cost.is_finite() {
+            cost
+        } else {
+            *graph = original;
+            f64::NAN
+        }
     }
 
     fn linearize(&self, graph: &PoseGraph) -> (f64, DMatrix<f64>, DVector<f64>) {
@@ -317,10 +429,6 @@ impl Default for LevenbergMarquardt {
         Self::new(OptimizerConfig::default())
     }
 }
-
-// 引用 `PoseNode` 与 `Matrix6` 以保持公共 API 表面
-#[allow(dead_code)]
-type _KeepRefs = (PoseNode, Matrix6<f64>, PoseEdge);
 
 #[cfg(test)]
 mod tests {
@@ -371,6 +479,66 @@ mod tests {
         let opt = GaussNewtonOptimizer::default();
         let cost = opt.optimize(&mut g);
         assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn optimizers_reject_invalid_config_and_non_finite_graphs() {
+        let mut graph = PoseGraph::new();
+        graph.add_node(0, Isometry3::identity());
+        let invalid = OptimizerConfig {
+            max_iterations: 0,
+            ..OptimizerConfig::default()
+        };
+        assert!(GaussNewtonOptimizer::new(invalid)
+            .optimize(&mut graph)
+            .is_nan());
+        assert!(LevenbergMarquardt::new(invalid)
+            .optimize(&mut graph)
+            .is_nan());
+
+        graph.nodes.get_mut(&0).unwrap().pose.translation.x = f64::NAN;
+        assert!(GaussNewtonOptimizer::default()
+            .optimize(&mut graph)
+            .is_nan());
+        assert!(LevenbergMarquardt::default().optimize(&mut graph).is_nan());
+    }
+
+    #[test]
+    fn gauss_newton_reports_singular_system_without_partial_update() {
+        let mut graph = PoseGraph::new();
+        let first = graph.add_node(0, Isometry3::identity());
+        let second = graph.add_node(1, Isometry3::translation(2.0, 0.0, 0.0));
+        graph.add_edge(PoseEdge::new(
+            first,
+            second,
+            Isometry3::translation(1.0, 0.0, 0.0),
+        ));
+        let before = graph.clone();
+        assert!(GaussNewtonOptimizer::default()
+            .optimize(&mut graph)
+            .is_nan());
+        for (id, node) in &before.nodes {
+            assert_eq!(graph.nodes[id].pose, node.pose);
+        }
+    }
+
+    #[test]
+    fn gauss_newton_rejects_numerically_insignificant_improvement() {
+        let mut graph = PoseGraph::new();
+        let fixed = graph.add_node(0, Isometry3::identity());
+        let moving = graph.add_node(1, Isometry3::translation(1e-10, 0.0, 0.0));
+        graph.nodes.get_mut(&fixed).unwrap().fixed = true;
+        graph.add_edge(PoseEdge::new(fixed, moving, Isometry3::identity()));
+        let before = graph.clone();
+
+        let optimizer = GaussNewtonOptimizer::new(OptimizerConfig {
+            gradient_tolerance: 0.0,
+            ..OptimizerConfig::default()
+        });
+        assert!(optimizer.optimize(&mut graph).is_nan());
+        for (id, node) in &before.nodes {
+            assert_eq!(graph.nodes[id].pose, node.pose);
+        }
     }
 
     // ----- H-8 修复新增用例 -----

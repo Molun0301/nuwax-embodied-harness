@@ -18,9 +18,9 @@ use tokio::sync::{broadcast, mpsc};
 mod runtime;
 
 pub use runtime::{
-    autoconnect, ConnectionSet, InputPort, LifecycleState, LocalTransport, ManagedModule,
-    ModuleInfo, ModulePorts, OutputPort, PortDirection, PortError, PortInfo, PortTransport,
-    PublishReport, RemoteStream, StopHandle,
+    autoconnect, ConnectionSet, InputPort, LatestDispatcher, LifecycleState, LocalTransport,
+    ManagedModule, ModuleInfo, ModulePorts, OutputPort, PortDirection, PortError, PortInfo,
+    PortTransport, PublishReport, RemoteStream, StopHandle,
 };
 
 /// Module 生命周期错误
@@ -134,6 +134,80 @@ pub fn channel<T>(_capacity: usize) -> (Out<T>, In<T>) {
     // _capacity 参数保留以兼容既有调用方,但此处不施加有界缓冲。
     let (tx, rx) = mpsc::unbounded_channel();
     (Out::Single(tx), In { rx })
+}
+
+/// Bounded typed input with explicit queue backpressure.
+pub struct BoundedIn<T> {
+    rx: mpsc::Receiver<T>,
+}
+
+impl<T> BoundedIn<T> {
+    /// Receives the next item, or `None` after every sender is closed.
+    pub async fn recv(&mut self) -> Option<T> {
+        self.rx.recv().await
+    }
+
+    /// Closes the receiving half while allowing already buffered items to drain.
+    pub fn close(&mut self) {
+        self.rx.close();
+    }
+}
+
+/// Cloneable bounded typed output.
+#[derive(Clone)]
+pub struct BoundedOut<T> {
+    tx: mpsc::Sender<T>,
+}
+
+impl<T> BoundedOut<T> {
+    /// Attempts an immediate send without waiting for queue capacity.
+    ///
+    /// # Errors
+    /// Returns `Full` when the bounded queue is saturated and `Closed` after input shutdown.
+    pub fn try_send(&self, value: T) -> Result<(), BoundedSendError> {
+        self.tx.try_send(value).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => BoundedSendError::Full,
+            mpsc::error::TrySendError::Closed(_) => BoundedSendError::Closed,
+        })
+    }
+
+    /// Waits asynchronously until capacity is available and sends one item.
+    ///
+    /// # Errors
+    /// Returns `Closed` after input shutdown.
+    pub async fn send(&self, value: T) -> Result<(), BoundedSendError> {
+        self.tx
+            .send(value)
+            .await
+            .map_err(|_| BoundedSendError::Closed)
+    }
+
+    /// Returns the currently available queue capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+}
+
+/// Bounded channel send failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BoundedSendError {
+    /// No queue slot is currently available.
+    #[error("bounded channel is full")]
+    Full,
+    /// The input side has closed.
+    #[error("bounded channel is closed")]
+    Closed,
+}
+
+/// Creates a bounded typed channel with explicit saturation behavior.
+///
+/// # Panics
+/// Panics when `capacity` is zero, matching Tokio's bounded channel contract.
+#[must_use]
+pub fn bounded_channel<T>(capacity: usize) -> (BoundedOut<T>, BoundedIn<T>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (BoundedOut { tx }, BoundedIn { rx })
 }
 
 /// 标准 Module——header + payload 点对点通信

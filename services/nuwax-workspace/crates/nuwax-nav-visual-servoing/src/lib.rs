@@ -28,6 +28,8 @@ pub use nuwax_nav_types_messages::Quaternion as FoundationQuaternion;
 pub use nuwax_nav_types_messages::Twist2 as FoundationTwist2;
 pub use nuwax_nav_types_messages::Twist3 as FoundationTwist3;
 
+/// Query target to arbitration/servo composition without a motion-output side channel.
+pub mod composition;
 pub mod detection3d;
 /// Original `PersonFollowSkillContainer` lifecycle and production input adapter.
 pub mod person_follow;

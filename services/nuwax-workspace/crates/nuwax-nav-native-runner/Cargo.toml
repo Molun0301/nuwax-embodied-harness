@@ -15,14 +15,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 
 [dev-dependencies]
-nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
-# mock-native binary 仅由 nuwax-nav-test-fixtures 在自身 [[bin]] 声明一次;
-# 本 crate 通过 nuwax-nav-test-fixtures::mock_native_path() 共享 helper 定位产物,
-# 避免重复声明 bin。nuwax-nav-test-fixtures 在这里既作为 [dependencies] 也作为
-# [dev-dependencies] 是为了让 unit-test 与 integration-test 都能直接调用 helper。

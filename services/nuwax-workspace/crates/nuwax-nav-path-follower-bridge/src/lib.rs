@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Auditable pure-pursuit controller core.
+pub mod core;
 pub mod spec;
 
 pub use spec::{

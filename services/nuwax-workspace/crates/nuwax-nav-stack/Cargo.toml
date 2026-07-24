@@ -227,6 +227,7 @@ pretty_assertions = { workspace = true }
 # (Foundation lane 修复中)。simple-2d / replanning-astar feature 的端到端 smoke
 # 等 Foundation 收敛后再追加。
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner" }
+nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 
 [[bin]]
 # 默认 CLI:提供 --profile / --dry-run / --replay / --list-features 入口

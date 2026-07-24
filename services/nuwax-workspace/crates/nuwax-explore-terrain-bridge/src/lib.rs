@@ -17,6 +17,8 @@
 
 pub mod bridge;
 pub mod config;
+/// Auditable voxel terrain classification core.
+pub mod core;
 pub mod spec;
 pub mod supervisor;
 

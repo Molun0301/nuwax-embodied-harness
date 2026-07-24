@@ -11,6 +11,8 @@
 #![warn(missing_docs)]
 
 pub mod bridge;
+/// Auditable frontier clustering and waypoint-selection core.
+pub mod core;
 pub mod spec;
 pub mod supervisor;
 pub mod waypoint;

@@ -37,12 +37,19 @@
 
 // 内部模块:仅在本 crate 内可见,集成测试通过 `crate::xxx` 引用
 pub mod adjacency;
+pub mod debug_events;
 pub mod dijkstra;
 pub mod edges;
+pub mod evaluator;
+pub mod goal_relay;
 pub mod lcm_worker;
+pub mod mesh_fixture;
 pub mod mls_planner;
 pub mod nodes;
 pub mod planner;
+pub mod rerun;
+pub mod scenarios;
 pub mod stamp_pair;
 pub mod surfaces;
+pub mod transformer;
 pub mod voxel;

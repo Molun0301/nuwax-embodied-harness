@@ -7,6 +7,7 @@ mod features;
 pub mod module;
 mod ransac;
 pub mod relocalize;
+pub mod runtime;
 
 pub use features::{
     compute_fpfh, estimate_normals, match_fpfh, voxel_downsample, FeatureConfig, FeatureMatch,
@@ -19,4 +20,8 @@ pub use relocalize::{
     ransac_align_stub, relocation_pipeline, relocation_pipeline_with_config, wall_subset_mask,
     IcpConfig, IcpResult, IcpSolver, RelocalizationConfig, RelocalizationResult,
     GRAVITY_TILT_MAX_DEG, WALL_NORMAL_Z_MAX,
+};
+pub use runtime::{
+    RelocalizationRuntime, RelocalizationRuntimeConfig, RelocalizationRuntimeError,
+    RelocalizationStatus, RelocalizationUpdate,
 };

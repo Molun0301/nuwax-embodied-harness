@@ -243,6 +243,11 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         to: "guarded_nav_scheduler".into(),
         topic: topics.get_or("map_pose", "map_pose").into(),
     });
+    g.push_edge(GraphEdge {
+        from: "guarded_nav_scheduler".into(),
+        to: "simple_planner".into(),
+        topic: topics.get_or("stop_movement", "stop_movement").into(),
+    });
 }
 
 // ---------- ReplanningAStar ----------
@@ -284,6 +289,11 @@ fn build_replanning_astar(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         from: "map_pose_adapter".into(),
         to: "guarded_nav_scheduler".into(),
         topic: topics.get_or("map_pose", "map_pose").into(),
+    });
+    g.push_edge(GraphEdge {
+        from: "guarded_nav_scheduler".into(),
+        to: "astar_planner".into(),
+        topic: topics.get_or("stop_movement", "stop_movement").into(),
     });
 }
 

@@ -22,3 +22,7 @@ tempfile = "3"
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
 tokio = { workspace = true }
+
+[[bin]]
+name = "nuwax-local-planner-core"
+path = "src/bin/nuwax-local-planner-core.rs"

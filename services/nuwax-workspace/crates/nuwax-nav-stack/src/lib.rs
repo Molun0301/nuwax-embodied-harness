@@ -67,6 +67,7 @@
 
 pub mod bin_support;
 pub mod builder;
+pub mod conformance;
 pub mod dry_run;
 pub mod error;
 pub mod features;

@@ -11,6 +11,7 @@
 
 pub mod fixtures;
 pub mod goldens;
+pub mod recorded_events;
 
 pub use fixtures::*;
 

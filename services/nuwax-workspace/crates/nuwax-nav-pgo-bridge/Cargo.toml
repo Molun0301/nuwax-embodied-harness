@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "PGO (Pose Graph Optimization) C++ native bridge — wraps result/bin/pgo with map->odom TF helper"
+description = "PGO C++ core and native bridge with an auditable batch/lifecycle contract"
 
 [dependencies]
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }

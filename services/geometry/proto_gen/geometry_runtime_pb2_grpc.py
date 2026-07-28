@@ -116,9 +116,14 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
                 _registered_method=True)
-        self.ActivateMapVersion = channel.unary_unary(
-                '/nuwax.geometry.GeometryRuntime/ActivateMapVersion',
-                request_serializer=geometry__runtime__pb2.ActivateMapVersionRequest.SerializeToString,
+        self.ExportMappingBackendCheckpoint = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/ExportMappingBackendCheckpoint',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingBackendCheckpoint.FromString,
+                _registered_method=True)
+        self.ActivateMap = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/ActivateMap',
+                request_serializer=geometry__runtime__pb2.ActivateMapRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
                 _registered_method=True)
         self.SetNavigationGoal = channel.unary_unary(
@@ -278,7 +283,7 @@ class GeometryRuntimeServicer(object):
 
     def GetRawOccupancyGridData(self, request, context):
         """Physical occupancy before virtual forbidden zones are composed.  Map
-        version persistence must use this getter to avoid baking keepouts into a
+        asset persistence must use this getter to avoid baking keepouts into a
         checkpoint permanently.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -321,7 +326,13 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ActivateMapVersion(self, request, context):
+    def ExportMappingBackendCheckpoint(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ActivateMap(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -532,9 +543,14 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
             ),
-            'ActivateMapVersion': grpc.unary_unary_rpc_method_handler(
-                    servicer.ActivateMapVersion,
-                    request_deserializer=geometry__runtime__pb2.ActivateMapVersionRequest.FromString,
+            'ExportMappingBackendCheckpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExportMappingBackendCheckpoint,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingBackendCheckpoint.SerializeToString,
+            ),
+            'ActivateMap': grpc.unary_unary_rpc_method_handler(
+                    servicer.ActivateMap,
+                    request_deserializer=geometry__runtime__pb2.ActivateMapRequest.FromString,
                     response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
             ),
             'SetNavigationGoal': grpc.unary_unary_rpc_method_handler(
@@ -1074,7 +1090,7 @@ class GeometryRuntime(object):
             _registered_method=True)
 
     @staticmethod
-    def ActivateMapVersion(request,
+    def ExportMappingBackendCheckpoint(request,
             target,
             options=(),
             channel_credentials=None,
@@ -1087,8 +1103,35 @@ class GeometryRuntime(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/nuwax.geometry.GeometryRuntime/ActivateMapVersion',
-            geometry__runtime__pb2.ActivateMapVersionRequest.SerializeToString,
+            '/nuwax.geometry.GeometryRuntime/ExportMappingBackendCheckpoint',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.MappingBackendCheckpoint.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ActivateMap(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/ActivateMap',
+            geometry__runtime__pb2.ActivateMapRequest.SerializeToString,
             geometry__runtime__pb2.MappingSessionState.FromString,
             options,
             channel_credentials,

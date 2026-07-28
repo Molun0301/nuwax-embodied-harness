@@ -37,7 +37,7 @@ class EvaluationTraceStatus(StrEnum):
 class EvaluationSliceKey(ContractModel):
     """评估聚合切分维度。"""
 
-    map_version_id: str = Field(default="unknown", description="地图版本。")
+    map_name: str = Field(default="unknown", description="地图名称。")
     perception_provider: str = Field(default="unknown", description="感知 provider（提供方）。")
     navigation_profile: str = Field(default="unknown", description="导航 profile（配置档）。")
     target_category: str = Field(default="unknown", description="目标类别。")
@@ -46,7 +46,7 @@ class EvaluationSliceKey(ContractModel):
     def as_key(self) -> str:
         return "|".join(
             [
-                self.map_version_id,
+                self.map_name,
                 self.perception_provider,
                 self.navigation_profile,
                 self.target_category,

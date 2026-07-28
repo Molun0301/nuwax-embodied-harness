@@ -101,7 +101,11 @@ mod tests {
             ("nuwax_msgs.CancelNavigation", 0x9704_4b28_e9c5_dd22),
             ("nuwax_msgs.Frontier", 0x1abf_83ea_0ced_9c44),
             ("nuwax_msgs.FrontierList", 0x213d_b68f_b817_1f76),
-            ("nuwax_msgs.PersonFollowTarget", 0xe627_c308_2965_e18d),
+            ("nuwax_msgs.PersonFollowTarget", 0x49b0_abee_638b_1fdb),
+            ("nuwax_msgs.PersonFollowCommand", 0x76ad_78cf_d903_47e8),
+            ("nuwax_msgs.LioOdometryEnvelope", 0x742d_9b06_c0c7_a223),
+            ("nuwax_msgs.LioCloudEnvelope", 0xdcd4_ae0f_83a9_a81b),
+            ("nuwax_msgs.LioStatus", 0x6d7a_e636_d8ba_41b2),
         ];
         assert_eq!(STRUCT_SEEDS.len(), expected.len());
         for (fqn, upstream_fp) in expected {

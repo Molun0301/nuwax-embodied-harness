@@ -124,7 +124,7 @@ class PointCloudMapCache:
         path: Path,
         *,
         frame_id: str = DEFAULT_MAP_FRAME,
-        source_kind: str = "map_version_pcd",
+        source_kind: str = "map_asset_pcd",
     ) -> PointCloudMap:
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.exists() or not resolved.is_file():
@@ -152,7 +152,7 @@ class PointCloudMapCache:
             path=str(resolved),
             revision="pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
             frame_id=str(frame_id or DEFAULT_MAP_FRAME),
-            source_kind=str(source_kind or "map_version_pcd"),
+            source_kind=str(source_kind or "map_asset_pcd"),
             point_count=int(points_xyz.shape[0]),
             points_xyz=points_xyz,
             bounds_min=tuple(float(value) for value in bounds_min_arr),

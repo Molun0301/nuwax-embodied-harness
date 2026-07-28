@@ -222,13 +222,13 @@ class GroundingQueryPlanner:
         self,
         plan: GroundingQueryPlan,
         *,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
     ) -> MemoryPayloadFilter:
         metadata = dict(plan.metadata or {})
         preferred_record_kinds = self._record_kinds_from_metadata(metadata)
         filter_kwargs: dict[str, Any] = {
-            "map_version_id": map_version_id,
+            "map_name": map_name,
             "localization_session_id": localization_session_id,
             "record_kinds": preferred_record_kinds,
         }

@@ -83,7 +83,7 @@ def _exploration_owner_lock(service):
 
 @dataclass(frozen=True)
 class _ForbiddenZoneRuntimeAck:
-    map_version_id: str
+    map_name: str
     generation: int
     signature: str
     applied_revision: int
@@ -92,12 +92,12 @@ class _ForbiddenZoneRuntimeAck:
     def confirms(
         self,
         *,
-        map_version_id: str,
+        map_name: str,
         generation: int,
         signature: str,
     ) -> bool:
         return bool(
-            self.map_version_id == map_version_id
+            self.map_name == map_name
             and self.generation == generation
             and self.signature == signature
             and signature
@@ -196,7 +196,6 @@ class NavigationService:
         self._forbidden_zone_required_generation: Optional[int] = None
         self._forbidden_zone_required_signature: Optional[str] = None
         self._forbidden_zone_required_map_name: Optional[str] = None
-        self._forbidden_zone_required_map_version_id: Optional[str] = None
         self._forbidden_zone_cancel_wait_timeout_sec = 5.0
         self._forbidden_zone_cancel_poll_interval_sec = 0.05
         self._forbidden_zone_revision_wait_timeout_sec = 2.0
@@ -216,35 +215,23 @@ class NavigationService:
 
     def list_forbidden_zones(
         self,
-        map_version_id: Optional[str] = None,
-        *,
         map_name: Optional[str] = None,
     ) -> ForbiddenZonesEnvelope:
         """返回指定地图的禁行区；省略地图名时解析当前活动地图。"""
 
         resolved_map_name = self._resolve_forbidden_zone_map_name(map_name)
-        resolved_map_version_id = self._resolve_forbidden_zone_map_version_id(
-            map_version_id,
-            required=False,
-        )
-        return self._forbidden_zone_store.list_for_map(
-            resolved_map_version_id,
-            map_name=resolved_map_name,
-        )
+        return self._forbidden_zone_store.list_for_map(resolved_map_name)
 
     def load_forbidden_zones_for_map(
         self,
         *,
         map_name: str,
-        map_version_id: str,
     ) -> ForbiddenZonesEnvelope:
         """在地图载入后恢复其禁行区快照并同步前端与运行时栅栏。"""
 
-        envelope = self._forbidden_zone_store.list_for_map(
-            map_version_id,
-            map_name=map_name,
-        )
-        entry = envelope.maps[map_name]
+        resolved_map_name = self._resolve_forbidden_zone_map_name(map_name)
+        envelope = self._forbidden_zone_store.list_for_map(resolved_map_name)
+        entry = envelope.maps[resolved_map_name]
         observed_ack = self._read_forbidden_zone_runtime_ack()
         with self._forbidden_zone_state_lock():
             if (
@@ -253,7 +240,7 @@ class NavigationService:
                 and not (
                     observed_ack is not None
                     and observed_ack.confirms(
-                        map_version_id=map_version_id,
+                        map_name=resolved_map_name,
                         generation=entry.generation,
                         signature=entry.signature,
                     )
@@ -261,13 +248,11 @@ class NavigationService:
             ):
                 self._forbidden_zone_required_generation = entry.generation
                 self._forbidden_zone_required_signature = entry.signature
-                self._forbidden_zone_required_map_name = map_name
-                self._forbidden_zone_required_map_version_id = map_version_id
+                self._forbidden_zone_required_map_name = resolved_map_name
             else:
                 self._forbidden_zone_required_generation = None
                 self._forbidden_zone_required_signature = None
                 self._forbidden_zone_required_map_name = None
-                self._forbidden_zone_required_map_version_id = None
         if self._stream_bus is not None:
             self._stream_bus.publish(
                 "navigation.forbidden_zones",
@@ -278,8 +263,7 @@ class NavigationService:
                 revision=str(entry.generation),
                 status="available",
                 metadata={
-                    "map_name": map_name,
-                    "map_version_id": map_version_id,
+                    "map_name": resolved_map_name,
                     "generation": entry.generation,
                     "zone_count": len(entry.zones),
                     "lifecycle_action": "map_loaded",
@@ -306,7 +290,6 @@ class NavigationService:
                 self._forbidden_zone_required_generation = None
                 self._forbidden_zone_required_signature = None
                 self._forbidden_zone_required_map_name = None
-                self._forbidden_zone_required_map_version_id = None
         if self._stream_bus is not None:
             self._stream_bus.publish(
                 "navigation.forbidden_zones",
@@ -318,7 +301,6 @@ class NavigationService:
                 status="cleared",
                 metadata={
                     "map_name": map_name,
-                    "map_version_id": entry.map_version_id,
                     "generation": entry.generation,
                     "zone_count": 0,
                     "lifecycle_action": "map_deleted",
@@ -330,14 +312,12 @@ class NavigationService:
         self,
         *,
         map_name: Optional[str] = None,
-        map_version_id: Optional[str] = None,
         zones: Sequence[ForbiddenZone],
         expected_generation: Optional[int] = None,
     ) -> ForbiddenZonesEnvelope:
         """原子替换禁行区；活动地图更新前先停止旧 revision 上的运动任务。"""
 
         resolved_map_name = self._resolve_forbidden_zone_map_name(map_name)
-        requested_map_version_id = str(map_version_id or "").strip()
         zone_snapshot = tuple(zones)
         update_lock = getattr(self, "_forbidden_zone_update_lock", None)
         if update_lock is None:
@@ -347,27 +327,19 @@ class NavigationService:
             affects_active_map = self._forbidden_zone_update_affects_active_map(
                 resolved_map_name
             )
-            resolved_map_version_id = (
-                self._resolve_forbidden_zone_runtime_version(resolved_map_name)
-                if affects_active_map
-                else requested_map_version_id
-            )
             self._preflight_forbidden_zone_generation(
                 map_name=resolved_map_name,
-                map_version_id=resolved_map_version_id,
                 expected_generation=expected_generation,
             )
             if affects_active_map:
                 envelope = self._replace_active_map_forbidden_zones(
                     map_name=resolved_map_name,
-                    map_version_id=resolved_map_version_id,
                     zones=zone_snapshot,
                     expected_generation=expected_generation,
                 )
             else:
                 envelope = self._replace_inactive_map_forbidden_zones(
                     map_name=resolved_map_name,
-                    map_version_id=resolved_map_version_id,
                     zones=zone_snapshot,
                     expected_generation=expected_generation,
                 )
@@ -383,7 +355,6 @@ class NavigationService:
                     status="available",
                     metadata={
                         "map_name": resolved_map_name,
-                        "map_version_id": resolved_map_version_id,
                         "generation": entry.generation,
                         "zone_count": len(entry.zones),
                     },
@@ -393,18 +364,13 @@ class NavigationService:
     def _preflight_forbidden_zone_generation(
         self,
         *,
-        map_name: Optional[str] = None,
-        map_version_id: str,
+        map_name: str,
         expected_generation: Optional[int],
     ) -> int:
         """在任何取消动作前验证 store 可读且 CAS generation 匹配。"""
 
-        envelope = self._forbidden_zone_store.list_for_map(
-            map_version_id,
-            map_name=map_name,
-        )
-        storage_key = str(map_name or map_version_id).strip()
-        current_generation = envelope.maps[storage_key].generation
+        envelope = self._forbidden_zone_store.list_for_map(map_name)
+        current_generation = envelope.maps[map_name].generation
         if (
             expected_generation is not None
             and expected_generation != current_generation
@@ -424,8 +390,7 @@ class NavigationService:
     def _replace_inactive_map_forbidden_zones(
         self,
         *,
-        map_name: Optional[str] = None,
-        map_version_id: str,
+        map_name: str,
         zones: Sequence[ForbiddenZone],
         expected_generation: Optional[int],
     ) -> ForbiddenZonesEnvelope:
@@ -435,7 +400,6 @@ class NavigationService:
         try:
             return self._forbidden_zone_store.replace(
                 map_name=map_name,
-                map_version_id=map_version_id,
                 zones=zones,
                 expected_generation=expected_generation,
             )
@@ -535,8 +499,7 @@ class NavigationService:
     def _replace_active_map_forbidden_zones(
         self,
         *,
-        map_name: Optional[str] = None,
-        map_version_id: str,
+        map_name: str,
         zones: Sequence[ForbiddenZone],
         expected_generation: Optional[int],
     ) -> ForbiddenZonesEnvelope:
@@ -601,22 +564,19 @@ class NavigationService:
 
             envelope = self._forbidden_zone_store.replace(
                 map_name=map_name,
-                map_version_id=map_version_id,
                 zones=zones,
                 expected_generation=expected_generation,
             )
-            storage_key = str(map_name or map_version_id).strip()
-            entry = envelope.maps[storage_key]
+            entry = envelope.maps[map_name]
             required_generation = entry.generation
             required_signature = entry.signature
             with state_lock:
                 self._forbidden_zone_required_generation = required_generation
                 self._forbidden_zone_required_signature = required_signature
                 self._forbidden_zone_required_map_name = map_name
-                self._forbidden_zone_required_map_version_id = map_version_id
 
             observed_ack = self._wait_for_forbidden_zone_runtime_ack(
-                map_version_id=map_version_id,
+                map_name=map_name,
                 generation=required_generation,
                 signature=required_signature,
             )
@@ -624,7 +584,7 @@ class NavigationService:
                 if (
                     observed_ack is not None
                     and observed_ack.confirms(
-                        map_version_id=map_version_id,
+                        map_name=map_name,
                         generation=required_generation,
                         signature=required_signature,
                     )
@@ -632,22 +592,20 @@ class NavigationService:
                     == required_generation
                     and self._forbidden_zone_required_signature
                     == required_signature
-                    and self._forbidden_zone_required_map_version_id
-                    == map_version_id
+                    and self._forbidden_zone_required_map_name == map_name
                 ):
                     self._forbidden_zone_required_generation = None
                     self._forbidden_zone_required_signature = None
                     self._forbidden_zone_required_map_name = None
-                    self._forbidden_zone_required_map_version_id = None
             if observed_ack is None or not observed_ack.confirms(
-                map_version_id=map_version_id,
+                map_name=map_name,
                 generation=required_generation,
                 signature=required_signature,
             ):
                 LOGGER.warning(
                     "禁行区已保存，但 Geometry Runtime/planner 尚未确认消费该 generation；"
-                    "map_version_id=%s generation=%s observed_ack=%s",
-                    map_version_id,
+                    "map_name=%s generation=%s observed_ack=%s",
+                    map_name,
                     required_generation,
                     observed_ack,
                 )
@@ -1085,8 +1043,8 @@ class NavigationService:
             return parsed if parsed >= 0 else 0
 
         return _ForbiddenZoneRuntimeAck(
-            map_version_id=str(
-                readiness.get("forbidden_zone_map_version_id") or ""
+            map_name=str(
+                readiness.get("forbidden_zone_map_name") or ""
             ).strip(),
             generation=_nonnegative_int(
                 readiness.get("forbidden_zone_generation")
@@ -1105,7 +1063,7 @@ class NavigationService:
     def _wait_for_forbidden_zone_runtime_ack(
         self,
         *,
-        map_version_id: str,
+        map_name: str,
         generation: int,
         signature: str,
     ) -> Optional[_ForbiddenZoneRuntimeAck]:
@@ -1134,7 +1092,7 @@ class NavigationService:
         while True:
             observed_ack = self._read_forbidden_zone_runtime_ack()
             if observed_ack is not None and observed_ack.confirms(
-                map_version_id=map_version_id,
+                map_name=map_name,
                 generation=generation,
                 signature=signature,
             ):
@@ -1161,12 +1119,12 @@ class NavigationService:
                 "_forbidden_zone_required_generation",
                 None,
             )
-            required_map_version_id = getattr(
+            required_map_name = getattr(
                 self,
-                "_forbidden_zone_required_map_version_id",
+                "_forbidden_zone_required_map_name",
                 None,
             )
-        if required_generation is None or not required_map_version_id:
+        if required_generation is None or not required_map_name:
             return
 
         observed_ack = self._read_forbidden_zone_runtime_ack(
@@ -1184,9 +1142,9 @@ class NavigationService:
                 "_forbidden_zone_required_generation",
                 None,
             )
-            current_required_map_version_id = getattr(
+            current_required_map_name = getattr(
                 self,
-                "_forbidden_zone_required_map_version_id",
+                "_forbidden_zone_required_map_name",
                 None,
             )
             current_required_signature = getattr(
@@ -1199,7 +1157,7 @@ class NavigationService:
             if (
                 observed_ack is not None
                 and observed_ack.confirms(
-                    map_version_id=current_required_map_version_id,
+                    map_name=current_required_map_name,
                     generation=current_required_generation,
                     signature=current_required_signature or "",
                 )
@@ -1207,7 +1165,6 @@ class NavigationService:
                 self._forbidden_zone_required_generation = None
                 self._forbidden_zone_required_signature = None
                 self._forbidden_zone_required_map_name = None
-                self._forbidden_zone_required_map_version_id = None
                 return
             self._raise_forbidden_zone_motion_start_blocked_locked(
                 observed_ack=observed_ack
@@ -1240,19 +1197,14 @@ class NavigationService:
                         "_forbidden_zone_required_map_name",
                         None,
                     ),
-                    "map_version_id": getattr(
-                        self,
-                        "_forbidden_zone_required_map_version_id",
-                        None,
-                    ),
                     "required_generation": required_generation,
                     "required_signature": getattr(
                         self,
                         "_forbidden_zone_required_signature",
                         None,
                     ),
-                    "observed_map_version_id": (
-                        observed_ack.map_version_id if observed_ack else None
+                    "observed_map_name": (
+                        observed_ack.map_name if observed_ack else None
                     ),
                     "observed_generation": (
                         observed_ack.generation if observed_ack else None
@@ -1315,110 +1267,6 @@ class NavigationService:
             "未提供 map_name，且当前没有可解析的活动地图。",
             error_code="map_name_required",
             http_status=400,
-        )
-
-    def _resolve_forbidden_zone_map_version_id(
-        self,
-        map_version_id: Optional[str],
-        *,
-        required: bool = True,
-    ) -> str:
-        resolved = str(map_version_id or "").strip()
-        if resolved:
-            return resolved
-
-        try:
-            active_session = self._localization_service.get_active_session()
-        except Exception:
-            active_session = None
-        resolved = str(getattr(active_session, "map_version_id", "") or "").strip()
-        if resolved:
-            return resolved
-
-        try:
-            map_snapshot = self._mapping_service.get_latest_snapshot()
-        except Exception:
-            map_snapshot = None
-        resolved = str(getattr(map_snapshot, "version_id", "") or "").strip()
-        if resolved:
-            return resolved
-
-        if required:
-            raise GatewayError(
-                "未提供 map_version_id，且当前没有可解析的活动地图版本。",
-                error_code="map_version_id_required",
-                http_status=400,
-            )
-        return ""
-
-    def _resolve_forbidden_zone_runtime_version(self, map_name: str) -> str:
-        """解析指定活动地图当前由 Geometry Runtime 使用的版本。"""
-
-        try:
-            active_session = self._localization_service.get_active_session()
-        except Exception:
-            active_session = None
-        if str(getattr(active_session, "map_name", "") or "").strip() == map_name:
-            resolved = str(
-                getattr(active_session, "map_version_id", "") or ""
-            ).strip()
-            if resolved:
-                return resolved
-
-        try:
-            map_snapshot = self._mapping_service.get_latest_snapshot()
-        except Exception:
-            map_snapshot = None
-        snapshot_metadata = getattr(map_snapshot, "metadata", None)
-        metadata = snapshot_metadata if isinstance(snapshot_metadata, dict) else {}
-        snapshot_map_name = next(
-            (
-                str(metadata.get(key) or "").strip()
-                for key in ("active_map_name", "map_name", "seed_map_name")
-                if str(metadata.get(key) or "").strip()
-            ),
-            "",
-        )
-        if snapshot_map_name == map_name:
-            for value in (
-                metadata.get("platform_map_version_id"),
-                metadata.get("seed_map_version_id"),
-                metadata.get("map_version_id"),
-                getattr(map_snapshot, "version_id", ""),
-            ):
-                resolved = str(value or "").strip()
-                if resolved:
-                    return resolved
-
-        for context in (
-            getattr(self, "_current_goal", None),
-            getattr(self, "_current_explore_request", None),
-        ):
-            context_metadata = getattr(context, "metadata", None)
-            metadata = context_metadata if isinstance(context_metadata, dict) else {}
-            context_map_name = str(
-                getattr(context, "map_name", "")
-                or metadata.get("map_name")
-                or metadata.get("active_map_name")
-                or ""
-            ).strip()
-            if context_map_name != map_name:
-                continue
-            for value in (
-                getattr(context, "map_version_id", ""),
-                metadata.get("map_version_id"),
-                metadata.get("latest_map_version_id"),
-                metadata.get("localization_session_map_version_id"),
-            ):
-                resolved = str(value or "").strip()
-                if resolved:
-                    return resolved
-
-        raise GatewayError(
-            "活动地图缺少运行时 map_version_id，无法确认禁行区已被规划器应用。",
-            error_code="map_version_id_required",
-            http_status=409,
-            details={"map_name": map_name},
         )
 
     def is_navigation_available(self) -> bool:
@@ -1923,11 +1771,21 @@ class NavigationService:
                 continue
             if region.centroid is None:
                 raise GatewayError(f"语义区域 {target_name} 没有可导航的中心位姿。")
+            try:
+                resolved_map_name = self._resolve_forbidden_zone_map_name(None)
+            except GatewayError:
+                resolved_map_name = None
+            goal_metadata = {
+                "resolved_region_id": region.region_id,
+                "map_snapshot_version_id": map_snapshot.version_id,
+            }
+            if resolved_map_name is not None:
+                goal_metadata["map_name"] = resolved_map_name
             return NavigationGoal(
                 goal_id=f"nav_named_{self._normalize_name(target_name)}",
                 target_pose=region.centroid,
                 target_name=target_name,
-                metadata={"resolved_region_id": region.region_id, "map_version_id": map_snapshot.version_id},
+                metadata=goal_metadata,
             )
         raise GatewayError(f"未在语义地图中找到命名位置：{target_name}")
 
@@ -2955,8 +2813,7 @@ class NavigationService:
         return {
             "map_name": map_name,
             "map_status": map_status,
-            "map_version_id": map_snapshot.version_id if map_snapshot is not None else None,
-            "latest_map_version_id": map_snapshot.version_id if map_snapshot is not None else None,
+            "map_snapshot_version_id": map_snapshot.version_id if map_snapshot is not None else None,
             "memory_library_name": memory_library_name or map_name,
             "localization_ready": localization_ready,
             "localization_session_status": (
@@ -2964,8 +2821,13 @@ class NavigationService:
                 if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
                 else None
             ),
-            "localization_session_map_version_id": (
-                localization_session.map_version_id
+            "localization_session_id": (
+                localization_session.session_id
+                if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
+                else None
+            ),
+            "asset_manifest_sha256": (
+                localization_session.asset_manifest_sha256
                 if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
                 else None
             ),

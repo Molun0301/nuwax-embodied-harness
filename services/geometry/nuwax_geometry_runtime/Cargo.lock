@@ -50,6 +50,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1179,7 +1185,9 @@ dependencies = [
  "nuwax-codec",
  "nuwax-exploration",
  "nuwax-explore-wavefront",
+ "nuwax-lio-backends",
  "nuwax-mapping",
+ "nuwax-mapping-raytracing",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-simple-planner",
@@ -1226,6 +1234,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-lio-backends"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nuwax-mapping"
 version = "0.1.0"
 dependencies = [
@@ -1241,6 +1257,26 @@ dependencies = [
  "nuwax-numeric",
  "nuwax-protocol",
  "nuwax-stream",
+ "nuwax-types",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "validator",
+]
+
+[[package]]
+name = "nuwax-mapping-raytracing"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrayvec",
+ "nalgebra",
+ "nuwax-core",
+ "nuwax-numeric",
+ "nuwax-protocol",
  "nuwax-types",
  "rayon",
  "serde",

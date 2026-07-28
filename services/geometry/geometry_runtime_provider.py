@@ -6,6 +6,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,10 +14,12 @@ import logging
 import math
 import os
 from pathlib import Path
+import struct
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import grpc
 
@@ -27,6 +30,12 @@ from contracts.navigation import NavigationGoal, NavigationState, NavigationStat
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
+from services.geometry.mapping_backend_checkpoint_store import (
+    MappingBackendCheckpoint,
+    MappingBackendCheckpointNotFoundError,
+    MappingBackendCheckpointStore,
+    StoredMappingBackendCheckpoint,
+)
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_provider")
 
@@ -35,6 +44,7 @@ _OCCUPANCY_SCHEMA_VERSION = 1
 _ROLLOVER_RECOVERY_DEADLINE_SEC = 4.0
 
 _MappingIdentity = Tuple[str, str, int]
+_MappingCheckpointProvenance = Tuple[str, bool, str, str]
 _NavigationStreamToken = Tuple[int, int, int]
 _NavigationLease = Tuple[str, int, str, int, int]
 _NavigationCommandToken = Tuple[str, _NavigationLease, int, int]
@@ -56,6 +66,7 @@ _EXPLORATION_CHILD_NAV_OWNER_KIND = int(
     pb2.NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
 )
 _MAX_MOTION_ADMISSION_GENERATION = (1 << 63) - 1
+_SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel"})
 
 
 def _decode_motion_admission_proof(value: object) -> Tuple[int, bytes, int]:
@@ -147,6 +158,446 @@ class GeometryRuntimeRpcError(RuntimeError):
             grpc_code=grpc_code,
             grpc_details=str(details or "gRPC call failed without details"),
         )
+
+
+class GeometryRuntimeMapActivationOutcomeUnknown(RuntimeError):
+    """ActivateMap crossed the RPC dispatch boundary without a trusted ACK."""
+
+    backend_activation_outcome_unknown = True
+
+
+class GeometryRuntimeMapActivationStaleRequest(RuntimeError):
+    """A terminal mapping session ID cannot be reused for another activation."""
+
+    backend_activation_stale_request = True
+    backend_switch_applied = False
+    backend_activation_disposition = "stale_request"
+
+    def __init__(
+        self,
+        *,
+        activation_request_id: str,
+        map_name: str,
+        current_phase: str,
+        current_map_name: str,
+    ) -> None:
+        self.activation_request_id = str(activation_request_id)
+        self.map_name = str(map_name)
+        self.current_phase = str(current_phase)
+        self.current_map_name = str(current_map_name)
+        super().__init__(
+            "mapping activation request ID is stale: request_id=%s "
+            "target_map=%s current_phase=%s current_map=%s"
+            % (
+                self.activation_request_id,
+                self.map_name,
+                self.current_phase or "<empty>",
+                self.current_map_name or "<empty>",
+            )
+        )
+
+
+def _freeze_checkpoint_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _freeze_checkpoint_value(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_checkpoint_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class MappingBackendCheckpointExportBundle:
+    """Immutable backend state plus the correlated canonical map assets."""
+
+    checkpoint: MappingBackendCheckpoint
+    occupancy_asset: Mapping[str, object]
+    cloud_asset: Mapping[str, object]
+    canonical_occupancy_checkpoint_bytes: bytes
+    canonical_cloud_checkpoint_bytes: bytes
+
+    @property
+    def backend_kind(self) -> str:
+        return self.checkpoint.backend_kind
+
+    def canonical_occupancy_checkpoint(self):
+        message = pb2.OccupancyGridData()
+        message.ParseFromString(self.canonical_occupancy_checkpoint_bytes)
+        return message
+
+    def canonical_cloud_checkpoint(self):
+        message = pb2.CloudMapCheckpoint()
+        message.ParseFromString(self.canonical_cloud_checkpoint_bytes)
+        return message
+
+    def publish_to(
+        self,
+        map_bundle_root: Path,
+    ) -> StoredMappingBackendCheckpoint:
+        """Persist backend payload and metadata under one finalized map bundle."""
+
+        return MappingBackendCheckpointStore(map_bundle_root).publish(
+            self.checkpoint,
+            occupancy_asset=self.occupancy_asset,
+            cloud_asset=self.cloud_asset,
+        )
+
+
+def _require_proto_message_field(message, field_name: str):
+    try:
+        present = bool(message.HasField(field_name))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            "mapping backend checkpoint protobuf lacks field %s" % field_name
+        ) from exc
+    if not present:
+        raise ValueError(
+            "mapping backend checkpoint requires field %s" % field_name
+        )
+    return getattr(message, field_name)
+
+
+def _mapping_commit_identity_dict(message) -> Dict[str, object]:
+    return {
+        "boot_nonce": bytes(getattr(message, "boot_nonce", b"") or b""),
+        "sequence": int(getattr(message, "sequence", 0) or 0),
+    }
+
+
+def _occupancy_receipt_dict(message) -> Dict[str, object]:
+    commit_id = _require_proto_message_field(message, "commit_id")
+    return {
+        "commit_id": _mapping_commit_identity_dict(commit_id),
+        "session_id": str(getattr(message, "session_id", "") or ""),
+        "session_generation": int(
+            getattr(message, "session_generation", 0) or 0
+        ),
+        "occupancy_revision": int(
+            getattr(message, "occupancy_revision", 0) or 0
+        ),
+        "source_timestamp_ns": int(
+            getattr(message, "source_timestamp_ns", 0) or 0
+        ),
+        "backend_kind": str(getattr(message, "backend_kind", "") or ""),
+        "backend_generation": int(
+            getattr(message, "backend_generation", 0) or 0
+        ),
+    }
+
+
+def _cloud_receipt_dict(message) -> Dict[str, object]:
+    commit_id = _require_proto_message_field(message, "commit_id")
+    return {
+        "commit_id": _mapping_commit_identity_dict(commit_id),
+        "session_generation": int(
+            getattr(message, "session_generation", 0) or 0
+        ),
+        "occupancy_revision": int(
+            getattr(message, "occupancy_revision", 0) or 0
+        ),
+        "cloud_revision": int(getattr(message, "cloud_revision", 0) or 0),
+        "source_timestamp_ns": int(
+            getattr(message, "source_timestamp_ns", 0) or 0
+        ),
+        "point_count": int(getattr(message, "point_count", 0) or 0),
+    }
+
+
+def _checkpoint_export_bundle_from_proto(
+    response,
+) -> MappingBackendCheckpointExportBundle:
+    occupancy_receipt = _require_proto_message_field(response, "occupancy_receipt")
+    cloud_receipt = _require_proto_message_field(response, "cloud_receipt")
+    occupancy_checkpoint = _require_proto_message_field(
+        response,
+        "canonical_occupancy_checkpoint",
+    )
+    cloud_checkpoint = _require_proto_message_field(
+        response,
+        "canonical_cloud_checkpoint",
+    )
+    occupancy_meta = _require_proto_message_field(occupancy_checkpoint, "meta")
+    occupancy_data = bytes(getattr(occupancy_checkpoint, "data", b"") or b"")
+    if any(value > 100 and value != 255 for value in occupancy_data):
+        raise ValueError(
+            "canonical occupancy checkpoint contains values outside [-1, 100]"
+        )
+    xyz_f32_le = bytes(getattr(cloud_checkpoint, "xyz_f32_le", b"") or b"")
+    if len(xyz_f32_le) % 12 != 0:
+        raise ValueError(
+            "canonical cloud checkpoint xyz_f32_le must contain packed XYZ float32"
+        )
+    if any(
+        not math.isfinite(component)
+        for point in struct.iter_unpack("<fff", xyz_f32_le)
+        for component in point
+    ):
+        raise ValueError("canonical cloud checkpoint contains non-finite XYZ")
+    actual_xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
+    declared_xyz_sha256 = str(
+        getattr(cloud_checkpoint, "xyz_sha256", "") or ""
+    )
+    if declared_xyz_sha256 != actual_xyz_sha256:
+        raise ValueError("canonical cloud checkpoint xyz_sha256 mismatch")
+
+    checkpoint = MappingBackendCheckpoint(
+        schema_version=int(getattr(response, "schema_version", 0) or 0),
+        backend_kind=str(getattr(response, "backend_kind", "") or ""),
+        source_session_id=str(
+            getattr(response, "source_session_id", "") or ""
+        ),
+        source_session_generation=int(
+            getattr(response, "source_session_generation", 0) or 0
+        ),
+        content_sha256=bytes(
+            getattr(response, "content_sha256", b"") or b""
+        ),
+        payload_size=int(getattr(response, "payload_size", 0) or 0),
+        created_at_ns=int(getattr(response, "created_at_ns", 0) or 0),
+        payload=bytes(getattr(response, "payload", b"") or b""),
+        occupancy_receipt=_occupancy_receipt_dict(occupancy_receipt),
+        cloud_receipt=_cloud_receipt_dict(cloud_receipt),
+    )
+    occupancy_asset = {
+        "raw_data_sha256": hashlib.sha256(occupancy_data).digest(),
+        "raw_data_size": len(occupancy_data),
+        "width": int(getattr(occupancy_meta, "width", 0) or 0),
+        "height": int(getattr(occupancy_meta, "height", 0) or 0),
+        "resolution": float(getattr(occupancy_meta, "resolution", 0.0) or 0.0),
+        "origin_x": float(getattr(occupancy_meta, "origin_x", 0.0) or 0.0),
+        "origin_y": float(getattr(occupancy_meta, "origin_y", 0.0) or 0.0),
+        "frame_id": str(getattr(occupancy_meta, "frame_id", "") or ""),
+        "source_occupancy_revision": int(
+            getattr(occupancy_meta, "revision", 0) or 0
+        ),
+        "timestamp_ns": int(getattr(occupancy_meta, "timestamp_ns", 0) or 0),
+    }
+    cloud_asset = {
+        "xyz_sha256": bytes.fromhex(actual_xyz_sha256),
+        "xyz_size": len(xyz_f32_le),
+        "frame_id": str(getattr(cloud_checkpoint, "frame_id", "") or ""),
+        "source_cloud_revision": int(
+            getattr(cloud_checkpoint, "source_revision", 0) or 0
+        ),
+        "point_count": int(getattr(cloud_checkpoint, "point_count", 0) or 0),
+        "voxel_size": float(
+            getattr(cloud_checkpoint, "voxel_size", 0.0) or 0.0
+        ),
+        "payload_schema_version": int(
+            getattr(cloud_checkpoint, "payload_schema_version", 0) or 0
+        ),
+    }
+    validated_checkpoint, validated_occupancy, validated_cloud = (
+        MappingBackendCheckpointStore.validate_checkpoint_bundle(
+            checkpoint,
+            occupancy_asset=occupancy_asset,
+            cloud_asset=cloud_asset,
+        )
+    )
+    frozen_checkpoint = MappingBackendCheckpoint(
+        schema_version=validated_checkpoint.schema_version,
+        backend_kind=validated_checkpoint.backend_kind,
+        source_session_id=validated_checkpoint.source_session_id,
+        source_session_generation=validated_checkpoint.source_session_generation,
+        content_sha256=validated_checkpoint.content_sha256,
+        payload_size=validated_checkpoint.payload_size,
+        created_at_ns=validated_checkpoint.created_at_ns,
+        payload=validated_checkpoint.payload,
+        occupancy_receipt=_freeze_checkpoint_value(
+            validated_checkpoint.occupancy_receipt
+        ),
+        cloud_receipt=_freeze_checkpoint_value(validated_checkpoint.cloud_receipt),
+    )
+    return MappingBackendCheckpointExportBundle(
+        checkpoint=frozen_checkpoint,
+        occupancy_asset=_freeze_checkpoint_value(validated_occupancy),
+        cloud_asset=_freeze_checkpoint_value(validated_cloud),
+        canonical_occupancy_checkpoint_bytes=occupancy_checkpoint.SerializeToString(
+            deterministic=True
+        ),
+        canonical_cloud_checkpoint_bytes=cloud_checkpoint.SerializeToString(
+            deterministic=True
+        ),
+    )
+
+
+def _mapping_commit_identity_proto(value: Mapping[str, object]):
+    return pb2.MappingCommitIdentity(
+        boot_nonce=bytes(value.get("boot_nonce") or b""),
+        sequence=int(value.get("sequence") or 0),
+    )
+
+
+def _mapping_backend_checkpoint_proto(
+    stored: StoredMappingBackendCheckpoint,
+    occupancy_checkpoint,
+    cloud_checkpoint,
+):
+    checkpoint = stored.checkpoint
+    occupancy_receipt = checkpoint.occupancy_receipt
+    cloud_receipt = checkpoint.cloud_receipt
+    return pb2.MappingBackendCheckpoint(
+        schema_version=checkpoint.schema_version,
+        backend_kind=checkpoint.backend_kind,
+        source_session_generation=checkpoint.source_session_generation,
+        content_sha256=checkpoint.content_sha256,
+        payload_size=checkpoint.payload_size,
+        created_at_ns=checkpoint.created_at_ns,
+        payload=checkpoint.payload,
+        source_session_id=checkpoint.source_session_id,
+        occupancy_receipt=pb2.CanonicalOccupancyCommitReceipt(
+            commit_id=_mapping_commit_identity_proto(
+                occupancy_receipt["commit_id"]
+            ),
+            session_id=str(occupancy_receipt["session_id"]),
+            session_generation=int(occupancy_receipt["session_generation"]),
+            occupancy_revision=int(occupancy_receipt["occupancy_revision"]),
+            source_timestamp_ns=int(occupancy_receipt["source_timestamp_ns"]),
+            backend_kind=str(occupancy_receipt["backend_kind"]),
+            backend_generation=int(occupancy_receipt["backend_generation"]),
+        ),
+        cloud_receipt=pb2.CanonicalCloudCommitReceipt(
+            commit_id=_mapping_commit_identity_proto(cloud_receipt["commit_id"]),
+            session_generation=int(cloud_receipt["session_generation"]),
+            occupancy_revision=int(cloud_receipt["occupancy_revision"]),
+            cloud_revision=int(cloud_receipt["cloud_revision"]),
+            source_timestamp_ns=int(cloud_receipt["source_timestamp_ns"]),
+            point_count=int(cloud_receipt["point_count"]),
+        ),
+        canonical_occupancy_checkpoint=occupancy_checkpoint,
+        canonical_cloud_checkpoint=cloud_checkpoint,
+    )
+
+
+def _datetime_exact_microsecond_ns(value: object) -> Optional[int]:
+    if not isinstance(value, datetime):
+        return None
+    normalized = value
+    if normalized.tzinfo is None:
+        normalized = normalized.replace(tzinfo=timezone.utc)
+    else:
+        normalized = normalized.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = normalized - epoch
+    return (
+        delta.days * 86_400_000_000_000
+        + delta.seconds * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+def _require_float_match(actual: float, expected: float, field_name: str) -> None:
+    if (
+        not math.isfinite(actual)
+        or not math.isfinite(expected)
+        or actual != expected
+    ):
+        raise ValueError(
+            "map asset occupancy %s does not match backend checkpoint descriptor"
+            % field_name
+        )
+
+
+def _require_float32_match(
+    actual: float,
+    expected: float,
+    field_name: str,
+) -> None:
+    try:
+        matches = (
+            math.isfinite(actual)
+            and math.isfinite(expected)
+            and struct.pack("<f", actual) == struct.pack("<f", expected)
+        )
+    except (OverflowError, struct.error):
+        matches = False
+    if not matches:
+        raise ValueError(
+            "map asset occupancy %s does not match backend checkpoint descriptor"
+            % field_name
+        )
+
+
+def _validate_asset_occupancy_checkpoint(
+    occupancy_grid: OccupancyGrid,
+    encoded: bytes,
+    descriptor: Mapping[str, object],
+) -> None:
+    expected_sha256 = bytes(descriptor["raw_data_sha256"])
+    if hashlib.sha256(encoded).digest() != expected_sha256:
+        raise ValueError(
+            "map asset occupancy payload SHA-256 does not match backend checkpoint"
+        )
+    if len(encoded) != int(descriptor["raw_data_size"]):
+        raise ValueError(
+            "map asset occupancy payload size does not match backend checkpoint"
+        )
+    if (
+        int(occupancy_grid.width) != int(descriptor["width"])
+        or int(occupancy_grid.height) != int(descriptor["height"])
+    ):
+        raise ValueError(
+            "map asset occupancy dimensions do not match backend checkpoint"
+        )
+    _require_float32_match(
+        float(occupancy_grid.resolution_m),
+        float(descriptor["resolution"]),
+        "resolution",
+    )
+    origin = occupancy_grid.origin.position
+    _require_float_match(float(origin.x), float(descriptor["origin_x"]), "origin_x")
+    _require_float_match(float(origin.y), float(descriptor["origin_y"]), "origin_y")
+    frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
+    if frame_id != str(descriptor["frame_id"]):
+        raise ValueError(
+            "map asset occupancy frame does not match backend checkpoint"
+        )
+    timestamp_ns = _datetime_exact_microsecond_ns(
+        getattr(occupancy_grid, "timestamp", None)
+    )
+    exact_timestamp_ns = int(descriptor["timestamp_ns"])
+    if timestamp_ns is None or abs(timestamp_ns - exact_timestamp_ns) >= 1_000:
+        raise ValueError(
+            "map asset occupancy timestamp does not match backend checkpoint"
+        )
+
+
+def _resolve_map_bundle_asset(
+    bundle_root: Path,
+    relative_path: object,
+    field_name: str,
+) -> Path:
+    requested_root = Path(bundle_root).expanduser()
+    if not requested_root.is_absolute():
+        raise ValueError("bundle_root must be an absolute path")
+    resolved_root = requested_root.resolve(strict=True)
+    if not resolved_root.is_dir():
+        raise ValueError("bundle_root must be a directory")
+
+    path_text = str(relative_path or "").strip()
+    if not path_text:
+        raise ValueError("%s must not be empty" % field_name)
+    if "\\" in path_text:
+        raise ValueError("%s must use a POSIX relative path" % field_name)
+    relative = Path(path_text)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("%s must be a canonical bundle-relative path" % field_name)
+
+    candidate = resolved_root / relative
+    if candidate.is_symlink():
+        raise ValueError("%s must not be a symlink" % field_name)
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("%s escapes bundle_root" % field_name) from exc
+    if not resolved.is_file():
+        raise ValueError("%s is not a regular file" % field_name)
+    return resolved
 
 
 class _NavigationNotificationTicket:
@@ -789,7 +1240,7 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "motion_sink_generation": None,
         "map_frame": None,
         "pose_frame": None,
-        "forbidden_zone_map_version_id": None,
+        "forbidden_zone_map_name": None,
         "forbidden_zone_generation": None,
         "forbidden_zone_signature": None,
         "forbidden_zone_applied_revision": None,
@@ -1056,6 +1507,7 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
                     child_frame_id=edge.child_frame_id,
                     translation=edge.translation,
                     rotation=edge.rotation,
+                    authority=edge.authority,
                 )
             )
             appended += 1
@@ -1068,6 +1520,60 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
     except Exception:  # pragma: no cover
         return frame_tree
 
+
+def resolve_direct_static_calibration_edge(
+    frame_tree: FrameTree,
+    *,
+    parent_frame_id: str,
+    child_frame_id: str,
+) -> Transform:
+    """Resolve one direct, finite, unit-quaternion static calibration edge."""
+    matches = [
+        edge
+        for edge in frame_tree.transforms
+        if edge.parent_frame_id == parent_frame_id
+        and edge.child_frame_id == child_frame_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "expected exactly one direct calibration edge %s->%s; found %d"
+            % (parent_frame_id, child_frame_id, len(matches))
+        )
+
+    edge = matches[0]
+    if edge.authority != "calibration_static":
+        raise ValueError(
+            "direct calibration edge %s->%s must have authority=calibration_static"
+            % (parent_frame_id, child_frame_id)
+        )
+
+    translation = edge.translation
+    rotation = edge.rotation
+    values = (
+        translation.x,
+        translation.y,
+        translation.z,
+        rotation.x,
+        rotation.y,
+        rotation.z,
+        rotation.w,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError(
+            "direct calibration edge %s->%s must contain only finite values"
+            % (parent_frame_id, child_frame_id)
+        )
+
+    quaternion_norm_squared = sum(
+        float(value) * float(value)
+        for value in (rotation.x, rotation.y, rotation.z, rotation.w)
+    )
+    if not math.isclose(quaternion_norm_squared, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(
+            "direct calibration edge %s->%s must use a unit quaternion"
+            % (parent_frame_id, child_frame_id)
+        )
+    return edge
 
 
 class GeometryRuntimeProvider:
@@ -1163,6 +1669,9 @@ class GeometryRuntimeProvider:
         self._last_occupancy_grid: Optional[OccupancyGrid] = None
         self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
         self._mapping_identity: Optional[_MappingIdentity] = None
+        self._mapping_checkpoint_provenance: Optional[
+            _MappingCheckpointProvenance
+        ] = None
         self._map_connection_epoch = 0
         self._mapping_transition_epoch = 0
         self._mapping_transition_inflight = False
@@ -1839,9 +2348,6 @@ class GeometryRuntimeProvider:
             "message": str(getattr(response, "message", "") or ""),
             "session_id": str(getattr(response, "session_id", "") or ""),
             "map_name": str(getattr(response, "map_name", "") or ""),
-            "map_version_id": str(
-                getattr(response, "map_version_id", "") or ""
-            ),
             "session_generation": int(
                 getattr(response, "session_generation", 0) or 0
             ),
@@ -1850,13 +2356,19 @@ class GeometryRuntimeProvider:
             "idempotent_replay": bool(
                 getattr(response, "idempotent_replay", False)
             ),
+            "legacy_checkpoint_reconstructed": bool(
+                getattr(response, "legacy_checkpoint_reconstructed", False)
+            ),
+            "mapping_backend_kind": str(
+                getattr(response, "mapping_backend_kind", "") or ""
+            ),
         }
 
     @staticmethod
     def _mapping_identity_from_payload(payload: Dict[str, Any]) -> _MappingIdentity:
         identity = (
             str(payload.get("session_id") or "").strip(),
-            str(payload.get("map_version_id") or "").strip(),
+            str(payload.get("map_name") or "").strip(),
             int(payload.get("session_generation") or 0),
         )
         if not identity[0] or not identity[1] or identity[2] <= 0:
@@ -1905,6 +2417,8 @@ class GeometryRuntimeProvider:
         transition_epoch: int,
         *,
         identity: Optional[_MappingIdentity] = None,
+        checkpoint_provenance: Optional[_MappingCheckpointProvenance] = None,
+        preserve_checkpoint_provenance: bool = False,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
         with _cooperative_post_rpc_lock(
@@ -1928,6 +2442,8 @@ class GeometryRuntimeProvider:
                         self._last_occupancy_grid = None
                         self._last_occupancy_grid_identity = None
                     self._mapping_identity = identity
+                    if not preserve_checkpoint_provenance:
+                        self._mapping_checkpoint_provenance = checkpoint_provenance
                 self._mapping_transition_inflight = False
                 return True
 
@@ -1936,6 +2452,7 @@ class GeometryRuntimeProvider:
         self._mapping_transition_epoch += 1
         self._mapping_transition_inflight = False
         self._mapping_identity = None
+        self._mapping_checkpoint_provenance = None
         self._last_occupancy_grid = None
         self._last_occupancy_grid_identity = None
 
@@ -2030,7 +2547,6 @@ class GeometryRuntimeProvider:
         *,
         session_id: str,
         map_name: str,
-        map_version_id: str,
         deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("start_mapping")
@@ -2050,7 +2566,6 @@ class GeometryRuntimeProvider:
                 pb2.StartMappingRequest(
                     session_id=str(session_id or "").strip(),
                     map_name=str(map_name or "").strip(),
-                    map_version_id=str(map_version_id or "").strip(),
                 ),
                 timeout=rpc_timeout,
             )
@@ -2061,7 +2576,6 @@ class GeometryRuntimeProvider:
                 or not payload["active"]
                 or payload["session_id"] != str(session_id or "").strip()
                 or payload["map_name"] != str(map_name or "").strip()
-                or payload["map_version_id"] != str(map_version_id or "").strip()
                 or payload["session_generation"] <= 0
             ):
                 raise RuntimeError("StartMapping 未返回匹配的 ACTIVE 会话。")
@@ -2075,6 +2589,8 @@ class GeometryRuntimeProvider:
         if not self._finish_mapping_transition(
             transition_epoch,
             identity=identity,
+            checkpoint_provenance=None,
+            preserve_checkpoint_provenance=bool(payload["idempotent_replay"]),
             deadline_monotonic=deadline_monotonic,
         ):
             raise RuntimeError(
@@ -2082,30 +2598,148 @@ class GeometryRuntimeProvider:
             )
         return payload
 
-    def activate_platform_map_version(
+    def export_mapping_backend_checkpoint(
+        self,
+    ) -> MappingBackendCheckpointExportBundle:
+        """Export one barrier-consistent backend/occupancy/cloud bundle."""
+
+        self._raise_if_stopping("export_mapping_backend_checkpoint")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        rpc = getattr(self._stub, "ExportMappingBackendCheckpoint", None)
+        if not callable(rpc):
+            raise RuntimeError("Geometry runtime 不支持 backend checkpoint 导出。")
+        try:
+            response = rpc(pb2.Empty(), timeout=_heavy_deadline_sec())
+        except grpc.RpcError as exc:
+            raise GeometryRuntimeRpcError.from_rpc_error(
+                "ExportMappingBackendCheckpoint",
+                exc,
+            ) from exc
+        return _checkpoint_export_bundle_from_proto(response)
+
+    def _selected_mapping_backend_state(self) -> Dict[str, Any]:
+        state = self.get_mapping_state()
+        backend_kind = str(state.get("mapping_backend_kind") or "").strip()
+        if backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS:
+            raise RuntimeError(
+                "Geometry runtime returned unsupported mapping_backend_kind: %s"
+                % (backend_kind or "<empty>")
+            )
+        return state
+
+    def activate_platform_map(
         self,
         *,
         map_name: str,
-        version_id: str,
-        geometry_asset=None,
-        metadata=None,
+        bundle_root: Path,
+        mapping_database_path: str,
+        pcd_path: Optional[str],
+        nav_map_yaml_path: str,
+        asset_manifest_sha256: str,
         occupancy_grid: OccupancyGrid,
+        activation_request_id: Optional[str] = None,
+        expected_mapping_backend_kind: Optional[str] = None,
+        expected_backend_checkpoint_manifest_sha256: Optional[str] = None,
+        expected_backend_checkpoint_object_sha256: Optional[str] = None,
     ) -> Dict[str, Any]:
-        del metadata
-        self._raise_if_stopping("activate_platform_map_version")
+        self._raise_if_stopping("activate_platform_map")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
         if occupancy_grid is None:
-            raise RuntimeError("地图版本缺少可激活的 OccupancyGrid checkpoint。")
+            raise RuntimeError("地图资产缺少可激活的 OccupancyGrid checkpoint。")
         map_name = str(map_name or "").strip()
-        version_id = str(version_id or "").strip()
-        if not map_name or not version_id:
-            raise ValueError("map_name and version_id must not be empty")
-        frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
-        if frame_id != "map":
+        if not map_name:
+            raise ValueError("map_name must not be empty")
+        asset_manifest_sha256 = str(asset_manifest_sha256 or "").strip().lower()
+        if len(asset_manifest_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in asset_manifest_sha256
+        ):
+            raise ValueError("asset_manifest_sha256 must be lowercase SHA-256 hex")
+
+        expected_backend_kind = (
+            str(expected_mapping_backend_kind or "").strip()
+            if expected_mapping_backend_kind is not None
+            else None
+        )
+        if (
+            expected_backend_kind is not None
+            and expected_backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS
+        ):
             raise ValueError(
-                "native map checkpoint frame must be map, received %s" % frame_id
+                "expected_mapping_backend_kind must identify a supported backend"
             )
+
+        def normalize_expected_sha256(
+            value: Optional[str],
+            field_name: str,
+        ) -> Optional[str]:
+            if value is None:
+                return None
+            resolved = str(value or "").strip()
+            if len(resolved) != 64 or any(
+                character not in "0123456789abcdef" for character in resolved
+            ):
+                raise ValueError(
+                    "%s must be lowercase SHA-256 hex" % field_name
+                )
+            return resolved
+
+        expected_checkpoint_manifest_sha256 = normalize_expected_sha256(
+            expected_backend_checkpoint_manifest_sha256,
+            "expected_backend_checkpoint_manifest_sha256",
+        )
+        expected_checkpoint_object_sha256 = normalize_expected_sha256(
+            expected_backend_checkpoint_object_sha256,
+            "expected_backend_checkpoint_object_sha256",
+        )
+        if (
+            expected_checkpoint_manifest_sha256 is None
+        ) != (
+            expected_checkpoint_object_sha256 is None
+        ):
+            raise ValueError(
+                "expected backend checkpoint manifest and object SHA-256 "
+                "must be provided together"
+            )
+        if (
+            expected_checkpoint_manifest_sha256 is not None
+            and expected_backend_kind is None
+        ):
+            raise ValueError(
+                "expected_mapping_backend_kind is required with checkpoint identity"
+            )
+
+        _resolve_map_bundle_asset(
+            bundle_root,
+            mapping_database_path,
+            "mapping_database_path",
+        )
+        _resolve_map_bundle_asset(
+            bundle_root,
+            nav_map_yaml_path,
+            "nav_map_yaml_path",
+        )
+        resolved_pcd_path = (
+            _resolve_map_bundle_asset(bundle_root, pcd_path, "pcd_path")
+            if str(pcd_path or "").strip()
+            else None
+        )
+        resolved_bundle_root = Path(bundle_root).expanduser().resolve(strict=True)
+        mapping_state = self._selected_mapping_backend_state()
+        selected_backend_kind = mapping_state["mapping_backend_kind"]
+        if (
+            expected_backend_kind is not None
+            and selected_backend_kind != expected_backend_kind
+        ):
+            raise RuntimeError(
+                "mapping backend kind does not match finalized map asset: "
+                "live=%s expected=%s"
+                % (selected_backend_kind, expected_backend_kind)
+            )
+        frame_id = str(occupancy_grid.frame_id or "").strip().lstrip("/")
+        if not frame_id:
+            raise ValueError("native map checkpoint frame must not be empty")
         values = [int(value) for value in occupancy_grid.data]
         if any(value < -1 or value > 100 for value in values):
             raise ValueError("occupancy checkpoint values must be within [-1, 100]")
@@ -2113,84 +2747,166 @@ class GeometryRuntimeProvider:
         timestamp = getattr(occupancy_grid, "timestamp", None)
         timestamp_ns = int(timestamp.timestamp() * 1_000_000_000) if timestamp else 0
         origin = occupancy_grid.origin.position
-        asset_payload = geometry_asset
-        if asset_payload is not None and not isinstance(asset_payload, dict):
-            dumper = getattr(asset_payload, "model_dump", None)
-            asset_payload = dumper(mode="json") if callable(dumper) else None
-        asset_payload = dict(asset_payload or {})
-        pcd_path_value = str(asset_payload.get("pcd_path") or "").strip()
-        cloud_checkpoint = None
-        if pcd_path_value:
-            pcd_path = Path(pcd_path_value).expanduser()
-            if pcd_path.is_file():
-                import numpy as np
-
-                from services.geometry.pointcloud_map import read_pcd_xyz
-
-                try:
-                    _header, points_xyz = read_pcd_xyz(pcd_path)
-                except Exception as exc:
-                    raise RuntimeError(
-                        "读取历史地图 3D PCD checkpoint 失败：%s" % exc
-                    ) from exc
-                points_xyz = np.asarray(points_xyz, dtype="<f4", order="C")
-                finite_mask = np.isfinite(points_xyz).all(axis=1)
-                if not bool(finite_mask.all()):
-                    points_xyz = np.asarray(
-                        points_xyz[finite_mask], dtype="<f4", order="C"
-                    )
-                if points_xyz.ndim != 2 or points_xyz.shape[1] != 3 or not points_xyz.size:
-                    raise RuntimeError("历史地图 3D PCD checkpoint 没有可用 XYZ 点。")
-                point_count = int(points_xyz.shape[0])
-                if point_count > 0xFFFF_FFFF:
-                    raise RuntimeError("历史地图 3D PCD checkpoint 点数超过 uint32。")
-                xyz_f32_le = points_xyz.tobytes(order="C")
-                xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
-                quality_metrics = dict(asset_payload.get("quality_metrics") or {})
-                pcd_quality = dict(quality_metrics.get("pcd") or {})
-                expected_sha256 = str(pcd_quality.get("xyz_sha256") or "").strip()
-                if expected_sha256 and expected_sha256 != xyz_sha256:
-                    raise RuntimeError("历史地图 3D PCD checkpoint SHA256 校验失败。")
-                try:
-                    voxel_size = float(pcd_quality.get("voxel_size") or 0.05)
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError("历史地图 3D PCD voxel_size 非法。") from exc
-                if not math.isfinite(voxel_size) or voxel_size <= 0.0:
-                    raise RuntimeError("历史地图 3D PCD voxel_size 必须为正有限数。")
-                try:
-                    source_revision = max(
-                        0, int(pcd_quality.get("cloud_revision") or 0)
-                    )
-                except (TypeError, ValueError):
-                    source_revision = 0
-                cloud_frame_id = str(
-                    asset_payload.get("frame_id") or frame_id
-                ).strip().lstrip("/")
-                if cloud_frame_id != "map":
-                    raise ValueError(
-                        "native cloud checkpoint frame must be map, received %s"
-                        % cloud_frame_id
-                    )
-                cloud_checkpoint = pb2.CloudMapCheckpoint(
-                    frame_id=cloud_frame_id,
-                    source_revision=source_revision,
-                    point_count=point_count,
-                    voxel_size=voxel_size,
-                    xyz_f32_le=xyz_f32_le,
-                    xyz_sha256=xyz_sha256,
-                    payload_schema_version=1,
+        checkpoint_store = MappingBackendCheckpointStore(resolved_bundle_root)
+        try:
+            stored_backend_checkpoint = checkpoint_store.load(selected_backend_kind)
+        except MappingBackendCheckpointNotFoundError as exc:
+            if expected_checkpoint_manifest_sha256 is not None:
+                raise RuntimeError(
+                    "finalized map asset expected a mapping backend checkpoint "
+                    "that is not available"
+                ) from exc
+            stored_backend_checkpoint = None
+        if stored_backend_checkpoint is not None and expected_backend_kind is not None:
+            loaded_checkpoint = stored_backend_checkpoint.checkpoint
+            loaded_backend_kind = str(loaded_checkpoint.backend_kind or "").strip()
+            if loaded_backend_kind != expected_backend_kind:
+                raise RuntimeError(
+                    "mapping backend checkpoint kind does not match finalized map asset: "
+                    "loaded=%s expected=%s"
+                    % (loaded_backend_kind, expected_backend_kind)
                 )
-        current_identity = self._mapping_identity
-        session_id = (
-            current_identity[0]
-            if current_identity is not None and current_identity[1] == version_id
-            else "mapload:%s" % uuid.uuid4().hex
+            if (
+                expected_checkpoint_manifest_sha256 is not None
+                and stored_backend_checkpoint.manifest_sha256
+                != expected_checkpoint_manifest_sha256
+            ):
+                raise RuntimeError(
+                    "mapping backend checkpoint manifest SHA-256 does not match "
+                    "finalized map asset"
+                )
+            loaded_object_sha256 = bytes(loaded_checkpoint.content_sha256).hex()
+            if (
+                expected_checkpoint_object_sha256 is not None
+                and loaded_object_sha256 != expected_checkpoint_object_sha256
+            ):
+                raise RuntimeError(
+                    "mapping backend checkpoint object SHA-256 does not match "
+                    "finalized map asset"
+                )
+        if (
+            stored_backend_checkpoint is None
+            and selected_backend_kind == "raytracing"
+        ):
+            raise RuntimeError(
+                "BACKEND_CHECKPOINT_REQUIRED: raytracing map activation requires "
+                "mapping_backend/raytracing/checkpoint-v1.json"
+            )
+        legacy_checkpoint_reconstructed = stored_backend_checkpoint is None
+        checkpoint_provenance: _MappingCheckpointProvenance = (
+            selected_backend_kind,
+            legacy_checkpoint_reconstructed,
+            asset_manifest_sha256,
+            (
+                stored_backend_checkpoint.manifest_sha256
+                if stored_backend_checkpoint is not None
+                else ""
+            ),
         )
-        request = pb2.ActivateMapVersionRequest(
-            session_id=session_id,
-            map_name=map_name,
-            map_version_id=version_id,
-            checkpoint=pb2.OccupancyGridData(
+
+        cloud_checkpoint = None
+        if stored_backend_checkpoint is not None and resolved_pcd_path is None:
+            raise ValueError(
+                "mapping backend checkpoint requires its contained canonical PCD"
+            )
+        if resolved_pcd_path is not None:
+            import numpy as np
+
+            from services.geometry.pointcloud_map import read_pcd_xyz
+
+            try:
+                _header, points_xyz = read_pcd_xyz(resolved_pcd_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    "读取地图资产 3D PCD checkpoint 失败：%s" % exc
+                ) from exc
+            points_xyz = np.asarray(points_xyz, dtype="<f4", order="C")
+            finite_mask = np.isfinite(points_xyz).all(axis=1)
+            if not bool(finite_mask.all()):
+                if stored_backend_checkpoint is not None:
+                    raise RuntimeError(
+                        "mapping backend checkpoint PCD contains non-finite XYZ"
+                    )
+                points_xyz = np.asarray(
+                    points_xyz[finite_mask],
+                    dtype="<f4",
+                    order="C",
+                )
+            if points_xyz.ndim != 2 or points_xyz.shape[1] != 3 or not points_xyz.size:
+                raise RuntimeError("地图资产 3D PCD checkpoint 没有可用 XYZ 点。")
+            point_count = int(points_xyz.shape[0])
+            if point_count > 0xFFFF_FFFF:
+                raise RuntimeError("地图资产 3D PCD checkpoint 点数超过 uint32。")
+            xyz_f32_le = points_xyz.tobytes(order="C")
+            xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
+            if stored_backend_checkpoint is not None:
+                cloud_descriptor = stored_backend_checkpoint.cloud_asset
+                if bytes.fromhex(xyz_sha256) != bytes(cloud_descriptor["xyz_sha256"]):
+                    raise ValueError(
+                        "map asset PCD SHA-256 does not match backend checkpoint"
+                    )
+                if len(xyz_f32_le) != int(cloud_descriptor["xyz_size"]):
+                    raise ValueError(
+                        "map asset PCD size does not match backend checkpoint"
+                    )
+                if point_count != int(cloud_descriptor["point_count"]):
+                    raise ValueError(
+                        "map asset PCD point_count does not match backend checkpoint"
+                    )
+                voxel_size = float(cloud_descriptor["voxel_size"])
+                source_revision = int(cloud_descriptor["source_cloud_revision"])
+                cloud_frame_id = str(cloud_descriptor["frame_id"])
+                payload_schema_version = int(
+                    cloud_descriptor["payload_schema_version"]
+                )
+            else:
+                voxel_size = 0.05
+                source_revision = 0
+                cloud_frame_id = frame_id
+                payload_schema_version = 1
+            if cloud_frame_id != frame_id:
+                raise ValueError(
+                    "native cloud checkpoint frame must match occupancy frame %s, "
+                    "received %s" % (frame_id, cloud_frame_id)
+                )
+            cloud_checkpoint = pb2.CloudMapCheckpoint(
+                frame_id=cloud_frame_id,
+                source_revision=source_revision,
+                point_count=point_count,
+                voxel_size=voxel_size,
+                xyz_f32_le=xyz_f32_le,
+                xyz_sha256=xyz_sha256,
+                payload_schema_version=payload_schema_version,
+            )
+        if stored_backend_checkpoint is not None and cloud_checkpoint is None:
+            raise ValueError(
+                "mapping backend checkpoint canonical PCD is missing or unreadable"
+            )
+
+        if stored_backend_checkpoint is not None:
+            occupancy_descriptor = stored_backend_checkpoint.occupancy_asset
+            _validate_asset_occupancy_checkpoint(
+                occupancy_grid,
+                encoded,
+                occupancy_descriptor,
+            )
+            occupancy_checkpoint = pb2.OccupancyGridData(
+                meta=pb2.OccupancyGridMeta(
+                    width=int(occupancy_descriptor["width"]),
+                    height=int(occupancy_descriptor["height"]),
+                    resolution=float(occupancy_descriptor["resolution"]),
+                    origin_x=float(occupancy_descriptor["origin_x"]),
+                    origin_y=float(occupancy_descriptor["origin_y"]),
+                    frame_id=str(occupancy_descriptor["frame_id"]),
+                    revision=int(
+                        occupancy_descriptor["source_occupancy_revision"]
+                    ),
+                    timestamp_ns=int(occupancy_descriptor["timestamp_ns"]),
+                ),
+                data=encoded,
+            )
+        else:
+            occupancy_checkpoint = pb2.OccupancyGridData(
                 meta=pb2.OccupancyGridMeta(
                     width=int(occupancy_grid.width),
                     height=int(occupancy_grid.height),
@@ -2202,13 +2918,207 @@ class GeometryRuntimeProvider:
                     timestamp_ns=max(0, timestamp_ns),
                 ),
                 data=encoded,
-            ),
+            )
+        with self._map_state_lock:
+            current_identity = self._mapping_identity
+            current_checkpoint_provenance = self._mapping_checkpoint_provenance
+        if activation_request_id is not None:
+            session_id = str(activation_request_id or "").strip()
+            request_suffix = session_id.removeprefix("mapload:")
+            if (
+                not session_id.startswith("mapload:")
+                or len(request_suffix) != 32
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in request_suffix
+                )
+            ):
+                raise ValueError(
+                    "activation_request_id must be mapload: followed by 32 lowercase hex characters"
+                )
+        else:
+            session_id = (
+                current_identity[0]
+                if (
+                    current_identity is not None
+                    and current_identity[1] == map_name
+                    and current_checkpoint_provenance == checkpoint_provenance
+                )
+                else "mapload:%s" % uuid.uuid4().hex
+            )
+        request = pb2.ActivateMapRequest(
+            session_id=session_id,
+            map_name=map_name,
+            checkpoint=occupancy_checkpoint,
         )
         if cloud_checkpoint is not None:
             request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
+        if stored_backend_checkpoint is not None:
+            assert cloud_checkpoint is not None
+            request.mapping_backend_checkpoint.CopyFrom(
+                _mapping_backend_checkpoint_proto(
+                    stored_backend_checkpoint,
+                    occupancy_checkpoint,
+                    cloud_checkpoint,
+                )
+            )
         transition_epoch = self._begin_mapping_transition()
+        backend_mutation_dispatched = False
+        backend_stop_confirmed = False
+
+        def invalidate_transition_map_identity() -> None:
+            with self._map_state_lock:
+                if transition_epoch != self._mapping_transition_epoch:
+                    return
+                self._mapping_identity = None
+                self._mapping_checkpoint_provenance = None
+                self._last_occupancy_grid = None
+                self._last_occupancy_grid_identity = None
+
+        def finish_failed_transition(*, invalidate_identity: bool) -> None:
+            if invalidate_identity:
+                invalidate_transition_map_identity()
+            try:
+                self._finish_mapping_transition(transition_epoch)
+            except Exception:
+                LOGGER.exception(
+                    "Map activation transition cleanup failed after RPC failure."
+                )
+
+        def outcome_unknown(message: str) -> GeometryRuntimeMapActivationOutcomeUnknown:
+            error = GeometryRuntimeMapActivationOutcomeUnknown(message)
+            error.backend_changed = bool(backend_mutation_dispatched)
+            error.backend_stop_confirmed = bool(backend_stop_confirmed)
+            error.backend_activation_disposition = "unknown"
+            error.activation_request_id = session_id
+            error.map_name = map_name
+            return error
+
         try:
-            response = self._stub.ActivateMapVersion(
+            authoritative_response = self._stub.GetMappingState(
+                pb2.Empty(),
+                timeout=_read_deadline_sec(),
+            )
+            authoritative_state = self._mapping_state_payload(
+                authoritative_response
+            )
+            authoritative_phase = str(
+                authoritative_state["phase"] or ""
+            ).strip().upper()
+            authoritative_backend_kind = str(
+                authoritative_state["mapping_backend_kind"] or ""
+            ).strip()
+            if not authoritative_state["success"]:
+                raise RuntimeError(
+                    "GetMappingState did not return a successful authoritative state"
+                )
+            if authoritative_phase not in {"IDLE", "ACTIVE", "STOPPED"}:
+                raise RuntimeError(
+                    "Geometry runtime returned unsupported mapping phase: %s"
+                    % (authoritative_phase or "<empty>")
+                )
+            if (
+                authoritative_state["active"]
+                and authoritative_phase != "ACTIVE"
+            ):
+                raise RuntimeError(
+                    "GetMappingState returned an inconsistent active mapping state"
+                )
+            if (
+                authoritative_phase == "ACTIVE"
+                and not authoritative_state["active"]
+            ):
+                raise RuntimeError(
+                    "GetMappingState returned ACTIVE without an active session"
+                )
+            authoritative_session_id = str(
+                authoritative_state["session_id"] or ""
+            ).strip()
+            authoritative_map_name = str(
+                authoritative_state["map_name"] or ""
+            ).strip()
+            if (
+                authoritative_phase == "STOPPED"
+                and authoritative_session_id == session_id
+            ):
+                raise GeometryRuntimeMapActivationStaleRequest(
+                    activation_request_id=session_id,
+                    map_name=map_name,
+                    current_phase=authoritative_phase,
+                    current_map_name=authoritative_map_name,
+                )
+            if authoritative_backend_kind != selected_backend_kind:
+                raise RuntimeError(
+                    "mapping backend kind changed while validating map activation: "
+                    "validated=%s authoritative=%s"
+                    % (
+                        selected_backend_kind,
+                        authoritative_backend_kind or "<empty>",
+                    )
+                )
+
+            stop_session_id = ""
+            if authoritative_state["active"]:
+                if (
+                    not authoritative_session_id
+                    or not authoritative_map_name
+                    or int(authoritative_state["session_generation"] or 0) <= 0
+                ):
+                    raise RuntimeError(
+                        "GetMappingState returned an incomplete ACTIVE identity"
+                    )
+                if authoritative_session_id == session_id:
+                    if authoritative_map_name != map_name:
+                        raise GeometryRuntimeMapActivationStaleRequest(
+                            activation_request_id=session_id,
+                            map_name=map_name,
+                            current_phase=authoritative_phase or "ACTIVE",
+                            current_map_name=authoritative_map_name,
+                        )
+                    # The Rust service verifies the checkpoint digest on replay.
+                else:
+                    stop_session_id = authoritative_session_id
+        except Exception:
+            finish_failed_transition(invalidate_identity=False)
+            raise
+
+        if stop_session_id:
+            backend_mutation_dispatched = True
+            try:
+                stop_response = self._stub.StopMapping(
+                    pb2.StopMappingRequest(
+                        session_id=stop_session_id,
+                        reason="activate platform map %s" % map_name,
+                    ),
+                    timeout=_heavy_deadline_sec(),
+                )
+                stopped_state = self._mapping_state_payload(stop_response)
+                if (
+                    not stopped_state["success"]
+                    or stopped_state["phase"] != "STOPPED"
+                    or stopped_state["active"]
+                    or stopped_state["session_id"] != stop_session_id
+                    or stopped_state["map_name"] != authoritative_map_name
+                    or stopped_state["session_generation"]
+                    != authoritative_state["session_generation"]
+                    or stopped_state["mapping_backend_kind"]
+                    != selected_backend_kind
+                ):
+                    raise RuntimeError(
+                        "StopMapping 未返回匹配的 STOPPED 旧地图会话。"
+                    )
+                backend_stop_confirmed = True
+                invalidate_transition_map_identity()
+            except Exception as exc:
+                finish_failed_transition(invalidate_identity=True)
+                raise outcome_unknown(
+                    "StopMapping dispatch or acknowledgement failed before "
+                    "ActivateMap: %s" % exc
+                ) from exc
+
+        backend_mutation_dispatched = True
+        try:
+            response = self._stub.ActivateMap(
                 request,
                 timeout=_heavy_deadline_sec(),
             )
@@ -2219,34 +3129,70 @@ class GeometryRuntimeProvider:
                 or not payload["active"]
                 or payload["session_id"] != session_id
                 or payload["map_name"] != map_name
-                or payload["map_version_id"] != version_id
                 or payload["session_generation"] <= 0
                 or payload["revision"] <= 0
+                or payload["mapping_backend_kind"] != selected_backend_kind
+                or payload["legacy_checkpoint_reconstructed"]
+                != legacy_checkpoint_reconstructed
             ):
-                raise RuntimeError("ActivateMapVersion 未返回匹配的 ACTIVE checkpoint 会话。")
+                raise RuntimeError(
+                    "ActivateMap 未返回匹配的 ACTIVE checkpoint 会话。"
+                )
             identity = self._mapping_identity_from_payload(payload)
-        except Exception:
-            self._finish_mapping_transition(transition_epoch)
-            raise
-        if not self._finish_mapping_transition(
-            transition_epoch,
-            identity=identity,
-        ):
-            raise RuntimeError(
-                "ActivateMapVersion 完成时 mapping transition 已被断连或新代际取代。"
+        except Exception as exc:
+            finish_failed_transition(invalidate_identity=True)
+            raise outcome_unknown(
+                "ActivateMap dispatch or acknowledgement failed: %s" % exc
+            ) from exc
+        try:
+            transition_finished = self._finish_mapping_transition(
+                transition_epoch,
+                identity=identity,
+                checkpoint_provenance=checkpoint_provenance,
+            )
+        except Exception as exc:
+            finish_failed_transition(invalidate_identity=True)
+            raise outcome_unknown(
+                "ActivateMap acknowledgement was valid but transition commit failed: %s"
+                % exc
+            ) from exc
+        if not transition_finished:
+            invalidate_transition_map_identity()
+            raise outcome_unknown(
+                "ActivateMap 完成时 mapping transition 已被断连或新代际取代。"
             )
         return {
             **payload,
+            "asset_manifest_sha256": asset_manifest_sha256,
+            "mapping_database_path": Path(mapping_database_path).as_posix(),
+            "pcd_path": Path(pcd_path).as_posix() if resolved_pcd_path is not None else None,
+            "nav_map_yaml_path": Path(nav_map_yaml_path).as_posix(),
             "backend_switch_applied": True,
+            "backend_activation_disposition": "applied",
+            "activation_request_id": session_id,
             "backend_mode": (
-                "native_map_checkpoint"
-                if cloud_checkpoint is not None
-                else "native_occupancy_checkpoint"
+                "native_mapping_backend_checkpoint"
+                if stored_backend_checkpoint is not None
+                else (
+                    "native_map_checkpoint"
+                    if cloud_checkpoint is not None
+                    else "native_occupancy_checkpoint"
+                )
             ),
             "checkpoint_kind": (
-                "occupancy_grid+cloud_map"
-                if cloud_checkpoint is not None
-                else "occupancy_grid"
+                "occupancy_grid+cloud_map+mapping_backend"
+                if stored_backend_checkpoint is not None
+                else (
+                    "occupancy_grid+cloud_map"
+                    if cloud_checkpoint is not None
+                    else "occupancy_grid"
+                )
+            ),
+            "backend_checkpoint_present": stored_backend_checkpoint is not None,
+            "backend_checkpoint_manifest_sha256": (
+                stored_backend_checkpoint.manifest_sha256
+                if stored_backend_checkpoint is not None
+                else ""
             ),
             "cloud_checkpoint_present": cloud_checkpoint is not None,
             "cloud_checkpoint_point_count": (
@@ -2259,6 +3205,10 @@ class GeometryRuntimeProvider:
                 if cloud_checkpoint is not None
                 else 0
             ),
+            "legacy_checkpoint_reconstructed": payload[
+                "legacy_checkpoint_reconstructed"
+            ],
+            "mapping_backend_kind": payload["mapping_backend_kind"],
             "mapping_session_id": payload["session_id"],
         }
 
@@ -2300,6 +3250,7 @@ class GeometryRuntimeProvider:
                     self._mapping_transition_epoch += 1
                 # STOPPED 后保留同一身份的最终栅格，供 save-map 收尾读取。
                 self._mapping_identity = stopped_identity
+                self._mapping_checkpoint_provenance = None
         return payload
 
     def get_mapping_state(self) -> Dict[str, Any]:
@@ -2621,6 +3572,8 @@ class GeometryRuntimeProvider:
             raise ValueError("occupancy width/height must be positive")
         if resolution <= 0.0:
             raise ValueError("occupancy resolution must be positive")
+        if timestamp_ns < 0:
+            raise ValueError("occupancy timestamp_ns must be non-negative")
         expected_size = width * height
         if len(data) != expected_size:
             raise ValueError(
@@ -2631,10 +3584,9 @@ class GeometryRuntimeProvider:
         if any(value < -1 or value > 100 for value in decoded):
             raise ValueError("occupancy data contains values outside [-1, 100]")
         frame_id = str(frame_id or "map").strip().lstrip("/") or "map"
-        timestamp = (
-            datetime.fromtimestamp(timestamp_ns / 1_000_000_000.0, tz=timezone.utc)
-            if timestamp_ns > 0
-            else datetime.now(timezone.utc)
+        timestamp = datetime.fromtimestamp(
+            timestamp_ns / 1_000_000_000.0,
+            tz=timezone.utc,
         )
         return OccupancyGrid(
             timestamp=timestamp,
@@ -2704,8 +3656,28 @@ class GeometryRuntimeProvider:
                 self._last_occupancy_grid_identity = request_identity
         return grid
 
+    def get_occupancy_grid_identity(
+        self,
+        occupancy_grid: Optional[OccupancyGrid] = None,
+    ) -> Optional[_MappingIdentity]:
+        """Return the session identity that still owns a validated grid."""
+
+        with self._map_state_lock:
+            identity = self._mapping_identity
+            cached = self._last_occupancy_grid
+            if (
+                self._stopping
+                or self._mapping_transition_inflight
+                or identity is None
+                or self._last_occupancy_grid_identity != identity
+                or cached is None
+                or (occupancy_grid is not None and occupancy_grid != cached)
+            ):
+                return None
+            return identity
+
     def get_raw_occupancy_grid(self) -> Optional[OccupancyGrid]:
-        """返回物理栅格，供地图版本持久化避免烘焙虚拟禁行区。"""
+        """返回物理栅格，供地图资产持久化避免烘焙虚拟禁行区。"""
 
         payload = self.get_raw_occupancy_grid_data()
         if payload is None:
@@ -2745,9 +3717,9 @@ class GeometryRuntimeProvider:
         schema_version = int(update.schema_version)
         checksum = str(update.checksum or "").strip().lower()
         session_id = str(update.session_id or "").strip()
-        map_version_id = str(update.map_version_id or "").strip()
+        map_name = str(update.map_name or "").strip()
         session_generation = int(update.session_generation)
-        if not session_id or not map_version_id or session_generation <= 0:
+        if not session_id or not map_name or session_generation <= 0:
             raise ValueError("map update is missing mapping session identity")
         expected_size = int(meta.width) * int(meta.height)
         if declared_size != len(data) or declared_size != expected_size:
@@ -2862,7 +3834,7 @@ class GeometryRuntimeProvider:
             "timestamp_ns": int(meta.timestamp_ns),
             "mapping_session_id": session_id,
             "session_id": session_id,
-            "map_version_id": map_version_id,
+            "map_name": map_name,
             "session_generation": session_generation,
             "known_cell_count": known_cell_count,
             "occupied_cell_count": occupied_cell_count,
@@ -2873,7 +3845,7 @@ class GeometryRuntimeProvider:
                 "occupied_cell_count": occupied_cell_count,
             },
         }
-        identity = (session_id, map_version_id, session_generation)
+        identity = (session_id, map_name, session_generation)
         with self._map_state_lock:
             if self._stopping or self._mapping_transition_inflight:
                 raise ValueError(
@@ -2906,7 +3878,7 @@ class GeometryRuntimeProvider:
                 "frame_id": grid.frame_id,
                 "revision": revision,
                 "session_id": session_id,
-                "map_version_id": map_version_id,
+                "map_name": map_name,
                 "session_generation": session_generation,
                 "metadata": metadata,
             },
@@ -3041,8 +4013,8 @@ class GeometryRuntimeProvider:
                     ),
                     "map_frame": str(getattr(resp, "map_frame", "") or ""),
                     "pose_frame": str(getattr(resp, "pose_frame", "") or ""),
-                    "forbidden_zone_map_version_id": str(
-                        getattr(resp, "forbidden_zone_map_version_id", "") or ""
+                    "forbidden_zone_map_name": str(
+                        getattr(resp, "forbidden_zone_map_name", "") or ""
                     ),
                     "forbidden_zone_generation": int(
                         getattr(resp, "forbidden_zone_generation", 0) or 0
@@ -5129,7 +6101,7 @@ class GeometryRuntimeProvider:
         payload: bytes,
         point_step: int,
         *,
-        frame_id: str = "map",
+        frame_id: str = "",
         timestamp_ns: int = 0,
         fields: Optional[List[Dict[str, Any]]] = None,
         point_count: int = 0,
@@ -5138,10 +6110,15 @@ class GeometryRuntimeProvider:
         """Publish normalized PointCloud2 data through the Rust gRPC facade.
 
         ``payload`` and ``point_step`` remain positional for compatibility with the
-        original bridge call shape. Metadata is keyword-only so older direct callers
-        can continue to publish while the runtime applies its legacy defaults.
+        original bridge call shape. Point-cloud metadata is keyword-only, and
+        ``frame_id`` is semantically required: missing or whitespace-padded values
+        are rejected before any RPC instead of being repaired to a legacy frame.
         """
         self._raise_if_stopping("publish_point_cloud")
+        raw_frame_id = str(frame_id or "")
+        normalized_frame_id = raw_frame_id.strip()
+        if not normalized_frame_id or normalized_frame_id != raw_frame_id:
+            return False
         if not self._stub:
             return False
 
@@ -5160,7 +6137,7 @@ class GeometryRuntimeProvider:
             request = pb2.PublishPointCloudRequest(
                 points=bytes(payload),
                 point_step=max(0, int(point_step)),
-                frame_id=str(frame_id or "map"),
+                frame_id=normalized_frame_id,
                 timestamp_ns=max(0, int(timestamp_ns)),
                 fields=proto_fields,
                 point_count=max(0, int(point_count)),

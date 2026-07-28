@@ -42,6 +42,28 @@ scripts/ci/*
 **/goldens/
 **/recordings/
 *.md
+!services/nuwax-workspace/crates/nuwax-lio-backends/native/livox/cpp/README.md
+!services/nuwax-workspace/crates/nuwax-lio-backends/tests/
+!services/nuwax-workspace/crates/nuwax-lio-backends/tests/*.rs
+!services/nuwax-workspace/crates/nuwax-lio-backends/fixtures/
+!services/nuwax-workspace/crates/nuwax-lio-backends/fixtures/*.json
+!services/nuwax-workspace/crates/nuwax-lio-backends/goldens/
+!services/nuwax-workspace/crates/nuwax-lio-backends/goldens/*.json
+!/tests/
+/tests/*
+!/tests/unit/
+/tests/unit/*
+!tests/unit/test_geometry_canonical_writer_contract.py
+!tests/unit/test_geometry_lio_profile_conflicts.py
+!tests/unit/test_mapping_backend_checkpoint_store.py
+!/docs/开发文档/
+/docs/开发文档/*
+!/docs/开发文档/建图导航探索重构/
+/docs/开发文档/建图导航探索重构/*
+!/docs/开发文档/建图导航探索重构/2026-07-24_功能库流程编排_A2V2/
+/docs/开发文档/建图导航探索重构/2026-07-24_功能库流程编排_A2V2/*
+!docs/开发文档/建图导航探索重构/2026-07-24_功能库流程编排_A2V2/05_G013_FastLIO2_PointLIO原生Owner与V2验证.md
+!docs/开发文档/建图导航探索重构/2026-07-24_功能库流程编排_A2V2/06_G014_LIO聚合验收与V2验证.md
 
 # 本轮本地 release gate 与格式说明不入库。
 .github/workflows/release-gates.yml

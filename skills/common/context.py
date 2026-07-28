@@ -47,7 +47,7 @@ class SkillContext:
     event_bus: Optional[EventBus]
     serialize: Callable[[Any], Any]
     serialize_lightweight: Callable[[Any], Any]
-    # P2-4 批3：编排型 handler（relocalize/activate/delete/load_map_version）依赖网关
+    # P2-4 批3：编排型 handler（relocalize/activate/delete）依赖网关
     # 运行时内部状态的私有方法（几何运行时启动锁/事件、流帧发布等），无法下沉到 skills，
     # 按设计文档 §2.5「作为 ctx 上的可调用句柄注入」下传（与 serialize 同范式，守 R4b）。
     ensure_geometry_runtime_for_capability: Callable[[str], None]

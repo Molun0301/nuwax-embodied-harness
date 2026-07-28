@@ -320,7 +320,11 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),
     ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
     ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),
-    ("nuwax_msgs.PersonFollowTarget", 0xf313_e184_14b2_f0c6_u64),
+    ("nuwax_msgs.PersonFollowTarget", 0xa4d8_55f7_31c5_8fed_u64),
+    ("nuwax_msgs.PersonFollowCommand", 0x3b56_bc67_ec81_a3f4_u64),
+    ("nuwax_msgs.LioOdometryEnvelope", 0xba16_cd83_6063_d111_u64),
+    ("nuwax_msgs.LioCloudEnvelope", 0xee6a_5707_c1d4_d40d_u64),
+    ("nuwax_msgs.LioStatus", 0x36bd_731b_6c5d_20d9_u64),
 ];
 
 /// 按 FQN 查 per-type seed(线性搜索,固定表小)。`None` 表示未在 STRUCT_SEEDS

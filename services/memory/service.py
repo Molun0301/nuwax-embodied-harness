@@ -155,7 +155,7 @@ class MemoryService:
 
     _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
     _SEGMENTATION_REPROJECTION_ERROR_GATE = 2.0
-    _NAVIGATION_QUALITY_SCHEMA_VERSION = "4.4-v1"
+    _NAVIGATION_QUALITY_SCHEMA_VERSION = "4.4-v2"
     _NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN = 0.55
     _NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE = 0.35
     _NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN = 0.20
@@ -266,13 +266,14 @@ class MemoryService:
         self._semantic_graph_relations_by_id: Dict[str, SemanticGraphRelation] = {}
         self._semantic_summary_nodes_by_id: Dict[str, SemanticSummaryNode] = {}
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=None,
+            map_name=None,
             frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
         )
         self._latest_semantic_map_context_localization_session_id: Optional[str] = None
+        self._latest_semantic_map_context_snapshot_id: Optional[str] = None
         self._tagged_location_history: Deque[TaggedLocation] = deque(maxlen=max(1, history_limit))
         self._semantic_history: Deque[SemanticMemoryEntry] = deque(maxlen=max(1, history_limit))
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
@@ -509,7 +510,7 @@ class MemoryService:
         return index
 
     def build_memory_checkpoint(self, *, library_name: Optional[str] = None) -> Dict[str, object]:
-        """构建可写入地图版本 manifest 的记忆检查点。"""
+        """构建可写入地图资产包 manifest 的记忆检查点。"""
 
         target_library = str(library_name or "").strip() or self._active_library_name
 
@@ -856,13 +857,14 @@ class MemoryService:
         self._semantic_graph_relation_history.clear()
         self._semantic_summary_history.clear()
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=None,
+            map_name=None,
             frame_id=DEFAULT_MAP_FRAME,
             semantic_regions=(),
             anchors_by_id={},
             topology_nodes_by_id={},
         )
         self._latest_semantic_map_context_localization_session_id = None
+        self._latest_semantic_map_context_snapshot_id = None
         self._vector_store.clear_all()
 
     def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
@@ -1135,7 +1137,11 @@ class MemoryService:
             map_snapshot.metadata if map_snapshot is not None else {},
             metadata,
         )
-        self._refresh_semantic_map_context(map_snapshot)
+        resolved_map_name = self._resolve_stable_map_name(
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+        )
+        self._refresh_semantic_map_context(map_snapshot, map_name=resolved_map_name)
         anchor_id = self._resolve_anchor_id_for_pose(
             localization_snapshot.current_pose,
             semantic_region_id=semantic_region_id,
@@ -1155,13 +1161,14 @@ class MemoryService:
         )
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
+        merged_metadata["map_name"] = resolved_map_name
         tagged_location = TaggedLocation(
             location_id=build_location_id("tag"),
             name=name.strip(),
             normalized_name=normalized_name,
             aliases=self._normalize_aliases(aliases),
             pose=localization_snapshot.current_pose,
-            map_version_id=map_snapshot.version_id if map_snapshot is not None else None,
+            map_name=resolved_map_name,
             localization_session_id=str(merged_metadata.get("localization_session_id") or "") or None,
             localization_source_name=localization_snapshot.source_name,
             topo_node_id=topo_node_id,
@@ -1269,7 +1276,7 @@ class MemoryService:
             scene_space = self._build_semantic_exploration_scene_space(
                 query=query,
                 pose=current_pose,
-                map_version_id=entry.map_version_id,
+                map_name=entry.map_name,
                 localization_session_id=entry.localization_session_id,
                 reason=reason,
                 memory_id=entry.memory_id,
@@ -1298,7 +1305,7 @@ class MemoryService:
         *,
         query: str,
         pose: Pose,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         reason: str,
         memory_id: str,
@@ -1323,7 +1330,7 @@ class MemoryService:
         )
         return SceneSpace(
             scene_space_id=build_scene_space_id("semantic_exploration"),
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             frame_id=pose.frame_id,
             boundary=boundary,
@@ -1500,7 +1507,7 @@ class MemoryService:
         query: str,
         *,
         similarity_threshold: float = 0.55,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
     ) -> Optional[TaggedLocation]:
         """返回最优地点命中。"""
@@ -1511,10 +1518,10 @@ class MemoryService:
         payload_filter = (
             MemoryPayloadFilter(
                 record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=resolved_localization_session_id,
             )
-            if map_version_id or resolved_localization_session_id
+            if map_name or resolved_localization_session_id
             else None
         )
         result = self.query_location(
@@ -1732,7 +1739,7 @@ class MemoryService:
         self,
         candidate: MemoryNavigationCandidate,
         *,
-        expected_map_version_id: Optional[str],
+        expected_map_name: Optional[str],
         expected_localization_session_id: Optional[str],
         goal_spec: Optional[GoalSpec] = None,
     ) -> GoalCandidateScoreBreakdown:
@@ -1763,7 +1770,7 @@ class MemoryService:
         )
         failure_evidence = self._navigation_candidate_failure_evidence(candidate)
         failure_penalty = float(failure_evidence.get("penalty") or 0.0)
-        map_mismatch = bool(expected_map_version_id and candidate.map_version_id and candidate.map_version_id != expected_map_version_id)
+        map_mismatch = bool(expected_map_name and candidate.map_name and candidate.map_name != expected_map_name)
         localization_session_id = str(metadata.get("localization_session_id") or "") or None
         localization_mismatch = bool(
             expected_localization_session_id
@@ -1798,7 +1805,7 @@ class MemoryService:
                 "failure_reason_codes": failure_evidence.get("reason_codes") or [],
                 "failure_count_since_success": failure_evidence.get("failure_count") or 0,
                 "failure_trajectory_event_ids": failure_evidence.get("trajectory_event_ids") or [],
-                "map_version_valid": not map_mismatch,
+                "map_binding_valid": not map_mismatch,
                 "localization_session_valid": not localization_mismatch,
                 "attribute_bonus": round(attribute_bonus, 6),
             },
@@ -1844,8 +1851,8 @@ class MemoryService:
         quality_level = str(navigation_quality.get("level") or metadata.get("navigation_quality_level") or "")
         reason_codes = [str(item) for item in navigation_quality.get("reason_codes") or [] if str(item)]
         reasons: List[str] = []
-        if score_breakdown.metadata.get("map_version_valid") is False:
-            reasons.append("map_version_mismatch")
+        if score_breakdown.metadata.get("map_binding_valid") is False:
+            reasons.append("map_binding_mismatch")
         if score_breakdown.metadata.get("localization_session_valid") is False:
             reasons.append("localization_session_mismatch")
         if score_breakdown.failure_penalty > 0.0:
@@ -1855,7 +1862,7 @@ class MemoryService:
         for reason in reason_codes:
             if reason not in reasons:
                 reasons.append(reason)
-        if reasons and any(reason in {"map_version_mismatch", "localization_session_mismatch", "projection_geometry_missing"} for reason in reasons):
+        if reasons and any(reason in {"map_binding_mismatch", "localization_session_mismatch", "projection_geometry_missing"} for reason in reasons):
             return "reject", reasons, False
         if quality_level == "not_navigable":
             return "reject", reasons or ["candidate_not_navigable"], False
@@ -1941,7 +1948,7 @@ class MemoryService:
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         goal_id: Optional[str] = None,
     ) -> Optional[MemoryNavigationCandidate]:
@@ -1952,7 +1959,7 @@ class MemoryService:
             camera_id=camera_id,
             similarity_threshold=similarity_threshold,
             max_age_sec=max_age_sec,
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             limit=1,
             goal_id=goal_id,
@@ -1976,7 +1983,7 @@ class MemoryService:
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         limit: int = 5,
         goal_id: Optional[str] = None,
@@ -1991,11 +1998,8 @@ class MemoryService:
         match_limit = candidate_pool_limit
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
-        self._refresh_semantic_map_context(map_snapshot)
         semantic_context = self.get_navigation_semantic_context()
-        effective_map_version_id = str(
-            map_version_id or (map_snapshot.version_id if map_snapshot is not None else "")
-        ).strip() or None
+        effective_map_name = str(map_name or semantic_context.map_name or "").strip() or None
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
         effective_localization_session_id = str(
             localization_session_id or active_localization_session_id or ""
@@ -2009,7 +2013,7 @@ class MemoryService:
         )
         payload_filter = self._grounding_query_planner.build_payload_filter(
             grounding_plan,
-            map_version_id=effective_map_version_id,
+            map_name=effective_map_name,
             localization_session_id=effective_localization_session_id,
         )
         if MemoryRecordKind.SCENE_SPACE not in payload_filter.record_kinds:
@@ -2080,7 +2084,7 @@ class MemoryService:
                 limit=max(requested_limit, match_limit),
                 payload_filter=MemoryPayloadFilter(
                     record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
-                    map_version_id=effective_map_version_id,
+                    map_name=effective_map_name,
                     localization_session_id=effective_localization_session_id,
                 ),
                 grounding_plan=grounding_plan,
@@ -2109,16 +2113,15 @@ class MemoryService:
             "returned_candidate_count": 0,
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
-            "map_version_id": effective_map_version_id or "",
+            "map_name": effective_map_name or "",
             "localization_session_id": effective_localization_session_id or "",
-            "map_name": semantic_context.map_name or "",
             "camera_id": camera_id or "",
         }
         decorated_pool: List[MemoryNavigationCandidate] = []
         for candidate in candidates:
             score_breakdown = self._build_candidate_score_breakdown(
                 candidate,
-                expected_map_version_id=effective_map_version_id,
+                expected_map_name=effective_map_name,
                 expected_localization_session_id=effective_localization_session_id,
                 goal_spec=goal_spec,
             )
@@ -2219,7 +2222,7 @@ class MemoryService:
                 target_name=target_name,
                 metadata={
                     "resolved_scene_space_id": scene_space.scene_space_id,
-                    "map_version_id": semantic_context.map_version_id,
+                    "map_name": semantic_context.map_name,
                     "localization_session_id": semantic_context.localization_session_id,
                     "source": "platform_navigation_scene_space",
                 },
@@ -2247,7 +2250,7 @@ class MemoryService:
                 target_name=target_name,
                 metadata={
                     "resolved_region_id": region.region_id,
-                    "map_version_id": semantic_context.map_version_id,
+                    "map_name": semantic_context.map_name,
                     "localization_session_id": semantic_context.localization_session_id,
                     "source": "platform_navigation_semantics",
                 },
@@ -2261,7 +2264,7 @@ class MemoryService:
         navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]] = None,
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.55,
-        expected_map_version_id: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         goal_id: Optional[str] = None,
     ) -> MemoryArrivalVerification:
@@ -2285,7 +2288,7 @@ class MemoryService:
                         "arrival_score": 0.0,
                         "arrival_reason_code": "memory_disabled",
                         "camera_id": camera_id or "",
-                        "map_version_id": expected_map_version_id or "",
+                        "map_name": expected_map_name or "",
                         "localization_session_id": localization_session_id or "",
                         "goal_id": resolved_goal_id or "",
                     },
@@ -2300,13 +2303,13 @@ class MemoryService:
             metadata_goal_id = str(legacy_candidate.metadata.get("goal_id") or "").strip()
             if metadata_goal_id:
                 resolved_goal_id = metadata_goal_id
-        effective_map_version_id = str(
-            expected_map_version_id
-            or (legacy_candidate.map_version_id if legacy_candidate is not None else "")
+        effective_map_name = str(
+            expected_map_name
+            or (legacy_candidate.map_name if legacy_candidate is not None else "")
         ).strip() or None
         semantic_context = self.get_navigation_semantic_context()
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
-        if effective_map_version_id and semantic_context.map_version_id not in {None, effective_map_version_id}:
+        if effective_map_name and semantic_context.map_name not in {None, effective_map_name}:
             return self._record_arrival_verification(
                 MemoryArrivalVerification(
                     query=query,
@@ -2314,15 +2317,14 @@ class MemoryService:
                     score=0.0,
                     matched_labels=[],
                     matched_memory_id=None,
-                    reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
+                    reason="当前地图与导航候选所属地图不一致，已拒绝到点复核。",
                     goal_id=resolved_goal_id,
                     candidate_id=candidate_id_from_metadata,
                     metadata={
-                        "expected_map_version_id": effective_map_version_id,
-                        "active_map_version_id": semantic_context.map_version_id,
-                        "map_version_id": semantic_context.map_version_id or "",
+                        "expected_map_name": effective_map_name,
+                        "active_map_name": semantic_context.map_name,
+                        "map_name": semantic_context.map_name or "",
                         "localization_session_id": localization_session_id or active_localization_session_id or "",
-                        "map_name": semantic_context.map_name,
                         "camera_id": camera_id or "",
                         "arrival_verified": False,
                         "arrival_score": 0.0,
@@ -2344,13 +2346,12 @@ class MemoryService:
                     goal_id=resolved_goal_id,
                     candidate_id=candidate_id_from_metadata,
                     metadata={
-                        "expected_map_version_id": effective_map_version_id,
-                        "active_map_version_id": semantic_context.map_version_id,
-                        "map_version_id": semantic_context.map_version_id or "",
+                        "expected_map_name": effective_map_name,
+                        "active_map_name": semantic_context.map_name,
+                        "map_name": semantic_context.map_name or "",
                         "expected_localization_session_id": localization_session_id,
                         "active_localization_session_id": active_localization_session_id,
                         "localization_session_id": active_localization_session_id or "",
-                        "map_name": semantic_context.map_name,
                         "camera_id": camera_id or "",
                         "arrival_verified": False,
                         "arrival_score": 0.0,
@@ -2472,8 +2473,7 @@ class MemoryService:
                 "record_kind": legacy_candidate.record_kind.value if legacy_candidate is not None else "",
                 "candidate_id": candidate_id_from_metadata or "",
                 "goal_id": resolved_goal_id or "",
-                "map_name": semantic_context.map_name,
-                "map_version_id": effective_map_version_id or semantic_context.map_version_id,
+                "map_name": effective_map_name or semantic_context.map_name,
                 "localization_session_id": localization_session_id or active_localization_session_id,
                 "arrival_verified": verified,
                 "arrival_score": round(score, 6),
@@ -2534,28 +2534,28 @@ class MemoryService:
         *,
         map_name: Optional[str] = None,
     ) -> NavigationSemanticContext:
-        """返回当前平台地图版本绑定的语义导航上下文。"""
+        """返回当前命名地图绑定的语义导航上下文。"""
 
         map_snapshot = self._get_map_snapshot()
-        map_context = self._refresh_semantic_map_context(map_snapshot)
         active_session = self._localization_service.get_active_session()
-        resolved_map_name = (
-            str(map_name or "").strip()
-            or (active_session.map_name if active_session is not None else "")
-            or str(self._active_library_name or "").strip()
-            or None
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
+        )
+        map_context = self._refresh_semantic_map_context(
+            map_snapshot,
+            map_name=resolved_map_name,
         )
         localization_session_id = None
         localization_ready = False
         if active_session is not None and (
-            map_context.map_version_id is None or active_session.map_version_id == map_context.map_version_id
+            map_context.map_name is None or active_session.map_name == map_context.map_name
         ):
             localization_session_id = active_session.session_id
             localization_ready = bool(active_session.pose_available)
         dynamic_anchors = self._build_dynamic_instance_anchors()
         context = NavigationSemanticContext(
             map_name=resolved_map_name,
-            map_version_id=map_context.map_version_id,
             localization_session_id=localization_session_id,
             localization_ready=localization_ready,
             semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
@@ -2584,8 +2584,7 @@ class MemoryService:
             source="memory_service",
             metadata={
                 "kind": "navigation_semantic_context",
-                "map_name": resolved_map_name,
-                "map_version_id": context.map_version_id,
+                "map_name": context.map_name,
             },
         )
         return context
@@ -2602,7 +2601,7 @@ class MemoryService:
                     node_id=node_id,
                     label=label,
                     frame_id=map_context.frame_id,
-                    map_version_id=map_context.map_version_id,
+                    map_name=map_context.map_name,
                     anchor_id=str(node.get("anchor_id") or "") or None,
                     pose=self._build_topology_node_pose(node, frame_id=map_context.frame_id),
                     aliases=self._normalize_aliases([*(node.get("aliases") or []), *(node.get("labels") or [])]),
@@ -2620,27 +2619,53 @@ class MemoryService:
         *,
         map_snapshot=None,
         localization_snapshot=None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
     ) -> Dict[str, object]:
         active_session = self._localization_service.get_active_session()
-        resolved_map_version_id = str(
-            map_version_id
-            or (map_snapshot.version_id if map_snapshot is not None else "")
-            or (active_session.map_version_id if active_session is not None else "")
-        ).strip() or None
-        resolved_map_name = str(
-            (active_session.map_name if active_session is not None else "")
-            or (self._active_library_name or "")
-        ).strip() or None
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+        )
+        session_matches_map = bool(
+            active_session is not None
+            and (
+                resolved_map_name is None
+                or str(active_session.map_name or "").strip() == resolved_map_name
+            )
+        )
         return {
             "map_name": resolved_map_name,
-            "map_version_id": resolved_map_version_id,
-            "localization_session_id": active_session.session_id if active_session is not None else None,
-            "localization_session_status": active_session.status.value if active_session is not None else None,
+            "localization_session_id": active_session.session_id if session_matches_map else None,
+            "localization_session_status": active_session.status.value if session_matches_map else None,
             "localization_source_name": (
                 localization_snapshot.source_name if localization_snapshot is not None else None
             ),
         }
+
+    def _resolve_stable_map_name(
+        self,
+        *,
+        map_name: Optional[str] = None,
+        map_snapshot=None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+    ) -> Optional[str]:
+        active_session = self._localization_service.get_active_session()
+        map_metadata = dict(getattr(map_snapshot, "metadata", {}) or {})
+        localization_metadata = dict(
+            getattr(localization_snapshot, "metadata", {}) or {}
+        )
+        for candidate in (
+            map_name,
+            active_session.map_name if active_session is not None else None,
+            map_metadata.get("map_name"),
+            localization_metadata.get("map_name"),
+            self._active_library_name,
+        ):
+            resolved = str(candidate or "").strip()
+            if resolved:
+                return resolved
+        return None
 
     def _build_topology_node_pose(self, node: Dict[str, object], *, frame_id: str) -> Optional[Pose]:
         try:
@@ -2778,7 +2803,7 @@ class MemoryService:
         limit: Optional[int] = None,
         payload_filter: Optional[MemoryPayloadFilter] = None,
         scene_space_ids: Optional[List[str]] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[List[Union[SceneSpaceReviewStatus, str]]] = None,
     ) -> Tuple[SceneSpace, ...]:
@@ -2788,7 +2813,7 @@ class MemoryService:
         if payload_filter is None:
             spaces = self._repository.list_scene_spaces(
                 scene_space_ids=scene_space_ids,
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=localization_session_id,
                 review_statuses=review_statuses,
                 limit=limit,
@@ -2797,8 +2822,8 @@ class MemoryService:
             resolved_filter = payload_filter.model_copy(deep=True)
             if scene_space_ids is not None:
                 resolved_filter.scene_space_ids = list(scene_space_ids)
-            if map_version_id is not None:
-                resolved_filter.map_version_id = map_version_id
+            if map_name is not None:
+                resolved_filter.map_name = map_name
             if localization_session_id is not None:
                 resolved_filter.localization_session_id = localization_session_id
             if review_statuses is not None:
@@ -3012,6 +3037,13 @@ class MemoryService:
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
+        resolved_map_name = (
+            linked_location.map_name
+            if linked_location is not None
+            else str(merged_metadata.get("map_name") or "").strip() or None
+        )
+        merged_metadata["map_name"] = resolved_map_name
+
         entry = SemanticMemoryEntry(
             memory_id=build_memory_id("scene"),
             kind=MemoryRecordKind.SCENE if linked_location is None else MemoryRecordKind.NOTE,
@@ -3020,11 +3052,7 @@ class MemoryService:
             tags=self._normalize_tags(tags),
             linked_location_id=linked_location.location_id if linked_location is not None else None,
             pose=pose,
-            map_version_id=(
-                linked_location.map_version_id
-                if linked_location is not None
-                else map_snapshot.version_id if map_snapshot is not None else None
-            ),
+            map_name=resolved_map_name,
             localization_session_id=str(merged_metadata.get("localization_session_id") or "") or None,
             topo_node_id=topo_node_id,
             semantic_region_id=semantic_region_id,
@@ -3157,7 +3185,7 @@ class MemoryService:
                 item,
                 current_pose,
                 grounding_plan=grounding_plan,
-                expected_map_version_id=payload_filter.map_version_id if payload_filter is not None else None,
+                expected_map_name=payload_filter.map_name if payload_filter is not None else None,
                 expected_localization_session_id=(
                     payload_filter.localization_session_id if payload_filter is not None else None
                 ),
@@ -3385,8 +3413,8 @@ class MemoryService:
         backend_name: str,
         candidate_score: Optional[float] = None,
         grounding_plan: Optional[GroundingQueryPlan] = None,
-        map_version_id: Optional[str] = None,
-        expected_map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         expected_localization_session_id: Optional[str] = None,
     ) -> Dict[str, object]:
@@ -3401,8 +3429,8 @@ class MemoryService:
         resolved_candidate_score = self._coerce_optional_float(
             candidate_score if candidate_score is not None else resolved_metadata.get("candidate_score")
         )
-        resolved_map_version_id = str(map_version_id or resolved_metadata.get("map_version_id") or "").strip() or None
-        resolved_expected_map_version_id = str(expected_map_version_id or "").strip() or None
+        resolved_map_name = str(map_name or resolved_metadata.get("map_name") or "").strip() or None
+        resolved_expected_map_name = str(expected_map_name or "").strip() or None
         resolved_localization_session_id = str(
             localization_session_id or resolved_metadata.get("localization_session_id") or ""
         ).strip() or None
@@ -3419,8 +3447,8 @@ class MemoryService:
             segmentation_projection_status=segmentation_projection_status,
             segmentation_summary=segmentation_summary,
             grounding_plan=grounding_plan,
-            map_version_id=resolved_map_version_id,
-            expected_map_version_id=resolved_expected_map_version_id,
+            map_name=resolved_map_name,
+            expected_map_name=resolved_expected_map_name,
             localization_session_id=resolved_localization_session_id,
             expected_localization_session_id=resolved_expected_localization_session_id,
         )
@@ -3467,8 +3495,8 @@ class MemoryService:
         segmentation_projection_status: str,
         segmentation_summary: Dict[str, object],
         grounding_plan: Optional[GroundingQueryPlan],
-        map_version_id: Optional[str],
-        expected_map_version_id: Optional[str],
+        map_name: Optional[str],
+        expected_map_name: Optional[str],
         localization_session_id: Optional[str],
         expected_localization_session_id: Optional[str],
     ) -> Dict[str, object]:
@@ -3485,8 +3513,8 @@ class MemoryService:
             if code not in reason_codes:
                 reason_codes.append(code)
 
-        if expected_map_version_id and map_version_id and map_version_id != expected_map_version_id:
-            add_reason("map_version_mismatch")
+        if expected_map_name and map_name and map_name != expected_map_name:
+            add_reason("map_binding_mismatch")
         if (
             expected_localization_session_id
             and localization_session_id
@@ -3594,8 +3622,8 @@ class MemoryService:
                 "planner_ambiguity_count": ambiguity_count,
                 "planner_negative_constraint_count": negative_constraint_count,
                 "candidate_ranking_hints_present": candidate_ranking_hints_present,
-                "map_version_id": map_version_id,
-                "expected_map_version_id": expected_map_version_id,
+                "map_name": map_name,
+                "expected_map_name": expected_map_name,
                 "localization_session_id": localization_session_id,
                 "expected_localization_session_id": expected_localization_session_id,
                 "dynamic_state": str(metadata.get("dynamic_state") or "") or None,
@@ -3672,7 +3700,7 @@ class MemoryService:
             "not_navigable": "候选存在明确不可导航风险，已拒绝直接导航。",
         }
         reason_explanations = {
-            "map_version_mismatch": "地图版本不一致。",
+            "map_binding_mismatch": "地图绑定不一致。",
             "localization_session_mismatch": "定位会话不一致。",
             "current_pose_fallback": "候选使用当前位置回退投影。",
             "candidate_score_low": "候选召回分偏低。",
@@ -3892,7 +3920,7 @@ class MemoryService:
             {**dict(scene_space.metadata), **self._build_scene_space_payload(scene_space)},
             backend_name=str(scene_space.metadata.get("backend") or "memory_service.scene_space"),
             candidate_score=1.0,
-            map_version_id=scene_space.map_version_id,
+            map_name=scene_space.map_name,
             localization_session_id=scene_space.localization_session_id
             or str(scene_space.metadata.get("localization_session_id") or "")
             or None,
@@ -3907,7 +3935,7 @@ class MemoryService:
                 anchor_pose=scene_space.boundary.centroid if scene_space.boundary is not None else navigation_pose,
                 target_name=scene_space.primary_label or scene_space.scene_space_id,
                 linked_location_id=None,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 topo_node_id=scene_space.linked_topology_node_ids[0] if scene_space.linked_topology_node_ids else None,
                 semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
                 artifact_ids=self._scene_space_artifact_ids(scene_space),
@@ -3947,7 +3975,7 @@ class MemoryService:
         current_pose: Optional[Pose],
         *,
         grounding_plan: Optional[GroundingQueryPlan] = None,
-        expected_map_version_id: Optional[str] = None,
+        expected_map_name: Optional[str] = None,
         expected_localization_session_id: Optional[str] = None,
         include_non_direct_navigation_candidate: bool = False,
     ) -> MemoryQueryMatch:
@@ -3958,8 +3986,8 @@ class MemoryService:
             backend_name=str(candidate.point.payload.get("backend") or candidate.point.payload.get("backend_type") or "memory_service"),
             candidate_score=candidate.final_score,
             grounding_plan=grounding_plan,
-            map_version_id=str(candidate.point.payload.get("map_version_id") or "").strip() or None,
-            expected_map_version_id=expected_map_version_id,
+            map_name=str(candidate.point.payload.get("map_name") or "").strip() or None,
+            expected_map_name=expected_map_name,
             localization_session_id=candidate_localization_session_id,
             expected_localization_session_id=expected_localization_session_id,
         )
@@ -3971,8 +3999,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.tagged_location.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.tagged_location.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -3986,7 +4014,7 @@ class MemoryService:
                     anchor_pose=candidate.tagged_location.pose,
                     target_name=candidate.tagged_location.name,
                     linked_location_id=candidate.tagged_location.location_id,
-                    map_version_id=candidate.tagged_location.map_version_id,
+                    map_name=candidate.tagged_location.map_name,
                     topo_node_id=candidate.tagged_location.topo_node_id,
                     semantic_region_id=candidate.tagged_location.semantic_region_id,
                     artifact_ids=[],
@@ -4008,8 +4036,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.semantic_memory.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.semantic_memory.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -4026,7 +4054,7 @@ class MemoryService:
                     anchor_pose=candidate.semantic_memory.pose,
                     target_name=candidate.semantic_memory.title,
                     linked_location_id=candidate.semantic_memory.linked_location_id,
-                    map_version_id=candidate.semantic_memory.map_version_id,
+                    map_name=candidate.semantic_memory.map_name,
                     topo_node_id=candidate.semantic_memory.topo_node_id,
                     semantic_region_id=candidate.semantic_memory.semantic_region_id,
                     artifact_ids=candidate.semantic_memory.artifact_ids,
@@ -4052,8 +4080,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.semantic_instance.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.semantic_instance.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -4071,7 +4099,7 @@ class MemoryService:
                     anchor_pose=candidate.semantic_instance.pose,
                     target_name=candidate.semantic_instance.display_name or candidate.semantic_instance.label,
                     linked_location_id=None,
-                    map_version_id=candidate.semantic_instance.map_version_id,
+                    map_name=candidate.semantic_instance.map_name,
                     topo_node_id=candidate.semantic_instance.topo_node_id,
                     semantic_region_id=candidate.semantic_instance.semantic_region_id,
                     artifact_ids=candidate.semantic_instance.artifact_ids,
@@ -4100,8 +4128,8 @@ class MemoryService:
                 backend_name=backend_name,
                 candidate_score=candidate.final_score,
                 grounding_plan=grounding_plan,
-                map_version_id=candidate.observation_event.map_version_id,
-                expected_map_version_id=expected_map_version_id,
+                map_name=candidate.observation_event.map_name,
+                expected_map_name=expected_map_name,
                 localization_session_id=candidate_localization_session_id,
                 expected_localization_session_id=expected_localization_session_id,
             )
@@ -4122,7 +4150,7 @@ class MemoryService:
                     anchor_pose=candidate.observation_event.pose,
                     target_name=candidate.observation_event.title,
                     linked_location_id=None,
-                    map_version_id=candidate.observation_event.map_version_id,
+                    map_name=candidate.observation_event.map_name,
                     topo_node_id=candidate.observation_event.topo_node_id,
                     semantic_region_id=candidate.observation_event.semantic_region_id,
                     artifact_ids=candidate.observation_event.artifact_ids,
@@ -4146,8 +4174,8 @@ class MemoryService:
                     backend_name=backend_name,
                     candidate_score=candidate.final_score,
                     grounding_plan=grounding_plan,
-                    map_version_id=candidate.scene_space.map_version_id,
-                    expected_map_version_id=expected_map_version_id,
+                    map_name=candidate.scene_space.map_name,
+                    expected_map_name=expected_map_name,
                     localization_session_id=candidate_localization_session_id,
                     expected_localization_session_id=expected_localization_session_id,
                 )
@@ -4161,7 +4189,7 @@ class MemoryService:
                         anchor_pose=candidate.scene_space.boundary.centroid if candidate.scene_space.boundary is not None else navigation_pose,
                         target_name=candidate.scene_space.primary_label or candidate.scene_space.scene_space_id,
                         linked_location_id=None,
-                        map_version_id=candidate.scene_space.map_version_id,
+                        map_name=candidate.scene_space.map_name,
                         topo_node_id=candidate.scene_space.linked_topology_node_ids[0] if candidate.scene_space.linked_topology_node_ids else None,
                         semantic_region_id=candidate.scene_space.linked_semantic_region_ids[0] if candidate.scene_space.linked_semantic_region_ids else None,
                         artifact_ids=self._scene_space_artifact_ids(candidate.scene_space),
@@ -4214,7 +4242,7 @@ class MemoryService:
         anchor_pose: Optional[Pose],
         target_name: str,
         linked_location_id: Optional[str],
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         topo_node_id: Optional[str],
         semantic_region_id: Optional[str],
         artifact_ids: List[str],
@@ -4230,14 +4258,15 @@ class MemoryService:
     ) -> NavigationCandidate:
         _, distance_m = self._compute_spatial_score(current_pose, inspection_pose)
         verification_artifact_id = artifact_ids[0] if artifact_ids else None
-        platform_binding = self._build_platform_semantic_metadata(map_version_id=map_version_id)
+        platform_binding = self._build_platform_semantic_metadata(map_name=map_name)
+        resolved_map_name = str(platform_binding.get("map_name") or "").strip() or None
         clamped_score = self._clamp_score(candidate_score)
         if navigation_metadata is None:
             navigation_metadata = self._evaluate_navigation_metadata(
                 source_metadata,
                 backend_name=backend_name,
                 candidate_score=clamped_score,
-                map_version_id=map_version_id,
+                map_name=resolved_map_name,
                 localization_session_id=str(
                     localization_session_id
                     or platform_binding.get("localization_session_id")
@@ -4255,7 +4284,7 @@ class MemoryService:
             target_name=target_name,
             inspection_pose=inspection_pose,
             anchor_pose=anchor_pose,
-            map_version_id=map_version_id,
+            map_name=resolved_map_name,
             localization_session_id=str(
                 localization_session_id
                 or platform_binding.get("localization_session_id")
@@ -4275,8 +4304,7 @@ class MemoryService:
                 "scene_space_id": str((source_metadata or {}).get("scene_space_id") or ""),
                 "linked_object_instance_ids": list((source_metadata or {}).get("linked_instance_ids") or []),
                 "verification_memory_id": verification_memory_id or "",
-                "map_name": str(platform_binding.get("map_name") or "") or "",
-                "map_version_id": str(map_version_id or "") or "",
+                "map_name": resolved_map_name or "",
                 "localization_session_id": str(
                     localization_session_id
                     or platform_binding.get("localization_session_id")
@@ -4961,7 +4989,7 @@ class MemoryService:
             "normalized_name": location.normalized_name,
             "aliases": list(location.aliases),
             "linked_location_id": location.location_id,
-            "map_version_id": location.map_version_id,
+            "map_name": location.map_name,
             "localization_session_id": location.localization_session_id or str(location.metadata.get("localization_session_id", "") or "") or None,
             "localization_source_name": location.localization_source_name,
             "topo_node_id": location.topo_node_id,
@@ -5004,7 +5032,7 @@ class MemoryService:
             "tags": list(entry.tags),
             "linked_location_id": entry.linked_location_id,
             "linked_location_name": linked_location_name,
-            "map_version_id": entry.map_version_id,
+            "map_name": entry.map_name,
             "localization_session_id": entry.localization_session_id or str(entry.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": entry.scene_space_id or str(entry.metadata.get("scene_space_id", "") or "") or None,
             "topo_node_id": entry.topo_node_id,
@@ -5051,7 +5079,7 @@ class MemoryService:
             "dynamic_short_term_obstacle_context": bool(instance.metadata.get("dynamic_short_term_obstacle_context")),
             "long_term_static_target_eligible": bool(instance.metadata.get("long_term_static_target_eligible")),
             "observation_window": list(instance.metadata.get("observation_window") or []),
-            "map_version_id": instance.map_version_id,
+            "map_name": instance.map_name,
             "localization_session_id": instance.localization_session_id or str(instance.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": instance.scene_space_id or str(instance.metadata.get("scene_space_id", "") or "") or None,
             "topo_node_id": instance.topo_node_id,
@@ -5092,7 +5120,7 @@ class MemoryService:
             "title": event.title,
             "summary": event.summary,
             "camera_id": event.camera_id or "",
-            "map_version_id": event.map_version_id,
+            "map_name": event.map_name,
             "localization_session_id": event.localization_session_id or str(event.metadata.get("localization_session_id", "") or "") or None,
             "scene_space_id": event.scene_space_id or str(event.metadata.get("scene_space_id", "") or "") or None,
             "frame_id": event.frame_id or (event.pose.frame_id if event.pose is not None else None),
@@ -5141,7 +5169,7 @@ class MemoryService:
             "name": scene_space.primary_label or scene_space.scene_space_id,
             "primary_label": scene_space.primary_label or "",
             "aliases": list(scene_space.human_aliases),
-            "map_version_id": scene_space.map_version_id,
+            "map_name": scene_space.map_name,
             "localization_session_id": scene_space.localization_session_id or str(scene_space.metadata.get("localization_session_id", "") or "") or None,
             "topo_node_id": topo_node_id,
             "semantic_region_id": semantic_region_id,
@@ -5302,7 +5330,7 @@ class MemoryService:
             "primary_label": scene_space.primary_label or "",
             "candidate_labels": [item.label for item in scene_space.candidate_labels[:5]],
             "review_status": scene_space.review_status.value,
-            "map_version_id": scene_space.map_version_id,
+            "map_name": scene_space.map_name,
             "localization_session_id": scene_space.localization_session_id,
             "linked_object_instance_ids": list(scene_space.linked_object_instance_ids),
             "linked_topology_node_ids": list(scene_space.linked_topology_node_ids),
@@ -5689,8 +5717,8 @@ class MemoryService:
         record_kinds = {item.value if hasattr(item, "value") else str(item) for item in payload_filter.record_kinds}
         if record_kinds and point.record_kind not in record_kinds:
             return False
-        if payload_filter.map_version_id:
-            if str(point.payload.get("map_version_id") or "").strip() != str(payload_filter.map_version_id).strip():
+        if payload_filter.map_name:
+            if str(point.payload.get("map_name") or "").strip() != str(payload_filter.map_name).strip():
                 return False
         if payload_filter.localization_session_id:
             if str(point.payload.get("localization_session_id") or "").strip() != str(payload_filter.localization_session_id).strip():
@@ -5756,22 +5784,40 @@ class MemoryService:
             merged.max_distance_m = max_distance_m
         return merged
 
-    def _refresh_semantic_map_context(self, map_snapshot) -> SemanticMapBuildResult:
+    def _refresh_semantic_map_context(
+        self,
+        map_snapshot,
+        *,
+        map_name: Optional[str] = None,
+    ) -> SemanticMapBuildResult:
         active_session = self._localization_service.get_active_session()
         active_session_id = active_session.session_id if active_session is not None else None
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
+        )
         if map_snapshot is None:
-            self._latest_semantic_map_context = self._semantic_map_builder.build(None)
+            self._latest_semantic_map_context = self._semantic_map_builder.build(
+                None,
+                map_name=resolved_map_name,
+            )
             self._latest_semantic_map_context_localization_session_id = active_session_id
+            self._latest_semantic_map_context_snapshot_id = None
             return self._latest_semantic_map_context
+        snapshot_id = str(getattr(map_snapshot, "version_id", "") or "").strip() or None
         if (
-            self._latest_semantic_map_context.map_version_id == map_snapshot.version_id
+            self._latest_semantic_map_context.map_name == resolved_map_name
             and self._latest_semantic_map_context_localization_session_id == active_session_id
+            and self._latest_semantic_map_context_snapshot_id == snapshot_id
         ):
             return self._latest_semantic_map_context
-        built_context = self._semantic_map_builder.build(map_snapshot)
+        built_context = self._semantic_map_builder.build(
+            map_snapshot,
+            map_name=resolved_map_name,
+        )
         scene_spaces = tuple(self._prepare_built_scene_space(item, active_session_id) for item in built_context.scene_spaces)
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=built_context.map_version_id,
+            map_name=built_context.map_name,
             frame_id=built_context.frame_id,
             semantic_regions=built_context.semantic_regions,
             anchors_by_id=built_context.anchors_by_id,
@@ -5779,6 +5825,7 @@ class MemoryService:
             scene_spaces=scene_spaces,
         )
         self._latest_semantic_map_context_localization_session_id = active_session_id
+        self._latest_semantic_map_context_snapshot_id = snapshot_id
         if self.is_enabled():
             self._ensure_embedders_initialized()
             for scene_space in scene_spaces:
@@ -5792,7 +5839,7 @@ class MemoryService:
             "semantic_map_context",
             self._latest_semantic_map_context,
             source="memory_service",
-            metadata={"kind": "semantic_map_context", "map_version_id": map_snapshot.version_id},
+            metadata={"kind": "semantic_map_context", "map_name": resolved_map_name},
         )
         return self._latest_semantic_map_context
 
@@ -5800,7 +5847,7 @@ class MemoryService:
         existing = self._scene_spaces_by_id.get(scene_space.scene_space_id)
         same_binding = (
             existing is not None
-            and existing.map_version_id == scene_space.map_version_id
+            and existing.map_name == scene_space.map_name
             and (existing.localization_session_id or str(existing.metadata.get("localization_session_id") or "") or None)
             == (localization_session_id or None)
         )
@@ -5981,7 +6028,7 @@ class MemoryService:
         if not updated_spaces:
             return
         self._latest_semantic_map_context = SemanticMapBuildResult(
-            map_version_id=self._latest_semantic_map_context.map_version_id,
+            map_name=self._latest_semantic_map_context.map_name,
             frame_id=self._latest_semantic_map_context.frame_id,
             semantic_regions=self._latest_semantic_map_context.semantic_regions,
             anchors_by_id=self._latest_semantic_map_context.anchors_by_id,
@@ -5996,7 +6043,7 @@ class MemoryService:
             "semantic_map_context",
             self._latest_semantic_map_context,
             source="memory_service",
-            metadata={"kind": "semantic_map_context", "map_version_id": self._latest_semantic_map_context.map_version_id},
+            metadata={"kind": "semantic_map_context", "map_name": self._latest_semantic_map_context.map_name},
         )
 
     def _upsert_scene_space(self, scene_space: SceneSpace, *, publish_event: bool = True) -> SceneSpace:
@@ -6033,7 +6080,7 @@ class MemoryService:
         localization_snapshot: Optional[LocalizationSnapshot],
         current_pose: Optional[Pose],
         camera_id: Optional[str] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         now: Optional[datetime] = None,
         persist: bool = True,
@@ -6053,7 +6100,15 @@ class MemoryService:
         if perception_context is None or current_pose is None:
             return None, None, []
         resolved_now = now or utc_now()
-        map_context = self._refresh_semantic_map_context(map_snapshot)
+        resolved_map_name = self._resolve_stable_map_name(
+            map_name=map_name,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+        )
+        map_context = self._refresh_semantic_map_context(
+            map_snapshot,
+            map_name=resolved_map_name,
+        )
         ray_history = None
         if getattr(self._deferred_projection_config, "triangulation_enabled", False):
             ray_history = InstanceCacheRayHistoryProvider(self._semantic_instances_by_id.values())
@@ -6066,7 +6121,6 @@ class MemoryService:
         )
         if not projected:
             return None, None, []
-        resolved_map_version_id = map_version_id or (map_snapshot.version_id if map_snapshot is not None else None)
         resolved_session_id = localization_session_id or (
             str((localization_snapshot.metadata or {}).get("session_id") or "") if localization_snapshot else None
         ) or None
@@ -6076,7 +6130,7 @@ class MemoryService:
             updated_instances, outcomes = self._instance_association_service.associate(
                 projected,
                 existing_instances=self._semantic_instances_by_id,
-                map_version_id=resolved_map_version_id,
+                map_name=resolved_map_name,
                 localization_session_id=resolved_session_id,
                 occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
                 cost_map=map_snapshot.cost_map if map_snapshot is not None else None,
@@ -6101,7 +6155,7 @@ class MemoryService:
             platform_metadata = self._build_platform_semantic_metadata(
                 map_snapshot=map_snapshot,
                 localization_snapshot=localization_snapshot,
-                map_version_id=outcome.instance.map_version_id,
+                map_name=outcome.instance.map_name,
             )
             projection_metadata.update(platform_metadata)
             projection_metadata.update(
@@ -6112,7 +6166,7 @@ class MemoryService:
                         or projection_metadata.get("backend_type")
                         or "memory_service.semantic_instance"
                     ),
-                    map_version_id=str(platform_metadata.get("map_version_id") or "").strip() or None,
+                    map_name=str(platform_metadata.get("map_name") or "").strip() or None,
                     localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
                 )
             )
@@ -6162,7 +6216,7 @@ class MemoryService:
             localization_snapshot=localization_snapshot,
             current_pose=current_pose,
             camera_id=camera_id,
-            map_version_id=memory_entry.map_version_id,
+            map_name=memory_entry.map_name,
             localization_session_id=memory_entry.localization_session_id
             or str(memory_entry.metadata.get("localization_session_id") or "")
             or None,
@@ -6486,7 +6540,7 @@ class MemoryService:
                     summary=event_summary,
                     camera_id=item.camera_id or camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
                     pose=item.pose,
-                    map_version_id=memory_entry.map_version_id,
+                    map_name=memory_entry.map_name,
                     localization_session_id=memory_entry.localization_session_id
                     or str(memory_entry.metadata.get("localization_session_id") or "")
                     or None,
@@ -6547,7 +6601,7 @@ class MemoryService:
                 summary=memory_entry.summary,
                 camera_id=camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
                 pose=current_pose,
-                map_version_id=memory_entry.map_version_id,
+                map_name=memory_entry.map_name,
                 localization_session_id=memory_entry.localization_session_id
                 or str(memory_entry.metadata.get("localization_session_id") or "")
                 or None,
@@ -6587,7 +6641,7 @@ class MemoryService:
                     anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE,
                     name=instance.display_name or instance.label,
                     pose=instance.pose,
-                    map_version_id=instance.map_version_id,
+                    map_name=instance.map_name,
                     topo_node_id=instance.topo_node_id,
                     semantic_region_id=instance.semantic_region_id,
                     semantic_labels=self._normalize_tags(
@@ -6632,7 +6686,7 @@ class MemoryService:
             target_pose=candidate.inspection_pose,
             target_name=candidate.target_name,
             linked_location_id=str(candidate.metadata.get("linked_location_id") or "") or None,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             topo_node_id=candidate.topo_node_id,
             semantic_region_id=candidate.semantic_region_id,
             scene_space_id=str(candidate.metadata.get("scene_space_id") or "") or None,
@@ -6830,7 +6884,7 @@ class MemoryService:
         target_node_kind: str,
         target_node_id: Optional[str],
         *,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         confidence: float = 1.0,
         evidence_observation_event_ids: Optional[List[str]] = None,
@@ -6854,7 +6908,7 @@ class MemoryService:
             source_node_id=source_id,
             target_node_kind=target_node_kind,
             target_node_id=target_id,
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             confidence=self._clamp_score(confidence),
             evidence_observation_event_ids=self._normalize_aliases(evidence_observation_event_ids or []),
@@ -6931,7 +6985,7 @@ class MemoryService:
                     scene_space_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=event.map_version_id,
+                    map_name=event.map_name,
                     localization_session_id=event.localization_session_id,
                     evidence_observation_event_ids=[event.event_id],
                     metadata={"source": "observation_ingest"},
@@ -6943,7 +6997,7 @@ class MemoryService:
                     source_region_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=event.map_version_id,
+                    map_name=event.map_name,
                     localization_session_id=event.localization_session_id,
                     evidence_observation_event_ids=[event.event_id],
                     metadata={"source": "observation_ingest"},
@@ -6951,7 +7005,7 @@ class MemoryService:
             outcome = association_outcomes[event_index] if event_index < len(association_outcomes) else None
             for instance_id in event.linked_instance_ids:
                 instance = self._semantic_instances_by_id.get(instance_id)
-                instance_map_version_id = instance.map_version_id if instance is not None else event.map_version_id
+                instance_map_name = instance.map_name if instance is not None else event.map_name
                 instance_session_id = instance.localization_session_id if instance is not None else event.localization_session_id
                 self._record_semantic_graph_relation(
                     SemanticGraphRelationKind.OBSERVED_FROM,
@@ -6959,7 +7013,7 @@ class MemoryService:
                     instance_id,
                     MemoryRecordKind.OBSERVATION_EVENT.value,
                     event.event_id,
-                    map_version_id=instance_map_version_id,
+                    map_name=instance_map_name,
                     localization_session_id=instance_session_id,
                     confidence=instance.confidence if instance is not None else 1.0,
                     evidence_observation_event_ids=[event.event_id],
@@ -6972,7 +7026,7 @@ class MemoryService:
                         event.event_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         confidence=outcome.matched_score,
                         evidence_observation_event_ids=[event.event_id],
@@ -6985,7 +7039,7 @@ class MemoryService:
                         scene_space_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         evidence_observation_event_ids=[event.event_id],
                         metadata={"source": "observation_ingest"},
@@ -6997,7 +7051,7 @@ class MemoryService:
                         source_region_id,
                         MemoryRecordKind.OBJECT_INSTANCE.value,
                         instance_id,
-                        map_version_id=instance_map_version_id,
+                        map_name=instance_map_name,
                         localization_session_id=instance_session_id,
                         evidence_observation_event_ids=[event.event_id],
                         metadata={"source": "observation_ingest"},
@@ -7012,7 +7066,7 @@ class MemoryService:
                 scene_space.scene_space_id,
                 MemoryRecordKind.OBSERVATION_EVENT.value,
                 event_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=[event_id],
                 metadata={"source": "scene_space_aggregation"},
@@ -7024,7 +7078,7 @@ class MemoryService:
                 scene_space.scene_space_id,
                 MemoryRecordKind.OBJECT_INSTANCE.value,
                 instance_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=evidence_event_ids,
                 metadata={"source": "scene_space_aggregation"},
@@ -7036,7 +7090,7 @@ class MemoryService:
                 region_id,
                 MemoryRecordKind.SCENE_SPACE.value,
                 scene_space.scene_space_id,
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 evidence_observation_event_ids=evidence_event_ids,
                 metadata={"source": "scene_space_aggregation"},
@@ -7054,7 +7108,7 @@ class MemoryService:
                     left_id,
                     MemoryRecordKind.OBJECT_INSTANCE.value,
                     right_id,
-                    map_version_id=scene_space.map_version_id or left.map_version_id or right.map_version_id,
+                    map_name=scene_space.map_name or left.map_name or right.map_name,
                     localization_session_id=scene_space.localization_session_id or left.localization_session_id or right.localization_session_id,
                     evidence_observation_event_ids=evidence_event_ids,
                     metadata={"source": "scene_space_aggregation", "distance_m": round(self._distance_between_poses(left.pose, right.pose), 4)},
@@ -7074,7 +7128,7 @@ class MemoryService:
             summary_kind=SemanticSummaryKind.REGION,
             title="区域摘要：%s" % region_label,
             summary=self._build_scene_space_search_text(scene_space),
-            map_version_id=scene_space.map_version_id,
+            map_name=scene_space.map_name,
             localization_session_id=scene_space.localization_session_id,
             scene_space_id=scene_space.scene_space_id,
             semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -7103,7 +7157,7 @@ class MemoryService:
                 summary_kind=SemanticSummaryKind.OBJECT_CLUSTER,
                 title="对象簇摘要：%s" % region_label,
                 summary="%s 内包含对象：%s。" % (region_label, "、".join(labels) if labels else "未知对象"),
-                map_version_id=scene_space.map_version_id,
+                map_name=scene_space.map_name,
                 localization_session_id=scene_space.localization_session_id,
                 scene_space_id=scene_space.scene_space_id,
                 semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -7120,7 +7174,7 @@ class MemoryService:
                     item.instance_id
                     for item in self._semantic_instances_by_id.values()
                     if item.label == label
-                    and item.map_version_id == scene_space.map_version_id
+                    and item.map_name == scene_space.map_name
                     and (not scene_space.localization_session_id or item.localization_session_id == scene_space.localization_session_id)
                 ]
                 category_summary = SemanticSummaryNode(
@@ -7128,7 +7182,7 @@ class MemoryService:
                     summary_kind=SemanticSummaryKind.TARGET_CATEGORY_CLUSTER,
                     title="目标类别簇摘要：%s" % label,
                     summary="类别 %s 在当前地图中累计实例 %d 个。" % (label, len(members)),
-                    map_version_id=scene_space.map_version_id,
+                    map_name=scene_space.map_name,
                     localization_session_id=scene_space.localization_session_id,
                     scene_space_id=scene_space.scene_space_id,
                     semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None,
@@ -7161,7 +7215,7 @@ class MemoryService:
             event_kind=NavigationTrajectoryEventKind.REACHABLE_POSE,
             pose=self._get_current_pose(),
             target_pose=candidate.target_pose,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             localization_session_id=str(metadata.get("localization_session_id") or "") or None,
             navigation_candidate_id=candidate_id,
             source_record_kind=candidate.record_kind.value,
@@ -7178,7 +7232,7 @@ class MemoryService:
             candidate.record_id,
             MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
             stored_event.trajectory_event_id,
-            map_version_id=candidate.map_version_id,
+            map_name=candidate.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "navigation_candidate_resolution", "candidate_id": candidate_id},
@@ -7212,7 +7266,7 @@ class MemoryService:
             event_kind=event_kind,
             pose=self._get_current_pose(),
             target_pose=None,
-            map_version_id=str(metadata.get("map_version_id") or metadata.get("active_map_version_id") or "") or None,
+            map_name=str(metadata.get("map_name") or metadata.get("active_map_name") or "") or None,
             localization_session_id=str(metadata.get("localization_session_id") or metadata.get("active_localization_session_id") or "") or None,
             navigation_candidate_id=candidate_id,
             source_record_kind=record_kind,
@@ -7230,7 +7284,7 @@ class MemoryService:
                 record_id,
                 MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
                 stored_event.trajectory_event_id,
-                map_version_id=stored_event.map_version_id,
+                map_name=stored_event.map_name,
                 localization_session_id=stored_event.localization_session_id,
                 evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
                 metadata={"source": "arrival_verification", "candidate_id": candidate_id},
@@ -7242,7 +7296,7 @@ class MemoryService:
             record_id,
             MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
             stored_event.trajectory_event_id,
-            map_version_id=stored_event.map_version_id,
+            map_name=stored_event.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "arrival_verification", "candidate_id": candidate_id, "reason_code": reason_code},
@@ -7253,7 +7307,7 @@ class MemoryService:
             record_id,
             "navigation_failure",
             reason_code,
-            map_version_id=stored_event.map_version_id,
+            map_name=stored_event.map_name,
             localization_session_id=stored_event.localization_session_id,
             evidence_trajectory_event_ids=[stored_event.trajectory_event_id],
             metadata={"source": "arrival_verification", "candidate_id": candidate_id, "reason": result.reason or ""},
@@ -7489,9 +7543,9 @@ class MemoryService:
         )
         current_pose = self._get_current_pose()
         target_pose = legacy_candidate.target_pose if legacy_candidate is not None else getattr(navigation_goal, "target_pose", None)
-        map_version_id = str(
-            (verification.metadata or {}).get("map_version_id") if verification is not None else ""
-        ) or (legacy_candidate.map_version_id if legacy_candidate is not None else None)
+        map_name = str(
+            (verification.metadata or {}).get("map_name") if verification is not None else ""
+        ) or (legacy_candidate.map_name if legacy_candidate is not None else None)
         localization_session_id = str(
             (verification.metadata or {}).get("localization_session_id") if verification is not None else ""
         ) or str(candidate_metadata.get("localization_session_id") or "") or None
@@ -7511,7 +7565,7 @@ class MemoryService:
                 event_kind=event_kind,
                 pose=current_pose,
                 target_pose=target_pose,
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=localization_session_id,
                 navigation_candidate_id=candidate_id or None,
                 source_record_kind=record_kind,
@@ -7542,7 +7596,7 @@ class MemoryService:
                 record_id,
                 MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
                 stored_event.trajectory_event_id,
-                map_version_id=stored_event.map_version_id,
+                map_name=stored_event.map_name,
                 localization_session_id=stored_event.localization_session_id,
                 confidence=verification.score if verification is not None else (1.0 if verified else 0.6),
                 evidence_observation_event_ids=observation_event_ids,
@@ -7563,7 +7617,7 @@ class MemoryService:
                     record_id,
                     "navigation_failure",
                     reason_code,
-                    map_version_id=stored_event.map_version_id,
+                    map_name=stored_event.map_name,
                     localization_session_id=stored_event.localization_session_id,
                     confidence=1.0,
                     evidence_observation_event_ids=observation_event_ids,
@@ -7679,7 +7733,7 @@ class MemoryService:
                 "arrival_score": round(result.score, 6),
                 "arrival_reason_code": metadata.get("arrival_reason_code") or "unknown",
                 "camera_id": metadata.get("camera_id") or "",
-                "map_version_id": metadata.get("map_version_id") or metadata.get("active_map_version_id") or "",
+                "map_name": metadata.get("map_name") or metadata.get("active_map_name") or "",
                 "localization_session_id": metadata.get("localization_session_id") or metadata.get("active_localization_session_id") or "",
             },
         )

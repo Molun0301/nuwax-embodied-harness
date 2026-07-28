@@ -20,6 +20,8 @@ struct _nuwax_msgs_PersonFollowTarget
 {
 
     /**
+     * Locked wire groups: identity/correlation, source stamp, camera snapshot,
+     * camera model, bounding box, then tracking state.
      * LCM Type: string
      */
     char*      session_id;
@@ -28,6 +30,8 @@ struct _nuwax_msgs_PersonFollowTarget
      * LCM Type: string
      */
     char*      query;
+    int64_t    target_seq;
+    int64_t    required_cloud_revision;
     int64_t    stamp_sec;
     int32_t    stamp_nsec;
 
@@ -35,6 +39,18 @@ struct _nuwax_msgs_PersonFollowTarget
      * LCM Type: string
      */
     char*      camera_frame;
+
+    /**
+     * LCM Type: string
+     */
+    char*      camera_parent_frame;
+    double     camera_translation_x;
+    double     camera_translation_y;
+    double     camera_translation_z;
+    double     camera_rotation_x;
+    double     camera_rotation_y;
+    double     camera_rotation_z;
+    double     camera_rotation_w;
     int32_t    image_width;
     int32_t    image_height;
     double     fx;

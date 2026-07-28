@@ -169,7 +169,7 @@ pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String
         .collect()
 }
 
-fn navigation_goal_topic(topics: &NavTopicConfig) -> &str {
+pub(crate) fn navigation_goal_topic(topics: &NavTopicConfig) -> &str {
     topics
         .topics
         .get("goal_pose")

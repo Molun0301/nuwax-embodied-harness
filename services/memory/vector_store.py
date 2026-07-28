@@ -138,6 +138,17 @@ class SQLiteNamedVectorStore:
         updated_at: Optional[str] = None,
     ) -> None:
         resolved_updated_at = updated_at or utc_now().isoformat()
+        payload = dict(payload)
+        payload.pop("map_version_id", None)
+        resolved_map_name = str(payload.get("map_name") or "").strip()
+        if not resolved_map_name:
+            library_name = str(payload.get("memory_library_name") or "").strip()
+            metadata = payload.get("metadata")
+            if not library_name and isinstance(metadata, dict):
+                library_name = str(metadata.get("memory_library_name") or "").strip()
+            if library_name and library_name != "legacy_default":
+                resolved_map_name = library_name
+        payload["map_name"] = resolved_map_name or None
         payload_json = json.dumps(payload, ensure_ascii=False)
         timestamp_ts = str(payload.get("timestamp") or resolved_updated_at)
         last_seen_ts = str(payload.get("last_seen_ts") or "")
@@ -148,7 +159,7 @@ class SQLiteNamedVectorStore:
                     point_id,
                     collection_name,
                     record_kind,
-                    map_version_id,
+                    map_name,
                     localization_session_id,
                     linked_location_id,
                     camera_id,
@@ -166,7 +177,7 @@ class SQLiteNamedVectorStore:
                 ON CONFLICT(point_id) DO UPDATE SET
                     collection_name = excluded.collection_name,
                     record_kind = excluded.record_kind,
-                    map_version_id = excluded.map_version_id,
+                    map_name = excluded.map_name,
                     localization_session_id = excluded.localization_session_id,
                     linked_location_id = excluded.linked_location_id,
                     camera_id = excluded.camera_id,
@@ -184,7 +195,7 @@ class SQLiteNamedVectorStore:
                     point_id,
                     collection_name,
                     record_kind,
-                    self._string_or_none(payload.get("map_version_id")),
+                    self._string_or_none(payload.get("map_name")),
                     self._string_or_none(payload.get("localization_session_id")),
                     self._string_or_none(payload.get("linked_location_id")),
                     self._string_or_none(payload.get("camera_id")),
@@ -270,7 +281,7 @@ class SQLiteNamedVectorStore:
         with self._read_lock:
             point_row = self._read_conn.execute(
                 """
-                SELECT point_id, collection_name, record_kind, payload_json, updated_at
+                SELECT point_id, collection_name, record_kind, map_name, payload_json, updated_at
                 FROM memory_vector_points
                 WHERE point_id = ?
                 """,
@@ -300,7 +311,7 @@ class SQLiteNamedVectorStore:
             placeholders = ",".join("?" * len(batch))
             with self._read_lock:
                 point_rows = self._read_conn.execute(
-                    f"SELECT point_id, collection_name, record_kind, payload_json, updated_at "
+                    f"SELECT point_id, collection_name, record_kind, map_name, payload_json, updated_at "
                     f"FROM memory_vector_points WHERE point_id IN ({placeholders})",
                     batch,
                 ).fetchall()
@@ -322,7 +333,7 @@ class SQLiteNamedVectorStore:
         with self._read_lock:
             point_rows = self._read_conn.execute(
                 """
-                SELECT point_id, collection_name, record_kind, payload_json, updated_at
+                SELECT point_id, collection_name, record_kind, map_name, payload_json, updated_at
                 FROM memory_vector_points
                 ORDER BY updated_at ASC, point_id ASC
                 """
@@ -480,7 +491,7 @@ class SQLiteNamedVectorStore:
         collection_names: Optional[Iterable[str]],
     ) -> List[sqlite3.Row]:
         query = [
-            "SELECT point_id, collection_name, record_kind, payload_json, updated_at",
+            "SELECT point_id, collection_name, record_kind, map_name, payload_json, updated_at",
             "FROM memory_vector_points",
             "WHERE 1 = 1",
         ]
@@ -529,9 +540,9 @@ class SQLiteNamedVectorStore:
         if record_kinds:
             query.append("AND record_kind IN (%s)" % ",".join("?" for _ in record_kinds))
             params.extend(record_kinds)
-        if payload_filter.map_version_id:
-            query.append("AND map_version_id = ?")
-            params.append(payload_filter.map_version_id)
+        if payload_filter.map_name:
+            query.append("AND map_name = ?")
+            params.append(payload_filter.map_name)
         if payload_filter.localization_session_id:
             query.append("AND localization_session_id = ?")
             params.append(payload_filter.localization_session_id)
@@ -573,6 +584,9 @@ class SQLiteNamedVectorStore:
 
     def _build_point(self, point_row: sqlite3.Row, vector_rows: List[sqlite3.Row]) -> VectorPoint:
         payload = json.loads(str(point_row["payload_json"]))
+        payload.pop("map_version_id", None)
+        resolved_map_name = str(payload.get("map_name") or point_row["map_name"] or "").strip()
+        payload["map_name"] = resolved_map_name or None
         vectors = {
             str(row["vector_name"]): NamedVector(
                 vector_name=str(row["vector_name"]),
@@ -598,6 +612,10 @@ class SQLiteNamedVectorStore:
     ) -> bool:
         if payload_filter is None:
             return True
+        if payload_filter.map_name:
+            map_name = str(payload.get("map_name") or "").strip()
+            if map_name != str(payload_filter.map_name).strip():
+                return False
         if payload_filter.localization_session_id:
             localization_session_id = str(payload.get("localization_session_id") or "").strip()
             if localization_session_id != str(payload_filter.localization_session_id).strip():
@@ -661,7 +679,7 @@ class SQLiteNamedVectorStore:
                     point_id TEXT PRIMARY KEY,
                     collection_name TEXT NOT NULL DEFAULT 'legacy',
                     record_kind TEXT NOT NULL,
-                    map_version_id TEXT,
+                    map_name TEXT,
                     localization_session_id TEXT,
                     linked_location_id TEXT,
                     camera_id TEXT,
@@ -678,6 +696,7 @@ class SQLiteNamedVectorStore:
                 """
             )
             self._ensure_point_columns()
+            self._migrate_point_map_names()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_named_vectors (
@@ -699,7 +718,7 @@ class SQLiteNamedVectorStore:
                 "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_record_kind ON memory_vector_points(record_kind)"
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_map_version ON memory_vector_points(map_version_id)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_map_name ON memory_vector_points(map_name)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_localization_session ON memory_vector_points(localization_session_id)"
@@ -732,7 +751,7 @@ class SQLiteNamedVectorStore:
         existing = {str(row["name"]) for row in rows}
         required_columns = {
             "collection_name": "TEXT NOT NULL DEFAULT 'legacy'",
-            "map_version_id": "TEXT",
+            "map_name": "TEXT",
             "localization_session_id": "TEXT",
             "linked_location_id": "TEXT",
             "camera_id": "TEXT",
@@ -748,6 +767,42 @@ class SQLiteNamedVectorStore:
             if column_name in existing:
                 continue
             self._conn.execute("ALTER TABLE memory_vector_points ADD COLUMN %s %s" % (column_name, ddl))
+
+    def _migrate_point_map_names(self) -> None:
+        rows = self._conn.execute(
+            "SELECT point_id, map_name, payload_json FROM memory_vector_points"
+        ).fetchall()
+        updates = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            payload.pop("map_version_id", None)
+            resolved_map_name = str(payload.get("map_name") or row["map_name"] or "").strip()
+            if not resolved_map_name:
+                library_name = str(payload.get("memory_library_name") or "").strip()
+                metadata = payload.get("metadata")
+                if not library_name and isinstance(metadata, dict):
+                    library_name = str(metadata.get("memory_library_name") or "").strip()
+                if library_name and library_name != "legacy_default":
+                    resolved_map_name = library_name
+            payload["map_name"] = resolved_map_name or None
+            updates.append(
+                (
+                    resolved_map_name or None,
+                    json.dumps(payload, ensure_ascii=False),
+                    str(row["point_id"]),
+                )
+            )
+        if updates:
+            self._conn.executemany(
+                "UPDATE memory_vector_points SET map_name = ?, payload_json = ? WHERE point_id = ?",
+                updates,
+            )
 
     def _migrate_vector_payload_to_blob(self) -> None:
         """将旧 JSON 格式的 vector_payload 迁移为 BLOB 格式（仅处理仍为 TEXT 的行）。"""

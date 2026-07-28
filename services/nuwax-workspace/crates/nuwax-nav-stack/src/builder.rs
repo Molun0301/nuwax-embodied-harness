@@ -41,6 +41,7 @@
 use crate::error::NavStackResult;
 use crate::features::{NavFeatureFlags, NavStackPreset};
 use crate::graph::ModuleGraph;
+use crate::manifest::ProfileManifest;
 use crate::profile::NavStackProfile;
 use crate::profiles;
 use crate::runner::StackRunner;
@@ -104,6 +105,12 @@ impl NavStackBuilder {
         self.features
     }
 
+    /// Return the explicit orchestration manifest for the current configuration.
+    #[must_use]
+    pub fn manifest(&self) -> ProfileManifest {
+        ProfileManifest::for_profile(self.profile, &self.topics)
+    }
+
     /// 构建 `ModuleGraph`。
     ///
     /// **不会启动任何进程**,也不会触发 native binary 下载,
@@ -112,6 +119,9 @@ impl NavStackBuilder {
         let graph = profiles::build_graph(self.profile, &self.topics, self.features);
         graph
             .validate()
+            .map_err(crate::error::NavStackError::invalid)?;
+        self.manifest()
+            .validate_graph(&graph)
             .map_err(crate::error::NavStackError::invalid)?;
         Ok(graph)
     }

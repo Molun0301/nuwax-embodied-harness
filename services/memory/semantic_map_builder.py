@@ -25,7 +25,7 @@ from services.memory.inspection_pose_planner import InspectionPosePlanner
 class SemanticMapBuildResult:
     """语义地图构建结果。"""
 
-    map_version_id: Optional[str]
+    map_name: Optional[str]
     frame_id: str
     semantic_regions: Tuple[SemanticRegion, ...]
     anchors_by_id: Dict[str, SpatialAnchor]
@@ -39,10 +39,16 @@ class SemanticMapBuilder:
     def __init__(self, *, inspection_pose_planner: Optional[InspectionPosePlanner] = None) -> None:
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
 
-    def build(self, snapshot: Optional[MapSnapshot]) -> SemanticMapBuildResult:
+    def build(
+        self,
+        snapshot: Optional[MapSnapshot],
+        *,
+        map_name: Optional[str] = None,
+    ) -> SemanticMapBuildResult:
+        resolved_map_name = str(map_name or "").strip() or None
         if snapshot is None:
             return SemanticMapBuildResult(
-                map_version_id=None,
+                map_name=resolved_map_name,
                 frame_id=DEFAULT_MAP_FRAME,
                 semantic_regions=(),
                 scene_spaces=(),
@@ -60,6 +66,7 @@ class SemanticMapBuilder:
                 self._build_from_semantic_map(
                     snapshot.semantic_map,
                     snapshot=snapshot,
+                    map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
                 )
@@ -68,6 +75,7 @@ class SemanticMapBuilder:
             semantic_regions.extend(
                 self._build_coarse_regions_from_topology(
                     snapshot=snapshot,
+                    map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
                     frame_id=frame_id,
@@ -92,7 +100,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.TOPOLOGY_NODE,
                 name=label,
                 pose=node_pose,
-                map_version_id=snapshot.version_id,
+                map_name=resolved_map_name,
                 topo_node_id=node_id,
                 semantic_labels=self._normalize_labels(
                     [label, *(node.get("aliases") or []), *(node.get("labels") or [])]
@@ -107,13 +115,14 @@ class SemanticMapBuilder:
         scene_spaces = self._build_scene_spaces(
             semantic_regions=semantic_regions,
             snapshot=snapshot,
+            map_name=resolved_map_name,
             topology_nodes_by_id=topology_nodes_by_id,
             anchors_by_id=anchors_by_id,
             frame_id=frame_id,
         )
 
         return SemanticMapBuildResult(
-            map_version_id=snapshot.version_id,
+            map_name=resolved_map_name,
             frame_id=frame_id,
             semantic_regions=tuple(semantic_regions),
             scene_spaces=tuple(scene_spaces),
@@ -126,6 +135,7 @@ class SemanticMapBuilder:
         semantic_map: SemanticMap,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
     ) -> List[SemanticRegion]:
@@ -153,7 +163,7 @@ class SemanticMapBuilder:
             semantic_region = SemanticRegion(
                 region_id=region_id,
                 anchor_id=anchor_id,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 frame_id=semantic_map.frame_id,
                 label=region.label,
                 aliases=aliases,
@@ -171,7 +181,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.SEMANTIC_REGION,
                 name=region.label,
                 pose=centroid,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 topo_node_id=topo_node_ids[0] if topo_node_ids else None,
                 semantic_region_id=region_id,
                 semantic_labels=self._normalize_labels([region.label, *aliases]),
@@ -184,6 +194,7 @@ class SemanticMapBuilder:
         self,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
         frame_id: str,
@@ -208,7 +219,7 @@ class SemanticMapBuilder:
                 SemanticRegion(
                     region_id=region_id,
                     anchor_id=anchor_id,
-                    map_version_id=snapshot.version_id,
+                    map_name=map_name,
                     frame_id=frame_id,
                     label=label,
                     aliases=aliases,
@@ -224,7 +235,7 @@ class SemanticMapBuilder:
                 anchor_kind=SpatialAnchorKind.SEMANTIC_REGION,
                 name=label,
                 pose=node_pose,
-                map_version_id=snapshot.version_id,
+                map_name=map_name,
                 topo_node_id=node_id,
                 semantic_region_id=region_id,
                 semantic_labels=self._normalize_labels([label, *aliases]),
@@ -238,6 +249,7 @@ class SemanticMapBuilder:
         *,
         semantic_regions: List[SemanticRegion],
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
         frame_id: str,
@@ -250,6 +262,7 @@ class SemanticMapBuilder:
             scene_space = self._scene_space_from_region(
                 region,
                 snapshot=snapshot,
+                map_name=map_name,
                 topology_nodes_by_id=topology_nodes_by_id,
                 anchors_by_id=anchors_by_id,
             )
@@ -274,6 +287,7 @@ class SemanticMapBuilder:
                 node,
                 node_pose=node_pose,
                 snapshot=snapshot,
+                map_name=map_name,
                 anchors_by_id=anchors_by_id,
             )
             if scene_space.scene_space_id in seen_ids:
@@ -287,6 +301,7 @@ class SemanticMapBuilder:
         region: SemanticRegion,
         *,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
     ) -> SceneSpace:
@@ -319,7 +334,7 @@ class SemanticMapBuilder:
         )
         return SceneSpace(
             scene_space_id=self._stable_scene_space_id("region", region.region_id),
-            map_version_id=snapshot.version_id,
+            map_name=map_name,
             frame_id=region.frame_id,
             boundary=boundary,
             entry_poses=entry_poses,
@@ -351,6 +366,7 @@ class SemanticMapBuilder:
         *,
         node_pose: Pose,
         snapshot: MapSnapshot,
+        map_name: Optional[str],
         anchors_by_id: Dict[str, SpatialAnchor],
     ) -> SceneSpace:
         label = str(node.get("label") or node.get("name") or node_id).strip()
@@ -376,7 +392,7 @@ class SemanticMapBuilder:
         )
         return SceneSpace(
             scene_space_id=self._stable_scene_space_id("topo", node_id),
-            map_version_id=snapshot.version_id,
+            map_name=map_name,
             frame_id=node_pose.frame_id,
             boundary=boundary,
             entry_poses=entry_poses,

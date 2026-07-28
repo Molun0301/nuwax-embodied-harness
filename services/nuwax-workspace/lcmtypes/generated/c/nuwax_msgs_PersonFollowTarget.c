@@ -21,12 +21,22 @@ uint64_t __nuwax_msgs_PersonFollowTarget_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_PersonFollowTarget_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xf313e18414b2f0c6LL
+    uint64_t hash = (uint64_t)0xa4d855f731c58fedLL
          + __string_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
+         + __string_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
@@ -66,6 +76,12 @@ int __nuwax_msgs_PersonFollowTarget_encode_array(void *buf, int offset, int maxl
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].query), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].target_seq), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].required_cloud_revision), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].stamp_sec), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -73,6 +89,30 @@ int __nuwax_msgs_PersonFollowTarget_encode_array(void *buf, int offset, int maxl
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_frame), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_parent_frame), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_x), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_y), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_z), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_x), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_y), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_z), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_w), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].image_width), 1);
@@ -135,11 +175,31 @@ int __nuwax_msgs_PersonFollowTarget_encoded_array_size(const nuwax_msgs_PersonFo
 
         size += __string_encoded_array_size(&(p[element].query), 1);
 
+        size += __int64_t_encoded_array_size(&(p[element].target_seq), 1);
+
+        size += __int64_t_encoded_array_size(&(p[element].required_cloud_revision), 1);
+
         size += __int64_t_encoded_array_size(&(p[element].stamp_sec), 1);
 
         size += __int32_t_encoded_array_size(&(p[element].stamp_nsec), 1);
 
         size += __string_encoded_array_size(&(p[element].camera_frame), 1);
+
+        size += __string_encoded_array_size(&(p[element].camera_parent_frame), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_translation_x), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_translation_y), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_translation_z), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_rotation_x), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_rotation_y), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_rotation_z), 1);
+
+        size += __double_encoded_array_size(&(p[element].camera_rotation_w), 1);
 
         size += __int32_t_encoded_array_size(&(p[element].image_width), 1);
 
@@ -184,6 +244,12 @@ int __nuwax_msgs_PersonFollowTarget_decode_array(const void *buf, int offset, in
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].query), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].target_seq), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].required_cloud_revision), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].stamp_sec), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -191,6 +257,30 @@ int __nuwax_msgs_PersonFollowTarget_decode_array(const void *buf, int offset, in
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_frame), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_parent_frame), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_x), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_y), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_translation_z), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_x), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_y), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_z), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].camera_rotation_w), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].image_width), 1);
@@ -240,11 +330,31 @@ int __nuwax_msgs_PersonFollowTarget_decode_array_cleanup(nuwax_msgs_PersonFollow
 
         __string_decode_array_cleanup(&(p[element].query), 1);
 
+        __int64_t_decode_array_cleanup(&(p[element].target_seq), 1);
+
+        __int64_t_decode_array_cleanup(&(p[element].required_cloud_revision), 1);
+
         __int64_t_decode_array_cleanup(&(p[element].stamp_sec), 1);
 
         __int32_t_decode_array_cleanup(&(p[element].stamp_nsec), 1);
 
         __string_decode_array_cleanup(&(p[element].camera_frame), 1);
+
+        __string_decode_array_cleanup(&(p[element].camera_parent_frame), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_translation_x), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_translation_y), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_translation_z), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_rotation_x), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_rotation_y), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_rotation_z), 1);
+
+        __double_decode_array_cleanup(&(p[element].camera_rotation_w), 1);
 
         __int32_t_decode_array_cleanup(&(p[element].image_width), 1);
 
@@ -302,11 +412,31 @@ int __nuwax_msgs_PersonFollowTarget_clone_array(const nuwax_msgs_PersonFollowTar
 
         __string_clone_array(&(p[element].query), &(q[element].query), 1);
 
+        __int64_t_clone_array(&(p[element].target_seq), &(q[element].target_seq), 1);
+
+        __int64_t_clone_array(&(p[element].required_cloud_revision), &(q[element].required_cloud_revision), 1);
+
         __int64_t_clone_array(&(p[element].stamp_sec), &(q[element].stamp_sec), 1);
 
         __int32_t_clone_array(&(p[element].stamp_nsec), &(q[element].stamp_nsec), 1);
 
         __string_clone_array(&(p[element].camera_frame), &(q[element].camera_frame), 1);
+
+        __string_clone_array(&(p[element].camera_parent_frame), &(q[element].camera_parent_frame), 1);
+
+        __double_clone_array(&(p[element].camera_translation_x), &(q[element].camera_translation_x), 1);
+
+        __double_clone_array(&(p[element].camera_translation_y), &(q[element].camera_translation_y), 1);
+
+        __double_clone_array(&(p[element].camera_translation_z), &(q[element].camera_translation_z), 1);
+
+        __double_clone_array(&(p[element].camera_rotation_x), &(q[element].camera_rotation_x), 1);
+
+        __double_clone_array(&(p[element].camera_rotation_y), &(q[element].camera_rotation_y), 1);
+
+        __double_clone_array(&(p[element].camera_rotation_z), &(q[element].camera_rotation_z), 1);
+
+        __double_clone_array(&(p[element].camera_rotation_w), &(q[element].camera_rotation_w), 1);
 
         __int32_t_clone_array(&(p[element].image_width), &(q[element].image_width), 1);
 

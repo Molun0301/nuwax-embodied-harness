@@ -44,8 +44,12 @@ use thiserror::Error;
 
 use crate::CodecResult;
 
+/// Versioned LIO ingress envelope codecs.
+pub mod lio;
 /// Repository-native tracked-person input codec.
 pub mod person_follow;
+/// Repository-native person-follow command codec.
+pub mod person_follow_command;
 /// Codecs generated from the locked DimOS LCM schemas.
 pub mod schema;
 

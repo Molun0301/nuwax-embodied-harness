@@ -5,18 +5,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
-use nuwax_codec::lcm::{person_follow, schema};
+use nuwax_codec::lcm::{person_follow, person_follow_command, schema};
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder};
 use nuwax_tf::lcm::{LcmTf, LcmTfError};
-use nuwax_tf::TfTree;
+use nuwax_tf::{make_transform, TfTree, TransformStamped};
 use nuwax_transport::{LcmFrameStream, LcmTransport, TransportError};
 use thiserror::Error;
 
 use crate::person_follow::{
     PackedPointCloud, PersonFollowConfig, PersonFollowController, PersonFollowError,
-    PersonFollowOutput, TrackedPerson, TrackingState,
+    PersonFollowOutput, PersonFollowState, TargetStamp, TrackedPerson, TrackingState,
 };
-use crate::{CameraIntrinsics, DetectionNavigationConfig, PoseStamped, TfLike, Twist};
+use crate::{CameraIntrinsics, DetectionNavigationConfig, PoseStamped, TfLike};
 
 /// Default typed tracked-person input channel.
 pub const DEFAULT_TARGET_CHANNEL: &str = "/person_follow_target";
@@ -29,7 +29,7 @@ pub const DEFAULT_COMMAND_CHANNEL: &str = "/gateway/person_follow_cmd_vel";
 
 const TARGET_TYPE: &str = "nuwax_msgs.PersonFollowTarget";
 const POINTCLOUD_TYPE: &str = "sensor_msgs.PointCloud2";
-const TWIST_TYPE: &str = "geometry_msgs.Twist";
+const COMMAND_TYPE: &str = "nuwax_msgs.PersonFollowCommand";
 const TF_TYPED_SUFFIX: &str = "tf2_msgs.TFMessage";
 
 /// Real-LCM owner configuration.
@@ -138,8 +138,9 @@ impl PersonFollowLcmOwner {
         let typed_tf_channel = format!("{}#{TF_TYPED_SUFFIX}", self.config.tf_channel);
         let tf = LcmTf::from_context(context, &typed_tf_channel, self.config.tf_buffer_size_secs)
             .await?;
-        let controller = PersonFollowController::new(
-            Box::new(TfTreeSource::new(tf.tree())),
+        let tree = tf.tree();
+        let mut controller = PersonFollowController::new(
+            Box::new(TfTreeSource::new(Arc::clone(&tree))),
             self.config.navigation.clone(),
             self.config.controller,
         )?;
@@ -154,21 +155,27 @@ impl PersonFollowLcmOwner {
 
         let runtime_result = match ready() {
             Ok(()) => {
-                self.run_loop(controller, targets, pointclouds, shutdown)
+                self.run_loop(&mut controller, tree, targets, pointclouds, shutdown)
                     .await
             }
             Err(error) => Err(error),
         };
-        let zero_result = publish_zero(&self.transport, &self.config.command_channel).await;
+        let terminal_result = match controller.teardown() {
+            Some(output) => {
+                publish_output(&self.transport, &self.config.command_channel, output).await
+            }
+            None => Ok(()),
+        };
         let tf_result = tf.stop().await.map_err(PersonFollowLcmError::from);
         runtime_result?;
-        zero_result?;
+        terminal_result?;
         tf_result
     }
 
     async fn run_loop<F>(
         &self,
-        mut controller: PersonFollowController,
+        controller: &mut PersonFollowController,
+        tree: Arc<TfTree>,
         mut targets: LcmFrameStream,
         mut pointclouds: LcmFrameStream,
         shutdown: F,
@@ -187,16 +194,45 @@ impl PersonFollowLcmOwner {
                 _ = &mut shutdown => return Ok(()),
                 frame = targets.next() => {
                     let frame = required_frame(frame, "person-follow target")?;
-                    let target = decode_target(&frame.payload)?;
-                    controller.update_target(target, started.elapsed());
-                    if let Some(output) = controller.tick(started.elapsed()) {
-                        publish_output(&self.transport, &self.config.command_channel, output).await?;
+                    let decoded = match decode_target(&frame.payload) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            tracing::warn!(%error, "rejecting invalid person-follow target");
+                            continue;
+                        }
+                    };
+                    match controller.accept_target(
+                        decoded.target,
+                        decoded.target_seq,
+                        decoded.required_cloud_revision,
+                        decoded.stamp,
+                        started.elapsed(),
+                    ) {
+                        Ok(true) => tree.set(decoded.calibration),
+                        Ok(false) => tracing::warn!("rejecting stale, duplicate, or cross-session target"),
+                        Err(error) => tracing::warn!(%error, "rejecting invalid person-follow target"),
                     }
                 }
                 frame = pointclouds.next() => {
                     let frame = required_frame(frame, "person-follow pointcloud")?;
-                    let cloud = decode_pointcloud_body(&frame.payload)?;
-                    controller.update_pointcloud(PackedPointCloud::from_lcm(&cloud)?);
+                    match decode_pointcloud_body(&frame.payload)
+                        .and_then(|cloud| PackedPointCloud::from_lcm(&cloud).map_err(Into::into))
+                    {
+                        Ok(cloud) => controller.update_pointcloud(cloud),
+                        Err(error) => {
+                            tracing::warn!(%error, "rejecting invalid global pointcloud");
+                            if let Some(output) = controller.fail_active(format!(
+                                "invalid global pointcloud: {error}"
+                            )) {
+                                publish_output(
+                                    &self.transport,
+                                    &self.config.command_channel,
+                                    output,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                 }
                 _ = control_tick.tick() => {
                     if let Some(output) = controller.tick(started.elapsed()) {
@@ -260,13 +296,73 @@ fn required_frame(
         .map_err(PersonFollowLcmError::from)
 }
 
-fn decode_target(body: &[u8]) -> PersonFollowLcmResult<TrackedPerson> {
+#[derive(Debug)]
+struct DecodedTarget {
+    target: TrackedPerson,
+    target_seq: i64,
+    required_cloud_revision: i64,
+    stamp: TargetStamp,
+    calibration: TransformStamped,
+}
+
+fn decode_target(body: &[u8]) -> PersonFollowLcmResult<DecodedTarget> {
     let message = person_follow::decode_person_follow_target_body(body)?;
+    if message.target_seq <= 0 || message.required_cloud_revision <= 0 {
+        return Err(invalid_target(
+            "target_seq and required_cloud_revision must be positive",
+        ));
+    }
     if !(0..1_000_000_000).contains(&message.stamp_nsec) {
         return Err(PersonFollowLcmError::InvalidConfig(format!(
             "target stamp_nsec {} is outside [0, 1e9)",
             message.stamp_nsec
         )));
+    }
+    if message.stamp_sec < 0 {
+        return Err(invalid_target("stamp_sec must be non-negative"));
+    }
+    for (name, value) in [
+        ("session_id", message.session_id.as_str()),
+        ("query", message.query.as_str()),
+        ("camera_frame", message.camera_frame.as_str()),
+        ("camera_parent_frame", message.camera_parent_frame.as_str()),
+    ] {
+        if value.is_empty() || value.len() > 255 {
+            return Err(invalid_target(&format!(
+                "{name} must contain 1..=255 bytes"
+            )));
+        }
+    }
+    if message.camera_parent_frame == message.camera_frame {
+        return Err(invalid_target("camera parent and child frames must differ"));
+    }
+    if matches!(
+        message.camera_frame.as_str(),
+        "map" | "odom" | "base_link" | "base_footprint"
+    ) {
+        return Err(invalid_target(
+            "camera calibration cannot overwrite a reserved map/odom/base child frame",
+        ));
+    }
+    let translation = [
+        message.camera_translation_x,
+        message.camera_translation_y,
+        message.camera_translation_z,
+    ];
+    let rotation = [
+        message.camera_rotation_x,
+        message.camera_rotation_y,
+        message.camera_rotation_z,
+        message.camera_rotation_w,
+    ];
+    if !translation.into_iter().chain(rotation).all(f64::is_finite) {
+        return Err(invalid_target(
+            "camera calibration contains non-finite values",
+        ));
+    }
+    let quaternion_norm_squared = rotation.into_iter().map(|value| value * value).sum::<f64>();
+    if (quaternion_norm_squared - 1.0).abs() > 1e-3 {
+        return Err(invalid_target("camera quaternion is not near unit length"));
     }
     let image_width = u32::try_from(message.image_width).map_err(|_| {
         PersonFollowLcmError::InvalidConfig("target image_width is negative".into())
@@ -284,29 +380,51 @@ fn decode_target(body: &[u8]) -> PersonFollowLcmResult<TrackedPerson> {
             )))
         }
     };
-    Ok(TrackedPerson {
-        session_id: message.session_id,
-        query: message.query,
-        image_timestamp: message.stamp_sec as f64 + f64::from(message.stamp_nsec) * 1e-9,
-        camera_frame: message.camera_frame,
-        image_width,
-        image_height,
-        intrinsics: CameraIntrinsics::new(
-            message.fx,
-            message.fy,
-            message.cx,
-            message.cy,
+    let stamp = TargetStamp {
+        sec: message.stamp_sec,
+        nsec: message.stamp_nsec as u32,
+    };
+    let mut calibration = make_transform(
+        message.camera_parent_frame.clone(),
+        message.camera_frame.clone(),
+        translation,
+        rotation,
+    );
+    calibration.stamp_secs = stamp.sec;
+    calibration.stamp_nanos = stamp.nsec;
+    Ok(DecodedTarget {
+        target: TrackedPerson {
+            session_id: message.session_id,
+            query: message.query,
+            image_timestamp: stamp.sec as f64 + f64::from(stamp.nsec) * 1e-9,
+            camera_frame: message.camera_frame,
             image_width,
             image_height,
-        ),
-        bbox: crate::BBox::new(
-            message.bbox_x1,
-            message.bbox_y1,
-            message.bbox_x2,
-            message.bbox_y2,
-        ),
-        state,
+            intrinsics: CameraIntrinsics::new(
+                message.fx,
+                message.fy,
+                message.cx,
+                message.cy,
+                image_width,
+                image_height,
+            ),
+            bbox: crate::BBox::new(
+                message.bbox_x1,
+                message.bbox_y1,
+                message.bbox_x2,
+                message.bbox_y2,
+            ),
+            state,
+        },
+        target_seq: message.target_seq,
+        required_cloud_revision: message.required_cloud_revision,
+        stamp,
+        calibration,
     })
+}
+
+fn invalid_target(reason: &str) -> PersonFollowLcmError {
+    PersonFollowLcmError::InvalidConfig(format!("invalid person-follow target: {reason}"))
 }
 
 fn decode_pointcloud_body(body: &[u8]) -> PersonFollowLcmResult<schema::PointCloud2> {
@@ -322,37 +440,40 @@ async fn publish_output(
     output: PersonFollowOutput,
 ) -> PersonFollowLcmResult<()> {
     match &output.state {
-        crate::person_follow::PersonFollowState::Failed(reason) => {
+        PersonFollowState::Failed(reason) => {
             tracing::error!(reason, "person-follow session failed after zeroing command");
         }
-        crate::person_follow::PersonFollowState::Lost {
-            frames,
-            terminal: true,
-        } => {
-            tracing::warn!(frames, "person-follow target lost; session ended");
+        PersonFollowState::Lost => {
+            tracing::warn!("person-follow target lost; session ended");
         }
         _ => {}
     }
-    publish_twist(transport, channel, output.command).await
-}
-
-async fn publish_zero(transport: &LcmTransport, channel: &str) -> PersonFollowLcmResult<()> {
-    publish_twist(transport, channel, Twist::zero()).await
-}
-
-async fn publish_twist(
-    transport: &LcmTransport,
-    channel: &str,
-    command: Twist,
-) -> PersonFollowLcmResult<()> {
+    let state = match output.state {
+        PersonFollowState::WaitingData => person_follow_command::WAITING_DATA,
+        PersonFollowState::Tracking => person_follow_command::TRACKING,
+        PersonFollowState::Lost => person_follow_command::LOST,
+        PersonFollowState::Stopped => person_follow_command::STOPPED,
+        PersonFollowState::Failed(_) => person_follow_command::FAILED,
+    };
     let topic = LcmTopic::new(channel)
         .map_err(|error| PersonFollowLcmError::InvalidConfig(error.to_string()))?;
-    let message_type = LcmMessageType::new(TWIST_TYPE)
+    let message_type = LcmMessageType::new(COMMAND_TYPE)
         .map_err(|error| PersonFollowLcmError::InvalidConfig(error.to_string()))?;
-    let body = schema::encode_twist_body(&schema::Twist {
-        linear: command.linear,
-        angular: command.angular,
-    });
+    let body = person_follow_command::encode_person_follow_command_body(
+        &person_follow_command::PersonFollowCommand {
+            session_id: output.session_id,
+            target_seq: output.target_seq,
+            target_stamp_sec: output.target_stamp.sec,
+            target_stamp_nsec: output.target_stamp.nsec as i32,
+            command_seq: output.command_seq,
+            cloud_revision: output.cloud_revision,
+            state,
+            reason: output.reason,
+            linear_x: output.command.linear[0],
+            linear_y: output.command.linear[1],
+            angular_z: output.command.angular[2],
+        },
+    )?;
     transport
         .publish(
             RawLcmFrameBuilder::new(topic, message_type)
@@ -419,6 +540,37 @@ impl TfLike for TfTreeSource {
 mod tests {
     use super::*;
 
+    fn target_message() -> person_follow::PersonFollowTarget {
+        person_follow::PersonFollowTarget {
+            session_id: "session".into(),
+            query: "person".into(),
+            target_seq: 4,
+            required_cloud_revision: 7,
+            stamp_sec: 1_000_000_000,
+            stamp_nsec: 123,
+            camera_frame: "camera_optical".into(),
+            camera_parent_frame: "base_link".into(),
+            camera_translation_x: 0.1,
+            camera_translation_y: 0.2,
+            camera_translation_z: 0.3,
+            camera_rotation_x: 0.0,
+            camera_rotation_y: 0.0,
+            camera_rotation_z: 0.0,
+            camera_rotation_w: 1.0,
+            image_width: 640,
+            image_height: 480,
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            bbox_x1: 100.0,
+            bbox_y1: 100.0,
+            bbox_x2: 200.0,
+            bbox_y2: 300.0,
+            tracking_state: person_follow::PERSON_FOLLOW_TRACKED,
+        }
+    }
+
     #[test]
     fn default_command_channel_is_gateway_guard_ingress() {
         let config = PersonFollowLcmConfig::default();
@@ -436,6 +588,62 @@ mod tests {
             let error = validate_config(&config).expect_err("forbidden motion channel");
             assert!(error.to_string().contains("forbidden"));
         }
+    }
+
+    #[test]
+    fn target_decode_preserves_exact_stamp_and_local_calibration() {
+        let body = person_follow::encode_person_follow_target_body(&target_message())
+            .expect("encode target");
+        let decoded = decode_target(&body).expect("decode target");
+
+        assert_eq!(decoded.target_seq, 4);
+        assert_eq!(decoded.required_cloud_revision, 7);
+        assert_eq!(decoded.stamp.sec, 1_000_000_000);
+        assert_eq!(decoded.stamp.nsec, 123);
+        assert_eq!(decoded.calibration.parent, "base_link");
+        assert_eq!(decoded.calibration.child, "camera_optical");
+        assert_eq!(decoded.calibration.stamp_secs, 1_000_000_000);
+        assert_eq!(decoded.calibration.stamp_nanos, 123);
+        assert_eq!(decoded.calibration.transform.translation.vector.x, 0.1);
+    }
+
+    #[test]
+    fn target_query_is_bounded_to_255_bytes() {
+        let mut accepted = target_message();
+        accepted.query = "q".repeat(255);
+        let body = person_follow::encode_person_follow_target_body(&accepted)
+            .expect("encode bounded target");
+        decode_target(&body).expect("255-byte query");
+
+        let mut rejected = target_message();
+        rejected.query = "q".repeat(256);
+        let body = person_follow::encode_person_follow_target_body(&rejected)
+            .expect("encode overlong target");
+        assert!(decode_target(&body)
+            .expect_err("256-byte query")
+            .to_string()
+            .contains("1..=255 bytes"));
+    }
+
+    #[test]
+    fn invalid_calibration_and_reserved_child_are_rejected() {
+        let mut message = target_message();
+        message.camera_rotation_w = 0.5;
+        let body =
+            person_follow::encode_person_follow_target_body(&message).expect("encode target");
+        assert!(decode_target(&body)
+            .expect_err("non-unit quaternion")
+            .to_string()
+            .contains("near unit"));
+
+        let mut message = target_message();
+        message.camera_frame = "odom".into();
+        let body =
+            person_follow::encode_person_follow_target_body(&message).expect("encode target");
+        assert!(decode_target(&body)
+            .expect_err("reserved child")
+            .to_string()
+            .contains("reserved"));
     }
 
     #[tokio::test]

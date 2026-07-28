@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 import threading
 from typing import Any
 
@@ -9,11 +8,11 @@ from contracts.runtime_views import MapSnapshot
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
 from providers import MapProvider
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class MappingService:
-    """统一地图快照与版本管理服务。"""
+    """统一运行态地图快照服务。"""
 
     def __init__(
         self,
@@ -22,14 +21,12 @@ class MappingService:
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
         stream_bus: Optional[StreamBus] = None,
-        history_limit: int = 100,
     ) -> None:
         self._provider_owner = provider_owner
         self._state_store = state_store
         self._event_bus = event_bus
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
-        self._history: Deque[MapSnapshot] = deque(maxlen=max(1, history_limit))
         self._latest_snapshot: Optional[MapSnapshot] = None
         self._revision_by_source: Dict[str, int] = {}
         self._stream_occupancy_key_by_source: Dict[str, Tuple[object, ...]] = {}
@@ -191,9 +188,17 @@ class MappingService:
             else:
                 revision = self._revision_by_source.get(source_name, 0) + 1
             self._revision_by_source[source_name] = max(self._revision_by_source.get(source_name, 0), revision)
+            normalized_source = "".join(
+                char if char.isalnum() else "_"
+                for char in source_name.lower()
+            ).strip("_") or "map"
+            snapshot_id = version_id_override or "mapsnap_%s_%06d" % (
+                normalized_source,
+                revision,
+            )
             snapshot = MapSnapshot(
                 source_name=source_name,
-                version_id=str(version_id_override or self._build_version_id(source_name, revision)),
+                version_id=str(snapshot_id),
                 revision=revision,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
@@ -201,7 +206,6 @@ class MappingService:
                 metadata=snapshot_metadata,
             )
             self._latest_snapshot = snapshot
-            self._history.append(snapshot)
             self._state_store.write(
                 StateNamespace.MAP,
                 source_name,
@@ -371,15 +375,6 @@ class MappingService:
                 )
             )
 
-    def list_history(self, *, limit: Optional[int] = None) -> Tuple[MapSnapshot, ...]:
-        """返回地图历史。"""
-
-        with self._lock:
-            items = list(self._history)
-        if limit is not None:
-            items = items[-max(0, limit) :]
-        return tuple(items)
-
     def is_available(self) -> bool:
         """判断地图服务当前是否可用。"""
 
@@ -491,10 +486,10 @@ class MappingService:
         )
 
     def _infer_snapshot_kind(self, metadata: Dict[str, object]) -> str:
-        source_mode = str(metadata.get("source_mode") or metadata.get("map_version_source_mode") or "").strip()
+        source_mode = str(metadata.get("source_mode") or "").strip()
         if source_mode == "live_streaming_checkpoint" or metadata.get("mapping_live_streaming_ready") is True:
             return "live_streaming"
-        if metadata.get("platform_map_version_id") or metadata.get("geometry_asset_summary"):
+        if metadata.get("geometry_asset_summary"):
             return "offline_checkpoint"
         return "provider_snapshot"
 
@@ -507,16 +502,6 @@ class MappingService:
         if semantic_map is not None:
             layers.append("semantic_map")
         return layers
-
-    def _build_version_id(self, source_name: str, revision: int) -> str:
-        normalized = []
-        for char in source_name.lower():
-            if char.isalnum():
-                normalized.append(char)
-            else:
-                normalized.append("_")
-        safe_source = "".join(normalized).strip("_") or "map"
-        return f"mapv_{safe_source}_{revision:06d}"
 
     def _is_equivalent_to_latest_snapshot(
         self,

@@ -98,7 +98,6 @@ _INTERNAL_ERROR_CODES = frozenset(
 )
 _FACT_KEYS = (
     "map_name",
-    "map_version_id",
     "goal_id",
     "request_id",
     "task_id",
@@ -114,7 +113,6 @@ _FACT_KEYS = (
     "error_code",
     "frontier_count",
     "maps_count",
-    "map_versions_count",
     "count",
     "retry_after_sec",
     "elapsed_sec",

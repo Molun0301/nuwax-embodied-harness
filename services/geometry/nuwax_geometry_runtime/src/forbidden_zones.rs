@@ -77,8 +77,6 @@ pub struct ForbiddenZone {
 pub struct ForbiddenZoneSet {
     #[serde(default)]
     pub map_name: String,
-    #[serde(default)]
-    pub map_version_id: String,
     pub generation: u64,
     #[serde(default)]
     pub signature: String,
@@ -138,38 +136,23 @@ impl LoadedForbiddenZones {
     }
 }
 
-#[cfg(test)]
-pub fn load_for_map(path: &Path, map_version_id: &str) -> LoadedForbiddenZones {
-    load_for_map_binding(path, "", map_version_id)
-}
-
-pub fn load_for_map_binding(
-    path: &Path,
-    map_name: &str,
-    map_version_id: &str,
-) -> LoadedForbiddenZones {
+pub fn load_for_map(path: &Path, map_name: &str) -> LoadedForbiddenZones {
     let map_name = map_name.trim();
-    let map_version_id = map_version_id.trim();
-    if map_name.is_empty() && map_version_id.is_empty() {
+    if map_name.is_empty() {
         return LoadedForbiddenZones::fail_closed(
             "invalid:empty-map-binding".to_string(),
             "active map_name is empty",
         );
     }
-    let binding_id = if map_name.is_empty() {
-        map_version_id
-    } else {
-        map_name
-    };
 
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LoadedForbiddenZones::empty(format!("missing:{binding_id}"));
+            return LoadedForbiddenZones::empty(format!("missing:{map_name}"));
         }
         Err(error) => {
             return LoadedForbiddenZones::fail_closed(
-                format!("io-error:{binding_id}:{error}"),
+                format!("io-error:{map_name}:{error}"),
                 format!("cannot read {}: {error}", path.display()),
             );
         }
@@ -193,39 +176,11 @@ pub fn load_for_map_binding(
             ),
         );
     }
-    let selected = if map_name.is_empty() {
-        document
-            .maps
-            .get(map_version_id)
-            .map(|zone_set| (map_version_id, zone_set))
-    } else {
-        document
-            .maps
-            .get(map_name)
-            .map(|zone_set| (map_name, zone_set))
-            .or_else(|| {
-                if map_version_id.is_empty() {
-                    None
-                } else {
-                    document
-                        .maps
-                        .get(map_version_id)
-                        .map(|zone_set| (map_version_id, zone_set))
-                }
-            })
-    };
-    let Some((storage_key, zone_set)) = selected else {
-        return LoadedForbiddenZones::empty(format!(
-            "absent:{}:{map_version_id}",
-            if map_name.is_empty() {
-                "legacy"
-            } else {
-                map_name
-            }
-        ));
+    let Some(zone_set) = document.maps.get(map_name) else {
+        return LoadedForbiddenZones::empty(format!("absent:{map_name}"));
     };
     let stored_map_name = zone_set.map_name.trim();
-    if storage_key == map_name && stored_map_name != map_name {
+    if stored_map_name != map_name {
         return LoadedForbiddenZones::fail_closed(
             format!("map-name-mismatch:{file_hash}:{map_name}"),
             format!(
@@ -234,34 +189,16 @@ pub fn load_for_map_binding(
             ),
         );
     }
-    if !stored_map_name.is_empty() && !map_name.is_empty() && stored_map_name != map_name {
-        return LoadedForbiddenZones::fail_closed(
-            format!("map-name-mismatch:{file_hash}:{map_name}"),
-            format!(
-                "forbidden-zone entry for {map_version_id:?} belongs to map {:?}",
-                zone_set.map_name
-            ),
-        );
-    }
-    if storage_key != map_name && zone_set.map_version_id.trim() != map_version_id {
-        return LoadedForbiddenZones::fail_closed(
-            format!("map-version-mismatch:{file_hash}:{map_version_id}"),
-            format!(
-                "forbidden-zone key {map_version_id:?} contains map_version_id {:?}",
-                zone_set.map_version_id
-            ),
-        );
-    }
     if let Err(error) = validate_zone_set(zone_set) {
         return LoadedForbiddenZones::fail_closed(
-            format!("invalid-zone-set:{file_hash}:{map_version_id}"),
+            format!("invalid-zone-set:{file_hash}:{map_name}"),
             error,
         );
     }
     let entry_bytes = serde_json::to_vec(zone_set).unwrap_or_default();
     let signature = if zone_set.signature.trim().is_empty() {
         format!(
-            "legacy:{storage_key}:{}",
+            "derived:{map_name}:{}",
             crate::map_checksum::sha256_hex(&entry_bytes)
         )
     } else {
@@ -942,7 +879,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"schema_version":1,"maps":{{"map-v1":{{"map_version_id":"map-v1","generation":7,"signature":"{expected}","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}}}}"#
+                r#"{{"schema_version":1,"maps":{{"map-v1":{{"map_name":"map-v1","generation":7,"signature":"{expected}","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}}}}"#
             ),
         )
         .expect("write signed forbidden-zone document");
@@ -956,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn map_binding_separates_equal_version_ids() {
+    fn map_name_separates_forbidden_zone_sets() {
         let path = std::env::temp_dir().join(format!(
             "nuwax-forbidden-zone-map-binding-{}-{}.json",
             std::process::id(),
@@ -975,8 +912,8 @@ mod tests {
         )
         .expect("write map-bound forbidden-zone document");
 
-        let warehouse = load_for_map_binding(&path, "warehouse", "mapver_000009");
-        let office = load_for_map_binding(&path, "office", "mapver_000009");
+        let warehouse = load_for_map(&path, "warehouse");
+        let office = load_for_map(&path, "office");
 
         assert_eq!(warehouse.signature, warehouse_signature);
         assert_eq!(office.signature, office_signature);
@@ -995,7 +932,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            br#"{"schema_version":1,"maps":{"map-v1":{"map_version_id":"map-v1","generation":7,"signature":"wrong-content","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}"#,
+            br#"{"schema_version":1,"maps":{"map-v1":{"map_name":"map-v1","generation":7,"signature":"wrong-content","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}"#,
         )
         .expect("write invalid signed forbidden-zone document");
 

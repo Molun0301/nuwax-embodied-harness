@@ -538,7 +538,7 @@ _ZH_NAMES: Dict[str, str] = {
     # 共享内存 / Unix socket 路径
     "NUWAX_CLOUDMAP_SHM_PATH": "cloud_map 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_cloudmap.mmap）",
     "NUWAX_OCCUPANCY_SHM_PATH": "occupancy 共享内存映射文件路径（services/geometry/runtime.py 默认 /tmp/nuwax_occupancy.mmap）",
-    "NUWAX_FORBIDDEN_ZONES_PATH": "地图版本级禁行区 JSON 文件路径（Gateway 原子写，Geometry Runtime 监听）",
+    "NUWAX_FORBIDDEN_ZONES_PATH": "地图级禁行区 JSON 文件路径（Gateway 原子写，Geometry Runtime 监听）",
     "NUWAX_VIDEO_SHM_PATH": "视频共享内存路径",
     "NUWAX_VIDEO_UDS_PATH": "视频 Unix socket 路径",
     "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL": "runtime odom typed channel（与 NUWAX_LCM_CHANNEL_ODOM 等价别名）",
@@ -643,7 +643,6 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_LOCALIZATION_HISTORY_LIMIT": "定位历史记录上限",
     "NUWAX_MAP_AUTO_CREATE_LIBRARY": "自动创建地图库",
     "NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY": "删除地图时同时删除地图库",
-    "NUWAX_MAP_HISTORY_LIMIT": "地图历史记录上限",
     "NUWAX_MEMORY_DB_PATH": "记忆数据库路径",
     "NUWAX_MEMORY_EMBEDDING_BASE_URL": "记忆嵌入服务基础地址",
     "NUWAX_MEMORY_EMBEDDING_DIM": "记忆嵌入维度",

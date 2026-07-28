@@ -3,7 +3,7 @@
 use crate::{CodecError, CodecResult};
 
 /// Generated LCM fingerprint for `nuwax_msgs.PersonFollowTarget`.
-pub const PERSON_FOLLOW_TARGET_FINGERPRINT: [u8; 8] = 0xe627_c308_2965_e18d_u64.to_be_bytes();
+pub const PERSON_FOLLOW_TARGET_FINGERPRINT: [u8; 8] = 0x49b0_abee_638b_1fdb_u64.to_be_bytes();
 
 /// Target is visible and the bbox belongs to the current image timestamp.
 pub const PERSON_FOLLOW_TRACKED: i32 = 0;
@@ -19,12 +19,32 @@ pub struct PersonFollowTarget {
     pub session_id: String,
     /// Human-readable target description.
     pub query: String,
+    /// Monotonic target observation sequence within the session.
+    pub target_seq: i64,
+    /// Point-cloud revision required to resolve this target atomically.
+    pub required_cloud_revision: i64,
     /// Image timestamp seconds.
     pub stamp_sec: i64,
     /// Image timestamp nanoseconds.
     pub stamp_nsec: i32,
     /// Optical camera frame used for projection.
     pub camera_frame: String,
+    /// Parent frame in which the camera transform is expressed.
+    pub camera_parent_frame: String,
+    /// Camera translation X in the parent frame.
+    pub camera_translation_x: f64,
+    /// Camera translation Y in the parent frame.
+    pub camera_translation_y: f64,
+    /// Camera translation Z in the parent frame.
+    pub camera_translation_z: f64,
+    /// Camera quaternion X component.
+    pub camera_rotation_x: f64,
+    /// Camera quaternion Y component.
+    pub camera_rotation_y: f64,
+    /// Camera quaternion Z component.
+    pub camera_rotation_z: f64,
+    /// Camera quaternion W component.
+    pub camera_rotation_w: f64,
     /// Image width in pixels.
     pub image_width: i32,
     /// Image height in pixels.
@@ -63,9 +83,23 @@ pub fn encode_person_follow_target_body(message: &PersonFollowTarget) -> CodecRe
     let mut encoded = Vec::new();
     encode_string(&message.session_id, &mut encoded)?;
     encode_string(&message.query, &mut encoded)?;
+    encoded.extend_from_slice(&message.target_seq.to_be_bytes());
+    encoded.extend_from_slice(&message.required_cloud_revision.to_be_bytes());
     encoded.extend_from_slice(&message.stamp_sec.to_be_bytes());
     encoded.extend_from_slice(&message.stamp_nsec.to_be_bytes());
     encode_string(&message.camera_frame, &mut encoded)?;
+    encode_string(&message.camera_parent_frame, &mut encoded)?;
+    for value in [
+        message.camera_translation_x,
+        message.camera_translation_y,
+        message.camera_translation_z,
+        message.camera_rotation_x,
+        message.camera_rotation_y,
+        message.camera_rotation_z,
+        message.camera_rotation_w,
+    ] {
+        encoded.extend_from_slice(&value.to_be_bytes());
+    }
     encoded.extend_from_slice(&message.image_width.to_be_bytes());
     encoded.extend_from_slice(&message.image_height.to_be_bytes());
     for value in [
@@ -110,9 +144,19 @@ fn decode_body(cursor: &mut Cursor<'_>) -> CodecResult<PersonFollowTarget> {
     Ok(PersonFollowTarget {
         session_id: cursor.read_string()?,
         query: cursor.read_string()?,
+        target_seq: cursor.read_i64()?,
+        required_cloud_revision: cursor.read_i64()?,
         stamp_sec: cursor.read_i64()?,
         stamp_nsec: cursor.read_i32()?,
         camera_frame: cursor.read_string()?,
+        camera_parent_frame: cursor.read_string()?,
+        camera_translation_x: cursor.read_f64()?,
+        camera_translation_y: cursor.read_f64()?,
+        camera_translation_z: cursor.read_f64()?,
+        camera_rotation_x: cursor.read_f64()?,
+        camera_rotation_y: cursor.read_f64()?,
+        camera_rotation_z: cursor.read_f64()?,
+        camera_rotation_w: cursor.read_f64()?,
         image_width: cursor.read_i32()?,
         image_height: cursor.read_i32()?,
         fx: cursor.read_f64()?,

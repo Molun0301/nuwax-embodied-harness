@@ -10,6 +10,7 @@ INTERNAL_READY_FILE="${READY_FILE}.runtime"
 PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 CHILD_PID=""
+READY_MONITOR_PID=""
 
 [[ -r "${IDENTITY_HELPER}" ]] || {
   echo "nuwax-geometry-runtime launcher: process identity helper is unavailable: ${IDENTITY_HELPER}" >&2
@@ -45,9 +46,17 @@ stop_geometry_child() {
   wait "${CHILD_PID}" >/dev/null 2>&1 || true
 }
 
+stop_ready_monitor() {
+  [[ -n "${READY_MONITOR_PID}" ]] || return 0
+  kill "${READY_MONITOR_PID}" >/dev/null 2>&1 || true
+  wait "${READY_MONITOR_PID}" >/dev/null 2>&1 || true
+  READY_MONITOR_PID=""
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
+  stop_ready_monitor
   rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
     "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" 2>/dev/null || true
   stop_geometry_child
@@ -65,6 +74,15 @@ geometry_internal_health_ready() {
   internal_port="$(< "${INTERNAL_READY_FILE}")" || return 1
   [[ "${internal_port}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "${internal_port}" -le 65535 && "${internal_port}" == "${PORT}" ]]
+}
+
+monitor_geometry_ready_lease() {
+  while kill -0 "${CHILD_PID}" >/dev/null 2>&1; do
+    if ! geometry_internal_health_ready; then
+      rm -f "${READY_FILE}" "${READY_FILE}.tmp" 2>/dev/null || true
+    fi
+    sleep 0.1
+  done
 }
 
 case "${PORT}" in
@@ -117,9 +135,13 @@ printf 'pid=%s\nboot_id=%s\nstarttime=%s\nport=%s\nhealth_ready=1\n' \
   "${CHILD_PID}" "${BOOT_ID}" "${CHILD_STARTTIME}" "${PORT}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 
+monitor_geometry_ready_lease &
+READY_MONITOR_PID="$!"
+
 set +e
 wait "${CHILD_PID}"
 status=$?
 set -e
+stop_ready_monitor
 CHILD_PID=""
 exit "${status}"

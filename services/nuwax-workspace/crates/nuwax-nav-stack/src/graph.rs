@@ -24,7 +24,7 @@
 //! **不持有运行时句柄**:graph 是纯数据,不持有进程、channel、async task。
 //! 真正的 spawn / wait 由各 upstream crate 在收到 graph 后自行完成。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "native-runner")]
 use nuwax_exploration::NativeSpecSummary;
@@ -280,6 +280,13 @@ impl ModuleGraph {
 
     /// 校验拓扑:确保每个 `depends_on` 都指向真实存在的节点 id。
     pub fn validate(&self) -> Result<(), String> {
+        let mut unique_ids = BTreeSet::new();
+        for node in &self.nodes {
+            if !unique_ids.insert(node.id.as_str()) {
+                return Err(format!("duplicate node id `{}`", node.id));
+            }
+        }
+
         let ids: BTreeMap<&str, ()> = self.nodes.iter().map(|n| (n.id.as_str(), ())).collect();
 
         for n in &self.nodes {
@@ -331,6 +338,14 @@ mod tests {
         g.push_node(ModuleNode::new("b", "B", ModuleKind::RustAlgorithm).depends_on_node("ghost"));
         let err = g.validate().unwrap_err();
         assert!(err.contains("ghost"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_node_ids() {
+        let mut g = ModuleGraph::new("test");
+        g.push_node(ModuleNode::new("same", "First", ModuleKind::RustAlgorithm));
+        g.push_node(ModuleNode::new("same", "Second", ModuleKind::Coordinator));
+        assert_eq!(g.validate().unwrap_err(), "duplicate node id `same`");
     }
 
     #[test]

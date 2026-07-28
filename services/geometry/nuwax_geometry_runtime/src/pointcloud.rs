@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 
 use memmap2::MmapMut;
 use nalgebra::Point3;
 use tracing::{error, info, warn};
+
+use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
 
 pub const VOXEL_SIZE: f32 = 0.05;
 
@@ -70,6 +73,92 @@ pub struct CloudMapShmWriter {
     session_generation: u64,
     voxels: HashSet<VoxelKey>,
     max_points: usize,
+    last_occupancy_receipt: Option<OccupancyCommitReceipt>,
+    last_cloud_receipt: Option<CloudCommitReceipt>,
+    typed_publish_state: Arc<TypedCloudPublishState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingTypedCloudClear {
+    pub(crate) revision: u64,
+    pub(crate) point_count: u32,
+    pub(crate) voxel_size: f32,
+    pub(crate) session_generation: u64,
+}
+
+#[derive(Default)]
+struct TypedCloudPublishProgress {
+    published_identity: Option<(u64, u64)>,
+    pending_clear: Option<PendingTypedCloudClear>,
+}
+
+pub(crate) struct TypedCloudPublishState {
+    sequencer: tokio::sync::Mutex<()>,
+    progress: parking_lot::Mutex<TypedCloudPublishProgress>,
+    session_generation_tx: tokio::sync::watch::Sender<u64>,
+}
+
+impl TypedCloudPublishState {
+    fn new() -> Self {
+        let (session_generation_tx, _) = tokio::sync::watch::channel(0);
+        Self {
+            sequencer: tokio::sync::Mutex::new(()),
+            progress: parking_lot::Mutex::new(TypedCloudPublishProgress::default()),
+            session_generation_tx,
+        }
+    }
+
+    pub(crate) async fn lock_sequencer(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sequencer.lock().await
+    }
+
+    pub(crate) fn session_generation_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.session_generation_tx.subscribe()
+    }
+
+    pub(crate) fn observe_session_generation(&self, session_generation: u64) {
+        if *self.session_generation_tx.borrow() != session_generation {
+            self.session_generation_tx.send_replace(session_generation);
+        }
+    }
+
+    pub(crate) fn pending_clear_for_session(
+        &self,
+        session_generation: u64,
+    ) -> Option<PendingTypedCloudClear> {
+        let mut progress = self.progress.lock();
+        if progress
+            .pending_clear
+            .as_ref()
+            .is_some_and(|clear| clear.session_generation != session_generation)
+        {
+            progress.pending_clear = None;
+        }
+        progress.pending_clear.clone()
+    }
+
+    pub(crate) fn published_identity(&self) -> Option<(u64, u64)> {
+        self.progress.lock().published_identity
+    }
+
+    pub(crate) fn mark_published(&self, identity: (u64, u64)) {
+        let mut progress = self.progress.lock();
+        progress.published_identity = Some(identity);
+        if progress
+            .pending_clear
+            .as_ref()
+            .map(|clear| (clear.session_generation, clear.revision))
+            == Some(identity)
+        {
+            progress.pending_clear = None;
+        }
+    }
+
+    fn reserve_session_clear(&self, clear: PendingTypedCloudClear) {
+        let session_generation = clear.session_generation;
+        self.progress.lock().pending_clear = Some(clear);
+        self.session_generation_tx.send_replace(session_generation);
+    }
 }
 
 /// One successfully committed cumulative cloud-map revision and the exact
@@ -78,7 +167,13 @@ pub(crate) struct CommittedCloudMapSnapshot {
     pub revision: u64,
     pub point_count: u32,
     pub voxel_size: f32,
+    pub session_generation: u64,
     pub xyz_f32_le: Vec<u8>,
+}
+
+pub(crate) struct CorrelatedCloudMapCommit {
+    pub(crate) snapshot: CommittedCloudMapSnapshot,
+    pub(crate) receipt: CloudCommitReceipt,
 }
 
 impl CloudMapShmWriter {
@@ -105,7 +200,14 @@ impl CloudMapShmWriter {
             session_generation: 0,
             voxels: HashSet::new(),
             max_points: CM_MAX_POINTS,
+            last_occupancy_receipt: None,
+            last_cloud_receipt: None,
+            typed_publish_state: Arc::new(TypedCloudPublishState::new()),
         })
+    }
+
+    pub(crate) fn typed_publish_state(&self) -> Arc<TypedCloudPublishState> {
+        self.typed_publish_state.clone()
     }
 
     /// Increment the independent cloud-map voxel accumulator with one accepted
@@ -151,23 +253,98 @@ impl CloudMapShmWriter {
 
     /// Commit the cumulative voxel map and expose a deterministic packed XYZ
     /// snapshot for the corresponding typed `/global_map` publication.
-    pub(crate) fn commit_accumulated_snapshot(&mut self) -> Option<CommittedCloudMapSnapshot> {
-        let (revision, point_count, voxel_size) = self.commit_accumulated()?;
-        let mut keys = self.voxels.iter().copied().collect::<Vec<_>>();
-        keys.sort_unstable();
-        let mut xyz_f32_le = Vec::with_capacity(keys.len() * CM_POINT_SIZE_BYTES);
-        for key in keys {
-            for coordinate in voxel_center_f32(key, voxel_size) {
-                xyz_f32_le.extend_from_slice(&coordinate.to_le_bytes());
-            }
+    pub(crate) fn commit_accumulated_snapshot(
+        &mut self,
+        occupancy_receipt: &OccupancyCommitReceipt,
+    ) -> Result<Option<CorrelatedCloudMapCommit>, String> {
+        self.validate_occupancy_receipt(occupancy_receipt)?;
+        if self.commit_accumulated().is_none() {
+            return Ok(None);
         }
-        debug_assert_eq!(xyz_f32_le.len() / CM_POINT_SIZE_BYTES, point_count as usize);
+        let snapshot = self
+            .committed_snapshot()
+            .ok_or_else(|| "committed cloud-map snapshot is inconsistent".to_owned())?;
+        let receipt = CloudCommitReceipt {
+            commit_id: occupancy_receipt.commit_id,
+            session_generation: occupancy_receipt.session_generation,
+            occupancy_revision: occupancy_receipt.occupancy_revision,
+            cloud_revision: snapshot.revision,
+            source_timestamp_ns: occupancy_receipt.source_timestamp_ns,
+            point_count: snapshot.point_count,
+        };
+        self.last_occupancy_receipt = Some(occupancy_receipt.clone());
+        self.last_cloud_receipt = Some(receipt.clone());
+        Ok(Some(CorrelatedCloudMapCommit { snapshot, receipt }))
+    }
+
+    /// Read the exact active SHM payload without advancing its revision.
+    pub(crate) fn committed_snapshot(&self) -> Option<CommittedCloudMapSnapshot> {
+        if self.revision == 0 || self.session_generation == 0 {
+            return None;
+        }
+        let active_buf = u32::from_le_bytes(
+            self.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_ACTIVE_BUFFER_OFFSET + 4]
+                .try_into()
+                .ok()?,
+        );
+        if Some(active_buf) != cloud_map_active_slot(self.revision) {
+            return None;
+        }
+        let active_buf = usize::try_from(active_buf).ok()?;
+        let (slot_revision_offset, slot_point_count_offset) = slot_metadata_offsets(active_buf)?;
+        let global_revision = u64::from_le_bytes(
+            self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8]
+                .try_into()
+                .ok()?,
+        );
+        let slot_revision = u64::from_le_bytes(
+            self.mmap[slot_revision_offset..slot_revision_offset + 8]
+                .try_into()
+                .ok()?,
+        );
+        if global_revision != self.revision || slot_revision != self.revision {
+            return None;
+        }
+        let point_count = u32::from_le_bytes(
+            self.mmap[slot_point_count_offset..slot_point_count_offset + 4]
+                .try_into()
+                .ok()?,
+        );
+        let global_point_count = u32::from_le_bytes(
+            self.mmap[CM_GLOBAL_POINT_COUNT_OFFSET..CM_GLOBAL_POINT_COUNT_OFFSET + 4]
+                .try_into()
+                .ok()?,
+        );
+        if global_point_count != point_count {
+            return None;
+        }
+        let voxel_size = f32::from_le_bytes(
+            self.mmap[CM_VOXEL_SIZE_OFFSET..CM_VOXEL_SIZE_OFFSET + 4]
+                .try_into()
+                .ok()?,
+        );
+        if voxel_size.to_bits() != self.voxel_size.to_bits() {
+            return None;
+        }
+        let data_size = usize::try_from(point_count)
+            .ok()?
+            .checked_mul(CM_POINT_SIZE_BYTES)?;
+        if data_size > CM_SINGLE_BUFFER_SIZE {
+            return None;
+        }
+        let start = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
+        let end = start.checked_add(data_size)?;
         Some(CommittedCloudMapSnapshot {
-            revision,
+            revision: self.revision,
             point_count,
             voxel_size,
-            xyz_f32_le,
+            session_generation: self.session_generation,
+            xyz_f32_le: self.mmap.get(start..end)?.to_vec(),
         })
+    }
+
+    pub(crate) fn last_cloud_receipt(&self) -> Option<CloudCommitReceipt> {
+        self.last_cloud_receipt.clone()
     }
 
     /// Fence a newly started mapping session from the prior session's 3D map.
@@ -178,7 +355,15 @@ impl CloudMapShmWriter {
             return None;
         }
         self.reset_accumulator(session_generation);
-        self.publish_snapshot(true)
+        let (revision, point_count, voxel_size) = self.publish_snapshot(true)?;
+        self.typed_publish_state
+            .reserve_session_clear(PendingTypedCloudClear {
+                revision,
+                point_count,
+                voxel_size,
+                session_generation,
+            });
+        Some((revision, point_count, voxel_size))
     }
 
     pub(crate) fn validate_checkpoint(
@@ -195,11 +380,12 @@ impl CloudMapShmWriter {
     /// mapping generation. Subsequent lidar frames continue from these voxels.
     pub(crate) fn install_checkpoint(
         &mut self,
-        session_generation: u64,
+        occupancy_receipt: &OccupancyCommitReceipt,
         voxel_size: f32,
         point_count: u32,
         xyz_f32_le: &[u8],
-    ) -> Result<(u64, u32, f32), String> {
+    ) -> Result<CorrelatedCloudMapCommit, String> {
+        let session_generation = occupancy_receipt.session_generation;
         if session_generation == 0 {
             return Err("cloud-map checkpoint generation must be positive".to_string());
         }
@@ -208,10 +394,11 @@ impl CloudMapShmWriter {
             .ok_or_else(|| "cloud-map revision exhausted".to_string())?;
         let voxels =
             decode_checkpoint_voxels(voxel_size, point_count, xyz_f32_le, self.max_points)?;
+        self.validate_occupancy_receipt_for_generation(occupancy_receipt, session_generation)?;
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels;
-        self.publish_snapshot(false)
+        self.commit_accumulated_snapshot(occupancy_receipt)?
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
     }
 
@@ -246,12 +433,10 @@ impl CloudMapShmWriter {
         // The invalid marker must become globally ordered before any payload
         // bytes in this slot are overwritten by the new snapshot.
         fence(Ordering::SeqCst);
-        for (index, point) in self
-            .voxels
-            .iter()
-            .map(|key| voxel_center_f32(*key, self.voxel_size))
-            .enumerate()
-        {
+        let mut keys = self.voxels.iter().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        for (index, key) in keys.into_iter().enumerate() {
+            let point = voxel_center_f32(key, self.voxel_size);
             let offset = buf_offset + index * CM_POINT_SIZE_BYTES;
             self.mmap[offset..offset + 4].copy_from_slice(&point[0].to_le_bytes());
             self.mmap[offset + 4..offset + 8].copy_from_slice(&point[1].to_le_bytes());
@@ -294,6 +479,43 @@ impl CloudMapShmWriter {
         self.voxels.clear();
         self.voxel_size = VOXEL_SIZE;
         self.session_generation = session_generation;
+        self.last_occupancy_receipt = None;
+        self.last_cloud_receipt = None;
+    }
+
+    fn validate_occupancy_receipt(&self, receipt: &OccupancyCommitReceipt) -> Result<(), String> {
+        self.validate_occupancy_receipt_for_generation(receipt, self.session_generation)
+    }
+
+    fn validate_occupancy_receipt_for_generation(
+        &self,
+        receipt: &OccupancyCommitReceipt,
+        session_generation: u64,
+    ) -> Result<(), String> {
+        if receipt.commit_id.boot_nonce == 0
+            || receipt.commit_id.sequence == 0
+            || receipt.session_id.trim().is_empty()
+            || receipt.session_generation == 0
+            || receipt.occupancy_revision == 0
+            || receipt.backend_generation == 0
+        {
+            return Err("cloud-map occupancy receipt identity is incomplete".to_owned());
+        }
+        if receipt.session_generation != session_generation {
+            return Err(format!(
+                "cloud-map occupancy receipt generation mismatch: receipt={} writer={}",
+                receipt.session_generation, session_generation
+            ));
+        }
+        if let Some(previous) = self.last_occupancy_receipt.as_ref() {
+            if receipt.commit_id.boot_nonce != previous.commit_id.boot_nonce
+                || receipt.commit_id.sequence <= previous.commit_id.sequence
+                || receipt.occupancy_revision <= previous.occupancy_revision
+            {
+                return Err("cloud-map occupancy receipt is duplicate or out of order".to_owned());
+            }
+        }
+        Ok(())
     }
 
     fn coarsen_to_fit(&mut self) -> bool {
@@ -372,6 +594,12 @@ fn decode_checkpoint_voxels(
             format!("cloud-map checkpoint point {index} is non-finite or out of range")
         })?;
         voxels.insert(key);
+    }
+    if voxels.len() != point_count {
+        return Err(format!(
+            "cloud-map checkpoint contains duplicate voxels: declared={point_count} unique={}",
+            voxels.len()
+        ));
     }
     if voxels.is_empty() {
         return Err("cloud-map checkpoint contains no usable voxels".to_string());
@@ -508,6 +736,18 @@ mod tests {
     fn restored_checkpoint_accepts_later_live_frames() {
         let path = test_path("checkpoint-restore");
         let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        let occupancy_receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 1,
+                sequence: 1,
+            },
+            session_id: "checkpoint-session".to_owned(),
+            session_generation: 7,
+            occupancy_revision: 11,
+            source_timestamp_ns: 13,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
         let checkpoint_points = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]];
         let xyz_f32_le = checkpoint_points
             .iter()
@@ -516,9 +756,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         let restored = writer
-            .install_checkpoint(7, VOXEL_SIZE, 2, &xyz_f32_le)
+            .install_checkpoint(&occupancy_receipt, VOXEL_SIZE, 2, &xyz_f32_le)
             .expect("restore checkpoint");
-        assert_eq!(restored, (1, 2, VOXEL_SIZE));
+        assert_eq!(restored.snapshot.revision, 1);
+        assert_eq!(restored.snapshot.point_count, 2);
+        assert_eq!(restored.snapshot.voxel_size, VOXEL_SIZE);
+        assert_eq!(restored.receipt.commit_id, occupancy_receipt.commit_id);
+        assert_eq!(restored.receipt.occupancy_revision, 11);
+        assert_eq!(restored.receipt.cloud_revision, 1);
         assert_eq!(writer.session_generation, 7);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 2);
 
@@ -527,6 +772,111 @@ mod tests {
         assert_eq!(continued, (2, 3, VOXEL_SIZE));
         assert_eq!(read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET), 2);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 3);
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejected_checkpoint_receipt_does_not_mutate_writer_state() {
+        let path = test_path("checkpoint-invalid-receipt");
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        assert!(writer.accumulate_mapping_frame(3, &[Point3::new(0.0, 0.0, 0.0)]));
+        let before_revision = writer.revision;
+        let before_generation = writer.session_generation;
+        let before_voxel_size = writer.voxel_size;
+        let before_voxels = writer.voxels.clone();
+        let before_global_revision = read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET);
+        let invalid_receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 0,
+                sequence: 1,
+            },
+            session_id: "checkpoint-session".to_owned(),
+            session_generation: 7,
+            occupancy_revision: 11,
+            source_timestamp_ns: 13,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        let xyz_f32_le = [0.025_f32, 0.025, 0.025]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let Err(error) =
+            writer.install_checkpoint(&invalid_receipt, VOXEL_SIZE * 2.0, 1, &xyz_f32_le)
+        else {
+            panic!("invalid receipt must reject checkpoint");
+        };
+
+        assert!(error.contains("occupancy receipt identity is incomplete"));
+        assert_eq!(writer.revision, before_revision);
+        assert_eq!(writer.session_generation, before_generation);
+        assert_eq!(writer.voxel_size, before_voxel_size);
+        assert_eq!(writer.voxels, before_voxels);
+        assert_eq!(
+            read_u64(&writer.mmap, CM_GLOBAL_REVISION_OFFSET),
+            before_global_revision
+        );
+        assert!(writer.last_occupancy_receipt.is_none());
+        assert!(writer.last_cloud_receipt.is_none());
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn correlated_cloud_commit_rejects_duplicate_receipts() {
+        let path = test_path("receipt-order");
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        assert!(writer.accumulate_mapping_frame(7, &[Point3::new(0.0, 0.0, 0.0)]));
+        let first_receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 19,
+                sequence: 1,
+            },
+            session_id: "receipt-session".to_owned(),
+            session_generation: 7,
+            occupancy_revision: 41,
+            source_timestamp_ns: 101,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 3,
+        };
+
+        let first = writer
+            .commit_accumulated_snapshot(&first_receipt)
+            .expect("valid receipt")
+            .expect("first cloud commit");
+        assert_eq!(first.receipt.commit_id, first_receipt.commit_id);
+        assert_eq!(first.receipt.occupancy_revision, 41);
+        assert_eq!(first.receipt.cloud_revision, 1);
+        assert_ne!(
+            first.receipt.occupancy_revision, first.receipt.cloud_revision,
+            "occupancy and cloud revisions are independent domains"
+        );
+
+        assert!(writer.accumulate_mapping_frame(7, &[Point3::new(1.0, 0.0, 0.0)]));
+        let revision_before_duplicate = writer.revision;
+        assert!(writer.commit_accumulated_snapshot(&first_receipt).is_err());
+        assert_eq!(writer.revision, revision_before_duplicate);
+
+        let second_receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 19,
+                sequence: 2,
+            },
+            occupancy_revision: 42,
+            source_timestamp_ns: 102,
+            ..first_receipt
+        };
+        let second = writer
+            .commit_accumulated_snapshot(&second_receipt)
+            .expect("next receipt")
+            .expect("second cloud commit");
+        assert_eq!(second.receipt.commit_id, second_receipt.commit_id);
+        assert_eq!(second.receipt.occupancy_revision, 42);
+        assert_eq!(second.receipt.cloud_revision, 2);
 
         drop(writer);
         let _ = std::fs::remove_file(path);

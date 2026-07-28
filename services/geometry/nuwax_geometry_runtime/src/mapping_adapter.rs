@@ -34,10 +34,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nalgebra::Point3;
+#[cfg(test)]
+use nuwax_mapping::cost_mapper::SimplePointCloud2;
 use nuwax_mapping::cost_mapper::{
-    CostAlgoSelector, CostMapperConfig, OccupancyConfig, PointCloud2Like, SimplePointCloud2,
+    CostAlgoSelector, CostMapperConfig, OccupancyConfig, PointCloud2Like,
 };
-use nuwax_mapping::pointclouds::occupancy::{MappingError, PointCloudOccConfig};
+#[cfg(test)]
+use nuwax_mapping::pointclouds::occupancy::MappingError;
+use nuwax_mapping::pointclouds::occupancy::PointCloudOccConfig;
 use nuwax_mapping::{CostMapper, MappingSession, OccupancyGrid, PointCloudAccumulator};
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
@@ -47,6 +51,14 @@ use tracing::warn;
 use nuwax_mapping::SessionStats as MappingSessionStats;
 
 use crate::lcm_runtime::{MapRevisionEvent, MapState, SharedState};
+use crate::mapping_backend::{
+    MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
+    MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput, MappingBackendKind,
+    MappingBackendSpec, MappingBackendWorker, MappingComputeToken,
+};
+#[cfg(test)]
+use crate::mapping_backend::{MappingBackendTestGate, MappingKernel};
+use crate::mapping_commit::{MappingCommitClock, OccupancyCommitReceipt};
 use crate::sequence_state::SequenceStateStore;
 
 const MIN_REBUILD_INTERVAL_NS: u64 = 250_000_000;
@@ -587,24 +599,26 @@ pub struct MappingSessionSnapshot {
     pub phase: MappingSessionPhase,
     pub session_id: String,
     pub map_name: String,
-    pub map_version_id: String,
     pub session_generation: u64,
     pub revision: u64,
     pub active: bool,
     pub idempotent_replay: bool,
+    pub legacy_checkpoint_reconstructed: bool,
+    pub mapping_backend_kind: String,
 }
 
 impl MappingSessionSnapshot {
-    fn idle() -> Self {
+    fn idle(mapping_backend_kind: MappingBackendKind) -> Self {
         Self {
             phase: MappingSessionPhase::Idle,
             session_id: String::new(),
             map_name: String::new(),
-            map_version_id: String::new(),
             session_generation: 0,
             revision: 0,
             active: false,
             idempotent_replay: false,
+            legacy_checkpoint_reconstructed: false,
+            mapping_backend_kind: mapping_backend_kind.stable_name().to_owned(),
         }
     }
 }
@@ -621,6 +635,8 @@ pub enum MappingLifecycleError {
     TerminalSession(String),
     #[error("mapping session generation exhausted")]
     GenerationExhausted,
+    #[error("mapping backend lifecycle failed: {0}")]
+    Backend(String),
 }
 
 /// Exact forbidden-zone snapshot currently composed into the effective map.
@@ -630,10 +646,121 @@ pub enum MappingLifecycleError {
 /// revision without changing this acknowledgement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ForbiddenZoneAck {
-    pub map_version_id: String,
+    pub map_name: String,
     pub generation: u64,
     pub signature: String,
     pub applied_revision: u64,
+}
+
+/// Read-only result of registering a raw odom-frame cloud into the canonical map frame.
+///
+/// This seam performs only frame registration. The caller remains responsible for
+/// handing the returned points to the canonical mapping ingestion path exactly once.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RegisteredMapCloud {
+    pub(crate) points: Vec<Point3<f64>>,
+    pub(crate) session_generation: u64,
+    pub(crate) frame_generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMappingCompute {
+    pub(crate) worker: MappingBackendClient,
+    pub(crate) token: MappingComputeToken,
+    pub(crate) input: MappingBackendInput,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMappingFlush {
+    pub(crate) worker: MappingBackendClient,
+    pub(crate) token: MappingComputeToken,
+}
+
+#[derive(Debug)]
+pub(crate) struct CommittedMappingCandidate {
+    pub(crate) token: MappingComputeToken,
+    pub(crate) resolution: MappingBackendCommitHandle,
+    pub(crate) accepted_map_points: Vec<Point3<f64>>,
+    pub(crate) event: Option<MapRevisionEvent>,
+    pub(crate) session_generation: u64,
+    pub(crate) source_timestamp_ns: u64,
+    pub(crate) backend_kind: MappingBackendKind,
+    pub(crate) backend_generation: u64,
+    pub(crate) occupancy_receipt: Option<OccupancyCommitReceipt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MappingBackendRetirement {
+    generation: u64,
+    worker: MappingBackendWorker,
+}
+
+impl MappingBackendRetirement {
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn stop_and_join(self) -> Result<(), String> {
+        self.worker.stop_and_join()
+    }
+}
+
+pub(crate) async fn finish_backend_retirement(
+    adapter: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    retirement: Option<MappingBackendRetirement>,
+) -> Result<(), MappingLifecycleError> {
+    let Some(retirement) = retirement else {
+        return Ok(());
+    };
+    let owner =
+        spawn_backend_retirement_owner(Arc::clone(adapter), Arc::clone(lifecycle_lock), retirement);
+    owner.await.map_err(|error| {
+        MappingLifecycleError::Backend(format!(
+            "mapping backend retirement owner task failed: {error}"
+        ))
+    })?
+}
+
+fn spawn_backend_retirement_owner(
+    adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    retirement: MappingBackendRetirement,
+) -> tokio::task::JoinHandle<Result<(), MappingLifecycleError>> {
+    tokio::spawn(async move {
+        let generation = retirement.generation();
+        let result = tokio::task::spawn_blocking(move || retirement.stop_and_join())
+            .await
+            .map_err(|error| {
+                MappingLifecycleError::Backend(format!(
+                    "mapping backend retirement task failed: {error}"
+                ))
+            })?;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        adapter
+            .lock()
+            .complete_backend_retirement(generation, result)
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct MappingStopTransition {
+    pub(crate) snapshot: MappingSessionSnapshot,
+    pub(crate) retirement: Option<MappingBackendRetirement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MappingCheckpointExportLease {
+    lease_id: u128,
+    session_id: String,
+    session_generation: u64,
+    backend_generation: u64,
+}
+
+#[derive(Debug)]
+struct ActiveMappingCheckpointExport {
+    lease: MappingCheckpointExportLease,
+    flush_token_id: Option<u128>,
 }
 
 /// nuwax-mapping adapter 本体。
@@ -658,6 +785,21 @@ pub(crate) struct ForbiddenZoneAck {
 /// - `readiness()` —— 综合字段,给 Python diagnostics + runtime_diagnostics 对账
 pub struct MappingAdapter {
     config: MappingAdapterConfig,
+    mapping_backend: MappingBackendSpec,
+    #[cfg(test)]
+    mapping_kernel: MappingKernel,
+    mapping_worker: Option<MappingBackendWorker>,
+    pending_backend_retirement: Option<u64>,
+    backend_generation: u64,
+    in_flight_compute: Option<MappingComputeToken>,
+    checkpoint_export: Option<ActiveMappingCheckpointExport>,
+    token_namespace: u128,
+    next_token_sequence: u64,
+    next_source_frame_sequence: u64,
+    coalesced_frame_count: u64,
+    stale_completion_count: u64,
+    commit_clock: MappingCommitClock,
+    last_occupancy_commit_receipt: Option<OccupancyCommitReceipt>,
     /// 旧的 crate-private 测试仍直接读取该字段；生产入口不再写入。
     #[allow(deprecated)]
     pub(crate) accumulator: FeedOnlyAccumulator,
@@ -708,6 +850,7 @@ pub struct MappingAdapter {
     /// out merely because the bounded point budget is full.
     persistent_grid: Option<PersistentOccupancyGrid>,
     checkpoint_installed: bool,
+    checkpoint_activation_digest: Option<[u8; 32]>,
     /// Optional production-only shared forbidden-zone document.
     forbidden_zones_path: Option<PathBuf>,
     /// Last physical occupancy grid before virtual forbidden zones are applied.
@@ -740,7 +883,29 @@ impl MappingAdapter {
         map_frame_id: impl Into<String>,
         odom_frame_id: impl Into<String>,
     ) -> Self {
-        Self::new_with_frames_and_optional_sequence_store(config, map_frame_id, odom_frame_id, None)
+        Self::new_with_frames_and_optional_sequence_store(
+            config,
+            MappingBackendSpec::Voxel,
+            map_frame_id,
+            odom_frame_id,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_backend_for_tests(
+        config: MappingAdapterConfig,
+        mapping_backend: MappingBackendSpec,
+        map_frame_id: impl Into<String>,
+        odom_frame_id: impl Into<String>,
+    ) -> Self {
+        Self::new_with_frames_and_optional_sequence_store(
+            config,
+            mapping_backend,
+            map_frame_id,
+            odom_frame_id,
+            None,
+        )
     }
 
     /// Construct a production adapter backed by the process-exclusive durable
@@ -753,17 +918,19 @@ impl MappingAdapter {
     ) -> Self {
         Self::new_with_frames_and_optional_sequence_store(
             config,
+            MappingBackendSpec::Voxel,
             map_frame_id,
             odom_frame_id,
             Some(sequence_store),
         )
     }
 
-    /// Construct the production adapter with a shared map-version-scoped
+    /// Construct the production adapter with a shared map-scoped
     /// forbidden-zone document.  The existing constructor remains unchanged so
     /// legacy/unit callers do not acquire filesystem behavior implicitly.
     pub(crate) fn new_with_frames_sequence_store_and_forbidden_zones(
         config: MappingAdapterConfig,
+        mapping_backend: MappingBackendSpec,
         map_frame_id: impl Into<String>,
         odom_frame_id: impl Into<String>,
         sequence_store: Arc<SequenceStateStore>,
@@ -771,6 +938,7 @@ impl MappingAdapter {
     ) -> Self {
         let mut adapter = Self::new_with_frames_and_optional_sequence_store(
             config,
+            mapping_backend,
             map_frame_id,
             odom_frame_id,
             Some(sequence_store),
@@ -781,6 +949,7 @@ impl MappingAdapter {
 
     fn new_with_frames_and_optional_sequence_store(
         config: MappingAdapterConfig,
+        mapping_backend: MappingBackendSpec,
         map_frame_id: impl Into<String>,
         odom_frame_id: impl Into<String>,
         sequence_store: Option<Arc<SequenceStateStore>>,
@@ -807,11 +976,29 @@ impl MappingAdapter {
         let global_revision = sequence_store
             .as_ref()
             .map_or(0, |store| store.current_map_revision());
+        let session = MappingSession::new();
+        #[cfg(test)]
+        let session_capacity = session.capacity();
         Self {
             config,
+            mapping_backend,
+            #[cfg(test)]
+            mapping_kernel: mapping_backend.into_kernel(session_capacity),
+            mapping_worker: None,
+            pending_backend_retirement: None,
+            backend_generation: 0,
+            in_flight_compute: None,
+            checkpoint_export: None,
+            token_namespace: uuid::Uuid::new_v4().as_u128() & (u128::MAX << 64),
+            next_token_sequence: 0,
+            next_source_frame_sequence: 0,
+            coalesced_frame_count: 0,
+            stale_completion_count: 0,
+            commit_clock: MappingCommitClock::new(),
+            last_occupancy_commit_receipt: None,
             #[allow(deprecated)]
             accumulator: FeedOnlyAccumulator::new(),
-            session: MappingSession::new(),
+            session,
             cost_mapper,
             last_sensor_origin: [0.0, 0.0, 0.0],
             has_data: false,
@@ -836,6 +1023,7 @@ impl MappingAdapter {
             latest_accepted_point_count: 0,
             persistent_grid: None,
             checkpoint_installed: false,
+            checkpoint_activation_digest: None,
             forbidden_zones_path: None,
             raw_map: None,
             forbidden_zone_signature: String::new(),
@@ -844,7 +1032,7 @@ impl MappingAdapter {
             last_built_generation: 0,
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
-            lifecycle: MappingSessionSnapshot::idle(),
+            lifecycle: MappingSessionSnapshot::idle(mapping_backend.kind()),
             next_session_generation: 0,
         }
     }
@@ -872,16 +1060,84 @@ impl MappingAdapter {
         &mut self,
         session_id: &str,
         map_name: &str,
-        map_version_id: &str,
+    ) -> Result<MappingSessionSnapshot, MappingLifecycleError> {
+        self.start_session_inner(session_id, map_name, None)
+    }
+
+    pub(crate) fn stage_backend_worker_for_next_session(
+        &self,
+    ) -> Result<MappingBackendWorker, MappingLifecycleError> {
+        if self.lifecycle.active {
+            return Err(MappingLifecycleError::Conflict(format!(
+                "active_session_id={} active_map_name={}",
+                self.lifecycle.session_id, self.lifecycle.map_name
+            )));
+        }
+        if let Some(generation) = self.pending_backend_retirement {
+            return Err(MappingLifecycleError::Backend(format!(
+                "backend generation {generation} retirement is still pending"
+            )));
+        }
+        let backend_generation = self
+            .backend_generation
+            .checked_add(1)
+            .ok_or_else(|| MappingLifecycleError::Backend("generation exhausted".to_owned()))?;
+        MappingBackendWorker::start(
+            self.mapping_backend,
+            backend_generation,
+            self.backend_compute_config(),
+        )
+        .map_err(MappingLifecycleError::Backend)
+    }
+
+    pub(crate) fn start_session_with_staged_backend(
+        &mut self,
+        session_id: &str,
+        map_name: &str,
+        worker: MappingBackendWorker,
+    ) -> Result<MappingSessionSnapshot, MappingLifecycleError> {
+        self.start_session_inner(session_id, map_name, Some(worker))
+    }
+
+    pub(crate) fn abort_started_session_detached(
+        &mut self,
+        session_id: &str,
+        session_generation: u64,
+    ) -> Result<Option<MappingBackendRetirement>, MappingLifecycleError> {
+        if !self.lifecycle.active
+            || self.lifecycle.session_id != session_id
+            || self.lifecycle.session_generation != session_generation
+        {
+            return Err(MappingLifecycleError::StaleSession(format!(
+                "requested={session_id}/{session_generation} current={}/{} phase={}",
+                self.lifecycle.session_id,
+                self.lifecycle.session_generation,
+                self.lifecycle.phase.as_str()
+            )));
+        }
+        self.in_flight_compute = None;
+        self.checkpoint_export = None;
+        let retirement = self.detach_backend_worker()?;
+        self.backend_generation = self
+            .backend_generation
+            .checked_add(1)
+            .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        self.lifecycle = MappingSessionSnapshot::idle(self.mapping_backend.kind());
+        self.revision = 0;
+        self.checkpoint_installed = false;
+        self.checkpoint_activation_digest = None;
+        Ok(retirement)
+    }
+
+    fn start_session_inner(
+        &mut self,
+        session_id: &str,
+        map_name: &str,
+        staged_worker: Option<MappingBackendWorker>,
     ) -> Result<MappingSessionSnapshot, MappingLifecycleError> {
         let session_id = session_id.trim();
         let map_name = map_name.trim();
-        let map_version_id = map_version_id.trim();
-        for (field, value) in [
-            ("session_id", session_id),
-            ("map_name", map_name),
-            ("map_version_id", map_version_id),
-        ] {
+        for (field, value) in [("session_id", session_id), ("map_name", map_name)] {
             if value.is_empty() {
                 return Err(MappingLifecycleError::InvalidArgument(format!(
                     "{field} must not be empty"
@@ -890,17 +1146,14 @@ impl MappingAdapter {
         }
 
         if self.lifecycle.active {
-            if self.lifecycle.session_id == session_id
-                && self.lifecycle.map_name == map_name
-                && self.lifecycle.map_version_id == map_version_id
-            {
+            if self.lifecycle.session_id == session_id && self.lifecycle.map_name == map_name {
                 let mut replay = self.snapshot();
                 replay.idempotent_replay = true;
                 return Ok(replay);
             }
             return Err(MappingLifecycleError::Conflict(format!(
-                "active_session_id={} active_map_name={} active_map_version_id={}",
-                self.lifecycle.session_id, self.lifecycle.map_name, self.lifecycle.map_version_id
+                "active_session_id={} active_map_name={}",
+                self.lifecycle.session_id, self.lifecycle.map_name
             )));
         }
         if self.lifecycle.phase == MappingSessionPhase::Stopped
@@ -911,21 +1164,52 @@ impl MappingAdapter {
             ));
         }
 
+        if let Some(generation) = self.pending_backend_retirement {
+            return Err(MappingLifecycleError::Backend(format!(
+                "backend generation {generation} retirement is still pending"
+            )));
+        }
         let generation = self
             .next_session_generation
             .checked_add(1)
             .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        let backend_generation = self
+            .backend_generation
+            .checked_add(1)
+            .ok_or_else(|| MappingLifecycleError::Backend("generation exhausted".to_owned()))?;
+        let worker = match staged_worker {
+            Some(worker) => {
+                let client = worker.client();
+                if client.backend_generation() != backend_generation
+                    || client.backend_kind() != self.mapping_backend.kind()
+                {
+                    return Err(MappingLifecycleError::Backend(
+                        "staged mapping backend worker identity mismatch".to_owned(),
+                    ));
+                }
+                worker
+            }
+            None => MappingBackendWorker::start(
+                self.mapping_backend,
+                backend_generation,
+                self.backend_compute_config(),
+            )
+            .map_err(MappingLifecycleError::Backend)?,
+        };
         self.reset_for_new_session();
+        self.backend_generation = backend_generation;
+        self.mapping_worker = Some(worker);
         self.next_session_generation = generation;
         self.lifecycle = MappingSessionSnapshot {
             phase: MappingSessionPhase::Active,
             session_id: session_id.to_string(),
             map_name: map_name.to_string(),
-            map_version_id: map_version_id.to_string(),
             session_generation: generation,
             revision: 0,
             active: true,
             idempotent_replay: false,
+            legacy_checkpoint_reconstructed: false,
+            mapping_backend_kind: self.mapping_backend.kind().stable_name().to_owned(),
         };
         Ok(self.snapshot())
     }
@@ -934,6 +1218,19 @@ impl MappingAdapter {
         &mut self,
         session_id: &str,
     ) -> Result<MappingSessionSnapshot, MappingLifecycleError> {
+        let transition = self.stop_session_detached(session_id)?;
+        if let Some(retirement) = transition.retirement {
+            let generation = retirement.generation();
+            let result = retirement.stop_and_join();
+            self.complete_backend_retirement(generation, result)?;
+        }
+        Ok(transition.snapshot)
+    }
+
+    pub(crate) fn stop_session_detached(
+        &mut self,
+        session_id: &str,
+    ) -> Result<MappingStopTransition, MappingLifecycleError> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
             return Err(MappingLifecycleError::InvalidArgument(
@@ -949,7 +1246,10 @@ impl MappingAdapter {
         if self.lifecycle.phase == MappingSessionPhase::Stopped {
             let mut replay = self.snapshot();
             replay.idempotent_replay = true;
-            return Ok(replay);
+            return Ok(MappingStopTransition {
+                snapshot: replay,
+                retirement: None,
+            });
         }
         if !self.lifecycle.active {
             return Err(MappingLifecycleError::StaleSession(format!(
@@ -959,12 +1259,536 @@ impl MappingAdapter {
         }
         self.lifecycle.phase = MappingSessionPhase::Stopped;
         self.lifecycle.active = false;
-        Ok(self.snapshot())
+        self.in_flight_compute = None;
+        self.checkpoint_export = None;
+        let retirement = self.detach_backend_worker()?;
+        self.backend_generation = self
+            .backend_generation
+            .checked_add(1)
+            .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        Ok(MappingStopTransition {
+            snapshot: self.snapshot(),
+            retirement,
+        })
+    }
+
+    fn detach_backend_worker(
+        &mut self,
+    ) -> Result<Option<MappingBackendRetirement>, MappingLifecycleError> {
+        let Some(worker) = self.mapping_worker.take() else {
+            return Ok(None);
+        };
+        if let Some(generation) = self.pending_backend_retirement {
+            return Err(MappingLifecycleError::Backend(format!(
+                "backend generation {generation} retirement is already pending"
+            )));
+        }
+        let generation = worker.backend_generation();
+        self.pending_backend_retirement = Some(generation);
+        Ok(Some(MappingBackendRetirement { generation, worker }))
+    }
+
+    pub(crate) fn complete_backend_retirement(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) -> Result<(), MappingLifecycleError> {
+        if self.pending_backend_retirement != Some(generation) {
+            return Err(MappingLifecycleError::Backend(format!(
+                "backend retirement acknowledgement mismatch: pending={:?} completed={generation}",
+                self.pending_backend_retirement
+            )));
+        }
+        result.map_err(MappingLifecycleError::Backend)?;
+        self.pending_backend_retirement = None;
+        Ok(())
+    }
+
+    fn backend_compute_config(&self) -> MappingBackendComputeConfig {
+        MappingBackendComputeConfig {
+            resolution: self.config.resolution,
+            occupancy_algo: self.config.occupancy_algo,
+            initial_safe_radius_meters: self.config.initial_safe_radius_meters,
+            window_capacity: self.session.capacity(),
+        }
+    }
+
+    pub(crate) const fn backend_kind(&self) -> MappingBackendKind {
+        self.mapping_backend.kind()
+    }
+
+    pub(crate) fn backend_checkpoint_client(&self) -> Result<MappingBackendClient, String> {
+        if !self.is_active() {
+            return Err("mapping backend checkpoint requires an active session".to_owned());
+        }
+        if self.in_flight_compute.is_some() {
+            return Err("mapping backend checkpoint requires compute to drain".to_owned());
+        }
+        if self.pending_backend_retirement.is_some() {
+            return Err("mapping backend checkpoint is fenced by worker retirement".to_owned());
+        }
+        let worker = self
+            .mapping_worker
+            .as_ref()
+            .ok_or_else(|| "mapping backend worker is unavailable".to_owned())?;
+        let client = worker.client();
+        if client.backend_generation() != self.backend_generation
+            || client.backend_kind() != self.mapping_backend.kind()
+        {
+            return Err("mapping backend worker identity mismatch".to_owned());
+        }
+        Ok(client)
+    }
+
+    pub(crate) fn begin_backend_checkpoint_export(
+        &mut self,
+    ) -> Result<MappingCheckpointExportLease, String> {
+        if !self.is_active() {
+            return Err("mapping backend checkpoint requires an active session".to_owned());
+        }
+        if self.checkpoint_export.is_some() {
+            return Err("mapping backend checkpoint export is already pending".to_owned());
+        }
+        let lease = MappingCheckpointExportLease {
+            lease_id: uuid::Uuid::new_v4().as_u128(),
+            session_id: self.lifecycle.session_id.clone(),
+            session_generation: self.lifecycle.session_generation,
+            backend_generation: self.backend_generation,
+        };
+        self.checkpoint_export = Some(ActiveMappingCheckpointExport {
+            lease: lease.clone(),
+            flush_token_id: None,
+        });
+        Ok(lease)
+    }
+
+    pub(crate) fn backend_checkpoint_client_if_drained(
+        &self,
+        lease: &MappingCheckpointExportLease,
+    ) -> Result<Option<MappingBackendClient>, String> {
+        self.validate_backend_checkpoint_export_lease(lease)?;
+        if self.in_flight_compute.is_some() {
+            return Ok(None);
+        }
+        self.backend_checkpoint_client().map(Some)
+    }
+
+    pub(crate) fn finish_backend_checkpoint_export(
+        &mut self,
+        lease: &MappingCheckpointExportLease,
+    ) {
+        let Some(active) = self.checkpoint_export.as_ref() else {
+            return;
+        };
+        if &active.lease != lease {
+            return;
+        }
+        if let Some(flush_token_id) = active.flush_token_id {
+            if self
+                .in_flight_compute
+                .as_ref()
+                .is_some_and(|token| token.token_id == flush_token_id)
+            {
+                self.in_flight_compute = None;
+            }
+        }
+        self.checkpoint_export = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_export_pending_for_tests(&self) -> bool {
+        self.checkpoint_export.is_some()
+    }
+
+    pub(crate) fn prepare_backend_checkpoint_flush(
+        &mut self,
+        lease: &MappingCheckpointExportLease,
+        prepared_at_ns: u64,
+    ) -> Result<Option<PreparedMappingFlush>, String> {
+        self.validate_backend_checkpoint_export_lease(lease)?;
+        if self.in_flight_compute.is_some() {
+            return Ok(None);
+        }
+        if self.next_source_frame_sequence == 0 {
+            return Ok(None);
+        }
+        let worker = self.backend_checkpoint_client()?;
+        self.next_token_sequence = self
+            .next_token_sequence
+            .checked_add(1)
+            .ok_or_else(|| "mapping checkpoint flush token sequence exhausted".to_owned())?;
+        let token = MappingComputeToken {
+            token_id: self.token_namespace | u128::from(self.next_token_sequence),
+            session_id: self.lifecycle.session_id.clone(),
+            session_generation: self.lifecycle.session_generation,
+            backend_generation: self.backend_generation,
+            source_frame_sequence: self.next_source_frame_sequence,
+            source_timestamp_ns: self.latest_pointcloud_timestamp_ns,
+            prepared_at_ns,
+            base_occupancy_revision: self.revision.max(self.global_revision),
+        };
+        self.in_flight_compute = Some(token.clone());
+        self.checkpoint_export
+            .as_mut()
+            .expect("validated mapping checkpoint export lease")
+            .flush_token_id = Some(token.token_id);
+        Ok(Some(PreparedMappingFlush { worker, token }))
+    }
+
+    fn validate_backend_checkpoint_export_lease(
+        &self,
+        lease: &MappingCheckpointExportLease,
+    ) -> Result<(), String> {
+        let active = self
+            .checkpoint_export
+            .as_ref()
+            .ok_or_else(|| "mapping backend checkpoint export barrier is not active".to_owned())?;
+        if &active.lease != lease
+            || lease.session_id != self.lifecycle.session_id
+            || lease.session_generation != self.lifecycle.session_generation
+            || lease.backend_generation != self.backend_generation
+            || !self.is_active()
+        {
+            return Err("mapping backend checkpoint export lease is stale".to_owned());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_backend_compute(
+        &mut self,
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        received_at_ns: u64,
+        frame_id: &str,
+        source_timestamp_ns: u64,
+        source_fenced: bool,
+    ) -> Result<Option<PreparedMappingCompute>, nuwax_mapping::SessionError> {
+        if self.checkpoint_export.is_some() || self.in_flight_compute.is_some() {
+            self.coalesced_frame_count = self.coalesced_frame_count.saturating_add(1);
+            return Ok(None);
+        }
+        let worker = self
+            .mapping_worker
+            .as_ref()
+            .map(MappingBackendWorker::client)
+            .ok_or_else(|| nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: normalize_frame_id(frame_id),
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "mapping backend worker is unavailable".to_owned(),
+            })?;
+        if worker.backend_generation() != self.backend_generation
+            || worker.backend_kind() != self.mapping_backend.kind()
+        {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: normalize_frame_id(frame_id),
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "mapping backend worker identity mismatch".to_owned(),
+            });
+        }
+
+        let stats = if source_fenced {
+            self.feed_pointcloud_session_after_source_fence_impl(
+                points,
+                odom_xy,
+                point_step,
+                received_at_ns,
+                frame_id,
+                source_timestamp_ns,
+                false,
+            )?
+        } else {
+            self.feed_pointcloud_session_impl(
+                points,
+                odom_xy,
+                point_step,
+                received_at_ns,
+                frame_id,
+                source_timestamp_ns,
+                false,
+            )?
+        };
+        if stats.accepted == 0 {
+            return Ok(None);
+        }
+
+        self.next_source_frame_sequence = self
+            .next_source_frame_sequence
+            .checked_add(1)
+            .ok_or_else(|| nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: normalize_frame_id(frame_id),
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "mapping source frame sequence exhausted".to_owned(),
+            })?;
+        self.next_token_sequence = self.next_token_sequence.checked_add(1).ok_or_else(|| {
+            nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: normalize_frame_id(frame_id),
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "mapping compute token sequence exhausted".to_owned(),
+            }
+        })?;
+        let source_frame_sequence = self.next_source_frame_sequence;
+        let effective_timestamp_ns = self.latest_pointcloud_timestamp_ns;
+        let token = MappingComputeToken {
+            token_id: self.token_namespace | u128::from(self.next_token_sequence),
+            session_id: self.lifecycle.session_id.clone(),
+            session_generation: self.lifecycle.session_generation,
+            backend_generation: self.backend_generation,
+            source_frame_sequence,
+            source_timestamp_ns: effective_timestamp_ns,
+            prepared_at_ns: received_at_ns,
+            base_occupancy_revision: self.revision.max(self.global_revision),
+        };
+        let input = MappingBackendInput {
+            session_id: token.session_id.clone(),
+            session_generation: token.session_generation,
+            backend_generation: token.backend_generation,
+            frame_sequence: source_frame_sequence,
+            source_timestamp_ns: effective_timestamp_ns,
+            received_at_ns,
+            registered_frame_id: self.map_frame_id.clone(),
+            sensor_origin_map: self.last_sensor_origin,
+            registered_points_map: self.take_latest_accepted_map_points(),
+        };
+        self.in_flight_compute = Some(token.clone());
+        Ok(Some(PreparedMappingCompute {
+            worker,
+            token,
+            input,
+        }))
+    }
+
+    pub(crate) fn fail_backend_compute(&mut self, token: &MappingComputeToken) -> bool {
+        if self.in_flight_compute.as_ref() != Some(token) {
+            self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+            return false;
+        }
+        self.in_flight_compute = None;
+        true
+    }
+
+    pub(crate) fn commit_backend_completion(
+        &mut self,
+        completion: MappingBackendCompletion,
+        state: &Arc<RwLock<SharedState>>,
+    ) -> Result<Option<CommittedMappingCandidate>, String> {
+        let MappingBackendCompletion {
+            token,
+            accepted_points_map,
+            result,
+            resolution,
+        } = completion;
+        if self.in_flight_compute.as_ref() != Some(&token) {
+            self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+            return Ok(None);
+        }
+        if !self.is_active()
+            || self.lifecycle.session_id != token.session_id
+            || self.lifecycle.session_generation != token.session_generation
+            || self.backend_generation != token.backend_generation
+            || self.revision.max(self.global_revision) != token.base_occupancy_revision
+        {
+            self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+            self.in_flight_compute = None;
+            return Ok(None);
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.in_flight_compute = None;
+                return Err(error);
+            }
+        };
+        let Some(candidate) = result else {
+            return Ok(Some(CommittedMappingCandidate {
+                token: token.clone(),
+                resolution,
+                accepted_map_points: accepted_points_map,
+                event: None,
+                session_generation: token.session_generation,
+                source_timestamp_ns: token.source_timestamp_ns,
+                backend_kind: self.mapping_backend.kind(),
+                backend_generation: token.backend_generation,
+                occupancy_receipt: None,
+            }));
+        };
+        if let Err(error) = self.validate_backend_candidate(&token, &candidate) {
+            self.in_flight_compute = None;
+            return Err(error);
+        }
+        match self.commit_backend_candidate(token, candidate, resolution, state) {
+            Ok(committed) => Ok(Some(committed)),
+            Err(error) => {
+                self.in_flight_compute = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn resolve_backend_completion(
+        &mut self,
+        token: &MappingComputeToken,
+        resolution: MappingBackendCommitHandle,
+        commit: bool,
+    ) -> Result<(), String> {
+        if self.in_flight_compute.as_ref() != Some(token)
+            || resolution.transaction_id() != token.token_id
+        {
+            self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+            let _ = resolution.abort();
+            return Err("mapping backend completion resolution identity is stale".to_owned());
+        }
+        let result = if commit {
+            resolution.commit()
+        } else {
+            resolution.abort()
+        };
+        if result.is_ok() {
+            self.in_flight_compute = None;
+        }
+        result
+    }
+
+    fn validate_backend_candidate(
+        &self,
+        token: &MappingComputeToken,
+        candidate: &MappingBackendCandidate,
+    ) -> Result<(), String> {
+        if candidate.session_id != token.session_id
+            || candidate.session_generation != token.session_generation
+            || candidate.backend_generation != token.backend_generation
+            || candidate.source_frame_sequence != token.source_frame_sequence
+            || candidate.source_timestamp_ns != token.source_timestamp_ns
+            || candidate.backend_kind != self.mapping_backend.kind()
+            || candidate.live_window_occupancy.frame_id != self.map_frame_id
+            || candidate.latest_frame_occupancy.frame_id != self.map_frame_id
+        {
+            return Err("mapping backend candidate identity mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    fn commit_backend_candidate(
+        &mut self,
+        token: MappingComputeToken,
+        candidate: MappingBackendCandidate,
+        resolution: MappingBackendCommitHandle,
+        state: &Arc<RwLock<SharedState>>,
+    ) -> Result<CommittedMappingCandidate, String> {
+        let mut next_persistent = if candidate.backend_kind == MappingBackendKind::Raytracing {
+            PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy.clone())?
+        } else {
+            match self.persistent_grid.clone() {
+                Some(persistent) => persistent,
+                None => {
+                    PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy.clone())?
+                }
+            }
+        };
+        if candidate.backend_kind != MappingBackendKind::Raytracing {
+            next_persistent.merge(
+                &candidate.live_window_occupancy,
+                &candidate.latest_frame_occupancy,
+            )?;
+        }
+        let grid = next_persistent.grid.clone();
+        let mut shared = state.try_write().map_err(|_| {
+            "SharedState.try_write failed during mapping candidate commit".to_owned()
+        })?;
+        let revision_floor = shared
+            .map
+            .revision
+            .max(self.revision)
+            .max(self.global_revision);
+        if revision_floor != token.base_occupancy_revision {
+            self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+            return Err("mapping candidate base occupancy revision changed".to_owned());
+        }
+        let next_revision = self.reserve_next_revision(revision_floor)?;
+        let raw_map = MapState {
+            width: grid.width,
+            height: grid.height,
+            resolution: grid.resolution as f32,
+            origin_x: grid.origin[0],
+            origin_y: grid.origin[1],
+            frame_id: grid.frame_id,
+            revision: next_revision,
+            timestamp_ns: candidate.source_timestamp_ns,
+            data: grid.data,
+        };
+        let loaded = self.load_forbidden_zones();
+        let effective_map = self.compose_forbidden_zones(&raw_map, &loaded)?;
+        let occupancy_receipt = self.reserve_occupancy_commit_receipt(
+            next_revision,
+            candidate.source_timestamp_ns,
+            candidate.backend_kind,
+            candidate.backend_generation,
+        )?;
+        self.persistent_grid = Some(next_persistent);
+        self.record_forbidden_zone_application(&loaded, next_revision);
+        self.global_revision = next_revision;
+        self.revision = next_revision;
+        self.lifecycle.revision = next_revision;
+        self.last_built_generation = self.session.generation();
+        self.last_built_point_count = self.session.current_size();
+        self.last_built_received_at_ns = candidate.received_at_ns;
+        shared.map = effective_map;
+        let event =
+            MapRevisionEvent::from_effective_and_raw(&shared.map, &raw_map, &self.lifecycle);
+        self.last_occupancy_commit_receipt = Some(occupancy_receipt.clone());
+        self.raw_map = Some(raw_map);
+        drop(shared);
+        Ok(CommittedMappingCandidate {
+            token: token.clone(),
+            resolution,
+            accepted_map_points: candidate.accepted_points_map,
+            event: Some(event),
+            session_generation: token.session_generation,
+            source_timestamp_ns: token.source_timestamp_ns,
+            backend_kind: candidate.backend_kind,
+            backend_generation: candidate.backend_generation,
+            occupancy_receipt: Some(occupancy_receipt),
+        })
+    }
+
+    fn reserve_occupancy_commit_receipt(
+        &mut self,
+        occupancy_revision: u64,
+        source_timestamp_ns: u64,
+        backend_kind: MappingBackendKind,
+        backend_generation: u64,
+    ) -> Result<OccupancyCommitReceipt, String> {
+        if occupancy_revision == 0
+            || self.lifecycle.session_id.is_empty()
+            || self.lifecycle.session_generation == 0
+            || backend_generation == 0
+        {
+            return Err("mapping occupancy commit identity is incomplete".to_owned());
+        }
+        Ok(OccupancyCommitReceipt {
+            commit_id: self.commit_clock.reserve()?,
+            session_id: self.lifecycle.session_id.clone(),
+            session_generation: self.lifecycle.session_generation,
+            occupancy_revision,
+            source_timestamp_ns,
+            backend_kind,
+            backend_generation,
+        })
+    }
+
+    pub(crate) fn latest_occupancy_commit_receipt(&self) -> Option<OccupancyCommitReceipt> {
+        self.last_occupancy_commit_receipt.clone()
+    }
+
+    pub(crate) fn set_legacy_checkpoint_reconstructed(&mut self, reconstructed: bool) {
+        self.lifecycle.legacy_checkpoint_reconstructed = reconstructed;
     }
 
     pub fn install_checkpoint(
         &mut self,
         checkpoint: OccupancyGrid,
+        source_timestamp_ns: u64,
         revision_floor: u64,
     ) -> Result<(MapState, MapRevisionEvent), String> {
         if !self.is_active() {
@@ -974,14 +1798,6 @@ impl MappingAdapter {
         let persistent_grid = PersistentOccupancyGrid::from_grid(checkpoint.clone())?;
         let next_revision = self
             .reserve_next_revision(revision_floor.max(self.revision).max(self.global_revision))?;
-        let timestamp_ns = if checkpoint.ts.is_finite() && checkpoint.ts > 0.0 {
-            (checkpoint.ts * 1_000_000_000.0).round() as u64
-        } else {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64
-        };
         let raw_map = MapState {
             width: checkpoint.width,
             height: checkpoint.height,
@@ -990,11 +1806,17 @@ impl MappingAdapter {
             origin_y: checkpoint.origin[1],
             frame_id: checkpoint.frame_id.clone(),
             revision: next_revision,
-            timestamp_ns,
+            timestamp_ns: source_timestamp_ns,
             data: checkpoint.data.clone(),
         };
         let loaded = self.load_forbidden_zones();
         let map = self.compose_forbidden_zones(&raw_map, &loaded)?;
+        let receipt = self.reserve_occupancy_commit_receipt(
+            next_revision,
+            source_timestamp_ns,
+            self.mapping_backend.kind(),
+            self.backend_generation,
+        )?;
         self.checkpoint_installed = true;
         self.persistent_grid = Some(persistent_grid);
         self.record_forbidden_zone_application(&loaded, next_revision);
@@ -1002,12 +1824,25 @@ impl MappingAdapter {
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
         let event = MapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle);
+        self.last_occupancy_commit_receipt = Some(receipt);
         self.raw_map = Some(raw_map);
         Ok((map, event))
     }
 
     pub fn has_checkpoint(&self) -> bool {
         self.checkpoint_installed && self.is_active() && self.current_revision() > 0
+    }
+
+    pub(crate) fn checkpoint_activation_matches(&self, digest: &[u8; 32]) -> bool {
+        self.has_checkpoint() && self.checkpoint_activation_digest.as_ref() == Some(digest)
+    }
+
+    pub(crate) fn record_checkpoint_activation(&mut self, digest: [u8; 32]) -> Result<(), String> {
+        if !self.has_checkpoint() {
+            return Err("mapping checkpoint must be installed before activation commit".to_owned());
+        }
+        self.checkpoint_activation_digest = Some(digest);
+        Ok(())
     }
 
     pub fn snapshot(&self) -> MappingSessionSnapshot {
@@ -1028,16 +1863,9 @@ impl MappingAdapter {
 
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
         match self.forbidden_zones_path.as_deref() {
-            Some(path) => crate::forbidden_zones::load_for_map_binding(
-                path,
-                &self.lifecycle.map_name,
-                &self.lifecycle.map_version_id,
-            ),
+            Some(path) => crate::forbidden_zones::load_for_map(path, &self.lifecycle.map_name),
             None => crate::forbidden_zones::LoadedForbiddenZones {
-                signature: format!(
-                    "disabled:{}:{}",
-                    self.lifecycle.map_name, self.lifecycle.map_version_id
-                ),
+                signature: format!("disabled:{}", self.lifecycle.map_name),
                 generation: 0,
                 zones: Vec::new(),
                 status: crate::forbidden_zones::ZoneLoadStatus::Empty,
@@ -1069,7 +1897,7 @@ impl MappingAdapter {
 
     pub(crate) fn forbidden_zone_ack(&self) -> ForbiddenZoneAck {
         ForbiddenZoneAck {
-            map_version_id: self.lifecycle.map_version_id.clone(),
+            map_name: self.lifecycle.map_name.clone(),
             generation: self.forbidden_zone_generation,
             signature: self.forbidden_zone_signature.clone(),
             applied_revision: self.forbidden_zone_applied_revision,
@@ -1083,7 +1911,7 @@ impl MappingAdapter {
     ) -> Result<MapState, String> {
         if let crate::forbidden_zones::ZoneLoadStatus::FailClosed(reason) = &loaded.status {
             warn!(
-                map_version_id = %self.lifecycle.map_version_id,
+                map_name = %self.lifecycle.map_name,
                 generation = loaded.generation,
                 %reason,
                 "forbidden-zone snapshot rejected; effective occupancy fails closed"
@@ -1145,8 +1973,22 @@ impl MappingAdapter {
     /// 喂入一帧点云;`mapping_adapter` 不持锁跨 await,调用方负责同步。
     ///
     /// 无源时间戳时不做重放去重，但仍受滚动点预算约束。
+    #[cfg(test)]
     pub fn feed_pointcloud(&mut self, points: &[Point3<f64>]) {
         if !self.is_active() || points.is_empty() {
+            return;
+        }
+        let accepted = points.len().min(self.session.capacity());
+        let accepted_points = &points[points.len() - accepted..];
+        if let Err(error) = self
+            .mapping_kernel
+            .prepare_map_frame(self.last_sensor_origin, accepted_points)
+        {
+            warn!(
+                backend = self.mapping_kernel.stable_name(),
+                %error,
+                "mapping frame rejected"
+            );
             return;
         }
         let now_ns = std::time::SystemTime::now()
@@ -1155,6 +1997,14 @@ impl MappingAdapter {
             .as_nanos() as u64;
         let stats = self.session.feed_unstamped(points);
         if stats.accepted > 0 {
+            if let Err(error) = self.mapping_kernel.commit_prepared_map_frame() {
+                warn!(
+                    backend = self.mapping_kernel.stable_name(),
+                    %error,
+                    "prepared mapping frame commit failed"
+                );
+                return;
+            }
             self.latest_accepted_point_count = stats.accepted;
             self.pointcloud_count = self.pointcloud_count.saturating_add(1);
             self.has_data = true;
@@ -1168,6 +2018,62 @@ impl MappingAdapter {
                 self.global_frame_established = true;
             }
         }
+    }
+
+    /// Register a raw odom-frame cloud into the canonical map frame without mutating mapping state.
+    ///
+    /// The narrow contract rejects already-registered map input and all other source frames so a
+    /// Device ingress owner cannot accidentally apply `map <- odom` zero or multiple times.
+    pub(crate) fn register_odom_cloud_to_map(
+        &self,
+        points: &[Point3<f64>],
+        source_frame_id: &str,
+    ) -> Result<RegisteredMapCloud, nuwax_mapping::SessionError> {
+        let source_frame_id = normalize_frame_id(source_frame_id);
+        if !self.is_active() {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "mapping session is inactive".to_string(),
+            });
+        }
+        if source_frame_id != self.odom_frame_id {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "raw cloud source frame must equal the configured odom frame".to_string(),
+            });
+        }
+        let transform = self.map_odom_transform.as_ref().ok_or_else(|| {
+            nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: source_frame_id.clone(),
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "first valid odom pose has not anchored T_map_odom".to_string(),
+            }
+        })?;
+        if points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite())
+        {
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id,
+                target_frame_id: self.map_frame_id.clone(),
+                reason: "point cloud contains a non-finite point".to_string(),
+            });
+        }
+
+        let points = points
+            .iter()
+            .map(|point| {
+                let transformed = transform.transform_position([point.x, point.y, point.z]);
+                Point3::new(transformed[0], transformed[1], transformed[2])
+            })
+            .collect();
+        Ok(RegisteredMapCloud {
+            points,
+            session_generation: self.lifecycle.session_generation,
+            frame_generation: self.frame_generation,
+        })
     }
 
     /// 喂入一帧点云到 `MappingSession`(RALPLAN §Phase M #1 主入口)。
@@ -1187,6 +2093,28 @@ impl MappingAdapter {
         received_at_ns: u64,
         frame_id: &str,
         source_timestamp_ns: u64,
+    ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
+        self.feed_pointcloud_session_impl(
+            points,
+            odom_xy,
+            point_step,
+            received_at_ns,
+            frame_id,
+            source_timestamp_ns,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn feed_pointcloud_session_impl(
+        &mut self,
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        received_at_ns: u64,
+        frame_id: &str,
+        source_timestamp_ns: u64,
+        compatibility_kernel: bool,
     ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
         self.latest_accepted_map_points.clear();
         self.latest_accepted_point_count = 0;
@@ -1248,10 +2176,47 @@ impl MappingAdapter {
                     true,
                 )
             };
+        let candidate_count = map_points.len().min(self.session.capacity());
+        let candidate_points = &map_points[map_points.len() - candidate_count..];
+        self.mapping_backend
+            .validate_frame_input(self.last_sensor_origin, candidate_points)
+            .map_err(
+                |reason| nuwax_mapping::SessionError::FrameTransformUnavailable {
+                    source_frame_id: source_frame_id.clone(),
+                    target_frame_id: self.map_frame_id.clone(),
+                    reason,
+                },
+            )?;
+        #[cfg(test)]
+        if compatibility_kernel {
+            self.mapping_kernel
+                .prepare_map_frame(self.last_sensor_origin, candidate_points)
+                .map_err(
+                    |reason| nuwax_mapping::SessionError::FrameTransformUnavailable {
+                        source_frame_id: source_frame_id.clone(),
+                        target_frame_id: self.map_frame_id.clone(),
+                        reason,
+                    },
+                )?;
+        }
+        #[cfg(not(test))]
+        let _ = compatibility_kernel;
         let stats =
             self.session
                 .feed_pointcloud(map_points, dedup_xy, point_step, message_timestamp_ns)?;
         if stats.accepted > 0 {
+            #[cfg(test)]
+            if compatibility_kernel {
+                self.mapping_kernel
+                    .commit_prepared_map_frame()
+                    .map_err(
+                        |reason| nuwax_mapping::SessionError::FrameTransformUnavailable {
+                            source_frame_id: source_frame_id.clone(),
+                            target_frame_id: self.map_frame_id.clone(),
+                            reason,
+                        },
+                    )?;
+            }
             self.latest_accepted_point_count = stats.accepted;
             let accepted_start = map_points.len().saturating_sub(stats.accepted);
             self.latest_accepted_map_points
@@ -1267,6 +2232,56 @@ impl MappingAdapter {
                 self.frame_generation = self.frame_generation.saturating_add(1).max(1);
                 self.global_frame_established = true;
             }
+        }
+        Ok(stats)
+    }
+
+    /// Feed a point cloud whose source identity has already been fenced by the
+    /// generation owner. The adapter receipt clock drives session freshness,
+    /// while canonical output metadata retains the exact source timestamp,
+    /// including the valid value zero.
+    pub(crate) fn feed_pointcloud_session_after_source_fence(
+        &mut self,
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        received_at_ns: u64,
+        frame_id: &str,
+        source_timestamp_ns: u64,
+    ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
+        self.feed_pointcloud_session_after_source_fence_impl(
+            points,
+            odom_xy,
+            point_step,
+            received_at_ns,
+            frame_id,
+            source_timestamp_ns,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn feed_pointcloud_session_after_source_fence_impl(
+        &mut self,
+        points: &[Point3<f64>],
+        odom_xy: (f64, f64),
+        point_step: u32,
+        received_at_ns: u64,
+        frame_id: &str,
+        source_timestamp_ns: u64,
+        compatibility_kernel: bool,
+    ) -> Result<nuwax_mapping::FeedStats, nuwax_mapping::SessionError> {
+        let stats = self.feed_pointcloud_session_impl(
+            points,
+            odom_xy,
+            point_step,
+            received_at_ns,
+            frame_id,
+            received_at_ns,
+            compatibility_kernel,
+        )?;
+        if stats.accepted > 0 {
+            self.latest_pointcloud_timestamp_ns = source_timestamp_ns;
         }
         Ok(stats)
     }
@@ -1384,6 +2399,11 @@ impl MappingAdapter {
         self.session.current_size()
     }
 
+    /// Canonical map frame fixed by the runtime's validated startup bindings.
+    pub(crate) fn configured_map_frame_id(&self) -> &str {
+        &self.map_frame_id
+    }
+
     /// Move out the most recent accepted frame after it has been transformed
     /// into the canonical map frame. Production consumes this once to update
     /// the independent cloud-map voxel accumulator without cloning the full
@@ -1436,15 +2456,18 @@ impl MappingAdapter {
     /// 后续 feed 仍能继续累积;若要清空,调用方调用 `reset_accumulator`。
     ///
     /// 该只读诊断入口保留 clone；生产 `build_and_publish` 走零拷贝连续切片。
+    #[cfg(test)]
     pub fn build_occupancy(&self) -> Result<OccupancyGrid, MappingError> {
         self.build_maps().map(|(_, occupancy)| occupancy)
     }
 
+    #[cfg(test)]
     fn build_maps(&self) -> Result<(CostMapper, OccupancyGrid), MappingError> {
-        let points = self.session.clone_points();
+        let voxel_points = self.session.clone_points();
+        let points = self.mapping_kernel.accumulated_points(&voxel_points);
         let origin = self.last_sensor_origin;
         let cloud = SimplePointCloud2::with_metadata(
-            points,
+            points.to_vec(),
             nalgebra::point![origin[0], origin[1], origin[2]],
             self.latest_pointcloud_frame_id.clone(),
             self.latest_pointcloud_timestamp_ns as f64 / 1_000_000_000.0,
@@ -1457,6 +2480,7 @@ impl MappingAdapter {
         Ok((mapper, occupancy))
     }
 
+    #[cfg(test)]
     fn build_maps_zero_copy(
         &mut self,
     ) -> Result<(CostMapper, OccupancyGrid, OccupancyGrid), MappingError> {
@@ -1466,7 +2490,8 @@ impl MappingAdapter {
         let occupancy_config = self.cost_mapper.config().config.clone();
         let resolution = self.config.resolution;
         let latest_count = self.latest_accepted_point_count;
-        let points = self.session.make_contiguous_points();
+        let voxel_points = self.session.make_contiguous_points();
+        let points = self.mapping_kernel.accumulated_points(voxel_points);
         let cloud = BorrowedPointCloud {
             points,
             sensor_origin: nalgebra::point![origin[0], origin[1], origin[2]],
@@ -1476,7 +2501,9 @@ impl MappingAdapter {
         let (mapper, occupancy, _costmap) =
             CostMapper::from_pointcloud_auto(&cloud, &occupancy_config, resolution)?;
         let latest_count = latest_count.min(points.len());
-        let latest_grid = if latest_count == 0 {
+        let latest_grid = if self.mapping_kernel.is_raytracing() {
+            occupancy.clone()
+        } else if latest_count == 0 {
             let mut unknown = occupancy.clone();
             unknown.data.fill(-1);
             unknown
@@ -1539,6 +2566,7 @@ impl MappingAdapter {
     ///   (data/size/schema_version/checksum),`server::subscribe_map_updates`
     ///   不再轮询 500ms。
     /// - 单测路径默认 `None` 保持兼容,无需广播通道也能验证业务。
+    #[cfg(test)]
     pub fn build_and_publish(
         &mut self,
         state: &Arc<RwLock<SharedState>>,
@@ -1546,6 +2574,7 @@ impl MappingAdapter {
     ) -> bool {
         if !self.is_active()
             || !self.has_data()
+            || !self.mapping_kernel.ready_to_build()
             || !self
                 .frame_contract(&self.map_frame_id)
                 .ready_for_global_consumers()
@@ -1566,20 +2595,35 @@ impl MappingAdapter {
             }
         };
         self.cost_mapper = mapper;
-        let mut next_persistent = match self.persistent_grid.clone() {
-            Some(persistent) => persistent,
-            None => match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
+        let raytracing_backend = self.mapping_kernel.is_raytracing();
+        let mut next_persistent = if raytracing_backend {
+            match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
                 Ok(persistent) => persistent,
                 Err(error) => {
                     warn!("mapping_adapter: persistent occupancy initialization failed: {error}");
                     return false;
                 }
-            },
+            }
+        } else {
+            match self.persistent_grid.clone() {
+                Some(persistent) => persistent,
+                None => match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
+                    Ok(persistent) => persistent,
+                    Err(error) => {
+                        warn!(
+                            "mapping_adapter: persistent occupancy initialization failed: {error}"
+                        );
+                        return false;
+                    }
+                },
+            }
         };
-        if let Err(error) = next_persistent.merge(&live_grid, &latest_grid) {
-            warn!("mapping_adapter: persistent/live occupancy merge failed: {error}");
-            return false;
-        };
+        if !raytracing_backend {
+            if let Err(error) = next_persistent.merge(&live_grid, &latest_grid) {
+                warn!("mapping_adapter: persistent/live occupancy merge failed: {error}");
+                return false;
+            }
+        }
         let grid = next_persistent.grid.clone();
         if let Ok(mut s) = state.try_write() {
             let revision_floor = s.map.revision.max(self.revision).max(self.global_revision);
@@ -1611,6 +2655,18 @@ impl MappingAdapter {
                     return false;
                 }
             };
+            let receipt = match self.reserve_occupancy_commit_receipt(
+                next_revision,
+                self.latest_pointcloud_timestamp_ns,
+                self.mapping_backend.kind(),
+                self.backend_generation,
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    warn!(%error, "mapping_adapter: commit receipt reservation failed closed");
+                    return false;
+                }
+            };
             self.persistent_grid = Some(next_persistent);
             self.record_forbidden_zone_application(&loaded, next_revision);
             self.global_revision = next_revision;
@@ -1623,6 +2679,7 @@ impl MappingAdapter {
             // 属于同一 revision，server 不需要再读取可能已前进的 SharedState。
             self.lifecycle.revision = next_revision;
             let event = MapRevisionEvent::from_effective_and_raw(&s.map, &raw_map, &self.lifecycle);
+            self.last_occupancy_commit_receipt = Some(receipt);
             self.raw_map = Some(raw_map);
             drop(s); // 释放 write lock,后续 send 不持锁
             if let Some(tx) = map_revision_tx {
@@ -1641,11 +2698,36 @@ impl MappingAdapter {
     ///
     /// 同时清理 session 和遗留测试兼容壳。
     pub fn reset_accumulator(&mut self) {
+        let retirement = self.reset_accumulator_detached();
+        if let Some(retirement) = retirement {
+            let generation = retirement.generation();
+            let result = retirement.stop_and_join();
+            if let Err(error) = self.complete_backend_retirement(generation, result) {
+                warn!(%error, "mapping backend worker retirement failed during reset");
+                return;
+            }
+        }
+        self.restart_backend_worker_after_reset();
+    }
+
+    fn reset_accumulator_detached(&mut self) -> Option<MappingBackendRetirement> {
+        self.in_flight_compute = None;
+        self.checkpoint_export = None;
+        let retirement = match self.detach_backend_worker() {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                warn!(%error, "mapping backend worker detach failed during reset");
+                None
+            }
+        };
+        self.backend_generation = self.backend_generation.saturating_add(1);
         #[allow(deprecated)]
         {
             self.accumulator = FeedOnlyAccumulator::new();
         }
         self.session.reset_state();
+        #[cfg(test)]
+        self.mapping_kernel.reset();
         self.has_data = false;
         self.last_sensor_origin = [0.0, 0.0, 0.0];
         self.latest_pointcloud_source_frame_id.clear();
@@ -1661,13 +2743,29 @@ impl MappingAdapter {
         self.latest_accepted_point_count = 0;
         self.persistent_grid = None;
         self.checkpoint_installed = false;
+        self.checkpoint_activation_digest = None;
         self.raw_map = None;
+        self.last_occupancy_commit_receipt = None;
         self.forbidden_zone_signature.clear();
         self.forbidden_zone_generation = 0;
         self.forbidden_zone_applied_revision = 0;
         self.last_built_generation = 0;
         self.last_built_point_count = 0;
         self.last_built_received_at_ns = 0;
+        retirement
+    }
+
+    fn restart_backend_worker_after_reset(&mut self) {
+        if self.is_active() && self.pending_backend_retirement.is_none() {
+            match MappingBackendWorker::start(
+                self.mapping_backend,
+                self.backend_generation,
+                self.backend_compute_config(),
+            ) {
+                Ok(worker) => self.mapping_worker = Some(worker),
+                Err(error) => warn!(%error, "mapping backend worker restart failed after reset"),
+            }
+        }
     }
 
     /// Reset per-session mapping data while preserving process-wide generations and revision.
@@ -1689,6 +2787,23 @@ impl MappingAdapter {
     /// 进程级最后提交 revision。仅用于跨会话 fencing/诊断，不投影为新会话当前地图。
     pub fn global_revision(&self) -> u64 {
         self.global_revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_worker_with_test_gate(
+        &mut self,
+        gate: MappingBackendTestGate,
+    ) -> Result<(), String> {
+        if let Some(worker) = self.mapping_worker.take() {
+            worker.stop_and_join()?;
+        }
+        self.mapping_worker = Some(MappingBackendWorker::start_with_test_gate(
+            self.mapping_backend,
+            self.backend_generation,
+            self.backend_compute_config(),
+            gate,
+        )?);
+        Ok(())
     }
 
     // ============================================================================
@@ -2008,8 +3123,22 @@ mod tests {
     fn active_adapter(config: MappingAdapterConfig) -> MappingAdapter {
         let mut adapter = MappingAdapter::new(config);
         adapter
-            .start_session("test-session", "test-map", "mapver_000001")
+            .start_session("test-session", "test-map")
             .expect("activate test mapping session");
+        adapter
+    }
+
+    fn active_raytracing_adapter() -> MappingAdapter {
+        let mut adapter = MappingAdapter::new_with_frames_and_optional_sequence_store(
+            sample_config(),
+            MappingBackendSpec::raytracing_defaults(),
+            "map",
+            "odom",
+            None,
+        );
+        adapter
+            .start_session("ray-session", "ray-map")
+            .expect("activate raytracing mapping session");
         adapter
     }
 
@@ -2031,7 +3160,7 @@ mod tests {
             sequence_store,
         );
         adapter
-            .start_session("persistent-session", "test-map", "mapver_000001")
+            .start_session("persistent-session", "test-map")
             .expect("activate persistent mapping session");
         adapter
     }
@@ -2041,6 +3170,55 @@ mod tests {
             (actual - expected).abs() < 1.0e-9,
             "actual={actual} expected={expected}"
         );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RegistrationState {
+        lifecycle: MappingSessionSnapshot,
+        session_stats: MappingSessionStats,
+        session_points: Vec<Point3<f64>>,
+        transform: Option<MapOdomTransformSnapshot>,
+        cached_transform: Option<MapOdomTransformSnapshot>,
+        frame_generation: u64,
+        global_frame_established: bool,
+        has_data: bool,
+        odom_count: u64,
+        pointcloud_count: u64,
+        latest_accepted_map_points: Vec<Point3<f64>>,
+        transformed_points: Vec<Point3<f64>>,
+    }
+
+    fn registration_state(adapter: &MappingAdapter) -> RegistrationState {
+        RegistrationState {
+            lifecycle: adapter.snapshot(),
+            session_stats: adapter.session_stats(),
+            session_points: adapter.session.clone_points(),
+            transform: adapter.map_odom_transform_snapshot(),
+            cached_transform: adapter.map_odom_transform_cache.read().clone(),
+            frame_generation: adapter.frame_generation,
+            global_frame_established: adapter.global_frame_established,
+            has_data: adapter.has_data,
+            odom_count: adapter.odom_count,
+            pointcloud_count: adapter.pointcloud_count,
+            latest_accepted_map_points: adapter.latest_accepted_map_points.clone(),
+            transformed_points: adapter.transformed_points.clone(),
+        }
+    }
+
+    fn assert_registration_rejected_without_mutation(
+        adapter: &MappingAdapter,
+        points: &[Point3<f64>],
+        source_frame_id: &str,
+    ) -> String {
+        let before = registration_state(adapter);
+        let error = adapter
+            .register_odom_cloud_to_map(points, source_frame_id)
+            .expect_err("registration must fail closed");
+        assert_eq!(registration_state(adapter), before);
+        match error {
+            nuwax_mapping::SessionError::FrameTransformUnavailable { reason, .. } => reason,
+            other => panic!("unexpected registration error: {other}"),
+        }
     }
 
     fn grid_cell_at_world(grid: &OccupancyGrid, x: f64, y: f64) -> i8 {
@@ -2317,7 +3495,7 @@ mod tests {
         ));
         std::fs::write(
             &zone_path,
-            br#"{"schema_version":1,"maps":{"mapver_000001":{"map_version_id":"mapver_000001","generation":1,"signature":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-19T00:00:00Z","zones":[{"id":"box","shape":"rectangle","mode":"inside","frame_id":"map","vertices":[{"x":2.0,"y":2.0},{"x":4.0,"y":4.0}],"center":null,"radius_m":null,"stroke_width_m":null,"enabled":true,"metadata":{}}]}}}"#,
+            br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":1,"signature":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-07-19T00:00:00Z","zones":[{"id":"box","shape":"rectangle","mode":"inside","frame_id":"map","vertices":[{"x":2.0,"y":2.0},{"x":4.0,"y":4.0}],"center":null,"radius_m":null,"stroke_width_m":null,"enabled":true,"metadata":{}}]}}}"#,
         )
         .expect("write initial forbidden zones");
 
@@ -2328,10 +3506,10 @@ mod tests {
         checkpoint.origin = [0.0, 0.0, 0.0];
         checkpoint.ts = 10.0;
         let (effective, _) = adapter
-            .install_checkpoint(checkpoint, 0)
+            .install_checkpoint(checkpoint, 10_000_000_000, 0)
             .expect("install physical checkpoint with virtual zone");
         let initial_ack = adapter.forbidden_zone_ack();
-        assert_eq!(initial_ack.map_version_id, "mapver_000001");
+        assert_eq!(initial_ack.map_name, "test-map");
         assert_eq!(initial_ack.generation, 1);
         assert_eq!(initial_ack.signature, "a".repeat(64));
         assert_eq!(initial_ack.applied_revision, effective.revision);
@@ -2351,7 +3529,7 @@ mod tests {
         let (map_revision_tx, mut map_revision_rx) = broadcast::channel(2);
         std::fs::write(
             &zone_path,
-            br#"{"schema_version":1,"maps":{"mapver_000001":{"map_version_id":"mapver_000001","generation":2,"signature":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","updated_at":"2026-07-19T00:01:00Z","zones":[]}}}"#,
+            br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":2,"signature":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","updated_at":"2026-07-19T00:01:00Z","zones":[]}}}"#,
         )
         .expect("replace forbidden zones with explicit empty set");
         assert!(adapter
@@ -2369,7 +3547,7 @@ mod tests {
         assert_eq!(event.revision, adapter.current_revision());
         assert!(event.data.iter().all(|value| *value == 0));
         let refreshed_ack = adapter.forbidden_zone_ack();
-        assert_eq!(refreshed_ack.map_version_id, "mapver_000001");
+        assert_eq!(refreshed_ack.map_name, "test-map");
         assert_eq!(refreshed_ack.generation, 2);
         assert_eq!(refreshed_ack.signature, "b".repeat(64));
         assert_eq!(refreshed_ack.applied_revision, event.revision);
@@ -2385,7 +3563,11 @@ mod tests {
         replacement_checkpoint.origin = [0.0, 0.0, 0.0];
         replacement_checkpoint.ts = 11.0;
         adapter
-            .install_checkpoint(replacement_checkpoint, adapter.current_revision())
+            .install_checkpoint(
+                replacement_checkpoint,
+                11_000_000_000,
+                adapter.current_revision(),
+            )
             .expect("install later physical checkpoint with unchanged forbidden zones");
         assert!(adapter.current_revision() > refreshed_ack.applied_revision);
         let rebuilt_ack = adapter.forbidden_zone_ack();
@@ -2493,17 +3675,21 @@ mod tests {
     fn mapping_lifecycle_keeps_global_revision_monotonic_across_sessions() {
         let mut adapter = MappingAdapter::new(sample_config());
         let first = adapter
-            .start_session("session-1", "warehouse", "mapver_000001")
+            .start_session("session-1", "warehouse")
             .expect("first start");
         assert_eq!(first.session_generation, 1);
         assert!(first.active);
 
         let replay = adapter
-            .start_session("session-1", "warehouse", "mapver_000001")
+            .start_session("session-1", "warehouse")
             .expect("idempotent start");
         assert!(replay.idempotent_replay);
         assert!(matches!(
-            adapter.start_session("session-2", "warehouse", "mapver_000002"),
+            adapter.start_session("session-1", "office"),
+            Err(MappingLifecycleError::Conflict(_))
+        ));
+        assert!(matches!(
+            adapter.start_session("session-2", "warehouse"),
             Err(MappingLifecycleError::Conflict(_))
         ));
 
@@ -2527,7 +3713,7 @@ mod tests {
         );
 
         let second = adapter
-            .start_session("session-2", "warehouse", "mapver_000002")
+            .start_session("session-2", "warehouse")
             .expect("second start");
         assert_eq!(second.session_generation, 2);
         assert_eq!(second.revision, 0);
@@ -2625,6 +3811,43 @@ mod tests {
     }
 
     #[test]
+    fn source_fenced_zero_timestamp_uses_receipt_freshness_and_preserves_metadata() {
+        const RECEIVED_AT_NS: u64 = 10_000_000_000;
+
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
+            .expect("odom anchor");
+        let stats = adapter
+            .feed_pointcloud_session_after_source_fence(
+                &[Point3::new(0.0, 0.0, 0.0)],
+                (0.0, 0.0),
+                16,
+                RECEIVED_AT_NS,
+                "odom",
+                0,
+            )
+            .expect("source-fenced frame accepted");
+
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(adapter.session.last_seen_at_ns(), RECEIVED_AT_NS);
+        assert_eq!(adapter.latest_pointcloud_received_at_ns, RECEIVED_AT_NS);
+        assert_eq!(adapter.latest_pointcloud_timestamp_ns, 0);
+
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (revision_tx, mut revision_rx) = broadcast::channel(1);
+        assert!(adapter.build_and_publish(&state, Some(&revision_tx)));
+        assert_eq!(state.try_read().expect("canonical map").map.timestamp_ns, 0);
+        assert_eq!(
+            revision_rx
+                .try_recv()
+                .expect("canonical revision")
+                .timestamp_ns,
+            0
+        );
+    }
+
+    #[test]
     fn odom_pointcloud_before_pose_is_rejected_without_mutation() {
         let mut adapter = active_adapter(sample_config());
         let error = adapter
@@ -2701,6 +3924,86 @@ mod tests {
         let state = Arc::new(RwLock::new(SharedState::default()));
         assert!(adapter.build_and_publish(&state, None));
         assert_eq!(state.try_read().expect("map state").map.frame_id, "map");
+    }
+
+    #[test]
+    fn odom_cloud_registration_transforms_once_and_returns_authoritative_generations() {
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .feed_pose_in_frame(10.0, 5.0, 2.0, std::f64::consts::FRAC_PI_2, "odom")
+            .expect("establish odom anchor");
+        let before = registration_state(&adapter);
+
+        let registered = adapter
+            .register_odom_cloud_to_map(
+                &[Point3::new(10.0, 6.0, 3.0), Point3::new(8.0, 5.0, 1.0)],
+                "/odom",
+            )
+            .expect("raw odom cloud registration");
+
+        assert_eq!(
+            registered.session_generation,
+            adapter.snapshot().session_generation
+        );
+        assert_eq!(
+            registered.frame_generation,
+            adapter.global_frame_generation()
+        );
+        assert_eq!(registered.points.len(), 2);
+        assert_close(registered.points[0].x, 1.0);
+        assert_close(registered.points[0].y, 0.0);
+        assert_close(registered.points[0].z, 1.0);
+        assert_close(registered.points[1].x, 0.0);
+        assert_close(registered.points[1].y, 2.0);
+        assert_close(registered.points[1].z, -1.0);
+        assert_eq!(registration_state(&adapter), before);
+    }
+
+    #[test]
+    fn odom_cloud_registration_rejects_non_raw_or_unregistered_frames_without_mutation() {
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
+            .expect("establish odom anchor");
+        let points = [Point3::new(1.0, 2.0, 3.0)];
+
+        let map_reason = assert_registration_rejected_without_mutation(&adapter, &points, "/map");
+        assert!(map_reason.contains("configured odom frame"));
+        let sensor_reason =
+            assert_registration_rejected_without_mutation(&adapter, &points, "lidar_link");
+        assert!(sensor_reason.contains("configured odom frame"));
+    }
+
+    #[test]
+    fn odom_cloud_registration_rejects_inactive_missing_anchor_and_nonfinite_without_mutation() {
+        let inactive = MappingAdapter::new(sample_config());
+        let inactive_reason = assert_registration_rejected_without_mutation(
+            &inactive,
+            &[Point3::new(0.0, 0.0, 0.0)],
+            "odom",
+        );
+        assert!(inactive_reason.contains("inactive"));
+
+        let missing_anchor = active_adapter(sample_config());
+        let missing_anchor_reason = assert_registration_rejected_without_mutation(
+            &missing_anchor,
+            &[Point3::new(0.0, 0.0, 0.0)],
+            "odom",
+        );
+        assert!(missing_anchor_reason.contains("has not anchored"));
+
+        let mut anchored = active_adapter(sample_config());
+        anchored
+            .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
+            .expect("establish odom anchor");
+        for point in [
+            Point3::new(f64::NAN, 0.0, 0.0),
+            Point3::new(0.0, f64::INFINITY, 0.0),
+            Point3::new(0.0, 0.0, f64::NEG_INFINITY),
+        ] {
+            let reason = assert_registration_rejected_without_mutation(&anchored, &[point], "odom");
+            assert!(reason.contains("non-finite"));
+        }
     }
 
     #[test]
@@ -2975,24 +4278,46 @@ mod tests {
     fn installed_checkpoint_is_ready_without_fake_pointcloud_input() {
         let mut adapter = MappingAdapter::new(sample_config());
         adapter
-            .start_session("mapload:one", "warehouse", "mapver_000001")
+            .start_session("mapload:one", "warehouse")
             .expect("start checkpoint session");
         let mut checkpoint = OccupancyGrid::with_frame(2, 2, 0.05, "map");
         checkpoint.origin = [-1.0, 2.0, 0.0];
         checkpoint.data = vec![-1, 0, 100, 50];
 
         let (map, event) = adapter
-            .install_checkpoint(checkpoint, 0)
+            .install_checkpoint(checkpoint, 0, 0)
             .expect("install checkpoint");
 
         assert_eq!(map.data, vec![-1, 0, 100, 50]);
-        assert_eq!(event.map_version_id, "mapver_000001");
+        assert_eq!(event.map_name, "warehouse");
         assert_eq!(event.session_id, "mapload:one");
         assert_eq!(event.revision, 1);
         assert_eq!(adapter.pointcloud_count(), 0);
         let readiness = MappingReadiness::compute(Some(&adapter), true);
         assert!(readiness.ready);
         assert!(readiness.global_consumer_ready);
+    }
+
+    #[test]
+    fn rejected_checkpoint_receipt_does_not_mutate_adapter_state() {
+        let mut adapter = active_adapter(sample_config());
+        adapter.backend_generation = 0;
+        let before = adapter.snapshot();
+        let mut checkpoint = OccupancyGrid::with_frame(2, 2, 0.05, "map");
+        checkpoint.data = vec![-1, 0, 100, 50];
+
+        let Err(error) = adapter.install_checkpoint(checkpoint, 17, 0) else {
+            panic!("invalid backend identity must reject checkpoint");
+        };
+
+        assert!(error.contains("occupancy commit identity is incomplete"));
+        assert_eq!(adapter.snapshot(), before);
+        assert_eq!(adapter.current_revision(), 0);
+        assert_eq!(adapter.global_revision(), 0);
+        assert!(!adapter.checkpoint_installed);
+        assert!(adapter.persistent_grid.is_none());
+        assert!(adapter.raw_map.is_none());
+        assert!(adapter.last_occupancy_commit_receipt.is_none());
     }
 
     #[test]
@@ -3038,7 +4363,7 @@ mod tests {
         checkpoint.origin = [-0.0977304454380725, 0.0, 0.0];
         checkpoint.data = vec![100, 0];
         let (checkpoint_map, _) = adapter
-            .install_checkpoint(checkpoint, 0)
+            .install_checkpoint(checkpoint, 0, 0)
             .expect("install checkpoint");
         let state = Arc::new(RwLock::new(SharedState::default()));
         state.blocking_write().map = checkpoint_map;
@@ -3061,5 +4386,336 @@ mod tests {
             .expect("live map revision broadcast");
         assert!(event.revision > 1);
         assert_eq!(state.blocking_read().map.revision, event.revision);
+    }
+
+    #[test]
+    fn raytracing_health_gate_commits_through_the_canonical_revision_path() {
+        let mut adapter = active_raytracing_adapter();
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (revision_tx, mut revision_rx) = broadcast::channel(4);
+        let points = [
+            Point3::new(1.0, -0.1, 2.0),
+            Point3::new(1.0, 0.0, 2.0),
+            Point3::new(1.0, 0.1, 2.0),
+        ];
+
+        for timestamp_ns in [1_000_000_000, 2_000_000_000] {
+            let stats = adapter
+                .feed_pointcloud_session(&points, (0.0, 0.0), 24, timestamp_ns, "map", timestamp_ns)
+                .expect("raytracing frame accepted");
+            assert_eq!(stats.accepted, points.len());
+            assert!(!adapter.build_and_publish(&state, Some(&revision_tx)));
+            assert_eq!(adapter.current_revision(), 0);
+            assert!(revision_rx.try_recv().is_err());
+        }
+
+        adapter
+            .feed_pointcloud_session(&points, (0.0, 0.0), 24, 3_000_000_000, "map", 3_000_000_000)
+            .expect("third hit makes ray voxels healthy");
+        assert!(adapter.build_and_publish(&state, Some(&revision_tx)));
+        let event = revision_rx
+            .try_recv()
+            .expect("canonical raytracing revision");
+        assert_eq!(event.revision, 1);
+        assert_eq!(event.frame_id, "map");
+        assert_eq!(event.session_id, "ray-session");
+        assert_eq!(state.blocking_read().map.revision, event.revision);
+        assert!(!event.data.is_empty());
+    }
+
+    #[test]
+    fn raytracing_rejection_stop_and_generation_reset_do_not_advance_revision() {
+        let mut adapter = active_raytracing_adapter();
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let points = [Point3::new(1.0, 0.0, 2.0)];
+        for timestamp_ns in [1_000_000_000, 2_000_000_000, 3_000_000_000] {
+            adapter
+                .feed_pointcloud_session(&points, (0.0, 0.0), 24, timestamp_ns, "map", timestamp_ns)
+                .expect("valid raytracing frame");
+        }
+        assert!(adapter.build_and_publish(&state, None));
+        let committed_revision = adapter.current_revision();
+        let session_before_rejection = adapter.session_stats();
+
+        let error = adapter
+            .feed_pointcloud_session(
+                &[Point3::new(f64::MAX, 0.0, 0.0)],
+                (0.0, 0.0),
+                24,
+                4_000_000_000,
+                "map",
+                4_000_000_000,
+            )
+            .expect_err("unrepresentable ray point must fail closed");
+        assert!(error.to_string().contains("RAYTRACING_UPDATE_REJECTED"));
+        assert_eq!(adapter.session_stats(), session_before_rejection);
+        assert_eq!(adapter.current_revision(), committed_revision);
+        assert!(!adapter.build_and_publish(&state, None));
+
+        adapter
+            .stop_session("ray-session")
+            .expect("stop exact session");
+        let stopped_error = adapter
+            .feed_pointcloud_session(&points, (0.0, 0.0), 24, 5_000_000_000, "map", 5_000_000_000)
+            .expect_err("stopped session must reject input");
+        assert!(stopped_error.to_string().contains("inactive"));
+        assert!(!adapter.build_and_publish(&state, None));
+        assert_eq!(adapter.current_revision(), committed_revision);
+
+        adapter
+            .start_session("ray-session-2", "ray-map")
+            .expect("start next generation");
+        adapter
+            .feed_pointcloud_session(&points, (0.0, 0.0), 24, 6_000_000_000, "map", 6_000_000_000)
+            .expect("new generation accepts input");
+        assert!(
+            !adapter.build_and_publish(&state, None),
+            "one hit in a reset ray kernel must remain below the health gate"
+        );
+        assert_eq!(adapter.current_revision(), 0);
+        assert_eq!(state.blocking_read().map.revision, committed_revision);
+    }
+
+    #[test]
+    fn backend_protocol_coalesces_one_in_flight_and_rejects_duplicate_completion() {
+        let mut adapter = active_adapter(sample_config());
+        let points = [Point3::new(1.0, 0.0, 1.0)];
+        let prepared = adapter
+            .prepare_backend_compute(
+                &points,
+                (0.0, 0.0),
+                12,
+                1_000_000_000,
+                "map",
+                1_000_000_000,
+                false,
+            )
+            .expect("prepare first frame")
+            .expect("first frame obtains token");
+        assert!(adapter
+            .prepare_backend_compute(
+                &points,
+                (0.0, 0.0),
+                12,
+                2_000_000_000,
+                "map",
+                2_000_000_000,
+                false,
+            )
+            .expect("coalesced frame is not an error")
+            .is_none());
+        assert_eq!(adapter.coalesced_frame_count, 1);
+
+        let duplicate = MappingBackendCompletion {
+            token: prepared.token.clone(),
+            accepted_points_map: prepared.input.registered_points_map.clone(),
+            result: Ok(None),
+            resolution: MappingBackendCommitHandle::detached_for_tests(prepared.token.token_id),
+        };
+        let completion = prepared
+            .worker
+            .submit(prepared.token, prepared.input)
+            .expect("submit first frame")
+            .blocking_recv()
+            .expect("worker completion");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        assert!(adapter
+            .commit_backend_completion(completion, &state)
+            .expect("first completion")
+            .is_some());
+        assert!(adapter
+            .commit_backend_completion(duplicate, &state)
+            .expect("duplicate is dropped, not fatal")
+            .is_none());
+        assert_eq!(adapter.stale_completion_count, 1);
+    }
+
+    #[test]
+    fn backend_protocol_rejects_base_revision_change_without_reservation() {
+        let mut adapter = active_adapter(sample_config());
+        let prepared = adapter
+            .prepare_backend_compute(
+                &[Point3::new(1.0, 0.0, 1.0)],
+                (0.0, 0.0),
+                12,
+                1_000_000_000,
+                "map",
+                1_000_000_000,
+                false,
+            )
+            .expect("prepare frame")
+            .expect("token");
+        let completion = prepared
+            .worker
+            .submit(prepared.token, prepared.input)
+            .expect("submit frame")
+            .blocking_recv()
+            .expect("completion");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        state.blocking_write().map.revision = 7;
+        let error = adapter
+            .commit_backend_completion(completion, &state)
+            .expect_err("changed base revision must reject candidate");
+        assert!(error.contains("base occupancy revision changed"));
+        assert_eq!(adapter.current_revision(), 0);
+        assert_eq!(adapter.global_revision(), 0);
+        assert_eq!(state.blocking_read().map.revision, 7);
+    }
+
+    #[test]
+    fn backend_retirement_fences_late_completion_and_next_generation() {
+        let mut adapter = active_adapter(sample_config());
+        let prepared = adapter
+            .prepare_backend_compute(
+                &[Point3::new(1.0, 0.0, 1.0)],
+                (0.0, 0.0),
+                12,
+                1_000_000_000,
+                "map",
+                1_000_000_000,
+                false,
+            )
+            .expect("prepare frame")
+            .expect("token");
+        let late = MappingBackendCompletion {
+            token: prepared.token.clone(),
+            accepted_points_map: prepared.input.registered_points_map,
+            result: Ok(None),
+            resolution: MappingBackendCommitHandle::detached_for_tests(prepared.token.token_id),
+        };
+        let transition = adapter
+            .stop_session_detached("test-session")
+            .expect("detach active worker");
+        let retirement = transition.retirement.expect("owned retirement");
+        let generation = retirement.generation();
+        let blocked = adapter
+            .start_session("test-session-2", "test-map")
+            .expect_err("new worker cannot start before old worker is destroyed");
+        assert!(blocked.to_string().contains("retirement is still pending"));
+        let result = retirement.stop_and_join();
+        adapter
+            .complete_backend_retirement(generation, result)
+            .expect("acknowledge destroyed worker");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        assert!(adapter
+            .commit_backend_completion(late, &state)
+            .expect("late completion is dropped")
+            .is_none());
+        let started = adapter
+            .start_session("test-session-2", "test-map")
+            .expect("next generation starts after retirement");
+        assert_eq!(started.session_generation, 2);
+        assert!(adapter.backend_generation > generation);
+    }
+
+    #[tokio::test]
+    async fn detached_retirement_owner_still_acknowledges_completion() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let retirement = adapter
+            .lock()
+            .stop_session_detached("test-session")
+            .expect("detach active worker")
+            .retirement
+            .expect("owned retirement");
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let observer = spawn_backend_retirement_owner(
+            Arc::clone(&adapter),
+            Arc::clone(&lifecycle_lock),
+            retirement,
+        );
+
+        drop(observer);
+        drop(lifecycle_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let start_result = adapter.lock().start_session("test-session-2", "test-map");
+                match start_result {
+                    Ok(started) => {
+                        assert_eq!(started.session_generation, 2);
+                        break;
+                    }
+                    Err(MappingLifecycleError::Backend(message))
+                        if message.contains("retirement is still pending") =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected next-session failure: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("owned retirement must acknowledge after observer cancellation");
+    }
+
+    #[test]
+    fn checkpoint_export_lease_rejects_stop_start_aba() {
+        let mut adapter = active_adapter(sample_config());
+        let lease_a = adapter
+            .begin_backend_checkpoint_export()
+            .expect("begin session-one export");
+        adapter
+            .stop_session("test-session")
+            .expect("stop session one");
+        adapter
+            .start_session("test-session-2", "test-map")
+            .expect("start session two");
+        let lease_b = adapter
+            .begin_backend_checkpoint_export()
+            .expect("begin session-two export");
+
+        let error = adapter
+            .backend_checkpoint_client_if_drained(&lease_a)
+            .expect_err("stale lease must not observe the new export");
+        assert!(error.contains("stale"));
+        adapter.finish_backend_checkpoint_export(&lease_a);
+        assert!(adapter.checkpoint_export_pending_for_tests());
+        assert!(adapter
+            .backend_checkpoint_client_if_drained(&lease_b)
+            .expect("live lease")
+            .is_some());
+
+        adapter.finish_backend_checkpoint_export(&lease_b);
+        assert!(!adapter.checkpoint_export_pending_for_tests());
+        adapter
+            .stop_session("test-session-2")
+            .expect("stop session two");
+    }
+
+    #[test]
+    fn checkpoint_export_finish_clears_only_lease_owned_flush_token() {
+        let mut adapter = active_adapter(sample_config());
+        adapter.next_source_frame_sequence = 1;
+        adapter.latest_pointcloud_timestamp_ns = 1_000_000_000;
+        let lease = adapter
+            .begin_backend_checkpoint_export()
+            .expect("begin checkpoint export");
+        let prepared = adapter
+            .prepare_backend_checkpoint_flush(&lease, 1_000_000_001)
+            .expect("prepare checkpoint flush")
+            .expect("flush token");
+        assert_eq!(adapter.in_flight_compute.as_ref(), Some(&prepared.token));
+        adapter.finish_backend_checkpoint_export(&lease);
+        assert!(adapter.in_flight_compute.is_none());
+        assert!(!adapter.checkpoint_export_pending_for_tests());
+
+        let lease = adapter
+            .begin_backend_checkpoint_export()
+            .expect("begin second checkpoint export");
+        let prepared = adapter
+            .prepare_backend_checkpoint_flush(&lease, 1_000_000_002)
+            .expect("prepare second checkpoint flush")
+            .expect("second flush token");
+        let mut unrelated = prepared.token;
+        unrelated.token_id = unrelated.token_id.saturating_add(1);
+        adapter.in_flight_compute = Some(unrelated.clone());
+        adapter.finish_backend_checkpoint_export(&lease);
+        assert_eq!(adapter.in_flight_compute.as_ref(), Some(&unrelated));
+        assert!(!adapter.checkpoint_export_pending_for_tests());
+        adapter.in_flight_compute = None;
+        adapter
+            .stop_session("test-session")
+            .expect("stop checkpoint test session");
     }
 }

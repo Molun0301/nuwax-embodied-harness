@@ -4,7 +4,7 @@ from services.artifact_service import ArtifactService
 from services.audio import AudioService
 from services.evaluation import EvaluationService
 from services.localization import LocalizationService
-from services.mapping import MapCatalogRepository, MapVersionRepository, MappingService
+from services.mapping import MapAssetBundleRepository, MapCatalogRepository, MappingService
 from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.observation_service import ObservationService
@@ -16,8 +16,8 @@ __all__ = [
     "AudioService",
     "EvaluationService",
     "LocalizationService",
+    "MapAssetBundleRepository",
     "MapCatalogRepository",
-    "MapVersionRepository",
     "MappingService",
     "MemoryService",
     "NavigationService",

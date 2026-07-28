@@ -32,7 +32,7 @@ enum GeometryRpcMethod {
     StartMapping,
     StopMapping,
     GetMappingState,
-    ActivateMapVersion,
+    ActivateMap,
     SetNavigationGoal,
     CancelNavigation,
     GetNavigationReadiness,
@@ -61,7 +61,7 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::StartMapping,
     GeometryRpcMethod::StopMapping,
     GeometryRpcMethod::GetMappingState,
-    GeometryRpcMethod::ActivateMapVersion,
+    GeometryRpcMethod::ActivateMap,
     GeometryRpcMethod::SetNavigationGoal,
     GeometryRpcMethod::CancelNavigation,
     GeometryRpcMethod::GetNavigationReadiness,
@@ -92,7 +92,7 @@ impl GeometryRpcMethod {
             Self::StartMapping => "start_mapping",
             Self::StopMapping => "stop_mapping",
             Self::GetMappingState => "get_mapping_state",
-            Self::ActivateMapVersion => "activate_map_version",
+            Self::ActivateMap => "activate_map",
             Self::SetNavigationGoal => "set_navigation_goal",
             Self::CancelNavigation => "cancel_navigation",
             Self::GetNavigationReadiness => "get_navigation_readiness",
@@ -217,8 +217,8 @@ impl GeometryRpcHandler {
             GeometryRpcMethod::GetMappingState => {
                 call_unary!(Empty, get_mapping_state)
             }
-            GeometryRpcMethod::ActivateMapVersion => {
-                call_unary!(ActivateMapVersionRequest, activate_map_version)
+            GeometryRpcMethod::ActivateMap => {
+                call_unary!(ActivateMapRequest, activate_map)
             }
             GeometryRpcMethod::SetNavigationGoal => {
                 call_unary!(NavigationGoal, set_navigation_goal)

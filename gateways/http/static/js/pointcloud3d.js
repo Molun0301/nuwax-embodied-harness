@@ -211,7 +211,7 @@ function normalizeForbiddenZone(value) {
 function forbiddenZoneEntry(value, preferredMapName = null) {
   let root = value;
   for (let index = 0; index < 3; index += 1) {
-    if (!root || typeof root !== 'object' || root.maps || root.zones || root.map_name || root.map_version_id) break;
+    if (!root || typeof root !== 'object' || root.maps || root.zones || root.map_name) break;
     const next = root.data || root.result || root.payload;
     if (!next || next === root) break;
     root = next;

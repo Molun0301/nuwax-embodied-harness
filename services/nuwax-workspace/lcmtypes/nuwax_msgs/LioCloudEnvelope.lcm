@@ -1,0 +1,30 @@
+package nuwax_msgs;
+
+struct LioCloudEnvelope {
+    const int32_t SCHEMA_VERSION_V1 = 1;
+    const int32_t BACKEND_DEVICE = 1;
+    const int32_t BACKEND_FASTLIO2 = 2;
+    const int32_t BACKEND_POINTLIO = 3;
+    const int32_t REGISTRATION_RAW_SENSOR = 1;
+    const int32_t REGISTRATION_REGISTERED_MAP = 2;
+    const int64_t MAX_SOURCE_POINT_COUNT = 250000;
+    const int64_t MAX_EMITTED_POINT_COUNT = 100000;
+
+    int32_t schema_version;
+    int32_t backend;
+    int64_t runtime_generation;
+    int64_t source_sequence;
+    // Zero is a valid present source timestamp, never an absence sentinel.
+    int64_t source_timestamp_ns;
+    int64_t correlated_odometry_source_sequence;
+    // Zero is valid when the correlated sequence is positive.
+    int64_t correlated_odometry_source_timestamp_ns;
+    string sensor_frame_id;
+    string body_frame_id;
+    string odom_frame_id;
+    string map_frame_id;
+    int32_t registration_state;
+    int64_t source_point_count;
+    int64_t emitted_point_count;
+    sensor_msgs.PointCloud2 cloud;
+}

@@ -272,7 +272,7 @@ _FORBIDDEN_DIR_CHARS = set('/\\\x00:*?"<>|')
 
 
 def build_safe_dir_segment(raw_name: str) -> str:
-    """把任意 map_name / version_id 规整成单层安全目录名。
+    """把任意资产标识规整成单层安全目录名。
 
     命名规则属平台契约层，原私有实现 `_to_safe_dir_segment` 长在
     services/mapping/catalog.py，被 geometry 跨模块导入（违反治理规则 R7：
@@ -288,8 +288,7 @@ def build_safe_dir_segment(raw_name: str) -> str:
 
     candidate = unicodedata.normalize("NFC", str(raw_name or "").strip())
     if not candidate:
-        # 空字符串永远不允许落到文件系统：返回单字符占位避免 mkdir/sqlite 异常。
-        return "_"
+        raise ValueError("资产标识不能为空。")
     chars: List[str] = []
     for ch in candidate:
         if ch in _FORBIDDEN_DIR_CHARS or unicodedata.category(ch).startswith("C"):
@@ -299,4 +298,7 @@ def build_safe_dir_segment(raw_name: str) -> str:
     normalized = "".join(chars)
     while "__" in normalized:
         normalized = normalized.replace("__", "_")
-    return normalized.strip("_") or "_"
+    segment = normalized.strip("_") or "_"
+    if segment in {".", ".."}:
+        raise ValueError("资产标识不能解析为当前目录或父目录。")
+    return segment

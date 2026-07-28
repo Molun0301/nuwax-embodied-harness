@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ SHM_PAYLOAD_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 # 默认 frame_id 兜底：odom 维度。真实 frame_id 应来自 provider。
 _DEFAULT_ODOM_FRAME = "odom"
+_LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
+_DEVICE_LIO_BACKEND = "device"
 
 # sensor_msgs/PointField constants for the normalized XYZ float32 payload emitted below.
 _CANONICAL_XYZ_FIELDS = (
@@ -212,6 +215,13 @@ class RuntimeInputBridge:
             ``True`` 表示至少 ``LocalizationProvider`` 订阅成功。pointcloud 不可用
             时不会阻止 ``start()``，但 ``is_ready()`` 在订阅两者都失败时返回 ``False``。
         """
+        selected_lio_backend = os.environ.get(_LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND)
+        if selected_lio_backend != _DEVICE_LIO_BACKEND:
+            self._record_error(
+                "RuntimeInputBridge 仅允许 device LIO owner；"
+                f"拒绝为 {_LIO_BACKEND_ENV}={selected_lio_backend!r} 启动 DirectDDS/provider forwarding"
+            )
+            return False
         with self._lock:
             if self._started:
                 return True
@@ -394,6 +404,15 @@ class RuntimeInputBridge:
             return
 
         point_cloud_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        raw_frame_id = str(getattr(point_cloud, "frame_id", "") or "")
+        frame_id = raw_frame_id.strip()
+        if not frame_id or frame_id != raw_frame_id:
+            self.counters.dropped_pointcloud_count += 1
+            self._record_error(
+                "拒绝缺失或带首尾空白的 PointCloud frame_id："
+                f"frame_id={raw_frame_id or '<empty>'!r}"
+            )
+            return
         is_go2_point_cloud = (
             point_cloud_metadata.get("source") == "go2_direct_dds_pointcloud"
         )
@@ -402,7 +421,6 @@ class RuntimeInputBridge:
             registered_frame = str(
                 point_cloud_metadata.get("registered_frame") or ""
             ).strip()
-            frame_id = str(getattr(point_cloud, "frame_id", "") or "").strip()
             registered_to_odom = (
                 point_cloud_metadata.get("point_cloud_xyz_registered_to_odom") is True
             )
@@ -463,7 +481,7 @@ class RuntimeInputBridge:
                     else 0
                 )
             metadata = {
-                "frame_id": str(getattr(payload, "frame_id", "") or "map"),
+                "frame_id": frame_id,
                 "timestamp_ns": timestamp_ns,
                 "fields": _CANONICAL_XYZ_FIELDS,
                 "point_count": len(bytes_payload) // point_step,
@@ -472,15 +490,10 @@ class RuntimeInputBridge:
             try:
                 inspect.signature(publisher).bind(bytes_payload, point_step, **metadata)
             except (TypeError, ValueError) as exc:
-                if is_go2_point_cloud:
-                    raise TypeError(
-                        "Go2 pointcloud publisher 必须接受 "
-                        "frame_id/timestamp_ns/fields/point_count/is_dense metadata"
-                    ) from exc
-                # Compatibility for pre-extension provider implementations. The real
-                # GeometryRuntimeProvider accepts metadata; only non-Go2 legacy
-                # providers may receive the original two positional arguments.
-                result = publisher(bytes_payload, point_step)
+                raise TypeError(
+                    "pointcloud publisher 必须接受 "
+                    "frame_id/timestamp_ns/fields/point_count/is_dense metadata"
+                ) from exc
             else:
                 result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:

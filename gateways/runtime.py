@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import IntEnum
 from functools import partial
@@ -31,7 +31,7 @@ from contracts.base import MetadataDict, utc_now
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-from contracts.geometry import Pose, Quaternion, Twist, Vector3
+from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import (
@@ -59,7 +59,13 @@ from gateways.motion_guard import (
     MotionAdmission,
 )
 from gateways.person_follow import (
+    PERSON_FOLLOW_LOST,
+    PERSON_FOLLOW_STOP,
+    PERSON_FOLLOW_TRACKED,
+    GatewayPersonFollowBridge,
+    PersonFollowBridgeError,
     PersonFollowReadiness,
+    build_person_follow_target,
     read_person_follow_readiness,
 )
 from gateways.request_context import categorize_gateway_error
@@ -83,6 +89,7 @@ from services.geometry import (
 from services.geometry.geometry_runtime_provider import GeometryRuntimeRpcError
 from services.geometry.geometry_runtime_provider import (
     _exploration_child_lease_fingerprint,
+    resolve_direct_static_calibration_edge,
 )
 from services.geometry.pointcloud_map import WEB_POINTCLOUD_MAX_POINTS
 from services.localization import LocalizationService
@@ -172,7 +179,6 @@ class _ShmVideoFrameSource:
         frame_bytes, _seq, ts_ns = result
         if not frame_bytes:
             return None
-        # __SHM_FRAME_SOURCE_PLACEHOLDER__
         try:
             from contracts.image import ImageFrame, ImageEncoding
             resolved_camera_id = str(camera_id or "front_camera")
@@ -190,7 +196,7 @@ class _ShmVideoFrameSource:
             metadata = {
                 "source_kind": "platform_video_ingest_stream",
                 "ingest_sequence": _seq,
-                "ts_ns": ts_ns,
+                "source_timestamp_ns": int(ts_ns),
                 "width_px": width_px,
                 "height_px": height_px,
             }
@@ -248,7 +254,6 @@ _REQUEST_CONTEXT_KEYS = (
     "rpc_request_id",
     "mcp_method",
     "tool_name",
-    "map_version_id",
     "localization_session_id",
     "map_name",
     "camera_id",
@@ -263,8 +268,8 @@ _RUNTIME_METADATA_LOG_KEYS = (
     "rpc_request_id",
     "mcp_method",
     "tool_name",
-    "map_version_id",
     "localization_session_id",
+    "map_name",
 )
 
 
@@ -366,22 +371,12 @@ class _ExplorationStopTransaction:
     release_motion_stop_generation: int = 0
     released_task_ids: Tuple[str, ...] = ()
 _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
-    "load_map_version": {
+    "activate_map": {
         "initial_wait_sec": 45.0,
         "poll_interval_sec": 12.0,
         "hint": (
-            "load_map_version 会启动 go2.sh --localization，通常需 45–90 秒；"
-            "并自动激活与 map_name 同名的记忆库（无需再调 enable_memory_library）。"
-            "提交后请先等待约 45 秒，再调用 get_task_status；之后每 12 秒轮询一次直至 state=succeeded。"
-            "禁止连续秒级高频轮询。"
-        ),
-    },
-    "activate_map": {
-        "initial_wait_sec": 15.0,
-        "poll_interval_sec": 8.0,
-        "hint": (
-            "activate_map 为异步任务。提交后等待约 15 秒再 get_task_status，之后每 8 秒轮询一次。"
-            "勿连续高频轮询。"
+            "activate_map 会加载该地图唯一的 current 资产包并启动定位，通常需 45–90 秒；"
+            "同名记忆库会一并激活。提交后先等待约 45 秒，再每 12 秒轮询 get_task_status。"
         ),
     },
     "explore_area": {
@@ -401,11 +396,15 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area_v2"] = dict(
 )
 _SAFETY_WATCHDOG_REFRESH_INTERVAL_SEC = 1.5
 _RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
+_PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC = 0.2
+_PERSON_FOLLOW_TARGET_WATCHDOG_SEC = 1.5
+_PERSON_FOLLOW_DEFAULT_LOST_TIMEOUT_SEC = 2.0
+_PERSON_FOLLOW_PREFLIGHT_TIMEOUT_SEC = 3.0
 _GEOMETRY_ONLY_CAPABILITY_NAMES = frozenset(
     {
         "relocalize_active_map",
-        "load_map_version",
-        "save_active_map_version",
+        "activate_map",
+        "finalize_active_map",
         "start_mapping",
     }
 )
@@ -461,10 +460,10 @@ _MOTION_ADMISSION_CAPABILITY_NAMES = frozenset(
 )
 _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
     {
-        # relocalize_active_map / load_map_version 已改为 ASYNC_TASK（见超时根因 D3）：
+        # relocalize_active_map / activate_map 通过后台 task runner 启动重型运行时，
         # 它们的重型阻塞段在后台 task runner 内 ensure 几何运行时，不再走此同步门禁，
-        # 故从本集合移除，否则 _ensure_geometry_runtime_for_invoke 会在异步分派前同步等待。
-        "save_active_map_version",
+        # 避免 _ensure_geometry_runtime_for_invoke 在异步分派前同步等待。
+        "finalize_active_map",
         "start_mapping",
         *_GUARD_ONLY_CAPABILITY_NAMES,
         *_PERSON_FOLLOW_CAPABILITY_NAMES,
@@ -630,6 +629,7 @@ class GatewayRuntime:
         task_manager: Optional[TaskManager] = None,
         artifact_store: Optional[LocalArtifactStore] = None,
         motion_guard: Optional[GatewayMotionGuard] = None,
+        person_follow_bridge: Optional[GatewayPersonFollowBridge] = None,
         register_default_capabilities: bool = True,
     ) -> None:
         self.config = config
@@ -656,6 +656,7 @@ class GatewayRuntime:
             self.task_manager.motion_resource_quarantine_snapshot
         )
         self.motion_guard = motion_guard or GatewayMotionGuard()
+        self.person_follow_bridge = person_follow_bridge or GatewayPersonFollowBridge()
         self._exploration_stop_transaction_lock = threading.RLock()
         self._exploration_stop_transactions: OrderedDict[
             str, _ExplorationStopTransaction
@@ -706,7 +707,6 @@ class GatewayRuntime:
             state_store=self.state_store,
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
-            history_limit=config.runtime_data.map_history_limit,
         )
         perception_components = _build_perception_components(config)
         self.perception_service = PerceptionService(
@@ -969,6 +969,13 @@ class GatewayRuntime:
             )
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
+            try:
+                self.person_follow_bridge.start()
+            except Exception:
+                RUNTIME_LOGGER.exception(
+                    "PersonFollow Gateway LCM bridge failed to start; "
+                    "the optional follow capability will remain unavailable."
+                )
             self._started = True
             try:
                 if self.perception_video_runtime.should_auto_start():
@@ -977,7 +984,7 @@ class GatewayRuntime:
                 RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
             self._start_safety_watchdog_loop()
             self._start_data_frame_stream_sources()
-            # 地图工作区仅由 MCP（activate_map / load_map_version 等）显式切换，启动时不自动恢复。
+            # 地图工作区仅由 MCP activate_map 显式切换，启动时不自动恢复。
             if self.config.runtime_data.map_active_restore_on_start:
                 try:
                     self.map_workspace_service.restore_active_workspace(load_memory_history=True)
@@ -1045,6 +1052,14 @@ class GatewayRuntime:
             self._stop_data_frame_stream_sources()
             self.perception_video_runtime.stop()
             self.robot.stop()
+            try:
+                self.person_follow_bridge.close()
+            except Exception as exc:
+                if stop_error is None:
+                    stop_error = exc
+                RUNTIME_LOGGER.exception(
+                    "PersonFollow bridge failed to close with a verified fence"
+                )
             try:
                 self.motion_guard.close()
             except Exception as exc:
@@ -1556,7 +1571,6 @@ class GatewayRuntime:
             )
         return {
             "map_name": source_summary.get("map_name"),
-            "map_version_id": source_summary.get("map_version_id"),
             "revision": pointcloud_map.revision,
             "frame_id": pointcloud_map.frame_id,
             "source": "pointcloud_map_cache",
@@ -1648,7 +1662,6 @@ class GatewayRuntime:
     ) -> None:
         payload = {
             "map_name": source_summary.get("map_name"),
-            "map_version_id": source_summary.get("map_version_id"),
             "revision": None,
             "frame_id": frame_id,
             "source": "pointcloud_map_cache",
@@ -1916,7 +1929,7 @@ class GatewayRuntime:
             _descriptor(
                 "get_localization_snapshot",
                 "获取定位快照",
-                "读取当前定位与 TF 快照；若已激活地图工作区，则优先返回平台地图版本绑定后的定位结果。",
+                "读取当前定位与 TF 快照；若已激活地图工作区，则优先返回该地图资产绑定的定位结果。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 output_schema=_schema_object(
@@ -1942,7 +1955,8 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK；该能力保留为显式 unsupported。",
+                "仅在已加载地图上重新估计机器人位姿，不选图、不切图、不发布资产。"
+                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，因此该能力显式 unsupported。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -1979,7 +1993,7 @@ class GatewayRuntime:
             _descriptor(
                 "get_navigation_semantic_context",
                 "获取导航语义上下文",
-                "读取当前平台地图版本绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
+                "读取当前地图绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 output_schema=_schema_object({"navigation_semantic_context": {"type": "object"}}),
@@ -1996,7 +2010,7 @@ class GatewayRuntime:
                         "camera_id": {"type": "string"},
                         "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.25},
                         "limit": {"type": "integer", "minimum": 1, "default": 5},
-                        "map_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
                         "localization_session_id": {"type": "string"},
                         "max_age_sec": {"type": "number", "minimum": 0.0},
                     },
@@ -2029,7 +2043,8 @@ class GatewayRuntime:
             _descriptor(
                 "activate_map",
                 "启用地图",
-                "仅切换/启用地图工作区与记忆库，不启动 go2.sh。本能力为异步任务：立即返回 task_id；请等待约 15s 后再 get_task_status，之后每 8s 轮询，勿高频连刷。",
+                "选择并启用地图工作区与同名记忆库；若地图已完成，则加载其唯一的 current 资产包。"
+                "不启动建图或探索。本能力为异步任务，立即返回 task_id。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -2069,25 +2084,9 @@ class GatewayRuntime:
                 output_schema=_schema_object({"active_workspace": {"type": "object"}}),
             ),
             _descriptor(
-                "list_map_versions",
-                "列出地图版本",
-                "列出某张地图在平台侧已经保存的历史版本。",
-                execution_mode=CapabilityExecutionMode.SYNC,
-                risk_level=CapabilityRiskLevel.LOW,
-                input_schema=_schema_object(
-                    {
-                        "map_name": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1},
-                    },
-                    required=("map_name",),
-                ),
-                output_schema=_schema_object({"map_versions": {"type": "array"}}),
-            ),
-            _descriptor(
-                "save_active_map_version",
-                "保存当前地图版本",
-                "把当前激活地图工作区中的地图快照保存为平台正式版本。"
-                "MCP 响应仅返回版本摘要（不含 occupancy_grid.data 数组）；完整栅格已写入 version.json。",
+                "finalize_active_map",
+                "完成当前地图",
+                "将当前建图结果原子发布为该地图唯一的 current 资产包。已完成地图不可被不同内容覆盖。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -2096,14 +2095,14 @@ class GatewayRuntime:
                         "reason": {"type": "string"},
                     },
                 ),
-                output_schema=_schema_object({"map_version": {"type": "object"}, "active_workspace": {"type": "object"}}),
+                output_schema=_schema_object({"map_asset_bundle": {"type": "object"}, "active_workspace": {"type": "object"}}),
             ),
             _descriptor(
                 "start_mapping",
                 "启动遥控建图",
                 "遥控/手动建图专用：启动 nuwax-geometry-runtime mapping 会话，"
                 "不启动 frontier 探索、不下发探索点。"
-                "典型流程：create_map → activate_map → start_mapping → 用户遥控移动 → save_active_map_version → stop_mapping。",
+                "典型流程：create_map → activate_map → start_mapping → 用户遥控移动 → finalize_active_map → stop_mapping。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -2116,7 +2115,9 @@ class GatewayRuntime:
                     {
                         "mapping_launch_mode": {"type": "string"},
                         "mapping_database_path": {"type": "string"},
-                        "mapping_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
+                        "mapping_session_id": {"type": "string"},
+                        "session_generation": {"type": "integer"},
                         "geometry_stack_running": {"type": "boolean"},
                     }
                 ),
@@ -2139,7 +2140,9 @@ class GatewayRuntime:
                         "stopped": {"type": "boolean"},
                         "geometry_stack_running": {"type": "boolean"},
                         "mapping_database_path": {"type": "string"},
-                        "mapping_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
+                        "mapping_session_id": {"type": "string"},
+                        "session_generation": {"type": "integer"},
                     }
                 ),
                 required_resources=(RuntimeResource.NAVIGATION.value,),
@@ -2172,28 +2175,6 @@ class GatewayRuntime:
                     RuntimeResource.BASE_MOTION.value,
                     RuntimeResource.NAVIGATION.value,
                 ),
-            ),
-            _descriptor(
-                "load_map_version",
-                "加载地图版本",
-                "把平台侧已保存的地图版本加载到当前地图工作区、自动激活同名记忆库，并启动 go2.sh --localization。"
-                "异步任务：立即返回 task_id；请等待约 45s 后再 get_task_status，之后每 12s 轮询直至 succeeded，勿秒级高频连刷。"
-                "加载成功后无需再单独调用 enable_memory_library。",
-                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
-                risk_level=CapabilityRiskLevel.LOW,
-                input_schema=_schema_object(
-                    {
-                        "map_name": {"type": "string"},
-                        "version_id": {"type": "string"},
-                        "load_memory_history": {"type": "boolean", "default": True},
-                        "reset_memory_library": {"type": "boolean", "default": False},
-                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                    },
-                    required=("map_name",),
-                ),
-                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
-                required_resources=(RuntimeResource.MAP_WORKSPACE.value,),
-                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
             ),
             _descriptor(
                 "list_memory_libraries",
@@ -2318,7 +2299,7 @@ class GatewayRuntime:
                         "query": {"type": "string"},
                         "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.55},
                         "limit": {"type": "integer", "minimum": 1, "default": 5},
-                        "map_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
                         "camera_id": {"type": "string"},
                         "semantic_labels": {"type": "array"},
                         "visual_labels": {"type": "array"},
@@ -2346,7 +2327,7 @@ class GatewayRuntime:
                         "query": {"type": "string"},
                         "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.25},
                         "limit": {"type": "integer", "minimum": 1, "default": 5},
-                        "map_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
                         "camera_id": {"type": "string"},
                         "linked_location_id": {"type": "string"},
                         "semantic_labels": {"type": "array"},
@@ -2367,7 +2348,7 @@ class GatewayRuntime:
             _descriptor(
                 "list_scene_spaces",
                 "列出场景空间",
-                "列出当前记忆库内的场景空间，可按地图版本、定位会话、审核状态或空间标识筛选。",
+                "列出当前记忆库内的场景空间，可按地图名称、定位会话、审核状态或空间标识筛选。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -2375,7 +2356,7 @@ class GatewayRuntime:
                         "limit": {"type": "integer", "minimum": 1, "default": 20},
                         "scene_space_id": {"type": "string"},
                         "scene_space_ids": {"type": "array", "items": {"type": "string"}},
-                        "map_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
                         "localization_session_id": {"type": "string"},
                         "review_status": {"type": "string"},
                         "review_statuses": {"type": "array", "items": {"type": "string"}},
@@ -2403,7 +2384,7 @@ class GatewayRuntime:
                         "query": {"type": "string"},
                         "similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.25},
                         "limit": {"type": "integer", "minimum": 1, "default": 5},
-                        "map_version_id": {"type": "string"},
+                        "map_name": {"type": "string"},
                         "localization_session_id": {"type": "string"},
                         "camera_id": {"type": "string"},
                         "semantic_labels": {"type": "array"},
@@ -2792,13 +2773,11 @@ class GatewayRuntime:
             "activate_map": self._handle_activate_map_async,
             "delete_map": partial(localization_skills.handle_delete_map, self._skill_ctx),
             "get_active_map": partial(localization_skills.handle_get_active_map, self._skill_ctx),
-            "list_map_versions": partial(localization_skills.handle_list_map_versions, self._skill_ctx),
-            "save_active_map_version": partial(localization_skills.handle_save_active_map_version, self._skill_ctx),
+            "finalize_active_map": partial(localization_skills.handle_finalize_active_map, self._skill_ctx),
             # 建图能力尚未下放到 skills，保留 runtime 方法派发。
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
             "stop_exploration": self._handle_stop_exploration,
-            "load_map_version": self._handle_load_map_version_async,
             "list_memory_libraries": partial(memory_skills.handle_list_memory_libraries, self._skill_ctx),
             "create_memory_library": partial(memory_skills.handle_create_memory_library, self._skill_ctx),
             "enable_memory_library": partial(memory_skills.handle_enable_memory_library, self._skill_ctx),
@@ -2904,7 +2883,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_localization_snapshot",
                 display_name="获取定位快照",
-                description="读取当前定位和 TF 快照，优先返回平台地图版本绑定后的定位结果。",
+                description="读取当前定位和 TF 快照，优先返回该地图资产绑定后的定位结果。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_localization_snapshot",
             ),
@@ -2918,14 +2897,17 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="relocalize_active_map",
                 display_name="重定位当前地图",
-                description="仅在地图版本已加载且 active_workspace.map_loaded=true 后刷新定位；加载旧地图请先调用 load_map_version。",
+                description=(
+                    "仅在已加载地图上重新估计机器人位姿，不选图、不切图、不发布资产。"
+                    "当前 typed Relocalize RPC/ACK 尚未提供。"
+                ),
                 category=SkillCategory.SYSTEM,
                 capability_name="relocalize_active_map",
             ),
             SkillDescriptor(
                 name="get_map_snapshot",
                 display_name="获取地图快照",
-                description="读取当前地图快照和地图版本信息。",
+                description="读取当前运行态地图快照信息。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_map_snapshot",
             ),
@@ -2939,7 +2921,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_navigation_semantic_context",
                 display_name="获取导航语义上下文",
-                description="读取当前平台地图版本绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
+                description="读取当前地图绑定的语义区域、拓扑节点、场景空间候选和证据摘要。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_semantic_context",
             ),
@@ -3051,7 +3033,10 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="activate_map",
                 display_name="启用地图",
-                description="仅启用地图工作区，不启动建图或探索会话。遥控建图后接 start_mapping；自主探索用 explore_area。",
+                description=(
+                    "选择并启用地图；已完成地图会加载其唯一的 current 资产包。"
+                    "不会启动建图或探索会话。"
+                ),
                 category=SkillCategory.MEMORY,
                 capability_name="activate_map",
             ),
@@ -3070,21 +3055,14 @@ class GatewayRuntime:
                 capability_name="get_active_map",
             ),
             SkillDescriptor(
-                name="list_map_versions",
-                display_name="列出地图版本",
-                description="列出某张地图在平台侧已保存的历史版本。",
-                category=SkillCategory.MEMORY,
-                capability_name="list_map_versions",
-            ),
-            SkillDescriptor(
-                name="save_active_map_version",
-                display_name="保存当前地图版本",
+                name="finalize_active_map",
+                display_name="完成当前地图",
                 description=(
-                    "把当前激活地图工作区中的地图快照保存为平台版本。"
-                    "响应为精简摘要（无栅格 data 数组）；完整数据落盘于 version.json。"
+                    "将当前激活地图工作区原子发布为唯一的 current 资产包。"
+                    "已完成地图不可被不同内容覆盖。"
                 ),
                 category=SkillCategory.MEMORY,
-                capability_name="save_active_map_version",
+                capability_name="finalize_active_map",
             ),
             SkillDescriptor(
                 name="start_mapping",
@@ -3109,13 +3087,6 @@ class GatewayRuntime:
                 ),
                 category=SkillCategory.TASK,
                 capability_name="stop_exploration",
-            ),
-            SkillDescriptor(
-                name="load_map_version",
-                display_name="加载地图版本",
-                description="加载已保存地图版本、自动激活同名记忆库，并启动 go2.sh --localization。成功后无需再调 enable_memory_library。异步：返回 task_id 后等待约 45s 再 get_task_status，每 12s 轮询，勿高频连刷。",
-                category=SkillCategory.MEMORY,
-                capability_name="load_map_version",
             ),
             SkillDescriptor(
                 name="list_memory_libraries",
@@ -3535,8 +3506,7 @@ class GatewayRuntime:
                 "list_maps",
                 "get_active_map",
                 "delete_map",
-                "list_map_versions",
-                "save_active_map_version",
+                "finalize_active_map",
                 "start_mapping",
                 "stop_mapping",
                 "stop_exploration",
@@ -3683,7 +3653,7 @@ class GatewayRuntime:
                 "route": profile.get("route") or "unknown",
                 "go2_boundary": "dds_only",
                 "source": "platform_service_contracts",
-                "map_version_id": getattr(map_snapshot, "version_id", None),
+                "map_name": getattr(active_workspace, "active_map_name", None),
                 "localization_session_id": getattr(localization_session, "session_id", None),
                 "geometry_runtime": geometry_runtime_status,
                 "live_mapping_diagnostics": self.platform_geometry_runtime.get_live_mapping_diagnostics(),
@@ -3830,8 +3800,7 @@ class GatewayRuntime:
     def _health_workspace_summary(self, workspace: Any) -> Dict[str, Any]:
         return {
             "available": bool(workspace is not None),
-            "map_name": getattr(workspace, "map_name", None),
-            "map_version_id": getattr(workspace, "map_version_id", None),
+            "map_name": getattr(workspace, "active_map_name", None),
             "frame_id": getattr(workspace, "frame_id", None),
         }
 
@@ -3909,7 +3878,9 @@ class GatewayRuntime:
             "available": True,
             "session_id": getattr(localization_session, "session_id", None),
             "map_name": getattr(localization_session, "map_name", None),
-            "map_version_id": getattr(localization_session, "map_version_id", None),
+            "asset_manifest_sha256": getattr(
+                localization_session, "asset_manifest_sha256", None
+            ),
             "frame_id": getattr(localization_session, "frame_id", None),
             "status": status,
             "pose_available": bool(getattr(localization_session, "pose_available", False)),
@@ -4251,7 +4222,7 @@ class GatewayRuntime:
             height = getattr(occupancy_grid, "height", None)
             map_status = ServiceHealthStatus.AVAILABLE
             map_summary = "地图帧已上报"
-            map_evidence = f"栅格 {width or '--'}×{height or '--'}，版本 {getattr(map_snapshot, 'version_id', None) or '--'}"
+            map_evidence = f"栅格 {width or '--'}×{height or '--'}，快照 {getattr(map_snapshot, 'version_id', None) or '--'}"
         elif map_workspace_name:
             map_status = ServiceHealthStatus.IDLE
             map_summary = "已加载地图工作区，等待实时地图帧"
@@ -4644,19 +4615,15 @@ class GatewayRuntime:
         if state in terminal_states:
             if state == "succeeded" and isinstance(snapshot.get("result"), dict):
                 result = dict(snapshot["result"])
-                if not result.get("next_step_hint"):
-                    if spec.capability_name == "load_map_version":
-                        map_name = str(result.get("map_version", {}).get("map_name") or "").strip()
-                        memory_ok = result.get("memory_library_activated")
-                        memory_note = (
-                            "同名记忆库已激活。"
-                            if memory_ok is not False
-                            else "请检查 memory_summary.active_library_name 是否与地图一致。"
-                        )
-                        result["next_step_hint"] = (
-                            "地图版本已加载%s。%s Debug 应立即可见 checkpoint 地图；可直接 navigate_to_pose。"
-                            % (("（%s）" % map_name) if map_name else "", memory_note)
-                        )
+                if not result.get("next_step_hint") and spec.capability_name == "activate_map":
+                    workspace = result.get("active_workspace")
+                    if hasattr(workspace, "model_dump"):
+                        workspace = workspace.model_dump(mode="json")
+                    map_name = str((workspace or {}).get("active_map_name") or "").strip()
+                    result["next_step_hint"] = (
+                        "地图%s的 current 资产包与同名记忆库已激活，可等待定位收敛后开始导航。"
+                        % ((" " + map_name) if map_name else "")
+                    )
                     snapshot["result"] = result
             return snapshot
 
@@ -4820,26 +4787,25 @@ class GatewayRuntime:
         }
 
     @staticmethod
-    def _slim_map_version(version: Any) -> Dict[str, Any]:
-        if version is None:
+    def _slim_map_asset_bundle(bundle: Any) -> Dict[str, Any]:
+        if bundle is None:
             return {}
-        if hasattr(version, "model_dump"):
-            data = version.model_dump(mode="json")
-        elif isinstance(version, dict):
-            data = dict(version)
+        if hasattr(bundle, "model_dump"):
+            data = bundle.model_dump(mode="json")
+        elif isinstance(bundle, dict):
+            data = dict(bundle)
         else:
-            return {"version_id": str(version)}
+            return {"map_name": str(bundle)}
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         slim: Dict[str, Any] = {
             key: data[key]
             for key in (
                 "timestamp",
                 "map_name",
-                "version_id",
-                "revision",
                 "source_name",
-                "source_version_id",
+                "source_snapshot_id",
                 "frame_id",
+                "manifest_sha256",
             )
             if key in data
         }
@@ -4855,7 +4821,6 @@ class GatewayRuntime:
                 "mapping_database_path",
                 "backend_session_id",
                 "backend_run_id",
-                "exploration_pinned_version_id",
                 "requested_by",
             )
             if key in metadata
@@ -4879,8 +4844,9 @@ class GatewayRuntime:
                 "display_name",
                 "status",
                 "active",
-                "latest_version_id",
-                "latest_revision",
+                "finalized",
+                "asset_manifest_sha256",
+                "finalized_at",
                 "frame_id",
                 "localization_ready",
                 "last_activated_at",
@@ -5018,7 +4984,7 @@ class GatewayRuntime:
         if "map_asset" in slim:
             slim["map_asset"] = self._slim_map_asset(slim.get("map_asset"))
         if "active_workspace" in slim:
-            include_memory = capability_name in {"activate_map", "load_map_version"}
+            include_memory = capability_name == "activate_map"
             slim["active_workspace"] = self._slim_workspace(
                 slim.get("active_workspace"),
                 include_memory=include_memory,
@@ -5042,14 +5008,10 @@ class GatewayRuntime:
             slim["maps_count"] = len(maps) if isinstance(maps, (list, tuple)) else 0
             if capability_name == "list_maps":
                 slim["maps"] = self._slim_map_catalog(maps)
-        if "map_version" in slim:
-            slim["map_version"] = self._slim_map_version(slim.get("map_version"))
-        if "map_versions" in slim:
-            versions = slim.get("map_versions")
-            if isinstance(versions, (list, tuple)):
-                slim["map_versions"] = [self._slim_map_version(item) for item in versions]
-        if capability_name == "save_active_map_version" and not slim.get("next_step_hint"):
-            slim["next_step_hint"] = "地图版本已保存。请调用 stop_mapping 停止几何建图栈。"
+        if "map_asset_bundle" in slim:
+            slim["map_asset_bundle"] = self._slim_map_asset_bundle(slim.get("map_asset_bundle"))
+        if capability_name == "finalize_active_map" and not slim.get("next_step_hint"):
+            slim["next_step_hint"] = "地图 current 资产包已完成。请调用 stop_mapping 停止几何建图栈。"
         return slim
 
     @staticmethod
@@ -5086,14 +5048,14 @@ class GatewayRuntime:
         exploration_context = slim.get("exploration_context")
         if exploration_context is not None:
             slim["exploration_context"] = GatewayRuntime._slim_exploration_context(exploration_context)
-        if "map_version" in slim:
-            slim["map_version"] = GatewayRuntime._slim_map_version(slim.get("map_version"))
-        if "saved_map_version" in slim:
-            slim["saved_map_version"] = GatewayRuntime._slim_map_version(slim.get("saved_map_version"))
-        if "map_versions" in slim:
-            versions = slim.get("map_versions")
-            if isinstance(versions, (list, tuple)):
-                slim["map_versions"] = [GatewayRuntime._slim_map_version(item) for item in versions]
+        if "map_asset_bundle" in slim:
+            slim["map_asset_bundle"] = GatewayRuntime._slim_map_asset_bundle(
+                slim.get("map_asset_bundle")
+            )
+        if "finalized_map_asset" in slim:
+            slim["finalized_map_asset"] = GatewayRuntime._slim_map_asset_bundle(
+                slim.get("finalized_map_asset")
+            )
         if "active_workspace" in slim:
             slim["active_workspace"] = GatewayRuntime._slim_workspace(slim.get("active_workspace"))
         if slim.get("next_step_hint"):
@@ -5373,7 +5335,7 @@ class GatewayRuntime:
         launch_plan["geometry_stack"] = self._geometry_stack_summary()
         launch_plan["next_step_hint"] = (
             "nuwax-geometry-runtime 建图会话已启动。请遥控机器狗移动建图；"
-            "完成后调用 save_active_map_version，再 stop_mapping。"
+            "完成后调用 finalize_active_map，再 stop_mapping。"
         )
         return launch_plan
 
@@ -5870,11 +5832,6 @@ class GatewayRuntime:
         verify_on_arrival = bool(arguments.get("verify_on_arrival", False))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
         target_name_hint = str(arguments.get("target_name") or goal.target_name or "navigate_to_pose").strip()
-        current_map_version_id = (
-            workspace.latest_map_snapshot.version_id
-            if workspace is not None and workspace.latest_map_snapshot is not None
-            else None
-        )
         current_localization_session_id = (
             workspace.active_localization_session.session_id
             if workspace is not None and workspace.active_localization_session is not None
@@ -5897,7 +5854,7 @@ class GatewayRuntime:
                         navigation_candidate=None,
                         verify_similarity_threshold=verify_similarity_threshold,
                         strict=False,
-                        expected_map_version_id=current_map_version_id,
+                        expected_map_name=map_name,
                         localization_session_id=current_localization_session_id,
                         goal_id=goal.goal_id,
                         requested_by=requested_by,
@@ -6122,11 +6079,6 @@ class GatewayRuntime:
         verify_on_arrival = bool(arguments.get("verify_on_arrival", True))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
         self._ensure_workspace_memory_library_ready(map_name=map_name)
-        current_map_version_id = (
-            workspace.latest_map_snapshot.version_id
-            if workspace is not None and workspace.latest_map_snapshot is not None
-            else None
-        )
         current_localization_session_id = (
             workspace.active_localization_session.session_id
             if workspace is not None and workspace.active_localization_session is not None
@@ -6135,14 +6087,14 @@ class GatewayRuntime:
         navigation_candidate = None
         tagged_location = self.memory_service.resolve_tagged_location(
             target_name,
-            map_version_id=current_map_version_id,
+            map_name=map_name,
             localization_session_id=current_localization_session_id,
         )
         if tagged_location is not None:
             navigation_candidate = self.memory_service.resolve_navigation_candidate(
                 target_name,
                 camera_id=camera_id,
-                map_version_id=current_map_version_id,
+                map_name=map_name,
                 localization_session_id=current_localization_session_id,
             )
             goal = NavigationGoal(
@@ -6153,7 +6105,7 @@ class GatewayRuntime:
                 metadata={
                     "resolved_from": "memory",
                     "location_id": tagged_location.location_id,
-                    "map_version_id": current_map_version_id,
+                    "map_name": map_name,
                     "localization_session_id": current_localization_session_id,
                     "requested_by": requested_by or "unknown",
                 },
@@ -6162,7 +6114,7 @@ class GatewayRuntime:
             navigation_candidate = self.memory_service.resolve_navigation_candidate(
                 target_name,
                 camera_id=camera_id,
-                map_version_id=current_map_version_id,
+                map_name=map_name,
                 localization_session_id=current_localization_session_id,
             )
             if navigation_candidate is not None:
@@ -6175,7 +6127,7 @@ class GatewayRuntime:
                         "resolved_from": "semantic_memory",
                         "record_id": navigation_candidate.record_id,
                         "record_kind": navigation_candidate.record_kind.value,
-                        "map_version_id": current_map_version_id,
+                        "map_name": map_name,
                         "localization_session_id": current_localization_session_id,
                         "requested_by": requested_by or "unknown",
                     },
@@ -6208,7 +6160,7 @@ class GatewayRuntime:
                 "goal_id": self._build_runtime_request_id("nav_named"),
                 "metadata": {
                     **dict(goal.metadata),
-                    "map_version_id": current_map_version_id,
+                    "map_name": map_name,
                     "localization_session_id": current_localization_session_id,
                     "requested_by": requested_by or "unknown",
                 },
@@ -6235,7 +6187,7 @@ class GatewayRuntime:
                         navigation_candidate=navigation_candidate,
                         verify_similarity_threshold=verify_similarity_threshold,
                         strict=should_fail_on_arrival_verification,
-                        expected_map_version_id=current_map_version_id,
+                        expected_map_name=map_name,
                         localization_session_id=current_localization_session_id,
                         goal_id=goal.goal_id,
                         requested_by=requested_by,
@@ -7330,7 +7282,11 @@ class GatewayRuntime:
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
         duration_sec = self._float(arguments, "duration_sec", 2.0)
         interval_sec = self._float(arguments, "interval_sec", 0.1)
-        lost_timeout_sec = self._float(arguments, "lost_timeout_sec", 0.8)
+        lost_timeout_sec = self._float(
+            arguments,
+            "lost_timeout_sec",
+            _PERSON_FOLLOW_DEFAULT_LOST_TIMEOUT_SEC,
+        )
         timeout_sec = self._resolve_async_timeout("follow_target", arguments, minimum_sec=0.1)
         descriptor = self.capability_registry.get_descriptor("follow_target")
         if duration_sec <= 0 or interval_sec <= 0 or lost_timeout_sec <= 0:
@@ -7340,71 +7296,278 @@ class GatewayRuntime:
                 http_status=422,
                 jsonrpc_code=-32602,
             )
+        if interval_sec > _PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC:
+            raise GatewayError(
+                "interval_sec 不得超过 0.2 秒。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        if lost_timeout_sec < _PERSON_FOLLOW_TARGET_WATCHDOG_SEC:
+            raise GatewayError(
+                "lost_timeout_sec 不得短于 1.5 秒的 PersonFollow bridge watchdog。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
 
         def runner(context) -> Dict[str, Any]:
-            try:
-                session = self._run_with_motion_admission(
-                    motion_admission,
-                    lambda: self.motion_guard.acquire_follow_session(
-                        motion_admission.proof
-                    ),
-                )
-                start_time = time.monotonic()
-                last_seen_time = 0.0
-                last_detection = None
-                try:
-                    while True:
-                        context.ensure_active()
-                        elapsed = time.monotonic() - start_time
-                        if elapsed >= duration_sec:
-                            break
-                        perception_context = self.perception_service.perceive_current_scene(
-                            camera_id=camera_id,
-                            requested_by=requested_by,
-                            detector_backend_name=detector_backend,
-                            store_artifact=False,
-                        )
-                        detection = self._find_best_detection(query, perception_context)
-                        if detection is None:
-                            if (
-                                last_seen_time
-                                and time.monotonic() - last_seen_time > lost_timeout_sec
-                            ):
-                                raise GatewayError(f"目标 {query} 已丢失。")
-                            session.stop()
-                            context.update(
-                                progress=min(0.95, elapsed / duration_sec),
-                                stage="follow_searching",
-                                message=f"正在搜索目标 {query}。",
-                            )
-                            time.sleep(interval_sec)
-                            continue
+            session_id = "follow:%s" % uuid.uuid4().hex
+            bridge = getattr(self, "person_follow_bridge", None)
+            session = None
+            bound = False
+            last_target = None
+            last_detection = None
+            last_observation_stamp: Optional[Tuple[int, int]] = None
+            lost_since: Optional[float] = None
+            camera_frame: Optional[str] = None
+            calibration = None
+            required_cloud_revision = 0
+            started_at = time.monotonic()
+            deadline = started_at + duration_sec
+            next_tick = started_at
 
-                        last_seen_time = time.monotonic()
-                        last_detection = detection
-                        follow_command = self._build_follow_twist(
-                            perception_context,
-                            detection,
+            def wait_for_tick() -> Optional[float]:
+                nonlocal next_tick
+                now = time.monotonic()
+                if now >= deadline:
+                    return None
+                if now < next_tick:
+                    time.sleep(next_tick - now)
+                tick_started = time.monotonic()
+                if tick_started >= deadline:
+                    return None
+                next_tick += interval_sec
+                if next_tick <= tick_started:
+                    missed = math.floor((tick_started - next_tick) / interval_sec) + 1
+                    next_tick += missed * interval_sec
+                return tick_started
+
+            def target_from_context(
+                perception_context,
+                detection,
+                *,
+                tracking_state: int,
+                target_seq: int,
+            ):
+                assert calibration is not None
+                return build_person_follow_target(
+                    session_id=session_id,
+                    query=query,
+                    target_seq=target_seq,
+                    required_cloud_revision=required_cloud_revision,
+                    camera_parent_frame=calibration.parent_frame_id,
+                    camera_translation=(
+                        calibration.translation.x,
+                        calibration.translation.y,
+                        calibration.translation.z,
+                    ),
+                    camera_rotation=(
+                        calibration.rotation.x,
+                        calibration.rotation.y,
+                        calibration.rotation.z,
+                        calibration.rotation.w,
+                    ),
+                    perception_context=perception_context,
+                    detection=detection,
+                    tracking_state=tracking_state,
+                )
+
+            def terminate_bound_session(tracking_state: int, reason: str) -> None:
+                nonlocal bound
+                if not bound:
+                    return
+                try:
+                    if last_target is None:
+                        bridge.fence_session(session_id, reason=reason)
+                    else:
+                        bridge.end_session(
+                            last_target.lifecycle(tracking_state),
+                            reason=reason,
                         )
-                        session.twist(
-                            follow_command.linear.x,
-                            follow_command.linear.y,
-                            follow_command.angular.z,
-                        )
-                        context.update(
-                            progress=min(0.99, elapsed / duration_sec),
-                            stage="follow_tracking",
-                            message=f"正在跟随目标 {query}。",
-                            payload={
-                                "label": detection.label,
-                                "score": detection.score,
-                            },
-                        )
-                        time.sleep(interval_sec)
+                except BaseException:
+                    try:
+                        bridge.fence_session(session_id, reason=reason)
+                    except BaseException:
+                        if session is not None and not getattr(session, "fenced", False):
+                            self.motion_guard.stop_and_fence(session)
+                    raise
                 finally:
-                    self.motion_guard.stop_and_fence(session)
+                    bound = False
+
+            try:
+                while last_target is None:
+                    context.ensure_active()
+                    tick_started = wait_for_tick()
+                    if tick_started is None:
+                        break
+                    perception_context = self.perception_service.detect_current_frame_fast(
+                        camera_id=camera_id,
+                        requested_by=requested_by,
+                        detector_backend_name=detector_backend,
+                    )
+                    source_stamp = self._person_follow_source_stamp(perception_context)
+                    if (
+                        last_observation_stamp is not None
+                        and source_stamp <= last_observation_stamp
+                    ):
+                        continue
+                    last_observation_stamp = source_stamp
+                    detection = self._find_best_detection(query, perception_context)
+                    if detection is None:
+                        context.update(
+                            progress=min(0.95, (tick_started - started_at) / duration_sec),
+                            stage="follow_searching",
+                            message=f"正在搜索目标 {query}。",
+                        )
+                        continue
+
+                    camera_info = getattr(perception_context, "camera_info", None)
+                    camera_frame = str(getattr(camera_info, "frame_id", "") or "").strip()
+                    calibration = self._resolve_person_follow_calibration(camera_frame)
+                    required_cloud_revision = self._person_follow_required_cloud_revision()
+                    first_target = target_from_context(
+                        perception_context,
+                        detection,
+                        tracking_state=PERSON_FOLLOW_TRACKED,
+                        target_seq=1,
+                    )
+                    if bridge is None or not getattr(bridge, "started", False):
+                        raise GatewayError(
+                            "PersonFollow Gateway LCM bridge 未就绪。",
+                            error_code="person_follow_unavailable",
+                            http_status=503,
+                            jsonrpc_code=-32010,
+                        )
+                    preflight_stop = bridge.prepare_session(
+                        first_target,
+                        timeout_sec=_PERSON_FOLLOW_PREFLIGHT_TIMEOUT_SEC,
+                    )
+                    context.ensure_active()
+                    if time.monotonic() >= deadline:
+                        break
+                    session = self._run_with_motion_admission(
+                        motion_admission,
+                        lambda: self.motion_guard.acquire_follow_session(
+                            motion_admission.proof
+                        ),
+                    )
+                    try:
+                        bridge.bind_session(
+                            session_id,
+                            session,
+                            fence_session=self.motion_guard.stop_and_fence,
+                            target_timeout_sec=_PERSON_FOLLOW_TARGET_WATCHDOG_SEC,
+                        )
+                    except BaseException:
+                        self.motion_guard.stop_and_fence(session)
+                        raise
+                    bound = True
+                    initial_bound_target = replace(
+                        first_target,
+                        target_seq=preflight_stop.target_seq + 1,
+                    )
+                    last_target = initial_bound_target
+                    published = bridge.publish_tracked(initial_bound_target)
+                    if published is not None:
+                        last_target = published
+                    last_detection = detection
+                    context.update(
+                        progress=min(0.99, (tick_started - started_at) / duration_sec),
+                        stage="follow_tracking",
+                        message=f"正在跟随目标 {query}。",
+                        payload={"label": detection.label, "score": detection.score},
+                    )
+
+                while bound:
+                    context.ensure_active()
+                    bridge.assert_session_healthy(session_id)
+                    tick_started = wait_for_tick()
+                    if tick_started is None:
+                        break
+                    perception_context = self.perception_service.detect_current_frame_fast(
+                        camera_id=camera_id,
+                        requested_by=requested_by,
+                        detector_backend_name=detector_backend,
+                    )
+                    source_stamp = self._person_follow_source_stamp(perception_context)
+                    if source_stamp <= (last_observation_stamp or source_stamp):
+                        if lost_since is None:
+                            lost_since = tick_started
+                        if tick_started - lost_since >= lost_timeout_sec:
+                            bridge.fence_session(
+                                session_id,
+                                reason="PersonFollow source images stopped advancing",
+                            )
+                            bound = False
+                            raise GatewayError(f"目标 {query} 已丢失。")
+                        continue
+                    last_observation_stamp = source_stamp
+                    current_camera = str(
+                        getattr(
+                            getattr(perception_context, "camera_info", None),
+                            "frame_id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    if current_camera != camera_frame:
+                        raise PersonFollowBridgeError(
+                            "PersonFollow camera frame changed during an active session"
+                        )
+                    detection = self._find_best_detection(query, perception_context)
+                    next_seq = last_target.target_seq + 1
+                    if detection is None:
+                        lost_target = target_from_context(
+                            perception_context,
+                            None,
+                            tracking_state=PERSON_FOLLOW_LOST,
+                            target_seq=next_seq,
+                        )
+                        published = bridge.publish_lost(lost_target)
+                        last_target = published or lost_target
+                        if lost_since is None:
+                            lost_since = tick_started
+                        context.update(
+                            progress=min(0.95, (tick_started - started_at) / duration_sec),
+                            stage="follow_searching",
+                            message=f"正在重新搜索目标 {query}。",
+                        )
+                        if tick_started - lost_since >= lost_timeout_sec:
+                            terminate_bound_session(
+                                PERSON_FOLLOW_LOST,
+                                "PersonFollow semantic target timeout",
+                            )
+                            raise GatewayError(f"目标 {query} 已丢失。")
+                        continue
+
+                    lost_since = None
+                    tracked_target = target_from_context(
+                        perception_context,
+                        detection,
+                        tracking_state=PERSON_FOLLOW_TRACKED,
+                        target_seq=next_seq,
+                    )
+                    published = bridge.publish_tracked(tracked_target)
+                    last_target = published or tracked_target
+                    last_detection = detection
+                    context.update(
+                        progress=min(0.99, (tick_started - started_at) / duration_sec),
+                        stage="follow_tracking",
+                        message=f"正在跟随目标 {query}。",
+                        payload={"label": detection.label, "score": detection.score},
+                    )
+
+                terminate_bound_session(
+                    PERSON_FOLLOW_STOP,
+                    "PersonFollow task completed",
+                )
             except (GatewayMotionGuardError, MotionGuardError) as exc:
+                terminate_bound_session(PERSON_FOLLOW_STOP, "PersonFollow guard failure")
                 raise self._motion_guard_gateway_error("follow_target", exc) from exc
+            except BaseException:
+                terminate_bound_session(PERSON_FOLLOW_STOP, "PersonFollow task aborted")
+                raise
 
             context.update(progress=1.0, stage="completed", message="目标跟随完成。")
             return {
@@ -7617,7 +7780,7 @@ class GatewayRuntime:
             return False
         if workspace.map_loaded:
             return True
-        return bool(workspace.map_asset.latest_version_id)
+        return bool(workspace.map_asset.finalized)
 
     def _ensure_localization_ready(
         self,
@@ -7648,8 +7811,10 @@ class GatewayRuntime:
                 "localization_session_status": (
                     localization_session.status.value if localization_session is not None else None
                 ),
-                "map_version_id": (
-                    localization_session.map_version_id if localization_session is not None else None
+                "asset_manifest_sha256": (
+                    localization_session.asset_manifest_sha256
+                    if localization_session is not None
+                    else None
                 ),
             },
         )
@@ -7818,7 +7983,7 @@ class GatewayRuntime:
         navigation_candidate,
         verify_similarity_threshold: float,
         strict: bool,
-        expected_map_version_id: Optional[str],
+        expected_map_name: Optional[str],
         localization_session_id: Optional[str],
         goal_id: Optional[str] = None,
         requested_by: Optional[str] = None,
@@ -7834,7 +7999,7 @@ class GatewayRuntime:
             navigation_candidate=navigation_candidate,
             camera_id=camera_id,
             similarity_threshold=verify_similarity_threshold,
-            expected_map_version_id=expected_map_version_id,
+            expected_map_name=expected_map_name,
             localization_session_id=localization_session_id,
             goal_id=goal_id,
         )
@@ -7846,7 +8011,6 @@ class GatewayRuntime:
             arrival_verification=arrival_verification,
             map_name=map_name,
             goal_id=goal_id,
-            map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
             reason_source="navigation_arrival",
         )
@@ -7879,7 +8043,6 @@ class GatewayRuntime:
         arrival_verification,
         map_name: Optional[str],
         goal_id: Optional[str],
-        map_version_id: Optional[str],
         localization_session_id: Optional[str],
         reason_source: str,
     ) -> Dict[str, Any]:
@@ -7940,8 +8103,7 @@ class GatewayRuntime:
             "record_id": record_id,
             "record_kind": record_kind,
             "target_name": target_name,
-            "map_name": map_name or "",
-            "map_version_id": map_version_id or str(verification_metadata.get("map_version_id") or ""),
+            "map_name": map_name or str(verification_metadata.get("map_name") or ""),
             "localization_session_id": localization_session_id
             or str(verification_metadata.get("localization_session_id") or ""),
             "matched_memory_id": str(getattr(arrival_verification, "matched_memory_id", "") or ""),
@@ -8243,10 +8405,10 @@ class GatewayRuntime:
         rejected_record_ids: Set[str],
     ) -> Dict[str, Any]:
         workspace = self.map_workspace_service.get_active_workspace()
-        current_map_version_id = (
-            workspace.latest_map_snapshot.version_id
-            if workspace is not None and workspace.latest_map_snapshot is not None
-            else None
+        current_map_name = (
+            workspace.active_map_name
+            if workspace is not None and workspace.active_map_name
+            else map_name
         )
         current_localization_session_id = (
             workspace.active_localization_session.session_id
@@ -8258,7 +8420,7 @@ class GatewayRuntime:
             navigation_candidate=None,
             camera_id=camera_id,
             similarity_threshold=verify_similarity_threshold,
-            expected_map_version_id=current_map_version_id,
+            expected_map_name=current_map_name,
             localization_session_id=current_localization_session_id,
         )
         current_scene_detection_evidence = self._build_target_detection_evidence(
@@ -8283,7 +8445,7 @@ class GatewayRuntime:
             for candidate in self.memory_service.resolve_navigation_candidates(
                 query,
                 camera_id=camera_id,
-                map_version_id=current_map_version_id,
+                map_name=current_map_name,
                 localization_session_id=current_localization_session_id,
                 limit=5,
             )
@@ -8304,7 +8466,7 @@ class GatewayRuntime:
         semantic_goal = None
         return {
             "workspace": workspace,
-            "current_map_version_id": current_map_version_id,
+            "current_map_name": current_map_name,
             "current_localization_session_id": current_localization_session_id,
             "current_scene_verification": current_scene_verification,
             "current_scene_detection_evidence": current_scene_detection_evidence,
@@ -8595,7 +8757,7 @@ class GatewayRuntime:
             "record_id": str(getattr(candidate, "record_id", "") or ""),
             "record_kind": record_kind_value,
             "target_name": str(getattr(candidate, "target_name", "") or ""),
-            "map_version_id": getattr(candidate, "map_version_id", None),
+            "map_name": getattr(candidate, "map_name", None),
             "topo_node_id": getattr(candidate, "topo_node_id", None),
             "semantic_region_id": getattr(candidate, "semantic_region_id", None),
             "distance_m": getattr(candidate, "distance_m", None),
@@ -8797,7 +8959,6 @@ class GatewayRuntime:
         query: str,
         candidate,
         requested_by: Optional[str],
-        map_version_id: Optional[str],
         localization_session_id: Optional[str],
     ) -> NavigationGoal:
         return NavigationGoal(
@@ -8810,7 +8971,6 @@ class GatewayRuntime:
                 "record_id": candidate.record_id,
                 "record_kind": candidate.record_kind.value,
                 "query": query,
-                "map_version_id": map_version_id,
                 "localization_session_id": localization_session_id,
                 "requested_by": requested_by or "unknown",
             },
@@ -8825,7 +8985,7 @@ class GatewayRuntime:
         navigation_candidate,
         verify_similarity_threshold: float,
         requested_by: Optional[str],
-        expected_map_version_id: Optional[str],
+        expected_map_name: Optional[str],
         localization_session_id: Optional[str],
         goal_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -8842,7 +9002,7 @@ class GatewayRuntime:
             navigation_candidate=navigation_candidate,
             camera_id=camera_id,
             similarity_threshold=verify_similarity_threshold,
-            expected_map_version_id=expected_map_version_id,
+            expected_map_name=expected_map_name,
             localization_session_id=localization_session_id,
             goal_id=goal_id,
         )
@@ -8868,7 +9028,6 @@ class GatewayRuntime:
             arrival_verification=arrival_verification,
             map_name=map_name,
             goal_id=goal_id,
-            map_version_id=expected_map_version_id,
             localization_session_id=localization_session_id,
             reason_source="target_arrival_verify",
         )
@@ -8980,7 +9139,7 @@ class GatewayRuntime:
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
         clarification = search_state.get("clarification")
-        current_map_version_id = search_state["current_map_version_id"]
+        current_map_name = search_state["current_map_name"]
         current_localization_session_id = search_state["current_localization_session_id"]
         workspace = search_state["workspace"]
         candidate_diagnostics = [dict(item) for item in search_state.get("candidate_diagnostics", ())]
@@ -9125,7 +9284,6 @@ class GatewayRuntime:
                 query=query,
                 candidate=candidate,
                 requested_by=requested_by,
-                map_version_id=current_map_version_id,
                 localization_session_id=current_localization_session_id,
             )
             task_context.ensure_active()
@@ -9182,7 +9340,7 @@ class GatewayRuntime:
                 navigation_candidate=candidate,
                 verify_similarity_threshold=verify_similarity_threshold,
                 requested_by=requested_by,
-                expected_map_version_id=current_map_version_id,
+                expected_map_name=current_map_name,
                 localization_session_id=current_localization_session_id,
                 goal_id=goal.goal_id,
             )
@@ -9260,7 +9418,7 @@ class GatewayRuntime:
                     navigation_candidate=None,
                     verify_similarity_threshold=verify_similarity_threshold,
                     requested_by=requested_by,
-                    expected_map_version_id=current_map_version_id,
+                    expected_map_name=current_map_name,
                     localization_session_id=current_localization_session_id,
                     goal_id=semantic_goal.goal_id,
                 )
@@ -9332,14 +9490,13 @@ class GatewayRuntime:
     ):
         """把重型几何 skill handler 包进后台 task runner（超时根因 D3）。
 
-        activate_map / relocalize_active_map / load_map_version 原为 SYNC，其 handler 内
+        activate_map / relocalize_active_map 原为 SYNC，其 handler 内
         会同步启动建图与定位后端（数十秒），在 MCP 单次请求线程内执行会
         超过客户端 ~60s 超时（-32001）。此处复用既有 ASYNC_TASK 机制（参照
         _submit_navigation_task）：立即返回 task_id，handler 整体在后台线程执行。
 
-        handler 自身已携带各自的几何运行时 ensure（activate_map→ensure_geometry_runtime_started，
-        relocalize→ensure_geometry_runtime_for_capability）；load_map_version 的 handler 不自带
-        ensure，由本 runner 在调用 handler 前显式补 ensure（见下，N2 收口）。
+        handler 自身携带各自的几何运行时 ensure（activate_map→ensure_geometry_runtime_started，
+        relocalize→ensure_geometry_runtime_for_capability）。
         """
         descriptor = self.capability_registry.get_descriptor(capability_name)
         timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
@@ -9352,10 +9509,6 @@ class GatewayRuntime:
                 stage="prepare_geometry_runtime",
                 message=f"准备执行 {capability_name}（含按需启动几何运行时）。",
             )
-            # N2：load_map_version 的 handler 体内无 ensure，移出 _SYNC_ 后门禁不再启栈，
-            # 故 runner 必须在调用 handler 前显式启动几何运行时（其它两者 handler 自带 ensure）。
-            if capability_name == "load_map_version":
-                self._ensure_geometry_runtime_for_capability("load_map_version")
             context.ensure_active()
             result = skill_handler(payload, requested_by=requested_by)
             context.update(progress=1.0, stage="completed", message=f"{capability_name} 已完成。")
@@ -9409,21 +9562,6 @@ class GatewayRuntime:
             http_status=501,
             jsonrpc_code=-32601,
             details={"missing_contract": "typed Relocalize RPC/ACK"},
-        )
-
-    def _handle_load_map_version_async(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-        request_context: Optional[MetadataDict] = None,
-    ):
-        return self._submit_geometry_skill_task(
-            capability_name="load_map_version",
-            skill_handler=partial(localization_skills.handle_load_map_version, self._skill_ctx),
-            arguments=arguments,
-            requested_by=requested_by,
-            request_context=request_context,
         )
 
     # ------------------------------------------------------------------
@@ -12096,37 +12234,98 @@ class GatewayRuntime:
         detections.sort(key=lambda item: item.score, reverse=True)
         return detections[0]
 
-    def _build_follow_twist(self, perception_context, detection) -> Twist:
-        camera_info = perception_context.camera_info
-        scene_metadata = dict(perception_context.scene_summary.metadata)
-        width = float(
-            camera_info.width_px
-            if camera_info is not None
-            else scene_metadata.get("image_width_px") or detection.bbox.width_px or 1.0
+    @staticmethod
+    def _person_follow_source_stamp(perception_context) -> Tuple[int, int]:
+        for metadata in (
+            getattr(perception_context, "metadata", None),
+            getattr(getattr(perception_context, "observation", None), "metadata", None),
+        ):
+            if not isinstance(metadata, dict):
+                continue
+            value = metadata.get("source_timestamp_ns")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                continue
+            return value // 1_000_000_000, value % 1_000_000_000
+        raise PersonFollowBridgeError(
+            "PersonFollow requires an exact positive source_timestamp_ns"
         )
-        height = float(
-            camera_info.height_px
-            if camera_info is not None
-            else scene_metadata.get("image_height_px") or detection.bbox.height_px or 1.0
-        )
-        bbox = detection.bbox
-        center_x = bbox.x_px + bbox.width_px / 2.0
-        normalized_error_x = ((center_x - width / 2.0) / max(width / 2.0, 1.0))
-        bbox_ratio = bbox.height_px / max(height, 1.0)
-        desired_ratio = 0.45
-        distance_error = desired_ratio - bbox_ratio
 
-        linear_x = max(-0.18, min(0.22, distance_error * 0.6))
-        angular_z = max(-0.5, min(0.5, -normalized_error_x * 0.8))
-        if abs(distance_error) < 0.05:
-            linear_x = 0.0
-        if abs(normalized_error_x) < 0.05:
-            angular_z = 0.0
-        return Twist(
-            frame_id=self.robot.defaults.frame_ids.get("base", "world/base"),
-            linear=Vector3(x=linear_x, y=0.0, z=0.0),
-            angular=Vector3(x=0.0, y=0.0, z=angular_z),
-        )
+    def _person_follow_required_cloud_revision(self) -> int:
+        reader = getattr(self, "_cloud_map_mmap_reader", None)
+        if reader is None:
+            revision = max(0, int(getattr(self, "_cloud_map_last_revision", 0) or 0))
+        else:
+            revision = 0
+            try:
+                header = reader.read_header()
+            except Exception as exc:
+                raise GatewayError(
+                    "PersonFollow 无法读取当前 cloud map revision。",
+                    error_code="person_follow_cloud_unavailable",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                ) from exc
+            if header is not None and int(header[3]) > 0:
+                revision = max(0, int(header[5]))
+        if revision <= 0:
+            raise GatewayError(
+                "PersonFollow 需要已发布的非空 global map。",
+                error_code="person_follow_cloud_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+            )
+        return revision
+
+    def _resolve_person_follow_calibration(self, camera_frame: str):
+        camera_frame = str(camera_frame or "").strip()
+        if not camera_frame:
+            raise GatewayError(
+                "PersonFollow 图像缺少 camera frame。",
+                error_code="person_follow_calibration_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+            )
+        provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
+        frame_tree = None if provider is None else provider.get_frame_tree()
+        if frame_tree is None:
+            raise GatewayError(
+                "PersonFollow 无法获取 calibration frame tree。",
+                error_code="person_follow_calibration_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+            )
+        candidates = [
+            edge
+            for edge in frame_tree.transforms
+            if edge.child_frame_id == camera_frame
+            and edge.authority == "calibration_static"
+        ]
+        if len(candidates) != 1:
+            raise GatewayError(
+                "PersonFollow camera 必须匹配唯一 direct calibration_static 边。",
+                error_code="person_follow_calibration_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={
+                    "camera_frame": camera_frame,
+                    "candidate_count": len(candidates),
+                },
+            )
+        candidate = candidates[0]
+        try:
+            return resolve_direct_static_calibration_edge(
+                frame_tree,
+                parent_frame_id=candidate.parent_frame_id,
+                child_frame_id=camera_frame,
+            )
+        except ValueError as exc:
+            raise GatewayError(
+                "PersonFollow camera calibration 不满足静态直接边约束。",
+                error_code="person_follow_calibration_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={"camera_frame": camera_frame, "reason": str(exc)},
+            ) from exc
 
     def _refresh_dynamic_capability_matrix(self) -> None:
         if not self._gateway_capability_names:
@@ -12673,7 +12872,7 @@ class GatewayRuntime:
         )
 
     def _schedule_exploration_workspace_finalize(self, *, map_name: str, trigger: str) -> None:
-        """探索任务先标记 succeeded，地图版本保存放到后台，避免阻塞 get_task_status。"""
+        """探索任务先标记 succeeded，地图资产发布放到后台，避免阻塞 get_task_status。"""
 
         def _run_finalize() -> None:
             try:
@@ -12690,7 +12889,7 @@ class GatewayRuntime:
                 self._finalize_workspace_assets_after_task(map_name=map_name, trigger=trigger)
             except Exception:
                 RUNTIME_LOGGER.exception(
-                    "探索任务后台保存地图版本失败 map_name=%s trigger=%s",
+                    "探索任务后台发布地图资产失败 map_name=%s trigger=%s",
                     map_name,
                     trigger,
                 )
@@ -12737,23 +12936,23 @@ class GatewayRuntime:
         *,
         map_name: Optional[str],
         trigger: str,
-        ) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         if not map_name:
             return {}
         self._refresh_workspace_snapshots()
-        saved_map_version = None
+        finalized_map_asset = None
         if trigger.startswith("explore"):
-            saved_map_version = self._maybe_save_map_version_after_exploration(
+            finalized_map_asset = self._maybe_finalize_map_after_exploration(
                 map_name=map_name,
                 trigger=trigger,
             )
         active_workspace = self.map_workspace_service.get_active_workspace()
         return {
             "active_workspace": active_workspace,
-            "saved_map_version": saved_map_version,
+            "finalized_map_asset": finalized_map_asset,
         }
 
-    def _maybe_save_map_version_after_exploration(
+    def _maybe_finalize_map_after_exploration(
         self,
         *,
         map_name: str,
@@ -12764,60 +12963,38 @@ class GatewayRuntime:
             return None
         if active_workspace.latest_map_snapshot is None:
             return None
-        if not self._exploration_snapshot_matches_active_map_version(active_workspace):
+        map_asset = getattr(active_workspace, "map_asset", None)
+        if bool(getattr(map_asset, "finalized", False)):
+            return None
+        if not self._exploration_snapshot_matches_active_map(active_workspace):
             RUNTIME_LOGGER.warning(
-                "跳过探索后自动保存地图版本：live 地图快照未绑定当前激活版本 map_name=%s trigger=%s",
+                "跳过探索后自动完成地图：live 地图快照不属于当前激活地图 map_name=%s trigger=%s",
                 map_name,
                 trigger,
             )
             return None
         try:
-            return self.map_workspace_service.save_map_version(
+            return self.map_workspace_service.finalize_active_map(
                 map_name=map_name,
                 reason=trigger,
                 metadata={"source": "task_finalize"},
             )
         except Exception:
-            RUNTIME_LOGGER.exception("探索任务结束后自动保存平台地图版本失败 map_name=%s trigger=%s", map_name, trigger)
+            RUNTIME_LOGGER.exception("探索任务结束后自动完成地图失败 map_name=%s trigger=%s", map_name, trigger)
             return None
 
-    def _exploration_snapshot_matches_active_map_version(self, active_workspace) -> bool:
-        map_asset = getattr(active_workspace, "map_asset", None)
-        expected_version_id = str(getattr(map_asset, "latest_version_id", "") or "").strip()
-        if not expected_version_id:
-            return True
+    def _exploration_snapshot_matches_active_map(self, active_workspace) -> bool:
         snapshot = getattr(active_workspace, "latest_map_snapshot", None)
         if snapshot is None:
             return False
         metadata = dict(getattr(snapshot, "metadata", {}) or {})
-        live_snapshot = bool(
-            metadata.get("map_snapshot_kind") == "live_streaming"
-            or metadata.get("source_kind") == "platform_live_map_provider"
-            or metadata.get("live_streaming_ready")
-            or metadata.get("mapping_live_streaming_ready")
-        )
-        if not live_snapshot:
-            return True
-        if expected_version_id not in {
-            str(getattr(snapshot, "version_id", "") or ""),
-            str(metadata.get("seed_map_version_id") or ""),
-            str(metadata.get("platform_map_version_id") or ""),
-        }:
-            return False
-        versions = self.map_workspace_service.list_map_versions(map_name=active_workspace.active_map_name, limit=1)
-        if not versions:
-            return True
-        return not self._live_snapshot_under_covers_saved_version(snapshot, versions[0])
-
-    def _live_snapshot_under_covers_saved_version(self, snapshot, version) -> bool:
-        if getattr(version.snapshot, "occupancy_grid", None) is None:
-            return False
-        metadata = dict(getattr(snapshot, "metadata", {}) or {})
-        live_known_cells = self._metadata_known_cell_count(metadata)
-        if live_known_cells is None:
-            live_known_cells = self._occupancy_known_cell_count(getattr(snapshot, "occupancy_grid", None))
-        seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
-        return seed_known_cells is not None and (live_known_cells is None or live_known_cells < seed_known_cells)
+        snapshot_map_name = str(
+            getattr(snapshot, "map_name", "")
+            or metadata.get("map_name")
+            or metadata.get("active_map_name")
+            or ""
+        ).strip()
+        return not snapshot_map_name or snapshot_map_name == active_workspace.active_map_name
 
     def _metadata_known_cell_count(self, metadata: Dict[str, object]) -> Optional[int]:
         occupancy_metrics = metadata.get("occupancy_metrics")
@@ -12931,11 +13108,7 @@ class GatewayRuntime:
                 lambda: True,
                 None,
             ),
-            "list_map_versions": (
-                lambda: True,
-                None,
-            ),
-            "save_active_map_version": (
+            "finalize_active_map": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),
@@ -12950,10 +13123,6 @@ class GatewayRuntime:
             "stop_exploration": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
-            ),
-            "load_map_version": (
-                lambda: True,
-                None,
             ),
             "list_memory_libraries": (
                 lambda: True,

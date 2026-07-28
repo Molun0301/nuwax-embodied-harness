@@ -26,7 +26,6 @@ _REQUEST_CONTEXT_METADATA_KEYS = (
     "rpc_request_id",
     "mcp_method",
     "tool_name",
-    "map_version_id",
     "localization_session_id",
     "map_name",
     "camera_id",

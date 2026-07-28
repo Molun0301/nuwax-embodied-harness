@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     BBox, CameraIntrinsics, DetectionNavigation, DetectionNavigationConfig, ImageView,
-    PointCloud2Like, TfLike, Twist,
+    PointCloud2Like, TfLike, Twist, VisualServoingError,
 };
 
 const POINT_FIELD_FLOAT32: u8 = 7;
@@ -18,7 +18,7 @@ const POINT_FIELD_FLOAT64: u8 = 8;
 pub struct PersonFollowConfig {
     /// Fixed control frequency. The original owner uses 20 Hz.
     pub control_frequency_hz: u32,
-    /// Consecutive lost frames tolerated before ending a session.
+    /// Legacy compatibility setting; V2 LOST inputs are terminal immediately.
     pub max_lost_frames: u32,
     /// Maximum age of a tracked bbox before it counts as a lost frame.
     pub target_stale_after: Duration,
@@ -29,7 +29,7 @@ impl Default for PersonFollowConfig {
         Self {
             control_frequency_hz: 20,
             max_lost_frames: 15,
-            target_stale_after: Duration::from_millis(100),
+            target_stale_after: Duration::from_secs(1),
         }
     }
 }
@@ -68,18 +68,24 @@ pub struct TrackedPerson {
     pub state: TrackingState,
 }
 
+/// Exact source timestamp used for ordering and command correlation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TargetStamp {
+    /// Whole seconds.
+    pub sec: i64,
+    /// Nanoseconds within the second.
+    pub nsec: u32,
+}
+
 /// Observable result of one control tick.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PersonFollowState {
+    /// A target is accepted, but its cloud or TF inputs are not ready yet.
+    WaitingData,
     /// A valid 3D command was produced.
     Tracking,
-    /// Target is absent or stale; zero is emitted immediately.
-    Lost {
-        /// Number of consecutive lost control ticks.
-        frames: u32,
-        /// True after the original `lost_count > 15` boundary is crossed.
-        terminal: bool,
-    },
+    /// Target is absent or stale and the session has ended.
+    Lost,
     /// Session was explicitly stopped.
     Stopped,
     /// A typed input, pointcloud, TF, or projection error ended the session.
@@ -89,10 +95,22 @@ pub enum PersonFollowState {
 /// Command and lifecycle state emitted by one active control tick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersonFollowOutput {
-    /// Command routed to `nav_cmd_vel` by the production owner.
+    /// Stable follow session identifier.
+    pub session_id: String,
+    /// Exact target sequence consumed by this command.
+    pub target_seq: i64,
+    /// Exact target image timestamp.
+    pub target_stamp: TargetStamp,
+    /// Strictly increasing owner-lifetime command sequence.
+    pub command_seq: i64,
+    /// Actual latest point-cloud revision observed by the controller.
+    pub cloud_revision: i64,
+    /// Planar command routed to the Gateway ingress.
     pub command: Twist,
     /// State associated with the command.
     pub state: PersonFollowState,
+    /// Bounded human-readable state detail.
+    pub reason: String,
 }
 
 /// Errors rejected before a controller can start.
@@ -110,6 +128,7 @@ pub enum PersonFollowError {
 #[derive(Debug, Clone)]
 pub struct PackedPointCloud {
     frame_id: String,
+    revision: i64,
     xyz: Vec<[f64; 3]>,
     packed_xyz: Vec<u8>,
     is_dense: bool,
@@ -119,6 +138,16 @@ impl PackedPointCloud {
     /// Construct a packed cloud from decoded XYZ points.
     #[must_use]
     pub fn from_xyz(frame_id: impl Into<String>, xyz: Vec<[f64; 3]>) -> Self {
+        Self::from_xyz_with_revision(frame_id, 1, xyz)
+    }
+
+    /// Construct a packed cloud with an explicit positive map revision.
+    #[must_use]
+    pub fn from_xyz_with_revision(
+        frame_id: impl Into<String>,
+        revision: i64,
+        xyz: Vec<[f64; 3]>,
+    ) -> Self {
         let frame_id = frame_id.into();
         let packed_xyz = pack_xyz(&xyz);
         let is_dense = xyz
@@ -127,6 +156,7 @@ impl PackedPointCloud {
             .all(|coordinate| coordinate.is_finite());
         Self {
             frame_id,
+            revision,
             xyz,
             packed_xyz,
             is_dense,
@@ -138,6 +168,12 @@ impl PackedPointCloud {
         if message.header.frame_id.is_empty() {
             return Err(PersonFollowError::InvalidPointCloud(
                 "header.frame_id is empty".into(),
+            ));
+        }
+        let revision = i64::from(message.header.seq);
+        if revision <= 0 {
+            return Err(PersonFollowError::InvalidPointCloud(
+                "header.seq cloud revision must be positive".into(),
             ));
         }
         let width = positive_dimension(message.width, "width")?;
@@ -179,6 +215,7 @@ impl PackedPointCloud {
         let packed_xyz = pack_xyz(&xyz);
         Ok(Self {
             frame_id: message.header.frame_id.clone(),
+            revision,
             xyz,
             packed_xyz,
             is_dense: message.is_dense,
@@ -195,6 +232,12 @@ impl PackedPointCloud {
     #[must_use]
     pub fn xyz(&self) -> &[[f64; 3]] {
         &self.xyz
+    }
+
+    /// Monotonic map revision from `PointCloud2.header.seq`.
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        self.revision
     }
 }
 
@@ -302,6 +345,9 @@ fn pack_xyz(xyz: &[[f64; 3]]) -> Vec<u8> {
 #[derive(Debug, Clone)]
 struct TimedTarget {
     target: TrackedPerson,
+    target_seq: i64,
+    required_cloud_revision: i64,
+    stamp: TargetStamp,
     received_at: Duration,
 }
 
@@ -312,7 +358,12 @@ pub struct PersonFollowController {
     target: Option<TimedTarget>,
     pointcloud: Option<PackedPointCloud>,
     active: bool,
-    lost_frames: u32,
+    accepted_any: bool,
+    last_session_id: Option<String>,
+    last_target_seq: i64,
+    last_stamp: Option<TargetStamp>,
+    last_tracking_state: Option<TrackingState>,
+    command_seq: i64,
 }
 
 impl PersonFollowController {
@@ -338,7 +389,12 @@ impl PersonFollowController {
             target: None,
             pointcloud: None,
             active: false,
-            lost_frames: 0,
+            accepted_any: false,
+            last_session_id: None,
+            last_target_seq: 0,
+            last_stamp: None,
+            last_tracking_state: None,
+            command_seq: 0,
         })
     }
 
@@ -353,16 +409,75 @@ impl PersonFollowController {
         self.pointcloud = Some(pointcloud);
     }
 
-    /// Replace the latest tracker update and arm its session.
+    /// Compatibility adapter for in-process callers without V2 correlation metadata.
     pub fn update_target(&mut self, target: TrackedPerson, received_at: Duration) {
-        if target.state == TrackingState::Tracked {
-            self.lost_frames = 0;
+        let target_seq = self.last_target_seq.saturating_add(1).max(1);
+        let sec = target.image_timestamp.floor() as i64;
+        let nsec = ((target.image_timestamp - sec as f64) * 1e9).round() as u32;
+        let _ = self.accept_target(
+            target,
+            target_seq,
+            1,
+            TargetStamp { sec, nsec },
+            received_at,
+        );
+    }
+
+    /// Validate strict V2 ordering and arm an accepted target.
+    pub fn accept_target(
+        &mut self,
+        target: TrackedPerson,
+        target_seq: i64,
+        required_cloud_revision: i64,
+        stamp: TargetStamp,
+        received_at: Duration,
+    ) -> Result<bool, PersonFollowError> {
+        if target_seq <= 0 || required_cloud_revision <= 0 {
+            return Err(PersonFollowError::InvalidConfig(
+                "target_seq and required_cloud_revision must be positive".into(),
+            ));
         }
+        validate_target(&target).map_err(PersonFollowError::InvalidConfig)?;
+
+        if let Some(last_session_id) = self.last_session_id.as_deref() {
+            if target.session_id != last_session_id {
+                if self.active {
+                    return Ok(false);
+                }
+            } else {
+                if self.active && self.last_tracking_state == Some(TrackingState::Stop) {
+                    return Ok(false);
+                }
+                if target_seq <= self.last_target_seq {
+                    return Ok(false);
+                }
+                let last_stamp = self.last_stamp.expect("session has an exact stamp");
+                let same_stamp_transition = stamp == last_stamp
+                    && matches!(
+                        (self.last_tracking_state, target.state),
+                        (Some(TrackingState::Tracked), TrackingState::Stop)
+                            | (Some(TrackingState::Stop), TrackingState::Tracked)
+                    );
+                if stamp < last_stamp || (stamp == last_stamp && !same_stamp_transition) {
+                    return Ok(false);
+                }
+            }
+        }
+
         self.active = true;
+        self.accepted_any = true;
+        self.last_session_id = Some(target.session_id.clone());
+        self.last_target_seq = target_seq;
+        self.last_stamp = Some(stamp);
+        self.last_tracking_state = Some(target.state);
         self.target = Some(TimedTarget {
             target,
+            target_seq,
+            required_cloud_revision,
+            stamp,
             received_at,
         });
+        Ok(true)
     }
 
     /// Run one active control tick. Idle owners emit nothing.
@@ -372,29 +487,72 @@ impl PersonFollowController {
         }
         let timed = self.target.clone()?;
         match timed.target.state {
-            TrackingState::Stop => return Some(self.terminal(PersonFollowState::Stopped)),
-            TrackingState::Lost => return Some(self.lost()),
+            TrackingState::Stop => {
+                return Some(self.emit(
+                    &timed,
+                    PersonFollowState::Stopped,
+                    "target stopped",
+                    None,
+                    true,
+                ));
+            }
+            TrackingState::Lost => {
+                return Some(self.emit(&timed, PersonFollowState::Lost, "target lost", None, true));
+            }
             TrackingState::Tracked => {}
         }
-        if now.saturating_sub(timed.received_at) > self.config.target_stale_after {
-            return Some(self.lost());
+        if now.saturating_sub(timed.received_at) >= self.config.target_stale_after {
+            return Some(self.emit(&timed, PersonFollowState::Lost, "target stale", None, true));
+        }
+        let Some(pointcloud) = self.pointcloud.as_ref() else {
+            return Some(self.emit(
+                &timed,
+                PersonFollowState::WaitingData,
+                "waiting for pointcloud",
+                None,
+                false,
+            ));
+        };
+        if pointcloud.revision() < timed.required_cloud_revision {
+            return Some(self.emit(
+                &timed,
+                PersonFollowState::WaitingData,
+                "waiting for required pointcloud revision",
+                None,
+                false,
+            ));
         }
         let result = self.compute_command(&timed.target);
         Some(match result {
-            Ok(command) => PersonFollowOutput {
-                command,
-                state: PersonFollowState::Tracking,
-            },
-            Err(reason) => self.terminal(PersonFollowState::Failed(reason)),
+            Ok(command) => self.emit(
+                &timed,
+                PersonFollowState::Tracking,
+                "tracking",
+                Some(command),
+                false,
+            ),
+            Err(VisualServoingError::MissingTf(_)) => self.emit(
+                &timed,
+                PersonFollowState::WaitingData,
+                "waiting for transform",
+                None,
+                false,
+            ),
+            Err(error) => self.emit(
+                &timed,
+                PersonFollowState::Failed(error.to_string()),
+                &error.to_string(),
+                None,
+                true,
+            ),
         })
     }
 
-    fn compute_command(&self, target: &TrackedPerson) -> Result<Twist, String> {
-        validate_target(target)?;
+    fn compute_command(&self, target: &TrackedPerson) -> Result<Twist, VisualServoingError> {
         let pointcloud = self
             .pointcloud
             .as_ref()
-            .ok_or_else(|| "no pointcloud available for 3D navigation".to_string())?;
+            .expect("tick checks pointcloud availability");
         let image = ImageView {
             width: target.image_width,
             height: target.image_height,
@@ -412,35 +570,94 @@ impl PersonFollowController {
                 Some(target.image_timestamp),
             )
             .map(|command| Twist {
-                linear: command.linear,
-                angular: command.angular,
+                linear: [command.linear[0], command.linear[1], 0.0],
+                angular: [0.0, 0.0, command.angular[2]],
             })
-            .map_err(|error| error.to_string())
+            .and_then(|command| {
+                command
+                    .linear
+                    .into_iter()
+                    .chain(command.angular)
+                    .all(f64::is_finite)
+                    .then_some(command)
+                    .ok_or_else(|| {
+                        VisualServoingError::ProjectionFailed(
+                            "computed command contains non-finite values".into(),
+                        )
+                    })
+            })
     }
 
-    fn lost(&mut self) -> PersonFollowOutput {
-        self.lost_frames = self.lost_frames.saturating_add(1);
-        let terminal = self.lost_frames > self.config.max_lost_frames;
+    fn emit(
+        &mut self,
+        target: &TimedTarget,
+        state: PersonFollowState,
+        reason: &str,
+        command: Option<Twist>,
+        terminal: bool,
+    ) -> PersonFollowOutput {
+        self.command_seq = self
+            .command_seq
+            .checked_add(1)
+            .expect("command sequence exhausted");
         if terminal {
             self.active = false;
         }
         PersonFollowOutput {
-            command: Twist::zero(),
-            state: PersonFollowState::Lost {
-                frames: self.lost_frames,
-                terminal,
-            },
+            session_id: target.target.session_id.clone(),
+            target_seq: target.target_seq,
+            target_stamp: target.stamp,
+            command_seq: self.command_seq,
+            cloud_revision: self
+                .pointcloud
+                .as_ref()
+                .map_or(0, PackedPointCloud::revision),
+            command: command.unwrap_or_else(Twist::zero),
+            state,
+            reason: bounded_reason(reason),
         }
     }
 
-    fn terminal(&mut self, state: PersonFollowState) -> PersonFollowOutput {
-        self.active = false;
-        self.lost_frames = 0;
-        PersonFollowOutput {
-            command: Twist::zero(),
-            state,
+    /// Emit exactly one correlated terminal zero during owner teardown.
+    pub fn teardown(&mut self) -> Option<PersonFollowOutput> {
+        if !self.accepted_any {
+            return None;
         }
+        self.accepted_any = false;
+        let target = self.target.clone()?;
+        Some(self.emit(
+            &target,
+            PersonFollowState::Stopped,
+            "owner teardown",
+            None,
+            true,
+        ))
     }
+
+    /// End an accepted active session after malformed runtime input or computation failure.
+    pub fn fail_active(&mut self, reason: impl Into<String>) -> Option<PersonFollowOutput> {
+        if !self.active {
+            return None;
+        }
+        let target = self.target.clone()?;
+        let reason = reason.into();
+        Some(self.emit(
+            &target,
+            PersonFollowState::Failed(reason.clone()),
+            &reason,
+            None,
+            true,
+        ))
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    const MAX_REASON_BYTES: usize = 255;
+    let mut end = reason.len().min(MAX_REASON_BYTES);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
 }
 
 fn validate_target(target: &TrackedPerson) -> Result<(), String> {
@@ -453,16 +670,294 @@ fn validate_target(target: &TrackedPerson) -> Result<(), String> {
     if !target.image_timestamp.is_finite() || target.image_timestamp < 0.0 {
         return Err("image timestamp is invalid".into());
     }
-    if target.image_width != target.intrinsics.width
-        || target.image_height != target.intrinsics.height
-    {
-        return Err("image dimensions do not match camera intrinsics".into());
-    }
-    if !target.intrinsics.is_valid() {
-        return Err("camera intrinsics are invalid".into());
-    }
-    if !target.bbox.is_valid() {
-        return Err("bbox is invalid".into());
+    if target.state == TrackingState::Tracked {
+        if target.image_width != target.intrinsics.width
+            || target.image_height != target.intrinsics.height
+        {
+            return Err("image dimensions do not match camera intrinsics".into());
+        }
+        if !target.intrinsics.is_valid() {
+            return Err("camera intrinsics are invalid".into());
+        }
+        if !target.bbox.is_valid() {
+            return Err("bbox is invalid".into());
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PoseStamped;
+
+    struct ReadyTf;
+
+    impl TfLike for ReadyTf {
+        fn lookup(&self, target_frame: &str, source_frame: &str) -> Option<PoseStamped> {
+            match (target_frame, source_frame) {
+                ("camera", "map") => Some(PoseStamped::identity("camera", 0.0, 0.0, 0.0)),
+                ("map", "base_link") => Some(PoseStamped::identity("map", 0.0, 0.0, 0.0)),
+                _ => None,
+            }
+        }
+    }
+
+    struct MissingTf;
+
+    impl TfLike for MissingTf {
+        fn lookup(&self, _target_frame: &str, _source_frame: &str) -> Option<PoseStamped> {
+            None
+        }
+    }
+
+    fn controller(tf: Box<dyn TfLike>) -> PersonFollowController {
+        PersonFollowController::new(
+            tf,
+            DetectionNavigationConfig::default(),
+            PersonFollowConfig::default(),
+        )
+        .expect("controller")
+    }
+
+    fn target(session_id: &str, state: TrackingState) -> TrackedPerson {
+        TrackedPerson {
+            session_id: session_id.into(),
+            query: "person".into(),
+            image_timestamp: 10.000_000_001,
+            camera_frame: "camera".into(),
+            image_width: 640,
+            image_height: 480,
+            intrinsics: CameraIntrinsics::new(100.0, 100.0, 320.0, 240.0, 640, 480),
+            bbox: BBox::new(400.0, 220.0, 440.0, 260.0),
+            state,
+        }
+    }
+
+    fn stamp(nsec: u32) -> TargetStamp {
+        TargetStamp { sec: 10, nsec }
+    }
+
+    fn cloud(revision: i64) -> PackedPointCloud {
+        PackedPointCloud::from_xyz_with_revision("map", revision, vec![[3.0, 0.0, 3.0]; 12])
+    }
+
+    #[test]
+    fn defaults_lock_twenty_hz_and_one_second_staleness() {
+        let config = PersonFollowConfig::default();
+        assert_eq!(config.control_frequency_hz, 20);
+        assert_eq!(config.target_stale_after, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn missing_and_old_clouds_wait_without_ending_session() {
+        let mut controller = controller(Box::new(ReadyTf));
+        assert!(controller
+            .accept_target(
+                target("s", TrackingState::Tracked),
+                1,
+                2,
+                stamp(1),
+                Duration::ZERO
+            )
+            .expect("target accepted"));
+
+        let missing = controller.tick(Duration::ZERO).expect("waiting command");
+        assert_eq!(missing.state, PersonFollowState::WaitingData);
+        assert_eq!(missing.cloud_revision, 0);
+        assert_eq!(missing.command, Twist::zero());
+
+        controller.update_pointcloud(cloud(1));
+        let old = controller
+            .tick(Duration::from_millis(50))
+            .expect("waiting command");
+        assert_eq!(old.state, PersonFollowState::WaitingData);
+        assert_eq!(old.cloud_revision, 1);
+
+        controller.update_pointcloud(cloud(2));
+        let tracking = controller
+            .tick(Duration::from_millis(100))
+            .expect("tracking command");
+        assert_eq!(tracking.state, PersonFollowState::Tracking);
+        assert_eq!(tracking.cloud_revision, 2);
+        assert_eq!(tracking.command_seq, 3);
+        assert_eq!(tracking.command.linear[2], 0.0);
+        assert_eq!(tracking.command.angular[0..2], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn missing_tf_waits_and_preserves_exact_correlation() {
+        let mut controller = controller(Box::new(MissingTf));
+        controller.update_pointcloud(cloud(7));
+        controller
+            .accept_target(
+                target("session", TrackingState::Tracked),
+                9,
+                7,
+                stamp(3),
+                Duration::ZERO,
+            )
+            .expect("target accepted");
+
+        let output = controller
+            .tick(Duration::from_millis(50))
+            .expect("waiting command");
+        assert_eq!(output.state, PersonFollowState::WaitingData);
+        assert_eq!(output.session_id, "session");
+        assert_eq!(output.target_seq, 9);
+        assert_eq!(output.target_stamp, stamp(3));
+        assert_eq!(output.command_seq, 1);
+        assert_eq!(output.command, Twist::zero());
+    }
+
+    #[test]
+    fn duplicate_target_does_not_refresh_one_second_watchdog() {
+        let mut controller = controller(Box::new(MissingTf));
+        controller
+            .accept_target(
+                target("s", TrackingState::Tracked),
+                1,
+                1,
+                stamp(1),
+                Duration::ZERO,
+            )
+            .expect("target accepted");
+        assert!(!controller
+            .accept_target(
+                target("s", TrackingState::Tracked),
+                1,
+                1,
+                stamp(1),
+                Duration::from_millis(900),
+            )
+            .expect("duplicate rejected"));
+
+        let output = controller
+            .tick(Duration::from_secs(1))
+            .expect("stale command");
+        assert_eq!(output.state, PersonFollowState::Lost);
+        assert_eq!(output.command, Twist::zero());
+        assert!(controller.tick(Duration::from_millis(1050)).is_none());
+    }
+
+    #[test]
+    fn ordering_and_completed_session_switches_are_strict() {
+        let mut controller = controller(Box::new(MissingTf));
+        controller
+            .accept_target(
+                target("a", TrackingState::Tracked),
+                1,
+                1,
+                stamp(1),
+                Duration::ZERO,
+            )
+            .expect("initial target");
+        assert!(!controller
+            .accept_target(
+                target("b", TrackingState::Tracked),
+                1,
+                1,
+                stamp(2),
+                Duration::ZERO
+            )
+            .expect("active session switch rejected"));
+        assert!(!controller
+            .accept_target(
+                target("a", TrackingState::Tracked),
+                2,
+                1,
+                stamp(1),
+                Duration::ZERO
+            )
+            .expect("equal stamp rejected"));
+
+        assert!(controller
+            .accept_target(
+                target("a", TrackingState::Stop),
+                2,
+                1,
+                stamp(1),
+                Duration::ZERO
+            )
+            .expect("same-stamp stop accepted"));
+        assert!(!controller
+            .accept_target(
+                target("a", TrackingState::Tracked),
+                3,
+                1,
+                stamp(1),
+                Duration::ZERO
+            )
+            .expect("stop must be observed"));
+        assert_eq!(
+            controller.tick(Duration::ZERO).expect("stop command").state,
+            PersonFollowState::Stopped
+        );
+        assert!(controller
+            .accept_target(
+                target("a", TrackingState::Tracked),
+                3,
+                1,
+                stamp(1),
+                Duration::ZERO
+            )
+            .expect("same-stamp restart accepted"));
+        assert!(!controller
+            .accept_target(
+                target("a", TrackingState::Tracked),
+                4,
+                1,
+                stamp(0),
+                Duration::ZERO
+            )
+            .expect("older exact stamp rejected"));
+    }
+
+    #[test]
+    fn teardown_is_correlated_once_and_command_sequence_continues() {
+        let mut idle = controller(Box::new(MissingTf));
+        assert!(idle.teardown().is_none());
+
+        let mut controller = controller(Box::new(MissingTf));
+        controller
+            .accept_target(
+                target("s", TrackingState::Tracked),
+                4,
+                1,
+                stamp(8),
+                Duration::ZERO,
+            )
+            .expect("target accepted");
+        let waiting = controller.tick(Duration::ZERO).expect("waiting command");
+        let terminal = controller.teardown().expect("terminal command");
+        assert_eq!(terminal.state, PersonFollowState::Stopped);
+        assert_eq!(terminal.session_id, "s");
+        assert_eq!(terminal.target_seq, 4);
+        assert_eq!(terminal.target_stamp, stamp(8));
+        assert_eq!(terminal.command_seq, waiting.command_seq + 1);
+        assert_eq!(terminal.command, Twist::zero());
+        assert!(controller.teardown().is_none());
+    }
+
+    #[test]
+    fn malformed_runtime_input_fails_only_an_accepted_active_session() {
+        let mut controller = controller(Box::new(MissingTf));
+        assert!(controller.fail_active("bad cloud").is_none());
+        controller
+            .accept_target(
+                target("session", TrackingState::Tracked),
+                11,
+                3,
+                stamp(9),
+                Duration::ZERO,
+            )
+            .expect("target accepted");
+
+        let failed = controller.fail_active("bad cloud").expect("failed command");
+        assert_eq!(failed.state, PersonFollowState::Failed("bad cloud".into()));
+        assert_eq!(failed.session_id, "session");
+        assert_eq!(failed.target_seq, 11);
+        assert_eq!(failed.command, Twist::zero());
+        assert!(controller.tick(Duration::ZERO).is_none());
+    }
 }

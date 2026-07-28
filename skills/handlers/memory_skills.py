@@ -88,7 +88,7 @@ def _build_memory_payload_filter(payload: Dict[str, Any]) -> Optional[MemoryPayl
             orientation=Quaternion(w=1.0),
         )
     filter_payload = MemoryPayloadFilter(
-        map_version_id=params.optional_str(payload, "map_version_id"),
+        map_name=params.optional_str(payload, "map_name"),
         localization_session_id=params.optional_str(payload, "localization_session_id"),
         linked_location_id=params.optional_str(payload, "linked_location_id"),
         camera_ids=[params.optional_str(payload, "camera_id")] if params.optional_str(payload, "camera_id") else [],
@@ -105,7 +105,7 @@ def _build_memory_payload_filter(payload: Dict[str, Any]) -> Optional[MemoryPayl
     )
     has_filter = any(
         [
-            filter_payload.map_version_id,
+            filter_payload.map_name,
             filter_payload.localization_session_id,
             filter_payload.linked_location_id,
             filter_payload.camera_ids,
@@ -173,7 +173,7 @@ def handle_enable_memory_library(
             load_memory_history=bool(payload.get("load_history", True)),
             reset_memory_library=bool(payload.get("reset_library", False)),
             metadata={"requested_by": requested_by or "unknown", "source": "enable_memory_library"},
-            load_latest_version=False,
+            load_current_bundle=False,
         )
         compatibility_mode = "map_workspace"
     else:
@@ -337,7 +337,7 @@ def handle_list_scene_spaces(
             limit=max(1, params.optional_int(payload, "limit", 20)),
             payload_filter=payload_filter,
             scene_space_ids=_scene_space_ids_from_arguments(payload) or None,
-            map_version_id=params.optional_str(payload, "map_version_id"),
+            map_name=params.optional_str(payload, "map_name"),
             localization_session_id=params.optional_str(payload, "localization_session_id"),
             review_statuses=_review_statuses_from_arguments(payload) or None,
         ),

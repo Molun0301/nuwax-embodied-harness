@@ -600,7 +600,6 @@ class RuntimeDataConfig:
     observation_history_limit: int = 100
     perception_history_limit: int = 100
     localization_history_limit: int = 100
-    map_history_limit: int = 100
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
     map_catalog_root: str = ""
@@ -917,7 +916,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             mapping_crate=_cfg_str("NUWAX_MAPPING_CRATE", "nuwax-mapping"),
             occupancy_projection=_cfg_str("NUWAX_MAPPING_OCCUPANCY_PROJECTION", "projected_occupancy"),
             input_contract=_cfg_str("NUWAX_MAPPING_INPUT_CONTRACT", "platform_geometry_inputs"),
-            output_contract=_cfg_str("NUWAX_MAPPING_OUTPUT_CONTRACT", "platform_map_version_geometry_asset"),
+            output_contract=_cfg_str("NUWAX_MAPPING_OUTPUT_CONTRACT", "map_asset_bundle_geometry_asset"),
             timestamp_quality=GeometryTimestampQualityConfig(
                 source=_cfg_str("NUWAX_GEOMETRY_TIMESTAMP_SOURCE", "sensor_header"),
                 max_point_cloud_age_sec=max(0.0, _cfg_float("NUWAX_GEOMETRY_POINT_CLOUD_MAX_AGE_SEC", 0.5)),
@@ -1132,7 +1131,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         observation_history_limit=max(1, _cfg_int("NUWAX_OBSERVATION_HISTORY_LIMIT", 100)),
         perception_history_limit=max(1, _cfg_int("NUWAX_PERCEPTION_HISTORY_LIMIT", 100)),
         localization_history_limit=max(1, _cfg_int("NUWAX_LOCALIZATION_HISTORY_LIMIT", 100)),
-        map_history_limit=max(1, _cfg_int("NUWAX_MAP_HISTORY_LIMIT", 100)),
         navigation_history_limit=max(1, _cfg_int("NUWAX_NAVIGATION_HISTORY_LIMIT", 100)),
         memory_history_limit=max(1, _cfg_int("NUWAX_MEMORY_HISTORY_LIMIT", 200)),
         map_catalog_root=_cfg_str(

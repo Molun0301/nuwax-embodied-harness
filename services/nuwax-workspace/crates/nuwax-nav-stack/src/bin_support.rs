@@ -245,10 +245,7 @@ where
         return Ok(());
     }
 
-    if !matches!(
-        opts.profile,
-        NavStackProfile::Simple2D | NavStackProfile::ReplanningAStar
-    ) {
+    if !builder.manifest().activation.is_production_guarded() {
         return Err(crate::error::NavStackError::invalid(format!(
             "profile `{}` is not connected to the production guard-backed execution path; use --dry-run for graph inspection",
             opts.profile.as_str()
@@ -520,6 +517,23 @@ mod tests {
                 .await
                 .expect_err("unqualified production profile");
             assert!(error.to_string().contains("guard-backed execution path"));
+        }
+    }
+
+    #[test]
+    fn cli_production_admission_comes_from_profile_manifest() {
+        for profile in NavStackProfile::all() {
+            let builder =
+                NavStackBuilder::new(*profile).topics(NavTopicConfig::geometry_runtime_defaults());
+            let admitted = builder.manifest().activation.is_production_guarded();
+            assert_eq!(
+                admitted,
+                matches!(
+                    profile,
+                    NavStackProfile::Simple2D | NavStackProfile::ReplanningAStar
+                ),
+                "{profile}"
+            );
         }
     }
 

@@ -765,11 +765,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         return _stream_migration_response('map.frame')
 
-    @router.get("/api/maps/history")
-    async def api_maps_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
-        return _stream_migration_response('map.frame')
-
     @router.get("/api/maps/catalog")
     async def api_maps_catalog(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
@@ -847,60 +842,22 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
         }
 
-    @router.get("/api/maps/catalog/{map_name}/versions")
-    async def api_map_versions(
-        map_name: str,
-        request: Request,
-        limit: int = 20,
-    ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
-        return {
-            "map_versions": to_jsonable(
-                runtime.map_workspace_service.list_map_versions(
-                    map_name=map_name,
-                    limit=limit,
-                )
-            )
-        }
-
-    @router.post("/api/maps/versions/save")
-    async def api_map_versions_save(request: Request) -> Dict[str, Any]:
+    @router.post("/api/maps/finalize")
+    async def api_maps_finalize(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        map_version = await run_in_threadpool(
-            lambda: runtime.map_workspace_service.save_map_version(
+        map_asset_bundle = await run_in_threadpool(
+            lambda: runtime.map_workspace_service.finalize_active_map(
                 map_name=str(payload.get("map_name", "")).strip() or None,
                 reason=str(payload.get("reason", "")).strip(),
                 metadata={"requested_by": "http_api"},
             )
         )
         return {
-            "map_version": to_jsonable(map_version),
+            "map_asset_bundle": to_jsonable(map_asset_bundle),
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-        }
-
-    @router.post("/api/maps/versions/load")
-    async def api_map_versions_load(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            payload = {}
-        map_name = str(payload.get("map_name", "")).strip()
-        map_version, workspace = await run_in_threadpool(
-            lambda: runtime.map_workspace_service.load_map_version(
-                map_name=map_name,
-                version_id=str(payload.get("version_id", "")).strip() or None,
-                activate_if_needed=True,
-                load_memory_history=bool(payload.get("load_memory_history", True)),
-                reset_memory_library=bool(payload.get("reset_memory_library", False)),
-                metadata={"requested_by": "http_api", "source": "http_api_load_map_version"},
-            )
-        )
-        return {
-            "map_version": to_jsonable(map_version),
-            "active_workspace": to_jsonable(workspace),
         }
 
     @router.get("/api/navigation/latest")
@@ -912,14 +869,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_forbidden_zones_get(
         request: Request,
         map_name: Optional[str] = None,
-        map_version_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         try:
             envelope = await run_in_threadpool(
                 runtime.navigation_service.list_forbidden_zones,
                 map_name=map_name,
-                map_version_id=map_version_id,
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
@@ -935,7 +890,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             envelope = await run_in_threadpool(
                 runtime.navigation_service.replace_forbidden_zones,
                 map_name=body.map_name,
-                map_version_id=body.map_version_id,
                 zones=body.zones,
                 expected_generation=body.expected_generation,
             )
@@ -1192,7 +1146,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         limit: int = 20,
         scene_space_id: Optional[str] = None,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_status: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -1200,7 +1154,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         arguments: Dict[str, Any] = {"limit": limit}
         for key, value in {
             "scene_space_id": scene_space_id,
-            "map_version_id": map_version_id,
+            "map_name": map_name,
             "localization_session_id": localization_session_id,
             "review_status": review_status,
         }.items():
@@ -1214,7 +1168,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         query: str,
         limit: int = 5,
         similarity_threshold: float = 0.25,
-        map_version_id: Optional[str] = None,
+        map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_status: Optional[str] = None,
         max_distance_m: Optional[float] = None,
@@ -1226,7 +1180,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "similarity_threshold": similarity_threshold,
         }
         for key, value in {
-            "map_version_id": map_version_id,
+            "map_name": map_name,
             "localization_session_id": localization_session_id,
             "review_status": review_status,
             "max_distance_m": max_distance_m,

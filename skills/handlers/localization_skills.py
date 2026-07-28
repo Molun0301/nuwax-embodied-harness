@@ -5,7 +5,7 @@ ctx: SkillContext，函数体内原 self.xxx 重写为 ctx.xxx，原 self._requi
 _optional_str / _int 等校验助手改用 skills.common.params 的纯函数。行为与抛错条件与
 迁移前完全一致。
 
-编排型 handler（relocalize_active_map / activate_map / delete_map / load_map_version）
+编排型 handler（relocalize_active_map / activate_map / finalize_active_map / delete_map）
 依赖网关运行时内部状态的私有方法（几何运行时启动、流帧发布、感知运行时同步等），
 这些方法无法下沉到 skills，按设计文档 §2.5 以可调用句柄注入 SkillContext，handler 经
 ctx.<callable>(...) 调用，守 R4b（skills 不反向 import gateways）。
@@ -126,13 +126,24 @@ def handle_resolve_navigation_candidates(
 ) -> Dict[str, Any]:
     del requested_by
     query = params.require_str(payload, "query")
+    active_workspace = ctx.map_workspace_service.get_active_workspace(
+        refresh_localization=False,
+    )
+    map_name = (
+        params.optional_str(payload, "map_name")
+        or (
+            active_workspace.active_map_name
+            if active_workspace is not None
+            else None
+        )
+    )
     return {
         "navigation_candidates": ctx.memory_service.resolve_navigation_candidates(
             query,
             camera_id=params.optional_str(payload, "camera_id"),
             similarity_threshold=params.optional_float(payload, "similarity_threshold", 0.25),
             max_age_sec=params.optional_float(payload, "max_age_sec", 0.0) or None,
-            map_version_id=params.optional_str(payload, "map_version_id"),
+            map_name=map_name,
             localization_session_id=params.optional_str(payload, "localization_session_id"),
             limit=max(1, params.optional_int(payload, "limit", 5)),
         )
@@ -194,12 +205,12 @@ def handle_activate_map(
         reset_memory_library=bool(payload.get("reset_memory_library", False)),
         metadata={"requested_by": requested_by or "unknown"},
     )
-    has_platform_map_version = bool(
+    has_finalized_bundle = bool(
         active_workspace is not None
         and active_workspace.map_asset is not None
-        and active_workspace.map_asset.latest_version_id
+        and active_workspace.map_asset.finalized
     )
-    if has_platform_map_version:
+    if has_finalized_bundle:
         ctx.refresh_workspace_snapshots(refresh_localization=False)
         ctx.publish_pointcloud_map_stream_frame(reason="activate_map")
         ctx.publish_runtime_governance_stream_frame()
@@ -256,69 +267,28 @@ def handle_get_active_map(
     }
 
 
-def handle_list_map_versions(
+def handle_finalize_active_map(
     ctx: SkillContext,
     payload: Dict[str, Any],
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    del requested_by
-    map_name = params.require_str(payload, "map_name")
-    return {
-        "map_versions": ctx.map_workspace_service.list_map_versions(
-            map_name=map_name,
-            limit=params.optional_int(payload, "limit", 20),
-        )
-    }
-
-
-def handle_save_active_map_version(
-    ctx: SkillContext,
-    payload: Dict[str, Any],
-    *,
-    requested_by: Optional[str] = None,
-) -> Dict[str, Any]:
-    map_version = ctx.map_workspace_service.save_map_version(
-        map_name=str(payload.get("map_name", "")).strip() or None,
+    map_name = str(payload.get("map_name", "")).strip() or None
+    bundle = ctx.map_workspace_service.finalize_active_map(
+        map_name=map_name,
         reason=str(payload.get("reason", "")).strip(),
         metadata={"requested_by": requested_by or "unknown"},
     )
-    return {
-        "map_version": map_version,
-        "active_workspace": ctx.map_workspace_service.get_active_workspace(),
-    }
-
-
-def handle_load_map_version(
-    ctx: SkillContext,
-    payload: Dict[str, Any],
-    *,
-    requested_by: Optional[str] = None,
-) -> Dict[str, Any]:
-    map_name = params.require_str(payload, "map_name")
-    map_version, workspace = ctx.map_workspace_service.load_map_version(
-        map_name=map_name,
-        version_id=str(payload.get("version_id", "")).strip() or None,
-        activate_if_needed=True,
-        load_memory_history=bool(payload.get("load_memory_history", True)),
-        reset_memory_library=bool(payload.get("reset_memory_library", False)),
-        metadata={"requested_by": requested_by or "unknown", "source": "load_map_version"},
-    )
     ctx.refresh_workspace_snapshots(refresh_localization=False)
-    ctx.publish_pointcloud_map_stream_frame(reason="load_map_version")
+    ctx.publish_pointcloud_map_stream_frame(reason="finalize_active_map")
     ctx.publish_runtime_governance_stream_frame()
-    ctx.sync_perception_runtime_for_memory_state(enabled=True)
-    active_workspace = ctx.map_workspace_service.get_active_workspace(refresh_localization=False) or workspace
-    memory_summary = ctx.memory_service.get_summary()
-    active_library = memory_summary.metadata.get("active_library_name") if memory_summary is not None else None
+    active_workspace = ctx.map_workspace_service.get_active_workspace(
+        refresh_localization=False,
+    )
     return {
-        "map_version": map_version,
+        "map_asset_bundle": bundle,
         "active_workspace": active_workspace,
-        "memory_summary": memory_summary,
-        "memory_library_activated": str(active_library or "") == map_name,
         "next_step_hint": (
-            "地图版本已加载，同名记忆库 %s 已一并激活（无需再调 enable_memory_library）。"
-            "Debug 应立即可见 checkpoint 地图；可直接 navigate_to_pose 或等待定位收敛。"
-            % map_name
+            "地图 current 资产包已原子发布；后续 activate_map 会直接加载该资产包。"
         ),
     }

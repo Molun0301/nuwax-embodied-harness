@@ -179,6 +179,7 @@ class PerceptionService:
             detection_metadata=detection_metadata,
             open_vocabulary_classes=open_vocabulary_classes,
         )
+        source_timestamp_metadata = self._source_timestamp_metadata(image_frame)
 
         pipeline_started_at = perf_counter()
         stage_duration_ms: Dict[str, float] = {}
@@ -297,6 +298,7 @@ class PerceptionService:
                     round(lock_wait_ms, 3) if lock_wait_ms is not None else None
                 ),
                 **dict(detection_bundle.metadata),
+                **source_timestamp_metadata,
             },
         )
         context = PerceptionContext(
@@ -331,6 +333,7 @@ class PerceptionService:
                 "pipeline_lock_wait_ms": (
                     round(lock_wait_ms, 3) if lock_wait_ms is not None else None
                 ),
+                **source_timestamp_metadata,
             },
         )
         self._latest_by_camera[context.camera_id] = context
@@ -531,6 +534,7 @@ class PerceptionService:
             detection_metadata=detection_metadata,
             open_vocabulary_classes=open_vocabulary_classes,
         )
+        source_timestamp_metadata = self._source_timestamp_metadata(image_frame)
         pipeline_started_at = perf_counter()
         stage_duration_ms: Dict[str, float] = {}
         stage_status: Dict[str, str] = {
@@ -607,6 +611,7 @@ class PerceptionService:
                     round(lock_wait_ms, 3) if lock_wait_ms is not None else None
                 ),
                 **dict(detection_bundle.metadata),
+                **source_timestamp_metadata,
             },
         )
         context = PerceptionContext(
@@ -639,6 +644,7 @@ class PerceptionService:
                 "pipeline_lock_wait_ms": (
                     round(lock_wait_ms, 3) if lock_wait_ms is not None else None
                 ),
+                **source_timestamp_metadata,
             },
         )
         self._latest_by_camera[context.camera_id] = context
@@ -770,6 +776,13 @@ class PerceptionService:
                 deep=False,
             )
         return image_frame
+
+    @staticmethod
+    def _source_timestamp_metadata(image_frame) -> Dict[str, int]:
+        value = dict(image_frame.metadata or {}).get("source_timestamp_ns")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return {}
+        return {"source_timestamp_ns": value}
 
     def list_latest_contexts(self) -> Tuple[PerceptionContext, ...]:
         """返回各相机当前最新感知结果。"""
@@ -1029,6 +1042,7 @@ class PerceptionService:
             "publish_interval_ms": publish_interval_ms,
             "nms_stats": nms_stats,
             "pipeline_lock_wait_ms": context.metadata.get("pipeline_lock_wait_ms"),
+            "source_timestamp_ns": context.metadata.get("source_timestamp_ns"),
         }
         self._stream_bus.publish(
             "video.detections",

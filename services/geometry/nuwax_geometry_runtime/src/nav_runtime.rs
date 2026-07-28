@@ -1910,9 +1910,10 @@ pub async fn set_goal_with_boundary(
     if input.target.timestamp_ns == 0 {
         input.target.timestamp_ns = now_ns();
     }
+    let normalized_goal_frame = input.frame_id.trim().trim_start_matches('/');
     let boundary_invalid = boundary.as_ref().is_some_and(|boundary| {
         input.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-            || boundary.frame_id.trim().trim_start_matches('/') != "map"
+            || boundary.frame_id.trim().trim_start_matches('/') != normalized_goal_frame
             || boundary.points.len() < 3
             || boundary
                 .points
@@ -2057,7 +2058,12 @@ pub async fn set_goal_with_boundary(
         }
     };
     let (boundary_frame_id, boundary_points) = boundary
-        .map(|boundary| ("map".to_string(), boundary.points))
+        .map(|boundary| {
+            (
+                boundary.frame_id.trim().trim_start_matches('/').to_string(),
+                boundary.points,
+            )
+        })
         .unwrap_or_default();
     let mut envelope = schema::GoalEnvelope {
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
@@ -2559,12 +2565,13 @@ pub fn goal_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
 
 /// Resolve the strict versioned path channel consumed by geometry runtime.
 pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
-    resolve_strict_typed_binding(
+    let channel = channel_registry::resolve_strict_channel(
         PATH_CHANNEL_RUNTIME,
         PATH_CHANNEL_PLATFORM,
         PATH_CHANNEL_DEFAULT,
-        "nuwax_msgs.PathEnvelope",
     )
+    .map_err(|error| error.to_string())?;
+    strict_typed_binding(&channel, "nuwax_msgs.PathEnvelope")
 }
 
 /// publish `/nav/goal` typed frame。
@@ -3405,7 +3412,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.state.status, "ACCEPTED");
+        assert_eq!(
+            outcome.state.status, "ACCEPTED",
+            "{}",
+            outcome.state.message
+        );
         assert_eq!(outcome.state.goal_id, "stack-owned-goal");
         let goal = tokio::time::timeout(Duration::from_secs(1), goals.next())
             .await
@@ -3490,6 +3501,123 @@ mod tests {
         assert_eq!(envelope.parent_request_id, "explore-parent");
         assert_eq!(envelope.boundary_frame_id, "map");
         assert_eq!(envelope.boundary_points, points);
+    }
+
+    #[tokio::test]
+    async fn exploration_goal_envelope_preserves_configured_map_boundary() {
+        use futures::StreamExt;
+
+        let handle = make_handle().await;
+        {
+            let mut shared = handle.state.write().await;
+            shared.pose.frame_id = "robot/map".to_string();
+            shared.map.frame_id = "robot/map".to_string();
+        }
+        let state = NavRuntimeState::from_env();
+        observe_healthy_stack(&state).await;
+        state
+            .observe_tf_chain(TfChainObservation {
+                generation: 1,
+                map_frame: "robot/map".into(),
+                odom_frame: "odom".into(),
+                base_frame: "base_link".into(),
+                map_to_odom: true,
+                odom_to_base: true,
+            })
+            .expect("configured-frame TF observation");
+        state
+            .observe_planner_input(PlannerInputObservation {
+                generation: 1,
+                map_revision: 1,
+                map_frame: "robot/map".into(),
+                pose_frame: "robot/map".into(),
+                ready: true,
+            })
+            .expect("configured-frame planner observation");
+        state
+            .observe_motion_sink(MotionSinkObservation {
+                generation: 1,
+                ready: true,
+            })
+            .expect("ready motion sink observation");
+        let (goal_topic, _) = parse_channel_with_suffix(&channel_registry::resolve_channel(
+            GOAL_CHANNEL_RUNTIME,
+            GOAL_CHANNEL_PLATFORM,
+            GOAL_CHANNEL_DEFAULT,
+        ))
+        .expect("goal topic");
+        let mut goals = handle
+            .transport
+            .subscribe(goal_topic, Some(goal_msg_type()))
+            .await;
+        sleep(Duration::from_millis(30)).await;
+        let mut input = test_goal_input("configured-exploration-boundary");
+        input.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+        input.parent_request_id = "configured-explore-parent".to_string();
+        input.frame_id = "robot/map".to_string();
+        input.target.frame_id = "robot/map".to_string();
+        let points = vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]];
+
+        let outcome = set_goal_with_boundary(
+            &handle,
+            &state,
+            input,
+            Some(GoalBoundaryConstraint {
+                frame_id: "/robot/map".to_string(),
+                points: points.clone(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.state.status, "ACCEPTED",
+            "{}",
+            outcome.state.message
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(1), goals.next())
+            .await
+            .expect("configured-frame goal was not published")
+            .expect("goal stream closed")
+            .expect("goal transport error");
+        let envelope = schema::decode_goal_envelope_body(&frame.payload)
+            .expect("decode configured-frame exploration GoalEnvelope");
+        assert_eq!(envelope.goal.header.frame_id, "robot/map");
+        assert_eq!(envelope.boundary_frame_id, "robot/map");
+        assert_eq!(envelope.boundary_points, points);
+    }
+
+    #[tokio::test]
+    async fn configured_exploration_boundary_rejects_literal_map_without_publish() {
+        let (handle, backend) = make_blocking_handle([None]).await;
+        {
+            let mut shared = handle.state.write().await;
+            shared.pose.frame_id = "robot/map".to_string();
+            shared.map.frame_id = "robot/map".to_string();
+        }
+        let state = NavRuntimeState::from_env();
+        let mut input = test_goal_input("configured-boundary-mismatch");
+        input.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+        input.parent_request_id = "configured-explore-parent".to_string();
+        input.frame_id = "robot/map".to_string();
+        input.target.frame_id = "robot/map".to_string();
+
+        let outcome = set_goal_with_boundary(
+            &handle,
+            &state,
+            input,
+            Some(GoalBoundaryConstraint {
+                frame_id: "map".to_string(),
+                points: vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]],
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(outcome.state.message.contains("GOAL_BOUNDARY_INVALID"));
+        assert!(outcome.lease.is_none());
+        assert!(state.inner.read().await.goal.is_none());
+        assert_eq!(backend.publish_count(), 0);
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
     }
 
     #[tokio::test]

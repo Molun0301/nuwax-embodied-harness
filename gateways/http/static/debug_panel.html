@@ -573,7 +573,7 @@ button{font-family:inherit;cursor:pointer}
               <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
                 <div class="forbidden-zone-head">
                   <span class="forbidden-zone-title">导航禁行区</span>
-                  <span class="forbidden-zone-status" data-role="boundary-status">等待地图版本</span>
+                  <span class="forbidden-zone-status" data-role="boundary-status">等待地图</span>
                 </div>
                 <div class="forbidden-zone-grid">
                   <label class="forbidden-zone-field wide">名称
@@ -764,7 +764,6 @@ button{font-family:inherit;cursor:pointer}
         "find_target",
         "inspect_target",
         "relocalize_active_map",
-        "load_map_version",
         "activate_map",
       ]);
       const ACTIVE_LOCALIZATION_STATUSES = new Set([
@@ -2231,13 +2230,13 @@ button{font-family:inherit;cursor:pointer}
         if (activeLocalizationSessionReason()) {
           const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
           const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
-          if (sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint") {
+          if (sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint") {
             return false;
           }
         }
         const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
         const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
-        return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
+        return sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint";
       }
       function canvasPointer(event) {
         const rect = els.mapCanvas.getBoundingClientRect();
@@ -2749,22 +2748,17 @@ button{font-family:inherit;cursor:pointer}
         if (!status || !ACTIVE_LOCALIZATION_STATUSES.has(status)) return null;
         return "localization";
       }
-      function loadedMapVersionShouldDisplay(diagnostics) {
+      function loadedMapAssetShouldDisplay(diagnostics) {
         if (!diagnostics) return false;
         const mapName = String(diagnostics.active_map_name || diagnostics.map_name || "").trim();
         if (!mapName) return false;
-        const versionId = String(
-          diagnostics.platform_map_version_id ||
-          diagnostics.seed_map_version_id ||
-          diagnostics.map_version_id ||
-          ""
-        ).trim();
+        const manifestSha256 = String(diagnostics.asset_manifest_sha256 || "").trim();
         const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
         const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
         return Boolean(
-          versionId ||
+          manifestSha256 ||
           snapshotKind === "offline_checkpoint" ||
-          sourceKind === "platform_map_version" ||
+          sourceKind === "map_asset_bundle" ||
           diagnostics.checkpoint_ready === true ||
           diagnostics.geometry_ready === true
         );
@@ -2806,7 +2800,7 @@ button{font-family:inherit;cursor:pointer}
       function mapSnapshotIsOffline(diagnostics) {
         const sourceKind = String(diagnostics && diagnostics.source_kind || "").toLowerCase();
         const snapshotKind = String(diagnostics && diagnostics.map_snapshot_kind || "").toLowerCase();
-        return sourceKind === "platform_map_version" || snapshotKind === "offline_checkpoint";
+        return sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint";
       }
       function shouldPinLocalizationCheckpointDisplay(diagnostics) {
         if (!diagnostics) return false;
@@ -2819,7 +2813,7 @@ button{font-family:inherit;cursor:pointer}
           || (diagnostics.geometry_activation && diagnostics.geometry_activation.backend_mode)
           || ""
         ).trim().toLowerCase();
-        return backendMode === "mapping_localization" && loadedMapVersionShouldDisplay(diagnostics);
+        return backendMode === "mapping_localization" && loadedMapAssetShouldDisplay(diagnostics);
       }
       function hasLiveMapFlag(diagnostics, streamBridge) {
         if (!diagnostics) return false;
@@ -2860,8 +2854,8 @@ button{font-family:inherit;cursor:pointer}
         }
         const activeReason = activeSpatialContextReason();
         if (activeReason) return { display: true, reason: activeReason };
-        if (status === "available" && loadedMapVersionShouldDisplay(diagnostics)) {
-          return { display: true, reason: "loaded_map_version" };
+        if (status === "available" && loadedMapAssetShouldDisplay(diagnostics)) {
+          return { display: true, reason: "loaded_map_asset" };
         }
         if (status !== "available") {
           return { display: false, status: status || "stale", message: status === "stale" ? "地图数据已过期，已隐藏缓存帧。" : errorReason(envelope, MAP_DISPLAY_IDLE_MESSAGE) };
@@ -3820,15 +3814,15 @@ button{font-family:inherit;cursor:pointer}
       }
       function mapStreamLabel(status, diagnostics, streamBridge) {
         if (diagnostics && diagnostics.display_suppressed_reason) return "缓存地图已隐藏";
-        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return "定位模式·已载入版本";
-        if (loadedMapVersionShouldDisplay(diagnostics)) return "已载入地图版本";
+        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return "定位模式·已载入地图";
+        if (loadedMapAssetShouldDisplay(diagnostics)) return "已载入地图资产";
         const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
         const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
         const delta = diagnostics && diagnostics.message_count_delta;
         const bridgeStatus = streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode);
         if (!messageCount) return status === "available" ? "首帧已缓存" : "等待首帧";
         const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true || diagnostics.source_alive === true);
-        return `${live ? "实时流" : "离线资产/缓存"} · 版本 ${safeText(revision)} · 序号 ${safeText(messageCount)} · 桥接 ${displayStatus(bridgeStatus || status)}`;
+        return `${live ? "实时流" : "离线资产/缓存"} · 修订 ${safeText(revision)} · 序号 ${safeText(messageCount)} · 桥接 ${displayStatus(bridgeStatus || status)}`;
       }
       function updateMapStreamChip(status, diagnostics, streamBridge, timestamp) {
         if (!els.mapStreamStatus) return;
@@ -5890,39 +5884,6 @@ button{font-family:inherit;cursor:pointer}
           mapFixed: Boolean(anchor.mapFixed),
           yaw: Number(anchor.yaw) || 0,
         };
-      };
-      window.__nuwaxMapVersionId = function () {
-        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
-        const governance = state.latestGovernance || {};
-        const localizationSession = governance.localization_session || {};
-        const pointcloud = pointcloudMapSummary().payload;
-        const snapshot = state.lastMapEnvelope?.data?.map_snapshot || {};
-        const snapshotMetadata = snapshot.metadata || {};
-        const renderedMapVersionId = firstNonBlank(
-          diagnostics.platform_map_version_id,
-          diagnostics.seed_map_version_id,
-          diagnostics.map_version_id,
-          snapshotMetadata.platform_map_version_id,
-          snapshotMetadata.seed_map_version_id,
-          snapshotMetadata.map_version_id,
-          snapshot.map_version_id,
-          pointcloud.platform_map_version_id,
-          pointcloud.seed_map_version_id,
-          pointcloud.map_version_id,
-        );
-        const activeMapVersionId = firstNonBlank(
-          localizationSession.map_version_id,
-          governance.active_map_version_id,
-          governance.map_version_id,
-        );
-        const conflict = renderedMapVersionId && activeMapVersionId && renderedMapVersionId !== activeMapVersionId
-          ? { rendered: renderedMapVersionId, active: activeMapVersionId }
-          : null;
-        window.__nuwaxMapVersionConflict = conflict;
-        if (conflict) {
-          return null;
-        }
-        return renderedMapVersionId || activeMapVersionId || null;
       };
       window.__nuwaxMapViewMode = function () { return state.mapViewMode; };
       window.__nuwaxMapRequestDraw = function () { requestMapDraw(false); };

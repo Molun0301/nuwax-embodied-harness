@@ -147,7 +147,7 @@ class InstanceAssociationService:
         projected_observations: Iterable[ProjectedObservation],
         *,
         existing_instances: Dict[str, SemanticInstance],
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str] = None,
         occupancy_grid=None,
         cost_map=None,
@@ -172,7 +172,7 @@ class InstanceAssociationService:
                 merged = self._merge_instance(
                     best_instance,
                     item,
-                    map_version_id=map_version_id,
+                    map_name=map_name,
                     localization_session_id=localization_session_id,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
@@ -184,7 +184,7 @@ class InstanceAssociationService:
 
             created = self._create_instance(
                 item,
-                map_version_id=map_version_id,
+                map_name=map_name,
                 localization_session_id=localization_session_id,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
@@ -489,7 +489,7 @@ class InstanceAssociationService:
         current: SemanticInstance,
         observation: ProjectedObservation,
         *,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         occupancy_grid,
         cost_map,
@@ -558,7 +558,7 @@ class InstanceAssociationService:
         return current.model_copy(
             update={
                 "pose": blended_pose,
-                "map_version_id": map_version_id or current.map_version_id,
+                "map_name": map_name or current.map_name,
                 "localization_session_id": localization_session_id or current.localization_session_id,
                 "topo_node_id": observation.topo_node_id or current.topo_node_id,
                 "semantic_region_id": observation.semantic_region_id or current.semantic_region_id,
@@ -584,7 +584,7 @@ class InstanceAssociationService:
         self,
         observation: ProjectedObservation,
         *,
-        map_version_id: Optional[str],
+        map_name: Optional[str],
         localization_session_id: Optional[str],
         occupancy_grid,
         cost_map,
@@ -627,7 +627,7 @@ class InstanceAssociationService:
             label=observation.label.strip().lower(),
             display_name=str(observation.attributes.get("display_name_zh") or observation.label),
             pose=observation.pose,
-            map_version_id=map_version_id,
+            map_name=map_name,
             localization_session_id=localization_session_id,
             topo_node_id=observation.topo_node_id,
             semantic_region_id=observation.semantic_region_id,

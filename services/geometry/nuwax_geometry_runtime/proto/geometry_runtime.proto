@@ -65,6 +65,8 @@ message OccupancyGridMeta {
   uint64 timestamp_ns = 8;
 }
 message MapUpdateNotification {
+  reserved 9;
+  reserved "map_version_id";
   OccupancyGridMeta meta = 1;
   ShmRef shm_ref = 2;
   bytes data = 3;
@@ -73,13 +75,13 @@ message MapUpdateNotification {
   string checksum = 6;
   int64 last_seen_ms = 7;
   string session_id = 8;
-  string map_version_id = 9;
   uint64 session_generation = 10;
   // Physical occupancy from the same committed revision, before virtual
   // forbidden zones are composed into `data`. Empty means byte-identical to
   // `data` when raw_checksum equals checksum.
   bytes raw_data = 11;
   string raw_checksum = 12;
+  string map_name = 13;
 }
 message OccupancyGridData {
   OccupancyGridMeta meta = 1;
@@ -87,9 +89,10 @@ message OccupancyGridData {
 }
 
 message StartMappingRequest {
+  reserved 3;
+  reserved "map_version_id";
   string session_id = 1;
   string map_name = 2;
-  string map_version_id = 3;
 }
 
 message StopMappingRequest {
@@ -98,16 +101,19 @@ message StopMappingRequest {
 }
 
 message MappingSessionState {
+  reserved 6;
+  reserved "map_version_id";
   bool success = 1;
   string phase = 2;
   string message = 3;
   string session_id = 4;
   string map_name = 5;
-  string map_version_id = 6;
   uint64 session_generation = 7;
   uint64 revision = 8;
   bool active = 9;
   bool idempotent_replay = 10;
+  bool legacy_checkpoint_reconstructed = 11;
+  string mapping_backend_kind = 12;
 }
 
 message CloudMapCheckpoint {
@@ -120,12 +126,53 @@ message CloudMapCheckpoint {
   uint32 payload_schema_version = 7;
 }
 
-message ActivateMapVersionRequest {
+message MappingCommitIdentity {
+  bytes boot_nonce = 1;
+  uint64 sequence = 2;
+}
+
+message CanonicalOccupancyCommitReceipt {
+  MappingCommitIdentity commit_id = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+  uint64 occupancy_revision = 4;
+  uint64 source_timestamp_ns = 5;
+  string backend_kind = 6;
+  uint64 backend_generation = 7;
+}
+
+message CanonicalCloudCommitReceipt {
+  MappingCommitIdentity commit_id = 1;
+  uint64 session_generation = 2;
+  uint64 occupancy_revision = 3;
+  uint64 cloud_revision = 4;
+  uint64 source_timestamp_ns = 5;
+  uint32 point_count = 6;
+}
+
+message MappingBackendCheckpoint {
+  uint32 schema_version = 1;
+  string backend_kind = 2;
+  uint64 source_session_generation = 3;
+  bytes content_sha256 = 4;
+  uint64 payload_size = 5;
+  uint64 created_at_ns = 6;
+  bytes payload = 7;
+  string source_session_id = 8;
+  CanonicalOccupancyCommitReceipt occupancy_receipt = 9;
+  CanonicalCloudCommitReceipt cloud_receipt = 10;
+  OccupancyGridData canonical_occupancy_checkpoint = 11;
+  CloudMapCheckpoint canonical_cloud_checkpoint = 12;
+}
+
+message ActivateMapRequest {
+  reserved 3;
+  reserved "map_version_id";
   string session_id = 1;
   string map_name = 2;
-  string map_version_id = 3;
   OccupancyGridData checkpoint = 4;
   CloudMapCheckpoint cloud_checkpoint = 5;
+  MappingBackendCheckpoint mapping_backend_checkpoint = 6;
 }
 
 // === 视频帧共享内存 ===
@@ -211,6 +258,8 @@ message NavigationState {
   uint64 producer_runtime_generation = 25;
 }
 message NavigationReadiness {
+  reserved 10;
+  reserved "forbidden_zone_map_version_id";
   bool ready = 1;
   string reason = 2;
   string reason_code = 3;
@@ -220,11 +269,11 @@ message NavigationReadiness {
   uint64 motion_sink_generation = 7;
   string map_frame = 8;
   string pose_frame = 9;
-  string forbidden_zone_map_version_id = 10;
   uint64 forbidden_zone_generation = 11;
   string forbidden_zone_signature = 12;
   uint64 forbidden_zone_applied_revision = 13;
   uint64 planner_costmap_revision = 14;
+  string forbidden_zone_map_name = 15;
 }
 
 // Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
@@ -441,7 +490,7 @@ service GeometryRuntime {
   rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
   rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
   // Physical occupancy before virtual forbidden zones are composed.  Map
-  // version persistence must use this getter to avoid baking keepouts into a
+  // asset persistence must use this getter to avoid baking keepouts into a
   // checkpoint permanently.
   rpc GetRawOccupancyGridData(Empty) returns (OccupancyGridData);
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
@@ -450,7 +499,8 @@ service GeometryRuntime {
   rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
   rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
   rpc GetMappingState(Empty) returns (MappingSessionState);
-  rpc ActivateMapVersion(ActivateMapVersionRequest) returns (MappingSessionState);
+  rpc ExportMappingBackendCheckpoint(Empty) returns (MappingBackendCheckpoint);
+  rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);

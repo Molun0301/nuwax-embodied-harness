@@ -74,6 +74,7 @@ pub mod features;
 pub mod graph;
 #[cfg(feature = "lcm-runtime")]
 mod lcm_dataflow;
+pub mod manifest;
 #[cfg(feature = "lcm-runtime")]
 mod map_pose;
 pub mod profile;
@@ -87,6 +88,7 @@ pub use builder::{NavStackBuilder, NavStackHandle};
 pub use error::{NavStackError, NavStackResult};
 pub use features::{NavFeatureFlags, NavStackPreset};
 pub use graph::{ModuleGraph, ModuleKind, ModuleNode};
+pub use manifest::{CanonicalSlot, ProfileActivation, ProfileManifest};
 pub use profile::NavStackProfile;
 pub use runner::StackRunner;
 pub use topics::{NavTopicConfig, TopicName};

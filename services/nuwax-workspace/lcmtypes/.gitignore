@@ -1,7 +1,39 @@
-# Only generated C is checked in as an auditable lcm-gen fixture. Other
-# language bindings remain local build artifacts.
+# Generated C is checked in as an auditable lcm-gen fixture. The three LIO
+# Python bindings are also tracked as the cross-language ingress contract.
 generated/*
 !generated/c/
 generated/c/*
 !generated/c/*.c
 !generated/c/*.h
+!generated/python/
+generated/python/*
+!generated/python/std_msgs/
+generated/python/std_msgs/*
+!generated/python/std_msgs/__init__.py
+!generated/python/std_msgs/Time.py
+!generated/python/std_msgs/Header.py
+!generated/python/geometry_msgs/
+generated/python/geometry_msgs/*
+!generated/python/geometry_msgs/__init__.py
+!generated/python/geometry_msgs/Point.py
+!generated/python/geometry_msgs/Quaternion.py
+!generated/python/geometry_msgs/Pose.py
+!generated/python/geometry_msgs/PoseWithCovariance.py
+!generated/python/geometry_msgs/Vector3.py
+!generated/python/geometry_msgs/Twist.py
+!generated/python/geometry_msgs/TwistWithCovariance.py
+!generated/python/nav_msgs/
+generated/python/nav_msgs/*
+!generated/python/nav_msgs/__init__.py
+!generated/python/nav_msgs/Odometry.py
+!generated/python/sensor_msgs/
+generated/python/sensor_msgs/*
+!generated/python/sensor_msgs/__init__.py
+!generated/python/sensor_msgs/PointField.py
+!generated/python/sensor_msgs/PointCloud2.py
+!generated/python/nuwax_msgs/
+generated/python/nuwax_msgs/*
+!generated/python/nuwax_msgs/__init__.py
+!generated/python/nuwax_msgs/LioOdometryEnvelope.py
+!generated/python/nuwax_msgs/LioCloudEnvelope.py
+!generated/python/nuwax_msgs/LioStatus.py

@@ -40,7 +40,8 @@ use thiserror::Error;
 use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{error, info, warn};
 
-use crate::mapping_adapter::{MappingAdapter, MappingAdapterConfig};
+use crate::mapping_adapter::{finish_backend_retirement, MappingAdapter, MappingAdapterConfig};
+use crate::mapping_backend::MappingBackendSpec;
 use crate::occupancy_shm::OccupancyGridShmWriter;
 use crate::pointcloud::CloudMapShmWriter;
 use crate::sequence_state::{sequence_state_path_from_env, SequenceStateStore};
@@ -57,6 +58,10 @@ const POINT_CLOUD2_MESSAGE_TYPE: &str = "sensor_msgs.PointCloud2";
 // `channel_registry::channel_for(...)` 限定调用,无需每次都写完整 `crate::` 路径。
 use crate::channel_registry;
 use crate::channel_registry::ChannelKey;
+
+#[cfg(test)]
+#[path = "vertical_v2_canary.rs"]
+mod vertical_v2_canary;
 
 // ============================================================================
 // 状态定义
@@ -321,7 +326,7 @@ pub struct CloudMapNotification {
 #[derive(Clone, Debug)]
 pub struct MapRevisionEvent {
     pub session_id: String,
-    pub map_version_id: String,
+    pub map_name: String,
     pub session_generation: u64,
     pub revision: u64,
     pub width: u32,
@@ -354,7 +359,7 @@ impl MapRevisionEvent {
         let checksum = crate::map_checksum::sha256_hex(data.as_ref());
         Self {
             session_id: session.session_id.clone(),
-            map_version_id: session.map_version_id.clone(),
+            map_name: session.map_name.clone(),
             session_generation: session.session_generation,
             revision: map.revision,
             width: map.width,
@@ -441,15 +446,18 @@ pub struct OccupancyShmSnapshot {
     pub active_slot: usize,
 }
 
-fn is_global_map_frame(frame_id: &str) -> bool {
-    normalize_frame(frame_id) == "map"
+fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String> {
+    encode_occupancy_revision_in_frame(event, "map")
 }
 
-fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String> {
-    if !is_global_map_frame(&event.frame_id) {
+fn encode_occupancy_revision_in_frame(
+    event: &MapRevisionEvent,
+    expected_map_frame: &str,
+) -> Result<Vec<u8>, String> {
+    if event.frame_id != expected_map_frame {
         return Err(format!(
-            "global occupancy fanout requires frame=map, received {}",
-            event.frame_id
+            "global occupancy fanout requires frame={expected_map_frame}, received {}",
+            event.frame_id,
         ));
     }
     let expected_len = usize::try_from(event.width)
@@ -497,7 +505,7 @@ fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String
             seq: wire_revision,
             stamp_sec,
             stamp_nsec: (event.timestamp_ns % 1_000_000_000) as i32,
-            frame_id: "map".to_string(),
+            frame_id: expected_map_frame.to_string(),
         },
         info: schema::MapMetaData {
             map_load_time_sec: stamp_sec,
@@ -518,10 +526,17 @@ fn encode_occupancy_revision(event: &MapRevisionEvent) -> Result<Vec<u8>, String
 fn exploration_costmap_from_revision(
     event: &MapRevisionEvent,
 ) -> Result<crate::explore_runtime::ExploreCostmapSnapshot, String> {
-    if !is_global_map_frame(&event.frame_id) {
+    exploration_costmap_from_revision_in_frame(event, "map")
+}
+
+fn exploration_costmap_from_revision_in_frame(
+    event: &MapRevisionEvent,
+    expected_map_frame: &str,
+) -> Result<crate::explore_runtime::ExploreCostmapSnapshot, String> {
+    if event.frame_id != expected_map_frame {
         return Err(format!(
-            "global exploration requires frame=map, received {}",
-            event.frame_id
+            "global exploration requires frame={expected_map_frame}, received {}",
+            event.frame_id,
         ));
     }
     let expected_len = usize::try_from(event.width)
@@ -556,7 +571,7 @@ fn exploration_costmap_from_revision(
             event.height,
             cells,
         ),
-        frame_id: "map".to_string(),
+        frame_id: expected_map_frame.to_string(),
     })
 }
 
@@ -569,7 +584,7 @@ fn map_event_matches_current_session(
         && event.session_generation > 0
         && event.session_generation == snapshot.session_generation
         && event.session_id == snapshot.session_id
-        && event.map_version_id == snapshot.map_version_id
+        && event.map_name == snapshot.map_name
 }
 
 /// 几何 runtime 句柄。`server.rs` 通过此句柄读 SharedState、订阅 cloud_map_tx
@@ -653,6 +668,11 @@ impl GeometryRuntimeHandle {
         &self,
         session_generation: u64,
     ) -> Option<CloudMapNotification> {
+        let frame_id = self
+            .mapping_adapter
+            .as_ref()
+            .map(|adapter| adapter.lock().configured_map_frame_id().to_owned())
+            .unwrap_or_else(|| "map".to_owned());
         let update = {
             let mut guard = self.cloud_map_writer.lock();
             let writer = guard.as_mut()?;
@@ -666,9 +686,28 @@ impl GeometryRuntimeHandle {
         };
         {
             let mut shared = self.state.write().await;
-            shared.cloud_map_revision = update.revision;
+            if shared.cloud_map_revision < update.revision {
+                shared.cloud_map_revision = update.revision;
+            }
         }
         let _ = self.cloud_map_tx.send(update.clone());
+        let transport = self.transport.clone();
+        let writer = self.cloud_map_writer.clone();
+        let state = self.state.clone();
+        let cloud_map_tx = self.cloud_map_tx.clone();
+        tokio::spawn(async move {
+            if let Err(error) = publish_latest_canonical_cloud_map(
+                &transport,
+                &writer,
+                &state,
+                &cloud_map_tx,
+                &frame_id,
+            )
+            .await
+            {
+                warn!(%error, session_generation, "empty cloud-map revision was not delivered to typed /global_map");
+            }
+        });
         Some(update)
     }
 
@@ -885,6 +924,102 @@ const BASE_FRAME_ALIASES: &[&str] = &[
     "body",
     "go2_base_link",
 ];
+
+const MAP_FRAME_ENV: &str = "NUWAX_GEOMETRY_MAP_FRAME";
+const MAP_FRAME_LEGACY_ENV: &str = "NUWAX_MAP_FRAME";
+const ODOM_FRAME_ENV: &str = "NUWAX_GEOMETRY_ODOM_FRAME";
+const ODOM_FRAME_LEGACY_ENV: &str = "NUWAX_ODOM_FRAME";
+const BASE_FRAME_ENV: &str = "NUWAX_BASE_FRAME";
+const BASE_FRAME_LEGACY_ENV: &str = "NUWAX_GEOMETRY_BASE_FRAME";
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("FRAME_BINDING_INVALID role={role} env={variable} frame={value:?}")]
+pub(crate) struct FrameBindingError {
+    pub(crate) role: &'static str,
+    pub(crate) variable: &'static str,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedFrameBindings {
+    map_frame: String,
+    odom_frame: String,
+    base_frame: String,
+}
+
+impl ValidatedFrameBindings {
+    pub(crate) fn from_env() -> Result<Self, FrameBindingError> {
+        Ok(Self {
+            map_frame: read_frame_binding("map", MAP_FRAME_ENV, MAP_FRAME_LEGACY_ENV, "map")?,
+            odom_frame: read_frame_binding("odom", ODOM_FRAME_ENV, ODOM_FRAME_LEGACY_ENV, "odom")?,
+            base_frame: read_frame_binding(
+                "base",
+                BASE_FRAME_ENV,
+                BASE_FRAME_LEGACY_ENV,
+                "base_link",
+            )?,
+        })
+    }
+
+    fn from_values(
+        map_frame: impl Into<String>,
+        odom_frame: impl Into<String>,
+        base_frame: impl Into<String>,
+    ) -> Result<Self, FrameBindingError> {
+        Ok(Self {
+            map_frame: validate_frame_binding("map", "<value>", map_frame.into())?,
+            odom_frame: validate_frame_binding("odom", "<value>", odom_frame.into())?,
+            base_frame: validate_frame_binding("base", "<value>", base_frame.into())?,
+        })
+    }
+
+    fn into_parts(self) -> (String, String, String) {
+        (self.map_frame, self.odom_frame, self.base_frame)
+    }
+
+    pub(crate) fn as_parts(&self) -> (&str, &str, &str) {
+        (&self.map_frame, &self.odom_frame, &self.base_frame)
+    }
+}
+
+fn read_frame_binding(
+    role: &'static str,
+    preferred: &'static str,
+    legacy: &'static str,
+    default: &'static str,
+) -> Result<String, FrameBindingError> {
+    for variable in [preferred, legacy] {
+        match std::env::var(variable) {
+            Ok(value) => return validate_frame_binding(role, variable, value),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(FrameBindingError {
+                    role,
+                    variable,
+                    value: "<non-unicode>".to_string(),
+                });
+            }
+        }
+    }
+    validate_frame_binding(role, "<default>", default.to_string())
+}
+
+fn validate_frame_binding(
+    role: &'static str,
+    variable: &'static str,
+    value: String,
+) -> Result<String, FrameBindingError> {
+    let value = value.trim().to_string();
+    if validated_frame_tokens(&value).is_some() {
+        Ok(value)
+    } else {
+        Err(FrameBindingError {
+            role,
+            variable,
+            value,
+        })
+    }
+}
 
 fn validated_frame_tokens(frame_id: &str) -> Option<Vec<&str>> {
     let frame_id = frame_id.trim();
@@ -1615,6 +1750,7 @@ fn binding_for_key(
 #[derive(Clone)]
 struct SharedStatePoseProvider {
     state: Arc<RwLock<SharedState>>,
+    expected_map_frame: Arc<str>,
     freshness: Arc<parking_lot::Mutex<PoseFreshnessTracker>>,
     max_receipt_age: Duration,
 }
@@ -1630,10 +1766,10 @@ struct PoseFreshnessTracker {
 impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
     async fn current_pose(&self) -> Result<crate::explore_runtime::ExploreRobotPose, String> {
         let pose = self.state.read().await.pose.clone();
-        if !is_global_map_frame(&pose.frame_id) || pose.timestamp_ns == 0 {
+        if pose.frame_id != self.expected_map_frame.as_ref() || pose.timestamp_ns == 0 {
             return Err(format!(
-                "map-frame pose unavailable (frame={}, timestamp_ns={})",
-                pose.frame_id, pose.timestamp_ns
+                "map-frame pose unavailable (expected_frame={}, frame={}, timestamp_ns={})",
+                self.expected_map_frame, pose.frame_id, pose.timestamp_ns,
             ));
         }
         let source_age_ns =
@@ -1667,7 +1803,7 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
         Ok(crate::explore_runtime::ExploreRobotPose {
             x: pose.x,
             y: pose.y,
-            frame_id: "map".to_string(),
+            frame_id: self.expected_map_frame.to_string(),
             source_timestamp_ns: pose.timestamp_ns,
             received_monotonic_ns,
         })
@@ -1690,6 +1826,7 @@ fn exploration_child_lease(
 #[derive(Clone)]
 struct ExploreNavigationBridge {
     state: Arc<RwLock<SharedState>>,
+    expected_map_frame: Arc<str>,
     cloud_map_tx: broadcast::Sender<CloudMapNotification>,
     nav_state_tx: broadcast::Sender<NavigationUpdate>,
     frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
@@ -1717,7 +1854,10 @@ impl ExploreNavigationBridge {
             transport_backend_name: self.transport_backend_name,
             lcm_backend_available: self.lcm_backend_available,
             cmd_vel_sink_ready: self.cmd_vel_sink_ready.clone(),
-            explore: crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront(),
+            explore: crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(
+                self.expected_map_frame.to_string(),
+            )
+            .expect("startup-validated map frame must remain valid"),
             nav: self.nav.clone(),
             mapping_adapter: None,
             mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1836,7 +1976,18 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         let child_request_id = request.request_id.clone();
         let parent_request_id = request.parent_request_id.clone();
         let target = request.goal.target;
-        let frame_id = target.frame_id.as_str().to_string();
+        if !matches!(
+            &target.frame_id,
+            nuwax_nav_types_messages::frames::NavFrameId::Map
+        ) {
+            return Err(
+                crate::explore_runtime::ChildNavigationSubmitError::Rejected(format!(
+                    "exploration child goal requires internal map-frame semantics, received {}",
+                    target.frame_id.as_str(),
+                )),
+            );
+        }
+        let frame_id = self.expected_map_frame.to_string();
         let pose = target.pose;
         let target = PoseState {
             x: pose.position.x,
@@ -1855,7 +2006,7 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 .boundary
                 .as_ref()
                 .map(|boundary| crate::nav_runtime::GoalBoundaryConstraint {
-                    frame_id: "map".to_string(),
+                    frame_id: self.expected_map_frame.to_string(),
                     points: boundary
                         .vertices()
                         .iter()
@@ -1944,6 +2095,39 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 cancel_generation: cancel.generation,
             })
         }
+    }
+
+    fn recover_cancel_receipt(
+        &self,
+        expected: &crate::explore_runtime::ChildNavigationLease,
+    ) -> Option<crate::explore_runtime::ChildNavigationCancelRecovery> {
+        let cancel = self.nav.cancel_snapshot();
+        if cancel.generation == 0 || cancel.phase == crate::nav_runtime::CancelPhase::Idle {
+            return None;
+        }
+        let lease = cancel.lease.as_ref()?;
+        if lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD {
+            return None;
+        }
+        let projected = exploration_child_lease(lease);
+        if !projected.matches(expected) {
+            return None;
+        }
+        if cancel.phase == crate::nav_runtime::CancelPhase::Pending {
+            self.spawn_correlated_cancel_retry(lease.clone(), cancel.generation);
+        }
+        let failure = matches!(
+            cancel.phase,
+            crate::nav_runtime::CancelPhase::Failed | crate::nav_runtime::CancelPhase::TimedOut
+        )
+        .then(|| cancel.message.clone());
+        Some(crate::explore_runtime::ChildNavigationCancelRecovery {
+            ticket: crate::explore_runtime::ChildNavigationCancelTicket {
+                lease: projected,
+                cancel_generation: cancel.generation,
+            },
+            failure,
+        })
     }
 }
 
@@ -2217,6 +2401,28 @@ async fn report_exploration_navigation_terminal(
     }
 }
 
+async fn fanout_navigation_update(
+    state: &Arc<RwLock<SharedState>>,
+    nav_state_tx: &broadcast::Sender<NavigationUpdate>,
+    explore: &crate::explore_runtime::ExploreRuntimeHandle,
+    update: NavigationUpdate,
+) {
+    if exploration_navigation_terminal_result(&update).is_some() {
+        match state.try_write() {
+            Ok(mut state) => state.nav_state = update.state.clone(),
+            Err(_) => warn!(
+                goal_id = %update.state.goal_id,
+                status = %update.state.status,
+                "navigation telemetry cache busy; preserving ordered broadcast and ownership terminal"
+            ),
+        }
+    } else {
+        state.write().await.nav_state = update.state.clone();
+    }
+    let _ = nav_state_tx.send(update.clone());
+    report_exploration_navigation_terminal(explore, &update).await;
+}
+
 fn exploration_navigation_terminal_result(
     update: &NavigationUpdate,
 ) -> Option<crate::explore_runtime::ChildNavigationResult> {
@@ -2286,9 +2492,7 @@ fn spawn_cancel_timeout_task(
                 continue;
             };
             let update = NavigationUpdate::from_local(outcome.state, &nav, outcome.lease).await;
-            state.write().await.nav_state = update.state.clone();
-            let _ = nav_state_tx.send(update.clone());
-            report_exploration_navigation_terminal(&explore, &update).await;
+            fanout_navigation_update(&state, &nav_state_tx, &explore, update).await;
         }
     });
 }
@@ -2324,7 +2528,10 @@ fn spawn_path_envelope_consumer(
     });
 }
 
-fn frontier_entry(frontier: &nuwax_nav_types_messages::visual::FrontierGoal) -> FrontierEntry {
+fn frontier_entry(
+    frontier: &nuwax_nav_types_messages::visual::FrontierGoal,
+    expected_map_frame: &str,
+) -> FrontierEntry {
     let pose = frontier.pose.pose;
     FrontierEntry {
         x: pose.position.x,
@@ -2334,7 +2541,7 @@ fn frontier_entry(frontier: &nuwax_nav_types_messages::visual::FrontierGoal) -> 
         qy: pose.orientation.y,
         qz: pose.orientation.z,
         qw: pose.orientation.w,
-        frame_id: frontier.pose.frame_id.as_str().to_string(),
+        frame_id: expected_map_frame.to_string(),
         size_cells: frontier
             .metadata
             .get("cell_count")
@@ -2357,6 +2564,13 @@ fn stable_frontier_id(value: &str) -> i64 {
 fn encode_frontier_snapshot(
     snapshot: &crate::explore_runtime::FrontierSnapshot,
 ) -> Result<Vec<u8>, String> {
+    encode_frontier_snapshot_in_frame(snapshot, "map")
+}
+
+fn encode_frontier_snapshot_in_frame(
+    snapshot: &crate::explore_runtime::FrontierSnapshot,
+    expected_map_frame: &str,
+) -> Result<Vec<u8>, String> {
     if snapshot.frontiers.len() > schema::FRONTIER_LIST_CAPACITY {
         return Err(format!(
             "frontier count {} exceeds LCM capacity {}",
@@ -2366,11 +2580,13 @@ fn encode_frontier_snapshot(
     }
     if snapshot.frontiers.iter().any(|frontier| {
         !matches!(
-            frontier.pose.frame_id,
+            &frontier.pose.frame_id,
             nuwax_nav_types_messages::frames::NavFrameId::Map
         )
     }) {
-        return Err("frontier snapshot contains a non-map-frame goal".to_string());
+        return Err(format!(
+            "frontier snapshot contains a non-map semantic goal for configured frame {expected_map_frame}"
+        ));
     }
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2397,7 +2613,7 @@ fn encode_frontier_snapshot(
     schema::encode_frontier_list_body(&schema::FrontierList {
         stamp_sec: (now_ns / 1_000_000_000) as i64,
         stamp_nsec: (now_ns % 1_000_000_000) as i32,
-        frame_id: "map".to_string(),
+        frame_id: expected_map_frame.to_string(),
         frontiers_length: snapshot.frontiers.len(),
         frontiers,
     })
@@ -2405,15 +2621,40 @@ fn encode_frontier_snapshot(
 }
 
 fn spawn_map_revision_coalescer(
+    map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    spawn_map_revision_coalescer_in_frame(
+        map_revision_rx,
+        map_revision_latest_tx,
+        mapping_adapter,
+        mapping_lifecycle_lock,
+        Arc::from("map"),
+    );
+}
+
+fn spawn_map_revision_coalescer_in_frame(
     mut map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    expected_map_frame: Arc<str>,
 ) {
     tokio::spawn(async move {
         loop {
             match map_revision_rx.recv().await {
                 Ok(event) => {
+                    if event.frame_id != expected_map_frame.as_ref() {
+                        warn!(
+                            revision = event.revision,
+                            frame_id = %event.frame_id,
+                            expected_map_frame = %expected_map_frame,
+                            "map revision rejected before latest-state retention"
+                        );
+                        continue;
+                    }
                     let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
                     if !map_event_matches_current_session(&event, &mapping_adapter) {
                         warn!(
@@ -2451,9 +2692,40 @@ fn spawn_map_revision_fanout(
     mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
+    spawn_map_revision_fanout_in_frame(
+        map_revision_rx,
+        map_revision_latest_tx,
+        transport,
+        occupancy_topic,
+        occupancy_msg_type,
+        occupancy_shm,
+        occupancy_shm_path,
+        occupancy_shm_current,
+        explore,
+        mapping_adapter,
+        mapping_lifecycle_lock,
+        Arc::from("map"),
+    );
+}
+
+fn spawn_map_revision_fanout_in_frame(
+    map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    transport: LcmTransport,
+    occupancy_topic: LcmTopic,
+    occupancy_msg_type: LcmMessageType,
+    occupancy_shm: Option<Arc<parking_lot::Mutex<OccupancyGridShmWriter>>>,
+    occupancy_shm_path: Option<String>,
+    occupancy_shm_current: Arc<RwLock<Option<OccupancyShmSnapshot>>>,
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+    mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    expected_map_frame: Arc<str>,
+) {
     let mut shm_rx = map_revision_latest_tx.subscribe();
     let mut lcm_rx = map_revision_latest_tx.subscribe();
     let mut explore_rx = map_revision_latest_tx.subscribe();
+    let shm_expected_map_frame = expected_map_frame.clone();
 
     match (occupancy_shm, occupancy_shm_path) {
         (Some(writer), Some(path)) => {
@@ -2465,6 +2737,15 @@ fn spawn_map_revision_fanout(
                     let Some(event) = shm_rx.borrow_and_update().clone() else {
                         continue;
                     };
+                    if event.frame_id != shm_expected_map_frame.as_ref() {
+                        warn!(
+                            revision = event.revision,
+                            frame_id = %event.frame_id,
+                            expected_map_frame = %shm_expected_map_frame,
+                            "map revision rejected before occupancy SHM mutation"
+                        );
+                        continue;
+                    }
                     let _lifecycle_guard = lifecycle_lock.lock().await;
                     if !map_event_matches_current_session(&event, &mapping_adapter) {
                         continue;
@@ -2513,6 +2794,7 @@ fn spawn_map_revision_fanout(
 
     let lcm_mapping_adapter = mapping_adapter.clone();
     let lcm_lifecycle_lock = mapping_lifecycle_lock.clone();
+    let lcm_expected_map_frame = expected_map_frame.clone();
     tokio::spawn(async move {
         while lcm_rx.changed().await.is_ok() {
             let Some(event) = lcm_rx.borrow_and_update().clone() else {
@@ -2522,7 +2804,10 @@ fn spawn_map_revision_fanout(
             if !map_event_matches_current_session(&event, &lcm_mapping_adapter) {
                 continue;
             }
-            let payload = match encode_occupancy_revision(&event) {
+            let payload = match encode_occupancy_revision_in_frame(
+                &event,
+                lcm_expected_map_frame.as_ref(),
+            ) {
                 Ok(payload) => payload,
                 Err(error) => {
                     warn!(revision = event.revision, %error, "map revision rejected at global fanout boundary");
@@ -2549,6 +2834,7 @@ fn spawn_map_revision_fanout(
 
     let explore_mapping_adapter = mapping_adapter.clone();
     let explore_lifecycle_lock = mapping_lifecycle_lock.clone();
+    let explore_expected_map_frame = expected_map_frame.clone();
     tokio::spawn(async move {
         while explore_rx.changed().await.is_ok() {
             let Some(event) = explore_rx.borrow_and_update().clone() else {
@@ -2558,7 +2844,10 @@ fn spawn_map_revision_fanout(
             if !map_event_matches_current_session(&event, &explore_mapping_adapter) {
                 continue;
             }
-            match exploration_costmap_from_revision(&event) {
+            match exploration_costmap_from_revision_in_frame(
+                &event,
+                explore_expected_map_frame.as_ref(),
+            ) {
                 Ok(snapshot) => {
                     match tokio::time::timeout(
                         MAP_FANOUT_SINK_TIMEOUT,
@@ -2585,11 +2874,12 @@ fn spawn_map_revision_fanout(
         }
     });
 
-    spawn_map_revision_coalescer(
+    spawn_map_revision_coalescer_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
         mapping_adapter,
         mapping_lifecycle_lock,
+        expected_map_frame,
     );
 }
 
@@ -2629,6 +2919,24 @@ fn spawn_frontier_fanout(
     transport: LcmTransport,
     frontier_binding: Option<(LcmTopic, LcmMessageType)>,
 ) {
+    spawn_frontier_fanout_in_frame(
+        explore,
+        state,
+        frontiers_tx,
+        transport,
+        frontier_binding,
+        Arc::from("map"),
+    );
+}
+
+fn spawn_frontier_fanout_in_frame(
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+    state: Arc<RwLock<SharedState>>,
+    frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
+    transport: LcmTransport,
+    frontier_binding: Option<(LcmTopic, LcmMessageType)>,
+    expected_map_frame: Arc<str>,
+) {
     let mut frontier_rx = explore.subscribe_frontiers();
     tokio::spawn(async move {
         loop {
@@ -2636,7 +2944,24 @@ fn spawn_frontier_fanout(
                 break;
             }
             let snapshot = frontier_rx.borrow_and_update().clone();
-            let entries: Vec<_> = snapshot.frontiers.iter().map(frontier_entry).collect();
+            if snapshot.frontiers.iter().any(|frontier| {
+                !matches!(
+                    &frontier.pose.frame_id,
+                    nuwax_nav_types_messages::frames::NavFrameId::Map
+                )
+            }) {
+                warn!(
+                    revision = snapshot.revision,
+                    expected_map_frame = %expected_map_frame,
+                    "frontier snapshot rejected outside configured map frame"
+                );
+                continue;
+            }
+            let entries: Vec<_> = snapshot
+                .frontiers
+                .iter()
+                .map(|frontier| frontier_entry(frontier, expected_map_frame.as_ref()))
+                .collect();
             {
                 let mut shared = state.write().await;
                 shared.frontiers = entries.clone();
@@ -2646,13 +2971,14 @@ fn spawn_frontier_fanout(
             let Some((topic, msg_type)) = frontier_binding.as_ref() else {
                 continue;
             };
-            let payload = match encode_frontier_snapshot(&snapshot) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    warn!(revision = snapshot.revision, %error, "frontier LCM fanout rejected");
-                    continue;
-                }
-            };
+            let payload =
+                match encode_frontier_snapshot_in_frame(&snapshot, expected_map_frame.as_ref()) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(revision = snapshot.revision, %error, "frontier LCM fanout rejected");
+                        continue;
+                    }
+                };
             let frame = crate::typed_codec::build_typed_frame(
                 topic.clone(),
                 msg_type.clone(),
@@ -2672,20 +2998,24 @@ fn spawn_frontier_fanout(
 /// `LcmTransport::new_real(&lcm_url)`；若 liblcm 不可用或启动失败，
 /// → fail-fast 返回 [`RealLcmBackendUnavailable`]；二进制入口统一输出错误并退出。
 ///
-/// # Args
-///
-/// * `odometry_channel` — Phase 1 新增；`nav_msgs/Odometry` typed channel
-/// * 其余形参来自 Phase 0 默认 channel registry
+/// All channel, path, and frame inputs are immutable startup-preflight values;
+/// this function never reparses their environment variables after side effects.
 pub fn spawn_geometry_runtime(
     backend: LcmBackendKind,
-    occupancy_channel: &str,
-    tf_channel: &str,
-    cloud_map_channel: Option<&str>,
-    nav_state_channel: Option<&str>,
-    frontiers_channel: Option<&str>,
-    odometry_channel: Option<&str>,
+    mapping_backend: MappingBackendSpec,
+    channel_bindings: channel_registry::ValidatedChannelBindings,
+    path_binding: (LcmTopic, LcmMessageType),
+    frame_bindings: ValidatedFrameBindings,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let backend_name = backend.canonical_name();
+    let (occ_topic, occ_msg_type) = channel_bindings.binding(ChannelKey::Occupancy);
+    let (tf_topic, tf_msg_type) = channel_bindings.binding(ChannelKey::Tf);
+    let legacy_cm_binding = Some(channel_bindings.binding(ChannelKey::CloudMap));
+    let nav_binding = Some(channel_bindings.binding(ChannelKey::NavState));
+    let fr_binding = Some(channel_bindings.binding(ChannelKey::Frontiers));
+    let odom_binding = Some(channel_bindings.binding(ChannelKey::Odom));
+    let (map_frame, odom_frame, base_frame) = frame_bindings.into_parts();
+    let expected_map_frame: Arc<str> = Arc::from(map_frame.clone());
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
@@ -2719,7 +3049,13 @@ pub fn spawn_geometry_runtime(
             )));
         }
     };
-    let explore_runtime = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+    let explore_runtime =
+        crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame.clone())
+            .map_err(|error| {
+            RealLcmBackendUnavailable::configuration(format!(
+                "exploration map frame rejected after startup validation: {error}"
+            ))
+        })?;
     if let Err(error) = explore_runtime.restore_latest_durable_reconciliation_snapshot() {
         error!(
             reason = error.message(),
@@ -2782,98 +3118,8 @@ pub fn spawn_geometry_runtime(
         backend_name, backend_available
     );
 
-    let (occ_topic, occ_msg_type) =
-        match parse_expected_typed_channel(occupancy_channel, "nav_msgs.OccupancyGrid") {
-            Ok(binding) => binding,
-            Err(e) => {
-                error!("lcm_runtime::spawn: occupancy channel 解析失败: {}", e);
-                return Err(RealLcmBackendUnavailable::configuration(format!(
-                    "occupancy channel binding rejected: {e}"
-                )));
-            }
-        };
-    let (tf_topic, tf_msg_type) =
-        match parse_expected_typed_channel(tf_channel, "tf2_msgs.TFMessage") {
-            Ok(binding) => binding,
-            Err(e) => {
-                error!("lcm_runtime::spawn: tf channel 解析失败: {}", e);
-                return Err(RealLcmBackendUnavailable::configuration(format!(
-                    "tf channel binding rejected: {e}"
-                )));
-            }
-        };
-    // Legacy `/cloud_map` is diagnostics-only. MappingSession is the sole
-    // cloud-map writer; accepting both sources would interleave unrelated
-    // revisions in the same mmap.
-    let legacy_cm_binding = match cloud_map_channel {
-        Some(c) => match parse_expected_typed_channel(c, "sensor_msgs.PointCloud2") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: cloud_map channel 解析失败 ({}): 降级无 cloud_map 模式",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let nav_binding = match nav_state_channel {
-        Some(c) => match parse_expected_typed_channel(c, "nuwax_msgs.NavigationState") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: nav_state channel 解析失败 ({}): 降级无 nav 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let fr_binding = match frontiers_channel {
-        Some(c) => match parse_expected_typed_channel(c, "nuwax_msgs.FrontierList") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: frontiers channel 解析失败 ({}): 降级无 frontier 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    // Phase 1 channel registry 补齐:解析 typed odometry channel。
-    // Phase 4: 改走 `parse_channel_with_suffix`,强制 typed suffix;不再 untyped 兜底。
-    let odom_binding = match odometry_channel {
-        Some(c) => match parse_expected_typed_channel(c, "nav_msgs.Odometry") {
-            Ok(binding) => Some(binding),
-            Err(e) => {
-                warn!(
-                    "lcm_runtime::spawn: odom channel 解析失败 ({}): 降级无 /odom 订阅",
-                    e
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    if let Err(error) = crate::nav_runtime::goal_envelope_binding() {
-        error!(%error, "versioned goal channel binding rejected");
-        return Err(RealLcmBackendUnavailable::configuration(format!(
-            "versioned goal channel binding rejected: {error}"
-        )));
-    }
-    let path_binding = match crate::nav_runtime::path_envelope_binding() {
-        Ok(binding) => binding,
-        Err(error) => {
-            error!(%error, "versioned path channel binding rejected");
-            return Err(RealLcmBackendUnavailable::configuration(format!(
-                "versioned path channel binding rejected: {error}"
-            )));
-        }
-    };
+    // Every binding above was parsed and type-checked before Tokio, tracing,
+    // persistence, transport, files, or tasks were created.
     // Phase 1:打印 channel registry 让运维和 healthcheck 都能看到本进程
     // 注册的全部 typed channel;Phase 2+ 将在此基础上挂接订阅任务。
     info!(
@@ -2932,22 +3178,6 @@ pub fn spawn_geometry_runtime(
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
 
     // ---- 订阅 /tf：写入 canonical TfTree 历史并合成 base→map 位姿 ----
-    let map_frame = std::env::var("NUWAX_GEOMETRY_MAP_FRAME")
-        .or_else(|_| std::env::var("NUWAX_MAP_FRAME"))
-        .unwrap_or_else(|_| "map".into());
-    let odom_frame = std::env::var("NUWAX_GEOMETRY_ODOM_FRAME")
-        .or_else(|_| std::env::var("NUWAX_ODOM_FRAME"))
-        .unwrap_or_else(|_| "odom".into());
-    let base_frame = resolve_base_frame_alias(
-        std::env::var("NUWAX_BASE_FRAME").ok().as_deref(),
-        std::env::var("NUWAX_GEOMETRY_BASE_FRAME").ok().as_deref(),
-    );
-    if validated_frame_tokens(&base_frame).is_none() {
-        error!(frame = %base_frame, "configured base frame is not a valid frame ID");
-        return Err(RealLcmBackendUnavailable::configuration(format!(
-            "configured base frame is not a valid frame ID: {base_frame}"
-        )));
-    }
     let base_candidates = vec![base_frame.clone()];
 
     // Mapping exists for the process lifetime but starts inactive. The
@@ -2956,7 +3186,8 @@ pub fn spawn_geometry_runtime(
         let cfg = MappingAdapterConfig::from_env();
         let forbidden_zones_path = crate::forbidden_zones::path_from_env();
         info!(
-            "mapping_adapter 已构造且等待 StartMapping: resolution={}m auto_bounds_padding=1m occupancy_algo={} forbidden_zones_path={}",
+            "mapping_adapter 已构造且等待 StartMapping: backend={} resolution={}m auto_bounds_padding=1m occupancy_algo={} forbidden_zones_path={}",
+            mapping_backend.stable_name(),
             cfg.resolution,
             cfg.occupancy_algo.as_dimos_str(),
             forbidden_zones_path.display()
@@ -2964,6 +3195,7 @@ pub fn spawn_geometry_runtime(
         Some(Arc::new(parking_lot::Mutex::new(
             MappingAdapter::new_with_frames_sequence_store_and_forbidden_zones(
                 cfg,
+                mapping_backend,
                 map_frame.clone(),
                 odom_frame.clone(),
                 sequence_store.clone(),
@@ -3122,9 +3354,7 @@ pub fn spawn_geometry_runtime(
                 else {
                     continue;
                 };
-                nav_state.write().await.nav_state = update.state.clone();
-                let _ = nav_tx.send(update.clone());
-                report_exploration_navigation_terminal(&nav_explore, &update).await;
+                fanout_navigation_update(&nav_state, &nav_tx, &nav_explore, update).await;
             }
         });
     }
@@ -3138,12 +3368,13 @@ pub fn spawn_geometry_runtime(
 
     // ExploreRuntime is the sole frontier owner. Its watch stream updates the
     // process cache, gRPC broadcast, and typed LCM channel from one revision.
-    spawn_frontier_fanout(
+    spawn_frontier_fanout_in_frame(
         explore_runtime.clone(),
         state.clone(),
         frontiers_tx.clone(),
         transport.clone(),
         fr_binding,
+        expected_map_frame.clone(),
     );
 
     // Phase 3 增强:订阅 /odom 和 /go2/lidar/points 时同步把数据喂给 mapping
@@ -3213,6 +3444,7 @@ pub fn spawn_geometry_runtime(
 
     explore_runtime.set_navigation_sink(Arc::new(ExploreNavigationBridge {
         state: state.clone(),
+        expected_map_frame: expected_map_frame.clone(),
         cloud_map_tx,
         nav_state_tx,
         frontiers_tx,
@@ -3238,6 +3470,7 @@ pub fn spawn_geometry_runtime(
     let scheduler = explore_runtime.spawn_scheduler(
         Arc::new(SharedStatePoseProvider {
             state: state.clone(),
+            expected_map_frame: expected_map_frame.clone(),
             freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
             max_receipt_age: Duration::from_millis(pose_ttl_ms),
         }),
@@ -3251,7 +3484,7 @@ pub fn spawn_geometry_runtime(
         .as_ref()
         .expect("available LCM backend must construct mapping adapter")
         .clone();
-    spawn_map_revision_fanout(
+    spawn_map_revision_fanout_in_frame(
         map_revision_fanout_rx,
         map_revision_latest_tx,
         transport.clone(),
@@ -3263,6 +3496,7 @@ pub fn spawn_geometry_runtime(
         explore_runtime,
         fanout_mapping_adapter,
         mapping_lifecycle_lock,
+        expected_map_frame,
     );
     if let Some(mapping_arc) = handle.mapping_adapter.as_ref() {
         spawn_forbidden_zone_watcher(
@@ -3272,38 +3506,26 @@ pub fn spawn_geometry_runtime(
             handle.mapping_lifecycle_lock.clone(),
         );
     }
-    if let Some(mapping_arc) = mapping_adapter {
-        spawn_mapping_feed_tasks(
-            transport,
-            state,
-            mapping_arc,
-            map_revision_tx,
-            odom_binding,
-            (tf_topic, tf_msg_type),
-            base_frame,
-            handle.cloud_map_writer.clone(),
-            handle.cloud_map_tx.clone(),
-            handle.mapping_lifecycle_lock.clone(),
-        );
-    }
-
     Ok(handle)
 }
 
 #[derive(Debug)]
 struct MappingIngestOutcome {
     accepted_map_points: Vec<nalgebra::Point3<f64>>,
+    occupancy_event: Option<MapRevisionEvent>,
+    occupancy_receipt: Option<crate::mapping_commit::OccupancyCommitReceipt>,
+    #[cfg(test)]
     occupancy_committed: bool,
     session_generation: u64,
     source_timestamp_ns: u64,
 }
 
-struct CommittedMappingCloudMap {
-    notification: CloudMapNotification,
-    source_timestamp_ns: u64,
-    xyz_f32_le: Vec<u8>,
+struct MappingIngestCommit {
+    outcome: MappingIngestOutcome,
+    cloud_commit: Option<CommittedMappingCloudMap>,
 }
 
+#[cfg(test)]
 fn ingest_mapping_points(
     adapter: &mut MappingAdapter,
     points: &[nalgebra::Point3<f64>],
@@ -3326,6 +3548,8 @@ fn ingest_mapping_points(
     if stats.accepted == 0 {
         return Ok(MappingIngestOutcome {
             accepted_map_points: Vec::new(),
+            occupancy_event: None,
+            occupancy_receipt: None,
             occupancy_committed: false,
             session_generation: adapter.snapshot().session_generation,
             source_timestamp_ns,
@@ -3333,13 +3557,330 @@ fn ingest_mapping_points(
     }
     let accepted_map_points = adapter.take_latest_accepted_map_points();
     let session_generation = adapter.snapshot().session_generation;
+    let mut revision_rx = map_revision_tx.subscribe();
     let occupancy_committed = adapter.build_and_publish(state, Some(map_revision_tx));
+    let occupancy_event = occupancy_committed
+        .then(|| revision_rx.try_recv().ok())
+        .flatten();
+    let occupancy_receipt = occupancy_event
+        .as_ref()
+        .and_then(|_| adapter.latest_occupancy_commit_receipt());
     Ok(MappingIngestOutcome {
         accepted_map_points,
-        occupancy_committed,
+        occupancy_committed: occupancy_event.is_some(),
+        occupancy_event,
+        occupancy_receipt,
         session_generation,
         source_timestamp_ns,
     })
+}
+
+pub(crate) struct CommittedMappingCloudMap {
+    pub(crate) notification: CloudMapNotification,
+    pub(crate) source_timestamp_ns: u64,
+    pub(crate) xyz_f32_le: Vec<u8>,
+    pub(crate) receipt: crate::mapping_commit::CloudCommitReceipt,
+}
+
+async fn ingest_mapping_points_with_backend(
+    mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    cloud_map_writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    points: &[nalgebra::Point3<f64>],
+    point_step: u32,
+    received_at_ns: u64,
+    frame_id: &str,
+    source_timestamp_ns: u64,
+    state: &Arc<RwLock<SharedState>>,
+    source_fenced: bool,
+    expected_generations: Option<(u64, u64)>,
+) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
+    let owned_mapping = mapping.clone();
+    let owned_lifecycle_lock = lifecycle_lock.clone();
+    let owned_cloud_map_writer = cloud_map_writer.clone();
+    let owned_points = points.to_vec();
+    let owned_frame_id = frame_id.to_owned();
+    let owned_state = state.clone();
+    let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
+    tokio::spawn(async move {
+        ingest_mapping_points_with_backend_owned(
+            &owned_mapping,
+            &owned_lifecycle_lock,
+            &owned_cloud_map_writer,
+            &owned_points,
+            point_step,
+            received_at_ns,
+            &owned_frame_id,
+            source_timestamp_ns,
+            &owned_state,
+            source_fenced,
+            expected_generations,
+        )
+        .await
+    })
+    .await
+    .map_err(
+        |error| nuwax_mapping::SessionError::FrameTransformUnavailable {
+            source_frame_id: frame_id.to_owned(),
+            target_frame_id,
+            reason: format!("owned mapping backend task failed: {error}"),
+        },
+    )?
+}
+
+async fn ingest_mapping_points_with_backend_owned(
+    mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    cloud_map_writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    points: &[nalgebra::Point3<f64>],
+    point_step: u32,
+    received_at_ns: u64,
+    frame_id: &str,
+    source_timestamp_ns: u64,
+    state: &Arc<RwLock<SharedState>>,
+    source_fenced: bool,
+    expected_generations: Option<(u64, u64)>,
+) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
+    let prepared = {
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let mut adapter = mapping.lock();
+        if !adapter.is_active() {
+            return Ok(MappingIngestCommit {
+                outcome: MappingIngestOutcome {
+                    accepted_map_points: Vec::new(),
+                    occupancy_event: None,
+                    occupancy_receipt: None,
+                    #[cfg(test)]
+                    occupancy_committed: false,
+                    session_generation: adapter.snapshot().session_generation,
+                    source_timestamp_ns,
+                },
+                cloud_commit: None,
+            });
+        }
+        if let Some((expected_session_generation, expected_frame_generation)) = expected_generations
+        {
+            if adapter.snapshot().session_generation != expected_session_generation
+                || adapter.global_frame_generation() != expected_frame_generation
+            {
+                return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                    source_frame_id: frame_id.to_owned(),
+                    target_frame_id: adapter.configured_map_frame_id().to_owned(),
+                    reason: "registration permit mapping generation is stale".to_owned(),
+                });
+            }
+        }
+        let odom_xy = (adapter.last_sensor_origin[0], adapter.last_sensor_origin[1]);
+        adapter.prepare_backend_compute(
+            points,
+            odom_xy,
+            point_step,
+            received_at_ns,
+            frame_id,
+            source_timestamp_ns,
+            source_fenced,
+        )?
+    };
+    let Some(prepared) = prepared else {
+        let adapter = mapping.lock();
+        return Ok(MappingIngestCommit {
+            outcome: MappingIngestOutcome {
+                accepted_map_points: Vec::new(),
+                occupancy_event: None,
+                occupancy_receipt: None,
+                #[cfg(test)]
+                occupancy_committed: false,
+                session_generation: adapter.snapshot().session_generation,
+                source_timestamp_ns,
+            },
+            cloud_commit: None,
+        });
+    };
+    let token = prepared.token.clone();
+    let completion_rx = match prepared.worker.submit(prepared.token, prepared.input) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
+            let retirement_error =
+                fence_failed_mapping_backend(mapping, lifecycle_lock, &token.session_id)
+                    .await
+                    .err();
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: frame_id.to_owned(),
+                target_frame_id,
+                reason: match retirement_error {
+                    Some(retirement_error) => format!(
+                        "mapping backend submission failed: {error:?}; retirement failed: {retirement_error}"
+                    ),
+                    None => format!("mapping backend submission failed: {error:?}"),
+                },
+            });
+        }
+    };
+    let completion = match tokio::time::timeout(Duration::from_secs(5), completion_rx).await {
+        Ok(Ok(completion)) => completion,
+        Ok(Err(_)) | Err(_) => {
+            let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
+            let retirement_error =
+                fence_failed_mapping_backend(mapping, lifecycle_lock, &token.session_id)
+                    .await
+                    .err();
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: frame_id.to_owned(),
+                target_frame_id,
+                reason: match retirement_error {
+                    Some(error) => format!(
+                        "mapping backend completion timed out or closed; retirement failed: {error}"
+                    ),
+                    None => "mapping backend completion timed out or closed".to_owned(),
+                },
+            });
+        }
+    };
+    let commit_result: Result<
+        MappingIngestCommit,
+        (
+            String,
+            String,
+            Option<crate::mapping_adapter::MappingBackendRetirement>,
+        ),
+    > = {
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let mut adapter = mapping.lock();
+        let target_frame_id = adapter.configured_map_frame_id().to_owned();
+        match adapter.commit_backend_completion(completion, state) {
+            Ok(Some(committed)) => {
+                let crate::mapping_adapter::CommittedMappingCandidate {
+                    token: committed_token,
+                    resolution,
+                    accepted_map_points,
+                    event,
+                    session_generation,
+                    source_timestamp_ns: committed_timestamp_ns,
+                    occupancy_receipt,
+                    ..
+                } = committed;
+                let outcome = MappingIngestOutcome {
+                    accepted_map_points,
+                    #[cfg(test)]
+                    occupancy_committed: event.is_some(),
+                    occupancy_event: event,
+                    occupancy_receipt,
+                    session_generation,
+                    source_timestamp_ns: committed_timestamp_ns,
+                };
+                let current_session = adapter.snapshot();
+                drop(adapter);
+                let cloud_acceptance = update_mapping_cloud_map_with_acceptance(
+                    &outcome,
+                    &current_session,
+                    cloud_map_writer,
+                );
+                let accepted = cloud_acceptance.accepted;
+                let mut adapter = mapping.lock();
+                let resolution_result =
+                    adapter.resolve_backend_completion(&committed_token, resolution, accepted);
+                if !accepted || resolution_result.is_err() {
+                    let reason = if !accepted {
+                        "canonical cloud-map acceptance failed".to_owned()
+                    } else {
+                        format!(
+                            "mapping backend completion resolution failed: {}",
+                            resolution_result.expect_err("resolution failure checked above")
+                        )
+                    };
+                    let retirement = adapter
+                        .stop_session_detached(&token.session_id)
+                        .ok()
+                        .and_then(|transition| transition.retirement);
+                    Err((target_frame_id, reason, retirement))
+                } else {
+                    Ok(MappingIngestCommit {
+                        outcome,
+                        cloud_commit: cloud_acceptance.cloud_commit,
+                    })
+                }
+            }
+            Ok(None) => {
+                let retirement = if adapter.snapshot().active
+                    && adapter.snapshot().session_id == token.session_id
+                {
+                    adapter
+                        .stop_session_detached(&token.session_id)
+                        .ok()
+                        .and_then(|transition| transition.retirement)
+                } else {
+                    None
+                };
+                Err((
+                    target_frame_id,
+                    "mapping backend completion became stale".to_owned(),
+                    retirement,
+                ))
+            }
+            Err(reason) => {
+                let retirement = adapter
+                    .stop_session_detached(&token.session_id)
+                    .ok()
+                    .and_then(|transition| transition.retirement);
+                Err((target_frame_id, reason, retirement))
+            }
+        }
+    };
+    match commit_result {
+        Ok(commit) => Ok(commit),
+        Err((target_frame_id, reason, retirement)) => {
+            finish_mapping_ingest_failure(
+                mapping,
+                lifecycle_lock,
+                frame_id,
+                target_frame_id,
+                reason,
+                retirement,
+            )
+            .await
+        }
+    }
+}
+
+async fn finish_mapping_ingest_failure(
+    mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    frame_id: &str,
+    target_frame_id: String,
+    mut reason: String,
+    retirement: Option<crate::mapping_adapter::MappingBackendRetirement>,
+) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
+    if let Err(error) = finish_backend_retirement(mapping, lifecycle_lock, retirement).await {
+        reason = format!("{reason}; retirement failed: {error}");
+    }
+    Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+        source_frame_id: frame_id.to_owned(),
+        target_frame_id,
+        reason,
+    })
+}
+
+async fn fence_failed_mapping_backend(
+    mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    session_id: &str,
+) -> Result<(), String> {
+    let retirement = {
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let mut adapter = mapping.lock();
+        let snapshot = adapter.snapshot();
+        if !snapshot.active || snapshot.session_id != session_id {
+            return Ok(());
+        }
+        adapter
+            .stop_session_detached(session_id)
+            .map_err(|error| error.to_string())?
+            .retirement
+    };
+    finish_backend_retirement(mapping, lifecycle_lock, retirement)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn update_mapping_cloud_map_if_current(
@@ -3347,55 +3888,305 @@ fn update_mapping_cloud_map_if_current(
     current_session: &crate::mapping_adapter::MappingSessionSnapshot,
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
 ) -> Option<CommittedMappingCloudMap> {
-    if !current_session.active || current_session.session_generation != outcome.session_generation {
-        return None;
-    }
-    let mut writer = writer.lock();
-    let writer = writer.as_mut()?;
-    if !writer.accumulate_mapping_frame(
-        outcome.session_generation,
-        outcome.accepted_map_points.as_slice(),
-    ) || !outcome.occupancy_committed
-    {
-        return None;
-    }
-    let committed = writer.commit_accumulated_snapshot()?;
-    Some(CommittedMappingCloudMap {
-        notification: CloudMapNotification {
-            revision: committed.revision,
-            point_count: committed.point_count,
-            voxel_size: committed.voxel_size,
-            session_generation: outcome.session_generation,
-        },
-        source_timestamp_ns: outcome.source_timestamp_ns,
-        xyz_f32_le: committed.xyz_f32_le,
-    })
+    update_mapping_cloud_map_with_acceptance(outcome, current_session, writer).cloud_commit
 }
 
-async fn publish_committed_global_map(
+pub(crate) fn accept_mapping_cloud_map_for_backend_candidate(
+    accepted_map_points: &[nalgebra::Point3<f64>],
+    event: &Option<MapRevisionEvent>,
+    occupancy_receipt: &Option<crate::mapping_commit::OccupancyCommitReceipt>,
+    session_generation: u64,
+    source_timestamp_ns: u64,
+    current_session: &crate::mapping_adapter::MappingSessionSnapshot,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+) -> (bool, Option<CommittedMappingCloudMap>) {
+    let outcome = MappingIngestOutcome {
+        accepted_map_points: accepted_map_points.to_vec(),
+        occupancy_event: event.clone(),
+        occupancy_receipt: occupancy_receipt.clone(),
+        #[cfg(test)]
+        occupancy_committed: event.is_some(),
+        session_generation,
+        source_timestamp_ns,
+    };
+    let acceptance = update_mapping_cloud_map_with_acceptance(&outcome, current_session, writer);
+    (acceptance.accepted, acceptance.cloud_commit)
+}
+
+struct MappingCloudMapAcceptance {
+    cloud_commit: Option<CommittedMappingCloudMap>,
+    accepted: bool,
+}
+
+fn update_mapping_cloud_map_with_acceptance(
+    outcome: &MappingIngestOutcome,
+    current_session: &crate::mapping_adapter::MappingSessionSnapshot,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+) -> MappingCloudMapAcceptance {
+    if !current_session.active || current_session.session_generation != outcome.session_generation {
+        return MappingCloudMapAcceptance {
+            cloud_commit: None,
+            accepted: false,
+        };
+    }
+    let mut writer = writer.lock();
+    let Some(writer) = writer.as_mut() else {
+        return MappingCloudMapAcceptance {
+            cloud_commit: None,
+            accepted: true,
+        };
+    };
+    let (event, receipt) = match (
+        outcome.occupancy_event.as_ref(),
+        outcome.occupancy_receipt.as_ref(),
+    ) {
+        (None, None) => {
+            let accepted = outcome.accepted_map_points.is_empty()
+                || writer.accumulate_mapping_frame(
+                    outcome.session_generation,
+                    outcome.accepted_map_points.as_slice(),
+                );
+            return MappingCloudMapAcceptance {
+                cloud_commit: None,
+                accepted,
+            };
+        }
+        (Some(event), Some(receipt)) => (event, receipt),
+        _ => {
+            return MappingCloudMapAcceptance {
+                cloud_commit: None,
+                accepted: false,
+            };
+        }
+    };
+    if receipt.session_generation != outcome.session_generation
+        || receipt.session_generation != current_session.session_generation
+        || event.session_generation != receipt.session_generation
+        || receipt.occupancy_revision != event.revision
+        || receipt.source_timestamp_ns != outcome.source_timestamp_ns
+        || event.timestamp_ns != receipt.source_timestamp_ns
+        || receipt.session_id != current_session.session_id
+        || event.session_id != receipt.session_id
+    {
+        return MappingCloudMapAcceptance {
+            cloud_commit: None,
+            accepted: false,
+        };
+    }
+    if !outcome.accepted_map_points.is_empty()
+        && !writer.accumulate_mapping_frame(
+            outcome.session_generation,
+            outcome.accepted_map_points.as_slice(),
+        )
+    {
+        return MappingCloudMapAcceptance {
+            cloud_commit: None,
+            accepted: false,
+        };
+    }
+    let Some(committed) = writer.commit_accumulated_snapshot(receipt).ok().flatten() else {
+        return MappingCloudMapAcceptance {
+            cloud_commit: None,
+            accepted: false,
+        };
+    };
+    let snapshot = committed.snapshot;
+    MappingCloudMapAcceptance {
+        cloud_commit: Some(CommittedMappingCloudMap {
+            notification: CloudMapNotification {
+                revision: snapshot.revision,
+                point_count: snapshot.point_count,
+                voxel_size: snapshot.voxel_size,
+                session_generation: outcome.session_generation,
+            },
+            source_timestamp_ns: receipt.source_timestamp_ns,
+            xyz_f32_le: snapshot.xyz_f32_le,
+            receipt: committed.receipt,
+        }),
+        accepted: true,
+    }
+}
+
+pub(crate) async fn publish_committed_global_map_in_frame(
     transport: &LcmTransport,
     committed: &CommittedMappingCloudMap,
+    frame_id: &str,
 ) -> Result<(), String> {
-    let payload = crate::typed_codec::encode_global_map_pointcloud_payload(
+    publish_global_map_snapshot_in_frame(
+        transport,
         &committed.xyz_f32_le,
         committed.notification.revision,
         committed.source_timestamp_ns,
+        frame_id,
+    )
+    .await
+}
+
+async fn publish_global_map_snapshot_in_frame(
+    transport: &LcmTransport,
+    xyz_f32_le: &[u8],
+    revision: u64,
+    source_timestamp_ns: u64,
+    frame_id: &str,
+) -> Result<(), String> {
+    let payload = crate::typed_codec::encode_global_map_pointcloud_payload_in_frame(
+        xyz_f32_le,
+        revision,
+        source_timestamp_ns,
+        frame_id,
     )
     .map_err(|error| format!("global-map PointCloud2 encode failed: {error}"))?;
     let topic = LcmTopic::new(GLOBAL_MAP_CHANNEL)
         .map_err(|error| format!("canonical global-map topic invalid: {error}"))?;
     let message_type = LcmMessageType::new(POINT_CLOUD2_MESSAGE_TYPE)
         .map_err(|error| format!("canonical PointCloud2 type invalid: {error}"))?;
-    let frame = crate::typed_codec::build_typed_frame(
-        topic,
-        message_type,
-        payload,
-        committed.notification.revision,
-    );
+    let frame = crate::typed_codec::build_typed_frame(topic, message_type, payload, revision);
     match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, transport.publish(frame)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(format!("global-map typed publish failed: {error}")),
         Err(_) => Err("global-map typed publish timed out".to_string()),
+    }
+}
+
+struct CanonicalCloudPublication {
+    notification: CloudMapNotification,
+    source_timestamp_ns: u64,
+    xyz_f32_le: Vec<u8>,
+}
+
+fn latest_canonical_cloud_publication(
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+) -> Option<(
+    Arc<crate::pointcloud::TypedCloudPublishState>,
+    CanonicalCloudPublication,
+)> {
+    let guard = writer.lock();
+    let writer = guard.as_ref()?;
+    let publish_state = writer.typed_publish_state();
+    let snapshot = writer.committed_snapshot()?;
+    let source_timestamp_ns = writer
+        .last_cloud_receipt()
+        .filter(|receipt| {
+            receipt.session_generation == snapshot.session_generation
+                && receipt.cloud_revision == snapshot.revision
+        })
+        .map_or(0, |receipt| receipt.source_timestamp_ns);
+    publish_state.observe_session_generation(snapshot.session_generation);
+    Some((
+        publish_state,
+        CanonicalCloudPublication {
+            notification: CloudMapNotification {
+                revision: snapshot.revision,
+                point_count: snapshot.point_count,
+                voxel_size: snapshot.voxel_size,
+                session_generation: snapshot.session_generation,
+            },
+            source_timestamp_ns,
+            xyz_f32_le: snapshot.xyz_f32_le,
+        },
+    ))
+}
+
+async fn publish_latest_canonical_cloud_map(
+    transport: &LcmTransport,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    state: &Arc<RwLock<SharedState>>,
+    cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
+    frame_id: &str,
+) -> Result<Option<CloudMapNotification>, String> {
+    'acquire_sequencer: loop {
+        let Some((publish_state, _)) = latest_canonical_cloud_publication(writer) else {
+            return Ok(None);
+        };
+        let _sequencer = publish_state.lock_sequencer().await;
+        loop {
+            let Some((current_publish_state, latest_publication)) =
+                latest_canonical_cloud_publication(writer)
+            else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(&publish_state, &current_publish_state) {
+                continue 'acquire_sequencer;
+            }
+            let pending_clear = publish_state
+                .pending_clear_for_session(latest_publication.notification.session_generation);
+            let publication = pending_clear
+                .as_ref()
+                .map(|clear| CanonicalCloudPublication {
+                    notification: CloudMapNotification {
+                        revision: clear.revision,
+                        point_count: clear.point_count,
+                        voxel_size: clear.voxel_size,
+                        session_generation: clear.session_generation,
+                    },
+                    source_timestamp_ns: 0,
+                    xyz_f32_le: Vec::new(),
+                })
+                .unwrap_or(latest_publication);
+            let identity = (
+                publication.notification.session_generation,
+                publication.notification.revision,
+            );
+            if publish_state.published_identity() == Some(identity) {
+                publish_state.mark_published(identity);
+                if pending_clear.is_some() {
+                    continue;
+                }
+                return Ok(Some(publication.notification));
+            }
+
+            let mut session_generation_rx = publish_state.session_generation_rx();
+            if *session_generation_rx.borrow_and_update()
+                != publication.notification.session_generation
+            {
+                continue;
+            }
+            let publish_result = tokio::select! {
+                biased;
+                changed = session_generation_rx.changed() => {
+                    match changed {
+                        Ok(()) => None,
+                        Err(_) => return Ok(None),
+                    }
+                }
+                result = publish_global_map_snapshot_in_frame(
+                    transport,
+                    &publication.xyz_f32_le,
+                    publication.notification.revision,
+                    publication.source_timestamp_ns,
+                    frame_id,
+                ) => Some(result),
+            };
+            let Some(publish_result) = publish_result else {
+                continue;
+            };
+            publish_result?;
+
+            let mut shared = state.write().await;
+            let current_writer = writer.lock();
+            let Some(current_writer) = current_writer.as_ref() else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(&publish_state, &current_writer.typed_publish_state()) {
+                drop(shared);
+                continue 'acquire_sequencer;
+            }
+            let Some(current_snapshot) = current_writer.committed_snapshot() else {
+                return Ok(None);
+            };
+            if current_snapshot.session_generation != identity.0
+                || *session_generation_rx.borrow_and_update() != identity.0
+            {
+                drop(shared);
+                continue;
+            }
+
+            publish_state.mark_published(identity);
+            if shared.cloud_map_revision < publication.notification.revision {
+                shared.cloud_map_revision = publication.notification.revision;
+                let _ = cloud_map_tx.send(publication.notification.clone());
+            }
+        }
     }
 }
 
@@ -3406,6 +4197,146 @@ fn mapping_feed_should_wait_for_active_session(
         .try_lock()
         .map(|adapter| !adapter.is_active())
         .unwrap_or(false)
+}
+
+/// Apply one source-fenced LIO odometry observation through the existing
+/// canonical MappingAdapter pose/TF boundary.
+///
+/// The caller owns `mapping_lifecycle_lock`; this function deliberately does
+/// not introduce a second lifecycle or TF authority.
+pub(crate) async fn handoff_lio_odometry(
+    handle: &GeometryRuntimeHandle,
+    pose: &PoseState,
+    base_frame: &str,
+    tf_binding: &(LcmTopic, LcmMessageType),
+) -> Result<bool, String> {
+    let mapping = handle
+        .mapping_adapter
+        .as_ref()
+        .ok_or_else(|| "mapping adapter is unavailable".to_string())?;
+    if mapping_feed_should_wait_for_active_session(mapping.as_ref()) {
+        return Ok(false);
+    }
+
+    let transform_cache = mapping.lock().map_odom_transform_cache();
+    let observation = canonical_mapping_observation_for_odom(
+        mapping.as_ref(),
+        transform_cache.as_ref(),
+        pose,
+        base_frame,
+    )?;
+    apply_canonical_mapping_observation(&handle.state, &observation).await;
+
+    let tf_frame = crate::typed_codec::build_typed_frame(
+        tf_binding.0.clone(),
+        tf_binding.1.clone(),
+        observation.tf_payload,
+        pose.timestamp_ns,
+    );
+    match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, handle.transport.publish(tf_frame)).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(error)) => Err(format!("canonical mapping TF publish failed: {error}")),
+        Err(_) => Err("canonical mapping TF publish timed out".to_string()),
+    }
+}
+
+/// Commit one already-registered map-frame LIO cloud through the existing
+/// MappingAdapter map/revision/SHM fanout boundary.
+///
+/// `adapter_timestamp_ns` belongs to the adapter's monotonic freshness domain;
+/// `source_timestamp_ns` remains the public source identity and output metadata.
+/// The caller owns `mapping_lifecycle_lock` and the one-shot registration permit.
+pub(crate) async fn handoff_registered_lio_cloud(
+    handle: &GeometryRuntimeHandle,
+    points: &[nalgebra::Point3<f64>],
+    point_step: u32,
+    adapter_timestamp_ns: u64,
+    source_timestamp_ns: u64,
+    map_frame: &str,
+) -> Result<bool, String> {
+    handoff_registered_lio_cloud_inner(
+        handle,
+        points,
+        point_step,
+        adapter_timestamp_ns,
+        source_timestamp_ns,
+        map_frame,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn handoff_registered_lio_cloud_fenced(
+    handle: &GeometryRuntimeHandle,
+    points: &[nalgebra::Point3<f64>],
+    point_step: u32,
+    adapter_timestamp_ns: u64,
+    source_timestamp_ns: u64,
+    map_frame: &str,
+    expected_session_generation: u64,
+    expected_frame_generation: u64,
+) -> Result<bool, String> {
+    handoff_registered_lio_cloud_inner(
+        handle,
+        points,
+        point_step,
+        adapter_timestamp_ns,
+        source_timestamp_ns,
+        map_frame,
+        Some((expected_session_generation, expected_frame_generation)),
+    )
+    .await
+}
+
+async fn handoff_registered_lio_cloud_inner(
+    handle: &GeometryRuntimeHandle,
+    points: &[nalgebra::Point3<f64>],
+    point_step: u32,
+    adapter_timestamp_ns: u64,
+    source_timestamp_ns: u64,
+    map_frame: &str,
+    expected_generations: Option<(u64, u64)>,
+) -> Result<bool, String> {
+    let mapping = handle
+        .mapping_adapter
+        .as_ref()
+        .ok_or_else(|| "mapping adapter is unavailable".to_string())?;
+    let outcome = ingest_mapping_points_with_backend(
+        mapping,
+        &handle.mapping_lifecycle_lock,
+        &handle.cloud_map_writer,
+        points,
+        point_step,
+        adapter_timestamp_ns,
+        map_frame,
+        source_timestamp_ns,
+        &handle.state,
+        true,
+        expected_generations,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let MappingIngestCommit {
+        outcome,
+        cloud_commit,
+    } = outcome;
+    let occupancy_committed = outcome.occupancy_event.is_some();
+    if let Some(event) = outcome.occupancy_event.as_ref() {
+        let _ = handle.map_revision_tx.send(event.clone());
+    }
+
+    if cloud_commit.is_some() {
+        publish_latest_canonical_cloud_map(
+            &handle.transport,
+            &handle.cloud_map_writer,
+            &handle.state,
+            &handle.cloud_map_tx,
+            map_frame,
+        )
+        .await?
+        .ok_or_else(|| "canonical cloud-map snapshot became unavailable".to_owned())?;
+    }
+    Ok(occupancy_committed)
 }
 
 /// Phase 3: 把 LCM `/odom` 与 `/go2/lidar/points` typed channel 喂给 mapping adapter。
@@ -3428,6 +4359,7 @@ fn spawn_mapping_feed_tasks(
     mapping_arc: Arc<parking_lot::Mutex<MappingAdapter>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
     odom_binding: Option<(LcmTopic, LcmMessageType)>,
+    pointcloud_binding: (LcmTopic, LcmMessageType),
     tf_binding: (LcmTopic, LcmMessageType),
     base_frame: String,
     cloud_map_writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
@@ -3502,19 +4434,10 @@ fn spawn_mapping_feed_tasks(
     }
 
     // ---- /go2/lidar/points → feed_pointcloud + build_and_publish ----
-    let (lidar_topic, lidar_msg_type) =
-        match binding_for_key(ChannelKey::PointCloud, "sensor_msgs.PointCloud2") {
-            Ok(binding) => binding,
-            Err(e) => {
-                error!(
-                    "spawn_mapping_feed_tasks: pointcloud typed channel 无效: {}",
-                    e
-                );
-                return;
-            }
-        };
+    let (lidar_topic, lidar_msg_type) = pointcloud_binding;
     let transport_lidar = transport.clone();
     let mapping_lidar = mapping_arc.clone();
+    let mapping_lidar_frame = mapping_lidar.lock().configured_map_frame_id().to_string();
     let state_lidar = state.clone();
     let map_revision_lidar = map_revision_tx.clone();
     tokio::spawn(async move {
@@ -3578,54 +4501,50 @@ fn spawn_mapping_feed_tasks(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            let ingest = {
-                let mut adapter = mapping_lidar.lock();
-                if !adapter.is_active() {
-                    None
-                } else {
-                    let outcome = ingest_mapping_points(
-                        &mut adapter,
-                        &points,
-                        parsed.point_step,
-                        now_ns,
-                        &parsed.frame_id,
-                        parsed.timestamp_ns,
-                        &state_lidar,
-                        &map_revision_lidar,
-                    );
-                    Some(outcome)
-                }
-            };
-            let Some(ingest_outcome) = ingest else {
-                continue;
-            };
+            let ingest_outcome = ingest_mapping_points_with_backend(
+                &mapping_lidar,
+                &mapping_lifecycle_lock,
+                &cloud_map_writer,
+                &points,
+                parsed.point_step,
+                now_ns,
+                &parsed.frame_id,
+                parsed.timestamp_ns,
+                &state_lidar,
+                false,
+                None,
+            )
+            .await;
             match ingest_outcome {
-                Ok(outcome) => {
-                    let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
-                    let current_session = mapping_lidar.lock().snapshot();
-                    let Some(committed) = update_mapping_cloud_map_if_current(
-                        &outcome,
-                        &current_session,
-                        &cloud_map_writer,
-                    ) else {
+                Ok(commit) => {
+                    let MappingIngestCommit {
+                        outcome,
+                        cloud_commit,
+                    } = commit;
+                    if let Some(event) = outcome.occupancy_event.as_ref() {
+                        let _ = map_revision_lidar.send(event.clone());
+                    }
+                    let Some(committed) = cloud_commit else {
                         continue;
                     };
-                    if let Err(error) =
-                        publish_committed_global_map(&transport_lidar, &committed).await
+                    let expected_revision = committed.notification.revision;
+                    let expected_session_generation = committed.notification.session_generation;
+                    if let Err(error) = publish_latest_canonical_cloud_map(
+                        &transport_lidar,
+                        &cloud_map_writer,
+                        &state_lidar,
+                        &cloud_map_tx,
+                        &mapping_lidar_frame,
+                    )
+                    .await
                     {
                         warn!(
                             %error,
-                            revision = committed.notification.revision,
-                            session_generation = committed.notification.session_generation,
+                            revision = expected_revision,
+                            session_generation = expected_session_generation,
                             "committed cloud-map revision was not delivered to typed /global_map"
                         );
                     }
-                    let update = committed.notification;
-                    {
-                        let mut shared = state_lidar.write().await;
-                        shared.cloud_map_revision = update.revision;
-                    }
-                    let _ = cloud_map_tx.send(update);
                 }
                 Err(error) => {
                     warn!("mapping_feed: MappingSession 拒绝点云帧: {error}");
@@ -3876,12 +4795,38 @@ mod tf_tree_tests {
             "base_footprint"
         );
     }
+
+    #[test]
+    fn validated_frame_bindings_cover_map_odom_and_base_roles() {
+        let bindings = ValidatedFrameBindings::from_values("map", "robot/odom", "robot/base_link")
+            .expect("valid frame bindings");
+        assert_eq!(
+            bindings.into_parts(),
+            (
+                "map".to_string(),
+                "robot/odom".to_string(),
+                "robot/base_link".to_string()
+            )
+        );
+
+        for (map, odom, base, role) in [
+            ("invalid frame", "odom", "base_link", "map"),
+            ("map", "invalid frame", "base_link", "odom"),
+            ("map", "odom", "invalid frame", "base"),
+        ] {
+            let error = ValidatedFrameBindings::from_values(map, odom, base)
+                .expect_err("invalid frame must fail startup preflight");
+            assert_eq!(error.role, role);
+            assert_eq!(error.variable, "<value>");
+        }
+    }
 }
 
 #[cfg(test)]
 mod mapping_feed_tests {
     use super::*;
     use crate::mapping_adapter::MappingReadiness;
+    use crate::mapping_backend::MappingBackendTestGate;
     use nalgebra::Point3;
     use nuwax_protocol::RawLcmFrame;
     use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
@@ -3967,6 +4912,45 @@ mod mapping_feed_tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct FirstGlobalMapPublishGateBackend {
+        publish_attempts: Arc<std::sync::atomic::AtomicU64>,
+        first_publish_started: Arc<tokio::sync::Notify>,
+        frame_published: Arc<tokio::sync::Notify>,
+        published: Arc<std::sync::Mutex<Vec<RawLcmFrame>>>,
+    }
+
+    #[async_trait]
+    impl LcmBackend for FirstGlobalMapPublishGateBackend {
+        async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+            let attempt = self
+                .publish_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if attempt == 0 {
+                self.first_publish_started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            self.published
+                .lock()
+                .expect("global-map published frames")
+                .push(frame);
+            self.frame_published.notify_one();
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _topic: LcmTopic,
+            _msg_type: Option<LcmMessageType>,
+        ) -> LcmFrameStream {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn name(&self) -> &str {
+            "first-global-map-publish-gate"
+        }
+    }
+
     fn mapping_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
             resolution: 0.5,
@@ -3982,13 +4966,77 @@ mod mapping_feed_tests {
     fn active_mapping_adapter() -> MappingAdapter {
         let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "map", "odom");
         adapter
-            .start_session("test-session", "test-map", "mapver_000001")
+            .start_session("test-session", "test-map")
             .expect("active mapping test session");
         adapter
     }
 
     fn shared_active_mapping_adapter() -> Arc<parking_lot::Mutex<MappingAdapter>> {
         Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_compute_holds_neither_lifecycle_nor_adapter_lock() {
+        let mapping = shared_active_mapping_adapter();
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate = MappingBackendTestGate::default();
+        mapping
+            .lock()
+            .replace_worker_with_test_gate(gate.clone())
+            .expect("install gated worker");
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let cloud_map_writer = Arc::new(parking_lot::Mutex::new(None));
+        let task = {
+            let mapping = mapping.clone();
+            let lifecycle_lock = lifecycle_lock.clone();
+            let state = state.clone();
+            let cloud_map_writer = cloud_map_writer.clone();
+            tokio::spawn(async move {
+                ingest_mapping_points_with_backend(
+                    &mapping,
+                    &lifecycle_lock,
+                    &cloud_map_writer,
+                    &[Point3::new(1.0, 0.0, 1.0)],
+                    12,
+                    1_000_000_000,
+                    "map",
+                    1_000_000_000,
+                    &state,
+                    false,
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker entered compute");
+        assert!(
+            lifecycle_lock.try_lock().is_ok(),
+            "lifecycle lock must be free during backend compute"
+        );
+        assert!(
+            mapping.try_lock().is_some(),
+            "adapter lock must be free during backend compute"
+        );
+        gate.release();
+        let outcome = task.await.expect("ingest task").expect("backend ingest");
+        assert_eq!(outcome.outcome.accepted_map_points.len(), 1);
+        mapping
+            .lock()
+            .stop_session("test-session")
+            .expect("join test worker");
+    }
+
+    fn pointcloud_binding() -> (LcmTopic, LcmMessageType) {
+        (
+            LcmTopic::new("/test/mapping/pointcloud").expect("pointcloud topic"),
+            LcmMessageType::new("sensor_msgs.PointCloud2").expect("pointcloud type"),
+        )
     }
 
     #[test]
@@ -4004,7 +5052,7 @@ mod mapping_feed_tests {
 
         mapping
             .lock()
-            .start_session("test-session", "test-map", "mapver_000001")
+            .start_session("test-session", "test-map")
             .expect("active mapping test session");
         assert!(!mapping_feed_should_wait_for_active_session(
             mapping.as_ref()
@@ -4069,7 +5117,7 @@ mod mapping_feed_tests {
         let event = map_revision_rx.try_recv().expect("map revision event");
         assert_eq!(event.revision, 1);
         assert_eq!(event.session_id, "test-session");
-        assert_eq!(event.map_version_id, "mapver_000001");
+        assert_eq!(event.map_name, "test-map");
         assert_eq!(event.session_generation, 1);
         assert!(event.size > 0);
         assert_eq!(event.data.len() as u64, event.size);
@@ -4096,16 +5144,273 @@ mod mapping_feed_tests {
             CloudMapShmWriter::new(&path).expect("cloud map writer"),
         )));
         let current_session = adapter.snapshot();
+        let event = outcome
+            .occupancy_event
+            .as_ref()
+            .expect("occupancy event")
+            .clone();
+        let receipt = outcome
+            .occupancy_receipt
+            .as_ref()
+            .expect("occupancy receipt")
+            .clone();
+        for invalid_receipt in [
+            crate::mapping_commit::OccupancyCommitReceipt {
+                session_id: "wrong-session".to_owned(),
+                ..receipt.clone()
+            },
+            crate::mapping_commit::OccupancyCommitReceipt {
+                session_generation: receipt.session_generation + 1,
+                ..receipt.clone()
+            },
+            crate::mapping_commit::OccupancyCommitReceipt {
+                occupancy_revision: receipt.occupancy_revision + 1,
+                ..receipt.clone()
+            },
+            crate::mapping_commit::OccupancyCommitReceipt {
+                source_timestamp_ns: receipt.source_timestamp_ns + 1,
+                ..receipt.clone()
+            },
+        ] {
+            let invalid_outcome = MappingIngestOutcome {
+                accepted_map_points: outcome.accepted_map_points.clone(),
+                occupancy_event: Some(event.clone()),
+                occupancy_receipt: Some(invalid_receipt),
+                occupancy_committed: true,
+                session_generation: outcome.session_generation,
+                source_timestamp_ns: outcome.source_timestamp_ns,
+            };
+            assert!(update_mapping_cloud_map_if_current(
+                &invalid_outcome,
+                &current_session,
+                &writer
+            )
+            .is_none());
+            let writer_guard = writer.lock();
+            let writer_state = writer_guard.as_ref().expect("cloud writer");
+            assert!(writer_state.committed_snapshot().is_none());
+            assert!(writer_state.last_cloud_receipt().is_none());
+        }
         let update = update_mapping_cloud_map_if_current(&outcome, &current_session, &writer)
             .expect("cloud map update from mapping session");
         assert_eq!(update.notification.revision, 1);
         assert_eq!(update.notification.point_count, 2);
         assert_eq!(update.source_timestamp_ns, 1_234_567_890_123_456_789);
         assert_eq!(update.xyz_f32_le.len(), 24);
-        let mut stale_session = current_session;
+        assert_eq!(update.receipt.commit_id, receipt.commit_id);
+        assert_eq!(update.receipt.occupancy_revision, event.revision);
+        assert_eq!(update.receipt.cloud_revision, update.notification.revision);
+        let mut stale_session = current_session.clone();
         stale_session.session_generation += 1;
         assert!(update_mapping_cloud_map_if_current(&outcome, &stale_session, &writer).is_none());
         drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_session_one_global_map_publish_converges_to_session_two_clear() {
+        const MAP_FRAME: &str = "map";
+        let backend = FirstGlobalMapPublishGateBackend::default();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let mut handle = build_handle_for_tests()
+            .await
+            .expect("global-map race test handle");
+        handle.transport = transport.clone();
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-global-map-session-race-{}-{}.mmap",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        *handle.cloud_map_writer.lock() =
+            Some(CloudMapShmWriter::new(&path).expect("global-map race writer"));
+        {
+            let mut writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_mut().expect("global-map race writer");
+            assert_eq!(
+                writer.begin_session(1),
+                Some((1, 0, crate::pointcloud::VOXEL_SIZE))
+            );
+            assert!(writer.accumulate_mapping_frame(1, &[Point3::new(1.0, 0.0, 1.0)]));
+            let committed = writer
+                .commit_accumulated_snapshot(&crate::mapping_commit::OccupancyCommitReceipt {
+                    commit_id: crate::mapping_commit::MappingCommitId {
+                        boot_nonce: 1,
+                        sequence: 1,
+                    },
+                    session_id: "session-one".to_owned(),
+                    session_generation: 1,
+                    occupancy_revision: 1,
+                    source_timestamp_ns: 1_000_000_000,
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                    backend_generation: 1,
+                })
+                .expect("session-one cloud commit")
+                .expect("session-one cloud snapshot");
+            assert_eq!(committed.snapshot.revision, 2);
+        }
+        handle.state.write().await.cloud_map_revision = 2;
+        let mut cloud_updates = handle.cloud_map_tx.subscribe();
+
+        let session_one_publish = {
+            let transport = transport.clone();
+            let writer = handle.cloud_map_writer.clone();
+            let state = handle.state.clone();
+            let cloud_map_tx = handle.cloud_map_tx.clone();
+            tokio::spawn(async move {
+                publish_latest_canonical_cloud_map(
+                    &transport,
+                    &writer,
+                    &state,
+                    &cloud_map_tx,
+                    MAP_FRAME,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.first_publish_started.notified(),
+        )
+        .await
+        .expect("session-one typed publish entered gate");
+
+        let clear = handle
+            .begin_cloud_map_session(2)
+            .await
+            .expect("session-two clear revision");
+        assert_eq!(clear.revision, 3);
+        assert_eq!(clear.point_count, 0);
+        assert_eq!(clear.session_generation, 2);
+        {
+            let mut writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_mut().expect("global-map race writer");
+            assert!(writer.accumulate_mapping_frame(2, &[Point3::new(2.0, 0.0, 2.0)]));
+            let committed = writer
+                .commit_accumulated_snapshot(&crate::mapping_commit::OccupancyCommitReceipt {
+                    commit_id: crate::mapping_commit::MappingCommitId {
+                        boot_nonce: 1,
+                        sequence: 2,
+                    },
+                    session_id: "session-two".to_owned(),
+                    session_generation: 2,
+                    occupancy_revision: 2,
+                    source_timestamp_ns: 2_000_000_000,
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                    backend_generation: 2,
+                })
+                .expect("session-two cloud commit")
+                .expect("session-two cloud snapshot");
+            assert_eq!(committed.snapshot.revision, 4);
+            assert_eq!(committed.snapshot.point_count, 1);
+        }
+        let session_two_publish = {
+            let transport = transport.clone();
+            let writer = handle.cloud_map_writer.clone();
+            let state = handle.state.clone();
+            let cloud_map_tx = handle.cloud_map_tx.clone();
+            tokio::spawn(async move {
+                publish_latest_canonical_cloud_map(
+                    &transport,
+                    &writer,
+                    &state,
+                    &cloud_map_tx,
+                    MAP_FRAME,
+                )
+                .await
+            })
+        };
+        session_one_publish
+            .await
+            .expect("session-one publish join")
+            .expect("session-one publish convergence")
+            .expect("latest canonical cloud publication");
+        session_two_publish
+            .await
+            .expect("session-two publish join")
+            .expect("session-two publish convergence")
+            .expect("latest canonical cloud publication");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if backend
+                    .published
+                    .lock()
+                    .expect("global-map published frames")
+                    .len()
+                    >= 2
+                {
+                    break;
+                }
+                backend.frame_published.notified().await;
+            }
+        })
+        .await
+        .expect("session-two typed clear publication");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let published = backend
+            .published
+            .lock()
+            .expect("global-map published frames")
+            .clone();
+        assert_eq!(published.len(), 2);
+        assert_eq!(
+            backend
+                .publish_attempts
+                .load(std::sync::atomic::Ordering::Acquire),
+            3,
+            "one stale S1 attempt must be cancelled before two ordered S2 frames"
+        );
+        let clear_frame = &published[0];
+        assert_eq!(clear_frame.header.seqno, 3);
+        let mut encoded = Vec::with_capacity(8 + clear_frame.payload.len());
+        encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
+        encoded.extend_from_slice(&clear_frame.payload);
+        let clear_cloud =
+            schema::decode_point_cloud2(&encoded).expect("session-two empty PointCloud2");
+        assert_eq!(clear_cloud.header.seq, 3);
+        assert_eq!(clear_cloud.header.frame_id, MAP_FRAME);
+        assert_eq!(clear_cloud.width, 0);
+        assert!(clear_cloud.data.is_empty());
+
+        let final_frame = published.last().expect("session-two typed cloud");
+        assert_eq!(final_frame.header.seqno, 4);
+        let mut encoded = Vec::with_capacity(8 + final_frame.payload.len());
+        encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
+        encoded.extend_from_slice(&final_frame.payload);
+        let final_cloud = schema::decode_point_cloud2(&encoded).expect("session-two PointCloud2");
+        assert_eq!(final_cloud.header.seq, 4);
+        assert_eq!(final_cloud.header.frame_id, MAP_FRAME);
+        assert_eq!(final_cloud.width, 1);
+        assert_eq!(final_cloud.data.len(), 12);
+        assert_eq!(handle.state.read().await.cloud_map_revision, 4);
+        let clear_update = cloud_updates
+            .recv()
+            .await
+            .expect("session-two clear update");
+        assert_eq!(clear_update.revision, 3);
+        assert_eq!(clear_update.point_count, 0);
+        assert_eq!(clear_update.session_generation, 2);
+        let final_update = cloud_updates
+            .recv()
+            .await
+            .expect("session-two cloud update");
+        assert_eq!(final_update.revision, 4);
+        assert_eq!(final_update.point_count, 1);
+        assert_eq!(final_update.session_generation, 2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cloud_updates.recv())
+                .await
+                .is_err()
+        );
+        let final_snapshot = handle
+            .cloud_map_writer
+            .lock()
+            .as_ref()
+            .and_then(CloudMapShmWriter::committed_snapshot)
+            .expect("session-two SHM clear");
+        assert_eq!(final_snapshot.revision, 4);
+        assert_eq!(final_snapshot.session_generation, 2);
+        assert_eq!(final_snapshot.point_count, 1);
         let _ = std::fs::remove_file(path);
     }
 
@@ -4113,9 +5418,14 @@ mod mapping_feed_tests {
     async fn committed_cumulative_map_reaches_person_follow_decoder_once_per_revision() {
         use nuwax_nav_visual_servoing::person_follow::PackedPointCloud;
 
-        let mut adapter = active_mapping_adapter();
+        const MAP_FRAME: &str = "robot/map";
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), MAP_FRAME, "odom");
+        adapter
+            .start_session("test-session", "test-map")
+            .expect("active mapping test session");
         let state = Arc::new(RwLock::new(SharedState::default()));
         let (map_revision_tx, _) = broadcast::channel(4);
+        let (cloud_map_tx, _) = broadcast::channel(4);
         let path = std::env::temp_dir().join(format!(
             "nuwax-global-map-lcm-{}-{}.mmap",
             std::process::id(),
@@ -4142,19 +5452,25 @@ mod mapping_feed_tests {
                 &[point],
                 12,
                 timestamp_ns,
-                "map",
+                MAP_FRAME,
                 timestamp_ns,
                 &state,
                 &map_revision_tx,
             )
             .expect("accepted canonical map frame");
             assert!(outcome.occupancy_committed);
-            let committed =
-                update_mapping_cloud_map_if_current(&outcome, &adapter.snapshot(), &writer)
-                    .expect("committed cumulative cloud map");
-            publish_committed_global_map(&transport, &committed)
-                .await
-                .expect("typed global-map publish");
+            update_mapping_cloud_map_if_current(&outcome, &adapter.snapshot(), &writer)
+                .expect("committed cumulative cloud map");
+            publish_latest_canonical_cloud_map(
+                &transport,
+                &writer,
+                &state,
+                &cloud_map_tx,
+                MAP_FRAME,
+            )
+            .await
+            .expect("typed global-map publish")
+            .expect("canonical cloud snapshot");
         }
 
         let published = backend.published.lock().expect("published frames").clone();
@@ -4167,7 +5483,7 @@ mod mapping_feed_tests {
         encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
         encoded.extend_from_slice(&latest.payload);
         let cloud = schema::decode_point_cloud2(&encoded).expect("typed PointCloud2 body");
-        assert_eq!(cloud.header.frame_id, "map");
+        assert_eq!(cloud.header.frame_id, MAP_FRAME);
         assert_eq!(cloud.header.seq, 2);
         assert_eq!(
             cloud.width, 2,
@@ -4175,9 +5491,9 @@ mod mapping_feed_tests {
         );
         assert_eq!(cloud.point_step, 12);
         assert_eq!(cloud.row_step, 24);
-        let decoded =
-            PackedPointCloud::from_lcm(&cloud).expect("person-follow decoder accepts map");
-        assert_eq!(decoded.frame_id(), "map");
+        let decoded = PackedPointCloud::from_lcm(&cloud)
+            .expect("person-follow decoder accepts configured map frame");
+        assert_eq!(decoded.frame_id(), MAP_FRAME);
         assert_eq!(decoded.xyz().len(), 2);
 
         let replay_timestamp = 1_700_000_003_000_000_000;
@@ -4186,7 +5502,7 @@ mod mapping_feed_tests {
             &[Point3::new(1.0, 2.0, 3.0)],
             12,
             replay_timestamp + 1,
-            "map",
+            MAP_FRAME,
             replay_timestamp,
             &state,
             &map_revision_tx,
@@ -4202,7 +5518,7 @@ mod mapping_feed_tests {
             &[Point3::new(4.0, 5.0, 6.0)],
             12,
             replay_timestamp + 3_000_000_000,
-            "map",
+            MAP_FRAME,
             replay_timestamp + 3_000_000_000,
             &state,
             &map_revision_tx,
@@ -4458,6 +5774,7 @@ mod mapping_feed_tests {
             mapping.clone(),
             map_revision_tx,
             Some((odom_topic.clone(), odom_type.clone())),
+            pointcloud_binding(),
             (tf_topic, tf_type),
             "base_link".into(),
             Arc::new(parking_lot::Mutex::new(None)),
@@ -4530,6 +5847,7 @@ mod mapping_feed_tests {
             mapping,
             map_revision_tx,
             Some((odom_topic.clone(), odom_type.clone())),
+            pointcloud_binding(),
             (tf_topic, tf_type),
             "base_link".into(),
             Arc::new(parking_lot::Mutex::new(None)),
@@ -4598,6 +5916,7 @@ mod mapping_feed_tests {
             mapping.clone(),
             map_revision_tx,
             Some((odom_topic.clone(), odom_type.clone())),
+            pointcloud_binding(),
             (tf_topic, tf_type),
             "base_link".into(),
             Arc::new(parking_lot::Mutex::new(None)),
@@ -4774,7 +6093,7 @@ mod mapping_feed_tests {
             .as_ref()
             .expect("mapping adapter")
             .lock()
-            .start_session("external-test", "warehouse", "mapver_000001")
+            .start_session("external-test", "warehouse")
             .expect("active mapping session");
         let mut map_revision_rx = handle.map_revision_tx.subscribe();
         let event = map_revision_event(MapState {
@@ -4859,6 +6178,55 @@ mod mapping_feed_tests {
             costmap.grid.cells[3],
             nuwax_nav_types_messages::grid::OccupancyCell::Occupied
         );
+    }
+
+    #[tokio::test]
+    async fn configured_map_frame_is_preserved_by_occupancy_costmap_and_pose_adapters() {
+        const MAP_FRAME: &str = "robot/map";
+        let event = map_revision_event(MapState {
+            width: 2,
+            height: 1,
+            resolution: 0.25,
+            origin_x: -1.0,
+            origin_y: 2.0,
+            frame_id: MAP_FRAME.into(),
+            revision: 9,
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            data: vec![0, 100],
+        });
+
+        let payload = encode_occupancy_revision_in_frame(&event, MAP_FRAME)
+            .expect("configured-frame occupancy payload");
+        let decoded = schema::decode_occupancy_grid_body(&payload).expect("decode occupancy");
+        assert_eq!(decoded.header.frame_id, MAP_FRAME);
+        assert!(encode_occupancy_revision(&event).is_err());
+
+        let costmap = exploration_costmap_from_revision_in_frame(&event, MAP_FRAME)
+            .expect("configured-frame exploration snapshot");
+        assert_eq!(costmap.frame_id, MAP_FRAME);
+        assert!(exploration_costmap_from_revision(&event).is_err());
+
+        let state = Arc::new(RwLock::new(SharedState {
+            pose: PoseState {
+                x: 1.0,
+                y: 2.0,
+                qw: 1.0,
+                frame_id: MAP_FRAME.to_string(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                ..PoseState::default()
+            },
+            ..SharedState::default()
+        }));
+        let provider = SharedStatePoseProvider {
+            state,
+            expected_map_frame: Arc::from(MAP_FRAME),
+            freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
+            max_receipt_age: Duration::from_secs(1),
+        };
+        let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider)
+            .await
+            .expect("configured-frame pose");
+        assert_eq!(pose.frame_id, MAP_FRAME);
     }
 
     #[test]
@@ -4954,6 +6322,424 @@ mod mapping_feed_tests {
         assert_eq!(decoded.header.frame_id, "map");
         assert_eq!(decoded.data, vec![0, 100]);
     }
+
+    #[tokio::test]
+    async fn wrong_frame_revision_cannot_advance_configured_latest_or_occupancy_shm() {
+        const MAP_FRAME: &str = "robot/map";
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), MAP_FRAME, "odom");
+        adapter
+            .start_session("configured-session", "configured-map")
+            .expect("active configured mapping session");
+        let session = adapter.snapshot();
+        let mapping_adapter = Arc::new(parking_lot::Mutex::new(adapter));
+
+        static SHM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let shm_path = std::env::temp_dir().join(format!(
+            "nuwax-wrong-frame-occupancy-{}-{}.mmap",
+            std::process::id(),
+            SHM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let writer = Arc::new(parking_lot::Mutex::new(
+            OccupancyGridShmWriter::new(&shm_path).expect("temporary occupancy SHM"),
+        ));
+        assert_eq!(writer.lock().published_generation(), 0);
+        let current = Arc::new(RwLock::new(None));
+        let (tx, rx) = broadcast::channel(4);
+        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/test/configured-frame/unused-odom").expect("unused odom topic"),
+        );
+
+        spawn_map_revision_fanout_in_frame(
+            rx,
+            latest_tx,
+            LcmTransport::new(Arc::new(backend.clone())),
+            LcmTopic::new("/test/configured-frame/occupancy").expect("occupancy topic"),
+            LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
+            Some(writer.clone()),
+            Some(shm_path.to_string_lossy().into_owned()),
+            current.clone(),
+            crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(MAP_FRAME)
+                .expect("configured explore runtime"),
+            mapping_adapter,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::from(MAP_FRAME),
+        );
+
+        tx.send(MapRevisionEvent::from_map(
+            &MapState {
+                width: 1,
+                height: 1,
+                resolution: 0.25,
+                frame_id: "map".to_string(),
+                revision: 1,
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                data: vec![0],
+                ..MapState::default()
+            },
+            &session,
+        ))
+        .expect("configured fanout receiver registered");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), latest_rx.changed())
+                .await
+                .is_err(),
+            "wrong-frame revision advanced the retained latest event"
+        );
+        assert!(latest_rx.borrow().is_none());
+        assert!(current.read().await.is_none());
+        assert_eq!(writer.lock().published_generation(), 0);
+        assert_eq!(backend.published_count(), 0);
+
+        drop(tx);
+        let _ = std::fs::remove_file(shm_path);
+    }
+
+    #[tokio::test]
+    async fn handoff_lio_cloud_preserves_configured_map_frame_and_source_zero() {
+        let mut handle = build_handle_for_tests().await.expect("test runtime handle");
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "robot/map", "odom");
+        adapter
+            .start_session("lio-session", "lio-map")
+            .expect("active LIO mapping session");
+        adapter
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.0, "odom")
+            .expect("map <- odom anchor");
+        let mapping = Arc::new(parking_lot::Mutex::new(adapter));
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/lio/odom").expect("unused odom topic"),
+        );
+        handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.mapping_adapter = Some(mapping.clone());
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-lio-configured-frame-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+        let mut revision_rx = handle.map_revision_tx.subscribe();
+
+        assert!(handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(1.0, 2.0, 0.0)],
+            12,
+            100,
+            0,
+            "robot/map",
+        )
+        .await
+        .expect("configured-frame LIO handoff"));
+        assert_eq!(mapping.lock().current_revision(), 1);
+        let revision = revision_rx.try_recv().expect("map revision");
+        assert_eq!(revision.frame_id, "robot/map");
+        assert_eq!(revision.timestamp_ns, 0);
+        let state = handle.state.read().await;
+        assert_eq!(state.map.frame_id, "robot/map");
+        assert_eq!(state.map.timestamp_ns, 0);
+        assert_eq!(state.cloud_map_revision, 1);
+        drop(state);
+        let published = backend.published.lock().expect("published frames");
+        assert_eq!(published.len(), 1);
+        let mut encoded = Vec::with_capacity(8 + published[0].payload.len());
+        encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
+        encoded.extend_from_slice(&published[0].payload);
+        let cloud = schema::decode_point_cloud2(&encoded).expect("global cloud payload");
+        assert_eq!(cloud.header.frame_id, "robot/map");
+        assert_eq!((cloud.header.stamp_sec, cloud.header.stamp_nsec), (0, 0));
+        drop(published);
+        drop(handle);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn handoff_lio_cloud_without_shm_writer_still_commits_canonical_revision() {
+        let mut handle = build_handle_for_tests().await.expect("test runtime handle");
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "robot/map", "odom");
+        adapter
+            .start_session("lio-session", "lio-map")
+            .expect("active LIO mapping session");
+        adapter
+            .feed_pose_in_frame(1.0, 2.0, 0.0, 0.0, "odom")
+            .expect("map <- odom anchor");
+        let mapping = Arc::new(parking_lot::Mutex::new(adapter));
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/lio/odom").expect("unused odom topic"),
+        );
+        handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.mapping_adapter = Some(mapping.clone());
+        handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(None));
+        let mut revision_rx = handle.map_revision_tx.subscribe();
+
+        assert!(handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(1.0, 2.0, 0.0)],
+            12,
+            100,
+            0,
+            "robot/map",
+        )
+        .await
+        .expect("configured-frame LIO handoff without cloud SHM"));
+        assert_eq!(mapping.lock().current_revision(), 1);
+        let revision = revision_rx.try_recv().expect("map revision");
+        assert_eq!(revision.frame_id, "robot/map");
+        assert_eq!(revision.revision, 1);
+        let state = handle.state.read().await;
+        assert_eq!(state.map.frame_id, "robot/map");
+        assert_eq!(state.map.revision, 1);
+        assert_eq!(state.cloud_map_revision, 0);
+        drop(state);
+        assert_eq!(backend.published_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn backend_submission_failure_fences_prepared_session_state() {
+        let mut handle = build_handle_for_tests().await.expect("test runtime handle");
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "robot/map", "odom");
+        let session_id = "submit-failure-session";
+        adapter
+            .start_session(session_id, "submit-failure-map")
+            .expect("active mapping session");
+        let mapping = Arc::new(parking_lot::Mutex::new(adapter));
+        handle.mapping_adapter = Some(mapping.clone());
+        handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(None));
+
+        let client = mapping
+            .lock()
+            .backend_checkpoint_client()
+            .expect("backend checkpoint client");
+        let payload = tokio::time::timeout(
+            Duration::from_secs(1),
+            client
+                .export_checkpoint()
+                .expect("submit checkpoint export"),
+        )
+        .await
+        .expect("checkpoint export timeout")
+        .expect("checkpoint export response")
+        .expect("checkpoint payload");
+        let restore_resolution = tokio::time::timeout(
+            Duration::from_secs(1),
+            client
+                .restore_checkpoint(payload)
+                .expect("submit checkpoint restore"),
+        )
+        .await
+        .expect("checkpoint restore timeout")
+        .expect("checkpoint restore response")
+        .expect("checkpoint restore validation");
+        let queued_export = client
+            .export_checkpoint()
+            .expect("fill the single-slot worker queue");
+
+        let lifecycle_lock = handle.mapping_lifecycle_lock.clone();
+        let cloud_map_writer = handle.cloud_map_writer.clone();
+        let state = handle.state.clone();
+        let ingest_mapping = mapping.clone();
+        let ingest = tokio::spawn(async move {
+            ingest_mapping_points_with_backend(
+                &ingest_mapping,
+                &lifecycle_lock,
+                &cloud_map_writer,
+                &[Point3::new(1.0, 2.0, 0.0)],
+                12,
+                100,
+                "robot/map",
+                100,
+                &state,
+                false,
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !mapping.lock().snapshot().active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submission failure must fence the session before retirement join");
+        drop(restore_resolution);
+        let ingest_result = tokio::time::timeout(Duration::from_secs(1), ingest)
+            .await
+            .expect("submission failure retirement timeout")
+            .expect("owned ingest task");
+        let Err(error) = ingest_result else {
+            panic!("full worker queue must reject submission");
+        };
+        assert!(error
+            .to_string()
+            .contains("mapping backend submission failed"));
+        assert!(error.to_string().contains("QueueFull"));
+        drop(queued_export);
+        let snapshot = mapping.lock().snapshot();
+        assert_eq!(
+            snapshot.phase,
+            crate::mapping_adapter::MappingSessionPhase::Stopped
+        );
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.revision, 0);
+        let retry_error = mapping
+            .lock()
+            .start_session(session_id, "submit-failure-map")
+            .expect_err("failed generation must remain terminal");
+        assert!(matches!(
+            retry_error,
+            crate::mapping_adapter::MappingLifecycleError::TerminalSession(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn handoff_lio_inactive_adapter_returns_false_without_mutation() {
+        let mut handle = build_handle_for_tests().await.expect("test runtime handle");
+        let mapping = Arc::new(parking_lot::Mutex::new(MappingAdapter::new_with_frames(
+            mapping_config(),
+            "robot/map",
+            "odom",
+        )));
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/lio/odom").expect("unused odom topic"),
+        );
+        handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.mapping_adapter = Some(mapping.clone());
+        let tf_binding = (
+            LcmTopic::new("/test/lio/tf").expect("tf topic"),
+            LcmMessageType::new("tf2_msgs.TFMessage").expect("tf type"),
+        );
+        let pose = PoseState {
+            qw: 1.0,
+            frame_id: "odom".into(),
+            timestamp_ns: 0,
+            ..PoseState::default()
+        };
+
+        assert!(
+            !handoff_lio_odometry(&handle, &pose, "base_link", &tf_binding)
+                .await
+                .expect("inactive odometry is a zero commit")
+        );
+        assert!(!handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(1.0, 2.0, 0.0)],
+            12,
+            100,
+            0,
+            "robot/map",
+        )
+        .await
+        .expect("inactive cloud is a zero commit"));
+        let adapter_state = {
+            let adapter = mapping.lock();
+            (
+                adapter.odom_count(),
+                adapter.pointcloud_count(),
+                adapter.current_revision(),
+                adapter.accumulated_count(),
+            )
+        };
+        assert_eq!(adapter_state, (0, 0, 0, 0));
+        assert_eq!(backend.published_count(), 0);
+        let state = handle.state.read().await;
+        assert_eq!(state.pose.timestamp_ns, 0);
+        assert!(state.transforms.is_empty());
+        assert_eq!(state.cloud_map_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn handoff_lio_cloud_zero_revision_is_reported_false() {
+        let mut handle = build_handle_for_tests().await.expect("test runtime handle");
+        let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "map", "odom");
+        adapter
+            .start_session("lio-session", "lio-map")
+            .expect("active LIO mapping session");
+        let mapping = Arc::new(parking_lot::Mutex::new(adapter));
+        let backend = MappingFeedRecordingBackend::new(
+            LcmTopic::new("/unused/lio/odom").expect("unused odom topic"),
+        );
+        handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        handle.mapping_adapter = Some(mapping.clone());
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-lio-zero-commit-{}-{}.mmap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        handle.cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(
+            CloudMapShmWriter::new(&path).expect("cloud map writer"),
+        )));
+
+        assert!(handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(0.0, 0.0, 0.0)],
+            12,
+            10_000_000_000,
+            0,
+            "map",
+        )
+        .await
+        .expect("first revision"));
+        assert!(!handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(1.0, 0.0, 0.0)],
+            12,
+            10_100_000_000,
+            1,
+            "map",
+        )
+        .await
+        .expect("high-rate frame is accepted but coalesced"));
+        let adapter_state = {
+            let adapter = mapping.lock();
+            (
+                adapter.current_revision(),
+                adapter.pointcloud_count(),
+                adapter.accumulated_count(),
+            )
+        };
+        assert_eq!(adapter_state, (1, 2, 2));
+        assert_eq!(backend.published_count(), 1);
+        assert_eq!(handle.state.read().await.cloud_map_revision, 1);
+        {
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().expect("cloud-map writer");
+            let snapshot = writer.committed_snapshot().expect("first cloud snapshot");
+            assert_eq!(snapshot.revision, 1);
+            assert_eq!(snapshot.point_count, 1);
+        }
+
+        assert!(handoff_registered_lio_cloud(
+            &handle,
+            &[Point3::new(2.0, 0.0, 0.0)],
+            12,
+            11_000_000_000,
+            2,
+            "map",
+        )
+        .await
+        .expect("next cadence revision"));
+        assert_eq!(backend.published_count(), 2);
+        assert_eq!(handle.state.read().await.cloud_map_revision, 2);
+        {
+            let writer = handle.cloud_map_writer.lock();
+            let writer = writer.as_ref().expect("cloud-map writer");
+            let snapshot = writer.committed_snapshot().expect("second cloud snapshot");
+            assert_eq!(snapshot.revision, 2);
+            assert_eq!(snapshot.point_count, 3);
+        }
+        drop(handle);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -4978,6 +6764,7 @@ mod exploration_adapter_tests {
         (
             SharedStatePoseProvider {
                 state: state.clone(),
+                expected_map_frame: Arc::from("map"),
                 freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
                 max_receipt_age: ttl,
             },
@@ -5991,14 +7778,26 @@ mod exploration_cancel_retry_tests {
         }
     }
 
-    async fn start_cancel(
-        goal_id: &str,
-    ) -> (
-        ExploreNavigationBridge,
-        RecordingBackend,
-        crate::nav_runtime::GoalLease,
-        crate::explore_runtime::ChildNavigationCancelTicket,
-    ) {
+    fn frontier_costmap() -> crate::explore_runtime::ExploreCostmapSnapshot {
+        let mut grid = OccupancyGrid2D {
+            resolution: 0.5,
+            origin: Point2 { x: 0.0, y: 0.0 },
+            width: 12,
+            height: 12,
+            cells: vec![OccupancyCell::Unknown; 144],
+        };
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        crate::explore_runtime::ExploreCostmapSnapshot {
+            grid,
+            frame_id: "map".to_string(),
+        }
+    }
+
+    async fn configured_bridge() -> (ExploreNavigationBridge, RecordingBackend) {
         let backend = RecordingBackend::default();
         let transport = LcmTransport::new(Arc::new(backend.clone()));
         let nav = crate::nav_runtime::NavRuntimeState::from_env();
@@ -6039,6 +7838,7 @@ mod exploration_cancel_retry_tests {
         let (map_revision_latest_tx, _) = watch::channel(None);
         let bridge = ExploreNavigationBridge {
             state: Arc::new(RwLock::new(SharedState::default())),
+            expected_map_frame: Arc::from("map"),
             cloud_map_tx,
             nav_state_tx,
             frontiers_tx,
@@ -6051,14 +7851,38 @@ mod exploration_cancel_retry_tests {
             nav: nav.clone(),
             runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         };
+        (bridge, backend)
+    }
+
+    async fn start_goal(
+        goal_id: &str,
+    ) -> (
+        ExploreNavigationBridge,
+        RecordingBackend,
+        crate::nav_runtime::GoalLease,
+    ) {
+        let (bridge, backend) = configured_bridge().await;
         let outcome =
-            crate::nav_runtime::set_goal(&bridge.facade_handle(), &nav, goal_input(goal_id)).await;
+            crate::nav_runtime::set_goal(&bridge.facade_handle(), &bridge.nav, goal_input(goal_id))
+                .await;
         assert_eq!(
             outcome.state.status, "ACCEPTED",
             "{}",
             outcome.state.message
         );
         let lease = outcome.lease.expect("accepted goal lease");
+        (bridge, backend, lease)
+    }
+
+    async fn start_cancel(
+        goal_id: &str,
+    ) -> (
+        ExploreNavigationBridge,
+        RecordingBackend,
+        crate::nav_runtime::GoalLease,
+        crate::explore_runtime::ChildNavigationCancelTicket,
+    ) {
+        let (bridge, backend, lease) = start_goal(goal_id).await;
         let expected = exploration_child_lease(&lease);
         let ticket = crate::explore_runtime::ExploreNavigationSink::cancel(&bridge, &expected)
             .await
@@ -6144,6 +7968,150 @@ mod exploration_cancel_retry_tests {
             .await;
         assert_eq!(failed.state.status, "FAILED");
         assert_retry_stopped(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn exploration_cancel_receipt_survives_zeroed_active_lease_clear() {
+        let (bridge, backend, lease) = start_goal("receipt-after-zeroed").await;
+        let outcome = crate::nav_runtime::cancel(
+            &bridge.facade_handle(),
+            &bridge.nav,
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            },
+        )
+        .await;
+        assert_eq!(outcome.state.status, "PENDING");
+        let expected = exploration_child_lease(&lease);
+        let recovery = crate::explore_runtime::ExploreNavigationSink::recover_cancel_receipt(
+            &bridge, &expected,
+        )
+        .expect("exact pending cancellation receipt");
+        assert!(recovery.failure.is_none());
+        let ticket = recovery.ticket;
+        wait_for_cancel_count(&backend, 2).await;
+        assert_exact_cancels(&backend, &lease, ticket.cancel_generation);
+
+        let zeroed = bridge
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: ticket.cancel_generation,
+                goal_id: lease.session_id.clone(),
+                owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: "receipt recovery test zeroed".to_string(),
+            })
+            .await;
+        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        let zeroed_recovery =
+            crate::explore_runtime::ExploreNavigationSink::recover_cancel_receipt(
+                &bridge, &expected,
+            )
+            .expect("exact zeroed cancellation receipt");
+        assert!(zeroed_recovery.failure.is_none());
+        assert_eq!(zeroed_recovery.ticket, ticket);
+
+        let mut wrong = expected;
+        wrong.goal_generation = wrong.goal_generation.saturating_add(1);
+        assert!(
+            crate::explore_runtime::ExploreNavigationSink::recover_cancel_receipt(&bridge, &wrong)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_zero_releases_exploration_while_telemetry_cache_is_busy() {
+        let (bridge, backend) = configured_bridge().await;
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        explore.set_navigation_sink(Arc::new(bridge.clone()));
+        explore
+            .ingest_costmap_snapshot(frontier_costmap())
+            .await
+            .expect("frontier costmap");
+        assert_eq!(
+            explore
+                .start("telemetry-lock", "prefer_wavefront")
+                .await
+                .status,
+            crate::explore_runtime::STATUS_ACCEPTED
+        );
+        let active = explore.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, crate::explore_runtime::STATUS_ACTIVE);
+        let child_task_id = active.child_task_id.clone();
+        let child_lease = active.child_lease.expect("active exploration child lease");
+
+        let telemetry_guard = bridge.state.write().await;
+        let cached_goal_before = telemetry_guard.nav_state.goal_id.clone();
+        let cached_status_before = telemetry_guard.nav_state.status.clone();
+        let stop_task = {
+            let explore = explore.clone();
+            tokio::spawn(async move { explore.stop("telemetry-lock").await })
+        };
+        wait_for_cancel_count(&backend, 1).await;
+        let pending = bridge.nav.cancel_snapshot();
+        assert_eq!(pending.phase, crate::nav_runtime::CancelPhase::Pending);
+        let nav_lease = pending.lease.as_ref().expect("pending navigation lease");
+        assert_eq!(exploration_child_lease(nav_lease), child_lease);
+
+        let applied = apply_typed_navigation_feedback(
+            &bridge.nav,
+            NavigationUpdate {
+                producer_runtime_generation: nav_lease.producer_runtime_generation,
+                state: NavState {
+                    status: "CANCELLED".to_string(),
+                    message: "exact guard zero while telemetry cache is busy".to_string(),
+                    goal_id: nav_lease.session_id.clone(),
+                    timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                    ..NavState::default()
+                },
+                feedback: NavigationFeedback {
+                    cancel_generation: pending.generation,
+                    actuator_zeroed: true,
+                    zero_ack_id: "telemetry-lock-zero".to_string(),
+                    zero_applied_monotonic_ns: crate::explore_runtime::now_monotonic_nanos(),
+                    owner_kind: nav_lease.owner_kind,
+                    parent_request_id: nav_lease.parent_request_id.clone(),
+                    goal_generation: nav_lease.goal_generation,
+                    goal_payload_sha256: nav_lease.goal_payload_sha256,
+                    path_revision: nav_lease.path_revision,
+                    path_payload_sha256: nav_lease.path_payload_sha256,
+                    ..NavigationFeedback::default()
+                },
+            },
+        )
+        .await
+        .expect("exact typed ZEROED feedback");
+        assert_eq!(applied.state.status, "CANCELLED");
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+
+        let mut nav_updates = bridge.nav_state_tx.subscribe();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            fanout_navigation_update(&bridge.state, &bridge.nav_state_tx, &explore, applied),
+        )
+        .await
+        .expect("ownership terminal must bypass the busy telemetry cache");
+        let broadcast = nav_updates.try_recv().expect("ordered terminal broadcast");
+        assert_eq!(broadcast.state.status, "CANCELLED");
+        assert_eq!(broadcast.state.goal_id, child_task_id);
+        assert_eq!(telemetry_guard.nav_state.goal_id, cached_goal_before);
+        assert_eq!(telemetry_guard.nav_state.status, cached_status_before);
+
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop_task)
+            .await
+            .expect("exploration response-loss recovery deadline")
+            .expect("exploration Stop task");
+        assert_eq!(stopped.status, crate::explore_runtime::STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        assert!(!explore.blocks_mapping_mutation().await);
+        drop(telemetry_guard);
     }
 
     #[tokio::test]
@@ -6439,7 +8407,7 @@ mod exploration_lcm_smoke_tests {
     use nuwax_exploration::ExplorationBoundary;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
-    fn smoke_costmap(_fixture: u64) -> ExploreCostmapSnapshot {
+    fn smoke_costmap(_fixture: u64, map_frame: &str) -> ExploreCostmapSnapshot {
         let mut grid = OccupancyGrid2D {
             resolution: 0.5,
             origin: Point2 { x: 0.0, y: 0.0 },
@@ -6454,7 +8422,7 @@ mod exploration_lcm_smoke_tests {
         }
         ExploreCostmapSnapshot {
             grid,
-            frame_id: "map".to_string(),
+            frame_id: map_frame.to_string(),
         }
     }
 
@@ -6487,8 +8455,7 @@ mod exploration_lcm_smoke_tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn canonical_exploration_channels_round_trip_over_real_lcm() {
+    async fn exploration_channels_round_trip_over_real_lcm(map_frame: &'static str) {
         const MAP_REVISION: u64 = 41;
         const PARENT_REQUEST: &str = "smoke-explore";
 
@@ -6542,7 +8509,7 @@ mod exploration_lcm_smoke_tests {
                 x: 2.0,
                 y: 2.0,
                 qw: 1.0,
-                frame_id: "map".to_string(),
+                frame_id: map_frame.to_string(),
                 timestamp_ns: crate::explore_runtime::now_unix_nanos(),
                 ..PoseState::default()
             },
@@ -6550,7 +8517,7 @@ mod exploration_lcm_smoke_tests {
                 width: 12,
                 height: 12,
                 resolution: 0.5,
-                frame_id: "map".to_string(),
+                frame_id: map_frame.to_string(),
                 revision: MAP_REVISION,
                 timestamp_ns: crate::explore_runtime::now_unix_nanos(),
                 ..MapState::default()
@@ -6567,7 +8534,7 @@ mod exploration_lcm_smoke_tests {
         .await;
         nav.observe_tf_chain(TfChainObservation {
             generation: 1,
-            map_frame: "map".to_string(),
+            map_frame: map_frame.to_string(),
             odom_frame: "odom".to_string(),
             base_frame: "base_link".to_string(),
             map_to_odom: true,
@@ -6577,8 +8544,8 @@ mod exploration_lcm_smoke_tests {
         nav.observe_planner_input(PlannerInputObservation {
             generation: 1,
             map_revision: MAP_REVISION,
-            map_frame: "map".to_string(),
-            pose_frame: "map".to_string(),
+            map_frame: map_frame.to_string(),
+            pose_frame: map_frame.to_string(),
             ready: true,
         })
         .expect("planner observation");
@@ -6593,9 +8560,12 @@ mod exploration_lcm_smoke_tests {
         let (frontiers_tx, _) = broadcast::channel(4);
         let (map_revision_tx, _) = broadcast::channel(4);
         let (map_revision_latest_tx, _) = watch::channel(None);
-        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
-        explore.set_navigation_sink(Arc::new(ExploreNavigationBridge {
+        let explore =
+            crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame)
+                .expect("configured exploration runtime");
+        let bridge = ExploreNavigationBridge {
             state: state.clone(),
+            expected_map_frame: Arc::from(map_frame),
             cloud_map_tx,
             nav_state_tx,
             frontiers_tx: frontiers_tx.clone(),
@@ -6607,17 +8577,19 @@ mod exploration_lcm_smoke_tests {
             cmd_vel_sink_ready: Arc::new(AtomicBool::new(true)),
             nav: nav.clone(),
             runtime_observation_generation: Arc::new(AtomicU64::new(1)),
-        }));
-        spawn_frontier_fanout(
+        };
+        explore.set_navigation_sink(Arc::new(bridge.clone()));
+        spawn_frontier_fanout_in_frame(
             explore.clone(),
             state.clone(),
             frontiers_tx,
             publisher.clone(),
             Some((frontier_topic.clone(), frontier_type.clone())),
+            Arc::from(map_frame),
         );
 
         assert!(explore
-            .ingest_costmap_snapshot(smoke_costmap(MAP_REVISION))
+            .ingest_costmap_snapshot(smoke_costmap(MAP_REVISION, map_frame))
             .await
             .expect("ingest smoke costmap"));
         let boundary = ExplorationBoundary::from_vertices(vec![
@@ -6663,7 +8635,7 @@ mod exploration_lcm_smoke_tests {
         .expect("timed out waiting for non-empty canonical FrontierList");
         assert_eq!(frontier_frame.0.topic, frontier_topic);
         assert_eq!(frontier_frame.0.msg_type, frontier_type);
-        assert_eq!(frontier_frame.1.frame_id, "map");
+        assert_eq!(frontier_frame.1.frame_id, map_frame);
         assert_eq!(
             frontier_frame.1.frontiers.len(),
             schema::FRONTIER_LIST_CAPACITY
@@ -6726,7 +8698,8 @@ mod exploration_lcm_smoke_tests {
             goal.payload_sha256,
             schema::goal_envelope_payload_sha256(&goal).expect("recompute goal hash")
         );
-        assert_eq!(goal.boundary_frame_id, "map");
+        assert_eq!(goal.goal.header.frame_id, map_frame);
+        assert_eq!(goal.boundary_frame_id, map_frame);
         assert_eq!(
             goal.boundary_points,
             vec![
@@ -6737,9 +8710,37 @@ mod exploration_lcm_smoke_tests {
             ]
         );
 
+        let mut wrong_goal = nuwax_exploration::conversions::frontier_goal_to_navigation_goal(
+            &frontier_snapshot.frontiers[0],
+        );
+        wrong_goal.target.frame_id =
+            nuwax_nav_types_messages::frames::NavFrameId::Custom(map_frame.to_string());
+        let rejection = crate::explore_runtime::ExploreNavigationSink::submit(
+            &bridge,
+            crate::explore_runtime::ChildNavigationRequest {
+                parent_request_id: PARENT_REQUEST.to_string(),
+                request_id: "wrong-semantic-frame".to_string(),
+                motion_admission: crate::nav_runtime::test_motion_admission(),
+                frontier_goal_id: "wrong-semantic-frontier".to_string(),
+                goal: wrong_goal,
+                boundary: None,
+            },
+        )
+        .await
+        .expect_err("custom internal frame must fail closed before navigation submission");
+        assert!(matches!(
+            rejection,
+            crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
+                if message.contains("internal map-frame semantics")
+        ));
+
         let shared = state.read().await;
         assert_eq!(shared.frontiers_revision, frontier_snapshot.revision);
         assert_eq!(shared.frontiers.len(), frontier_snapshot.frontiers.len());
+        assert!(shared
+            .frontiers
+            .iter()
+            .all(|frontier| frontier.frame_id == map_frame));
         drop(shared);
 
         drop(frontier_frames);
@@ -6748,5 +8749,15 @@ mod exploration_lcm_smoke_tests {
         drop(subscriber);
         drop(publisher);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_exploration_channels_round_trip_over_real_lcm() {
+        exploration_channels_round_trip_over_real_lcm("map").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_map_frame_round_trips_over_real_exploration_channels() {
+        exploration_channels_round_trip_over_real_lcm("robot/map").await;
     }
 }

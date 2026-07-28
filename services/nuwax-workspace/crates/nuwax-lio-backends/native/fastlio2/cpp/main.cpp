@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,11 +66,14 @@ static float g_frequency = 10.0f;
 
 // Frame accumulator (Livox SDK raw → CustomMsg)
 static std::mutex g_pc_mutex;
+static std::mutex g_lio_mutex;
 static std::vector<custom_messages::CustomPoint> g_accumulated_points;
 static uint64_t g_frame_start_ns = 0;
 static bool g_frame_has_timestamp = false;
 
 // Helpers
+
+static constexpr uint64_t NANOS_PER_SECOND = 1000000000ULL;
 
 static uint64_t get_timestamp_ns(const LivoxLidarEthernetPacket* pkt) {
     uint64_t ns = 0;
@@ -77,8 +81,39 @@ static uint64_t get_timestamp_ns(const LivoxLidarEthernetPacket* pkt) {
     return ns;
 }
 
-using dimos::time_from_seconds;
+static bool next_source_timestamp(
+    const custom_messages::Odometry& odometry,
+    uint64_t last_output_source_timestamp_ns,
+    bool has_last_output_source_timestamp,
+    uint64_t& output_timestamp_ns
+) {
+    if (odometry.header.frame_id.empty()) { return false; }
+    const uint64_t seconds = static_cast<uint64_t>(odometry.header.stamp.sec);
+    const uint64_t nanoseconds = static_cast<uint64_t>(odometry.header.stamp.nsecs);
+    if (nanoseconds >= NANOS_PER_SECOND ||
+        seconds > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    const uint64_t timestamp_ns = seconds * NANOS_PER_SECOND + nanoseconds;
+    if (has_last_output_source_timestamp &&
+        timestamp_ns <= last_output_source_timestamp_ns) {
+        return false;
+    }
+    output_timestamp_ns = timestamp_ns;
+    return true;
+}
+
 using dimos::make_header;
+
+static std_msgs::Header make_source_header(
+    const std::string& frame_id,
+    uint64_t timestamp_ns
+) {
+    auto header = make_header(frame_id, 0.0);
+    header.stamp.sec = static_cast<int32_t>(timestamp_ns / NANOS_PER_SECOND);
+    header.stamp.nsec = static_cast<int32_t>(timestamp_ns % NANOS_PER_SECOND);
+    return header;
+}
 
 // Parse a comma-separated list of doubles (CLI vector args); empty on bad input.
 static std::vector<double> parse_doubles(const std::string& csv) {
@@ -99,14 +134,14 @@ static std::vector<double> parse_doubles(const std::string& csv) {
 
 // Publish a lidar point cloud, stamped with `frame_id`.
 
-static void publish_lidar(PointCloudXYZI::Ptr cloud, double timestamp, const std::string& frame_id, const std::string& topic = "") {
+static void publish_lidar(PointCloudXYZI::Ptr cloud, uint64_t timestamp_ns, const std::string& frame_id, const std::string& topic = "") {
     const std::string& chan = topic.empty() ? g_lidar_topic : topic;
     if (!g_lcm || !cloud || cloud->empty() || chan.empty()) { return; }
 
     int num_points = static_cast<int>(cloud->size());
 
     sensor_msgs::PointCloud2 pc;
-    pc.header = make_header(frame_id, timestamp);
+    pc.header = make_source_header(frame_id, timestamp_ns);
     pc.height = 1;
     pc.width = num_points;
     pc.is_bigendian = 0;
@@ -137,23 +172,26 @@ static void publish_lidar(PointCloudXYZI::Ptr cloud, double timestamp, const std
     pc.data.resize(pc.data_length);
 
     for (int i = 0; i < num_points; ++i) {
-        float* dst = reinterpret_cast<float*>(pc.data.data() + i * 16);
-        dst[0] = cloud->points[i].x;
-        dst[1] = cloud->points[i].y;
-        dst[2] = cloud->points[i].z;
-        dst[3] = cloud->points[i].intensity;
+        const size_t byte_offset = static_cast<size_t>(i) * 16;
+        const float x = cloud->points[i].x;
+        const float y = cloud->points[i].y;
+        const float z = cloud->points[i].z;
+        const float intensity = cloud->points[i].intensity;
+        std::memcpy(pc.data.data() + byte_offset, &x, sizeof(float));
+        std::memcpy(pc.data.data() + byte_offset + 4, &y, sizeof(float));
+        std::memcpy(pc.data.data() + byte_offset + 8, &z, sizeof(float));
+        std::memcpy(pc.data.data() + byte_offset + 12, &intensity, sizeof(float));
     }
 
     g_lcm->publish(chan, &pc);
 }
 
-// Publish odometry
-
-static void publish_odometry(const custom_messages::Odometry& odom, double timestamp) {
-    if (!g_lcm) { return; }
-
+static nav_msgs::Odometry make_odometry_message(
+    const custom_messages::Odometry& odom,
+    uint64_t timestamp_ns
+) {
     nav_msgs::Odometry msg;
-    msg.header = make_header(g_frame_id, timestamp);
+    msg.header = make_source_header(g_frame_id, timestamp_ns);
     msg.child_frame_id = g_child_frame_id;
 
     msg.pose.pose.position.x = odom.pose.pose.position.x;
@@ -178,6 +216,11 @@ static void publish_odometry(const custom_messages::Odometry& odom, double times
     msg.twist.twist.angular.z = 0;
     std::memset(msg.twist.covariance, 0, sizeof(msg.twist.covariance));
 
+    return msg;
+}
+
+static void publish_odometry(const nav_msgs::Odometry& msg) {
+    if (!g_lcm) { return; }
     g_lcm->publish(g_odometry_topic, &msg);
 }
 
@@ -230,11 +273,11 @@ static void on_imu_data(const uint32_t /*handle*/, const uint8_t /*dev_type*/, L
     if (!g_running.load() || data == nullptr || !g_fastlio) { return; }
 
     uint64_t pkt_ts_ns = get_timestamp_ns(data);
-
     double ts = static_cast<double>(pkt_ts_ns) / 1e9;
     auto* imu_pts = reinterpret_cast<const LivoxLidarImuRawPoint*>(data->data);
     uint16_t dot_num = data->dot_num;
 
+    std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
     for (uint16_t i = 0; i < dot_num; ++i) {
         auto imu_msg = boost::make_shared<custom_messages::Imu>();
         imu_msg->header.stamp = custom_messages::Time().fromSec(ts);
@@ -296,6 +339,8 @@ static void run_main_iter(
     std::chrono::microseconds frame_interval,
     std::chrono::microseconds pc_interval,
     std::chrono::microseconds odom_interval,
+    uint64_t& last_output_source_timestamp_ns,
+    bool& has_last_output_source_timestamp,
     bool scan_publish_en,
     bool dense_publish_en
 ) {
@@ -315,43 +360,66 @@ static void run_main_iter(
             last_emit = now;
         }
     }
-    if (!points.empty()) {
-        // Build CustomMsg
-        auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
-        lidar_msg->header.seq = 0;
-        lidar_msg->header.stamp = custom_messages::Time().fromSec(static_cast<double>(frame_start) / 1e9);
-        lidar_msg->header.frame_id = "livox_frame";
-        lidar_msg->timebase = frame_start;
-        lidar_msg->lidar_id = 0;
-        for (int i = 0; i < 3; i++) { lidar_msg->rsvd[i] = 0; }
-        lidar_msg->point_num = static_cast<uli>(points.size());
-        lidar_msg->points = std::move(points);
-        fast_lio.feed_lidar(lidar_msg);
-    }
+    const bool first_output = !has_last_output_source_timestamp;
+    bool cloud_due = scan_publish_en && !g_lidar_topic.empty() &&
+                     (first_output || now - last_pc_publish >= pc_interval);
+    const bool odometry_due = !g_odometry_topic.empty() &&
+                              (first_output || now - last_odom_publish >= odom_interval);
+    nav_msgs::Odometry odometry;
+    PointCloudXYZI::Ptr cloud;
+    uint64_t source_timestamp_ns = 0;
+    {
+        // SDK IMU callbacks and the main loop share the estimator. Snapshot
+        // odometry and cloud under one lock, then release it before LCM I/O.
+        std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
+        if (!points.empty()) {
+            auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
+            lidar_msg->header.seq = 0;
+            lidar_msg->header.stamp = custom_messages::Time().fromSec(static_cast<double>(frame_start) / 1e9);
+            lidar_msg->header.frame_id = "livox_frame";
+            lidar_msg->timebase = frame_start;
+            lidar_msg->lidar_id = 0;
+            for (int i = 0; i < 3; i++) { lidar_msg->rsvd[i] = 0; }
+            lidar_msg->point_num = static_cast<uli>(points.size());
+            lidar_msg->points = std::move(points);
+            fast_lio.feed_lidar(lidar_msg);
+        }
 
-    // Run one FAST-LIO IESKF step. Cheap when the IMU/lidar queues
-    // are empty; the heavy work happens after a feed_lidar above.
-    fast_lio.process();
+        // Cheap when the input queues are empty; a successful step updates the
+        // odometry header with the estimator's Livox-derived solution time.
+        fast_lio.process();
+        if (!cloud_due && !odometry_due) { return; }
 
-    // Check for new SLAM results and publish (rate-limited).
-    auto pose = fast_lio.get_pose();
-    if (!pose.empty() && (pose[0] != 0.0 || pose[1] != 0.0 || pose[2] != 0.0)) {
-        double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-        if (scan_publish_en && !g_lidar_topic.empty() && now - last_pc_publish >= pc_interval) {
+        const auto& estimator_odometry = fast_lio.get_odometry();
+        if (!next_source_timestamp(
+                estimator_odometry,
+                last_output_source_timestamp_ns,
+                has_last_output_source_timestamp,
+                source_timestamp_ns)) {
+            return;
+        }
+        odometry = make_odometry_message(estimator_odometry, source_timestamp_ns);
+        if (cloud_due) {
             // Sensor-frame cloud; register downstream via the odom pose.
-            // dense_publish_en false -> FAST-LIO's IESKF-downsampled scan.
-            auto cloud = dense_publish_en ? fast_lio.get_body_cloud() : fast_lio.get_body_cloud_down();
-            if (cloud && !cloud->empty()) {
-                publish_lidar(cloud, ts, g_sensor_frame_id);
-            }
-            last_pc_publish = now;
+            // dense_publish_en false selects the IESKF-downsampled scan.
+            cloud = dense_publish_en ? fast_lio.get_body_cloud() : fast_lio.get_body_cloud_down();
+            cloud_due = cloud && !cloud->empty();
         }
+    }
+    if (!cloud_due && !odometry_due) { return; }
 
-        // Pose + covariance, rate-limited to odom_freq.
-        if (!g_odometry_topic.empty() && now - last_odom_publish >= odom_interval) {
-            publish_odometry(fast_lio.get_odometry(), ts);
-            last_odom_publish = now;
-        }
+    last_output_source_timestamp_ns = source_timestamp_ns;
+    has_last_output_source_timestamp = true;
+
+    // Publish odometry first whenever a cloud is emitted so the two private
+    // channels carry an exact, source-timestamped pair for bounded reordering.
+    if (!g_odometry_topic.empty() && (odometry_due || cloud_due)) {
+        publish_odometry(odometry);
+        last_odom_publish = now;
+    }
+    if (cloud_due) {
+        publish_lidar(cloud, source_timestamp_ns, g_sensor_frame_id);
+        last_pc_publish = now;
     }
 }
 
@@ -466,6 +534,8 @@ int main(int argc, char** argv) {
     auto last_emit = std::chrono::steady_clock::now();
     auto last_pc_publish = last_emit;
     auto last_odom_publish = last_emit;
+    uint64_t last_output_source_timestamp_ns = 0;
+    bool has_last_output_source_timestamp = false;
 
     // The Livox SDK opens UDP sockets and dispatches via its own callback
     // threads; the main loop below consumes what's queued.
@@ -494,6 +564,8 @@ int main(int argc, char** argv) {
             frame_interval,
             pc_interval,
             odom_interval,
+            last_output_source_timestamp_ns,
+            has_last_output_source_timestamp,
             scan_publish_en,
             dense_publish_en
         );

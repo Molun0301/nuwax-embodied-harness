@@ -137,7 +137,6 @@ class DebugPointCloudMapView(ContractModel):
     """累计点云地图调试视图。"""
 
     map_name: Optional[str] = None
-    map_version_id: Optional[str] = None
     revision: Optional[str] = None
     frame_id: Optional[str] = None
     source: Optional[str] = None

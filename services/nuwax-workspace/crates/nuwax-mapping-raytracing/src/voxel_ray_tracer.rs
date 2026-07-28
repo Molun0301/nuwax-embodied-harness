@@ -19,7 +19,7 @@ pub const MAX_STEPS_PER_RAY: u64 = 200_000;
 /// Deterministic upper bound for all DDA traversals in one JSON request.
 pub const MAX_REQUEST_RAY_STEPS: u64 = 50_000_000;
 
-#[derive(Validate)]
+#[derive(Clone, Validate)]
 #[validate(schema(function = "validate_config_limits"))]
 // 注：原 `dimos_module::native_config` 过程宏在 1:1 源码中存在，它为 `dimos-module` 框架
 // 提供运行时反射支持。本 crate 作为 nuwax standalone 库不需要该反射元数据，
@@ -100,7 +100,7 @@ pub fn conservative_ray_step_bound(
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VoxelMap {
     pub voxels: AHashMap<VoxelKey, Voxel>,
     frame: u32,
@@ -217,6 +217,389 @@ impl Voxel {
         let mean = self.sum / n;
         fit_normal(self.m2 / n - mean * mean.transpose())
     }
+}
+
+pub const VOXEL_MAP_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const VOXEL_MAP_CHECKPOINT_MAGIC: [u8; 8] = *b"NUWAXVXL";
+/// Encoded bytes before the first voxel entry.
+pub const VOXEL_MAP_CHECKPOINT_HEADER_BYTES: usize = 24;
+/// Fixed encoded size of one voxel entry.
+pub const VOXEL_MAP_CHECKPOINT_ENTRY_BYTES: usize = 89;
+
+struct VoxelCheckpointEntry {
+    key: [i32; 3],
+    health: VoxelHealth,
+    num_pts: u32,
+    sum: [f32; 3],
+    m2: [f32; 9],
+    normal: Option<[f32; 3]>,
+    last_hit: u32,
+    recency: u32,
+}
+
+/// Return the exact encoded checkpoint length without allocating the payload.
+pub fn voxel_map_checkpoint_encoded_len(map: &VoxelMap) -> Result<usize, String> {
+    let voxel_count = u64::try_from(map.voxels.len()).map_err(|_| {
+        "RAYTRACING_CHECKPOINT_INVALID: voxel count cannot be represented as u64".to_owned()
+    })?;
+    voxel_map_checkpoint_encoded_len_for_count(voxel_count)
+}
+
+fn voxel_map_checkpoint_encoded_len_for_count(voxel_count: u64) -> Result<usize, String> {
+    let voxel_count = usize::try_from(voxel_count).map_err(|_| {
+        "RAYTRACING_CHECKPOINT_INVALID: voxel count exceeds platform limits".to_owned()
+    })?;
+    let entries_bytes = voxel_count
+        .checked_mul(VOXEL_MAP_CHECKPOINT_ENTRY_BYTES)
+        .ok_or_else(|| {
+            "RAYTRACING_CHECKPOINT_INVALID: encoded checkpoint length overflowed".to_owned()
+        })?;
+    VOXEL_MAP_CHECKPOINT_HEADER_BYTES
+        .checked_add(entries_bytes)
+        .ok_or_else(|| {
+            "RAYTRACING_CHECKPOINT_INVALID: encoded checkpoint length overflowed".to_owned()
+        })
+}
+
+pub fn encode_voxel_map_checkpoint(map: &VoxelMap) -> Result<Vec<u8>, String> {
+    let encoded_len = voxel_map_checkpoint_encoded_len(map)?;
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(encoded_len).map_err(|error| {
+        format!("RAYTRACING_CHECKPOINT_INVALID: payload allocation failed: {error}")
+    })?;
+    append_voxel_map_checkpoint(map, &mut payload)?;
+    Ok(payload)
+}
+
+/// Append one complete checkpoint to an already budgeted outer payload.
+pub fn append_voxel_map_checkpoint(map: &VoxelMap, payload: &mut Vec<u8>) -> Result<(), String> {
+    validate_voxel_checkpoint_frame(map.frame)?;
+    let encoded_len = voxel_map_checkpoint_encoded_len(map)?;
+    let voxel_count = u64::try_from(map.voxels.len()).map_err(|_| {
+        "RAYTRACING_CHECKPOINT_INVALID: voxel count cannot be represented as u64".to_owned()
+    })?;
+
+    let mut sorted_voxels = Vec::new();
+    sorted_voxels
+        .try_reserve_exact(map.voxels.len())
+        .map_err(|error| {
+            format!("RAYTRACING_CHECKPOINT_INVALID: sort allocation failed: {error}")
+        })?;
+    sorted_voxels.extend(map.voxels.iter());
+    sorted_voxels.sort_unstable_by_key(|(key, _)| **key);
+
+    for &(key, voxel) in &sorted_voxels {
+        let entry = voxel_checkpoint_entry(*key, voxel);
+        validate_voxel_checkpoint_entry(&entry, map.frame, None)?;
+    }
+
+    let original_len = payload.len();
+    payload.try_reserve_exact(encoded_len).map_err(|error| {
+        format!("RAYTRACING_CHECKPOINT_INVALID: payload allocation failed: {error}")
+    })?;
+    payload.extend_from_slice(&VOXEL_MAP_CHECKPOINT_MAGIC);
+    payload.extend_from_slice(&VOXEL_MAP_CHECKPOINT_SCHEMA_VERSION.to_le_bytes());
+    payload.extend_from_slice(&map.frame.to_le_bytes());
+    payload.extend_from_slice(&voxel_count.to_le_bytes());
+
+    for (&key, voxel) in sorted_voxels {
+        let entry = voxel_checkpoint_entry(key, voxel);
+        encode_voxel_checkpoint_entry(payload, &entry);
+    }
+    debug_assert_eq!(payload.len(), original_len + encoded_len);
+    Ok(())
+}
+
+pub fn decode_voxel_map_checkpoint(payload: &[u8], max_voxels: usize) -> Result<VoxelMap, String> {
+    decode_voxel_map_checkpoint_inner(payload, max_voxels, None)
+}
+
+pub fn decode_voxel_map_checkpoint_for_config(
+    payload: &[u8],
+    max_voxels: usize,
+    config: &Config,
+) -> Result<VoxelMap, String> {
+    config
+        .validate()
+        .map_err(|error| format!("RAYTRACING_CHECKPOINT_INVALID: invalid config: {error}"))?;
+    decode_voxel_map_checkpoint_inner(
+        payload,
+        max_voxels,
+        Some((config.min_health, config.max_health)),
+    )
+}
+
+fn decode_voxel_map_checkpoint_inner(
+    payload: &[u8],
+    max_voxels: usize,
+    health_bounds: Option<(VoxelHealth, VoxelHealth)>,
+) -> Result<VoxelMap, String> {
+    if payload.len() < VOXEL_MAP_CHECKPOINT_HEADER_BYTES {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: payload has {} bytes, shorter than the {}-byte header",
+            payload.len(),
+            VOXEL_MAP_CHECKPOINT_HEADER_BYTES
+        ));
+    }
+
+    let mut cursor = 0;
+    let magic = read_checkpoint_array::<8>(payload, &mut cursor)?;
+    if magic != VOXEL_MAP_CHECKPOINT_MAGIC {
+        return Err("RAYTRACING_CHECKPOINT_INVALID: invalid checkpoint magic".to_owned());
+    }
+    let schema_version = read_checkpoint_u32(payload, &mut cursor)?;
+    if schema_version != VOXEL_MAP_CHECKPOINT_SCHEMA_VERSION {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: unsupported schema version {schema_version}"
+        ));
+    }
+    let frame = read_checkpoint_u32(payload, &mut cursor)?;
+    validate_voxel_checkpoint_frame(frame)?;
+    let voxel_count_u64 = read_checkpoint_u64(payload, &mut cursor)?;
+    let voxel_count = usize::try_from(voxel_count_u64).map_err(|_| {
+        "RAYTRACING_CHECKPOINT_INVALID: voxel count exceeds platform limits".to_owned()
+    })?;
+    if voxel_count > max_voxels {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: voxel count {voxel_count} exceeds limit {max_voxels}"
+        ));
+    }
+    let expected_len = voxel_map_checkpoint_encoded_len_for_count(voxel_count_u64)?;
+    if payload.len() < expected_len {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: payload has {} bytes, expected {expected_len}",
+            payload.len()
+        ));
+    }
+    if payload.len() > expected_len {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: payload has {} trailing bytes",
+            payload.len() - expected_len
+        ));
+    }
+
+    let mut voxels = AHashMap::new();
+    voxels.try_reserve(voxel_count).map_err(|error| {
+        format!("RAYTRACING_CHECKPOINT_INVALID: voxel allocation failed: {error}")
+    })?;
+    for _ in 0..voxel_count {
+        let entry = decode_voxel_checkpoint_entry(payload, &mut cursor)?;
+        validate_voxel_checkpoint_entry(&entry, frame, health_bounds)?;
+        let key = (entry.key[0], entry.key[1], entry.key[2]);
+        let normal = entry
+            .normal
+            .map(|normal| Vector3::new(normal[0], normal[1], normal[2]));
+        let voxel = Voxel {
+            health: entry.health,
+            num_pts: entry.num_pts,
+            sum: Vector3::new(entry.sum[0], entry.sum[1], entry.sum[2]),
+            m2: Matrix3::from_row_slice(&entry.m2),
+            normal,
+            last_hit: entry.last_hit,
+            recency: entry.recency,
+        };
+        if voxels.insert(key, voxel).is_some() {
+            return Err(format!(
+                "RAYTRACING_CHECKPOINT_INVALID: duplicate voxel key {key:?}"
+            ));
+        }
+    }
+    debug_assert_eq!(cursor, expected_len);
+    Ok(VoxelMap { voxels, frame })
+}
+
+fn voxel_checkpoint_entry(key: VoxelKey, voxel: &Voxel) -> VoxelCheckpointEntry {
+    let mut m2 = [0.0_f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            m2[row * 3 + column] = voxel.m2[(row, column)];
+        }
+    }
+    VoxelCheckpointEntry {
+        key: [key.0, key.1, key.2],
+        health: voxel.health,
+        num_pts: voxel.num_pts,
+        sum: [voxel.sum.x, voxel.sum.y, voxel.sum.z],
+        m2,
+        normal: voxel.normal.map(|normal| [normal.x, normal.y, normal.z]),
+        last_hit: voxel.last_hit,
+        recency: voxel.recency,
+    }
+}
+
+fn encode_voxel_checkpoint_entry(payload: &mut Vec<u8>, entry: &VoxelCheckpointEntry) {
+    for value in entry.key {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    payload.extend_from_slice(&entry.health.to_le_bytes());
+    payload.extend_from_slice(&entry.num_pts.to_le_bytes());
+    for value in entry.sum {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in entry.m2 {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    match entry.normal {
+        Some(normal) => {
+            payload.push(1);
+            for value in normal {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        None => {
+            payload.push(0);
+            payload.extend_from_slice(&[0; 12]);
+        }
+    }
+    payload.extend_from_slice(&entry.last_hit.to_le_bytes());
+    payload.extend_from_slice(&entry.recency.to_le_bytes());
+}
+
+fn decode_voxel_checkpoint_entry(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<VoxelCheckpointEntry, String> {
+    let key = [
+        read_checkpoint_i32(payload, cursor)?,
+        read_checkpoint_i32(payload, cursor)?,
+        read_checkpoint_i32(payload, cursor)?,
+    ];
+    let health = read_checkpoint_i32(payload, cursor)?;
+    let num_pts = read_checkpoint_u32(payload, cursor)?;
+    let mut sum = [0.0; 3];
+    for value in &mut sum {
+        *value = read_checkpoint_f32(payload, cursor)?;
+    }
+    let mut m2 = [0.0; 9];
+    for value in &mut m2 {
+        *value = read_checkpoint_f32(payload, cursor)?;
+    }
+    let normal_present = read_checkpoint_u8(payload, cursor)?;
+    let mut normal_values = [0.0_f32; 3];
+    for value in &mut normal_values {
+        *value = read_checkpoint_f32(payload, cursor)?;
+    }
+    let normal = match normal_present {
+        0 if normal_values.iter().all(|value| value.to_bits() == 0) => None,
+        0 => {
+            return Err(format!(
+                "RAYTRACING_CHECKPOINT_INVALID: voxel {key:?} has nonzero normal data without a normal"
+            ));
+        }
+        1 => Some(normal_values),
+        flag => {
+            return Err(format!(
+                "RAYTRACING_CHECKPOINT_INVALID: voxel {key:?} has invalid normal flag {flag}"
+            ));
+        }
+    };
+    let last_hit = read_checkpoint_u32(payload, cursor)?;
+    let recency = read_checkpoint_u32(payload, cursor)?;
+    Ok(VoxelCheckpointEntry {
+        key,
+        health,
+        num_pts,
+        sum,
+        m2,
+        normal,
+        last_hit,
+        recency,
+    })
+}
+
+fn read_checkpoint_array<const N: usize>(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], String> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| "RAYTRACING_CHECKPOINT_INVALID: checkpoint cursor overflowed".to_owned())?;
+    let bytes = payload.get(*cursor..end).ok_or_else(|| {
+        format!(
+            "RAYTRACING_CHECKPOINT_INVALID: payload is truncated at byte {}",
+            *cursor
+        )
+    })?;
+    *cursor = end;
+    bytes.try_into().map_err(|_| {
+        "RAYTRACING_CHECKPOINT_INVALID: internal checkpoint field width mismatch".to_owned()
+    })
+}
+
+fn read_checkpoint_u8(payload: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    Ok(read_checkpoint_array::<1>(payload, cursor)?[0])
+}
+
+fn read_checkpoint_u32(payload: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_checkpoint_array(payload, cursor)?))
+}
+
+fn read_checkpoint_u64(payload: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(read_checkpoint_array(payload, cursor)?))
+}
+
+fn read_checkpoint_i32(payload: &[u8], cursor: &mut usize) -> Result<i32, String> {
+    Ok(i32::from_le_bytes(read_checkpoint_array(payload, cursor)?))
+}
+
+fn read_checkpoint_f32(payload: &[u8], cursor: &mut usize) -> Result<f32, String> {
+    Ok(f32::from_le_bytes(read_checkpoint_array(payload, cursor)?))
+}
+
+fn validate_voxel_checkpoint_frame(frame: u32) -> Result<(), String> {
+    if frame == u32::MAX {
+        return Err(
+            "RAYTRACING_CHECKPOINT_INVALID: frame counter is exhausted and cannot continue"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_voxel_checkpoint_entry(
+    voxel: &VoxelCheckpointEntry,
+    frame: u32,
+    health_bounds: Option<(VoxelHealth, VoxelHealth)>,
+) -> Result<(), String> {
+    let finite = voxel
+        .sum
+        .iter()
+        .chain(voxel.m2.iter())
+        .chain(voxel.normal.iter().flatten())
+        .all(|value| value.is_finite());
+    if !finite {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: voxel {:?} contains non-finite state",
+            voxel.key
+        ));
+    }
+    if voxel.last_hit > frame || voxel.recency > frame {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: voxel {:?} references a future frame",
+            voxel.key
+        ));
+    }
+    if voxel.num_pts == u32::MAX {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: voxel {:?} point counter is exhausted",
+            voxel.key
+        ));
+    }
+    if voxel.health == i32::MIN || voxel.health == i32::MAX {
+        return Err(format!(
+            "RAYTRACING_CHECKPOINT_INVALID: voxel {:?} health counter is exhausted",
+            voxel.key
+        ));
+    }
+    if let Some((min_health, max_health)) = health_bounds {
+        if !(min_health..=max_health).contains(&voxel.health) {
+            return Err(format!(
+                "RAYTRACING_CHECKPOINT_INVALID: voxel {:?} health {} is outside configured bounds {min_health}..={max_health}",
+                voxel.key, voxel.health
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The surface normal of a covariance, or None unless it is clearly planar.
@@ -621,7 +1004,7 @@ pub(crate) fn update_map_prevalidated(
     hits
 }
 
-pub(crate) fn validate_update_inputs(
+pub fn validate_update_inputs(
     origin: (f32, f32, f32),
     points: &[(f32, f32, f32)],
     cfg: &Config,
@@ -885,6 +1268,238 @@ mod tests {
             global_emit_every: 1,
             region_percentile: 95.0,
         }
+    }
+
+    const CHECKPOINT_SCHEMA_OFFSET: usize = 8;
+    const CHECKPOINT_FRAME_OFFSET: usize = 12;
+    const CHECKPOINT_COUNT_OFFSET: usize = 16;
+    const ENTRY_HEALTH_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 12;
+    const ENTRY_NUM_POINTS_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 16;
+    const ENTRY_SUM_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 20;
+    const ENTRY_NORMAL_FLAG_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 68;
+    const ENTRY_NORMAL_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 69;
+    const ENTRY_LAST_HIT_OFFSET: usize = VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 81;
+
+    fn overwrite_u32(payload: &mut [u8], offset: usize, value: u32) {
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_u64(payload: &mut [u8], offset: usize, value: u64) {
+        payload[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_i32(payload: &mut [u8], offset: usize, value: i32) {
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_f32(payload: &mut [u8], offset: usize, value: f32) {
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn voxel_checkpoint_binary_layout_is_fixed_and_deterministic() {
+        let mut forward = VoxelMap::default();
+        forward.set((-4, 5, 6), 1);
+        forward.set((1, 2, 3), 0);
+        let mut reverse = VoxelMap::default();
+        reverse.set((1, 2, 3), 0);
+        reverse.set((-4, 5, 6), 1);
+
+        let encoded = encode_voxel_map_checkpoint(&forward).expect("encode checkpoint");
+        assert_eq!(&encoded[..8], &VOXEL_MAP_CHECKPOINT_MAGIC);
+        assert_eq!(
+            encoded.len(),
+            VOXEL_MAP_CHECKPOINT_HEADER_BYTES + 2 * VOXEL_MAP_CHECKPOINT_ENTRY_BYTES
+        );
+        assert_eq!(
+            voxel_map_checkpoint_encoded_len(&forward).expect("checkpoint length"),
+            encoded.len()
+        );
+        assert_eq!(
+            encode_voxel_map_checkpoint(&reverse).expect("encode reverse checkpoint"),
+            encoded
+        );
+        assert!(voxel_map_checkpoint_encoded_len_for_count(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn voxel_checkpoint_round_trip_preserves_continued_updates() {
+        let cfg = basic_config();
+        let mut original = VoxelMap::default();
+        for offset in [0.1_f32, 0.2, 0.3] {
+            try_update_map(
+                &mut original,
+                (0.0, 0.0, 0.0),
+                &[(5.0 + offset, 0.5, 0.5), (0.5, 5.0 + offset, 0.5)],
+                &cfg,
+            )
+            .expect("ray update");
+        }
+
+        let encoded = encode_voxel_map_checkpoint(&original).expect("encode checkpoint");
+        let mut restored = decode_voxel_map_checkpoint(&encoded, original.voxels.len())
+            .expect("restore checkpoint");
+        assert_eq!(
+            encode_voxel_map_checkpoint(&restored).expect("re-encode checkpoint"),
+            encoded
+        );
+
+        let continuation = [(6.25, 0.5, 0.5), (0.5, 6.25, 0.5)];
+        try_update_map(&mut original, (0.0, 0.0, 0.0), &continuation, &cfg)
+            .expect("original continuation");
+        try_update_map(&mut restored, (0.0, 0.0, 0.0), &continuation, &cfg)
+            .expect("restored continuation");
+        assert_eq!(
+            encode_voxel_map_checkpoint(&restored).expect("encode restored continuation"),
+            encode_voxel_map_checkpoint(&original).expect("encode original continuation")
+        );
+    }
+
+    #[test]
+    fn voxel_checkpoint_rejects_duplicate_and_oversized_count() {
+        let mut map = VoxelMap::default();
+        map.set((1, 2, 3), 1);
+        let encoded = encode_voxel_map_checkpoint(&map).expect("encode checkpoint");
+        assert!(decode_voxel_map_checkpoint(&encoded, 0)
+            .err()
+            .expect("voxel ceiling must be enforced")
+            .contains("exceeds limit"));
+
+        let mut oversized_count = encoded.clone();
+        overwrite_u64(&mut oversized_count, CHECKPOINT_COUNT_OFFSET, 2);
+        assert!(decode_voxel_map_checkpoint(&oversized_count, 1)
+            .err()
+            .expect("declared voxel ceiling must be enforced before length validation")
+            .contains("exceeds limit"));
+
+        let mut duplicate = encoded.clone();
+        overwrite_u64(&mut duplicate, CHECKPOINT_COUNT_OFFSET, 2);
+        duplicate.extend_from_slice(
+            &encoded[VOXEL_MAP_CHECKPOINT_HEADER_BYTES
+                ..VOXEL_MAP_CHECKPOINT_HEADER_BYTES + VOXEL_MAP_CHECKPOINT_ENTRY_BYTES],
+        );
+        assert!(decode_voxel_map_checkpoint(&duplicate, 2)
+            .err()
+            .expect("duplicate key must fail")
+            .contains("duplicate voxel key"));
+    }
+
+    #[test]
+    fn voxel_checkpoint_rejects_bad_header_and_noncanonical_lengths() {
+        let mut map = VoxelMap::default();
+        map.set((1, 2, 3), 1);
+        let encoded = encode_voxel_map_checkpoint(&map).expect("encode checkpoint");
+
+        assert!(
+            decode_voxel_map_checkpoint(&encoded[..VOXEL_MAP_CHECKPOINT_HEADER_BYTES - 1], 1)
+                .err()
+                .expect("short header must fail")
+                .contains("shorter")
+        );
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(decode_voxel_map_checkpoint(&bad_magic, 1)
+            .err()
+            .expect("bad magic must fail")
+            .contains("magic"));
+
+        let mut unknown_version = encoded.clone();
+        overwrite_u32(
+            &mut unknown_version,
+            CHECKPOINT_SCHEMA_OFFSET,
+            VOXEL_MAP_CHECKPOINT_SCHEMA_VERSION + 1,
+        );
+        assert!(decode_voxel_map_checkpoint(&unknown_version, 1)
+            .err()
+            .expect("unknown version must fail")
+            .contains("unsupported schema version"));
+
+        let mut short_entry = encoded.clone();
+        short_entry.pop();
+        assert!(decode_voxel_map_checkpoint(&short_entry, 1)
+            .err()
+            .expect("short entry must fail")
+            .contains("expected"));
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_voxel_map_checkpoint(&trailing, 1)
+            .err()
+            .expect("trailing data must fail")
+            .contains("trailing bytes"));
+    }
+
+    #[test]
+    fn voxel_checkpoint_rejects_invalid_normal_encoding_and_nonfinite_state() {
+        let mut map = VoxelMap::default();
+        map.set((1, 2, 3), 1);
+        let encoded = encode_voxel_map_checkpoint(&map).expect("encode checkpoint");
+
+        let mut invalid_flag = encoded.clone();
+        invalid_flag[ENTRY_NORMAL_FLAG_OFFSET] = 2;
+        assert!(decode_voxel_map_checkpoint(&invalid_flag, 1)
+            .err()
+            .expect("invalid normal flag must fail")
+            .contains("invalid normal flag"));
+
+        let mut noncanonical_none = encoded.clone();
+        overwrite_f32(&mut noncanonical_none, ENTRY_NORMAL_OFFSET, 1.0);
+        assert!(decode_voxel_map_checkpoint(&noncanonical_none, 1)
+            .err()
+            .expect("nonzero None normal data must fail")
+            .contains("nonzero normal data"));
+
+        let mut nonfinite = encoded;
+        overwrite_f32(&mut nonfinite, ENTRY_SUM_OFFSET, f32::NAN);
+        assert!(decode_voxel_map_checkpoint(&nonfinite, 1)
+            .err()
+            .expect("non-finite voxel state must fail")
+            .contains("non-finite state"));
+    }
+
+    #[test]
+    fn voxel_checkpoint_rejects_exhausted_and_out_of_config_counters() {
+        let mut map = VoxelMap::default();
+        map.set((1, 2, 3), 1);
+        let encoded = encode_voxel_map_checkpoint(&map).expect("encode checkpoint");
+
+        let mut exhausted_frame = encoded.clone();
+        overwrite_u32(&mut exhausted_frame, CHECKPOINT_FRAME_OFFSET, u32::MAX);
+        assert!(decode_voxel_map_checkpoint(&exhausted_frame, 1)
+            .err()
+            .expect("exhausted frame must fail")
+            .contains("frame counter is exhausted"));
+
+        let mut exhausted_points = encoded.clone();
+        overwrite_u32(&mut exhausted_points, ENTRY_NUM_POINTS_OFFSET, u32::MAX);
+        assert!(decode_voxel_map_checkpoint(&exhausted_points, 1)
+            .err()
+            .expect("exhausted point counter must fail")
+            .contains("point counter is exhausted"));
+
+        let mut exhausted_health = encoded.clone();
+        overwrite_i32(&mut exhausted_health, ENTRY_HEALTH_OFFSET, i32::MAX);
+        assert!(decode_voxel_map_checkpoint(&exhausted_health, 1)
+            .err()
+            .expect("exhausted health counter must fail")
+            .contains("health counter is exhausted"));
+
+        let mut future_counter = encoded.clone();
+        overwrite_u32(&mut future_counter, ENTRY_LAST_HIT_OFFSET, 1);
+        assert!(decode_voxel_map_checkpoint(&future_counter, 1)
+            .err()
+            .expect("future hit counter must fail")
+            .contains("references a future frame"));
+
+        let mut outside_config = encoded;
+        overwrite_i32(&mut outside_config, ENTRY_HEALTH_OFFSET, 2);
+        assert!(
+            decode_voxel_map_checkpoint_for_config(&outside_config, 1, &basic_config())
+                .err()
+                .expect("out-of-config health must fail")
+                .contains("outside configured bounds")
+        );
     }
 
     #[test]

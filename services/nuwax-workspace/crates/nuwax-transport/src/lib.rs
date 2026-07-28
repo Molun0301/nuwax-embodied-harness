@@ -45,6 +45,9 @@ pub mod compat;
 #[cfg(feature = "real-lcm")]
 pub mod real_backend;
 
+#[cfg(feature = "real-lcm")]
+pub use real_backend::OwnedLcmSubscription;
+
 // ============================================================================
 // LCM-first API
 // ============================================================================
@@ -168,6 +171,26 @@ impl LcmTransport {
         msg_type: Option<LcmMessageType>,
     ) -> LcmFrameStream {
         self.backend.subscribe(topic, msg_type).await
+    }
+
+    /// Subscribe through the transport's existing real liblcm owner context.
+    ///
+    /// Unlike [`Self::subscribe`], the returned handle retains the underlying
+    /// subscription so its owner can explicitly wait for unsubscribe
+    /// acknowledgement during shutdown. Transports backed by anything other
+    /// than the real shared context fail closed.
+    #[cfg(feature = "real-lcm")]
+    pub async fn subscribe_owned(
+        &self,
+        topic: LcmTopic,
+        msg_type: Option<LcmMessageType>,
+    ) -> TransportResult<OwnedLcmSubscription> {
+        let context = self.shared_lcm_context().ok_or_else(|| {
+            TransportError::LcmBackend(
+                "owned subscription requires the real shared LCM context".to_owned(),
+            )
+        })?;
+        OwnedLcmSubscription::subscribe(context, topic, msg_type).await
     }
 }
 
@@ -298,6 +321,29 @@ mod tests {
     use super::*;
     use nuwax_protocol::RawLcmFrameBuilder;
 
+    #[cfg(feature = "real-lcm")]
+    struct ContextlessBackend;
+
+    #[cfg(feature = "real-lcm")]
+    #[async_trait]
+    impl LcmBackend for ContextlessBackend {
+        async fn publish(&self, _frame: RawLcmFrame) -> TransportResult<()> {
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _topic: LcmTopic,
+            _msg_type: Option<LcmMessageType>,
+        ) -> LcmFrameStream {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn name(&self) -> &str {
+            "contextless-test"
+        }
+    }
+
     #[test]
     #[allow(deprecated)]
     fn udp_transport_construct_compat() {
@@ -355,5 +401,46 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.provider(), "memq://");
+    }
+
+    #[cfg(feature = "real-lcm")]
+    #[tokio::test]
+    async fn owned_subscription_fails_closed_without_real_context() {
+        let transport = LcmTransport::new(Arc::new(ContextlessBackend));
+        let topic = LcmTopic::new("/owned/contextless").unwrap();
+        let error = transport
+            .subscribe_owned(topic, None)
+            .await
+            .expect_err("contextless backend must not create an owned subscription");
+
+        assert!(matches!(error, TransportError::LcmBackend(_)));
+    }
+
+    #[cfg(feature = "real-lcm")]
+    #[tokio::test]
+    async fn owned_subscription_retains_context_and_acknowledges_unsubscribe() {
+        let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
+        let topic = LcmTopic::new("/owned/pose").unwrap();
+        let msg_type = LcmMessageType::new("geometry_msgs/PoseStamped").unwrap();
+        let mut subscription = transport
+            .subscribe_owned(topic.clone(), Some(msg_type.clone()))
+            .await
+            .expect("owner-thread acknowledged subscribe");
+        let frame = RawLcmFrameBuilder::new(topic, msg_type)
+            .payload(b"owned-body".to_vec())
+            .build();
+
+        transport.publish(frame).await.expect("publish");
+        drop(transport);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), subscription.recv())
+            .await
+            .expect("receive timeout")
+            .expect("typed decode");
+        assert_eq!(received.payload, b"owned-body");
+
+        subscription
+            .unsubscribe()
+            .await
+            .expect("owner-thread acknowledged unsubscribe");
     }
 }

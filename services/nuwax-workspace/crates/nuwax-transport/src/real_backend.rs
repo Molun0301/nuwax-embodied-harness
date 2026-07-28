@@ -37,6 +37,103 @@ use nuwax_protocol::{
 
 use crate::{LcmBackend, LcmFrameStream, TransportError, TransportResult};
 
+/// An explicitly owned real-lcm subscription.
+///
+/// The handle is intentionally not [`Clone`]: one generation owner is
+/// responsible for receive, acknowledged unsubscribe, and final drop.
+/// Dropping without calling [`Self::unsubscribe`] retains the lower-level
+/// fire-and-forget fallback behavior.
+///
+/// ```compile_fail
+/// use nuwax_transport::OwnedLcmSubscription;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<OwnedLcmSubscription>();
+/// ```
+pub struct OwnedLcmSubscription {
+    // Retain the owner context until acknowledged unsubscribe completes. The
+    // transport/backend may be dropped before this generation owner shuts down.
+    _context: Arc<LcmContext>,
+    subscription: Option<LcmSubscription>,
+    msg_type_filter: Option<LcmMessageType>,
+    topic: LcmTopic,
+}
+
+impl std::fmt::Debug for OwnedLcmSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedLcmSubscription")
+            .field("topic", &self.topic)
+            .field("msg_type_filter", &self.msg_type_filter)
+            .field("active", &self.subscription.is_some())
+            .finish()
+    }
+}
+
+impl OwnedLcmSubscription {
+    pub(crate) async fn subscribe(
+        context: Arc<LcmContext>,
+        topic: LcmTopic,
+        msg_type_filter: Option<LcmMessageType>,
+    ) -> TransportResult<Self> {
+        let subscription_pattern = subscription_pattern(&topic, msg_type_filter.as_ref());
+        let subscription = context
+            .subscribe(&subscription_pattern)
+            .await
+            .map_err(|error| TransportError::LcmBackend(format!("subscribe 失败: {error}")))?;
+        Ok(Self {
+            _context: context,
+            subscription: Some(subscription),
+            msg_type_filter,
+            topic,
+        })
+    }
+
+    /// Receive and decode the next callback using the subscription's fixed
+    /// topic and optional typed-suffix filter.
+    ///
+    /// Lagged broadcast entries are reported through tracing and skipped.
+    pub async fn recv(&mut self) -> TransportResult<RawLcmFrame> {
+        let subscription = self
+            .subscription
+            .as_mut()
+            .ok_or(TransportError::ChannelClosed)?;
+        loop {
+            match subscription.receiver.recv().await {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        "owned real-lcm subscribe lagged ({} 条) — channel={}",
+                        n,
+                        self.topic.channel()
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(TransportError::ChannelClosed);
+                }
+                Ok(message) => {
+                    return decode_subscription_message(
+                        message,
+                        &self.topic,
+                        self.msg_type_filter.as_ref(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Wait until the liblcm owner thread has processed this unsubscribe.
+    ///
+    /// This consumes the handle so queued callback data cannot be observed by
+    /// the former owner after the acknowledgement.
+    pub async fn unsubscribe(mut self) -> TransportResult<()> {
+        let Some(mut subscription) = self.subscription.take() else {
+            return Ok(());
+        };
+        subscription
+            .unsubscribe()
+            .await
+            .map_err(|error| TransportError::LcmBackend(format!("unsubscribe 失败: {error}")))
+    }
+}
+
 /// `real-lcm` backend。
 ///
 /// The backend owns one `Arc<LcmContext>` shared by typed transport users and
@@ -116,9 +213,7 @@ impl LcmBackend for RealLcmBackend {
     }
 
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
-        let subscription_pattern = msg_type
-            .as_ref()
-            .map_or_else(|| topic.channel().to_owned(), |kind| topic.fqn(kind.fqn()));
+        let subscription_pattern = subscription_pattern(&topic, msg_type.as_ref());
         let sub_result: Result<LcmSubscription, LcmError> =
             self.context.subscribe(&subscription_pattern).await;
         let sub = match sub_result {
@@ -142,6 +237,10 @@ impl LcmBackend for RealLcmBackend {
     fn shared_lcm_context(&self) -> Option<Arc<LcmContext>> {
         Some(Arc::clone(&self.context))
     }
+}
+
+fn subscription_pattern(topic: &LcmTopic, msg_type: Option<&LcmMessageType>) -> String {
+    msg_type.map_or_else(|| topic.channel().to_owned(), |kind| topic.fqn(kind.fqn()))
 }
 
 /// 把单条 transport error 包装成立即结束 + 一条 error 的 stream。

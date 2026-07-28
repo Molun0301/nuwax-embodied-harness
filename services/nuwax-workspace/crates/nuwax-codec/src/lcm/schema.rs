@@ -740,6 +740,7 @@ fn validate_goal_envelope_semantics(
     if message.motion_stop_generation < 0 {
         return Err("motion_stop_generation must be non-negative".into());
     }
+    validate_navigation_frame_id(&message.goal.header.frame_id, "goal pose")?;
     match message.owner_kind {
         NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
             if !message.boundary_frame_id.is_empty() || !message.boundary_points.is_empty() {
@@ -751,14 +752,13 @@ fn validate_goal_envelope_semantics(
                 if !message.boundary_frame_id.is_empty() {
                     return Err("empty boundary must have an empty boundary_frame_id".into());
                 }
-            } else if message.boundary_frame_id != "map" {
-                return Err("exploration boundary_frame_id must be map".into());
+            } else if message.boundary_frame_id != message.goal.header.frame_id {
+                return Err(
+                    "exploration boundary_frame_id must match the goal pose frame_id".into(),
+                );
             }
         }
         _ => unreachable!("owner kind validated above"),
-    }
-    if message.goal.header.frame_id != "map" {
-        return Err("goal pose frame_id must be map".into());
     }
     if !pose_is_finite(&message.goal.pose)
         || message
@@ -900,19 +900,14 @@ fn validate_path_envelope_semantics(
     if message.goal_payload_sha256 == [0; 32] {
         return Err("goal_payload_sha256 must be populated".into());
     }
-    if message.path.header.frame_id != "map" {
-        return Err("path frame_id must be map".into());
-    }
+    validate_navigation_frame_id(&message.path.header.frame_id, "path")?;
     if message.path.poses.is_empty() {
         return Err("path must contain at least one pose".into());
     }
-    if message
-        .path
-        .poses
-        .iter()
-        .any(|pose| pose.header.frame_id != "map" || !pose_is_finite(&pose.pose))
-    {
-        return Err("path poses must be finite and use frame_id=map".into());
+    if message.path.poses.iter().any(|pose| {
+        pose.header.frame_id != message.path.header.frame_id || !pose_is_finite(&pose.pose)
+    }) {
+        return Err("path poses must be finite and match the path frame_id".into());
     }
     if check_digest {
         let expected = path_envelope_payload_sha256(message).map_err(|error| error.to_string())?;
@@ -921,6 +916,24 @@ fn validate_path_envelope_semantics(
         }
     }
     Ok(())
+}
+
+fn validate_navigation_frame_id(frame_id: &str, role: &str) -> Result<(), String> {
+    let valid = frame_id == frame_id.trim()
+        && !frame_id.is_empty()
+        && frame_id.len() <= 255
+        && frame_id.split('/').all(|token| {
+            let mut chars = token.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("{role} frame_id is invalid: {frame_id:?}"))
+    }
 }
 
 fn validate_navigation_identity(
@@ -1801,6 +1814,198 @@ mod tests {
         let encoded = encode_path(&message).unwrap();
         assert_eq!(&encoded[..8], &PATH_FINGERPRINT);
         assert_eq!(decode_path(&encoded).unwrap(), message);
+    }
+
+    fn configured_frame_goal(frame_id: &str) -> GoalEnvelope {
+        GoalEnvelope {
+            schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            session_id: "configured-frame-goal".into(),
+            owner_kind: NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            parent_request_id: "configured-frame-exploration".into(),
+            goal_generation: 2,
+            producer_runtime_generation: 7,
+            source_timestamp_ns: 123_000_000_456,
+            boundary_frame_id: frame_id.into(),
+            boundary_points: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            motion_guard_generation: 11,
+            motion_guard_boot_nonce: [0x5a; 16],
+            motion_stop_generation: 4,
+            goal: PoseStamped {
+                header: Header {
+                    seq: 42,
+                    stamp_sec: 123,
+                    stamp_nsec: 456,
+                    frame_id: frame_id.into(),
+                },
+                pose: Pose {
+                    position: [1.0, 2.0, 0.0],
+                    orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+            ..GoalEnvelope::default()
+        }
+    }
+
+    fn configured_frame_path(goal: &GoalEnvelope, frame_id: &str) -> PathEnvelope {
+        PathEnvelope {
+            schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            session_id: goal.session_id.clone(),
+            owner_kind: goal.owner_kind,
+            parent_request_id: goal.parent_request_id.clone(),
+            goal_generation: goal.goal_generation,
+            planner_runtime_generation: 8,
+            path_revision: 1,
+            source_timestamp_ns: 124_000_000_000,
+            goal_payload_sha256: goal.payload_sha256,
+            path: Path {
+                header: Header {
+                    frame_id: frame_id.into(),
+                    ..Header::default()
+                },
+                poses: vec![PoseStamped {
+                    header: Header {
+                        frame_id: frame_id.into(),
+                        ..Header::default()
+                    },
+                    pose: goal.goal.pose.clone(),
+                }],
+            },
+            ..PathEnvelope::default()
+        }
+    }
+
+    #[test]
+    fn configured_navigation_frames_round_trip_and_bind_payload_hashes() {
+        let mut goal_digests = Vec::new();
+        let mut path_digests = Vec::new();
+
+        for frame_id in ["map", "robot/map"] {
+            let mut goal = configured_frame_goal(frame_id);
+            seal_goal_envelope(&mut goal).unwrap();
+            assert_eq!(
+                goal.payload_sha256,
+                goal_envelope_payload_sha256(&goal).unwrap()
+            );
+
+            let goal_body = encode_goal_envelope_body(&goal).unwrap();
+            assert_eq!(decode_goal_envelope_body(&goal_body).unwrap(), goal);
+            let encoded_goal = encode_goal_envelope(&goal).unwrap();
+            assert_eq!(&encoded_goal[..8], &GOAL_ENVELOPE_FINGERPRINT);
+            assert_eq!(decode_goal_envelope(&encoded_goal).unwrap(), goal);
+            goal_digests.push(goal.payload_sha256);
+
+            if frame_id == "robot/map" {
+                let mut stale_goal_frame = goal.clone();
+                stale_goal_frame.boundary_frame_id = "robot/odom".into();
+                stale_goal_frame.goal.header.frame_id = "robot/odom".into();
+                assert!(encode_goal_envelope(&stale_goal_frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("payload_sha256 mismatch"));
+            }
+
+            let mut path = configured_frame_path(&goal, frame_id);
+            seal_path_envelope(&mut path).unwrap();
+            assert_eq!(
+                path.path_payload_sha256,
+                path_envelope_payload_sha256(&path).unwrap()
+            );
+
+            let path_body = encode_path_envelope_body(&path).unwrap();
+            assert_eq!(decode_path_envelope_body(&path_body).unwrap(), path);
+            let encoded_path = encode_path_envelope(&path).unwrap();
+            assert_eq!(&encoded_path[..8], &PATH_ENVELOPE_FINGERPRINT);
+            assert_eq!(decode_path_envelope(&encoded_path).unwrap(), path);
+            path_digests.push(path.path_payload_sha256);
+
+            if frame_id == "robot/map" {
+                let mut stale_path_frame = path.clone();
+                stale_path_frame.path.header.frame_id = "robot/odom".into();
+                stale_path_frame.path.poses[0].header.frame_id = "robot/odom".into();
+                assert!(encode_path_envelope(&stale_path_frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("payload_sha256 mismatch"));
+            }
+        }
+
+        assert_ne!(goal_digests[0], goal_digests[1]);
+        assert_ne!(path_digests[0], path_digests[1]);
+    }
+
+    #[test]
+    fn configured_public_goal_without_boundary_remains_valid() {
+        let mut goal = configured_frame_goal("robot/map");
+        goal.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
+        goal.parent_request_id = "configured-frame-public".into();
+        goal.boundary_frame_id.clear();
+        goal.boundary_points.clear();
+
+        seal_goal_envelope(&mut goal).unwrap();
+        let encoded = encode_goal_envelope(&goal).unwrap();
+        assert_eq!(decode_goal_envelope(&encoded).unwrap(), goal);
+    }
+
+    #[test]
+    fn configured_navigation_frames_reject_empty_mismatched_or_non_finite_geometry() {
+        for invalid_frame_id in ["", " robot/map ", "/robot/map"] {
+            let mut goal = configured_frame_goal(invalid_frame_id);
+            assert!(seal_goal_envelope(&mut goal)
+                .unwrap_err()
+                .to_string()
+                .contains("goal pose frame_id is invalid"));
+        }
+
+        let mut missing_boundary_frame = configured_frame_goal("robot/map");
+        missing_boundary_frame.boundary_frame_id.clear();
+        assert!(seal_goal_envelope(&mut missing_boundary_frame)
+            .unwrap_err()
+            .to_string()
+            .contains("boundary_frame_id must match"));
+
+        let mut mismatched_boundary_frame = configured_frame_goal("robot/map");
+        mismatched_boundary_frame.boundary_frame_id = "map".into();
+        assert!(seal_goal_envelope(&mut mismatched_boundary_frame)
+            .unwrap_err()
+            .to_string()
+            .contains("boundary_frame_id must match"));
+
+        let mut non_finite_goal = configured_frame_goal("robot/map");
+        non_finite_goal.goal.pose.position[0] = f64::NAN;
+        assert!(seal_goal_envelope(&mut non_finite_goal)
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite coordinate"));
+
+        let mut non_finite_boundary = configured_frame_goal("robot/map");
+        non_finite_boundary.boundary_points[0][0] = f64::INFINITY;
+        assert!(seal_goal_envelope(&mut non_finite_boundary)
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite coordinate"));
+
+        let mut goal = configured_frame_goal("robot/map");
+        seal_goal_envelope(&mut goal).unwrap();
+
+        let mut empty_path_frame = configured_frame_path(&goal, "");
+        assert!(seal_path_envelope(&mut empty_path_frame)
+            .unwrap_err()
+            .to_string()
+            .contains("path frame_id is invalid"));
+
+        let mut mismatched_pose_frame = configured_frame_path(&goal, "robot/map");
+        mismatched_pose_frame.path.poses[0].header.frame_id = "map".into();
+        assert!(seal_path_envelope(&mut mismatched_pose_frame)
+            .unwrap_err()
+            .to_string()
+            .contains("match the path frame_id"));
+
+        let mut non_finite_path = configured_frame_path(&goal, "robot/map");
+        non_finite_path.path.poses[0].pose.position[0] = f64::INFINITY;
+        assert!(seal_path_envelope(&mut non_finite_path)
+            .unwrap_err()
+            .to_string()
+            .contains("must be finite"));
     }
 
     #[test]

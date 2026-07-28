@@ -3,7 +3,7 @@ from __future__ import annotations
 from contracts.compat import StrEnum
 from datetime import datetime
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from contracts.artifacts import ArtifactRef
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
@@ -150,7 +150,10 @@ class LocalizationSession(TimestampedContract):
 
     session_id: str = Field(description="平台定位会话标识。")
     map_name: str = Field(description="当前绑定的地图名称。")
-    map_version_id: str = Field(description="当前绑定的地图版本标识。")
+    asset_manifest_sha256: Optional[str] = Field(
+        default=None,
+        description="当前绑定地图资产清单的不可变 SHA-256 摘要。",
+    )
     frame_id: Optional[str] = Field(default=None, description="当前定位会话目标坐标系。")
     status: LocalizationSessionStatus = Field(
         default=LocalizationSessionStatus.LOCALIZING,
@@ -165,6 +168,23 @@ class LocalizationSession(TimestampedContract):
     last_error: Optional[str] = Field(default=None, description="最近一次定位失败或未就绪说明。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
+    @field_validator("map_name")
+    @classmethod
+    def _validate_map_name(cls, value: str) -> str:
+        return _validate_map_asset_name(value)
+
+    @field_validator("asset_manifest_sha256")
+    @classmethod
+    def _validate_asset_manifest_sha256(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        resolved = str(value or "").strip().lower()
+        if len(resolved) != 64 or any(
+            character not in "0123456789abcdef" for character in resolved
+        ):
+            raise ValueError("asset_manifest_sha256 必须为 64 位十六进制字符串。")
+        return resolved
+
 
 class TopologyNodeSummary(TimestampedContract):
     """平台导航语义层中的拓扑节点摘要。"""
@@ -172,18 +192,22 @@ class TopologyNodeSummary(TimestampedContract):
     node_id: str = Field(description="拓扑节点标识。")
     label: str = Field(description="拓扑节点名称。")
     frame_id: str = Field(description="拓扑节点所在坐标系。")
-    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    map_name: Optional[str] = Field(default=None, description="所属地图名称。")
     anchor_id: Optional[str] = Field(default=None, description="关联锚点标识。")
     pose: Optional[Pose] = Field(default=None, description="节点中心位姿。")
     aliases: List[str] = Field(default_factory=list, description="节点别名。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("map_name")
+    @classmethod
+    def _validate_map_name(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_optional_map_asset_name(value)
 
 
 class NavigationSemanticContext(TimestampedContract):
     """平台当前激活地图的语义导航上下文。"""
 
     map_name: Optional[str] = Field(default=None, description="当前地图名称。")
-    map_version_id: Optional[str] = Field(default=None, description="当前平台地图版本。")
     localization_session_id: Optional[str] = Field(default=None, description="当前绑定的定位会话。")
     localization_ready: bool = Field(default=False, description="当前平台定位是否已就绪。")
     semantic_regions: List[SpatialSemanticRegion] = Field(default_factory=list, description="当前语义区域集合。")
@@ -191,6 +215,24 @@ class NavigationSemanticContext(TimestampedContract):
     topology_nodes: List[TopologyNodeSummary] = Field(default_factory=list, description="当前拓扑节点集合。")
     anchors: List[SpatialAnchor] = Field(default_factory=list, description="当前空间锚点集合。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("map_name")
+    @classmethod
+    def _validate_map_name(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_optional_map_asset_name(value)
+
+
+def _validate_map_asset_name(value: object) -> str:
+    resolved = str(value or "").strip()
+    if not resolved:
+        raise ValueError("map_name 不能为空。")
+    return resolved
+
+
+def _validate_optional_map_asset_name(value: object) -> Optional[str]:
+    if value is None or not str(value).strip():
+        return None
+    return _validate_map_asset_name(value)
 
 
 class LocalizationSnapshot(TimestampedContract):
@@ -206,7 +248,7 @@ class MapSnapshot(TimestampedContract):
     """地图服务快照。"""
 
     source_name: str = Field(description="地图来源名称。")
-    version_id: str = Field(description="地图版本标识。")
+    version_id: str = Field(description="运行态地图快照标识。")
     revision: int = Field(default=1, ge=1, description="来源内递增版本号。")
     frame_id: Optional[str] = Field(default=None, description="地图快照统一消费坐标系。")
     occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")

@@ -52,7 +52,6 @@
     mapName: null,
     observedMapName: null,
     mapNameInitialized: false,
-    runtimeMapVersionId: null,
     generation: 0,
     signature: null,
     updatedAt: null,
@@ -157,7 +156,7 @@
     let current = raw;
     for (let index = 0; index < 3; index += 1) {
       if (!current || typeof current !== 'object') break;
-      if (current.maps || current.zones || current.map_name || current.map_version_id) break;
+      if (current.maps || current.zones || current.map_name) break;
       const next = current.data || current.result || current.payload;
       if (!next || next === current) break;
       current = next;
@@ -169,7 +168,6 @@
     const root = unwrapEnvelope(raw);
     let entry = root;
     let mapName = String(root.map_name || '').trim() || null;
-    let mapVersionId = String(root.map_version_id || '').trim() || null;
     if (root.maps && typeof root.maps === 'object') {
       const keys = Object.keys(root.maps);
       const preferred = String(preferredMapName || '').trim();
@@ -181,12 +179,10 @@
       if (!selectedKey) return null;
       entry = root.maps[selectedKey] || {};
       mapName = String(entry.map_name || selectedKey).trim() || null;
-      mapVersionId = String(entry.map_version_id || '').trim() || null;
     }
     if (!entry || !Array.isArray(entry.zones)) return null;
     return {
       mapName,
-      mapVersionId,
       generation: Math.max(0, Number(entry.generation) || 0),
       signature: String(entry.signature || '').trim() || null,
       updatedAt: entry.updated_at || null,
@@ -199,7 +195,6 @@
     if (state.mapName) {
       maps[state.mapName] = {
         map_name: state.mapName,
-        map_version_id: state.runtimeMapVersionId || '',
         generation: state.generation,
         signature: state.signature || '',
         updated_at: state.updatedAt,
@@ -207,23 +202,6 @@
       };
     }
     return { schema_version: 1, maps };
-  }
-
-  function currentRuntimeMapVersionId() {
-    const conflict = currentMapVersionConflict();
-    if (conflict) return conflict.active;
-    if (typeof window.__nuwaxMapVersionId !== 'function') return null;
-    const value = window.__nuwaxMapVersionId();
-    const resolved = String(value === null || value === undefined ? '' : value).trim();
-    return resolved || null;
-  }
-
-  function currentMapVersionConflict() {
-    const conflict = window.__nuwaxMapVersionConflict;
-    if (!conflict || typeof conflict !== 'object') return null;
-    const rendered = String(conflict.rendered || '').trim();
-    const active = String(conflict.active || '').trim();
-    return rendered && active && rendered !== active ? { rendered, active } : null;
   }
 
   function firstNonBlank() {
@@ -270,11 +248,6 @@
     return firstNonBlank(window.__nuwaxActiveMapName());
   }
 
-  function syncRuntimeMapVersion() {
-    const resolved = currentRuntimeMapVersionId();
-    if (resolved) state.runtimeMapVersionId = resolved;
-  }
-
   function setStatus(message, stateName) {
     if (!state.statusEl) return;
     state.statusEl.textContent = message;
@@ -310,7 +283,6 @@
   function applyEntry(entry) {
     if (!entry) return false;
     state.mapName = entry.mapName || state.mapName;
-    state.runtimeMapVersionId = entry.mapVersionId || state.runtimeMapVersionId;
     state.generation = entry.generation;
     state.signature = entry.signature;
     state.updatedAt = entry.updatedAt;
@@ -353,7 +325,6 @@
     const preservingCurrentSnapshot = requestedMapName === null || requestedMapName === state.mapName;
     if (requestedMapName) state.mapName = requestedMapName;
     if (!preservingCurrentSnapshot) {
-      state.runtimeMapVersionId = null;
       state.generation = 0;
       state.signature = null;
       state.updatedAt = null;
@@ -376,7 +347,6 @@
         throw new Error('服务端返回了错误的 map_name');
       }
       applyEntry(entry);
-      syncRuntimeMapVersion();
       setStatus(entry.mapName + ' · ' + entry.zones.length + ' 个 · G' + entry.generation, 'ready');
     } catch (error) {
       if (serial !== state.requestSerial) return;
@@ -396,7 +366,6 @@
     }
     const serial = ++state.requestSerial;
     const mapName = state.mapName;
-    syncRuntimeMapVersion();
     setBusy(true, '保存 ' + nextZones.length + ' 个禁行区');
     try {
       const raw = await fetchJson(API_URL, {
@@ -404,7 +373,6 @@
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
           map_name: mapName,
-          map_version_id: state.runtimeMapVersionId || '',
           expected_generation: state.generation,
           zones: nextZones.map(canonicalZone),
         }),
@@ -1029,7 +997,6 @@
   }
 
   function onDrawTick() {
-    syncRuntimeMapVersion();
     syncMapView();
     redrawOverlay();
   }
@@ -1044,7 +1011,6 @@
   }
 
   function onMapContextStream(event) {
-    syncRuntimeMapVersion();
     syncMapName(false, event.detail);
   }
 

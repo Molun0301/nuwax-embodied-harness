@@ -1,21 +1,65 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
+import logging
+import threading
 
 from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
-from contracts.map_workspace import MapAsset, MapAssetStatus, MapVersion, MapWorkspace
+from contracts.map_workspace import MapAsset, MapAssetBundle, MapAssetStatus, MapWorkspace
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
 from core.errors import GatewayError
 from services.geometry import PlatformGeometryRuntime
 from services.localization import LocalizationService
+from services.mapping.asset_store import MapAssetBundleError, MapAssetBundleRepository
 from services.mapping.catalog import MapCatalogRepository
 from services.mapping.service import MappingService
-from services.mapping.version_store import MapVersionRepository
 from services.memory.service import MemoryService
 from services.navigation.service import NavigationService
 from typing import Dict, Optional, Tuple
+
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.skills.map_workspace")
+
+
+def _serialized_map_activation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        guard = getattr(self._repository, "map_activation_guard", None)
+        if not callable(guard):
+            return method(self, *args, **kwargs)
+        with guard():
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _serialized_map_activation_execution(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        guard = getattr(self._repository, "map_activation_executor_guard", None)
+        if not callable(guard):
+            return method(self, *args, **kwargs)
+        with guard():
+            state = getattr(self, "_map_activation_execution_state", None)
+            if state is None:
+                state = threading.local()
+                self._map_activation_execution_state = state
+            depth = int(getattr(state, "depth", 0) or 0)
+            state.depth = depth + 1
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                state.depth = depth
+
+    return wrapped
+
+
+class _MapActivationReconciliationError(RuntimeError):
+    backend_activation_applied = True
 
 
 class MapWorkspaceService:
@@ -35,7 +79,7 @@ class MapWorkspaceService:
         auto_create_library: bool = True,
     ) -> None:
         self._repository = MapCatalogRepository(catalog_root)
-        self._version_repository = MapVersionRepository(catalog_root)
+        self._asset_repository = MapAssetBundleRepository(catalog_root)
         self._geometry_runtime = geometry_runtime
         self._mapping_service = mapping_service
         self._localization_service = localization_service
@@ -44,13 +88,22 @@ class MapWorkspaceService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._auto_create_library = bool(auto_create_library)
+        self._map_activation_execution_state = threading.local()
+        self._map_activation_fence_arm_error: Optional[Dict[str, object]] = None
+        with self._repository.map_activation_guard():
+            pending_activation = self._repository.get_map_activation()
+        self._arm_map_activation_fence(
+            pending_activation,
+            reason="workspace_service_restore",
+        )
 
     @property
     def catalog_root(self) -> str:
         return str(self._repository.root_dir)
 
+    @_serialized_map_activation
     def list_maps(self, *, refresh_localization: bool = True) -> Tuple[MapAsset, ...]:
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self.get_active_map_name()
         assets = [
             self._sync_asset(
                 item,
@@ -62,17 +115,19 @@ class MapWorkspaceService:
         assets.sort(key=lambda item: (not item.active, item.display_name.lower(), item.display_name))
         return tuple(assets)
 
+    @_serialized_map_activation
     def get_map(self, map_name: str, *, refresh_localization: bool = True) -> Optional[MapAsset]:
         asset = self._repository.get_map_asset(self._require_map_name(map_name))
         if asset is None:
             return None
-        active_map_name = self._repository.get_active_map_name()
+        active_map_name = self.get_active_map_name()
         return self._sync_asset(
             asset,
             is_active=(asset.map_name == active_map_name),
             refresh_localization=refresh_localization,
         )
 
+    @_serialized_map_activation
     def create_map(
         self,
         *,
@@ -83,7 +138,10 @@ class MapWorkspaceService:
         resolved_name = self._require_map_name(map_name)
         existing = self._repository.get_map_asset(resolved_name)
         if existing is not None:
-            return self._sync_asset(existing, is_active=(existing.map_name == self._repository.get_active_map_name()))
+            return self._sync_asset(
+                existing,
+                is_active=(existing.map_name == self.get_active_map_name()),
+            )
         asset = MapAsset(
             map_name=resolved_name,
             display_name=str(display_name or resolved_name).strip() or resolved_name,
@@ -111,6 +169,7 @@ class MapWorkspaceService:
         )
         return asset
 
+    @_serialized_map_activation_execution
     def activate_map(
         self,
         *,
@@ -119,83 +178,522 @@ class MapWorkspaceService:
         load_memory_history: bool = True,
         reset_memory_library: bool = False,
         metadata: Optional[Dict[str, object]] = None,
-        load_latest_version: bool = True,
+        load_current_bundle: bool = True,
+        _force_new_activation_request: bool = False,
+        _stale_request_retry_attempted: bool = False,
     ) -> MapWorkspace:
-        resolved_name = self._require_map_name(map_name)
-        previous_active_map_name = self._repository.get_active_map_name()
-        if previous_active_map_name != resolved_name:
-            self._geometry_runtime.clear_active_map_version(reason="switch_active_map")
-            self._mapping_service.clear_latest_snapshot(
-                cleared_map_name=previous_active_map_name,
-                reason="switch_active_map",
-            )
-            self._localization_service.clear_latest_snapshot()
-            self._localization_service.clear_active_session(reason="switch_active_map")
-        asset = self._repository.get_map_asset(resolved_name)
-        if asset is None:
-            if not create_if_missing:
-                raise GatewayError(
-                    "未找到地图：%s" % resolved_name,
-                    error_code="map_not_found",
-                    http_status=404,
-                    jsonrpc_code=-32000,
-                )
-            asset = self.create_map(map_name=resolved_name, metadata=metadata)
+        """激活地图工作区，并按需将其 finalized current 资产包加载到运行态。"""
 
-        self._memory_service.ensure_memory_library(library_name=resolved_name)
-        self._memory_service.activate_memory_library(
-            library_name=resolved_name,
-            load_history=load_memory_history,
-            reset_library=reset_memory_library,
-            expected_library_name=resolved_name,
-        )
-        now = datetime.now(asset.updated_at.tzinfo) if asset.updated_at.tzinfo is not None else datetime.utcnow()
-        synced_asset = self._sync_asset(
-            asset.model_copy(
-                update={
-                    "active": True,
-                    "last_activated_at": now,
-                    "updated_at": now,
-                    "metadata": {**dict(asset.metadata), **dict(metadata or {})},
-                },
-                deep=True,
-            ),
-            is_active=True,
-            refresh_localization=False,
-        )
-        self._repository.set_active_map_name(resolved_name)
-        self._save_asset(synced_asset)
-        clear_exploration_context = getattr(self._navigation_service, "clear_latest_exploration_context", None)
-        if callable(clear_exploration_context):
-            clear_exploration_context(reason="activate_map")
-        if load_latest_version and synced_asset.latest_version_id:
-            # activate_map 与 load_map_version 使用同一定位加载入口。
-            # load 失败时回滚 active map：set_active_map_name 已在前面改写，
-            # 若不回滚会留下「active 指向尚未成功载入 runtime 的地图」的不一致状态。
-            try:
-                self._load_map_version_into_runtime(
-                    self._require_map_version(resolved_name, synced_asset.latest_version_id),
-                    require_backend_switch=True,
+        resolved_name = self._require_map_name(map_name)
+        with self._repository.map_activation_guard():
+            pending_activation = self._read_map_activation()
+            if (
+                pending_activation is not None
+                and pending_activation["target_map_name"] != resolved_name
+            ):
+                raise GatewayError(
+                    "地图 %s 正在恢复激活；完成前不能切换到 %s。"
+                    % (pending_activation["target_map_name"], resolved_name),
+                    error_code="map_activation_recovery_required",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        **pending_activation,
+                        "recommended_next_tool": "activate_map",
+                        "recommended_map_name": pending_activation[
+                            "target_map_name"
+                        ],
+                    },
                 )
-            except Exception:
-                if previous_active_map_name:
-                    self._repository.set_active_map_name(previous_active_map_name)
-                else:
-                    self._repository.clear_active_map_name()
+            asset = self._repository.get_map_asset(resolved_name)
+            if asset is None:
+                if not create_if_missing:
+                    raise GatewayError(
+                        "未找到地图：%s" % resolved_name,
+                        error_code="map_not_found",
+                        http_status=404,
+                        jsonrpc_code=-32000,
+                    )
+                asset = self.create_map(map_name=resolved_name, metadata=metadata)
+
+            bundle = None
+            if load_current_bundle:
+                bundle = self.get_map_asset_bundle(map_name=resolved_name)
+                if bundle is None and asset.finalized:
+                    raise GatewayError(
+                        "地图 %s 标记为 finalized，但 current 资产包不存在。"
+                        % resolved_name,
+                        error_code="map_asset_bundle_not_found",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                    )
+                if bundle is not None:
+                    asset = self._repository.get_map_asset(resolved_name) or asset
+
+            if bundle is not None and reset_memory_library:
+                raise GatewayError(
+                    "finalized 地图资产包激活不支持重置记忆库。",
+                    error_code="map_activation_memory_reset_not_supported",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={"map_name": resolved_name},
+                )
+
+            if pending_activation is not None:
+                if bundle is None or (
+                    str(bundle.manifest_sha256 or "").strip().lower()
+                    != pending_activation["target_manifest_sha256"]
+                ):
+                    raise GatewayError(
+                        "地图激活恢复日志与目标 current 资产包不一致。",
+                        error_code="map_activation_identity_mismatch",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                        details=dict(pending_activation),
+                    )
+
+        reuse_completed_request_id = False
+        probed_receipt_request_id = None
+        if bundle is not None and pending_activation is None:
+            if not _force_new_activation_request:
+                (
+                    reuse_completed_request_id,
+                    probed_receipt_request_id,
+                ) = self._should_reuse_completed_activation_request(
+                    target_map_name=resolved_name,
+                    target_manifest_sha256=str(bundle.manifest_sha256 or ""),
+                )
+
+        with self._repository.map_activation_guard():
+            current_pending_activation = self._read_map_activation()
+            if pending_activation is not None:
+                if current_pending_activation is None or any(
+                    current_pending_activation.get(key) != pending_activation.get(key)
+                    for key in (
+                        "target_map_name",
+                        "target_manifest_sha256",
+                        "activation_request_id",
+                    )
+                ):
+                    raise GatewayError(
+                        "地图激活恢复日志在准备期间发生变化，请重试。",
+                        error_code="map_activation_identity_mismatch",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                    )
+                pending_activation = current_pending_activation
+            elif bundle is None and current_pending_activation is not None:
+                raise GatewayError(
+                    "其它地图正在恢复激活，请重试当前工作区切换。",
+                    error_code="map_activation_recovery_required",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details=dict(current_pending_activation),
+                )
+            elif bundle is not None:
+                latest_bundle = self.get_map_asset_bundle(map_name=resolved_name)
+                if latest_bundle is None or (
+                    str(latest_bundle.manifest_sha256 or "").strip().lower()
+                    != str(bundle.manifest_sha256 or "").strip().lower()
+                ):
+                    raise GatewayError(
+                        "地图 current 资产包在激活准备期间发生变化，请重试。",
+                        error_code="map_activation_identity_mismatch",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                    )
+                bundle = latest_bundle
+                asset = self._repository.get_map_asset(resolved_name) or asset
+                if reuse_completed_request_id:
+                    current_receipt = (
+                        self._repository.get_last_successful_map_activation_receipt()
+                    )
+                    if current_receipt is None or any(
+                        current_receipt.get(key) != expected
+                        for key, expected in (
+                            ("target_map_name", resolved_name),
+                            (
+                                "target_manifest_sha256",
+                                str(bundle.manifest_sha256 or ""),
+                            ),
+                            (
+                                "activation_request_id",
+                                probed_receipt_request_id,
+                            ),
+                        )
+                    ):
+                        raise GatewayError(
+                            "地图激活成功凭据在后端身份确认期间发生变化，请重试。",
+                            error_code="map_activation_identity_mismatch",
+                            http_status=409,
+                            jsonrpc_code=-32000,
+                        )
+                try:
+                    pending_activation = self._repository.begin_map_activation(
+                        previous_map_name=self._repository.get_active_map_name(),
+                        target_map_name=resolved_name,
+                        target_manifest_sha256=str(bundle.manifest_sha256 or ""),
+                        load_memory_history=load_memory_history,
+                        reuse_completed_request_id=reuse_completed_request_id,
+                    )
+                except GatewayError:
+                    raise
+                except Exception as exc:
+                    raise GatewayError(
+                        "无法持久化地图激活恢复日志：%s" % exc,
+                        error_code="map_activation_journal_write_failed",
+                        http_status=500,
+                        jsonrpc_code=-32000,
+                    ) from exc
+
+            previous_active_map_name = self._repository.get_active_map_name()
+            activation_previous_map_name = (
+                str(pending_activation.get("previous_map_name") or "").strip()
+                if pending_activation is not None
+                else previous_active_map_name
+            ) or None
+            prior_backend_outcome_uncertain = bool(
+                pending_activation is not None
+                and pending_activation.get("phase") != "prepared"
+            )
+            activation_load_memory_history = (
+                bool(pending_activation["load_memory_history"])
+                if pending_activation is not None
+                else bool(load_memory_history)
+            )
+            activation_identity = (
+                {
+                    "target_map_name": resolved_name,
+                    "target_manifest_sha256": str(bundle.manifest_sha256 or ""),
+                    "activation_request_id": str(
+                        pending_activation["activation_request_id"]
+                    ),
+                }
+                if bundle is not None and pending_activation is not None
+                else None
+            )
+            activation_journal_phase = (
+                str(pending_activation["phase"])
+                if bundle is not None and pending_activation is not None
+                else None
+            )
+        if bundle is not None:
+            assert activation_identity is not None
+            assert activation_journal_phase is not None
+            if activation_journal_phase == "prepared":
+                arm_runtime_activation = getattr(
+                    self._geometry_runtime,
+                    "arm_map_asset_activation_fence",
+                    None,
+                )
+                arm_failure = None
+                try:
+                    runtime_activation_armed = bool(
+                        callable(arm_runtime_activation)
+                        and arm_runtime_activation(
+                            map_name=resolved_name,
+                            asset_manifest_sha256=str(
+                                bundle.manifest_sha256 or ""
+                            ),
+                            activation_request_id=str(
+                                activation_identity["activation_request_id"]
+                            ),
+                            reason="workspace_activation_dispatch",
+                        )
+                        is True
+                    )
+                except Exception as exc:
+                    runtime_activation_armed = False
+                    arm_failure = "%s: %s" % (type(exc).__name__, exc)
+                if not runtime_activation_armed:
+                    raise GatewayError(
+                        "地图激活恢复日志无法建立匹配的运行态 fence。",
+                        error_code=(
+                            "map_activation_runtime_fence_identity_mismatch"
+                        ),
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                        details={
+                            **activation_identity,
+                            "reason": arm_failure
+                            or "runtime_activation_fence_arm_failed",
+                        },
+                    )
+                self._map_activation_fence_arm_error = None
+            with self._repository.map_activation_guard():
+                pending_activation = self._repository.update_map_activation_phase(
+                    "backend_dispatching",
+                    **activation_identity,
+                    expected_phases=(activation_journal_phase,),
+                )
+        backend_outcome = "not_attempted"
+        try:
+            if bundle is not None:
+                assert activation_identity is not None
+                self._activate_map_asset_bundle(
+                    bundle,
+                    require_backend_switch=True,
+                    activation_request_id=str(
+                        pending_activation["activation_request_id"]
+                    ),
+                )
+                backend_outcome = "applied"
+                with self._repository.map_activation_guard():
+                    pending_activation = self._repository.update_map_activation_phase(
+                        "backend_applied",
+                        **activation_identity,
+                        expected_phases=("backend_dispatching",),
+                    )
+                    self._repository.set_active_map_name(resolved_name)
+                    pending_activation = self._repository.update_map_activation_phase(
+                        "reconciling",
+                        **activation_identity,
+                        expected_phases=("backend_applied",),
+                    )
+
+            self._memory_service.ensure_memory_library(library_name=resolved_name)
+            self._memory_service.activate_memory_library(
+                library_name=resolved_name,
+                load_history=activation_load_memory_history,
+                reset_library=reset_memory_library,
+                expected_library_name=resolved_name,
+            )
+            if bundle is None and previous_active_map_name != resolved_name:
+                self._geometry_runtime.clear_active_map_asset(reason="switch_active_map")
+                self._mapping_service.clear_latest_snapshot(
+                    cleared_map_name=previous_active_map_name,
+                    reason="switch_active_map",
+                )
+                self._localization_service.clear_latest_snapshot()
+                self._localization_service.clear_active_session(
+                    reason="switch_active_map"
+                )
+            with self._repository.map_activation_guard():
+                if bundle is None:
+                    self._repository.set_active_map_name(resolved_name)
+                self._reconcile_catalog_active_flags(resolved_name)
+                asset = self._repository.get_map_asset(resolved_name) or asset
+                now = (
+                    datetime.now(asset.updated_at.tzinfo)
+                    if asset.updated_at.tzinfo is not None
+                    else datetime.utcnow()
+                )
+                with self._allow_internal_activation_coherent_read(
+                    activation_identity
+                ):
+                    synced_asset = self._sync_asset(
+                        asset.model_copy(
+                            update={
+                                "active": True,
+                                "last_activated_at": now,
+                                "updated_at": now,
+                                "metadata": {
+                                    **dict(asset.metadata),
+                                    **dict(metadata or {}),
+                                    "activation_recovery_pending": False,
+                                    "activation_phase": "active",
+                                },
+                            },
+                            deep=True,
+                        ),
+                        is_active=True,
+                        refresh_localization=False,
+                        completing_activation=True,
+                    )
+                self._save_asset(synced_asset)
+            clear_exploration_context = getattr(
+                self._navigation_service,
+                "clear_latest_exploration_context",
+                None,
+            )
+            if callable(clear_exploration_context):
+                clear_exploration_context(reason="activate_map")
+            with self._allow_internal_activation_coherent_read(
+                activation_identity
+            ):
+                self._ensure_active_localization_session_binding(
+                    metadata={
+                        "requested_by": (metadata or {}).get(
+                            "requested_by", "unknown"
+                        ),
+                        "source": "activate_map",
+                    },
+                    refresh=False,
+                )
+                workspace = self._build_workspace(
+                    synced_asset,
+                    refresh_localization=False,
+                )
+        except Exception as exc:
+            if bundle is None:
                 raise
-        self._ensure_active_localization_session_binding(
-            metadata={
-                "requested_by": (metadata or {}).get("requested_by", "unknown"),
-                "source": "activate_map",
-            },
-            refresh=False,
-        )
-        self._publish_event(
-            "map.workspace_activated",
-            "地图工作区 %s 已激活。" % resolved_name,
-            payload={"map_name": resolved_name},
-        )
-        return self._build_workspace(synced_asset, refresh_localization=False)
+            if self._is_stale_backend_activation_request(exc):
+                assert activation_identity is not None
+                if _stale_request_retry_attempted:
+                    with self._repository.map_activation_guard():
+                        recovery_error = self._mark_map_activation_recovering(
+                            map_name=resolved_name,
+                            bundle=bundle,
+                            cause=exc,
+                        )
+                    raise recovery_error from exc
+                with self._repository.map_activation_guard():
+                    self._repository.update_map_activation_phase(
+                        "prepared",
+                        **activation_identity,
+                        expected_phases=("prepared", "backend_dispatching"),
+                    )
+                    rotated_activation = (
+                        self._repository.rotate_map_activation_request_id(
+                            **activation_identity,
+                        )
+                    )
+                rotated_identity = {
+                    "target_map_name": resolved_name,
+                    "target_manifest_sha256": str(bundle.manifest_sha256 or ""),
+                    "activation_request_id": str(
+                        rotated_activation["activation_request_id"]
+                    ),
+                }
+                rotate_runtime_fence = getattr(
+                    self._geometry_runtime,
+                    "rotate_map_asset_activation_fence",
+                    None,
+                )
+                runtime_fence_rotated = bool(
+                    callable(rotate_runtime_fence)
+                    and rotate_runtime_fence(
+                        map_name=resolved_name,
+                        asset_manifest_sha256=str(bundle.manifest_sha256 or ""),
+                        previous_activation_request_id=str(
+                            activation_identity["activation_request_id"]
+                        ),
+                        activation_request_id=str(
+                            rotated_identity["activation_request_id"]
+                        )
+                    )
+                )
+                if not runtime_fence_rotated:
+                    mismatch_error = GatewayError(
+                        "stale 地图激活请求的运行态 fence 身份不匹配。",
+                        error_code="map_activation_runtime_fence_identity_mismatch",
+                        http_status=409,
+                        jsonrpc_code=-32000,
+                        details=dict(rotated_identity),
+                    )
+                    with self._repository.map_activation_guard():
+                        self._mark_map_activation_recovering(
+                            map_name=resolved_name,
+                            bundle=bundle,
+                            cause=mismatch_error,
+                        )
+                    self._arm_map_activation_fence(
+                        self._repository.get_map_activation(),
+                        reason="stale_request_fence_rotation_failed",
+                    )
+                    raise mismatch_error from exc
+                return self.activate_map(
+                    map_name=resolved_name,
+                    create_if_missing=create_if_missing,
+                    load_memory_history=load_memory_history,
+                    reset_memory_library=reset_memory_library,
+                    metadata=metadata,
+                    load_current_bundle=load_current_bundle,
+                    _stale_request_retry_attempted=True,
+                )
+            backend_may_have_changed = bool(
+                prior_backend_outcome_uncertain
+                or backend_outcome == "applied"
+                or getattr(exc, "backend_activation_applied", False)
+                or getattr(exc, "backend_activation_outcome_unknown", False)
+            )
+            if backend_may_have_changed:
+                with self._repository.map_activation_guard():
+                    recovery_error = self._mark_map_activation_recovering(
+                        map_name=resolved_name,
+                        bundle=bundle,
+                        cause=exc,
+                    )
+                raise recovery_error from exc
+            assert activation_identity is not None
+            if self._is_explicit_backend_activation_rejection(exc):
+                self._clear_deterministic_map_activation(
+                    activation_identity=activation_identity,
+                )
+                raise GatewayError(
+                    "地图 %s 的 current 资产包未被几何后端确认加载。"
+                    % resolved_name,
+                    error_code="map_asset_backend_switch_unavailable",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "map_name": resolved_name,
+                        "asset_manifest_sha256": bundle.manifest_sha256,
+                        "backend_switch_applied": False,
+                        "backend_activation_disposition": "not_attempted",
+                        "reason": str(exc),
+                    },
+                ) from exc
+            self._clear_deterministic_map_activation(
+                activation_identity=activation_identity,
+            )
+            raise
+
+        if bundle is not None:
+            assert activation_identity is not None
+            try:
+                with self._repository.map_activation_guard():
+                    completion_receipt = (
+                        self._repository.complete_map_activation_durable(
+                            **activation_identity,
+                            expected_phases=("reconciling",),
+                        )
+                    )
+                complete_runtime_activation = getattr(
+                    self._geometry_runtime,
+                    "complete_map_asset_activation",
+                    None,
+                )
+                runtime_completion = (
+                    complete_runtime_activation(
+                        map_name=str(completion_receipt["target_map_name"]),
+                        asset_manifest_sha256=str(
+                            completion_receipt["target_manifest_sha256"]
+                        ),
+                        activation_request_id=str(
+                            completion_receipt["activation_request_id"]
+                        ),
+                    )
+                    if callable(complete_runtime_activation)
+                    else None
+                )
+                if runtime_completion is False:
+                    raise RuntimeError("地图运行态激活 fence 身份不匹配。")
+            except Exception as exc:
+                with self._repository.map_activation_guard():
+                    if self._read_map_activation() is None:
+                        self._repository.begin_map_activation(
+                            previous_map_name=activation_previous_map_name,
+                            target_map_name=resolved_name,
+                            target_manifest_sha256=str(bundle.manifest_sha256 or ""),
+                            load_memory_history=activation_load_memory_history,
+                            reuse_completed_request_id=True,
+                        )
+                    recovery_error = self._mark_map_activation_recovering(
+                        map_name=resolved_name,
+                        bundle=bundle,
+                        cause=exc,
+                    )
+                raise recovery_error from exc
+        try:
+            self._publish_event(
+                "map.workspace_activated",
+                "地图工作区 %s 已激活。" % resolved_name,
+                payload={"map_name": resolved_name},
+            )
+        except Exception:
+            LOGGER.exception("地图 %s 已激活，但发布 workspace 事件失败。", resolved_name)
+        return workspace
 
     def ensure_workspace(
         self,
@@ -206,6 +704,14 @@ class MapWorkspaceService:
         reset_memory_library: bool = False,
         metadata: Optional[Dict[str, object]] = None,
     ) -> MapWorkspace:
+        if self._read_map_activation() is not None:
+            return self.activate_map(
+                map_name=map_name,
+                create_if_missing=create_if_missing,
+                load_memory_history=load_memory_history,
+                reset_memory_library=reset_memory_library,
+                metadata=metadata,
+            )
         current = self.get_active_workspace()
         if current is not None and current.active_map_name == self._require_map_name(map_name):
             return current
@@ -217,8 +723,15 @@ class MapWorkspaceService:
             metadata=metadata,
         )
 
+    @_serialized_map_activation
     def get_active_workspace(self, *, refresh_localization: bool = True) -> Optional[MapWorkspace]:
-        active_map_name = self._repository.get_active_map_name()
+        pending_activation = self._read_map_activation()
+        if (
+            pending_activation is not None
+            and pending_activation.get("phase") != "prepared"
+        ):
+            return None
+        active_map_name = self.get_active_map_name()
         if not active_map_name:
             return None
         asset = self._repository.get_map_asset(active_map_name)
@@ -228,10 +741,489 @@ class MapWorkspaceService:
         synced_asset = self._sync_asset(asset, is_active=True, refresh_localization=refresh_localization)
         return self._build_workspace(synced_asset, refresh_localization=refresh_localization)
 
+    @_serialized_map_activation
     def get_active_map_name(self) -> Optional[str]:
         """返回当前激活地图名称。"""
 
+        pending_activation = self._read_map_activation()
+        if pending_activation is not None:
+            if pending_activation.get("phase") == "prepared":
+                return (
+                    str(pending_activation.get("previous_map_name") or "").strip()
+                    or self._repository.get_active_map_name()
+                )
+            return str(pending_activation["target_map_name"])
         return self._repository.get_active_map_name()
+
+    def _arm_map_activation_fence(
+        self,
+        pending_activation: Optional[Dict[str, object]],
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            pending_activation is None
+            or pending_activation.get("phase") == "prepared"
+        ):
+            return
+        arm_fence = getattr(
+            self._geometry_runtime,
+            "arm_map_asset_activation_fence",
+            None,
+        )
+        if not callable(arm_fence):
+            return
+        identity = {
+            "map_name": str(pending_activation["target_map_name"]),
+            "asset_manifest_sha256": str(
+                pending_activation["target_manifest_sha256"]
+            ),
+            "activation_request_id": str(
+                pending_activation["activation_request_id"]
+            ),
+        }
+        try:
+            armed = arm_fence(**identity, reason=reason)
+        except Exception as exc:
+            self._map_activation_fence_arm_error = {
+                **identity,
+                "reason": "%s: %s" % (type(exc).__name__, exc),
+            }
+            return
+        if armed is False:
+            self._map_activation_fence_arm_error = {
+                **identity,
+                "reason": "runtime_activation_fence_identity_mismatch",
+            }
+            return
+        self._map_activation_fence_arm_error = None
+
+    def _should_reuse_completed_activation_request(
+        self,
+        *,
+        target_map_name: str,
+        target_manifest_sha256: str,
+    ) -> Tuple[bool, Optional[str]]:
+        receipt = self._repository.get_last_successful_map_activation_receipt()
+        if receipt is None or (
+            receipt["target_map_name"] != target_map_name
+            or receipt["target_manifest_sha256"] != target_manifest_sha256
+        ):
+            return False, None
+
+        def unavailable(reason: str, cause: Optional[Exception] = None):
+            error = GatewayError(
+                "无法确认后端当前 mapping session 身份，请重试。",
+                error_code="map_activation_authoritative_state_unavailable",
+                http_status=503,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": target_map_name,
+                    "asset_manifest_sha256": target_manifest_sha256,
+                    "activation_request_id": receipt["activation_request_id"],
+                    "reason": reason,
+                },
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
+
+        state_reader = getattr(
+            self._geometry_runtime,
+            "get_authoritative_mapping_session_state",
+            None,
+        )
+        if not callable(state_reader):
+            unavailable("authoritative_state_reader_missing")
+        try:
+            state = state_reader()
+        except Exception as exc:
+            unavailable("authoritative_state_read_failed", exc)
+        if not isinstance(state, dict) or state.get("success") is not True:
+            unavailable("authoritative_state_invalid")
+
+        phase = str(state.get("phase") or "").strip().upper()
+        active = state.get("active")
+        if phase in {"IDLE", "STOPPED"} and active is False:
+            return False, None
+        if phase != "ACTIVE" or active is not True:
+            unavailable("authoritative_state_inconsistent")
+
+        session_id = str(state.get("session_id") or "").strip()
+        map_name = str(state.get("map_name") or "").strip()
+        try:
+            session_generation = int(state.get("session_generation") or 0)
+            revision = int(state.get("revision") or 0)
+        except (TypeError, ValueError):
+            unavailable("authoritative_state_identity_invalid")
+        if (
+            not session_id
+            or not map_name
+            or session_generation <= 0
+            or revision <= 0
+        ):
+            unavailable("authoritative_state_identity_invalid")
+        reuse_request_id = bool(
+            session_id == receipt["activation_request_id"]
+            and map_name == target_map_name
+        )
+        return (
+            reuse_request_id,
+            str(receipt["activation_request_id"])
+            if reuse_request_id
+            else None,
+        )
+
+    def _clear_deterministic_map_activation(
+        self,
+        *,
+        activation_identity: Dict[str, object],
+    ) -> None:
+        with self._repository.map_activation_guard():
+            self._repository.update_map_activation_phase(
+                "prepared",
+                **activation_identity,
+                expected_phases=("prepared", "backend_dispatching"),
+            )
+
+        complete_runtime_activation = getattr(
+            self._geometry_runtime,
+            "complete_map_asset_activation",
+            None,
+        )
+        runtime_completion_failure = None
+        try:
+            runtime_completion_succeeded = bool(
+                callable(complete_runtime_activation)
+                and complete_runtime_activation(
+                    map_name=str(activation_identity["target_map_name"]),
+                    asset_manifest_sha256=str(
+                        activation_identity["target_manifest_sha256"]
+                    ),
+                    activation_request_id=str(
+                        activation_identity["activation_request_id"]
+                    ),
+                )
+                is True
+            )
+        except Exception as exc:
+            runtime_completion_succeeded = False
+            runtime_completion_failure = "%s: %s" % (
+                type(exc).__name__,
+                exc,
+            )
+        if not runtime_completion_succeeded:
+            raise GatewayError(
+                "确定性地图激活失败后，运行态 fence 身份无法确认。",
+                error_code="map_activation_runtime_fence_identity_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    **activation_identity,
+                    "reason": runtime_completion_failure
+                    or "runtime_activation_fence_completion_failed",
+                },
+            )
+
+        with self._repository.map_activation_guard():
+            self._repository.clear_map_activation(
+                **activation_identity,
+                expected_phases=("prepared",),
+            )
+
+    @contextmanager
+    def _allow_internal_activation_coherent_read(
+        self,
+        activation_identity: Optional[Dict[str, object]],
+    ):
+        state = getattr(self, "_map_activation_execution_state", None)
+        if (
+            activation_identity is None
+            or state is None
+            or int(getattr(state, "depth", 0) or 0) <= 0
+        ):
+            yield
+            return
+        previous_identity = getattr(state, "coherent_read_identity", None)
+        state.coherent_read_identity = dict(activation_identity)
+        try:
+            yield
+        finally:
+            state.coherent_read_identity = previous_identity
+
+    def _read_map_activation(self) -> Optional[Dict[str, object]]:
+        reader = getattr(self._repository, "get_map_activation", None)
+        if not callable(reader):
+            return None
+        try:
+            pending = reader()
+        except Exception as exc:
+            raise GatewayError(
+                "地图激活恢复日志损坏：%s" % exc,
+                error_code="map_activation_journal_invalid",
+                http_status=500,
+                jsonrpc_code=-32000,
+            ) from exc
+        resolved = dict(pending) if isinstance(pending, dict) else None
+        arm_error = getattr(self, "_map_activation_fence_arm_error", None)
+        if (
+            resolved is not None
+            and resolved.get("phase") != "prepared"
+            and isinstance(arm_error, dict)
+        ):
+            raise GatewayError(
+                "地图激活恢复日志与运行态 fence 身份不一致，拒绝读取或恢复。",
+                error_code="map_activation_runtime_fence_identity_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={**resolved, "runtime_fence_error": dict(arm_error)},
+            )
+        return resolved
+
+    def _require_no_map_activation_recovery(self, operation: str) -> None:
+        pending = self._read_map_activation()
+        if pending is None:
+            return
+        raise GatewayError(
+            "地图 %s 正在恢复激活，不能执行 %s。"
+            % (pending["target_map_name"], operation),
+            error_code="map_activation_recovery_required",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                **pending,
+                "recommended_next_tool": "activate_map",
+                "recommended_map_name": pending["target_map_name"],
+            },
+        )
+
+    @staticmethod
+    def _is_explicit_backend_activation_rejection(exc: Exception) -> bool:
+        return (
+            str(getattr(exc, "backend_activation_disposition", "") or "").strip()
+            == "not_attempted"
+        )
+
+    @staticmethod
+    def _is_stale_backend_activation_request(exc: Exception) -> bool:
+        return bool(getattr(exc, "backend_activation_stale_request", False))
+
+    def _reconcile_catalog_active_flags(
+        self,
+        active_map_name: Optional[str],
+    ) -> None:
+        resolved_active_name = str(active_map_name or "").strip() or None
+        for candidate in self._repository.list_map_assets():
+            should_be_active = bool(
+                resolved_active_name and candidate.map_name == resolved_active_name
+            )
+            if candidate.active == should_be_active:
+                continue
+            self._repository.save_map_asset(
+                candidate.model_copy(
+                    update={"active": should_be_active},
+                    deep=True,
+                )
+            )
+
+    def _restore_local_activation_after_backend_rejection(
+        self,
+        *,
+        previous_map_name: Optional[str],
+        target_map_name: str,
+    ) -> None:
+        previous_name = str(previous_map_name or "").strip() or None
+        failures = []
+        try:
+            if previous_name:
+                self._repository.set_active_map_name(previous_name)
+            else:
+                self._repository.clear_active_map_name()
+        except Exception as exc:
+            failures.append("active_pointer: %s" % exc)
+
+        try:
+            target_asset = self._repository.get_map_asset(target_map_name)
+            if target_asset is not None and target_map_name != previous_name:
+                self._save_asset(
+                    target_asset.model_copy(
+                        update={
+                            "active": False,
+                            "localization_ready": False,
+                            "status": (
+                                MapAssetStatus.READY
+                                if target_asset.finalized
+                                else MapAssetStatus.CREATED
+                            ),
+                            "metadata": {
+                                **dict(target_asset.metadata),
+                                "activation_recovery_pending": False,
+                                "activation_phase": "rejected",
+                            },
+                        },
+                        deep=True,
+                    )
+                )
+            if previous_name:
+                previous_asset = self._repository.get_map_asset(previous_name)
+                if previous_asset is not None:
+                    self._save_asset(
+                        previous_asset.model_copy(
+                            update={"active": True},
+                            deep=True,
+                        )
+                    )
+            self._reconcile_catalog_active_flags(previous_name)
+        except Exception as exc:
+            failures.append("catalog: %s" % exc)
+
+        try:
+            if previous_name:
+                self._memory_service.ensure_memory_library(
+                    library_name=previous_name
+                )
+                self._memory_service.activate_memory_library(
+                    library_name=previous_name,
+                    load_history=True,
+                    reset_library=False,
+                    expected_library_name=previous_name,
+                )
+            else:
+                disable_memory = getattr(
+                    self._memory_service,
+                    "disable_memory_library",
+                    None,
+                )
+                if callable(disable_memory):
+                    disable_memory()
+        except Exception as exc:
+            failures.append("memory: %s" % exc)
+
+        try:
+            if previous_name:
+                previous_asset = self._repository.get_map_asset(previous_name)
+                if previous_asset is not None:
+                    self._build_workspace(
+                        previous_asset,
+                        refresh_localization=False,
+                    )
+            else:
+                self._state_store.write(
+                    StateNamespace.MAP,
+                    "active_workspace",
+                    None,
+                    source="map_workspace_service",
+                    metadata={"kind": "active_workspace"},
+                )
+        except Exception as exc:
+            failures.append("workspace_state: %s" % exc)
+
+        if failures:
+            raise GatewayError(
+                "后端明确拒绝地图切换，但恢复旧的本地激活状态失败。",
+                error_code="map_activation_local_rollback_failed",
+                http_status=500,
+                jsonrpc_code=-32000,
+                details={
+                    "previous_map_name": previous_name,
+                    "target_map_name": target_map_name,
+                    "failures": failures,
+                },
+            )
+
+    def _mark_map_activation_recovering(
+        self,
+        *,
+        map_name: str,
+        bundle: MapAssetBundle,
+        cause: Exception,
+    ) -> GatewayError:
+        persistence_failures = []
+        pending_activation = None
+        try:
+            pending_activation = self._read_map_activation()
+            if pending_activation is None:
+                raise RuntimeError("地图激活恢复日志不存在。")
+            pending_activation = self._repository.update_map_activation_phase(
+                "recovering",
+                target_map_name=map_name,
+                target_manifest_sha256=str(bundle.manifest_sha256 or ""),
+                activation_request_id=str(
+                    pending_activation["activation_request_id"]
+                ),
+                expected_phases=(
+                    "prepared",
+                    "backend_dispatching",
+                    "backend_applied",
+                    "reconciling",
+                    "recovering",
+                ),
+            )
+        except Exception as exc:
+            persistence_failures.append("journal: %s" % exc)
+        try:
+            self._repository.set_active_map_name(map_name)
+        except Exception as exc:
+            persistence_failures.append("active_pointer: %s" % exc)
+        try:
+            self._reconcile_catalog_active_flags(map_name)
+            asset = self._repository.get_map_asset(map_name)
+            if asset is not None:
+                recovering_asset = asset.model_copy(
+                    update={
+                        "active": True,
+                        "status": MapAssetStatus.ACTIVATING,
+                        "localization_ready": False,
+                        "metadata": {
+                            **dict(asset.metadata),
+                            "activation_recovery_pending": True,
+                            "activation_phase": "recovering",
+                            "activation_target_manifest_sha256": bundle.manifest_sha256,
+                        },
+                    },
+                    deep=True,
+                )
+                try:
+                    self._save_asset(recovering_asset)
+                except Exception:
+                    self._repository.save_map_asset(recovering_asset)
+        except Exception as exc:
+            persistence_failures.append("catalog: %s" % exc)
+        try:
+            self._state_store.write(
+                StateNamespace.MAP,
+                "active_workspace",
+                None,
+                source="map_workspace_service",
+                metadata={
+                    "kind": "active_workspace",
+                    "map_name": map_name,
+                    "activation_recovery_pending": True,
+                },
+            )
+        except Exception as exc:
+            persistence_failures.append("workspace_state: %s" % exc)
+        return GatewayError(
+            "地图 %s 的后端激活已成功或结果不确定；系统将只向该地图继续收敛，请重放 activate_map。"
+            % map_name,
+            error_code="map_activation_recovery_pending",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "map_name": map_name,
+                "asset_manifest_sha256": bundle.manifest_sha256,
+                "activation_request_id": (
+                    pending_activation.get("activation_request_id")
+                    if pending_activation is not None
+                    else None
+                ),
+                "activation_phase": "recovering",
+                "cause": "%s: %s" % (type(cause).__name__, cause),
+                "persistence_failures": persistence_failures,
+                "recommended_next_tool": "activate_map",
+                "recommended_map_name": map_name,
+            },
+        )
 
     def get_active_localization_session(self) -> Optional[LocalizationSession]:
         """返回当前激活地图绑定的平台定位会话。"""
@@ -241,6 +1233,7 @@ class MapWorkspaceService:
             metadata={"source": "get_active_localization_session"},
         )
 
+    @_serialized_map_activation
     def sync_active_localization_session(
         self,
         *,
@@ -253,6 +1246,12 @@ class MapWorkspaceService:
         平台侧决定定位是否就绪，不依赖 Go2 数据面自报状态。
         """
 
+        pending_activation = self._read_map_activation()
+        if (
+            pending_activation is not None
+            and pending_activation.get("phase") != "prepared"
+        ):
+            return None
         coherent_binding = self._read_coherent_active_map_snapshot()
         if coherent_binding is None:
             self._localization_service.clear_latest_snapshot()
@@ -269,69 +1268,117 @@ class MapWorkspaceService:
             force_relocalize=force_relocalize,
         )
 
-    def list_map_versions(self, *, map_name: str, limit: Optional[int] = None) -> Tuple[MapVersion, ...]:
+    @_serialized_map_activation
+    def get_map_asset_bundle(self, *, map_name: str) -> Optional[MapAssetBundle]:
         resolved_name = self._require_map_name(map_name)
-        if self._repository.get_map_asset(resolved_name) is None:
+        asset = self._repository.get_map_asset(resolved_name)
+        if asset is None:
             raise GatewayError(
                 "未找到地图：%s" % resolved_name,
                 error_code="map_not_found",
                 http_status=404,
                 jsonrpc_code=-32000,
             )
-        return self._version_repository.list_map_versions(resolved_name, limit=limit)
+        try:
+            bundle = self._asset_repository.get_map_asset_bundle(resolved_name)
+        except MapAssetBundleError as exc:
+            raise GatewayError(
+                "地图 %s 的 current 资产包无效：%s" % (resolved_name, exc),
+                error_code="map_asset_bundle_invalid",
+                http_status=409,
+                jsonrpc_code=-32000,
+            ) from exc
+        if bundle is None:
+            return None
 
-    def save_map_version(
+        manifest_sha256 = str(bundle.manifest_sha256 or "").strip().lower()
+        frame_id = bundle.frame_id or asset.frame_id
+        if (
+            not asset.finalized
+            or asset.asset_manifest_sha256 != manifest_sha256
+            or asset.frame_id != frame_id
+            or asset.finalized_at is None
+        ):
+            now = (
+                datetime.now(asset.updated_at.tzinfo)
+                if asset.updated_at.tzinfo is not None
+                else datetime.utcnow()
+            )
+            asset = asset.model_copy(
+                update={
+                    "finalized": True,
+                    "asset_manifest_sha256": manifest_sha256,
+                    "finalized_at": asset.finalized_at or bundle.timestamp,
+                    "frame_id": frame_id,
+                    "updated_at": now,
+                },
+                deep=True,
+            )
+            self._save_asset(asset)
+        return bundle
+
+    @_serialized_map_activation
+    def finalize_active_map(
         self,
         *,
         map_name: Optional[str] = None,
         reason: str = "",
         metadata: Optional[Dict[str, object]] = None,
-        version_id_override: Optional[str] = None,
-    ) -> MapVersion:
-        active_workspace = self.get_active_workspace()
-        active_map_name = active_workspace.active_map_name if active_workspace is not None else None
+    ) -> MapAssetBundle:
+        """将当前建图快照物化并原子发布为该地图的 finalized current 资产包。"""
+
+        self._require_no_map_activation_recovery("finalize_active_map")
+        active_map_name = self._repository.get_active_map_name()
         resolved_name = self._require_map_name(map_name or active_map_name or "")
         if active_map_name != resolved_name:
             raise GatewayError(
-                "保存地图版本前必须先激活目标地图工作区：%s" % resolved_name,
+                "完成地图前必须先激活目标地图工作区：%s" % resolved_name,
                 error_code="map_not_activated",
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        snapshot = self._mapping_service.get_latest_snapshot()
-        if snapshot is None:
+        asset = self._repository.get_map_asset(resolved_name)
+        if asset is None:
             raise GatewayError(
-                "当前没有可保存的地图流帧。",
+                "未找到地图：%s" % resolved_name,
+                error_code="map_not_found",
+                http_status=404,
+                jsonrpc_code=-32000,
+            )
+        existing = self.get_map_asset_bundle(map_name=resolved_name)
+        if existing is not None:
+            return existing
+        if asset.finalized:
+            raise GatewayError(
+                "地图元数据标记为 finalized，但 current 资产包不存在。",
+                error_code="map_asset_bundle_missing",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+
+        coherent_binding = self._read_coherent_active_map_snapshot()
+        if coherent_binding is None or coherent_binding[0] != resolved_name:
+            raise GatewayError(
+                "当前没有属于激活地图的可发布地图快照。",
                 error_code="map_snapshot_unavailable",
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        pinned_version_id = version_id_override or self._geometry_runtime.get_exploration_pinned_version_id()
-        snapshot_map_version_id = str(snapshot.metadata.get("map_version_id") or "").strip()
-        if pinned_version_id and snapshot_map_version_id and snapshot_map_version_id != pinned_version_id:
-            raise GatewayError(
-                "当前地图流属于版本 %s，与 ACTIVE 建图会话版本 %s 不一致。"
-                % (snapshot_map_version_id, pinned_version_id),
-                error_code="mapping_session_version_mismatch",
-                http_status=409,
-                jsonrpc_code=-32000,
-            )
-        persistence_map_version_id = str(pinned_version_id or snapshot_map_version_id or snapshot.version_id).strip()
-        forbidden_zone_entry = None
-        if persistence_map_version_id:
-            forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
-                persistence_map_version_id,
-                map_name=resolved_name,
-            )
-            forbidden_zone_entry = forbidden_zone_envelope.maps.get(resolved_name)
+        snapshot = coherent_binding[1]
+        forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
+            map_name=resolved_name,
+        )
+        forbidden_zone_entry = forbidden_zone_envelope.maps.get(resolved_name)
         enabled_forbidden_zones = tuple(
-            zone for zone in getattr(forbidden_zone_entry, "zones", ()) if bool(getattr(zone, "enabled", False))
+            zone
+            for zone in getattr(forbidden_zone_entry, "zones", ())
+            if bool(getattr(zone, "enabled", False))
         )
         raw_reader = getattr(self._geometry_runtime, "get_raw_occupancy_grid", None)
         raw_occupancy = raw_reader() if callable(raw_reader) else None
         if snapshot.occupancy_grid is not None and raw_occupancy is None and enabled_forbidden_zones:
             raise GatewayError(
-                "禁行区已启用，但当前无法读取物理占据栅格；已拒绝保存，避免将虚拟障碍永久写入地图版本。",
+                "禁行区已启用，但当前无法读取物理占据栅格；已拒绝完成地图，避免将虚拟障碍写入资产包。",
                 error_code="raw_occupancy_unavailable",
                 http_status=409,
                 jsonrpc_code=-32000,
@@ -348,201 +1395,99 @@ class MapWorkspaceService:
             )
             if not same_layout:
                 raise GatewayError(
-                    "物理栅格与当前有效栅格布局不一致，无法安全保存地图版本。",
+                    "物理栅格与当前有效栅格布局不一致，无法安全完成地图。",
                     error_code="raw_occupancy_layout_mismatch",
                     http_status=409,
                     jsonrpc_code=-32000,
                 )
             snapshot = snapshot.model_copy(
-                update={
-                    "occupancy_grid": raw_occupancy,
-                    "metadata": {
-                        **dict(snapshot.metadata),
-                        "saved_occupancy_layer": "physical_raw",
-                        "forbidden_zone_generation": getattr(forbidden_zone_entry, "generation", 0),
-                    },
-                },
+                update={"occupancy_grid": raw_occupancy},
                 deep=True,
             )
-        version = self._version_repository.save_map_version(
+
+        snapshot_metadata = self._sanitize_map_metadata(snapshot.metadata)
+        snapshot_metadata.update(
+            {
+                "map_name": resolved_name,
+                "saved_occupancy_layer": "physical_raw" if raw_occupancy is not None else None,
+                "forbidden_zone_generation": getattr(forbidden_zone_entry, "generation", 0),
+            }
+        )
+        snapshot = snapshot.model_copy(
+            update={"metadata": snapshot_metadata},
+            deep=True,
+        )
+        bundle = MapAssetBundle(
             map_name=resolved_name,
-            snapshot=snapshot,
-            version_id_override=pinned_version_id,
+            source_name=snapshot.source_name,
+            source_snapshot_id=snapshot.version_id,
+            frame_id=self._resolve_map_frame_id(snapshot),
+            snapshot=snapshot.model_copy(deep=True),
             metadata={
                 "reason": str(reason or "").strip(),
-                "snapshot_kind": snapshot.metadata.get("map_snapshot_kind"),
-                "live_streaming_ready": snapshot.metadata.get("live_streaming_ready")
-                or snapshot.metadata.get("backend_streaming_ready"),
-                "checkpoint_ready": snapshot.metadata.get("checkpoint_ready"),
-                "backend_session_id": snapshot.metadata.get("backend_session_id")
-                or snapshot.metadata.get("mapping_session_id")
-                or snapshot.metadata.get("session_id"),
-                "backend_run_id": snapshot.metadata.get("backend_run_id")
-                or snapshot.metadata.get("mapping_run_id")
-                or snapshot.metadata.get("run_id"),
-                "mapping_database_path": snapshot.metadata.get("mapping_database_path"),
-                "update_sequence": snapshot.metadata.get("update_sequence"),
-                "content_revision": snapshot.metadata.get("content_revision"),
-                "seed_map_version_id": snapshot.metadata.get("seed_map_version_id"),
-                "exploration_pinned_version_id": pinned_version_id,
-                "mapping_session_id": snapshot.metadata.get("mapping_session_id")
-                or snapshot.metadata.get("session_id"),
-                "mapping_session_generation": snapshot.metadata.get("session_generation"),
-                "mapping_map_version_id": snapshot_map_version_id or pinned_version_id,
-                **dict(metadata or {}),
+                "mapping_session_id": snapshot_metadata.get("mapping_session_id")
+                or snapshot_metadata.get("session_id"),
+                "session_generation": snapshot_metadata.get("session_generation"),
+                "content_revision": snapshot_metadata.get("content_revision"),
+                **(self._sanitize_map_metadata(metadata) or {}),
             },
         )
-        version = self._version_repository.save_existing_map_version(
-            self._geometry_runtime.prepare_map_version_assets(version)
-        )
-        finalize_exploration_save = (
-            str(reason or "").strip().startswith("explore")
-            or str((metadata or {}).get("source") or "").strip() == "task_finalize"
-        )
-        if pinned_version_id and finalize_exploration_save:
-            self._geometry_runtime.clear_exploration_pinned_version_context()
-        asset = self._repository.get_map_asset(resolved_name)
-        if asset is None:
-            raise GatewayError(
-                "未找到地图：%s" % resolved_name,
-                error_code="map_not_found",
-                http_status=404,
-                jsonrpc_code=-32000,
+        staging_dir = self._asset_repository.create_staging_directory(resolved_name)
+        try:
+            prepared_bundle = self._geometry_runtime.prepare_map_asset_bundle(
+                bundle,
+                bundle_root=staging_dir,
             )
-        self._sync_asset(
-            asset.model_copy(
-                update={
-                    "latest_version_id": version.version_id,
-                    "latest_revision": version.revision,
-                    "frame_id": version.frame_id or asset.frame_id,
-                },
-                deep=True,
-            ),
-            is_active=(self._repository.get_active_map_name() == resolved_name),
-        )
-        self._publish_event(
-            "map.version_saved",
-            "地图 %s 已保存版本 %s。" % (resolved_name, version.version_id),
-            payload={"map_name": resolved_name, "version_id": version.version_id, "revision": version.revision},
-        )
-        return version
-
-    def _ensure_workspace_memory_active(
-        self,
-        *,
-        map_name: str,
-        load_memory_history: bool = True,
-        reset_memory_library: bool = False,
-    ) -> None:
-        """确保地图同名记忆库进入激活态（load_map_version 必调，避免仅切几何栈而记忆库未启用）。"""
-
-        resolved_name = self._require_map_name(map_name)
-        self._memory_service.ensure_memory_library(library_name=resolved_name)
-        self._memory_service.activate_memory_library(
-            library_name=resolved_name,
-            load_history=load_memory_history,
-            reset_library=reset_memory_library,
-            expected_library_name=resolved_name,
-        )
-
-    def load_map_version(
-        self,
-        *,
-        map_name: str,
-        version_id: Optional[str] = None,
-        activate_if_needed: bool = True,
-        load_memory_history: bool = True,
-        reset_memory_library: bool = False,
-        metadata: Optional[Dict[str, object]] = None,
-    ) -> Tuple[MapVersion, MapWorkspace]:
-        resolved_name = self._require_map_name(map_name)
-        if activate_if_needed and self._repository.get_active_map_name() != resolved_name:
-            self.activate_map(
-                map_name=resolved_name,
-                create_if_missing=False,
-                load_memory_history=load_memory_history,
-                reset_memory_library=reset_memory_library,
-                metadata=metadata,
-                load_latest_version=False,
+            finalized_bundle = self._asset_repository.finalize_map_asset_bundle(
+                prepared_bundle,
+                staging_dir=staging_dir,
             )
-        else:
-            self._ensure_workspace_memory_active(
-                map_name=resolved_name,
-                load_memory_history=load_memory_history,
-                reset_memory_library=reset_memory_library,
-            )
-            if activate_if_needed:
-                asset = self._repository.get_map_asset(resolved_name)
-                if asset is not None:
-                    self._repository.set_active_map_name(resolved_name)
-                    self._sync_asset(asset, is_active=True, refresh_localization=False)
-        version = (
-            self._require_map_version(resolved_name, version_id)
-            if version_id
-            else self._version_repository.get_latest_map_version(resolved_name)
-        )
-        if version is None:
-            raise GatewayError(
-                "地图 %s 当前没有可加载的平台版本。" % resolved_name,
-                error_code="map_version_not_found",
-                http_status=404,
-                jsonrpc_code=-32000,
-            )
-        self._localization_service.clear_latest_snapshot()
-        # 显式加载历史版本时，后端必须确认已切换到对应的可定位状态。
-        self._load_map_version_into_runtime(version, require_backend_switch=True)
-        self._ensure_active_localization_session_binding(
-            metadata={
-                **dict(metadata or {}),
-                "source": "load_map_version",
-            },
-            refresh=False,
-        )
-        # commit 2 §2.5：load_map_version 是 MCP 用户显式选择切到已保存地图的入口，
-        # 完成 active session 绑定后 MUST 触发 observer 切到 "localization" 模式并 emit
-        # 初始心跳（_on_external_geometry_session_mode_changed("localization") 内部会调
-        # set_session_mode + emit_initial_heartbeat），闭合 R3 设计的 saved-map activate 入口。
-        _geometry_runtime = getattr(self, "_geometry_runtime", None)
-        if _geometry_runtime is not None:
-            try:
-                _geometry_runtime._on_external_geometry_session_mode_changed("localization")
-            except Exception:
-                import logging
-
-                logging.getLogger(__name__).debug(
-                    'load_map_version 触发 _on_external_geometry_session_mode_changed("localization") 失败。',
-                    exc_info=True,
+        except Exception as exc:
+            if staging_dir.exists():
+                self._asset_repository.discard_staging_directory(
+                    resolved_name,
+                    staging_dir,
                 )
-        asset = self._repository.get_map_asset(resolved_name)
-        if asset is None:
+            if isinstance(exc, GatewayError):
+                raise
             raise GatewayError(
-                "未找到地图：%s" % resolved_name,
-                error_code="map_not_found",
-                http_status=404,
+                "地图 %s 资产包发布失败：%s" % (resolved_name, exc),
+                error_code="map_asset_finalize_failed",
+                http_status=409,
                 jsonrpc_code=-32000,
-            )
-        synced_asset = self._sync_asset(
-            asset.model_copy(
-                update={
-                    "latest_version_id": version.version_id,
-                    "latest_revision": version.revision,
-                    "frame_id": version.frame_id or asset.frame_id,
+            ) from exc
+
+        now = (
+            datetime.now(asset.updated_at.tzinfo)
+            if asset.updated_at.tzinfo is not None
+            else datetime.utcnow()
+        )
+        updated_asset = asset.model_copy(
+            update={
+                "finalized": True,
+                "asset_manifest_sha256": finalized_bundle.manifest_sha256,
+                "finalized_at": now,
+                "frame_id": finalized_bundle.frame_id or asset.frame_id,
+                "status": MapAssetStatus.READY,
+                "updated_at": now,
+                "metadata": {
+                    **dict(asset.metadata),
+                    "finalize_reason": str(reason or "").strip() or None,
+                    **(self._sanitize_map_metadata(metadata) or {}),
                 },
-                deep=True,
-            ),
-            is_active=(self._repository.get_active_map_name() == resolved_name),
-            refresh_localization=False,
+            },
+            deep=True,
         )
-        workspace = self.get_active_workspace(refresh_localization=False) or self._build_workspace(
-            synced_asset,
-            refresh_localization=False,
-        )
+        self._save_asset(updated_asset)
         self._publish_event(
-            "map.version_loaded",
-            "地图 %s 已加载平台版本 %s。" % (resolved_name, version.version_id),
-            payload={"map_name": resolved_name, "version_id": version.version_id, "revision": version.revision},
+            "map.asset_finalized",
+            "地图 %s 已发布 current 资产包。" % resolved_name,
+            payload={
+                "map_name": resolved_name,
+                "asset_manifest_sha256": finalized_bundle.manifest_sha256,
+            },
         )
-        return version, workspace
+        return finalized_bundle
 
     def relocalize_active_map(
         self,
@@ -550,13 +1495,9 @@ class MapWorkspaceService:
         map_name: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Tuple[LocalizationSession, MapWorkspace]:
-        """对当前激活地图执行一次平台重定位刷新。
+        """在已加载 current 资产包上重置定位会话，不加载或切换地图资产。"""
 
-        正式主链：activate_map -> ensure_active_session -> relocalize -> READY -> navigation available
-        平台决定定位是否就绪，不依赖 Go2 数据面自报状态。
-        """
-
-        active_workspace = self.get_active_workspace()
+        active_workspace = self.get_active_workspace(refresh_localization=False)
         active_map_name = active_workspace.active_map_name if active_workspace is not None else None
         resolved_name = self._require_map_name(map_name or active_map_name or "")
         if active_map_name != resolved_name:
@@ -566,72 +1507,71 @@ class MapWorkspaceService:
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        if active_workspace is None or not active_workspace.map_loaded:
+        asset = active_workspace.map_asset
+        bundle = self._require_map_asset_bundle(resolved_name)
+        runtime_descriptor_reader = getattr(self._geometry_runtime, "describe_backend", None)
+        try:
+            runtime_descriptor = (
+                runtime_descriptor_reader()
+                if callable(runtime_descriptor_reader)
+                else {}
+            )
+        except Exception:
+            runtime_descriptor = {}
+        if not isinstance(runtime_descriptor, dict):
+            runtime_descriptor = {}
+        runtime_map_name = str(runtime_descriptor.get("active_map_name") or "").strip()
+        runtime_manifest_sha256 = str(
+            runtime_descriptor.get("asset_manifest_sha256") or ""
+        ).strip().lower()
+        catalog_manifest_sha256 = str(
+            getattr(asset, "asset_manifest_sha256", None) or ""
+        ).strip().lower()
+        bundle_manifest_sha256 = str(bundle.manifest_sha256 or "").strip().lower()
+        runtime_identity_matches = bool(
+            active_workspace.map_loaded
+            and active_workspace.latest_map_snapshot is not None
+            and asset is not None
+            and asset.finalized
+            and catalog_manifest_sha256 == bundle_manifest_sha256
+            and runtime_map_name == resolved_name
+            and runtime_manifest_sha256 == bundle_manifest_sha256
+        )
+        if not runtime_identity_matches:
             raise GatewayError(
-                "地图 %s 尚未加载到运行态；请先调用 load_map_version(map_name=%s, version_id=<latest_version_id>) 启动旧地图 localization，再执行重定位。"
-                % (resolved_name, resolved_name),
+                "地图 %s 的 current 资产包尚未加载到运行态或运行态身份不一致；"
+                "请先重新调用 activate_map。" % resolved_name,
                 error_code="map_runtime_not_loaded",
                 http_status=409,
                 jsonrpc_code=-32000,
                 details={
                     "map_name": resolved_name,
-                    "latest_version_id": (
-                        active_workspace.map_asset.latest_version_id
-                        if active_workspace is not None and active_workspace.map_asset is not None
-                        else None
-                    ),
-                    "recommended_next_tool": "load_map_version",
+                    "finalized": bool(asset is not None and asset.finalized),
+                    "workspace_map_loaded": active_workspace.map_loaded,
+                    "expected_asset_manifest_sha256": bundle_manifest_sha256,
+                    "catalog_asset_manifest_sha256": catalog_manifest_sha256 or None,
+                    "runtime_active_map_name": runtime_map_name or None,
+                    "runtime_asset_manifest_sha256": runtime_manifest_sha256 or None,
+                    "recommended_next_tool": "activate_map",
                 },
             )
-        expected_version_id = (
-            active_workspace.map_asset.latest_version_id
-            if active_workspace is not None and active_workspace.map_asset is not None
-            else None
-        )
-        if expected_version_id:
-            # relocalize 必须确认后端真正可定位到该版本，否则不能伪装成功。
-            self._load_map_version_into_runtime(
-                self._require_map_version(resolved_name, expected_version_id),
-                require_backend_switch=True,
-            )
-        latest_map_snapshot = self._mapping_service.get_latest_snapshot()
-        if latest_map_snapshot is None:
-            raise GatewayError(
-                "地图 %s 当前没有可用于重定位的平台地图快照。" % resolved_name,
-                error_code="map_snapshot_unavailable",
-                http_status=409,
-                jsonrpc_code=-32000,
-            )
-        if not self._snapshot_matches_map_version(latest_map_snapshot, expected_version_id):
-            raise GatewayError(
-                "地图 %s 当前地图快照不属于已激活的最新版本 %s，拒绝重定位。" % (resolved_name, expected_version_id),
-                error_code="map_snapshot_version_mismatch",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={
-                    "map_name": resolved_name,
-                    "expected_version_id": expected_version_id,
-                    "snapshot_version_id": latest_map_snapshot.version_id,
-                    "seed_map_version_id": latest_map_snapshot.metadata.get("seed_map_version_id"),
-                    "platform_map_version_id": latest_map_snapshot.metadata.get("platform_map_version_id"),
-                },
-            )
-        frame_id = self._resolve_map_frame_id(latest_map_snapshot)
-        localization_map_version_id = expected_version_id or latest_map_snapshot.version_id
 
+        latest_map_snapshot = active_workspace.latest_map_snapshot
+        frame_id = self._resolve_map_frame_id(latest_map_snapshot)
         session = self._localization_service.relocalize_active_session(
             map_name=resolved_name,
-            map_version_id=localization_map_version_id,
+            asset_manifest_sha256=bundle_manifest_sha256,
             frame_id=frame_id,
             metadata={
-                **dict(metadata or {}),
+                **(self._sanitize_map_metadata(metadata) or {}),
+                "map_name": resolved_name,
                 "source": "relocalize_active_map",
                 "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
                 "snapshot_version_id": latest_map_snapshot.version_id,
             },
             geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
-        workspace = self.get_active_workspace()
+        workspace = self.get_active_workspace(refresh_localization=False)
         if workspace is None:
             raise GatewayError(
                 "地图 %s 当前没有激活工作区。" % resolved_name,
@@ -641,17 +1581,20 @@ class MapWorkspaceService:
             )
         return session, workspace
 
+    @_serialized_map_activation
     def clear_active_map(self, *, disable_memory_library: bool = False) -> Optional[MapAsset]:
         """清空当前激活地图。"""
 
+        self._require_no_map_activation_recovery("clear_active_map")
         active_map_name = self._repository.get_active_map_name()
         if not active_map_name:
             return None
         asset = self._repository.get_map_asset(active_map_name)
         self._repository.clear_active_map_name()
+        self._reconcile_catalog_active_flags(None)
         if disable_memory_library and self._memory_service.get_active_library_name() == active_map_name:
             self._memory_service.disable_memory_library()
-        self._geometry_runtime.clear_active_map_version(reason="clear_active_map")
+        self._geometry_runtime.clear_active_map_asset(reason="clear_active_map")
         self._mapping_service.clear_latest_snapshot(
             cleared_map_name=active_map_name,
             reason="clear_active_map",
@@ -670,7 +1613,7 @@ class MapWorkspaceService:
         cleared_asset = asset.model_copy(
             update={
                 "active": False,
-                "status": MapAssetStatus.READY if asset.latest_version_id else MapAssetStatus.CREATED,
+                "status": MapAssetStatus.READY if asset.finalized else MapAssetStatus.CREATED,
                 "updated_at": datetime.now(asset.updated_at.tzinfo)
                 if asset.updated_at.tzinfo is not None
                 else datetime.utcnow(),
@@ -687,8 +1630,20 @@ class MapWorkspaceService:
         )
         return cleared_asset
 
+    @_serialized_map_activation_execution
     def restore_active_workspace(self, *, load_memory_history: bool = True) -> Optional[MapWorkspace]:
-        active_map_name = self._repository.get_active_map_name()
+        pending_activation = self._read_map_activation()
+        self._arm_map_activation_fence(
+            pending_activation,
+            reason="restore_active_workspace",
+        )
+        with self._repository.map_activation_guard():
+            pending_activation = self._read_map_activation()
+            active_map_name = (
+                str(pending_activation["target_map_name"])
+                if pending_activation is not None
+                else self._repository.get_active_map_name()
+            )
         if not active_map_name:
             return None
         return self.activate_map(
@@ -698,21 +1653,24 @@ class MapWorkspaceService:
             reset_memory_library=False,
         )
 
+    @_serialized_map_activation
     def delete_map(
         self,
         *,
         map_name: str,
         delete_memory_library: bool = True,
     ) -> Dict[str, object]:
+        self._require_no_map_activation_recovery("delete_map")
         resolved_name = self._require_map_name(map_name)
         asset = self._repository.get_map_asset(resolved_name)
         was_active = bool(asset is not None and self._repository.get_active_map_name() == resolved_name)
         deleted_memory_library = False
         if was_active:
             self._repository.clear_active_map_name()
+            self._reconcile_catalog_active_flags(None)
             if self._memory_service.get_active_library_name() == resolved_name:
                 self._memory_service.disable_memory_library()
-            self._geometry_runtime.clear_active_map_version(reason="delete_active_map")
+            self._geometry_runtime.clear_active_map_asset(reason="delete_active_map")
             self._mapping_service.clear_latest_snapshot(
                 cleared_map_name=resolved_name,
                 reason="delete_active_map",
@@ -822,7 +1780,21 @@ class MapWorkspaceService:
         )
         return workspace
 
-    def _sync_asset(self, asset: MapAsset, *, is_active: bool, refresh_localization: bool = True) -> MapAsset:
+    def _sync_asset(
+        self,
+        asset: MapAsset,
+        *,
+        is_active: bool,
+        refresh_localization: bool = True,
+        completing_activation: bool = False,
+    ) -> MapAsset:
+        pending_activation = self._read_map_activation()
+        recovering_target = bool(
+            not completing_activation
+            and pending_activation is not None
+            and pending_activation.get("phase") != "prepared"
+            and pending_activation.get("target_map_name") == asset.map_name
+        )
         latest_map_snapshot = None
         active_localization_session = None
         if is_active:
@@ -858,6 +1830,8 @@ class MapWorkspaceService:
             and active_localization_session.status == LocalizationSessionStatus.READY
             and runtime_readiness.get("localization_ready", True)
         )
+        if recovering_target:
+            localization_ready = False
         memory_active = (
             memory_summary is not None
             and memory_summary.metadata.get("active_library_name") == asset.bound_memory_library_name
@@ -865,16 +1839,30 @@ class MapWorkspaceService:
         updated_asset = asset.model_copy(
             update={
                 "active": is_active,
-                "latest_version_id": asset.latest_version_id,
-                "latest_revision": asset.latest_revision,
                 "frame_id": frame_id,
                 "localization_ready": localization_ready,
-                "status": self._infer_status(
-                    is_active=is_active,
-                    has_map=live_map_loaded,
-                    has_saved_version=bool(asset.latest_version_id),
-                    localization_ready=localization_ready,
-                    memory_active=memory_active,
+                "status": (
+                    MapAssetStatus.ACTIVATING
+                    if recovering_target
+                    else self._infer_status(
+                        is_active=is_active,
+                        has_map=live_map_loaded,
+                        has_finalized_bundle=asset.finalized,
+                        localization_ready=localization_ready,
+                        memory_active=memory_active,
+                    )
+                ),
+                "metadata": (
+                    {
+                        **dict(asset.metadata),
+                        "activation_recovery_pending": True,
+                        "activation_phase": str(pending_activation["phase"]),
+                        "activation_target_manifest_sha256": pending_activation[
+                            "target_manifest_sha256"
+                        ],
+                    }
+                    if recovering_target
+                    else dict(asset.metadata)
                 ),
                 "updated_at": asset.updated_at
                 if latest_map_snapshot is None and asset.active == is_active
@@ -884,7 +1872,8 @@ class MapWorkspaceService:
             },
             deep=True,
         )
-        self._save_asset(updated_asset)
+        if pending_activation is None or completing_activation:
+            self._save_asset(updated_asset)
         return updated_asset
 
     def _active_runtime_readiness(self) -> Dict[str, object]:
@@ -893,7 +1882,7 @@ class MapWorkspaceService:
         Map and localization services may retain the last good snapshot after
         exploration exits. The active workspace should expose live runtime
         readiness, not merely cached snapshots, so agents know to call
-        load_map_version before navigating on a saved map.
+        activate_map before navigating on a finalized map.
         """
 
         diagnostics_reader = getattr(self._geometry_runtime, "get_live_mapping_diagnostics", None)
@@ -959,17 +1948,17 @@ class MapWorkspaceService:
         *,
         is_active: bool,
         has_map: bool,
-        has_saved_version: bool,
+        has_finalized_bundle: bool,
         localization_ready: bool,
         memory_active: bool,
     ) -> MapAssetStatus:
         if not is_active:
-            return MapAssetStatus.READY if has_map or has_saved_version else MapAssetStatus.CREATED
+            return MapAssetStatus.READY if has_map or has_finalized_bundle else MapAssetStatus.CREATED
         if not memory_active:
             return MapAssetStatus.ACTIVATING
         if has_map and localization_ready:
             return MapAssetStatus.READY
-        if has_map or has_saved_version:
+        if has_map or has_finalized_bundle:
             return MapAssetStatus.LOCALIZING
         return MapAssetStatus.MAPPING
 
@@ -1003,8 +1992,8 @@ class MapWorkspaceService:
             "quality_metrics": quality_metrics,
             "diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
             "snapshot_kind": latest_map_snapshot.metadata.get("map_snapshot_kind"),
-            "source_mode": latest_map_snapshot.metadata.get("source_mode")
-            or latest_map_snapshot.metadata.get("map_version_source_mode"),
+            "source_mode": latest_map_snapshot.metadata.get("source_mode"),
+            "asset_manifest_sha256": latest_map_snapshot.metadata.get("asset_manifest_sha256"),
             "live_streaming_ready": latest_map_snapshot.metadata.get("mapping_live_streaming_ready")
             or latest_map_snapshot.metadata.get("live_streaming_ready"),
             "checkpoint_ready": latest_map_snapshot.metadata.get("checkpoint_ready"),
@@ -1016,32 +2005,37 @@ class MapWorkspaceService:
         }
 
     def restore_localization_checkpoint_display(self) -> bool:
-        """定位模式下把 Debug 显示层恢复为已加载的平台 checkpoint 栅格。"""
+        """定位模式下把 Debug 显示层恢复为已加载的 current checkpoint。"""
 
         workspace = self.get_active_workspace(refresh_localization=False)
-        if workspace is None or workspace.map_asset is None:
-            return False
-        map_name = workspace.active_map_name
-        version_id = workspace.map_asset.latest_version_id
-        if not map_name or not version_id:
+        if (
+            workspace is None
+            or workspace.map_asset is None
+            or not workspace.map_asset.finalized
+            or not workspace.active_map_name
+        ):
             return False
         try:
-            prepared_version = self._require_map_version(map_name, version_id)
+            bundle = self._require_map_asset_bundle(workspace.active_map_name)
         except GatewayError:
             return False
         latest_snapshot = self._mapping_service.get_latest_snapshot()
         if latest_snapshot is not None:
             metadata = dict(getattr(latest_snapshot, "metadata", {}) or {})
-            snapshot_kind = str(metadata.get("map_snapshot_kind") or "").lower()
             if (
-                snapshot_kind == "offline_checkpoint"
-                and str(metadata.get("platform_map_version_id") or "") == version_id
+                self._checkpoint_map_displayable(latest_snapshot)
+                and str(metadata.get("asset_manifest_sha256") or "")
+                == str(bundle.manifest_sha256 or "")
             ):
                 return True
         runtime_snapshot = self._geometry_runtime.get_map_snapshot()
-        runtime_metadata = dict(runtime_snapshot.metadata or {}) if runtime_snapshot is not None else {}
+        runtime_metadata = (
+            dict(runtime_snapshot.metadata or {})
+            if runtime_snapshot is not None
+            else {}
+        )
         self._ingest_localization_checkpoint_snapshot(
-            prepared_version=prepared_version,
+            bundle=bundle,
             runtime_snapshot=runtime_snapshot,
             runtime_metadata=runtime_metadata,
         )
@@ -1050,31 +2044,31 @@ class MapWorkspaceService:
     def _ingest_localization_checkpoint_snapshot(
         self,
         *,
-        prepared_version: MapVersion,
+        bundle: MapAssetBundle,
         runtime_snapshot,
         runtime_metadata: Dict[str, object],
     ) -> None:
-        """定位模式加载版本后先展示离线 checkpoint，live /map_obstacles 不替换显示层。"""
+        """先展示 finalized checkpoint，后续 live 流只更新运行态诊断。"""
 
-        occupancy_grid = prepared_version.snapshot.occupancy_grid if prepared_version.snapshot is not None else None
-        cost_map = prepared_version.snapshot.cost_map if prepared_version.snapshot is not None else None
-        semantic_map = prepared_version.snapshot.semantic_map if prepared_version.snapshot is not None else None
+        bundle_snapshot = bundle.snapshot
+        occupancy_grid = bundle_snapshot.occupancy_grid
+        cost_map = bundle_snapshot.cost_map
+        semantic_map = bundle_snapshot.semantic_map
         if occupancy_grid is None and runtime_snapshot is not None:
             occupancy_grid = runtime_snapshot.occupancy_grid
             cost_map = runtime_snapshot.cost_map
             semantic_map = runtime_snapshot.semantic_map
         checkpoint_metadata = {
-            **dict(prepared_version.snapshot.metadata if prepared_version.snapshot is not None else {}),
-            **dict(runtime_metadata or {}),
+            **self._sanitize_map_metadata(bundle_snapshot.metadata),
+            **self._sanitize_map_metadata(runtime_metadata),
             "map_snapshot_kind": "offline_checkpoint",
-            "source_kind": "platform_map_version",
-            "platform_map_version_id": prepared_version.version_id,
-            "platform_map_version_revision": prepared_version.revision,
-            "active_map_name": prepared_version.map_name,
-            "map_name": prepared_version.map_name,
+            "source_kind": "map_asset_bundle",
+            "map_name": bundle.map_name,
+            "asset_manifest_sha256": bundle.manifest_sha256,
+            "source_snapshot_id": bundle.source_snapshot_id,
             "checkpoint_ready": True,
             "geometry_ready": True,
-            "loaded_as_seed": True,
+            "loaded_from_current_bundle": True,
             "continues_live_updates": True,
             "waiting_for_live_stream": True,
             "live_streaming_ready": False,
@@ -1082,17 +2076,13 @@ class MapWorkspaceService:
             "backend_mode": "mapping_localization",
         }
         self._mapping_service.ingest_external_snapshot(
-            source_name=(
-                prepared_version.snapshot.source_name
-                if prepared_version.snapshot is not None
-                else getattr(runtime_snapshot, "source_name", "platform_geometry_runtime")
-            ),
+            source_name=bundle_snapshot.source_name,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
             semantic_map=semantic_map,
             metadata=checkpoint_metadata,
-            version_id_override=prepared_version.version_id,
-            revision_override=prepared_version.revision,
+            version_id_override=bundle_snapshot.version_id,
+            revision_override=bundle_snapshot.revision,
         )
 
     def _checkpoint_map_displayable(self, latest_map_snapshot) -> bool:
@@ -1101,161 +2091,156 @@ class MapWorkspaceService:
         metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
         snapshot_kind = str(metadata.get("map_snapshot_kind") or "").lower()
         source_kind = str(metadata.get("source_kind") or "").lower()
-        if snapshot_kind == "offline_checkpoint" or source_kind == "platform_map_version":
-            return True
         return bool(
-            metadata.get("checkpoint_ready")
-            or metadata.get("platform_map_version_id")
-            or metadata.get("seed_map_version_id")
+            snapshot_kind == "offline_checkpoint"
+            or source_kind == "map_asset_bundle"
+            or (
+                metadata.get("checkpoint_ready")
+                and metadata.get("map_name")
+                and metadata.get("asset_manifest_sha256")
+            )
         )
 
-    def _load_map_version_into_runtime(
+    def _activate_map_asset_bundle(
         self,
-        version: MapVersion,
+        bundle: MapAssetBundle,
         *,
         require_backend_switch: bool,
+        activation_request_id: Optional[str] = None,
     ) -> None:
-        prepared_version = version
-        if prepared_version.geometry_asset is None:
-            prepared_version = self._version_repository.save_existing_map_version(
-                self._geometry_runtime.prepare_map_version_assets(prepared_version)
-            )
-        runtime_snapshot = self._geometry_runtime.activate_map_version(
-            prepared_version,
+        bundle_root = self._asset_repository.current_directory(bundle.map_name)
+        runtime_snapshot = self._geometry_runtime.activate_map_asset_bundle(
+            bundle,
+            bundle_root=bundle_root,
             require_backend_switch=require_backend_switch,
+            activation_request_id=activation_request_id,
         )
-        runtime_metadata = dict(runtime_snapshot.metadata or {})
-        activation_result = dict(getattr(self._geometry_runtime, "_last_activation_result", None) or {})
-        self._ensure_backend_version_switch_applied(
-            prepared_version=prepared_version,
-            runtime_metadata=runtime_metadata,
-            require_backend_switch=require_backend_switch,
-        )
-        self._navigation_service.load_forbidden_zones_for_map(
-            map_name=prepared_version.map_name,
-            map_version_id=prepared_version.version_id,
-        )
-        if (
-            require_backend_switch
-            and activation_result.get("backend_switch_applied") is True
-            and str(activation_result.get("backend_mode") or "") == "mapping_localization"
-        ):
-            navigation_map = (
-                activation_result.get("navigation_map")
-                if isinstance(activation_result.get("navigation_map"), dict)
-                else {}
+        try:
+            runtime_metadata = {
+                **self._sanitize_map_metadata(runtime_snapshot.metadata),
+                "map_name": bundle.map_name,
+                "asset_manifest_sha256": bundle.manifest_sha256,
+                "source_snapshot_id": bundle.source_snapshot_id,
+                "loaded_from_current_bundle": True,
+            }
+            activation_result = dict(
+                getattr(self._geometry_runtime, "_last_activation_result", None) or {}
             )
-            if not bool(navigation_map.get("used_for_static_map")):
-                # 定位模式 live /map_obstacles 可能数十秒后才首帧；先 ingest 版本 checkpoint 供 Debug/MCP 立即可见。
+            runtime_metadata["geometry_activation"] = activation_result
+            self._ensure_backend_asset_activation_applied(
+                bundle=bundle,
+                runtime_metadata=runtime_metadata,
+                require_backend_switch=require_backend_switch,
+            )
+            self._navigation_service.load_forbidden_zones_for_map(
+                map_name=bundle.map_name,
+            )
+            if (
+                require_backend_switch
+                and activation_result.get("backend_switch_applied") is True
+                and str(activation_result.get("backend_mode") or "")
+                == "mapping_localization"
+            ):
+                navigation_map = (
+                    activation_result.get("navigation_map")
+                    if isinstance(activation_result.get("navigation_map"), dict)
+                    else {}
+                )
+                if not bool(navigation_map.get("used_for_static_map")):
+                    self._ingest_localization_checkpoint_snapshot(
+                        bundle=bundle,
+                        runtime_snapshot=runtime_snapshot,
+                        runtime_metadata=runtime_metadata,
+                    )
+                    self._localization_service.clear_latest_snapshot()
+                    return
+
+            live_streaming_snapshot = bool(
+                runtime_metadata.get("map_snapshot_kind") == "live_streaming"
+                or runtime_metadata.get("source_kind")
+                == "platform_live_map_provider"
+                or runtime_metadata.get("live_streaming_ready")
+                or runtime_metadata.get("backend_streaming_ready")
+                or runtime_metadata.get("mapping_live_streaming_ready")
+            )
+            if live_streaming_snapshot and self._live_snapshot_under_covers_bundle(
+                runtime_snapshot,
+                bundle,
+            ):
                 self._ingest_localization_checkpoint_snapshot(
-                    prepared_version=prepared_version,
+                    bundle=bundle,
                     runtime_snapshot=runtime_snapshot,
                     runtime_metadata=runtime_metadata,
                 )
-                self._localization_service.clear_latest_snapshot()
-                return
-        live_streaming_snapshot = bool(
-            runtime_metadata.get("map_snapshot_kind") == "live_streaming"
-            or runtime_metadata.get("source_kind") == "platform_live_map_provider"
-            or runtime_metadata.get("live_streaming_ready")
-            or runtime_metadata.get("backend_streaming_ready")
-            or runtime_metadata.get("mapping_live_streaming_ready")
-        )
-        ingest_kwargs = {
-            "source_name": runtime_snapshot.source_name,
-            "occupancy_grid": runtime_snapshot.occupancy_grid,
-            "cost_map": runtime_snapshot.cost_map,
-            "semantic_map": runtime_snapshot.semantic_map,
-            "metadata": {
-                **runtime_metadata,
-                "seed_map_name": prepared_version.map_name,
-                "seed_map_version_id": prepared_version.version_id,
-                "seed_map_version_revision": prepared_version.revision,
-                "loaded_as_seed": True,
-                "continues_live_updates": True,
-            },
-        }
-        if not live_streaming_snapshot:
-            ingest_kwargs["version_id_override"] = prepared_version.version_id
-            ingest_kwargs["revision_override"] = prepared_version.revision
-        if live_streaming_snapshot and (
-            not self._snapshot_matches_map_version(runtime_snapshot, prepared_version.version_id)
-            or self._live_snapshot_under_covers_seed(runtime_snapshot, prepared_version)
-        ):
-            seed_metadata = {
-                **dict(prepared_version.snapshot.metadata),
-                "seed_map_name": prepared_version.map_name,
-                "seed_map_version_id": prepared_version.version_id,
-                "seed_map_version_revision": prepared_version.revision,
-                "loaded_as_seed": True,
-                "continues_live_updates": True,
-            }
-            self._mapping_service.ingest_external_snapshot(
-                source_name=prepared_version.snapshot.source_name,
-                occupancy_grid=prepared_version.snapshot.occupancy_grid,
-                cost_map=prepared_version.snapshot.cost_map,
-                semantic_map=prepared_version.snapshot.semantic_map,
-                metadata=seed_metadata,
-                version_id_override=prepared_version.version_id,
-                revision_override=prepared_version.revision,
-            )
-        else:
-            self._mapping_service.ingest_external_snapshot(**ingest_kwargs)
-        self._localization_service.clear_latest_snapshot()
+            else:
+                self._mapping_service.ingest_external_snapshot(
+                    source_name=runtime_snapshot.source_name,
+                    occupancy_grid=runtime_snapshot.occupancy_grid,
+                    cost_map=runtime_snapshot.cost_map,
+                    semantic_map=runtime_snapshot.semantic_map,
+                    metadata=runtime_metadata,
+                    version_id_override=runtime_snapshot.version_id,
+                    revision_override=runtime_snapshot.revision,
+                )
+            self._localization_service.clear_latest_snapshot()
+        except Exception as exc:
+            raise _MapActivationReconciliationError(
+                "地图 %s 的后端已切换，但本地快照或禁行区尚未完成收敛。"
+                % bundle.map_name
+            ) from exc
 
-    def _ensure_backend_version_switch_applied(
+    def _ensure_backend_asset_activation_applied(
         self,
         *,
-        prepared_version: MapVersion,
+        bundle: MapAssetBundle,
         runtime_metadata: Dict[str, object],
         require_backend_switch: bool,
     ) -> None:
         activation = runtime_metadata.get("geometry_activation")
         activation_result = activation if isinstance(activation, dict) else {}
-        if activation_result.get("backend_switch_applied") is True:
+        if (
+            activation_result.get("backend_switch_applied") is True
+            and activation_result.get("backend_activation_disposition") == "applied"
+        ):
             return
-        # 恢复活跃工作区时只需重新注入种子图，不要求切换底层数据库。
         if not require_backend_switch:
             return
         quality_metrics = runtime_metadata.get("quality_metrics")
         metrics = quality_metrics if isinstance(quality_metrics, dict) else {}
         database = metrics.get("database")
         database_metrics = database if isinstance(database, dict) else {}
-        self._geometry_runtime.clear_active_map_version(reason="backend_switch_not_applied")
         raise GatewayError(
-            "平台地图版本 %s 只恢复了平台快照，当前几何后端未确认版本切换，拒绝伪装成已切换可定位。"
-            % prepared_version.version_id,
-            error_code="map_version_backend_switch_unavailable",
+            "地图 %s 的 current 资产包未被几何后端确认加载，拒绝伪装成可定位。"
+            % bundle.map_name,
+            error_code="map_asset_backend_switch_unavailable",
             http_status=409,
             jsonrpc_code=-32000,
             details={
-                "map_name": prepared_version.map_name,
-                "version_id": prepared_version.version_id,
+                "map_name": bundle.map_name,
+                "asset_manifest_sha256": bundle.manifest_sha256,
                 "backend_switch_applied": False,
-                "reason": activation_result.get("reason") or "backend_switch_not_applied",
+                "backend_activation_disposition": activation_result.get(
+                    "backend_activation_disposition"
+                ),
+                "reason": activation_result.get("reason")
+                or "backend_switch_not_applied",
                 "geometry_stack": runtime_metadata.get("geometry_stack"),
                 "map_snapshot_kind": runtime_metadata.get("map_snapshot_kind"),
                 "source_kind": runtime_metadata.get("source_kind"),
-                "checkpoint_ready": metrics.get("checkpoint_ready") or runtime_metadata.get("checkpoint_ready"),
+                "checkpoint_ready": metrics.get("checkpoint_ready")
+                or runtime_metadata.get("checkpoint_ready"),
                 "backend_checkpoint_ready": metrics.get("backend_checkpoint_ready"),
-                "platform_snapshot_only": metrics.get("platform_snapshot_only"),
                 "database_present": database_metrics.get("present"),
                 "mapping_database_path": runtime_metadata.get("mapping_database_path"),
                 "geometry_activation": activation_result,
             },
         )
 
-    def _snapshot_matches_map_version(self, snapshot, expected_version_id: Optional[str]) -> bool:
-        if not expected_version_id:
-            return True
-        metadata = dict(getattr(snapshot, "metadata", {}) or {})
-        return expected_version_id in {
-            str(getattr(snapshot, "version_id", "") or ""),
-            str(metadata.get("seed_map_version_id") or ""),
-            str(metadata.get("platform_map_version_id") or ""),
-        }
-
-    def _live_snapshot_under_covers_seed(self, snapshot, version: MapVersion) -> bool:
+    def _live_snapshot_under_covers_bundle(
+        self,
+        snapshot,
+        bundle: MapAssetBundle,
+    ) -> bool:
         metadata = dict(getattr(snapshot, "metadata", {}) or {})
         live_snapshot = bool(
             metadata.get("map_snapshot_kind") == "live_streaming"
@@ -1263,17 +2248,29 @@ class MapWorkspaceService:
             or metadata.get("live_streaming_ready")
             or metadata.get("mapping_live_streaming_ready")
         )
-        if not live_snapshot or version.snapshot.occupancy_grid is None:
+        if not live_snapshot or bundle.snapshot.occupancy_grid is None:
             return False
         live_known_cells = self._metadata_known_cell_count(metadata)
         if live_known_cells is None:
-            live_known_cells = self._occupancy_known_cell_count(getattr(snapshot, "occupancy_grid", None))
-        seed_known_cells = self._occupancy_known_cell_count(version.snapshot.occupancy_grid)
-        return seed_known_cells is not None and (live_known_cells is None or live_known_cells < seed_known_cells)
+            live_known_cells = self._occupancy_known_cell_count(
+                getattr(snapshot, "occupancy_grid", None)
+            )
+        bundle_known_cells = self._occupancy_known_cell_count(
+            bundle.snapshot.occupancy_grid
+        )
+        return bundle_known_cells is not None and (
+            live_known_cells is None or live_known_cells < bundle_known_cells
+        )
 
-    def _metadata_known_cell_count(self, metadata: Dict[str, object]) -> Optional[int]:
+    def _metadata_known_cell_count(
+        self,
+        metadata: Dict[str, object],
+    ) -> Optional[int]:
         occupancy_metrics = metadata.get("occupancy_metrics")
-        if not isinstance(occupancy_metrics, dict) or "known_cell_count" not in occupancy_metrics:
+        if (
+            not isinstance(occupancy_metrics, dict)
+            or "known_cell_count" not in occupancy_metrics
+        ):
             return None
         try:
             return int(occupancy_metrics.get("known_cell_count") or 0)
@@ -1286,16 +2283,16 @@ class MapWorkspaceService:
             return None
         return sum(1 for value in data if int(value) >= 0)
 
-    def _require_map_version(self, map_name: str, version_id: str) -> MapVersion:
-        version = self._version_repository.get_map_version(map_name, version_id)
-        if version is None:
+    def _require_map_asset_bundle(self, map_name: str) -> MapAssetBundle:
+        bundle = self.get_map_asset_bundle(map_name=map_name)
+        if bundle is None:
             raise GatewayError(
-                "地图 %s 中未找到平台版本：%s" % (map_name, version_id),
-                error_code="map_version_not_found",
+                "地图 %s 当前没有 finalized current 资产包。" % map_name,
+                error_code="map_asset_bundle_not_found",
                 http_status=404,
                 jsonrpc_code=-32000,
             )
-        return version
+        return bundle
 
     def _save_asset(self, asset: MapAsset) -> MapAsset:
         self._repository.save_map_asset(asset)
@@ -1341,23 +2338,32 @@ class MapWorkspaceService:
     ) -> LocalizationSession:
         snapshot_metadata = dict(latest_map_snapshot.metadata)
         session_metadata = {
-            **dict(metadata or {}),
+            **(self._sanitize_map_metadata(metadata) or {}),
+            "map_name": active_map_name,
             "geometry_diagnostics": snapshot_metadata.get("geometry_diagnostics"),
         }
-        live_identity = self._live_mapping_identity(latest_map_snapshot)
-        session_map_version_id = latest_map_snapshot.version_id
+        live_identity = self._live_mapping_identity(
+            latest_map_snapshot,
+            map_name=active_map_name,
+        )
         if live_identity is not None:
-            mapping_session_id, session_map_version_id, session_generation = live_identity
+            mapping_session_id, _live_map_name, session_generation = live_identity
             session_metadata.update(
                 {
                     "mapping_session_id": mapping_session_id,
-                    "map_version_id": session_map_version_id,
                     "session_generation": session_generation,
                     "content_revision": snapshot_metadata.get("content_revision"),
                 }
             )
         geometry_asset = self._resolve_geometry_asset_summary(latest_map_snapshot)
-        desired_key = self._localization_snapshot_binding_key(latest_map_snapshot)
+        asset_manifest_sha256 = self._resolve_asset_manifest_for_snapshot(
+            active_map_name,
+            latest_map_snapshot,
+        )
+        desired_key = self._localization_snapshot_binding_key(
+            latest_map_snapshot,
+            map_name=active_map_name,
+        )
         if desired_key is None:
             raise GatewayError(
                 "地图快照缺少稳定定位身份，请重试。",
@@ -1376,7 +2382,7 @@ class MapWorkspaceService:
             expected_live_mapping_identity=existing_identity,
             expected_mutation_epoch=mutation_epoch,
             map_name=active_map_name,
-            map_version_id=session_map_version_id,
+            asset_manifest_sha256=asset_manifest_sha256,
             frame_id=frame_id,
             metadata=session_metadata,
             refresh=refresh,
@@ -1386,7 +2392,10 @@ class MapWorkspaceService:
         coherent_binding = self._read_coherent_active_map_snapshot()
         if coherent_binding is not None:
             latest_active_map_name, latest_snapshot = coherent_binding
-            latest_key = self._localization_snapshot_binding_key(latest_snapshot)
+            latest_key = self._localization_snapshot_binding_key(
+                latest_snapshot,
+                map_name=latest_active_map_name,
+            )
             if (
                 matched
                 and committed is not None
@@ -1414,24 +2423,65 @@ class MapWorkspaceService:
             jsonrpc_code=-32000,
         )
 
-    def _localization_snapshot_binding_key(self, snapshot):
-        live_identity = self._live_mapping_identity(snapshot)
+    def _localization_snapshot_binding_key(
+        self,
+        snapshot,
+        *,
+        map_name: Optional[str] = None,
+    ):
+        live_identity = self._live_mapping_identity(snapshot, map_name=map_name)
         if live_identity is not None:
             return ("live",) + live_identity
         metadata = dict(getattr(snapshot, "metadata", {}) or {})
         if metadata.get("map_snapshot_kind") == "live_streaming":
             return None
-        version_id = str(getattr(snapshot, "version_id", "") or "").strip()
-        return ("snapshot", version_id) if version_id else None
+        resolved_map_name = str(map_name or metadata.get("map_name") or "").strip()
+        asset_manifest_sha256 = self._resolve_asset_manifest_for_snapshot(
+            resolved_map_name,
+            snapshot,
+        )
+        frame_id = self._resolve_map_frame_id(snapshot)
+        if not resolved_map_name or not asset_manifest_sha256:
+            return None
+        return ("asset", resolved_map_name, asset_manifest_sha256, frame_id)
 
+    @_serialized_map_activation
     def _read_coherent_active_map_snapshot(self):
         """Read an active-map/snapshot pair that stayed coherent across capture."""
 
+        pending_activation = self._read_map_activation()
+        execution_state = getattr(self, "_map_activation_execution_state", None)
+        internal_identity = (
+            getattr(execution_state, "coherent_read_identity", None)
+            if execution_state is not None
+            else None
+        )
+        internal_reconciliation_read = bool(
+            pending_activation is not None
+            and pending_activation.get("phase") == "reconciling"
+            and int(getattr(execution_state, "depth", 0) or 0) > 0
+            and isinstance(internal_identity, dict)
+            and all(
+                str(internal_identity.get(key) or "")
+                == str(pending_activation.get(key) or "")
+                for key in (
+                    "target_map_name",
+                    "target_manifest_sha256",
+                    "activation_request_id",
+                )
+            )
+        )
+        if (
+            pending_activation is not None
+            and pending_activation.get("phase") != "prepared"
+            and not internal_reconciliation_read
+        ):
+            return None
         observed_incoherence = False
         for _attempt in range(3):
-            active_before = self._repository.get_active_map_name()
+            active_before = self.get_active_map_name()
             snapshot = self._mapping_service.get_latest_snapshot()
-            active_after = self._repository.get_active_map_name()
+            active_after = self.get_active_map_name()
             if active_before != active_after:
                 observed_incoherence = True
                 continue
@@ -1457,19 +2507,31 @@ class MapWorkspaceService:
             )
         return None
 
-    def _live_mapping_identity(self, latest_map_snapshot) -> Optional[Tuple[str, str, int]]:
+    def _live_mapping_identity(
+        self,
+        latest_map_snapshot,
+        *,
+        map_name: Optional[str] = None,
+    ) -> Optional[Tuple[str, str, int]]:
         if not self._is_live_streaming_snapshot(latest_map_snapshot):
             return None
-        return self._live_mapping_identity_from_metadata(dict(getattr(latest_map_snapshot, "metadata", {}) or {}))
+        metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
+        if map_name and not metadata.get("map_name"):
+            metadata["map_name"] = map_name
+        return self._live_mapping_identity_from_metadata(metadata)
 
     @staticmethod
     def _live_mapping_identity_from_metadata(
         metadata: Dict[str, object],
     ) -> Optional[Tuple[str, str, int]]:
         mapping_session_id = str(metadata.get("mapping_session_id") or "").strip()
-        map_version_id = str(metadata.get("map_version_id") or "").strip()
+        map_name = str(metadata.get("map_name") or "").strip()
         session_generation = metadata.get("session_generation")
-        if not mapping_session_id or not map_version_id or session_generation is None:
+        if (
+            not mapping_session_id
+            or not map_name
+            or session_generation is None
+        ):
             return None
         try:
             resolved_generation = int(session_generation)
@@ -1477,7 +2539,55 @@ class MapWorkspaceService:
             return None
         if resolved_generation <= 0:
             return None
-        return mapping_session_id, map_version_id, resolved_generation
+        return mapping_session_id, map_name, resolved_generation
+
+    def _resolve_asset_manifest_for_snapshot(
+        self,
+        map_name: str,
+        latest_map_snapshot,
+    ) -> Optional[str]:
+        metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})
+        geometry_asset = metadata.get("geometry_asset_summary")
+        geometry_metadata = geometry_asset if isinstance(geometry_asset, dict) else {}
+        asset = self._repository.get_map_asset(map_name) if map_name else None
+        for candidate in (
+            metadata.get("asset_manifest_sha256"),
+            geometry_metadata.get("asset_manifest_sha256"),
+            getattr(asset, "asset_manifest_sha256", None),
+        ):
+            resolved = str(candidate or "").strip().lower()
+            if len(resolved) == 64 and all(
+                character in "0123456789abcdef" for character in resolved
+            ):
+                return resolved
+        return None
+
+    @classmethod
+    def _sanitize_map_metadata(cls, value):
+        if isinstance(value, dict):
+            retired_keys = {
+                "map_version_id",
+                "platform_map_version_id",
+                "platform_map_version_revision",
+                "seed_map_version_id",
+                "seed_map_version_revision",
+                "latest_map_version_id",
+                "latest_version_id",
+                "latest_revision",
+                "localization_session_map_version_id",
+                "mapping_map_version_id",
+                "map_revision",
+            }
+            return {
+                key: cls._sanitize_map_metadata(item)
+                for key, item in value.items()
+                if key not in retired_keys
+            }
+        if isinstance(value, list):
+            return [cls._sanitize_map_metadata(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._sanitize_map_metadata(item) for item in value]
+        return value
 
     def _is_live_streaming_snapshot(self, latest_map_snapshot) -> bool:
         metadata = dict(getattr(latest_map_snapshot, "metadata", {}) or {})

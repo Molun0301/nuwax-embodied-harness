@@ -1,0 +1,41 @@
+package nuwax_msgs;
+
+struct LioStatus {
+    const int32_t SCHEMA_VERSION_V1 = 1;
+    const int32_t BACKEND_DEVICE = 1;
+    const int32_t BACKEND_FASTLIO2 = 2;
+    const int32_t BACKEND_POINTLIO = 3;
+    const int32_t LIFECYCLE_STARTING = 1;
+    const int32_t LIFECYCLE_READY = 2;
+    const int32_t LIFECYCLE_STOPPING = 3;
+    const int32_t LIFECYCLE_STOPPED = 4;
+    const int32_t LIFECYCLE_FAILED = 5;
+    const int32_t REASON_NONE = 0;
+    const int32_t REASON_STARTUP_TIMEOUT = 1;
+    const int32_t REASON_CHILD_EXITED = 2;
+    const int32_t REASON_CHILD_CRASHED = 3;
+    const int32_t REASON_SHUTDOWN_REQUESTED = 4;
+    const int32_t REASON_PREFLIGHT_FAILED = 5;
+    const int32_t REASON_TRANSPORT_ERROR = 6;
+
+    int32_t schema_version;
+    int32_t backend;
+    int64_t runtime_generation;
+    int64_t status_sequence;
+    // Zero is a valid present status timestamp, never an absence sentinel.
+    int64_t status_timestamp_ns;
+    // This pair is absent only as (sequence=0, timestamp=0). A positive
+    // sequence may carry the valid timestamp zero.
+    int64_t last_odometry_source_sequence;
+    int64_t last_odometry_source_timestamp_ns;
+    // This pair follows the same sequence-owned absence rule.
+    int64_t last_cloud_source_sequence;
+    int64_t last_cloud_source_timestamp_ns;
+    string sensor_frame_id;
+    string body_frame_id;
+    string odom_frame_id;
+    string map_frame_id;
+    int32_t lifecycle_state;
+    int32_t reason_code;
+    string reason;
+}

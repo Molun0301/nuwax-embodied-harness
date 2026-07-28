@@ -46,7 +46,7 @@ from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSev
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
-from contracts.map_workspace import MapAsset, MapAssetStatus, MapGeometryAssetBinding, MapVersion, MapWorkspace
+from contracts.map_workspace import MapAsset, MapAssetBundle, MapAssetStatus, MapGeometryAssetBinding, MapWorkspace
 from contracts.memory import (
     GoalCandidateScoreBreakdown,
     GoalConstraint,
@@ -198,10 +198,10 @@ __all__ = [
     "LocalizationSessionStatus",
     "LocalizationSnapshot",
     "MapAsset",
+    "MapAssetBundle",
     "MapAssetStatus",
     "MapGeometryAssetBinding",
     "MapSnapshot",
-    "MapVersion",
     "MapWorkspace",
     "MemoryQueryMatch",
     "MemoryQueryResult",

@@ -1,0 +1,17 @@
+package nuwax_msgs;
+
+struct PersonFollowCommand {
+    // Locked wire groups: session/target correlation, command/cloud revision,
+    // state/reason, then planar velocity.
+    string session_id;
+    int64_t target_seq;
+    int64_t target_stamp_sec;
+    int32_t target_stamp_nsec;
+    int64_t command_seq;
+    int64_t cloud_revision;
+    int32_t state;
+    string reason;
+    double linear_x;
+    double linear_y;
+    double angular_z;
+}

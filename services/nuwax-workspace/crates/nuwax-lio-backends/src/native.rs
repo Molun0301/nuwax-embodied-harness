@@ -22,6 +22,7 @@ pub const LIVOX_SDK2_SOURCE_HASH: &str = "sha256-NGscO/vLiQ17yQJtdPyFzhhMGE89AJ9
 const MAX_TOPIC_BYTES: usize = 1_024;
 const MAX_FRAME_BYTES: usize = 255;
 const MAX_FREQUENCY_HZ: f64 = 1_000.0;
+const ROTATION_TOLERANCE: f64 = 1.0e-6;
 static ACTIVE_NATIVE_BACKEND: Mutex<Option<NativeBackend>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,8 @@ pub struct NativeLioConfig {
     pub frame_id: String,
     pub child_frame_id: String,
     pub sensor_frame_id: String,
+    pub extrinsic_translation_m: [f64; 3],
+    pub extrinsic_rotation_row_major: [f64; 9],
     pub host_ip: String,
     pub lidar_ip: String,
     pub lidar_frequency_hz: f64,
@@ -96,6 +99,8 @@ impl NativeLioConfig {
             frame_id: ODOM_FRAME.into(),
             child_frame_id: BODY_FRAME.into(),
             sensor_frame_id: SENSOR_FRAME.into(),
+            extrinsic_translation_m: [0.0; 3],
+            extrinsic_rotation_row_major: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             host_ip: "192.168.1.5".into(),
             lidar_ip: "192.168.1.155".into(),
             lidar_frequency_hz: 10.0,
@@ -117,6 +122,8 @@ impl NativeLioConfig {
         {
             return Err("odom, body, and sensor frame IDs must be distinct".into());
         }
+        validate_extrinsic_translation(&self.extrinsic_translation_m)?;
+        validate_extrinsic_rotation(&self.extrinsic_rotation_row_major)?;
 
         let host_ip = validate_ipv4(&self.host_ip, "host_ip")?;
         let lidar_ip = validate_ipv4(&self.lidar_ip, "lidar_ip")?;
@@ -143,6 +150,10 @@ impl NativeLioConfig {
             self.child_frame_id.clone(),
             "--sensor_frame_id".into(),
             self.sensor_frame_id.clone(),
+            "--extrinsic_t".into(),
+            render_numbers(&self.extrinsic_translation_m),
+            "--extrinsic_r".into(),
+            render_numbers(&self.extrinsic_rotation_row_major),
             "--host_ip".into(),
             self.host_ip.clone(),
             "--lidar_ip".into(),
@@ -418,6 +429,230 @@ fn validate_frequency(value: f64, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_extrinsic_translation(translation: &[f64; 3]) -> Result<(), String> {
+    if translation.iter().any(|value| !value.is_finite()) {
+        return Err("extrinsic_translation_m must contain only finite values".into());
+    }
+    Ok(())
+}
+
+fn validate_extrinsic_rotation(rotation: &[f64; 9]) -> Result<(), String> {
+    if rotation.iter().any(|value| !value.is_finite()) {
+        return Err("extrinsic_rotation_row_major must contain only finite values".into());
+    }
+
+    for row in 0..3 {
+        for other_row in 0..3 {
+            let dot_product = (0..3)
+                .map(|column| rotation[row * 3 + column] * rotation[other_row * 3 + column])
+                .sum::<f64>();
+            let expected = if row == other_row { 1.0 } else { 0.0 };
+            if (dot_product - expected).abs() > ROTATION_TOLERANCE {
+                return Err(
+                    "extrinsic_rotation_row_major must be an orthonormal rotation matrix".into(),
+                );
+            }
+        }
+    }
+
+    let determinant = rotation[0] * (rotation[4] * rotation[8] - rotation[5] * rotation[7])
+        - rotation[1] * (rotation[3] * rotation[8] - rotation[5] * rotation[6])
+        + rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6]);
+    if (determinant - 1.0).abs() > ROTATION_TOLERANCE {
+        return Err(
+            "extrinsic_rotation_row_major must be a proper rotation matrix with determinant +1"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
 fn render_number(value: f64) -> String {
     value.to_string()
+}
+
+fn render_numbers(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(|value| render_number(*value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    const FASTLIO2_MAIN: &str = include_str!("../native/fastlio2/cpp/main.cpp");
+    const POINTLIO_MAIN: &str = include_str!("../native/pointlio/cpp/main.cpp");
+    const PAIRING_MARKER: &str = "Publish odometry first whenever a cloud is emitted";
+
+    fn assert_arg_value(args: &[String], option: &str, expected: &str) {
+        let option_index = args
+            .iter()
+            .position(|argument| argument == option)
+            .unwrap_or_else(|| panic!("missing native option {option}"));
+        assert_eq!(
+            args.get(option_index + 1).map(String::as_str),
+            Some(expected),
+            "unexpected value for native option {option}"
+        );
+    }
+
+    #[test]
+    fn private_topic_argv_is_preserved() {
+        let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        config.lidar_topic =
+            "/geometry/lio/private/42/fastlio2/cloud#sensor_msgs.PointCloud2".into();
+        config.odometry_topic =
+            "/geometry/lio/private/42/fastlio2/odometry#nav_msgs.Odometry".into();
+
+        let args = config.render_args().expect("private topics must be valid");
+        assert_arg_value(&args, "--lidar", &config.lidar_topic);
+        assert_arg_value(&args, "--odometry", &config.odometry_topic);
+    }
+
+    #[test]
+    fn non_identity_extrinsic_argv_is_stable() {
+        let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
+        config.extrinsic_translation_m = [0.125, -0.25, 1.5];
+        config.extrinsic_rotation_row_major = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+        let args = config
+            .render_args()
+            .expect("proper extrinsic must be valid");
+        assert_arg_value(&args, "--extrinsic_t", "0.125,-0.25,1.5");
+        assert_arg_value(&args, "--extrinsic_r", "0,-1,0,1,0,0,0,0,1");
+    }
+
+    #[test]
+    fn invalid_extrinsic_fails_closed() {
+        let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        config.extrinsic_translation_m[0] = f64::NAN;
+        assert!(config.render_args().is_err());
+
+        let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        config.extrinsic_rotation_row_major[0] = 2.0;
+        assert!(config.render_args().is_err());
+
+        let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        config.extrinsic_rotation_row_major[0] = f64::INFINITY;
+        assert!(config.render_args().is_err());
+
+        let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        config.extrinsic_rotation_row_major = [-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert!(config.render_args().is_err());
+    }
+
+    #[test]
+    fn source_lock_manifest_covers_hardened_native_sources() {
+        let manifest: Value = serde_json::from_str(include_str!("../native/SOURCE_LOCKS.json"))
+            .expect("source-lock manifest must be valid JSON");
+        let files = manifest["files"]
+            .as_object()
+            .expect("source-lock files must be an object");
+
+        assert_eq!(files.len(), 17);
+        assert_eq!(
+            files["fastlio2/cpp/main.cpp"],
+            "61a71d5d7ab3fbbb79738a32e824f0067433c3dd0d4100d0362262978a95265d"
+        );
+        assert_eq!(
+            files["pointlio/cpp/main.cpp"],
+            "a89c915c1c62acedd8a348316d50f0697070c03b3db29fd60b7299c05cd60944"
+        );
+        assert_eq!(
+            files["livox/cpp/README.md"],
+            "3077f45bcaacda21cf6d333a12c30cc486904e1d1bbaf9affddb1c393129af01"
+        );
+        assert!(include_str!("../native/livox/cpp/README.md")
+            .starts_with("# Livox Mid-360 Native Module (C++)"));
+    }
+
+    #[test]
+    fn native_publishers_use_monotonic_source_timestamp_pairs() {
+        for (backend, source) in [("fastlio2", FASTLIO2_MAIN), ("pointlio", POINTLIO_MAIN)] {
+            assert!(source.contains("next_source_timestamp"), "{backend}");
+            assert!(source.contains("make_source_header"), "{backend}");
+            assert!(
+                source.contains("odometry.header.stamp.sec")
+                    && source.contains("odometry.header.stamp.nsecs"),
+                "{backend} must reconstruct the estimator solution timestamp"
+            );
+            assert!(
+                source.contains("std::numeric_limits<int32_t>::max()"),
+                "{backend} must reject source timestamps the output cannot represent"
+            );
+            assert!(
+                source.contains("if (odometry.header.frame_id.empty()) { return false; }"),
+                "{backend} must reject an uninitialized estimator result"
+            );
+            assert!(
+                source.contains("const bool first_output = !has_last_output_source_timestamp;"),
+                "{backend} must emit its first valid solution immediately"
+            );
+            assert!(
+                source.contains("static std::mutex g_lio_mutex;"),
+                "{backend} must serialize estimator access"
+            );
+            assert!(
+                source
+                    .matches("std::lock_guard<std::mutex> lio_lock(g_lio_mutex);")
+                    .count()
+                    >= 2,
+                "{backend} must lock both callback and snapshot access"
+            );
+            assert!(
+                source.contains(
+                    "odometry = make_odometry_message(estimator_odometry, source_timestamp_ns);"
+                ),
+                "{backend} must build one initialized estimator snapshot before publishing"
+            );
+            assert!(
+                !source.contains("odometry = estimator_odometry;"),
+                "{backend}"
+            );
+            assert!(
+                !source.contains("pose[0] != 0.0 || pose[1] != 0.0 || pose[2] != 0.0"),
+                "{backend} must allow a valid zero-translation pose"
+            );
+            assert!(
+                !source.contains("g_latest_source_timestamp_ns"),
+                "{backend}"
+            );
+            assert!(!source.contains("observe_source_timestamp"), "{backend}");
+            assert!(!source.contains("system_clock::now"), "{backend}");
+            assert!(!source.contains("get_publish_ts"), "{backend}");
+            assert!(
+                !source.contains("reinterpret_cast<float*>(pc.data.data()"),
+                "{backend} must not write floats through an unaligned byte buffer"
+            );
+            assert!(
+                source.contains("std::memcpy(pc.data.data() + byte_offset + 12"),
+                "{backend} must serialize point fields with alignment-safe copies"
+            );
+
+            let paired_publish = source
+                .split_once(PAIRING_MARKER)
+                .unwrap_or_else(|| panic!("{backend} is missing the pairing contract"))
+                .1;
+            let odometry_position = paired_publish
+                .find("publish_odometry")
+                .unwrap_or_else(|| panic!("{backend} is missing paired odometry"));
+            let cloud_position = paired_publish
+                .find("publish_lidar")
+                .unwrap_or_else(|| panic!("{backend} is missing paired cloud"));
+            assert!(
+                odometry_position < cloud_position,
+                "{backend} must publish odometry before its paired cloud"
+            );
+        }
+
+        assert!(POINTLIO_MAIN.contains("!last_pc_publish.has_value()"));
+        assert!(POINTLIO_MAIN.contains("!last_odom_publish.has_value()"));
+        assert_eq!(POINTLIO_MAIN.matches("last_pc_publish = now;").count(), 1);
+        assert_eq!(POINTLIO_MAIN.matches("last_odom_publish = now;").count(), 1);
+    }
 }

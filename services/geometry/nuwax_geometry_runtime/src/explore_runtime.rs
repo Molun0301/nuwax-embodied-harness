@@ -60,6 +60,18 @@ const POLICY_FIRST_AVAILABLE: &str = "first_available";
 const DEFAULT_SCHEDULER_PERIOD: Duration = Duration::from_millis(200);
 const DEFAULT_POSE_RECEIPT_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_POSE_UNAVAILABLE_GRACE: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const SCHEDULER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SCHEDULER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const SCHEDULER_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const SCHEDULER_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub fn parse_arbitration_policy(s: &str) -> ExplorationArbitrationPolicy {
     try_parse_arbitration_policy(s).unwrap_or(ExplorationArbitrationPolicy::PreferWavefront)
@@ -291,6 +303,12 @@ pub struct ChildNavigationCancelTicket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNavigationCancelRecovery {
+    pub ticket: ChildNavigationCancelTicket,
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNavigationTerminalProof {
     pub lease: ChildNavigationLease,
 }
@@ -374,6 +392,16 @@ pub trait ExploreNavigationSink: Send + Sync {
         &self,
         lease: &ChildNavigationLease,
     ) -> Result<ChildNavigationCancelTicket, String>;
+
+    /// Recover an exact cancellation receipt when the async response was lost.
+    /// A receipt identifies the transaction only; ownership remains held until
+    /// a matching `ZEROED` proof is reported.
+    fn recover_cancel_receipt(
+        &self,
+        _lease: &ChildNavigationLease,
+    ) -> Option<ChildNavigationCancelRecovery> {
+        None
+    }
 }
 
 #[async_trait]
@@ -1360,6 +1388,7 @@ fn build_controller(
 #[derive(Clone)]
 pub struct ExploreRuntimeHandle {
     inner: Arc<Mutex<ExploreRuntimeInner>>,
+    expected_map_frame: Arc<str>,
     readiness_cache: Arc<SyncMutex<ExplorationReadinessDetail>>,
     snapshot_cache: Arc<RwLock<ExploreRuntimeSnapshot>>,
     navigation_sink: Arc<RwLock<Option<Arc<dyn ExploreNavigationSink>>>>,
@@ -1369,9 +1398,19 @@ pub struct ExploreRuntimeHandle {
 
 impl ExploreRuntimeHandle {
     pub fn default_with_wavefront() -> Self {
+        Self::new_with_validated_map_frame(Arc::from("map"))
+    }
+
+    pub fn with_wavefront_map_frame(expected_map_frame: impl Into<String>) -> Result<Self, String> {
+        let expected_map_frame = validate_expected_map_frame(expected_map_frame.into())?;
+        Ok(Self::new_with_validated_map_frame(expected_map_frame))
+    }
+
+    fn new_with_validated_map_frame(expected_map_frame: Arc<str>) -> Self {
         let (frontier_tx, _) = watch::channel(FrontierSnapshot::default());
         Self {
             inner: Arc::new(Mutex::new(ExploreRuntimeInner::new())),
+            expected_map_frame,
             readiness_cache: Arc::new(SyncMutex::new(ExplorationReadinessDetail {
                 ready: false,
                 reason: "exploration controller not started".to_string(),
@@ -1389,6 +1428,10 @@ impl ExploreRuntimeHandle {
             frontier_tx,
             generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn expected_map_frame(&self) -> &str {
+        self.expected_map_frame.as_ref()
     }
 
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
@@ -1621,6 +1664,7 @@ impl ExploreRuntimeHandle {
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -1767,6 +1811,7 @@ impl ExploreRuntimeHandle {
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -2026,6 +2071,7 @@ impl ExploreRuntimeHandle {
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -2136,6 +2182,7 @@ impl ExploreRuntimeHandle {
             let backend_available = self.readiness_cache.lock().backend_available;
             let readiness = Self::compute_readiness_locked(
                 &guard,
+                self.expected_map_frame.as_ref(),
                 backend_available,
                 self.navigation_sink.read().is_some(),
             );
@@ -2175,25 +2222,77 @@ impl ExploreRuntimeHandle {
                 .record_child_cancel_failure(
                     &child.lease,
                     "navigation sink unavailable during child cancellation".to_string(),
+                    None,
                 )
                 .await;
         };
-        let ticket = match sink.cancel(&child.lease).await {
-            Ok(ticket) if ticket.cancel_generation > 0 && ticket.lease.matches(&child.lease) => {
-                ticket
-            }
-            Ok(_) => {
-                return self
-                    .record_child_cancel_failure(
-                        &child.lease,
-                        "navigation sink returned an invalid cancellation ticket".to_string(),
-                    )
-                    .await;
-            }
-            Err(error) => {
-                return self.record_child_cancel_failure(&child.lease, error).await;
-            }
-        };
+        let (ticket, recovered_after_timeout) =
+            match tokio::time::timeout(CHILD_CANCEL_DISPATCH_TIMEOUT, sink.cancel(&child.lease))
+                .await
+            {
+                Err(_) => match sink.recover_cancel_receipt(&child.lease) {
+                    Some(recovery)
+                        if recovery.ticket.cancel_generation > 0
+                            && recovery.ticket.lease.matches(&child.lease) =>
+                    {
+                        if let Some(failure) = recovery.failure {
+                            return self
+                                .record_child_cancel_failure(
+                                    &child.lease,
+                                    failure,
+                                    Some(recovery.ticket),
+                                )
+                                .await;
+                        }
+                        (recovery.ticket, true)
+                    }
+                    Some(_) => {
+                        return self
+                            .record_child_cancel_failure(
+                                &child.lease,
+                                "navigation sink recovered an invalid cancellation ticket"
+                                    .to_string(),
+                                None,
+                            )
+                            .await;
+                    }
+                    None => {
+                        return self
+                            .record_child_cancel_failure(
+                                &child.lease,
+                                "navigation child cancellation dispatch timed out".to_string(),
+                                None,
+                            )
+                            .await;
+                    }
+                },
+                Ok(Ok(ticket))
+                    if ticket.cancel_generation > 0 && ticket.lease.matches(&child.lease) =>
+                {
+                    (ticket, false)
+                }
+                Ok(Ok(_)) => {
+                    return self
+                        .record_child_cancel_failure(
+                            &child.lease,
+                            "navigation sink returned an invalid cancellation ticket".to_string(),
+                            None,
+                        )
+                        .await;
+                }
+                Ok(Err(error)) => {
+                    let ticket = sink
+                        .recover_cancel_receipt(&child.lease)
+                        .filter(|recovery| {
+                            recovery.ticket.cancel_generation > 0
+                                && recovery.ticket.lease.matches(&child.lease)
+                        })
+                        .map(|recovery| recovery.ticket);
+                    return self
+                        .record_child_cancel_failure(&child.lease, error, ticket)
+                        .await;
+                }
+            };
 
         let mut guard = self.inner.lock().await;
         if guard
@@ -2216,7 +2315,9 @@ impl ExploreRuntimeHandle {
             STATUS_STOPPING,
             format!(
                 "{}: child {} cancel_generation={} awaiting ZEROED",
-                if retry {
+                if recovered_after_timeout {
+                    "CANCEL_RECEIPT_RECOVERED"
+                } else if retry {
                     "CANCEL_RETRY_PENDING"
                 } else {
                     "CANCEL_PENDING"
@@ -2240,6 +2341,7 @@ impl ExploreRuntimeHandle {
         &self,
         child_lease: &ChildNavigationLease,
         error: String,
+        ticket: Option<ChildNavigationCancelTicket>,
     ) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if guard
@@ -2254,6 +2356,11 @@ impl ExploreRuntimeHandle {
         };
         pending.dispatch_in_flight = false;
         pending.failure = Some(error.clone());
+        let early_terminal = ticket.and_then(|ticket| {
+            let cancel_generation = ticket.cancel_generation;
+            pending.ticket = Some(ticket);
+            take_early_cancel_terminal(pending, cancel_generation)
+        });
         let _ = guard
             .controller
             .stop_with_reason(ExplorationStopReason::ConsecutiveFailuresExceeded);
@@ -2270,6 +2377,7 @@ impl ExploreRuntimeHandle {
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -2277,6 +2385,11 @@ impl ExploreRuntimeHandle {
         let snapshot = self.store_snapshot(snapshot);
         drop(guard);
         self.publish_frontiers(frontier_update);
+        if let Some(result) = early_terminal {
+            return Box::pin(self.report_navigation_result(&child_lease.session_id, result))
+                .await
+                .unwrap_or(snapshot);
+        }
         snapshot
     }
 
@@ -2285,7 +2398,7 @@ impl ExploreRuntimeHandle {
         self.tick_with_pose(ExploreRobotPose {
             x: robot_xy.0,
             y: robot_xy.1,
-            frame_id: "map".to_string(),
+            frame_id: self.expected_map_frame.to_string(),
             source_timestamp_ns: now_unix_nanos(),
             received_monotonic_ns: now_monotonic_ns,
         })
@@ -2302,14 +2415,14 @@ impl ExploreRuntimeHandle {
         generation: u64,
         pose: ExploreRobotPose,
     ) -> ExploreRuntimeSnapshot {
-        if normalize_frame(&pose.frame_id) != "map" {
+        if normalize_frame(&pose.frame_id) != self.expected_map_frame.as_ref() {
             return self
                 .finish_session(
                     None,
                     ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!(
-                        "global exploration requires map-frame pose; received frame={}",
-                        pose.frame_id
+                        "global exploration requires pose frame={}; received frame={}",
+                        self.expected_map_frame, pose.frame_id
                     ),
                 )
                 .await;
@@ -2373,15 +2486,15 @@ impl ExploreRuntimeHandle {
             drop(guard);
             return self.store_snapshot(snapshot);
         };
-        if normalize_frame(&costmap.frame_id) != "map" {
+        if normalize_frame(&costmap.frame_id) != self.expected_map_frame.as_ref() {
             drop(guard);
             return self
                 .finish_session(
                     None,
                     ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!(
-                        "global exploration requires map-frame costmap; received frame={}",
-                        costmap.frame_id
+                        "global exploration requires costmap frame={}; received frame={}",
+                        self.expected_map_frame, costmap.frame_id
                     ),
                 )
                 .await;
@@ -2682,7 +2795,9 @@ impl ExploreRuntimeHandle {
                     let child_lease = active_child.lease.clone();
                     let reason = reason.clone();
                     drop(guard);
-                    return Ok(self.record_child_cancel_failure(&child_lease, reason).await);
+                    return Ok(self
+                        .record_child_cancel_failure(&child_lease, reason, None)
+                        .await);
                 }
                 ChildNavigationResult::Cancelled(proof) => {
                     if proof.cancel_generation == 0
@@ -2850,6 +2965,7 @@ impl ExploreRuntimeHandle {
             let backend_available = self.readiness_cache.lock().backend_available;
             let readiness = Self::compute_readiness_locked(
                 &guard,
+                self.expected_map_frame.as_ref(),
                 backend_available,
                 self.navigation_sink.read().is_some(),
             );
@@ -2900,7 +3016,7 @@ impl ExploreRuntimeHandle {
     pub async fn ingest_costmap(&self, costmap: OccupancyGrid2D) -> bool {
         self.ingest_costmap_snapshot(ExploreCostmapSnapshot {
             grid: costmap,
-            frame_id: "map".to_string(),
+            frame_id: self.expected_map_frame.to_string(),
         })
         .await
         .unwrap_or(false)
@@ -2910,7 +3026,7 @@ impl ExploreRuntimeHandle {
         &self,
         snapshot: ExploreCostmapSnapshot,
     ) -> Result<bool, String> {
-        validate_costmap_snapshot(&snapshot)?;
+        validate_costmap_snapshot(&snapshot, self.expected_map_frame.as_ref())?;
         let mut guard = self.inner.lock().await;
         if guard.costmap_input.as_ref() == Some(&snapshot) {
             return Ok(false);
@@ -2923,6 +3039,7 @@ impl ExploreRuntimeHandle {
         let backend_available = self.readiness_cache.lock().backend_available;
         let readiness = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -2937,6 +3054,7 @@ impl ExploreRuntimeHandle {
         if let Ok(guard) = self.inner.try_lock() {
             let detail = Self::compute_readiness_locked(
                 &guard,
+                self.expected_map_frame.as_ref(),
                 backend_available,
                 self.navigation_sink.read().is_some(),
             );
@@ -2961,6 +3079,7 @@ impl ExploreRuntimeHandle {
         let guard = self.inner.lock().await;
         let detail = Self::compute_readiness_locked(
             &guard,
+            self.expected_map_frame.as_ref(),
             backend_available,
             self.navigation_sink.read().is_some(),
         );
@@ -2973,6 +3092,7 @@ impl ExploreRuntimeHandle {
         if let Ok(guard) = self.inner.try_lock() {
             let detail = Self::compute_readiness_locked(
                 &guard,
+                self.expected_map_frame.as_ref(),
                 backend_available,
                 self.navigation_sink.read().is_some(),
             );
@@ -2989,16 +3109,16 @@ impl ExploreRuntimeHandle {
 
     fn compute_readiness_locked(
         guard: &ExploreRuntimeInner,
+        expected_map_frame: &str,
         backend_available: bool,
         navigation_sink_ready: bool,
     ) -> ExplorationReadinessDetail {
         let controller_active = guard.controller.is_active();
         let source_count = guard.controller.source_count();
         let frontier_source_ready = controller_active && source_count > 0;
-        let costmap_input_ready = guard
-            .costmap_input
-            .as_ref()
-            .is_some_and(|snapshot| validate_costmap_snapshot(snapshot).is_ok());
+        let costmap_input_ready = guard.costmap_input.as_ref().is_some_and(|snapshot| {
+            validate_costmap_snapshot(snapshot, expected_map_frame).is_ok()
+        });
         let ready = backend_available
             && frontier_source_ready
             && costmap_input_ready
@@ -3066,11 +3186,14 @@ impl ExploreRuntimeHandle {
     }
 }
 
-fn validate_costmap_snapshot(snapshot: &ExploreCostmapSnapshot) -> Result<(), String> {
-    if normalize_frame(&snapshot.frame_id) != "map" {
+fn validate_costmap_snapshot(
+    snapshot: &ExploreCostmapSnapshot,
+    expected_map_frame: &str,
+) -> Result<(), String> {
+    if normalize_frame(&snapshot.frame_id) != expected_map_frame {
         return Err(format!(
-            "global exploration requires map-frame costmap; received frame={}",
-            snapshot.frame_id
+            "global exploration requires costmap frame={expected_map_frame}; received frame={}",
+            snapshot.frame_id,
         ));
     }
     if snapshot.grid.width == 0 || snapshot.grid.height == 0 {
@@ -3081,6 +3204,25 @@ fn validate_costmap_snapshot(snapshot: &ExploreCostmapSnapshot) -> Result<(), St
         return Err("costmap cells length does not match width * height".to_string());
     }
     Ok(())
+}
+
+fn validate_expected_map_frame(frame_id: String) -> Result<Arc<str>, String> {
+    let valid = frame_id == frame_id.trim()
+        && !frame_id.is_empty()
+        && frame_id.len() <= 255
+        && frame_id.split('/').all(|token| {
+            let mut chars = token.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        });
+    if !valid {
+        return Err(format!(
+            "exploration expected map frame is invalid: {frame_id:?}"
+        ));
+    }
+    Ok(Arc::from(frame_id))
 }
 
 fn normalize_frame(frame_id: &str) -> &str {
@@ -3212,9 +3354,15 @@ impl ExploreSchedulerHandle {
         Self { shutdown_tx, join }
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.join.await;
+        if tokio::time::timeout(SCHEDULER_SHUTDOWN_TIMEOUT, &mut self.join)
+            .await
+            .is_err()
+        {
+            self.join.abort();
+            let _ = tokio::time::timeout(SCHEDULER_ABORT_JOIN_TIMEOUT, &mut self.join).await;
+        }
     }
 }
 
@@ -3276,6 +3424,7 @@ mod tests {
         submit_errors: StdMutex<VecDeque<ChildNavigationSubmitError>>,
         cancelled: StdMutex<Vec<String>>,
         cancel_error: StdMutex<Option<String>>,
+        cancel_recovery: StdMutex<Option<ChildNavigationCancelRecovery>>,
         lease_override: StdMutex<Option<ChildNavigationLease>>,
         next_goal_generation: AtomicU64,
         next_cancel_generation: AtomicU64,
@@ -3337,6 +3486,17 @@ mod tests {
                 cancel_generation: self.next_cancel_generation.fetch_add(1, Ordering::SeqCst) + 1,
             })
         }
+
+        fn recover_cancel_receipt(
+            &self,
+            lease: &ChildNavigationLease,
+        ) -> Option<ChildNavigationCancelRecovery> {
+            self.cancel_recovery
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|recovery| recovery.ticket.lease.matches(lease))
+        }
     }
 
     struct StaticPoseProvider;
@@ -3360,6 +3520,18 @@ mod tests {
     impl ExplorePoseProvider for MissingPoseProvider {
         async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
             Err("test pose stream stale".to_string())
+        }
+    }
+
+    struct BlockingPoseProvider {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ExplorePoseProvider for BlockingPoseProvider {
+        async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
+            self.entered.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -3609,6 +3781,99 @@ mod tests {
             .ingest_costmap_snapshot(frontier_costmap(1))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn configured_robot_map_frame_drives_default_costmap_and_pose() {
+        let handle = ExploreRuntimeHandle::with_wavefront_map_frame("robot/map")
+            .expect("configured map frame");
+        let cloned = handle.clone();
+        assert_eq!(handle.expected_map_frame(), "robot/map");
+        assert_eq!(cloned.expected_map_frame(), "robot/map");
+        assert!(Arc::ptr_eq(
+            &handle.expected_map_frame,
+            &cloned.expected_map_frame
+        ));
+
+        let sink = Arc::new(RecordingNavSink::default());
+        handle.set_navigation_sink(sink.clone());
+        assert!(handle.ingest_costmap(frontier_costmap(1).grid).await);
+        assert_eq!(
+            handle
+                .inner
+                .lock()
+                .await
+                .costmap_input
+                .as_ref()
+                .expect("configured costmap")
+                .frame_id,
+            "robot/map"
+        );
+        assert_eq!(
+            handle
+                .start("req-robot-map", "prefer_wavefront")
+                .await
+                .status,
+            STATUS_ACCEPTED
+        );
+        let readiness = handle.readiness(true).await;
+        assert!(readiness.ready, "{}", readiness.reason);
+
+        let active = handle.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE);
+        let submitted = sink.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].goal.target.frame_id, NavFrameId::Map);
+    }
+
+    #[tokio::test]
+    async fn configured_robot_map_frame_rejects_literal_map_inputs() {
+        for invalid in ["", " robot/map", "/robot/map", "robot//map", "robot/map-1"] {
+            assert!(
+                ExploreRuntimeHandle::with_wavefront_map_frame(invalid).is_err(),
+                "invalid configured frame accepted: {invalid:?}"
+            );
+        }
+
+        let handle = ExploreRuntimeHandle::with_wavefront_map_frame("robot/map")
+            .expect("configured map frame");
+        handle.set_navigation_sink(Arc::new(RecordingNavSink::default()));
+        let literal_map = frontier_costmap(1);
+        let error = handle
+            .ingest_costmap_snapshot(literal_map.clone())
+            .await
+            .expect_err("literal map must not satisfy configured robot/map");
+        assert!(error.contains("costmap frame=robot/map"), "{error}");
+
+        handle.inner.lock().await.costmap_input = Some(literal_map);
+        let readiness = handle.readiness(true).await;
+        assert!(!readiness.costmap_input_ready);
+        assert!(!readiness.ready);
+
+        let mut configured_costmap = frontier_costmap(2);
+        configured_costmap.frame_id = "robot/map".to_string();
+        assert!(handle
+            .ingest_costmap_snapshot(configured_costmap)
+            .await
+            .expect("configured costmap"));
+        assert_eq!(
+            handle
+                .start("req-wrong-pose", "prefer_wavefront")
+                .await
+                .status,
+            STATUS_ACCEPTED
+        );
+        let failed = handle
+            .tick_with_pose(ExploreRobotPose {
+                x: 2.0,
+                y: 2.0,
+                frame_id: "map".to_string(),
+                source_timestamp_ns: now_unix_nanos(),
+                received_monotonic_ns: now_monotonic_nanos(),
+            })
+            .await;
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.message.contains("pose frame=robot/map"));
     }
 
     #[tokio::test]
@@ -3915,6 +4180,76 @@ mod tests {
         assert_eq!(failed.last_stop_reason, "child_cancel_failed");
         assert_eq!(failed.child_task_id, active.child_task_id);
         assert!(handle.is_active().await);
+        assert!(handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn cancel_error_retains_exact_receipt_for_late_zeroed_reconciliation() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle
+            .start("req-cancel-error-receipt", "prefer_wavefront")
+            .await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let lease = active_child_lease(&handle).await;
+        *sink.cancel_error.lock().unwrap() = Some("uncertain cancel publish error".to_string());
+        *sink.cancel_recovery.lock().unwrap() = Some(ChildNavigationCancelRecovery {
+            ticket: ChildNavigationCancelTicket {
+                lease: lease.clone(),
+                cancel_generation: 37,
+            },
+            failure: Some("CANCEL_DISPATCH_FAILED".to_string()),
+        });
+
+        let failed = handle.stop("req-cancel-error-receipt").await;
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.message.contains("uncertain cancel publish error"));
+        assert_eq!(failed.child_task_id, active.child_task_id);
+        assert!(failed.global_stop_reconciliation.eligible);
+        assert!(handle.blocks_mapping_mutation().await);
+
+        let released = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 37)),
+            )
+            .await
+            .expect("late exact ZEROED after uncertain publish error");
+        assert_eq!(released.status, STATUS_FAILED);
+        assert!(released.child_task_id.is_empty());
+        assert!(released.ownership_reconciliation_receipt.is_some());
+        assert!(!handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn cancel_dispatch_timeout_is_retryable_and_retains_safety_ownership() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle
+            .start("req-cancel-timeout-retry", "prefer_wavefront")
+            .await;
+        let active = handle.tick((2.0, 2.0)).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.cancel_release.lock().unwrap() = Some(release);
+
+        let failed = handle.stop("req-cancel-timeout-retry").await;
+
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.message.contains("dispatch timed out"));
+        assert_eq!(failed.child_task_id, active.child_task_id);
+        assert!(handle.blocks_mapping_mutation().await);
+
+        *sink.cancel_release.lock().unwrap() = None;
+        let retried = handle.stop("req-cancel-timeout-retry").await;
+        assert_eq!(retried.status, STATUS_STOPPING);
+        assert!(retried.message.contains("CANCEL_RETRY_PENDING"));
+        assert_eq!(retried.child_task_id, active.child_task_id);
         assert!(handle.blocks_mapping_mutation().await);
     }
 
@@ -5027,6 +5362,57 @@ mod tests {
 
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
         scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_aborts_a_blocked_pose_provider_within_deadline() {
+        let (handle, _) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-blocked-pose", "prefer_wavefront").await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let scheduler = handle.spawn_scheduler(
+            Arc::new(BlockingPoseProvider {
+                entered: entered.clone(),
+            }),
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("scheduler must enter the blocking pose provider");
+
+        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+            .await
+            .expect("scheduler shutdown must abort a blocked pose provider");
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_aborts_blocked_submit_and_releases_runtime_lock() {
+        let (handle, sink) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-blocked-submit", "prefer_wavefront").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.submit_release.lock().unwrap() = Some(release);
+        let scheduler =
+            handle.spawn_scheduler(Arc::new(StaticPoseProvider), Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(1), sink.submit_entered.notified())
+            .await
+            .expect("scheduler must enter child submit");
+
+        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+            .await
+            .expect("scheduler shutdown must abort blocked child submit");
+        let stopped =
+            tokio::time::timeout(Duration::from_secs(1), handle.stop("req-blocked-submit"))
+                .await
+                .expect("aborting the scheduler must release ExploreRuntimeInner");
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]

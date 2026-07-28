@@ -197,7 +197,7 @@ class MappingBackendConfig:
     mapping_crate: str = "nuwax-mapping"
     occupancy_projection: str = "projected_occupancy"
     input_contract: str = "platform_geometry_inputs"
-    output_contract: str = "platform_map_version_geometry_asset"
+    output_contract: str = "map_asset_bundle_geometry_asset"
     timestamp_quality: GeometryTimestampQualityConfig = field(default_factory=GeometryTimestampQualityConfig)
     point_cloud_preprocess: GeometryPointCloudPreprocessConfig = field(default_factory=GeometryPointCloudPreprocessConfig)
     odometry_quality: GeometryOdometryQualityConfig = field(default_factory=GeometryOdometryQualityConfig)

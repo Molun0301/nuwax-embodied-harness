@@ -147,14 +147,9 @@ class ForbiddenZoneMapEntry(ContractModel):
     """单个地图资产的禁行区快照。"""
 
     map_name: str = Field(
-        default="",
+        min_length=1,
         max_length=256,
-        description="地图资产主键；空串仅用于读取旧版版本键文档。",
-    )
-    map_version_id: str = Field(
-        default="",
-        max_length=256,
-        description="当前运行时地图版本；不参与禁行区归属或持久化键选择。",
+        description="地图资产主键。",
     )
     generation: int = Field(default=0, ge=0, description="该地图禁行区的递增代次。")
     signature: str = Field(
@@ -166,18 +161,27 @@ class ForbiddenZoneMapEntry(ContractModel):
     zones: List[ForbiddenZone] = Field(
         default_factory=list,
         max_length=MAX_FORBIDDEN_ZONES,
-        description="该地图版本的禁行区列表。",
+        description="该地图的禁行区列表。",
     )
 
-    @field_validator("map_version_id")
+    @model_validator(mode="before")
     @classmethod
-    def _validate_map_version_id(cls, value: str) -> str:
-        return str(value or "").strip()
+    def _discard_legacy_map_version_id(cls, value: object) -> object:
+        """读取旧文档时丢弃版本身份，不用它推导地图资产主键。"""
+
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        migrated.pop("map_version_id", None)
+        return migrated
 
     @field_validator("map_name")
     @classmethod
     def _validate_map_name(cls, value: str) -> str:
-        return str(value or "").strip()
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("map_name 不能为空。")
+        return resolved
 
     @field_validator("signature")
     @classmethod
@@ -194,8 +198,6 @@ class ForbiddenZoneMapEntry(ContractModel):
 
     @model_validator(mode="after")
     def _validate_unique_zone_ids(self) -> "ForbiddenZoneMapEntry":
-        if not self.map_name and not self.map_version_id:
-            raise ValueError("map_name 不能为空。")
         _ensure_unique_zone_ids(self.zones)
         return self
 
@@ -206,15 +208,37 @@ class ForbiddenZonesEnvelope(ContractModel):
     schema_version: Literal[FORBIDDEN_ZONES_SCHEMA_VERSION] = FORBIDDEN_ZONES_SCHEMA_VERSION
     maps: Dict[str, ForbiddenZoneMapEntry] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_entries(cls, value: object) -> object:
+        """仅按旧条目中显式的 map_name 重键并移除版本字段。"""
+
+        if not isinstance(value, dict) or not isinstance(value.get("maps"), dict):
+            return value
+        migrated_maps = {}
+        for raw_key, raw_entry in value["maps"].items():
+            target_key = raw_key
+            migrated_entry = raw_entry
+            if isinstance(raw_entry, dict):
+                migrated_entry = dict(raw_entry)
+                has_legacy_version = "map_version_id" in migrated_entry
+                map_name = str(migrated_entry.get("map_name") or "").strip()
+                migrated_entry.pop("map_version_id", None)
+                if has_legacy_version and map_name:
+                    target_key = map_name
+            if target_key in migrated_maps:
+                raise ValueError(f"旧版禁行区条目迁移后产生重复 maps 键 {target_key!r}。")
+            migrated_maps[target_key] = migrated_entry
+        migrated = dict(value)
+        migrated["maps"] = migrated_maps
+        return migrated
+
     @model_validator(mode="after")
     def _validate_map_keys(self) -> "ForbiddenZonesEnvelope":
         for key, entry in self.maps.items():
             resolved_key = str(key).strip()
-            expected_key = entry.map_name or entry.map_version_id
-            if resolved_key != expected_key:
-                raise ValueError(
-                    f"maps 键 {key!r} 与地图归属键 {expected_key!r} 不一致。"
-                )
+            if resolved_key != entry.map_name:
+                raise ValueError(f"maps 键 {key!r} 与 map_name {entry.map_name!r} 不一致。")
         return self
 
 
@@ -222,14 +246,9 @@ class ReplaceForbiddenZonesRequest(ContractModel):
     """整体替换单个地图资产禁行区的请求。"""
 
     map_name: str = Field(
-        default="",
+        min_length=1,
         max_length=256,
-        description="地图资产主键；空串仅用于兼容旧版版本键调用。",
-    )
-    map_version_id: str = Field(
-        default="",
-        max_length=256,
-        description="当前运行时地图版本；不参与禁行区归属。",
+        description="地图资产主键。",
     )
     expected_generation: Optional[int] = Field(
         default=None,
@@ -238,20 +257,16 @@ class ReplaceForbiddenZonesRequest(ContractModel):
     )
     zones: List[ForbiddenZone] = Field(default_factory=list, max_length=MAX_FORBIDDEN_ZONES)
 
-    @field_validator("map_version_id")
-    @classmethod
-    def _validate_map_version_id(cls, value: str) -> str:
-        return str(value or "").strip()
-
     @field_validator("map_name")
     @classmethod
     def _validate_map_name(cls, value: str) -> str:
-        return str(value or "").strip()
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("map_name 不能为空。")
+        return resolved
 
     @model_validator(mode="after")
     def _validate_unique_zone_ids(self) -> "ReplaceForbiddenZonesRequest":
-        if not self.map_name and not self.map_version_id:
-            raise ValueError("map_name 不能为空。")
         _ensure_unique_zone_ids(self.zones)
         return self
 

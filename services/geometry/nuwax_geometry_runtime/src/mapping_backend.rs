@@ -4,12 +4,13 @@
 mod sidecar;
 
 use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::env;
 use std::fmt::Display;
 use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -31,6 +32,12 @@ use crate::owner_profile::MappingBackend;
 
 const WORKER_QUEUE_CAPACITY: usize = 1;
 const WORKER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
+const WORKER_RESOLUTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
+const PREINSTALL_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
 const MAX_CANDIDATE_INTERVAL_NS: u64 = 1_000_000_000;
 const CANDIDATE_GROWTH_DIVISOR: usize = 20;
@@ -59,6 +66,11 @@ const MAPPING_BACKEND_OCCUPANCY_FIXED_BYTES: usize = 2 * size_of::<u32>()
     + size_of::<u64>();
 const MAPPING_BACKEND_KIND_VOXEL: u8 = 0;
 const MAPPING_BACKEND_KIND_RAYTRACING: u8 = 1;
+
+thread_local! {
+    static MAPPING_BACKEND_WORKER_STOPPED: RefCell<Option<Arc<AtomicBool>>> =
+        const { RefCell::new(None) };
+}
 
 pub(crate) fn run_requested_sidecar() -> Option<Result<(), String>> {
     sidecar::run_requested_sidecar()
@@ -414,13 +426,30 @@ fn mapping_backend_resolution_commits(
     transaction_id: u128,
     receiver: &mpsc::Receiver<MappingBackendDecision>,
 ) -> bool {
-    matches!(
-        receiver.recv_timeout(WORKER_RESOLUTION_TIMEOUT),
-        Ok(MappingBackendDecision {
-            transaction_id: resolved_id,
-            kind: MappingBackendDecisionKind::Commit,
-        }) if resolved_id == transaction_id
-    )
+    let deadline = Instant::now() + WORKER_RESOLUTION_TIMEOUT;
+    loop {
+        let stopped = MAPPING_BACKEND_WORKER_STOPPED.with(|worker_stopped| {
+            worker_stopped
+                .borrow()
+                .as_ref()
+                .is_some_and(|stopped| stopped.load(Ordering::Acquire))
+        });
+        if stopped {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match receiver.recv_timeout(WORKER_RESOLUTION_STOP_POLL_INTERVAL.min(remaining)) {
+            Ok(MappingBackendDecision {
+                transaction_id: resolved_id,
+                kind: MappingBackendDecisionKind::Commit,
+            }) => return resolved_id == transaction_id,
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -483,11 +512,125 @@ pub(crate) struct MappingBackendWorker {
     join: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct MappingBackendJoinHandle {
+    join: Option<thread::JoinHandle<()>>,
+}
+
+fn mapping_backend_process_exit_retention() -> &'static Mutex<Vec<thread::JoinHandle<()>>> {
+    static RETAINED: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
+    RETAINED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retain_mapping_backend_join_until_process_exit(join: thread::JoinHandle<()>) {
+    mapping_backend_process_exit_retention()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(join);
+}
+
+#[cfg(test)]
+pub(crate) fn mapping_backend_process_exit_retains_thread_for_tests(
+    thread_id: thread::ThreadId,
+) -> bool {
+    mapping_backend_process_exit_retention()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|join| join.thread().id() == thread_id)
+}
+
+#[cfg(test)]
+pub(crate) fn join_retained_mapping_backend_thread_for_tests(
+    thread_id: thread::ThreadId,
+) -> Result<(), String> {
+    let join = {
+        let mut retained = mapping_backend_process_exit_retention()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = retained
+            .iter()
+            .position(|join| join.thread().id() == thread_id)
+            .ok_or_else(|| format!("retained Mapping backend thread {thread_id:?} is missing"))?;
+        retained.swap_remove(index)
+    };
+    join.join()
+        .map_err(|_| "retained mapping backend worker panicked during shutdown".to_owned())
+}
+
+impl MappingBackendJoinHandle {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(|join| join.is_finished())
+    }
+
+    pub(crate) fn join(mut self) -> Result<(), String> {
+        self.join
+            .take()
+            .expect("Mapping backend final join handle is present")
+            .join()
+            .map_err(|_| "mapping backend worker panicked during shutdown".to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_id(&self) -> thread::ThreadId {
+        self.join
+            .as_ref()
+            .expect("Mapping backend final join handle is present")
+            .thread()
+            .id()
+    }
+}
+
+impl Drop for MappingBackendJoinHandle {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            retain_mapping_backend_join_until_process_exit(join);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MappingBackendTestGate {
     entered: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct MappingBackendRetirementTestGate {
+    entered: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    panic_after_release: bool,
+}
+
+#[cfg(test)]
+impl MappingBackendRetirementTestGate {
+    pub(crate) fn blocked() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            panic_after_release: false,
+        }
+    }
+
+    pub(crate) fn failing() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(true)),
+            panic_after_release: true,
+        }
+    }
+
+    pub(crate) fn entered(&self) -> bool {
+        self.entered.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +694,9 @@ impl MappingBackendWorker {
                 backend_kind.stable_name()
             ))
             .spawn(move || {
+                MAPPING_BACKEND_WORKER_STOPPED.with(|worker_stopped_slot| {
+                    *worker_stopped_slot.borrow_mut() = Some(Arc::clone(&worker_stopped));
+                });
                 if let Some(sidecar) = supervised_sidecar {
                     sidecar::run_worker_loop(sidecar, receiver, worker_stopped);
                     return;
@@ -688,6 +834,57 @@ impl MappingBackendWorker {
         })
     }
 
+    pub(crate) fn into_stop_join_handle(mut self) -> Result<MappingBackendJoinHandle, String> {
+        self.client.request_stop();
+        self.join
+            .take()
+            .map(|join| MappingBackendJoinHandle { join: Some(join) })
+            .ok_or_else(|| "mapping backend worker final join handle is missing".to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_retirement_test_gate(
+        spec: MappingBackendSpec,
+        backend_generation: u64,
+        gate: MappingBackendRetirementTestGate,
+    ) -> Result<Self, String> {
+        if backend_generation == 0 {
+            return Err("mapping backend generation must be positive".to_owned());
+        }
+        let backend_kind = spec.kind();
+        let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let join = thread::Builder::new()
+            .name(format!(
+                "mapping-{}-{backend_generation}-retirement-test",
+                backend_kind.stable_name()
+            ))
+            .spawn(move || {
+                let _receiver = receiver;
+                while !worker_stopped.load(Ordering::Acquire) {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                gate.entered.store(true, Ordering::Release);
+                while !gate.released.load(Ordering::Acquire) {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                if gate.panic_after_release {
+                    panic!("injected mapping backend retirement failure");
+                }
+            })
+            .map_err(|error| format!("mapping backend worker spawn failed: {error}"))?;
+        Ok(Self {
+            client: MappingBackendClient {
+                backend_generation,
+                backend_kind,
+                sender,
+                stopped,
+            },
+            join: Some(join),
+        })
+    }
+
     pub(crate) fn client(&self) -> MappingBackendClient {
         self.client.clone()
     }
@@ -696,13 +893,35 @@ impl MappingBackendWorker {
         self.client.backend_generation()
     }
 
+    #[cfg(test)]
+    pub(crate) fn thread_id_for_tests(&self) -> thread::ThreadId {
+        self.join
+            .as_ref()
+            .expect("Mapping backend worker join handle is present")
+            .thread()
+            .id()
+    }
+
     pub(crate) fn stop_and_join(mut self) -> Result<(), String> {
         self.client.request_stop();
         let Some(join) = self.join.take() else {
             return Ok(());
         };
-        join.join()
-            .map_err(|_| "mapping backend worker panicked during shutdown".to_owned())
+        let generation = self.client.backend_generation();
+        let join_handle = MappingBackendJoinHandle { join: Some(join) };
+        let deadline = Instant::now() + PREINSTALL_WORKER_JOIN_TIMEOUT;
+        while !join_handle.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(join_handle);
+                return Err(format!(
+                    "mapping backend generation {generation} pre-install stop remained pending after {} ms; exact join owner retained until process exit",
+                    PREINSTALL_WORKER_JOIN_TIMEOUT.as_millis()
+                ));
+            }
+            thread::sleep(PREINSTALL_WORKER_JOIN_POLL_INTERVAL.min(remaining));
+        }
+        join_handle.join()
     }
 }
 
@@ -2012,6 +2231,69 @@ fn compute_candidate_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_join_handle_drop_is_nonblocking_and_retains_blocked_thread() {
+        let gate = MappingBackendRetirementTestGate::blocked();
+        let worker = MappingBackendWorker::start_with_retirement_test_gate(
+            MappingBackendSpec::Voxel,
+            1,
+            gate.clone(),
+        )
+        .expect("start blocked retirement worker");
+        let join_handle = worker
+            .into_stop_join_handle()
+            .expect("extract final backend join handle");
+        for _ in 0..1_000 {
+            if gate.entered() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(gate.entered(), "retirement worker reached the blocking gate");
+        let retained_before = mapping_backend_process_exit_retention()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(join_handle);
+            dropped_tx
+                .send(())
+                .expect("report nonblocking join-handle destruction");
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("Drop must not join the blocked backend thread");
+        dropper.join().expect("join Drop observer");
+        let retained_after = mapping_backend_process_exit_retention()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(retained_after, retained_before + 1);
+        gate.release();
+    }
+
+    #[test]
+    fn stop_interrupts_pending_resolution_before_worker_join() {
+        let worker = MappingBackendWorker::start(MappingBackendSpec::Voxel, 1, compute_config())
+            .expect("start backend worker");
+        let completion = worker
+            .client()
+            .submit(token(1), input(1))
+            .expect("submit unresolved compute")
+            .blocking_recv()
+            .expect("receive unresolved completion");
+        let started = Instant::now();
+        worker
+            .stop_and_join()
+            .expect("stop flag interrupts resolution wait and joins worker");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "worker join must not wait for the 15-second resolution deadline"
+        );
+        drop(completion);
+    }
 
     fn compute_config() -> MappingBackendComputeConfig {
         MappingBackendComputeConfig {

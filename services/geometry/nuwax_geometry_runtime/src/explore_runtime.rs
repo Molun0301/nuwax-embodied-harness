@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,7 +37,7 @@ use nuwax_nav_types_messages::visual::FrontierGoal;
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::nav_runtime::MotionAdmissionProof;
 
@@ -1436,6 +1436,14 @@ impl ExploreRuntimeHandle {
 
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
         *self.navigation_sink.write() = Some(sink);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn navigation_sink_for_tests(&self) -> Arc<dyn ExploreNavigationSink> {
+        self.navigation_sink
+            .read()
+            .clone()
+            .expect("production exploration navigation sink")
     }
 
     pub fn clear_navigation_sink(&self) {
@@ -3269,9 +3277,139 @@ fn coverage_pct(grid: &OccupancyGrid2D) -> f64 {
     known as f64 * 100.0 / grid.cells.len() as f64
 }
 
+#[derive(Clone)]
 pub struct ExploreSchedulerHandle {
+    inner: Arc<ExploreSchedulerInner>,
+}
+
+struct ExploreSchedulerInner {
     shutdown_tx: watch::Sender<bool>,
-    join: JoinHandle<()>,
+    terminal_tx: watch::Sender<Option<Result<(), String>>>,
+    terminal_rx: watch::Receiver<Option<Result<(), String>>>,
+    monitor: Mutex<JoinHandle<()>>,
+    worker_abort: AbortHandle,
+    monitor_state: AtomicU8,
+    monitor_error: SyncMutex<Option<String>>,
+}
+
+const SCHEDULER_MONITOR_PENDING: u8 = 0;
+const SCHEDULER_MONITOR_SETTLED: u8 = 1;
+const SCHEDULER_MONITOR_FAILED: u8 = 2;
+
+/// A shutdown deadline that can wake an async waiter even when the Tokio time
+/// driver is owned by a synchronously blocked producer.
+struct WallClockWake {
+    wake: tokio::sync::oneshot::Receiver<()>,
+}
+
+struct WallClockDeadlineRequest {
+    deadline: Instant,
+    wake: tokio::sync::oneshot::Sender<()>,
+}
+
+struct WallClockDeadlineService {
+    sender: std::sync::mpsc::Sender<WallClockDeadlineRequest>,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+fn wall_clock_deadline_service() -> Result<&'static WallClockDeadlineService, String> {
+    static SERVICE: OnceLock<Result<WallClockDeadlineService, String>> = OnceLock::new();
+    match SERVICE.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("explore-scheduler-wall-clock".to_owned())
+            .spawn(move || run_wall_clock_deadline_service(receiver))
+            .map_err(|error| format!("spawn wall-clock deadline failed: {error}"))?;
+        Ok(WallClockDeadlineService {
+            sender,
+            _worker: worker,
+        })
+    }) {
+        Ok(service) => Ok(service),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn run_wall_clock_deadline_service(receiver: std::sync::mpsc::Receiver<WallClockDeadlineRequest>) {
+    let mut pending: Vec<WallClockDeadlineRequest> = Vec::new();
+    loop {
+        let now = Instant::now();
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].wake.is_closed() {
+                pending.swap_remove(index);
+            } else if pending[index].deadline <= now {
+                let request = pending.swap_remove(index);
+                let _ = request.wake.send(());
+            } else {
+                index += 1;
+            }
+        }
+
+        let next_wait = pending
+            .iter()
+            .map(|request| request.deadline.saturating_duration_since(Instant::now()))
+            .min();
+        let received = match next_wait {
+            Some(wait) => receiver.recv_timeout(wait),
+            None => match receiver.recv() {
+                Ok(request) => {
+                    pending.push(request);
+                    continue;
+                }
+                Err(_) => return,
+            },
+        };
+        match received {
+            Ok(request) => pending.push(request),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+impl WallClockWake {
+    fn new(duration: Duration) -> Result<Self, String> {
+        let deadline = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| "wall-clock deadline overflow".to_owned())?;
+        let (wake_tx, wake) = tokio::sync::oneshot::channel();
+        wall_clock_deadline_service()?
+            .sender
+            .send(WallClockDeadlineRequest {
+                deadline,
+                wake: wake_tx,
+            })
+            .map_err(|_| "wall-clock deadline service stopped".to_owned())?;
+        Ok(Self { wake })
+    }
+
+    async fn wait(&mut self) {
+        let _ = (&mut self.wake).await;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExploreSchedulerShutdownOutcome {
+    result: Result<(), String>,
+    producers_settled: bool,
+}
+
+impl ExploreSchedulerShutdownOutcome {
+    fn new(result: Result<(), String>, producers_settled: bool) -> Self {
+        Self {
+            result,
+            producers_settled,
+        }
+    }
+
+    pub(crate) fn producers_settled(&self) -> bool {
+        self.producers_settled
+    }
+
+    pub(crate) fn into_result(self) -> Result<(), String> {
+        self.result
+    }
 }
 
 impl ExploreSchedulerHandle {
@@ -3295,12 +3433,16 @@ impl ExploreSchedulerHandle {
         pose_unavailable_grace: Duration,
     ) -> Self {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        #[cfg(test)]
+        let topology_control = crate::lcm_runtime::topology_test_control();
         let period = if period.is_zero() {
             DEFAULT_SCHEDULER_PERIOD
         } else {
             period
         };
-        let join = tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
+            #[cfg(test)]
+            crate::lcm_runtime::wait_for_topology_scheduler_release(topology_control);
             let mut interval = tokio::time::interval(period);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut pose_unavailable_since = None;
@@ -3351,17 +3493,199 @@ impl ExploreSchedulerHandle {
                 }
             }
         });
-        Self { shutdown_tx, join }
+        let worker_abort = worker.abort_handle();
+        let (terminal_tx, terminal_rx) = watch::channel(None);
+        let monitor_terminal_tx = terminal_tx.clone();
+        let monitor = tokio::spawn(async move {
+            let result = worker
+                .await
+                .map_err(|error| format!("exploration scheduler task join failed: {error}"));
+            monitor_terminal_tx.send_replace(Some(result));
+        });
+        Self {
+            inner: Arc::new(ExploreSchedulerInner {
+                shutdown_tx,
+                terminal_tx,
+                terminal_rx,
+                monitor: Mutex::new(monitor),
+                worker_abort,
+                monitor_state: AtomicU8::new(SCHEDULER_MONITOR_PENDING),
+                monitor_error: SyncMutex::new(None),
+            }),
+        }
     }
 
-    pub async fn shutdown(mut self) {
-        let _ = self.shutdown_tx.send(true);
-        if tokio::time::timeout(SCHEDULER_SHUTDOWN_TIMEOUT, &mut self.join)
+    pub fn shutdown_is_requested(&self) -> bool {
+        *self.inner.shutdown_tx.borrow()
+    }
+
+    async fn wait_final_result(&self) -> Result<(), String> {
+        let mut terminal_rx = self.inner.terminal_rx.clone();
+        if let Some(result) = terminal_rx.borrow().clone() {
+            return result;
+        }
+        let result = terminal_rx
+            .wait_for(Option::is_some)
             .await
-            .is_err()
-        {
-            self.join.abort();
-            let _ = tokio::time::timeout(SCHEDULER_ABORT_JOIN_TIMEOUT, &mut self.join).await;
+            .map_err(|_| "exploration scheduler terminal channel closed".to_owned())?
+            .clone()
+            .expect("scheduler terminal wait accepts only Some");
+        result
+    }
+
+    /// Observe only an unrequested scheduler terminal. A clean terminal after
+    /// `shutdown()` remains owned by the root task supervisor, which performs
+    /// the final settlement when its persistent-stop signal arrives.
+    pub async fn wait_terminal(&self) -> Result<(), String> {
+        let result = self.wait_final_result().await;
+        if result.is_ok() && self.shutdown_is_requested() {
+            std::future::pending::<Result<(), String>>().await
+        } else {
+            result
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_with_settlement().await.into_result()
+    }
+
+    pub(crate) async fn shutdown_with_settlement(&self) -> ExploreSchedulerShutdownOutcome {
+        self.inner.shutdown_tx.send_replace(true);
+        match self.inner.monitor_state.load(Ordering::Acquire) {
+            SCHEDULER_MONITOR_SETTLED => {
+                return ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true);
+            }
+            SCHEDULER_MONITOR_FAILED => {
+                let error = self
+                    .inner
+                    .monitor_error
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "exploration scheduler monitor failed".to_owned());
+                return ExploreSchedulerShutdownOutcome::new(Err(error), false);
+            }
+            SCHEDULER_MONITOR_PENDING => {}
+            _ => unreachable!("invalid exploration scheduler monitor state"),
+        }
+
+        let mut acquisition_deadline = match WallClockWake::new(SCHEDULER_SHUTDOWN_TIMEOUT) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return ExploreSchedulerShutdownOutcome::new(
+                    Err(format!(
+                        "exploration scheduler monitor acquisition deadline unavailable: {error}"
+                    )),
+                    false,
+                )
+            }
+        };
+        let mut monitor = tokio::select! {
+            biased;
+            monitor = self.inner.monitor.lock() => monitor,
+            _ = acquisition_deadline.wait() => {
+                return ExploreSchedulerShutdownOutcome::new(
+                    Err("exploration scheduler concurrent shutdown timed out".to_owned()),
+                    false,
+                )
+            }
+        };
+        match self.inner.monitor_state.load(Ordering::Acquire) {
+            SCHEDULER_MONITOR_SETTLED => {
+                drop(monitor);
+                return ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true);
+            }
+            SCHEDULER_MONITOR_FAILED => {
+                let error = self
+                    .inner
+                    .monitor_error
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "exploration scheduler monitor failed".to_owned());
+                drop(monitor);
+                return ExploreSchedulerShutdownOutcome::new(Err(error), false);
+            }
+            SCHEDULER_MONITOR_PENDING => {}
+            _ => unreachable!("invalid exploration scheduler monitor state"),
+        }
+        let mut graceful_deadline = match WallClockWake::new(SCHEDULER_SHUTDOWN_TIMEOUT) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return ExploreSchedulerShutdownOutcome::new(
+                    Err(format!(
+                        "exploration scheduler shutdown deadline unavailable: {error}"
+                    )),
+                    false,
+                )
+            }
+        };
+        tokio::select! {
+            biased;
+            result = &mut *monitor => match result {
+                Ok(()) => {
+                    self.inner
+                        .monitor_state
+                        .store(SCHEDULER_MONITOR_SETTLED, Ordering::Release);
+                    drop(monitor);
+                    return ExploreSchedulerShutdownOutcome::new(
+                        self.wait_final_result().await,
+                        true,
+                    );
+                }
+                Err(error) => {
+                    let detail = format!("exploration scheduler monitor join failed: {error}");
+                    *self.inner.monitor_error.lock() = Some(detail.clone());
+                    self.inner
+                        .monitor_state
+                        .store(SCHEDULER_MONITOR_FAILED, Ordering::Release);
+                    drop(monitor);
+                    return ExploreSchedulerShutdownOutcome::new(
+                        Err(detail),
+                        false,
+                    );
+                }
+            },
+            _ = graceful_deadline.wait() => {}
+        }
+        self.inner.worker_abort.abort();
+        let mut abort_deadline = match WallClockWake::new(SCHEDULER_ABORT_JOIN_TIMEOUT) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return ExploreSchedulerShutdownOutcome::new(
+                    Err(format!(
+                        "exploration scheduler abort-join deadline unavailable: {error}"
+                    )),
+                    false,
+                )
+            }
+        };
+        tokio::select! {
+            biased;
+            result = &mut *monitor => match result {
+                Ok(()) => {
+                    self.inner
+                        .monitor_state
+                        .store(SCHEDULER_MONITOR_SETTLED, Ordering::Release);
+                    drop(monitor);
+                    ExploreSchedulerShutdownOutcome::new(self.wait_final_result().await, true)
+                }
+                Err(error) => {
+                    let detail = format!(
+                        "exploration scheduler monitor abort join failed: {error}"
+                    );
+                    *self.inner.monitor_error.lock() = Some(detail.clone());
+                    self.inner
+                        .monitor_state
+                        .store(SCHEDULER_MONITOR_FAILED, Ordering::Release);
+                    drop(monitor);
+                    ExploreSchedulerShutdownOutcome::new(Err(detail), false)
+                }
+            },
+            _ = abort_deadline.wait() => {
+                ExploreSchedulerShutdownOutcome::new(
+                    Err("exploration scheduler abort join timed out".to_owned()),
+                    false,
+                )
+            }
         }
     }
 }
@@ -3532,6 +3856,31 @@ mod tests {
         async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
             self.entered.notify_one();
             std::future::pending().await
+        }
+    }
+
+    struct PanickingPoseProvider;
+
+    #[async_trait]
+    impl ExplorePoseProvider for PanickingPoseProvider {
+        async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
+            panic!("injected exploration scheduler panic")
+        }
+    }
+
+    struct SynchronousBlockingPoseProvider {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ExplorePoseProvider for SynchronousBlockingPoseProvider {
+        async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            StaticPoseProvider.current_pose().await
         }
     }
 
@@ -5361,7 +5710,10 @@ mod tests {
         .expect("scheduler should submit a goal without GET polling");
 
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
-        scheduler.shutdown().await;
+        scheduler
+            .shutdown()
+            .await
+            .expect("scheduler graceful shutdown");
     }
 
     #[tokio::test]
@@ -5383,9 +5735,11 @@ mod tests {
             .await
             .expect("scheduler must enter the blocking pose provider");
 
-        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+        let error = tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
             .await
-            .expect("scheduler shutdown must abort a blocked pose provider");
+            .expect("scheduler shutdown must abort a blocked pose provider")
+            .expect_err("forced scheduler abort must remain visible");
+        assert!(error.contains("scheduler task join failed"));
     }
 
     #[tokio::test]
@@ -5404,15 +5758,154 @@ mod tests {
             .await
             .expect("scheduler must enter child submit");
 
-        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+        let error = tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
             .await
-            .expect("scheduler shutdown must abort blocked child submit");
+            .expect("scheduler shutdown must abort blocked child submit")
+            .expect_err("forced scheduler abort must remain visible");
+        assert!(error.contains("scheduler task join failed"));
         let stopped =
             tokio::time::timeout(Duration::from_secs(1), handle.stop("req-blocked-submit"))
                 .await
                 .expect("aborting the scheduler must release ExploreRuntimeInner");
         assert_eq!(stopped.status, STATUS_CANCELLED);
         assert!(!handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requested_clean_scheduler_terminal_waits_for_root_owner_stop() {
+        let (handle, _) = configured_handle();
+        let scheduler =
+            handle.spawn_scheduler(Arc::new(StaticPoseProvider), Duration::from_millis(5));
+        let observer = scheduler.clone();
+        let mut terminal = Box::pin(observer.wait_terminal());
+
+        scheduler
+            .shutdown()
+            .await
+            .expect("requested scheduler shutdown must settle cleanly");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), terminal.as_mut())
+                .await
+                .is_err(),
+            "a requested clean terminal must remain quiescent for the persistent owner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduler_panic_is_fatal_and_settled() {
+        let (handle, _) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-panic", "prefer_wavefront").await;
+        let scheduler =
+            handle.spawn_scheduler(Arc::new(PanickingPoseProvider), Duration::from_millis(5));
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), scheduler.wait_terminal())
+            .await
+            .expect("scheduler panic terminal deadline")
+            .expect_err("scheduler panic must be visible");
+        assert!(terminal.contains("scheduler task join failed"));
+        let outcome = scheduler.shutdown_with_settlement().await;
+        assert!(outcome.producers_settled());
+        assert!(outcome.into_result().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduler_abort_join_timeout_retains_final_handle_and_reports_unsettled() {
+        let (handle, _) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle.start("req-unsettled", "prefer_wavefront").await;
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scheduler = handle.spawn_scheduler(
+            Arc::new(SynchronousBlockingPoseProvider {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler entered synchronous producer");
+
+        let first = scheduler.shutdown_with_settlement().await;
+        assert!(!first.producers_settled());
+        assert!(first
+            .clone()
+            .into_result()
+            .expect_err("abort join timeout must be fatal")
+            .contains("abort join timed out"));
+
+        release.store(true, Ordering::Release);
+        let second =
+            tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown_with_settlement())
+                .await
+                .expect("retained monitor final join deadline");
+        assert!(second.producers_settled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduler_shutdown_cancellation_retains_monitor_for_retry() {
+        let (handle, _) = configured_handle();
+        handle
+            .ingest_costmap_snapshot(frontier_costmap(1))
+            .await
+            .unwrap();
+        handle
+            .start("req-cancelled-shutdown", "prefer_wavefront")
+            .await;
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scheduler = handle.spawn_scheduler(
+            Arc::new(SynchronousBlockingPoseProvider {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler entered synchronous producer");
+
+        let mut cancellation = WallClockWake::new(Duration::from_millis(25))
+            .expect("independent cancellation wake starts");
+        let cancelled = tokio::select! {
+            biased;
+            outcome = scheduler.shutdown_with_settlement() => Some(outcome),
+            _ = cancellation.wait() => None,
+        };
+        assert!(
+            cancelled.is_none(),
+            "outer shutdown future must be cancelled"
+        );
+        assert_eq!(
+            scheduler.inner.monitor_state.load(Ordering::Acquire),
+            SCHEDULER_MONITOR_PENDING
+        );
+
+        release.store(true, Ordering::Release);
+        let settled =
+            tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown_with_settlement())
+                .await
+                .expect("retry joins retained monitor");
+        assert!(settled.producers_settled());
+        assert_eq!(
+            scheduler.inner.monitor_state.load(Ordering::Acquire),
+            SCHEDULER_MONITOR_SETTLED
+        );
     }
 
     #[tokio::test]
@@ -5443,7 +5936,10 @@ mod tests {
         .expect("active child stale pose must request cancellation");
         assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
         assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        scheduler.shutdown().await;
+        scheduler
+            .shutdown()
+            .await
+            .expect("scheduler graceful shutdown");
     }
 
     #[tokio::test]
@@ -5477,7 +5973,10 @@ mod tests {
             .contains("pose source unavailable"));
         assert!(!handle.is_active().await);
         assert!(!handle.blocks_mapping_mutation().await);
-        scheduler.shutdown().await;
+        scheduler
+            .shutdown()
+            .await
+            .expect("scheduler graceful shutdown");
     }
 
     #[tokio::test]

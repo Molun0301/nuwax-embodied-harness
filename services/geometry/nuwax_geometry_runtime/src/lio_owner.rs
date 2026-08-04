@@ -15,8 +15,13 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
 use crate::channel_registry::{ChannelKey, ValidatedChannelBindings};
-use crate::lcm_runtime::{GeometryRuntimeHandle, ValidatedFrameBindings};
-use crate::mapping_adapter::finish_backend_retirement;
+use crate::lcm_runtime::{
+    GeometryRuntimeHandle, GeometryRuntimeTaskOwner, GeometryTaskShutdownOutcome,
+    SpawnedGeometryRuntime, ValidatedFrameBindings,
+};
+use crate::mapping_adapter::{
+    MappingFinalAttempt, MappingFinalOwner, MappingPendingCause, ShutdownFailures,
+};
 use crate::native_lio_owner::{BoundNativeLioRuntime, NativeProcessOwner};
 
 pub(crate) const DEFAULT_LIO_ODOMETRY_CHANNEL: &str =
@@ -57,10 +62,109 @@ const LIO_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LIO_SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(4_750);
 #[cfg(test)]
 const LIO_SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(not(test))]
-const LIO_OWNER_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(3);
+const GEOMETRY_SHUTDOWN_EVENT_SCHEMA_VERSION: u64 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeometryShutdownStage {
+    GeometryTasksSettled,
+    CorrectionSettled,
+    MappingRetired,
+    LioJoined,
+    ResourceCleanupComplete,
+}
+
+impl GeometryShutdownStage {
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::GeometryTasksSettled => {
+                "nuwax.geometry.runtime.shutdown.geometry_tasks_settled.v1"
+            }
+            Self::CorrectionSettled => "nuwax.geometry.runtime.shutdown.correction_settled.v1",
+            Self::MappingRetired => "nuwax.geometry.runtime.shutdown.mapping_retired.v1",
+            Self::LioJoined => "nuwax.geometry.runtime.shutdown.lio_joined.v1",
+            Self::ResourceCleanupComplete => {
+                "nuwax.geometry.runtime.shutdown.resource_cleanup_complete.v1"
+            }
+        }
+    }
+
+    fn stable_name(self) -> &'static str {
+        match self {
+            Self::GeometryTasksSettled => "geometry_tasks_settled",
+            Self::CorrectionSettled => "correction_settled",
+            Self::MappingRetired => "mapping_retired",
+            Self::LioJoined => "lio_joined",
+            Self::ResourceCleanupComplete => "resource_cleanup_complete",
+        }
+    }
+
+    fn ordinal(self) -> u64 {
+        match self {
+            Self::GeometryTasksSettled => 1,
+            Self::CorrectionSettled => 2,
+            Self::MappingRetired => 3,
+            Self::LioJoined => 4,
+            Self::ResourceCleanupComplete => 5,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeometryShutdownEventEmitter {
+    runtime_generation: u64,
+    #[cfg(test)]
+    completed: Option<Arc<parking_lot::Mutex<Vec<GeometryShutdownStage>>>>,
+}
+
+impl GeometryShutdownEventEmitter {
+    pub(crate) fn new(runtime_generation: u64) -> Self {
+        Self {
+            runtime_generation,
+            #[cfg(test)]
+            completed: None,
+        }
+    }
+
+    pub(crate) fn emit_completed(&self, stage: GeometryShutdownStage) {
+        info!(
+            event_name = stage.event_name(),
+            event_schema_version = GEOMETRY_SHUTDOWN_EVENT_SCHEMA_VERSION,
+            runtime_generation = self.runtime_generation,
+            stage_ordinal = stage.ordinal(),
+            stage = stage.stable_name(),
+            status = "completed",
+            "geometry runtime shutdown stage completed"
+        );
+        #[cfg(test)]
+        if let Some(completed) = &self.completed {
+            completed.lock().push(stage);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recording(runtime_generation: u64) -> (Self, GeometryShutdownEventRecorder) {
+        let completed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        (
+            Self {
+                runtime_generation,
+                completed: Some(completed.clone()),
+            },
+            GeometryShutdownEventRecorder { completed },
+        )
+    }
+}
+
 #[cfg(test)]
-const LIO_OWNER_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) struct GeometryShutdownEventRecorder {
+    completed: Arc<parking_lot::Mutex<Vec<GeometryShutdownStage>>>,
+}
+
+#[cfg(test)]
+impl GeometryShutdownEventRecorder {
+    pub(crate) fn stages(&self) -> Vec<GeometryShutdownStage> {
+        self.completed.lock().clone()
+    }
+}
 
 /// Immutable Device-LIO bindings validated before any transport side effect.
 #[derive(Clone, Debug)]
@@ -340,6 +444,7 @@ pub(crate) trait LioIngressSink: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub(crate) struct LioShutdownControl {
     request_tx: watch::Sender<bool>,
+    #[cfg(test)]
     completion_rx: watch::Receiver<Option<Result<(), String>>>,
 }
 
@@ -369,6 +474,12 @@ impl LioShutdownControl {
         self.request_tx.send_replace(true);
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        *self.request_tx.borrow()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn shutdown_and_wait(&self) -> Result<(), String> {
         self.request_shutdown();
         let mut completion_rx = self.completion_rx.clone();
@@ -406,6 +517,11 @@ impl std::fmt::Debug for LioOwnerHandle {
 }
 
 impl LioOwnerHandle {
+    #[cfg(test)]
+    pub(crate) fn shutdown_control_for_tests(&self) -> LioShutdownControl {
+        self.shutdown.clone()
+    }
+
     /// Acquire every subscription acknowledgement and return without waiting
     /// for the first sensor message.
     pub(crate) async fn start(
@@ -513,9 +629,13 @@ impl LioOwnerHandle {
 
         let (request_tx, request_rx) = watch::channel(false);
         let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+        #[cfg(test)]
         let (completion_tx, completion_rx) = watch::channel(None);
+        #[cfg(not(test))]
+        let (completion_tx, _) = watch::channel::<Option<Result<(), String>>>(None);
         let shutdown = LioShutdownControl {
             request_tx: request_tx.clone(),
+            #[cfg(test)]
             completion_rx,
         };
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -566,10 +686,6 @@ impl LioOwnerHandle {
         }
     }
 
-    pub(crate) fn shutdown_control(&self) -> LioShutdownControl {
-        self.shutdown.clone()
-    }
-
     pub(crate) async fn wait_terminal(&mut self) -> Result<(), String> {
         if let Some(result) = self.terminal.clone() {
             return result;
@@ -596,7 +712,7 @@ impl LioOwnerHandle {
                 .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
-    pub(crate) async fn shutdown(mut self) -> Result<(), String> {
+    async fn shutdown_retained(&mut self) -> Result<(), String> {
         self.shutdown.request_shutdown();
         match tokio::time::timeout(LIO_SUPERVISOR_SHUTDOWN_TIMEOUT, self.wait_terminal()).await {
             Ok(result) => result,
@@ -611,6 +727,10 @@ impl LioOwnerHandle {
             }
         }
     }
+
+    pub(crate) async fn shutdown(mut self) -> Result<(), String> {
+        self.shutdown_retained().await
+    }
 }
 
 impl Drop for LioOwnerHandle {
@@ -622,88 +742,330 @@ impl Drop for LioOwnerHandle {
 /// Root lifetime token retained by `main` until all Geometry I/O is quiescent.
 pub(crate) struct GeometryRuntimeOwner {
     handle: GeometryRuntimeHandle,
+    task_owner: Option<GeometryRuntimeTaskOwner>,
     lio: LioOwnerHandle,
+    geometry_task_settlement: Option<crate::lcm_runtime::GeometryTaskSettlement>,
+    geometry_task_failure: Option<String>,
+    mapping_final_owner: Option<MappingFinalOwner>,
+    mapping_final_sticky: ShutdownFailures,
+}
+
+pub(crate) enum GeometryOwnedTerminal {
+    Tasks(Result<(), String>),
+    Lio(Result<(), String>),
+}
+
+pub(crate) enum GeometryRuntimeAfterTasksAttempt {
+    Pending {
+        cause: MappingPendingCause,
+        sticky: ShutdownFailures,
+    },
+    Settled {
+        terminal: Result<(), String>,
+    },
+}
+
+pub(crate) struct GeometryRuntimeOwnerShutdownFailure {
+    detail: String,
+    pending_owner: Option<Box<GeometryRuntimeOwner>>,
+}
+
+impl std::fmt::Debug for GeometryRuntimeOwnerShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GeometryRuntimeOwnerShutdownFailure")
+            .field("detail", &self.detail)
+            .field("has_pending_owner", &self.pending_owner.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for GeometryRuntimeOwnerShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl GeometryRuntimeOwnerShutdownFailure {
+    fn terminal(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            pending_owner: None,
+        }
+    }
+
+    fn unsettled(detail: impl Into<String>, owner: GeometryRuntimeOwner) -> Self {
+        Self {
+            detail: detail.into(),
+            pending_owner: Some(Box::new(owner)),
+        }
+    }
+
+    pub(crate) fn into_pending_owner(self) -> Option<Box<GeometryRuntimeOwner>> {
+        self.pending_owner
+    }
 }
 
 impl GeometryRuntimeOwner {
-    pub(crate) fn new(handle: GeometryRuntimeHandle, lio: LioOwnerHandle) -> Self {
-        Self { handle, lio }
+    pub(crate) fn new(spawned: SpawnedGeometryRuntime, lio: LioOwnerHandle) -> Self {
+        Self {
+            handle: spawned.handle,
+            task_owner: Some(spawned.task_owner),
+            lio,
+            geometry_task_settlement: None,
+            geometry_task_failure: None,
+            mapping_final_owner: None,
+            mapping_final_sticky: ShutdownFailures::default(),
+        }
     }
 
     pub(crate) fn handle(&self) -> GeometryRuntimeHandle {
         self.handle.clone()
     }
 
-    pub(crate) fn shutdown_control(&self) -> LioShutdownControl {
-        self.lio.shutdown_control()
-    }
-
     pub(crate) async fn wait_lio_terminal(&mut self) -> Result<(), String> {
         self.lio.wait_terminal().await
+    }
+
+    pub(crate) fn close_task_admission(&self) {
+        if let Some(task_owner) = &self.task_owner {
+            task_owner.close_admission();
+        }
+    }
+
+    pub(crate) async fn wait_geometry_terminal(&mut self) -> Result<(), String> {
+        match self.task_owner.as_mut() {
+            Some(task_owner) => task_owner.wait_terminal().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> GeometryOwnedTerminal {
+        match self.task_owner.as_mut() {
+            Some(task_owner) => tokio::select! {
+                biased;
+                result = task_owner.wait_terminal() => GeometryOwnedTerminal::Tasks(result),
+                result = self.lio.wait_terminal() => GeometryOwnedTerminal::Lio(result),
+            },
+            None => GeometryOwnedTerminal::Lio(self.lio.wait_terminal().await),
+        }
+    }
+
+    pub(crate) fn geometry_completed_failure(&self) -> Option<String> {
+        self.task_owner
+            .as_ref()
+            .and_then(GeometryRuntimeTaskOwner::completed_failure)
+    }
+
+    pub(crate) fn is_geometry_finished(&self) -> bool {
+        self.task_owner
+            .as_ref()
+            .is_some_and(GeometryRuntimeTaskOwner::is_finished)
     }
 
     pub(crate) fn is_lio_finished(&self) -> bool {
         self.lio.is_finished()
     }
 
-    pub(crate) async fn shutdown(self) -> Result<(), String> {
-        let Self { handle, lio } = self;
-        let mapping_result = match tokio::time::timeout(
-            LIO_OWNER_LIFECYCLE_TIMEOUT,
-            handle.mapping_lifecycle_lock.lock(),
-        )
-        .await
-        {
-            Ok(guard) => {
-                let transition = if let Some(adapter) = &handle.mapping_adapter {
-                    let mut adapter = adapter.lock();
-                    let snapshot = adapter.snapshot();
-                    if snapshot.active {
-                        adapter
-                            .stop_session_detached(&snapshot.session_id)
-                            .map_err(|error| {
-                                format!("failed to stop mapping during owner shutdown: {error}")
-                            })
-                    } else {
-                        Ok(crate::mapping_adapter::MappingStopTransition {
-                            snapshot,
-                            retirement: None,
-                        })
-                    }
+    #[cfg(test)]
+    pub(crate) async fn settle_lio_then_inject_terminal_failure_for_shutdown_tests(
+        &mut self,
+        detail: impl Into<String>,
+    ) {
+        self.lio
+            .shutdown_retained()
+            .await
+            .expect("test LIO supervisor must settle cleanly before terminal failure injection");
+        assert!(
+            self.lio.supervisor.is_none(),
+            "test LIO failure injection requires the final supervisor handle to be joined"
+        );
+        assert!(
+            self.lio
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.is_ok()),
+            "test LIO failure injection requires an already settled terminal"
+        );
+        self.lio.terminal = Some(Err(detail.into()));
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), GeometryRuntimeOwnerShutdownFailure> {
+        self.shutdown_with_events(None).await
+    }
+
+    async fn shutdown_with_events(
+        mut self,
+        events: Option<&GeometryShutdownEventEmitter>,
+    ) -> Result<(), GeometryRuntimeOwnerShutdownFailure> {
+        let (task_result, task_settlement) = match self.geometry_task_settlement {
+            Some(settlement) => (
+                self.geometry_task_failure.clone().map_or(Ok(()), Err),
+                settlement,
+            ),
+            None => self.shutdown_geometry_tasks(events).await.into_parts(),
+        };
+        if !task_settlement.is_settled() {
+            let detail = task_result.clone().err().unwrap_or_else(|| {
+                "Geometry task producers remained unsettled during runtime shutdown".to_owned()
+            });
+            return Err(GeometryRuntimeOwnerShutdownFailure::unsettled(detail, self));
+        }
+        let runtime_attempt = self
+            .shutdown_after_geometry_tasks(task_settlement, events)
+            .await;
+        let mut errors = task_result.err().into_iter().collect::<Vec<_>>();
+        match runtime_attempt {
+            GeometryRuntimeAfterTasksAttempt::Pending { cause, sticky } => {
+                if let Some(detail) = sticky.detail() {
+                    errors.push(detail);
+                }
+                errors.push(cause.to_string());
+                Err(GeometryRuntimeOwnerShutdownFailure::unsettled(
+                    errors.join("; "),
+                    self,
+                ))
+            }
+            GeometryRuntimeAfterTasksAttempt::Settled { terminal } => {
+                if let Err(error) = terminal {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
                 } else {
-                    drop(guard);
-                    return lio.shutdown().await;
-                };
-                drop(guard);
-                match transition {
-                    Ok(transition) => finish_backend_retirement(
-                        handle
-                            .mapping_adapter
-                            .as_ref()
-                            .expect("mapping adapter existed for transition"),
-                        &handle.mapping_lifecycle_lock,
-                        transition.retirement,
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!("failed to retire mapping backend during owner shutdown: {error}")
-                    }),
-                    Err(error) => Err(error),
+                    Err(GeometryRuntimeOwnerShutdownFailure::terminal(
+                        errors.join("; "),
+                    ))
                 }
             }
-            Err(_) => {
-                Err("timed out acquiring mapping lifecycle lock during owner shutdown".into())
-            }
-        };
-        let lio_result = lio.shutdown().await;
-        match (mapping_result, lio_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(mapping_error), Err(lio_error)) => Err(format!(
-                "{mapping_error}; failed to shut down LIO owner: {lio_error}"
-            )),
         }
     }
+
+    pub(crate) async fn shutdown_geometry_tasks(
+        &mut self,
+        events: Option<&GeometryShutdownEventEmitter>,
+    ) -> GeometryTaskShutdownOutcome {
+        self.close_task_admission();
+        let outcome = match self.task_owner.as_mut() {
+            Some(task_owner) => task_owner.shutdown().await,
+            None => GeometryTaskShutdownOutcome::unsettled(
+                "Geometry runtime root task owner is missing",
+            ),
+        };
+        if outcome.producers_settled() {
+            let (result, settlement) = outcome.clone().into_parts();
+            self.geometry_task_settlement = Some(settlement);
+            self.geometry_task_failure = result.err();
+            self.task_owner.take();
+            if let Some(events) = events {
+                events.emit_completed(GeometryShutdownStage::GeometryTasksSettled);
+            }
+        }
+        outcome
+    }
+
+    pub(crate) async fn shutdown_after_geometry_tasks(
+        &mut self,
+        geometry_task_settlement: crate::lcm_runtime::GeometryTaskSettlement,
+        events: Option<&GeometryShutdownEventEmitter>,
+    ) -> GeometryRuntimeAfterTasksAttempt {
+        if !geometry_task_settlement.is_settled() {
+            return GeometryRuntimeAfterTasksAttempt::Pending {
+                cause: MappingPendingCause::RetirementUnproven(
+                    "Geometry task producers remained unsettled; downstream teardown was withheld"
+                        .to_owned(),
+                ),
+                sticky: ShutdownFailures::default(),
+            };
+        }
+        let mapping_owner = self.mapping_final_owner.take().unwrap_or_else(|| {
+            MappingFinalOwner::waiting_for_lifecycle_lock(
+                self.handle.mapping_adapter.clone(),
+                Arc::clone(&self.handle.mapping_lifecycle_lock),
+            )
+        });
+        let mapping_attempt = mapping_owner
+            .attempt(std::mem::take(&mut self.mapping_final_sticky))
+            .await;
+        let mapping_terminal = match mapping_attempt {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause,
+                sticky,
+            } => {
+                self.mapping_final_owner = Some(owner);
+                self.mapping_final_sticky = sticky.clone();
+                return GeometryRuntimeAfterTasksAttempt::Pending { cause, sticky };
+            }
+            MappingFinalAttempt::Settled {
+                capability: _capability,
+                terminal,
+            } => {
+                if let Some(events) = events {
+                    events.emit_completed(GeometryShutdownStage::MappingRetired);
+                }
+                terminal.map_err(|error| error.to_string())
+            }
+        };
+
+        let lio_result = self.lio.shutdown_retained().await;
+        if let Some(events) = events {
+            events.emit_completed(GeometryShutdownStage::LioJoined);
+        }
+
+        let cleanup_result = cleanup_product_owned_runtime_files(&self.handle, events);
+
+        let mut errors = Vec::new();
+        if let Err(error) = mapping_terminal {
+            errors.push(error);
+        }
+        if let Err(error) = lio_result {
+            errors.push(format!("failed to shut down LIO owner: {error}"));
+        }
+        if let Err(error) = cleanup_result {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            GeometryRuntimeAfterTasksAttempt::Settled { terminal: Ok(()) }
+        } else {
+            GeometryRuntimeAfterTasksAttempt::Settled {
+                terminal: Err(errors.join("; ")),
+            }
+        }
+    }
+}
+
+fn cleanup_product_owned_runtime_files(
+    handle: &GeometryRuntimeHandle,
+    events: Option<&GeometryShutdownEventEmitter>,
+) -> Result<(), String> {
+    let occupancy_result = match handle.occupancy_shm.as_ref() {
+        Some(writer) => writer
+            .lock()
+            .cleanup_product_owned_file()
+            .map_err(|error| format!("product-owned occupancy mmap cleanup failed: {error}")),
+        None => Ok(()),
+    };
+    let cloud_result = {
+        let mut cloud_writer = handle.cloud_map_writer.lock();
+        match cloud_writer.as_mut() {
+            Some(writer) => writer
+                .cleanup_product_owned_file()
+                .map_err(|error| format!("product-owned cloud mmap cleanup failed: {error}")),
+            None => Ok(()),
+        }
+    };
+    let result = match (occupancy_result, cloud_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(occupancy), Err(cloud)) => Err(format!("{occupancy}; {cloud}")),
+    };
+    if result.is_ok() {
+        if let Some(events) = events {
+            events.emit_completed(GeometryShutdownStage::ResourceCleanupComplete);
+        }
+    }
+    result
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1372,6 +1734,74 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn shutdown_event_contract_has_stable_names_fields_and_order() {
+        let stages = [
+            GeometryShutdownStage::GeometryTasksSettled,
+            GeometryShutdownStage::CorrectionSettled,
+            GeometryShutdownStage::MappingRetired,
+            GeometryShutdownStage::LioJoined,
+            GeometryShutdownStage::ResourceCleanupComplete,
+        ];
+        assert_eq!(
+            stages[0].event_name(),
+            "nuwax.geometry.runtime.shutdown.geometry_tasks_settled.v1"
+        );
+        assert_eq!(
+            stages[1].event_name(),
+            "nuwax.geometry.runtime.shutdown.correction_settled.v1"
+        );
+        assert_eq!(
+            stages[2].event_name(),
+            "nuwax.geometry.runtime.shutdown.mapping_retired.v1"
+        );
+        assert_eq!(
+            stages[3].event_name(),
+            "nuwax.geometry.runtime.shutdown.lio_joined.v1"
+        );
+        assert_eq!(
+            stages[4].event_name(),
+            "nuwax.geometry.runtime.shutdown.resource_cleanup_complete.v1"
+        );
+        assert_eq!(GEOMETRY_SHUTDOWN_EVENT_SCHEMA_VERSION, 2);
+        assert_eq!(stages.map(GeometryShutdownStage::ordinal), [1, 2, 3, 4, 5]);
+
+        let (emitter, recorder) = GeometryShutdownEventEmitter::recording(77);
+        for stage in stages {
+            emitter.emit_completed(stage);
+        }
+        assert_eq!(recorder.stages(), stages);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_preserves_replacement_and_emits_no_false_completion() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-LCM Geometry handle");
+        let path = std::env::temp_dir().join(format!(
+            "nuwax-cleanup-failure-{}-{}.mmap",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        *handle.cloud_map_writer.lock() =
+            Some(CloudMapShmWriter::new(&path).expect("product cloud writer"));
+        std::fs::remove_file(&path).expect("remove owned cloud name");
+        std::fs::write(&path, b"foreign replacement").expect("install replacement");
+
+        let (events, recorder) = GeometryShutdownEventEmitter::recording(78);
+        let error = cleanup_product_owned_runtime_files(&handle, Some(&events))
+            .expect_err("replacement identity mismatch must fail cleanup");
+        assert!(error.contains("product-owned cloud mmap cleanup failed"));
+        assert!(!recorder
+            .stages()
+            .contains(&GeometryShutdownStage::ResourceCleanupComplete));
+        assert_eq!(
+            std::fs::read(&path).expect("replacement remains"),
+            b"foreign replacement"
+        );
+        std::fs::remove_file(path).expect("remove replacement");
+    }
 
     #[derive(Default)]
     struct TestIngressSink {

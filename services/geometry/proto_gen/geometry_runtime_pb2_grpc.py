@@ -126,6 +126,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.ActivateMapRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
                 _registered_method=True)
+        self.Relocalize = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/Relocalize',
+                request_serializer=geometry__runtime__pb2.RelocalizeRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.RelocalizeResult.FromString,
+                _registered_method=True)
         self.SetNavigationGoal = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/SetNavigationGoal',
                 request_serializer=geometry__runtime__pb2.NavigationGoal.SerializeToString,
@@ -333,6 +338,12 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ActivateMap(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Relocalize(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -552,6 +563,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.ActivateMap,
                     request_deserializer=geometry__runtime__pb2.ActivateMapRequest.FromString,
                     response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
+            ),
+            'Relocalize': grpc.unary_unary_rpc_method_handler(
+                    servicer.Relocalize,
+                    request_deserializer=geometry__runtime__pb2.RelocalizeRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.RelocalizeResult.SerializeToString,
             ),
             'SetNavigationGoal': grpc.unary_unary_rpc_method_handler(
                     servicer.SetNavigationGoal,
@@ -1133,6 +1149,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/ActivateMap',
             geometry__runtime__pb2.ActivateMapRequest.SerializeToString,
             geometry__runtime__pb2.MappingSessionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Relocalize(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/Relocalize',
+            geometry__runtime__pb2.RelocalizeRequest.SerializeToString,
+            geometry__runtime__pb2.RelocalizeResult.FromString,
             options,
             channel_credentials,
             insecure,

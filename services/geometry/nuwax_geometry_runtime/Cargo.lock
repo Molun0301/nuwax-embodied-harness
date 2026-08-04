@@ -1190,6 +1190,7 @@ dependencies = [
  "nuwax-mapping-raytracing",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
+ "nuwax-nav-pgo-bridge",
  "nuwax-nav-simple-planner",
  "nuwax-nav-stack",
  "nuwax-nav-terrain-map-ext",
@@ -1344,6 +1345,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-native-runner"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nuwax-nav-patrolling"
 version = "0.1.0"
 dependencies = [
@@ -1354,6 +1369,22 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "nuwax-nav-pgo-bridge"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "nuwax-codec",
+ "nuwax-lcm",
+ "nuwax-nav-base",
+ "nuwax-nav-native-runner",
+ "nuwax-nav-types-messages",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

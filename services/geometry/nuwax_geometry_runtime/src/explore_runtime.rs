@@ -3496,10 +3496,13 @@ impl ExploreSchedulerHandle {
         let worker_abort = worker.abort_handle();
         let (terminal_tx, terminal_rx) = watch::channel(None);
         let monitor_terminal_tx = terminal_tx.clone();
+        let monitor_shutdown_rx = shutdown_tx.subscribe();
         let monitor = tokio::spawn(async move {
-            let result = worker
-                .await
-                .map_err(|error| format!("exploration scheduler task join failed: {error}"));
+            let result = match worker.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() && *monitor_shutdown_rx.borrow() => Ok(()),
+                Err(error) => Err(format!("exploration scheduler task join failed: {error}")),
+            };
             monitor_terminal_tx.send_replace(Some(result));
         });
         Self {
@@ -5717,7 +5720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_shutdown_aborts_a_blocked_pose_provider_within_deadline() {
+    async fn scheduler_shutdown_settles_owner_cancelled_blocked_pose_provider() {
         let (handle, _) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -5735,15 +5738,14 @@ mod tests {
             .await
             .expect("scheduler must enter the blocking pose provider");
 
-        let error = tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
             .await
             .expect("scheduler shutdown must abort a blocked pose provider")
-            .expect_err("forced scheduler abort must remain visible");
-        assert!(error.contains("scheduler task join failed"));
+            .expect("owner-requested scheduler cancellation must settle nonfatally");
     }
 
     #[tokio::test]
-    async fn scheduler_shutdown_aborts_blocked_submit_and_releases_runtime_lock() {
+    async fn scheduler_shutdown_settles_blocked_submit_and_releases_runtime_lock() {
         let (handle, sink) = configured_handle();
         handle
             .ingest_costmap_snapshot(frontier_costmap(1))
@@ -5758,17 +5760,30 @@ mod tests {
             .await
             .expect("scheduler must enter child submit");
 
-        let error = tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+        tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
             .await
             .expect("scheduler shutdown must abort blocked child submit")
-            .expect_err("forced scheduler abort must remain visible");
-        assert!(error.contains("scheduler task join failed"));
+            .expect("owner-requested scheduler cancellation must settle nonfatally");
         let stopped =
             tokio::time::timeout(Duration::from_secs(1), handle.stop("req-blocked-submit"))
                 .await
                 .expect("aborting the scheduler must release ExploreRuntimeInner");
         assert_eq!(stopped.status, STATUS_CANCELLED);
         assert!(!handle.blocks_mapping_mutation().await);
+    }
+
+    #[tokio::test]
+    async fn unexpected_scheduler_cancellation_remains_fatal() {
+        let (handle, _) = configured_handle();
+        let scheduler =
+            handle.spawn_scheduler(Arc::new(StaticPoseProvider), Duration::from_millis(5));
+
+        scheduler.inner.worker_abort.abort();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), scheduler.wait_terminal())
+            .await
+            .expect("unexpected scheduler cancellation terminal deadline")
+            .expect_err("unexpected scheduler cancellation must remain fatal");
+        assert!(terminal.contains("scheduler task join failed"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

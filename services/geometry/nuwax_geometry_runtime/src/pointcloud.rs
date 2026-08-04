@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::io::{Error, ErrorKind};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::Arc;
 
@@ -19,6 +22,7 @@ pub const VOXEL_SIZE: f32 = 0.05;
 /// 超过此上限说明上游 LCM 帧 `point_step` 或 `data` 长度异常,直接拒绝
 /// 该帧，避免按异常 raw_count 分配超大 Vec(2026-07-08 实机 abort 模式)。
 pub const POINTCLOUD_MAX_FRAME_POINTS: usize = 100_000;
+pub(crate) const IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES: usize = 120 * 1024 * 1024;
 
 /// 单次 cloud_map 帧允许的 point_step 字节数上限(防御性 sanity cap)。
 ///
@@ -45,6 +49,71 @@ const MAX_VOXEL_SIZE: f32 = 1_048_576.0;
 
 type VoxelKey = (i32, i32, i32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProductOwnedMmapIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ProductOwnedMmapIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+pub(crate) fn capture_product_owned_mmap(
+    path: &Path,
+    file: &std::fs::File,
+) -> std::io::Result<ProductOwnedMmapIdentity> {
+    let descriptor_metadata = file.metadata()?;
+    let named_metadata = std::fs::symlink_metadata(path)?;
+    let descriptor_identity = ProductOwnedMmapIdentity::from_metadata(&descriptor_metadata);
+    let named_identity = ProductOwnedMmapIdentity::from_metadata(&named_metadata);
+    if !named_metadata.file_type().is_file() || named_identity != descriptor_identity {
+        return Err(Error::other(format!(
+            "product-owned mmap path changed during creation: path={} descriptor={descriptor_identity:?} named={named_identity:?}",
+            path.display()
+        )));
+    }
+    Ok(descriptor_identity)
+}
+
+pub(crate) fn unlink_product_owned_mmap(
+    path: &Path,
+    expected_identity: ProductOwnedMmapIdentity,
+) -> std::io::Result<()> {
+    let named_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let actual_identity = ProductOwnedMmapIdentity::from_metadata(&named_metadata);
+    if !named_metadata.file_type().is_file() || actual_identity != expected_identity {
+        return Err(Error::other(format!(
+            "refusing to unlink replaced mmap path: path={} expected={expected_identity:?} actual={actual_identity:?}",
+            path.display()
+        )));
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(metadata) => Err(Error::other(format!(
+            "mmap path was recreated during cleanup: path={} actual={:?}",
+            path.display(),
+            ProductOwnedMmapIdentity::from_metadata(&metadata)
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
 const CM_ACTIVE_BUFFER_OFFSET: usize = 12;
 const CM_GLOBAL_POINT_COUNT_OFFSET: usize = 16;
 const CM_TIMESTAMP_NS_OFFSET: usize = 20;
@@ -68,6 +137,8 @@ pub(crate) fn cloud_map_active_slot(revision: u64) -> Option<u32> {
 
 pub struct CloudMapShmWriter {
     mmap: MmapMut,
+    shm_path: std::path::PathBuf,
+    shm_identity: ProductOwnedMmapIdentity,
     revision: u64,
     voxel_size: f32,
     session_generation: u64,
@@ -176,6 +247,110 @@ pub(crate) struct CorrelatedCloudMapCommit {
     pub(crate) receipt: CloudCommitReceipt,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ImmutableActivatedTarget {
+    pub(crate) frame_id: String,
+    pub(crate) source_revision: u64,
+    pub(crate) point_count: u32,
+    pub(crate) voxel_size: f32,
+    pub(crate) xyz_f32_le: Vec<u8>,
+    pub(crate) xyz_sha256: [u8; 32],
+    pub(crate) payload_schema_version: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_immutable_activated_target(
+    frame_id: &str,
+    expected_map_frame_id: &str,
+    source_revision: u64,
+    point_count: u32,
+    voxel_size: f32,
+    xyz_f32_le: &[u8],
+    xyz_sha256: &str,
+    payload_schema_version: u32,
+) -> Result<ImmutableActivatedTarget, String> {
+    if payload_schema_version != CM_PAYLOAD_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported immutable target schema: expected={} actual={payload_schema_version}",
+            CM_PAYLOAD_SCHEMA_VERSION
+        ));
+    }
+    if frame_id.is_empty()
+        || frame_id.len() > 256
+        || frame_id != frame_id.trim()
+        || frame_id != expected_map_frame_id
+    {
+        return Err(format!(
+            "immutable target frame must be canonical {expected_map_frame_id}, received {frame_id}"
+        ));
+    }
+    if source_revision == 0 {
+        return Err("immutable target source_revision must be positive".to_owned());
+    }
+    if point_count == 0 {
+        return Err("immutable target must contain at least one point".to_owned());
+    }
+    if !voxel_size.is_finite() || voxel_size <= 0.0 || voxel_size > MAX_VOXEL_SIZE {
+        return Err("immutable target voxel_size must be finite and positive".to_owned());
+    }
+
+    let expected_size = usize::try_from(point_count)
+        .map_err(|_| "immutable target point_count exceeds usize".to_owned())?
+        .checked_mul(CM_POINT_SIZE_BYTES)
+        .ok_or_else(|| "immutable target payload size overflow".to_owned())?;
+    if expected_size > IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES {
+        return Err(format!(
+            "immutable target exceeds {} bytes: {expected_size}",
+            IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES
+        ));
+    }
+    if xyz_f32_le.len() != expected_size {
+        return Err(format!(
+            "immutable target payload size mismatch: expected={expected_size} actual={}",
+            xyz_f32_le.len()
+        ));
+    }
+
+    let expected_digest = decode_checkpoint_sha256(xyz_sha256)?;
+    let actual_digest = crate::map_checksum::sha256_bytes(xyz_f32_le);
+    if actual_digest != expected_digest {
+        return Err("immutable target xyz_sha256 mismatch".to_owned());
+    }
+    for (index, point) in xyz_f32_le.chunks_exact(CM_POINT_SIZE_BYTES).enumerate() {
+        let coordinates = [
+            f32::from_le_bytes(point[0..4].try_into().unwrap()),
+            f32::from_le_bytes(point[4..8].try_into().unwrap()),
+            f32::from_le_bytes(point[8..12].try_into().unwrap()),
+        ];
+        if coordinates.iter().any(|value| !value.is_finite()) {
+            return Err(format!("immutable target point {index} is non-finite"));
+        }
+    }
+
+    Ok(ImmutableActivatedTarget {
+        frame_id: frame_id.to_owned(),
+        source_revision,
+        point_count,
+        voxel_size,
+        xyz_f32_le: xyz_f32_le.to_vec(),
+        xyz_sha256: actual_digest,
+        payload_schema_version,
+    })
+}
+
+pub(crate) fn decode_checkpoint_sha256(value: &str) -> Result<[u8; 32], String> {
+    let value = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("immutable target xyz_sha256 must be exactly 64 hexadecimal digits".to_owned());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "immutable target xyz_sha256 is invalid".to_owned())?;
+    }
+    Ok(digest)
+}
+
 impl CloudMapShmWriter {
     pub fn new(shm_path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -184,6 +359,7 @@ impl CloudMapShmWriter {
             .create(true)
             .truncate(true)
             .open(shm_path)?;
+        let shm_identity = capture_product_owned_mmap(shm_path, &file)?;
         file.set_len(CM_TOTAL_SIZE as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
@@ -195,6 +371,8 @@ impl CloudMapShmWriter {
         );
         Ok(Self {
             mmap,
+            shm_path: shm_path.to_path_buf(),
+            shm_identity,
             revision: 0,
             voxel_size: VOXEL_SIZE,
             session_generation: 0,
@@ -204,6 +382,10 @@ impl CloudMapShmWriter {
             last_cloud_receipt: None,
             typed_publish_state: Arc::new(TypedCloudPublishState::new()),
         })
+    }
+
+    pub(crate) fn cleanup_product_owned_file(&mut self) -> std::io::Result<()> {
+        unlink_product_owned_mmap(&self.shm_path, self.shm_identity)
     }
 
     pub(crate) fn typed_publish_state(&self) -> Arc<TypedCloudPublishState> {
@@ -667,6 +849,126 @@ mod tests {
 
     fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn product_cleanup_unlinks_owned_cloud_mmap() {
+        let path = test_path("owned-cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+
+        writer
+            .cleanup_product_owned_file()
+            .expect("owned cloud mmap cleanup");
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn product_cleanup_rejects_replaced_cloud_mmap() {
+        let path = test_path("replaced-cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        std::fs::remove_file(&path).expect("remove owned name");
+        std::fs::write(&path, b"foreign replacement").expect("install replacement");
+
+        let error = writer
+            .cleanup_product_owned_file()
+            .expect_err("replacement must be preserved");
+
+        assert!(error
+            .to_string()
+            .contains("refusing to unlink replaced mmap path"));
+        assert_eq!(
+            std::fs::read(&path).expect("replacement remains"),
+            b"foreign replacement"
+        );
+        std::fs::remove_file(path).expect("remove replacement");
+    }
+
+    #[test]
+    fn product_cleanup_is_idempotent_when_cloud_mmap_is_missing() {
+        let path = test_path("missing-cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = CloudMapShmWriter::new(&path).expect("cloud map writer");
+        std::fs::remove_file(&path).expect("remove owned name");
+
+        writer
+            .cleanup_product_owned_file()
+            .expect("first missing cleanup");
+        writer
+            .cleanup_product_owned_file()
+            .expect("repeated missing cleanup");
+    }
+
+    #[test]
+    fn immutable_target_decoder_retains_exact_bytes_and_accepts_legacy_hex_formatting() {
+        let xyz_f32_le = [1.0_f32, -2.0, 3.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let digest = format!(
+            " \t{}\r\n",
+            crate::map_checksum::sha256_hex(&xyz_f32_le).to_ascii_uppercase()
+        );
+        let target = decode_immutable_activated_target(
+            "map",
+            "map",
+            9,
+            1,
+            0.1,
+            &xyz_f32_le,
+            &digest,
+            CM_PAYLOAD_SCHEMA_VERSION,
+        )
+        .expect("strict immutable target");
+        assert_eq!(target.xyz_f32_le, xyz_f32_le);
+        assert_eq!(
+            target.xyz_sha256,
+            crate::map_checksum::sha256_bytes(&target.xyz_f32_le)
+        );
+    }
+
+    #[test]
+    fn immutable_target_decoder_rejects_malformed_and_unbounded_payloads() {
+        let finite = [1.0_f32, 2.0, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let digest = crate::map_checksum::sha256_hex(&finite);
+        let decode = |frame: &str,
+                      revision: u64,
+                      count: u32,
+                      voxel: f32,
+                      bytes: &[u8],
+                      checksum: &str,
+                      schema: u32| {
+            decode_immutable_activated_target(
+                frame, "map", revision, count, voxel, bytes, checksum, schema,
+            )
+        };
+        assert!(decode("/map", 9, 1, 0.1, &finite, &digest, 1).is_err());
+        assert!(decode("map", 0, 1, 0.1, &finite, &digest, 1).is_err());
+        assert!(decode("map", 9, 0, 0.1, &[], &digest, 1).is_err());
+        assert!(decode("map", 9, 1, -0.0, &finite, &digest, 1).is_err());
+        assert!(decode("map", 9, 1, 0.1, &finite, &digest, 2).is_err());
+        assert!(decode("map", 9, 1, 0.1, &finite, &"00".repeat(32), 1).is_err());
+
+        let mut trailing = finite.clone();
+        trailing.push(0);
+        let trailing_digest = crate::map_checksum::sha256_hex(&trailing);
+        assert!(decode("map", 9, 1, 0.1, &trailing, &trailing_digest, 1).is_err());
+
+        let nonfinite = [f32::INFINITY, 2.0, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let nonfinite_digest = crate::map_checksum::sha256_hex(&nonfinite);
+        assert!(decode("map", 9, 1, 0.1, &nonfinite, &nonfinite_digest, 1).is_err());
+
+        let over_limit_count =
+            u32::try_from(IMMUTABLE_ACTIVATED_TARGET_MAX_BYTES / CM_POINT_SIZE_BYTES + 1).unwrap();
+        assert!(decode("map", 9, over_limit_count, 0.1, &[], &"00".repeat(32), 1).is_err());
     }
 
     #[test]

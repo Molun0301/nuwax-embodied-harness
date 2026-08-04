@@ -100,6 +100,19 @@ message StopMappingRequest {
   string reason = 2;
 }
 
+enum ActivationReceiptDisposition {
+  ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED = 0;
+  ACTIVATION_RECEIPT_DISPOSITION_STAGED = 1;
+  ACTIVATION_RECEIPT_DISPOSITION_SEALED = 2;
+  ACTIVATION_RECEIPT_DISPOSITION_SEALED_REPLAY = 3;
+  ACTIVATION_RECEIPT_DISPOSITION_LEGACY_UNBOUND = 4;
+  ACTIVATION_RECEIPT_DISPOSITION_RETIRED = 5;
+  ACTIVATION_RECEIPT_DISPOSITION_CONFLICT = 6;
+  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_PRECOMMIT = 7;
+  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_POSTCOMMIT = 8;
+  ACTIVATION_RECEIPT_DISPOSITION_OUTCOME_UNKNOWN = 9;
+}
+
 message MappingSessionState {
   reserved 6;
   reserved "map_version_id";
@@ -114,6 +127,23 @@ message MappingSessionState {
   bool idempotent_replay = 10;
   bool legacy_checkpoint_reconstructed = 11;
   string mapping_backend_kind = 12;
+  uint32 activation_receipt_schema_version = 13;
+  ActivationReceiptDisposition activation_receipt_disposition = 14;
+  uint64 runtime_generation = 15;
+  uint64 backend_generation = 16;
+  string activation_request_id = 17;
+  bytes activation_request_identity_sha256 = 18;
+  bytes activation_identity_sha256 = 19;
+  bytes target_receipt_sha256 = 20;
+  bytes asset_manifest_sha256 = 21;
+  bytes asset_bundle_sha256 = 22;
+  bool relocalization_target_available = 23;
+  uint32 source_policy_version = 24;
+  bytes source_policy_sha256 = 25;
+  uint32 deadline_policy_version = 26;
+  bytes deadline_policy_sha256 = 27;
+  uint32 algorithm_options_version = 28;
+  bytes algorithm_options_sha256 = 29;
 }
 
 message CloudMapCheckpoint {
@@ -173,6 +203,101 @@ message ActivateMapRequest {
   OccupancyGridData checkpoint = 4;
   CloudMapCheckpoint cloud_checkpoint = 5;
   MappingBackendCheckpoint mapping_backend_checkpoint = 6;
+  string activation_request_id = 7;
+  bytes asset_manifest_sha256 = 8;
+  bytes asset_bundle_sha256 = 9;
+  uint64 expected_runtime_generation = 10;
+  uint32 activation_contract_version = 11;
+}
+
+enum RelocalizeDisposition {
+  RELOCALIZE_DISPOSITION_UNSPECIFIED = 0;
+  RELOCALIZE_DISPOSITION_APPLIED = 1;
+  RELOCALIZE_DISPOSITION_ALREADY_APPLIED = 2;
+  RELOCALIZE_DISPOSITION_REJECTED = 3;
+  RELOCALIZE_DISPOSITION_TARGET_UNAVAILABLE = 4;
+  RELOCALIZE_DISPOSITION_STALE_SESSION = 5;
+  RELOCALIZE_DISPOSITION_SESSION_INVALIDATED = 6;
+  RELOCALIZE_DISPOSITION_TARGET_INVALIDATED = 7;
+  RELOCALIZE_DISPOSITION_REPLAY_CONFLICT = 8;
+  RELOCALIZE_DISPOSITION_BUSY = 9;
+  RELOCALIZE_DISPOSITION_CANCELLED = 10;
+  RELOCALIZE_DISPOSITION_DEADLINE_EXCEEDED = 11;
+  RELOCALIZE_DISPOSITION_INSUFFICIENT_SOURCE = 12;
+  RELOCALIZE_DISPOSITION_ALGORITHM_REJECTED = 13;
+  RELOCALIZE_DISPOSITION_OWNER_FAILED = 14;
+  RELOCALIZE_DISPOSITION_OWNER_STOPPED = 15;
+}
+
+message RelocalizeRequest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  uint64 runtime_generation = 3;
+  string session_id = 4;
+  string map_name = 5;
+  uint64 session_generation = 6;
+  uint64 backend_generation = 7;
+  bytes activation_identity_sha256 = 8;
+  bytes target_receipt_sha256 = 9;
+  uint64 target_cloud_revision = 10;
+  bytes target_cloud_sha256 = 11;
+  bytes asset_manifest_sha256 = 12;
+  bytes asset_bundle_sha256 = 13;
+  uint32 source_policy_version = 14;
+  bytes source_policy_sha256 = 15;
+  uint32 deadline_policy_version = 16;
+  bytes deadline_policy_sha256 = 17;
+  uint64 logical_timeout_ms = 18;
+  uint32 algorithm_options_version = 19;
+  bytes algorithm_options_sha256 = 20;
+}
+
+message RelocalizeResult {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  bytes request_identity_sha256 = 3;
+  uint64 runtime_generation = 4;
+  string session_id = 5;
+  string map_name = 6;
+  uint64 session_generation = 7;
+  uint64 backend_generation = 8;
+  bytes activation_identity_sha256 = 9;
+  bytes target_receipt_sha256 = 10;
+  uint64 target_cloud_revision = 11;
+  bytes target_cloud_sha256 = 12;
+  bytes asset_manifest_sha256 = 13;
+  bytes asset_bundle_sha256 = 14;
+  uint32 source_policy_version = 15;
+  bytes source_policy_sha256 = 16;
+  uint32 deadline_policy_version = 17;
+  bytes deadline_policy_sha256 = 18;
+  uint64 logical_timeout_ms = 19;
+  uint32 algorithm_options_version = 20;
+  bytes algorithm_options_sha256 = 21;
+  RelocalizeDisposition disposition = 22;
+  uint64 candidate_sequence = 23;
+  bytes candidate_payload_sha256 = 24;
+  bytes evidence_sha256 = 25;
+  uint64 correction_revision = 26;
+  bytes terminal_proof_sha256 = 27;
+  string detail = 28;
+  // Exact CorrectionCandidate LCM body prefix hashed by field 24; max 4096 bytes.
+  bytes candidate_payload_preimage_v1 = 29;
+  // Bounded evidence transcript, all integers big-endian:
+  // domain "nuwax.geometry.relocalize.evidence-disclosure.v1\0", u32 version,
+  // u8 mode. Mode 0 is u64 length + the complete small evidence preimage.
+  // Mode 1 is four u64 lengths (full/prefix/source/suffix), prefix bytes,
+  // SHA-256(source), then suffix bytes. Prefix ends in the canonical
+  // "nuwax.geometry.relocalize.source-commitment.v1\0" record containing the
+  // independently checked source length and digest. Field 25 is SHA-256 of
+  // domain "nuwax.geometry.relocalize.evidence-composite.v1\0", u32 version,
+  // and tagged 0..3 full/prefix/source/suffix length-bound components; source
+  // contributes its anchored digest instead of an unverifiable SHA midstate.
+  // Prefix/source/suffix remain bounded by 16384/2400008/4096 bytes and the
+  // retained disclosure by 20736 bytes.
+  // Fields 29 and 30 are deliberately excluded from the frozen v1 terminal-
+  // proof preimage, which remains protobuf fields 1 through 28 only.
+  bytes evidence_disclosure_v1 = 30;
 }
 
 // === 视频帧共享内存 ===
@@ -501,6 +626,7 @@ service GeometryRuntime {
   rpc GetMappingState(Empty) returns (MappingSessionState);
   rpc ExportMappingBackendCheckpoint(Empty) returns (MappingBackendCheckpoint);
   rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
+  rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);

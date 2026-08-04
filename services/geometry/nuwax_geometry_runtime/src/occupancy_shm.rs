@@ -12,9 +12,12 @@ use std::io::{Error, ErrorKind};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 
 use memmap2::{Mmap, MmapMut};
-use tracing::{error, info};
+use tracing::info;
 
 use crate::lcm_runtime::MapState;
+use crate::pointcloud::{
+    capture_product_owned_mmap, unlink_product_owned_mmap, ProductOwnedMmapIdentity,
+};
 
 #[cfg(not(target_has_atomic = "64"))]
 compile_error!("occupancy SHM v2 requires lock-free 64-bit atomics");
@@ -56,7 +59,7 @@ const SLOT_ORIGIN_Y_OFFSET: usize = 80;
 const SLOT_CHECKSUM_OFFSET: usize = 88;
 const SLOT_FRAME_ID_OFFSET: usize = 120;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MapWriteIdentity {
     width: u32,
     height: u32,
@@ -68,6 +71,56 @@ struct MapWriteIdentity {
     timestamp_ns: u64,
     data_len: usize,
     data_checksum: [u8; 32],
+}
+
+/// Opaque proof that one complete occupancy payload was flushed into an
+/// inactive slot without changing the reader-visible global header.
+///
+/// The token is deliberately non-`Clone`: dropping it aborts publication.
+/// `commit_prepared` also validates the writer/session/base-state epoch, so a
+/// restart or a newer prepare makes an older token unusable.
+#[derive(Debug)]
+pub(crate) struct PreparedOccupancyWrite {
+    staging_epoch: u64,
+    session_generation: u64,
+    base_published_generation: u64,
+    base_active_slot: Option<usize>,
+    base_slot_capacity: usize,
+    base_last_revision: u64,
+    staged_generation: u64,
+    staged_slot: Option<usize>,
+    staged_slot_capacity: usize,
+    revision: u64,
+    identity: MapWriteIdentity,
+}
+
+/// Exact descriptor facts returned after the global header has been committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OccupancyShmCommit {
+    pub file_size: u64,
+    pub revision: u64,
+    pub generation: u64,
+    pub active_slot: usize,
+    pub layout_version: u32,
+}
+
+/// Single-use rollback authority for one occupancy session-fence advance.
+///
+/// Rollback restores the prior logical session identity only while no prepare
+/// or publication has crossed the installed fence. The staging epoch remains
+/// consumed so a token prepared before the advance cannot become valid again.
+#[derive(Debug)]
+pub(crate) struct OccupancySessionFenceTransaction {
+    previous_session_generation: u64,
+    previous_last_revision: u64,
+    previous_last_identity: Option<MapWriteIdentity>,
+    installed_session_generation: u64,
+    installed_staging_epoch: u64,
+    base_published_generation: u64,
+    base_active_slot: Option<usize>,
+    base_slot_capacity: usize,
+    base_physical_write_count: u64,
+    advanced: bool,
 }
 
 impl MapWriteIdentity {
@@ -98,8 +151,10 @@ pub struct OccupancyGridShmWriter {
     session_generation: u64,
     last_revision: u64,
     last_identity: Option<MapWriteIdentity>,
+    staging_epoch: u64,
     physical_write_count: u64,
     shm_path: std::path::PathBuf,
+    shm_identity: ProductOwnedMmapIdentity,
 }
 
 impl OccupancyGridShmWriter {
@@ -120,6 +175,7 @@ impl OccupancyGridShmWriter {
             .create(true)
             .truncate(true)
             .open(shm_path)?;
+        let shm_identity = capture_product_owned_mmap(shm_path, &file)?;
         file.set_len(usize_to_u64(capacity, "occupancy SHM capacity")?)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         mmap.fill(0);
@@ -157,14 +213,28 @@ impl OccupancyGridShmWriter {
             session_generation: 0,
             last_revision: 0,
             last_identity: None,
+            staging_epoch: 0,
             physical_write_count: 0,
             shm_path: shm_path.to_path_buf(),
+            shm_identity,
         })
+    }
+
+    pub(crate) fn cleanup_product_owned_file(&mut self) -> std::io::Result<()> {
+        unlink_product_owned_mmap(&self.shm_path, self.shm_identity)
     }
 
     /// Fence revision tracking to a mapping session while keeping the physical
     /// SHM publication generation monotonic across sessions.
     pub fn begin_session(&mut self, session_generation: u64) -> std::io::Result<()> {
+        self.begin_session_transactional(session_generation)
+            .map(drop)
+    }
+
+    pub(crate) fn begin_session_transactional(
+        &mut self,
+        session_generation: u64,
+    ) -> std::io::Result<OccupancySessionFenceTransaction> {
         if session_generation == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -180,16 +250,79 @@ impl OccupancyGridShmWriter {
                 ),
             ));
         }
+        let previous_session_generation = self.session_generation;
+        let previous_last_revision = self.last_revision;
+        let previous_last_identity = self.last_identity.clone();
+        let base_published_generation = self.published_generation;
+        let base_active_slot = self.active_slot;
+        let base_slot_capacity = self.slot_capacity;
+        let base_physical_write_count = self.physical_write_count;
+        let mut advanced = false;
         if session_generation > self.session_generation {
+            self.staging_epoch = self.staging_epoch.checked_add(1).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "occupancy SHM staging epoch exhausted",
+                )
+            })?;
             self.session_generation = session_generation;
             self.last_revision = 0;
             self.last_identity = None;
+            advanced = true;
         }
+        Ok(OccupancySessionFenceTransaction {
+            previous_session_generation,
+            previous_last_revision,
+            previous_last_identity,
+            installed_session_generation: self.session_generation,
+            installed_staging_epoch: self.staging_epoch,
+            base_published_generation,
+            base_active_slot,
+            base_slot_capacity,
+            base_physical_write_count,
+            advanced,
+        })
+    }
+
+    pub(crate) fn rollback_session_fence(
+        &mut self,
+        transaction: OccupancySessionFenceTransaction,
+    ) -> std::io::Result<()> {
+        if !transaction.advanced {
+            return Ok(());
+        }
+        if self.session_generation != transaction.installed_session_generation
+            || self.staging_epoch != transaction.installed_staging_epoch
+            || self.published_generation != transaction.base_published_generation
+            || self.active_slot != transaction.base_active_slot
+            || self.slot_capacity != transaction.base_slot_capacity
+            || self.physical_write_count != transaction.base_physical_write_count
+            || self.last_revision != 0
+            || self.last_identity.is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "occupancy SHM session fence crossed prepare or publication before rollback",
+            ));
+        }
+        self.session_generation = transaction.previous_session_generation;
+        self.last_revision = transaction.previous_last_revision;
+        self.last_identity = transaction.previous_last_identity;
         Ok(())
     }
 
     /// Serialize and atomically publish one map revision into the inactive slot.
     pub fn write_occupancy(&mut self, map: &MapState) -> std::io::Result<u64> {
+        let prepared = self.prepare_occupancy(map)?;
+        Ok(self.commit_prepared(prepared)?.revision)
+    }
+
+    /// Write, verify, and flush a map into an inactive slot while leaving the
+    /// reader-visible global publication header unchanged.
+    pub(crate) fn prepare_occupancy(
+        &mut self,
+        map: &MapState,
+    ) -> std::io::Result<PreparedOccupancyWrite> {
         validate_map(map)?;
         let identity = MapWriteIdentity::from_map(map);
         if map.revision < self.last_revision {
@@ -203,7 +336,25 @@ impl OccupancyGridShmWriter {
         }
         if map.revision == self.last_revision {
             if self.last_identity.as_ref() == Some(&identity) {
-                return Ok(map.revision);
+                self.staging_epoch = self.staging_epoch.checked_add(1).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "occupancy SHM staging epoch exhausted",
+                    )
+                })?;
+                return Ok(PreparedOccupancyWrite {
+                    staging_epoch: self.staging_epoch,
+                    session_generation: self.session_generation,
+                    base_published_generation: self.published_generation,
+                    base_active_slot: self.active_slot,
+                    base_slot_capacity: self.slot_capacity,
+                    base_last_revision: self.last_revision,
+                    staged_generation: self.published_generation,
+                    staged_slot: None,
+                    staged_slot_capacity: self.slot_capacity,
+                    revision: map.revision,
+                    identity,
+                });
             }
             if self.last_identity.is_some() {
                 return Err(Error::new(
@@ -216,33 +367,94 @@ impl OccupancyGridShmWriter {
             }
         }
 
+        self.staging_epoch = self.staging_epoch.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "occupancy SHM staging epoch exhausted",
+            )
+        })?;
+
         let required_slot = SLOT_HEADER_BYTES
             .checked_add(map.data.len())
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "occupancy slot size overflow"))?;
-        let grew = if required_slot > self.slot_capacity {
-            let new_slot_capacity = required_slot.max(
+        let staged_slot_capacity = if required_slot > self.slot_capacity {
+            required_slot.max(
                 self.slot_capacity
                     .checked_mul(OCC_GROW_FACTOR)
                     .unwrap_or(required_slot),
-            );
-            self.grow(new_slot_capacity)?;
-            true
+            )
         } else {
-            false
+            self.slot_capacity
         };
+        let layout_grows = staged_slot_capacity > self.slot_capacity;
+        if layout_grows {
+            self.grow(staged_slot_capacity)?;
+        }
 
         let next_generation = self
             .published_generation
             .checked_add(1)
             .filter(|generation| *generation <= (u64::MAX >> 1))
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "SHM generation exhausted"))?;
-        let next_slot = match (grew, self.active_slot) {
+        let next_slot = match (layout_grows, self.active_slot) {
             // A grown slot1 starts after both old physical slots, so a failed write can safely
             // restore the old descriptor regardless of which old slot was active.
             (true, _) => 1,
             (false, Some(slot)) => 1 - slot,
             (false, None) => 0,
         };
+        self.write_and_verify_slot(
+            next_slot,
+            staged_slot_capacity,
+            next_generation,
+            map,
+            &identity,
+        )?;
+
+        Ok(PreparedOccupancyWrite {
+            staging_epoch: self.staging_epoch,
+            session_generation: self.session_generation,
+            base_published_generation: self.published_generation,
+            base_active_slot: self.active_slot,
+            base_slot_capacity: self.slot_capacity,
+            base_last_revision: self.last_revision,
+            staged_generation: next_generation,
+            staged_slot: Some(next_slot),
+            staged_slot_capacity,
+            revision: map.revision,
+            identity,
+        })
+    }
+
+    /// Atomically expose a previously flushed inactive slot.
+    ///
+    /// All fallible validation happens before the first global-header store.
+    /// The mmap is transient process-shared state (startup truncates it), so
+    /// release-atomic visibility, rather than crash-durable header flushing,
+    /// defines the commit acknowledgement.
+    pub(crate) fn commit_prepared(
+        &mut self,
+        prepared: PreparedOccupancyWrite,
+    ) -> std::io::Result<OccupancyShmCommit> {
+        self.validate_prepared_base(&prepared)?;
+        let file_size = usize_to_u64(self.capacity, "occupancy SHM file size")?;
+
+        let Some(next_slot) = prepared.staged_slot else {
+            let active_slot = self.active_slot.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "idempotent occupancy commit has no active slot",
+                )
+            })?;
+            return Ok(OccupancyShmCommit {
+                file_size,
+                revision: prepared.revision,
+                generation: self.published_generation,
+                active_slot,
+                layout_version: OCCUPANCY_SHM_LAYOUT_VERSION,
+            });
+        };
+
         let previous_stable_sequence = self
             .published_generation
             .checked_mul(2)
@@ -250,70 +462,91 @@ impl OccupancyGridShmWriter {
         let in_progress_sequence = previous_stable_sequence
             .checked_add(1)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "SHM write sequence overflow"))?;
-        let next_stable_sequence = next_generation
+        let next_stable_sequence = prepared
+            .staged_generation
             .checked_mul(2)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "SHM write sequence overflow"))?;
-
-        // Readers see odd before any inactive-slot mutation.
-        atomic_store_u64(
-            &self.mmap,
-            GLOBAL_WRITE_SEQUENCE_OFFSET,
-            in_progress_sequence,
-            Ordering::Release,
+        let next_published_state = encode_published_state(prepared.staged_generation, next_slot)?;
+        let previous_published_state = match self.active_slot {
+            Some(active_slot) => encode_published_state(self.published_generation, active_slot)?,
+            None if self.published_generation == 0 => 0,
+            None => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "published occupancy generation has no active slot",
+                ));
+            }
+        };
+        let staged_slot_capacity = usize_to_u64(
+            prepared.staged_slot_capacity,
+            "staged occupancy slot capacity",
         )?;
+        let current_slot_capacity = usize_to_u64(self.slot_capacity, "occupancy slot capacity")?;
 
-        let write_result = self.write_and_verify_slot(next_slot, next_generation, map, &identity);
-        if let Err(write_error) = write_result {
-            // The published descriptor and global slot capacity were not changed. Restore the
-            // previous stable sequence so readers can continue using the old active slot.
-            atomic_store_u64(
-                &self.mmap,
-                GLOBAL_WRITE_SEQUENCE_OFFSET,
-                previous_stable_sequence,
-                Ordering::Release,
-            )?;
-            return Err(write_error);
+        let sequence = atomic_u64_at(&self.mmap, GLOBAL_WRITE_SEQUENCE_OFFSET)?;
+        let published_state = atomic_u64_at(&self.mmap, GLOBAL_PUBLISHED_STATE_OFFSET)?;
+        let slot_capacity = atomic_u64_at(&self.mmap, GLOBAL_SLOT_CAPACITY_OFFSET)?;
+        if sequence.load(Ordering::Acquire) != previous_stable_sequence
+            || published_state.load(Ordering::Acquire) != previous_published_state
+            || slot_capacity.load(Ordering::Acquire) != current_slot_capacity
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "occupancy SHM global header differs from prepared base state",
+            ));
         }
 
-        atomic_store_u64(
-            &self.mmap,
-            GLOBAL_SLOT_CAPACITY_OFFSET,
-            usize_to_u64(self.slot_capacity, "occupancy slot capacity")?,
-            Ordering::Release,
-        )?;
+        sequence.store(in_progress_sequence, Ordering::Release);
+        slot_capacity.store(staged_slot_capacity, Ordering::Release);
         fence(Ordering::Release);
-        atomic_store_u64(
-            &self.mmap,
-            GLOBAL_PUBLISHED_STATE_OFFSET,
-            encode_published_state(next_generation, next_slot)?,
-            Ordering::Release,
-        )?;
-        atomic_store_u64(
-            &self.mmap,
-            GLOBAL_WRITE_SEQUENCE_OFFSET,
-            next_stable_sequence,
-            Ordering::Release,
-        )?;
+        published_state.store(next_published_state, Ordering::Release);
+        sequence.store(next_stable_sequence, Ordering::Release);
 
+        self.slot_capacity = prepared.staged_slot_capacity;
         self.active_slot = Some(next_slot);
-        self.published_generation = next_generation;
-        self.last_revision = map.revision;
-        self.last_identity = Some(identity);
+        self.published_generation = prepared.staged_generation;
+        self.last_revision = prepared.revision;
+        self.last_identity = Some(prepared.identity);
         self.physical_write_count = self.physical_write_count.saturating_add(1);
-        if let Err(flush_error) = self.mmap.flush_range(0, GLOBAL_HEADER_BYTES) {
-            error!("occupancy grid SHM publication header flush failed: {flush_error}");
+        Ok(OccupancyShmCommit {
+            file_size,
+            revision: self.last_revision,
+            generation: self.published_generation,
+            active_slot: next_slot,
+            layout_version: OCCUPANCY_SHM_LAYOUT_VERSION,
+        })
+    }
+
+    /// Consume a prepared token without exposing its inactive slot.
+    pub(crate) fn abort_prepared(&mut self, prepared: PreparedOccupancyWrite) -> bool {
+        self.validate_prepared_base(&prepared).is_ok()
+    }
+
+    fn validate_prepared_base(&self, prepared: &PreparedOccupancyWrite) -> std::io::Result<()> {
+        if prepared.staging_epoch != self.staging_epoch
+            || prepared.session_generation != self.session_generation
+            || prepared.base_published_generation != self.published_generation
+            || prepared.base_active_slot != self.active_slot
+            || prepared.base_slot_capacity != self.slot_capacity
+            || prepared.base_last_revision != self.last_revision
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "occupancy SHM prepared token is stale",
+            ));
         }
-        Ok(map.revision)
+        Ok(())
     }
 
     fn write_and_verify_slot(
         &mut self,
         slot: usize,
+        slot_capacity: usize,
         generation: u64,
         map: &MapState,
         identity: &MapWriteIdentity,
     ) -> std::io::Result<()> {
-        let slot_offset = slot_offset(slot, self.slot_capacity)?;
+        let slot_offset = slot_offset(slot, slot_capacity)?;
         let payload_offset = slot_offset
             .checked_add(SLOT_HEADER_BYTES)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "payload offset overflow"))?;
@@ -409,15 +642,17 @@ impl OccupancyGridShmWriter {
     fn grow(&mut self, new_slot_capacity: usize) -> std::io::Result<()> {
         let new_slot_capacity = new_slot_capacity.max(SLOT_HEADER_BYTES + 1);
         let new_capacity = total_capacity(new_slot_capacity)?;
+        if new_capacity <= self.capacity {
+            return Ok(());
+        }
         self.mmap.flush()?;
         self.file
             .set_len(usize_to_u64(new_capacity, "occupancy SHM capacity")?)?;
         let new_mmap = unsafe { MmapMut::map_mut(&self.file)? };
         self.mmap = new_mmap;
         self.capacity = new_capacity;
-        self.slot_capacity = new_slot_capacity;
         info!(
-            "occupancy grid SHM v2 grew in-place: total={} slot={}",
+            "occupancy grid SHM v2 allocation grew in-place: total={} staged_slot={}",
             new_capacity, new_slot_capacity
         );
         Ok(())
@@ -449,6 +684,15 @@ impl OccupancyGridShmWriter {
 
     pub fn physical_write_count(&self) -> u64 {
         self.physical_write_count
+    }
+
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    #[cfg(test)]
+    fn staging_epoch(&self) -> u64 {
+        self.staging_epoch
     }
 }
 
@@ -921,6 +1165,56 @@ mod tests {
     }
 
     #[test]
+    fn product_cleanup_unlinks_owned_occupancy_mmap() {
+        let path = test_path("owned_cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+
+        writer
+            .cleanup_product_owned_file()
+            .expect("owned occupancy mmap cleanup");
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn product_cleanup_rejects_replaced_occupancy_mmap() {
+        let path = test_path("replaced_cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        std::fs::remove_file(&path).expect("remove owned name");
+        std::fs::write(&path, b"foreign replacement").expect("install replacement");
+
+        let error = writer
+            .cleanup_product_owned_file()
+            .expect_err("replacement must be preserved");
+
+        assert!(error
+            .to_string()
+            .contains("refusing to unlink replaced mmap path"));
+        assert_eq!(
+            std::fs::read(&path).expect("replacement remains"),
+            b"foreign replacement"
+        );
+        std::fs::remove_file(path).expect("remove replacement");
+    }
+
+    #[test]
+    fn product_cleanup_is_idempotent_when_occupancy_mmap_is_missing() {
+        let path = test_path("missing_cleanup");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        std::fs::remove_file(&path).expect("remove owned name");
+
+        writer
+            .cleanup_product_owned_file()
+            .expect("first missing cleanup");
+        writer
+            .cleanup_product_owned_file()
+            .expect("repeated missing cleanup");
+    }
+
+    #[test]
     fn create_writer_succeeds_with_v2_atomic_header() {
         let path = test_path("create");
         let _ = std::fs::remove_file(&path);
@@ -1024,6 +1318,265 @@ mod tests {
         );
         assert_eq!(writer.physical_write_count(), 1);
         assert_eq!(writer.last_revision(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prepare_and_abort_leave_public_header_and_reader_snapshot_unchanged() {
+        let path = test_path("prepare_abort");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 4096).expect("create");
+        let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
+        let first = sample_map(16, 16, 7);
+        writer.write_occupancy(&first).expect("baseline write");
+        let baseline = read_until_snapshot(&mut reader, 1);
+        let header_before = writer.mmap[..GLOBAL_HEADER_BYTES].to_vec();
+
+        let mut second = sample_map(16, 16, 8);
+        second.revision = 2;
+        second.timestamp_ns = 23456;
+        let prepared = writer.prepare_occupancy(&second).expect("prepare");
+
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+        assert_eq!(read_until_snapshot(&mut reader, 1), baseline);
+        assert!(writer.abort_prepared(prepared));
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+        assert_eq!(read_until_snapshot(&mut reader, 1), baseline);
+        assert_eq!(writer.published_generation(), 1);
+        assert_eq!(writer.physical_write_count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commit_exposes_only_the_exact_flushed_prepare_token() {
+        let path = test_path("prepare_commit");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
+        let first = sample_map(4, 4, 1);
+        writer.write_occupancy(&first).expect("baseline write");
+
+        let mut second = sample_map(4, 4, 2);
+        second.revision = 2;
+        second.timestamp_ns = 23456;
+        let prepared = writer.prepare_occupancy(&second).expect("prepare");
+        assert_eq!(read_until_snapshot(&mut reader, 1).data, first.data);
+
+        let commit = writer.commit_prepared(prepared).expect("commit");
+        assert_eq!(commit.revision, 2);
+        assert_eq!(commit.generation, 2);
+        assert_eq!(commit.active_slot, 1);
+        assert_eq!(commit.file_size, writer.capacity() as u64);
+        let snapshot = read_until_snapshot(&mut reader, 2);
+        assert_eq!(snapshot.generation, commit.generation);
+        assert_eq!(snapshot.active_slot, commit.active_slot);
+        assert_eq!(snapshot.data, second.data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restart_and_newer_prepare_invalidate_old_tokens_without_publication() {
+        let path = test_path("stale_tokens");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
+        writer.begin_session(1).expect("session one");
+        let first = sample_map(4, 4, 1);
+        writer.write_occupancy(&first).expect("baseline write");
+        let header_before = writer.mmap[..GLOBAL_HEADER_BYTES].to_vec();
+
+        let mut stale_after_restart = sample_map(4, 4, 2);
+        stale_after_restart.revision = 2;
+        let stale_after_restart = writer
+            .prepare_occupancy(&stale_after_restart)
+            .expect("prepare before restart");
+        writer.begin_session(2).expect("session two");
+        assert_eq!(
+            writer
+                .commit_prepared(stale_after_restart)
+                .expect_err("restart must invalidate token")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+
+        let mut superseded = sample_map(4, 4, 3);
+        superseded.revision = 3;
+        let superseded = writer
+            .prepare_occupancy(&superseded)
+            .expect("first session-two prepare");
+        let mut current = sample_map(4, 4, 4);
+        current.revision = 4;
+        let current_token = writer
+            .prepare_occupancy(&current)
+            .expect("superseding prepare");
+        assert_eq!(
+            writer
+                .commit_prepared(superseded)
+                .expect_err("newer prepare must invalidate old token")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+        writer
+            .commit_prepared(current_token)
+            .expect("current token commit");
+        assert_eq!(read_until_snapshot(&mut reader, 4).data, current.data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn occupancy_session_fence_rollback_restores_identity_without_resurrecting_tokens() {
+        let path = test_path("session_fence_rollback");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        writer.begin_session(1).expect("session one");
+        let baseline = sample_map(4, 4, 1);
+        writer.write_occupancy(&baseline).expect("baseline write");
+
+        let mut stale = sample_map(4, 4, 2);
+        stale.revision = 2;
+        let stale = writer
+            .prepare_occupancy(&stale)
+            .expect("prepare before session fence");
+        let epoch_before = writer.staging_epoch();
+        let transaction = writer
+            .begin_session_transactional(2)
+            .expect("transactional session fence");
+        let installed_epoch = writer.staging_epoch();
+        assert!(installed_epoch > epoch_before);
+
+        writer
+            .rollback_session_fence(transaction)
+            .expect("rollback untouched session fence");
+
+        assert_eq!(writer.session_generation(), 1);
+        assert_eq!(writer.last_revision(), 1);
+        assert_eq!(writer.staging_epoch(), installed_epoch);
+        assert_eq!(
+            writer
+                .commit_prepared(stale)
+                .expect_err("pre-fence prepare must remain stale after rollback")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn occupancy_session_fence_rollback_rejects_after_prepare_or_commit() {
+        let prepare_path = test_path("session_fence_prepare_crossed");
+        let _ = std::fs::remove_file(&prepare_path);
+        let mut prepare_writer =
+            OccupancyGridShmWriter::new(&prepare_path).expect("prepare writer");
+        prepare_writer.begin_session(1).expect("session one");
+        prepare_writer
+            .write_occupancy(&sample_map(4, 4, 1))
+            .expect("baseline write");
+        let prepare_transaction = prepare_writer
+            .begin_session_transactional(2)
+            .expect("prepare transaction");
+        let staged = prepare_writer
+            .prepare_occupancy(&sample_map(4, 4, 2))
+            .expect("cross fence with prepare");
+        assert_eq!(
+            prepare_writer
+                .rollback_session_fence(prepare_transaction)
+                .expect_err("prepare must prevent rollback")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(prepare_writer.abort_prepared(staged));
+        let _ = std::fs::remove_file(&prepare_path);
+
+        let commit_path = test_path("session_fence_commit_crossed");
+        let _ = std::fs::remove_file(&commit_path);
+        let mut commit_writer = OccupancyGridShmWriter::new(&commit_path).expect("commit writer");
+        commit_writer.begin_session(1).expect("session one");
+        commit_writer
+            .write_occupancy(&sample_map(4, 4, 1))
+            .expect("baseline write");
+        let commit_transaction = commit_writer
+            .begin_session_transactional(2)
+            .expect("commit transaction");
+        let staged = commit_writer
+            .prepare_occupancy(&sample_map(4, 4, 2))
+            .expect("prepare committed revision");
+        commit_writer
+            .commit_prepared(staged)
+            .expect("cross fence with commit");
+        assert_eq!(
+            commit_writer
+                .rollback_session_fence(commit_transaction)
+                .expect_err("commit must prevent rollback")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(commit_writer.session_generation(), 2);
+        let _ = std::fs::remove_file(&commit_path);
+    }
+
+    #[test]
+    fn aborted_growth_preserves_old_layout_and_committed_growth_remaps_reader() {
+        let path = test_path("staged_growth");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new_with_capacity(&path, 1024).expect("create");
+        let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
+        let first = sample_map(8, 8, 1);
+        writer.write_occupancy(&first).expect("first write");
+        let mut second = sample_map(8, 8, 2);
+        second.revision = 2;
+        writer.write_occupancy(&second).expect("second write");
+        let baseline = read_until_snapshot(&mut reader, 2);
+        let published_capacity = writer.slot_capacity;
+        let header_before = writer.mmap[..GLOBAL_HEADER_BYTES].to_vec();
+        let inode_before = file_identity(&path);
+
+        let mut grown = sample_map(128, 64, 3);
+        grown.revision = 3;
+        let prepared = writer.prepare_occupancy(&grown).expect("growth prepare");
+        assert!(writer.capacity() > 1024);
+        assert_eq!(writer.slot_capacity, published_capacity);
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+        assert_eq!(read_until_snapshot(&mut reader, 2), baseline);
+        assert!(writer.abort_prepared(prepared));
+        assert_eq!(read_until_snapshot(&mut reader, 2), baseline);
+
+        let prepared = writer
+            .prepare_occupancy(&grown)
+            .expect("repeat growth prepare");
+        let commit = writer.commit_prepared(prepared).expect("growth commit");
+        assert_eq!(commit.active_slot, 1);
+        assert_eq!(file_identity(&path), inode_before);
+        let snapshot = read_until_snapshot(&mut reader, 3);
+        assert_eq!(snapshot.data, grown.data);
+        assert_eq!(snapshot.active_slot, commit.active_slot);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_prepare_leaves_previous_header_and_snapshot_readable() {
+        let path = test_path("failed_prepare");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = OccupancyGridShmWriter::new(&path).expect("create");
+        let mut reader = OccupancyGridShmReader::open(&path).expect("reader mmap");
+        let first = sample_map(4, 4, 1);
+        writer.write_occupancy(&first).expect("baseline write");
+        let baseline = read_until_snapshot(&mut reader, 1);
+        let header_before = writer.mmap[..GLOBAL_HEADER_BYTES].to_vec();
+
+        let mut malformed = sample_map(4, 4, 2);
+        malformed.revision = 2;
+        malformed.data.pop();
+        assert_eq!(
+            writer
+                .prepare_occupancy(&malformed)
+                .expect_err("malformed payload must fail prepare")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(&writer.mmap[..GLOBAL_HEADER_BYTES], header_before);
+        assert_eq!(read_until_snapshot(&mut reader, 1), baseline);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1700,6 +1700,7 @@ dependencies = [
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "pretty_assertions",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1742,12 +1743,13 @@ name = "nuwax-nav-pgo-bridge"
 version = "0.1.0"
 dependencies = [
  "approx",
- "nalgebra 0.33.3",
+ "bytes",
+ "nuwax-codec",
+ "nuwax-lcm",
  "nuwax-nav-base",
  "nuwax-nav-native-runner",
  "nuwax-nav-test-fixtures",
  "nuwax-nav-types-messages",
- "nuwax-tf",
  "pretty_assertions",
  "serde",
  "serde_json",

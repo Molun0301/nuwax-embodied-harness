@@ -28,4 +28,7 @@ fn main() {
     assert!(binary.is_file(), "native PGO artifact missing");
     println!("cargo:rustc-env=NUWAX_PGO_NATIVE_BIN={}", binary.display());
     println!("cargo:rerun-if-changed=native/pgo");
+    println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoRequest.lcm");
+    println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoResult.lcm");
+    println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoStatus.lcm");
 }

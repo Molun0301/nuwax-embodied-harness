@@ -9,13 +9,15 @@ publish.workspace = true
 description = "PGO C++ core and native bridge with an auditable batch/lifecycle contract"
 
 [dependencies]
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-lcm = { path = "../nuwax-lcm", features = ["link-liblcm"] }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
-nuwax-tf = { path = "../nuwax-tf" }
-nalgebra = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -23,6 +25,4 @@ pretty_assertions = { workspace = true }
 approx = { workspace = true }
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
-nuwax-tf = { path = "../nuwax-tf" }
-tokio = { workspace = true }
 serde_json = { workspace = true }

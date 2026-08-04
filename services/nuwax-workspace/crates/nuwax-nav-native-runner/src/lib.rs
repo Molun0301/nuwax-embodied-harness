@@ -17,11 +17,13 @@ pub mod build;
 pub mod rendered_args;
 pub mod runner;
 pub mod spec;
+pub mod supervised;
 
 pub use build::*;
 pub use rendered_args::*;
 pub use runner::*;
 pub use spec::*;
+pub use supervised::*;
 
 /// 便捷 re-export 入口,供 `nuwax-nav-stack` 编排 crate 使用。
 pub mod prelude {

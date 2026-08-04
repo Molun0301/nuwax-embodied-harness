@@ -259,82 +259,32 @@ pub fn to_native_args(config: &PgoBridgeConfig) -> Vec<String> {
     out
 }
 
-/// PGO bridge 顶层句柄。
+/// Lifecycle-only compatibility handle for the native artifact.
+///
+/// This handle deliberately owns no TF tree, map state, correction state, or
+/// message handler. Production online correction must use `OnlinePgoOwner`,
+/// which can return candidates but cannot apply canonical state.
 pub struct PgoBridge {
-    /// 内部 NativeRunner
+    /// Retained lifecycle-only native process runner.
     pub runner: nuwax_nav_native_runner::NativeRunner,
-    /// native spec 缓存
-    pub spec: NativeProgramSpec,
-    /// cwd
-    pub cwd: Option<PathBuf>,
-    /// env
-    pub env: BTreeMap<String, String>,
-    /// build command
-    pub build_command: Option<String>,
-    /// 当前最新的 pgo_tf 修正(由订阅循环填充)
-    pub latest_pgo_tf: Option<super::tf_helper::PgoTfMessage>,
-    /// 是否已发送 identity seed TF(与 Python `start()` 行为对齐)
-    pub seeded: bool,
-    /// TF tree(`handle_pgo_tf` 写入这里;订阅循环和单元测试都通过它读)
-    pub tf_tree: std::sync::Arc<nuwax_tf::TfTree>,
-    /// world frame 名(默认 "map";`handle_pgo_tf` 用作 transform parent)
-    pub world_frame: String,
-    /// local frame 名(默认 "odom";`handle_pgo_tf` 用作 transform child)
-    pub local_frame: String,
 }
 
 impl PgoBridge {
-    /// 从配置 + topics 构造 bridge。
+    /// Build a lifecycle-only process facade.
     #[must_use]
     pub fn new(config: PgoBridgeConfig, topics: &PgoTopics) -> Self {
-        use crate::build_runner;
+        use nuwax_nav_native_runner::{NativeBuildPolicy, NativeBuildSpec, NativeRunner};
+
         let spec = build_spec(config.clone(), topics);
-        let runner = build_runner(&config, topics);
-        Self {
-            runner,
-            spec,
+        let build = NativeBuildSpec {
+            build_command: config.build_command.clone(),
+            policy: NativeBuildPolicy::Never,
             cwd: config.cwd.clone(),
             env: config.env.clone(),
-            build_command: config.build_command.clone(),
-            latest_pgo_tf: None,
-            seeded: false,
-            tf_tree: std::sync::Arc::new(nuwax_tf::TfTree::new()),
-            world_frame: config.world_frame.clone(),
-            local_frame: config.local_frame.clone(),
+        };
+        Self {
+            runner: NativeRunner::new(spec, build),
         }
-    }
-
-    /// 渲染后的完整 argv(首项为可执行路径)。
-    #[must_use]
-    pub fn argv(&self) -> Vec<String> {
-        let mut v = vec![self.spec.executable.display().to_string()];
-        for (port, topic) in &self.spec.topics {
-            v.push(format!("--{port}"));
-            v.push(topic.clone());
-        }
-        v.extend(self.spec.args.iter().cloned());
-        v
-    }
-
-    /// 处理一条 PGO transform 订阅消息(bridge subscription handler)。
-    ///
-    /// 行为:
-    /// 1. 用 [`super::tf_helper::apply_pgo_tf_to_tree`] 写入 `self.tf_tree`
-    ///    (parent = `self.world_frame`,child = `self.local_frame`)
-    /// 2. 更新 `self.latest_pgo_tf` 字段,便于上层在任意时刻读到最新修正
-    /// 3. 不返回 Result(TF 写入是 in-process、无 IO 失败语义;如果未来要捕获错误,
-    ///    可以把签名改为 `Result<(), TfError>`)
-    ///
-    /// 该方法不直接订阅 LCM/ROS2 socket;真实订阅由上层 transport 负责把
-    /// 反序列化得到的 `PgoTfMessage` 喂进来。
-    pub fn handle_pgo_tf(&mut self, msg: super::tf_helper::PgoTfMessage) {
-        super::tf_helper::apply_pgo_tf_to_tree(
-            &self.tf_tree,
-            &msg,
-            &self.world_frame,
-            &self.local_frame,
-        );
-        self.latest_pgo_tf = Some(msg);
     }
 }
 
@@ -404,27 +354,5 @@ mod tests {
         let cfg = PgoBridgeConfig::default();
         assert_eq!(cfg.world_frame, "map");
         assert_eq!(cfg.local_frame, "odom");
-    }
-
-    #[test]
-    fn bridge_argv_order_topics_then_config() {
-        let cfg = PgoBridgeConfig::default();
-        let topics = PgoTopics {
-            odometry: Some("/odom".to_string()),
-            pgo_tf: Some("/tf".to_string()),
-            ..Default::default()
-        };
-        let bridge = PgoBridge::new(cfg, &topics);
-        let argv = bridge.argv();
-        assert!(argv[0].ends_with("pgo"));
-        assert_eq!(argv[1], "--odometry");
-        assert_eq!(argv[2], "/odom");
-        assert_eq!(argv[3], "--pgo_tf");
-        assert_eq!(argv[4], "/tf");
-        let pos = argv
-            .iter()
-            .position(|a| a == "--world_frame")
-            .expect("world_frame present");
-        assert!(pos > 4);
     }
 }

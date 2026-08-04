@@ -1,5 +1,7 @@
 #include "simple_pgo.h"
+#include "online_owner.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -156,8 +158,25 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signalHandler);
     if (argc == 2 && std::string(argv[1]) == "--help") {
         std::cout << "pgo [LIFECYCLE_OPTION VALUE ...] | "
-                     "--batch-input FILE --batch-output FILE\n";
+                     "--batch-input FILE --batch-output FILE | "
+                     "--mode online --lcm-url URL --runtime-generation N "
+                     "--backend-generation N --request-channel TYPED "
+                     "--result-channel TYPED --status-channel TYPED "
+                     "--cancel-channel TYPED [ALGORITHM_OPTION VALUE ...]\n";
         return 0;
+    }
+
+    const bool has_mode_option = std::any_of(
+        argv + 1, argv + argc,
+        [](const char* argument) { return std::string(argument) == "--mode"; });
+    if (has_mode_option) {
+        OnlinePgoOptions options;
+        std::string error;
+        if (!parseOnlinePgoOptions(argc, argv, options, error)) {
+            std::cerr << "PGO: " << error << '\n';
+            return 2;
+        }
+        return runOnlinePgoOwner(options, running);
     }
 
     std::string input_path;

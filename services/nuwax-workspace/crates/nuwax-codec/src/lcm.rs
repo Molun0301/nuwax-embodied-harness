@@ -46,6 +46,8 @@ use crate::CodecResult;
 
 /// Versioned LIO ingress envelope codecs.
 pub mod lio;
+/// Versioned native-PGO request, result, and owner-status codecs.
+pub mod native_pgo;
 /// Repository-native tracked-person input codec.
 pub mod person_follow;
 /// Repository-native person-follow command codec.

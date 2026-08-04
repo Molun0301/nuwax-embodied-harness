@@ -32,6 +32,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nalgebra::Point3;
 #[cfg(test)]
@@ -54,16 +55,25 @@ use crate::lcm_runtime::{MapRevisionEvent, MapState, SharedState};
 use crate::mapping_backend::{
     MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
     MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput, MappingBackendKind,
-    MappingBackendSpec, MappingBackendWorker, MappingComputeToken,
+    MappingBackendJoinHandle, MappingBackendSpec, MappingBackendWorker, MappingComputeToken,
 };
 #[cfg(test)]
-use crate::mapping_backend::{MappingBackendTestGate, MappingKernel};
+use crate::mapping_backend::{
+    join_retained_mapping_backend_thread_for_tests,
+    mapping_backend_process_exit_retains_thread_for_tests, MappingBackendRetirementTestGate,
+    MappingBackendTestGate, MappingKernel,
+};
 use crate::mapping_commit::{MappingCommitClock, OccupancyCommitReceipt};
 use crate::sequence_state::SequenceStateStore;
 
 const MIN_REBUILD_INTERVAL_NS: u64 = 250_000_000;
 const MAX_REBUILD_INTERVAL_NS: u64 = 1_000_000_000;
 const REBUILD_GROWTH_DIVISOR: usize = 20;
+#[cfg(not(test))]
+const MAPPING_FINAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const MAPPING_FINAL_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(50);
+const MAPPING_FINAL_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// 栅格输出坐标系契约。未执行真实 transform 时，输出必须保留源 frame。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +702,7 @@ pub(crate) struct CommittedMappingCandidate {
 #[derive(Debug)]
 pub(crate) struct MappingBackendRetirement {
     generation: u64,
+    acknowledge_pending: bool,
     worker: MappingBackendWorker,
 }
 
@@ -700,8 +711,447 @@ impl MappingBackendRetirement {
         self.generation
     }
 
+    const fn acknowledge_pending(&self) -> bool {
+        self.acknowledge_pending
+    }
+
     pub(crate) fn stop_and_join(self) -> Result<(), String> {
-        self.worker.stop_and_join()
+        self.worker.into_stop_join_handle()?.join()
+    }
+
+    fn into_stop_join_handle(
+        self,
+    ) -> Result<(u64, bool, MappingBackendJoinHandle), MappingTerminalError> {
+        let Self {
+            generation,
+            acknowledge_pending,
+            worker,
+        } = self;
+        let join_handle = worker
+            .into_stop_join_handle()
+            .map_err(MappingTerminalError::new)?;
+        Ok((generation, acknowledge_pending, join_handle))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShutdownFailures {
+    failures: Vec<String>,
+}
+
+impl ShutdownFailures {
+    pub(crate) fn record(&mut self, failure: impl Into<String>) {
+        let failure = failure.into();
+        if !self.failures.iter().any(|existing| existing == &failure) {
+            self.failures.push(failure);
+        }
+    }
+
+    pub(crate) fn detail(&self) -> Option<String> {
+        (!self.failures.is_empty()).then(|| self.failures.join("; "))
+    }
+
+    fn into_terminal(
+        mut self,
+        joined_terminal: Result<(), MappingTerminalError>,
+    ) -> Result<(), MappingTerminalError> {
+        if let Err(error) = joined_terminal {
+            self.record(error.to_string());
+        }
+        match self.detail() {
+            Some(detail) => Err(MappingTerminalError::new(detail)),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{detail}")]
+pub(crate) struct MappingTerminalError {
+    detail: String,
+}
+
+impl MappingTerminalError {
+    fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum MappingPendingCause {
+    #[error("timed out acquiring the Mapping lifecycle lock")]
+    LifecycleLockTimeout,
+    #[error("timed out joining Mapping backend generation {generation}")]
+    BackendJoinTimeout { generation: u64 },
+    #[error("timed out acquiring the Mapping retirement ACK lock for generation {generation}")]
+    RetirementAckLockTimeout { generation: u64 },
+    #[error(
+        "Mapping retirement acknowledgement generation mismatch: expected={expected} pending={pending:?}"
+    )]
+    GenerationMismatch {
+        expected: u64,
+        pending: Option<u64>,
+    },
+    #[error("Mapping retirement could not be proven: {0}")]
+    RetirementUnproven(String),
+}
+
+#[derive(Debug)]
+enum MappingRetirementProof {
+    NoBackend,
+    QuiescentGeneration(u64),
+    ExactGeneration(u64),
+}
+
+#[derive(Debug)]
+pub(crate) struct MappingRetiredCapability {
+    proof: MappingRetirementProof,
+}
+
+impl MappingRetiredCapability {
+    fn no_backend() -> Self {
+        Self {
+            proof: MappingRetirementProof::NoBackend,
+        }
+    }
+
+    fn quiescent(generation: u64) -> Self {
+        Self {
+            proof: MappingRetirementProof::QuiescentGeneration(generation),
+        }
+    }
+
+    fn exact(generation: u64) -> Self {
+        Self {
+            proof: MappingRetirementProof::ExactGeneration(generation),
+        }
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> Option<u64> {
+        match self.proof {
+            MappingRetirementProof::NoBackend => None,
+            MappingRetirementProof::QuiescentGeneration(generation)
+            | MappingRetirementProof::ExactGeneration(generation) => Some(generation),
+        }
+    }
+}
+
+pub(crate) enum MappingFinalOwner {
+    WaitingLifecycleLock {
+        adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    },
+    WaitingBackendJoin {
+        adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        generation: u64,
+        acknowledge_pending: bool,
+        join_handle: MappingBackendJoinHandle,
+    },
+    WaitingRetirementAck {
+        adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        generation: u64,
+        acknowledge_pending: bool,
+        joined_terminal: Result<(), MappingTerminalError>,
+    },
+}
+
+impl std::fmt::Debug for MappingFinalOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WaitingLifecycleLock { .. } => formatter
+                .debug_struct("WaitingLifecycleLock")
+                .finish_non_exhaustive(),
+            Self::WaitingBackendJoin { generation, .. } => formatter
+                .debug_struct("WaitingBackendJoin")
+                .field("generation", generation)
+                .finish_non_exhaustive(),
+            Self::WaitingRetirementAck {
+                generation,
+                joined_terminal,
+                ..
+            } => formatter
+                .debug_struct("WaitingRetirementAck")
+                .field("generation", generation)
+                .field("joined_terminal", joined_terminal)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+pub(crate) enum MappingFinalAttempt {
+    Pending {
+        owner: MappingFinalOwner,
+        cause: MappingPendingCause,
+        sticky: ShutdownFailures,
+    },
+    Settled {
+        capability: MappingRetiredCapability,
+        terminal: Result<(), MappingTerminalError>,
+    },
+}
+
+enum MappingFinalPreparation {
+    Pending(MappingPendingCause),
+    Settled(MappingRetiredCapability),
+    Retirement {
+        retirement: MappingBackendRetirement,
+        sticky_error: Option<MappingTerminalError>,
+    },
+}
+
+impl MappingFinalOwner {
+    pub(crate) fn waiting_for_lifecycle_lock(
+        adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self::WaitingLifecycleLock {
+            adapter,
+            lifecycle_lock,
+        }
+    }
+
+    fn from_retirement(
+        adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        retirement: MappingBackendRetirement,
+    ) -> Result<Self, MappingTerminalError> {
+        let (generation, acknowledge_pending, join_handle) =
+            retirement.into_stop_join_handle()?;
+        Ok(Self::WaitingBackendJoin {
+            adapter,
+            lifecycle_lock,
+            generation,
+            acknowledge_pending,
+            join_handle,
+        })
+    }
+
+    pub(crate) async fn attempt(self, mut sticky: ShutdownFailures) -> MappingFinalAttempt {
+        let mut owner = self;
+        loop {
+            owner = match owner {
+                Self::WaitingLifecycleLock {
+                    adapter,
+                    lifecycle_lock,
+                } => {
+                    let lifecycle_guard = match tokio::time::timeout(
+                        MAPPING_FINAL_ATTEMPT_TIMEOUT,
+                        Arc::clone(&lifecycle_lock).lock_owned(),
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return MappingFinalAttempt::Pending {
+                                owner: Self::WaitingLifecycleLock {
+                                    adapter,
+                                    lifecycle_lock,
+                                },
+                                cause: MappingPendingCause::LifecycleLockTimeout,
+                                sticky,
+                            };
+                        }
+                    };
+                    let Some(adapter) = adapter else {
+                        drop(lifecycle_guard);
+                        return MappingFinalAttempt::Settled {
+                            capability: MappingRetiredCapability::no_backend(),
+                            terminal: sticky.into_terminal(Ok(())),
+                        };
+                    };
+                    let preparation = adapter.lock().prepare_final_backend_retirement();
+                    drop(lifecycle_guard);
+                    match preparation {
+                        MappingFinalPreparation::Pending(cause) => {
+                            return MappingFinalAttempt::Pending {
+                                owner: Self::WaitingLifecycleLock {
+                                    adapter: Some(adapter),
+                                    lifecycle_lock,
+                                },
+                                cause,
+                                sticky,
+                            };
+                        }
+                        MappingFinalPreparation::Settled(capability) => {
+                            return MappingFinalAttempt::Settled {
+                                capability,
+                                terminal: sticky.into_terminal(Ok(())),
+                            };
+                        }
+                        MappingFinalPreparation::Retirement {
+                            retirement,
+                            sticky_error,
+                        } => {
+                            if let Some(error) = sticky_error {
+                                sticky.record(error.to_string());
+                            }
+                            match Self::from_retirement(
+                                Arc::clone(&adapter),
+                                Arc::clone(&lifecycle_lock),
+                                retirement,
+                            ) {
+                                Ok(owner) => owner,
+                                Err(error) => {
+                                    sticky.record(error.to_string());
+                                    return MappingFinalAttempt::Pending {
+                                        owner: Self::WaitingLifecycleLock {
+                                            adapter: Some(adapter),
+                                            lifecycle_lock,
+                                        },
+                                        cause: MappingPendingCause::RetirementUnproven(
+                                            error.to_string(),
+                                        ),
+                                        sticky,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                Self::WaitingBackendJoin {
+                    adapter,
+                    lifecycle_lock,
+                    generation,
+                    acknowledge_pending,
+                    join_handle,
+                } => {
+                    let deadline = Instant::now() + MAPPING_FINAL_ATTEMPT_TIMEOUT;
+                    while !join_handle.is_finished() {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return MappingFinalAttempt::Pending {
+                                owner: Self::WaitingBackendJoin {
+                                    adapter,
+                                    lifecycle_lock,
+                                    generation,
+                                    acknowledge_pending,
+                                    join_handle,
+                                },
+                                cause: MappingPendingCause::BackendJoinTimeout { generation },
+                                sticky,
+                            };
+                        }
+                        tokio::time::sleep(MAPPING_FINAL_JOIN_POLL_INTERVAL.min(remaining)).await;
+                    }
+                    let joined_terminal = join_handle.join().map_err(MappingTerminalError::new);
+                    Self::WaitingRetirementAck {
+                        adapter,
+                        lifecycle_lock,
+                        generation,
+                        acknowledge_pending,
+                        joined_terminal,
+                    }
+                }
+                Self::WaitingRetirementAck {
+                    adapter,
+                    lifecycle_lock,
+                    generation,
+                    acknowledge_pending,
+                    joined_terminal,
+                } => {
+                    if !acknowledge_pending {
+                        return MappingFinalAttempt::Pending {
+                            owner: Self::WaitingRetirementAck {
+                                adapter,
+                                lifecycle_lock,
+                                generation,
+                                acknowledge_pending,
+                                joined_terminal,
+                            },
+                            cause: MappingPendingCause::RetirementUnproven(format!(
+                                "generation {generation} is owned by another retirement token"
+                            )),
+                            sticky,
+                        };
+                    }
+                    let lifecycle_guard = match tokio::time::timeout(
+                        MAPPING_FINAL_ATTEMPT_TIMEOUT,
+                        Arc::clone(&lifecycle_lock).lock_owned(),
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return MappingFinalAttempt::Pending {
+                                owner: Self::WaitingRetirementAck {
+                                    adapter,
+                                    lifecycle_lock,
+                                    generation,
+                                    acknowledge_pending,
+                                    joined_terminal,
+                                },
+                                cause: MappingPendingCause::RetirementAckLockTimeout { generation },
+                                sticky,
+                            };
+                        }
+                    };
+                    let (acknowledgement, pending) = {
+                        let mut adapter_guard = adapter.lock();
+                        let acknowledgement =
+                            adapter_guard.acknowledge_backend_retirement(generation);
+                        (acknowledgement, adapter_guard.pending_backend_retirement)
+                    };
+                    drop(lifecycle_guard);
+                    match acknowledgement {
+                        Ok(capability) => {
+                            return MappingFinalAttempt::Settled {
+                                capability,
+                                terminal: sticky.into_terminal(joined_terminal),
+                            };
+                        }
+                        Err(error) => {
+                            sticky.record(error.to_string());
+                            return MappingFinalAttempt::Pending {
+                                owner: Self::WaitingRetirementAck {
+                                    adapter,
+                                    lifecycle_lock,
+                                    generation,
+                                    acknowledge_pending,
+                                    joined_terminal,
+                                },
+                                cause: MappingPendingCause::GenerationMismatch {
+                                    expected: generation,
+                                    pending,
+                                },
+                                sticky,
+                            };
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    #[cfg(test)]
+    fn state_name(&self) -> &'static str {
+        match self {
+            Self::WaitingLifecycleLock { .. } => "waiting_lifecycle_lock",
+            Self::WaitingBackendJoin { .. } => "waiting_backend_join",
+            Self::WaitingRetirementAck { .. } => "waiting_retirement_ack",
+        }
+    }
+
+    #[cfg(test)]
+    fn join_thread_id(&self) -> Option<std::thread::ThreadId> {
+        match self {
+            Self::WaitingBackendJoin { join_handle, .. } => Some(join_handle.thread_id()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn joined_terminal(&self) -> Option<&Result<(), MappingTerminalError>> {
+        match self {
+            Self::WaitingRetirementAck {
+                joined_terminal, ..
+            } => Some(joined_terminal),
+            _ => None,
+        }
     }
 }
 
@@ -729,6 +1179,7 @@ fn spawn_backend_retirement_owner(
 ) -> tokio::task::JoinHandle<Result<(), MappingLifecycleError>> {
     tokio::spawn(async move {
         let generation = retirement.generation();
+        let acknowledge_pending = retirement.acknowledge_pending();
         let result = tokio::task::spawn_blocking(move || retirement.stop_and_join())
             .await
             .map_err(|error| {
@@ -737,9 +1188,13 @@ fn spawn_backend_retirement_owner(
                 ))
             })?;
         let _lifecycle_guard = lifecycle_lock.lock().await;
-        adapter
-            .lock()
-            .complete_backend_retirement(generation, result)
+        if acknowledge_pending {
+            adapter
+                .lock()
+                .complete_backend_retirement(generation, result)
+        } else {
+            result.map_err(MappingLifecycleError::Backend)
+        }
     })
 }
 
@@ -747,6 +1202,16 @@ fn spawn_backend_retirement_owner(
 pub(crate) struct MappingStopTransition {
     pub(crate) snapshot: MappingSessionSnapshot,
     pub(crate) retirement: Option<MappingBackendRetirement>,
+}
+
+enum MappingSessionStartAdmission {
+    Replay(MappingSessionSnapshot),
+    Ready {
+        session_id: String,
+        map_name: String,
+        session_generation: u64,
+        backend_generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1115,18 +1580,53 @@ impl MappingAdapter {
                 self.lifecycle.phase.as_str()
             )));
         }
-        self.in_flight_compute = None;
-        self.checkpoint_export = None;
-        let retirement = self.detach_backend_worker()?;
-        self.backend_generation = self
+        let next_backend_generation = self
             .backend_generation
             .checked_add(1)
             .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        let retirement = self.detach_backend_worker()?;
+        self.in_flight_compute = None;
+        self.checkpoint_export = None;
+        self.backend_generation = next_backend_generation;
         self.lifecycle = MappingSessionSnapshot::idle(self.mapping_backend.kind());
         self.revision = 0;
         self.checkpoint_installed = false;
         self.checkpoint_activation_digest = None;
         Ok(retirement)
+    }
+
+    /// Terminalize the exact session after a post-start process-fatal error.
+    ///
+    /// Unlike the ordinary stop transition, this path cannot reject generation
+    /// exhaustion. The process is already poisoned, so keeping the terminal
+    /// session identity and returning every worker owner is more important than
+    /// reserving a generation for a future session that will never be admitted.
+    pub(crate) fn force_stop_started_session_detached(
+        &mut self,
+        session_id: &str,
+        session_generation: u64,
+    ) -> Result<MappingStopTransition, MappingLifecycleError> {
+        if !self.lifecycle.active
+            || self.lifecycle.session_id != session_id
+            || self.lifecycle.session_generation != session_generation
+        {
+            return Err(MappingLifecycleError::StaleSession(format!(
+                "requested={session_id}/{session_generation} current={}/{} phase={}",
+                self.lifecycle.session_id,
+                self.lifecycle.session_generation,
+                self.lifecycle.phase.as_str()
+            )));
+        }
+        let retirement = self.detach_backend_worker_for_terminal_failure();
+        self.lifecycle.phase = MappingSessionPhase::Stopped;
+        self.lifecycle.active = false;
+        self.in_flight_compute = None;
+        self.checkpoint_export = None;
+        self.backend_generation = self.backend_generation.saturating_add(1);
+        Ok(MappingStopTransition {
+            snapshot: self.snapshot(),
+            retirement,
+        })
     }
 
     fn start_session_inner(
@@ -1135,6 +1635,70 @@ impl MappingAdapter {
         map_name: &str,
         staged_worker: Option<MappingBackendWorker>,
     ) -> Result<MappingSessionSnapshot, MappingLifecycleError> {
+        let admission = self.prepare_session_start_admission(session_id, map_name);
+        let (session_id, map_name, generation, backend_generation) = match admission {
+            Ok(MappingSessionStartAdmission::Replay(snapshot)) => {
+                Self::settle_rejected_staged_worker(staged_worker)?;
+                return Ok(snapshot);
+            }
+            Ok(MappingSessionStartAdmission::Ready {
+                session_id,
+                map_name,
+                session_generation,
+                backend_generation,
+            }) => (
+                session_id,
+                map_name,
+                session_generation,
+                backend_generation,
+            ),
+            Err(error) => return Err(Self::reject_staged_worker(staged_worker, error)),
+        };
+        let worker = match staged_worker {
+            Some(worker) => {
+                let client = worker.client();
+                if client.backend_generation() != backend_generation
+                    || client.backend_kind() != self.mapping_backend.kind()
+                {
+                    return Err(Self::reject_staged_worker(
+                        Some(worker),
+                        MappingLifecycleError::Backend(
+                            "staged mapping backend worker identity mismatch".to_owned(),
+                        ),
+                    ));
+                }
+                worker
+            }
+            None => MappingBackendWorker::start(
+                self.mapping_backend,
+                backend_generation,
+                self.backend_compute_config(),
+            )
+            .map_err(MappingLifecycleError::Backend)?,
+        };
+        self.reset_for_new_session();
+        self.backend_generation = backend_generation;
+        self.mapping_worker = Some(worker);
+        self.next_session_generation = generation;
+        self.lifecycle = MappingSessionSnapshot {
+            phase: MappingSessionPhase::Active,
+            session_id,
+            map_name,
+            session_generation: generation,
+            revision: 0,
+            active: true,
+            idempotent_replay: false,
+            legacy_checkpoint_reconstructed: false,
+            mapping_backend_kind: self.mapping_backend.kind().stable_name().to_owned(),
+        };
+        Ok(self.snapshot())
+    }
+
+    fn prepare_session_start_admission(
+        &self,
+        session_id: &str,
+        map_name: &str,
+    ) -> Result<MappingSessionStartAdmission, MappingLifecycleError> {
         let session_id = session_id.trim();
         let map_name = map_name.trim();
         for (field, value) in [("session_id", session_id), ("map_name", map_name)] {
@@ -1149,7 +1713,7 @@ impl MappingAdapter {
             if self.lifecycle.session_id == session_id && self.lifecycle.map_name == map_name {
                 let mut replay = self.snapshot();
                 replay.idempotent_replay = true;
-                return Ok(replay);
+                return Ok(MappingSessionStartAdmission::Replay(replay));
             }
             return Err(MappingLifecycleError::Conflict(format!(
                 "active_session_id={} active_map_name={}",
@@ -1177,41 +1741,37 @@ impl MappingAdapter {
             .backend_generation
             .checked_add(1)
             .ok_or_else(|| MappingLifecycleError::Backend("generation exhausted".to_owned()))?;
-        let worker = match staged_worker {
-            Some(worker) => {
-                let client = worker.client();
-                if client.backend_generation() != backend_generation
-                    || client.backend_kind() != self.mapping_backend.kind()
-                {
-                    return Err(MappingLifecycleError::Backend(
-                        "staged mapping backend worker identity mismatch".to_owned(),
-                    ));
-                }
-                worker
-            }
-            None => MappingBackendWorker::start(
-                self.mapping_backend,
-                backend_generation,
-                self.backend_compute_config(),
-            )
-            .map_err(MappingLifecycleError::Backend)?,
-        };
-        self.reset_for_new_session();
-        self.backend_generation = backend_generation;
-        self.mapping_worker = Some(worker);
-        self.next_session_generation = generation;
-        self.lifecycle = MappingSessionSnapshot {
-            phase: MappingSessionPhase::Active,
-            session_id: session_id.to_string(),
-            map_name: map_name.to_string(),
+        Ok(MappingSessionStartAdmission::Ready {
+            session_id: session_id.to_owned(),
+            map_name: map_name.to_owned(),
             session_generation: generation,
-            revision: 0,
-            active: true,
-            idempotent_replay: false,
-            legacy_checkpoint_reconstructed: false,
-            mapping_backend_kind: self.mapping_backend.kind().stable_name().to_owned(),
-        };
-        Ok(self.snapshot())
+            backend_generation,
+        })
+    }
+
+    fn settle_rejected_staged_worker(
+        staged_worker: Option<MappingBackendWorker>,
+    ) -> Result<(), MappingLifecycleError> {
+        match staged_worker {
+            Some(worker) => worker.stop_and_join().map_err(|error| {
+                MappingLifecycleError::Backend(format!(
+                    "rejected worker join failed: {error}"
+                ))
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn reject_staged_worker(
+        staged_worker: Option<MappingBackendWorker>,
+        rejection: MappingLifecycleError,
+    ) -> MappingLifecycleError {
+        match Self::settle_rejected_staged_worker(staged_worker) {
+            Ok(()) => rejection,
+            Err(join_error) => {
+                MappingLifecycleError::Backend(format!("{rejection}; {join_error}"))
+            }
+        }
     }
 
     pub fn stop_session(
@@ -1257,15 +1817,16 @@ impl MappingAdapter {
                 self.lifecycle.phase.as_str()
             )));
         }
+        let next_backend_generation = self
+            .backend_generation
+            .checked_add(1)
+            .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        let retirement = self.detach_backend_worker()?;
         self.lifecycle.phase = MappingSessionPhase::Stopped;
         self.lifecycle.active = false;
         self.in_flight_compute = None;
         self.checkpoint_export = None;
-        let retirement = self.detach_backend_worker()?;
-        self.backend_generation = self
-            .backend_generation
-            .checked_add(1)
-            .ok_or(MappingLifecycleError::GenerationExhausted)?;
+        self.backend_generation = next_backend_generation;
         Ok(MappingStopTransition {
             snapshot: self.snapshot(),
             retirement,
@@ -1275,17 +1836,117 @@ impl MappingAdapter {
     fn detach_backend_worker(
         &mut self,
     ) -> Result<Option<MappingBackendRetirement>, MappingLifecycleError> {
-        let Some(worker) = self.mapping_worker.take() else {
-            return Ok(None);
-        };
         if let Some(generation) = self.pending_backend_retirement {
             return Err(MappingLifecycleError::Backend(format!(
                 "backend generation {generation} retirement is already pending"
             )));
         }
+        let Some(worker) = self.mapping_worker.take() else {
+            return Ok(None);
+        };
         let generation = worker.backend_generation();
         self.pending_backend_retirement = Some(generation);
-        Ok(Some(MappingBackendRetirement { generation, worker }))
+        Ok(Some(MappingBackendRetirement {
+            generation,
+            acknowledge_pending: true,
+            worker,
+        }))
+    }
+
+    fn detach_backend_worker_for_terminal_failure(&mut self) -> Option<MappingBackendRetirement> {
+        let worker = self.mapping_worker.take()?;
+        let generation = worker.backend_generation();
+        let acknowledge_pending = if self.pending_backend_retirement.is_none() {
+            self.pending_backend_retirement = Some(generation);
+            true
+        } else {
+            false
+        };
+        Some(MappingBackendRetirement {
+            generation,
+            acknowledge_pending,
+            worker,
+        })
+    }
+
+    fn prepare_final_backend_retirement(&mut self) -> MappingFinalPreparation {
+        if let Some(generation) = self.pending_backend_retirement {
+            return MappingFinalPreparation::Pending(
+                MappingPendingCause::RetirementUnproven(format!(
+                    "backend generation {generation} already has a detached retirement owner"
+                )),
+            );
+        }
+
+        if self.lifecycle.active {
+            let session_id = self.lifecycle.session_id.clone();
+            let session_generation = self.lifecycle.session_generation;
+            return match self.stop_session_detached(&session_id) {
+                Ok(transition) => match transition.retirement {
+                    Some(retirement) => MappingFinalPreparation::Retirement {
+                        retirement,
+                        sticky_error: None,
+                    },
+                    None => MappingFinalPreparation::Settled(
+                        MappingRetiredCapability::quiescent(self.backend_generation),
+                    ),
+                },
+                Err(MappingLifecycleError::GenerationExhausted) => {
+                    let sticky_error = MappingTerminalError::new(
+                        "mapping backend generation exhausted during final retirement",
+                    );
+                    match self
+                        .force_stop_started_session_detached(&session_id, session_generation)
+                    {
+                        Ok(transition) => match transition.retirement {
+                            Some(retirement) => MappingFinalPreparation::Retirement {
+                                retirement,
+                                sticky_error: Some(sticky_error),
+                            },
+                            None => MappingFinalPreparation::Pending(
+                                MappingPendingCause::RetirementUnproven(
+                                    "active Mapping session had no final backend join handle"
+                                        .to_owned(),
+                                ),
+                            ),
+                        },
+                        Err(error) => MappingFinalPreparation::Pending(
+                            MappingPendingCause::RetirementUnproven(error.to_string()),
+                        ),
+                    }
+                }
+                Err(error) => MappingFinalPreparation::Pending(
+                    MappingPendingCause::RetirementUnproven(error.to_string()),
+                ),
+            };
+        }
+
+        match self.detach_backend_worker() {
+            Ok(Some(retirement)) => MappingFinalPreparation::Retirement {
+                retirement,
+                sticky_error: None,
+            },
+            Ok(None) => MappingFinalPreparation::Settled(MappingRetiredCapability::quiescent(
+                self.backend_generation,
+            )),
+            Err(error) => MappingFinalPreparation::Pending(
+                MappingPendingCause::RetirementUnproven(error.to_string()),
+            ),
+        }
+    }
+
+    pub(crate) fn acknowledge_backend_retirement(
+        &mut self,
+        generation: u64,
+    ) -> Result<MappingRetiredCapability, MappingLifecycleError> {
+        if self.pending_backend_retirement != Some(generation) {
+            return Err(MappingLifecycleError::Backend(format!(
+                "backend retirement acknowledgement mismatch: pending={:?} completed={generation}",
+                self.pending_backend_retirement
+            )));
+        }
+        self.pending_backend_retirement = None;
+        Ok(MappingRetiredCapability::exact(generation))
     }
 
     pub(crate) fn complete_backend_retirement(
@@ -1293,15 +1954,9 @@ impl MappingAdapter {
         generation: u64,
         result: Result<(), String>,
     ) -> Result<(), MappingLifecycleError> {
-        if self.pending_backend_retirement != Some(generation) {
-            return Err(MappingLifecycleError::Backend(format!(
-                "backend retirement acknowledgement mismatch: pending={:?} completed={generation}",
-                self.pending_backend_retirement
-            )));
-        }
-        result.map_err(MappingLifecycleError::Backend)?;
-        self.pending_backend_retirement = None;
-        Ok(())
+        let terminal = result.map_err(MappingLifecycleError::Backend);
+        self.acknowledge_backend_retirement(generation)?;
+        terminal
     }
 
     fn backend_compute_config(&self) -> MappingBackendComputeConfig {
@@ -1398,6 +2053,24 @@ impl MappingAdapter {
     #[cfg(test)]
     pub(crate) fn checkpoint_export_pending_for_tests(&self) -> bool {
         self.checkpoint_export.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_backend_generation_for_tests(&mut self) {
+        self.backend_generation = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_owner_state_for_tests(&self) -> (bool, bool) {
+        (
+            self.mapping_worker.is_some(),
+            self.pending_backend_retirement.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    fn set_pending_backend_retirement_for_tests(&mut self, generation: u64) {
+        self.pending_backend_retirement = Some(generation);
     }
 
     pub(crate) fn prepare_backend_checkpoint_flush(
@@ -2801,6 +3474,22 @@ impl MappingAdapter {
             self.mapping_backend,
             self.backend_generation,
             self.backend_compute_config(),
+            gate,
+        )?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_worker_with_retirement_test_gate(
+        &mut self,
+        gate: MappingBackendRetirementTestGate,
+    ) -> Result<(), String> {
+        if let Some(worker) = self.mapping_worker.take() {
+            worker.stop_and_join()?;
+        }
+        self.mapping_worker = Some(MappingBackendWorker::start_with_retirement_test_gate(
+            self.mapping_backend,
+            self.backend_generation,
             gate,
         )?);
         Ok(())
@@ -4606,6 +5295,465 @@ mod tests {
             .expect("next generation starts after retirement");
         assert_eq!(started.session_generation, 2);
         assert!(adapter.backend_generation > generation);
+    }
+
+    #[tokio::test]
+    async fn mapping_final_lifecycle_lock_timeout_retains_every_owner() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle_guard = Arc::clone(&lifecycle_lock).lock_owned().await;
+        let attempt = MappingFinalOwner::waiting_for_lifecycle_lock(
+            Some(Arc::clone(&adapter)),
+            Arc::clone(&lifecycle_lock),
+        )
+        .attempt(ShutdownFailures::default())
+        .await;
+        let (owner, sticky) = match attempt {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause: MappingPendingCause::LifecycleLockTimeout,
+                sticky,
+            } => (owner, sticky),
+            _ => panic!("lifecycle-lock contention must return the retained final owner"),
+        };
+        assert_eq!(owner.state_name(), "waiting_lifecycle_lock");
+        assert!(adapter.lock().snapshot().active);
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (true, false));
+
+        drop(lifecycle_guard);
+        match owner.attempt(sticky).await {
+            MappingFinalAttempt::Settled {
+                capability,
+                terminal,
+            } => {
+                assert!(capability.generation().is_some());
+                assert_eq!(terminal, Ok(()));
+            }
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("released lifecycle lock remained pending: {cause}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mapping_final_backend_join_timeout_retains_the_same_os_join_handle() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        let retirement_gate = MappingBackendRetirementTestGate::blocked();
+        adapter
+            .lock()
+            .replace_worker_with_retirement_test_gate(retirement_gate.clone())
+            .expect("install retained retirement worker");
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let attempt = MappingFinalOwner::waiting_for_lifecycle_lock(
+            Some(Arc::clone(&adapter)),
+            Arc::clone(&lifecycle_lock),
+        )
+        .attempt(ShutdownFailures::default())
+        .await;
+        assert!(retirement_gate.entered());
+        let (owner, sticky) = match attempt {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause: MappingPendingCause::BackendJoinTimeout { .. },
+                sticky,
+            } => (owner, sticky),
+            _ => panic!("blocked backend join must return Pending"),
+        };
+        let join_thread_id = owner
+            .join_thread_id()
+            .expect("pending owner retains the backend OS join handle");
+
+        let attempt = owner.attempt(sticky).await;
+        let (owner, sticky) = match attempt {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause: MappingPendingCause::BackendJoinTimeout { .. },
+                sticky,
+            } => (owner, sticky),
+            _ => panic!("second bounded attempt must retain the same join owner"),
+        };
+        assert_eq!(owner.join_thread_id(), Some(join_thread_id));
+        retirement_gate.release();
+
+        match owner.attempt(sticky).await {
+            MappingFinalAttempt::Settled {
+                capability,
+                terminal,
+            } => {
+                assert!(capability.generation().is_some());
+                assert_eq!(terminal, Ok(()));
+            }
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("released backend join remained pending: {cause}")
+            }
+        }
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[tokio::test]
+    async fn mapping_final_ack_lock_timeout_retains_the_joined_terminal() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        let retirement = adapter
+            .lock()
+            .stop_session_detached("test-session")
+            .expect("detach exact backend generation")
+            .retirement
+            .expect("active session owns backend retirement");
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = MappingFinalOwner::from_retirement(
+            Arc::clone(&adapter),
+            Arc::clone(&lifecycle_lock),
+            retirement,
+        )
+        .expect("retirement owns final OS join handle");
+        let lifecycle_guard = Arc::clone(&lifecycle_lock).lock_owned().await;
+
+        let (owner, sticky) = match owner.attempt(ShutdownFailures::default()).await {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause: MappingPendingCause::RetirementAckLockTimeout { .. },
+                sticky,
+            } => (owner, sticky),
+            _ => panic!("ACK-lock contention after join must return Pending"),
+        };
+        assert_eq!(owner.state_name(), "waiting_retirement_ack");
+        assert_eq!(owner.joined_terminal(), Some(&Ok(())));
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, true));
+
+        drop(lifecycle_guard);
+        match owner.attempt(sticky).await {
+            MappingFinalAttempt::Settled { terminal, .. } => assert_eq!(terminal, Ok(())),
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("released ACK lock remained pending: {cause}")
+            }
+        }
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[tokio::test]
+    async fn mapping_final_generation_mismatch_never_creates_a_capability() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        let retirement = adapter
+            .lock()
+            .stop_session_detached("test-session")
+            .expect("detach exact backend generation")
+            .retirement
+            .expect("active session owns backend retirement");
+        let exact_generation = retirement.generation();
+        let mismatched_generation = exact_generation
+            .checked_add(1)
+            .expect("test generation increment");
+        adapter
+            .lock()
+            .set_pending_backend_retirement_for_tests(mismatched_generation);
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = MappingFinalOwner::from_retirement(
+            Arc::clone(&adapter),
+            Arc::clone(&lifecycle_lock),
+            retirement,
+        )
+        .expect("retirement owns final OS join handle");
+
+        let (owner, sticky) = match owner.attempt(ShutdownFailures::default()).await {
+            MappingFinalAttempt::Pending {
+                owner,
+                cause:
+                    MappingPendingCause::GenerationMismatch {
+                        expected,
+                        pending,
+                    },
+                sticky,
+            } => {
+                assert_eq!(expected, exact_generation);
+                assert_eq!(pending, Some(mismatched_generation));
+                (owner, sticky)
+            }
+            MappingFinalAttempt::Settled { .. } => {
+                panic!("generation mismatch must not mint a retirement capability")
+            }
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("unexpected pending cause: {cause}")
+            }
+        };
+        assert_eq!(owner.state_name(), "waiting_retirement_ack");
+        assert_eq!(owner.joined_terminal(), Some(&Ok(())));
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, true));
+
+        adapter
+            .lock()
+            .set_pending_backend_retirement_for_tests(exact_generation);
+        match owner.attempt(sticky).await {
+            MappingFinalAttempt::Settled {
+                capability,
+                terminal,
+            } => {
+                assert_eq!(capability.generation(), Some(exact_generation));
+                assert!(terminal.is_err(), "the observed mismatch remains sticky");
+            }
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("restored exact generation remained pending: {cause}")
+            }
+        }
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[tokio::test]
+    async fn joined_backend_error_still_acknowledges_the_exact_generation() {
+        let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
+        adapter
+            .lock()
+            .replace_worker_with_retirement_test_gate(
+                MappingBackendRetirementTestGate::failing(),
+            )
+            .expect("install failing retirement worker");
+        let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = MappingFinalOwner::waiting_for_lifecycle_lock(
+            Some(Arc::clone(&adapter)),
+            lifecycle_lock,
+        );
+
+        match owner.attempt(ShutdownFailures::default()).await {
+            MappingFinalAttempt::Settled {
+                capability,
+                terminal,
+            } => {
+                assert!(capability.generation().is_some());
+                assert!(terminal.is_err(), "joined panic remains a sticky terminal");
+            }
+            MappingFinalAttempt::Pending { cause, .. } => {
+                panic!("joined backend error remained pending: {cause}")
+            }
+        }
+        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[test]
+    fn legacy_completion_clears_exact_pending_generation_before_returning_join_error() {
+        let mut adapter = active_adapter(sample_config());
+        adapter
+            .replace_worker_with_retirement_test_gate(
+                MappingBackendRetirementTestGate::failing(),
+            )
+            .expect("install failing retirement worker");
+        let retirement = adapter
+            .stop_session_detached("test-session")
+            .expect("detach exact backend generation")
+            .retirement
+            .expect("active session owns backend retirement");
+        let generation = retirement.generation();
+        let joined_terminal = retirement.stop_and_join();
+        assert!(joined_terminal.is_err());
+        assert!(adapter
+            .complete_backend_retirement(generation, joined_terminal)
+            .is_err());
+        assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[test]
+    fn rejected_staged_worker_is_joined_before_identity_error_returns() {
+        // Every rejected staged worker gets an explicit stop-and-join.  Releasing the
+        // retirement gate before admission makes a successful join observable without
+        // adding a timing dependency to the admission assertions.
+        let settled_staged_worker = |generation| {
+            let gate = MappingBackendRetirementTestGate::blocked();
+            gate.release();
+            let worker = MappingBackendWorker::start_with_retirement_test_gate(
+                MappingBackendSpec::Voxel,
+                generation,
+                gate.clone(),
+            )
+            .expect("start staged worker");
+            (worker, gate)
+        };
+
+        let mut invalid = MappingAdapter::new(sample_config());
+        let (staged, gate) = settled_staged_worker(1);
+        let error = invalid
+            .start_session_with_staged_backend("", "test-map", staged)
+            .expect_err("empty session id must be rejected");
+        assert_eq!(
+            error,
+            MappingLifecycleError::InvalidArgument("session_id must not be empty".to_owned())
+        );
+        assert!(gate.entered(), "invalid session id worker was not joined");
+
+        let (staged, gate) = settled_staged_worker(2);
+        let error = invalid
+            .start_session_with_staged_backend("test-session", "   ", staged)
+            .expect_err("empty map name must be rejected");
+        assert_eq!(
+            error,
+            MappingLifecycleError::InvalidArgument("map_name must not be empty".to_owned())
+        );
+        assert!(gate.entered(), "invalid map name worker was not joined");
+        assert_eq!(invalid.backend_owner_state_for_tests(), (false, false));
+
+        let mut active = MappingAdapter::new(sample_config());
+        let active_snapshot = active
+            .start_session("active-session", "active-map")
+            .expect("start active session");
+        let (staged, gate) = settled_staged_worker(99);
+        let replay = active
+            .start_session_with_staged_backend("active-session", "active-map", staged)
+            .expect("same active session is an idempotent replay");
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.session_generation, active_snapshot.session_generation);
+        assert!(gate.entered(), "replay worker was not joined");
+
+        let (staged, gate) = settled_staged_worker(100);
+        let error = active
+            .start_session_with_staged_backend("other-session", "active-map", staged)
+            .expect_err("different active session must conflict");
+        assert!(matches!(error, MappingLifecycleError::Conflict(_)));
+        assert!(gate.entered(), "conflict worker was not joined");
+        active
+            .stop_session("active-session")
+            .expect("settle the active adapter worker");
+
+        let mut terminal = MappingAdapter::new(sample_config());
+        terminal
+            .start_session("terminal-session", "terminal-map")
+            .expect("start terminal-session fixture");
+        terminal
+            .stop_session("terminal-session")
+            .expect("terminalize session fixture");
+        let (staged, gate) = settled_staged_worker(3);
+        let error = terminal
+            .start_session_with_staged_backend("terminal-session", "new-map", staged)
+            .expect_err("stopped session id must remain terminal");
+        assert_eq!(
+            error,
+            MappingLifecycleError::TerminalSession("terminal-session".to_owned())
+        );
+        assert!(gate.entered(), "terminal-session worker was not joined");
+        assert_eq!(terminal.backend_owner_state_for_tests(), (false, false));
+
+        let mut pending_retirement = MappingAdapter::new(sample_config());
+        pending_retirement.set_pending_backend_retirement_for_tests(7);
+        let (staged, gate) = settled_staged_worker(4);
+        let error = pending_retirement
+            .start_session_with_staged_backend("pending-session", "pending-map", staged)
+            .expect_err("pending backend retirement must reject admission");
+        assert!(matches!(error, MappingLifecycleError::Backend(message) if message.contains("retirement is still pending")));
+        assert!(gate.entered(), "pending-retirement worker was not joined");
+
+        let mut session_exhausted = MappingAdapter::new(sample_config());
+        session_exhausted.next_session_generation = u64::MAX;
+        let (staged, gate) = settled_staged_worker(5);
+        let error = session_exhausted
+            .start_session_with_staged_backend("exhausted-session", "exhausted-map", staged)
+            .expect_err("session generation exhaustion must reject admission");
+        assert_eq!(error, MappingLifecycleError::GenerationExhausted);
+        assert!(gate.entered(), "session-exhaustion worker was not joined");
+
+        let mut backend_exhausted = MappingAdapter::new(sample_config());
+        backend_exhausted.exhaust_backend_generation_for_tests();
+        let (staged, gate) = settled_staged_worker(6);
+        let error = backend_exhausted
+            .start_session_with_staged_backend("backend-exhausted", "backend-map", staged)
+            .expect_err("backend generation exhaustion must reject admission");
+        assert!(matches!(error, MappingLifecycleError::Backend(message) if message.contains("generation exhausted")));
+        assert!(gate.entered(), "backend-exhaustion worker was not joined");
+
+        let mut identity = MappingAdapter::new(sample_config());
+        let (staged, gate) = settled_staged_worker(99);
+        let error = identity
+            .start_session_with_staged_backend("identity-session", "identity-map", staged)
+            .expect_err("wrong-generation staged worker must be rejected");
+        assert_eq!(
+            error,
+            MappingLifecycleError::Backend(
+                "staged mapping backend worker identity mismatch".to_owned()
+            )
+        );
+        assert!(gate.entered(), "identity-mismatch worker was not joined");
+        assert_eq!(identity.backend_owner_state_for_tests(), (false, false));
+
+        let mut failed_join = MappingAdapter::new(sample_config());
+        let failing_gate = MappingBackendRetirementTestGate::failing();
+        let staged = MappingBackendWorker::start_with_retirement_test_gate(
+            MappingBackendSpec::Voxel,
+            99,
+            failing_gate.clone(),
+        )
+        .expect("start failing staged worker");
+        let error = failed_join
+            .start_session_with_staged_backend("identity-session", "identity-map", staged)
+            .expect_err("identity rejection with a failed join must remain an error");
+        assert!(failing_gate.entered(), "failed-join worker was not joined");
+        let detail = error.to_string();
+        assert!(detail.contains("staged mapping backend worker identity mismatch"));
+        assert!(detail.contains("rejected worker join failed"));
+        assert_eq!(failed_join.backend_owner_state_for_tests(), (false, false));
+    }
+
+    #[test]
+    fn blocked_rejected_staged_worker_returns_with_the_exact_retained_join_owner() {
+        let mut adapter = MappingAdapter::new(sample_config());
+        let gate = MappingBackendRetirementTestGate::blocked();
+        let staged = MappingBackendWorker::start_with_retirement_test_gate(
+            MappingBackendSpec::Voxel,
+            99,
+            gate.clone(),
+        )
+        .expect("start blocked staged worker");
+        let thread_id = staged.thread_id_for_tests();
+
+        let started = Instant::now();
+        let error = adapter
+            .start_session_with_staged_backend("identity-session", "identity-map", staged)
+            .expect_err("wrong-generation staged worker must be rejected");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked staged-worker rejection must return within its bounded join deadline"
+        );
+        let detail = error.to_string();
+        assert!(detail.contains("staged mapping backend worker identity mismatch"));
+        assert!(detail.contains("pre-install stop remained pending"));
+        assert!(detail.contains("exact join owner retained until process exit"));
+        assert!(
+            mapping_backend_process_exit_retains_thread_for_tests(thread_id),
+            "bounded rejection must retain the exact unfinished OS join handle"
+        );
+        assert_eq!(adapter.backend_owner_state_for_tests(), (false, false));
+
+        gate.release();
+        join_retained_mapping_backend_thread_for_tests(thread_id)
+            .expect("released retained staged worker joins exactly once");
+        assert!(!mapping_backend_process_exit_retains_thread_for_tests(
+            thread_id
+        ));
+    }
+
+    #[test]
+    fn failed_stop_keeps_worker_owned_until_terminal_fallback_retires_it() {
+        let mut adapter = active_adapter(sample_config());
+        let session = adapter.snapshot();
+        adapter.exhaust_backend_generation_for_tests();
+
+        assert!(matches!(
+            adapter.stop_session_detached(&session.session_id),
+            Err(MappingLifecycleError::GenerationExhausted)
+        ));
+        assert!(adapter.snapshot().active);
+        assert!(adapter.mapping_worker.is_some());
+        assert!(adapter.pending_backend_retirement.is_none());
+
+        let transition = adapter
+            .force_stop_started_session_detached(&session.session_id, session.session_generation)
+            .expect("process-fatal fallback terminalizes the exact session");
+        assert!(!transition.snapshot.active);
+        assert_eq!(transition.snapshot.phase, MappingSessionPhase::Stopped);
+        let retirement = transition
+            .retirement
+            .expect("fallback owns worker retirement");
+        let generation = retirement.generation();
+        let result = retirement.stop_and_join();
+        adapter
+            .complete_backend_retirement(generation, result)
+            .expect("fallback retirement joins and acknowledges worker");
+        assert!(adapter.mapping_worker.is_none());
+        assert!(adapter.pending_backend_retirement.is_none());
     }
 
     #[tokio::test]

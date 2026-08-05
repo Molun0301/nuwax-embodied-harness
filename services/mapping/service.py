@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any
 
 from contracts.events import RuntimeEventCategory
-from contracts.runtime_views import MapSnapshot
+from contracts.runtime_views import MapSnapshot, map_content_sha256
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
 from providers import MapProvider
@@ -28,7 +29,9 @@ class MappingService:
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
         self._latest_snapshot: Optional[MapSnapshot] = None
-        self._revision_by_source: Dict[str, int] = {}
+        self._service_epoch = uuid.uuid4().hex
+        self._source_epoch_by_source: Dict[str, str] = {}
+        self._update_sequence_by_source_epoch: Dict[Tuple[str, str], int] = {}
         self._stream_occupancy_key_by_source: Dict[str, Tuple[object, ...]] = {}
         self._map_update_subscription_id: Optional[object] = None
         subscription = getattr(self._provider_owner, "subscribe_map_updates", None)
@@ -55,13 +58,19 @@ class MappingService:
                     or metadata.get("source_kind") == "platform_live_map_provider"
                 )
                 return self.ingest_external_snapshot(
+                    map_name=runtime_snapshot.map_name,
                     source_name=runtime_snapshot.source_name,
+                    source_epoch=runtime_snapshot.source_epoch,
                     occupancy_grid=runtime_snapshot.occupancy_grid,
                     cost_map=runtime_snapshot.cost_map,
                     semantic_map=runtime_snapshot.semantic_map,
                     metadata=metadata,
-                    version_id_override=None if live_streaming else runtime_snapshot.version_id,
-                    revision_override=None if live_streaming else runtime_snapshot.revision,
+                    update_sequence_override=(
+                        None if live_streaming else runtime_snapshot.update_sequence
+                    ),
+                    content_sha256=(
+                        None if live_streaming else runtime_snapshot.content_sha256
+                    ),
                 )
 
         provider = self._get_map_provider()
@@ -90,6 +99,13 @@ class MappingService:
                 return latest_snapshot
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
         return self.ingest_external_snapshot(
+            map_name=self._resolve_map_name(
+                explicit_map_name=None,
+                metadata=provider_metadata,
+                occupancy_grid=occupancy_grid,
+                cost_map=cost_map,
+                semantic_map=semantic_map,
+            ),
             source_name=provider.provider_name,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
@@ -110,7 +126,9 @@ class MappingService:
                 return self._latest_snapshot
         display_metadata = payload.get("display_occupancy_metadata")
         return self.ingest_external_snapshot(
+            map_name=str(payload.get("map_name") or "").strip() or None,
             source_name=source_name,
+            source_epoch=str(payload.get("source_epoch") or "").strip() or None,
             occupancy_grid=payload.get("occupancy_grid"),
             cost_map=payload.get("cost_map"),
             semantic_map=payload.get("semantic_map"),
@@ -131,13 +149,15 @@ class MappingService:
     def ingest_external_snapshot(
         self,
         *,
+        map_name: Optional[str] = None,
         source_name: str,
+        source_epoch: Optional[str] = None,
         occupancy_grid=None,
         cost_map=None,
         semantic_map=None,
         metadata: Optional[Dict[str, object]] = None,
-        version_id_override: Optional[str] = None,
-        revision_override: Optional[int] = None,
+        update_sequence_override: Optional[int] = None,
+        content_sha256: Optional[str] = None,
         stream_occupancy_grid=None,
         stream_occupancy_source: Optional[str] = None,
         stream_occupancy_fallback_reason: Optional[str] = None,
@@ -149,6 +169,64 @@ class MappingService:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
 
         source_metadata = dict(metadata or {})
+        resolved_map_name = self._resolve_map_name(
+            explicit_map_name=map_name,
+            metadata=source_metadata,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+        )
+        resolved_source_epoch = self._resolve_source_epoch(
+            source_name=source_name,
+            explicit_source_epoch=source_epoch,
+            metadata=source_metadata,
+        )
+        metadata_update_sequence = source_metadata.get("update_sequence")
+        if update_sequence_override is None and metadata_update_sequence is not None:
+            try:
+                update_sequence_override = int(metadata_update_sequence)
+            except (TypeError, ValueError) as exc:
+                raise GatewayError("地图快照 update_sequence 非法。") from exc
+        declared_content_sha256 = (
+            str(content_sha256 or source_metadata.get("content_sha256") or "")
+            .strip()
+            .lower()
+            or None
+        )
+        resolved_content_sha256 = map_content_sha256(
+            map_name=resolved_map_name,
+            frame_id=self._resolve_snapshot_frame_id(
+                occupancy_grid,
+                cost_map,
+                semantic_map,
+            ),
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+        )
+        if (
+            declared_content_sha256 is not None
+            and declared_content_sha256 != resolved_content_sha256
+        ):
+            raise GatewayError("地图快照 content_sha256 与图层内容不一致。")
+        for legacy_key in (
+            "version_id",
+            "revision",
+            "source_snapshot_id",
+            "snapshot_revision",
+            "map_version_id",
+            "platform_map_version_id",
+            "platform_map_version_revision",
+        ):
+            source_metadata.pop(legacy_key, None)
+        for identity_key in (
+            "map_name",
+            "source_name",
+            "source_epoch",
+            "update_sequence",
+            "content_sha256",
+        ):
+            source_metadata.pop(identity_key, None)
         snapshot_metadata = {
             "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
             "map_snapshot_kind": source_metadata.get("map_snapshot_kind") or self._infer_snapshot_kind(source_metadata),
@@ -162,10 +240,12 @@ class MappingService:
         )
         with self._lock:
             if (
-                version_id_override is None
-                and revision_override is None
+                update_sequence_override is None
                 and self._is_equivalent_to_latest_snapshot(
+                    map_name=resolved_map_name,
                     source_name=source_name,
+                    source_epoch=resolved_source_epoch,
+                    content_sha256=resolved_content_sha256,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
                     semantic_map=semantic_map,
@@ -183,27 +263,52 @@ class MappingService:
             ):
                 return self._latest_snapshot  # type: ignore[return-value]
 
-            if revision_override is not None:
-                revision = max(1, int(revision_override))
-            else:
-                revision = self._revision_by_source.get(source_name, 0) + 1
-            self._revision_by_source[source_name] = max(self._revision_by_source.get(source_name, 0), revision)
-            normalized_source = "".join(
-                char if char.isalnum() else "_"
-                for char in source_name.lower()
-            ).strip("_") or "map"
-            snapshot_id = version_id_override or "mapsnap_%s_%06d" % (
-                normalized_source,
-                revision,
+            sequence_key = (source_name, resolved_source_epoch)
+            previous_sequence = self._update_sequence_by_source_epoch.get(
+                sequence_key,
+                0,
             )
+            if update_sequence_override is not None:
+                if isinstance(update_sequence_override, bool):
+                    raise GatewayError("地图快照 update_sequence 非法。")
+                update_sequence = int(update_sequence_override)
+                if update_sequence < 1:
+                    raise GatewayError("地图快照 update_sequence 必须大于零。")
+                if update_sequence < previous_sequence:
+                    raise GatewayError("地图快照 update_sequence 发生回退。")
+                if update_sequence == previous_sequence:
+                    latest = self._latest_snapshot
+                    if (
+                        latest is not None
+                        and latest.source_name == source_name
+                        and latest.source_epoch == resolved_source_epoch
+                        and latest.map_name == resolved_map_name
+                        and latest.content_sha256 == resolved_content_sha256
+                    ):
+                        return latest
+            else:
+                update_sequence = previous_sequence + 1
+            self._update_sequence_by_source_epoch[sequence_key] = update_sequence
             snapshot = MapSnapshot(
+                map_name=resolved_map_name,
                 source_name=source_name,
-                version_id=str(snapshot_id),
-                revision=revision,
+                source_epoch=resolved_source_epoch,
+                update_sequence=update_sequence,
+                content_sha256=resolved_content_sha256,
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
                 semantic_map=semantic_map,
                 metadata=snapshot_metadata,
+            )
+            frame_metadata = self._build_map_frame_metadata(snapshot)
+            snapshot = snapshot.model_copy(
+                update={
+                    "metadata": {
+                        **dict(snapshot.metadata),
+                        **frame_metadata,
+                    }
+                },
+                deep=True,
             )
             self._latest_snapshot = snapshot
             self._state_store.write(
@@ -211,16 +316,22 @@ class MappingService:
                 source_name,
                 snapshot,
                 source=source_name,
-                metadata={"kind": "latest_map", "version_id": snapshot.version_id, "revision": revision},
+                metadata={
+                    "kind": "latest_map",
+                    "map_name": snapshot.map_name,
+                    "source_epoch": snapshot.source_epoch,
+                    "update_sequence": snapshot.update_sequence,
+                    "content_sha256": snapshot.content_sha256,
+                },
             )
-            frame_metadata = self._build_map_frame_metadata(snapshot)
             event_payload = {
+                "map_name": snapshot.map_name,
                 "source_name": source_name,
-                "version_id": snapshot.version_id,
-                "revision": revision,
+                "source_epoch": snapshot.source_epoch,
+                "update_sequence": snapshot.update_sequence,
+                "content_sha256": snapshot.content_sha256,
                 **frame_metadata,
             }
-            snapshot.metadata.update(frame_metadata)
             stream_snapshot = None
             stream_event_payload = None
             stream_sequence = None
@@ -234,6 +345,13 @@ class MappingService:
                     stream_snapshot = snapshot.model_copy(
                         update={
                             "occupancy_grid": stream_occupancy_grid,
+                            "content_sha256": map_content_sha256(
+                                map_name=snapshot.map_name,
+                                frame_id=snapshot.frame_id,
+                                occupancy_grid=stream_occupancy_grid,
+                                cost_map=snapshot.cost_map,
+                                semantic_map=snapshot.semantic_map,
+                            ),
                             "metadata": dict(snapshot.metadata),
                         },
                         deep=False,
@@ -244,9 +362,6 @@ class MappingService:
                     display_fallback_reason = str(
                         stream_occupancy_fallback_reason or ""
                     ).strip() or None
-                    stream_snapshot.metadata.update(
-                        dict(stream_occupancy_metadata or {})
-                    )
                     display_annotations = {
                         "occupancy_view": display_source,
                         "display_occupancy_source": display_source,
@@ -258,11 +373,31 @@ class MappingService:
                         "navigation_occupancy_source": "effective",
                         "navigation_occupancy_content_hash": effective_occupancy_hash,
                     }
-                    stream_snapshot.metadata.update(display_annotations)
+                    stream_snapshot = stream_snapshot.model_copy(
+                        update={
+                            "metadata": {
+                                **dict(stream_snapshot.metadata),
+                                **dict(stream_occupancy_metadata or {}),
+                                **display_annotations,
+                            }
+                        },
+                        deep=True,
+                    )
                     stream_frame_metadata = self._build_map_frame_metadata(
                         stream_snapshot
                     )
-                    stream_snapshot.metadata.update(stream_frame_metadata)
+                    stream_snapshot = stream_snapshot.model_copy(
+                        update={
+                            "metadata": {
+                                **dict(stream_snapshot.metadata),
+                                **stream_frame_metadata,
+                            }
+                        },
+                        deep=True,
+                    )
+                    stream_event_payload["content_sha256"] = (
+                        stream_snapshot.content_sha256
+                    )
                     stream_event_payload.update(stream_frame_metadata)
                     stream_event_payload.update(display_annotations)
                 stream_sequence = self._extract_stream_sequence(
@@ -294,7 +429,7 @@ class MappingService:
                 payload=stream_snapshot,
                 frame_id=stream_snapshot.frame_id,
                 sequence=stream_sequence,
-                revision=str(stream_snapshot.revision),
+                revision=str(stream_snapshot.update_sequence),
                 status="available",
                 metadata=stream_event_payload,
             )
@@ -335,8 +470,14 @@ class MappingService:
             "event_type": "catalog_cleared",
             "cleared_map_name": str(cleared_map_name or "").strip() or None,
             "reason": str(reason or "").strip() or None,
-            "previous_version_id": previous.version_id if previous is not None else None,
-            "previous_revision": previous.revision if previous is not None else None,
+            "previous_map_name": previous.map_name if previous is not None else None,
+            "previous_source_epoch": previous.source_epoch if previous is not None else None,
+            "previous_update_sequence": (
+                previous.update_sequence if previous is not None else None
+            ),
+            "previous_content_sha256": (
+                previous.content_sha256 if previous is not None else None
+            ),
             "source_alive": False,
             "live_streaming_ready": False,
             "mapping_live_streaming_ready": False,
@@ -444,7 +585,9 @@ class MappingService:
                     revisions.append(int(value))
                 except (TypeError, ValueError):
                     pass
-            content_revision = sum(revisions) if revisions else snapshot.revision
+            content_revision = (
+                sum(revisions) if revisions else snapshot.update_sequence
+            )
         occupancy_hash = metadata.get("occupancy_content_hash") or occupancy_metrics.get("content_hash")
         cost_map_hash = metadata.get("cost_map_content_hash") or cost_map_metrics.get("content_hash")
         return {
@@ -506,14 +649,23 @@ class MappingService:
     def _is_equivalent_to_latest_snapshot(
         self,
         *,
+        map_name: str,
         source_name: str,
+        source_epoch: str,
+        content_sha256: str,
         occupancy_grid,
         cost_map,
         semantic_map,
         metadata: Dict[str, object],
     ) -> bool:
         latest = self._latest_snapshot
-        if latest is None or latest.source_name != source_name:
+        if (
+            latest is None
+            or latest.map_name != map_name
+            or latest.source_name != source_name
+            or latest.source_epoch != source_epoch
+            or latest.content_sha256 != content_sha256
+        ):
             return False
         latest_meta = latest.metadata if isinstance(latest.metadata, dict) else {}
         new_hash = metadata.get("content_hash") or metadata.get("occupancy_content_hash")
@@ -594,9 +746,11 @@ class MappingService:
             if latest is None:
                 return False
             return (
-                latest.source_name == snapshot.source_name
-                and latest.version_id == snapshot.version_id
-                and latest.revision == snapshot.revision
+                latest.map_name == snapshot.map_name
+                and latest.source_name == snapshot.source_name
+                and latest.source_epoch == snapshot.source_epoch
+                and latest.update_sequence == snapshot.update_sequence
+                and latest.content_sha256 == snapshot.content_sha256
                 and self._normalize_snapshot_value(latest.occupancy_grid)
                 == self._normalize_snapshot_value(snapshot.occupancy_grid)
                 and self._normalize_snapshot_value(latest.cost_map)
@@ -606,6 +760,84 @@ class MappingService:
                 and self._normalize_snapshot_value(latest.metadata)
                 == self._normalize_snapshot_value(snapshot.metadata)
             )
+
+    def _resolve_map_name(
+        self,
+        *,
+        explicit_map_name: Optional[str],
+        metadata: Dict[str, object],
+        occupancy_grid,
+        cost_map,
+        semantic_map,
+    ) -> str:
+        candidates = []
+        explicit = str(explicit_map_name or "").strip()
+        metadata_name = str(metadata.get("map_name") or "").strip()
+        if explicit:
+            candidates.append(explicit)
+        if metadata_name:
+            candidates.append(metadata_name)
+        for layer in (occupancy_grid, cost_map, semantic_map):
+            if layer is not None:
+                layer_name = str(getattr(layer, "map_id", "") or "").strip()
+                if layer_name:
+                    candidates.append(layer_name)
+        if not candidates:
+            raise GatewayError("地图快照缺少 map_name。")
+        map_name = candidates[0]
+        if any(candidate != map_name for candidate in candidates[1:]):
+            raise GatewayError("地图快照 map_name 与图层 map_id 不一致。")
+        return map_name
+
+    def _resolve_source_epoch(
+        self,
+        *,
+        source_name: str,
+        explicit_source_epoch: Optional[str],
+        metadata: Dict[str, object],
+    ) -> str:
+        explicit = str(explicit_source_epoch or "").strip()
+        metadata_epoch = str(metadata.get("source_epoch") or "").strip()
+        if explicit and metadata_epoch and explicit != metadata_epoch:
+            raise GatewayError("地图快照 source_epoch 不一致。")
+        session_id = str(
+            metadata.get("mapping_session_id")
+            or metadata.get("session_id")
+            or ""
+        ).strip()
+        session_generation = metadata.get("session_generation")
+        session_epoch = (
+            "%s:%s" % (session_id, session_generation)
+            if session_id and session_generation is not None
+            else ""
+        )
+        declared_epoch = explicit or metadata_epoch
+        if declared_epoch and session_epoch and declared_epoch != session_epoch:
+            raise GatewayError("地图快照 source_epoch 与建图会话不一致。")
+        if declared_epoch:
+            return declared_epoch
+        if session_id and session_generation is not None:
+            return session_epoch
+        return self._source_epoch_by_source.setdefault(
+            source_name,
+            "%s:%s" % (self._service_epoch, source_name),
+        )
+
+    def _resolve_snapshot_frame_id(
+        self,
+        occupancy_grid,
+        cost_map,
+        semantic_map,
+    ) -> Optional[str]:
+        frame_ids = {
+            str(getattr(layer, "frame_id", "") or "").strip()
+            for layer in (occupancy_grid, cost_map, semantic_map)
+            if layer is not None
+            and str(getattr(layer, "frame_id", "") or "").strip()
+        }
+        if len(frame_ids) > 1:
+            raise GatewayError("地图快照图层 frame_id 不一致。")
+        return next(iter(frame_ids), None)
 
     def _get_map_provider(self) -> MapProvider:
         provider = self._find_map_provider()

@@ -32,6 +32,15 @@ from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.map_workspace import (
+    MAP_GEOREFERENCE_ALTITUDE_POLICY,
+    MAP_GEOREFERENCE_AXIS_CONVENTION,
+    MAP_GEOREFERENCE_MAX_COORDINATE_M,
+    MAP_GEOREFERENCE_MAX_LATITUDE_DEG,
+    MAP_GEOREFERENCE_PROJECTED_CRS,
+    MAP_GEOREFERENCE_SCHEMA_VERSION,
+    MAP_GEOREFERENCE_SOURCE_CRS,
+)
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import (
@@ -563,6 +572,77 @@ def _schema_object(
         "required": list(required),
         "additionalProperties": False,
     }
+
+
+def _map_georeference_input_schema() -> Dict[str, object]:
+    return _schema_object(
+        {
+            "schema_version": {
+                "type": "integer",
+                "const": MAP_GEOREFERENCE_SCHEMA_VERSION,
+            },
+            "map_name": {"type": "string", "minLength": 1},
+            "map_frame_id": {"type": "string", "minLength": 1},
+            "source_crs": {"type": "string", "const": MAP_GEOREFERENCE_SOURCE_CRS},
+            "projected_crs": {
+                "type": "string",
+                "const": MAP_GEOREFERENCE_PROJECTED_CRS,
+            },
+            "axis_convention": {
+                "type": "string",
+                "const": MAP_GEOREFERENCE_AXIS_CONVENTION,
+            },
+            "anchor_lat_deg": {
+                "type": "number",
+                "minimum": -MAP_GEOREFERENCE_MAX_LATITUDE_DEG,
+                "maximum": MAP_GEOREFERENCE_MAX_LATITUDE_DEG,
+            },
+            "anchor_lng_deg": {"type": "number", "minimum": -180.0, "maximum": 180.0},
+            "anchor_easting_m": {"type": "number"},
+            "anchor_northing_m": {"type": "number"},
+            "map_origin_x_m": {
+                "type": "number",
+                "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+            },
+            "map_origin_y_m": {
+                "type": "number",
+                "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+            },
+            "map_from_projected_yaw_rad": {
+                "type": "number",
+                "minimum": -math.pi,
+                "exclusiveMaximum": math.pi,
+            },
+            "altitude_policy": {
+                "type": "string",
+                "const": MAP_GEOREFERENCE_ALTITUDE_POLICY,
+            },
+            "map_plane_z_m": {
+                "type": "number",
+                "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+            },
+        },
+        required=(
+            "schema_version",
+            "map_name",
+            "map_frame_id",
+            "source_crs",
+            "projected_crs",
+            "axis_convention",
+            "anchor_lat_deg",
+            "anchor_lng_deg",
+            "anchor_easting_m",
+            "anchor_northing_m",
+            "map_origin_x_m",
+            "map_origin_y_m",
+            "map_from_projected_yaw_rad",
+            "altitude_policy",
+            "map_plane_z_m",
+        ),
+    )
 
 
 def _exploration_stop_conditions_schema() -> Dict[str, object]:
@@ -1955,13 +2035,13 @@ class GatewayRuntime:
             _descriptor(
                 "relocalize_active_map",
                 "重定位当前地图",
-                "仅在已加载地图上重新估计机器人位姿，不选图、不切图、不发布资产。"
-                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，因此该能力显式 unsupported。",
+                "仅在已加载地图上重新估计机器人位姿，不选图、不切图、不发布资产。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
+                        "request_id": {"type": "string"},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
                 ),
@@ -2093,6 +2173,7 @@ class GatewayRuntime:
                     {
                         "map_name": {"type": "string"},
                         "reason": {"type": "string"},
+                        "georeference": _map_georeference_input_schema(),
                     },
                 ),
                 output_schema=_schema_object({"map_asset_bundle": {"type": "object"}, "active_workspace": {"type": "object"}}),
@@ -2899,7 +2980,6 @@ class GatewayRuntime:
                 display_name="重定位当前地图",
                 description=(
                     "仅在已加载地图上重新估计机器人位姿，不选图、不切图、不发布资产。"
-                    "当前 typed Relocalize RPC/ACK 尚未提供。"
                 ),
                 category=SkillCategory.SYSTEM,
                 capability_name="relocalize_active_map",
@@ -3752,9 +3832,11 @@ class GatewayRuntime:
         return {
             "available": bool(occupancy_grid is not None),
             "timestamp": getattr(snapshot, "timestamp", None),
-            "version_id": getattr(snapshot, "version_id", None),
-            "revision": getattr(snapshot, "revision", None),
+            "map_name": getattr(snapshot, "map_name", None),
             "source_name": getattr(snapshot, "source_name", None),
+            "source_epoch": getattr(snapshot, "source_epoch", None),
+            "update_sequence": getattr(snapshot, "update_sequence", None),
+            "content_sha256": getattr(snapshot, "content_sha256", None),
             "frame_id": getattr(snapshot, "frame_id", None),
             "occupancy_grid": {
                 "timestamp": getattr(occupancy_grid, "timestamp", None),
@@ -4222,7 +4304,11 @@ class GatewayRuntime:
             height = getattr(occupancy_grid, "height", None)
             map_status = ServiceHealthStatus.AVAILABLE
             map_summary = "地图帧已上报"
-            map_evidence = f"栅格 {width or '--'}×{height or '--'}，快照 {getattr(map_snapshot, 'version_id', None) or '--'}"
+            map_evidence = (
+                f"栅格 {width or '--'}×{height or '--'}，地图 "
+                f"{getattr(map_snapshot, 'map_name', None) or '--'}，更新 "
+                f"{getattr(map_snapshot, 'update_sequence', None) or '--'}"
+            )
         elif map_workspace_name:
             map_status = ServiceHealthStatus.IDLE
             map_summary = "已加载地图工作区，等待实时地图帧"
@@ -4726,7 +4812,15 @@ class GatewayRuntime:
             return {}
         slim: Dict[str, Any] = {
             key: data[key]
-            for key in ("timestamp", "source_name", "version_id", "revision", "frame_id")
+            for key in (
+                "timestamp",
+                "map_name",
+                "source_name",
+                "source_epoch",
+                "update_sequence",
+                "content_sha256",
+                "frame_id",
+            )
             if key in data
         }
         if data.get("occupancy_grid") is not None:
@@ -4803,7 +4897,6 @@ class GatewayRuntime:
                 "timestamp",
                 "map_name",
                 "source_name",
-                "source_snapshot_id",
                 "frame_id",
                 "manifest_sha256",
             )
@@ -7959,19 +8052,18 @@ class GatewayRuntime:
         except GatewayError as exc:
             if exc.error_code != "localization_unavailable":
                 raise
-        del workspace, requested_by
-        raise GatewayError(
-            "地图 %s 尚未完成定位，且 geometry-runtime proto 未提供 typed "
-            "Relocalize RPC/ACK，无法为 %s 自动重定位。"
-            % (map_name, capability_name),
-            error_code="unsupported",
-            http_status=501,
-            jsonrpc_code=-32601,
-            details={
-                "map_name": map_name,
-                "capability_name": capability_name,
-                "missing_contract": "typed Relocalize RPC/ACK",
+        _session, refreshed_workspace = self.map_workspace_service.relocalize_active_map(
+            map_name=map_name,
+            metadata={
+                "requested_by": requested_by or "unknown",
+                "source": capability_name,
+                "logical_timeout_ms": 10_000,
             },
+        )
+        return self._ensure_localization_ready(
+            capability_name=capability_name,
+            map_name=map_name,
+            workspace=refreshed_workspace,
         )
 
     def _build_navigation_arrival_result(
@@ -9501,6 +9593,44 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor(capability_name)
         timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
         payload = dict(arguments or {})
+        if capability_name == "relocalize_active_map":
+            def canonical_relocalize_request_id(source: str) -> str:
+                source = str(source or "").strip()
+                if source.startswith("relocalize:"):
+                    return source
+                return "relocalize:%s" % hashlib.sha256(
+                    source.encode("utf-8")
+                ).hexdigest()
+
+            request_id = str(payload.get("request_id") or "").strip()
+            if not request_id:
+                rpc_request_id = (request_context or {}).get("rpc_request_id")
+                if rpc_request_id is not None and rpc_request_id != "":
+                    rpc_request_id_text = str(rpc_request_id).strip()
+                    if rpc_request_id_text.startswith("relocalize:"):
+                        request_id = rpc_request_id_text
+                    else:
+                        request_id = json.dumps(
+                            {
+                                "kind": "mcp_rpc_request_id",
+                                "value": rpc_request_id,
+                            },
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+            if not request_id:
+                request_id = str(
+                    (request_context or {}).get("request_id") or ""
+                ).strip()
+            if not request_id:
+                request_id = uuid.uuid4().hex
+            request_id = canonical_relocalize_request_id(request_id)
+            payload["request_id"] = request_id
+            if request_context is not None and not str(
+                request_context.get("request_id") or ""
+            ).strip():
+                request_context["request_id"] = request_id
 
         def runner(context) -> Dict[str, Any]:
             context.ensure_active()
@@ -9554,14 +9684,15 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        del arguments, requested_by, request_context
-        raise GatewayError(
-            "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
-            "relocalize_active_map 暂不支持。",
-            error_code="unsupported",
-            http_status=501,
-            jsonrpc_code=-32601,
-            details={"missing_contract": "typed Relocalize RPC/ACK"},
+        return self._submit_geometry_skill_task(
+            capability_name="relocalize_active_map",
+            skill_handler=partial(
+                localization_skills.handle_relocalize_active_map,
+                self._skill_ctx,
+            ),
+            arguments=arguments,
+            requested_by=requested_by,
+            request_context=request_context,
         )
 
     # ------------------------------------------------------------------
@@ -12398,15 +12529,6 @@ class GatewayRuntime:
         - ASYNC 类几何 capability：仅做禁用 / blocked 检查；启动留给 runner 内的 ensure 调用。
         """
 
-        if capability_name == "relocalize_active_map":
-            raise GatewayError(
-                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
-                "relocalize_active_map 暂不支持。",
-                error_code="unsupported",
-                http_status=501,
-                jsonrpc_code=-32601,
-                details={"missing_contract": "typed Relocalize RPC/ACK"},
-            )
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
         activation_level = _runtime_activation_level(capability_name)
@@ -13069,8 +13191,8 @@ class GatewayRuntime:
                 None,
             ),
             "relocalize_active_map": (
-                lambda: False,
-                "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK。",
+                lambda: self.platform_geometry_runtime.is_relocalization_available(),
+                "当前激活地图没有可用的重定位目标。",
             ),
             "get_map_snapshot": (
                 lambda: True,

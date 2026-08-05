@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from copy import deepcopy
+
 from contracts.compat import StrEnum
 from datetime import datetime
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from contracts.artifacts import ArtifactRef
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
@@ -18,7 +22,7 @@ from contracts.spatial_memory import (
     SemanticRegion as SpatialSemanticRegion,
     SpatialAnchor,
 )
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 
 class DiagnosticLevel(StrEnum):
@@ -235,6 +239,45 @@ def _validate_optional_map_asset_name(value: object) -> Optional[str]:
     return _validate_map_asset_name(value)
 
 
+def map_content_sha256(
+    *,
+    map_name: str,
+    frame_id: Optional[str],
+    occupancy_grid=None,
+    cost_map=None,
+    semantic_map=None,
+) -> str:
+    """Return the deterministic digest for map content, excluding volatile timestamps."""
+
+    def normalize(value):
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            return {
+                str(key): normalize(inner)
+                for key, inner in sorted(value.items(), key=lambda item: str(item[0]))
+                if key != "timestamp"
+            }
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        return value
+
+    payload = {
+        "map_name": str(map_name or "").strip(),
+        "frame_id": str(frame_id or "").strip() or None,
+        "occupancy_grid": normalize(occupancy_grid),
+        "cost_map": normalize(cost_map),
+        "semantic_map": normalize(semantic_map),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class LocalizationSnapshot(TimestampedContract):
     """定位服务快照。"""
 
@@ -247,27 +290,96 @@ class LocalizationSnapshot(TimestampedContract):
 class MapSnapshot(TimestampedContract):
     """地图服务快照。"""
 
+    model_config = ConfigDict(frozen=True)
+
+    map_name: str = Field(description="用户选择的地图名称。")
     source_name: str = Field(description="地图来源名称。")
-    version_id: str = Field(description="运行态地图快照标识。")
-    revision: int = Field(default=1, ge=1, description="来源内递增版本号。")
+    source_epoch: str = Field(description="来源生命周期内稳定、跨生命周期变化的作用域标识。")
+    update_sequence: int = Field(ge=1, description="source_epoch 作用域内递增的更新序号。")
+    content_sha256: str = Field(description="快照规范内容 SHA-256。")
     frame_id: Optional[str] = Field(default=None, description="地图快照统一消费坐标系。")
     occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")
     cost_map: Optional[CostMap] = Field(default=None, description="代价地图。")
     semantic_map: Optional[SemanticMap] = Field(default=None, description="语义地图。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
-    @model_validator(mode="after")
-    def _derive_frame_id(self) -> "MapSnapshot":
-        """在未显式提供时，从地图层中推导统一坐标系。"""
+    @field_validator("map_name", "source_name", "source_epoch")
+    @classmethod
+    def _validate_snapshot_identity_text(cls, value: str) -> str:
+        resolved = str(value or "").strip()
+        if not resolved:
+            raise ValueError("地图快照身份字段不能为空。")
+        return resolved
 
-        if self.frame_id:
-            return self
-        for layer in (self.occupancy_grid, self.cost_map, self.semantic_map):
-            candidate = str(getattr(layer, "frame_id", "") or "").strip() if layer is not None else ""
-            if candidate:
-                self.frame_id = candidate
-                break
+    @field_validator("content_sha256")
+    @classmethod
+    def _validate_content_sha256(cls, value: str) -> str:
+        resolved = str(value or "").strip().lower()
+        if len(resolved) != 64 or any(char not in "0123456789abcdef" for char in resolved):
+            raise ValueError("content_sha256 必须为 64 位十六进制字符串。")
+        return resolved
+
+    @model_validator(mode="after")
+    def _validate_snapshot_identity(self) -> "MapSnapshot":
+        """先封存输入，再推导统一 frame 并验证内容身份。"""
+
+        occupancy_grid = deepcopy(object.__getattribute__(self, "occupancy_grid"))
+        cost_map = deepcopy(object.__getattribute__(self, "cost_map"))
+        semantic_map = deepcopy(object.__getattribute__(self, "semantic_map"))
+        metadata = deepcopy(object.__getattribute__(self, "metadata"))
+        object.__setattr__(self, "occupancy_grid", occupancy_grid)
+        object.__setattr__(self, "cost_map", cost_map)
+        object.__setattr__(self, "semantic_map", semantic_map)
+        object.__setattr__(self, "metadata", metadata)
+
+        map_name = object.__getattribute__(self, "map_name")
+        frame_id = object.__getattribute__(self, "frame_id")
+        layers = tuple(
+            layer
+            for layer in (occupancy_grid, cost_map, semantic_map)
+            if layer is not None
+        )
+        if not frame_id:
+            for layer in layers:
+                candidate = str(getattr(layer, "frame_id", "") or "").strip()
+                if candidate:
+                    frame_id = candidate
+                    object.__setattr__(self, "frame_id", frame_id)
+                    break
+        for layer in layers:
+            if str(layer.map_id or "").strip() != map_name:
+                raise ValueError("地图快照图层 map_id 必须等于 map_name。")
+            if frame_id and layer.frame_id != frame_id:
+                raise ValueError("地图快照图层 frame_id 不一致。")
+        expected_content_sha256 = map_content_sha256(
+            map_name=map_name,
+            frame_id=frame_id,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+        )
+        if object.__getattribute__(self, "content_sha256") != expected_content_sha256:
+            raise ValueError("地图快照 content_sha256 与规范内容不一致。")
         return self
+
+    def __getattribute__(self, name: str):
+        value = super().__getattribute__(name)
+        if name in {"occupancy_grid", "cost_map", "semantic_map", "metadata"}:
+            return deepcopy(value)
+        return value
+
+    def model_copy(
+        self,
+        *,
+        update: Optional[Mapping[str, object]] = None,
+        deep: bool = False,
+    ) -> "MapSnapshot":
+        payload = self.model_dump(mode="python")
+        if deep:
+            payload = deepcopy(payload)
+        changes = dict(update or {})
+        payload.update(deepcopy(changes) if deep else changes)
+        return type(self).model_validate(payload)
 
 
 class NavigationContext(TimestampedContract):

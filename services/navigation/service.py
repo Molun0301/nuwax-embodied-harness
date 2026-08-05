@@ -1241,6 +1241,9 @@ class NavigationService:
             map_snapshot = self._mapping_service.get_latest_snapshot()
         except Exception:
             map_snapshot = None
+        resolved = str(getattr(map_snapshot, "map_name", "") or "").strip()
+        if resolved:
+            return resolved
         snapshot_metadata = getattr(map_snapshot, "metadata", None)
         metadata = snapshot_metadata if isinstance(snapshot_metadata, dict) else {}
         for key in ("active_map_name", "map_name", "seed_map_name"):
@@ -1775,12 +1778,24 @@ class NavigationService:
                 resolved_map_name = self._resolve_forbidden_zone_map_name(None)
             except GatewayError:
                 resolved_map_name = None
+            if (
+                resolved_map_name is not None
+                and map_snapshot.map_name != resolved_map_name
+            ):
+                raise GatewayError(
+                    "当前语义地图与激活的 map_name 不一致。",
+                    error_code="map_snapshot_name_mismatch",
+                )
             goal_metadata = {
                 "resolved_region_id": region.region_id,
-                "map_snapshot_version_id": map_snapshot.version_id,
+                "map_name": map_snapshot.map_name,
+                "map_snapshot_identity": {
+                    "source_name": map_snapshot.source_name,
+                    "source_epoch": map_snapshot.source_epoch,
+                    "update_sequence": map_snapshot.update_sequence,
+                    "content_sha256": map_snapshot.content_sha256,
+                },
             }
-            if resolved_map_name is not None:
-                goal_metadata["map_name"] = resolved_map_name
             return NavigationGoal(
                 goal_id=f"nav_named_{self._normalize_name(target_name)}",
                 target_pose=region.centroid,
@@ -2793,7 +2808,23 @@ class NavigationService:
             and localization_session.status == LocalizationSessionStatus.READY
             and (map_name is None or localization_session.map_name == map_name)
         )
+        requested_map_name = str(map_name or "").strip() or None
+        active_map_name = (
+            str(localization_session.map_name or "").strip() or None
+            if localization_session is not None
+            else None
+        )
+        expected_map_name = requested_map_name or active_map_name
         has_map = map_snapshot is not None
+        if (
+            map_snapshot is not None
+            and expected_map_name is not None
+            and map_snapshot.map_name != expected_map_name
+        ):
+            raise GatewayError(
+                "运行态地图快照与导航请求的 map_name 不一致。",
+                error_code="map_snapshot_name_mismatch",
+            )
         if has_map and localization_ready:
             map_status = MapAssetStatus.READY.value
         elif has_map:
@@ -2811,9 +2842,22 @@ class NavigationService:
         elif not include_waiting_for:
             waiting_for = None
         return {
-            "map_name": map_name,
+            "map_name": (
+                requested_map_name
+                or (map_snapshot.map_name if map_snapshot is not None else None)
+                or active_map_name
+            ),
             "map_status": map_status,
-            "map_snapshot_version_id": map_snapshot.version_id if map_snapshot is not None else None,
+            "map_snapshot_identity": (
+                {
+                    "source_name": map_snapshot.source_name,
+                    "source_epoch": map_snapshot.source_epoch,
+                    "update_sequence": map_snapshot.update_sequence,
+                    "content_sha256": map_snapshot.content_sha256,
+                }
+                if map_snapshot is not None
+                else None
+            ),
             "memory_library_name": memory_library_name or map_name,
             "localization_ready": localization_ready,
             "localization_session_status": (

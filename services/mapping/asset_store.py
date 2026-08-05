@@ -1,25 +1,45 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import stat
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote
-import uuid
 
-from contracts.map_workspace import MapAssetBundle, MapGeometryAssetBinding, MapGeometryAssetType
+from contracts.map_workspace import (
+    MAP_GEOREFERENCE_RELATIVE_PATH,
+    MapAssetBundle,
+    MapGeometryAssetBinding,
+    MapGeometryAssetType,
+    MapGeoreferenceBindingV1,
+    MapGeoreferenceV1,
+)
 from contracts.naming import build_safe_dir_segment
-
+from contracts.runtime_views import map_content_sha256
 
 _BUNDLE_FILE_NAME = "bundle.json"
 _MANIFEST_FILE_NAME = "manifest.json"
 _MANIFEST_SCHEMA_VERSION = 1
 _STAGING_PREFIX = ".current.tmp-"
+_MAX_GEOREFERENCE_JSON_BYTES = 64 * 1024
+_MAX_MANIFEST_JSON_BYTES = 4 * 1024 * 1024
+_MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024
+_MAX_LEGACY_METADATA_JSON_BYTES = 4 * 1024 * 1024
+_MAX_LEGACY_VERSION_JSON_BYTES = 64 * 1024 * 1024
+_MAX_CHECKPOINT_JSON_BYTES = 4 * 1024 * 1024
+_MAX_NAV2_YAML_BYTES = 4 * 1024 * 1024
+_MAX_MANIFEST_FILE_ENTRIES = 8192
+_MAX_DIRECTORY_ENTRIES = _MAX_MANIFEST_FILE_ENTRIES + 128
+_MAX_JSON_NUMBER_TOKEN_BYTES = 128
+_FILE_READ_CHUNK_BYTES = 1024 * 1024
+_FILE_PREFIX_BYTES = 8192
 
 
 class MapAssetBundleError(RuntimeError):
@@ -99,35 +119,48 @@ class MapAssetBundleRepository:
             self._write_candidate_bundle(bundle, staging)
             candidate_manifest = self._write_manifest(map_name, staging)
             candidate_sha256 = _sha256_bytes(candidate_manifest)
-            self._validate_directory(map_name, staging, expected_manifest_sha256=candidate_sha256)
-            _fsync_tree(staging)
-            self._inject_fault("before_rename")
-
-            if current.exists() or current.is_symlink():
+            resolve_existing = False
+            committed_bundle: Optional[MapAssetBundle] = None
+            with _StableDirectoryTree(staging) as candidate_tree:
+                manifest_sha256, validated_bundle = self._validate_open_directory(
+                    map_name,
+                    candidate_tree,
+                    expected_manifest_sha256=candidate_sha256,
+                )
+                _fsync_tree(candidate_tree)
+                candidate_tree.verify_all()
+                self._inject_fault("before_rename")
+                if _entry_exists_at(candidate_tree.parent_descriptor, current.name):
+                    resolve_existing = True
+                else:
+                    try:
+                        _rename_directory_noreplace(
+                            candidate_tree.parent_descriptor,
+                            staging.name,
+                            current.name,
+                        )
+                    except OSError as exc:
+                        if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                            raise
+                        resolve_existing = True
+                    else:
+                        candidate_tree.rebind_root_after_rename(current.name)
+                        os.fsync(candidate_tree.parent_descriptor)
+                        committed_bundle = validated_bundle.model_copy(
+                            update={"manifest_sha256": manifest_sha256},
+                            deep=True,
+                        )
+                        self._inject_fault("after_rename")
+            if resolve_existing:
                 return self._resolve_existing_current(
                     map_name,
                     current,
                     staging,
                     candidate_sha256,
                 )
-            try:
-                os.rename(staging, current)
-            except OSError as exc:
-                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} and not current.exists():
-                    raise
-                return self._resolve_existing_current(
-                    map_name,
-                    current,
-                    staging,
-                    candidate_sha256,
-                )
-            _fsync_directory(current.parent)
-            self._inject_fault("after_rename")
-            return self._load_validated_bundle(
-                map_name,
-                current,
-                expected_manifest_sha256=candidate_sha256,
-            )
+            if committed_bundle is None:
+                raise MapAssetBundleValidationError("地图资产目录提交结果不确定。")
+            return committed_bundle
         except Exception:
             if staging.exists() or staging.is_symlink():
                 self.discard_staging_directory(map_name, staging)
@@ -143,6 +176,27 @@ class MapAssetBundleRepository:
         bundle: MapAssetBundle,
         staging_dir: Path,
     ) -> MapAssetBundle:
+        georeference = bundle.georeference
+        georeference_path = _contained_path(staging_dir, georeference.relative_path)
+        if not georeference_path.exists() and not georeference_path.is_symlink():
+            _atomic_write_relative(
+                staging_dir,
+                georeference.relative_path,
+                _model_json_bytes(georeference.contract),
+                create_parents=True,
+            )
+        georeference_payload = _read_regular_file(
+            georeference_path,
+            "地理参考文件",
+            maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
+        )
+        georeference = self._validate_georeference_asset(
+            georeference,
+            payload=georeference_payload,
+            raw_sha256=_sha256_bytes(georeference_payload),
+            require_bound_digest=False,
+        )
+
         geometry_asset = bundle.geometry_asset
         if geometry_asset is not None:
             geometry_relative = PurePosixPath(
@@ -160,33 +214,45 @@ class MapAssetBundleRepository:
                 },
                 deep=True,
             )
-            geometry_path = _contained_path(staging_dir, geometry_relative)
-            geometry_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_bytes(geometry_path, _model_json_bytes(geometry_asset))
+            _atomic_write_relative(
+                staging_dir,
+                geometry_relative,
+                _model_json_bytes(geometry_asset),
+                create_parents=True,
+            )
         candidate = bundle.model_copy(
-            update={"geometry_asset": geometry_asset, "manifest_sha256": None},
+            update={
+                "geometry_asset": geometry_asset,
+                "georeference": georeference,
+                "manifest_sha256": None,
+            },
             deep=True,
         )
-        _atomic_write_bytes(staging_dir / _BUNDLE_FILE_NAME, _model_json_bytes(candidate))
+        _atomic_write_relative(
+            staging_dir,
+            _BUNDLE_FILE_NAME,
+            _model_json_bytes(candidate),
+        )
         return candidate
 
     def _write_manifest(self, map_name: str, directory: Path) -> bytes:
         files = []
-        for relative_path, absolute_path in self._regular_files(directory):
-            if relative_path == _MANIFEST_FILE_NAME:
-                continue
-            size, sha256 = _hash_regular_file(
-                absolute_path,
-                "地图资产文件",
-            )
-            files.append(
-                {
-                    "path": relative_path,
-                    "size": size,
-                    "sha256": sha256,
-                }
-            )
+        with _StableDirectoryTree(directory) as tree:
+            for relative_path, managed_file in tree.files.items():
+                if relative_path == _MANIFEST_FILE_NAME:
+                    continue
+                size, sha256 = managed_file.hash()
+                files.append(
+                    {
+                        "path": relative_path,
+                        "size": size,
+                        "sha256": sha256,
+                    }
+                )
+            tree.verify_all()
         files.sort(key=lambda item: str(item["path"]))
+        if len(files) > _MAX_MANIFEST_FILE_ENTRIES:
+            raise MapAssetBundleValidationError("地图资产清单文件项数量超过上限。")
         document = {
             "schema_version": _MANIFEST_SCHEMA_VERSION,
             "map_name": map_name,
@@ -194,7 +260,9 @@ class MapAssetBundleRepository:
             "files": files,
         }
         payload = _canonical_json_bytes(document)
-        _atomic_write_bytes(directory / _MANIFEST_FILE_NAME, payload)
+        if len(payload) > _MAX_MANIFEST_JSON_BYTES:
+            raise MapAssetBundleValidationError("地图资产清单超过大小上限。")
+        _atomic_write_relative(directory, _MANIFEST_FILE_NAME, payload)
         return payload
 
     def _resolve_existing_current(
@@ -232,9 +300,24 @@ class MapAssetBundleRepository:
         *,
         expected_manifest_sha256: Optional[str] = None,
     ) -> Tuple[str, MapAssetBundle]:
-        self._require_real_directory(directory, "地图资产包目录")
-        manifest_path = directory / _MANIFEST_FILE_NAME
-        manifest_payload = _read_regular_file(manifest_path, "地图资产清单")
+        with _StableDirectoryTree(directory) as tree:
+            result = self._validate_open_directory(
+                map_name,
+                tree,
+                expected_manifest_sha256=expected_manifest_sha256,
+            )
+            tree.verify_all()
+            return result
+
+    def _validate_open_directory(
+        self,
+        map_name: str,
+        tree: _StableDirectoryTree,
+        *,
+        expected_manifest_sha256: Optional[str] = None,
+    ) -> Tuple[str, MapAssetBundle]:
+        manifest_file = tree.require_file(_MANIFEST_FILE_NAME, "地图资产清单")
+        manifest_payload, _manifest_size, manifest_sha256 = manifest_file.read_and_hash(_MAX_MANIFEST_JSON_BYTES)
         manifest_sha256 = _sha256_bytes(manifest_payload)
         if expected_manifest_sha256 and manifest_sha256 != expected_manifest_sha256:
             raise MapAssetBundleValidationError("地图资产清单摘要与提交摘要不一致。")
@@ -251,6 +334,8 @@ class MapAssetBundleRepository:
         entries = manifest.get("files")
         if not isinstance(entries, list):
             raise MapAssetBundleValidationError("地图资产清单 files 必须是数组。")
+        if len(entries) > _MAX_MANIFEST_FILE_ENTRIES:
+            raise MapAssetBundleValidationError("地图资产清单文件项数量超过上限。")
         expected_files: Dict[str, Mapping[str, object]] = {}
         for entry in entries:
             if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
@@ -265,36 +350,104 @@ class MapAssetBundleRepository:
             expected_files[relative] = {"size": size, "sha256": sha256}
 
         actual_files = {
-            relative: path
-            for relative, path in self._regular_files(directory)
-            if relative != _MANIFEST_FILE_NAME
+            relative: managed for relative, managed in tree.files.items() if relative != _MANIFEST_FILE_NAME
         }
         if set(actual_files) != set(expected_files):
             raise MapAssetBundleValidationError("地图资产清单与目录中的文件集合不一致。")
-        for relative, metadata in expected_files.items():
-            size, sha256 = _hash_regular_file(
-                actual_files[relative],
-                "地图资产文件",
-            )
-            if size != metadata["size"] or sha256 != metadata["sha256"]:
-                raise MapAssetBundleValidationError("地图资产文件大小或 SHA-256 不匹配：%s" % relative)
 
-        bundle_payload = _read_regular_file(directory / _BUNDLE_FILE_NAME, "地图资产包")
+        bundle_file = tree.require_file(_BUNDLE_FILE_NAME, "地图资产包")
+        bundle_payload, bundle_size, bundle_sha256 = bundle_file.read_and_hash(_MAX_BUNDLE_JSON_BYTES)
+        _validate_manifested_file_observation(
+            _BUNDLE_FILE_NAME,
+            expected_files.get(_BUNDLE_FILE_NAME),
+            bundle_size,
+            bundle_sha256,
+        )
         bundle_document = _parse_json_object(bundle_payload, "地图资产包")
         if bundle_document.get("manifest_sha256") is not None and bundle_document.get("manifest_sha256") != "":
             raise MapAssetBundleValidationError("bundle.json 不得自引用 manifest_sha256。")
+        georeference_document = bundle_document.get("georeference")
+        if not isinstance(georeference_document, dict) or set(georeference_document) != {
+            "schema_version",
+            "relative_path",
+            "raw_sha256",
+            "contract",
+        }:
+            raise MapAssetBundleValidationError("地图资产包地理参考绑定字段不完整或包含未知字段。")
         try:
             bundle = MapAssetBundle.model_validate(bundle_document)
         except Exception as exc:
             raise MapAssetBundleValidationError("地图资产包契约非法。") from exc
         if bundle.map_name != map_name:
             raise MapAssetBundleValidationError("地图资产包 map_name 不匹配。")
-        self._validate_geometry_assets(directory, bundle.geometry_asset, set(expected_files))
+        georeference_file = tree.require_file(
+            bundle.georeference.relative_path,
+            "地理参考文件",
+        )
+        georeference_payload, georeference_size, georeference_sha256 = georeference_file.read_and_hash(
+            _MAX_GEOREFERENCE_JSON_BYTES
+        )
+        _validate_manifested_file_observation(
+            bundle.georeference.relative_path,
+            expected_files.get(bundle.georeference.relative_path),
+            georeference_size,
+            georeference_sha256,
+        )
+        georeference = self._validate_georeference_asset(
+            bundle.georeference,
+            payload=georeference_payload,
+            raw_sha256=georeference_sha256,
+            manifested_paths=set(expected_files),
+            require_bound_digest=True,
+        )
+        bundle = bundle.model_copy(update={"georeference": georeference}, deep=True)
+        for relative, metadata in expected_files.items():
+            if relative in {_BUNDLE_FILE_NAME, bundle.georeference.relative_path}:
+                continue
+            size, sha256 = actual_files[relative].hash()
+            _validate_manifested_file_observation(relative, metadata, size, sha256)
+        self._validate_geometry_assets(tree, bundle.geometry_asset, set(expected_files))
+        tree.verify_all()
         return manifest_sha256, bundle
+
+    def _validate_georeference_asset(
+        self,
+        binding: MapGeoreferenceBindingV1,
+        *,
+        payload: bytes,
+        raw_sha256: str,
+        manifested_paths: Optional[set[str]] = None,
+        require_bound_digest: bool,
+    ) -> MapGeoreferenceBindingV1:
+        relative_path = binding.relative_path
+        if relative_path != MAP_GEOREFERENCE_RELATIVE_PATH:
+            raise MapAssetBundleValidationError("地理参考文件路径不是第一版固定路径。")
+        if manifested_paths is not None and relative_path not in manifested_paths:
+            raise MapAssetBundleValidationError("地理参考文件未被顶层清单绑定。")
+        if not payload:
+            raise MapAssetBundleValidationError("地理参考文件不能为空。")
+        if len(payload) > _MAX_GEOREFERENCE_JSON_BYTES:
+            raise MapAssetBundleValidationError("地理参考文件超过 64 KiB 上限。")
+
+        if require_bound_digest and binding.raw_sha256 is None:
+            raise MapAssetBundleValidationError("地图资产包缺少地理参考原文 SHA-256。")
+        if _sha256_bytes(payload) != raw_sha256:
+            raise MapAssetBundleValidationError("地理参考原文读取摘要不一致。")
+        if binding.raw_sha256 is not None and binding.raw_sha256 != raw_sha256:
+            raise MapAssetBundleValidationError("地理参考原文 SHA-256 与资产包绑定不一致。")
+
+        document = _parse_json_object(payload, "地理参考文件")
+        try:
+            contract = MapGeoreferenceV1.model_validate(document)
+        except Exception as exc:
+            raise MapAssetBundleValidationError("地理参考合同非法。") from exc
+        if contract.model_dump(mode="json") != binding.contract.model_dump(mode="json"):
+            raise MapAssetBundleValidationError("地理参考原文与资产包中的类型化合同不一致。")
+        return binding.model_copy(update={"raw_sha256": raw_sha256}, deep=True)
 
     def _validate_geometry_assets(
         self,
-        directory: Path,
+        tree: _StableDirectoryTree,
         geometry_asset: Optional[MapGeometryAssetBinding],
         manifested_paths: set[str],
     ) -> None:
@@ -309,31 +462,32 @@ class MapAssetBundleRepository:
             normalized = _validate_relative_path(relative, "几何资产路径")
             if normalized not in manifested_paths:
                 raise MapAssetBundleValidationError("几何资产未被顶层清单绑定：%s" % normalized)
-            _regular_file_size(_contained_path(directory, normalized), "几何资产")
+            tree.require_file(normalized, "几何资产").size()
 
-        database_path = _contained_path(directory, geometry_asset.mapping_database_path)
-        if _regular_file_size(database_path, "建图数据库") <= 4096:
+        database_file = tree.require_file(
+            geometry_asset.mapping_database_path,
+            "建图数据库",
+        )
+        if database_file.size() <= 4096:
             raise MapAssetBundleValidationError("建图数据库缺失或过小。")
-        self._validate_pcd(_contained_path(directory, geometry_asset.pcd_path))
+        self._validate_pcd(tree.require_file(geometry_asset.pcd_path, "PCD 地图"))
         navigation_assets = [
-            asset
-            for asset in geometry_asset.assets
-            if asset.asset_type == MapGeometryAssetType.NAVIGATION_MAP
+            asset for asset in geometry_asset.assets if asset.asset_type == MapGeometryAssetType.NAVIGATION_MAP
         ]
         if not navigation_assets:
             raise MapAssetBundleValidationError("地图资产包缺少 Nav2 地图资产。")
         for asset in geometry_asset.assets:
             if asset.asset_type == MapGeometryAssetType.NAVIGATION_MAP:
-                self._validate_nav2_yaml(directory, asset.path, manifested_paths)
+                self._validate_nav2_yaml(tree, asset.path, manifested_paths)
         self._validate_backend_checkpoint(
-            directory,
+            tree,
             geometry_asset,
             manifested_paths,
         )
 
     def _validate_backend_checkpoint(
         self,
-        directory: Path,
+        tree: _StableDirectoryTree,
         geometry_asset: MapGeometryAssetBinding,
         manifested_paths: set[str],
     ) -> None:
@@ -359,14 +513,12 @@ class MapAssetBundleRepository:
         ).as_posix()
         for relative in (selector_relative, manifest_relative, object_relative):
             if relative not in manifested_paths:
-                raise MapAssetBundleValidationError(
-                    "backend checkpoint 文件未被顶层清单绑定：%s" % relative
-                )
+                raise MapAssetBundleValidationError("backend checkpoint 文件未被顶层清单绑定：%s" % relative)
 
-        manifest_payload = _read_regular_file(
-            _contained_path(directory, manifest_relative),
+        manifest_payload, _manifest_size, manifest_sha256 = tree.require_file(
+            manifest_relative,
             "backend checkpoint manifest",
-        )
+        ).read_and_hash(_MAX_CHECKPOINT_JSON_BYTES)
         expected_manifest_sha256 = _validate_sha256(
             raw_checkpoint.get("manifest_sha256"),
             "backend checkpoint manifest SHA-256",
@@ -375,32 +527,28 @@ class MapAssetBundleRepository:
             raw_checkpoint.get("object_sha256"),
             "backend checkpoint object SHA-256",
         )
-        if _sha256_bytes(manifest_payload) != expected_manifest_sha256:
+        if manifest_sha256 != expected_manifest_sha256:
             raise MapAssetBundleValidationError("backend checkpoint manifest SHA-256 不匹配。")
-        _object_size, object_sha256 = _hash_regular_file(
-            _contained_path(directory, object_relative),
+        _object_size, object_sha256 = tree.require_file(
+            object_relative,
             "backend checkpoint object",
-        )
+        ).hash()
         if object_sha256 != expected_object_sha256:
             raise MapAssetBundleValidationError("backend checkpoint object SHA-256 不匹配。")
 
         selector = _parse_json_object(
-            _read_regular_file(
-                _contained_path(directory, selector_relative),
+            tree.require_file(
+                selector_relative,
                 "backend checkpoint selector",
-            ),
+            ).read_and_hash(_MAX_CHECKPOINT_JSON_BYTES)[0],
             "backend checkpoint selector",
         )
         selector_manifest = selector.get("manifest")
         backend_root = PurePosixPath("mapping_backend", backend_kind)
         try:
-            selector_manifest_path = PurePosixPath(manifest_relative).relative_to(
-                backend_root
-            ).as_posix()
+            selector_manifest_path = PurePosixPath(manifest_relative).relative_to(backend_root).as_posix()
         except ValueError as exc:
-            raise MapAssetBundleValidationError(
-                "backend checkpoint manifest 不属于目标 backend。"
-            ) from exc
+            raise MapAssetBundleValidationError("backend checkpoint manifest 不属于目标 backend。") from exc
         if (
             selector.get("schema_version") != schema_version
             or str(selector.get("backend_kind") or "") != backend_kind
@@ -415,32 +563,39 @@ class MapAssetBundleRepository:
                 MappingBackendCheckpointStoreError,
             )
 
-            stored = MappingBackendCheckpointStore(directory).load(
+            stored = MappingBackendCheckpointStore(tree.path).load(
                 backend_kind,
                 schema_version=schema_version,
             )
         except MappingBackendCheckpointStoreError as exc:
-            raise MapAssetBundleValidationError(
-                "backend checkpoint 内层契约不可加载。"
-            ) from exc
+            raise MapAssetBundleValidationError("backend checkpoint 内层契约不可加载。") from exc
         if (
             stored.manifest_sha256 != expected_manifest_sha256
             or stored.checkpoint.content_sha256.hex() != expected_object_sha256
         ):
-            raise MapAssetBundleValidationError(
-                "backend checkpoint 加载结果与资产包身份不一致。"
-            )
+            raise MapAssetBundleValidationError("backend checkpoint 加载结果与资产包身份不一致。")
+        tree.verify_all()
 
     @staticmethod
-    def _validate_pcd(path: Path) -> None:
-        header = _read_regular_file_prefix(path, "PCD 地图", 8192)
+    def _validate_pcd(managed_file: _ManagedRegularFile) -> None:
+        header = managed_file.prefix(_FILE_PREFIX_BYTES)
         if b"FIELDS x y z" not in header or b"DATA " not in header:
             raise MapAssetBundleValidationError("PCD 地图头部非法。")
 
     @staticmethod
-    def _validate_nav2_yaml(root: Path, yaml_relative: str, manifested_paths: set[str]) -> None:
-        yaml_path = _contained_path(root, yaml_relative)
-        text = _read_regular_file(yaml_path, "Nav2 地图 YAML").decode("utf-8")
+    def _validate_nav2_yaml(
+        tree: _StableDirectoryTree,
+        yaml_relative: str,
+        manifested_paths: set[str],
+    ) -> None:
+        text = (
+            tree.require_file(
+                yaml_relative,
+                "Nav2 地图 YAML",
+            )
+            .read_and_hash(_MAX_NAV2_YAML_BYTES)[0]
+            .decode("utf-8")
+        )
         image_values: List[str] = []
         for raw_line in text.splitlines():
             line = raw_line.strip()
@@ -466,11 +621,7 @@ class MapAssetBundleRepository:
         normalized = _validate_relative_path(combined.as_posix(), "Nav2 地图 image 路径")
         if normalized not in manifested_paths:
             raise MapAssetBundleValidationError("Nav2 地图 image 未被顶层清单绑定。")
-        pgm_header = _read_regular_file_prefix(
-            _contained_path(root, normalized),
-            "Nav2 地图图像",
-            2,
-        )
+        pgm_header = tree.require_file(normalized, "Nav2 地图图像").prefix(2)
         if pgm_header not in {b"P2", b"P5"}:
             raise MapAssetBundleValidationError("Nav2 地图图像不是有效的 PGM。")
 
@@ -500,7 +651,11 @@ class MapAssetBundleRepository:
         if not metadata_path.exists() or not versions_root.exists():
             return None
         metadata = _parse_json_object(
-            _read_regular_file(metadata_path, "旧地图 metadata.json"),
+            _read_regular_file(
+                metadata_path,
+                "旧地图 metadata.json",
+                maximum_bytes=_MAX_LEGACY_METADATA_JSON_BYTES,
+            ),
             "旧地图 metadata.json",
         )
         if str(metadata.get("map_name") or "") != map_name:
@@ -512,7 +667,11 @@ class MapAssetBundleRepository:
         try:
             self._copy_legacy_tree(selected, staging)
             legacy_document = _parse_json_object(
-                _read_regular_file(selected / "version.json", "旧地图 version.json"),
+                _read_regular_file(
+                    selected / "version.json",
+                    "旧地图 version.json",
+                    maximum_bytes=_MAX_LEGACY_VERSION_JSON_BYTES,
+                ),
                 "旧地图 version.json",
             )
             bundle = self._convert_legacy_bundle(map_name, selected, legacy_document)
@@ -552,7 +711,14 @@ class MapAssetBundleRepository:
         if not version_path.is_file() or version_path.is_symlink():
             return False
         try:
-            document = _parse_json_object(version_path.read_bytes(), "旧地图 version.json")
+            document = _parse_json_object(
+                _read_regular_file(
+                    version_path,
+                    "旧地图 version.json",
+                    maximum_bytes=_MAX_LEGACY_VERSION_JSON_BYTES,
+                ),
+                "旧地图 version.json",
+            )
         except Exception:
             return False
         return isinstance(document.get("snapshot"), dict) and bool(document.get("map_name"))
@@ -581,6 +747,34 @@ class MapAssetBundleRepository:
         source_dir: Path,
         document: Mapping[str, object],
     ) -> MapAssetBundle:
+        georeference_payload = document.get("georeference")
+        if not isinstance(georeference_payload, dict) or set(georeference_payload) != {
+            "schema_version",
+            "relative_path",
+            "raw_sha256",
+            "contract",
+        }:
+            raise MapAssetMigrationError("旧地图没有完整地理参考绑定，拒绝推测锚点或坐标变换。")
+        try:
+            georeference = MapGeoreferenceBindingV1.model_validate(georeference_payload)
+            georeference_path = _contained_path(
+                source_dir,
+                georeference.relative_path,
+            )
+            georeference_bytes = _read_regular_file(
+                georeference_path,
+                "旧地图地理参考文件",
+                maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
+            )
+            georeference = self._validate_georeference_asset(
+                georeference,
+                payload=georeference_bytes,
+                raw_sha256=_sha256_bytes(georeference_bytes),
+                require_bound_digest=True,
+            )
+        except Exception as exc:
+            raise MapAssetMigrationError("旧地图地理参考无法精确验证，拒绝迁移。") from exc
+
         geometry_payload = document.get("geometry_asset")
         geometry_asset = None
         if isinstance(geometry_payload, dict):
@@ -617,17 +811,70 @@ class MapAssetBundleRepository:
         if not isinstance(snapshot, dict):
             raise MapAssetMigrationError("旧地图缺少 snapshot。")
         snapshot_payload = dict(snapshot)
+        legacy_source_name = str(
+            document.get("source_name")
+            or snapshot_payload.get("source_name")
+            or "legacy_map_asset"
+        ).strip()
+        legacy_snapshot_token = str(
+            document.get("source_version_id")
+            or snapshot_payload.get("version_id")
+            or ""
+        ).strip()
+        legacy_epoch_preimage = "%s\0%s\0%s" % (
+            map_name,
+            legacy_source_name,
+            legacy_snapshot_token,
+        )
+        try:
+            legacy_update_sequence = max(
+                1,
+                int(snapshot_payload.get("revision") or 1),
+            )
+        except (TypeError, ValueError) as exc:
+            raise MapAssetMigrationError(
+                "旧地图 snapshot revision 非法。"
+            ) from exc
+        for layer_key in ("occupancy_grid", "cost_map", "semantic_map"):
+            layer_payload = snapshot_payload.get(layer_key)
+            if isinstance(layer_payload, dict):
+                normalized_layer = dict(layer_payload)
+                normalized_layer["map_id"] = map_name
+                snapshot_payload[layer_key] = normalized_layer
+        snapshot_payload.pop("version_id", None)
+        snapshot_payload.pop("revision", None)
+        snapshot_payload.pop("source_snapshot_id", None)
+        snapshot_payload["map_name"] = map_name
+        snapshot_payload["source_name"] = legacy_source_name
+        snapshot_payload["source_epoch"] = "legacy:%s" % hashlib.sha256(
+            legacy_epoch_preimage.encode("utf-8")
+        ).hexdigest()
+        snapshot_payload["update_sequence"] = legacy_update_sequence
         snapshot_payload["metadata"] = self._normalize_legacy_metadata(
             source_dir,
             snapshot_payload.get("metadata") or {},
         )
+        canonical_frame_id = snapshot_payload.get("frame_id")
+        if not canonical_frame_id:
+            for layer_key in ("occupancy_grid", "cost_map", "semantic_map"):
+                layer_payload = snapshot_payload.get(layer_key)
+                if isinstance(layer_payload, dict) and layer_payload.get("frame_id"):
+                    canonical_frame_id = layer_payload.get("frame_id")
+                    break
+        snapshot_payload["content_sha256"] = map_content_sha256(
+            map_name=map_name,
+            frame_id=canonical_frame_id,
+            occupancy_grid=snapshot_payload.get("occupancy_grid"),
+            cost_map=snapshot_payload.get("cost_map"),
+            semantic_map=snapshot_payload.get("semantic_map"),
+        )
         bundle_payload = {
             "map_name": map_name,
-            "source_name": document.get("source_name") or snapshot_payload.get("source_name"),
-            "source_snapshot_id": document.get("source_version_id") or snapshot_payload.get("version_id"),
+            "source_name": legacy_source_name,
             "frame_id": document.get("frame_id"),
             "snapshot": snapshot_payload,
             "geometry_asset": geometry_asset,
+            "georeference": georeference,
             "metadata": self._normalize_legacy_metadata(source_dir, document.get("metadata") or {}),
         }
         if document.get("timestamp") is not None:
@@ -665,6 +912,9 @@ class MapAssetBundleRepository:
                     "seed_map_version_revision",
                     "latest_version_id",
                     "latest_revision",
+                    "source_snapshot_id",
+                    "source_version_id",
+                    "snapshot_revision",
                 }:
                     continue
                 if key.endswith("_path") and isinstance(raw_value, str):
@@ -720,6 +970,425 @@ class MapAssetBundleRepository:
             self._fault_injector(phase)
 
 
+class _ManagedRegularFile:
+    def __init__(
+        self,
+        *,
+        descriptor: int,
+        parent_descriptor: int,
+        name: str,
+        relative_path: str,
+        initial_stat: os.stat_result,
+    ) -> None:
+        self.descriptor = descriptor
+        self.parent_descriptor = parent_descriptor
+        self.name = name
+        self.relative_path = relative_path
+        self.initial_stat = initial_stat
+        self._size: Optional[int] = None
+        self._sha256: Optional[str] = None
+        self._payload: Optional[bytes] = None
+        self._prefix = b""
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def _begin_observation(self) -> os.stat_result:
+        current = os.fstat(self.descriptor)
+        _validate_regular_file_stat(current, self.relative_path)
+        _require_same_file_state(self.initial_stat, current, self.relative_path)
+        return current
+
+    def _finish_observation(
+        self,
+        before: os.stat_result,
+        *,
+        observed_size: int,
+    ) -> os.stat_result:
+        after = os.fstat(self.descriptor)
+        _validate_regular_file_stat(after, self.relative_path)
+        _require_same_file_state(before, after, self.relative_path)
+        if observed_size != int(after.st_size):
+            raise MapAssetBundleValidationError("地图资产文件读取长度发生变化：%s" % self.relative_path)
+        self.verify_named_entry()
+        return after
+
+    def verify_named_entry(self) -> None:
+        try:
+            named = os.stat(
+                self.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise MapAssetBundleValidationError("地图资产文件命名项不可验证：%s" % self.relative_path) from exc
+        _validate_regular_file_stat(named, self.relative_path)
+        current = os.fstat(self.descriptor)
+        _require_same_file_identity(current, named, self.relative_path)
+        _require_same_file_state(self.initial_stat, current, self.relative_path)
+
+    def read_and_hash(self, maximum_bytes: int) -> Tuple[bytes, int, str]:
+        before = self._begin_observation()
+        if int(before.st_size) > maximum_bytes:
+            raise MapAssetBundleValidationError("地图资产文件超过大小上限：%s" % self.relative_path)
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        chunks = []
+        observed_size = 0
+        while True:
+            remaining = maximum_bytes + 1 - observed_size
+            if remaining <= 0:
+                raise MapAssetBundleValidationError("地图资产文件超过大小上限：%s" % self.relative_path)
+            chunk = os.read(
+                self.descriptor,
+                min(_FILE_READ_CHUNK_BYTES, remaining),
+            )
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            if observed_size > maximum_bytes:
+                raise MapAssetBundleValidationError("地图资产文件超过大小上限：%s" % self.relative_path)
+            digest.update(chunk)
+            chunks.append(chunk)
+        self._finish_observation(before, observed_size=observed_size)
+        payload = b"".join(chunks)
+        sha256 = digest.hexdigest()
+        self._record_observation(payload, observed_size, sha256)
+        return payload, observed_size, sha256
+
+    def hash(self) -> Tuple[int, str]:
+        if self._size is not None and self._sha256 is not None:
+            self.verify_named_entry()
+            return self._size, self._sha256
+        before = self._begin_observation()
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        prefix = bytearray()
+        observed_size = 0
+        while True:
+            chunk = os.read(self.descriptor, _FILE_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+            if len(prefix) < _FILE_PREFIX_BYTES:
+                prefix.extend(chunk[: _FILE_PREFIX_BYTES - len(prefix)])
+        self._finish_observation(before, observed_size=observed_size)
+        sha256 = digest.hexdigest()
+        self._prefix = bytes(prefix)
+        self._record_observation(None, observed_size, sha256)
+        return observed_size, sha256
+
+    def prefix(self, size: int) -> bytes:
+        if self._size is None or self._sha256 is None:
+            self.hash()
+        if size <= len(self._prefix):
+            self.verify_named_entry()
+            return self._prefix[:size]
+        payload, _size, _sha256 = self.read_and_hash(size)
+        return payload[:size]
+
+    def size(self) -> int:
+        if self._size is None:
+            self.hash()
+        self.verify_named_entry()
+        return int(self._size or 0)
+
+    def _record_observation(
+        self,
+        payload: Optional[bytes],
+        size: int,
+        sha256: str,
+    ) -> None:
+        if self._size is not None and self._size != size:
+            raise MapAssetBundleValidationError("地图资产文件重复读取大小不一致：%s" % self.relative_path)
+        if self._sha256 is not None and self._sha256 != sha256:
+            raise MapAssetBundleValidationError("地图资产文件重复读取摘要不一致：%s" % self.relative_path)
+        self._size = size
+        self._sha256 = sha256
+        if payload is not None:
+            self._payload = payload
+            self._prefix = payload[:_FILE_PREFIX_BYTES]
+
+
+class _ManagedDirectory:
+    def __init__(
+        self,
+        *,
+        descriptor: int,
+        parent_descriptor: int,
+        name: str,
+        relative_path: str,
+        initial_stat: os.stat_result,
+    ) -> None:
+        self.descriptor = descriptor
+        self.parent_descriptor = parent_descriptor
+        self.name = name
+        self.relative_path = relative_path
+        self.initial_stat = initial_stat
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+    def verify_named_entry(self) -> None:
+        try:
+            named = os.stat(
+                self.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise MapAssetBundleValidationError("地图资产目录命名项不可验证：%s" % self.relative_path) from exc
+        current = os.fstat(self.descriptor)
+        _validate_directory_stat(named, self.relative_path)
+        _validate_directory_stat(current, self.relative_path)
+        _require_same_file_identity(current, named, self.relative_path)
+        _require_same_directory_state(self.initial_stat, current, self.relative_path)
+
+    def refresh_after_rename(self, name: str, relative_path: str) -> None:
+        self.name = name
+        self.relative_path = relative_path
+        self.initial_stat = os.fstat(self.descriptor)
+        self.verify_named_entry()
+
+
+class _StableDirectoryTree:
+    def __init__(self, directory: Path) -> None:
+        self.path = Path(directory).absolute()
+        self.parent_descriptor = -1
+        self.root: Optional[_ManagedDirectory] = None
+        self.directories: List[_ManagedDirectory] = []
+        self.files: Dict[str, _ManagedRegularFile] = {}
+        self._entry_count = 0
+        self._open()
+
+    def __enter__(self) -> "_StableDirectoryTree":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for managed_file in self.files.values():
+            managed_file.close()
+        self.files.clear()
+        for directory in reversed(self.directories):
+            directory.close()
+        self.directories.clear()
+        self.root = None
+        if self.parent_descriptor >= 0:
+            os.close(self.parent_descriptor)
+            self.parent_descriptor = -1
+
+    def require_file(self, relative_path: str, description: str) -> _ManagedRegularFile:
+        normalized = _validate_relative_path(relative_path, description)
+        managed = self.files.get(normalized)
+        if managed is None:
+            raise MapAssetBundleValidationError("%s不存在：%s" % (description, normalized))
+        return managed
+
+    def verify_all(self) -> None:
+        for managed_file in self.files.values():
+            managed_file.verify_named_entry()
+        for directory in reversed(self.directories):
+            directory.verify_named_entry()
+        if self.root is None:
+            raise MapAssetBundleValidationError("地图资产目录描述符已关闭。")
+        try:
+            absolute_stat = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise MapAssetBundleValidationError("地图资产目录路径不可验证。") from exc
+        _require_same_file_identity(
+            os.fstat(self.root.descriptor),
+            absolute_stat,
+            str(self.path),
+        )
+
+    def rebind_root_after_rename(self, name: str) -> None:
+        if self.root is None:
+            raise MapAssetBundleValidationError("地图资产目录描述符已关闭。")
+        self.path = self.path.with_name(name)
+        self.root.refresh_after_rename(name, name)
+        self.verify_all()
+
+    def _open(self) -> None:
+        if not self.path.name or self.path.name in {".", ".."}:
+            raise MapAssetBundleValidationError("地图资产目录名称非法。")
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        root_descriptor = -1
+        try:
+            self.parent_descriptor = os.open(self.path.parent, directory_flags)
+            named = os.stat(
+                self.path.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+            root_descriptor = os.open(
+                self.path.name,
+                directory_flags,
+                dir_fd=self.parent_descriptor,
+            )
+            opened = os.fstat(root_descriptor)
+            _validate_directory_stat(named, str(self.path))
+            _validate_directory_stat(opened, str(self.path))
+            _require_same_file_identity(named, opened, str(self.path))
+            root = _ManagedDirectory(
+                descriptor=root_descriptor,
+                parent_descriptor=self.parent_descriptor,
+                name=self.path.name,
+                relative_path=self.path.name,
+                initial_stat=opened,
+            )
+            self.root = root
+            self.directories.append(root)
+            root_descriptor = -1
+            self._scan_directory(root, PurePosixPath())
+        except Exception:
+            if root_descriptor >= 0:
+                os.close(root_descriptor)
+            self.close()
+            raise
+
+    def _scan_directory(
+        self,
+        directory: _ManagedDirectory,
+        relative_parent: PurePosixPath,
+    ) -> None:
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        file_flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        with os.scandir(directory.descriptor) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            self._entry_count += 1
+            if self._entry_count > _MAX_DIRECTORY_ENTRIES:
+                raise MapAssetBundleValidationError("地图资产目录项数量超过上限。")
+            relative = relative_parent / entry.name
+            relative_text = relative.as_posix()
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise MapAssetBundleValidationError("地图资产包不得包含符号链接：%s" % relative_text)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_descriptor = os.open(
+                    entry.name,
+                    directory_flags,
+                    dir_fd=directory.descriptor,
+                )
+                try:
+                    child_stat = os.fstat(child_descriptor)
+                    _validate_directory_stat(child_stat, relative_text)
+                    _require_same_file_identity(entry_stat, child_stat, relative_text)
+                except Exception:
+                    os.close(child_descriptor)
+                    raise
+                child = _ManagedDirectory(
+                    descriptor=child_descriptor,
+                    parent_descriptor=directory.descriptor,
+                    name=entry.name,
+                    relative_path=relative_text,
+                    initial_stat=child_stat,
+                )
+                self.directories.append(child)
+                self._scan_directory(child, relative)
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise MapAssetBundleValidationError("地图资产包包含非普通文件：%s" % relative_text)
+            descriptor = os.open(
+                entry.name,
+                file_flags,
+                dir_fd=directory.descriptor,
+            )
+            try:
+                opened_stat = os.fstat(descriptor)
+                _validate_regular_file_stat(opened_stat, relative_text)
+                _require_same_file_identity(entry_stat, opened_stat, relative_text)
+            except Exception:
+                os.close(descriptor)
+                raise
+            self.files[relative_text] = _ManagedRegularFile(
+                descriptor=descriptor,
+                parent_descriptor=directory.descriptor,
+                name=entry.name,
+                relative_path=relative_text,
+                initial_stat=opened_stat,
+            )
+
+
+def _validate_regular_file_stat(path_stat: os.stat_result, description: str) -> None:
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise MapAssetBundleValidationError("%s必须是普通文件。" % description)
+    if int(path_stat.st_nlink) != 1:
+        raise MapAssetBundleValidationError("%s必须只有一个硬链接。" % description)
+
+
+def _validate_directory_stat(path_stat: os.stat_result, description: str) -> None:
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise MapAssetBundleValidationError("%s必须是真实目录。" % description)
+
+
+def _require_same_file_identity(
+    expected: os.stat_result,
+    actual: os.stat_result,
+    description: str,
+) -> None:
+    if (int(expected.st_dev), int(expected.st_ino)) != (
+        int(actual.st_dev),
+        int(actual.st_ino),
+    ):
+        raise MapAssetBundleValidationError("%s在校验期间被替换。" % description)
+
+
+def _require_same_file_state(
+    expected: os.stat_result,
+    actual: os.stat_result,
+    description: str,
+) -> None:
+    _require_same_file_identity(expected, actual, description)
+    expected_state = (
+        int(expected.st_nlink),
+        int(expected.st_size),
+        int(expected.st_mtime_ns),
+        int(expected.st_ctime_ns),
+    )
+    actual_state = (
+        int(actual.st_nlink),
+        int(actual.st_size),
+        int(actual.st_mtime_ns),
+        int(actual.st_ctime_ns),
+    )
+    if expected_state != actual_state:
+        raise MapAssetBundleValidationError("%s在校验期间发生变化。" % description)
+
+
+def _require_same_directory_state(
+    expected: os.stat_result,
+    actual: os.stat_result,
+    description: str,
+) -> None:
+    _require_same_file_identity(expected, actual, description)
+    expected_state = (
+        int(expected.st_nlink),
+        int(expected.st_mtime_ns),
+        int(expected.st_ctime_ns),
+    )
+    actual_state = (
+        int(actual.st_nlink),
+        int(actual.st_mtime_ns),
+        int(actual.st_ctime_ns),
+    )
+    if expected_state != actual_state:
+        raise MapAssetBundleValidationError("%s在校验期间发生变化。" % description)
+
+
 def _validate_relative_path(value: object, description: str) -> str:
     raw = str(value or "").strip()
     if not raw or "\\" in raw:
@@ -740,15 +1409,44 @@ def _contained_path(root: Path, relative: object) -> Path:
     return candidate
 
 
-def _read_regular_file(path: Path, description: str) -> bytes:
-    descriptor, _size = _open_regular_file(path, description)
+def _read_regular_file(
+    path: Path,
+    description: str,
+    *,
+    maximum_bytes: Optional[int] = None,
+) -> bytes:
+    descriptor, expected_size = _open_regular_file(path, description)
     try:
+        before = os.fstat(descriptor)
+        if maximum_bytes is not None and expected_size > maximum_bytes:
+            raise MapAssetBundleValidationError("%s超过大小上限。" % description)
         chunks = []
+        observed_size = 0
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            read_size = _FILE_READ_CHUNK_BYTES
+            if maximum_bytes is not None:
+                remaining = maximum_bytes + 1 - observed_size
+                if remaining <= 0:
+                    raise MapAssetBundleValidationError("%s超过大小上限。" % description)
+                read_size = min(read_size, remaining)
+            chunk = os.read(descriptor, read_size)
             if not chunk:
                 break
+            observed_size += len(chunk)
+            if maximum_bytes is not None and observed_size > maximum_bytes:
+                raise MapAssetBundleValidationError("%s超过大小上限。" % description)
             chunks.append(chunk)
+        after = os.fstat(descriptor)
+        _validate_regular_file_stat(after, description)
+        _require_same_file_state(before, after, description)
+        if observed_size != expected_size:
+            raise MapAssetBundleValidationError("%s在校验期间发生变化。" % description)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise MapAssetBundleValidationError("%s命名项不可验证。" % description) from exc
+        _validate_regular_file_stat(named, description)
+        _require_same_file_identity(after, named, description)
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -756,15 +1454,20 @@ def _read_regular_file(path: Path, description: str) -> bytes:
 
 def _open_regular_file(path: Path, description: str) -> Tuple[int, int]:
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
     except FileNotFoundError as exc:
         raise MapAssetBundleValidationError("%s不存在：%s" % (description, path)) from exc
     except OSError as exc:
         raise MapAssetBundleValidationError("无法打开%s：%s" % (description, path)) from exc
-    path_stat = os.fstat(descriptor)
-    if not stat.S_ISREG(path_stat.st_mode):
+    try:
+        path_stat = os.fstat(descriptor)
+        _validate_regular_file_stat(path_stat, description)
+    except Exception:
         os.close(descriptor)
-        raise MapAssetBundleValidationError("%s必须是普通文件：%s" % (description, path))
+        raise
     return descriptor, int(path_stat.st_size)
 
 
@@ -812,11 +1515,28 @@ def _parse_json_object(payload: bytes, description: str) -> Dict[str, object]:
     def reject_constant(value: str) -> object:
         raise MapAssetBundleValidationError("%s 包含非有限 JSON 数值：%s" % (description, value))
 
+    def parse_integer(value: str) -> int:
+        if len(value) > _MAX_JSON_NUMBER_TOKEN_BYTES:
+            raise MapAssetBundleValidationError("%s 包含过长 JSON 整数。" % description)
+        if value == "-0":
+            raise MapAssetBundleValidationError("%s 包含整数形式的负零。" % description)
+        return int(value)
+
+    def parse_float(value: str) -> float:
+        if len(value) > _MAX_JSON_NUMBER_TOKEN_BYTES:
+            raise MapAssetBundleValidationError("%s 包含过长 JSON 浮点数。" % description)
+        parsed = float(value)
+        if parsed == 0.0 and value.startswith("-"):
+            raise MapAssetBundleValidationError("%s 包含负零浮点数。" % description)
+        return parsed
+
     try:
         value = json.loads(
             payload.decode("utf-8"),
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_constant,
+            parse_int=parse_integer,
+            parse_float=parse_float,
         )
     except MapAssetBundleValidationError:
         raise
@@ -848,6 +1568,171 @@ def _model_json_bytes(model) -> bytes:
     return _canonical_json_bytes(model.model_dump(mode="json", exclude_none=True))
 
 
+def _validate_manifested_file_observation(
+    relative_path: str,
+    metadata: Optional[Mapping[str, object]],
+    observed_size: int,
+    observed_sha256: str,
+) -> None:
+    if metadata is None:
+        raise MapAssetBundleValidationError("地图资产文件未被顶层清单绑定：%s" % relative_path)
+    if observed_size != metadata.get("size") or observed_sha256 != metadata.get("sha256"):
+        raise MapAssetBundleValidationError("地图资产文件大小或 SHA-256 不匹配：%s" % relative_path)
+
+
+def _entry_exists_at(parent_descriptor: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _rename_directory_noreplace(
+    parent_descriptor: int,
+    source_name: str,
+    target_name: str,
+) -> None:
+    if (
+        not source_name
+        or not target_name
+        or "/" in source_name
+        or "/" in target_name
+        or source_name in {".", ".."}
+        or target_name in {".", ".."}
+    ):
+        raise MapAssetBundleValidationError("地图资产目录提交名称非法。")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOTSUP, "renameat2 不可用，拒绝降级为可覆盖提交")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(target_name),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _atomic_write_relative(
+    root: Path,
+    relative_path: str,
+    payload: bytes,
+    *,
+    create_parents: bool = False,
+) -> None:
+    normalized = _validate_relative_path(relative_path, "地图资产写入路径")
+    parts = PurePosixPath(normalized).parts
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptors: List[int] = []
+    directory_states: List[Tuple[int, int, str, os.stat_result]] = []
+    temporary_name = ".%s.%s.tmp" % (parts[-1], uuid.uuid4().hex)
+    temporary_descriptor = -1
+    try:
+        current_descriptor = os.open(Path(root).absolute(), directory_flags)
+        descriptors.append(current_descriptor)
+        for part in parts[:-1]:
+            try:
+                named = os.stat(
+                    part,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                if not create_parents:
+                    raise MapAssetBundleValidationError("地图资产写入目录不存在：%s" % part) from exc
+                os.mkdir(part, mode=0o700, dir_fd=current_descriptor)
+                named = os.stat(
+                    part,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            _validate_directory_stat(named, part)
+            child_descriptor = os.open(
+                part,
+                directory_flags,
+                dir_fd=current_descriptor,
+            )
+            try:
+                opened = os.fstat(child_descriptor)
+                _validate_directory_stat(opened, part)
+                _require_same_file_identity(named, opened, part)
+            except Exception:
+                os.close(child_descriptor)
+                raise
+            directory_states.append((current_descriptor, child_descriptor, part, opened))
+            descriptors.append(child_descriptor)
+            current_descriptor = child_descriptor
+
+        temporary_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=current_descriptor,
+        )
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(temporary_descriptor, view[written:])
+            if count <= 0:
+                raise OSError(errno.EIO, "地图资产临时文件写入失败")
+            written += count
+        os.fsync(temporary_descriptor)
+        temporary_stat = os.fstat(temporary_descriptor)
+        _validate_regular_file_stat(temporary_stat, normalized)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        os.replace(
+            temporary_name,
+            parts[-1],
+            src_dir_fd=current_descriptor,
+            dst_dir_fd=current_descriptor,
+        )
+        final_stat = os.stat(
+            parts[-1],
+            dir_fd=current_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_regular_file_stat(final_stat, normalized)
+        _require_same_file_identity(temporary_stat, final_stat, normalized)
+        os.fsync(current_descriptor)
+        for parent_descriptor, child_descriptor, part, opened in reversed(directory_states):
+            named = os.stat(
+                part,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            _validate_directory_stat(named, part)
+            _require_same_file_identity(opened, named, part)
+            _require_same_file_identity(opened, os.fstat(child_descriptor), part)
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if descriptors:
+            try:
+                os.unlink(temporary_name, dir_fd=descriptors[-1])
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -868,27 +1753,16 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             pass
 
 
-def _fsync_tree(root: Path) -> None:
-    directories = [root]
-    for current_root, directory_names, file_names in os.walk(root, followlinks=False):
-        current = Path(current_root)
-        for name in file_names:
-            path = current / name
-            path_stat = path.lstat()
-            if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
-                raise MapAssetBundleValidationError("地图资产包包含非普通文件：%s" % path)
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        for name in directory_names:
-            directory = current / name
-            if directory.is_symlink():
-                raise MapAssetBundleValidationError("地图资产包不得包含符号链接：%s" % directory)
-            directories.append(directory)
-    for directory in reversed(directories):
-        _fsync_directory(directory)
+def _fsync_tree(tree: _StableDirectoryTree) -> None:
+    for managed_file in tree.files.values():
+        managed_file.verify_named_entry()
+        os.fsync(managed_file.descriptor)
+        managed_file.verify_named_entry()
+    for directory in reversed(tree.directories):
+        directory.verify_named_entry()
+        os.fsync(directory.descriptor)
+        directory.verify_named_entry()
+    tree.verify_all()
 
 
 def _fsync_directory(path: Path) -> None:

@@ -8,11 +8,23 @@ import threading
 
 from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
-from contracts.map_workspace import MapAsset, MapAssetBundle, MapAssetStatus, MapWorkspace
-from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus
+from contracts.map_workspace import (
+    MapAsset,
+    MapAssetBundle,
+    MapAssetStatus,
+    MapGeoreferenceBindingV1,
+    MapGeoreferenceV1,
+    MapWorkspace,
+)
+from contracts.runtime_views import (
+    LocalizationSession,
+    LocalizationSessionStatus,
+    map_content_sha256,
+)
 from core import EventBus, StateNamespace, StateStore
 from core.errors import GatewayError
 from services.geometry import PlatformGeometryRuntime
+from services.geometry.runtime import GeometryRuntimeRelocalizationRejected
 from services.localization import LocalizationService
 from services.mapping.asset_store import MapAssetBundleError, MapAssetBundleRepository
 from services.mapping.catalog import MapCatalogRepository
@@ -1324,6 +1336,7 @@ class MapWorkspaceService:
         map_name: Optional[str] = None,
         reason: str = "",
         metadata: Optional[Dict[str, object]] = None,
+        georeference: Optional[MapGeoreferenceV1] = None,
     ) -> MapAssetBundle:
         """将当前建图快照物化并原子发布为该地图的 finalized current 资产包。"""
 
@@ -1356,6 +1369,31 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
 
+        if georeference is None:
+            raise GatewayError(
+                "新地图发布必须提供经过测量或配置冻结的地理参考。",
+                error_code="map_georeference_required",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        if not isinstance(georeference, MapGeoreferenceV1):
+            raise GatewayError(
+                "地图地理参考必须使用 MapGeoreferenceV1 强类型合同。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        if georeference.map_name != resolved_name or (
+            asset.frame_id is not None
+            and georeference.map_frame_id != asset.frame_id
+        ):
+            raise GatewayError(
+                "地图地理参考与待发布地图身份不一致。",
+                error_code="map_georeference_identity_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+
         coherent_binding = self._read_coherent_active_map_snapshot()
         if coherent_binding is None or coherent_binding[0] != resolved_name:
             raise GatewayError(
@@ -1365,6 +1403,14 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         snapshot = coherent_binding[1]
+        map_frame_id = self._resolve_map_frame_id(snapshot)
+        if not map_frame_id or georeference.map_frame_id != map_frame_id:
+            raise GatewayError(
+                "地图地理参考坐标系与当前可发布地图快照不一致。",
+                error_code="map_georeference_identity_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
         forbidden_zone_envelope = self._navigation_service.list_forbidden_zones(
             map_name=resolved_name,
         )
@@ -1401,8 +1447,24 @@ class MapWorkspaceService:
                     jsonrpc_code=-32000,
                 )
             snapshot = snapshot.model_copy(
-                update={"occupancy_grid": raw_occupancy},
+                update={
+                    "occupancy_grid": raw_occupancy,
+                    "content_sha256": map_content_sha256(
+                        map_name=snapshot.map_name,
+                        frame_id=snapshot.frame_id,
+                        occupancy_grid=raw_occupancy,
+                        cost_map=snapshot.cost_map,
+                        semantic_map=snapshot.semantic_map,
+                    ),
+                },
                 deep=True,
+            )
+        if snapshot.map_name != resolved_name:
+            raise GatewayError(
+                "运行态地图快照与请求的 map_name 不一致。",
+                error_code="map_snapshot_name_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
             )
 
         snapshot_metadata = self._sanitize_map_metadata(snapshot.metadata)
@@ -1420,9 +1482,9 @@ class MapWorkspaceService:
         bundle = MapAssetBundle(
             map_name=resolved_name,
             source_name=snapshot.source_name,
-            source_snapshot_id=snapshot.version_id,
-            frame_id=self._resolve_map_frame_id(snapshot),
+            frame_id=map_frame_id,
             snapshot=snapshot.model_copy(deep=True),
+            georeference=MapGeoreferenceBindingV1(contract=georeference),
             metadata={
                 "reason": str(reason or "").strip(),
                 "mapping_session_id": snapshot_metadata.get("mapping_session_id")
@@ -1558,17 +1620,56 @@ class MapWorkspaceService:
 
         latest_map_snapshot = active_workspace.latest_map_snapshot
         frame_id = self._resolve_map_frame_id(latest_map_snapshot)
-        session = self._localization_service.relocalize_active_session(
+        request_metadata = self._sanitize_map_metadata(metadata) or {}
+        request_id = request_metadata.get("request_id")
+        try:
+            logical_timeout_ms = int(request_metadata.get("logical_timeout_ms", 10_000))
+        except (TypeError, ValueError):
+            logical_timeout_ms = 10_000
+        try:
+            relocalization_result = self._geometry_runtime.relocalize_active_map(
+                map_name=resolved_name,
+                asset_manifest_sha256=bundle_manifest_sha256,
+                request_id=str(request_id).strip() if request_id is not None else None,
+                logical_timeout_ms=logical_timeout_ms,
+            )
+        except GeometryRuntimeRelocalizationRejected as exc:
+            result = dict(exc.result)
+            disposition = str(result.get("disposition_name") or "rejected")
+            raise GatewayError(
+                "地图 %s 重定位未应用：%s" % (resolved_name, disposition),
+                error_code="relocalization_%s" % disposition,
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={"relocalization_result": result},
+            ) from exc
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(
+                "地图 %s 重定位调用失败：%s" % (resolved_name, exc),
+                error_code="relocalization_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+            ) from exc
+        session = self._localization_service.refresh_active_session(
             map_name=resolved_name,
             asset_manifest_sha256=bundle_manifest_sha256,
             frame_id=frame_id,
             metadata={
-                **(self._sanitize_map_metadata(metadata) or {}),
+                **request_metadata,
                 "map_name": resolved_name,
-                "source": "relocalize_active_map",
+                "source": "typed_relocalize_rpc",
+                "relocalization_result": relocalization_result,
                 "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
-                "snapshot_version_id": latest_map_snapshot.version_id,
+                "map_snapshot_identity": {
+                    "source_name": latest_map_snapshot.source_name,
+                    "source_epoch": latest_map_snapshot.source_epoch,
+                    "update_sequence": latest_map_snapshot.update_sequence,
+                    "content_sha256": latest_map_snapshot.content_sha256,
+                },
             },
+            force_relocalize=False,
             geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
         )
         workspace = self.get_active_workspace(refresh_localization=False)
@@ -2063,9 +2164,7 @@ class MapWorkspaceService:
             **self._sanitize_map_metadata(runtime_metadata),
             "map_snapshot_kind": "offline_checkpoint",
             "source_kind": "map_asset_bundle",
-            "map_name": bundle.map_name,
             "asset_manifest_sha256": bundle.manifest_sha256,
-            "source_snapshot_id": bundle.source_snapshot_id,
             "checkpoint_ready": True,
             "geometry_ready": True,
             "loaded_from_current_bundle": True,
@@ -2076,13 +2175,15 @@ class MapWorkspaceService:
             "backend_mode": "mapping_localization",
         }
         self._mapping_service.ingest_external_snapshot(
+            map_name=bundle.map_name,
             source_name=bundle_snapshot.source_name,
+            source_epoch=bundle_snapshot.source_epoch,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
             semantic_map=semantic_map,
             metadata=checkpoint_metadata,
-            version_id_override=bundle_snapshot.version_id,
-            revision_override=bundle_snapshot.revision,
+            update_sequence_override=bundle_snapshot.update_sequence,
+            content_sha256=bundle_snapshot.content_sha256,
         )
 
     def _checkpoint_map_displayable(self, latest_map_snapshot) -> bool:
@@ -2115,12 +2216,14 @@ class MapWorkspaceService:
             require_backend_switch=require_backend_switch,
             activation_request_id=activation_request_id,
         )
+        if runtime_snapshot.map_name != bundle.map_name:
+            raise _MapActivationReconciliationError(
+                "地图 %s 的运行态快照 map_name 不匹配。" % bundle.map_name
+            )
         try:
             runtime_metadata = {
                 **self._sanitize_map_metadata(runtime_snapshot.metadata),
-                "map_name": bundle.map_name,
                 "asset_manifest_sha256": bundle.manifest_sha256,
-                "source_snapshot_id": bundle.source_snapshot_id,
                 "loaded_from_current_bundle": True,
             }
             activation_result = dict(
@@ -2174,13 +2277,15 @@ class MapWorkspaceService:
                 )
             else:
                 self._mapping_service.ingest_external_snapshot(
+                    map_name=bundle.map_name,
                     source_name=runtime_snapshot.source_name,
+                    source_epoch=runtime_snapshot.source_epoch,
                     occupancy_grid=runtime_snapshot.occupancy_grid,
                     cost_map=runtime_snapshot.cost_map,
                     semantic_map=runtime_snapshot.semantic_map,
                     metadata=runtime_metadata,
-                    version_id_override=runtime_snapshot.version_id,
-                    revision_override=runtime_snapshot.revision,
+                    update_sequence_override=runtime_snapshot.update_sequence,
+                    content_sha256=runtime_snapshot.content_sha256,
                 )
             self._localization_service.clear_latest_snapshot()
         except Exception as exc:

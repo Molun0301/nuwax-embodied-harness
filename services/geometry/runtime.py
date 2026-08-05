@@ -38,7 +38,7 @@ from contracts.navigation import (
     NavigationGoal,
     NavigationStatus,
 )
-from contracts.runtime_views import MapSnapshot
+from contracts.runtime_views import MapSnapshot, map_content_sha256
 from providers.data_plane import (
     ExplorationDataPlane,
     LocalizationDataPlane,
@@ -176,6 +176,19 @@ class MapAssetBackendActivationAppliedError(RuntimeError):
     def __init__(self, map_name: str) -> None:
         super().__init__(
             "地图 %s 的后端已完成激活，但 Python 运行态尚未完成收敛。" % map_name
+        )
+
+
+class GeometryRuntimeRelocalizationRejected(RuntimeError):
+    """The typed relocalization owner returned a non-success disposition."""
+
+    def __init__(self, result: Dict[str, object]) -> None:
+        self.result = dict(result or {})
+        disposition = str(self.result.get("disposition_name") or "unknown")
+        detail = str(self.result.get("detail") or "")
+        super().__init__(
+            "重定位未应用：disposition=%s detail=%s"
+            % (disposition, detail or "<empty>")
         )
 
 
@@ -3558,6 +3571,71 @@ class PlatformGeometryRuntime:
                 return
             self._external_debug_frontier_payload = self._clone_metadata(payload)
 
+    def is_relocalization_available(self) -> bool:
+        if (
+            not self._is_geometry_profile_enabled()
+            or self.is_map_asset_activation_recovery_pending()
+            or self._active_map_bundle is None
+        ):
+            return False
+        provider = self.get_geometry_runtime_provider()
+        if provider is None or not callable(getattr(provider, "relocalize", None)):
+            return False
+        activation = dict(self._last_activation_result or {})
+        return bool(
+            activation.get("relocalization_target_available")
+            and str(activation.get("map_name") or "")
+            == self._active_map_bundle.map_name
+            and str(activation.get("asset_manifest_sha256") or "").lower()
+            == str(self._active_map_bundle.manifest_sha256 or "").lower()
+        )
+
+    def relocalize_active_map(
+        self,
+        *,
+        map_name: str,
+        asset_manifest_sha256: str,
+        request_id: Optional[str] = None,
+        logical_timeout_ms: int = 10_000,
+    ) -> Dict[str, object]:
+        provider = self.get_geometry_runtime_provider()
+        if provider is None:
+            raise RuntimeError("Geometry runtime 未连接，无法重定位。")
+        active_bundle = self._active_map_bundle
+        resolved_map_name = str(map_name or "").strip()
+        resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
+        if (
+            active_bundle is None
+            or active_bundle.map_name != resolved_map_name
+            or str(active_bundle.manifest_sha256 or "").strip().lower()
+            != resolved_manifest
+        ):
+            raise RuntimeError("重定位目标与当前激活地图资产不一致。")
+        activation = self._clone_metadata(self._last_activation_result)
+        if (
+            not bool(activation.get("relocalization_target_available"))
+            or str(activation.get("map_name") or "").strip() != resolved_map_name
+            or str(activation.get("asset_manifest_sha256") or "").strip().lower()
+            != resolved_manifest
+        ):
+            raise RuntimeError("当前地图没有匹配的 sealed 重定位目标。")
+        result = provider.relocalize(
+            activation_state=activation,
+            request_id=request_id,
+            logical_timeout_ms=logical_timeout_ms,
+        )
+        if not bool(result.get("success")):
+            raise GeometryRuntimeRelocalizationRejected(result)
+        current_bundle = self._active_map_bundle
+        if (
+            current_bundle is None
+            or current_bundle.map_name != resolved_map_name
+            or str(current_bundle.manifest_sha256 or "").strip().lower()
+            != resolved_manifest
+        ):
+            raise RuntimeError("重定位完成前当前地图资产已经切换。")
+        return self._clone_metadata(result)
+
     def is_available(self) -> bool:
         """返回是否存在可供平台消费的几何后端。"""
 
@@ -4312,14 +4390,9 @@ class PlatformGeometryRuntime:
             )
         timestamp_ns = int(meta.timestamp_ns)
         timestamp = self._checkpoint_datetime(timestamp_ns)
-        current_grid = map_bundle.snapshot.occupancy_grid
-        map_id = (
-            str(getattr(current_grid, "map_id", "") or "").strip()
-            or "mapping-checkpoint-%d" % int(meta.revision)
-        )
         occupancy_grid = OccupancyGrid(
             timestamp=timestamp,
-            map_id=map_id,
+            map_id=map_bundle.map_name,
             frame_id=frame_id,
             width=int(meta.width),
             height=int(meta.height),
@@ -4347,6 +4420,13 @@ class PlatformGeometryRuntime:
             update={
                 "frame_id": frame_id,
                 "occupancy_grid": occupancy_grid,
+                "content_sha256": map_content_sha256(
+                    map_name=map_bundle.map_name,
+                    frame_id=frame_id,
+                    occupancy_grid=occupancy_grid,
+                    cost_map=map_bundle.snapshot.cost_map,
+                    semantic_map=map_bundle.snapshot.semantic_map,
+                ),
                 "metadata": {
                     **dict(map_bundle.snapshot.metadata),
                     "mapping_backend_checkpoint": checkpoint_metadata,
@@ -4880,9 +4960,7 @@ class PlatformGeometryRuntime:
                     "metadata": {
                         **dict(bundle.snapshot.metadata),
                         **offline_geometry_metadata,
-                        "map_name": bundle.map_name,
                         "asset_manifest_sha256": bundle.manifest_sha256,
-                        "source_snapshot_id": bundle.source_snapshot_id,
                         "source_kind": "map_asset_bundle",
                         "map_snapshot_kind": "offline_checkpoint",
                         "live_streaming_ready": False,
@@ -5457,9 +5535,12 @@ class PlatformGeometryRuntime:
             source_kind="map_asset_bundle",
         )
         snapshot = MapSnapshot(
-            source_name=self.providers.provider_name,
-            version_id=bundle.snapshot.version_id,
-            revision=bundle.snapshot.revision,
+            map_name=bundle.snapshot.map_name,
+            source_name=bundle.snapshot.source_name,
+            source_epoch=bundle.snapshot.source_epoch,
+            update_sequence=bundle.snapshot.update_sequence,
+            content_sha256=bundle.snapshot.content_sha256,
+            frame_id=bundle.snapshot.frame_id,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
             semantic_map=semantic_map,
@@ -5505,15 +5586,14 @@ class PlatformGeometryRuntime:
         cost_map_content_revision = int(cost_map_descriptor["revision"] or 0)
         occupancy_sequence = occupancy_content_revision
         cost_map_sequence = cost_map_content_revision
-        update_sequence = max(occupancy_sequence, cost_map_sequence)
+        update_sequence = max(
+            1,
+            occupancy_content_revision + cost_map_content_revision,
+        )
         message_count = int(live_occupancy is not None) + int(
             live_cost_map is not None
         )
         content_revision = occupancy_content_revision + cost_map_content_revision
-        try:
-            live_revision = max(1, int(content_revision or 1))
-        except (TypeError, ValueError):
-            live_revision = 1
         occupancy_content_hash = occupancy_descriptor["content_hash"]
         cost_map_content_hash = cost_map_descriptor["content_hash"]
         occupancy_metrics = {
@@ -5552,13 +5632,6 @@ class PlatformGeometryRuntime:
             "occupancy_metrics": occupancy_metrics,
             "cost_map_metrics": cost_map_metrics,
         })
-        seed = "|".join(str(part or "") for part in (
-            live_status.get("provider_name"),
-            live_status.get("occupancy_topic"),
-            live_status.get("cost_map_topic"),
-            live_status.get("started"),
-        ))
-        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16] if seed.strip("|") else "current"
         metadata = {
             "event_type": "content_update",
             "source_kind": "platform_live_map_provider",
@@ -5606,15 +5679,16 @@ class PlatformGeometryRuntime:
             metadata.update(
                 {
                     "mapping_session_id": mapping_session_id,
-                    "map_name": mapping_map_name,
                     "session_generation": mapping_session_generation,
                     "mapping_revision": int(mapping_context.get("revision") or 0),
                 }
             )
         if seed_bundle is not None:
+            if mapping_map_name and mapping_map_name != seed_bundle.map_name:
+                raise RuntimeError(
+                    "live mapping map_name does not match activated map bundle"
+                )
             metadata.update({
-                "map_name": seed_bundle.map_name,
-                "source_snapshot_id": seed_bundle.source_snapshot_id,
                 "asset_manifest_sha256": seed_bundle.manifest_sha256,
             })
             metadata.update(self._build_map_snapshot_geometry_metadata(
@@ -5636,17 +5710,51 @@ class PlatformGeometryRuntime:
                 "preprocessing": self._clone_metadata(self.config.build_metadata().get("preprocessing")),
                 "geometry_backend": self.describe_backend(),
             })
-        return MapSnapshot(
-            source_name=str(live_status.get("provider_name") or "geometry_runtime"),
-            version_id="live_%s_%s" % (digest, live_revision),
-            revision=live_revision,
-            occupancy_grid=self._clone_contract(live_occupancy),
-            cost_map=self._clone_contract(live_cost_map),
-            semantic_map=(
-                self._clone_contract(seed_bundle.snapshot.semantic_map)
-                if seed_bundle is not None
-                else None
+        map_name = mapping_map_name or (
+            seed_bundle.map_name if seed_bundle is not None else ""
+        )
+        if not map_name:
+            raise RuntimeError("live map snapshot is missing map_name")
+        if mapping_session_id and mapping_session_generation > 0:
+            source_epoch = "%s:%d" % (
+                mapping_session_id,
+                mapping_session_generation,
+            )
+        elif seed_bundle is not None:
+            source_epoch = seed_bundle.snapshot.source_epoch
+        else:
+            raise RuntimeError("live map snapshot is missing source epoch identity")
+        occupancy_grid = self._clone_contract(live_occupancy)
+        cost_map = self._clone_contract(live_cost_map)
+        semantic_map = (
+            self._clone_contract(seed_bundle.snapshot.semantic_map)
+            if seed_bundle is not None
+            else None
+        )
+        frame_id = next(
+            (
+                str(layer.frame_id or "").strip()
+                for layer in (occupancy_grid, cost_map, semantic_map)
+                if layer is not None and str(layer.frame_id or "").strip()
             ),
+            None,
+        )
+        return MapSnapshot(
+            map_name=map_name,
+            source_name=str(live_status.get("provider_name") or "geometry_runtime"),
+            source_epoch=source_epoch,
+            update_sequence=update_sequence,
+            content_sha256=map_content_sha256(
+                map_name=map_name,
+                frame_id=frame_id,
+                occupancy_grid=occupancy_grid,
+                cost_map=cost_map,
+                semantic_map=semantic_map,
+            ),
+            frame_id=frame_id,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
             metadata=metadata,
         )
 
@@ -5660,8 +5768,6 @@ class PlatformGeometryRuntime:
         source_kind: str,
     ) -> Dict[str, object]:
         bundle_metadata = {
-            "map_name": bundle.map_name,
-            "source_snapshot_id": bundle.source_snapshot_id,
             "asset_manifest_sha256": bundle.manifest_sha256,
         }
         metadata = {
@@ -6022,10 +6128,11 @@ class PlatformGeometryRuntime:
         )
         checkpoint = checkpoint_bundle.checkpoint
         identity = {
-            "schema_version": 1,
+            "schema_version": 2,
             "map_name": bundle.map_name,
-            "source_snapshot_id": bundle.source_snapshot_id,
-            "snapshot_revision": int(bundle.snapshot.revision),
+            "source_epoch": bundle.snapshot.source_epoch,
+            "update_sequence": int(bundle.snapshot.update_sequence),
+            "content_sha256": bundle.snapshot.content_sha256,
             "frame_id": str(bundle.frame_id or bundle.snapshot.frame_id or ""),
             "mapping_session_id": str(mapping_context.get("session_id") or ""),
             "session_generation": int(mapping_context.get("session_generation") or 0),
@@ -6038,15 +6145,16 @@ class PlatformGeometryRuntime:
             connection = sqlite3.connect(str(temporary))
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("PRAGMA user_version=1")
+            connection.execute("PRAGMA user_version=2")
             connection.execute(
                 """
                 CREATE TABLE map_asset_identity (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     schema_version INTEGER NOT NULL,
                     map_name TEXT NOT NULL,
-                    source_snapshot_id TEXT NOT NULL,
-                    snapshot_revision INTEGER NOT NULL,
+                    source_epoch TEXT NOT NULL,
+                    update_sequence INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
                     frame_id TEXT NOT NULL,
                     mapping_session_id TEXT NOT NULL,
                     session_generation INTEGER NOT NULL,
@@ -6062,21 +6170,23 @@ class PlatformGeometryRuntime:
                     singleton_id,
                     schema_version,
                     map_name,
-                    source_snapshot_id,
-                    snapshot_revision,
+                    source_epoch,
+                    update_sequence,
+                    content_sha256,
                     frame_id,
                     mapping_session_id,
                     session_generation,
                     backend_kind,
                     backend_checkpoint_content_sha256,
                     created_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identity["schema_version"],
                     identity["map_name"],
-                    identity["source_snapshot_id"],
-                    identity["snapshot_revision"],
+                    identity["source_epoch"],
+                    identity["update_sequence"],
+                    identity["content_sha256"],
                     identity["frame_id"],
                     identity["mapping_session_id"],
                     identity["session_generation"],

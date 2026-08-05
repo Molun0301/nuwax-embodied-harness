@@ -1,17 +1,222 @@
 from __future__ import annotations
 
+import math
+import unicodedata
+from copy import deepcopy
 from datetime import datetime
 from pathlib import PurePosixPath
+from typing import Dict, List, Mapping, Optional
 
-from contracts.compat import StrEnum
-
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
+from contracts.compat import StrEnum
 from contracts.memory import MemoryStoreSummary
 from contracts.naming import validate_frame_id
-from contracts.runtime_views import ExplorationContext, LocalizationSession, LocalizationSnapshot, MapSnapshot, NavigationContext
-from typing import List, Optional
+from contracts.runtime_views import (
+    ExplorationContext,
+    LocalizationSession,
+    LocalizationSnapshot,
+    MapSnapshot,
+    NavigationContext,
+)
+
+MAP_GEOREFERENCE_SCHEMA_VERSION = 1
+MAP_GEOREFERENCE_RELATIVE_PATH = "georeference/georeference-v1.json"
+MAP_GEOREFERENCE_SOURCE_CRS = "EPSG:4326"
+MAP_GEOREFERENCE_PROJECTED_CRS = "EPSG:3857"
+MAP_GEOREFERENCE_AXIS_CONVENTION = "projected_x_east_y_north_z_up"
+MAP_GEOREFERENCE_ALTITUDE_POLICY = "map_plane_constant"
+MAP_GEOREFERENCE_MAX_LATITUDE_DEG = 85.051_128_779_806_6
+MAP_GEOREFERENCE_MAX_COORDINATE_M = 1_000_000_000.0
+
+
+class MapGeoreferenceV1(ContractModel):
+    """最终地图资产使用的不可变地理参考第一版合同。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: int = Field(description="地理参考合同版本，固定为 1。")
+    map_name: str = Field(description="最终地图名称。")
+    map_frame_id: str = Field(description="右手系且 Z 轴向上的地图坐标系。")
+    source_crs: str = Field(description="地理坐标参考系，固定为 EPSG:4326。")
+    projected_crs: str = Field(description="投影坐标参考系，固定为 EPSG:3857。")
+    axis_convention: str = Field(description="投影坐标轴约定。")
+    anchor_lat_deg: float = Field(description="锚点的 WGS84 纬度。")
+    anchor_lng_deg: float = Field(description="锚点的 WGS84 经度。")
+    anchor_easting_m: float = Field(description="锚点的 EPSG:3857 东向坐标。")
+    anchor_northing_m: float = Field(description="锚点的 EPSG:3857 北向坐标。")
+    map_origin_x_m: float = Field(description="锚点对应的地图坐标系 X 坐标。")
+    map_origin_y_m: float = Field(description="锚点对应的地图坐标系 Y 坐标。")
+    map_from_projected_yaw_rad: float = Field(description="投影坐标系到地图坐标系的逆时针偏航角。")
+    altitude_policy: str = Field(description="高度策略，固定为地图平面常量。")
+    map_plane_z_m: float = Field(description="所有目标使用的地图平面 Z 坐标。")
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _validate_georeference_schema_version(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value != MAP_GEOREFERENCE_SCHEMA_VERSION:
+            raise ValueError("地理参考 schema_version 必须为 1。")
+        return value
+
+    @field_validator("map_name")
+    @classmethod
+    def _validate_georeference_map_name(cls, value: str) -> str:
+        if (
+            not value
+            or value.strip() != value
+            or len(value.encode("utf-8")) > 255
+            or any(unicodedata.category(character) == "Cc" for character in value)
+        ):
+            raise ValueError("地理参考 map_name 必须规范、无控制字符且不超过 255 字节。")
+        return value
+
+    @field_validator("map_frame_id")
+    @classmethod
+    def _validate_georeference_frame_id(cls, value: str) -> str:
+        if value.strip() != value or len(value.encode("utf-8")) > 255:
+            raise ValueError("地理参考 map_frame_id 非法。")
+        return validate_frame_id(value)
+
+    @field_validator(
+        "anchor_lat_deg",
+        "anchor_lng_deg",
+        "anchor_easting_m",
+        "anchor_northing_m",
+        "map_origin_x_m",
+        "map_origin_y_m",
+        "map_from_projected_yaw_rad",
+        "map_plane_z_m",
+        mode="before",
+    )
+    @classmethod
+    def _validate_georeference_number_input(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("地理参考数值字段必须为数字。")
+        return float(value)
+
+    @model_validator(mode="after")
+    def _validate_georeference_identity(self) -> MapGeoreferenceV1:
+        required_labels = {
+            "source_crs": MAP_GEOREFERENCE_SOURCE_CRS,
+            "projected_crs": MAP_GEOREFERENCE_PROJECTED_CRS,
+            "axis_convention": MAP_GEOREFERENCE_AXIS_CONVENTION,
+            "altitude_policy": MAP_GEOREFERENCE_ALTITUDE_POLICY,
+        }
+        for field_name, expected in required_labels.items():
+            if getattr(self, field_name) != expected:
+                raise ValueError(f"地理参考 {field_name} 必须为 {expected}。")
+
+        numeric_fields = (
+            "anchor_lat_deg",
+            "anchor_lng_deg",
+            "anchor_easting_m",
+            "anchor_northing_m",
+            "map_origin_x_m",
+            "map_origin_y_m",
+            "map_from_projected_yaw_rad",
+            "map_plane_z_m",
+        )
+        for field_name in numeric_fields:
+            value = getattr(self, field_name)
+            if not math.isfinite(value):
+                raise ValueError(f"地理参考 {field_name} 必须为有限数。")
+            if value == 0.0 and math.copysign(1.0, value) < 0.0:
+                raise ValueError(f"地理参考 {field_name} 的零值必须使用正零编码。")
+
+        if not (-MAP_GEOREFERENCE_MAX_LATITUDE_DEG <= self.anchor_lat_deg <= MAP_GEOREFERENCE_MAX_LATITUDE_DEG):
+            raise ValueError("地理参考 anchor_lat_deg 超出 EPSG:3857 范围。")
+        if not -180.0 <= self.anchor_lng_deg <= 180.0:
+            raise ValueError("地理参考 anchor_lng_deg 超出 WGS84 范围。")
+        if not -math.pi <= self.map_from_projected_yaw_rad < math.pi:
+            raise ValueError("地理参考 map_from_projected_yaw_rad 必须位于 [-pi, pi)。")
+        for field_name in ("map_origin_x_m", "map_origin_y_m", "map_plane_z_m"):
+            if abs(getattr(self, field_name)) > MAP_GEOREFERENCE_MAX_COORDINATE_M:
+                raise ValueError(f"地理参考 {field_name} 超出地图坐标范围。")
+
+        latitude_rad = math.radians(self.anchor_lat_deg)
+        expected_easting = 6_378_137.0 * math.radians(self.anchor_lng_deg)
+        expected_northing = 6_378_137.0 * math.log(math.tan(math.pi / 4.0 + latitude_rad / 2.0))
+        if (
+            abs(expected_easting - self.anchor_easting_m) > 1.0e-6
+            or abs(expected_northing - self.anchor_northing_m) > 1.0e-6
+        ):
+            raise ValueError("地理参考投影锚点与 WGS84 锚点不一致。")
+        return self
+
+    def model_copy(
+        self,
+        *,
+        update: Optional[Mapping[str, object]] = None,
+        deep: bool = False,
+    ) -> "MapGeoreferenceV1":
+        return _validated_model_copy(self, update=update, deep=deep)
+
+
+class MapGeoreferenceBindingV1(ContractModel):
+    """地理参考合同与资产包内精确原文字节的绑定。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: int = Field(
+        default=MAP_GEOREFERENCE_SCHEMA_VERSION,
+        description="绑定版本，固定为 1。",
+    )
+    relative_path: str = Field(
+        default=MAP_GEOREFERENCE_RELATIVE_PATH,
+        description="地理参考文件的规范相对路径。",
+    )
+    raw_sha256: Optional[str] = Field(
+        default=None,
+        description="地理参考原文字节 SHA-256；候选发布时计算，最终资产中必须存在。",
+    )
+    contract: MapGeoreferenceV1 = Field(description="经过类型校验的地理参考合同。")
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _validate_binding_schema_version(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value != MAP_GEOREFERENCE_SCHEMA_VERSION:
+            raise ValueError("地理参考绑定 schema_version 必须为 1。")
+        return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def _validate_binding_relative_path(cls, value: str) -> str:
+        if value != MAP_GEOREFERENCE_RELATIVE_PATH:
+            raise ValueError("地理参考文件必须使用固定规范路径。")
+        return value
+
+    @field_validator("raw_sha256")
+    @classmethod
+    def _validate_binding_raw_sha256(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if (
+            value.strip() != value
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            or value == "0" * 64
+        ):
+            raise ValueError("地理参考原文 SHA-256 非法。")
+        return value
+
+    def model_copy(
+        self,
+        *,
+        update: Optional[Mapping[str, object]] = None,
+        deep: bool = False,
+    ) -> "MapGeoreferenceBindingV1":
+        changes = dict(update or {})
+        if self.raw_sha256 is not None:
+            for field_name in (
+                "schema_version",
+                "relative_path",
+                "raw_sha256",
+                "contract",
+            ):
+                if field_name in changes and changes[field_name] != getattr(self, field_name):
+                    raise TypeError("已绑定原文摘要的地理参考不可改写。")
+        return _validated_model_copy(self, update=changes, deep=deep)
 
 
 class MapAssetStatus(StrEnum):
@@ -220,19 +425,21 @@ class MapGeometryAssetBinding(ContractModel):
 class MapAssetBundle(TimestampedContract):
     """一个 map_name 唯一且不可变的 finalized 地图资产包。"""
 
+    model_config = ConfigDict(frozen=True)
+
     map_name: str = Field(description="所属地图名称。")
     source_name: str = Field(description="生成资产包时使用的地图来源名称。")
-    source_snapshot_id: str = Field(description="生成资产包时的运行态快照标识。")
     frame_id: Optional[str] = Field(default=None, description="资产包对应的地图坐标系。")
     snapshot: MapSnapshot = Field(description="持久化的地图快照。")
     geometry_asset: Optional[MapGeometryAssetBinding] = Field(
         default=None,
         description="资产包绑定的几何资产信息。",
     )
+    georeference: MapGeoreferenceBindingV1 = Field(description="资产包绑定的不可变地理参考。")
     manifest_sha256: Optional[str] = Field(default=None, description="资产包清单 SHA-256；加载时计算。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
-    @field_validator("map_name", "source_name", "source_snapshot_id")
+    @field_validator("map_name", "source_name")
     @classmethod
     def _validate_required_text(cls, value: str) -> str:
         resolved = str(value or "").strip()
@@ -264,10 +471,16 @@ class MapAssetBundle(TimestampedContract):
     def _validate_bundle_identity(self) -> "MapAssetBundle":
         if self.source_name != self.snapshot.source_name:
             raise ValueError("地图资产包 source_name 与运行态快照不一致。")
-        if self.source_snapshot_id != self.snapshot.version_id:
-            raise ValueError("地图资产包 source_snapshot_id 与运行态快照不一致。")
+        if self.map_name != self.snapshot.map_name:
+            raise ValueError("地图资产包 map_name 与运行态快照不一致。")
         if self.geometry_asset is not None and self.geometry_asset.map_name != self.map_name:
             raise ValueError("地图资产包与 geometry_asset 的 map_name 不一致。")
+        if self.georeference.contract.map_name != self.map_name:
+            raise ValueError("地图资产包与 georeference 的 map_name 不一致。")
+        if not self.frame_id:
+            raise ValueError("绑定地理参考的地图资产包必须声明 frame_id。")
+        if self.georeference.contract.map_frame_id != self.frame_id:
+            raise ValueError("地图资产包与 georeference 的 frame_id 不一致。")
         if (
             self.geometry_asset is not None
             and self.frame_id
@@ -275,12 +488,34 @@ class MapAssetBundle(TimestampedContract):
             and self.frame_id != self.geometry_asset.frame_id
         ):
             raise ValueError("地图资产包与 geometry_asset 的 frame_id 不一致。")
-        snapshot_map_name = str(self.snapshot.metadata.get("map_name") or "").strip()
-        if snapshot_map_name and snapshot_map_name != self.map_name:
-            raise ValueError("地图资产包与运行态快照的 map_name 不一致。")
         if self.frame_id and self.snapshot.frame_id and self.frame_id != self.snapshot.frame_id:
             raise ValueError("地图资产包与运行态快照的 frame_id 不一致。")
         return self
+
+    def __getattribute__(self, name: str):
+        value = super().__getattribute__(name)
+        if name not in {"snapshot", "geometry_asset", "metadata"}:
+            return value
+        try:
+            manifest_sha256 = super().__getattribute__("manifest_sha256")
+        except AttributeError:
+            return value
+        if manifest_sha256 is None:
+            return value
+        return deepcopy(value)
+
+    def model_copy(
+        self,
+        *,
+        update: Optional[Mapping[str, object]] = None,
+        deep: bool = False,
+    ) -> "MapAssetBundle":
+        changes = dict(update or {})
+        if self.manifest_sha256 is not None:
+            changed_fields = {field_name for field_name, value in changes.items() if value != getattr(self, field_name)}
+            if changed_fields:
+                raise TypeError("已绑定清单摘要的地图资产包不可改写。")
+        return _validated_model_copy(self, update=changes, deep=deep)
 
 
 def _validate_bundle_relative_path(value: object, description: str) -> str:
@@ -293,3 +528,16 @@ def _validate_bundle_relative_path(value: object, description: str) -> str:
     if path.is_absolute() or resolved != path.as_posix() or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("%s必须是资产包内的规范相对路径。" % description)
     return path.as_posix()
+
+
+def _validated_model_copy(
+    model: ContractModel,
+    *,
+    update: Optional[Mapping[str, object]],
+    deep: bool,
+):
+    payload: Dict[str, object] = model.model_dump(mode="python")
+    if deep:
+        payload = deepcopy(payload)
+    payload.update(deepcopy(dict(update or {})) if deep else dict(update or {}))
+    return type(model).model_validate(payload)

@@ -346,7 +346,11 @@ def _build_map_diagnostics(snapshot: Any, *, refresh_error: Optional[str] = None
         "frame_id": frame_id,
         "expected_frame_id": expected_frame_id,
         "sequence": message_count,
-        "revision": getattr(snapshot, "revision", None),
+        "map_name": getattr(snapshot, "map_name", None),
+        "source_name": getattr(snapshot, "source_name", None),
+        "source_epoch": getattr(snapshot, "source_epoch", None),
+        "update_sequence": getattr(snapshot, "update_sequence", None),
+        "content_sha256": getattr(snapshot, "content_sha256", None),
         "message_count": message_count,
         "provider_status": status.get("provider_status") or ("available" if status.get("started") and status.get("ros_ready") else "unknown"),
         "frame_mismatch": frame_mismatch,
@@ -850,11 +854,18 @@ def _is_stale(source_timestamp: datetime, name: str, gateway_timestamp: datetime
 def _revision_from_map(snapshot: Any) -> Optional[str]:
     if snapshot is None:
         return None
-    version_id = getattr(snapshot, "version_id", None)
-    revision = getattr(snapshot, "revision", None)
-    if version_id is None and revision is None:
+    map_name = getattr(snapshot, "map_name", None)
+    source_epoch = getattr(snapshot, "source_epoch", None)
+    update_sequence = getattr(snapshot, "update_sequence", None)
+    content_sha256 = getattr(snapshot, "content_sha256", None)
+    if not map_name or not source_epoch or update_sequence is None or not content_sha256:
         return None
-    return "%s:%s" % (version_id or "map", revision or "")
+    return "%s:%s:%s:%s" % (
+        map_name,
+        source_epoch,
+        update_sequence,
+        str(content_sha256)[:12],
+    )
 
 
 def _frame_id_from_localization(snapshot: Any) -> Optional[str]:

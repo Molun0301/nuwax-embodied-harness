@@ -272,8 +272,9 @@ class MemoryService:
             anchors_by_id={},
             topology_nodes_by_id={},
         )
-        self._latest_semantic_map_context_localization_session_id: Optional[str] = None
-        self._latest_semantic_map_context_snapshot_id: Optional[str] = None
+        self._latest_semantic_map_context_identity: Optional[
+            Tuple[Optional[str], Optional[str], str, str, int, str]
+        ] = None
         self._tagged_location_history: Deque[TaggedLocation] = deque(maxlen=max(1, history_limit))
         self._semantic_history: Deque[SemanticMemoryEntry] = deque(maxlen=max(1, history_limit))
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
@@ -863,8 +864,7 @@ class MemoryService:
             anchors_by_id={},
             topology_nodes_by_id={},
         )
-        self._latest_semantic_map_context_localization_session_id = None
-        self._latest_semantic_map_context_snapshot_id = None
+        self._latest_semantic_map_context_identity = None
         self._vector_store.clear_all()
 
     def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
@@ -2655,9 +2655,29 @@ class MemoryService:
         localization_metadata = dict(
             getattr(localization_snapshot, "metadata", {}) or {}
         )
+        explicit_name = str(map_name or "").strip() or None
+        session_name = (
+            str(active_session.map_name or "").strip() or None
+            if active_session is not None
+            else None
+        )
+        snapshot_name = (
+            str(getattr(map_snapshot, "map_name", "") or "").strip() or None
+        )
+        authoritative_names = [
+            candidate
+            for candidate in (explicit_name, session_name, snapshot_name)
+            if candidate is not None
+        ]
+        if len(set(authoritative_names)) > 1:
+            raise GatewayError(
+                "地图名称与当前定位会话或地图快照不一致。",
+                error_code="map_snapshot_name_mismatch",
+            )
         for candidate in (
-            map_name,
-            active_session.map_name if active_session is not None else None,
+            explicit_name,
+            session_name,
+            snapshot_name,
             map_metadata.get("map_name"),
             localization_metadata.get("map_name"),
             self._active_library_name,
@@ -5801,14 +5821,19 @@ class MemoryService:
                 None,
                 map_name=resolved_map_name,
             )
-            self._latest_semantic_map_context_localization_session_id = active_session_id
-            self._latest_semantic_map_context_snapshot_id = None
+            self._latest_semantic_map_context_identity = None
             return self._latest_semantic_map_context
-        snapshot_id = str(getattr(map_snapshot, "version_id", "") or "").strip() or None
+        snapshot_identity = (
+            resolved_map_name,
+            active_session_id,
+            str(map_snapshot.source_name),
+            str(map_snapshot.source_epoch),
+            int(map_snapshot.update_sequence),
+            str(map_snapshot.content_sha256),
+        )
         if (
             self._latest_semantic_map_context.map_name == resolved_map_name
-            and self._latest_semantic_map_context_localization_session_id == active_session_id
-            and self._latest_semantic_map_context_snapshot_id == snapshot_id
+            and self._latest_semantic_map_context_identity == snapshot_identity
         ):
             return self._latest_semantic_map_context
         built_context = self._semantic_map_builder.build(
@@ -5824,8 +5849,7 @@ class MemoryService:
             topology_nodes_by_id=built_context.topology_nodes_by_id,
             scene_spaces=scene_spaces,
         )
-        self._latest_semantic_map_context_localization_session_id = active_session_id
-        self._latest_semantic_map_context_snapshot_id = snapshot_id
+        self._latest_semantic_map_context_identity = snapshot_identity
         if self.is_enabled():
             self._ensure_embedders_initialized()
             for scene_space in scene_spaces:

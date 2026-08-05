@@ -2811,7 +2811,10 @@ impl GeometryRuntimeHandle {
     /// Reserve cloud-map clear before any worker can touch SHM or lifecycle
     /// state. Rejected reservations own and immediately drop their unstarted
     /// future, so Phase A closure cannot fall through to detached work.
-    pub(crate) fn reserve_cloud_map_session(&self) -> CloudMapSessionRegistration {
+    pub(crate) fn reserve_cloud_map_session(
+        &self,
+        clear_canonical_mapping_view: bool,
+    ) -> CloudMapSessionRegistration {
         let transport = self.transport.clone();
         let writer = self.cloud_map_writer.clone();
         let state = self.state.clone();
@@ -2856,15 +2859,16 @@ impl GeometryRuntimeHandle {
             }
             let _ = cloud_map_tx.send(update.clone());
 
-            // Clear the canonical occupancy/map view only after begin_session has
-            // published the cloud generation. This avoids coupling cloud-writer
-            // admission to a caller-held state write lock.
-            {
-                let mut shared = state.write().await;
-                shared.map = MapState::default();
+            if clear_canonical_mapping_view {
+                // StartMapping retires the prior canonical occupancy/map view only
+                // after begin_session has exposed the new cloud generation.
+                {
+                    let mut shared = state.write().await;
+                    shared.map = MapState::default();
+                }
+                map_revision_latest_tx.send_replace(None);
+                *occupancy_shm_current.write().await = None;
             }
-            map_revision_latest_tx.send_replace(None);
-            *occupancy_shm_current.write().await = None;
             let _ = update_tx.send(CloudMapSessionAdmission::Registered(update));
 
             // Direct checkpoint callers already hold this fence. The deferred
@@ -2917,7 +2921,7 @@ impl GeometryRuntimeHandle {
         &self,
         session_generation: u64,
     ) -> CloudMapSessionAdmission {
-        match self.reserve_cloud_map_session() {
+        match self.reserve_cloud_map_session(false) {
             CloudMapSessionRegistration::Admitted(reservation) => {
                 reservation.activate(session_generation).await
             }

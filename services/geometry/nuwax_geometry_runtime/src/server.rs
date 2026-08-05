@@ -4704,7 +4704,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             }
         }
 
-        let cloud_map_reservation = match self.bridge.reserve_cloud_map_session() {
+        let cloud_map_reservation = match self.bridge.reserve_cloud_map_session(true) {
             CloudMapSessionRegistration::Admitted(reservation) => reservation,
             CloudMapSessionRegistration::Rejected(admission) => {
                 let detail = match admission {

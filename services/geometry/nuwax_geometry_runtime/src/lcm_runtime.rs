@@ -9532,10 +9532,22 @@ pub fn test_lcm_url() -> String {
 /// test helper 走 `LcmTransport::new_real`，真实验证 liblcm 行为。
 ///
 /// 与 `spawn_geometry_runtime` 的关键差异:
-/// - 不订阅任何 LCM typed channel
-/// - 不写 SHM 文件
+/// - 不启动订阅任务
+/// - 默认创建隔离的 cloud-map SHM；`build_handle_for_tests_without_cloud_writer` 覆盖 writer 缺失路径
 /// - 立即返回,适合 `#[tokio::test]` async 测试
 pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    build_handle_for_tests_with_cloud_writer(true).await
+}
+
+/// 构造测试句柄并显式禁用 cloud-map writer，覆盖 fail-closed 路径。
+pub async fn build_handle_for_tests_without_cloud_writer(
+) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
+    build_handle_for_tests_with_cloud_writer(false).await
+}
+
+async fn build_handle_for_tests_with_cloud_writer(
+    with_cloud_writer: bool,
+) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
@@ -9608,17 +9620,22 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
             .clone(),
         mapping_lifecycle_lock.clone(),
     );
-    static CM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let cloud_map_path = std::path::PathBuf::from(format!(
-        "/tmp/nuwax_cloudmap_test_{}_{}.mmap",
-        std::process::id(),
-        CM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    ));
-    let cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path)
-        .map_err(|error| RealLcmBackendUnavailable::persistence(format!(
-            "test cloud-map SHM initialization failed: {error}"
-        )))?;
-    let cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(cloud_map_writer)));
+    let cloud_map_writer = if with_cloud_writer {
+        static CM_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let cloud_map_path = std::path::PathBuf::from(format!(
+            "/tmp/nuwax_cloudmap_test_{}_{}.mmap",
+            std::process::id(),
+            CM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path)
+            .map_err(|error| RealLcmBackendUnavailable::persistence(format!(
+                "test cloud-map SHM initialization failed: {error}"
+            )))?;
+        Arc::new(parking_lot::Mutex::new(Some(cloud_map_writer)))
+    } else {
+        Arc::new(parking_lot::Mutex::new(None))
+    };
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,

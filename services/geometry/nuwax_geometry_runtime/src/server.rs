@@ -4618,24 +4618,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         if !self.bridge.lcm_backend_available {
             return Err(Status::unavailable("mapping LCM backend is unavailable"));
         }
-        let cloud_map_reservation = match self.bridge.reserve_cloud_map_session() {
-            CloudMapSessionRegistration::Admitted(reservation) => reservation,
-            CloudMapSessionRegistration::Rejected(admission) => {
-                let detail = match admission {
-                    CloudMapSessionAdmission::AdmissionClosed(detail)
-                    | CloudMapSessionAdmission::ClearRejected(detail) => detail,
-                    CloudMapSessionAdmission::WriterUnavailable => {
-                        "cloud-map writer is unavailable".to_owned()
-                    }
-                    CloudMapSessionAdmission::Registered(_) => {
-                        "cloud-map clear reservation returned an invalid admission".to_owned()
-                    }
-                };
-                return Err(Status::unavailable(format!(
-                    "StartMapping cloud-map clear registration failed: {detail}"
-                )));
-            }
-        };
 
         let mapping_transition = tokio::time::timeout(
             MAPPING_TRANSITION_TIMEOUT,
@@ -4721,6 +4703,25 @@ impl GeometryRuntime for GeometryRuntimeService {
                 barrier.wait().await;
             }
         }
+
+        let cloud_map_reservation = match self.bridge.reserve_cloud_map_session() {
+            CloudMapSessionRegistration::Admitted(reservation) => reservation,
+            CloudMapSessionRegistration::Rejected(admission) => {
+                let detail = match admission {
+                    CloudMapSessionAdmission::AdmissionClosed(detail)
+                    | CloudMapSessionAdmission::ClearRejected(detail) => detail,
+                    CloudMapSessionAdmission::WriterUnavailable => {
+                        "cloud-map writer is unavailable".to_owned()
+                    }
+                    CloudMapSessionAdmission::Registered(_) => {
+                        "cloud-map clear reservation returned an invalid admission".to_owned()
+                    }
+                };
+                return Err(Status::unavailable(format!(
+                    "StartMapping cloud-map clear registration failed: {detail}"
+                )));
+            }
+        };
 
         let lifecycle_guard = match self.take_any_activation_lifecycle_fence() {
             Some(guard) => guard,
@@ -8085,7 +8086,7 @@ mod lifecycle_tests {
                 .take_validated_startup_pair()
                 .expect("transfer deferred clear startup pair");
 
-            let mut handle = crate::lcm_runtime::build_handle_for_tests()
+            let mut handle = crate::lcm_runtime::build_handle_for_tests_without_cloud_writer()
                 .await
                 .expect("deferred clear Geometry handle");
             let occupancy_path = handle.occupancy_shm_path.clone().map(Into::into);
@@ -11010,7 +11011,7 @@ mod lifecycle_tests {
             "warehouse-metadata-mismatch",
             checkpoint,
         );
-        let handle = crate::lcm_runtime::build_handle_for_tests()
+        let handle = crate::lcm_runtime::build_handle_for_tests_without_cloud_writer()
             .await
             .expect("real-lcm test handle");
         let service = GeometryRuntimeService::new(handle.clone());

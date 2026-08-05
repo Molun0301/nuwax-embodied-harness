@@ -36,7 +36,7 @@ use futures::FutureExt;
 use nuwax_codec::lcm::schema;
 use nuwax_nav_types_messages::geometry::Point2;
 use nuwax_nav_types_messages::grid::{OccupancyCell, OccupancyGrid2D};
-use nuwax_protocol::{LcmMessageType, LcmTopic};
+use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use nuwax_tf::{make_transform, TfTree, TransformStamped};
 use nuwax_transport::LcmTransport;
 use thiserror::Error;
@@ -44,7 +44,9 @@ use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
-use crate::mapping_adapter::{finish_backend_retirement, MappingAdapter, MappingAdapterConfig};
+use crate::mapping_adapter::{
+    finish_backend_retirement, MappingAdapter, MappingAdapterConfig, MappingBackendRetirement,
+};
 use crate::mapping_backend::MappingBackendSpec;
 use crate::occupancy_shm::OccupancyGridShmWriter;
 use crate::pointcloud::CloudMapShmWriter;
@@ -318,6 +320,36 @@ pub(crate) enum CloudMapSessionAdmission {
     WriterUnavailable,
     ClearRejected(String),
     AdmissionClosed(String),
+}
+
+pub(crate) struct CloudMapSessionReservation {
+    activation_tx: Option<tokio::sync::oneshot::Sender<u64>>,
+    update_rx: tokio::sync::oneshot::Receiver<CloudMapSessionAdmission>,
+}
+
+pub(crate) enum CloudMapSessionRegistration {
+    Admitted(CloudMapSessionReservation),
+    Rejected(CloudMapSessionAdmission),
+}
+
+impl CloudMapSessionReservation {
+    pub(crate) async fn activate(mut self, session_generation: u64) -> CloudMapSessionAdmission {
+        let Some(activation_tx) = self.activation_tx.take() else {
+            return CloudMapSessionAdmission::AdmissionClosed(
+                "cloud-map clear reservation was already activated".to_owned(),
+            );
+        };
+        if activation_tx.send(session_generation).is_err() {
+            return CloudMapSessionAdmission::AdmissionClosed(
+                "cloud-map clear reservation task was unavailable".to_owned(),
+            );
+        }
+        self.update_rx.await.unwrap_or_else(|error| {
+            CloudMapSessionAdmission::ClearRejected(format!(
+                "cloud-map clear task did not report its admission result: {error}"
+            ))
+        })
+    }
 }
 
 /// RALPLAN §Phase M #3: occupancy grid revision 事件。
@@ -1156,6 +1188,40 @@ impl GeometryRuntimeTaskControl {
         future: impl Future<Output = Result<(), String>> + Send + 'static,
     ) -> Result<(), String> {
         self.register(name, GeometryTaskClass::Retained, future)
+    }
+
+    pub(crate) fn register_mapping_backend_retirement(
+        &self,
+        adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
+        lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        retirement: MappingBackendRetirement,
+    ) -> Result<(), (String, MappingBackendRetirement)> {
+        let retained = Arc::new(parking_lot::Mutex::new(Some(retirement)));
+        let task_retained = Arc::clone(&retained);
+        let task = async move {
+            let retirement = task_retained
+                .lock()
+                .take()
+                .ok_or_else(|| "mapping backend rejection retirement owner was empty".to_owned())?;
+            finish_backend_retirement(&adapter, &lifecycle_lock, Some(retirement))
+                .await
+                .map_err(|error| error.to_string())
+        };
+        let registration = Self::registration(
+            "mapping-backend-rejection-retirement",
+            GeometryTaskClass::Retained,
+            task,
+        );
+        match self.try_register(registration) {
+            Ok(()) => Ok(()),
+            Err(rejected) => {
+                let retirement = retained
+                    .lock()
+                    .take()
+                    .expect("rejected retirement registration must retain its capability");
+                Err((rejected.detail(), retirement))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2742,21 +2808,23 @@ impl GeometryRuntimeHandle {
         self.map_revision_latest_tx.subscribe()
     }
 
-    /// Register a zero-point cloud-map revision for a new Mapping generation.
-    /// The typed result lets callers distinguish an allowed missing writer from
-    /// rejected clear work or Phase A task-admission closure.
-    pub(crate) async fn begin_cloud_map_session(
-        &self,
-        session_generation: u64,
-    ) -> CloudMapSessionAdmission {
+    /// Reserve cloud-map clear before any worker can touch SHM or lifecycle
+    /// state. Rejected reservations own and immediately drop their unstarted
+    /// future, so Phase A closure cannot fall through to detached work.
+    pub(crate) fn reserve_cloud_map_session(&self) -> CloudMapSessionRegistration {
         let transport = self.transport.clone();
         let writer = self.cloud_map_writer.clone();
         let state = self.state.clone();
         let cloud_map_tx = self.cloud_map_tx.clone();
         let mapping_adapter = self.mapping_adapter.clone();
         let lifecycle_lock = self.mapping_lifecycle_lock.clone();
+        let (activation_tx, activation_rx) = tokio::sync::oneshot::channel();
         let (update_tx, update_rx) = tokio::sync::oneshot::channel();
         let task = async move {
+            let session_generation = match activation_rx.await {
+                Ok(session_generation) => session_generation,
+                Err(_) => return Ok(()),
+            };
             let update = {
                 let mut guard = writer.lock();
                 let Some(writer) = guard.as_mut() else {
@@ -2813,16 +2881,36 @@ impl GeometryRuntimeHandle {
                 task,
             );
             if let Err(rejected) = control.try_register(registration) {
-                return CloudMapSessionAdmission::AdmissionClosed(rejected.detail());
+                let detail = rejected.detail();
+                drop(rejected);
+                return CloudMapSessionRegistration::Rejected(
+                    CloudMapSessionAdmission::AdmissionClosed(detail),
+                );
             }
+            CloudMapSessionRegistration::Admitted(CloudMapSessionReservation {
+                activation_tx: Some(activation_tx),
+                update_rx,
+            })
         } else {
             tokio::spawn(task);
+            CloudMapSessionRegistration::Admitted(CloudMapSessionReservation {
+                activation_tx: Some(activation_tx),
+                update_rx,
+            })
         }
-        update_rx.await.unwrap_or_else(|error| {
-            CloudMapSessionAdmission::ClearRejected(format!(
-                "cloud-map clear task did not report its admission result: {error}"
-            ))
-        })
+    }
+
+    /// Reserve, activate, and await one cloud-map clear session.
+    pub(crate) async fn begin_cloud_map_session(
+        &self,
+        session_generation: u64,
+    ) -> CloudMapSessionAdmission {
+        match self.reserve_cloud_map_session() {
+            CloudMapSessionRegistration::Admitted(reservation) => {
+                reservation.activate(session_generation).await
+            }
+            CloudMapSessionRegistration::Rejected(admission) => admission,
+        }
     }
 
     /// Read the deprecated compatibility bit. This value is diagnostic only.
@@ -4336,7 +4424,15 @@ struct ExploreNavigationBridge {
 
 #[cfg(test)]
 static TEST_EXPLORE_BRIDGE_TASK_CONTROLS: LazyLock<
-    parking_lot::Mutex<HashMap<usize, Weak<GeometryRuntimeTaskControlInner>>>,
+    parking_lot::Mutex<
+        HashMap<
+            usize,
+            (
+                Weak<std::sync::atomic::AtomicU64>,
+                GeometryRuntimeTaskControl,
+            ),
+        >,
+    >,
 > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 impl ExploreNavigationBridge {
@@ -4348,11 +4444,18 @@ impl ExploreNavigationBridge {
     #[cfg(test)]
     fn geometry_task_control(&self) -> Option<GeometryRuntimeTaskControl> {
         let key = Arc::as_ptr(&self.runtime_observation_generation) as usize;
-        TEST_EXPLORE_BRIDGE_TASK_CONTROLS
-            .lock()
-            .get(&key)
-            .and_then(Weak::upgrade)
-            .map(|inner| GeometryRuntimeTaskControl { inner })
+        let mut controls = TEST_EXPLORE_BRIDGE_TASK_CONTROLS.lock();
+        controls.retain(|_, (generation, _)| generation.upgrade().is_some());
+        let Some((generation, control)) = controls.get(&key) else {
+            return None;
+        };
+        if generation.upgrade().is_some_and(|generation| {
+            Arc::ptr_eq(&generation, &self.runtime_observation_generation)
+        }) {
+            return Some(control.clone());
+        }
+        controls.remove(&key);
+        None
     }
 
     #[cfg(test)]
@@ -4360,7 +4463,13 @@ impl ExploreNavigationBridge {
         let key = Arc::as_ptr(&self.runtime_observation_generation) as usize;
         let mut controls = TEST_EXPLORE_BRIDGE_TASK_CONTROLS.lock();
         if let Some(control) = control {
-            controls.insert(key, Arc::downgrade(&control.inner));
+            controls.insert(
+                key,
+                (
+                    Arc::downgrade(&self.runtime_observation_generation),
+                    control,
+                ),
+            );
         } else {
             controls.remove(&key);
         }
@@ -7552,13 +7661,24 @@ pub(crate) async fn publish_committed_global_map_in_frame(
     Ok(())
 }
 
-async fn publish_global_map_snapshot_in_frame(
-    transport: &LcmTransport,
+pub(crate) fn build_committed_global_map_frame_in_frame(
+    committed: &CommittedMappingCloudMap,
+    frame_id: &str,
+) -> Result<RawLcmFrame, String> {
+    build_global_map_snapshot_frame_in_frame(
+        &committed.xyz_f32_le,
+        committed.notification.revision,
+        committed.source_timestamp_ns,
+        frame_id,
+    )
+}
+
+fn build_global_map_snapshot_frame_in_frame(
     xyz_f32_le: &[u8],
     revision: u64,
     source_timestamp_ns: u64,
     frame_id: &str,
-) -> Result<(), String> {
+) -> Result<RawLcmFrame, String> {
     let payload = crate::typed_codec::encode_global_map_pointcloud_payload_in_frame(
         xyz_f32_le,
         revision,
@@ -7570,12 +7690,43 @@ async fn publish_global_map_snapshot_in_frame(
         .map_err(|error| format!("canonical global-map topic invalid: {error}"))?;
     let message_type = LcmMessageType::new(POINT_CLOUD2_MESSAGE_TYPE)
         .map_err(|error| format!("canonical PointCloud2 type invalid: {error}"))?;
-    let frame = crate::typed_codec::build_typed_frame(topic, message_type, payload, revision);
+    Ok(crate::typed_codec::build_typed_frame(
+        topic,
+        message_type,
+        payload,
+        revision,
+    ))
+}
+
+async fn publish_raw_lcm_frame(transport: &LcmTransport, frame: RawLcmFrame) -> Result<(), String> {
     match tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT, transport.publish(frame)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(format!("global-map typed publish failed: {error}")),
         Err(_) => Err("global-map typed publish timed out".to_string()),
     }
+}
+
+pub(crate) async fn publish_retained_global_map_frame(
+    handle: &GeometryRuntimeHandle,
+    frame: &RawLcmFrame,
+) -> Result<(), String> {
+    publish_raw_lcm_frame(&handle.transport, frame.clone()).await
+}
+
+async fn publish_global_map_snapshot_in_frame(
+    transport: &LcmTransport,
+    xyz_f32_le: &[u8],
+    revision: u64,
+    source_timestamp_ns: u64,
+    frame_id: &str,
+) -> Result<(), String> {
+    let frame = build_global_map_snapshot_frame_in_frame(
+        xyz_f32_le,
+        revision,
+        source_timestamp_ns,
+        frame_id,
+    )?;
+    publish_raw_lcm_frame(transport, frame).await
 }
 
 #[derive(Clone)]

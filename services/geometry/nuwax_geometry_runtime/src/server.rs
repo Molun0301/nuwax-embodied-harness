@@ -16,7 +16,7 @@
 //! - env 解析入口统一走 `channel_registry`
 
 use nuwax_codec::{lcm::schema, CodecError, CodecResult};
-use nuwax_protocol::{LcmMessageType, LcmTopic};
+use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use prost::Message;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -28,9 +28,10 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::lcm_runtime::{
-    accept_mapping_cloud_map_for_backend_candidate, publish_committed_global_map_in_frame,
-    CloudMapNotification, CloudMapSessionAdmission, CommittedMappingCloudMap,
-    GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState,
+    accept_mapping_cloud_map_for_backend_candidate, build_committed_global_map_frame_in_frame,
+    publish_committed_global_map_in_frame, publish_retained_global_map_frame, CloudMapNotification,
+    CloudMapSessionAdmission, CloudMapSessionRegistration, CloudMapSessionReservation,
+    CommittedMappingCloudMap, GeometryRuntimeHandle, MapRevisionEvent, NavigationUpdate, PoseState,
 };
 use crate::mapping_adapter::{
     finish_backend_retirement, MappingAdapter, MappingBackendRetirement,
@@ -79,7 +80,54 @@ pub struct GeometryRuntimeService {
 struct ActivationLifecycleFence {
     activation_request_id: String,
     activation_request_identity_sha256: [u8; 32],
+    retained_global_map: Option<RetainedActivationGlobalMap>,
     lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct RetainedActivationGlobalMap {
+    activation_request_identity_sha256: [u8; 32],
+    map_frame_id: String,
+    installed_cloud_revision: u64,
+    cloud_receipt: crate::mapping_commit::CloudCommitReceipt,
+    frame: RawLcmFrame,
+}
+
+impl RetainedActivationGlobalMap {
+    fn from_committed(
+        activation_request_identity_sha256: [u8; 32],
+        map_frame_id: &str,
+        committed: &CommittedMappingCloudMap,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            activation_request_identity_sha256,
+            map_frame_id: map_frame_id.to_owned(),
+            installed_cloud_revision: committed.notification.revision,
+            cloud_receipt: committed.receipt.clone(),
+            frame: build_committed_global_map_frame_in_frame(committed, map_frame_id)?,
+        })
+    }
+
+    fn validate_replay(
+        &self,
+        activation_request_identity_sha256: [u8; 32],
+        map_frame_id: &str,
+        committed: &CommittedMappingCloudMap,
+    ) -> Result<(), String> {
+        let expected =
+            Self::from_committed(activation_request_identity_sha256, map_frame_id, committed)?;
+        if self.activation_request_identity_sha256 != activation_request_identity_sha256
+            || self.map_frame_id != map_frame_id
+            || self.installed_cloud_revision != committed.notification.revision
+            || self.cloud_receipt != committed.receipt
+            || self.frame != expected.frame
+        {
+            return Err(
+                "retained activation global-map publication identity does not match replay"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]
@@ -643,7 +691,7 @@ impl GeometryRuntimeService {
         &self,
         activation_request_id: &str,
         activation_request_identity_sha256: [u8; 32],
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ()> {
+    ) -> Result<Option<ActivationLifecycleFence>, ()> {
         let mut fence = self.activation_lifecycle_fence.lock();
         match fence.as_ref() {
             None => Ok(None),
@@ -652,7 +700,7 @@ impl GeometryRuntimeService {
                     && existing.activation_request_identity_sha256
                         == activation_request_identity_sha256 =>
             {
-                Ok(fence.take().map(|fence| fence.lifecycle_guard))
+                Ok(fence.take())
             }
             Some(_) => Err(()),
         }
@@ -662,6 +710,7 @@ impl GeometryRuntimeService {
         &self,
         activation_request_id: &str,
         activation_request_identity_sha256: [u8; 32],
+        retained_global_map: Option<RetainedActivationGlobalMap>,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), tokio::sync::OwnedMutexGuard<()>> {
         let mut fence = self.activation_lifecycle_fence.lock();
@@ -671,6 +720,7 @@ impl GeometryRuntimeService {
         *fence = Some(ActivationLifecycleFence {
             activation_request_id: activation_request_id.to_owned(),
             activation_request_identity_sha256,
+            retained_global_map,
             lifecycle_guard,
         });
         Ok(())
@@ -706,6 +756,7 @@ impl GeometryRuntimeService {
         request: StartMappingRequest,
         adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
         snapshot: MappingSessionSnapshot,
+        cloud_map_reservation: CloudMapSessionReservation,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
         _mapping_transition: tokio::sync::OwnedMutexGuard<()>,
         mut cancellation_rx: watch::Receiver<bool>,
@@ -797,19 +848,9 @@ impl GeometryRuntimeService {
                 }
             };
 
-            #[cfg(test)]
-            {
-                let barrier = self.start_mapping_before_cloud_clear.lock().take();
-                if let Some(barrier) = barrier {
-                    barrier.wait().await;
-                    barrier.wait().await;
-                }
-            }
-
             let clear = match await_start_mapping_step(
                 &mut cancellation_rx,
-                self.bridge
-                    .begin_cloud_map_session(snapshot.session_generation),
+                cloud_map_reservation.activate(snapshot.session_generation),
             )
             .await
             {
@@ -980,20 +1021,29 @@ impl GeometryRuntimeService {
             )));
         }
 
-        let clear = self
-            .bridge
-            .begin_cloud_map_session(snapshot.session_generation)
+        let clear = cloud_map_reservation
+            .activate(snapshot.session_generation)
             .await;
-        if let CloudMapSessionAdmission::ClearRejected(detail)
-        | CloudMapSessionAdmission::AdmissionClosed(detail) = clear
-        {
+        let clear_failure = match &clear {
+            CloudMapSessionAdmission::Registered(_) => {
+                validate_deferred_cloud_map_clear(&clear, snapshot.session_generation)
+                    .err()
+            }
+            CloudMapSessionAdmission::AdmissionClosed(detail)
+            | CloudMapSessionAdmission::ClearRejected(detail) => Some(detail.clone()),
+            CloudMapSessionAdmission::WriterUnavailable => {
+                Some("cloud-map writer is unavailable".to_owned())
+            }
+        };
+        if let Some(detail) = clear_failure {
+            let detail = format!("non-deferred StartMapping cloud-map clear failed: {detail}");
             let outcome = finish_failed_mapping_start_rollback(
                 &adapter,
                 &self.bridge.mapping_lifecycle_lock,
                 lifecycle_guard,
                 &snapshot,
                 occupancy_fence.take(),
-                format!("non-deferred StartMapping cloud-map clear failed: {detail}"),
+                detail,
             )
             .await;
             return Err(Status::unavailable(outcome.detail_with_diagnostics()));
@@ -1835,36 +1885,65 @@ async fn activate_map_r1(
         Status::deadline_exceeded("timed out joining the in-flight Mapping lifecycle transition")
     })?;
     let bridge = service.bridge.clone();
-    let mut lifecycle_guard = match service.take_matching_activation_lifecycle_fence(
-        identity_class.request_id(),
-        activation_request_identity_sha256,
-    ) {
-        Ok(Some(guard)) => guard,
-        Ok(None) => bridge.mapping_lifecycle_lock.clone().lock_owned().await,
-        Err(()) => {
-            let current = adapter.lock().snapshot();
-            let terminal = match service.activation_receipts.stage_or_replay(
-                seed.clone(),
-                mapping_session_state(current, "activation lifecycle fence conflict"),
+    let (mut retained_global_map, mut lifecycle_guard, restore_fence_on_early_return) =
+        match service.take_matching_activation_lifecycle_fence(
+            identity_class.request_id(),
+            activation_request_identity_sha256,
+        ) {
+            Ok(Some(fence)) => (fence.retained_global_map, Some(fence.lifecycle_guard), true),
+            Ok(None) => (
+                None,
+                Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await),
                 false,
-            ) {
-                crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => *state,
-                crate::correction_coordinator::ActivationLedgerAdmission::Execute(_) => {
-                    MappingSessionState {
-                        success: false,
-                        message: "ACTIVATE_MAP_LIFECYCLE_FENCE_BUSY".to_owned(),
-                        activation_receipt_disposition: ActivationReceiptDisposition::Conflict
-                            as i32,
-                        ..MappingSessionState::default()
+            ),
+            Err(()) => {
+                let current = adapter.lock().snapshot();
+                let terminal = match service.activation_receipts.stage_or_replay(
+                    seed.clone(),
+                    mapping_session_state(current, "activation lifecycle fence conflict"),
+                    false,
+                ) {
+                    crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => {
+                        *state
                     }
-                }
-            };
-            return Ok(Response::new(terminal));
+                    crate::correction_coordinator::ActivationLedgerAdmission::Execute(_) => {
+                        MappingSessionState {
+                            success: false,
+                            message: "ACTIVATE_MAP_LIFECYCLE_FENCE_BUSY".to_owned(),
+                            activation_receipt_disposition: ActivationReceiptDisposition::Conflict
+                                as i32,
+                            ..MappingSessionState::default()
+                        }
+                    }
+                };
+                return Ok(Response::new(terminal));
+            }
+        };
+    if let Err(status) = service.ensure_running_admission("ActivateMap").await {
+        if restore_fence_on_early_return {
+            service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
+                activation_request_id: identity_class.request_id().to_owned(),
+                activation_request_identity_sha256,
+                retained_global_map,
+                lifecycle_guard: lifecycle_guard
+                    .take()
+                    .expect("ActivateMap early return owns lifecycle guard"),
+            });
         }
-    };
-    service.ensure_running_admission("ActivateMap").await?;
+        return Err(status);
+    }
     if bridge.explore.blocks_mapping_mutation().await {
         let exploration = bridge.explore.snapshot();
+        if restore_fence_on_early_return {
+            service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
+                activation_request_id: identity_class.request_id().to_owned(),
+                activation_request_identity_sha256,
+                retained_global_map,
+                lifecycle_guard: lifecycle_guard
+                    .take()
+                    .expect("ActivateMap early return owns lifecycle guard"),
+            });
+        }
         return Err(Status::failed_precondition(format!(
             "exploration safety ownership must be released before ActivateMap: status={} request_id={} child_task_id={}",
             exploration.status, exploration.request_id, exploration.child_task_id
@@ -1882,12 +1961,25 @@ async fn activate_map_r1(
     );
     let mut token = match admission {
         crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => {
+            if restore_fence_on_early_return {
+                service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
+                    activation_request_id: identity_class.request_id().to_owned(),
+                    activation_request_identity_sha256,
+                    retained_global_map,
+                    lifecycle_guard: lifecycle_guard
+                        .take()
+                        .expect("ActivateMap early return owns lifecycle guard"),
+                });
+            }
             return Ok(Response::new(*state));
         }
         crate::correction_coordinator::ActivationLedgerAdmission::Execute(token) => token,
     };
 
     if current.active {
+        let mut lifecycle_guard = lifecycle_guard
+            .take()
+            .expect("active ActivateMap owns lifecycle guard");
         macro_rules! settle_current_failure {
             ($disposition:expr, $detail:expr) => {{
                 let detail = $detail;
@@ -1957,9 +2049,55 @@ async fn activate_map_r1(
                 xyz_f32_le: target.xyz_f32_le.clone(),
                 receipt: proof.cloud_receipt.clone(),
             };
-            let publish_result =
+            let replaying_retained_publication = retained_global_map.is_some();
+            let retained_publication = match retained_global_map.take() {
+                Some(retained) => {
+                    if let Err(error) = retained.validate_replay(
+                        activation_request_identity_sha256,
+                        &expected_map_frame_id,
+                        &committed,
+                    ) {
+                        let detail = format!(
+                            "cloud-map checkpoint retained publication identity failed: {error}"
+                        );
+                        match service.retain_activation_lifecycle_fence(
+                            identity_class.request_id(),
+                            activation_request_identity_sha256,
+                            Some(retained),
+                            lifecycle_guard,
+                        ) {
+                            Ok(()) => return Err(Status::internal(detail)),
+                            Err(guard) => {
+                                lifecycle_guard = guard;
+                                settle_current_failure!(
+                                    ActivationReceiptDisposition::OutcomeUnknown,
+                                    format!("{detail}; lifecycle fence retention failed")
+                                );
+                            }
+                        }
+                    }
+                    retained
+                }
+                None => match RetainedActivationGlobalMap::from_committed(
+                    activation_request_identity_sha256,
+                    &expected_map_frame_id,
+                    &committed,
+                ) {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        settle_current_failure!(
+                            ActivationReceiptDisposition::OutcomeUnknown,
+                            format!("ACTIVATE_MAP_GLOBAL_MAP_FRAME_BUILD_FAILED: {error}")
+                        );
+                    }
+                },
+            };
+            let publish_result = if replaying_retained_publication {
+                publish_retained_global_map_frame(&bridge, &retained_publication.frame).await
+            } else {
                 publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id)
-                    .await;
+                    .await
+            };
             if let Err(error) = publish_result {
                 let detail = format!(
                     "cloud-map checkpoint installed but typed /global_map publication failed: {error}"
@@ -1967,6 +2105,7 @@ async fn activate_map_r1(
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
                     activation_request_identity_sha256,
+                    Some(retained_publication),
                     lifecycle_guard,
                 ) {
                     Ok(()) => return Err(Status::internal(detail)),
@@ -2030,17 +2169,37 @@ async fn activate_map_r1(
         return Ok(Response::new(sealed));
     }
 
-    let staged_worker = match adapter.lock().stage_backend_worker_for_next_session() {
-        Ok(worker) => worker,
-        Err(error) => {
+    macro_rules! return_precommit_failure_with_fence {
+        ($disposition:expr, $detail:expr) => {{
+            let detail = $detail;
             let state = activation_failure_state(
                 &service,
                 &adapter,
                 &token,
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-                &format!("ACTIVATE_MAP_BACKEND_STAGE_FAILED: {error}"),
+                $disposition,
+                &detail,
             );
+            if restore_fence_on_early_return {
+                service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
+                    activation_request_id: identity_class.request_id().to_owned(),
+                    activation_request_identity_sha256,
+                    retained_global_map,
+                    lifecycle_guard: lifecycle_guard
+                        .take()
+                        .expect("ActivateMap early return owns lifecycle guard"),
+                });
+            }
             return Ok(Response::new(state));
+        }};
+    }
+
+    let staged_worker = match adapter.lock().stage_backend_worker_for_next_session() {
+        Ok(worker) => worker,
+        Err(error) => {
+            return_precommit_failure_with_fence!(
+                ActivationReceiptDisposition::InvalidatedPrecommit,
+                format!("ACTIVATE_MAP_BACKEND_STAGE_FAILED: {error}")
+            );
         }
     };
     let reserved_backend_generation = staged_worker.backend_generation();
@@ -2051,14 +2210,10 @@ async fn activate_map_r1(
         Some(token) => token,
         None => {
             let _ = staged_worker.stop_and_join();
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_PROVISIONAL_TOKEN_CAS_FAILED",
+                "ACTIVATE_MAP_PROVISIONAL_TOKEN_CAS_FAILED"
             );
-            return Ok(Response::new(state));
         }
     };
 
@@ -2073,14 +2228,10 @@ async fn activate_map_r1(
             None,
         ) {
             let _ = staged_worker.stop_and_join();
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_PREPARE_CAS_FAILED",
+                "ACTIVATE_MAP_RESTORE_PREPARE_CAS_FAILED"
             );
-            return Ok(Response::new(state));
         }
         let receiver = match staged_worker
             .client()
@@ -2089,14 +2240,10 @@ async fn activate_map_r1(
             Ok(receiver) => receiver,
             Err(error) => {
                 let _ = staged_worker.stop_and_join();
-                let state = activation_failure_state(
-                    &service,
-                    &adapter,
-                    &token,
+                return_precommit_failure_with_fence!(
                     ActivationReceiptDisposition::InvalidatedPrecommit,
-                    &format!("ACTIVATE_MAP_RESTORE_SUBMISSION_FAILED: {error:?}"),
+                    format!("ACTIVATE_MAP_RESTORE_SUBMISSION_FAILED: {error:?}")
                 );
-                return Ok(Response::new(state));
             }
         };
         if take_activation_fault_after(
@@ -2110,63 +2257,48 @@ async fn activate_map_r1(
             } else {
                 ActivationReceiptDisposition::OutcomeUnknown
             };
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 disposition,
-                "INJECTED_AFTER_BACKEND_RESTORE_SUBMISSION",
+                "INJECTED_AFTER_BACKEND_RESTORE_SUBMISSION"
             );
-            return Ok(Response::new(state));
         }
-        drop(lifecycle_guard);
+        drop(
+            lifecycle_guard
+                .take()
+                .expect("ActivateMap restore waits without lifecycle guard"),
+        );
         let restore = tokio::time::timeout(MAPPING_BACKEND_CHECKPOINT_TIMEOUT, receiver).await;
         if !service.activation_receipts.validate_token(&token) {
             let _ = staged_worker.stop_and_join();
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            lifecycle_guard = Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await);
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_TOKEN_RETIRED",
+                "ACTIVATE_MAP_RESTORE_TOKEN_RETIRED"
             );
-            return Ok(Response::new(state));
         }
-        lifecycle_guard = bridge.mapping_lifecycle_lock.clone().lock_owned().await;
+        lifecycle_guard = Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await);
         if !service.activation_receipts.validate_token(&token) {
             let _ = staged_worker.stop_and_join();
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_TOKEN_RETIRED_AFTER_RELOCK",
+                "ACTIVATE_MAP_RESTORE_TOKEN_RETIRED_AFTER_RELOCK"
             );
-            return Ok(Response::new(state));
         }
         let resolution = match restore {
             Ok(Ok(Ok(resolution))) => resolution,
             Ok(Ok(Err(error))) => {
                 let _ = staged_worker.stop_and_join();
-                let state = activation_failure_state(
-                    &service,
-                    &adapter,
-                    &token,
+                return_precommit_failure_with_fence!(
                     ActivationReceiptDisposition::InvalidatedPrecommit,
-                    &format!("ACTIVATE_MAP_RESTORE_REJECTED: {error}"),
+                    format!("ACTIVATE_MAP_RESTORE_REJECTED: {error}")
                 );
-                return Ok(Response::new(state));
             }
             Ok(Err(_)) | Err(_) => {
                 let _ = staged_worker.stop_and_join();
-                let state = activation_failure_state(
-                    &service,
-                    &adapter,
-                    &token,
+                return_precommit_failure_with_fence!(
                     ActivationReceiptDisposition::InvalidatedPrecommit,
-                    "ACTIVATE_MAP_RESTORE_TIMEOUT_OR_CLOSED",
+                    "ACTIVATE_MAP_RESTORE_TIMEOUT_OR_CLOSED"
                 );
-                return Ok(Response::new(state));
             }
         };
         if !record_activation_journal(
@@ -2180,14 +2312,10 @@ async fn activate_map_r1(
         ) {
             let _ = resolution.abort();
             let _ = staged_worker.stop_and_join();
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                "ACTIVATE_MAP_RESTORE_JOURNAL_CAS_FAILED",
+                "ACTIVATE_MAP_RESTORE_JOURNAL_CAS_FAILED"
             );
-            return Ok(Response::new(state));
         }
         Some(resolution)
     } else {
@@ -2204,14 +2332,10 @@ async fn activate_map_r1(
             if let Some(resolution) = restore_resolution.take() {
                 let _ = resolution.abort();
             }
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
+            return_precommit_failure_with_fence!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
-                &format!("ACTIVATE_MAP_SESSION_START_FAILED: {error}"),
+                format!("ACTIVATE_MAP_SESSION_START_FAILED: {error}")
             );
-            return Ok(Response::new(state));
         }
     };
     macro_rules! settle_started_failure {
@@ -2221,7 +2345,11 @@ async fn activate_map_r1(
             let retirement = adapter
                 .lock()
                 .abort_started_session_detached(&started.session_id, started.session_generation);
-            drop(lifecycle_guard);
+            drop(
+                lifecycle_guard
+                    .take()
+                    .expect("active ActivateMap settlement owns lifecycle guard"),
+            );
             let terminal = settle_failed_activation_retirement(
                 &service,
                 &adapter,
@@ -2685,6 +2813,19 @@ async fn activate_map_r1(
                     "ACTIVATE_MAP_CLOUD_EVENT_JOURNAL_CAS_FAILED".to_owned()
                 );
             }
+            let retained_publication = match RetainedActivationGlobalMap::from_committed(
+                activation_request_identity_sha256,
+                &expected_map_frame_id,
+                &committed,
+            ) {
+                Ok(retained) => retained,
+                Err(error) => {
+                    settle_started_failure!(
+                        ActivationReceiptDisposition::OutcomeUnknown,
+                        format!("ACTIVATE_MAP_GLOBAL_MAP_FRAME_BUILD_FAILED: {error}")
+                    );
+                }
+            };
             let publish_result =
                 publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id)
                     .await;
@@ -2695,11 +2836,14 @@ async fn activate_map_r1(
                 match service.retain_activation_lifecycle_fence(
                     identity_class.request_id(),
                     activation_request_identity_sha256,
-                    lifecycle_guard,
+                    Some(retained_publication),
+                    lifecycle_guard
+                        .take()
+                        .expect("ActivateMap publication retention owns lifecycle guard"),
                 ) {
                     Ok(()) => return Err(Status::internal(detail)),
                     Err(guard) => {
-                        lifecycle_guard = guard;
+                        lifecycle_guard = Some(guard);
                         settle_started_failure!(
                             ActivationReceiptDisposition::OutcomeUnknown,
                             format!("{detail}; lifecycle fence retention failed")
@@ -4474,6 +4618,25 @@ impl GeometryRuntime for GeometryRuntimeService {
         if !self.bridge.lcm_backend_available {
             return Err(Status::unavailable("mapping LCM backend is unavailable"));
         }
+        let cloud_map_reservation = match self.bridge.reserve_cloud_map_session() {
+            CloudMapSessionRegistration::Admitted(reservation) => reservation,
+            CloudMapSessionRegistration::Rejected(admission) => {
+                let detail = match admission {
+                    CloudMapSessionAdmission::AdmissionClosed(detail)
+                    | CloudMapSessionAdmission::ClearRejected(detail) => detail,
+                    CloudMapSessionAdmission::WriterUnavailable => {
+                        "cloud-map writer is unavailable".to_owned()
+                    }
+                    CloudMapSessionAdmission::Registered(_) => {
+                        "cloud-map clear reservation returned an invalid admission".to_owned()
+                    }
+                };
+                return Err(Status::unavailable(format!(
+                    "StartMapping cloud-map clear registration failed: {detail}"
+                )));
+            }
+        };
+
         let mapping_transition = tokio::time::timeout(
             MAPPING_TRANSITION_TIMEOUT,
             self.mapping_transition.clone().lock_owned(),
@@ -4501,17 +4664,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                 )
             })?;
         }
-        let lifecycle_guard = match self.take_any_activation_lifecycle_fence() {
-            Some(guard) => guard,
-            None => {
-                self.bridge
-                    .mapping_lifecycle_lock
-                    .clone()
-                    .lock_owned()
-                    .await
-            }
-        };
-        self.ensure_running_admission("StartMapping").await?;
         if let Some(detail) = self
             .deferred_replay
             .as_ref()
@@ -4561,6 +4713,27 @@ impl GeometryRuntime for GeometryRuntimeService {
             )));
         }
 
+        #[cfg(test)]
+        {
+            let barrier = self.start_mapping_before_cloud_clear.lock().take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+
+        let lifecycle_guard = match self.take_any_activation_lifecycle_fence() {
+            Some(guard) => guard,
+            None => {
+                self.bridge
+                    .mapping_lifecycle_lock
+                    .clone()
+                    .lock_owned()
+                    .await
+            }
+        };
+        self.ensure_running_admission("StartMapping").await?;
+
         self.activation_receipts
             .retire_for_mapping_change()
             .map_err(Status::resource_exhausted)?;
@@ -4585,6 +4758,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     request,
                     adapter,
                     snapshot,
+                    cloud_map_reservation,
                     lifecycle_guard,
                     mapping_transition,
                     cancellation_rx,
@@ -7411,6 +7585,7 @@ mod lifecycle_tests {
             .retain_activation_lifecycle_fence(
                 "relocalize-r1-gate",
                 activation_request_identity_sha256,
+                None,
                 lifecycle_guard,
             )
             .is_ok());
@@ -12431,6 +12606,30 @@ mod lifecycle_tests {
             "staged publication failure must retain lifecycle serialization"
         );
 
+        {
+            let mut state = service.state.write().await;
+            state.phase = "stopping".to_owned();
+        }
+        let transient_rejection =
+            GeometryRuntime::activate_map(&service, Request::new(request.clone()))
+                .await
+                .expect_err("same-request runtime rejection must remain retryable");
+        assert_eq!(transient_rejection.code(), tonic::Code::FailedPrecondition);
+        assert!(service.has_activation_lifecycle_fence());
+        assert_eq!(
+            backend
+                .published
+                .lock()
+                .expect("transient rejection publication count")
+                .len(),
+            1,
+            "ordinary retry rejection must not republish the retained frame"
+        );
+        {
+            let mut state = service.state.write().await;
+            state.phase = "running".to_owned();
+        }
+
         let empty_stop = GeometryRuntime::stop_mapping(
             &service,
             Request::new(StopMappingRequest {
@@ -12893,6 +13092,36 @@ mod lifecycle_tests {
             generation,
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn nondeferred_start_mapping_writer_unavailable_fails_closed() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("Geometry test handle");
+        *handle.cloud_map_writer.lock() = None;
+        let service = GeometryRuntimeService::new(handle.clone());
+        let error = GeometryRuntime::start_mapping(
+            &service,
+            Request::new(StartMappingRequest {
+                session_id: "writer-unavailable".to_owned(),
+                map_name: "writer-unavailable-map".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("WriterUnavailable must reject non-deferred StartMapping");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("writer is unavailable"));
+        assert!(
+            !handle
+                .mapping_adapter
+                .as_ref()
+                .expect("mapping adapter")
+                .lock()
+                .snapshot()
+                .active,
+            "WriterUnavailable rollback must leave Mapping inactive"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

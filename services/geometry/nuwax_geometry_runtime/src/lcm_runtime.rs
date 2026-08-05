@@ -2815,6 +2815,8 @@ impl GeometryRuntimeHandle {
         let transport = self.transport.clone();
         let writer = self.cloud_map_writer.clone();
         let state = self.state.clone();
+        let map_revision_latest_tx = self.map_revision_latest_tx.clone();
+        let occupancy_shm_current = self.occupancy_shm_current.clone();
         let cloud_map_tx = self.cloud_map_tx.clone();
         let mapping_adapter = self.mapping_adapter.clone();
         let lifecycle_lock = self.mapping_lifecycle_lock.clone();
@@ -2853,6 +2855,16 @@ impl GeometryRuntimeHandle {
                 }
             }
             let _ = cloud_map_tx.send(update.clone());
+
+            // Clear the canonical occupancy/map view only after begin_session has
+            // published the cloud generation. This avoids coupling cloud-writer
+            // admission to a caller-held state write lock.
+            {
+                let mut shared = state.write().await;
+                shared.map = MapState::default();
+            }
+            map_revision_latest_tx.send_replace(None);
+            *occupancy_shm_current.write().await = None;
             let _ = update_tx.send(CloudMapSessionAdmission::Registered(update));
 
             // Direct checkpoint callers already hold this fence. The deferred

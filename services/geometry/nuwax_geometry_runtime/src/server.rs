@@ -4739,13 +4739,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             .retire_for_mapping_change()
             .map_err(Status::resource_exhausted)?;
 
-        {
-            let mut shared = self.bridge.state.write().await;
-            shared.map = crate::lcm_runtime::MapState::default();
-        }
-        self.bridge.map_revision_latest_tx.send_replace(None);
-        *self.bridge.occupancy_shm_current.write().await = None;
-
         let snapshot = adapter
             .lock()
             .start_session(&request.session_id, &request.map_name)

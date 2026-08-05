@@ -9608,10 +9608,21 @@ pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBa
             .clone(),
         mapping_lifecycle_lock.clone(),
     );
+    static CM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cloud_map_path = std::path::PathBuf::from(format!(
+        "/tmp/nuwax_cloudmap_test_{}_{}.mmap",
+        std::process::id(),
+        CM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    let cloud_map_writer = CloudMapShmWriter::new(&cloud_map_path)
+        .map_err(|error| RealLcmBackendUnavailable::persistence(format!(
+            "test cloud-map SHM initialization failed: {error}"
+        )))?;
+    let cloud_map_writer = Arc::new(parking_lot::Mutex::new(Some(cloud_map_writer)));
     Ok(GeometryRuntimeHandle {
         state,
         cloud_map_tx,
-        cloud_map_writer: Arc::new(parking_lot::Mutex::new(None)),
+        cloud_map_writer,
         nav_state_tx,
         frontiers_tx,
         map_revision_tx,

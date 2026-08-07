@@ -6,6 +6,7 @@
 //! The supported persisted input schema is documented in the crate-local
 //! `FORMAT.md` and implemented by [`dataset`].
 
+pub mod artifact;
 pub mod cmd;
 pub mod dataset;
 pub mod native;

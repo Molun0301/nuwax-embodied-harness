@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod mid360_pcap;
 pub mod native;
 
 use serde::{Deserialize, Serialize};

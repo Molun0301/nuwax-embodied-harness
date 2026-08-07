@@ -39,13 +39,23 @@ const GUARDIAN_MESSAGE_READY: u32 = 2;
 const GUARDIAN_MESSAGE_ERROR: u32 = 3;
 const GUARDIAN_DISARM: u8 = b'D';
 const GROUP_GUARDIAN_PATH: &str = env!("NUWAX_GROUP_GUARDIAN_PATH");
+const VERIFIED_GROUP_GUARDIAN_ENV: &str = "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE";
 #[cfg(test)]
 const TEST_GROUP_GUARDIAN_PATH: &str = env!("NUWAX_GROUP_GUARDIAN_TEST_PATH");
 
-/// Built dedicated guardian executable used by this supervisor.
+/// Built dedicated guardian executable used only for release discovery.
 #[must_use]
-pub fn group_guardian_executable() -> &'static Path {
+pub fn discovery_group_guardian_executable() -> &'static Path {
     Path::new(GROUP_GUARDIAN_PATH)
+}
+
+fn verified_group_guardian_executable() -> PathBuf {
+    std::env::var_os(VERIFIED_GROUP_GUARDIAN_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("{VERIFIED_GROUP_GUARDIAN_ENV} must be injected by release verifier")
+        })
 }
 
 /// Explicit executable, argument, working-directory, and environment contract.
@@ -183,12 +193,12 @@ impl SupervisedNativeCommand {
         #[cfg(test)]
         let guardian_path =
             if self.guardian_test_checkpoint.is_some() || self.guardian_test_exit.is_some() {
-                TEST_GROUP_GUARDIAN_PATH
+                PathBuf::from(TEST_GROUP_GUARDIAN_PATH)
             } else {
-                GROUP_GUARDIAN_PATH
+                verified_group_guardian_executable()
             };
         #[cfg(not(test))]
-        let guardian_path = GROUP_GUARDIAN_PATH;
+        let guardian_path = verified_group_guardian_executable();
         let mut command = Command::new(guardian_path);
         command
             .arg("--parent-pid")

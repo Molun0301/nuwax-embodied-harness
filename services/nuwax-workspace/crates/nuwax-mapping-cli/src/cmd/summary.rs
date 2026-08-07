@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+use crate::artifact::{publish_new_file, ArtifactFormat};
 use crate::dataset::summarize;
 use crate::native::{input_format, read_command_dataset, summarize_memory2, InputFormat};
 
@@ -34,16 +35,23 @@ pub async fn run(args: SummaryArgs) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(&summary)?;
     println!("{json}");
     if let Some(output) = args.output {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output)
-            .map_err(|error| {
-                anyhow::anyhow!("create summary output {} failed: {error}", output.display())
-            })?;
-        file.write_all(json.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        publish_new_file(
+            &output,
+            ArtifactFormat::SummaryJson,
+            |writer| {
+                writer.write_all(json.as_bytes())?;
+                writer.write_all(b"\n")?;
+                Ok(())
+            },
+            |staging| {
+                let persisted: crate::dataset::DatasetSummary =
+                    serde_json::from_reader(std::fs::File::open(staging)?)?;
+                if persisted != summary {
+                    anyhow::bail!("persisted summary does not match generated summary");
+                }
+                Ok(())
+            },
+        )?;
     }
     Ok(())
 }

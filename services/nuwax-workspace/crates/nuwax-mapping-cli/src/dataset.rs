@@ -13,12 +13,14 @@
 //! decoder is added; those file types are rejected rather than guessed.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
+
+use crate::artifact::{publish_new_file, ArtifactFormat};
 
 /// Current dataset format identifier.
 pub const DATASET_FORMAT: &str = "nuwax-mapping-jsonl";
@@ -239,42 +241,26 @@ pub fn read_dataset(path: &Path) -> anyhow::Result<Dataset> {
 pub fn write_dataset(path: &Path, dataset: &Dataset) -> anyhow::Result<()> {
     require_supported_extension(path)?;
     validate_dataset(dataset)?;
-    if path.exists() {
-        bail!("refusing to overwrite existing dataset: {}", path.display());
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() {
-        bail!("output directory does not exist: {}", parent.display());
-    }
-    let temporary = temporary_path(path);
-    let result = (|| -> anyhow::Result<()> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .with_context(|| format!("create temporary dataset {}", temporary.display()))?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &dataset.header)?;
-        writer.write_all(b"\n")?;
-        for record in &dataset.records {
-            serde_json::to_writer(&mut writer, record)?;
+    publish_new_file(
+        path,
+        ArtifactFormat::DatasetJsonLines,
+        |writer| {
+            serde_json::to_writer(&mut *writer, &dataset.header)?;
             writer.write_all(b"\n")?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        std::fs::rename(&temporary, path).with_context(|| {
-            format!(
-                "rename temporary dataset {} to {}",
-                temporary.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+            for record in &dataset.records {
+                serde_json::to_writer(&mut *writer, record)?;
+                writer.write_all(b"\n")?;
+            }
+            Ok(())
+        },
+        |staging| {
+            let persisted = read_dataset(staging)?;
+            if persisted != *dataset {
+                bail!("persisted dataset does not match the validated input");
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Validate every record and the versioned header.
@@ -448,14 +434,6 @@ fn validate_finite(values: &[f64], label: &str) -> anyhow::Result<()> {
         bail!("{label} must contain only finite values");
     }
     Ok(())
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("dataset");
-    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
 #[cfg(test)]

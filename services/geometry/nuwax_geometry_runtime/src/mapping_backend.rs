@@ -3,8 +3,8 @@
 #[path = "mapping_backend_sidecar.rs"]
 mod sidecar;
 
-use std::collections::VecDeque;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::env;
 use std::fmt::Display;
 use std::mem::size_of;
@@ -560,9 +560,7 @@ pub(crate) fn join_retained_mapping_backend_thread_for_tests(
 
 impl MappingBackendJoinHandle {
     pub(crate) fn is_finished(&self) -> bool {
-        self.join
-            .as_ref()
-            .is_none_or(|join| join.is_finished())
+        self.join.as_ref().is_none_or(|join| join.is_finished())
     }
 
     pub(crate) fn join(mut self) -> Result<(), String> {
@@ -2250,7 +2248,10 @@ mod tests {
             }
             std::thread::yield_now();
         }
-        assert!(gate.entered(), "retirement worker reached the blocking gate");
+        assert!(
+            gate.entered(),
+            "retirement worker reached the blocking gate"
+        );
         let retained_before = mapping_backend_process_exit_retention()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -11,7 +11,7 @@ description = "nuwax 地图云服务"
 nuwax-types = { path = "../nuwax-types" }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 osmpbf = { workspace = true }
 image = { workspace = true, features = ["png"] }
 thiserror = { workspace = true }

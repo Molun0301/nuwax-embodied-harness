@@ -8,8 +8,13 @@
 
 use std::f64::consts::PI;
 
-/// Web Mercator 半周长（米），等价于地球赤道周长一半
-const WEB_MERCATOR_HALF_CIRCUMFERENCE: f64 = 20_037_508.342_789_244;
+/// EPSG:3857 spherical Earth radius in metres.
+const WEB_MERCATOR_EARTH_RADIUS_M: f64 = 6_378_137.0;
+/// CPython `math.radians` multiplies by this pre-rounded binary64 constant.
+const DEGREES_TO_RADIANS: f64 = PI / 180.0;
+/// Web Mercator half circumference in metres.
+#[cfg(test)]
+const WEB_MERCATOR_HALF_CIRCUMFERENCE: f64 = PI * WEB_MERCATOR_EARTH_RADIUS_M;
 
 /// WGS84 (lat/lng degrees) → Web Mercator (meters, EPSG:3857)。
 ///
@@ -17,15 +22,19 @@ const WEB_MERCATOR_HALF_CIRCUMFERENCE: f64 = 20_037_508.342_789_244;
 /// 对应经度 `[-180°, +180°]`；`y` 范围同上对应纬度 `≈[-85.05°, +85.05°]`
 /// （Web Mercator 在极区收敛到无穷大，工程上裁剪到 ±85.05112878）。
 ///
-/// 公式：`x = lng * R`、`y = R * ln(tan(π/4 + lat_rad/2))`。
+/// 公式：`x = R * lng_rad`、`y = R * ln(tan(π/4 + lat_rad/2))`，
+/// 其中 EPSG:3857 spherical radius `R = 6_378_137m`。运算顺序与
+/// Python Phase 2 发布器一致：先计算一次 `PI / 180`，再执行
+/// `degrees * degrees_to_radians`，最后左乘 `R`。
 ///
 /// # Panics
 /// 不 panic。`|lat| > 85.05112878` 时 `y` 会趋向 ±∞，调用方需自行裁剪。
 #[must_use]
 pub fn wgs84_to_web_mercator(lat: f64, lng: f64) -> (f64, f64) {
-    let x = lng * WEB_MERCATOR_HALF_CIRCUMFERENCE / 180.0;
-    let lat_rad = lat * PI / 180.0;
-    let y = WEB_MERCATOR_HALF_CIRCUMFERENCE * ((PI / 4.0 + lat_rad / 2.0).tan().ln());
+    let lng_rad = lng * DEGREES_TO_RADIANS;
+    let lat_rad = lat * DEGREES_TO_RADIANS;
+    let x = WEB_MERCATOR_EARTH_RADIUS_M * lng_rad;
+    let y = WEB_MERCATOR_EARTH_RADIUS_M * ((PI / 4.0 + lat_rad / 2.0).tan().ln());
     (x, y)
 }
 
@@ -39,8 +48,8 @@ pub fn wgs84_to_web_mercator(lat: f64, lng: f64) -> (f64, f64) {
 /// 不 panic。
 #[must_use]
 pub fn web_mercator_to_wgs84(x: f64, y: f64) -> (f64, f64) {
-    let lng = x * 180.0 / WEB_MERCATOR_HALF_CIRCUMFERENCE;
-    let lat_rad = 2.0 * (y / WEB_MERCATOR_HALF_CIRCUMFERENCE).exp().atan() - PI / 2.0;
+    let lng = (x / WEB_MERCATOR_EARTH_RADIUS_M) * 180.0 / PI;
+    let lat_rad = 2.0 * (y / WEB_MERCATOR_EARTH_RADIUS_M).exp().atan() - PI / 2.0;
     let lat = lat_rad * 180.0 / PI;
     (lat, lng)
 }
@@ -106,6 +115,44 @@ mod tests {
         );
         // FP 噪声：tan(π/4) 在 f64 中不是精确 1，R 倍放大后约 1e-8 量级。
         assert!(y.abs() < 1e-7, "y drift at lng=180: {y}");
+    }
+
+    #[test]
+    fn mercator_matches_proj_shanghai_oracle() {
+        // PROJ 9.4 / EPSG:3857 hard-coded oracle; this must not be derived by
+        // `web_mercator_to_wgs84`, otherwise the two functions can self-certify.
+        const EXPECTED_X_M: f64 = 13_522_390.428_774_875;
+        const EXPECTED_Y_M: f64 = 3_662_707.257_050_403;
+        let (x, y) = wgs84_to_web_mercator(31.230_4, 121.473_7);
+        assert!((x - EXPECTED_X_M).abs() < 1e-6, "x={x}");
+        assert!((y - EXPECTED_Y_M).abs() < 1e-6, "y={y}");
+
+        let (lat, lng) = web_mercator_to_wgs84(EXPECTED_X_M, EXPECTED_Y_M);
+        assert!((lat - 31.230_4).abs() < 1e-9, "lat={lat}");
+        assert!((lng - 121.473_7).abs() < 1e-9, "lng={lng}");
+    }
+
+    #[test]
+    fn mercator_matches_python_phase2_binary64_oracle() {
+        let (anchor_x, anchor_y) = wgs84_to_web_mercator(31.230_4, 121.473_7);
+        assert_eq!(anchor_x.to_bits(), 0x4169_caba_cdb8_8616);
+        assert_eq!(anchor_y.to_bits(), 0x414b_f1b9_a0e7_070f);
+
+        let (goal_x, goal_y) = wgs84_to_web_mercator(31.231_4, 121.473_7);
+        assert_eq!(goal_x.to_bits(), anchor_x.to_bits());
+        assert_eq!(goal_y.to_bits(), 0x414b_f1fa_b89f_e2e7);
+    }
+
+    #[test]
+    fn mercator_north_and_south_match_proj_oracles() {
+        const NORTH_Y_M: f64 = 111_325.142_866_385;
+        const SOUTH_Y_M: f64 = -111_325.142_866_385;
+        let (north_x, north_y) = wgs84_to_web_mercator(1.0, 0.0);
+        let (south_x, south_y) = wgs84_to_web_mercator(-1.0, 0.0);
+        assert!(north_x.abs() < 1e-9);
+        assert!(south_x.abs() < 1e-9);
+        assert!((north_y - NORTH_Y_M).abs() < 1e-6, "north={north_y}");
+        assert!((south_y - SOUTH_Y_M).abs() < 1e-6, "south={south_y}");
     }
 
     #[test]

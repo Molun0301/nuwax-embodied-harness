@@ -12,7 +12,9 @@ Environment=NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.j
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
 Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
+Environment=NUWAX_GEOMETRY_RELEASE_MANIFEST=@NUWAX_REPO_ROOT@/geometry/nuwax-geometry-release/manifest.json
 Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
+ExecStartPre=/usr/bin/python3 @NUWAX_REPO_ROOT@/services/geometry/release_manifest.py check --manifest @NUWAX_REPO_ROOT@/geometry/nuwax-geometry-release/manifest.json
 Environment=NUWAX_PERSON_FOLLOW_READY_FILE=/run/nuwax/person-follow/nuwax_person_follow.ready
-ExecStart=/usr/bin/env NUWAX_REPO_ROOT=@NUWAX_REPO_ROOT@ /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/activate_geometry_runtime.sh
+ExecStart=/usr/bin/env NUWAX_REPO_ROOT=@NUWAX_REPO_ROOT@ NUWAX_GEOMETRY_RELEASE_MANIFEST=@NUWAX_REPO_ROOT@/geometry/nuwax-geometry-release/manifest.json /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/activate_geometry_runtime.sh
 TimeoutStartSec=90

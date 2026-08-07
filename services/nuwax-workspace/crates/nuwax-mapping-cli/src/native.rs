@@ -16,6 +16,7 @@ use nuwax_protocol::lcm::schema::{
     decode_tf_message, PointCloud2,
 };
 
+use crate::artifact::publish_new_artifact;
 use crate::dataset::{
     read_dataset, validate_dataset, Dataset, DatasetRecord, DatasetSummary, PoseData,
     RecordPayload, StreamSummary,
@@ -454,35 +455,48 @@ fn with_memory2_copy(
     output_path: &Path,
     mutate: impl FnOnce(&sqlite::Connection) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if output_path.exists() {
-        bail!(
-            "refusing to overwrite existing dataset: {}",
-            output_path.display()
-        );
-    }
     if output_path.extension().and_then(|value| value.to_str()) != Some("db") {
         bail!(
             "memory2 output must use .db extension: {}",
             output_path.display()
         );
     }
-    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() {
-        bail!("output directory does not exist: {}", parent.display());
+    publish_new_artifact(
+        output_path,
+        |staging, reservation| {
+            drop(reservation);
+            let destination = sqlite::Connection::open_read_write_create(staging)?;
+            destination.backup_from(source)?;
+            mutate(&destination)?;
+            destination.query("PRAGMA wal_checkpoint(TRUNCATE)", &[])?;
+            let journal_mode = destination.query("PRAGMA journal_mode=DELETE", &[])?;
+            if journal_mode
+                .first()
+                .and_then(|row| row.first())
+                .and_then(sqlite::Value::as_text)
+                != Some("delete")
+            {
+                bail!("memory2 staging database did not enter DELETE journal mode");
+            }
+            drop(destination);
+            Ok(())
+        },
+        validate_memory2_publication,
+    )
+}
+
+fn validate_memory2_publication(path: &Path) -> anyhow::Result<()> {
+    let connection = sqlite::Connection::open_read_only(path)?;
+    let quick_check = connection.query("PRAGMA quick_check", &[])?;
+    if quick_check.len() != 1
+        || quick_check[0].len() != 1
+        || quick_check[0][0].as_text() != Some("ok")
+    {
+        bail!("memory2 staging database failed SQLite quick_check: {quick_check:?}");
     }
-    let result = (|| {
-        let destination = sqlite::Connection::open_read_write_create(output_path)?;
-        destination.backup_from(source)?;
-        mutate(&destination)?;
-        destination.query("PRAGMA wal_checkpoint(TRUNCATE)", &[])?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(output_path);
-        let _ = std::fs::remove_file(output_path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(output_path.with_extension("db-shm"));
-    }
-    result
+    require_memory2_schema(&connection, path)?;
+    load_stream_configs(&connection)?;
+    Ok(())
 }
 
 fn transaction(
@@ -1693,5 +1707,190 @@ mod sqlite {
             // SAFETY: `Statement` owns the prepared handle and finalizes once.
             unsafe { sqlite3_finalize(self.handle) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::artifact::ArtifactPublicationError;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            for _ in 0..32 {
+                let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "nuwax-mapping-memory2-{name}-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test directory {}: {error}", path.display()),
+                }
+            }
+            panic!("could not allocate memory2 test directory");
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn create_memory2_fixture(path: &Path) {
+        let connection = sqlite::Connection::open_read_write_create(path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE _streams (name TEXT PRIMARY KEY, config TEXT NOT NULL)",
+                &[],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO _streams (name, config) VALUES (?, ?)",
+                &[
+                    sqlite::Bind::Text("lidar"),
+                    sqlite::Bind::Text(r#"{"payload_module":"fixture.Raw","codec_id":"raw"}"#),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE lidar (id INTEGER PRIMARY KEY, ts REAL NOT NULL, value REAL, pose_x REAL, pose_y REAL, pose_z REAL, pose_qx REAL, pose_qy REAL, pose_qz REAL, pose_qw REAL, tags TEXT)",
+                &[],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lidar (id, ts, value, tags) VALUES (1, 1.0, 7.0, '{}')",
+                &[],
+            )
+            .unwrap();
+        drop(connection);
+        fs::File::open(path).unwrap().sync_all().unwrap();
+    }
+
+    fn has_sqlite_sidecar(path: &Path) -> bool {
+        ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            PathBuf::from(value).exists()
+        })
+    }
+
+    #[test]
+    fn memory2_copy_is_reopened_validated_and_published_without_sidecars() {
+        let directory = TestDir::new("publish");
+        let source = directory.0.join("source.db");
+        let output = directory.0.join("renamed.db");
+        create_memory2_fixture(&source);
+        let renames = BTreeMap::from([("lidar".to_string(), "cloud".to_string())]);
+
+        rename_memory2(
+            &source,
+            &output,
+            &renames,
+            &BTreeSet::new(),
+            0.0,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let inspection = inspect_memory2(&output).unwrap();
+        assert_eq!(inspection.streams.keys().collect::<Vec<_>>(), vec!["cloud"]);
+        assert_eq!(inspection.streams["cloud"].rows.len(), 1);
+        assert!(!has_sqlite_sidecar(&output));
+        let connection = sqlite::Connection::open_read_only(&output).unwrap();
+        assert_eq!(
+            connection.query("PRAGMA quick_check", &[]).unwrap(),
+            vec![vec![sqlite::Value::Text("ok".to_string())]]
+        );
+        assert_eq!(
+            connection.query("PRAGMA journal_mode", &[]).unwrap(),
+            vec![vec![sqlite::Value::Text("delete".to_string())]]
+        );
+
+        let conflict = rename_memory2(
+            &source,
+            &output,
+            &renames,
+            &BTreeSet::new(),
+            0.0,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            conflict.downcast_ref::<ArtifactPublicationError>(),
+            Some(ArtifactPublicationError::Conflict { .. })
+        ));
+        assert!(inspect_memory2(&output).is_ok());
+    }
+
+    #[test]
+    fn failed_memory2_mutation_leaves_no_final_or_staging_sidecars() {
+        let directory = TestDir::new("rollback");
+        let source_path = directory.0.join("source.db");
+        let output = directory.0.join("failed.db");
+        create_memory2_fixture(&source_path);
+        let source = open_memory2(&source_path).unwrap();
+
+        let error = with_memory2_copy(&source, &output, |_| {
+            bail!("injected memory2 mutation failure")
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected memory2 mutation failure"));
+        assert!(!output.exists());
+        assert!(!has_sqlite_sidecar(&output));
+        let entries: Vec<_> = fs::read_dir(&directory.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".nuwax-mapping-cli-stage-v1-"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "unexpected staging entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_memory2_staging_is_rejected_before_publication() {
+        let directory = TestDir::new("corrupt");
+        let output = directory.0.join("corrupt.db");
+
+        let error = publish_new_artifact(
+            &output,
+            |staging, reservation| {
+                drop(reservation);
+                fs::write(staging, b"not a SQLite database")?;
+                Ok(())
+            },
+            validate_memory2_publication,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("SQLite"));
+        assert!(!output.exists());
+        assert!(!has_sqlite_sidecar(&output));
+        assert!(fs::read_dir(&directory.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".nuwax-mapping-cli-stage-v1-")));
     }
 }

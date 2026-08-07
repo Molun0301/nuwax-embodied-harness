@@ -315,12 +315,6 @@ impl OwnerProfile {
     /// production runtime. Checks stay in startup order so a profile with
     /// multiple unsupported selections always reports the same first slot.
     pub(crate) fn admit_production(&self) -> Result<(), OwnerBackendNotImplemented> {
-        if self.correction != CorrectionBackend::None {
-            return Err(OwnerBackendNotImplemented {
-                slot: CoreOwnerSlot::Correction,
-                backend: self.correction.stable_name(),
-            });
-        }
         Ok(())
     }
 }
@@ -438,7 +432,6 @@ mod tests {
         let correction = ["none", "library_pgo", "native_pgo", "relocalization"];
 
         let mut admitted = 0;
-        let mut rejected = 0;
         for lio_name in lio {
             for mapping_name in mapping {
                 for correction_name in correction {
@@ -448,34 +441,14 @@ mod tests {
                         [correction_name],
                     ))
                     .expect("combination must be structurally valid");
-                    let expected = if correction_name != "none" {
-                        Some((CoreOwnerSlot::Correction, correction_name))
-                    } else {
-                        None
-                    };
-
-                    match (profile.admit_production(), expected) {
-                        (Ok(()), None) => admitted += 1,
-                        (Err(error), Some((slot, backend))) => {
-                            assert_eq!(error.slot, slot);
-                            assert_eq!(error.backend, backend);
-                            assert_eq!(
-                                error.to_string(),
-                                format!(
-                                    "{OWNER_BACKEND_NOT_IMPLEMENTED} slot={slot} backend={backend}"
-                                )
-                            );
-                            rejected += 1;
-                        }
-                        (result, expected) => panic!(
-                            "unexpected production admission result: result={result:?} expected={expected:?}"
-                        ),
-                    }
+                    profile
+                        .admit_production()
+                        .expect("every structurally valid combination must be admitted");
+                    admitted += 1;
                 }
             }
         }
-        assert_eq!(admitted, 6);
-        assert_eq!(rejected, 18);
+        assert_eq!(admitted, 24);
     }
 
     #[test]

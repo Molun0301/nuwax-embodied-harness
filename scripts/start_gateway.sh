@@ -529,7 +529,10 @@ status_gateway() {
 }
 
 should_start_geometry_runtime() {
-  local binary="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
+  local manifest="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json}"
+  local checker="${REPO_ROOT}/services/geometry/release_manifest.py"
+  local binary=""
+  binary="$(PYTHONPATH="${REPO_ROOT}" python3 "${checker}" runtime --manifest "${manifest}")" || return 1
   [[ -x "${binary}" ]] && is_truthy "${NUWAX_GEOMETRY_EXTERNAL_ENABLED:-true}"
 }
 
@@ -600,7 +603,8 @@ start_geometry_runtime() {
     echo "nuwax-geometry-runtime is enabled but its binary is not executable" >&2
     return 1
   fi
-  local binary="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
+  local binary=""
+  binary="$(PYTHONPATH="${REPO_ROOT}" python3 "${REPO_ROOT}/services/geometry/release_manifest.py" runtime --manifest "${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json}")" || return 1
   local launcher="${REPO_ROOT}/scripts/systemd/start_geometry_runtime.sh"
   echo "starting nuwax-geometry-runtime: ${binary}"
   (

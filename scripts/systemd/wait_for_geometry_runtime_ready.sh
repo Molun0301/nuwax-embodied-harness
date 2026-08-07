@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
+RELEASE_CHECKER="${SCRIPT_DIR}/../../services/geometry/release_manifest.py"
+RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${SCRIPT_DIR}/../../services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json}"
 ACTION="${1:-wait}"
 READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nuwax_geometry_runtime.ready}"
 EXPECTED_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
@@ -21,6 +23,11 @@ check_geometry_ready() {
   local starttime=""
   local port=""
   local health_ready=""
+  local runtime_binary_sha256=""
+  local release_manifest_sha256=""
+  local release_generation=""
+  local seen_release_manifest_sha256=0
+  local seen_release_generation=0
   local current_boot_id=""
   local current_starttime=""
   local key=""
@@ -30,6 +37,7 @@ check_geometry_ready() {
   local seen_starttime=0
   local seen_port=0
   local seen_health_ready=0
+  local seen_runtime_binary_sha256=0
 
   [[ -f "${READY_FILE}" && ! -L "${READY_FILE}" ]] || return 1
   while IFS='=' read -r key value || [[ -n "${key}${value}" ]]; do
@@ -59,13 +67,28 @@ check_geometry_ready() {
         health_ready="${value}"
         seen_health_ready=1
         ;;
+      runtime_binary_sha256)
+        [[ "${seen_runtime_binary_sha256}" -eq 0 ]] || return 1
+        runtime_binary_sha256="${value}"
+        seen_runtime_binary_sha256=1
+        ;;
+      release_manifest_sha256)
+        [[ "${seen_release_manifest_sha256}" -eq 0 ]] || return 1
+        release_manifest_sha256="${value}"
+        seen_release_manifest_sha256=1
+        ;;
+      release_generation)
+        [[ "${seen_release_generation}" -eq 0 ]] || return 1
+        release_generation="${value}"
+        seen_release_generation=1
+        ;;
       *)
         return 1
         ;;
     esac
   done < "${READY_FILE}"
 
-  [[ "${seen_pid}${seen_boot_id}${seen_starttime}${seen_port}${seen_health_ready}" == "11111" ]] \
+  [[ "${seen_pid}${seen_boot_id}${seen_starttime}${seen_port}${seen_health_ready}${seen_runtime_binary_sha256}${seen_release_manifest_sha256}${seen_release_generation}" == "11111111" ]] \
     || return 1
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "${starttime}" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -75,7 +98,11 @@ check_geometry_ready() {
   current_boot_id="$(nuwax_read_boot_id)" || return 1
   [[ "${boot_id}" == "${current_boot_id}" ]] || return 1
   current_starttime="$(nuwax_read_proc_starttime "${pid}")" || return 1
-  [[ "${starttime}" == "${current_starttime}" ]]
+  [[ "${starttime}" == "${current_starttime}" ]] || return 1
+  PYTHONPATH="${SCRIPT_DIR}/../.." python3 "${RELEASE_CHECKER}" check \
+    --manifest "${RELEASE_MANIFEST}" \
+    --runtime "${NUWAX_GEOMETRY_RUNTIME_BINARY:-$(PYTHONPATH="${SCRIPT_DIR}/../.." python3 "${RELEASE_CHECKER}" runtime --manifest "${RELEASE_MANIFEST}")}" \
+    --ready "${READY_FILE}" >/dev/null 2>&1
 }
 
 case "${ACTION}" in

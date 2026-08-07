@@ -1026,8 +1026,7 @@ impl GeometryRuntimeService {
             .await;
         let clear_failure = match &clear {
             CloudMapSessionAdmission::Registered(_) => {
-                validate_deferred_cloud_map_clear(&clear, snapshot.session_generation)
-                    .err()
+                validate_deferred_cloud_map_clear(&clear, snapshot.session_generation).err()
             }
             CloudMapSessionAdmission::AdmissionClosed(detail)
             | CloudMapSessionAdmission::ClearRejected(detail) => Some(detail.clone()),
@@ -2172,13 +2171,7 @@ async fn activate_map_r1(
     macro_rules! return_precommit_failure_with_fence {
         ($disposition:expr, $detail:expr) => {{
             let detail = $detail;
-            let state = activation_failure_state(
-                &service,
-                &adapter,
-                &token,
-                $disposition,
-                &detail,
-            );
+            let state = activation_failure_state(&service, &adapter, &token, $disposition, &detail);
             if restore_fence_on_early_return {
                 service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                     activation_request_id: identity_class.request_id().to_owned(),
@@ -4104,22 +4097,8 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
     }
 }
 
-#[tonic::async_trait]
-impl GeometryRuntime for GeometryRuntimeService {
-    // ========================================================================
-    // 控制面
-    // ========================================================================
-
-    async fn start(&self, _req: Request<StartRequest>) -> Result<Response<StartResult>, Status> {
-        Ok(Response::new(StartResult {
-            success: true,
-            message: "已在运行".into(),
-        }))
-    }
-
-    async fn stop(&self, _req: Request<StopRequest>) -> Result<Response<StopResult>, Status> {
-        info!("收到 Stop 指令");
-
+impl GeometryRuntimeService {
+    pub(crate) async fn perform_process_stop(&self) -> Result<(), Status> {
         let shutdown = self.shutdown.as_ref().ok_or_else(|| {
             Status::failed_precondition("runtime 未配置进程级 shutdown coordinator")
         })?;
@@ -4129,7 +4108,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .filter(|attempt| !attempt.owns_transition())
         {
             return match attempt.wait_for_owner_result().await {
-                Ok(()) => Ok(Response::new(StopResult { success: true })),
+                Ok(()) => Ok(()),
                 Err(()) => Err(Status::failed_precondition(
                     "the first Process Stop attempt failed or correction admission closed internally",
                 )),
@@ -4147,11 +4126,10 @@ impl GeometryRuntime for GeometryRuntimeService {
             }
         };
         if already_stopped {
-            let response = Response::new(StopResult { success: true });
             if let Some(process_stop_attempt) = process_stop_attempt {
                 process_stop_attempt.complete();
             }
-            return Ok(response);
+            return Ok(());
         }
         let mapping_transition = match tokio::time::timeout(
             STOP_LIFECYCLE_TIMEOUT,
@@ -4452,7 +4430,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             state.phase = "stopped".into();
             state.message = "gRPC listener 已关闭".into();
         }
-        let response = Response::new(StopResult { success: true });
         drop(lifecycle_guard);
         drop(mapping_transition);
         #[cfg(test)]
@@ -4467,7 +4444,27 @@ impl GeometryRuntime for GeometryRuntimeService {
         if let Some(process_stop_attempt) = process_stop_attempt {
             process_stop_attempt.complete();
         }
-        Ok(response)
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl GeometryRuntime for GeometryRuntimeService {
+    // ========================================================================
+    // 控制面
+    // ========================================================================
+
+    async fn start(&self, _req: Request<StartRequest>) -> Result<Response<StartResult>, Status> {
+        Ok(Response::new(StartResult {
+            success: true,
+            message: "已在运行".into(),
+        }))
+    }
+
+    async fn stop(&self, _req: Request<StopRequest>) -> Result<Response<StopResult>, Status> {
+        info!("收到 Stop 指令");
+        self.perform_process_stop().await?;
+        Ok(Response::new(StopResult { success: true }))
     }
 
     async fn get_status(&self, _req: Request<Empty>) -> Result<Response<RuntimeStatus>, Status> {

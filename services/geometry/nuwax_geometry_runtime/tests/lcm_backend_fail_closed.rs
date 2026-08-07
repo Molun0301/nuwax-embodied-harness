@@ -2316,6 +2316,25 @@ fn wait_for_child_exit(child_pid: u32, child_start_time: u64, scenario: &str) {
     }
 }
 
+#[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
+fn wait_for_process_identity_exit(
+    pid: u32,
+    start_time: u64,
+    timeout: Duration,
+    scenario: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| panic!("{scenario}: process identity deadline overflow"));
+    while process_start_time(pid) == Some(start_time) {
+        assert!(
+            Instant::now() < deadline,
+            "{scenario}: process identity pid={pid} start_time={start_time} remained"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(feature = "nuwax-lio-test-child")]
 fn with_fingerprint(fingerprint: [u8; 8], payload: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(8 + payload.len());
@@ -5972,10 +5991,11 @@ fn assert_native_pgo_geometry_sigkill_cleanup_is_distinguished(runtime: &tokio::
         None,
         "parent-death-cleaned native PGO process remained"
     );
-    assert_ne!(
-        process_start_time(guardian_pid),
-        Some(guardian_start_time),
-        "parent-death guardian process remained"
+    wait_for_process_identity_exit(
+        guardian_pid,
+        guardian_start_time,
+        NATIVE_FIXTURE_TIMEOUT,
+        "parent-death guardian process",
     );
     assert!(
         cycle.ready_path.exists(),
@@ -6694,10 +6714,11 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
         first_pgo_start_time,
         "first native PGO generation",
     );
-    assert_ne!(
-        process_start_time(first_guardian_pid),
-        Some(first_guardian_start_time),
-        "first native PGO guardian remained after Stop response drain"
+    wait_for_process_identity_exit(
+        first_guardian_pid,
+        first_guardian_start_time,
+        NATIVE_FIXTURE_TIMEOUT,
+        "first native PGO guardian after Stop response drain",
     );
     assert_eq!(
         process_start_time(first_geometry_pid),
@@ -6911,10 +6932,11 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
         second_pgo_start_time,
         "second native PGO generation",
     );
-    assert_ne!(
-        process_start_time(second_guardian_pid),
-        Some(second_guardian_start_time),
-        "second native PGO guardian remained after Stop response drain"
+    wait_for_process_identity_exit(
+        second_guardian_pid,
+        second_guardian_start_time,
+        NATIVE_FIXTURE_TIMEOUT,
+        "second native PGO guardian after Stop response drain",
     );
     assert_eq!(
         process_start_time(second_geometry_pid),
@@ -10741,10 +10763,11 @@ fn run_non_relocalization_matrix_profile(profile: MatrixProfile) {
     }
     if let Some((pid, start_time, guardian_pid, guardian_start_time)) = native_process {
         wait_for_native_pgo_process_group_exit(pid, start_time, &scenario);
-        assert_ne!(
-            process_start_time(guardian_pid),
-            Some(guardian_start_time),
-            "{scenario}: native PGO guardian remained after Stop"
+        wait_for_process_identity_exit(
+            guardian_pid,
+            guardian_start_time,
+            NATIVE_FIXTURE_TIMEOUT,
+            &format!("{scenario}: native PGO guardian after Stop"),
         );
     }
     drop(pgo);

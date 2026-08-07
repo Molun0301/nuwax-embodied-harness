@@ -848,16 +848,16 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        map_asset_bundle = await run_in_threadpool(
-            lambda: runtime.map_workspace_service.finalize_active_map(
-                map_name=str(payload.get("map_name", "")).strip() or None,
-                reason=str(payload.get("reason", "")).strip(),
-                metadata={"requested_by": "http_api"},
+        result = await run_in_threadpool(
+            lambda: localization_skills.handle_finalize_active_map(
+                runtime._skill_ctx,
+                payload,
+                requested_by="http_api",
             )
         )
         return {
-            "map_asset_bundle": to_jsonable(map_asset_bundle),
-            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
+            "map_asset_bundle": to_jsonable(result["map_asset_bundle"]),
+            "active_workspace": to_jsonable(result["active_workspace"]),
         }
 
     @router.get("/api/navigation/latest")

@@ -11,6 +11,7 @@ description = "Mutually exclusive FastLIO2 and Point-LIO estimator backends"
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 
 [[bin]]
 name = "nuwax-fastlio2-backend"
@@ -19,3 +20,7 @@ path = "src/bin/fastlio2.rs"
 [[bin]]
 name = "nuwax-pointlio-backend"
 path = "src/bin/pointlio.rs"
+
+[[bin]]
+name = "nuwax-mid360-pcap-to-lio-input"
+path = "src/bin/mid360_pcap_to_lio_input.rs"

@@ -20,6 +20,7 @@ from typing import Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, TYPE_CHE
 from .config import atomic_write, fsync_directory, render_env
 from .profile import profile_sha256
 from .runner import resolve_build_account, source_user_command, source_user_environment
+from services.geometry.release_manifest import ReleaseManifestError, verify_release_manifest
 
 if TYPE_CHECKING:
     from .engine import ExecutionContext
@@ -2808,6 +2809,79 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _geometry_release_paths(context: "ExecutionContext") -> Tuple[Path, Path]:
+    config = context.profile.metadata.get("geometry_release")
+    if not isinstance(config, dict):
+        raise DeploymentError("profile metadata has no Geometry release contract")
+    source_relative = config.get("source_manifest")
+    installed_relative = config.get("installed_manifest")
+    paths = []
+    for value, label in (
+        (source_relative, "source_manifest"),
+        (installed_relative, "installed_manifest"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise DeploymentError(f"Geometry release {label} must be a non-empty relative path")
+        relative = Path(value)
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != value:
+            raise DeploymentError(f"Geometry release {label} is not a canonical relative path")
+        if relative.name != "manifest.json":
+            raise DeploymentError(f"Geometry release {label} must identify manifest.json")
+        paths.append(relative)
+    return context.options.source_root / paths[0], context.options.release_dir / paths[1]
+
+
+def _publish_geometry_release(context: "ExecutionContext") -> Mapping[str, str]:
+    source_manifest, installed_manifest = _geometry_release_paths(context)
+    try:
+        source_proof = verify_release_manifest(source_manifest)
+    except ReleaseManifestError as exc:
+        raise DeploymentError(f"source Geometry release is invalid: {exc}") from exc
+
+    source_generation = source_proof.manifest_path.parent
+    destination = installed_manifest.parent
+    destination_parent = destination.parent
+    destination_parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging-",
+            dir=str(destination_parent),
+        )
+    )
+    try:
+        _copy_tree_normalized(source_generation, staging)
+        try:
+            staged_proof = verify_release_manifest(staging / "manifest.json")
+        except ReleaseManifestError as exc:
+            raise DeploymentError(f"staged Geometry release is invalid: {exc}") from exc
+        if (
+            staged_proof.manifest_sha256 != source_proof.manifest_sha256
+            or staged_proof.generation != source_proof.generation
+        ):
+            raise DeploymentError("staged Geometry release identity changed during publication")
+        if destination.exists() or destination.is_symlink():
+            raise DeploymentError(f"Geometry release destination already exists: {destination}")
+        os.replace(str(staging), str(destination))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    try:
+        installed_proof = verify_release_manifest(installed_manifest)
+    except ReleaseManifestError as exc:
+        raise DeploymentError(f"installed Geometry release is invalid: {exc}") from exc
+    if (
+        installed_proof.manifest_sha256 != source_proof.manifest_sha256
+        or installed_proof.generation != source_proof.generation
+    ):
+        raise DeploymentError("installed Geometry release identity differs from source manifest")
+    return {
+        "manifest_path": installed_manifest.relative_to(context.options.release_dir).as_posix(),
+        "manifest_sha256": installed_proof.manifest_sha256,
+        "generation": installed_proof.generation,
+    }
+
+
 def _source_revision(context: "ExecutionContext") -> str:
     if context.options.source_revision:
         return context.options.source_revision
@@ -2966,9 +3040,12 @@ def _validate_completed_release(release_dir: Path, manifest: Mapping[str, object
     binaries = manifest.get("binary_sha256")
     if not isinstance(binaries, dict) or not binaries:
         raise DeploymentError("completed release has no binary integrity records")
+    geometry_runtime_digest = binaries.get("nuwax-geometry-runtime")
     for name, expected in binaries.items():
         if not isinstance(name, str) or not isinstance(expected, str):
             raise DeploymentError("invalid release binary integrity record")
+        if name == "nuwax-geometry-runtime":
+            continue
         binary = release_dir / "bin" / name
         _require_file(binary, f"release binary {name}")
         if _sha256(binary) != expected:
@@ -2977,6 +3054,36 @@ def _validate_completed_release(release_dir: Path, manifest: Mapping[str, object
         raise DeploymentError("completed release source checksum mismatch")
     if manifest.get("venv_inventory_sha256") != _venv_inventory_digest(release_dir):
         raise DeploymentError("completed release Python environment drifted")
+    geometry = manifest.get("geometry_release")
+    if not isinstance(geometry, dict) or set(geometry) != {
+        "manifest_path",
+        "manifest_sha256",
+        "generation",
+    }:
+        raise DeploymentError("completed release Geometry integrity record is invalid")
+    raw_geometry_manifest = geometry.get("manifest_path")
+    if not isinstance(raw_geometry_manifest, str):
+        raise DeploymentError("completed release Geometry manifest path is invalid")
+    geometry_relative = Path(raw_geometry_manifest)
+    if (
+        geometry_relative.is_absolute()
+        or ".." in geometry_relative.parts
+        or geometry_relative.as_posix() != raw_geometry_manifest
+        or geometry_relative.name != "manifest.json"
+    ):
+        raise DeploymentError("completed release Geometry manifest path is unsafe")
+    try:
+        geometry_proof = verify_release_manifest(release_dir / geometry_relative)
+    except ReleaseManifestError as exc:
+        raise DeploymentError(f"completed release Geometry artifact set drifted: {exc}") from exc
+    if (
+        geometry.get("manifest_sha256") != geometry_proof.manifest_sha256
+        or geometry.get("generation") != geometry_proof.generation
+    ):
+        raise DeploymentError("completed release Geometry identity changed")
+    runtime_artifact = geometry_proof.artifact_for_role("geometry_runtime")
+    if geometry_runtime_digest != runtime_artifact.sha256:
+        raise DeploymentError("completed release Geometry runtime is not from recorded generation")
     vendor_hashes = manifest.get("vendor_tree_sha256")
     if not isinstance(vendor_hashes, dict):
         raise DeploymentError("completed release vendor integrity records are invalid")
@@ -3224,6 +3331,8 @@ def install_release(context: "ExecutionContext") -> None:
     binary_metadata = {}
     build_uid = resolve_build_account().pw_uid
     for build in context.profile.rust.builds:
+        if build.binary == "nuwax-geometry-runtime":
+            continue
         destination = bin_dir / build.binary
         _copy_rust_build_output(
             options.rust_target_dir(build.manifest),
@@ -3233,6 +3342,12 @@ def install_release(context: "ExecutionContext") -> None:
         )
         binary_hashes[build.binary] = _sha256(destination)
         binary_metadata[build.binary] = _validate_release_binary(destination)
+    geometry_release = _publish_geometry_release(context)
+    geometry_manifest = release_dir / geometry_release["manifest_path"]
+    geometry_proof = verify_release_manifest(geometry_manifest)
+    geometry_runtime = geometry_proof.artifact_for_role("geometry_runtime").path
+    binary_hashes["nuwax-geometry-runtime"] = _sha256(geometry_runtime)
+    binary_metadata["nuwax-geometry-runtime"] = _validate_release_binary(geometry_runtime)
     models = options.build_dir / "models"
     if models.is_dir():
         _copy_tree_normalized(models, release_dir / "models")
@@ -3285,6 +3400,7 @@ def install_release(context: "ExecutionContext") -> None:
         "python_input_sha256": _hash_existing_files(options.source_root, python_inputs),
         "binary_sha256": binary_hashes,
         "binary_file": binary_metadata,
+        "geometry_release": geometry_release,
         "source_tree_sha256": _release_source_digest(release_dir),
         "venv_inventory_sha256": _venv_inventory_digest(release_dir),
         "vendor_tree_sha256": (
@@ -3487,7 +3603,9 @@ def write_configuration(context: "ExecutionContext") -> None:
         "NUWAX_PYTHON_BIN": str(options.current_link / ".venv" / "bin" / "python"),
         "NUWAX_GATEWAY_HOST": options.gateway_host,
         "NUWAX_NUWAX_WORKSPACE_DIR": str(options.current_link / "services" / "nuwax-workspace"),
-        "NUWAX_GEOMETRY_RUNTIME_BINARY": str(options.current_link / "bin" / "nuwax-geometry-runtime"),
+        "NUWAX_GEOMETRY_RELEASE_MANIFEST": str(
+            options.current_link / _geometry_release_paths(context)[1].relative_to(options.release_dir)
+        ),
         "NUWAX_GATEWAY_ARTIFACT_DIR": "/var/lib/nuwax/gateway/artifacts",
         "NUWAX_MAP_CATALOG_ROOT": "/var/lib/nuwax/gateway/maps",
         "NUWAX_MAPPING_DATABASE_ROOT": "/var/lib/nuwax/gateway/geometry/mapping",

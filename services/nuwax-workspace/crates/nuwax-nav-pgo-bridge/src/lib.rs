@@ -23,10 +23,27 @@ use std::time::Duration;
 use nuwax_nav_base::error::NavResult;
 use nuwax_nav_base::native::NativeProcessDiagnostics;
 
-/// Return the CMake-built native PGO artifact embedded in this crate build.
+const VERIFIED_NATIVE_PGO_ENV: &str = "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE";
+
+/// Return the manifest-verified native PGO artifact for production spawn.
 #[must_use]
 pub fn native_executable() -> std::path::PathBuf {
+    std::env::var_os(VERIFIED_NATIVE_PGO_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("{VERIFIED_NATIVE_PGO_ENV} must be injected by release verifier"))
+}
+
+/// Return the build-time native PGO artifact for side-effect-free discovery only.
+#[must_use]
+pub fn discovery_native_executable() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("NUWAX_PGO_NATIVE_BIN"))
+}
+
+/// Return the build-time guardian artifact for side-effect-free discovery only.
+#[must_use]
+pub fn discovery_group_guardian_executable() -> std::path::PathBuf {
+    nuwax_nav_native_runner::discovery_group_guardian_executable().to_path_buf()
 }
 
 impl PgoBridge {

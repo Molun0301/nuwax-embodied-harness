@@ -3978,6 +3978,11 @@ mod preflight_only_contract {
         completed: bool,
     }
 
+    fn correction_frame_admission_fence() -> &'static parking_lot::Mutex<()> {
+        static FENCE: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+        FENCE.get_or_init(|| parking_lot::Mutex::new(()))
+    }
+
     impl CorrectionPhaseAControl {
         fn new(
             admission_open: Arc<AtomicBool>,
@@ -4041,6 +4046,7 @@ mod preflight_only_contract {
         }
 
         fn close_with_state(&self, requested_state: u8) -> bool {
+            let _frame_admission_guard = correction_frame_admission_fence().lock();
             let claim_fence = Arc::clone(&self.command_claim_fence);
             let _claim_guard = claim_fence.lock();
             let first_closer = self
@@ -4626,14 +4632,21 @@ mod preflight_only_contract {
                 lease,
             };
             let mut admission_rx = self.admission_rx.clone();
-            tokio::select! {
+            let permit = tokio::select! {
                 biased;
                 _ = wait_for_admission_close(&mut admission_rx) => {
                     return Err(CorrectionRuntimeError::Stopped);
                 }
-                result = self.sender.send(request) => {
-                    result.map_err(|_| CorrectionRuntimeError::IngressClosed)?;
+                result = self.sender.reserve() => {
+                    result.map_err(|_| CorrectionRuntimeError::IngressClosed)?
                 }
+            };
+            {
+                let _admission_guard = correction_frame_admission_fence().lock();
+                if !self.admission_open.load(Ordering::Acquire) {
+                    return Err(CorrectionRuntimeError::Stopped);
+                }
+                permit.send(request);
             }
             let mut response_rx = response_rx;
             tokio::select! {
@@ -4976,6 +4989,22 @@ mod preflight_only_contract {
         }
     }
 
+    async fn settle_queued_finalizer_jobs(
+        jobs: &mut mpsc::Receiver<CanonicalFinalizerJob>,
+        apply_waiters: &CandidateApplyWaiters,
+        detail: &str,
+    ) {
+        jobs.close();
+        while let Some(job) = jobs.recv().await {
+            job.lease.cancellation().operation().cancel_pending();
+            if job.release_lease_on_completion {
+                job.lease.release();
+            }
+            apply_waiters.complete(job.key, Err(detail.to_owned()));
+            let _ = job.outcome.send(Err(detail.to_owned()));
+        }
+    }
+
     async fn run_canonical_publish_finalizer(
         mut jobs: mpsc::Receiver<CanonicalFinalizerJob>,
         mut shutdown_rx: watch::Receiver<bool>,
@@ -4991,7 +5020,12 @@ mod preflight_only_contract {
                     None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
             };
-            run_canonical_finalizer_job(job, Arc::clone(&sink), &apply_waiters).await?;
+            if let Err(error) =
+                run_canonical_finalizer_job(job, Arc::clone(&sink), &apply_waiters).await
+            {
+                settle_queued_finalizer_jobs(&mut jobs, &apply_waiters, &error.to_string()).await;
+                return Err(error);
+            }
         }
     }
 

@@ -19,11 +19,44 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from contracts.map_workspace import MapGeoreferenceV1
 from core.errors import GatewayError
 from skills.common import params
 from skills.common.context import SkillContext
 
 _LOGGER = logging.getLogger("nuwax_robot_bridge.skills.localization")
+_FINALIZE_ACTIVE_MAP_ARGUMENTS = frozenset({"map_name", "reason", "georeference"})
+
+
+def _parse_map_georeference(payload: Dict[str, Any]) -> Optional[MapGeoreferenceV1]:
+    unknown_fields = sorted(set(payload) - _FINALIZE_ACTIVE_MAP_ARGUMENTS)
+    if unknown_fields:
+        raise GatewayError(
+            "finalize_active_map 包含未知参数。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+            details={"unknown_fields": unknown_fields},
+        )
+    raw_georeference = payload.get("georeference")
+    if raw_georeference is None:
+        return None
+    if not isinstance(raw_georeference, dict):
+        raise GatewayError(
+            "参数 georeference 必须是对象。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+        )
+    try:
+        return MapGeoreferenceV1.model_validate(raw_georeference)
+    except (TypeError, ValueError) as exc:
+        raise GatewayError(
+            "参数 georeference 不符合 MapGeoreferenceV1 合同。",
+            error_code="invalid_params",
+            http_status=422,
+            jsonrpc_code=-32602,
+        ) from exc
 
 
 def handle_get_localization_snapshot(
@@ -61,15 +94,22 @@ def handle_relocalize_active_map(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    del ctx, payload, requested_by
-    raise GatewayError(
-        "当前 geometry-runtime proto 未提供 typed Relocalize RPC/ACK，"
-        "relocalize_active_map 暂不支持。",
-        error_code="unsupported",
-        http_status=501,
-        jsonrpc_code=-32601,
-        details={"missing_contract": "typed Relocalize RPC/ACK"},
+    ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
+    timeout_sec = params.optional_float(payload, "timeout_sec", 10.0)
+    session, workspace = ctx.map_workspace_service.relocalize_active_map(
+        map_name=params.optional_str(payload, "map_name"),
+        metadata={
+            "requested_by": requested_by or "unknown",
+            "request_id": params.optional_str(payload, "request_id"),
+            "logical_timeout_ms": int(float(timeout_sec) * 1000.0),
+        },
     )
+    ctx.refresh_workspace_snapshots(refresh_localization=False)
+    ctx.publish_runtime_governance_stream_frame()
+    return {
+        "localization_session": session,
+        "active_workspace": workspace,
+    }
 
 
 def handle_get_map_snapshot(
@@ -273,11 +313,13 @@ def handle_finalize_active_map(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
+    georeference = _parse_map_georeference(payload)
     map_name = str(payload.get("map_name", "")).strip() or None
     bundle = ctx.map_workspace_service.finalize_active_map(
         map_name=map_name,
         reason=str(payload.get("reason", "")).strip(),
         metadata={"requested_by": requested_by or "unknown"},
+        georeference=georeference,
     )
     ctx.refresh_workspace_snapshots(refresh_localization=False)
     ctx.publish_pointcloud_map_stream_frame(reason="finalize_active_map")

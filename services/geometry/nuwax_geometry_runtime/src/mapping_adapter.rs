@@ -52,16 +52,17 @@ use tracing::warn;
 use nuwax_mapping::SessionStats as MappingSessionStats;
 
 use crate::lcm_runtime::{MapRevisionEvent, MapState, SharedState};
-use crate::mapping_backend::{
-    MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
-    MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput, MappingBackendKind,
-    MappingBackendJoinHandle, MappingBackendSpec, MappingBackendWorker, MappingComputeToken,
-};
 #[cfg(test)]
 use crate::mapping_backend::{
     join_retained_mapping_backend_thread_for_tests,
     mapping_backend_process_exit_retains_thread_for_tests, MappingBackendRetirementTestGate,
     MappingBackendTestGate, MappingKernel,
+};
+use crate::mapping_backend::{
+    MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
+    MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput,
+    MappingBackendJoinHandle, MappingBackendKind, MappingBackendSpec, MappingBackendWorker,
+    MappingComputeToken,
 };
 use crate::mapping_commit::{MappingCommitClock, OccupancyCommitReceipt};
 use crate::sequence_state::SequenceStateStore;
@@ -790,10 +791,7 @@ pub(crate) enum MappingPendingCause {
     #[error(
         "Mapping retirement acknowledgement generation mismatch: expected={expected} pending={pending:?}"
     )]
-    GenerationMismatch {
-        expected: u64,
-        pending: Option<u64>,
-    },
+    GenerationMismatch { expected: u64, pending: Option<u64> },
     #[error("Mapping retirement could not be proven: {0}")]
     RetirementUnproven(String),
 }
@@ -920,8 +918,7 @@ impl MappingFinalOwner {
         lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
         retirement: MappingBackendRetirement,
     ) -> Result<Self, MappingTerminalError> {
-        let (generation, acknowledge_pending, join_handle) =
-            retirement.into_stop_join_handle()?;
+        let (generation, acknowledge_pending, join_handle) = retirement.into_stop_join_handle()?;
         Ok(Self::WaitingBackendJoin {
             adapter,
             lifecycle_lock,
@@ -1646,12 +1643,7 @@ impl MappingAdapter {
                 map_name,
                 session_generation,
                 backend_generation,
-            }) => (
-                session_id,
-                map_name,
-                session_generation,
-                backend_generation,
-            ),
+            }) => (session_id, map_name, session_generation, backend_generation),
             Err(error) => return Err(Self::reject_staged_worker(staged_worker, error)),
         };
         let worker = match staged_worker {
@@ -1754,9 +1746,7 @@ impl MappingAdapter {
     ) -> Result<(), MappingLifecycleError> {
         match staged_worker {
             Some(worker) => worker.stop_and_join().map_err(|error| {
-                MappingLifecycleError::Backend(format!(
-                    "rejected worker join failed: {error}"
-                ))
+                MappingLifecycleError::Backend(format!("rejected worker join failed: {error}"))
             }),
             None => Ok(()),
         }
@@ -1768,9 +1758,7 @@ impl MappingAdapter {
     ) -> MappingLifecycleError {
         match Self::settle_rejected_staged_worker(staged_worker) {
             Ok(()) => rejection,
-            Err(join_error) => {
-                MappingLifecycleError::Backend(format!("{rejection}; {join_error}"))
-            }
+            Err(join_error) => MappingLifecycleError::Backend(format!("{rejection}; {join_error}")),
         }
     }
 
@@ -1871,11 +1859,9 @@ impl MappingAdapter {
 
     fn prepare_final_backend_retirement(&mut self) -> MappingFinalPreparation {
         if let Some(generation) = self.pending_backend_retirement {
-            return MappingFinalPreparation::Pending(
-                MappingPendingCause::RetirementUnproven(format!(
-                    "backend generation {generation} already has a detached retirement owner"
-                )),
-            );
+            return MappingFinalPreparation::Pending(MappingPendingCause::RetirementUnproven(
+                format!("backend generation {generation} already has a detached retirement owner"),
+            ));
         }
 
         if self.lifecycle.active {
@@ -1887,16 +1873,15 @@ impl MappingAdapter {
                         retirement,
                         sticky_error: None,
                     },
-                    None => MappingFinalPreparation::Settled(
-                        MappingRetiredCapability::quiescent(self.backend_generation),
-                    ),
+                    None => MappingFinalPreparation::Settled(MappingRetiredCapability::quiescent(
+                        self.backend_generation,
+                    )),
                 },
                 Err(MappingLifecycleError::GenerationExhausted) => {
                     let sticky_error = MappingTerminalError::new(
                         "mapping backend generation exhausted during final retirement",
                     );
-                    match self
-                        .force_stop_started_session_detached(&session_id, session_generation)
+                    match self.force_stop_started_session_detached(&session_id, session_generation)
                     {
                         Ok(transition) => match transition.retirement {
                             Some(retirement) => MappingFinalPreparation::Retirement {
@@ -5318,7 +5303,10 @@ mod tests {
         };
         assert_eq!(owner.state_name(), "waiting_lifecycle_lock");
         assert!(adapter.lock().snapshot().active);
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (true, false));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (true, false)
+        );
 
         drop(lifecycle_guard);
         match owner.attempt(sticky).await {
@@ -5387,7 +5375,10 @@ mod tests {
                 panic!("released backend join remained pending: {cause}")
             }
         }
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, false)
+        );
     }
 
     #[tokio::test]
@@ -5418,7 +5409,10 @@ mod tests {
         };
         assert_eq!(owner.state_name(), "waiting_retirement_ack");
         assert_eq!(owner.joined_terminal(), Some(&Ok(())));
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, true));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, true)
+        );
 
         drop(lifecycle_guard);
         match owner.attempt(sticky).await {
@@ -5427,7 +5421,10 @@ mod tests {
                 panic!("released ACK lock remained pending: {cause}")
             }
         }
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, false)
+        );
     }
 
     #[tokio::test]
@@ -5457,11 +5454,7 @@ mod tests {
         let (owner, sticky) = match owner.attempt(ShutdownFailures::default()).await {
             MappingFinalAttempt::Pending {
                 owner,
-                cause:
-                    MappingPendingCause::GenerationMismatch {
-                        expected,
-                        pending,
-                    },
+                cause: MappingPendingCause::GenerationMismatch { expected, pending },
                 sticky,
             } => {
                 assert_eq!(expected, exact_generation);
@@ -5477,7 +5470,10 @@ mod tests {
         };
         assert_eq!(owner.state_name(), "waiting_retirement_ack");
         assert_eq!(owner.joined_terminal(), Some(&Ok(())));
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, true));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, true)
+        );
 
         adapter
             .lock()
@@ -5494,7 +5490,10 @@ mod tests {
                 panic!("restored exact generation remained pending: {cause}")
             }
         }
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, false)
+        );
     }
 
     #[tokio::test]
@@ -5502,9 +5501,7 @@ mod tests {
         let adapter = Arc::new(parking_lot::Mutex::new(active_adapter(sample_config())));
         adapter
             .lock()
-            .replace_worker_with_retirement_test_gate(
-                MappingBackendRetirementTestGate::failing(),
-            )
+            .replace_worker_with_retirement_test_gate(MappingBackendRetirementTestGate::failing())
             .expect("install failing retirement worker");
         let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
         let owner = MappingFinalOwner::waiting_for_lifecycle_lock(
@@ -5524,16 +5521,17 @@ mod tests {
                 panic!("joined backend error remained pending: {cause}")
             }
         }
-        assert_eq!(adapter.lock().backend_owner_state_for_tests(), (false, false));
+        assert_eq!(
+            adapter.lock().backend_owner_state_for_tests(),
+            (false, false)
+        );
     }
 
     #[test]
     fn legacy_completion_clears_exact_pending_generation_before_returning_join_error() {
         let mut adapter = active_adapter(sample_config());
         adapter
-            .replace_worker_with_retirement_test_gate(
-                MappingBackendRetirementTestGate::failing(),
-            )
+            .replace_worker_with_retirement_test_gate(MappingBackendRetirementTestGate::failing())
             .expect("install failing retirement worker");
         let retirement = adapter
             .stop_session_detached("test-session")
@@ -5597,7 +5595,10 @@ mod tests {
             .start_session_with_staged_backend("active-session", "active-map", staged)
             .expect("same active session is an idempotent replay");
         assert!(replay.idempotent_replay);
-        assert_eq!(replay.session_generation, active_snapshot.session_generation);
+        assert_eq!(
+            replay.session_generation,
+            active_snapshot.session_generation
+        );
         assert!(gate.entered(), "replay worker was not joined");
 
         let (staged, gate) = settled_staged_worker(100);
@@ -5634,7 +5635,9 @@ mod tests {
         let error = pending_retirement
             .start_session_with_staged_backend("pending-session", "pending-map", staged)
             .expect_err("pending backend retirement must reject admission");
-        assert!(matches!(error, MappingLifecycleError::Backend(message) if message.contains("retirement is still pending")));
+        assert!(
+            matches!(error, MappingLifecycleError::Backend(message) if message.contains("retirement is still pending"))
+        );
         assert!(gate.entered(), "pending-retirement worker was not joined");
 
         let mut session_exhausted = MappingAdapter::new(sample_config());
@@ -5652,7 +5655,9 @@ mod tests {
         let error = backend_exhausted
             .start_session_with_staged_backend("backend-exhausted", "backend-map", staged)
             .expect_err("backend generation exhaustion must reject admission");
-        assert!(matches!(error, MappingLifecycleError::Backend(message) if message.contains("generation exhausted")));
+        assert!(
+            matches!(error, MappingLifecycleError::Backend(message) if message.contains("generation exhausted"))
+        );
         assert!(gate.entered(), "backend-exhaustion worker was not joined");
 
         let mut identity = MappingAdapter::new(sample_config());

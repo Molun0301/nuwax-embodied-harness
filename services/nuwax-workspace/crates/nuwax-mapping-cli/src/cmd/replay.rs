@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{publish_new_file, ArtifactFormat};
 use crate::dataset::DatasetRecord;
 use crate::native::read_command_dataset;
 
@@ -119,16 +120,23 @@ pub async fn run(args: ReplayArgs) -> anyhow::Result<()> {
         args.bag.with_file_name(format!("{file_name}.replay.json"))
     });
     if !args.dry_run {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output)
-            .map_err(|error| {
-                anyhow::anyhow!("create replay output {} failed: {error}", output.display())
-            })?;
-        serde_json::to_writer_pretty(&mut file, &manifest)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        publish_new_file(
+            &output,
+            ArtifactFormat::ReplayJson,
+            |writer| {
+                serde_json::to_writer_pretty(&mut *writer, &manifest)?;
+                writer.write_all(b"\n")?;
+                Ok(())
+            },
+            |staging| {
+                let persisted: ReplayManifest =
+                    serde_json::from_reader(std::fs::File::open(staging)?)?;
+                if persisted != manifest {
+                    anyhow::bail!("persisted replay manifest does not match generated manifest");
+                }
+                Ok(())
+            },
+        )?;
     }
     println!(
         "[replay] dataset={} start_offset={} rate={} events={} output={} dry_run={}",

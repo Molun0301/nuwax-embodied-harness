@@ -58,6 +58,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tonic::transport::Server;
 use tracing::{error, info};
 
@@ -96,6 +98,43 @@ static GEOMETRY_RETAINED_EXIT_SELECTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 type GrpcServerResult = Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>;
+
+#[cfg(unix)]
+struct UnixShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl UnixShutdownSignals {
+    fn register() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn forward_to(mut self, service: server::GeometryRuntimeService) {
+        loop {
+            let signal_name = tokio::select! {
+                signal = self.interrupt.recv() => signal.map(|_| "SIGINT"),
+                signal = self.terminate.recv() => signal.map(|_| "SIGTERM"),
+            };
+            let Some(signal_name) = signal_name else {
+                error!("Unix 关闭信号 stream 意外关闭");
+                return;
+            };
+            info!(
+                signal = signal_name,
+                "收到 Unix 关闭信号，执行 Process Stop"
+            );
+            if let Err(error) = service.perform_process_stop().await {
+                error!(signal = signal_name, error = %error, "Unix 信号 Process Stop 失败");
+                return;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupHealth {
@@ -144,9 +183,8 @@ fn retain_geometry_owner_until_process_exit(retention: GeometryProcessExitRetent
 #[cfg(test)]
 fn geometry_process_exit_retention_for_tests(
 ) -> &'static std::sync::Mutex<Vec<GeometryProcessExitRetention>> {
-    static RETAINED: std::sync::OnceLock<
-        std::sync::Mutex<Vec<GeometryProcessExitRetention>>,
-    > = std::sync::OnceLock::new();
+    static RETAINED: std::sync::OnceLock<std::sync::Mutex<Vec<GeometryProcessExitRetention>>> =
+        std::sync::OnceLock::new();
     RETAINED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -178,18 +216,12 @@ fn reset_geometry_retained_exit_after_test_settlement() {
         "retained-exit signal may reset only after all test retention is settled"
     );
     assert!(
-        GEOMETRY_RETAINED_EXIT_SELECTED.swap(
-            false,
-            std::sync::atomic::Ordering::AcqRel,
-        ),
+        GEOMETRY_RETAINED_EXIT_SELECTED.swap(false, std::sync::atomic::Ordering::AcqRel,),
         "test settlement must clear a selected retained-exit signal"
     );
 }
 
-fn finalize_geometry_runtime(
-    runtime: tokio::runtime::Runtime,
-    exit_code: ExitCode,
-) -> ExitCode {
+fn finalize_geometry_runtime(runtime: tokio::runtime::Runtime, exit_code: ExitCode) -> ExitCode {
     if GEOMETRY_RETAINED_EXIT_SELECTED.load(std::sync::atomic::Ordering::Acquire) {
         runtime.shutdown_background();
     } else {
@@ -1332,7 +1364,47 @@ fn exit_code_after_ready_cleanup(exit_code: ExitCode, ready_remove_failed: bool)
     }
 }
 
+fn print_requested_release_artifacts() -> Option<ExitCode> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--print-release-artifacts")) {
+        return None;
+    }
+    if args.next().is_some() {
+        eprintln!("--print-release-artifacts 不接受其它参数");
+        return Some(ExitCode::from(2));
+    }
+
+    let payload = serde_json::json!({
+        "schema_version": "nuwax.geometry.embedded-artifacts.v1",
+        "artifacts": [
+            {
+                "role": "native_pgo_payload",
+                "path": nuwax_nav_pgo_bridge::discovery_native_executable(),
+            },
+            {
+                "role": "group_guardian",
+                "path": nuwax_nav_pgo_bridge::discovery_group_guardian_executable(),
+            },
+        ],
+    });
+    match serde_json::to_string(&payload) {
+        Ok(encoded) => {
+            println!("{encoded}");
+            Some(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("序列化 release artifact discovery 失败: {error}");
+            Some(ExitCode::from(2))
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    if let Some(exit_code) = print_requested_release_artifacts() {
+        return exit_code;
+    }
+
     match video_relay::run_requested_helper() {
         Ok(true) => return ExitCode::SUCCESS,
         Ok(false) => {}
@@ -1396,6 +1468,14 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         .with_env_filter("nuwax_geometry_runtime=info,nuwax_protocol=warn,nuwax_transport=warn,nuwax_codec=warn,nuwax_tf=warn")
         .with_target(false)
         .init();
+    #[cfg(unix)]
+    let unix_shutdown_signals = match UnixShutdownSignals::register() {
+        Ok(signals) => signals,
+        Err(error) => {
+            error!("注册 Unix SIGINT/SIGTERM handler 失败: {}", error);
+            return ExitCode::from(7);
+        }
+    };
     info!(
         "Geometry owner profile selected: lio={} mapping={} correction={}",
         owner_profile.lio().stable_name(),
@@ -1828,16 +1908,19 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             let _ = graceful_rx.wait_for(|requested| *requested).await;
         }
     };
+    let server_service = service.clone();
     let mut server_task = tokio::spawn(async move {
         Server::builder()
             .add_service(
-                proto::geometry_runtime_server::GeometryRuntimeServer::new(service)
+                proto::geometry_runtime_server::GeometryRuntimeServer::new(server_service)
                     .max_decoding_message_size(GRPC_MESSAGE_LIMIT_BYTES)
                     .max_encoding_message_size(GRPC_MESSAGE_LIMIT_BYTES),
             )
             .serve_with_incoming_shutdown(incoming, graceful_shutdown)
             .await
     });
+    #[cfg(unix)]
+    let _signal_forwarder = tokio::spawn(unix_shutdown_signals.forward_to(service));
 
     let startup_check = wait_for_grpc_health(addr);
     tokio::pin!(startup_check);
@@ -3355,13 +3438,8 @@ pub(crate) mod lifecycle_tests {
             );
         })
         .await;
-        let mut fixture = lifecycle_production_fixture_with_setup(
-            51,
-            "reverse",
-            true,
-            topology_setup,
-        )
-        .await;
+        let mut fixture =
+            lifecycle_production_fixture_with_setup(51, "reverse", true, topology_setup).await;
         fixture.topology_control().release_terminal();
         let geometry_task_failure = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -3435,7 +3513,9 @@ pub(crate) mod lifecycle_tests {
             .expect("bounded production shutdown attempt")
             .expect("production shutdown task")
             .expect_err("blocked Correction returns the retained root owner");
-        assert!(shutdown_failure.to_string().contains(geometry_task_failure.as_str()));
+        assert!(shutdown_failure
+            .to_string()
+            .contains(geometry_task_failure.as_str()));
         assert!(mapping.lock().snapshot().active);
         assert!(!lio_shutdown.is_shutdown_requested());
         assert!(cloud_path.exists());
@@ -3450,13 +3530,12 @@ pub(crate) mod lifecycle_tests {
         let pending_owner = *shutdown_failure
             .into_pending_owner()
             .expect("Correction timeout retains the complete production owner");
-        let terminal_failure = pending_owner
-            .shutdown()
-            .await
-            .expect_err(
-                "retry joins the same Correction owner but preserves sticky Geometry failure",
-            );
-        assert!(terminal_failure.to_string().contains(geometry_task_failure.as_str()));
+        let terminal_failure = pending_owner.shutdown().await.expect_err(
+            "retry joins the same Correction owner but preserves sticky Geometry failure",
+        );
+        assert!(terminal_failure
+            .to_string()
+            .contains(geometry_task_failure.as_str()));
         assert!(
             terminal_failure.into_pending_owner().is_none(),
             "retry completed every owner despite the sticky terminal failure"
@@ -3728,8 +3807,7 @@ pub(crate) mod lifecycle_tests {
             let exit = finalize_geometry_runtime(retained_exit_runtime, ExitCode::from(7));
             let _ = finalizer_tx.send(exit);
         });
-        let finalizer_result =
-            tokio::time::timeout(Duration::from_secs(1), finalizer_rx).await;
+        let finalizer_result = tokio::time::timeout(Duration::from_secs(1), finalizer_rx).await;
         assert!(
             !blocking_completed.load(Ordering::Acquire),
             "blocking task must remain unreleased when retained-exit finalizer returns"
@@ -3763,8 +3841,7 @@ pub(crate) mod lifecycle_tests {
             }
         };
         assert_eq!(
-            pending_owner.shutdown_attempts_for_tests,
-            FINAL_OWNER_ATTEMPT_LIMIT,
+            pending_owner.shutdown_attempts_for_tests, FINAL_OWNER_ATTEMPT_LIMIT,
             "top-level shutdown must exhaust the complete final-owner attempt budget"
         );
         retirement_gate.release();
@@ -3790,8 +3867,8 @@ pub(crate) mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rollback_mapping_and_lio_exhausts_budget_and_retains_bare_owner_until_mapping_settles(
-    ) {
+    async fn rollback_mapping_and_lio_exhausts_budget_and_retains_bare_owner_until_mapping_settles()
+    {
         let _retention_guard = PROCESS_EXIT_RETENTION_TEST_LOCK.lock().await;
         assert!(
             geometry_process_exit_retention_for_tests()
@@ -3852,7 +3929,10 @@ pub(crate) mod lifecycle_tests {
         .await;
         assert_eq!(exit, ExitCode::from(7));
         assert!(retirement_gate.entered());
-        assert_eq!(mapping.lock().backend_owner_state_for_tests(), (false, true));
+        assert_eq!(
+            mapping.lock().backend_owner_state_for_tests(),
+            (false, true)
+        );
         assert!(!lio_shutdown.is_shutdown_requested());
         assert!(ingress_gate.is_closed());
         assert!(lio_probe.closed.load(Ordering::Acquire));
@@ -3881,19 +3961,20 @@ pub(crate) mod lifecycle_tests {
             };
         assert!(Arc::ptr_eq(&retained_ingress_gate, &ingress_gate));
         assert!(retained_ingress_gate.is_closed());
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(geometry_process_exit_retention_for_tests()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
 
         retirement_gate.release();
         pending_owner
             .shutdown()
             .await
             .expect("released bare owner settles Mapping, LIO, and product resources");
-        assert_eq!(mapping.lock().backend_owner_state_for_tests(), (false, false));
+        assert_eq!(
+            mapping.lock().backend_owner_state_for_tests(),
+            (false, false)
+        );
         assert!(lio_shutdown.is_shutdown_requested());
         assert!(!product_paths.0.exists());
         assert!(!product_paths.1.exists());
@@ -3926,12 +4007,9 @@ pub(crate) mod lifecycle_tests {
         .await;
         let product_paths = setup.product_paths();
         let control = setup.control.clone();
-        let (lio, lio_shutdown) = start_lio_before_geometry_for_tests(
-            setup.transport(),
-            63,
-            "startup-budget-retention",
-        )
-        .await;
+        let (lio, lio_shutdown) =
+            start_lio_before_geometry_for_tests(setup.transport(), 63, "startup-budget-retention")
+                .await;
         let mut failed = match setup.spawn().await {
             Err(failed) => failed,
             Ok(mut topology) => {
@@ -3982,12 +4060,10 @@ pub(crate) mod lifecycle_tests {
                 panic!("startup rollback retained only a Mapping/LIO owner")
             }
         };
-        assert!(
-            geometry_process_exit_retention_for_tests()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(geometry_process_exit_retention_for_tests()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
 
         control.release_scheduler_block();
         match geometry.shutdown().await {

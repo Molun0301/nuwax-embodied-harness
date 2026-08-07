@@ -1465,6 +1465,7 @@ dependencies = [
 name = "nuwax-lio-backends"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
 ]

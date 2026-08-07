@@ -18,7 +18,15 @@ import os
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Optional
+
+from services.geometry.release_manifest import (
+    ReleaseManifestError,
+    default_release_manifest_path,
+    verify_ready_release,
+    verify_release_manifest,
+)
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
@@ -74,11 +82,35 @@ class GeometryRuntimeSubprocess:
             if not self._is_port_open():
                 self._reset_attached_state_locked()
                 return False
+            if not self._verify_release_and_ready_locked():
+                self._last_error = "Geometry active release or ready identity changed"
+                self._reset_attached_state_locked()
+                return False
             return self._check_attached_health_locked()
 
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
+
+    def _verify_release_and_ready_locked(self) -> bool:
+        manifest = default_release_manifest_path()
+        ready = os.environ.get(
+            "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
+            str(
+                Path(__file__).resolve().parents[2]
+                / "runtime_data"
+                / "geometry"
+                / "nuwax_geometry_runtime.ready"
+            ),
+        )
+        try:
+            proof = verify_release_manifest(manifest)
+            runtime = proof.artifact_for_role("geometry_runtime").path
+            proof = verify_release_manifest(manifest, expected_runtime=runtime)
+            verify_ready_release(Path(ready), proof)
+            return True
+        except (OSError, ReleaseManifestError):
+            return False
 
     def _warn_if_video_relay_missing(self) -> None:
         """挂接已有 runtime 时探测视频中转产物，缺失则告警（不阻断 geometry）。
@@ -105,8 +137,13 @@ class GeometryRuntimeSubprocess:
 
         with self._lock:
             if self._started:
-                if self._attached and self._check_attached_health_locked(force=True):
+                if (
+                    self._attached
+                    and self._verify_release_and_ready_locked()
+                    and self._check_attached_health_locked(force=True)
+                ):
                     return True
+                self._last_error = "Geometry active release, ready identity, or health changed"
                 self._reset_attached_state_locked()
             if not self._is_port_open():
                 self._last_error = (
@@ -114,6 +151,10 @@ class GeometryRuntimeSubprocess:
                     "请由 %s 启动 canonical runtime" % (self._port, _CANONICAL_LAUNCHER)
                 )
                 LOGGER.error(self._last_error)
+                return False
+            if not self._verify_release_and_ready_locked():
+                self._last_error = "Geometry release proof or ready generation verification failed"
+                self._reset_attached_state_locked()
                 return False
             if not self._verify_attached_runtime_locked():
                 self._last_error = (

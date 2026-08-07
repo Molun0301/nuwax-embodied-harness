@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{publish_new_file, ArtifactFormat};
 use crate::dataset::{read_dataset, PoseData, RecordPayload};
 use crate::native::{input_format, read_command_dataset, InputFormat};
 
@@ -114,19 +115,22 @@ pub async fn run(args: ReplayMarkerArgs) -> anyhow::Result<()> {
         markers,
     };
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.output)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "create marker output {} failed: {error}",
-                args.output.display()
-            )
-        })?;
-    serde_json::to_writer_pretty(&mut file, &replay)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+    publish_new_file(
+        &args.output,
+        ArtifactFormat::MarkerReplayJson,
+        |writer| {
+            serde_json::to_writer_pretty(&mut *writer, &replay)?;
+            writer.write_all(b"\n")?;
+            Ok(())
+        },
+        |staging| {
+            let persisted: MarkerReplay = serde_json::from_reader(std::fs::File::open(staging)?)?;
+            if persisted != replay {
+                anyhow::bail!("persisted marker replay does not match generated replay");
+            }
+            Ok(())
+        },
+    )?;
     println!(
         "[replay-marker] dataset={} family={} markers={} unique_ids={} output={}",
         args.bag.display(),

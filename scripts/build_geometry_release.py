@@ -474,11 +474,11 @@ def _make_tree_removable(path):
     os.chmod(str(path), 0o700)
 
 
-def _validate_directory_fd(fd, label, expected_uid):
-    # type: (int, str, int) -> os.stat_result
+def _validate_directory_fd(fd, label, expected_uid, reject_group_other_writable=True):
+    # type: (int, str, int, bool) -> os.stat_result
     metadata = os.fstat(fd)
     if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != expected_uid
-            or stat.S_IMODE(metadata.st_mode) & 0o022):
+            or (reject_group_other_writable and stat.S_IMODE(metadata.st_mode) & 0o022)):
         raise RuntimeError("%s owner/mode/type 不安全" % label)
     return metadata
 
@@ -517,7 +517,10 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs):
     stage_fd = None  # type: Optional[int]
     basename = ""
     try:
-        parent_before = _validate_directory_fd(parent_fd, "--stage-only parent", os.geteuid())
+        parent_before = _validate_directory_fd(
+            parent_fd, "--stage-only parent", os.geteuid(),
+            reject_group_other_writable=False,
+        )
         for _attempt in range(128):
             candidate = "nuwax-geometry-stage-%s" % secrets.token_hex(16)
             try:
@@ -636,7 +639,10 @@ def _open_or_create_absolute_directory(path, expected_uid):
                               dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd
-        _validate_directory_fd(current_fd, "publish immediate parent", expected_uid)
+        _validate_directory_fd(
+            current_fd, "publish immediate parent", expected_uid,
+            reject_group_other_writable=False,
+        )
         return current_fd
     except Exception:
         os.close(current_fd)

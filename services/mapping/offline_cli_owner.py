@@ -3049,6 +3049,82 @@ class OfflineMappingCliOwner:
             except subprocess.TimeoutExpired as error:
                 raise OfflineCliRecoveryError("direct CLI child was not reaped") from error
 
+    def _cleanup_map_staging(
+        self,
+        record: Mapping[str, object],
+        pid: int,
+        process_start_token: int,
+        output_parent_fd: Optional[int] = None,
+    ) -> None:
+        if record["command_kind"] != OfflineCliCommandKind.MAP.value:
+            return
+        command = record["command"]
+        if not isinstance(command, Mapping):
+            raise OfflineCliRecoveryError("durable map command is unavailable for staging cleanup")
+        output_parts = _relative_parts(
+            str(command["output_path"]),
+            "durable map output path",
+        )
+        final_name = os.fsencode(output_parts[-1])
+        first = 0xCBF29CE484222325
+        second = 0x84222325CBF29CE4
+        mask = (1 << 64) - 1
+        for index, byte in enumerate(final_name):
+            first ^= byte
+            first = (first * 0x00000100000001B3) & mask
+            mixed = (byte + (((index << 23) | (index >> 41)) & mask)) & mask
+            second ^= mixed
+            second = (((second << 9) | (second >> 55)) & mask)
+            second = (second * 0x9E3779B185EBCA87) & mask
+        expected = re.compile(
+            re.escape(".nuwax-mapping-cli-map-bundle-v1-")
+            + str(pid)
+            + "-"
+            + ("%016x" % process_start_token)
+            + r"-[0-9a-f]{16}-"
+            + ("%016x%016x" % (first, second))
+            + r"\Z"
+        )
+
+        def remove_tree(parent_fd: int, name: str) -> None:
+            try:
+                child_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+            except NotADirectoryError:
+                os.unlink(name, dir_fd=parent_fd)
+                return
+            try:
+                with os.scandir(child_fd) as entries:
+                    child_names = [entry.name for entry in entries]
+                for child_name in child_names:
+                    remove_tree(child_fd, child_name)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=parent_fd)
+
+        owned_parent_fd = -1
+        try:
+            if output_parent_fd is None:
+                if self._output_root is None:
+                    raise OfflineCliClosedError("configured output root is unavailable")
+                self._output_root.verify_current_identity()
+                owned_parent_fd = self._output_root._open_parent(output_parts)
+                parent_fd = owned_parent_fd
+            else:
+                parent_fd = output_parent_fd
+            removed = False
+            with os.scandir(parent_fd) as entries:
+                names = [entry.name for entry in entries if expected.fullmatch(entry.name)]
+            for name in names:
+                remove_tree(parent_fd, name)
+                removed = True
+            if removed:
+                os.fsync(parent_fd)
+        except BaseException as error:
+            raise OfflineCliRecoveryError("MAP staging cleanup is unproven") from error
+        finally:
+            if owned_parent_fd >= 0:
+                os.close(owned_parent_fd)
+
     def _recover_stale_active(self) -> None:
         store = self._require_store()
         active = store.read_json(ACTIVE_JOURNAL_NAME)
@@ -3095,6 +3171,11 @@ class OfflineMappingCliOwner:
                 sid=int(active["sid"]),
                 process=None,
             )
+        self._cleanup_map_staging(
+            record,
+            int(active["pid"]),
+            int(active["process_start_token"]),
+        )
         if not bool(record["terminal"]):
             record.update(
                 {
@@ -3143,6 +3224,11 @@ class OfflineMappingCliOwner:
                         sid=int(record["sid"]),
                         process=None,
                     )
+                self._cleanup_map_staging(
+                    record,
+                    int(record["pid"]),
+                    int(record["process_start_token"]),
+                )
             record.update(
                 {
                     "state": OfflineCliState.FAILED.value,
@@ -3460,6 +3546,17 @@ class OfflineMappingCliOwner:
                 record["stderr_truncated"] = truncated
             if process is not None:
                 record["exit_code"] = process.returncode
+            if operation is not None and process_cleanup_proven:
+                try:
+                    self._cleanup_map_staging(
+                        operation.record,
+                        operation.process.pid,
+                        operation.process_start_token,
+                        operation.resolved_output.parent_fd,
+                    )
+                except BaseException as staging_error:
+                    if cleanup_error is None:
+                        cleanup_error = staging_error
             if input_alias_name is not None and process_cleanup_proven:
                 try:
                     self._require_store().remove_input_alias(input_alias_name)
@@ -3878,6 +3975,19 @@ class OfflineMappingCliOwner:
                 output_size = None
                 output_sha256 = None
         if process_cleanup_proven:
+            try:
+                self._cleanup_map_staging(
+                    operation.record,
+                    operation.process.pid,
+                    operation.process_start_token,
+                    operation.resolved_output.parent_fd,
+                )
+            except BaseException as staging_error:
+                cleanup_proven = False
+                message = "%s; MAP staging cleanup failed: %s" % (
+                    message,
+                    staging_error,
+                )
             try:
                 self._require_store().remove_input_alias(operation.input_alias_name)
             except BaseException as alias_error:

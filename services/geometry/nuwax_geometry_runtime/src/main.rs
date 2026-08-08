@@ -42,6 +42,7 @@ mod mapping_commit;
 mod nav_runtime;
 mod occupancy_shm;
 mod owner_profile;
+mod persistent_occupancy;
 mod pointcloud;
 mod rpc_runtime;
 mod runtime_diagnostics;

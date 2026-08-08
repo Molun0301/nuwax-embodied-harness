@@ -122,6 +122,22 @@ pub struct OfflineReplayRequestV1 {
     pub config: OfflineReplayConfigV1,
 }
 
+/// V2 快照绑定的、已经通过 V1 validator 校验的重放身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineReplayIdentityV2 {
+    pub map_name: String,
+    pub source_id: String,
+    pub map_frame_id: String,
+}
+
+/// 后续 `MapSnapshot` 构造所需的 canonical seed；最终来源身份由 Stage 5 决定。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineMapSnapshotSeedV2 {
+    pub map_name: String,
+    pub map_frame_id: String,
+    pub update_sequence: u64,
+}
+
 pub struct OfflineReplayValidator {
     request: ValidatedOfflineReplayRequestV1,
     last: Option<(u64, u64)>,
@@ -186,6 +202,22 @@ impl ValidatedOfflineReplayRequestV1 {
 
     pub fn backend_config(&self) -> &OfflineBackendConfigV1 {
         &self.config.backend
+    }
+
+    pub fn identity_v2(&self) -> OfflineReplayIdentityV2 {
+        OfflineReplayIdentityV2 {
+            map_name: self.map_name.clone(),
+            source_id: self.source_id.clone(),
+            map_frame_id: self.config.map_frame_id.clone(),
+        }
+    }
+
+    pub fn map_snapshot_seed_v2(&self, update_sequence: u64) -> OfflineMapSnapshotSeedV2 {
+        OfflineMapSnapshotSeedV2 {
+            map_name: self.map_name.clone(),
+            map_frame_id: self.config.map_frame_id.clone(),
+            update_sequence,
+        }
     }
 }
 

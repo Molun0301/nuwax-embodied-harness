@@ -2,12 +2,18 @@
 
 #[doc(hidden)]
 pub mod mapping_backend;
+mod offline_asset_export;
 mod offline_replay;
 mod offline_replay_owner;
 mod persistent_occupancy;
 
 #[doc(hidden)]
 pub mod __offline_replay_internal {
+    pub use super::offline_asset_export::{
+        export_offline_candidate_assets_v1, AssetReceiptV1, CandidateAssetEncodingV1,
+        CandidateAssetMemberV1, DeferredAssetMemberV1, OfflineAssetExportError,
+        OfflineCandidateAssetsV1,
+    };
     pub use super::offline_replay_owner::{
         GeometryOfflineReplayOwner, OfflineGeometrySnapshotV1, OfflineGeometrySnapshotV2,
         OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1,

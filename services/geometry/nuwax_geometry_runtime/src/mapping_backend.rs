@@ -28,7 +28,7 @@ use nuwax_mapping_raytracing::voxel_ray_tracer::{
     MAX_REQUEST_RAY_STEPS, VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
 };
 
-use crate::owner_profile::MappingBackend;
+
 
 const WORKER_QUEUE_CAPACITY: usize = 1;
 const WORKER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -253,13 +253,15 @@ fn ray_config_checkpoint_matches(config: &Config, checkpoint: RayConfigCheckpoin
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum MappingBackendSpec {
+#[doc(hidden)]
+pub enum MappingBackendSpec {
     Voxel,
     Raytracing(RaytracingBackendSpec),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MappingBackendKind {
+#[doc(hidden)]
+pub enum MappingBackendKind {
     Voxel,
     Raytracing,
 }
@@ -314,11 +316,12 @@ pub(crate) struct MappingBackendCandidate {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct MappingBackendComputeConfig {
-    pub(crate) resolution: f64,
-    pub(crate) occupancy_algo: CostAlgoSelector,
-    pub(crate) initial_safe_radius_meters: f32,
-    pub(crate) window_capacity: usize,
+#[doc(hidden)]
+pub struct MappingBackendComputeConfig {
+    pub resolution: f64,
+    pub occupancy_algo: CostAlgoSelector,
+    pub initial_safe_radius_meters: f32,
+    pub window_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -379,14 +382,27 @@ impl MappingBackendCommitHandle {
     fn resolve(&mut self, kind: MappingBackendDecisionKind) -> Result<(), String> {
         let sender = self
             .sender
-            .take()
+            .as_ref()
             .ok_or_else(|| "mapping backend completion was already resolved".to_owned())?;
-        sender
-            .send(MappingBackendDecision {
-                transaction_id: self.transaction_id,
-                kind,
-            })
-            .map_err(|_| "mapping backend worker closed before completion resolution".to_owned())
+        let decision = MappingBackendDecision {
+            transaction_id: self.transaction_id,
+            kind,
+        };
+        match sender.send(decision) {
+            Ok(()) => {
+                self.sender.take();
+                Ok(())
+            }
+            Err(_) => {
+                // Keep the sender pending.  Returning the error consumes the
+                // commit handle, whose Drop implementation performs the only
+                // available best-effort Abort delivery.  If the receiver is
+                // already closed, that abort is unavailable and the caller
+                // receives a terminal decision-unavailable error; no commit or
+                // abort is claimed to have been delivered.
+                Err("mapping backend worker closed before completion resolution; abort decision unavailable".to_owned())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1041,10 +1057,20 @@ impl MappingBackendClient {
 }
 
 impl MappingBackendSpec {
-    pub(crate) fn from_env(selected: MappingBackend) -> Result<Self, String> {
+    #[doc(hidden)]
+    pub fn raytracing(
+        voxel_size: f32, max_range: f32, ray_subsample: u32, shadow_depth: f32,
+        grace_depth: f32, min_health: i32, max_health: i32, graze_cos: f32,
+        recency_window: u32,
+    ) -> Self {
+        Self::Raytracing(RaytracingBackendSpec { voxel_size, max_range, ray_subsample, shadow_depth, grace_depth, min_health, max_health, graze_cos, recency_window })
+    }
+
+    #[doc(hidden)]
+    pub fn from_env(selected: MappingBackendKind) -> Result<Self, String> {
         match selected {
-            MappingBackend::Voxel => Ok(Self::Voxel),
-            MappingBackend::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?)),
+            MappingBackendKind::Voxel => Ok(Self::Voxel),
+            MappingBackendKind::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?)),
         }
     }
 

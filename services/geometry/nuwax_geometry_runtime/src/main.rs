@@ -387,7 +387,10 @@ impl StartupPreflight {
         let owner_profile = owner_profile::OwnerProfile::from_env()
             .map_err(|error| format!("invalid Geometry owner profile: {error}"))?;
         let mapping_backend =
-            mapping_backend::MappingBackendSpec::from_env(owner_profile.mapping())?;
+            mapping_backend::MappingBackendSpec::from_env(match owner_profile.mapping() {
+                owner_profile::MappingBackend::Voxel => mapping_backend::MappingBackendKind::Voxel,
+                owner_profile::MappingBackend::Raytracing => mapping_backend::MappingBackendKind::Raytracing,
+            })?;
         owner_profile
             .admit_production()
             .map_err(|error| error.to_string())?;

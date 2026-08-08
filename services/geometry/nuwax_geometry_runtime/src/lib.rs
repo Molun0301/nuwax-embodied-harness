@@ -1,6 +1,14 @@
 //! Geometry 可复用库入口。
 
+#[doc(hidden)]
+pub mod mapping_backend;
 mod offline_replay;
+mod offline_replay_owner;
+
+#[doc(hidden)]
+pub mod __offline_replay_internal {
+    pub use super::offline_replay_owner::{GeometryOfflineReplayOwner, OfflineGeometrySnapshotV1, OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1};
+}
 
 pub use offline_replay::{
     OfflineBackendConfigV1, OfflineBackendKind, OfflineGeometryFacade, OfflineGeoreferenceV1,

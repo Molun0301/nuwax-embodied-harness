@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于 Python 网关）"
 
+[lib]
+path = "src/lib.rs"
+
 # 依赖来源：nuwax-workspace LCM-first Rust 栈
 # 路径：本仓 repo-local `services/nuwax-workspace`（Phase 1,2026-07-07 已并入）
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。

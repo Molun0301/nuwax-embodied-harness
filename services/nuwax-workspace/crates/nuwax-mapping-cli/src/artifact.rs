@@ -59,8 +59,9 @@ impl MapBundleStageReaper {
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging has no name"))?
             .as_bytes();
-        let staging_name = CString::new(staging_name_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL"))?;
+        let staging_name = CString::new(staging_name_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL")
+        })?;
         let member = |name: &[u8]| -> io::Result<CString> {
             let mut relative = staging_name_bytes.to_vec();
             relative.push(b'/');
@@ -104,19 +105,11 @@ impl MapBundleStageReaper {
                 close(ready_fds[0]);
                 setsid();
                 let ready = 1_u8;
-                write(
-                    ready_fds[1],
-                    (&ready as *const u8).cast::<c_void>(),
-                    1,
-                );
+                write(ready_fds[1], (&ready as *const u8).cast::<c_void>(), 1);
                 close(ready_fds[1]);
                 let mut disarm = 0_u8;
                 let received = loop {
-                    let result = read(
-                        pipe_fds[0],
-                        (&mut disarm as *mut u8).cast::<c_void>(),
-                        1,
-                    );
+                    let result = read(pipe_fds[0], (&mut disarm as *mut u8).cast::<c_void>(), 1);
                     if result >= 0
                         || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
                     {
@@ -125,10 +118,10 @@ impl MapBundleStageReaper {
                 };
                 close(pipe_fds[0]);
                 if received == 0 {
-                    for member in &members {
-                        unlinkat(parent_directory.as_raw_fd(), member.as_ptr(), 0);
-                    }
-                    unlinkat(
+                    // 子进程兜底时必须递归清理整个 staging，不能只删除固定成员；
+                    // 生成器可能写入任意嵌套目录。父进程仍以常规路径完成同一清理。
+                    let _ = std::fs::remove_dir_all(staging);
+                    let _ = unlinkat(
                         parent_directory.as_raw_fd(),
                         staging_name.as_ptr(),
                         AT_REMOVEDIR,
@@ -142,11 +135,7 @@ impl MapBundleStageReaper {
             close(pipe_fds[0]);
             close(ready_fds[1]);
             let mut ready = 0_u8;
-            let received = read(
-                ready_fds[0],
-                (&mut ready as *mut u8).cast::<c_void>(),
-                1,
-            );
+            let received = read(ready_fds[0], (&mut ready as *mut u8).cast::<c_void>(), 1);
             close(ready_fds[0]);
             if received != 1 || ready != 1 {
                 close(pipe_fds[1]);
@@ -180,11 +169,7 @@ impl Drop for MapBundleStageReaper {
         unsafe {
             if !self.armed {
                 let disarm = 1_u8;
-                write(
-                    self.control_fd,
-                    (&disarm as *const u8).cast::<c_void>(),
-                    1,
-                );
+                write(self.control_fd, (&disarm as *const u8).cast::<c_void>(), 1);
             }
             close(self.control_fd);
         }
@@ -468,6 +453,61 @@ pub struct OfflineCheckpointBindingV1 {
     pub selector_path: String,
 }
 
+/// Geometry 导出的 `OfflineCandidateAssetsV1` 的 CLI 侧类型镜像。
+/// 该 DTO（数据传输对象）不依赖 geometry crate，可由边界层显式物化为发布合同。
+#[derive(Clone, Debug)]
+pub struct OfflineCandidateAssetsV1Dto {
+    pub schema_version: u32,
+    pub snapshot_schema_version: u32,
+    pub map_name: String,
+    pub map_frame_id: String,
+    pub backend_kind: String,
+    pub barrier_identity_json: Vec<u8>,
+    pub members: Vec<OfflineCandidateAssetMemberV1Dto>,
+    pub checkpoint: OfflineCheckpointBindingV1,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfflineCandidateAssetMemberV1Dto {
+    pub relative_path_intent: String,
+    pub media_type: String,
+    pub encoding: OfflineMemberEncodingV1,
+    pub bytes: Vec<u8>,
+    pub size_bytes: u64,
+    pub sha256_hex: String,
+    pub source_binding: String,
+}
+
+impl OfflineCandidateAssetsV1Dto {
+    /// 将 Stage3 字段形状物化为 Stage4 发布器内部合同。
+    pub fn into_publish_bundle(self) -> anyhow::Result<OfflineCandidateBundleV1> {
+        if self.schema_version != 1 || self.snapshot_schema_version != 2 {
+            bail!("unsupported OfflineCandidateAssetsV1 schema");
+        }
+        Ok(OfflineCandidateBundleV1 {
+            schema_version: self.schema_version,
+            map_name: self.map_name,
+            frame_id: self.map_frame_id,
+            backend_kind: self.backend_kind,
+            barrier_identity_json: self.barrier_identity_json,
+            members: self
+                .members
+                .into_iter()
+                .map(|member| OfflineCandidateMemberV1 {
+                    relative_path: member.relative_path_intent,
+                    media_type: member.media_type,
+                    encoding: member.encoding,
+                    bytes: member.bytes,
+                    size_bytes: member.size_bytes,
+                    sha256_hex: member.sha256_hex,
+                    source_binding: member.source_binding,
+                })
+                .collect(),
+            checkpoint: self.checkpoint,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OfflineCandidateBundleV1 {
     pub schema_version: u32,
@@ -504,7 +544,9 @@ pub fn publish_offline_candidate_bundle(
 }
 
 fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
-    if candidate.schema_version != 1 || !matches!(candidate.backend_kind.as_str(), "voxel" | "raytracing") {
+    if candidate.schema_version != 1
+        || !matches!(candidate.backend_kind.as_str(), "voxel" | "raytracing")
+    {
         bail!("invalid Stage4 candidate schema or backend kind");
     }
     let barrier: Value = serde_json::from_slice(&candidate.barrier_identity_json)
@@ -515,39 +557,84 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
     let mut paths = BTreeSet::new();
     for member in &candidate.members {
         validate_relative_path(&member.relative_path)?;
-        if !paths.insert(member.relative_path.clone()) { bail!("duplicate candidate path"); }
-        if member.size_bytes != member.bytes.len() as u64 || member.sha256_hex != digest_hex(&member.bytes) {
-            bail!("candidate receipt does not match bytes: {}", member.relative_path);
+        if !paths.insert(member.relative_path.clone()) {
+            bail!("duplicate candidate path");
+        }
+        if member.size_bytes != member.bytes.len() as u64
+            || member.sha256_hex != digest_hex(&member.bytes)
+        {
+            bail!(
+                "candidate receipt does not match bytes: {}",
+                member.relative_path
+            );
         }
     }
-    let checkpoint = candidate.members.iter().find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+    let mut checkpoint_iter = candidate
+        .members
+        .iter()
+        .filter(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject);
+    let checkpoint = checkpoint_iter
+        .next()
         .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
+    if checkpoint_iter.next().is_some() {
+        bail!("candidate has more than one checkpoint object");
+    }
     if checkpoint.relative_path != candidate.checkpoint.object_path
         || checkpoint.size_bytes != candidate.checkpoint.object_size_bytes
-        || checkpoint.sha256_hex != candidate.checkpoint.object_sha256_hex { bail!("checkpoint binding mismatch"); }
+        || checkpoint.sha256_hex != candidate.checkpoint.object_sha256_hex
+    {
+        bail!("checkpoint binding mismatch");
+    }
     validate_relative_path(&candidate.checkpoint.manifest_path)?;
     validate_relative_path(&candidate.checkpoint.selector_path)?;
-    if paths.contains(&candidate.checkpoint.manifest_path) || paths.contains(&candidate.checkpoint.selector_path) {
-        bail!("candidate reserves generated checkpoint paths");
+    if candidate.checkpoint.manifest_path == candidate.checkpoint.selector_path
+        || candidate.checkpoint.manifest_path == "manifest.json"
+        || candidate.checkpoint.selector_path == "manifest.json"
+        || paths.contains(&candidate.checkpoint.manifest_path)
+        || paths.contains(&candidate.checkpoint.selector_path)
+    {
+        bail!("candidate reserves conflicting generated checkpoint paths");
     }
     Ok(())
 }
 
 fn validate_relative_path(path: &str) -> anyhow::Result<()> {
     let p = Path::new(path);
-    if path.is_empty() || p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+    if path.is_empty()
+        || p.is_absolute()
+        || p.components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
         bail!("invalid relative candidate path: {path}");
     }
     Ok(())
 }
 
-fn materialize_offline_candidate(staging: &Path, candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
+fn write_synced_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn materialize_offline_candidate(
+    staging: &Path,
+    candidate: &OfflineCandidateBundleV1,
+) -> anyhow::Result<()> {
     for member in &candidate.members {
         let path = staging.join(&member.relative_path);
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         write_synced_file(&path, &member.bytes)?;
     }
-    let object = candidate.members.iter().find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject).unwrap();
+    let object = candidate
+        .members
+        .iter()
+        .find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+        .unwrap();
     let manifest_path = staging.join(&candidate.checkpoint.manifest_path);
     let selector_path = staging.join(&candidate.checkpoint.selector_path);
     let manifest = canonical_json_value(&json!({
@@ -570,39 +657,214 @@ fn materialize_offline_candidate(staging: &Path, candidate: &OfflineCandidateBun
         "checkpoint": {"selector_path": candidate.checkpoint.selector_path, "manifest_path": candidate.checkpoint.manifest_path,
             "object_path": object.relative_path, "manifest_sha256": digest_hex(&manifest), "object_sha256": object.sha256_hex}
     }))?;
-    write_synced_file(&staging.join("manifest.json"), &top)
+    write_synced_file(&staging.join("manifest.json"), &top)?;
+    Ok(())
 }
 
 fn collect_regular_files(root: &Path) -> anyhow::Result<Vec<Value>> {
     let mut paths = Vec::new();
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
-        for entry in fs::read_dir(dir)? { let entry = entry?; let path = entry.path(); let ft = entry.file_type()?;
-            if ft.is_symlink() { bail!("symlink in candidate staging"); }
-            if ft.is_dir() { walk(root, &path, out)?; } else if ft.is_file() {
-                let rel = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
-                if rel != "manifest.json" { out.push(rel); }
-            } else { bail!("unsupported candidate filesystem entry"); }
-        } Ok(())
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                bail!("symlink in candidate staging");
+            }
+            if ft.is_dir() {
+                walk(root, &path, out)?;
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel != "manifest.json" {
+                    out.push(rel);
+                }
+            } else {
+                bail!("unsupported candidate filesystem entry");
+            }
+        }
+        Ok(())
     }
-    walk(root, root, &mut paths)?; paths.sort();
-    paths.into_iter().map(|rel| { let p = root.join(&rel); let bytes = fs::read(&p)?; Ok(json!({"path": rel, "size": bytes.len(), "sha256": digest_hex(&bytes)})) }).collect()
+    walk(root, root, &mut paths)?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|rel| {
+            let p = root.join(&rel);
+            let bytes = fs::read(&p)?;
+            Ok(json!({"path": rel, "size": bytes.len(), "sha256": digest_hex(&bytes)}))
+        })
+        .collect()
 }
 
-fn validate_offline_candidate_directory(root: &Path, candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
-    for member in &candidate.members { let bytes = fs::read(root.join(&member.relative_path))?; if bytes.len() as u64 != member.size_bytes || digest_hex(&bytes) != member.sha256_hex { bail!("fresh validation failed: {}", member.relative_path); } }
-    let _ = fs::read(root.join(&candidate.checkpoint.selector_path))?;
-    let _ = fs::read(root.join(&candidate.checkpoint.manifest_path))?;
-    let _ = fs::read(root.join("manifest.json"))?;
+fn validate_offline_candidate_directory(
+    root: &Path,
+    candidate: &OfflineCandidateBundleV1,
+) -> anyhow::Result<()> {
+    // 每次验证都以新鲜 FD 打开最终 staging inode，并复核完整的 JSON 绑定链。
+    let mut expected = BTreeSet::new();
+    for member in &candidate.members {
+        expected.insert(member.relative_path.clone());
+        validate_open_file(
+            root,
+            &member.relative_path,
+            member.size_bytes,
+            &member.sha256_hex,
+        )?;
+    }
+    let object = candidate
+        .members
+        .iter()
+        .find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+        .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
+    expected.insert(candidate.checkpoint.selector_path.clone());
+    expected.insert(candidate.checkpoint.manifest_path.clone());
+
+    let manifest_bytes = read_fresh_file(root, &candidate.checkpoint.manifest_path)?;
+    let manifest: Value =
+        serde_json::from_slice(&manifest_bytes).context("checkpoint manifest is not JSON")?;
+    if canonical_json_value(&manifest)? != manifest_bytes {
+        bail!("checkpoint manifest is not canonical JSON");
+    }
+    if manifest.get("schema_version") != Some(&json!(1))
+        || manifest.get("backend_kind") != Some(&json!(candidate.backend_kind))
+        || manifest.pointer("/object/path").and_then(Value::as_str) != Some(&object.relative_path)
+        || manifest.pointer("/object/size").and_then(Value::as_u64) != Some(object.size_bytes)
+        || manifest.pointer("/object/sha256").and_then(Value::as_str)
+            != Some(object.sha256_hex.as_str())
+    {
+        bail!("checkpoint manifest binding mismatch");
+    }
+
+    let selector_bytes = read_fresh_file(root, &candidate.checkpoint.selector_path)?;
+    let selector: Value =
+        serde_json::from_slice(&selector_bytes).context("checkpoint selector is not JSON")?;
+    if canonical_json_value(&selector)? != selector_bytes
+        || selector.get("schema_version") != Some(&json!(1))
+        || selector.get("backend_kind") != Some(&json!(candidate.backend_kind))
+        || selector.pointer("/manifest/path").and_then(Value::as_str)
+            != Some(&candidate.checkpoint.manifest_path)
+        || selector.pointer("/manifest/sha256").and_then(Value::as_str)
+            != Some(&digest_hex(&manifest_bytes))
+    {
+        bail!("checkpoint selector binding mismatch");
+    }
+
+    let top_bytes = read_fresh_file(root, "manifest.json")?;
+    let top: Value =
+        serde_json::from_slice(&top_bytes).context("top-level manifest is not JSON")?;
+    if canonical_json_value(&top)? != top_bytes
+        || top.get("schema_version") != Some(&json!(1))
+        || top.get("map_name") != Some(&json!(candidate.map_name))
+        || top.get("frame_id") != Some(&json!(candidate.frame_id))
+        || top.get("backend_kind") != Some(&json!(candidate.backend_kind))
+        || top
+            .pointer("/checkpoint/selector_path")
+            .and_then(Value::as_str)
+            != Some(&candidate.checkpoint.selector_path)
+        || top
+            .pointer("/checkpoint/manifest_path")
+            .and_then(Value::as_str)
+            != Some(&candidate.checkpoint.manifest_path)
+        || top
+            .pointer("/checkpoint/object_path")
+            .and_then(Value::as_str)
+            != Some(&object.relative_path)
+        || top
+            .pointer("/checkpoint/manifest_sha256")
+            .and_then(Value::as_str)
+            != Some(&digest_hex(&manifest_bytes))
+        || top
+            .pointer("/checkpoint/object_sha256")
+            .and_then(Value::as_str)
+            != Some(object.sha256_hex.as_str())
+    {
+        bail!("top-level manifest binding mismatch");
+    }
+
+    let listed = top
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("top-level files is not an array"))?;
+    let mut listed_paths = BTreeSet::new();
+    for entry in listed {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file entry"))?;
+        let size = entry
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file size"))?;
+        let sha = entry
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file digest"))?;
+        if !listed_paths.insert(path.to_owned())
+            || !expected.contains(path)
+            || path == "manifest.json"
+        {
+            bail!("invalid top-level file set");
+        }
+        validate_open_file(root, path, size, sha)?;
+    }
+    if listed_paths != expected {
+        bail!("top-level file set does not match candidate");
+    }
+    Ok(())
+}
+
+fn read_fresh_file(root: &Path, relative: &str) -> anyhow::Result<Vec<u8>> {
+    let mut file = File::open(root.join(relative))?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn validate_open_file(
+    root: &Path,
+    relative: &str,
+    expected_size: u64,
+    expected_sha: &str,
+) -> anyhow::Result<()> {
+    let bytes = read_fresh_file(root, relative)?;
+    if bytes.len() as u64 != expected_size || digest_hex(&bytes) != expected_sha {
+        bail!("fresh validation failed: {relative}");
+    }
     Ok(())
 }
 
 fn canonical_json_value(value: &Value) -> anyhow::Result<Vec<u8>> {
-    fn sort(value: &Value) -> Value { match value { Value::Object(m) => { let mut keys: Vec<_> = m.keys().collect(); keys.sort(); let mut out = Map::new(); for k in keys { out.insert(k.clone(), sort(&m[k])); } Value::Object(out) }, Value::Array(a) => Value::Array(a.iter().map(sort).collect()), _ => value.clone() } }
-    let mut bytes = serde_json::to_vec(&sort(value))?; bytes.push(b'\n'); Ok(bytes)
+    fn sort(value: &Value) -> Value {
+        match value {
+            Value::Object(m) => {
+                let mut keys: Vec<_> = m.keys().collect();
+                keys.sort();
+                let mut out = Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sort(&m[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sort).collect()),
+            _ => value.clone(),
+        }
+    }
+    let mut bytes = serde_json::to_vec(&sort(value))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    // CLI 只依赖 workspace 已声明的 nuwax-codec，不耦合 geometry crate。
+    nuwax_codec::sha256_bytes(bytes)
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
-    nuwax_codec::sha256_bytes(bytes)
+    sha256_bytes(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -788,8 +1050,9 @@ fn recover_stale_map_bundle_stages(
     for entry in fs::read_dir(parent)
         .with_context(|| format!("scan map bundle staging for {}", final_directory.display()))?
     {
-        let entry = entry
-            .with_context(|| format!("scan map bundle staging for {}", final_directory.display()))?;
+        let entry = entry.with_context(|| {
+            format!("scan map bundle staging for {}", final_directory.display())
+        })?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -809,7 +1072,10 @@ fn recover_stale_map_bundle_stages(
         if recovery_policy.owner_is_proven_dead(owner) {
             let metadata = fs::symlink_metadata(&staging)?;
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                bail!("map bundle staging is not a real directory: {}", staging.display());
+                bail!(
+                    "map bundle staging is not a real directory: {}",
+                    staging.display()
+                );
             }
             cleanup_map_bundle_staging_io(parent, &staging).with_context(|| {
                 format!("recover stale map bundle staging {}", staging.display())
@@ -842,7 +1108,17 @@ fn cleanup_map_bundle_staging_io(parent: &Path, staging: &Path) -> io::Result<()
 }
 
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
-    sync_directory_io(path).with_context(|| format!("sync directory {}", path.display()))
+    sync_directory_tree(path).with_context(|| format!("sync directory tree {}", path.display()))
+}
+
+fn sync_directory_tree(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_directory_tree(&entry.path())?;
+        }
+    }
+    sync_directory_io(root)
 }
 
 fn sync_directory_io(path: &Path) -> io::Result<()> {

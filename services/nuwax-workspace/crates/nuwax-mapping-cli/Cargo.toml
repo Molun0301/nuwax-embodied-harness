@@ -37,6 +37,7 @@ nuwax-mapping-cloud = { path = "../nuwax-mapping-cloud" }
 # nuwax-mapping-raytracing = { path = "../nuwax-mapping-raytracing", optional = true }
 nuwax-protocol = { path = "../nuwax-protocol" }
 nuwax-types = { path = "../nuwax-types" }
+nuwax-codec = { path = "../nuwax-codec" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

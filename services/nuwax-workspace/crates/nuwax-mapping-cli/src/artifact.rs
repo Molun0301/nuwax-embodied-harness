@@ -5,7 +5,7 @@
 //! staging file beside the destination makes the publication boundary stay on
 //! one filesystem.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, Metadata};
@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
+use serde_json::{json, Map, Value};
 
 const STAGE_DOMAIN: &str = ".nuwax-mapping-cli-stage-v1-";
 const BUNDLE_STAGE_DOMAIN: &str = ".nuwax-mapping-cli-map-bundle-v1-";
@@ -438,6 +439,173 @@ impl std::error::Error for MapBundlePublicationError {
             Self::Conflict { cleanup: None, .. } => None,
         }
     }
+}
+
+/// Stage4 候选资产的最小、与 geometry 解耦的适配 DTO。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineCandidateMemberV1 {
+    pub relative_path: String,
+    pub media_type: String,
+    pub encoding: OfflineMemberEncodingV1,
+    pub bytes: Vec<u8>,
+    pub size_bytes: u64,
+    pub sha256_hex: String,
+    pub source_binding: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfflineMemberEncodingV1 {
+    Raw,
+    CheckpointObject,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfflineCheckpointBindingV1 {
+    pub object_path: String,
+    pub object_size_bytes: u64,
+    pub object_sha256_hex: String,
+    pub manifest_path: String,
+    pub selector_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfflineCandidateBundleV1 {
+    pub schema_version: u32,
+    pub map_name: String,
+    pub frame_id: String,
+    pub backend_kind: String,
+    pub barrier_identity_json: Vec<u8>,
+    pub members: Vec<OfflineCandidateMemberV1>,
+    pub checkpoint: OfflineCheckpointBindingV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflinePublishedBundleV1 {
+    pub final_directory: PathBuf,
+    pub manifest_sha256_hex: String,
+}
+
+/// 物化并发布 Stage4 离线候选；不接入 map 命令，也不生成 Stage5 资产。
+pub fn publish_offline_candidate_bundle(
+    final_directory: &Path,
+    candidate: &OfflineCandidateBundleV1,
+) -> anyhow::Result<OfflinePublishedBundleV1> {
+    validate_offline_candidate(candidate)?;
+    publish_map_bundle(
+        final_directory,
+        |staging| materialize_offline_candidate(staging, candidate),
+        |staging| validate_offline_candidate_directory(staging, candidate),
+    )?;
+    let manifest = fs::read(final_directory.join("manifest.json"))?;
+    Ok(OfflinePublishedBundleV1 {
+        final_directory: final_directory.to_path_buf(),
+        manifest_sha256_hex: digest_hex(&manifest),
+    })
+}
+
+fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
+    if candidate.schema_version != 1 || !matches!(candidate.backend_kind.as_str(), "voxel" | "raytracing") {
+        bail!("invalid Stage4 candidate schema or backend kind");
+    }
+    let barrier: Value = serde_json::from_slice(&candidate.barrier_identity_json)
+        .context("barrier identity is not JSON")?;
+    if canonical_json_value(&barrier)? != candidate.barrier_identity_json {
+        bail!("barrier identity must be canonical JSON");
+    }
+    let mut paths = BTreeSet::new();
+    for member in &candidate.members {
+        validate_relative_path(&member.relative_path)?;
+        if !paths.insert(member.relative_path.clone()) { bail!("duplicate candidate path"); }
+        if member.size_bytes != member.bytes.len() as u64 || member.sha256_hex != digest_hex(&member.bytes) {
+            bail!("candidate receipt does not match bytes: {}", member.relative_path);
+        }
+    }
+    let checkpoint = candidate.members.iter().find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+        .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
+    if checkpoint.relative_path != candidate.checkpoint.object_path
+        || checkpoint.size_bytes != candidate.checkpoint.object_size_bytes
+        || checkpoint.sha256_hex != candidate.checkpoint.object_sha256_hex { bail!("checkpoint binding mismatch"); }
+    validate_relative_path(&candidate.checkpoint.manifest_path)?;
+    validate_relative_path(&candidate.checkpoint.selector_path)?;
+    if paths.contains(&candidate.checkpoint.manifest_path) || paths.contains(&candidate.checkpoint.selector_path) {
+        bail!("candidate reserves generated checkpoint paths");
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &str) -> anyhow::Result<()> {
+    let p = Path::new(path);
+    if path.is_empty() || p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        bail!("invalid relative candidate path: {path}");
+    }
+    Ok(())
+}
+
+fn materialize_offline_candidate(staging: &Path, candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
+    for member in &candidate.members {
+        let path = staging.join(&member.relative_path);
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        write_synced_file(&path, &member.bytes)?;
+    }
+    let object = candidate.members.iter().find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject).unwrap();
+    let manifest_path = staging.join(&candidate.checkpoint.manifest_path);
+    let selector_path = staging.join(&candidate.checkpoint.selector_path);
+    let manifest = canonical_json_value(&json!({
+        "schema_version": 1, "backend_kind": candidate.backend_kind,
+        "barrier_identity": serde_json::from_slice::<Value>(&candidate.barrier_identity_json)?,
+        "object": {"path": object.relative_path, "size": object.size_bytes, "sha256": object.sha256_hex}
+    }))?;
+    write_synced_file(&manifest_path, &manifest)?;
+    let selector = canonical_json_value(&json!({
+        "schema_version": 1, "backend_kind": candidate.backend_kind,
+        "manifest": {"path": candidate.checkpoint.manifest_path, "sha256": digest_hex(&manifest)}
+    }))?;
+    write_synced_file(&selector_path, &selector)?;
+    let files = collect_regular_files(staging)?;
+    let top = canonical_json_value(&json!({
+        "schema_version": 1, "map_name": candidate.map_name, "frame_id": candidate.frame_id,
+        "backend_kind": candidate.backend_kind,
+        "barrier_identity": serde_json::from_slice::<Value>(&candidate.barrier_identity_json)?,
+        "files": files,
+        "checkpoint": {"selector_path": candidate.checkpoint.selector_path, "manifest_path": candidate.checkpoint.manifest_path,
+            "object_path": object.relative_path, "manifest_sha256": digest_hex(&manifest), "object_sha256": object.sha256_hex}
+    }))?;
+    write_synced_file(&staging.join("manifest.json"), &top)
+}
+
+fn collect_regular_files(root: &Path) -> anyhow::Result<Vec<Value>> {
+    let mut paths = Vec::new();
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(dir)? { let entry = entry?; let path = entry.path(); let ft = entry.file_type()?;
+            if ft.is_symlink() { bail!("symlink in candidate staging"); }
+            if ft.is_dir() { walk(root, &path, out)?; } else if ft.is_file() {
+                let rel = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+                if rel != "manifest.json" { out.push(rel); }
+            } else { bail!("unsupported candidate filesystem entry"); }
+        } Ok(())
+    }
+    walk(root, root, &mut paths)?; paths.sort();
+    paths.into_iter().map(|rel| { let p = root.join(&rel); let bytes = fs::read(&p)?; Ok(json!({"path": rel, "size": bytes.len(), "sha256": digest_hex(&bytes)})) }).collect()
+}
+
+fn validate_offline_candidate_directory(root: &Path, candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
+    for member in &candidate.members { let bytes = fs::read(root.join(&member.relative_path))?; if bytes.len() as u64 != member.size_bytes || digest_hex(&bytes) != member.sha256_hex { bail!("fresh validation failed: {}", member.relative_path); } }
+    let _ = fs::read(root.join(&candidate.checkpoint.selector_path))?;
+    let _ = fs::read(root.join(&candidate.checkpoint.manifest_path))?;
+    let _ = fs::read(root.join("manifest.json"))?;
+    Ok(())
+}
+
+fn canonical_json_value(value: &Value) -> anyhow::Result<Vec<u8>> {
+    fn sort(value: &Value) -> Value { match value { Value::Object(m) => { let mut keys: Vec<_> = m.keys().collect(); keys.sort(); let mut out = Map::new(); for k in keys { out.insert(k.clone(), sort(&m[k])); } Value::Object(out) }, Value::Array(a) => Value::Array(a.iter().map(sort).collect()), _ => value.clone() } }
+    let mut bytes = serde_json::to_vec(&sort(value))?; bytes.push(b'\n'); Ok(bytes)
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    nuwax_codec::sha256_bytes(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub(crate) fn publish_map_bundle<B, V>(

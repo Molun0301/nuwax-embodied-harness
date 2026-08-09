@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,192 +25,10 @@ const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "linux")]
-struct MapBundleStageReaper {
-    child_pid: i32,
-    control_fd: i32,
-    armed: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl MapBundleStageReaper {
-    fn arm(parent: &Path, staging: &Path) -> io::Result<Self> {
-        use std::ffi::CString;
-        use std::os::fd::AsRawFd;
-        use std::os::raw::{c_char, c_int, c_void};
-        use std::os::unix::ffi::OsStrExt;
-
-        const O_CLOEXEC: c_int = 0o2000000;
-        const AT_REMOVEDIR: c_int = 0x200;
-        extern "C" {
-            fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
-            fn fork() -> c_int;
-            fn setsid() -> c_int;
-            fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
-            fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
-            fn close(fd: c_int) -> c_int;
-            fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
-            fn fsync(fd: c_int) -> c_int;
-            fn _exit(status: c_int) -> !;
-        }
-
-        let parent_directory = File::open(parent)?;
-        let staging_name_bytes = staging
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging has no name"))?
-            .as_bytes();
-        let staging_name = CString::new(staging_name_bytes).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "staging name contains NUL")
-        })?;
-        let member = |name: &[u8]| -> io::Result<CString> {
-            let mut relative = staging_name_bytes.to_vec();
-            relative.push(b'/');
-            relative.extend_from_slice(name);
-            CString::new(relative).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "staging member contains NUL")
-            })
-        };
-        let members = [
-            member(b"manifest.json")?,
-            member(b"asset.json")?,
-            member(b"map.pgm")?,
-        ];
-        let mut pipe_fds = [-1, -1];
-        let mut ready_fds = [-1, -1];
-        if unsafe { pipe2(pipe_fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { pipe2(ready_fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                close(pipe_fds[0]);
-                close(pipe_fds[1]);
-            }
-            return Err(error);
-        }
-        let child_pid = unsafe { fork() };
-        if child_pid < 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                close(pipe_fds[0]);
-                close(pipe_fds[1]);
-                close(ready_fds[0]);
-                close(ready_fds[1]);
-            }
-            return Err(error);
-        }
-        if child_pid == 0 {
-            unsafe {
-                close(pipe_fds[1]);
-                close(ready_fds[0]);
-                setsid();
-                let ready = 1_u8;
-                write(ready_fds[1], (&ready as *const u8).cast::<c_void>(), 1);
-                close(ready_fds[1]);
-                let mut disarm = 0_u8;
-                let received = loop {
-                    let result = read(pipe_fds[0], (&mut disarm as *mut u8).cast::<c_void>(), 1);
-                    if result >= 0
-                        || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
-                    {
-                        break result;
-                    }
-                };
-                close(pipe_fds[0]);
-                if received == 0 {
-                    // 子进程兜底时必须递归清理整个 staging，不能只删除固定成员；
-                    // 生成器可能写入任意嵌套目录。父进程仍以常规路径完成同一清理。
-                    let _ = std::fs::remove_dir_all(staging);
-                    let _ = unlinkat(
-                        parent_directory.as_raw_fd(),
-                        staging_name.as_ptr(),
-                        AT_REMOVEDIR,
-                    );
-                    fsync(parent_directory.as_raw_fd());
-                }
-                _exit(0);
-            }
-        }
-        unsafe {
-            close(pipe_fds[0]);
-            close(ready_fds[1]);
-            let mut ready = 0_u8;
-            let received = read(ready_fds[0], (&mut ready as *mut u8).cast::<c_void>(), 1);
-            close(ready_fds[0]);
-            if received != 1 || ready != 1 {
-                close(pipe_fds[1]);
-                wait_for_reaper(child_pid);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "map bundle staging reaper did not become ready",
-                ));
-            }
-        }
-        Ok(Self {
-            child_pid,
-            control_fd: pipe_fds[1],
-            armed: true,
-        })
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for MapBundleStageReaper {
-    fn drop(&mut self) {
-        use std::os::raw::{c_int, c_void};
-        extern "C" {
-            fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
-            fn close(fd: c_int) -> c_int;
-        }
-        unsafe {
-            if !self.armed {
-                let disarm = 1_u8;
-                write(self.control_fd, (&disarm as *const u8).cast::<c_void>(), 1);
-            }
-            close(self.control_fd);
-        }
-        wait_for_reaper(self.child_pid);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_reaper(child_pid: i32) {
-    use std::os::raw::c_int;
-    extern "C" {
-        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-    }
-    loop {
-        let waited = unsafe { waitpid(child_pid, std::ptr::null_mut(), 0) };
-        if waited == child_pid
-            || waited < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
-        {
-            break;
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-struct MapBundleStageReaper;
-
-#[cfg(not(target_os = "linux"))]
-impl MapBundleStageReaper {
-    fn arm(_parent: &Path, _staging: &Path) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "map bundle forced-termination cleanup requires Linux",
-        ))
-    }
-
-    fn disarm(&mut self) {}
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArtifactFormat {
     DatasetJsonLines,
+    #[allow(dead_code)]
     MapPgm,
     ReplayJson,
     MarkerReplayJson,
@@ -373,13 +191,13 @@ pub(crate) enum MapBundlePublicationError {
         path: PathBuf,
         cleanup: Option<ArtifactCleanupFailure>,
     },
-    DurabilityUnknown {
-        path: PathBuf,
-        source: io::Error,
-    },
     CleanupFailure {
         path: PathBuf,
         cleanup: ArtifactCleanupFailure,
+    },
+    DurabilityUnknown {
+        path: PathBuf,
+        source: io::Error,
     },
 }
 
@@ -397,16 +215,17 @@ impl fmt::Display for MapBundlePublicationError {
                 }
                 Ok(())
             }
+            Self::CleanupFailure { path, cleanup } => write!(
+                formatter,
+                "map bundle {} failed and staging cleanup also failed: {}",
+                path.display(),
+                cleanup
+            ),
             Self::DurabilityUnknown { path, source } => write!(
                 formatter,
                 "map bundle {} is visible and validated, but publication durability is unknown: {}",
                 path.display(),
                 source
-            ),
-            Self::CleanupFailure { path, cleanup } => write!(
-                formatter,
-                "map bundle {} was not published, but {cleanup}",
-                path.display()
             ),
         }
     }
@@ -418,30 +237,53 @@ impl std::error::Error for MapBundlePublicationError {
             Self::Conflict {
                 cleanup: Some(cleanup),
                 ..
-            }
-            | Self::CleanupFailure { cleanup, .. } => Some(cleanup),
+            } => Some(cleanup),
+            Self::CleanupFailure { cleanup, .. } => Some(cleanup),
             Self::DurabilityUnknown { source, .. } => Some(source),
             Self::Conflict { cleanup: None, .. } => None,
         }
     }
 }
 
-/// Stage4 候选资产的最小、与 geometry 解耦的适配 DTO。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OfflineCandidateMemberV1 {
-    pub relative_path: String,
+/// Stage3 权威候选资产的 CLI 边界镜像。复杂字段以 canonical JSON bytes
+/// 传递，避免 CLI 依赖 Geometry crate，同时保证 Stage5 所需字段逐一保真。
+#[derive(Clone, Debug)]
+pub struct OfflineCandidateAssetsV1Dto {
+    pub schema_version: u32,
+    pub snapshot_schema_version: u32,
+    pub identity_json: Vec<u8>,
+    pub backend_kind: String,
+    pub last_source_timestamp_ns: u64,
+    pub georeference_json: Vec<u8>,
+    pub processing_receipt_json: Vec<u8>,
+    pub map_snapshot_seed_json: Vec<u8>,
+    pub deferred_json: Vec<u8>,
+    pub members: Vec<OfflineCandidateAssetMemberV1Dto>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OfflineCandidateAssetMemberV1Dto {
+    pub relative_path_intent: String,
     pub media_type: String,
-    pub encoding: OfflineMemberEncodingV1,
+    pub encoding: String,
     pub bytes: Vec<u8>,
+    pub receipt_relative_path_intent: String,
+    pub receipt_media_type: String,
+    pub receipt_encoding: String,
     pub size_bytes: u64,
     pub sha256_hex: String,
     pub source_binding: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OfflineMemberEncodingV1 {
-    Raw,
-    CheckpointObject,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineCandidateMemberV1 {
+    pub relative_path: String,
+    pub media_type: String,
+    pub encoding: String,
+    pub bytes: Vec<u8>,
+    pub size_bytes: u64,
+    pub sha256_hex: String,
+    pub source_binding: String,
 }
 
 #[derive(Clone, Debug)]
@@ -453,47 +295,54 @@ pub struct OfflineCheckpointBindingV1 {
     pub selector_path: String,
 }
 
-/// Geometry 导出的 `OfflineCandidateAssetsV1` 的 CLI 侧类型镜像。
-/// 该 DTO（数据传输对象）不依赖 geometry crate，可由边界层显式物化为发布合同。
-#[derive(Clone, Debug)]
-pub struct OfflineCandidateAssetsV1Dto {
-    pub schema_version: u32,
-    pub snapshot_schema_version: u32,
-    pub map_name: String,
-    pub map_frame_id: String,
-    pub backend_kind: String,
-    pub barrier_identity_json: Vec<u8>,
-    pub members: Vec<OfflineCandidateAssetMemberV1Dto>,
-    pub checkpoint: OfflineCheckpointBindingV1,
-}
-
-#[derive(Clone, Debug)]
-pub struct OfflineCandidateAssetMemberV1Dto {
-    pub relative_path_intent: String,
-    pub media_type: String,
-    pub encoding: OfflineMemberEncodingV1,
-    pub bytes: Vec<u8>,
-    pub size_bytes: u64,
-    pub sha256_hex: String,
-    pub source_binding: String,
-}
-
 impl OfflineCandidateAssetsV1Dto {
-    /// 将 Stage3 字段形状物化为 Stage4 发布器内部合同。
     pub fn into_publish_bundle(self) -> anyhow::Result<OfflineCandidateBundleV1> {
         if self.schema_version != 1 || self.snapshot_schema_version != 2 {
             bail!("unsupported OfflineCandidateAssetsV1 schema");
         }
-        Ok(OfflineCandidateBundleV1 {
-            schema_version: self.schema_version,
-            map_name: self.map_name,
-            frame_id: self.map_frame_id,
-            backend_kind: self.backend_kind,
-            barrier_identity_json: self.barrier_identity_json,
-            members: self
-                .members
-                .into_iter()
-                .map(|member| OfflineCandidateMemberV1 {
+        let identity = canonical_boundary_json("identity", self.identity_json)?;
+        let georeference = canonical_boundary_json("georeference", self.georeference_json)?;
+        let processing_receipt =
+            canonical_boundary_json("processing_receipt", self.processing_receipt_json)?;
+        let map_snapshot_seed =
+            canonical_boundary_json("map_snapshot_seed", self.map_snapshot_seed_json)?;
+        let deferred = canonical_boundary_json("deferred", self.deferred_json)?;
+        let map_name = identity
+            .get("map_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("identity.map_name is missing"))?
+            .to_owned();
+        let frame_id = identity
+            .get("map_frame_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("identity.map_frame_id is missing"))?
+            .to_owned();
+        let checkpoint_member = self
+            .members
+            .iter()
+            .find(|member| member.encoding == "checkpoint_object_v1")
+            .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
+        let checkpoint = OfflineCheckpointBindingV1 {
+            object_path: checkpoint_member.relative_path_intent.clone(),
+            object_size_bytes: checkpoint_member.size_bytes,
+            object_sha256_hex: checkpoint_member.sha256_hex.clone(),
+            manifest_path: "mapping_backend/checkpoint-manifest.json".to_owned(),
+            selector_path: "mapping_backend/checkpoint-selector.json".to_owned(),
+        };
+        let members = self
+            .members
+            .into_iter()
+            .map(|member| {
+                if member.relative_path_intent != member.receipt_relative_path_intent
+                    || member.media_type != member.receipt_media_type
+                    || member.encoding != member.receipt_encoding
+                {
+                    bail!(
+                        "member and receipt metadata mismatch: {}",
+                        member.relative_path_intent
+                    );
+                }
+                Ok(OfflineCandidateMemberV1 {
                     relative_path: member.relative_path_intent,
                     media_type: member.media_type,
                     encoding: member.encoding,
@@ -502,19 +351,48 @@ impl OfflineCandidateAssetsV1Dto {
                     sha256_hex: member.sha256_hex,
                     source_binding: member.source_binding,
                 })
-                .collect(),
-            checkpoint: self.checkpoint,
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(OfflineCandidateBundleV1 {
+            schema_version: self.schema_version,
+            snapshot_schema_version: self.snapshot_schema_version,
+            map_name,
+            frame_id,
+            backend_kind: self.backend_kind,
+            last_source_timestamp_ns: self.last_source_timestamp_ns,
+            identity_json: canonical_json_value(&identity)?,
+            georeference_json: canonical_json_value(&georeference)?,
+            processing_receipt_json: canonical_json_value(&processing_receipt)?,
+            map_snapshot_seed_json: canonical_json_value(&map_snapshot_seed)?,
+            deferred_json: canonical_json_value(&deferred)?,
+            members,
+            checkpoint,
         })
     }
+}
+
+fn canonical_boundary_json(label: &str, bytes: Vec<u8>) -> anyhow::Result<Value> {
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("{label} is not JSON"))?;
+    if canonical_json_value(&value)? != bytes {
+        bail!("{label} must be canonical JSON");
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug)]
 pub struct OfflineCandidateBundleV1 {
     pub schema_version: u32,
+    pub snapshot_schema_version: u32,
     pub map_name: String,
     pub frame_id: String,
     pub backend_kind: String,
-    pub barrier_identity_json: Vec<u8>,
+    pub last_source_timestamp_ns: u64,
+    pub identity_json: Vec<u8>,
+    pub georeference_json: Vec<u8>,
+    pub processing_receipt_json: Vec<u8>,
+    pub map_snapshot_seed_json: Vec<u8>,
+    pub deferred_json: Vec<u8>,
     pub members: Vec<OfflineCandidateMemberV1>,
     pub checkpoint: OfflineCheckpointBindingV1,
 }
@@ -531,7 +409,7 @@ pub fn publish_offline_candidate_bundle(
     candidate: &OfflineCandidateBundleV1,
 ) -> anyhow::Result<OfflinePublishedBundleV1> {
     validate_offline_candidate(candidate)?;
-    publish_map_bundle(
+    publish_map_bundle_stable(
         final_directory,
         |staging| materialize_offline_candidate(staging, candidate),
         |staging| validate_offline_candidate_directory(staging, candidate),
@@ -545,20 +423,38 @@ pub fn publish_offline_candidate_bundle(
 
 fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::Result<()> {
     if candidate.schema_version != 1
+        || candidate.snapshot_schema_version != 2
         || !matches!(candidate.backend_kind.as_str(), "voxel" | "raytracing")
     {
         bail!("invalid Stage4 candidate schema or backend kind");
     }
-    let barrier: Value = serde_json::from_slice(&candidate.barrier_identity_json)
-        .context("barrier identity is not JSON")?;
-    if canonical_json_value(&barrier)? != candidate.barrier_identity_json {
-        bail!("barrier identity must be canonical JSON");
+    for (label, bytes) in [
+        ("identity", &candidate.identity_json),
+        ("georeference", &candidate.georeference_json),
+        ("processing_receipt", &candidate.processing_receipt_json),
+        ("map_snapshot_seed", &candidate.map_snapshot_seed_json),
+        ("deferred", &candidate.deferred_json),
+    ] {
+        canonical_boundary_json(label, bytes.clone())?;
     }
-    let mut paths = BTreeSet::new();
+    let mut paths = Vec::new();
     for member in &candidate.members {
         validate_relative_path(&member.relative_path)?;
-        if !paths.insert(member.relative_path.clone()) {
-            bail!("duplicate candidate path");
+        let expected_media = match member.encoding.as_str() {
+            "nav2_occupancy_yaml_v1" => ("application/x-yaml", "canonical_raw_occupancy"),
+            "nav2_occupancy_pgm_p5_v1" => ("image/x-portable-graymap", "canonical_raw_occupancy"),
+            "pcd_xyz_binary_v1" => (
+                "application/vnd.pointclouds.pcd",
+                "committed_transformed_accepted_cloud",
+            ),
+            "checkpoint_object_v1" => ("application/octet-stream", "mapping_backend_checkpoint"),
+            _ => bail!("unsupported candidate encoding: {}", member.encoding),
+        };
+        if member.media_type != expected_media.0 || member.source_binding != expected_media.1 {
+            bail!(
+                "candidate media/source binding mismatch: {}",
+                member.relative_path
+            );
         }
         if member.size_bytes != member.bytes.len() as u64
             || member.sha256_hex != digest_hex(&member.bytes)
@@ -568,11 +464,12 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
                 member.relative_path
             );
         }
+        paths.push(member.relative_path.as_str());
     }
     let mut checkpoint_iter = candidate
         .members
         .iter()
-        .filter(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject);
+        .filter(|m| m.encoding == "checkpoint_object_v1");
     let checkpoint = checkpoint_iter
         .next()
         .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
@@ -587,15 +484,29 @@ fn validate_offline_candidate(candidate: &OfflineCandidateBundleV1) -> anyhow::R
     }
     validate_relative_path(&candidate.checkpoint.manifest_path)?;
     validate_relative_path(&candidate.checkpoint.selector_path)?;
-    if candidate.checkpoint.manifest_path == candidate.checkpoint.selector_path
-        || candidate.checkpoint.manifest_path == "manifest.json"
-        || candidate.checkpoint.selector_path == "manifest.json"
-        || paths.contains(&candidate.checkpoint.manifest_path)
-        || paths.contains(&candidate.checkpoint.selector_path)
-    {
-        bail!("candidate reserves conflicting generated checkpoint paths");
+    paths.extend([
+        candidate.checkpoint.manifest_path.as_str(),
+        candidate.checkpoint.selector_path.as_str(),
+        "manifest.json",
+    ]);
+    for (index, left) in paths.iter().enumerate() {
+        for right in paths.iter().skip(index + 1) {
+            if path_conflicts(left, right) {
+                bail!("candidate paths conflict: {left} and {right}");
+            }
+        }
     }
     Ok(())
+}
+
+fn path_conflicts(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|tail| tail.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|tail| tail.starts_with('/'))
 }
 
 fn validate_relative_path(path: &str) -> anyhow::Result<()> {
@@ -633,14 +544,15 @@ fn materialize_offline_candidate(
     let object = candidate
         .members
         .iter()
-        .find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+        .find(|m| m.encoding == "checkpoint_object_v1")
         .unwrap();
     let manifest_path = staging.join(&candidate.checkpoint.manifest_path);
     let selector_path = staging.join(&candidate.checkpoint.selector_path);
     let manifest = canonical_json_value(&json!({
         "schema_version": 1, "backend_kind": candidate.backend_kind,
-        "barrier_identity": serde_json::from_slice::<Value>(&candidate.barrier_identity_json)?,
-        "object": {"path": object.relative_path, "size": object.size_bytes, "sha256": object.sha256_hex}
+        "processing_receipt": serde_json::from_slice::<Value>(&candidate.processing_receipt_json)?,
+        "object": {"path": object.relative_path, "media_type": object.media_type, "encoding": object.encoding,
+            "source_binding": object.source_binding, "size": object.size_bytes, "sha256": object.sha256_hex}
     }))?;
     write_synced_file(&manifest_path, &manifest)?;
     let selector = canonical_json_value(&json!({
@@ -648,11 +560,47 @@ fn materialize_offline_candidate(
         "manifest": {"path": candidate.checkpoint.manifest_path, "sha256": digest_hex(&manifest)}
     }))?;
     write_synced_file(&selector_path, &selector)?;
-    let files = collect_regular_files(staging)?;
+    let mut files = candidate
+        .members
+        .iter()
+        .map(|member| {
+            json!({
+                "path": member.relative_path,
+                "media_type": member.media_type,
+                "encoding": member.encoding,
+                "source_binding": member.source_binding,
+                "size": member.size_bytes,
+                "sha256": member.sha256_hex,
+            })
+        })
+        .collect::<Vec<_>>();
+    files.push(json!({
+        "path": candidate.checkpoint.manifest_path,
+        "media_type": "application/json",
+        "encoding": "canonical_json_v1",
+        "source_binding": "stage4_checkpoint_manifest",
+        "size": manifest.len(),
+        "sha256": digest_hex(&manifest),
+    }));
+    files.push(json!({
+        "path": candidate.checkpoint.selector_path,
+        "media_type": "application/json",
+        "encoding": "canonical_json_v1",
+        "source_binding": "stage4_checkpoint_selector",
+        "size": selector.len(),
+        "sha256": digest_hex(&selector),
+    }));
+    files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
     let top = canonical_json_value(&json!({
         "schema_version": 1, "map_name": candidate.map_name, "frame_id": candidate.frame_id,
         "backend_kind": candidate.backend_kind,
-        "barrier_identity": serde_json::from_slice::<Value>(&candidate.barrier_identity_json)?,
+        "snapshot_schema_version": candidate.snapshot_schema_version,
+        "last_source_timestamp_ns": candidate.last_source_timestamp_ns,
+        "identity": serde_json::from_slice::<Value>(&candidate.identity_json)?,
+        "georeference": serde_json::from_slice::<Value>(&candidate.georeference_json)?,
+        "processing_receipt": serde_json::from_slice::<Value>(&candidate.processing_receipt_json)?,
+        "map_snapshot_seed": serde_json::from_slice::<Value>(&candidate.map_snapshot_seed_json)?,
+        "deferred": serde_json::from_slice::<Value>(&candidate.deferred_json)?,
         "files": files,
         "checkpoint": {"selector_path": candidate.checkpoint.selector_path, "manifest_path": candidate.checkpoint.manifest_path,
             "object_path": object.relative_path, "manifest_sha256": digest_hex(&manifest), "object_sha256": object.sha256_hex}
@@ -661,46 +609,8 @@ fn materialize_offline_candidate(
     Ok(())
 }
 
-fn collect_regular_files(root: &Path) -> anyhow::Result<Vec<Value>> {
-    let mut paths = Vec::new();
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let ft = entry.file_type()?;
-            if ft.is_symlink() {
-                bail!("symlink in candidate staging");
-            }
-            if ft.is_dir() {
-                walk(root, &path, out)?;
-            } else if ft.is_file() {
-                let rel = path
-                    .strip_prefix(root)?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if rel != "manifest.json" {
-                    out.push(rel);
-                }
-            } else {
-                bail!("unsupported candidate filesystem entry");
-            }
-        }
-        Ok(())
-    }
-    walk(root, root, &mut paths)?;
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|rel| {
-            let p = root.join(&rel);
-            let bytes = fs::read(&p)?;
-            Ok(json!({"path": rel, "size": bytes.len(), "sha256": digest_hex(&bytes)}))
-        })
-        .collect()
-}
-
 fn validate_offline_candidate_directory(
-    root: &Path,
+    root: &StableDirectory,
     candidate: &OfflineCandidateBundleV1,
 ) -> anyhow::Result<()> {
     // 每次验证都以新鲜 FD 打开最终 staging inode，并复核完整的 JSON 绑定链。
@@ -717,7 +627,7 @@ fn validate_offline_candidate_directory(
     let object = candidate
         .members
         .iter()
-        .find(|m| m.encoding == OfflineMemberEncodingV1::CheckpointObject)
+        .find(|m| m.encoding == "checkpoint_object_v1")
         .ok_or_else(|| anyhow::anyhow!("candidate has no checkpoint object"))?;
     expected.insert(candidate.checkpoint.selector_path.clone());
     expected.insert(candidate.checkpoint.manifest_path.clone());
@@ -730,7 +640,22 @@ fn validate_offline_candidate_directory(
     }
     if manifest.get("schema_version") != Some(&json!(1))
         || manifest.get("backend_kind") != Some(&json!(candidate.backend_kind))
+        || manifest.get("processing_receipt")
+            != Some(&canonical_boundary_json(
+                "processing_receipt",
+                candidate.processing_receipt_json.clone(),
+            )?)
         || manifest.pointer("/object/path").and_then(Value::as_str) != Some(&object.relative_path)
+        || manifest
+            .pointer("/object/media_type")
+            .and_then(Value::as_str)
+            != Some(object.media_type.as_str())
+        || manifest.pointer("/object/encoding").and_then(Value::as_str)
+            != Some(object.encoding.as_str())
+        || manifest
+            .pointer("/object/source_binding")
+            .and_then(Value::as_str)
+            != Some(object.source_binding.as_str())
         || manifest.pointer("/object/size").and_then(Value::as_u64) != Some(object.size_bytes)
         || manifest.pointer("/object/sha256").and_then(Value::as_str)
             != Some(object.sha256_hex.as_str())
@@ -760,6 +685,33 @@ fn validate_offline_candidate_directory(
         || top.get("map_name") != Some(&json!(candidate.map_name))
         || top.get("frame_id") != Some(&json!(candidate.frame_id))
         || top.get("backend_kind") != Some(&json!(candidate.backend_kind))
+        || top.get("snapshot_schema_version") != Some(&json!(candidate.snapshot_schema_version))
+        || top.get("last_source_timestamp_ns") != Some(&json!(candidate.last_source_timestamp_ns))
+        || top.get("identity")
+            != Some(&canonical_boundary_json(
+                "identity",
+                candidate.identity_json.clone(),
+            )?)
+        || top.get("georeference")
+            != Some(&canonical_boundary_json(
+                "georeference",
+                candidate.georeference_json.clone(),
+            )?)
+        || top.get("processing_receipt")
+            != Some(&canonical_boundary_json(
+                "processing_receipt",
+                candidate.processing_receipt_json.clone(),
+            )?)
+        || top.get("map_snapshot_seed")
+            != Some(&canonical_boundary_json(
+                "map_snapshot_seed",
+                candidate.map_snapshot_seed_json.clone(),
+            )?)
+        || top.get("deferred")
+            != Some(&canonical_boundary_json(
+                "deferred",
+                candidate.deferred_json.clone(),
+            )?)
         || top
             .pointer("/checkpoint/selector_path")
             .and_then(Value::as_str)
@@ -802,11 +754,53 @@ fn validate_offline_candidate_directory(
             .get("sha256")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("invalid top-level file digest"))?;
+        let media_type = entry
+            .get("media_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file media_type"))?;
+        let encoding = entry
+            .get("encoding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file encoding"))?;
+        let source_binding = entry
+            .get("source_binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("invalid top-level file source_binding"))?;
         if !listed_paths.insert(path.to_owned())
             || !expected.contains(path)
             || path == "manifest.json"
         {
             bail!("invalid top-level file set");
+        }
+        if let Some(member) = candidate
+            .members
+            .iter()
+            .find(|member| member.relative_path == path)
+        {
+            if media_type != member.media_type
+                || encoding != member.encoding
+                || source_binding != member.source_binding
+                || size != member.size_bytes
+                || sha != member.sha256_hex
+            {
+                bail!("top-level member receipt mismatch: {path}");
+            }
+        } else {
+            let expected_generated = if path == candidate.checkpoint.manifest_path {
+                ("stage4_checkpoint_manifest", manifest_bytes.as_slice())
+            } else if path == candidate.checkpoint.selector_path {
+                ("stage4_checkpoint_selector", selector_bytes.as_slice())
+            } else {
+                bail!("unexpected generated file entry: {path}");
+            };
+            if media_type != "application/json"
+                || encoding != "canonical_json_v1"
+                || source_binding != expected_generated.0
+                || size != expected_generated.1.len() as u64
+                || sha != digest_hex(expected_generated.1)
+            {
+                bail!("top-level generated receipt mismatch: {path}");
+            }
         }
         validate_open_file(root, path, size, sha)?;
     }
@@ -816,16 +810,23 @@ fn validate_offline_candidate_directory(
     Ok(())
 }
 
-fn read_fresh_file(root: &Path, relative: &str) -> anyhow::Result<Vec<u8>> {
-    let mut file = File::open(root.join(relative))?;
+fn read_fresh_file(root: &StableDirectory, relative: &str) -> anyhow::Result<Vec<u8>> {
+    validate_relative_path(relative)?;
+    let mut file = root.open_beneath(Path::new(relative), false)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("candidate member is not a regular file: {relative}");
+    }
     let mut bytes = Vec::new();
-    use std::io::Read;
     file.read_to_end(&mut bytes)?;
+    if file.metadata()?.len() != bytes.len() as u64 {
+        bail!("candidate member changed while being read: {relative}");
+    }
     Ok(bytes)
 }
 
 fn validate_open_file(
-    root: &Path,
+    root: &StableDirectory,
     relative: &str,
     expected_size: u64,
     expected_sha: &str,
@@ -879,126 +880,124 @@ where
     B: FnOnce(&Path) -> anyhow::Result<()>,
     V: FnOnce(&Path) -> anyhow::Result<()>,
 {
+    publish_map_bundle_stable(final_directory, build, |staging| {
+        validate(&staging.descriptor_path())
+    })
+}
+
+fn publish_map_bundle_stable<B, V>(
+    final_directory: &Path,
+    build: B,
+    validate: V,
+) -> anyhow::Result<()>
+where
+    B: FnOnce(&Path) -> anyhow::Result<()>,
+    V: FnOnce(&StableDirectory) -> anyhow::Result<()>,
+{
+    let final_name = final_directory
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("map bundle output has no directory name"))?;
     let parent = parent_directory(final_directory);
-    final_directory.file_name().ok_or_else(|| {
-        anyhow::anyhow!(
-            "map bundle output has no directory name: {}",
-            final_directory.display()
-        )
-    })?;
-    if final_directory.exists() {
+    let recovery_policy = RecoveryPolicy::acquire()?;
+    fs::create_dir_all(parent)?;
+    let directory = StableDirectory::open(parent)?;
+    recover_stale_map_bundle_stages(&directory, final_name, final_directory, &recovery_policy)?;
+    if directory.entry_exists(final_name)? {
         return Err(MapBundlePublicationError::Conflict {
             path: final_directory.to_path_buf(),
             cleanup: None,
         }
         .into());
     }
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create map bundle parent {}", parent.display()))?;
-    let recovery_policy = RecoveryPolicy::acquire()?;
-    let final_name = final_directory
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("map bundle output has no directory name"))?;
-    recover_stale_map_bundle_stages(parent, final_name, final_directory, &recovery_policy)?;
     let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
     let nonce = mix64(sequence ^ timestamp ^ u64::from(std::process::id()));
-    let staging = parent.join(format!(
+    let staging_name = OsString::from(format!(
         "{BUNDLE_STAGE_DOMAIN}{}-{:016x}-{nonce:016x}-{}",
         std::process::id(),
         recovery_policy.current_process_start(),
         bundle_name_hash(final_name)
     ));
-    fs::create_dir(&staging)
-        .with_context(|| format!("reserve map bundle staging {}", staging.display()))?;
-    let mut stage_reaper = match MapBundleStageReaper::arm(parent, &staging) {
-        Ok(reaper) => reaper,
-        Err(error) => {
-            let cleanup = match fs::remove_dir(&staging) {
-                Ok(()) => sync_directory_io(parent),
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                    sync_directory_io(parent)
-                }
-                Err(source) => Err(source),
-            };
-            if let Err(source) = cleanup {
-                return Err(MapBundlePublicationError::CleanupFailure {
-                    path: final_directory.to_path_buf(),
-                    cleanup: ArtifactCleanupFailure {
-                        staging: staging.clone(),
-                        source,
-                    },
-                }
-                .into());
+    directory.create_directory(&staging_name)?;
+    let staging_directory = directory.open_stable_directory(&staging_name)?;
+    let staging = staging_directory.descriptor_path();
+
+    let operation = build(&staging)
+        .and_then(|()| validate(&staging_directory))
+        .and_then(|()| staging_directory.sync_tree().map_err(Into::into));
+    if let Err(primary) = operation {
+        return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+            Ok(()) => Err(primary),
+            Err(source) => Err(MapBundlePublicationError::CleanupFailure {
+                path: final_directory.to_path_buf(),
+                cleanup: ArtifactCleanupFailure {
+                    staging: staging.clone(),
+                    source,
+                },
             }
-            return Err(anyhow::Error::new(error).context(format!(
-                "arm map bundle staging reaper {}",
-                staging.display()
-            )));
-        }
-    };
-
-    if let Err(error) = build(&staging).and_then(|()| {
-        validate(&staging)
-            .with_context(|| format!("validate map bundle staging {}", staging.display()))
-    }) {
-        match cleanup_map_bundle_staging(parent, &staging, final_directory) {
-            Ok(()) => stage_reaper.disarm(),
-            Err(cleanup_error) => return Err(cleanup_error),
-        }
-        return Err(error);
-    }
-    if let Err(error) = sync_directory(&staging) {
-        match cleanup_map_bundle_staging(parent, &staging, final_directory) {
-            Ok(()) => stage_reaper.disarm(),
-            Err(cleanup_error) => return Err(cleanup_error),
-        }
-        return Err(error);
+            .into()),
+        };
     }
 
-    match rename_directory_no_replace(&staging, final_directory) {
-        Ok(()) => {
-            stage_reaper.disarm();
-        }
+    let named = directory.open_stable_directory(&staging_name)?;
+    if !same_file_identity(&staging_directory.metadata()?, &named.metadata()?) {
+        let primary = anyhow::anyhow!("staging directory inode changed before publication");
+        return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+            Ok(()) => Err(primary),
+            Err(source) => Err(MapBundlePublicationError::CleanupFailure {
+                path: final_directory.to_path_buf(),
+                cleanup: ArtifactCleanupFailure {
+                    staging: staging.clone(),
+                    source,
+                },
+            }
+            .into()),
+        };
+    }
+    match rename_directory_no_replace_at(&directory, &staging_name, final_name) {
+        Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let cleanup = cleanup_map_bundle_staging_io(parent, &staging)
+            let cleanup = cleanup_map_bundle_staging_io(&directory, &staging_name)
                 .err()
                 .map(|source| ArtifactCleanupFailure {
                     staging: staging.clone(),
                     source,
                 });
-            if cleanup.is_none() {
-                stage_reaper.disarm();
-            }
             return Err(MapBundlePublicationError::Conflict {
                 path: final_directory.to_path_buf(),
                 cleanup,
             }
             .into());
         }
-        Err(error) => {
-            match cleanup_map_bundle_staging(parent, &staging, final_directory) {
-                Ok(()) => stage_reaper.disarm(),
-                Err(cleanup_error) => return Err(cleanup_error),
-            }
-            return Err(anyhow::Error::new(error).context(format!(
-                "atomically publish map bundle {} as {}",
-                staging.display(),
-                final_directory.display()
-            )));
+        Err(primary) => {
+            return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+                Ok(()) => Err(primary.into()),
+                Err(source) => Err(MapBundlePublicationError::CleanupFailure {
+                    path: final_directory.to_path_buf(),
+                    cleanup: ArtifactCleanupFailure {
+                        staging: staging.clone(),
+                        source,
+                    },
+                }
+                .into()),
+            };
         }
     }
-
-    if let Err(source) = sync_directory_io(parent) {
-        return Err(MapBundlePublicationError::DurabilityUnknown {
+    let published = directory.open_stable_directory(final_name)?;
+    if !same_file_identity(&staging_directory.metadata()?, &published.metadata()?) {
+        let _ = rename_directory_no_replace_at(&directory, final_name, &staging_name);
+        let _ = cleanup_map_bundle_staging_io(&directory, &staging_name);
+        bail!("published directory is not the validated staging inode");
+    }
+    directory
+        .sync()
+        .map_err(|source| MapBundlePublicationError::DurabilityUnknown {
             path: final_directory.to_path_buf(),
             source,
-        }
-        .into());
-    }
+        })?;
     Ok(())
 }
 
@@ -1040,26 +1039,28 @@ fn parse_map_bundle_stage_name(name: &str, expected_hash: &str) -> Option<StageO
 }
 
 fn recover_stale_map_bundle_stages(
-    parent: &Path,
+    parent: &StableDirectory,
     final_name: &OsStr,
     final_directory: &Path,
     recovery_policy: &RecoveryPolicy,
 ) -> anyhow::Result<()> {
     let expected_hash = bundle_name_hash(final_name);
     let mut stale = Vec::new();
-    for entry in fs::read_dir(parent)
+    for entry in parent
+        .read_dir()
         .with_context(|| format!("scan map bundle staging for {}", final_directory.display()))?
     {
         let entry = entry.with_context(|| {
             format!("scan map bundle staging for {}", final_directory.display())
         })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
             continue;
         };
-        let Some(owner) = parse_map_bundle_stage_name(&name, &expected_hash) else {
+        let Some(owner) = parse_map_bundle_stage_name(name_text, &expected_hash) else {
             continue;
         };
-        stale.push((entry.path(), owner));
+        stale.push((name, owner));
         if stale.len() > MAX_STAGES_PER_ARTIFACT {
             bail!(
                 "more than {} map bundle staging directories exist for {}; refusing unbounded cleanup",
@@ -1068,71 +1069,30 @@ fn recover_stale_map_bundle_stages(
             );
         }
     }
-    for (staging, owner) in stale {
+    for (staging_name, owner) in stale {
         if recovery_policy.owner_is_proven_dead(owner) {
-            let metadata = fs::symlink_metadata(&staging)?;
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                bail!(
-                    "map bundle staging is not a real directory: {}",
-                    staging.display()
-                );
-            }
-            cleanup_map_bundle_staging_io(parent, &staging).with_context(|| {
-                format!("recover stale map bundle staging {}", staging.display())
-            })?;
+            cleanup_map_bundle_staging_io(parent, &staging_name)
+                .with_context(|| format!("recover stale map bundle staging {:?}", staging_name))?;
         }
     }
     Ok(())
 }
 
-fn cleanup_map_bundle_staging(
-    parent: &Path,
-    staging: &Path,
-    final_directory: &Path,
-) -> anyhow::Result<()> {
-    cleanup_map_bundle_staging_io(parent, staging).map_err(|source| {
-        MapBundlePublicationError::CleanupFailure {
-            path: final_directory.to_path_buf(),
-            cleanup: ArtifactCleanupFailure {
-                staging: staging.to_path_buf(),
-                source,
-            },
-        }
-        .into()
-    })
-}
-
-fn cleanup_map_bundle_staging_io(parent: &Path, staging: &Path) -> io::Result<()> {
-    fs::remove_dir_all(staging)?;
-    sync_directory_io(parent)
-}
-
-fn sync_directory(path: &Path) -> anyhow::Result<()> {
-    sync_directory_tree(path).with_context(|| format!("sync directory tree {}", path.display()))
-}
-
-fn sync_directory_tree(root: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            sync_directory_tree(&entry.path())?;
-        }
-    }
-    sync_directory_io(root)
-}
-
-fn sync_directory_io(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+fn cleanup_map_bundle_staging_io(parent: &StableDirectory, staging_name: &OsStr) -> io::Result<()> {
+    parent.remove_tree(staging_name)?;
+    parent.sync()
 }
 
 #[cfg(target_os = "linux")]
-fn rename_directory_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_directory_no_replace_at(
+    directory: &StableDirectory,
+    source: &OsStr,
+    destination: &OsStr,
+) -> io::Result<()> {
     use std::ffi::CString;
+    use std::os::fd::AsRawFd;
     use std::os::raw::{c_char, c_int};
     use std::os::unix::ffi::OsStrExt;
-
-    const AT_FDCWD: c_int = -100;
-    const RENAME_NOREPLACE: u32 = 1;
     extern "C" {
         fn renameat2(
             olddirfd: c_int,
@@ -1142,19 +1102,17 @@ fn rename_directory_no_replace(source: &Path, destination: &Path) -> io::Result<
             flags: u32,
         ) -> c_int;
     }
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
-    })?;
-    // SAFETY: 两个路径均为 NUL 结尾的有效字符串，flags 请求内核禁止覆盖目标。
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source contains NUL"))?;
+    let destination = CString::new(destination.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination contains NUL"))?;
     let result = unsafe {
         renameat2(
-            AT_FDCWD,
+            directory.file.as_raw_fd(),
             source.as_ptr(),
-            AT_FDCWD,
+            directory.file.as_raw_fd(),
             destination.as_ptr(),
-            RENAME_NOREPLACE,
+            1,
         )
     };
     if result == 0 {
@@ -1165,7 +1123,11 @@ fn rename_directory_no_replace(source: &Path, destination: &Path) -> io::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_directory_no_replace(_source: &Path, _destination: &Path) -> io::Result<()> {
+fn rename_directory_no_replace_at(
+    _directory: &StableDirectory,
+    _source: &OsStr,
+    _destination: &OsStr,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "map bundle publication requires Linux renameat2",
@@ -1802,7 +1764,7 @@ fn parse_linux_process_start(text: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-struct StableDirectory {
+pub(crate) struct StableDirectory {
     file: File,
 }
 
@@ -1876,7 +1838,7 @@ impl StableDirectory {
         Ok(directory)
     }
 
-    fn descriptor_path(&self) -> PathBuf {
+    pub(crate) fn descriptor_path(&self) -> PathBuf {
         use std::os::fd::AsRawFd;
         Path::new("/proc/self/fd").join(self.file.as_raw_fd().to_string())
     }
@@ -1902,6 +1864,133 @@ impl StableDirectory {
         const O_CLOEXEC: i32 = 0o2_000_000;
         const O_NOFOLLOW: i32 = 0o400_000;
         self.open_at(name, O_CLOEXEC | O_NOFOLLOW, None)
+    }
+
+    fn open_directory(&self, name: &OsStr) -> io::Result<File> {
+        const O_CLOEXEC: i32 = 0o2_000_000;
+        const O_DIRECTORY: i32 = 0o200_000;
+        const O_NOFOLLOW: i32 = 0o400_000;
+        self.open_at(name, O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW, None)
+    }
+
+    fn metadata(&self) -> io::Result<Metadata> {
+        self.file.metadata()
+    }
+
+    fn open_stable_directory(&self, name: &OsStr) -> io::Result<Self> {
+        Ok(Self {
+            file: self.open_directory(name)?,
+        })
+    }
+
+    fn create_directory(&self, name: &OsStr) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+        extern "C" {
+            fn mkdirat(directory: c_int, path: *const c_char, mode: u32) -> c_int;
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory name contains NUL")
+        })?;
+        let result = unsafe { mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o777) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn open_beneath(&self, path: &Path, directory: bool) -> io::Result<File> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::raw::{c_char, c_int, c_long};
+        use std::os::unix::ffi::OsStrExt;
+        const O_CLOEXEC: u64 = 0o2_000_000;
+        const O_DIRECTORY: u64 = 0o200_000;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const SYS_OPENAT2: c_long = 437;
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        extern "C" {
+            fn syscall(number: c_long, ...) -> c_long;
+        }
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "relative path contains NUL")
+        })?;
+        let how = OpenHow {
+            flags: O_CLOEXEC | if directory { O_DIRECTORY } else { 0 },
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        let descriptor = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                c_long::from(self.file.as_raw_fd()),
+                path.as_ptr().cast::<c_char>(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = c_int::try_from(descriptor)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "descriptor exceeds c_int"))?;
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn remove_tree(&self, name: &OsStr) -> io::Result<()> {
+        let child = self.open_stable_directory(name)?;
+        for entry in child.read_dir()? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            match child.open_stable_directory(&entry_name) {
+                Ok(_) => child.remove_tree(&entry_name)?,
+                Err(error) if matches!(error.raw_os_error(), Some(20)) => {
+                    child.remove_if_present(&entry_name)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.remove_directory(name)
+    }
+
+    fn remove_directory(&self, name: &OsStr) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+        extern "C" {
+            fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
+        }
+        const AT_REMOVEDIR: c_int = 0x200;
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory name contains NUL")
+        })?;
+        let result = unsafe { unlinkat(self.file.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn sync_tree(&self) -> io::Result<()> {
+        for entry in self.read_dir()? {
+            let entry = entry?;
+            if let Ok(child) = self.open_stable_directory(&entry.file_name()) {
+                child.sync_tree()?;
+            }
+        }
+        self.sync()
     }
 
     fn open_at(&self, name: &OsStr, flags: i32, mode: Option<u32>) -> io::Result<File> {
@@ -2039,6 +2128,29 @@ impl StableDirectory {
     }
 
     fn open_read(&self, _name: &OsStr) -> io::Result<File> {
+        Err(Self::unsupported())
+    }
+
+    fn metadata(&self) -> io::Result<Metadata> {
+        Err(Self::unsupported())
+    }
+    fn open_stable_directory(&self, _name: &OsStr) -> io::Result<Self> {
+        Err(Self::unsupported())
+    }
+    fn create_directory(&self, _name: &OsStr) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+    fn open_beneath(&self, _path: &Path, _directory: bool) -> io::Result<File> {
+        Err(Self::unsupported())
+    }
+    fn remove_tree(&self, _name: &OsStr) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+    fn sync_tree(&self) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+
+    fn open_directory(&self, _name: &OsStr) -> io::Result<File> {
         Err(Self::unsupported())
     }
 

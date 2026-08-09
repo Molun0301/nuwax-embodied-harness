@@ -193,7 +193,13 @@ pub(crate) enum MapBundlePublicationError {
     },
     CleanupFailure {
         path: PathBuf,
+        primary: anyhow::Error,
         cleanup: ArtifactCleanupFailure,
+    },
+    RollbackFailure {
+        path: PathBuf,
+        primary: anyhow::Error,
+        rollback: ArtifactCleanupFailure,
     },
     DurabilityUnknown {
         path: PathBuf,
@@ -215,11 +221,27 @@ impl fmt::Display for MapBundlePublicationError {
                 }
                 Ok(())
             }
-            Self::CleanupFailure { path, cleanup } => write!(
+            Self::CleanupFailure {
+                path,
+                primary,
+                cleanup,
+            } => write!(
                 formatter,
-                "map bundle {} failed and staging cleanup also failed: {}",
+                "map bundle {} failed: {}; staging cleanup also failed: {}",
                 path.display(),
+                primary,
                 cleanup
+            ),
+            Self::RollbackFailure {
+                path,
+                primary,
+                rollback,
+            } => write!(
+                formatter,
+                "map bundle {} publication verification failed: {}; rollback failed and final state is unknown: {}",
+                path.display(),
+                primary,
+                rollback
             ),
             Self::DurabilityUnknown { path, source } => write!(
                 formatter,
@@ -239,6 +261,7 @@ impl std::error::Error for MapBundlePublicationError {
                 ..
             } => Some(cleanup),
             Self::CleanupFailure { cleanup, .. } => Some(cleanup),
+            Self::RollbackFailure { rollback, .. } => Some(rollback),
             Self::DurabilityUnknown { source, .. } => Some(source),
             Self::Conflict { cleanup: None, .. } => None,
         }
@@ -409,15 +432,17 @@ pub fn publish_offline_candidate_bundle(
     candidate: &OfflineCandidateBundleV1,
 ) -> anyhow::Result<OfflinePublishedBundleV1> {
     validate_offline_candidate(candidate)?;
-    publish_map_bundle_stable(
+    let manifest_sha256_hex = publish_map_bundle_stable(
         final_directory,
         |staging| materialize_offline_candidate(staging, candidate),
-        |staging| validate_offline_candidate_directory(staging, candidate),
+        |staging| {
+            validate_offline_candidate_directory(staging, candidate)?;
+            Ok(digest_hex(&read_fresh_file(staging, "manifest.json")?))
+        },
     )?;
-    let manifest = fs::read(final_directory.join("manifest.json"))?;
     Ok(OfflinePublishedBundleV1 {
         final_directory: final_directory.to_path_buf(),
-        manifest_sha256_hex: digest_hex(&manifest),
+        manifest_sha256_hex,
     })
 }
 
@@ -521,45 +546,30 @@ fn validate_relative_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_synced_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
 fn materialize_offline_candidate(
-    staging: &Path,
+    staging: &StableDirectory,
     candidate: &OfflineCandidateBundleV1,
 ) -> anyhow::Result<()> {
     for member in &candidate.members {
-        let path = staging.join(&member.relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        write_synced_file(&path, &member.bytes)?;
+        staging.write_synced_beneath(Path::new(&member.relative_path), &member.bytes)?;
     }
     let object = candidate
         .members
         .iter()
         .find(|m| m.encoding == "checkpoint_object_v1")
         .unwrap();
-    let manifest_path = staging.join(&candidate.checkpoint.manifest_path);
-    let selector_path = staging.join(&candidate.checkpoint.selector_path);
     let manifest = canonical_json_value(&json!({
         "schema_version": 1, "backend_kind": candidate.backend_kind,
         "processing_receipt": serde_json::from_slice::<Value>(&candidate.processing_receipt_json)?,
         "object": {"path": object.relative_path, "media_type": object.media_type, "encoding": object.encoding,
             "source_binding": object.source_binding, "size": object.size_bytes, "sha256": object.sha256_hex}
     }))?;
-    write_synced_file(&manifest_path, &manifest)?;
+    staging.write_synced_beneath(Path::new(&candidate.checkpoint.manifest_path), &manifest)?;
     let selector = canonical_json_value(&json!({
         "schema_version": 1, "backend_kind": candidate.backend_kind,
         "manifest": {"path": candidate.checkpoint.manifest_path, "sha256": digest_hex(&manifest)}
     }))?;
-    write_synced_file(&selector_path, &selector)?;
+    staging.write_synced_beneath(Path::new(&candidate.checkpoint.selector_path), &selector)?;
     let mut files = candidate
         .members
         .iter()
@@ -605,7 +615,7 @@ fn materialize_offline_candidate(
         "checkpoint": {"selector_path": candidate.checkpoint.selector_path, "manifest_path": candidate.checkpoint.manifest_path,
             "object_path": object.relative_path, "manifest_sha256": digest_hex(&manifest), "object_sha256": object.sha256_hex}
     }))?;
-    write_synced_file(&staging.join("manifest.json"), &top)?;
+    staging.write_synced_beneath(Path::new("manifest.json"), &top)?;
     Ok(())
 }
 
@@ -880,19 +890,24 @@ where
     B: FnOnce(&Path) -> anyhow::Result<()>,
     V: FnOnce(&Path) -> anyhow::Result<()>,
 {
-    publish_map_bundle_stable(final_directory, build, |staging| {
-        validate(&staging.descriptor_path())
-    })
+    publish_map_bundle_stable(
+        final_directory,
+        |staging| build(&staging.descriptor_path()),
+        |staging| {
+            validate(&staging.descriptor_path())?;
+            Ok(())
+        },
+    )
 }
 
-fn publish_map_bundle_stable<B, V>(
+fn publish_map_bundle_stable<B, V, R>(
     final_directory: &Path,
     build: B,
     validate: V,
-) -> anyhow::Result<()>
+) -> anyhow::Result<R>
 where
-    B: FnOnce(&Path) -> anyhow::Result<()>,
-    V: FnOnce(&StableDirectory) -> anyhow::Result<()>,
+    B: FnOnce(&StableDirectory) -> anyhow::Result<()>,
+    V: FnOnce(&StableDirectory) -> anyhow::Result<R>,
 {
     let final_name = final_directory
         .file_name()
@@ -925,22 +940,29 @@ where
     let staging_directory = directory.open_stable_directory(&staging_name)?;
     let staging = staging_directory.descriptor_path();
 
-    let operation = build(&staging)
+    let operation = build(&staging_directory)
         .and_then(|()| validate(&staging_directory))
-        .and_then(|()| staging_directory.sync_tree().map_err(Into::into));
-    if let Err(primary) = operation {
-        return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
-            Ok(()) => Err(primary),
-            Err(source) => Err(MapBundlePublicationError::CleanupFailure {
-                path: final_directory.to_path_buf(),
-                cleanup: ArtifactCleanupFailure {
-                    staging: staging.clone(),
-                    source,
-                },
-            }
-            .into()),
-        };
-    }
+        .and_then(|result| {
+            staging_directory.sync_tree()?;
+            Ok(result)
+        });
+    let result = match operation {
+        Ok(result) => result,
+        Err(primary) => {
+            return match cleanup_map_bundle_staging_io(&directory, &staging_name) {
+                Ok(()) => Err(primary),
+                Err(source) => Err(MapBundlePublicationError::CleanupFailure {
+                    path: final_directory.to_path_buf(),
+                    primary,
+                    cleanup: ArtifactCleanupFailure {
+                        staging: staging.clone(),
+                        source,
+                    },
+                }
+                .into()),
+            };
+        }
+    };
 
     let named = directory.open_stable_directory(&staging_name)?;
     if !same_file_identity(&staging_directory.metadata()?, &named.metadata()?) {
@@ -949,6 +971,7 @@ where
             Ok(()) => Err(primary),
             Err(source) => Err(MapBundlePublicationError::CleanupFailure {
                 path: final_directory.to_path_buf(),
+                primary,
                 cleanup: ArtifactCleanupFailure {
                     staging: staging.clone(),
                     source,
@@ -977,6 +1000,7 @@ where
                 Ok(()) => Err(primary.into()),
                 Err(source) => Err(MapBundlePublicationError::CleanupFailure {
                     path: final_directory.to_path_buf(),
+                    primary: primary.into(),
                     cleanup: ArtifactCleanupFailure {
                         staging: staging.clone(),
                         source,
@@ -988,9 +1012,22 @@ where
     }
     let published = directory.open_stable_directory(final_name)?;
     if !same_file_identity(&staging_directory.metadata()?, &published.metadata()?) {
-        let _ = rename_directory_no_replace_at(&directory, final_name, &staging_name);
-        let _ = cleanup_map_bundle_staging_io(&directory, &staging_name);
-        bail!("published directory is not the validated staging inode");
+        let primary = anyhow::anyhow!("published directory is not the validated staging inode");
+        let rollback = directory
+            .remove_tree_bound(final_name, &published)
+            .and_then(|()| directory.sync());
+        return match rollback {
+            Ok(()) => Err(primary),
+            Err(source) => Err(MapBundlePublicationError::RollbackFailure {
+                path: final_directory.to_path_buf(),
+                primary,
+                rollback: ArtifactCleanupFailure {
+                    staging: directory.child_path(final_name),
+                    source,
+                },
+            }
+            .into()),
+        };
     }
     directory
         .sync()
@@ -998,7 +1035,7 @@ where
             path: final_directory.to_path_buf(),
             source,
         })?;
-    Ok(())
+    Ok(result)
 }
 
 fn bundle_name_hash(final_name: &OsStr) -> String {
@@ -1947,20 +1984,83 @@ impl StableDirectory {
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
+    fn write_synced_beneath(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut components = path.components().peekable();
+        let mut directory = Self {
+            file: self.file.try_clone()?,
+        };
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bundle member path must be relative and normalized",
+                ));
+            };
+            if components.peek().is_none() {
+                let mut file = directory.create_new(name)?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                return Ok(());
+            }
+            match directory.create_directory(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            directory = directory.open_stable_directory(name)?;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bundle member path is empty",
+        ))
+    }
+
     fn remove_tree(&self, name: &OsStr) -> io::Result<()> {
         let child = self.open_stable_directory(name)?;
+        self.remove_tree_bound(name, &child)
+    }
+
+    fn remove_tree_bound(&self, name: &OsStr, child: &StableDirectory) -> io::Result<()> {
+        self.require_named_identity(name, child)?;
         for entry in child.read_dir()? {
             let entry = entry?;
             let entry_name = entry.file_name();
             match child.open_stable_directory(&entry_name) {
-                Ok(_) => child.remove_tree(&entry_name)?,
+                Ok(grandchild) => child.remove_tree_bound(&entry_name, &grandchild)?,
                 Err(error) if matches!(error.raw_os_error(), Some(20)) => {
+                    let file = child.open_read(&entry_name)?;
+                    child.require_named_file_identity(&entry_name, &file)?;
                     child.remove_if_present(&entry_name)?;
                 }
                 Err(error) => return Err(error),
             }
         }
+        self.require_named_identity(name, child)?;
         self.remove_directory(name)
+    }
+
+    fn require_named_identity(&self, name: &OsStr, held: &StableDirectory) -> io::Result<()> {
+        let named = self.open_stable_directory(name)?;
+        if same_file_identity(&named.metadata()?, &held.metadata()?) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "directory name no longer identifies held inode",
+            ))
+        }
+    }
+
+    fn require_named_file_identity(&self, name: &OsStr, held: &File) -> io::Result<()> {
+        let named = self.open_read(name)?;
+        if same_file_identity(&named.metadata()?, &held.metadata()?) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "file name no longer identifies held inode",
+            ))
+        }
     }
 
     fn remove_directory(&self, name: &OsStr) -> io::Result<()> {
@@ -2143,7 +2243,13 @@ impl StableDirectory {
     fn open_beneath(&self, _path: &Path, _directory: bool) -> io::Result<File> {
         Err(Self::unsupported())
     }
+    fn write_synced_beneath(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
     fn remove_tree(&self, _name: &OsStr) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+    fn remove_tree_bound(&self, _name: &OsStr, _child: &StableDirectory) -> io::Result<()> {
         Err(Self::unsupported())
     }
     fn sync_tree(&self) -> io::Result<()> {
@@ -2712,6 +2818,71 @@ mod tests {
 
         assert!(format!("{error:#}").contains("openat2"));
         assert!(fs::read_dir(real_parent).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_bundle_transaction_returns_fresh_manifest_digest() {
+        let directory = TestDir::new("bundle-digest");
+        let output = directory.0.join("bundle");
+        let expected = digest_hex(br#"{"schema_version":1}"#);
+
+        let observed = publish_map_bundle_stable(
+            &output,
+            |staging| {
+                staging
+                    .write_synced_beneath(Path::new("manifest.json"), br#"{"schema_version":1}"#)?;
+                Ok(())
+            },
+            |staging| Ok(digest_hex(&read_fresh_file(staging, "manifest.json")?)),
+        )
+        .unwrap();
+
+        assert_eq!(observed, expected);
+        assert_eq!(
+            digest_hex(&fs::read(output.join("manifest.json")).unwrap()),
+            expected
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_directory_writes_nested_files_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new("bundle-write-symlink");
+        let outside = directory.0.join("outside");
+        let root = directory.0.join("root");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("nested")).unwrap();
+        let stable = StableDirectory::open(&root).unwrap();
+
+        assert!(stable
+            .write_synced_beneath(Path::new("nested/member.bin"), b"blocked")
+            .is_err());
+        assert!(!outside.join("member.bin").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_tree_rejects_name_rebound_to_another_inode() {
+        let directory = TestDir::new("bundle-remove-binding");
+        let original = directory.0.join("original");
+        let moved = directory.0.join("moved");
+        fs::create_dir(&original).unwrap();
+        let parent = StableDirectory::open(&directory.0).unwrap();
+        let held = parent
+            .open_stable_directory(OsStr::new("original"))
+            .unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+
+        assert!(parent
+            .remove_tree_bound(OsStr::new("original"), &held)
+            .is_err());
+        assert!(original.exists());
+        assert!(moved.exists());
     }
 
     #[cfg(target_os = "linux")]

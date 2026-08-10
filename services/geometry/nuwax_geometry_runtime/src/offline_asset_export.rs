@@ -625,7 +625,12 @@ mod tests {
         OfflinePointXyzV1, OfflinePoseV1, OfflineRaytracingConfigV1, OfflineReplayConfigV1,
         OfflineReplayFrameV1, OfflineReplayRequestV1, OfflineVoxelConfigV1,
     };
-    use crate::offline_replay_owner::{GeometryOfflineReplayOwner, ReplayBarrierIdentityV1};
+    use crate::offline_replay_owner::{
+        GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV1,
+        OfflineCanonicalCloudAssetProjectionV1, OfflineCanonicalCloudReceiptV1,
+        OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV1,
+        OfflineCanonicalOccupancyReceiptV1, ReplayBarrierIdentityV1,
+    };
 
     fn georeference() -> OfflineGeoreferenceV1 {
         OfflineGeoreferenceV1 {
@@ -735,6 +740,70 @@ mod tests {
             std::f64::consts::FRAC_PI_4.cos(),
         ];
         grid.frame_id = "map_frame".to_owned();
+        let commit_id = OfflineCanonicalCommitIdV1 {
+            boot_nonce: 1,
+            sequence: 1,
+        };
+        let occupancy_receipt = OfflineCanonicalOccupancyReceiptV1 {
+            commit_id,
+            session_id: "map:source".to_owned(),
+            session_generation: 1,
+            occupancy_revision: 1,
+            source_timestamp_ns: 1,
+            backend_kind: OfflineBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        let cloud_receipt = OfflineCanonicalCloudReceiptV1 {
+            commit_id,
+            session_generation: 1,
+            occupancy_revision: 1,
+            cloud_revision: 1,
+            source_timestamp_ns: 1,
+            point_count: 1,
+        };
+        let xyz_f32_le = [0.025_f32, 0.025, 0.025]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let canonical_checkpoint_projection = OfflineCanonicalCheckpointProjectionV1 {
+            schema_version: 1,
+            created_at_ns: 1,
+            source_session_id: "map:source".to_owned(),
+            source_session_generation: 1,
+            backend_kind: OfflineBackendKind::Voxel,
+            checkpoint_sha256: nuwax_codec::sha256_bytes(&checkpoint),
+            checkpoint_size: checkpoint.len() as u64,
+            occupancy_receipt,
+            cloud_receipt,
+            occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV1 {
+                raw_data_sha256: nuwax_codec::sha256_bytes(
+                    &grid
+                        .data
+                        .iter()
+                        .map(|value| value.to_le_bytes()[0])
+                        .collect::<Vec<_>>(),
+                ),
+                raw_data_size: 6,
+                width: 2,
+                height: 3,
+                resolution: 0.05,
+                origin_x: 1.25,
+                origin_y: -2.5,
+                frame_id: "map_frame".to_owned(),
+                source_occupancy_revision: 1,
+                timestamp_ns: 1,
+            },
+            cloud_asset: OfflineCanonicalCloudAssetProjectionV1 {
+                xyz_sha256: nuwax_codec::sha256_bytes(&xyz_f32_le),
+                xyz_size: 12,
+                frame_id: "map_frame".to_owned(),
+                source_cloud_revision: 1,
+                point_count: 1,
+                voxel_size: 0.05,
+                payload_schema_version: 1,
+                xyz_f32_le,
+            },
+        };
         OfflineGeometrySnapshotV2 {
             schema_version: 2,
             barrier: barrier.clone(),
@@ -772,6 +841,7 @@ mod tests {
                 map_frame_id: "map_frame".to_owned(),
                 update_sequence: 1,
             },
+            canonical_checkpoint_projection,
         }
     }
 
@@ -862,6 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_stage2_voxel_and_ray_snapshots_export_repeatably() {
+        let mut boot_nonces = Vec::new();
         for kind in [OfflineBackendKind::Voxel, OfflineBackendKind::Raytracing] {
             let snapshot = real_snapshot(kind).await;
             let first = export_offline_candidate_assets_v1(&snapshot).unwrap();
@@ -887,7 +958,71 @@ mod tests {
             assert!(first.members.windows(2).all(|pair| {
                 pair[0].relative_path_intent.as_bytes() < pair[1].relative_path_intent.as_bytes()
             }));
+            let projection = &snapshot.canonical_checkpoint_projection;
+            assert_eq!(projection.schema_version, 1);
+            assert!(projection.created_at_ns > 0);
+            assert_eq!(projection.source_session_id, "map:source");
+            assert_eq!(projection.source_session_generation, 1);
+            assert_eq!(projection.backend_kind, kind);
+            assert_eq!(projection.checkpoint_size, snapshot.checkpoint.len() as u64);
+            assert_eq!(
+                projection.checkpoint_sha256,
+                nuwax_codec::sha256_bytes(&snapshot.checkpoint)
+            );
+            assert_ne!(projection.occupancy_receipt.commit_id.boot_nonce, 0);
+            boot_nonces.push(projection.occupancy_receipt.commit_id.boot_nonce);
+            assert_eq!(projection.occupancy_receipt.commit_id.sequence, 3);
+            assert_eq!(projection.occupancy_receipt.session_id, "map:source");
+            assert_eq!(projection.occupancy_receipt.session_generation, 1);
+            assert_eq!(projection.occupancy_receipt.backend_generation, 1);
+            assert_eq!(projection.occupancy_receipt.occupancy_revision, 3);
+            assert_eq!(
+                projection.cloud_receipt.commit_id,
+                projection.occupancy_receipt.commit_id
+            );
+            assert_eq!(projection.cloud_receipt.session_generation, 1);
+            assert_eq!(projection.cloud_receipt.occupancy_revision, 3);
+            assert_eq!(projection.cloud_receipt.cloud_revision, 3);
+            assert_eq!(
+                projection.cloud_receipt.source_timestamp_ns,
+                projection.occupancy_receipt.source_timestamp_ns
+            );
+            assert_eq!(snapshot.barrier.mapping_commit_sequence, 3);
+            assert_eq!(projection.cloud_asset.payload_schema_version, 1);
+            assert!(projection.cloud_asset.voxel_size.is_finite());
+            assert!(projection.cloud_asset.voxel_size > 0.0);
+            assert_eq!(
+                projection.cloud_asset.xyz_f32_le.len(),
+                projection.cloud_asset.point_count as usize * 12
+            );
+            assert_eq!(
+                projection.cloud_asset.xyz_sha256,
+                nuwax_codec::sha256_bytes(&projection.cloud_asset.xyz_f32_le)
+            );
+            assert_eq!(
+                projection.cloud_asset.source_cloud_revision,
+                projection.cloud_receipt.cloud_revision
+            );
+            assert_eq!(
+                projection.occupancy_asset.source_occupancy_revision,
+                projection.occupancy_receipt.occupancy_revision
+            );
+            assert_eq!(
+                projection.occupancy_asset.timestamp_ns,
+                projection.occupancy_receipt.source_timestamp_ns
+            );
+            assert_eq!(
+                projection.occupancy_asset.raw_data_size,
+                u64::from(projection.occupancy_asset.width)
+                    * u64::from(projection.occupancy_asset.height)
+            );
+            assert_eq!(
+                projection.cloud_asset.frame_id,
+                projection.occupancy_asset.frame_id
+            );
         }
+        assert_eq!(boot_nonces.len(), 2);
+        assert_ne!(boot_nonces[0], boot_nonces[1]);
     }
 
     #[tokio::test]

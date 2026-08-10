@@ -2,7 +2,9 @@
 
 #[doc(hidden)]
 pub mod mapping_backend;
+mod mapping_commit;
 mod offline_asset_export;
+mod offline_canonical_cloud;
 mod offline_replay;
 mod offline_replay_owner;
 mod persistent_occupancy;
@@ -20,6 +22,9 @@ pub use offline_replay::{
     ValidatedOfflineReplayFrameV1, ValidatedOfflineReplayRequestV1,
 };
 pub use offline_replay_owner::{
-    GeometryOfflineReplayOwner, OfflineGeometrySnapshotV2, OfflineReplayProcessingReceiptV1,
-    ReplayBarrierIdentityV1,
+    GeometryOfflineReplayOwner, OfflineCanonicalCheckpointProjectionV1,
+    OfflineCanonicalCloudAssetProjectionV1, OfflineCanonicalCloudReceiptV1,
+    OfflineCanonicalCommitIdV1, OfflineCanonicalOccupancyAssetProjectionV1,
+    OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV2,
+    OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1,
 };

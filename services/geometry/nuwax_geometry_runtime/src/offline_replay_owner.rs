@@ -1,5 +1,7 @@
 //! Geometry 库私有离线重放 owner。
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use nalgebra::Point3;
 use nuwax_mapping::OccupancyGrid;
 
@@ -7,6 +9,11 @@ use super::mapping_backend::{
     MappingBackendCandidate, MappingBackendCompletion, MappingBackendComputeConfig,
     MappingBackendInput, MappingBackendKind, MappingBackendSpec, MappingBackendWorker,
     MappingComputeToken,
+};
+use super::mapping_commit::{MappingCommitClock, MappingCommitId};
+use super::offline_canonical_cloud::{
+    OfflineCanonicalCloud, OfflineCanonicalCloudSnapshot,
+    OFFLINE_CANONICAL_CLOUD_PAYLOAD_SCHEMA_VERSION,
 };
 use super::offline_replay::{
     OfflineBackendConfigV1, OfflineBackendKind, OfflineGeometryFacade, OfflineGeoreferenceV1,
@@ -40,6 +47,74 @@ pub struct OfflineGeometrySnapshotV1 {
     pub processing_receipt: OfflineReplayProcessingReceiptV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfflineCanonicalCommitIdV1 {
+    pub boot_nonce: u128,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfflineCanonicalOccupancyReceiptV1 {
+    pub commit_id: OfflineCanonicalCommitIdV1,
+    pub session_id: String,
+    pub session_generation: u64,
+    pub occupancy_revision: u64,
+    pub source_timestamp_ns: u64,
+    pub backend_kind: OfflineBackendKind,
+    pub backend_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfflineCanonicalCloudReceiptV1 {
+    pub commit_id: OfflineCanonicalCommitIdV1,
+    pub session_generation: u64,
+    pub occupancy_revision: u64,
+    pub cloud_revision: u64,
+    pub source_timestamp_ns: u64,
+    pub point_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OfflineCanonicalOccupancyAssetProjectionV1 {
+    pub raw_data_sha256: [u8; 32],
+    pub raw_data_size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub resolution: f64,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub frame_id: String,
+    pub source_occupancy_revision: u64,
+    pub timestamp_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OfflineCanonicalCloudAssetProjectionV1 {
+    pub xyz_f32_le: Vec<u8>,
+    pub xyz_sha256: [u8; 32],
+    pub xyz_size: u64,
+    pub frame_id: String,
+    pub source_cloud_revision: u64,
+    pub point_count: u32,
+    pub voxel_size: f32,
+    pub payload_schema_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OfflineCanonicalCheckpointProjectionV1 {
+    pub schema_version: u32,
+    pub created_at_ns: u64,
+    pub source_session_id: String,
+    pub source_session_generation: u64,
+    pub backend_kind: OfflineBackendKind,
+    pub checkpoint_sha256: [u8; 32],
+    pub checkpoint_size: u64,
+    pub occupancy_receipt: OfflineCanonicalOccupancyReceiptV1,
+    pub cloud_receipt: OfflineCanonicalCloudReceiptV1,
+    pub occupancy_asset: OfflineCanonicalOccupancyAssetProjectionV1,
+    pub cloud_asset: OfflineCanonicalCloudAssetProjectionV1,
+}
+
 #[derive(Clone, Debug)]
 pub struct OfflineGeometrySnapshotV2 {
     pub schema_version: u32,
@@ -54,6 +129,7 @@ pub struct OfflineGeometrySnapshotV2 {
     pub committed_transformed_accepted_cloud: Vec<Point3<f64>>,
     pub processing_receipt: OfflineReplayProcessingReceiptV1,
     pub map_snapshot_seed: OfflineMapSnapshotSeedV2,
+    pub canonical_checkpoint_projection: OfflineCanonicalCheckpointProjectionV1,
 }
 
 struct FinishedReplayBarrier {
@@ -72,6 +148,12 @@ pub struct GeometryOfflineReplayOwner {
     accepted_cloud: Vec<Point3<f64>>,
     occupancy_observation: Option<OccupancyGrid>,
     canonical_occupancy: Option<PersistentOccupancyGrid>,
+    commit_clock: MappingCommitClock,
+    occupancy_revision: u64,
+    canonical_cloud: OfflineCanonicalCloud,
+    last_occupancy_receipt: Option<OfflineCanonicalOccupancyReceiptV1>,
+    last_cloud_receipt: Option<OfflineCanonicalCloudReceiptV1>,
+    last_cloud_snapshot: Option<OfflineCanonicalCloudSnapshot>,
     committed_frame_count: u64,
     intake_open: bool,
 }
@@ -97,6 +179,12 @@ impl GeometryOfflineReplayOwner {
             accepted_cloud: Vec::new(),
             occupancy_observation: None,
             canonical_occupancy: None,
+            commit_clock: MappingCommitClock::new(),
+            occupancy_revision: 0,
+            canonical_cloud: OfflineCanonicalCloud::new(),
+            last_occupancy_receipt: None,
+            last_cloud_receipt: None,
+            last_cloud_snapshot: None,
             committed_frame_count: 0,
             intake_open: true,
         })
@@ -201,6 +289,29 @@ impl GeometryOfflineReplayOwner {
             .ok_or_else(|| "offline replay produced no canonical occupancy".to_owned())?
             .grid
             .clone();
+        let occupancy_receipt = self
+            .last_occupancy_receipt
+            .clone()
+            .ok_or_else(|| "offline replay produced no canonical occupancy receipt".to_owned())?;
+        let cloud_receipt = self
+            .last_cloud_receipt
+            .clone()
+            .ok_or_else(|| "offline replay produced no canonical cloud receipt".to_owned())?;
+        let cloud_snapshot = self
+            .last_cloud_snapshot
+            .clone()
+            .ok_or_else(|| "offline replay produced no canonical cloud snapshot".to_owned())?;
+        let created_at_ns = current_unix_time_ns()?;
+        let canonical_checkpoint_projection = canonical_checkpoint_projection(
+            &self.replay_id,
+            self.backend_kind,
+            created_at_ns,
+            &checkpoint,
+            &canonical_raw_occupancy,
+            occupancy_receipt,
+            cloud_receipt,
+            cloud_snapshot,
+        )?;
         let barrier = ReplayBarrierIdentityV1 {
             replay_id: self.replay_id.clone(),
             backend_generation: self.backend_generation,
@@ -233,6 +344,7 @@ impl GeometryOfflineReplayOwner {
                 committed_transformed_accepted_cloud: std::mem::take(&mut self.accepted_cloud),
                 processing_receipt,
                 map_snapshot_seed,
+                canonical_checkpoint_projection,
             },
             backend_occupancy_observation: self.occupancy_observation.take(),
         })
@@ -308,9 +420,65 @@ impl GeometryOfflineReplayOwner {
                 return Err(error);
             }
         };
+        let mut staged_cloud = match self.canonical_cloud.stage_frame(&accepted_points_map) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = resolution.abort();
+                return Err(error);
+            }
+        };
+        let cloud_snapshot = match staged_cloud.commit_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = resolution.abort();
+                return Err(error);
+            }
+        };
+        let occupancy_revision = self
+            .occupancy_revision
+            .checked_add(1)
+            .ok_or_else(|| "offline canonical occupancy revision exhausted".to_owned())?;
+        let committed_frame_count = self
+            .committed_frame_count
+            .checked_add(1)
+            .ok_or_else(|| "offline committed frame count exhausted".to_owned())?;
+        let committed_point_count = self
+            .accepted_cloud
+            .len()
+            .checked_add(accepted_points_map.len())
+            .ok_or_else(|| "offline committed point count exhausted".to_owned())?;
+        u64::try_from(committed_point_count)
+            .map_err(|_| "offline committed point count exceeds u64".to_owned())?;
+        self.accepted_cloud
+            .try_reserve(accepted_points_map.len())
+            .map_err(|error| format!("offline accepted cloud allocation failed: {error}"))?;
+        let receipt_session_id = self.replay_id.clone();
         commit_fail_closed(resolution)?;
+        let commit_id = offline_commit_id(self.commit_clock.reserve()?);
+        let occupancy_receipt = OfflineCanonicalOccupancyReceiptV1 {
+            commit_id,
+            session_id: receipt_session_id,
+            session_generation: 1,
+            occupancy_revision,
+            source_timestamp_ns: timestamp,
+            backend_kind: self.backend_kind,
+            backend_generation: self.backend_generation,
+        };
+        let cloud_receipt = OfflineCanonicalCloudReceiptV1 {
+            commit_id,
+            session_generation: 1,
+            occupancy_revision,
+            cloud_revision: cloud_snapshot.revision,
+            source_timestamp_ns: timestamp,
+            point_count: cloud_snapshot.point_count,
+        };
         self.canonical_occupancy = Some(staged);
-        self.committed_frame_count += 1;
+        self.canonical_cloud = staged_cloud;
+        self.occupancy_revision = occupancy_revision;
+        self.last_occupancy_receipt = Some(occupancy_receipt);
+        self.last_cloud_receipt = Some(cloud_receipt);
+        self.last_cloud_snapshot = Some(cloud_snapshot);
+        self.committed_frame_count = committed_frame_count;
         self.accepted_cloud.extend(accepted_points_map);
         self.occupancy_observation = Some(candidate.live_window_occupancy);
         Ok(())
@@ -344,32 +512,25 @@ impl GeometryOfflineReplayOwner {
                 return Err(error);
             }
         };
-        let staged = match candidate.as_ref() {
-            Some(candidate) => match self.stage_candidate(candidate, sequence, timestamp) {
-                Ok(staged) => Some(staged),
-                Err(error) => {
-                    let _ = resolution.abort();
-                    return Err(error);
-                }
-            },
-            None => None,
-        };
-        commit_fail_closed(resolution)?;
-        if let Some(staged) = staged {
-            self.canonical_occupancy = Some(staged);
+        if let Some(candidate) = candidate.as_ref() {
+            if let Err(error) = self.validate_candidate_identity(candidate, sequence, timestamp) {
+                let _ = resolution.abort();
+                return Err(error);
+            }
         }
+        commit_fail_closed(resolution)?;
         if let Some(candidate) = candidate {
             self.occupancy_observation = Some(candidate.live_window_occupancy);
         }
         Ok(())
     }
 
-    fn stage_candidate(
+    fn validate_candidate_identity(
         &self,
         candidate: &MappingBackendCandidate,
         sequence: u64,
         timestamp: u64,
-    ) -> Result<PersistentOccupancyGrid, String> {
+    ) -> Result<(), String> {
         let expected_kind = match self.backend_kind {
             OfflineBackendKind::Voxel => MappingBackendKind::Voxel,
             OfflineBackendKind::Raytracing => MappingBackendKind::Raytracing,
@@ -384,8 +545,19 @@ impl GeometryOfflineReplayOwner {
             || candidate.live_window_occupancy.frame_id != self.map_frame_id
             || candidate.latest_frame_occupancy.frame_id != self.map_frame_id
         {
-            return Err("mapping backend candidate identity mismatch".to_owned());
+            Err("mapping backend candidate identity mismatch".to_owned())
+        } else {
+            Ok(())
         }
+    }
+
+    fn stage_candidate(
+        &self,
+        candidate: &MappingBackendCandidate,
+        sequence: u64,
+        timestamp: u64,
+    ) -> Result<PersistentOccupancyGrid, String> {
+        self.validate_candidate_identity(candidate, sequence, timestamp)?;
         match candidate.backend_kind {
             MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
                 self.canonical_occupancy.as_ref(),
@@ -405,6 +577,125 @@ impl GeometryOfflineReplayOwner {
             Err(join_error) => Err(format!("{error}; exact join failed: {join_error}")),
         }
     }
+}
+
+fn offline_commit_id(commit_id: MappingCommitId) -> OfflineCanonicalCommitIdV1 {
+    OfflineCanonicalCommitIdV1 {
+        boot_nonce: commit_id.boot_nonce,
+        sequence: commit_id.sequence,
+    }
+}
+
+fn current_unix_time_ns() -> Result<u64, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before unix epoch".to_owned())?
+        .as_nanos();
+    let timestamp =
+        u64::try_from(nanos).map_err(|_| "unix timestamp exceeds u64 nanoseconds".to_owned())?;
+    if timestamp == 0 {
+        return Err("unix timestamp must be positive".to_owned());
+    }
+    Ok(timestamp)
+}
+
+fn canonical_checkpoint_projection(
+    replay_id: &str,
+    backend_kind: OfflineBackendKind,
+    created_at_ns: u64,
+    checkpoint: &[u8],
+    occupancy: &OccupancyGrid,
+    occupancy_receipt: OfflineCanonicalOccupancyReceiptV1,
+    cloud_receipt: OfflineCanonicalCloudReceiptV1,
+    cloud_snapshot: OfflineCanonicalCloudSnapshot,
+) -> Result<OfflineCanonicalCheckpointProjectionV1, String> {
+    if created_at_ns == 0
+        || checkpoint.is_empty()
+        || replay_id.trim().is_empty()
+        || occupancy_receipt.session_id != replay_id
+        || occupancy_receipt.session_generation != 1
+        || occupancy_receipt.backend_generation != 1
+        || occupancy_receipt.backend_kind != backend_kind
+        || occupancy_receipt.commit_id != cloud_receipt.commit_id
+        || cloud_receipt.session_generation != 1
+        || cloud_receipt.occupancy_revision != occupancy_receipt.occupancy_revision
+        || cloud_receipt.source_timestamp_ns != occupancy_receipt.source_timestamp_ns
+        || cloud_receipt.cloud_revision != cloud_snapshot.revision
+        || cloud_receipt.point_count != cloud_snapshot.point_count
+        || occupancy_receipt.commit_id.boot_nonce == 0
+        || occupancy_receipt.commit_id.sequence == 0
+        || occupancy_receipt.occupancy_revision == 0
+        || cloud_receipt.cloud_revision == 0
+        || cloud_snapshot.point_count == 0
+        || !cloud_snapshot.voxel_size.is_finite()
+        || cloud_snapshot.voxel_size <= 0.0
+    {
+        return Err("offline canonical checkpoint projection identity mismatch".to_owned());
+    }
+    let expected_cloud_size = usize::try_from(cloud_snapshot.point_count)
+        .ok()
+        .and_then(|count| count.checked_mul(12))
+        .ok_or_else(|| "offline canonical cloud payload size overflow".to_owned())?;
+    if cloud_snapshot.xyz_f32_le.len() != expected_cloud_size {
+        return Err("offline canonical cloud payload length mismatch".to_owned());
+    }
+    let raw_data = occupancy
+        .data
+        .iter()
+        .map(|value| value.to_le_bytes()[0])
+        .collect::<Vec<_>>();
+    let expected_occupancy_size = usize::try_from(occupancy.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(occupancy.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| "offline canonical occupancy dimensions overflow".to_owned())?;
+    if raw_data.is_empty() || raw_data.len() != expected_occupancy_size {
+        return Err("offline canonical occupancy payload length mismatch".to_owned());
+    }
+    let checkpoint_size = u64::try_from(checkpoint.len())
+        .map_err(|_| "offline checkpoint size exceeds u64".to_owned())?;
+    let raw_data_size = u64::try_from(raw_data.len())
+        .map_err(|_| "offline canonical occupancy size exceeds u64".to_owned())?;
+    let xyz_size = u64::try_from(cloud_snapshot.xyz_f32_le.len())
+        .map_err(|_| "offline canonical cloud size exceeds u64".to_owned())?;
+    let occupancy_asset = OfflineCanonicalOccupancyAssetProjectionV1 {
+        raw_data_sha256: nuwax_codec::sha256_bytes(&raw_data),
+        raw_data_size,
+        width: occupancy.width,
+        height: occupancy.height,
+        resolution: occupancy.resolution,
+        origin_x: occupancy.origin[0],
+        origin_y: occupancy.origin[1],
+        frame_id: occupancy.frame_id.clone(),
+        source_occupancy_revision: occupancy_receipt.occupancy_revision,
+        timestamp_ns: occupancy_receipt.source_timestamp_ns,
+    };
+    let cloud_asset = OfflineCanonicalCloudAssetProjectionV1 {
+        xyz_sha256: nuwax_codec::sha256_bytes(&cloud_snapshot.xyz_f32_le),
+        xyz_size,
+        frame_id: occupancy.frame_id.clone(),
+        source_cloud_revision: cloud_receipt.cloud_revision,
+        point_count: cloud_snapshot.point_count,
+        voxel_size: cloud_snapshot.voxel_size,
+        payload_schema_version: OFFLINE_CANONICAL_CLOUD_PAYLOAD_SCHEMA_VERSION,
+        xyz_f32_le: cloud_snapshot.xyz_f32_le,
+    };
+    Ok(OfflineCanonicalCheckpointProjectionV1 {
+        schema_version: 1,
+        created_at_ns,
+        source_session_id: replay_id.to_owned(),
+        source_session_generation: 1,
+        backend_kind,
+        checkpoint_sha256: nuwax_codec::sha256_bytes(checkpoint),
+        checkpoint_size,
+        occupancy_receipt,
+        cloud_receipt,
+        occupancy_asset,
+        cloud_asset,
+    })
 }
 
 fn finish_with_exact_join<T>(

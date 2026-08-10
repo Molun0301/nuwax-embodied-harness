@@ -1801,6 +1801,15 @@ fn parse_linux_process_start(text: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
+fn directory_or_regular_file<T>(opened: io::Result<T>) -> io::Result<Option<T>> {
+    match opened {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if matches!(error.raw_os_error(), Some(20)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct StableDirectory {
     file: File,
 }
@@ -2086,7 +2095,9 @@ impl StableDirectory {
     fn sync_tree(&self) -> io::Result<()> {
         for entry in self.read_dir()? {
             let entry = entry?;
-            if let Ok(child) = self.open_stable_directory(&entry.file_name()) {
+            if let Some(child) =
+                directory_or_regular_file(self.open_stable_directory(&entry.file_name()))?
+            {
                 child.sync_tree()?;
             }
         }
@@ -2801,6 +2812,22 @@ mod tests {
         ));
         assert!(error.to_string().contains("refusing to overwrite"));
         assert!(error.to_string().contains("injected cleanup"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_tree_directory_open_classification_propagates_non_enotdir_errors() {
+        assert_eq!(
+            directory_or_regular_file::<()>(Err(io::Error::from_raw_os_error(20))).unwrap(),
+            None
+        );
+
+        for raw_os_error in [13, 5, 24, 40, 116] {
+            let error =
+                directory_or_regular_file::<()>(Err(io::Error::from_raw_os_error(raw_os_error)))
+                    .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(raw_os_error));
+        }
     }
 
     #[cfg(target_os = "linux")]

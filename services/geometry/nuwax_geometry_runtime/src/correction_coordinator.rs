@@ -14,6 +14,11 @@
 mod preflight_only_contract {
 
     use std::collections::{HashMap, HashSet};
+    use std::ffi::OsString;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc as std_mpsc, Arc,
@@ -21,6 +26,7 @@ mod preflight_only_contract {
     use std::time::{Duration, Instant};
 
     use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
+    use nix::fcntl::{Flock, FlockArg};
     use nuwax_codec::lcm::native_pgo as native_pgo_codec;
     use nuwax_mapping::loop_closure::{
         LoopClosureCoordinator, LoopClosurePipelineConfig, ProcessFrameResult,
@@ -35,6 +41,7 @@ mod preflight_only_contract {
     use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
     use nuwax_transport::{LcmTransport, OwnedLcmSubscription};
     use prost::Message;
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -71,6 +78,18 @@ mod preflight_only_contract {
     const RELOCALIZATION_COMMAND_QUEUE_CAPACITY: usize = 16;
     const RELOCALIZATION_MAX_WAITERS: usize = 16;
     const RELOCALIZATION_MAX_COMMAND_RECORDS: usize = 1_024;
+    const RELOCALIZATION_MAX_TERMINAL_BYTES: usize = 65_536;
+    const RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES: usize =
+        2 * RELOCALIZATION_MAX_TERMINAL_BYTES + 128 + 3 * 64 + 512;
+    const RELOCALIZATION_TERMINAL_TEMP_PREFIX: &str = ".nuwax-relocalization-terminal-store-v4.";
+    const RELOCALIZATION_TERMINAL_TEMP_SUFFIX: &str = ".tmp";
+    const RELOCALIZATION_TERMINAL_LEASE_PREFIX: &str = ".nuwax-relocalization-owner-v4.";
+    const RELOCALIZATION_TERMINAL_LEASE_SUFFIX: &str = ".lease";
+    const RELOCALIZATION_TERMINAL_CLEANUP_LOCK_NAME: &str = ".cleanup.lock";
+    const RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES: usize = 16;
+    const RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES: usize = 16;
+    const RELOCALIZATION_TERMINAL_STORE_DIR_ENV: &str =
+        "NUWAX_GEOMETRY_RELOCALIZATION_TERMINAL_STORE_DIR";
     const RELOCALIZATION_MAX_CONFLICTS_PER_RECORD: usize = 64;
     const RELOCALIZATION_MAX_FRAME_PROOF_SCOPES: usize = 8;
     const RELOCALIZATION_MAX_FRAME_PROOFS_PER_SCOPE: usize = 16;
@@ -5115,9 +5134,18 @@ mod preflight_only_contract {
         mapping_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     }
 
+    struct RelocalizationTerminalQueryRequest {
+        request_id: String,
+        request_identity_sha256: [u8; 32],
+        activation_identity_sha256: [u8; 32],
+        response: oneshot::Sender<Result<RelocalizationTerminalQuerySnapshot, &'static str>>,
+    }
+
     #[derive(Clone)]
     pub(crate) struct RelocalizationCommandIngress {
         sender: mpsc::Sender<RelocalizationAdmissionRequest>,
+        terminal_query_sender: mpsc::Sender<RelocalizationTerminalQueryRequest>,
+        terminal_store: RelocalizationTerminalStore,
         admission_open: Arc<AtomicBool>,
         admission_rx: watch::Receiver<bool>,
         waiter_capacity: Arc<Semaphore>,
@@ -5186,6 +5214,103 @@ mod preflight_only_contract {
             }
         }
 
+        pub(crate) async fn terminal_snapshot(
+            &self,
+            request_id: &str,
+            request_identity_sha256: [u8; 32],
+            activation_identity_sha256: [u8; 32],
+        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
+            let (response, response_rx) = oneshot::channel();
+            self.terminal_query_sender
+                .send(RelocalizationTerminalQueryRequest {
+                    request_id: request_id.to_owned(),
+                    request_identity_sha256,
+                    activation_identity_sha256,
+                    response,
+                })
+                .await
+                .map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_OWNER_UNAVAILABLE")?;
+            response_rx
+                .await
+                .map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_RESPONSE_LOST")?
+        }
+
+        #[cfg(test)]
+        pub(crate) fn terminal_query_fixture_for_tests(root: PathBuf) -> Self {
+            let (sender, _receiver) = mpsc::channel(1);
+            let (terminal_query_sender, mut terminal_query_receiver) =
+                mpsc::channel::<RelocalizationTerminalQueryRequest>(1);
+            let terminal_store = RelocalizationTerminalStore::open_at(root)
+                .expect("open terminal query fixture store");
+            let query_store = terminal_store.clone();
+            tokio::spawn(async move {
+                while let Some(query) = terminal_query_receiver.recv().await {
+                    let terminal = query_store.snapshot(
+                        &query.request_id,
+                        query.request_identity_sha256,
+                        query.activation_identity_sha256,
+                    );
+                    let _ = query.response.send(Ok(RelocalizationTerminalQuerySnapshot {
+                        terminal,
+                        ledger_observation: crate::proto::RelocalizationLedgerObservation {
+                            observation_schema_version: 1,
+                            observation_epoch: 1,
+                            ..Default::default()
+                        },
+                    }));
+                }
+            });
+            let (_admission_tx, admission_rx) = watch::channel(true);
+            Self {
+                sender,
+                terminal_query_sender,
+                terminal_store,
+                admission_open: Arc::new(AtomicBool::new(true)),
+                admission_rx,
+                waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn mark_terminal_query_pending_for_tests(
+            &self,
+            request_id: &str,
+            request_identity_sha256: [u8; 32],
+            activation_identity_sha256: [u8; 32],
+        ) {
+            self.terminal_store.state.lock().pending.insert(
+                request_id.to_owned(),
+                (request_identity_sha256, activation_identity_sha256),
+            );
+        }
+
+        #[cfg(test)]
+        pub(crate) fn persist_terminal_query_result_for_tests(
+            &self,
+            result: crate::proto::RelocalizeResult,
+        ) {
+            let request_identity_sha256: [u8; 32] = result
+                .request_identity_sha256
+                .as_slice()
+                .try_into()
+                .expect("request identity");
+            let activation_identity_sha256: [u8; 32] = result
+                .activation_identity_sha256
+                .as_slice()
+                .try_into()
+                .expect("activation identity");
+            let request_id = result.request_id.clone();
+            let terminal = StoredRelocalizationResult::new(result);
+            self.terminal_store
+                .persist_terminal(
+                    &request_id,
+                    request_identity_sha256,
+                    activation_identity_sha256,
+                    &terminal,
+                )
+                .expect("persist terminal query fixture result");
+        }
+
         pub(crate) fn is_open(&self) -> bool {
             self.admission_open.load(Ordering::Acquire)
         }
@@ -5222,6 +5347,18 @@ mod preflight_only_contract {
         Ok(())
     }
 
+    pub(crate) fn validate_relocalization_request_id(value: &str) -> Result<(), String> {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+        {
+            return Err("RELOCALIZATION_REQUEST_ID_INVALID".to_owned());
+        }
+        Ok(())
+    }
+
     fn normalize_relocalization_logical_timeout_ms(value: u64) -> Result<u64, String> {
         match value {
             0 => Ok(RELOCALIZATION_MAX_LOGICAL_TIMEOUT_MS),
@@ -5235,7 +5372,7 @@ mod preflight_only_contract {
     fn canonical_relocalization_request_preimage(
         request: &crate::proto::RelocalizeRequest,
     ) -> Result<Vec<u8>, String> {
-        validate_relocalization_string("request_id", &request.request_id)?;
+        validate_relocalization_request_id(&request.request_id)?;
         validate_relocalization_string("session_id", &request.session_id)?;
         validate_relocalization_string("map_name", &request.map_name)?;
         let activation_identity =
@@ -5360,6 +5497,726 @@ mod preflight_only_contract {
         }
     }
 
+    #[derive(Clone, Debug)]
+    pub(crate) enum RelocalizationTerminalSnapshot {
+        Terminal(crate::proto::RelocalizeResult),
+        Pending,
+        NotFound,
+        IdentityConflict,
+    }
+
+    pub(crate) struct RelocalizationTerminalQuerySnapshot {
+        pub(crate) terminal: RelocalizationTerminalSnapshot,
+        pub(crate) ledger_observation: crate::proto::RelocalizationLedgerObservation,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct DurableRelocalizationTerminalV1 {
+        schema_version: u32,
+        request_id: String,
+        request_identity_sha256: String,
+        activation_identity_sha256: String,
+        terminal_hex: String,
+        terminal_sha256: String,
+    }
+
+    #[derive(Clone)]
+    struct DurableRelocalizationTerminal {
+        request_identity_sha256: [u8; 32],
+        activation_identity_sha256: [u8; 32],
+        terminal: StoredRelocalizationResult,
+    }
+
+    struct RelocalizationTerminalStoreState {
+        terminals: HashMap<String, DurableRelocalizationTerminal>,
+        pending: HashMap<String, ([u8; 32], [u8; 32])>,
+    }
+
+    struct RelocalizationTerminalOwnerLease {
+        root: PathBuf,
+        owner_token: String,
+        _lock: Flock<File>,
+    }
+
+    impl Drop for RelocalizationTerminalOwnerLease {
+        fn drop(&mut self) {
+            let cleanup_lock = match lock_terminal_cleanup(&self.root) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
+                    return;
+                }
+            };
+            if terminal_owner_has_temporary(&self.root, &self.owner_token) != Ok(false) {
+                drop(cleanup_lock);
+                return;
+            }
+            let lease_path = self.root.join(terminal_lease_name(&self.owner_token));
+            match fs::remove_file(lease_path) {
+                Ok(()) => {
+                    if let Err(error) = fsync_directory(&self.root) {
+                        tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct RelocalizationTerminalStore {
+        root: Arc<PathBuf>,
+        owner_token: Arc<String>,
+        _owner_lease: Arc<RelocalizationTerminalOwnerLease>,
+        state: Arc<parking_lot::Mutex<RelocalizationTerminalStoreState>>,
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        out
+    }
+
+    fn decode_hex(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
+            return Err("RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned());
+        }
+        fn digit(value: u8) -> Option<u8> {
+            match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'a'..=b'f' => Some(value - b'a' + 10),
+                _ => None,
+            }
+        }
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = digit(pair[0])
+                    .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned())?;
+                let low = digit(pair[1])
+                    .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned())?;
+                Ok((high << 4) | low)
+            })
+            .collect()
+    }
+
+    fn read_terminal_record_bytes(
+        mut reader: impl Read,
+        metadata_len: u64,
+    ) -> Result<Vec<u8>, String> {
+        if metadata_len > RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64 {
+            return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned());
+        }
+        let mut bytes = Vec::new();
+        reader
+            .by_ref()
+            .take((RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+        if bytes.len() > RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES {
+            return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned());
+        }
+        Ok(bytes)
+    }
+
+    fn read_terminal_record(path: &Path) -> Result<Vec<u8>, String> {
+        let file = File::open(path)
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+        let metadata_len = file
+            .metadata()
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
+            .len();
+        read_terminal_record_bytes(file, metadata_len)
+    }
+
+    fn terminal_store_root_from(
+        explicit: Option<OsString>,
+        state_directory: Option<OsString>,
+        runtime_data: Option<OsString>,
+    ) -> Result<PathBuf, String> {
+        if let Some(value) = explicit {
+            let root = PathBuf::from(value);
+            return if root.is_absolute() {
+                Ok(root)
+            } else {
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+            };
+        }
+        if let Some(value) = state_directory {
+            let root = std::env::split_paths(&value)
+                .next()
+                .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())?;
+            return if root.is_absolute() {
+                Ok(root.join("relocalization_terminals_v1"))
+            } else {
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+            };
+        }
+        if let Some(value) = runtime_data {
+            let root = PathBuf::from(value);
+            return if root.is_absolute() {
+                Ok(root.join("geometry").join("relocalization_terminals_v1"))
+            } else {
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+            };
+        }
+        Err("RELOCALIZATION_TERMINAL_STORE_PATH_UNAVAILABLE".to_owned())
+    }
+
+    fn terminal_store_root() -> Result<PathBuf, String> {
+        terminal_store_root_from(
+            std::env::var_os(RELOCALIZATION_TERMINAL_STORE_DIR_ENV),
+            std::env::var_os("STATE_DIRECTORY"),
+            std::env::var_os("NUWAX_RUNTIME_DATA_DIR"),
+        )
+    }
+
+    fn fsync_directory(path: &Path) -> Result<(), String> {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}"))
+    }
+
+    fn lock_terminal_cleanup(root: &Path) -> Result<Flock<File>, String> {
+        let lock_path = root.join(RELOCALIZATION_TERMINAL_CLEANUP_LOCK_NAME);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
+            })?;
+        let lock_file_metadata = lock_file.metadata().map_err(|error| {
+            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
+        })?;
+        let lock = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, error)| {
+            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_FAILED:{error}")
+        })?;
+        let path_metadata = fs::metadata(&lock_path).map_err(|error| {
+            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
+        })?;
+        if lock_file_metadata.dev() != path_metadata.dev()
+            || lock_file_metadata.ino() != path_metadata.ino()
+        {
+            return Err("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_IDENTITY_CHANGED".to_owned());
+        }
+        lock.sync_all().map_err(|error| {
+            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_FSYNC_FAILED:{error}")
+        })?;
+        fsync_directory(root)?;
+        Ok(lock)
+    }
+
+    fn terminal_owner_token() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    fn terminal_lease_name(owner_token: &str) -> String {
+        format!(
+            "{RELOCALIZATION_TERMINAL_LEASE_PREFIX}{owner_token}{RELOCALIZATION_TERMINAL_LEASE_SUFFIX}"
+        )
+    }
+
+    fn terminal_owner_token_from_lease_name(file_name: &str) -> Option<&str> {
+        let token = file_name
+            .strip_prefix(RELOCALIZATION_TERMINAL_LEASE_PREFIX)?
+            .strip_suffix(RELOCALIZATION_TERMINAL_LEASE_SUFFIX)?;
+        is_terminal_token(token, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES).then_some(token)
+    }
+
+    fn is_terminal_token(value: &str, bytes: usize) -> bool {
+        value.len() == bytes * 2 && decode_hex(value, bytes).is_ok()
+    }
+
+    fn terminal_owner_token_from_temporary_name(file_name: &str) -> Option<&str> {
+        let body = file_name
+            .strip_prefix(RELOCALIZATION_TERMINAL_TEMP_PREFIX)?
+            .strip_suffix(RELOCALIZATION_TERMINAL_TEMP_SUFFIX)?;
+        let mut fields = body.split('.');
+        let (Some(owner), Some(attempt), Some(request), Some(record), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return None;
+        };
+        (is_terminal_token(owner, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES)
+            && is_terminal_token(attempt, RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES)
+            && is_terminal_token(request, 32)
+            && is_terminal_token(record, 32))
+        .then_some(owner)
+    }
+
+    fn is_owned_terminal_temporary_name(file_name: &str) -> bool {
+        terminal_owner_token_from_temporary_name(file_name).is_some()
+    }
+
+    fn terminal_owner_has_temporary(root: &Path, owner_token: &str) -> Result<bool, String> {
+        let entries = fs::read_dir(root)
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+            let file_name = entry.file_name();
+            if file_name
+                .to_str()
+                .and_then(terminal_owner_token_from_temporary_name)
+                == Some(owner_token)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn cleanup_terminal_owner(
+        root: &Path,
+        owner_token: &str,
+        _cleanup_lock: &Flock<File>,
+    ) -> Result<usize, String> {
+        let lease_path = root.join(terminal_lease_name(owner_token));
+        let lease_file = match OpenOptions::new().read(true).write(true).open(&lease_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_MISSING".to_owned())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_OPEN_FAILED:{error}"
+                ))
+            }
+        };
+        let lease = match Flock::lock(lease_file, FlockArg::LockExclusiveNonblock) {
+            Ok(lease) => lease,
+            Err((lease_file, error))
+                if error == nix::errno::Errno::EWOULDBLOCK
+                    || error == nix::errno::Errno::EAGAIN =>
+            {
+                drop(lease_file);
+                return Ok(0);
+            }
+            Err((lease_file, error)) => {
+                drop(lease_file);
+                return Err(format!(
+                    "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_LOCK_FAILED:{error}"
+                ));
+            }
+        };
+        let entries = fs::read_dir(root)
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+        let mut removed = 0_usize;
+        for entry in entries {
+            let file_name = entry.file_name();
+            if file_name
+                .to_str()
+                .and_then(terminal_owner_token_from_temporary_name)
+                == Some(owner_token)
+            {
+                remove_terminal_temporary(&entry.path(), root)?;
+                removed += 1;
+            }
+        }
+        if !terminal_owner_has_temporary(root, owner_token)? {
+            match fs::remove_file(&lease_path) {
+                Ok(()) => fsync_directory(root)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Ok(removed),
+            }
+        }
+        drop(lease);
+        Ok(removed)
+    }
+
+    fn cleanup_failed_terminal_owner_lease(
+        root: &Path,
+        lease_path: &Path,
+        primary: String,
+        _cleanup_lock: &Flock<File>,
+    ) -> String {
+        match fs::remove_file(lease_path) {
+            Ok(()) => match fsync_directory(root) {
+                Ok(()) => primary,
+                Err(_) => format!("{primary}|OWNER_LEASE_CLEANUP_FAILED"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => primary,
+            Err(_) => format!("{primary}|OWNER_LEASE_CLEANUP_FAILED"),
+        }
+    }
+
+    fn create_terminal_owner_lease(
+        root: &Path,
+        cleanup_lock: &Flock<File>,
+    ) -> Result<(String, Flock<File>), String> {
+        for _ in 0..16 {
+            let owner_token = terminal_owner_token();
+            let lease_path = root.join(terminal_lease_name(&owner_token));
+            let lease_file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lease_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_CREATE_FAILED:{error}"
+                    ))
+                }
+            };
+            let lease = match Flock::lock(lease_file, FlockArg::LockExclusiveNonblock) {
+                Ok(lease) => lease,
+                Err((lease_file, error)) => {
+                    drop(lease_file);
+                    let primary =
+                        format!("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_LOCK_FAILED:{error}");
+                    return Err(cleanup_failed_terminal_owner_lease(
+                        root,
+                        &lease_path,
+                        primary,
+                        cleanup_lock,
+                    ));
+                }
+            };
+            if let Err(error) = lease.sync_all() {
+                let primary =
+                    format!("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_FSYNC_FAILED:{error}");
+                drop(lease);
+                return Err(cleanup_failed_terminal_owner_lease(
+                    root,
+                    &lease_path,
+                    primary,
+                    cleanup_lock,
+                ));
+            }
+            if let Err(primary) = fsync_directory(root) {
+                drop(lease);
+                return Err(cleanup_failed_terminal_owner_lease(
+                    root,
+                    &lease_path,
+                    primary,
+                    cleanup_lock,
+                ));
+            }
+            return Ok((owner_token, lease));
+        }
+        Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_COLLISION".to_owned())
+    }
+
+    fn remove_terminal_temporary(path: &Path, root: &Path) -> Result<(), String> {
+        match fs::remove_file(path) {
+            Ok(()) => fsync_directory(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:{error}"
+            )),
+        }
+    }
+
+    fn combine_terminal_persist_results(
+        write_result: Result<(), String>,
+        cleanup_result: Result<(), String>,
+    ) -> Result<(), String> {
+        match (write_result, cleanup_result) {
+            (Err(primary), Err(_)) => Err(format!("{primary}|TEMP_CLEANUP_FAILED")),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(cleanup)) => {
+                tracing::warn!(error = %cleanup, "durable terminal temp cleanup deferred");
+                Ok(())
+            }
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    impl RelocalizationTerminalStore {
+        fn open() -> Result<Self, String> {
+            Self::open_at(terminal_store_root()?)
+        }
+
+        fn open_at(root: PathBuf) -> Result<Self, String> {
+            fs::create_dir_all(&root)
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_OPEN_FAILED:{error}"))?;
+            fsync_directory(&root)?;
+            {
+                let cleanup_lock = lock_terminal_cleanup(&root)?;
+                let mut entries = fs::read_dir(&root)
+                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}")
+                    })?;
+                entries.sort_by_key(std::fs::DirEntry::file_name);
+                let mut owner_tokens = HashSet::new();
+                for entry in &entries {
+                    let file_name = entry.file_name();
+                    if let Some(owner_token) = file_name
+                        .to_str()
+                        .and_then(terminal_owner_token_from_temporary_name)
+                        .or_else(|| {
+                            file_name
+                                .to_str()
+                                .and_then(terminal_owner_token_from_lease_name)
+                        })
+                    {
+                        owner_tokens.insert(owner_token.to_owned());
+                    }
+                }
+                for owner_token in owner_tokens {
+                    cleanup_terminal_owner(&root, &owner_token, &cleanup_lock)?;
+                }
+                let retained_temporary_count = fs::read_dir(&root)
+                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .map(is_owned_terminal_temporary_name)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if retained_temporary_count > RELOCALIZATION_MAX_COMMAND_RECORDS {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_TEMP_RETENTION_EXCEEDED".to_owned());
+                }
+            }
+            let mut terminals = HashMap::new();
+            let entries = fs::read_dir(&root)
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
+            for entry in entries {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                if terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".to_owned());
+                }
+                let bytes = read_terminal_record(&path)?;
+                let record: DurableRelocalizationTerminalV1 = serde_json::from_slice(&bytes)
+                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
+                if record.schema_version != 1
+                    || validate_relocalization_request_id(&record.request_id).is_err()
+                {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned());
+                }
+                let request_identity_sha256: [u8; 32] =
+                    decode_hex(&record.request_identity_sha256, 32)?
+                        .try_into()
+                        .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
+                let activation_identity_sha256: [u8; 32] =
+                    decode_hex(&record.activation_identity_sha256, 32)?
+                        .try_into()
+                        .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID".to_owned())?;
+                let encoded = decode_hex(&record.terminal_hex, RELOCALIZATION_MAX_TERMINAL_BYTES)?;
+                if encode_hex(&sha256_bytes(&encoded)) != record.terminal_sha256 {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_DIGEST_MISMATCH".to_owned());
+                }
+                let result = crate::proto::RelocalizeResult::decode(encoded.as_slice())
+                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_TERMINAL_INVALID".to_owned())?;
+                if result.request_id != record.request_id
+                    || result.request_identity_sha256.as_slice() != request_identity_sha256
+                    || result.activation_identity_sha256.as_slice() != activation_identity_sha256
+                {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_MISMATCH".to_owned());
+                }
+                let terminal = StoredRelocalizationResult::new(result);
+                if terminal.encoded != encoded {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_NON_CANONICAL".to_owned());
+                }
+                if terminals
+                    .insert(
+                        record.request_id,
+                        DurableRelocalizationTerminal {
+                            request_identity_sha256,
+                            activation_identity_sha256,
+                            terminal,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".to_owned());
+                }
+            }
+            let cleanup_lock = lock_terminal_cleanup(&root)?;
+            let (owner_token, owner_lock) = create_terminal_owner_lease(&root, &cleanup_lock)?;
+            drop(cleanup_lock);
+            let owner_lease = RelocalizationTerminalOwnerLease {
+                root: root.clone(),
+                owner_token: owner_token.clone(),
+                _lock: owner_lock,
+            };
+            Ok(Self {
+                root: Arc::new(root),
+                owner_token: Arc::new(owner_token),
+                _owner_lease: Arc::new(owner_lease),
+                state: Arc::new(parking_lot::Mutex::new(RelocalizationTerminalStoreState {
+                    terminals,
+                    pending: HashMap::new(),
+                })),
+            })
+        }
+
+        fn mark_pending(&self, request: &ValidatedRelocalizeRequest) -> Result<(), String> {
+            let mut state = self.state.lock();
+            if let Some(existing) = state.terminals.get(&request.request.request_id) {
+                return if existing.request_identity_sha256 == request.identity_sha256
+                    && existing.activation_identity_sha256 == request.activation_identity_sha256
+                {
+                    Ok(())
+                } else {
+                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
+                };
+            }
+            match state.pending.get(&request.request.request_id) {
+                Some(identity)
+                    if *identity
+                        != (request.identity_sha256, request.activation_identity_sha256) =>
+                {
+                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
+                }
+                _ => {
+                    state.pending.insert(
+                        request.request.request_id.clone(),
+                        (request.identity_sha256, request.activation_identity_sha256),
+                    );
+                    Ok(())
+                }
+            }
+        }
+
+        fn persist_terminal(
+            &self,
+            request_id: &str,
+            request_identity_sha256: [u8; 32],
+            activation_identity_sha256: [u8; 32],
+            terminal: &StoredRelocalizationResult,
+        ) -> Result<(), String> {
+            if terminal.encoded.len() > RELOCALIZATION_MAX_TERMINAL_BYTES {
+                return Err("RELOCALIZATION_TERMINAL_STORE_TERMINAL_TOO_LARGE".to_owned());
+            }
+            let mut state = self.state.lock();
+            if let Some(existing) = state.terminals.get(request_id) {
+                return if existing.request_identity_sha256 == request_identity_sha256
+                    && existing.activation_identity_sha256 == activation_identity_sha256
+                    && existing.terminal.encoded == terminal.encoded
+                {
+                    Ok(())
+                } else {
+                    Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
+                };
+            }
+            if state.terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
+                return Err("RELOCALIZATION_TERMINAL_STORE_RETENTION_EXCEEDED".to_owned());
+            }
+            let record = DurableRelocalizationTerminalV1 {
+                schema_version: 1,
+                request_id: request_id.to_owned(),
+                request_identity_sha256: encode_hex(&request_identity_sha256),
+                activation_identity_sha256: encode_hex(&activation_identity_sha256),
+                terminal_hex: encode_hex(&terminal.encoded),
+                terminal_sha256: encode_hex(&terminal.encoded_sha256),
+            };
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_ENCODE_FAILED:{error}"))?;
+            let request_digest = encode_hex(&sha256_bytes(request_id.as_bytes()));
+            let file_name = format!("{request_digest}.json");
+            let final_path = self.root.join(file_name);
+            let attempt = terminal_owner_token();
+            let temporary_path = self.root.join(format!(
+                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
+                self.owner_token,
+                attempt,
+                request_digest,
+                encode_hex(&sha256_bytes(&bytes))
+            ));
+            let mut temporary = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_CREATE_FAILED:{error}"))?;
+            let write_result = (|| {
+                temporary.write_all(&bytes).map_err(|error| {
+                    format!("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:{error}")
+                })?;
+                temporary.sync_all().map_err(|error| {
+                    format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}")
+                })?;
+                drop(temporary);
+                match fs::hard_link(&temporary_path, &final_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let existing = read_terminal_record(&final_path)?;
+                        if existing != bytes {
+                            return Err(
+                                "RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "RELOCALIZATION_TERMINAL_STORE_PUBLISH_FAILED:{error}"
+                        ))
+                    }
+                }
+                fsync_directory(&self.root)
+            })();
+            let cleanup_result = remove_terminal_temporary(&temporary_path, &self.root);
+            combine_terminal_persist_results(write_result, cleanup_result)?;
+            state.terminals.insert(
+                request_id.to_owned(),
+                DurableRelocalizationTerminal {
+                    request_identity_sha256,
+                    activation_identity_sha256,
+                    terminal: terminal.clone(),
+                },
+            );
+            state.pending.remove(request_id);
+            Ok(())
+        }
+
+        pub(crate) fn snapshot(
+            &self,
+            request_id: &str,
+            request_identity_sha256: [u8; 32],
+            activation_identity_sha256: [u8; 32],
+        ) -> RelocalizationTerminalSnapshot {
+            let state = self.state.lock();
+            if let Some(terminal) = state.terminals.get(request_id) {
+                return if terminal.request_identity_sha256 == request_identity_sha256
+                    && terminal.activation_identity_sha256 == activation_identity_sha256
+                {
+                    RelocalizationTerminalSnapshot::Terminal(terminal.terminal.result.clone())
+                } else {
+                    RelocalizationTerminalSnapshot::IdentityConflict
+                };
+            }
+            match state.pending.get(request_id) {
+                Some(identity)
+                    if *identity == (request_identity_sha256, activation_identity_sha256) =>
+                {
+                    RelocalizationTerminalSnapshot::Pending
+                }
+                Some(_) => RelocalizationTerminalSnapshot::IdentityConflict,
+                None => RelocalizationTerminalSnapshot::NotFound,
+            }
+        }
+    }
+
     struct RelocalizationLedgerRecord {
         request: crate::proto::RelocalizeRequest,
         identity_sha256: [u8; 32],
@@ -5400,12 +6257,30 @@ mod preflight_only_contract {
         result: StoredRelocalizationResult,
     }
 
-    #[derive(Default)]
     struct RelocalizationCommandLedger {
         records: HashMap<String, RelocalizationLedgerRecord>,
         active_request_id: Option<String>,
         next_admission_ordinal: u64,
+        admitted_command_count: u64,
+        claimed_command_count: u64,
+        observation_epoch: u64,
         relocalization_mode: Arc<RelocalizationModeFence>,
+    }
+
+    impl Default for RelocalizationCommandLedger {
+        fn default() -> Self {
+            let mut epoch_bytes = [0_u8; 8];
+            epoch_bytes.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+            Self {
+                records: HashMap::new(),
+                active_request_id: None,
+                next_admission_ordinal: 0,
+                admitted_command_count: 0,
+                claimed_command_count: 0,
+                observation_epoch: u64::from_be_bytes(epoch_bytes).max(1),
+                relocalization_mode: Arc::new(RelocalizationModeFence::default()),
+            }
+        }
     }
 
     impl RelocalizationCommandLedger {
@@ -5482,11 +6357,16 @@ mod preflight_only_contract {
                 .next_admission_ordinal
                 .checked_add(1)
                 .ok_or("RELOCALIZATION_ADMISSION_ORDINAL_EXHAUSTED")?;
+            let admitted_command_count = self
+                .admitted_command_count
+                .checked_add(1)
+                .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
             let logical_deadline = now
                 .checked_add(Duration::from_millis(request.request.logical_timeout_ms))
                 .ok_or("RELOCALIZATION_LOGICAL_DEADLINE_OVERFLOW")?;
             self.relocalization_mode.activate()?;
             self.next_admission_ordinal = admission_ordinal;
+            self.admitted_command_count = admitted_command_count;
             self.active_request_id = Some(request.request.request_id.clone());
             self.records.insert(
                 request.request.request_id.clone(),
@@ -5523,6 +6403,10 @@ mod preflight_only_contract {
             if self.records.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
                 return Err("RELOCALIZATION_COMMAND_LEDGER_CAPACITY_EXCEEDED");
             }
+            let admitted_command_count = self
+                .admitted_command_count
+                .checked_add(1)
+                .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
             self.records.insert(
                 request.request.request_id.clone(),
                 RelocalizationLedgerRecord {
@@ -5537,6 +6421,7 @@ mod preflight_only_contract {
                     conflict_overflow: None,
                 },
             );
+            self.admitted_command_count = admitted_command_count;
             Ok(())
         }
 
@@ -5552,7 +6437,13 @@ mod preflight_only_contract {
             if record.identity_sha256 != identity_sha256 || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
-            record.claim_phase = RelocalizationClaimPhase::Postclaim;
+            if record.claim_phase == RelocalizationClaimPhase::Preclaim {
+                self.claimed_command_count = self
+                    .claimed_command_count
+                    .checked_add(1)
+                    .ok_or("RELOCALIZATION_CLAIMED_COMMAND_COUNT_EXHAUSTED")?;
+                record.claim_phase = RelocalizationClaimPhase::Postclaim;
+            }
             Ok(())
         }
 
@@ -5609,6 +6500,56 @@ mod preflight_only_contract {
             })
         }
 
+        fn observation(
+            &self,
+        ) -> Result<crate::proto::RelocalizationLedgerObservation, &'static str> {
+            let terminal_record_count =
+                self.records.values().try_fold(0_u64, |count, record| {
+                    if record.terminal.is_some() {
+                        count
+                            .checked_add(1)
+                            .ok_or("RELOCALIZATION_TERMINAL_RECORD_COUNT_EXHAUSTED")
+                    } else {
+                        Ok(count)
+                    }
+                })?;
+            let pending_record_count = self.records.values().try_fold(0_u64, |count, record| {
+                if record.terminal.is_none() {
+                    count
+                        .checked_add(1)
+                        .ok_or("RELOCALIZATION_PENDING_RECORD_COUNT_EXHAUSTED")
+                } else {
+                    Ok(count)
+                }
+            })?;
+            let active_waiter_count = self.records.values().try_fold(0_u64, |count, record| {
+                let record_waiters = u64::try_from(record.waiter_ids.len())
+                    .map_err(|_| "RELOCALIZATION_ACTIVE_WAITER_COUNT_EXHAUSTED")?;
+                count
+                    .checked_add(record_waiters)
+                    .ok_or("RELOCALIZATION_ACTIVE_WAITER_COUNT_EXHAUSTED")
+            })?;
+            let record_count = u64::try_from(self.records.len())
+                .map_err(|_| "RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?;
+            if terminal_record_count
+                .checked_add(pending_record_count)
+                .ok_or("RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?
+                != record_count
+                || self.observation_epoch == 0
+            {
+                return Err("RELOCALIZATION_LEDGER_OBSERVATION_INCONSISTENT");
+            }
+            Ok(crate::proto::RelocalizationLedgerObservation {
+                observation_schema_version: 1,
+                admitted_command_count: self.admitted_command_count,
+                claimed_command_count: self.claimed_command_count,
+                terminal_record_count,
+                pending_record_count,
+                active_waiter_count,
+                observation_epoch: self.observation_epoch,
+            })
+        }
+
         fn terminal(&self, request_id: &str) -> Option<&StoredRelocalizationResult> {
             self.records
                 .get(request_id)
@@ -5660,6 +6601,7 @@ mod preflight_only_contract {
         odom_frame_id: String,
         body_frame_id: String,
         runtime: Option<RelocalizationRuntimeContext>,
+        terminal_store: RelocalizationTerminalStore,
     }
 
     struct RelocalizationAccumulation {
@@ -5791,15 +6733,22 @@ mod preflight_only_contract {
             runtime: Option<RelocalizationRuntimeContext>,
         ) -> Self {
             let (sender, receiver) = mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
+            let (terminal_query_sender, terminal_query_receiver) =
+                mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
             let (detached_tx, detached_rx) = mpsc::unbounded_channel();
+            let terminal_store = RelocalizationTerminalStore::open()
+                .expect("durable relocalization terminal store must open before admission");
             let ingress = RelocalizationCommandIngress {
                 sender,
+                terminal_query_sender,
+                terminal_store: terminal_store.clone(),
                 admission_open: Arc::clone(&phase_a.admission_open),
                 admission_rx: phase_a.admission_tx.subscribe(),
                 waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
             };
             let worker = tokio::spawn(run_relocalization_command_owner(
                 receiver,
+                terminal_query_receiver,
                 detached_rx,
                 detached_tx,
                 RelocalizationOwnerConfig {
@@ -5809,6 +6758,7 @@ mod preflight_only_contract {
                     odom_frame_id,
                     body_frame_id,
                     runtime,
+                    terminal_store,
                 },
             ));
             Self {
@@ -5864,6 +6814,7 @@ mod preflight_only_contract {
         validated_frame_proofs:
             HashMap<(RelocalizationFrameScope, RelocalizationFrameKey), [u8; 32]>,
         next_candidate_sequence: u64,
+        terminal_store: RelocalizationTerminalStore,
     }
 
     impl RelocalizationCommandActor {
@@ -5872,6 +6823,23 @@ mod preflight_only_contract {
             map_frame_id: String,
             odom_frame_id: String,
             body_frame_id: String,
+        ) -> Self {
+            Self::new_with_terminal_store(
+                owner_identity,
+                map_frame_id,
+                odom_frame_id,
+                body_frame_id,
+                RelocalizationTerminalStore::open()
+                    .expect("durable relocalization terminal store must open"),
+            )
+        }
+
+        fn new_with_terminal_store(
+            owner_identity: CorrectionOwnerRuntimeIdentity,
+            map_frame_id: String,
+            odom_frame_id: String,
+            body_frame_id: String,
+            terminal_store: RelocalizationTerminalStore,
         ) -> Self {
             Self {
                 ledger: RelocalizationCommandLedger::default(),
@@ -5886,7 +6854,23 @@ mod preflight_only_contract {
                 last_validated_frames: HashMap::new(),
                 validated_frame_proofs: HashMap::new(),
                 next_candidate_sequence: 0,
+                terminal_store,
             }
+        }
+
+        fn handle_terminal_query(&self, query: RelocalizationTerminalQueryRequest) {
+            let terminal = self.terminal_store.snapshot(
+                &query.request_id,
+                query.request_identity_sha256,
+                query.activation_identity_sha256,
+            );
+            let result = self.ledger.observation().map(|ledger_observation| {
+                RelocalizationTerminalQuerySnapshot {
+                    terminal,
+                    ledger_observation,
+                }
+            });
+            let _ = query.response.send(result);
         }
 
         fn next_waiter_id(&mut self) -> Result<u64, RelocalizationCommandError> {
@@ -6044,6 +7028,33 @@ mod preflight_only_contract {
             )
         }
 
+        fn settle_terminal_durable(
+            &mut self,
+            request_id: &str,
+            identity_sha256: [u8; 32],
+            terminal: StoredRelocalizationResult,
+        ) -> Result<RelocalizationTerminalWaiters, CorrectionRuntimeError> {
+            let request = self.ledger.request(request_id).ok_or_else(|| {
+                CorrectionRuntimeError::Apply(
+                    "relocalization request missing before durable terminal".to_owned(),
+                )
+            })?;
+            let activation_identity_sha256 =
+                relocalization_digest(&request.activation_identity_sha256, "activation identity")
+                    .map_err(CorrectionRuntimeError::Apply)?;
+            self.terminal_store
+                .persist_terminal(
+                    request_id,
+                    identity_sha256,
+                    activation_identity_sha256,
+                    &terminal,
+                )
+                .map_err(CorrectionRuntimeError::Apply)?;
+            self.ledger
+                .settle_terminal(request_id, identity_sha256, terminal)
+                .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))
+        }
+
         fn notify_terminal(&mut self, terminal: RelocalizationTerminalWaiters) {
             for waiter_id in terminal.waiter_ids {
                 if let Some((_, _, capacity_lease)) = self.waiter_requests.remove(&waiter_id) {
@@ -6088,10 +7099,7 @@ mod preflight_only_contract {
             let request =
                 validate_relocalize_request(request).map_err(CorrectionRuntimeError::Apply)?;
             let terminal = self.terminal_result(&request, Some(ordinal), disposition, detail);
-            let terminal = self
-                .ledger
-                .settle_terminal(&request_id, identity_sha256, terminal)
-                .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
+            let terminal = self.settle_terminal_durable(&request_id, identity_sha256, terminal)?;
             self.notify_terminal(terminal);
             self.clear_frame_proofs();
             Ok(true)
@@ -6230,6 +7238,9 @@ mod preflight_only_contract {
                     admission_ordinal,
                     logical_deadline,
                 } => {
+                    self.terminal_store
+                        .mark_pending(&request)
+                        .map_err(CorrectionRuntimeError::Apply)?;
                     let mode_snapshot = phase_a.relocalization_mode().snapshot();
                     if !mode_snapshot.active {
                         return Err(CorrectionRuntimeError::Apply(
@@ -6290,14 +7301,11 @@ mod preflight_only_contract {
                             crate::proto::RelocalizeDisposition::OwnerFailed,
                             detail,
                         );
-                        let pending = self
-                            .ledger
-                            .settle_terminal(
-                                &request.request.request_id,
-                                request.identity_sha256,
-                                terminal,
-                            )
-                            .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
+                        let pending = self.settle_terminal_durable(
+                            &request.request.request_id,
+                            request.identity_sha256,
+                            terminal,
+                        )?;
                         let result = pending.result.result.clone();
                         self.notify_terminal(pending);
                         self.drop_synchronous_preclaim_execution();
@@ -6314,6 +7322,14 @@ mod preflight_only_contract {
                             crate::proto::RelocalizeDisposition::OwnerFailed,
                             detail,
                         );
+                        self.terminal_store
+                            .persist_terminal(
+                                &request.request.request_id,
+                                request.identity_sha256,
+                                request.activation_identity_sha256,
+                                &terminal,
+                            )
+                            .map_err(CorrectionRuntimeError::Apply)?;
                         self.ledger
                             .store_capacity_terminal(&request, Instant::now(), terminal.clone())
                             .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
@@ -6773,14 +7789,11 @@ mod preflight_only_contract {
                 correction_revision,
                 detail,
             )?;
-            let terminal = self
-                .ledger
-                .settle_terminal(
-                    &computed.request.request.request_id,
-                    computed.request.identity_sha256,
-                    terminal,
-                )
-                .map_err(|detail| CorrectionRuntimeError::Apply(detail.to_owned()))?;
+            let terminal = self.settle_terminal_durable(
+                &computed.request.request.request_id,
+                computed.request.identity_sha256,
+                terminal,
+            )?;
             self.notify_terminal(terminal);
             self.clear_frame_proofs();
             Ok(())
@@ -7202,6 +8215,7 @@ mod preflight_only_contract {
 
     async fn run_relocalization_command_owner(
         mut admissions: mpsc::Receiver<RelocalizationAdmissionRequest>,
+        mut terminal_queries: mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         mut detached: mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: mpsc::UnboundedSender<RelocalizationWaiterEvent>,
         config: RelocalizationOwnerConfig,
@@ -7213,12 +8227,14 @@ mod preflight_only_contract {
             odom_frame_id,
             body_frame_id,
             runtime,
+            terminal_store,
         } = config;
-        let mut actor = RelocalizationCommandActor::new(
+        let mut actor = RelocalizationCommandActor::new_with_terminal_store(
             owner_identity,
             map_frame_id,
             odom_frame_id,
             body_frame_id,
+            terminal_store,
         );
         actor.ledger.relocalization_mode = phase_a.relocalization_mode();
         match runtime {
@@ -7226,6 +8242,7 @@ mod preflight_only_contract {
                 run_relocalization_runtime_loop(
                     &mut actor,
                     &mut admissions,
+                    &mut terminal_queries,
                     &mut detached,
                     &detached_tx,
                     &phase_a,
@@ -7237,6 +8254,7 @@ mod preflight_only_contract {
                 run_relocalization_ledger_loop(
                     &mut actor,
                     &mut admissions,
+                    &mut terminal_queries,
                     &mut detached,
                     &detached_tx,
                     &phase_a,
@@ -7249,6 +8267,7 @@ mod preflight_only_contract {
     async fn run_relocalization_ledger_loop(
         actor: &mut RelocalizationCommandActor,
         admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
+        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>,
         phase_a: &CorrectionPhaseAControl,
@@ -7266,6 +8285,10 @@ mod preflight_only_contract {
                     )?;
                     return Ok(());
                 }
+                query = terminal_queries.recv() => match query {
+                    Some(query) => actor.handle_terminal_query(query),
+                    None => return Err(CorrectionRuntimeError::IngressClosed),
+                },
                 event = detached.recv() => match event {
                     Some(RelocalizationWaiterEvent::Detached(waiter_id)) => {
                         actor.handle_detached(waiter_id)?;
@@ -7291,6 +8314,7 @@ mod preflight_only_contract {
     async fn run_relocalization_runtime_loop(
         actor: &mut RelocalizationCommandActor,
         admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
+        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>,
         phase_a: &CorrectionPhaseAControl,
@@ -7358,6 +8382,10 @@ mod preflight_only_contract {
                         )));
                     }
                     None => {}
+                },
+                query = terminal_queries.recv() => match query {
+                    Some(query) => actor.handle_terminal_query(query),
+                    None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
                 event = detached.recv() => match event {
                     Some(RelocalizationWaiterEvent::Detached(waiter_id)) => {
@@ -10033,6 +11061,412 @@ mod preflight_only_contract {
         }
 
         #[test]
+        fn relocalization_request_id_uses_canonical_ascii_contract() {
+            assert!(validate_relocalization_request_id("req.A_z:9-0").is_ok());
+            for invalid in ["", " request", "request ", "request/child", "请求", "a\n"] {
+                assert_eq!(
+                    validate_relocalization_request_id(invalid),
+                    Err("RELOCALIZATION_REQUEST_ID_INVALID".to_owned())
+                );
+            }
+            assert_eq!(
+                validate_relocalization_request_id(&"a".repeat(129)),
+                Err("RELOCALIZATION_REQUEST_ID_INVALID".to_owned())
+            );
+        }
+
+        #[test]
+        fn relocalization_terminal_store_root_uses_absolute_deployment_ssot() {
+            assert_eq!(
+                terminal_store_root_from(
+                    Some(OsString::from("/override/store")),
+                    Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
+                    Some(OsString::from("/runtime-data")),
+                ),
+                Ok(PathBuf::from("/override/store"))
+            );
+            assert_eq!(
+                terminal_store_root_from(
+                    None,
+                    Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
+                    Some(OsString::from("/runtime-data")),
+                ),
+                Ok(PathBuf::from(
+                    "/var/lib/nuwax/geometry-runtime/relocalization_terminals_v1"
+                ))
+            );
+            assert_eq!(
+                terminal_store_root_from(None, None, Some(OsString::from("/runtime-data"))),
+                Ok(PathBuf::from(
+                    "/runtime-data/geometry/relocalization_terminals_v1"
+                ))
+            );
+            assert_eq!(
+                terminal_store_root_from(
+                    Some(OsString::from("relative")),
+                    Some(OsString::from("/state")),
+                    Some(OsString::from("/runtime-data")),
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+            );
+            assert_eq!(
+                terminal_store_root_from(None, Some(OsString::from("relative:/state")), None),
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+            );
+            assert_eq!(
+                terminal_store_root_from(None, None, None),
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_UNAVAILABLE".to_owned())
+            );
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_reopens_and_detects_identity_conflict() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-store-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+            ));
+            let request_identity = [3_u8; 32];
+            let activation_identity = [5_u8; 32];
+            let result = crate::proto::RelocalizeResult {
+                schema_version: 1,
+                request_id: "req-store-reopen".to_owned(),
+                request_identity_sha256: request_identity.to_vec(),
+                activation_identity_sha256: activation_identity.to_vec(),
+                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
+                terminal_proof_sha256: vec![7; 32],
+                ..Default::default()
+            };
+            let terminal = StoredRelocalizationResult::new(result.clone());
+            {
+                let store = RelocalizationTerminalStore::open_at(root.clone())
+                    .expect("open terminal store");
+                store
+                    .persist_terminal(
+                        &result.request_id,
+                        request_identity,
+                        activation_identity,
+                        &terminal,
+                    )
+                    .expect("persist terminal");
+            }
+            let reopened =
+                RelocalizationTerminalStore::open_at(root.clone()).expect("reopen terminal store");
+            match reopened.snapshot(&result.request_id, request_identity, activation_identity) {
+                RelocalizationTerminalSnapshot::Terminal(replayed) => {
+                    assert_eq!(replayed.encode_to_vec(), result.encode_to_vec());
+                }
+                other => panic!("unexpected reopened snapshot: {other:?}"),
+            }
+            assert!(matches!(
+                reopened.snapshot(&result.request_id, [9; 32], activation_identity),
+                RelocalizationTerminalSnapshot::IdentityConflict
+            ));
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_rejects_noncanonical_record_request_id() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-invalid-id-{}-{}",
+                std::process::id(),
+                terminal_owner_token(),
+            ));
+            let request_id = "req-store-invalid-id";
+            let request_identity = [3_u8; 32];
+            let activation_identity = [5_u8; 32];
+            let terminal = StoredRelocalizationResult::new(crate::proto::RelocalizeResult {
+                schema_version: 1,
+                request_id: request_id.to_owned(),
+                request_identity_sha256: request_identity.to_vec(),
+                activation_identity_sha256: activation_identity.to_vec(),
+                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
+                terminal_proof_sha256: vec![7; 32],
+                ..Default::default()
+            });
+            {
+                let store = RelocalizationTerminalStore::open_at(root.clone())
+                    .expect("open terminal store");
+                store
+                    .persist_terminal(request_id, request_identity, activation_identity, &terminal)
+                    .expect("persist terminal");
+            }
+            let path = root.join(format!(
+                "{}.json",
+                encode_hex(&sha256_bytes(request_id.as_bytes()))
+            ));
+            let mut record: DurableRelocalizationTerminalV1 =
+                serde_json::from_slice(&fs::read(&path).expect("read terminal record"))
+                    .expect("decode terminal record");
+            record.request_id = " invalid".to_owned();
+            fs::write(
+                &path,
+                serde_json::to_vec(&record).expect("encode invalid terminal record"),
+            )
+            .expect("write invalid terminal record");
+
+            assert_eq!(
+                RelocalizationTerminalStore::open_at(root.clone())
+                    .err()
+                    .expect("invalid request ID must fail closed"),
+                "RELOCALIZATION_TERMINAL_STORE_RECORD_INVALID"
+            );
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_cleans_only_unlocked_owner() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-temp-cleanup-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+            ));
+            fs::create_dir_all(&root).expect("create terminal store root");
+            let digest = "0".repeat(64);
+            let active_owner = terminal_owner_token();
+            let active_lease_path = root.join(terminal_lease_name(&active_owner));
+            let active_lease_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&active_lease_path)
+                .expect("create active lease");
+            let active_lease = Flock::lock(active_lease_file, FlockArg::LockExclusiveNonblock)
+                .expect("lock active lease");
+            let active = root.join(format!(
+                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
+                active_owner,
+                terminal_owner_token(),
+                digest,
+                digest,
+            ));
+            fs::write(&active, b"active").expect("write active temp");
+
+            let orphan_owner = terminal_owner_token();
+            let orphan_lease = root.join(terminal_lease_name(&orphan_owner));
+            fs::write(&orphan_lease, b"").expect("write orphan lease");
+            let orphan = root.join(format!(
+                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
+                orphan_owner,
+                terminal_owner_token(),
+                digest,
+                digest,
+            ));
+            fs::write(&orphan, b"orphan").expect("write orphan temp");
+
+            RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
+
+            assert!(active.exists());
+            assert!(active_lease_path.exists());
+            assert!(!orphan.exists());
+            assert!(!orphan_lease.exists());
+            drop(active_lease);
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_lock_unknown_is_retained() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-lock-unknown-{}-{}",
+                std::process::id(),
+                terminal_owner_token(),
+            ));
+            fs::create_dir_all(&root).expect("create terminal store root");
+            let owner = terminal_owner_token();
+            let digest = "0".repeat(64);
+            let temporary = root.join(format!(
+                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
+                owner,
+                terminal_owner_token(),
+                digest,
+                digest,
+            ));
+            fs::write(&temporary, b"unknown").expect("write unknown temp");
+
+            let cleanup_lock = lock_terminal_cleanup(&root).expect("lock terminal cleanup");
+            assert_eq!(
+                cleanup_terminal_owner(&root, &owner, &cleanup_lock),
+                Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_MISSING".to_owned())
+            );
+            drop(cleanup_lock);
+            assert!(temporary.exists());
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_incarnations_do_not_collide() {
+            let first = terminal_owner_token();
+            let second = terminal_owner_token();
+            assert_ne!(first, second);
+            assert!(is_terminal_token(
+                &first,
+                RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES
+            ));
+            assert!(is_terminal_token(
+                &second,
+                RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES
+            ));
+            assert_ne!(terminal_lease_name(&first), terminal_lease_name(&second));
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_preserves_primary_on_cleanup_failure() {
+            assert_eq!(
+                combine_terminal_persist_results(
+                    Err("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:disk".to_owned()),
+                    Err("RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:denied".to_owned()),
+                ),
+                Err(
+                    "RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:disk|TEMP_CLEANUP_FAILED"
+                        .to_owned()
+                )
+            );
+            assert_eq!(
+                combine_terminal_persist_results(
+                    Ok(()),
+                    Err("RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:denied".to_owned()),
+                ),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_removes_temporary_on_publish_conflict() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-temp-conflict-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+            ));
+            let request_id = "req-store-conflict-cleanup";
+            let request_identity = [3_u8; 32];
+            let activation_identity = [5_u8; 32];
+            let result = crate::proto::RelocalizeResult {
+                schema_version: 1,
+                request_id: request_id.to_owned(),
+                request_identity_sha256: request_identity.to_vec(),
+                activation_identity_sha256: activation_identity.to_vec(),
+                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
+                terminal_proof_sha256: vec![7; 32],
+                ..Default::default()
+            };
+            let terminal = StoredRelocalizationResult::new(result);
+            let store =
+                RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
+            let final_path = root.join(format!(
+                "{}.json",
+                encode_hex(&sha256_bytes(request_id.as_bytes()))
+            ));
+            fs::write(&final_path, b"different terminal").expect("write conflicting object");
+
+            assert_eq!(
+                store.persist_terminal(
+                    request_id,
+                    request_identity,
+                    activation_identity,
+                    &terminal,
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".to_owned())
+            );
+            let owned_temporary_count = fs::read_dir(&root)
+                .expect("read terminal store")
+                .map(|entry| entry.expect("read terminal entry"))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(is_owned_terminal_temporary_name)
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(owned_temporary_count, 0);
+            assert_eq!(
+                fs::read(&final_path).expect("read conflicting object"),
+                b"different terminal"
+            );
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
+        fn terminal_record_reader_enforces_fixed_limit_and_growth_boundary() {
+            let at_limit = vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES];
+            assert_eq!(
+                read_terminal_record_bytes(
+                    std::io::Cursor::new(at_limit.clone()),
+                    RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64,
+                )
+                .expect("fixed-limit reader accepts exactly the byte limit"),
+                at_limit
+            );
+            assert_eq!(
+                read_terminal_record_bytes(
+                    std::io::Cursor::new(vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1]),
+                    (RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64,
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned())
+            );
+            assert_eq!(
+                read_terminal_record_bytes(
+                    std::io::Cursor::new(vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1]),
+                    RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64,
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned()),
+                "bounded read must detect growth after metadata inspection"
+            );
+        }
+
+        #[test]
+        fn durable_relocalization_terminal_store_bounds_publish_conflict_read() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-relocalization-terminal-bounded-conflict-{}-{}",
+                std::process::id(),
+                terminal_owner_token(),
+            ));
+            let request_id = "req-store-bounded-conflict";
+            let request_identity = [3_u8; 32];
+            let activation_identity = [5_u8; 32];
+            let terminal = StoredRelocalizationResult::new(crate::proto::RelocalizeResult {
+                schema_version: 1,
+                request_id: request_id.to_owned(),
+                request_identity_sha256: request_identity.to_vec(),
+                activation_identity_sha256: activation_identity.to_vec(),
+                disposition: crate::proto::RelocalizeDisposition::Applied as i32,
+                terminal_proof_sha256: vec![7; 32],
+                ..Default::default()
+            });
+            let store =
+                RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
+            let final_path = root.join(format!(
+                "{}.json",
+                encode_hex(&sha256_bytes(request_id.as_bytes()))
+            ));
+            let oversized = File::create(&final_path).expect("create oversized conflicting object");
+            oversized
+                .set_len((RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64)
+                .expect("extend oversized conflicting object");
+            drop(oversized);
+
+            assert_eq!(
+                store.persist_terminal(
+                    request_id,
+                    request_identity,
+                    activation_identity,
+                    &terminal,
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned())
+            );
+            fs::remove_dir_all(root).expect("remove terminal store");
+        }
+
+        #[test]
         fn relocalization_terminal_proof_v1_matches_independent_full_result_golden() {
             let result = crate::proto::RelocalizeResult {
                 schema_version: 1,
@@ -10636,6 +12070,55 @@ mod preflight_only_contract {
                     _ => panic!("same identity must join"),
                 }
             }
+        }
+
+        #[test]
+        fn relocalization_ledger_observation_counts_only_new_admission_and_first_claim() {
+            let request = validate_relocalize_request(relocalization_command_request("req-a", 7))
+                .expect("valid request");
+            let mut ledger = RelocalizationCommandLedger::default();
+            let epoch = ledger
+                .observation()
+                .expect("initial observation")
+                .observation_epoch;
+            assert_ne!(epoch, 0);
+
+            ledger
+                .admit(&request, 1, Instant::now(), || unreachable!("no conflict"))
+                .expect("first admission");
+            ledger
+                .admit(&request, 2, Instant::now(), || {
+                    unreachable!("same identity")
+                })
+                .expect("same-ID join");
+            let before_claim = ledger.observation().expect("before claim observation");
+            assert_eq!(before_claim.admitted_command_count, 1);
+            assert_eq!(before_claim.claimed_command_count, 0);
+            assert_eq!(before_claim.terminal_record_count, 0);
+            assert_eq!(before_claim.pending_record_count, 1);
+            assert_eq!(before_claim.active_waiter_count, 2);
+
+            ledger
+                .mark_postclaim("req-a", request.identity_sha256)
+                .expect("first claim");
+            ledger
+                .mark_postclaim("req-a", request.identity_sha256)
+                .expect("idempotent claim");
+            let terminal = relocalization_command_terminal(
+                &request,
+                crate::proto::RelocalizeDisposition::Cancelled,
+                "RELOCALIZATION_CANCELLED",
+            );
+            ledger
+                .settle_terminal("req-a", request.identity_sha256, terminal)
+                .expect("terminal settlement");
+            let settled = ledger.observation().expect("settled observation");
+            assert_eq!(settled.observation_epoch, epoch);
+            assert_eq!(settled.admitted_command_count, 1);
+            assert_eq!(settled.claimed_command_count, 1);
+            assert_eq!(settled.terminal_record_count, 1);
+            assert_eq!(settled.pending_record_count, 0);
+            assert_eq!(settled.active_waiter_count, 0);
         }
 
         #[test]
@@ -17022,16 +18505,17 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 pub(crate) use preflight_only_contract::{
     body_points_sha256, expected_map_boundary_sha256, odom_pose_sha256,
     relocalization_algorithm_options_sha256_v1, relocalization_deadline_policy_sha256_v1,
-    relocalization_source_policy_sha256_v1, ActivatedTargetReceiptControl, ActivationJournalEntry,
-    ActivationJournalStatus, ActivationJournalStep, ActivationLedgerAdmission,
-    ActivationPublicationProof, ActivationReceiptSeed, ActivationToken, CanonicalCorrectionApplier,
+    relocalization_source_policy_sha256_v1, validate_relocalization_request_id,
+    ActivatedTargetReceiptControl, ActivationJournalEntry, ActivationJournalStatus,
+    ActivationJournalStep, ActivationLedgerAdmission, ActivationPublicationProof,
+    ActivationReceiptSeed, ActivationToken, CanonicalCorrectionApplier,
     CanonicalCorrectionApplyError, CanonicalCorrectionTransaction, CommittedMapProof,
     CorrectionCandidateBackend, CorrectionFrameIngress, CorrectionFrameInput, CorrectionLeaseId,
     CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec, CorrectionPhaseAControl,
     CorrectionProcessStopAttempt, CorrectionRequestCancellation, CorrectionRuntimeError,
     CorrectionTransportOwner, CorrelatedOdomProof, FrozenCorrelatedOdom, GeometryCorrectionSink,
     RegisteredCloudProof, RelocalizationCommandError, RelocalizationCommandIngress,
-    RelocalizationCommandWaiter, RelocalizationModeFence,
+    RelocalizationCommandWaiter, RelocalizationModeFence, RelocalizationTerminalSnapshot,
     RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1, RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
     RELOCALIZATION_SOURCE_POLICY_VERSION_V1,
 };

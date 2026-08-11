@@ -5303,6 +5303,69 @@ impl GeometryRuntime for GeometryRuntimeService {
             .map_err(relocalization_command_status)
     }
 
+    async fn get_relocalization_terminal(
+        &self,
+        req: Request<GetRelocalizationTerminalRequest>,
+    ) -> Result<Response<GetRelocalizationTerminalResponse>, Status> {
+        let ingress = self
+            .relocalization_ingress
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
+        let request = req.into_inner();
+        if request.schema_version != 1
+            || crate::correction_coordinator::validate_relocalization_request_id(
+                &request.request_id,
+            )
+            .is_err()
+        {
+            return Err(Status::invalid_argument(
+                "RELOCALIZATION_TERMINAL_QUERY_INVALID",
+            ));
+        }
+        let request_identity_sha256: [u8; 32] = request
+            .request_identity_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("RELOCALIZATION_REQUEST_IDENTITY_INVALID"))?;
+        let activation_identity_sha256: [u8; 32] = request
+            .activation_identity_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("RELOCALIZATION_ACTIVATION_IDENTITY_INVALID"))?;
+        let snapshot = ingress
+            .terminal_snapshot(
+                &request.request_id,
+                request_identity_sha256,
+                activation_identity_sha256,
+            )
+            .await
+            .map_err(Status::failed_precondition)?;
+        let ledger_observation = Some(snapshot.ledger_observation);
+        let (status, terminal) = match snapshot.terminal {
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::Terminal(terminal) => {
+                (RelocalizationTerminalStatus::Terminal, Some(terminal))
+            }
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending => {
+                (RelocalizationTerminalStatus::Pending, None)
+            }
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound => {
+                (RelocalizationTerminalStatus::NotFound, None)
+            }
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => {
+                (RelocalizationTerminalStatus::IdentityConflict, None)
+            }
+        };
+        Ok(Response::new(GetRelocalizationTerminalResponse {
+            schema_version: 1,
+            request_id: request.request_id,
+            request_identity_sha256: request.request_identity_sha256,
+            activation_identity_sha256: request.activation_identity_sha256,
+            status: status as i32,
+            terminal,
+            ledger_observation,
+        }))
+    }
+
     async fn get_occupancy_grid(
         &self,
         _req: Request<Empty>,
@@ -14510,5 +14573,155 @@ mod navigation_feedback_contract_tests {
         .await
         .expect_err("public RPC cannot forge exploration owner");
         assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+    }
+}
+
+#[cfg(test)]
+mod relocalization_terminal_query_tests {
+    use super::*;
+
+    async fn query_service(
+        ingress: crate::correction_coordinator::RelocalizationCommandIngress,
+    ) -> GeometryRuntimeService {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
+        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None, None);
+        GeometryRuntimeService::new_with_shutdown_and_point_cloud_binding(
+            handle,
+            shutdown,
+            None,
+            Some(ingress),
+        )
+    }
+
+    fn query_request(
+        request_id: &str,
+        request_identity_sha256: Vec<u8>,
+        activation_identity_sha256: Vec<u8>,
+    ) -> GetRelocalizationTerminalRequest {
+        GetRelocalizationTerminalRequest {
+            schema_version: 1,
+            request_id: request_id.to_owned(),
+            request_identity_sha256,
+            activation_identity_sha256,
+        }
+    }
+
+    fn query_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "nuwax-terminal-query-{name}-{}-{}",
+            std::process::id(),
+            now_ns()
+        ))
+    }
+
+    #[tokio::test]
+    async fn terminal_query_rejects_invalid_id_and_identity_lengths() {
+        let root = query_root("invalid");
+        let ingress = crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
+        let service = query_service(ingress).await;
+        for request in [
+            query_request(" invalid", vec![3; 32], vec![5; 32]),
+            query_request("req-invalid-request-digest", vec![3; 31], vec![5; 32]),
+            query_request("req-invalid-activation-digest", vec![3; 32], vec![5; 33]),
+        ] {
+            let error =
+                GeometryRuntime::get_relocalization_terminal(&service, Request::new(request))
+                    .await
+                    .expect_err("invalid terminal query must fail closed");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+        std::fs::remove_dir_all(root).expect("remove terminal query store");
+    }
+
+    #[tokio::test]
+    async fn terminal_query_projects_four_read_only_states_without_mutating_runtime() {
+        let root = query_root("states");
+        let ingress = crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
+        let request_identity = [3_u8; 32];
+        let activation_identity = [5_u8; 32];
+        ingress.mark_terminal_query_pending_for_tests(
+            "req-pending",
+            request_identity,
+            activation_identity,
+        );
+        ingress.persist_terminal_query_result_for_tests(RelocalizeResult {
+            schema_version: 1,
+            request_id: "req-terminal".to_owned(),
+            request_identity_sha256: request_identity.to_vec(),
+            activation_identity_sha256: activation_identity.to_vec(),
+            disposition: RelocalizeDisposition::Applied as i32,
+            terminal_proof_sha256: vec![7; 32],
+            ..RelocalizeResult::default()
+        });
+        let service = query_service(ingress.clone()).await;
+        let map_revision_before = service.bridge.state.read().await.map.revision;
+
+        for (request_id, request_digest, expected_status, has_terminal) in [
+            (
+                "req-terminal",
+                request_identity,
+                RelocalizationTerminalStatus::Terminal,
+                true,
+            ),
+            (
+                "req-pending",
+                request_identity,
+                RelocalizationTerminalStatus::Pending,
+                false,
+            ),
+            (
+                "req-missing",
+                request_identity,
+                RelocalizationTerminalStatus::NotFound,
+                false,
+            ),
+            (
+                "req-terminal",
+                [9; 32],
+                RelocalizationTerminalStatus::IdentityConflict,
+                false,
+            ),
+        ] {
+            let response = GeometryRuntime::get_relocalization_terminal(
+                &service,
+                Request::new(query_request(
+                    request_id,
+                    request_digest.to_vec(),
+                    activation_identity.to_vec(),
+                )),
+            )
+            .await
+            .expect("terminal query response")
+            .into_inner();
+            assert_eq!(response.status, expected_status as i32);
+            assert_eq!(response.terminal.is_some(), has_terminal);
+            let observation = response
+                .ledger_observation
+                .expect("successful query must include ledger observation");
+            assert_eq!(observation.observation_schema_version, 1);
+            assert_ne!(observation.observation_epoch, 0);
+            assert_eq!(observation.admitted_command_count, 0);
+            assert_eq!(observation.claimed_command_count, 0);
+            assert_eq!(observation.terminal_record_count, 0);
+            assert_eq!(observation.pending_record_count, 0);
+            assert_eq!(observation.active_waiter_count, 0);
+        }
+
+        assert_eq!(
+            service.bridge.state.read().await.map.revision,
+            map_revision_before
+        );
+        assert!(matches!(
+            ingress
+                .terminal_snapshot("req-pending", request_identity, activation_identity)
+                .await
+                .expect("terminal snapshot")
+                .terminal,
+            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending
+        ));
+        std::fs::remove_dir_all(root).expect("remove terminal query store");
     }
 }

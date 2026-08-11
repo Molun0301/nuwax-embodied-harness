@@ -193,6 +193,15 @@ class GeometryRuntimeRelocalizationRejected(RuntimeError):
 
 
 @dataclass(frozen=True)
+class _MapActivationSnapshot:
+    bundle: Optional[MapAssetBundle]
+    bundle_root: Optional[Path]
+    activation_result_json: str
+    generation: int
+    identity: Tuple[object, ...]
+
+
+@dataclass(frozen=True)
 class _ValidatedLiveMapCache:
     backend: object
     mapping_identity: Tuple[object, ...]
@@ -925,9 +934,14 @@ class PlatformGeometryRuntime:
         self._event_bus = event_bus
         self._catalog_root = Path(catalog_root).expanduser()
         self._catalog_root.mkdir(parents=True, exist_ok=True)
-        self._active_map_bundle: Optional[MapAssetBundle] = None
-        self._active_map_bundle_root: Optional[Path] = None
-        self._last_activation_result: Dict[str, object] = {}
+        self._runtime_state_lock = threading.RLock()
+        self._map_activation_snapshot = _MapActivationSnapshot(
+            bundle=None,
+            bundle_root=None,
+            activation_result_json="{}",
+            generation=0,
+            identity=(0, None, None, None, None),
+        )
         # 以下4个 Python provider 已由 Rust bridge (GeometryRuntimeProvider) 替代，保留 None 占位以兼容现有引用
         self._live_map_provider = None
         self._tf_localization_provider = None
@@ -946,7 +960,6 @@ class PlatformGeometryRuntime:
         self._navigation_update_subscribers: Dict[int, Callable[[object], None]] = {}
         self._remote_navigation_subscription_ids: Dict[int, int] = {}
         self._next_navigation_subscription_id = 1
-        self._runtime_state_lock = threading.RLock()
         self._mapping_lifecycle_lock = threading.RLock()
         self._mapping_session_context: Optional[Dict[str, object]] = None
         self._mapping_session_provider_attach_epoch: Optional[int] = None
@@ -2795,9 +2808,10 @@ class PlatformGeometryRuntime:
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
+        activation_snapshot = self._map_activation_snapshot_read()
         localization_process = bool(
             self._external_geometry_process_is_localization()
-            or str((self._last_activation_result or {}).get("backend_mode") or "") == "mapping_localization"
+            or str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
         )
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
         streaming_required = not localization_process
@@ -2887,9 +2901,10 @@ class PlatformGeometryRuntime:
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
+        activation_snapshot = self._map_activation_snapshot_read()
         localization_process = bool(
             self._external_geometry_process_is_localization()
-            or str((self._last_activation_result or {}).get("backend_mode") or "") == "mapping_localization"
+            or str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
         )
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
         streaming_required = not localization_process
@@ -3571,24 +3586,398 @@ class PlatformGeometryRuntime:
                 return
             self._external_debug_frontier_payload = self._clone_metadata(payload)
 
-    def is_relocalization_available(self) -> bool:
+    def _activation_result_from_snapshot(
+        self,
+        snapshot: _MapActivationSnapshot,
+    ) -> Dict[str, object]:
+        return json.loads(snapshot.activation_result_json)
+
+    def _map_activation_snapshot_locked(self) -> _MapActivationSnapshot:
+        snapshot = getattr(self, "_map_activation_snapshot", None)
+        if not isinstance(snapshot, _MapActivationSnapshot):
+            snapshot = _MapActivationSnapshot(
+                bundle=None,
+                bundle_root=None,
+                activation_result_json="{}",
+                generation=0,
+                identity=(0, None, None, None, None),
+            )
+            self._map_activation_snapshot = snapshot
+        return snapshot
+
+    def _map_activation_snapshot_read(self) -> _MapActivationSnapshot:
+        state_lock = getattr(self, "_runtime_state_lock", None)
+        if state_lock is None:
+            snapshot = self._map_activation_snapshot_locked()
+        else:
+            with state_lock:
+                snapshot = self._map_activation_snapshot_locked()
+        return _MapActivationSnapshot(
+            bundle=self._clone_contract(snapshot.bundle),
+            bundle_root=snapshot.bundle_root,
+            activation_result_json=snapshot.activation_result_json,
+            generation=snapshot.generation,
+            identity=snapshot.identity,
+        )
+
+    def _install_map_activation_snapshot_locked(
+        self,
+        *,
+        bundle: Optional[MapAssetBundle],
+        bundle_root: Optional[Path],
+        activation_result: Dict[str, object],
+    ) -> _MapActivationSnapshot:
+        previous = self._map_activation_snapshot_locked()
+        installed_bundle = self._clone_contract(bundle)
+        installed_result = self._clone_metadata(activation_result or {})
+        installed_result_json = json.dumps(
+            installed_result,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        generation = previous.generation + 1
+        identity = (
+            generation,
+            installed_bundle.map_name if installed_bundle is not None else None,
+            str(installed_bundle.manifest_sha256 or "").strip().lower()
+            if installed_bundle is not None
+            else None,
+            installed_result.get("activation_identity_sha256"),
+            hashlib.sha256(installed_result_json.encode("utf-8")).hexdigest(),
+        )
+        snapshot = _MapActivationSnapshot(
+            bundle=installed_bundle,
+            bundle_root=bundle_root,
+            activation_result_json=installed_result_json,
+            generation=generation,
+            identity=identity,
+        )
+        self._map_activation_snapshot = snapshot
+        return self._map_activation_snapshot_read()
+
+    def _map_activation_snapshot_still_current_locked(
+        self,
+        expected: _MapActivationSnapshot,
+    ) -> bool:
+        current = self._map_activation_snapshot
+        return (
+            current.generation == expected.generation
+            and current.identity == expected.identity
+        )
+
+    def _require_map_activation_target_locked(
+        self,
+        *,
+        map_name: str,
+        asset_manifest_sha256: str,
+    ) -> Tuple[_MapActivationSnapshot, Dict[str, object]]:
+        snapshot = self._map_activation_snapshot_locked()
+        bundle = snapshot.bundle
+        activation = self._activation_result_from_snapshot(snapshot)
         if (
-            not self._is_geometry_profile_enabled()
-            or self.is_map_asset_activation_recovery_pending()
-            or self._active_map_bundle is None
+            bundle is None
+            or bundle.map_name != map_name
+            or str(bundle.manifest_sha256 or "").strip().lower()
+            != asset_manifest_sha256
+            or not bool(activation.get("relocalization_target_available"))
+            or str(activation.get("map_name") or "").strip() != map_name
+            or str(activation.get("asset_manifest_sha256") or "").strip().lower()
+            != asset_manifest_sha256
         ):
+            raise RuntimeError("重定位目标与当前 sealed 激活资产不一致。")
+        return snapshot, activation
+
+    def get_validated_map_activation_receipt(self) -> Dict[str, object]:
+        """返回 provider 已验证且仍绑定当前资产的 sealed 激活身份。"""
+
+        with self._runtime_state_lock:
+            snapshot = self._map_activation_snapshot_locked()
+            active_bundle = snapshot.bundle
+            activation = self._activation_result_from_snapshot(snapshot)
+            if (
+                active_bundle is None
+                or activation.get("backend_switch_applied") is not True
+                or str(activation.get("backend_activation_disposition") or "")
+                != "applied"
+                or str(activation.get("map_name") or "").strip()
+                != active_bundle.map_name
+                or str(activation.get("asset_manifest_sha256") or "").strip().lower()
+                != str(active_bundle.manifest_sha256 or "").strip().lower()
+                or not bool(activation.get("relocalization_target_available"))
+            ):
+                raise RuntimeError("当前运行态没有匹配资产的 sealed 激活凭据。")
+            fields = (
+                "activation_receipt_schema_version",
+                "activation_receipt_disposition",
+                "activation_receipt_disposition_name",
+                "runtime_generation",
+                "session_id",
+                "session_generation",
+                "backend_generation",
+                "mapping_backend_kind",
+                "activation_request_identity_sha256",
+                "activation_identity_sha256",
+                "target_receipt_sha256",
+                "asset_bundle_sha256",
+                "relocalization_target_available",
+                "cloud_source_revision",
+                "cloud_source_sha256",
+                "source_policy_version",
+                "source_policy_sha256",
+                "deadline_policy_version",
+                "deadline_policy_sha256",
+                "algorithm_options_version",
+                "algorithm_options_sha256",
+            )
+            return {field_name: activation.get(field_name) for field_name in fields}
+
+    def get_validated_relocalization_receipt(
+        self,
+        result: Dict[str, object],
+        *,
+        map_name: str,
+        asset_manifest_sha256: str,
+        activation_receipt: Dict[str, object],
+        _expected_activation_snapshot: Optional[_MapActivationSnapshot] = None,
+    ) -> Dict[str, object]:
+        """在同一运行态快照内投影 provider 已验证的重定位成功终态。"""
+
+        with self._runtime_state_lock:
+            payload = self._clone_metadata(result)
+            snapshot = self._map_activation_snapshot_locked()
+            if (
+                _expected_activation_snapshot is not None
+                and not self._map_activation_snapshot_still_current_locked(
+                    _expected_activation_snapshot
+                )
+            ):
+                raise RuntimeError("重定位终态投影前激活身份已变化。")
+            active_bundle = snapshot.bundle
+            activation = self._activation_result_from_snapshot(snapshot)
+            resolved_map_name = str(map_name or "").strip()
+            resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
+            trusted_activation = dict(activation_receipt or {})
+            if payload.get("success") is not True:
+                raise ValueError("重定位结果不是 provider 已验证的成功终态。")
+            if (
+                trusted_activation.get("trusted_identity") is not True
+                or active_bundle is None
+                or active_bundle.map_name != resolved_map_name
+                or str(active_bundle.manifest_sha256 or "").strip().lower()
+                != resolved_manifest
+                or str(activation.get("map_name") or "").strip()
+                != resolved_map_name
+                or str(activation.get("asset_manifest_sha256") or "")
+                .strip()
+                .lower()
+                != resolved_manifest
+                or not bool(activation.get("relocalization_target_available"))
+                or trusted_activation.get("target_map_name") != resolved_map_name
+                or trusted_activation.get("target_manifest_sha256")
+                != resolved_manifest
+            ):
+                raise RuntimeError("重定位终态投影时当前激活 target 已变化。")
+            identity_fields = (
+                "runtime_generation",
+                "session_id",
+                "session_generation",
+                "backend_generation",
+                "activation_identity_sha256",
+                "target_receipt_sha256",
+                "asset_bundle_sha256",
+            )
+            if any(
+                activation.get(field_name)
+                != trusted_activation.get(field_name)
+                or payload.get(field_name)
+                != trusted_activation.get(field_name)
+                for field_name in identity_fields
+            ):
+                raise RuntimeError("重定位终态与当前 trusted activation 身份不一致。")
+            if (
+                payload.get("map_name") != resolved_map_name
+                or payload.get("asset_manifest_sha256") != resolved_manifest
+            ):
+                raise RuntimeError("重定位终态与当前资产身份不一致。")
+            fields = (
+                "schema_version",
+                "request_id",
+                "request_identity_sha256",
+                "runtime_generation",
+                "session_id",
+                "map_name",
+                "session_generation",
+                "backend_generation",
+                "activation_identity_sha256",
+                "target_receipt_sha256",
+                "target_cloud_revision",
+                "target_cloud_sha256",
+                "asset_manifest_sha256",
+                "asset_bundle_sha256",
+                "source_policy_version",
+                "source_policy_sha256",
+                "deadline_policy_version",
+                "deadline_policy_sha256",
+                "logical_timeout_ms",
+                "algorithm_options_version",
+                "algorithm_options_sha256",
+                "disposition",
+                "disposition_name",
+                "candidate_sequence",
+                "candidate_payload_sha256",
+                "evidence_sha256",
+                "correction_revision",
+                "terminal_proof_sha256",
+            )
+            if any(field_name not in payload for field_name in fields):
+                raise ValueError("重定位成功终态缺少可持久化身份字段。")
+            return {field_name: payload[field_name] for field_name in fields}
+
+    def get_relocalization_terminal(
+        self,
+        *,
+        request_id: str,
+        logical_timeout_ms: int,
+        map_name: str,
+        asset_manifest_sha256: str,
+        activation_receipt: Dict[str, object],
+    ) -> Dict[str, object]:
+        """两阶段快照查询权威终态，并对 terminal 做完整投影。"""
+
+        provider = self.get_geometry_runtime_provider()
+        if provider is None:
+            raise RuntimeError("Geometry runtime 未连接，无法查询重定位终态。")
+        query = getattr(provider, "get_relocalization_terminal", None)
+        if not callable(query):
+            raise RuntimeError("Geometry runtime 不支持重定位终态查询。")
+        resolved_map_name = str(map_name or "").strip()
+        resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
+        trusted_activation = dict(activation_receipt or {})
+        identity_fields = (
+            "runtime_generation",
+            "session_id",
+            "session_generation",
+            "backend_generation",
+            "activation_identity_sha256",
+            "target_receipt_sha256",
+            "asset_bundle_sha256",
+        )
+        with self._runtime_state_lock:
+            snapshot = self._map_activation_snapshot_locked()
+            active_bundle = snapshot.bundle
+            activation = self._activation_result_from_snapshot(snapshot)
+            if (
+                trusted_activation.get("trusted_identity") is not True
+                or active_bundle is None
+                or active_bundle.map_name != resolved_map_name
+                or str(active_bundle.manifest_sha256 or "").strip().lower()
+                != resolved_manifest
+                or str(activation.get("map_name") or "").strip()
+                != resolved_map_name
+                or str(activation.get("asset_manifest_sha256") or "")
+                .strip()
+                .lower()
+                != resolved_manifest
+                or any(
+                    activation.get(field_name)
+                    != trusted_activation.get(field_name)
+                    for field_name in identity_fields
+                )
+            ):
+                raise RuntimeError("重定位终态查询时当前激活 target 不一致。")
+        result = query(
+            activation_state=activation,
+            request_id=request_id,
+            logical_timeout_ms=logical_timeout_ms,
+        )
+        with self._runtime_state_lock:
+            if not self._map_activation_snapshot_still_current_locked(snapshot):
+                raise RuntimeError("重定位终态查询完成前激活身份已变化。")
+        status = str(result.get("status") or "").strip().lower()
+        if status not in {"terminal", "pending", "not_found", "identity_conflict"}:
+            raise RuntimeError("重定位终态查询返回未知状态。")
+        observation = result.get("ledger_observation")
+        observation_fields = (
+            "observation_schema_version",
+            "admitted_command_count",
+            "claimed_command_count",
+            "terminal_record_count",
+            "pending_record_count",
+            "active_waiter_count",
+            "observation_epoch",
+        )
+        ledger_observation = None
+        if isinstance(observation, dict) and all(
+            field_name in observation for field_name in observation_fields
+        ):
+            candidate_observation = {
+                field_name: observation[field_name] for field_name in observation_fields
+            }
+            if not any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in candidate_observation.values()
+            ) and (
+                candidate_observation["observation_schema_version"] == 1
+                and candidate_observation["observation_epoch"] != 0
+                and candidate_observation["terminal_record_count"]
+                + candidate_observation["pending_record_count"]
+                <= candidate_observation["admitted_command_count"]
+            ):
+                ledger_observation = candidate_observation
+        if status != "terminal":
+            return {
+                "status": status,
+                "request_id": str(result.get("request_id") or ""),
+                "request_identity_sha256": str(
+                    result.get("request_identity_sha256") or ""
+                ),
+                "activation_identity_sha256": str(
+                    result.get("activation_identity_sha256") or ""
+                ),
+                "terminal_receipt": None,
+                "ledger_observation": ledger_observation,
+            }
+        terminal = result.get("terminal")
+        if not isinstance(terminal, dict):
+            raise RuntimeError("重定位 terminal query 缺少完整 proof。")
+        receipt = self.get_validated_relocalization_receipt(
+            terminal,
+            map_name=resolved_map_name,
+            asset_manifest_sha256=resolved_manifest,
+            activation_receipt=trusted_activation,
+            _expected_activation_snapshot=snapshot,
+        )
+        return {
+            "status": "terminal",
+            "request_id": str(result.get("request_id") or ""),
+            "request_identity_sha256": str(
+                result.get("request_identity_sha256") or ""
+            ),
+            "activation_identity_sha256": str(
+                result.get("activation_identity_sha256") or ""
+            ),
+            "terminal_receipt": receipt,
+            "ledger_observation": ledger_observation,
+        }
+
+    def is_relocalization_available(self) -> bool:
+        if not self._is_geometry_profile_enabled():
             return False
         provider = self.get_geometry_runtime_provider()
         if provider is None or not callable(getattr(provider, "relocalize", None)):
             return False
-        activation = dict(self._last_activation_result or {})
-        return bool(
-            activation.get("relocalization_target_available")
-            and str(activation.get("map_name") or "")
-            == self._active_map_bundle.map_name
-            and str(activation.get("asset_manifest_sha256") or "").lower()
-            == str(self._active_map_bundle.manifest_sha256 or "").lower()
-        )
+        with self._runtime_state_lock:
+            snapshot = self._map_activation_snapshot_locked()
+            if self.is_map_asset_activation_recovery_pending() or snapshot.bundle is None:
+                return False
+            activation = self._activation_result_from_snapshot(snapshot)
+            return bool(
+                activation.get("relocalization_target_available")
+                and str(activation.get("map_name") or "")
+                == snapshot.bundle.map_name
+                and str(activation.get("asset_manifest_sha256") or "").lower()
+                == str(snapshot.bundle.manifest_sha256 or "").lower()
+            )
 
     def relocalize_active_map(
         self,
@@ -3601,24 +3990,13 @@ class PlatformGeometryRuntime:
         provider = self.get_geometry_runtime_provider()
         if provider is None:
             raise RuntimeError("Geometry runtime 未连接，无法重定位。")
-        active_bundle = self._active_map_bundle
         resolved_map_name = str(map_name or "").strip()
         resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
-        if (
-            active_bundle is None
-            or active_bundle.map_name != resolved_map_name
-            or str(active_bundle.manifest_sha256 or "").strip().lower()
-            != resolved_manifest
-        ):
-            raise RuntimeError("重定位目标与当前激活地图资产不一致。")
-        activation = self._clone_metadata(self._last_activation_result)
-        if (
-            not bool(activation.get("relocalization_target_available"))
-            or str(activation.get("map_name") or "").strip() != resolved_map_name
-            or str(activation.get("asset_manifest_sha256") or "").strip().lower()
-            != resolved_manifest
-        ):
-            raise RuntimeError("当前地图没有匹配的 sealed 重定位目标。")
+        with self._runtime_state_lock:
+            snapshot, activation = self._require_map_activation_target_locked(
+                map_name=resolved_map_name,
+                asset_manifest_sha256=resolved_manifest,
+            )
         result = provider.relocalize(
             activation_state=activation,
             request_id=request_id,
@@ -3626,14 +4004,9 @@ class PlatformGeometryRuntime:
         )
         if not bool(result.get("success")):
             raise GeometryRuntimeRelocalizationRejected(result)
-        current_bundle = self._active_map_bundle
-        if (
-            current_bundle is None
-            or current_bundle.map_name != resolved_map_name
-            or str(current_bundle.manifest_sha256 or "").strip().lower()
-            != resolved_manifest
-        ):
-            raise RuntimeError("重定位完成前当前地图资产已经切换。")
+        with self._runtime_state_lock:
+            if not self._map_activation_snapshot_still_current_locked(snapshot):
+                raise RuntimeError("重定位完成前当前地图激活身份已经切换。")
         return self._clone_metadata(result)
 
     def is_available(self) -> bool:
@@ -3664,16 +4037,18 @@ class PlatformGeometryRuntime:
     def describe_backend(self) -> dict:
         """返回当前几何后端来源说明。"""
 
+        activation_snapshot = self._map_activation_snapshot_read()
+        active_bundle = activation_snapshot.bundle
         if not self._is_geometry_profile_enabled():
             return {
                 "source_kind": "disabled",
                 "backend_name": None,
                 "runtime_status": self.get_runtime_status(),
                 "navigation_backend_policy": self._navigation_backend_policy(),
-                "active_map_name": self._active_map_bundle.map_name if self._active_map_bundle is not None else None,
+                "active_map_name": active_bundle.map_name if active_bundle is not None else None,
                 "asset_manifest_sha256": (
-                    self._active_map_bundle.manifest_sha256
-                    if self._active_map_bundle is not None
+                    active_bundle.manifest_sha256
+                    if active_bundle is not None
                     else None
                 ),
                 **self.config.build_metadata(),
@@ -3705,10 +4080,10 @@ class PlatformGeometryRuntime:
             "odometry_publisher": self._geometry_runtime_status_stub("odometry_publisher"),
             "point_cloud_publisher": self._geometry_runtime_status_stub("point_cloud_publisher"),
             "navigation_backend_policy": self._navigation_backend_policy(),
-            "active_map_name": self._active_map_bundle.map_name if self._active_map_bundle is not None else None,
+            "active_map_name": active_bundle.map_name if active_bundle is not None else None,
             "asset_manifest_sha256": (
-                self._active_map_bundle.manifest_sha256
-                if self._active_map_bundle is not None
+                active_bundle.manifest_sha256
+                if active_bundle is not None
                 else None
             ),
             **self.config.build_metadata(),
@@ -4044,12 +4419,14 @@ class PlatformGeometryRuntime:
         """清空当前激活的 finalized 地图资产包上下文。"""
 
         def clear_bundle_context() -> None:
-            self._active_map_bundle = None
-            self._active_map_bundle_root = None
-            self._last_activation_result = {
-                "cleared": True,
-                "reason": str(reason or "").strip() or None,
-            }
+            self._install_map_activation_snapshot_locked(
+                bundle=None,
+                bundle_root=None,
+                activation_result={
+                    "cleared": True,
+                    "reason": str(reason or "").strip() or None,
+                },
+            )
 
         state_lock = getattr(self, "_runtime_state_lock", None)
         if state_lock is None:
@@ -4852,6 +5229,7 @@ class PlatformGeometryRuntime:
 
         resolved_bundle_root = self._require_bundle_root(bundle_root)
         self._validate_bundle_manifest(bundle, resolved_bundle_root)
+        previous_activation = self._map_activation_snapshot_read()
         geometry_asset = bundle.geometry_asset
         if geometry_asset is None:
             raise RuntimeError("finalized 地图资产包缺少 geometry_asset。")
@@ -4922,8 +5300,6 @@ class PlatformGeometryRuntime:
                     raise MapAssetBackendActivationRejected(activation_result)
                 raise MapAssetBackendActivationOutcomeUnknown(bundle.map_name)
         try:
-            self._active_map_bundle = bundle.model_copy(deep=True)
-            self._active_map_bundle_root = resolved_bundle_root
             snapshot_error = None
             try:
                 with self._map_asset_activation_snapshot_read_guard():
@@ -4945,7 +5321,16 @@ class PlatformGeometryRuntime:
                 "backend_snapshot_correlated": ready_snapshot is not None,
                 "backend_snapshot_error": snapshot_error,
             }
-            self._last_activation_result = activation_result
+            with self._runtime_state_lock:
+                if not self._map_activation_snapshot_still_current_locked(
+                    previous_activation
+                ):
+                    raise RuntimeError("地图激活结果提交前资产身份已变化。")
+                self._install_map_activation_snapshot_locked(
+                    bundle=bundle,
+                    bundle_root=resolved_bundle_root,
+                    activation_result=activation_result,
+                )
             if ready_snapshot is not None:
                 return ready_snapshot
             offline_geometry_metadata = self._build_map_snapshot_geometry_metadata(
@@ -4954,6 +5339,7 @@ class PlatformGeometryRuntime:
                 live_available=False,
                 map_snapshot_kind="offline_checkpoint",
                 source_kind="map_asset_bundle",
+                activation_result=activation_result,
             )
             return bundle.snapshot.model_copy(
                 update={
@@ -5227,16 +5613,21 @@ class PlatformGeometryRuntime:
             return activation_fence_payload(activation_fence)
         if not isinstance(payload, dict):
             return finalize(payload)
-        bundle = self._active_map_bundle
+        activation_snapshot = self._map_activation_snapshot_read()
+        bundle = activation_snapshot.bundle
         if bundle is None:
             return finalize(payload)
         metadata = self._clone_metadata(payload.get("metadata") or {})
+        activation_result = self._activation_result_from_snapshot(
+            activation_snapshot
+        )
         metadata.update(self._build_map_snapshot_geometry_metadata(
             bundle=bundle,
             geometry_asset=bundle.geometry_asset,
             live_available=True,
             map_snapshot_kind="live_streaming",
             source_kind="platform_live_map_provider",
+            activation_result=activation_result,
         ))
         mapping_context = getattr(self, "_mapping_session_context", None)
         mapping_active = isinstance(mapping_context, dict) and bool(
@@ -5247,7 +5638,13 @@ class PlatformGeometryRuntime:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
         elif (
             self._external_geometry_process_is_localization()
-            or str((self._last_activation_result or {}).get("backend_mode") or "") == "mapping_localization"
+            or str(
+                self._activation_result_from_snapshot(activation_snapshot).get(
+                    "backend_mode"
+                )
+                or ""
+            )
+            == "mapping_localization"
         ) and bundle.snapshot.occupancy_grid is not None:
             # 定位模式 Debug 固定展示已加载的平台 checkpoint；live /map_obstacles
             # （含 2D Pose 后零星重发）与已加载资产包栅格不一致，不得替换显示层。
@@ -5373,12 +5770,27 @@ class PlatformGeometryRuntime:
             return None
         return sum(1 for value in data if int(value) >= 0)
 
-    def get_map_snapshot(self) -> Optional[MapSnapshot]:
+    def get_map_snapshot(
+        self,
+        *,
+        _seed_bundle: Optional[MapAssetBundle] = None,
+        _seed_activation_result: Optional[Dict[str, object]] = None,
+    ) -> Optional[MapSnapshot]:
         """返回当前平台几何运行时对外暴露的地图快照。"""
 
         if self._map_asset_activation_snapshot_read_blocked():
             return None
-        bundle = self._active_map_bundle
+        activation_snapshot = self._map_activation_snapshot_read()
+        bundle = (
+            self._clone_contract(_seed_bundle)
+            if _seed_bundle is not None
+            else activation_snapshot.bundle
+        )
+        activation_result = (
+            self._clone_metadata(_seed_activation_result)
+            if _seed_activation_result is not None
+            else self._activation_result_from_snapshot(activation_snapshot)
+        )
         for _attempt in range(_LIVE_MAP_SNAPSHOT_MAX_ATTEMPTS):
             mapping_context_before = self.get_mapping_session_context()
             backend = self._resolve_mapping_backend()
@@ -5458,6 +5870,7 @@ class PlatformGeometryRuntime:
                     live_status=live_status,
                     mapping_context=mapping_context_after,
                     seed_bundle=bundle,
+                    activation_result=activation_result,
                 )
                 if mapping_identity_complete:
                     validated_cache = _ValidatedLiveMapCache(
@@ -5515,6 +5928,7 @@ class PlatformGeometryRuntime:
                 live_status=validated_cache.live_status,
                 mapping_context=validated_cache.mapping_context,
                 seed_bundle=validated_cache.seed_bundle,
+                activation_result=activation_result,
             )
             if self._map_asset_activation_snapshot_read_blocked():
                 return None
@@ -5533,6 +5947,7 @@ class PlatformGeometryRuntime:
             live_available=False,
             map_snapshot_kind="offline_checkpoint",
             source_kind="map_asset_bundle",
+            activation_result=activation_result,
         )
         snapshot = MapSnapshot(
             map_name=bundle.snapshot.map_name,
@@ -5579,6 +5994,7 @@ class PlatformGeometryRuntime:
         live_status: Dict[str, object],
         mapping_context: Optional[Dict[str, object]],
         seed_bundle: Optional[MapAssetBundle],
+        activation_result: Optional[Dict[str, object]] = None,
     ) -> MapSnapshot:
         live_status = self._clone_metadata(live_status)
         mapping_context = self._clone_metadata(mapping_context or {})
@@ -5697,6 +6113,7 @@ class PlatformGeometryRuntime:
                 live_available=True,
                 map_snapshot_kind="live_streaming",
                 source_kind="platform_live_map_provider",
+                activation_result=activation_result,
             ))
         else:
             metadata.update({
@@ -5766,6 +6183,7 @@ class PlatformGeometryRuntime:
         live_available: bool,
         map_snapshot_kind: str,
         source_kind: str,
+        activation_result: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         bundle_metadata = {
             "asset_manifest_sha256": bundle.manifest_sha256,
@@ -5802,7 +6220,13 @@ class PlatformGeometryRuntime:
             "geometry_diagnostics": self._clone_metadata(
                 geometry_asset.quality_metrics.get("diagnostics", []) if geometry_asset is not None else []
             ),
-            "geometry_activation": self._clone_metadata(self._last_activation_result),
+            "geometry_activation": self._clone_metadata(
+                activation_result
+                if activation_result is not None
+                else self._activation_result_from_snapshot(
+                    self._map_activation_snapshot_read()
+                )
+            ),
             "profile": self._clone_metadata(
                 geometry_asset.parameter_summary.get("profile") if geometry_asset is not None else self.config.build_metadata().get("profile")
             ),
@@ -6880,8 +7304,9 @@ class PlatformGeometryRuntime:
         activation_fence = self._map_asset_activation_fence_snapshot()
         if activation_fence is not None:
             return activation_fence_summary(activation_fence)
-        active_bundle = self._active_map_bundle
-        active_root = self._active_map_bundle_root
+        activation_snapshot = self._map_activation_snapshot_read()
+        active_bundle = activation_snapshot.bundle
+        active_root = activation_snapshot.bundle_root
         if (
             active_bundle is not None
             and active_bundle.geometry_asset is not None
@@ -7010,8 +7435,9 @@ class PlatformGeometryRuntime:
         if self.is_map_asset_activation_recovery_pending():
             return None
         resolved_candidate = None
-        active_bundle = self._active_map_bundle
-        active_root = self._active_map_bundle_root
+        activation_snapshot = self._map_activation_snapshot_read()
+        active_bundle = activation_snapshot.bundle
+        active_root = activation_snapshot.bundle_root
         if (
             active_bundle is not None
             and active_bundle.geometry_asset is not None
@@ -7057,8 +7483,9 @@ class PlatformGeometryRuntime:
         if self.is_map_asset_activation_recovery_pending():
             return None
         resolved_candidate = None
-        active_bundle = self._active_map_bundle
-        active_root = self._active_map_bundle_root
+        activation_snapshot = self._map_activation_snapshot_read()
+        active_bundle = activation_snapshot.bundle
+        active_root = activation_snapshot.bundle_root
         if (
             active_bundle is not None
             and active_bundle.geometry_asset is not None
@@ -7764,7 +8191,10 @@ class PlatformGeometryRuntime:
 
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         while True:
-            snapshot = self.get_map_snapshot()
+            snapshot = self.get_map_snapshot(
+                _seed_bundle=bundle,
+                _seed_activation_result=activation_result,
+            )
             if snapshot is not None:
                 metadata = dict(snapshot.metadata or {})
                 expected_mapping_identity = (
@@ -7838,7 +8268,7 @@ class PlatformGeometryRuntime:
     def _has_live_or_seed_map(self) -> bool:
         return bool(
             (self._remote_provider is not None and self._remote_provider.is_connected)
-            or self._active_map_bundle is not None
+            or self._map_activation_snapshot_read().bundle is not None
         )
 
     def subscribe_localization_updates(self, callback) -> Optional[int]:
@@ -8608,7 +9038,7 @@ class PlatformGeometryRuntime:
         if provider is None or not _remote_is_connected(provider):
             raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法启动建图。")
 
-        active_bundle = getattr(self, "_active_map_bundle", None)
+        active_bundle = self._map_activation_snapshot_read().bundle
         resolved_map_name = str(
             map_name or (active_bundle.map_name if active_bundle is not None else "")
         ).strip()
@@ -10036,12 +10466,12 @@ class PlatformGeometryProviderBundle(
         except Exception:
             pass
         if not active:
-            activation = getattr(self.runtime, "_last_activation_result", None)
-            if isinstance(activation, dict):
-                active = (
-                    str(activation.get("backend_mode") or "")
-                    == "mapping_localization"
-                )
+            snapshot = self.runtime._map_activation_snapshot_read()
+            activation = self.runtime._activation_result_from_snapshot(snapshot)
+            active = (
+                str(activation.get("backend_mode") or "")
+                == "mapping_localization"
+            )
         return active and not self._map_asset_activation_recovery_pending()
 
     def is_map_available(self) -> bool:

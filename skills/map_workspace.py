@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
+import json
 import logging
 import threading
+import uuid
 
 from contracts.events import RuntimeEventCategory
 from contracts.frame_semantics import frame_ids_semantically_equal
@@ -35,6 +38,23 @@ from typing import Dict, Optional, Tuple
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.skills.map_workspace")
+
+_RELOCALIZATION_SESSION_METADATA_KEY = "relocalization_receipt"
+_RELOCALIZATION_SESSION_RECEIPT_MAX_BYTES = 8192
+_RELOCALIZATION_SESSION_FORBIDDEN_KEYS = frozenset(
+    {
+        "relocalization_result",
+        "raw_relocalization_result",
+        "candidate",
+        "evidence",
+        "disclosure",
+        "terminal_proof_preimage",
+    }
+)
+_RELOCALIZATION_SESSION_RESERVED_KEYS = (
+    _RELOCALIZATION_SESSION_FORBIDDEN_KEYS
+    | {_RELOCALIZATION_SESSION_METADATA_KEY}
+)
 
 
 def _serialized_map_activation(method):
@@ -74,6 +94,17 @@ class _MapActivationReconciliationError(RuntimeError):
     backend_activation_applied = True
 
 
+@dataclass(frozen=True)
+class _RelocalizationRecoveryOutcome:
+    settled: bool
+    state: str
+    request_id: Optional[str] = None
+    receipt: Optional[Dict[str, object]] = None
+    session: Optional[LocalizationSession] = None
+    workspace: Optional[MapWorkspace] = None
+    pending: Optional[Dict[str, object]] = None
+
+
 class MapWorkspaceService:
     """地图资产目录与当前工作区聚合服务。"""
 
@@ -102,12 +133,18 @@ class MapWorkspaceService:
         self._auto_create_library = bool(auto_create_library)
         self._map_activation_execution_state = threading.local()
         self._map_activation_fence_arm_error: Optional[Dict[str, object]] = None
+        self._retained_relocalization_terminal: Optional[Dict[str, object]] = None
         with self._repository.map_activation_guard():
             pending_activation = self._repository.get_map_activation()
         self._arm_map_activation_fence(
             pending_activation,
             reason="workspace_service_restore",
         )
+        with self._repository.map_activation_executor_guard():
+            startup_recovery = self._recover_relocalization_owner_complete_core(
+                operation="workspace_service_restore",
+            )
+        self._relocalization_startup_recovery = startup_recovery
 
     @property
     def catalog_root(self) -> str:
@@ -196,6 +233,7 @@ class MapWorkspaceService:
     ) -> MapWorkspace:
         """激活地图工作区，并按需将其 finalized current 资产包加载到运行态。"""
 
+        self._require_no_relocalization_recovery("activate_map")
         resolved_name = self._require_map_name(map_name)
         with self._repository.map_activation_guard():
             pending_activation = self._read_map_activation()
@@ -655,9 +693,18 @@ class MapWorkspaceService:
             assert activation_identity is not None
             try:
                 with self._repository.map_activation_guard():
+                    activation_receipt_reader = getattr(
+                        self._geometry_runtime,
+                        "get_validated_map_activation_receipt",
+                        None,
+                    )
+                    if not callable(activation_receipt_reader):
+                        raise RuntimeError("运行态未提供 sealed 激活凭据投影。")
+                    activation_receipt = activation_receipt_reader()
                     completion_receipt = (
                         self._repository.complete_map_activation_durable(
                             **activation_identity,
+                            activation_receipt=activation_receipt,
                             expected_phases=("reconciling",),
                         )
                     )
@@ -818,7 +865,8 @@ class MapWorkspaceService:
     ) -> Tuple[bool, Optional[str]]:
         receipt = self._repository.get_last_successful_map_activation_receipt()
         if receipt is None or (
-            receipt["target_map_name"] != target_map_name
+            receipt.get("trusted_identity") is not True
+            or receipt["target_map_name"] != target_map_name
             or receipt["target_manifest_sha256"] != target_manifest_sha256
         ):
             return False, None
@@ -875,9 +923,47 @@ class MapWorkspaceService:
             or revision <= 0
         ):
             unavailable("authoritative_state_identity_invalid")
+        activation_receipt_reader = getattr(
+            self._geometry_runtime,
+            "get_validated_map_activation_receipt",
+            None,
+        )
+        if not callable(activation_receipt_reader):
+            unavailable("validated_activation_receipt_reader_missing")
+        try:
+            runtime_receipt = activation_receipt_reader()
+        except Exception as exc:
+            if phase in {"IDLE", "STOPPED"} and active is False:
+                return False, None
+            unavailable("validated_activation_receipt_read_failed", exc)
+        identity_fields = (
+            "activation_receipt_schema_version",
+            "runtime_generation",
+            "session_id",
+            "session_generation",
+            "backend_generation",
+            "mapping_backend_kind",
+            "activation_request_identity_sha256",
+            "activation_identity_sha256",
+            "target_receipt_sha256",
+            "asset_bundle_sha256",
+            "relocalization_target_available",
+            "cloud_source_revision",
+            "cloud_source_sha256",
+            "source_policy_version",
+            "source_policy_sha256",
+            "deadline_policy_version",
+            "deadline_policy_sha256",
+            "algorithm_options_version",
+            "algorithm_options_sha256",
+        )
         reuse_request_id = bool(
             session_id == receipt["activation_request_id"]
             and map_name == target_map_name
+            and all(
+                runtime_receipt.get(key) == receipt.get(key)
+                for key in identity_fields
+            )
         )
         return (
             reuse_request_id,
@@ -1551,6 +1637,794 @@ class MapWorkspaceService:
         )
         return finalized_bundle
 
+    def _require_no_relocalization_recovery(self, operation: str) -> None:
+        pending = self._repository.get_relocalization_intent()
+        if pending is None:
+            return
+        raise GatewayError(
+            "重定位 durable receipt 尚未 settled，当前操作被阻止。",
+            error_code="relocalization_receipt_recovery_required",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "operation": str(operation or "").strip(),
+                "request_id": pending["request_id"],
+                "phase": pending["phase"],
+                "target_map_name": pending["target_map_name"],
+                "target_manifest_sha256": pending[
+                    "target_manifest_sha256"
+                ],
+                "recommended_next_tool": "relocalize_active_map",
+            },
+        )
+
+    @staticmethod
+    def _sanitize_relocalization_request_metadata(value: object) -> object:
+        """递归移除调用方不得写入的重定位会话保留字段。"""
+
+        if isinstance(value, dict):
+            return {
+                key: MapWorkspaceService._sanitize_relocalization_request_metadata(
+                    item
+                )
+                for key, item in value.items()
+                if key not in _RELOCALIZATION_SESSION_RESERVED_KEYS
+            }
+        if isinstance(value, list):
+            return [
+                MapWorkspaceService._sanitize_relocalization_request_metadata(item)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                MapWorkspaceService._sanitize_relocalization_request_metadata(item)
+                for item in value
+            )
+        return value
+
+    def _canonical_relocalization_session_metadata(
+        self,
+        receipt: Dict[str, object],
+    ) -> Dict[str, object]:
+        """从 catalog durable readback 投影有界会话凭据。"""
+
+        durable = self._repository.get_last_successful_relocalization_receipt()
+        if durable is None or durable != dict(receipt or {}):
+            candidate = durable if durable is not None else dict(receipt or {})
+            raise GatewayError(
+                "重定位会话凭据与平台 canonical receipt 不一致。",
+                error_code="relocalization_session_receipt_identity_mismatch",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "request_id": candidate.get("request_id"),
+                    "phase": "session_metadata_projection",
+                    "target_map_name": candidate.get("map_name"),
+                    "target_manifest_sha256": candidate.get(
+                        "asset_manifest_sha256"
+                    ),
+                },
+            )
+        return {
+            "source": "typed_relocalize_rpc",
+            _RELOCALIZATION_SESSION_METADATA_KEY: dict(durable),
+        }
+
+    @staticmethod
+    def _relocalization_metadata_contains_forbidden_key(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                key in _RELOCALIZATION_SESSION_FORBIDDEN_KEYS
+                or MapWorkspaceService._relocalization_metadata_contains_forbidden_key(
+                    item
+                )
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(
+                MapWorkspaceService._relocalization_metadata_contains_forbidden_key(
+                    item
+                )
+                for item in value
+            )
+        return False
+
+    def _raise_relocalization_session_metadata_invalid(
+        self,
+        receipt: Dict[str, object],
+        *,
+        reason: str,
+    ) -> None:
+        raise GatewayError(
+            "重定位会话 metadata 不符合 bounded receipt 合同。",
+            error_code="relocalization_session_metadata_invalid",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "request_id": receipt.get("request_id"),
+                "phase": "session_metadata_validation",
+                "reason": reason,
+            },
+        )
+
+    def _validate_bounded_relocalization_session(
+        self,
+        session: LocalizationSession,
+        receipt: Dict[str, object],
+    ) -> None:
+        """在 settle 前验证已发布 session 只携带 canonical receipt。"""
+
+        canonical_metadata = self._canonical_relocalization_session_metadata(receipt)
+        canonical = canonical_metadata[_RELOCALIZATION_SESSION_METADATA_KEY]
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_missing",
+            )
+        if metadata.get("source") != "typed_relocalize_rpc":
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_shape_invalid",
+            )
+        if self._relocalization_metadata_contains_forbidden_key(metadata):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="legacy_raw_result_present",
+            )
+        session_receipt = metadata.get(_RELOCALIZATION_SESSION_METADATA_KEY)
+        if not isinstance(session_receipt, dict):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_missing",
+            )
+        if set(session_receipt) != set(canonical):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_shape_invalid",
+            )
+        if session_receipt != canonical:
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_identity_mismatch",
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (str, int))
+            for value in session_receipt.values()
+        ):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_shape_invalid",
+            )
+        string_limits = {
+            "request_id": 128,
+            "session_id": 128,
+            "map_name": 256,
+            "disposition_name": 32,
+        }
+        if any(
+            not isinstance(session_receipt.get(field_name), str)
+            or not session_receipt[field_name]
+            or len(session_receipt[field_name]) > max_length
+            for field_name, max_length in string_limits.items()
+        ):
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_shape_invalid",
+            )
+        encoded = json.dumps(
+            session_receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(encoded) > _RELOCALIZATION_SESSION_RECEIPT_MAX_BYTES:
+            self._raise_relocalization_session_metadata_invalid(
+                canonical,
+                reason="receipt_size_exceeded",
+            )
+
+    def _retain_validated_relocalization_terminal(
+        self,
+        receipt: Dict[str, object],
+    ) -> Dict[str, object]:
+        retained = self._repository.validate_relocalization_terminal(receipt)
+        existing = self._retained_relocalization_terminal
+        if existing is not None and not self._repository.relocalization_terminals_match(
+            existing,
+            retained,
+        ):
+            raise GatewayError(
+                "重定位 authoritative terminal 身份冲突。",
+                error_code="relocalization_terminal_identity_conflict",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={"request_id": retained.get("request_id")},
+            )
+        self._retained_relocalization_terminal = retained
+        return dict(retained)
+
+    def _reconcile_known_relocalization_terminal(
+        self,
+        receipt: Dict[str, object],
+        *,
+        activation_receipt: Dict[str, object],
+    ) -> Dict[str, object]:
+        retained = self._retain_validated_relocalization_terminal(receipt)
+        try:
+            durable = self._repository.reconcile_relocalization_known_terminal(
+                relocalization_receipt=retained,
+                activation_receipt=activation_receipt,
+            )
+        except Exception:
+            durable = self._repository.reconcile_relocalization_known_terminal(
+                relocalization_receipt=retained,
+                activation_receipt=activation_receipt,
+            )
+        self._retained_relocalization_terminal = None
+        return durable
+
+    def _raise_relocalization_persistence_failed(
+        self,
+        receipt: Dict[str, object],
+        *,
+        stage: str,
+        cause: Exception,
+    ) -> None:
+        raise GatewayError(
+            "重定位已由后端应用，但平台凭据尚未持久化。",
+            error_code="relocalization_applied_but_receipt_persistence_failed",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "request_id": receipt.get("request_id"),
+                "phase": "backend_applied_pending_receipt",
+                "request_identity_sha256": receipt.get(
+                    "request_identity_sha256"
+                ),
+                "terminal_proof_sha256": receipt.get("terminal_proof_sha256"),
+                "persistence_failure_stage": stage,
+            },
+        ) from cause
+
+    def get_relocalization_recovery_status(self) -> Optional[Dict[str, object]]:
+        """返回有界的 retained relocalization owner 状态。"""
+
+        pending = self._repository.get_relocalization_intent()
+        retained = self._retained_relocalization_terminal
+        if pending is None:
+            return None
+        terminal = retained if retained is not None else pending.get("terminal_receipt")
+        phase = (
+            "backend_applied_pending_receipt"
+            if retained is not None
+            else pending["phase"]
+        )
+        return {
+            "request_id": pending["request_id"],
+            "phase": phase,
+            "target_map_name": pending["target_map_name"],
+            "target_manifest_sha256": pending["target_manifest_sha256"],
+            "request_identity_sha256": (
+                terminal.get("request_identity_sha256")
+                if isinstance(terminal, dict)
+                else None
+            ),
+            "terminal_proof_sha256": (
+                terminal.get("terminal_proof_sha256")
+                if isinstance(terminal, dict)
+                else None
+            ),
+        }
+
+    def _raise_relocalization_pending(
+        self,
+        pending: Dict[str, object],
+        *,
+        operation: str,
+    ) -> None:
+        status = self.get_relocalization_recovery_status() or {
+            "request_id": pending["request_id"],
+            "phase": pending["phase"],
+            "target_map_name": pending["target_map_name"],
+            "target_manifest_sha256": pending["target_manifest_sha256"],
+        }
+        raise GatewayError(
+            "重定位 durable owner 尚未 settled。",
+            error_code=(
+                "relocalization_outcome_unknown"
+                if pending["phase"] in {
+                    "backend_dispatching",
+                    "backend_outcome_unknown",
+                }
+                else "relocalization_receipt_recovery_required"
+            ),
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={**status, "operation": operation},
+        )
+
+    def _complete_retained_relocalization_receipt(
+        self,
+        pending: Dict[str, object],
+        *,
+        activation_receipt: Dict[str, object],
+    ) -> Dict[str, object]:
+        terminal = self._retained_relocalization_terminal
+        if terminal is None:
+            terminal = pending.get("terminal_receipt")
+        if not isinstance(terminal, dict):
+            self._raise_relocalization_pending(
+                pending,
+                operation="recover_relocalization_receipt",
+            )
+        try:
+            return self._reconcile_known_relocalization_terminal(
+                terminal,
+                activation_receipt=activation_receipt,
+            )
+        except Exception as exc:
+            self._raise_relocalization_persistence_failed(
+                terminal,
+                stage="receipt_write",
+                cause=exc,
+            )
+
+    def _raise_relocalization_recovery_pending(
+        self,
+        pending: Dict[str, object],
+        *,
+        operation: str,
+        reason: str,
+    ) -> None:
+        raise GatewayError(
+            "重定位 durable owner 尚未取得 authoritative terminal。",
+            error_code="relocalization_receipt_recovery_pending",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "operation": operation,
+                "request_id": pending["request_id"],
+                "phase": pending["phase"],
+                "target_map_name": pending["target_map_name"],
+                "target_manifest_sha256": pending[
+                    "target_manifest_sha256"
+                ],
+                "reason": reason,
+            },
+        )
+
+    def _raise_relocalization_session_recovery_incomplete(
+        self,
+        pending: Dict[str, object],
+        *,
+        operation: str,
+        reason: str,
+    ) -> None:
+        raise GatewayError(
+            "重定位终态已持久化，但定位会话尚未完成同步。",
+            error_code="relocalization_session_recovery_incomplete",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "operation": operation,
+                "request_id": pending["request_id"],
+                "phase": pending["phase"],
+                "target_map_name": pending["target_map_name"],
+                "target_manifest_sha256": pending[
+                    "target_manifest_sha256"
+                ],
+                "reason": reason,
+            },
+        )
+
+    def _raise_relocalization_settlement_persistence_failed(
+        self,
+        pending: Dict[str, object],
+        *,
+        operation: str,
+        reason: str,
+    ) -> None:
+        raise GatewayError(
+            "重定位恢复已完成，但 durable owner 尚未 settled。",
+            error_code="relocalization_settlement_persistence_failed",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={
+                "operation": operation,
+                "request_id": pending["request_id"],
+                "phase": pending["phase"],
+                "target_map_name": pending["target_map_name"],
+                "target_manifest_sha256": pending[
+                    "target_manifest_sha256"
+                ],
+                "reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _bounded_relocalization_pending(
+        pending: Dict[str, object],
+    ) -> Dict[str, object]:
+        terminal = pending.get("terminal_receipt")
+        return {
+            "request_id": pending["request_id"],
+            "phase": pending["phase"],
+            "target_map_name": pending["target_map_name"],
+            "target_manifest_sha256": pending[
+                "target_manifest_sha256"
+            ],
+            "request_identity_sha256": (
+                terminal.get("request_identity_sha256")
+                if isinstance(terminal, dict)
+                else None
+            ),
+            "terminal_proof_sha256": (
+                terminal.get("terminal_proof_sha256")
+                if isinstance(terminal, dict)
+                else None
+            ),
+        }
+
+    def _validate_relocalization_recovery_completion(
+        self,
+        *,
+        pending: Dict[str, object],
+        activation_receipt: Dict[str, object],
+        receipt: Dict[str, object],
+        session: LocalizationSession,
+        workspace: MapWorkspace,
+        operation: str,
+    ) -> None:
+        current = self._repository.get_relocalization_intent()
+        durable = self._repository.get_last_successful_relocalization_receipt()
+        current_activation = (
+            self._repository.get_last_successful_map_activation_receipt()
+        )
+        target_name = str(pending["target_map_name"])
+        target_manifest = str(pending["target_manifest_sha256"])
+        asset = workspace.map_asset
+        latest_snapshot = workspace.latest_map_snapshot
+        descriptor_reader = getattr(self._geometry_runtime, "describe_backend", None)
+        try:
+            descriptor = descriptor_reader() if callable(descriptor_reader) else {}
+        except Exception:
+            descriptor = {}
+        if not isinstance(descriptor, dict):
+            descriptor = {}
+        valid = bool(
+            current is not None
+            and current["request_id"] == pending["request_id"]
+            and current["phase"] == "backend_applied_pending_receipt"
+            and current_activation == activation_receipt
+            and durable == receipt
+            and session.map_name == target_name
+            and session.asset_manifest_sha256 == target_manifest
+            and workspace.active_map_name == target_name
+            and workspace.map_loaded
+            and asset is not None
+            and asset.finalized
+            and str(asset.asset_manifest_sha256 or "").lower()
+            == target_manifest
+            and latest_snapshot is not None
+            and str(descriptor.get("active_map_name") or "") == target_name
+            and str(descriptor.get("asset_manifest_sha256") or "").lower()
+            == target_manifest
+        )
+        if not valid:
+            self._raise_relocalization_session_recovery_incomplete(
+                pending,
+                operation=operation,
+                reason="final_workspace_mismatch",
+            )
+        try:
+            self._validate_bounded_relocalization_session(session, receipt)
+        except Exception:
+            self._raise_relocalization_session_recovery_incomplete(
+                pending,
+                operation=operation,
+                reason="session_metadata_invalid",
+            )
+
+    def _finish_relocalization_recovery(
+        self,
+        *,
+        pending: Dict[str, object],
+        activation_receipt: Dict[str, object],
+        receipt: Dict[str, object],
+        operation: str,
+        request_metadata: Optional[Dict[str, object]] = None,
+    ) -> _RelocalizationRecoveryOutcome:
+        target_name = str(pending["target_map_name"])
+        target_manifest = str(pending["target_manifest_sha256"])
+        workspace = self.get_active_workspace(refresh_localization=False)
+        if workspace is None or workspace.latest_map_snapshot is None:
+            self._raise_relocalization_session_recovery_incomplete(
+                pending,
+                operation=operation,
+                reason="final_workspace_mismatch",
+            )
+        latest_snapshot = workspace.latest_map_snapshot
+        metadata = {
+            **dict(request_metadata or {}),
+            "map_name": target_name,
+            **self._canonical_relocalization_session_metadata(receipt),
+        }
+        try:
+            session = self._localization_service.refresh_active_session(
+                map_name=target_name,
+                asset_manifest_sha256=target_manifest,
+                frame_id=self._resolve_map_frame_id(latest_snapshot),
+                metadata=metadata,
+                force_relocalize=False,
+                geometry_asset=self._resolve_geometry_asset_summary(
+                    latest_snapshot
+                ),
+            )
+        except Exception:
+            self._raise_relocalization_session_recovery_incomplete(
+                pending,
+                operation=operation,
+                reason="session_refresh_failed",
+            )
+        workspace = self.get_active_workspace(refresh_localization=False)
+        if workspace is None:
+            self._raise_relocalization_session_recovery_incomplete(
+                pending,
+                operation=operation,
+                reason="final_workspace_mismatch",
+            )
+        self._validate_relocalization_recovery_completion(
+            pending=pending,
+            activation_receipt=activation_receipt,
+            receipt=receipt,
+            session=session,
+            workspace=workspace,
+            operation=operation,
+        )
+        try:
+            settled_receipt = self._repository.settle_relocalization_durable(
+                request_id=str(pending["request_id"]),
+                activation_receipt=activation_receipt,
+            )
+        except Exception:
+            self._raise_relocalization_settlement_persistence_failed(
+                pending,
+                operation=operation,
+                reason="intent_tombstone_failed",
+            )
+        if self._repository.get_relocalization_intent() is not None:
+            self._raise_relocalization_settlement_persistence_failed(
+                pending,
+                operation=operation,
+                reason="intent_reopen_present",
+            )
+        durable = self._repository.get_last_successful_relocalization_receipt()
+        if durable != settled_receipt:
+            self._raise_relocalization_settlement_persistence_failed(
+                pending,
+                operation=operation,
+                reason="receipt_reopen_mismatch",
+            )
+        return _RelocalizationRecoveryOutcome(
+            settled=True,
+            state="terminal_settled",
+            request_id=str(pending["request_id"]),
+            receipt=dict(durable),
+            session=session,
+            workspace=workspace,
+        )
+
+    def _recover_relocalization_owner_complete_core(
+        self,
+        *,
+        operation: str,
+        expected_request_id: Optional[str] = None,
+        require_existing: bool = False,
+    ) -> _RelocalizationRecoveryOutcome:
+        pending = self._repository.get_relocalization_intent()
+        if pending is None:
+            if require_existing:
+                raise GatewayError(
+                    "重定位 durable owner 不存在。",
+                    error_code="relocalization_receipt_recovery_required",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={"operation": operation},
+                )
+            return _RelocalizationRecoveryOutcome(
+                settled=True,
+                state="absent",
+            )
+        if (
+            expected_request_id is not None
+            and expected_request_id != pending["request_id"]
+        ):
+            self._raise_relocalization_pending(
+                pending,
+                operation=operation,
+            )
+        if pending["phase"] == "prepared":
+            self._repository.abort_relocalization_before_apply(
+                request_id=str(pending["request_id"])
+            )
+            if self._repository.get_relocalization_intent() is not None:
+                self._raise_relocalization_settlement_persistence_failed(
+                    pending,
+                    operation=operation,
+                    reason="intent_reopen_present",
+                )
+            return _RelocalizationRecoveryOutcome(
+                settled=True,
+                state="prepared_aborted",
+                request_id=str(pending["request_id"]),
+            )
+        activation_receipt = (
+            self._repository.get_last_successful_map_activation_receipt()
+        )
+        if (
+            activation_receipt is None
+            or activation_receipt.get("trusted_identity") is not True
+            or activation_receipt["target_map_name"]
+            != pending["target_map_name"]
+            or activation_receipt["target_manifest_sha256"]
+            != pending["target_manifest_sha256"]
+        ):
+            raise GatewayError(
+                "重定位 authoritative terminal 身份冲突。",
+                error_code="relocalization_terminal_identity_conflict",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "request_id": pending["request_id"],
+                    "phase": pending["phase"],
+                },
+            )
+        terminal = self._retained_relocalization_terminal
+        if terminal is None:
+            terminal = pending.get("terminal_receipt")
+        if terminal is None:
+            durable = self._repository.get_last_successful_relocalization_receipt()
+            if (
+                isinstance(durable, dict)
+                and durable.get("request_id") == pending["request_id"]
+            ):
+                terminal = durable
+        if terminal is None:
+            query = self._geometry_runtime.get_relocalization_terminal(
+                request_id=str(pending["request_id"]),
+                logical_timeout_ms=int(pending["logical_timeout_ms"]),
+                map_name=str(pending["target_map_name"]),
+                asset_manifest_sha256=str(
+                    pending["target_manifest_sha256"]
+                ),
+                activation_receipt=activation_receipt,
+            )
+            status = str(query.get("status") or "").strip().lower()
+            if status in {"pending", "not_found"}:
+                return _RelocalizationRecoveryOutcome(
+                    settled=False,
+                    state="terminal_pending",
+                    request_id=str(pending["request_id"]),
+                    pending=self._bounded_relocalization_pending(pending),
+                )
+            if status == "identity_conflict":
+                raise GatewayError(
+                    "重定位 authoritative terminal 身份冲突。",
+                    error_code="relocalization_terminal_identity_conflict",
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "request_id": pending["request_id"],
+                        "phase": pending["phase"],
+                    },
+                )
+            terminal = query.get("terminal_receipt")
+            if status != "terminal" or not isinstance(terminal, dict):
+                raise GatewayError(
+                    "重定位 terminal query 返回非法状态。",
+                    error_code="relocalization_terminal_query_invalid",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={
+                        "operation": operation,
+                        "request_id": pending["request_id"],
+                        "phase": pending["phase"],
+                    },
+                )
+        self._retain_validated_relocalization_terminal(terminal)
+        try:
+            receipt = self._reconcile_known_relocalization_terminal(
+                terminal,
+                activation_receipt=activation_receipt,
+            )
+        except GatewayError:
+            raise
+        except Exception as exc:
+            current_activation = (
+                self._repository.get_last_successful_map_activation_receipt()
+            )
+            if current_activation != activation_receipt:
+                self._raise_relocalization_session_recovery_incomplete(
+                    pending,
+                    operation=operation,
+                    reason="final_workspace_mismatch",
+                )
+            self._raise_relocalization_persistence_failed(
+                terminal,
+                stage="receipt_write",
+                cause=exc,
+            )
+        reopened = self._repository.get_relocalization_intent()
+        if reopened is None:
+            self._raise_relocalization_settlement_persistence_failed(
+                pending,
+                operation=operation,
+                reason="intent_reopen_present",
+            )
+        return self._finish_relocalization_recovery(
+            pending=reopened,
+            activation_receipt=activation_receipt,
+            receipt=receipt,
+            operation=operation,
+        )
+
+    @_serialized_map_activation_execution
+    def _recover_relocalization_owner_complete(
+        self,
+        *,
+        operation: str,
+        expected_request_id: Optional[str] = None,
+        require_existing: bool = False,
+    ) -> _RelocalizationRecoveryOutcome:
+        return self._recover_relocalization_owner_complete_core(
+            operation=operation,
+            expected_request_id=expected_request_id,
+            require_existing=require_existing,
+        )
+
+    @_serialized_map_activation_execution
+    def recover_relocalization_receipt(self) -> Optional[Dict[str, object]]:
+        """完整恢复 retained owner，并返回 canonical receipt。"""
+
+        outcome = self._recover_relocalization_owner_complete_core(
+            operation="recover_relocalization_receipt",
+        )
+        if not outcome.settled:
+            pending = self._repository.get_relocalization_intent()
+            if pending is not None:
+                self._raise_relocalization_recovery_pending(
+                    pending,
+                    operation="recover_relocalization_receipt",
+                    reason="terminal_pending",
+                )
+        return dict(outcome.receipt) if outcome.receipt is not None else None
+
+    @_serialized_map_activation_execution
+    def shutdown_relocalization_owner(self) -> Dict[str, object]:
+        """关闭前通过统一 owner core 尝试完整收敛。"""
+
+        try:
+            outcome = self._recover_relocalization_owner_complete_core(
+                operation="shutdown_relocalization_owner",
+            )
+        except GatewayError:
+            return {
+                "settled": False,
+                "pending": self.get_relocalization_recovery_status(),
+            }
+        return {
+            "settled": outcome.settled,
+            "pending": outcome.pending,
+        }
+
+    def close(self) -> Dict[str, object]:
+        """保留可重启 durable owner 的 workspace 关闭入口。"""
+
+        return self.shutdown_relocalization_owner()
+
+    @_serialized_map_activation_execution
     def relocalize_active_map(
         self,
         *,
@@ -1560,7 +2434,11 @@ class MapWorkspaceService:
         """在已加载 current 资产包上重置定位会话，不加载或切换地图资产。"""
 
         active_workspace = self.get_active_workspace(refresh_localization=False)
-        active_map_name = active_workspace.active_map_name if active_workspace is not None else None
+        active_map_name = (
+            active_workspace.active_map_name
+            if active_workspace is not None
+            else None
+        )
         resolved_name = self._require_map_name(map_name or active_map_name or "")
         if active_map_name != resolved_name:
             raise GatewayError(
@@ -1571,7 +2449,75 @@ class MapWorkspaceService:
             )
         asset = active_workspace.map_asset
         bundle = self._require_map_asset_bundle(resolved_name)
-        runtime_descriptor_reader = getattr(self._geometry_runtime, "describe_backend", None)
+        bundle_manifest_sha256 = str(bundle.manifest_sha256 or "").strip().lower()
+        pending_intent = self._repository.get_relocalization_intent()
+        request_metadata = self._sanitize_map_metadata(metadata) or {}
+        request_metadata = self._sanitize_relocalization_request_metadata(
+            request_metadata
+        )
+        if not isinstance(request_metadata, dict):
+            request_metadata = {}
+        requested_id = request_metadata.get("request_id")
+        if pending_intent is None and requested_id is not None:
+            durable_receipt = (
+                self._repository.get_last_successful_relocalization_receipt()
+            )
+            if (
+                isinstance(durable_receipt, dict)
+                and durable_receipt.get("request_id") == requested_id
+                and durable_receipt.get("map_name") == resolved_name
+                and durable_receipt.get("asset_manifest_sha256")
+                == bundle_manifest_sha256
+            ):
+                session = self._localization_service.get_active_session()
+                if session is None:
+                    raise GatewayError(
+                        "重定位终态已持久化，但定位会话尚未完成同步。",
+                        error_code="relocalization_session_recovery_incomplete",
+                        http_status=503,
+                        jsonrpc_code=-32010,
+                        details={
+                            "operation": "relocalize_active_map",
+                            "request_id": requested_id,
+                            "reason": "session_refresh_failed",
+                        },
+                    )
+                self._validate_bounded_relocalization_session(
+                    session,
+                    durable_receipt,
+                )
+                return session, active_workspace
+        if pending_intent is not None:
+            if (
+                pending_intent["target_map_name"] != resolved_name
+                or pending_intent["target_manifest_sha256"]
+                != bundle_manifest_sha256
+                or requested_id is None
+                or requested_id != pending_intent["request_id"]
+            ):
+                self._raise_relocalization_pending(
+                    pending_intent,
+                    operation="relocalize_active_map",
+                )
+            outcome = self._recover_relocalization_owner_complete_core(
+                operation="relocalize_active_map",
+                expected_request_id=requested_id,
+                require_existing=True,
+            )
+            if not outcome.settled:
+                self._raise_relocalization_recovery_pending(
+                    pending_intent,
+                    operation="relocalize_active_map",
+                    reason="terminal_pending",
+                )
+            if outcome.session is None or outcome.workspace is None:
+                raise RuntimeError("重定位恢复缺少最终 session/workspace。")
+            return outcome.session, outcome.workspace
+        runtime_descriptor_reader = getattr(
+            self._geometry_runtime,
+            "describe_backend",
+            None,
+        )
         try:
             runtime_descriptor = (
                 runtime_descriptor_reader()
@@ -1582,15 +2528,16 @@ class MapWorkspaceService:
             runtime_descriptor = {}
         if not isinstance(runtime_descriptor, dict):
             runtime_descriptor = {}
-        runtime_map_name = str(runtime_descriptor.get("active_map_name") or "").strip()
+        runtime_map_name = str(
+            runtime_descriptor.get("active_map_name") or ""
+        ).strip()
         runtime_manifest_sha256 = str(
             runtime_descriptor.get("asset_manifest_sha256") or ""
         ).strip().lower()
         catalog_manifest_sha256 = str(
             getattr(asset, "asset_manifest_sha256", None) or ""
         ).strip().lower()
-        bundle_manifest_sha256 = str(bundle.manifest_sha256 or "").strip().lower()
-        runtime_identity_matches = bool(
+        if not bool(
             active_workspace.map_loaded
             and active_workspace.latest_map_snapshot is not None
             and asset is not None
@@ -1598,94 +2545,175 @@ class MapWorkspaceService:
             and catalog_manifest_sha256 == bundle_manifest_sha256
             and runtime_map_name == resolved_name
             and runtime_manifest_sha256 == bundle_manifest_sha256
-        )
-        if not runtime_identity_matches:
+        ):
             raise GatewayError(
-                "地图 %s 的 current 资产包尚未加载到运行态或运行态身份不一致；"
-                "请先重新调用 activate_map。" % resolved_name,
+                "当前地图运行态身份不一致。",
                 error_code="map_runtime_not_loaded",
                 http_status=409,
                 jsonrpc_code=-32000,
                 details={
                     "map_name": resolved_name,
-                    "finalized": bool(asset is not None and asset.finalized),
-                    "workspace_map_loaded": active_workspace.map_loaded,
                     "expected_asset_manifest_sha256": bundle_manifest_sha256,
-                    "catalog_asset_manifest_sha256": catalog_manifest_sha256 or None,
                     "runtime_active_map_name": runtime_map_name or None,
                     "runtime_asset_manifest_sha256": runtime_manifest_sha256 or None,
-                    "recommended_next_tool": "activate_map",
                 },
             )
-
-        latest_map_snapshot = active_workspace.latest_map_snapshot
-        frame_id = self._resolve_map_frame_id(latest_map_snapshot)
-        request_metadata = self._sanitize_map_metadata(metadata) or {}
-        request_id = request_metadata.get("request_id")
-        try:
-            logical_timeout_ms = int(request_metadata.get("logical_timeout_ms", 10_000))
-        except (TypeError, ValueError):
-            logical_timeout_ms = 10_000
-        try:
-            relocalization_result = self._geometry_runtime.relocalize_active_map(
-                map_name=resolved_name,
-                asset_manifest_sha256=bundle_manifest_sha256,
-                request_id=str(request_id).strip() if request_id is not None else None,
-                logical_timeout_ms=logical_timeout_ms,
-            )
-        except GeometryRuntimeRelocalizationRejected as exc:
-            result = dict(exc.result)
-            disposition = str(result.get("disposition_name") or "rejected")
-            raise GatewayError(
-                "地图 %s 重定位未应用：%s" % (resolved_name, disposition),
-                error_code="relocalization_%s" % disposition,
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={"relocalization_result": result},
-            ) from exc
-        except GatewayError:
-            raise
-        except Exception as exc:
-            raise GatewayError(
-                "地图 %s 重定位调用失败：%s" % (resolved_name, exc),
-                error_code="relocalization_unavailable",
-                http_status=503,
-                jsonrpc_code=-32010,
-            ) from exc
-        session = self._localization_service.refresh_active_session(
-            map_name=resolved_name,
-            asset_manifest_sha256=bundle_manifest_sha256,
-            frame_id=frame_id,
-            metadata={
-                **request_metadata,
-                "map_name": resolved_name,
-                "source": "typed_relocalize_rpc",
-                "relocalization_result": relocalization_result,
-                "geometry_diagnostics": latest_map_snapshot.metadata.get("geometry_diagnostics"),
-                "map_snapshot_identity": {
-                    "source_name": latest_map_snapshot.source_name,
-                    "source_epoch": latest_map_snapshot.source_epoch,
-                    "update_sequence": latest_map_snapshot.update_sequence,
-                    "content_sha256": latest_map_snapshot.content_sha256,
-                },
-            },
-            force_relocalize=False,
-            geometry_asset=self._resolve_geometry_asset_summary(latest_map_snapshot),
+        activation_receipt = (
+            self._repository.get_last_successful_map_activation_receipt()
         )
-        workspace = self.get_active_workspace(refresh_localization=False)
-        if workspace is None:
+        if (
+            activation_receipt is None
+            or activation_receipt.get("trusted_identity") is not True
+            or activation_receipt["target_map_name"] != resolved_name
+            or activation_receipt["target_manifest_sha256"]
+            != bundle_manifest_sha256
+        ):
             raise GatewayError(
-                "地图 %s 当前没有激活工作区。" % resolved_name,
-                error_code="map_not_activated",
+                "当前地图缺少匹配的 trusted activation receipt。",
+                error_code="map_activation_identity_mismatch",
                 http_status=409,
                 jsonrpc_code=-32000,
             )
-        return session, workspace
+        if pending_intent is not None:
+            raise RuntimeError("重定位恢复分支未由统一 owner core 返回。")
+        else:
+            try:
+                logical_timeout_ms = int(
+                    request_metadata.get("logical_timeout_ms", 10_000)
+                )
+            except (TypeError, ValueError):
+                logical_timeout_ms = 10_000
+            resolved_request_id = (
+                str(requested_id).strip()
+                if requested_id is not None
+                else "relocalize:%s" % uuid.uuid4().hex
+            )
+            pending_intent = self._repository.begin_relocalization_durable(
+                request_id=resolved_request_id,
+                logical_timeout_ms=logical_timeout_ms,
+                activation_receipt=activation_receipt,
+            )
+            pending_intent = (
+                self._repository.mark_relocalization_backend_dispatching(
+                    request_id=resolved_request_id
+                )
+            )
+            try:
+                provider_result = self._geometry_runtime.relocalize_active_map(
+                    map_name=resolved_name,
+                    asset_manifest_sha256=bundle_manifest_sha256,
+                    request_id=resolved_request_id,
+                    logical_timeout_ms=logical_timeout_ms,
+                )
+            except GeometryRuntimeRelocalizationRejected as exc:
+                result = dict(exc.result)
+                raw_disposition = str(
+                    result.get("disposition_name") or "rejected"
+                ).strip().lower()
+                disposition = (
+                    raw_disposition
+                    if raw_disposition in {
+                        "rejected",
+                        "invalid_request",
+                        "target_unavailable",
+                        "candidate_rejected",
+                        "deadline_exceeded",
+                        "stale_request",
+                    }
+                    else "rejected"
+                )
+                self._repository.abort_relocalization_before_apply(
+                    request_id=resolved_request_id
+                )
+                raise GatewayError(
+                    "重定位请求被 provider 明确拒绝。",
+                    error_code="relocalization_%s" % disposition,
+                    http_status=409,
+                    jsonrpc_code=-32000,
+                    details={
+                        "request_id": resolved_request_id,
+                        "disposition": disposition,
+                    },
+                ) from exc
+            except Exception as exc:
+                self._repository.mark_relocalization_outcome_unknown(
+                    request_id=resolved_request_id
+                )
+                raise GatewayError(
+                    "重定位结果未知，durable owner 已保留。",
+                    error_code="relocalization_outcome_unknown",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={
+                        "request_id": resolved_request_id,
+                        "phase": "backend_outcome_unknown",
+                        "map_name": resolved_name,
+                        "asset_manifest_sha256": bundle_manifest_sha256,
+                    },
+                ) from exc
+            try:
+                relocalization_receipt = (
+                    self._geometry_runtime.get_validated_relocalization_receipt(
+                        provider_result,
+                        map_name=resolved_name,
+                        asset_manifest_sha256=bundle_manifest_sha256,
+                        activation_receipt=activation_receipt,
+                    )
+                )
+            except Exception as exc:
+                try:
+                    self._repository.mark_relocalization_outcome_unknown(
+                        request_id=resolved_request_id
+                    )
+                except Exception:
+                    pass
+                raise GatewayError(
+                    "重定位 authoritative terminal 校验失败。",
+                    error_code="relocalization_outcome_unknown",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={
+                        "request_id": resolved_request_id,
+                        "phase": "backend_outcome_unknown",
+                    },
+                ) from exc
+            self._retain_validated_relocalization_terminal(relocalization_receipt)
+            try:
+                relocalization_receipt = (
+                    self._reconcile_known_relocalization_terminal(
+                        relocalization_receipt,
+                        activation_receipt=activation_receipt,
+                    )
+                )
+            except Exception as exc:
+                self._raise_relocalization_persistence_failed(
+                    relocalization_receipt,
+                    stage="pending_write",
+                    cause=exc,
+                )
+        reopened = self._repository.get_relocalization_intent()
+        if reopened is None:
+            self._raise_relocalization_settlement_persistence_failed(
+                pending_intent,
+                operation="relocalize_active_map",
+                reason="intent_reopen_present",
+            )
+        outcome = self._finish_relocalization_recovery(
+            pending=reopened,
+            activation_receipt=activation_receipt,
+            receipt=relocalization_receipt,
+            operation="relocalize_active_map",
+            request_metadata=request_metadata,
+        )
+        if outcome.session is None or outcome.workspace is None:
+            raise RuntimeError("重定位完成后缺少最终 session/workspace。")
+        return outcome.session, outcome.workspace
 
-    @_serialized_map_activation
+    @_serialized_map_activation_execution
     def clear_active_map(self, *, disable_memory_library: bool = False) -> Optional[MapAsset]:
         """清空当前激活地图。"""
 
+        self._require_no_relocalization_recovery("clear_active_map")
         self._require_no_map_activation_recovery("clear_active_map")
         active_map_name = self._repository.get_active_map_name()
         if not active_map_name:
@@ -1733,6 +2761,17 @@ class MapWorkspaceService:
 
     @_serialized_map_activation_execution
     def restore_active_workspace(self, *, load_memory_history: bool = True) -> Optional[MapWorkspace]:
+        recovery = self._recover_relocalization_owner_complete_core(
+            operation="restore_active_workspace",
+        )
+        if not recovery.settled:
+            pending = self._repository.get_relocalization_intent()
+            if pending is not None:
+                self._raise_relocalization_recovery_pending(
+                    pending,
+                    operation="restore_active_workspace",
+                    reason="terminal_pending",
+                )
         pending_activation = self._read_map_activation()
         self._arm_map_activation_fence(
             pending_activation,

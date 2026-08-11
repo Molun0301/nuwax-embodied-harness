@@ -1076,12 +1076,12 @@ impl MappingBackendSpec {
 
     #[cfg(test)]
     fn from_lookup(
-        selected: MappingBackend,
+        selected: MappingBackendKind,
         lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, String> {
         match selected {
-            MappingBackend::Voxel => Ok(Self::Voxel),
-            MappingBackend::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_lookup(
+            MappingBackendKind::Voxel => Ok(Self::Voxel),
+            MappingBackendKind::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_lookup(
                 lookup,
             )?)),
         }
@@ -2371,15 +2371,16 @@ mod tests {
 
     #[test]
     fn voxel_selection_does_not_parse_raytracing_environment() {
-        let spec =
-            MappingBackendSpec::from_lookup(MappingBackend::Voxel, |_| Some("invalid".to_owned()))
-                .expect("inactive raytracing config must not affect voxel startup");
+        let spec = MappingBackendSpec::from_lookup(MappingBackendKind::Voxel, |_| {
+            Some("invalid".to_owned())
+        })
+        .expect("inactive raytracing config must not affect voxel startup");
         assert_eq!(spec, MappingBackendSpec::Voxel);
     }
 
     #[test]
     fn raytracing_defaults_are_valid_and_deterministic() {
-        let spec = MappingBackendSpec::from_lookup(MappingBackend::Raytracing, |_| None)
+        let spec = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |_| None)
             .expect("defaults must pass standalone validation");
         assert_eq!(spec.stable_name(), "raytracing");
         let mut kernel = spec.into_kernel(1024);
@@ -2405,7 +2406,7 @@ mod tests {
 
     #[test]
     fn invalid_selected_config_fails_closed_with_key() {
-        let error = MappingBackendSpec::from_lookup(MappingBackend::Raytracing, |key| {
+        let error = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |key| {
             (key == RAY_SUBSAMPLE_ENV).then(|| "0".to_owned())
         })
         .expect_err("zero ray subsample must fail startup");

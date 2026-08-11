@@ -1090,6 +1090,83 @@ class GatewayRuntime:
                 )
             )
 
+    @staticmethod
+    def _bounded_relocalization_owner_pending(
+        pending: object,
+    ) -> Optional[Dict[str, object]]:
+        if not isinstance(pending, dict):
+            return None
+        projected: Dict[str, object] = {}
+        limits = {
+            "request_id": 128,
+            "phase": 64,
+            "recovery_state": 64,
+            "target_map_name": 256,
+            "target_manifest_sha256": 64,
+            "request_identity_sha256": 64,
+            "terminal_proof_sha256": 64,
+        }
+        for key, limit in limits.items():
+            value = pending.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value or len(value) > limit:
+                return None
+            projected[key] = value
+        if not isinstance(projected.get("request_id"), str):
+            return None
+        if not isinstance(
+            projected.get("phase", projected.get("recovery_state")),
+            str,
+        ):
+            return None
+        return projected
+
+    def _settle_relocalization_owner_before_geometry_stop(
+        self,
+        *,
+        operation: str,
+    ) -> Dict[str, object]:
+        try:
+            outcome = self.map_workspace_service.shutdown_relocalization_owner()
+        except Exception as exc:
+            raise GatewayError(
+                "Gateway停止前重定位 durable owner 状态无效。",
+                error_code="gateway_stop_relocalization_owner_invalid",
+                http_status=503,
+                jsonrpc_code=-32010,
+                details={
+                    "operation": operation,
+                    "reason": "owner_call_failed",
+                },
+            ) from exc
+        if not isinstance(outcome, dict):
+            reason = "outcome_not_mapping"
+        elif not isinstance(outcome.get("settled"), bool):
+            reason = "settled_not_boolean"
+        elif outcome["settled"] is True and outcome.get("pending") is None:
+            return {"settled": True, "pending": None}
+        else:
+            pending = self._bounded_relocalization_owner_pending(
+                outcome.get("pending") if isinstance(outcome, dict) else None
+            )
+            if pending is not None and outcome.get("settled") is False:
+                raise GatewayError(
+                    "Gateway停止前重定位 durable owner 尚未 settled。",
+                    error_code="gateway_stop_relocalization_owner_pending",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={"operation": operation, **pending},
+                )
+            reason = "pending_shape_invalid"
+        raise GatewayError(
+            "Gateway停止前重定位 durable owner 状态无效。",
+            error_code="gateway_stop_relocalization_owner_invalid",
+            http_status=503,
+            jsonrpc_code=-32010,
+            details={"operation": operation, "reason": reason},
+        )
+
     def stop(self) -> None:
         """停止宿主机运行时。
 
@@ -1102,6 +1179,8 @@ class GatewayRuntime:
         """
 
         stop_error: Optional[Exception] = None
+        relocalization_stop_error: Optional[GatewayError] = None
+        relocalization_pending: Dict[str, object] = {}
         with self._lock:
             if not self._started:
                 RUNTIME_LOGGER.info("宿主机运行时未启动，忽略停止请求。")
@@ -1126,12 +1205,46 @@ class GatewayRuntime:
                     "motion guard global stop was not confirmed during gateway shutdown"
                 )
             self.task_manager.shutdown(wait=True)
+            try:
+                self._settle_relocalization_owner_before_geometry_stop(
+                    operation="gateway_stop",
+                )
+            except GatewayError as exc:
+                relocalization_stop_error = exc
+                relocalization_pending = {
+                    key: value
+                    for key, value in exc.details.items()
+                    if key not in {"operation", "reason"}
+                }
+                RUNTIME_LOGGER.error(
+                    "Gateway停止前重定位 durable owner 未收敛。",
+                    extra={
+                        "error_code": exc.error_code,
+                        "request_id": relocalization_pending.get("request_id", "-"),
+                        "phase": relocalization_pending.get(
+                            "phase",
+                            relocalization_pending.get("recovery_state", "-"),
+                        ),
+                    },
+                )
             self._stop_runtime_input_bridge()
-            self.platform_geometry_runtime.stop()
-            self.audio_service.stop()
-            self._stop_data_frame_stream_sources()
-            self.perception_video_runtime.stop()
-            self.robot.stop()
+            cleanup_steps = (
+                ("geometry runtime", self.platform_geometry_runtime.stop),
+                ("audio service", self.audio_service.stop),
+                ("data frame streams", self._stop_data_frame_stream_sources),
+                ("perception video runtime", self.perception_video_runtime.stop),
+                ("robot", self.robot.stop),
+            )
+            for component_name, cleanup in cleanup_steps:
+                try:
+                    cleanup()
+                except Exception as exc:
+                    if stop_error is None:
+                        stop_error = exc
+                    RUNTIME_LOGGER.exception(
+                        "%s failed during gateway shutdown",
+                        component_name,
+                    )
             try:
                 self.person_follow_bridge.close()
             except Exception as exc:
@@ -1150,14 +1263,33 @@ class GatewayRuntime:
                 )
             self._started = False
 
+        owner_settled = relocalization_stop_error is None
+        event_payload: Dict[str, object] = {
+            "success": stop_error is None and owner_settled,
+            "relocalization_owner_settled": owner_settled,
+            "stop_error_code": (
+                relocalization_stop_error.error_code
+                if relocalization_stop_error is not None
+                else None
+            ),
+        }
+        event_payload.update(relocalization_pending)
         self.event_bus.publish(
             self.event_bus.build_event(
                 "system.gateway_stopped",
                 category=RuntimeEventCategory.SYSTEM,
                 source="gateway_runtime",
+                severity=(
+                    RuntimeEventSeverity.INFO
+                    if event_payload["success"]
+                    else RuntimeEventSeverity.ERROR
+                ),
                 message="宿主机网关运行时已停止。",
+                payload=event_payload,
             )
         )
+        if relocalization_stop_error is not None:
+            raise relocalization_stop_error
         if stop_error is not None:
             raise stop_error
 
@@ -12890,6 +13022,10 @@ class GatewayRuntime:
                         ensure_activation_deadline()
                         runtime_status = self.platform_geometry_runtime.get_runtime_status()
                         if runtime_status.get("started"):
+                            ensure_activation_deadline()
+                            self._settle_relocalization_owner_before_geometry_stop(
+                                operation="geometry_runtime_restart",
+                            )
                             ensure_activation_deadline()
                             self._stop_runtime_input_bridge()
                             self.platform_geometry_runtime.stop()

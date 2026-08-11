@@ -646,6 +646,29 @@ def _canonical_asset_bundle_sha256(
     return hashlib.sha256(preimage).digest()
 
 
+def _canonical_relocalization_request_id(
+    value: Optional[str], *, generate_if_missing: bool
+) -> str:
+    if value is None:
+        if not generate_if_missing:
+            raise ValueError("request_id is required")
+        resolved = "relocalize:%s" % uuid.uuid4().hex
+    elif isinstance(value, str):
+        resolved = value
+    else:
+        raise ValueError("request_id must be canonical ASCII [A-Za-z0-9._:-]")
+    if (
+        not resolved
+        or len(resolved) > 128
+        or any(
+            not (character.isascii() and (character.isalnum() or character in "._:-"))
+            for character in resolved
+        )
+    ):
+        raise ValueError("request_id must be canonical ASCII [A-Za-z0-9._:-]")
+    return resolved
+
+
 def _canonical_relocalize_request_sha256(request) -> bytes:
     """Encode the R2 request identity in the same order as the Rust owner."""
 
@@ -5064,18 +5087,9 @@ class GeometryRuntimeProvider:
             raise RuntimeError("Geometry runtime 不支持 Relocalize RPC。")
 
         state = dict(activation_state or {})
-        resolved_request_id = str(request_id or "").strip() or (
-            "relocalize:%s" % uuid.uuid4().hex
+        resolved_request_id = _canonical_relocalization_request_id(
+            request_id, generate_if_missing=True
         )
-        if (
-            len(resolved_request_id) > 128
-            or not resolved_request_id
-            or any(
-                not (character.isascii() and (character.isalnum() or character in "._:-"))
-                for character in resolved_request_id
-            )
-        ):
-            raise ValueError("request_id must be canonical ASCII [A-Za-z0-9._:-]")
         timeout_ms = int(logical_timeout_ms)
         if timeout_ms < 250 or timeout_ms > 30_000:
             raise ValueError("logical_timeout_ms must be in [250, 30000]")
@@ -5182,6 +5196,181 @@ class GeometryRuntimeProvider:
         ):
             raise RuntimeError("Relocalize returned a mismatched terminal identity")
         return payload
+
+    def get_relocalization_terminal(
+        self,
+        *,
+        activation_state: Mapping[str, object],
+        request_id: str,
+        logical_timeout_ms: int,
+    ) -> Dict[str, Any]:
+        """只读查询已存在 request 的权威终态，不创建或推进请求。"""
+
+        self._raise_if_stopping("get_relocalization_terminal")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        rpc = getattr(self._stub, "GetRelocalizationTerminal", None)
+        if not callable(rpc):
+            raise RuntimeError(
+                "Geometry runtime 不支持 GetRelocalizationTerminal RPC。"
+            )
+        state = dict(activation_state or {})
+        resolved_request_id = _canonical_relocalization_request_id(
+            request_id, generate_if_missing=False
+        )
+        relocalize_request = pb2.RelocalizeRequest(
+            schema_version=1,
+            request_id=resolved_request_id,
+            runtime_generation=int(state.get("runtime_generation") or 0),
+            session_id=str(state.get("session_id") or ""),
+            map_name=str(state.get("map_name") or ""),
+            session_generation=int(state.get("session_generation") or 0),
+            backend_generation=int(state.get("backend_generation") or 0),
+            activation_identity_sha256=_require_digest_bytes(
+                state.get("activation_identity_sha256"),
+                "activation_identity_sha256",
+            ),
+            target_receipt_sha256=_require_digest_bytes(
+                state.get("target_receipt_sha256"), "target_receipt_sha256"
+            ),
+            target_cloud_revision=int(state.get("cloud_source_revision") or 0),
+            target_cloud_sha256=_require_digest_bytes(
+                state.get("cloud_source_sha256"), "target_cloud_sha256"
+            ),
+            asset_manifest_sha256=_require_digest_bytes(
+                state.get("asset_manifest_sha256"), "asset_manifest_sha256"
+            ),
+            asset_bundle_sha256=_require_digest_bytes(
+                state.get("asset_bundle_sha256"), "asset_bundle_sha256"
+            ),
+            source_policy_version=int(state.get("source_policy_version") or 0),
+            source_policy_sha256=_require_digest_bytes(
+                state.get("source_policy_sha256"), "source_policy_sha256"
+            ),
+            deadline_policy_version=int(state.get("deadline_policy_version") or 0),
+            deadline_policy_sha256=_require_digest_bytes(
+                state.get("deadline_policy_sha256"), "deadline_policy_sha256"
+            ),
+            logical_timeout_ms=int(logical_timeout_ms),
+            algorithm_options_version=int(
+                state.get("algorithm_options_version") or 0
+            ),
+            algorithm_options_sha256=_require_digest_bytes(
+                state.get("algorithm_options_sha256"),
+                "algorithm_options_sha256",
+            ),
+        )
+        request_identity = _canonical_relocalize_request_sha256(
+            relocalize_request
+        )
+        activation_identity = bytes(
+            relocalize_request.activation_identity_sha256
+        )
+        request = pb2.GetRelocalizationTerminalRequest(
+            schema_version=1,
+            request_id=resolved_request_id,
+            request_identity_sha256=request_identity,
+            activation_identity_sha256=activation_identity,
+        )
+        try:
+            response = rpc(request, timeout=_read_deadline_sec())
+        except grpc.RpcError as exc:
+            raise GeometryRuntimeRpcError.from_rpc_error(
+                "GetRelocalizationTerminal", exc
+            ) from exc
+        try:
+            raw_status = response.status
+        except Exception:
+            raise RuntimeError(
+                "GetRelocalizationTerminal returned an invalid terminal status"
+            ) from None
+        if isinstance(raw_status, bool) or not isinstance(raw_status, int):
+            raise RuntimeError(
+                "GetRelocalizationTerminal returned an invalid terminal status"
+            )
+        status_name = {
+            1: "terminal",
+            2: "pending",
+            3: "not_found",
+            4: "identity_conflict",
+        }.get(raw_status)
+        if status_name is None:
+            raise RuntimeError(
+                "GetRelocalizationTerminal returned an invalid terminal status"
+            )
+        if (
+            int(response.schema_version) != 1
+            or str(response.request_id) != resolved_request_id
+            or bytes(response.request_identity_sha256) != request_identity
+            or bytes(response.activation_identity_sha256) != activation_identity
+            or status_name
+            not in {"terminal", "pending", "not_found", "identity_conflict"}
+        ):
+            raise RuntimeError(
+                "GetRelocalizationTerminal returned a mismatched query identity"
+            )
+        try:
+            has_observation = response.HasField("ledger_observation")
+        except Exception:
+            has_observation = False
+        ledger_observation = None
+        if has_observation:
+            observation = response.ledger_observation
+            observation_values = {
+                "observation_schema_version": observation.observation_schema_version,
+                "admitted_command_count": observation.admitted_command_count,
+                "claimed_command_count": observation.claimed_command_count,
+                "terminal_record_count": observation.terminal_record_count,
+                "pending_record_count": observation.pending_record_count,
+                "active_waiter_count": observation.active_waiter_count,
+                "observation_epoch": observation.observation_epoch,
+            }
+            if not any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in observation_values.values()
+            ) and (
+                observation_values["observation_schema_version"] == 1
+                and observation_values["observation_epoch"] != 0
+                and observation_values["terminal_record_count"]
+                + observation_values["pending_record_count"]
+                <= observation_values["admitted_command_count"]
+            ):
+                ledger_observation = dict(observation_values)
+        has_terminal = response.HasField("terminal")
+        if status_name != "terminal":
+            if has_terminal:
+                raise RuntimeError(
+                    "non-terminal query response unexpectedly contained terminal bytes"
+                )
+            return {
+                "status": status_name,
+                "request_id": resolved_request_id,
+                "request_identity_sha256": request_identity.hex(),
+                "activation_identity_sha256": activation_identity.hex(),
+                "terminal": None,
+                "ledger_observation": ledger_observation,
+            }
+        if not has_terminal:
+            raise RuntimeError("terminal query response omitted terminal proof")
+        terminal = self._relocalize_result_payload(response.terminal)
+        if (
+            terminal.get("request_id") != resolved_request_id
+            or terminal.get("request_identity_sha256") != request_identity.hex()
+            or terminal.get("activation_identity_sha256")
+            != activation_identity.hex()
+            or terminal.get("disposition_name") == "unknown"
+        ):
+            raise RuntimeError(
+                "GetRelocalizationTerminal returned an invalid terminal proof"
+            )
+        return {
+            "status": status_name,
+            "request_id": resolved_request_id,
+            "request_identity_sha256": request_identity.hex(),
+            "activation_identity_sha256": activation_identity.hex(),
+            "terminal": terminal,
+            "ledger_observation": ledger_observation,
+        }
 
     def stop_mapping(self, *, session_id: str, reason: str = "") -> Dict[str, Any]:
         self._raise_if_stopping("stop_mapping")

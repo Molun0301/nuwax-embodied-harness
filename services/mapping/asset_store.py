@@ -41,6 +41,7 @@ _MAX_DIRECTORY_ENTRIES = _MAX_MANIFEST_FILE_ENTRIES + 128
 _MAX_JSON_NUMBER_TOKEN_BYTES = 128
 _FILE_READ_CHUNK_BYTES = 1024 * 1024
 _FILE_PREFIX_BYTES = 8192
+_VALIDATED_SNAPSHOT_DOMAIN = b"nuwax.mapping.validated-map-asset-snapshot.v1\0"
 
 
 class MapAssetBundleError(RuntimeError):
@@ -73,6 +74,7 @@ class ValidatedMapAssetBundleSnapshot:
     georeference_bytes: bytes
     repository_device: int
     repository_inode: int
+    repository_fingerprint: str
 
 
 class MapAssetBundleRepository:
@@ -144,14 +146,21 @@ class MapAssetBundleRepository:
             if tree.root is None:
                 raise MapAssetBundleValidationError("地图资产目录描述符已关闭。")
             repository_stat = os.fstat(tree.root.descriptor)
-        return ValidatedMapAssetBundleSnapshot(
-            bundle=bundle.model_copy(
+            validated_bundle = bundle.model_copy(
                 update={"manifest_sha256": manifest_sha256},
                 deep=True,
-            ),
+            )
+            repository_fingerprint = _validated_snapshot_fingerprint(
+                tree,
+                validated_bundle,
+                georeference_bytes,
+            )
+        return ValidatedMapAssetBundleSnapshot(
+            bundle=validated_bundle,
             georeference_bytes=georeference_bytes,
             repository_device=repository_stat.st_dev,
             repository_inode=repository_stat.st_ino,
+            repository_fingerprint=repository_fingerprint,
         )
 
     def validate_map_asset_bundle_snapshot_identity(
@@ -159,19 +168,14 @@ class MapAssetBundleRepository:
         map_name: str,
         snapshot: ValidatedMapAssetBundleSnapshot,
     ) -> None:
-        """重验 fixed current 命名项仍指向已验证的 repository snapshot。"""
+        """从可信 current 命名项重建快照，并拒绝解析期间的任何变化。"""
 
-        current_dir = self._current_dir(map_name)
-        try:
-            current_stat = os.stat(current_dir, follow_symlinks=False)
-        except OSError as exc:
-            raise MapAssetBundleValidationError("finalized 地图 current 身份不可重验。") from exc
-        _validate_directory_stat(current_stat, str(current_dir))
-        if (
-            current_stat.st_dev != snapshot.repository_device
-            or current_stat.st_ino != snapshot.repository_inode
-        ):
-            raise MapAssetBundleValidationError("finalized 地图 current 已被替换。")
+        refreshed = self.get_validated_map_asset_bundle_snapshot(
+            map_name,
+            expected_manifest_sha256=str(snapshot.bundle.manifest_sha256 or ""),
+        )
+        if refreshed is None or refreshed != snapshot:
+            raise MapAssetBundleValidationError("finalized 地图 repository snapshot 已被替换。")
 
     def finalize_map_asset_bundle(
         self,
@@ -1388,6 +1392,51 @@ class _StableDirectoryTree:
                 relative_path=relative_text,
                 initial_stat=opened_stat,
             )
+
+
+def _validated_snapshot_fingerprint(
+    tree: _StableDirectoryTree,
+    bundle: MapAssetBundle,
+    georeference_bytes: bytes,
+) -> str:
+    """绑定一次完整验证所得的类型化合同、原文与全部目录成员观察。"""
+
+    digest = hashlib.sha256()
+    digest.update(_VALIDATED_SNAPSHOT_DOMAIN)
+    canonical_bundle = json.dumps(
+        bundle.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    for field in (canonical_bundle, georeference_bytes):
+        digest.update(len(field).to_bytes(8, "big"))
+        digest.update(field)
+    for relative_path in sorted(tree.files):
+        managed = tree.files[relative_path]
+        size, sha256 = managed.hash()
+        current = os.fstat(managed.descriptor)
+        metadata = json.dumps(
+            {
+                "device": int(current.st_dev),
+                "inode": int(current.st_ino),
+                "mode": int(current.st_mode),
+                "nlink": int(current.st_nlink),
+                "size": size,
+                "mtime_ns": int(current.st_mtime_ns),
+                "ctime_ns": int(current.st_ctime_ns),
+                "sha256": sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        path_bytes = relative_path.encode("utf-8")
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+    tree.verify_all()
+    return digest.hexdigest()
 
 
 def _validate_regular_file_stat(path_stat: os.stat_result, description: str) -> None:

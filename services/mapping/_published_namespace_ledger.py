@@ -10,6 +10,7 @@ _MAGIC = b"NWPLED1\0"
 _PROTOCOL = "nuwax.mapping.published-namespace-ledger.v1"
 _SCHEMA_VERSION = 1
 _MAX_BODY_BYTES = 65536
+_MAX_JSON_DEPTH = 32
 _I64_MAX = (1 << 63) - 1
 _ZERO_HASH = "0" * 64
 _RECORD_DOMAIN = b"nuwax.mapping.published-namespace-ledger.record.v1\0"
@@ -32,6 +33,7 @@ _RECORD_KEYS = frozenset(
     }
 )
 _IDENTITY_KEYS = frozenset({"device", "gid", "inode", "mode", "nlink", "uid"})
+_LOCK_IDENTITY_KEYS = frozenset({"device", "gid", "inode", "mode", "nlink", "size", "uid"})
 _EXACT_BINDING_KEYS = frozenset(
     {"canonical_sha256", "device", "gid", "inode", "mode", "nlink", "size", "uid"}
 )
@@ -106,7 +108,7 @@ def make_root_id(
     """计算 genesis 后不可变化的 root/lock/ledger 初始绑定。"""
 
     _validate_identity(root_binding, "root_binding")
-    _validate_identity(lock_binding, "lock_binding", require_zero_size=False)
+    _validate_identity(lock_binding, "lock_binding", require_zero_size=True)
     _validate_identity(ledger_binding, "ledger_binding")
     binding = {
         "ledger_binding": dict(ledger_binding),
@@ -294,6 +296,12 @@ def replay_ledger(data: bytes) -> LedgerReplay:
     ledger_binding: Optional[Mapping[str, Any]] = None
     while offset < len(data):
         record, next_offset = decode_record(data, offset=offset)
+        if records and records[-1].record_type == "CHECKPOINT":
+            _fail(
+                "record_after_checkpoint",
+                "冻结 ledger 的 CHECKPOINT 必须是 terminal record。",
+                offset=offset,
+            )
         body = record.body
         sequence = record.sequence
         if not records:
@@ -337,7 +345,16 @@ def replay_ledger(data: bytes) -> LedgerReplay:
 
 def _decode_canonical_object(body_bytes: bytes, *, offset: int) -> Mapping[str, Any]:
     try:
+        _validate_json_nesting(body_bytes, offset=offset)
         text = body_bytes.decode("utf-8")
+    except PublishedNamespaceLedgerError:
+        raise
+    except (MemoryError, RecursionError) as exc:
+        raise PublishedNamespaceLedgerError(
+            "json_resource_limit",
+            "ledger JSON 解码超出资源限制。",
+            offset=offset,
+        ) from exc
     except UnicodeDecodeError as exc:
         raise PublishedNamespaceLedgerError(
             "body_utf8_invalid",
@@ -368,6 +385,12 @@ def _decode_canonical_object(body_bytes: bytes, *, offset: int) -> Mapping[str, 
         )
     except PublishedNamespaceLedgerError:
         raise
+    except (MemoryError, RecursionError) as exc:
+        raise PublishedNamespaceLedgerError(
+            "json_resource_limit",
+            "ledger JSON 解码超出资源限制。",
+            offset=offset,
+        ) from exc
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise PublishedNamespaceLedgerError(
             "json_invalid",
@@ -376,9 +399,42 @@ def _decode_canonical_object(body_bytes: bytes, *, offset: int) -> Mapping[str, 
         ) from exc
     if not isinstance(value, dict):
         _fail("record_type_invalid", "ledger body 必须是 JSON object。", offset=offset)
-    if canonical_json_bytes(value) != body_bytes:
+    try:
+        canonical_bytes = canonical_json_bytes(value)
+    except PublishedNamespaceLedgerError as exc:
+        raise PublishedNamespaceLedgerError(exc.code, str(exc), offset=offset) from exc
+    except (MemoryError, RecursionError) as exc:
+        raise PublishedNamespaceLedgerError(
+            "json_resource_limit",
+            "ledger JSON canonical 校验超出资源限制。",
+            offset=offset,
+        ) from exc
+    if canonical_bytes != body_bytes:
         _fail("json_noncanonical", "ledger body 不是唯一 canonical JSON。", offset=offset)
     return value
+
+
+def _validate_json_nesting(body_bytes: bytes, *, offset: int) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in body_bytes:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                _fail("json_depth", "ledger JSON 嵌套深度超限。", offset=offset)
+        elif byte in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
 
 
 def _validate_record_body(body: Mapping[str, Any], *, offset: Optional[int] = None) -> None:
@@ -433,7 +489,7 @@ def _validate_genesis_payload(
 ) -> None:
     _require_exact_keys(payload, _GENESIS_PAYLOAD_KEYS, "genesis payload", offset=offset)
     _validate_identity(payload["root_binding"], "root_binding", offset=offset)
-    _validate_identity(payload["lock_binding"], "lock_binding", offset=offset)
+    _validate_identity(payload["lock_binding"], "lock_binding", require_zero_size=True, offset=offset)
     _validate_exact_binding(payload["marker_binding"], "marker_binding", offset=offset)
     _validate_exact_binding(payload["state_binding"], "state_binding", offset=offset)
     expected_root_id = make_root_id(
@@ -484,12 +540,13 @@ def _validate_identity(
 ) -> None:
     if not isinstance(value, dict):
         _fail("identity_type", "%s 必须是 object。" % name, offset=offset)
-    _require_exact_keys(value, _IDENTITY_KEYS, name, offset=offset)
-    for key in _IDENTITY_KEYS:
+    expected_keys = _LOCK_IDENTITY_KEYS if require_zero_size else _IDENTITY_KEYS
+    _require_exact_keys(value, expected_keys, name, offset=offset)
+    for key in expected_keys:
         minimum = 1 if key in {"device", "inode", "nlink"} else 0
         _require_int(value[key], "%s.%s" % (name, key), minimum=minimum, maximum=_I64_MAX, offset=offset)
-    if require_zero_size:
-        _fail("identity_schema", "%s 不应包含 size。" % name, offset=offset)
+    if require_zero_size and value["size"] != 0:
+        _fail("identity_size", "%s.size 必须为 0。" % name, offset=offset)
 
 
 def _validate_exact_binding(value: Any, name: str, *, offset: Optional[int]) -> None:

@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
 from contracts.map_workspace import MapGeoreferenceV1
-from services.mapping.asset_store import MapAssetBundleRepository
+from services.mapping.asset_store import (
+    MapAssetBundleRepository,
+    MapAssetBundleValidationError,
+)
 from services.mapping.catalog import MapCatalogRepository
 
 _COMPANION_DOMAIN = b"nuwax.mapping.finalized-asset-authority.v1\0"
@@ -153,6 +156,16 @@ class FinalizedAssetAuthorityResolver:
             self._fail("runtime_authority_changed", "解析期间 Geometry 地图权威已变化。")
         if final_owner_epoch != owner_epoch:
             self._fail("owner_epoch_changed", "解析期间 S5 owner epoch 已变化。")
+        try:
+            self._asset_repository.validate_map_asset_bundle_snapshot_identity(
+                sealed.map_name,
+                snapshot,
+            )
+        except MapAssetBundleValidationError as exc:
+            raise FinalizedAssetAuthorityError(
+                "repository_snapshot_changed",
+                "解析期间 finalized repository snapshot 已变化。",
+            ) from exc
 
         digest_fields = {
             "activation_identity_sha256": sealed.activation_identity_sha256,

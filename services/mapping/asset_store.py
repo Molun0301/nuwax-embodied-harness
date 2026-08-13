@@ -71,6 +71,8 @@ class ValidatedMapAssetBundleSnapshot:
 
     bundle: MapAssetBundle
     georeference_bytes: bytes
+    repository_device: int
+    repository_inode: int
 
 
 class MapAssetBundleRepository:
@@ -139,13 +141,37 @@ class MapAssetBundleRepository:
             if georeference_sha256 != bundle.georeference.raw_sha256:
                 raise MapAssetBundleValidationError("地理参考原文摘要在稳定读取期间发生变化。")
             tree.verify_all()
+            if tree.root is None:
+                raise MapAssetBundleValidationError("地图资产目录描述符已关闭。")
+            repository_stat = os.fstat(tree.root.descriptor)
         return ValidatedMapAssetBundleSnapshot(
             bundle=bundle.model_copy(
                 update={"manifest_sha256": manifest_sha256},
                 deep=True,
             ),
             georeference_bytes=georeference_bytes,
+            repository_device=repository_stat.st_dev,
+            repository_inode=repository_stat.st_ino,
         )
+
+    def validate_map_asset_bundle_snapshot_identity(
+        self,
+        map_name: str,
+        snapshot: ValidatedMapAssetBundleSnapshot,
+    ) -> None:
+        """重验 fixed current 命名项仍指向已验证的 repository snapshot。"""
+
+        current_dir = self._current_dir(map_name)
+        try:
+            current_stat = os.stat(current_dir, follow_symlinks=False)
+        except OSError as exc:
+            raise MapAssetBundleValidationError("finalized 地图 current 身份不可重验。") from exc
+        _validate_directory_stat(current_stat, str(current_dir))
+        if (
+            current_stat.st_dev != snapshot.repository_device
+            or current_stat.st_ino != snapshot.repository_inode
+        ):
+            raise MapAssetBundleValidationError("finalized 地图 current 已被替换。")
 
     def finalize_map_asset_bundle(
         self,

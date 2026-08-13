@@ -9,6 +9,7 @@ import shlex
 import shutil
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote
@@ -64,6 +65,14 @@ class MapAssetMigrationError(MapAssetBundleError):
     """Legacy version storage cannot be migrated without guessing."""
 
 
+@dataclass(frozen=True)
+class ValidatedMapAssetBundleSnapshot:
+    """一次稳定目录读取中验证完成的 finalized 资产与地理参考原文。"""
+
+    bundle: MapAssetBundle
+    georeference_bytes: bytes
+
+
 class MapAssetBundleRepository:
     """Store one immutable, integrity-checked ``current/`` bundle per map name."""
 
@@ -105,6 +114,38 @@ class MapAssetBundleRepository:
         if not migrate_legacy:
             return None
         return self._migrate_legacy_latest(map_name)
+
+    def get_validated_map_asset_bundle_snapshot(
+        self,
+        map_name: str,
+        *,
+        expected_manifest_sha256: str,
+    ) -> Optional[ValidatedMapAssetBundleSnapshot]:
+        """只读加载 modern current，并在同一稳定目录视图中返回地理参考原文。"""
+
+        current_dir = self._current_dir(map_name)
+        if not current_dir.exists() and not current_dir.is_symlink():
+            return None
+        with _StableDirectoryTree(current_dir) as tree:
+            manifest_sha256, bundle = self._validate_open_directory(
+                map_name,
+                tree,
+                expected_manifest_sha256=expected_manifest_sha256,
+            )
+            georeference_bytes, _size, georeference_sha256 = tree.require_file(
+                bundle.georeference.relative_path,
+                "地理参考文件",
+            ).read_and_hash(_MAX_GEOREFERENCE_JSON_BYTES)
+            if georeference_sha256 != bundle.georeference.raw_sha256:
+                raise MapAssetBundleValidationError("地理参考原文摘要在稳定读取期间发生变化。")
+            tree.verify_all()
+        return ValidatedMapAssetBundleSnapshot(
+            bundle=bundle.model_copy(
+                update={"manifest_sha256": manifest_sha256},
+                deep=True,
+            ),
+            georeference_bytes=georeference_bytes,
+        )
 
     def finalize_map_asset_bundle(
         self,

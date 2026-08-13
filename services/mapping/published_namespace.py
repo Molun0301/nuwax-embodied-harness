@@ -23,12 +23,8 @@ _STATE_FILE_NAME = ".published_namespace_state.json"
 _MARKER_FILE_NAME = ".published_namespace_protocol.json"
 _MAX_DOCUMENT_BYTES = 64 * 1024
 _FILE_MODE = 0o600
-_ALLOWED_OPERATIONS = frozenset(
-    {"bootstrap", "finalize", "delete", "legacy_finalize", "bootstrap_recovery"}
-)
-_ALLOWED_STABLE_OUTCOMES = frozenset(
-    {"initialized", "committed", "aborted", "recovered"}
-)
+_ALLOWED_MUTATIONS = frozenset({"finalize", "delete", "legacy_finalize"})
+_PROTOCOL_NAMES = frozenset({_LOCK_FILE_NAME, _STATE_FILE_NAME, _MARKER_FILE_NAME})
 
 
 class PublishedNamespaceError(RuntimeError):
@@ -48,7 +44,7 @@ class PublishedNamespaceLeaseTimeoutError(PublishedNamespaceError):
 
 
 class PublishedNamespaceRecoveryRequiredError(PublishedNamespaceError):
-    """持久 generation 为奇数，必须由显式 recovery owner 恢复。"""
+    """持久 residue 必须由显式 recovery owner 恢复。"""
 
 
 class PublishedNamespaceGenerationExhaustedError(PublishedNamespaceError):
@@ -65,6 +61,7 @@ class FileIdentity:
 
     device: int
     inode: int
+    size: int
     uid: int
     gid: int
     mode: int
@@ -88,6 +85,20 @@ class PublishedNamespaceState:
     outcome: str
     writer_instance_id: str
     updated_at_ns: int
+    lock_path: str
+    lock_device: int
+    lock_inode: int
+    lock_size: int
+    lock_mode: int
+    lock_uid: int
+    lock_gid: int
+    lock_nlink: int
+    root_device: int
+    root_inode: int
+    root_mode: int
+    root_uid: int
+    root_gid: int
+    root_nlink: int
 
     @property
     def is_stable(self) -> bool:
@@ -98,61 +109,31 @@ class PublishedNamespaceState:
         return self.phase == "mutating" and self.generation % 2 == 1
 
     def canonical_bytes(self) -> bytes:
-        payload = {
-            "after_identity": self.after_identity,
-            "before_identity": self.before_identity,
-            "generation": self.generation,
-            "map_name": self.map_name,
-            "operation": self.operation,
-            "outcome": self.outcome,
-            "phase": self.phase,
-            "protocol": self.protocol,
-            "schema_version": self.schema_version,
-            "transaction_id": self.transaction_id,
-            "updated_at_ns": self.updated_at_ns,
-            "writer_instance_id": self.writer_instance_id,
-        }
-        return _canonical_json_bytes(payload)
+        return _canonical_json_bytes(self.__dict__)
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "PublishedNamespaceState":
         payload = _load_strict_json_object(raw, "published namespace state")
-        expected = {
-            "schema_version",
-            "protocol",
-            "generation",
-            "phase",
-            "transaction_id",
-            "operation",
-            "map_name",
-            "before_identity",
-            "after_identity",
-            "outcome",
-            "writer_instance_id",
-            "updated_at_ns",
-        }
+        expected = set(cls.__dataclass_fields__)
         if set(payload) != expected:
             raise PublishedNamespaceIntegrityError(
                 "published namespace state 字段集合不符合 schema v1。"
             )
-        state = cls(
-            schema_version=_require_int(payload, "schema_version", 1, 1),
-            protocol=_require_text(payload, "protocol", allow_empty=False),
-            generation=_require_int(payload, "generation", 0, _MAX_GENERATION),
-            phase=_require_text(payload, "phase", allow_empty=False),
-            transaction_id=_require_text(payload, "transaction_id", allow_empty=False),
-            operation=_require_text(payload, "operation", allow_empty=False),
-            map_name=_require_text(payload, "map_name", allow_empty=True),
-            before_identity=_require_text(payload, "before_identity", allow_empty=True),
-            after_identity=_require_text(payload, "after_identity", allow_empty=True),
-            outcome=_require_text(payload, "outcome", allow_empty=False),
-            writer_instance_id=_require_text(
-                payload, "writer_instance_id", allow_empty=False
-            ),
-            updated_at_ns=_require_int(
-                payload, "updated_at_ns", 0, _MAX_GENERATION
-            ),
-        )
+        text_fields = {
+            "protocol", "phase", "transaction_id", "operation", "map_name",
+            "before_identity", "after_identity", "outcome", "writer_instance_id",
+            "lock_path",
+        }
+        empty_fields = {"map_name", "before_identity", "after_identity"}
+        values = {}
+        for name in expected:
+            if name in text_fields:
+                values[name] = _require_text(
+                    payload, name, allow_empty=name in empty_fields
+                )
+            else:
+                values[name] = _require_int(payload, name, 0, _MAX_GENERATION)
+        state = cls(**values)
         state._validate()
         if state.canonical_bytes() != raw:
             raise PublishedNamespaceIntegrityError(
@@ -169,26 +150,15 @@ class PublishedNamespaceState:
             raise PublishedNamespaceIntegrityError(
                 "published namespace generation 尚未初始化。"
             )
-        if self.operation not in _ALLOWED_OPERATIONS:
-            raise PublishedNamespaceIntegrityError(
-                "published namespace operation 不受支持。"
-            )
         _require_uuid(self.transaction_id, "transaction_id")
         _require_uuid(self.writer_instance_id, "writer_instance_id")
-        if self.phase == "stable":
-            if self.generation % 2 != 0 or self.outcome not in _ALLOWED_STABLE_OUTCOMES:
-                raise PublishedNamespaceIntegrityError(
-                    "stable state 必须使用偶数 generation 与 stable outcome。"
-                )
-        elif self.phase == "mutating":
-            if self.generation % 2 != 1 or self.outcome != "in_progress":
-                raise PublishedNamespaceIntegrityError(
-                    "mutating state 必须使用奇数 generation 与 in_progress。"
-                )
-        else:
-            raise PublishedNamespaceIntegrityError(
-                "published namespace phase 不受支持。"
-            )
+        if self.lock_path != _LOCK_FILE_NAME or self.lock_nlink != 1:
+            raise PublishedNamespaceIntegrityError("state lock 持久绑定非法。")
+        if self.lock_mode != _FILE_MODE or self.lock_size != 0:
+            raise PublishedNamespaceIntegrityError("state lock mode/size 非法。")
+        if self.root_device < 0 or self.root_inode < 1:
+            raise PublishedNamespaceIntegrityError("state root identity 非法。")
+        _validate_state_matrix(self)
 
 
 @dataclass(frozen=True)
@@ -204,12 +174,7 @@ class PublishedNamespaceMutation:
 
 
 class PublishedNamespaceLease:
-    """持有 catalog-root 固定 inode 上的 SH 或 EX advisory lease。
-
-    威胁模型仅覆盖所有 writer 都协作使用同一固定 lock inode 的进程；拥有同等
-    文件权限且绕过 flock 的进程不在模型内。调用方必须遵守固定锁序：
-    map_activation_guard -> repository lease -> runtime/owner read。禁止 SH->EX 升级。
-    """
+    """持有 catalog-root 固定 inode 上的 SH 或 EX advisory lease。"""
 
     def __init__(
         self,
@@ -232,8 +197,7 @@ class PublishedNamespaceLease:
     def read_state(self) -> PublishedNamespaceState:
         self._require_open()
         return self._protocol._read_state(
-            self._root_descriptor,
-            self.root_identity,
+            self._root_descriptor, self.root_identity, self.lock_identity
         )
 
     def read_stable_state(self) -> PublishedNamespaceState:
@@ -260,7 +224,7 @@ class PublishedNamespaceLease:
             raise PublishedNamespaceGenerationExhaustedError(
                 "published namespace generation 已耗尽，writer 永久 fail closed。"
             )
-        if operation not in _ALLOWED_OPERATIONS - {"bootstrap"}:
+        if operation not in _ALLOWED_MUTATIONS:
             raise PublishedNamespaceTransactionError("mutation operation 不受支持。")
         resolved_map_name = str(map_name or "").strip()
         if not resolved_map_name:
@@ -270,11 +234,8 @@ class PublishedNamespaceLease:
         _require_uuid(resolved_writer, "writer_instance_id")
         resolved_transaction = str(transaction_id or uuid.uuid4())
         _require_uuid(resolved_transaction, "transaction_id")
-        odd_generation = stable.generation + 1
-        state = PublishedNamespaceState(
-            schema_version=_SCHEMA_VERSION,
-            protocol=_PROTOCOL,
-            generation=odd_generation,
+        state = self._protocol._state_with_binding(
+            generation=stable.generation + 1,
             phase="mutating",
             transaction_id=resolved_transaction,
             operation=operation,
@@ -284,20 +245,18 @@ class PublishedNamespaceLease:
             outcome="in_progress",
             writer_instance_id=resolved_writer,
             updated_at_ns=_resolve_updated_at_ns(updated_at_ns),
+            lock_identity=self.lock_identity,
         )
-        state._validate()
         self._protocol._replace_state(
-            self._root_descriptor,
-            self.root_identity,
-            state,
+            self._root_descriptor, self.root_identity, self.lock_identity, state
         )
         return PublishedNamespaceMutation(
-            generation=odd_generation,
-            transaction_id=resolved_transaction,
-            operation=operation,
-            map_name=resolved_map_name,
-            before_identity=resolved_before,
-            writer_instance_id=resolved_writer,
+            generation=state.generation,
+            transaction_id=state.transaction_id,
+            operation=state.operation,
+            map_name=state.map_name,
+            before_identity=state.before_identity,
+            writer_instance_id=state.writer_instance_id,
         )
 
     def commit_mutation(
@@ -308,10 +267,8 @@ class PublishedNamespaceLease:
         updated_at_ns: Optional[int] = None,
     ) -> PublishedNamespaceState:
         return self._finish_mutation(
-            mutation,
-            after_identity=after_identity,
-            outcome="committed",
-            updated_at_ns=updated_at_ns,
+            mutation, after_identity=after_identity, outcome="committed",
+            updated_at_ns=updated_at_ns
         )
 
     def abort_mutation(
@@ -325,8 +282,7 @@ class PublishedNamespaceLease:
             mutation,
             after_identity=(
                 mutation.before_identity
-                if after_identity is None
-                else str(after_identity).strip()
+                if after_identity is None else str(after_identity).strip()
             ),
             outcome="aborted",
             updated_at_ns=updated_at_ns,
@@ -340,7 +296,7 @@ class PublishedNamespaceLease:
         outcome: str,
         updated_at_ns: Optional[int] = None,
     ) -> PublishedNamespaceState:
-        """将可证明的 odd residue 前推到 even；本 helper 不猜测 namespace 结果。"""
+        """只前推一个可证明的 odd residue；不重置 generation 或恢复额度。"""
 
         self._require_exclusive()
         if outcome not in {"aborted", "recovered"}:
@@ -352,16 +308,13 @@ class PublishedNamespaceLease:
             raise PublishedNamespaceTransactionError(
                 "只有 odd mutating residue 可以 recovery。"
             )
-        expected = str(expected_transaction_id or "").strip()
-        if odd.transaction_id != expected:
+        if odd.transaction_id != str(expected_transaction_id or "").strip():
             raise PublishedNamespaceTransactionError(
                 "recovery transaction_id 与 durable residue 不一致。"
             )
         return self._write_stable_successor(
-            odd,
-            after_identity=str(after_identity or "").strip(),
-            outcome=outcome,
-            updated_at_ns=updated_at_ns,
+            odd, after_identity=str(after_identity or "").strip(), outcome=outcome,
+            updated_at_ns=updated_at_ns
         )
 
     def _finish_mutation(
@@ -375,28 +328,18 @@ class PublishedNamespaceLease:
         self._require_exclusive()
         odd = self.read_state()
         if not odd.is_mutating or (
-            odd.generation,
-            odd.transaction_id,
-            odd.operation,
-            odd.map_name,
-            odd.before_identity,
-            odd.writer_instance_id,
+            odd.generation, odd.transaction_id, odd.operation, odd.map_name,
+            odd.before_identity, odd.writer_instance_id,
         ) != (
-            mutation.generation,
-            mutation.transaction_id,
-            mutation.operation,
-            mutation.map_name,
-            mutation.before_identity,
-            mutation.writer_instance_id,
+            mutation.generation, mutation.transaction_id, mutation.operation,
+            mutation.map_name, mutation.before_identity, mutation.writer_instance_id,
         ):
             raise PublishedNamespaceTransactionError(
                 "mutation token 与当前 durable odd journal 不一致。"
             )
         return self._write_stable_successor(
-            odd,
-            after_identity=str(after_identity or "").strip(),
-            outcome=outcome,
-            updated_at_ns=updated_at_ns,
+            odd, after_identity=str(after_identity or "").strip(), outcome=outcome,
+            updated_at_ns=updated_at_ns
         )
 
     def _write_stable_successor(
@@ -411,9 +354,7 @@ class PublishedNamespaceLease:
             raise PublishedNamespaceGenerationExhaustedError(
                 "odd generation 无可表示的 even successor。"
             )
-        stable = PublishedNamespaceState(
-            schema_version=_SCHEMA_VERSION,
-            protocol=_PROTOCOL,
+        stable = self._protocol._state_with_binding(
             generation=odd.generation + 1,
             phase="stable",
             transaction_id=odd.transaction_id,
@@ -424,12 +365,10 @@ class PublishedNamespaceLease:
             outcome=outcome,
             writer_instance_id=odd.writer_instance_id,
             updated_at_ns=_resolve_updated_at_ns(updated_at_ns),
+            lock_identity=self.lock_identity,
         )
-        stable._validate()
         self._protocol._replace_state(
-            self._root_descriptor,
-            self.root_identity,
-            stable,
+            self._root_descriptor, self.root_identity, self.lock_identity, stable
         )
         verified = self.read_state()
         if verified != stable:
@@ -461,18 +400,23 @@ class PublishedNamespaceLease:
 
 
 class PublishedNamespaceProtocol:
-    """catalog-root 级 published namespace 持久协议。
-
-    本 R0 helper 不自动 bootstrap，也不接入任何 writer/resolver。marker/state 缺失、
-    odd residue、未知 schema、inode 漂移、owner/mode/type/nlink 非法均 fail closed。
-    """
+    """catalog-root 级 published namespace 持久协议。"""
 
     def __init__(self, catalog_root: str, *, lease_timeout_seconds: float = 5.0) -> None:
         self._catalog_root = Path(catalog_root).expanduser()
         self._lease_timeout_seconds = _require_timeout(lease_timeout_seconds)
-        root_descriptor, identity = _open_catalog_root(self._catalog_root)
-        os.close(root_descriptor)
+        descriptor, identity = _open_catalog_root(self._catalog_root)
+        self._catalog_root_descriptor = descriptor
         self._catalog_root_identity = identity
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_catalog_root_descriptor", -1)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._catalog_root_descriptor = -1
 
     @property
     def catalog_root_identity(self) -> FileIdentity:
@@ -481,69 +425,150 @@ class PublishedNamespaceProtocol:
     @property
     def lock_order(self) -> Tuple[str, str, str]:
         return (
-            "map_activation_guard",
-            "published_namespace_lease",
-            "runtime_owner_read",
+            "map_activation_guard", "published_namespace_lease", "runtime_owner_read"
         )
 
     def bootstrap(self, *, writer_instance_id: str) -> PublishedNamespaceState:
-        """在已停写且版本锁步的部署窗口显式创建 v1 协议。
-
-        调用方负责先扫描 current/staging/legacy namespace；本函数故意不在普通读取时
-        自动初始化，也不把不完整 repository 猜成安全状态。
-        """
+        """只在无 marker/state/lock/temp 的全新目录初始化协议。"""
 
         resolved_writer = str(writer_instance_id or "").strip()
         _require_uuid(resolved_writer, "writer_instance_id")
         root_descriptor = self._open_verified_root()
         lock_descriptor = -1
         try:
-            lock_descriptor = _open_or_create_lock(root_descriptor)
+            residues = _protocol_residues(root_descriptor)
+            if residues:
+                raise PublishedNamespaceRecoveryRequiredError(
+                    "bootstrap 发现协议 residue；只能调用 recover_bootstrap 人工恢复：%s。"
+                    % ",".join(residues)
+                )
+            lock_descriptor = _create_lock(root_descriptor)
             _acquire_flock(
-                lock_descriptor,
-                exclusive=True,
-                timeout_seconds=self._lease_timeout_seconds,
+                lock_descriptor, exclusive=True,
+                timeout_seconds=self._lease_timeout_seconds
             )
-            _verify_lock_entry(root_descriptor, lock_descriptor)
-            marker_exists = _entry_exists(root_descriptor, _MARKER_FILE_NAME)
-            state_exists = _entry_exists(root_descriptor, _STATE_FILE_NAME)
-            if marker_exists or state_exists:
-                if not marker_exists or not state_exists:
-                    raise PublishedNamespaceIntegrityError(
-                        "bootstrap residue 不完整；禁止覆盖或猜测恢复。"
-                    )
-                self._read_marker(root_descriptor, self._catalog_root_identity)
-                return self._read_state(root_descriptor, self._catalog_root_identity)
-            marker = _canonical_json_bytes(_marker_payload())
+            lock_identity = _verify_lock_entry(root_descriptor, lock_descriptor)
+            transaction_id = str(uuid.uuid4())
+            marker = self._marker_payload(
+                lock_identity=lock_identity,
+                transaction_id=transaction_id,
+                writer_instance_id=resolved_writer,
+                operation="bootstrap",
+            )
             _atomic_replace_bytes(
-                root_descriptor,
-                _MARKER_FILE_NAME,
-                marker,
-                replace_existing=False,
+                root_descriptor, _MARKER_FILE_NAME,
+                _canonical_json_bytes(marker), replace_existing=False
             )
-            initial = PublishedNamespaceState(
-                schema_version=_SCHEMA_VERSION,
-                protocol=_PROTOCOL,
+            initial = self._state_with_binding(
                 generation=_INITIAL_GENERATION,
                 phase="stable",
-                transaction_id=str(uuid.uuid4()),
+                transaction_id=transaction_id,
                 operation="bootstrap",
-                map_name="",
-                before_identity="",
-                after_identity="",
+                map_name="", before_identity="", after_identity="",
                 outcome="initialized",
                 writer_instance_id=resolved_writer,
                 updated_at_ns=time.time_ns(),
+                lock_identity=lock_identity,
             )
-            initial._validate()
             _atomic_replace_bytes(
-                root_descriptor,
-                _STATE_FILE_NAME,
-                initial.canonical_bytes(),
-                replace_existing=False,
+                root_descriptor, _STATE_FILE_NAME, initial.canonical_bytes(),
+                replace_existing=False
             )
-            self._verify_root_descriptor(root_descriptor, self._catalog_root_identity)
-            return self._read_state(root_descriptor, self._catalog_root_identity)
+            return self._read_state(
+                root_descriptor, self._catalog_root_identity, lock_identity
+            )
+        finally:
+            if lock_descriptor >= 0:
+                try:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_descriptor)
+            os.close(root_descriptor)
+
+    def recover_bootstrap(
+        self,
+        *,
+        writer_instance_id: str,
+        expected_root_identity: FileIdentity,
+        expected_lock_identity: FileIdentity,
+    ) -> PublishedNamespaceState:
+        """人工完成 bootstrap crash residue；这是唯一允许的恢复合同。
+
+        调用方必须从停写窗口的审计收据传入 root/lock 完整身份。该操作只完成
+        generation=2，不回退已有 generation，也不创建缺失 lock。
+        """
+
+        resolved_writer = str(writer_instance_id or "").strip()
+        _require_uuid(resolved_writer, "writer_instance_id")
+        if not _same_pinned_identity(expected_root_identity, self._catalog_root_identity):
+            raise PublishedNamespaceIntegrityError("人工恢复的 root 身份收据不匹配。")
+        root_descriptor = self._open_verified_root()
+        lock_descriptor = -1
+        try:
+            lock_descriptor = _open_existing_file(
+                root_descriptor, _LOCK_FILE_NAME, flags=os.O_RDWR
+            )
+            _acquire_flock(
+                lock_descriptor, exclusive=True,
+                timeout_seconds=self._lease_timeout_seconds
+            )
+            lock_identity = _verify_lock_entry(root_descriptor, lock_descriptor)
+            if not _same_pinned_identity(lock_identity, expected_lock_identity):
+                raise PublishedNamespaceIntegrityError("人工恢复的 lock 身份收据不匹配。")
+            marker_exists = _entry_exists(root_descriptor, _MARKER_FILE_NAME)
+            state_exists = _entry_exists(root_descriptor, _STATE_FILE_NAME)
+            if state_exists:
+                if not marker_exists:
+                    raise PublishedNamespaceIntegrityError(
+                        "state durable 但 marker 缺失，无法证明协议来源。"
+                    )
+                state = self._read_state(
+                    root_descriptor, self._catalog_root_identity, lock_identity
+                )
+                if state.generation != _INITIAL_GENERATION:
+                    raise PublishedNamespaceIntegrityError(
+                        "recover_bootstrap 禁止重置已有 generation。"
+                    )
+                _remove_protocol_temporaries(root_descriptor)
+                os.fsync(root_descriptor)
+                return state
+            transaction_id = str(uuid.uuid4())
+            if marker_exists:
+                marker = self._read_marker(
+                    root_descriptor, self._catalog_root_identity, lock_identity
+                )
+                transaction_id = marker["transaction_id"]
+            _remove_protocol_temporaries(root_descriptor)
+            recovery_marker = self._marker_payload(
+                lock_identity=lock_identity,
+                transaction_id=transaction_id,
+                writer_instance_id=resolved_writer,
+                operation="bootstrap_recovery",
+            )
+            _atomic_replace_bytes(
+                root_descriptor, _MARKER_FILE_NAME,
+                _canonical_json_bytes(recovery_marker),
+                replace_existing=marker_exists,
+            )
+            recovered = self._state_with_binding(
+                generation=_INITIAL_GENERATION,
+                phase="stable",
+                transaction_id=transaction_id,
+                operation="bootstrap_recovery",
+                map_name="", before_identity="", after_identity="",
+                outcome="recovered",
+                writer_instance_id=resolved_writer,
+                updated_at_ns=time.time_ns(),
+                lock_identity=lock_identity,
+            )
+            _atomic_replace_bytes(
+                root_descriptor, _STATE_FILE_NAME, recovered.canonical_bytes(),
+                replace_existing=False
+            )
+            os.fsync(root_descriptor)
+            return self._read_state(
+                root_descriptor, self._catalog_root_identity, lock_identity
+            )
         finally:
             if lock_descriptor >= 0:
                 try:
@@ -568,33 +593,29 @@ class PublishedNamespaceProtocol:
 
     @contextmanager
     def _lease(
-        self,
-        *,
-        exclusive: bool,
-        timeout_seconds: Optional[float],
+        self, *, exclusive: bool, timeout_seconds: Optional[float]
     ) -> Iterator[PublishedNamespaceLease]:
         timeout = (
-            self._lease_timeout_seconds
-            if timeout_seconds is None
+            self._lease_timeout_seconds if timeout_seconds is None
             else _require_timeout(timeout_seconds)
         )
         root_descriptor = self._open_verified_root()
         lock_descriptor = -1
-        lease: Optional[PublishedNamespaceLease] = None
+        lease = None
         try:
-            self._read_marker(root_descriptor, self._catalog_root_identity)
             lock_descriptor = _open_existing_file(
-                root_descriptor,
-                _LOCK_FILE_NAME,
-                flags=os.O_RDWR,
+                root_descriptor, _LOCK_FILE_NAME, flags=os.O_RDWR
             )
             _acquire_flock(
-                lock_descriptor,
-                exclusive=exclusive,
-                timeout_seconds=timeout,
+                lock_descriptor, exclusive=exclusive, timeout_seconds=timeout
             )
             lock_identity = _verify_lock_entry(root_descriptor, lock_descriptor)
-            self._verify_root_descriptor(root_descriptor, self._catalog_root_identity)
+            self._read_marker(
+                root_descriptor, self._catalog_root_identity, lock_identity
+            )
+            self._verify_root_descriptor(
+                root_descriptor, self._catalog_root_identity
+            )
             lease = PublishedNamespaceLease(
                 self,
                 root_descriptor=root_descriptor,
@@ -616,54 +637,120 @@ class PublishedNamespaceProtocol:
                     os.close(root_descriptor)
 
     def _open_verified_root(self) -> int:
-        descriptor, identity = _open_catalog_root(self._catalog_root)
-        if not _same_pinned_identity(identity, self._catalog_root_identity):
-            os.close(descriptor)
-            raise PublishedNamespaceIntegrityError(
-                "catalog root 固定 inode/owner/mode 已漂移。"
-            )
+        try:
+            descriptor = os.dup(self._catalog_root_descriptor)
+        except OSError as exc:
+            raise PublishedNamespaceUnavailableError(
+                "catalog root 稳定 dirfd 已关闭。"
+            ) from exc
+        self._verify_root_descriptor(descriptor, self._catalog_root_identity)
         return descriptor
 
     def _verify_root_descriptor(
-        self,
-        descriptor: int,
-        expected: FileIdentity,
+        self, descriptor: int, expected: FileIdentity
     ) -> None:
         actual = _identity_from_stat(os.fstat(descriptor), expected_type="directory")
-        path_stat = os.stat(self._catalog_root, follow_symlinks=False)
-        path_identity = _identity_from_stat(path_stat, expected_type="directory")
+        try:
+            path_stat = os.stat(self._catalog_root, follow_symlinks=False)
+            path_identity = _identity_from_stat(path_stat, expected_type="directory")
+        except OSError as exc:
+            raise PublishedNamespaceIntegrityError(
+                "catalog root 当前路径无法验证。"
+            ) from exc
         if not _same_pinned_identity(actual, expected) or not _same_pinned_identity(
             path_identity, expected
         ):
             raise PublishedNamespaceIntegrityError(
-                "catalog root 路径与持有 dirfd 不再指向固定可信 inode。"
+                "catalog root 路径与稳定 dirfd 不再指向持久绑定 inode。"
             )
 
-    def _read_marker(self, root_descriptor: int, root_identity: FileIdentity) -> None:
+    def _marker_payload(
+        self,
+        *,
+        lock_identity: FileIdentity,
+        transaction_id: str,
+        writer_instance_id: str,
+        operation: str,
+    ) -> Dict[str, object]:
+        payload = {
+            "generation_encoding": "signed-i64-even-stable-odd-mutating-no-wrap",
+            "lock_order": "map_activation_guard->repository_lease->runtime_owner_read",
+            "protocol": _PROTOCOL,
+            "schema_version": _SCHEMA_VERSION,
+            "state_file": _STATE_FILE_NAME,
+            "threat_model": "cooperative-cross-process-advisory-flock",
+            "transaction_id": transaction_id,
+            "writer_instance_id": writer_instance_id,
+            "operation": operation,
+        }
+        payload.update(_binding_payload(self._catalog_root_identity, lock_identity))
+        return payload
+
+    def _read_marker(
+        self,
+        root_descriptor: int,
+        root_identity: FileIdentity,
+        lock_identity: FileIdentity,
+    ) -> Dict[str, object]:
         raw = _read_stable_regular_file(
-            root_descriptor,
-            _MARKER_FILE_NAME,
-            expected_mode=_FILE_MODE,
+            root_descriptor, _MARKER_FILE_NAME, expected_mode=_FILE_MODE
         )
         payload = _load_strict_json_object(raw, "published namespace marker")
-        if payload != _marker_payload() or _canonical_json_bytes(payload) != raw:
+        expected = set(self._marker_payload(
+            lock_identity=lock_identity,
+            transaction_id=str(uuid.uuid4()),
+            writer_instance_id=str(uuid.uuid4()),
+            operation="bootstrap",
+        ))
+        if set(payload) != expected:
+            raise PublishedNamespaceIntegrityError(
+                "published namespace marker 字段集合非法。"
+            )
+        if payload["protocol"] != _PROTOCOL or payload["schema_version"] != 1:
+            raise PublishedNamespaceIntegrityError("marker 协议版本非法。")
+        if payload["operation"] not in {"bootstrap", "bootstrap_recovery"}:
+            raise PublishedNamespaceIntegrityError("marker operation 非法。")
+        _require_uuid(_require_text(payload, "transaction_id", allow_empty=False), "transaction_id")
+        _require_uuid(_require_text(payload, "writer_instance_id", allow_empty=False), "writer_instance_id")
+        expected_binding = _binding_payload(root_identity, lock_identity)
+        for key, value in expected_binding.items():
+            if payload.get(key) != value:
+                raise PublishedNamespaceIntegrityError(
+                    "marker 持久 root/lock 身份绑定不匹配。"
+                )
+        fixed = self._marker_payload(
+            lock_identity=lock_identity,
+            transaction_id=payload["transaction_id"],
+            writer_instance_id=payload["writer_instance_id"],
+            operation=payload["operation"],
+        )
+        if payload != fixed or _canonical_json_bytes(payload) != raw:
             raise PublishedNamespaceIntegrityError(
                 "published namespace marker schema/canonical bytes 非法。"
             )
         self._verify_root_descriptor(root_descriptor, root_identity)
+        return payload
 
     def _read_state(
         self,
         root_descriptor: int,
         root_identity: FileIdentity,
+        lock_identity: FileIdentity,
     ) -> PublishedNamespaceState:
-        self._read_marker(root_descriptor, root_identity)
+        marker = self._read_marker(root_descriptor, root_identity, lock_identity)
         raw = _read_stable_regular_file(
-            root_descriptor,
-            _STATE_FILE_NAME,
-            expected_mode=_FILE_MODE,
+            root_descriptor, _STATE_FILE_NAME, expected_mode=_FILE_MODE
         )
         state = PublishedNamespaceState.from_bytes(raw)
+        _verify_state_binding(state, root_identity, lock_identity)
+        if state.operation in {"bootstrap", "bootstrap_recovery"} and (
+            state.transaction_id != marker["transaction_id"]
+            or state.operation != marker["operation"]
+            or state.writer_instance_id != marker["writer_instance_id"]
+        ):
+            raise PublishedNamespaceIntegrityError(
+                "bootstrap state 与 marker 恢复合同不一致。"
+            )
         self._verify_root_descriptor(root_descriptor, root_identity)
         return state
 
@@ -671,29 +758,97 @@ class PublishedNamespaceProtocol:
         self,
         root_descriptor: int,
         root_identity: FileIdentity,
+        lock_identity: FileIdentity,
         state: PublishedNamespaceState,
     ) -> None:
         state._validate()
-        self._read_marker(root_descriptor, root_identity)
+        self._read_marker(root_descriptor, root_identity, lock_identity)
+        _verify_state_binding(state, root_identity, lock_identity)
         _atomic_replace_bytes(
-            root_descriptor,
-            _STATE_FILE_NAME,
-            state.canonical_bytes(),
-            replace_existing=True,
+            root_descriptor, _STATE_FILE_NAME, state.canonical_bytes(),
+            replace_existing=True
         )
         self._verify_root_descriptor(root_descriptor, root_identity)
 
+    def _state_with_binding(self, *, lock_identity: FileIdentity, **values: object) -> PublishedNamespaceState:
+        values.update(_binding_payload(self._catalog_root_identity, lock_identity))
+        state = PublishedNamespaceState(
+            schema_version=_SCHEMA_VERSION, protocol=_PROTOCOL, **values
+        )
+        state._validate()
+        return state
 
-def _marker_payload() -> Dict[str, object]:
+
+def _binding_payload(root: FileIdentity, lock: FileIdentity) -> Dict[str, object]:
     return {
-        "generation_encoding": "signed-i64-even-stable-odd-mutating-no-wrap",
-        "lock_file": _LOCK_FILE_NAME,
-        "lock_order": "map_activation_guard->repository_lease->runtime_owner_read",
-        "protocol": _PROTOCOL,
-        "schema_version": _SCHEMA_VERSION,
-        "state_file": _STATE_FILE_NAME,
-        "threat_model": "cooperative-cross-process-advisory-flock",
+        "lock_path": _LOCK_FILE_NAME,
+        "lock_device": lock.device,
+        "lock_inode": lock.inode,
+        "lock_size": lock.size,
+        "lock_mode": lock.mode,
+        "lock_uid": lock.uid,
+        "lock_gid": lock.gid,
+        "lock_nlink": lock.link_count,
+        "root_device": root.device,
+        "root_inode": root.inode,
+        "root_mode": root.mode,
+        "root_uid": root.uid,
+        "root_gid": root.gid,
+        "root_nlink": root.link_count,
     }
+
+
+def _verify_state_binding(
+    state: PublishedNamespaceState,
+    root: FileIdentity,
+    lock: FileIdentity,
+) -> None:
+    expected = _binding_payload(root, lock)
+    for key, value in expected.items():
+        if getattr(state, key) != value:
+            raise PublishedNamespaceIntegrityError(
+                "state 持久 root/lock 身份绑定不匹配。"
+            )
+
+
+def _validate_state_matrix(state: PublishedNamespaceState) -> None:
+    bootstrap = state.operation in {"bootstrap", "bootstrap_recovery"}
+    if bootstrap:
+        expected_outcome = (
+            "initialized" if state.operation == "bootstrap" else "recovered"
+        )
+        if (
+            state.phase != "stable" or state.generation != _INITIAL_GENERATION
+            or state.outcome != expected_outcome or state.map_name
+            or state.before_identity or state.after_identity
+        ):
+            raise PublishedNamespaceIntegrityError(
+                "bootstrap operation/outcome/map/identity 组合非法。"
+            )
+        return
+    if state.operation not in _ALLOWED_MUTATIONS or not state.map_name:
+        raise PublishedNamespaceIntegrityError(
+            "state operation/map_name 组合非法。"
+        )
+    if state.phase == "mutating":
+        if state.generation % 2 != 1 or state.outcome != "in_progress" or state.after_identity:
+            raise PublishedNamespaceIntegrityError(
+                "mutating operation/outcome/identity 组合非法。"
+            )
+        return
+    if state.phase != "stable" or state.generation % 2 != 0:
+        raise PublishedNamespaceIntegrityError("state phase/generation 组合非法。")
+    if state.outcome not in {"committed", "aborted", "recovered"}:
+        raise PublishedNamespaceIntegrityError("stable outcome 组合非法。")
+    if state.operation == "delete":
+        if state.outcome == "committed" and (not state.before_identity or state.after_identity):
+            raise PublishedNamespaceIntegrityError("delete committed identity 组合非法。")
+        if state.outcome == "aborted" and state.after_identity != state.before_identity:
+            raise PublishedNamespaceIntegrityError("delete aborted identity 组合非法。")
+    elif state.outcome == "committed" and not state.after_identity:
+        raise PublishedNamespaceIntegrityError("finalize committed 必须有 after_identity。")
+    elif state.outcome == "aborted" and state.after_identity != state.before_identity:
+        raise PublishedNamespaceIntegrityError("finalize aborted identity 组合非法。")
 
 
 def _open_catalog_root(path: Path) -> Tuple[int, FileIdentity]:
@@ -710,9 +865,7 @@ def _open_catalog_root(path: Path) -> Tuple[int, FileIdentity]:
             os.stat(path, follow_symlinks=False), expected_type="directory"
         )
         if not _same_pinned_identity(identity, path_identity):
-            raise PublishedNamespaceIntegrityError(
-                "catalog root open 前后身份不稳定。"
-            )
+            raise PublishedNamespaceIntegrityError("catalog root open 前后身份不稳定。")
         if identity.uid != os.geteuid() or identity.mode & 0o022:
             raise PublishedNamespaceIntegrityError(
                 "catalog root 必须由当前服务账号拥有且不可 group/world writable。"
@@ -737,56 +890,40 @@ def _identity_from_stat(result: os.stat_result, *, expected_type: str) -> FileId
             "协议对象 type/nlink 非法：%s。" % expected_type
         )
     return FileIdentity(
-        device=int(result.st_dev),
-        inode=int(result.st_ino),
-        uid=int(result.st_uid),
-        gid=int(result.st_gid),
-        mode=stat.S_IMODE(result.st_mode),
-        link_count=int(result.st_nlink),
+        device=int(result.st_dev), inode=int(result.st_ino), size=int(result.st_size),
+        uid=int(result.st_uid), gid=int(result.st_gid),
+        mode=stat.S_IMODE(result.st_mode), link_count=int(result.st_nlink),
         file_type=expected_type,
     )
 
 
 def _same_pinned_identity(left: FileIdentity, right: FileIdentity) -> bool:
     return (
-        left.device,
-        left.inode,
-        left.uid,
-        left.gid,
-        left.mode,
-        left.file_type,
+        left.device, left.inode, left.size, left.uid, left.gid, left.mode,
+        left.link_count, left.file_type,
     ) == (
-        right.device,
-        right.inode,
-        right.uid,
-        right.gid,
-        right.mode,
-        right.file_type,
-    ) and left.link_count >= (2 if left.file_type == "directory" else 1)
+        right.device, right.inode, right.size, right.uid, right.gid, right.mode,
+        right.link_count, right.file_type,
+    )
 
 
-def _open_or_create_lock(root_descriptor: int) -> int:
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    created = False
+def _create_lock(root_descriptor: int) -> int:
+    flags = (
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         descriptor = os.open(
-            _LOCK_FILE_NAME,
-            flags | os.O_CREAT | os.O_EXCL,
-            _FILE_MODE,
-            dir_fd=root_descriptor,
+            _LOCK_FILE_NAME, flags, _FILE_MODE, dir_fd=root_descriptor
         )
-        created = True
-    except FileExistsError:
-        descriptor = _open_existing_file(
-            root_descriptor,
-            _LOCK_FILE_NAME,
-            flags=os.O_RDWR,
-        )
+    except FileExistsError as exc:
+        raise PublishedNamespaceRecoveryRequiredError(
+            "lock 已存在；bootstrap 禁止自动复用或重建。"
+        ) from exc
     try:
-        if created:
-            os.fchmod(descriptor, _FILE_MODE)
-            os.fsync(descriptor)
-            os.fsync(root_descriptor)
+        os.fchmod(descriptor, _FILE_MODE)
+        os.fsync(descriptor)
+        os.fsync(root_descriptor)
         _verify_lock_entry(root_descriptor, descriptor)
         return descriptor
     except Exception:
@@ -810,36 +947,33 @@ def _open_existing_file(root_descriptor: int, name: str, *, flags: int) -> int:
 
 def _verify_lock_entry(root_descriptor: int, descriptor: int) -> FileIdentity:
     opened = _identity_from_stat(os.fstat(descriptor), expected_type="regular")
-    entry = _identity_from_stat(
-        os.stat(_LOCK_FILE_NAME, dir_fd=root_descriptor, follow_symlinks=False),
-        expected_type="regular",
-    )
+    try:
+        entry_stat = os.stat(
+            _LOCK_FILE_NAME, dir_fd=root_descriptor, follow_symlinks=False
+        )
+    except OSError as exc:
+        raise PublishedNamespaceIntegrityError(
+            "published namespace lock 当前目录项缺失。"
+        ) from exc
+    entry = _identity_from_stat(entry_stat, expected_type="regular")
     if (
-        not _same_pinned_identity(opened, entry)
-        or opened.link_count != 1
-        or opened.mode != _FILE_MODE
-        or opened.uid != os.geteuid()
+        not _same_pinned_identity(opened, entry) or opened.link_count != 1
+        or opened.mode != _FILE_MODE or opened.uid != os.geteuid()
+        or opened.size != 0
     ):
         raise PublishedNamespaceIntegrityError(
-            "published namespace lock owner/mode/type/nlink/dev/ino 非法。"
+            "published namespace lock owner/mode/type/nlink/dev/ino/size 非法。"
         )
     return opened
 
 
 def _read_stable_regular_file(
-    root_descriptor: int,
-    name: str,
-    *,
-    expected_mode: int,
+    root_descriptor: int, name: str, *, expected_mode: int
 ) -> bytes:
     descriptor = _open_existing_file(root_descriptor, name, flags=os.O_RDONLY)
     try:
         before = _identity_from_stat(os.fstat(descriptor), expected_type="regular")
-        if (
-            before.link_count != 1
-            or before.mode != expected_mode
-            or before.uid != os.geteuid()
-        ):
+        if before.link_count != 1 or before.mode != expected_mode or before.uid != os.geteuid():
             raise PublishedNamespaceIntegrityError(
                 "%s owner/mode/type/nlink 非法。" % name
             )
@@ -874,10 +1008,7 @@ def _atomic_replace_bytes(
 ) -> None:
     temporary_name = ".%s.%s.tmp" % (name, uuid.uuid4().hex)
     flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor = os.open(temporary_name, flags, _FILE_MODE, dir_fd=root_descriptor)
@@ -901,20 +1032,68 @@ def _atomic_replace_bytes(
     finally:
         os.close(descriptor)
     try:
-        if not replace_existing and _entry_exists(root_descriptor, name):
-            raise PublishedNamespaceIntegrityError("协议文件已存在，禁止 bootstrap 覆盖。")
-        os.replace(
-            temporary_name,
-            name,
-            src_dir_fd=root_descriptor,
-            dst_dir_fd=root_descriptor,
-        )
+        if replace_existing:
+            os.replace(
+                temporary_name, name,
+                src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor
+            )
+        else:
+            try:
+                os.link(
+                    temporary_name, name,
+                    src_dir_fd=root_descriptor, dst_dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise PublishedNamespaceIntegrityError(
+                    "协议文件已存在，禁止 bootstrap 覆盖。"
+                ) from exc
+            os.unlink(temporary_name, dir_fd=root_descriptor)
         os.fsync(root_descriptor)
     finally:
         try:
             os.unlink(temporary_name, dir_fd=root_descriptor)
+            os.fsync(root_descriptor)
         except FileNotFoundError:
             pass
+
+
+def _protocol_residues(root_descriptor: int) -> Tuple[str, ...]:
+    names = []
+    for name in os.listdir(root_descriptor):
+        if name in _PROTOCOL_NAMES or _is_protocol_temporary(name):
+            names.append(name)
+    return tuple(sorted(names))
+
+
+def _is_protocol_temporary(name: str) -> bool:
+    return any(
+        name.startswith(".%s." % target) and name.endswith(".tmp")
+        for target in (_MARKER_FILE_NAME, _STATE_FILE_NAME)
+    )
+
+
+def _remove_protocol_temporaries(root_descriptor: int) -> None:
+    removed = False
+    for name in os.listdir(root_descriptor):
+        if _is_protocol_temporary(name):
+            try:
+                identity = _identity_from_stat(
+                    os.stat(name, dir_fd=root_descriptor, follow_symlinks=False),
+                    expected_type="regular",
+                )
+            except OSError as exc:
+                raise PublishedNamespaceIntegrityError(
+                    "bootstrap temp residue 无法验证。"
+                ) from exc
+            if identity.uid != os.geteuid() or identity.link_count != 1:
+                raise PublishedNamespaceIntegrityError(
+                    "bootstrap temp residue 身份非法。"
+                )
+            os.unlink(name, dir_fd=root_descriptor)
+            removed = True
+    if removed:
+        os.fsync(root_descriptor)
 
 
 def _entry_exists(root_descriptor: int, name: str) -> bool:
@@ -926,10 +1105,7 @@ def _entry_exists(root_descriptor: int, name: str) -> bool:
 
 
 def _acquire_flock(
-    descriptor: int,
-    *,
-    exclusive: bool,
-    timeout_seconds: float,
+    descriptor: int, *, exclusive: bool, timeout_seconds: float
 ) -> None:
     operation = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
     deadline = time.monotonic() + timeout_seconds
@@ -951,11 +1127,8 @@ def _acquire_flock(
 
 def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
     return json.dumps(
-        payload,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
+        payload, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":")
     ).encode("utf-8")
 
 
@@ -965,15 +1138,14 @@ def _load_strict_json_object(raw: bytes, label: str) -> Dict[str, object]:
     try:
         text = raw.decode("utf-8")
         pairs = json.loads(
-            text,
-            object_pairs_hook=lambda values: values,
-            parse_constant=lambda value: (_raise_invalid_number(value)),
+            text, object_pairs_hook=lambda values: values,
+            parse_constant=lambda value: _raise_invalid_number(value)
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise PublishedNamespaceIntegrityError("%s 不是严格 JSON。" % label) from exc
     if not isinstance(pairs, list):
         raise PublishedNamespaceIntegrityError("%s 顶层必须为 object。" % label)
-    payload: Dict[str, object] = {}
+    payload = {}
     for item in pairs:
         if not isinstance(item, tuple) or len(item) != 2 or not isinstance(item[0], str):
             raise PublishedNamespaceIntegrityError("%s object 结构非法。" % label)
@@ -989,10 +1161,7 @@ def _raise_invalid_number(value: str) -> object:
 
 
 def _require_text(
-    payload: Mapping[str, object],
-    key: str,
-    *,
-    allow_empty: bool,
+    payload: Mapping[str, object], key: str, *, allow_empty: bool
 ) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or (not allow_empty and not value):
@@ -1003,10 +1172,7 @@ def _require_text(
 
 
 def _require_int(
-    payload: Mapping[str, object],
-    key: str,
-    minimum: int,
-    maximum: int,
+    payload: Mapping[str, object], key: str, minimum: int, maximum: int
 ) -> int:
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, int):

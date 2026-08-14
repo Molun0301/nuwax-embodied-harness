@@ -3045,6 +3045,83 @@ mod tests {
         assert_eq!(slot.phase, NavPhase::Idle);
     }
 
+    async fn install_committed_map_fixture(
+        handle: &GeometryRuntimeHandle,
+        frame_id: &str,
+        with_pose: bool,
+    ) {
+        let timestamp_ns = now_ns();
+        let map = MapState {
+            width: 10,
+            height: 10,
+            resolution: 0.5,
+            origin_x: -2.5,
+            origin_y: -2.5,
+            frame_id: frame_id.to_string(),
+            revision: 1,
+            timestamp_ns,
+            data: vec![0; 100],
+        };
+        let data: Arc<[u8]> = map
+            .data
+            .iter()
+            .map(|value| *value as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let checksum = crate::map_checksum::sha256_hex(data.as_ref());
+        let event = crate::lcm_runtime::MapRevisionEvent {
+            session_id: "nav-fixture-session".to_string(),
+            map_name: "nav-fixture-map".to_string(),
+            session_generation: 1,
+            revision: map.revision,
+            width: map.width,
+            height: map.height,
+            resolution: map.resolution,
+            origin_x: map.origin_x,
+            origin_y: map.origin_y,
+            frame_id: map.frame_id.clone(),
+            timestamp_ns: map.timestamp_ns,
+            data: data.clone(),
+            raw_data: Vec::<u8>::new().into(),
+            size: data.len() as u64,
+            schema_version: 1,
+            checksum: checksum.clone(),
+            raw_checksum: checksum,
+            last_seen_ms: (timestamp_ns / 1_000_000) as i64,
+        };
+        {
+            let mut shared = handle.state.write().await;
+            shared.map = map;
+            if with_pose {
+                shared.pose = PoseState {
+                    qw: 1.0,
+                    frame_id: frame_id.to_string(),
+                    timestamp_ns,
+                    ..PoseState::default()
+                };
+            }
+        }
+        let _ = handle.map_revision_tx.send(event.clone());
+        handle
+            .map_revision_latest_tx
+            .send_replace(Some(event.clone()));
+        *handle
+            .committed_map_authority
+            .lock()
+            .expect("committed map fixture authority") = Some(
+            crate::lcm_runtime::committed_map_identity_from_revision(&event)
+                .expect("committed map fixture identity"),
+        );
+        let visible = handle
+            .map_revision_latest_tx
+            .borrow()
+            .clone()
+            .expect("committed map fixture must be visible before returning");
+        assert_eq!(visible.revision, event.revision);
+        assert_eq!(visible.frame_id, event.frame_id);
+        assert_eq!(visible.checksum, event.checksum);
+    }
+
     /// 构造一个测试 handle:test backend(走 real-lcm + test_lcm_url 隔离端口)+ 一个非空 pose 与 map。
     ///
     /// 注意:不能直接构造 `LcmTransport`(其字段非 pub);这里用 `build_handle_for_tests`
@@ -3054,30 +3131,7 @@ mod tests {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("build test handle");
-        let mut s = handle.state.write().await;
-        s.pose = PoseState {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            qx: 0.0,
-            qy: 0.0,
-            qz: 0.0,
-            qw: 1.0,
-            frame_id: "map".into(),
-            timestamp_ns: now_ns(),
-        };
-        s.map = MapState {
-            width: 10,
-            height: 10,
-            resolution: 0.5,
-            origin_x: -2.5,
-            origin_y: -2.5,
-            frame_id: "map".into(),
-            revision: 1,
-            timestamp_ns: now_ns(),
-            ..Default::default()
-        };
-        drop(s);
+        install_committed_map_fixture(&handle, "map", true).await;
         handle
     }
 
@@ -3482,7 +3536,8 @@ mod tests {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("handle");
-        // 不动 pose / map → readiness.tf=false
+        install_committed_map_fixture(&handle, "map", false).await;
+        // 保留 committed map，只不注入 pose，以精确验证 readiness.tf=false。
         let state = NavRuntimeState::from_env();
         let mut input = test_goal_input("g2");
         input.target.x = 1.0;
@@ -3689,6 +3744,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_committed_map_authority_rejects_goal_without_side_effects() {
+        let mut handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("build test handle");
+        let backend = BlockingPublishBackend::new([None]);
+        handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+        assert!(handle
+            .committed_map_authority
+            .lock()
+            .expect("committed map authority")
+            .is_none());
+        let state = NavRuntimeState::from_env();
+        let cancel_before = state.cancel_snapshot();
+        let next_cancel_before = state.next_cancel_generation.load(AtomicOrdering::Acquire);
+
+        let outcome = set_goal(
+            &handle,
+            &state,
+            test_goal_input("missing-committed-map-authority"),
+        )
+        .await;
+
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(
+            outcome
+                .state
+                .message
+                .contains("authoritative committed map is unavailable"),
+            "{}",
+            outcome.state.message
+        );
+        assert!(outcome.lease.is_none());
+        let slot = state.inner.read().await;
+        assert!(slot.goal.is_none());
+        assert_eq!(slot.phase, NavPhase::Idle);
+        drop(slot);
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(
+            state.next_cancel_generation.load(AtomicOrdering::Acquire),
+            next_cancel_before
+        );
+        assert_eq!(backend.publish_count(), 0);
+    }
+
+    #[tokio::test]
     async fn set_goal_only_publishes_goal_and_returns_accepted() {
         use futures::StreamExt;
 
@@ -3831,11 +3932,7 @@ mod tests {
         use futures::StreamExt;
 
         let handle = make_handle().await;
-        {
-            let mut shared = handle.state.write().await;
-            shared.pose.frame_id = "robot/map".to_string();
-            shared.map.frame_id = "robot/map".to_string();
-        }
+        install_committed_map_fixture(&handle, "robot/map", true).await;
         let state = NavRuntimeState::from_env();
         observe_healthy_stack(&state).await;
         state
@@ -3912,11 +4009,7 @@ mod tests {
     #[tokio::test]
     async fn configured_exploration_boundary_rejects_literal_map_without_publish() {
         let (handle, backend) = make_blocking_handle([None]).await;
-        {
-            let mut shared = handle.state.write().await;
-            shared.pose.frame_id = "robot/map".to_string();
-            shared.map.frame_id = "robot/map".to_string();
-        }
+        install_committed_map_fixture(&handle, "robot/map", true).await;
         let state = NavRuntimeState::from_env();
         let mut input = test_goal_input("configured-boundary-mismatch");
         input.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;

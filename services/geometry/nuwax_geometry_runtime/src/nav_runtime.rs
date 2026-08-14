@@ -46,13 +46,14 @@ use nuwax_nav_stack::{
     graph::ModuleNode, NavStackBuilder, NavStackHandle, NavStackPreset, NavStackProfile,
 };
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
+use nuwax_transport::LcmTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::channel_registry;
-use crate::lcm_runtime::{GeometryRuntimeHandle, NavState, PoseState};
+use crate::lcm_runtime::{GeometryRuntimeHandle, NavState, PoseState, SharedState};
 use crate::sequence_state::{SequenceStateError, SequenceStateStore};
 use crate::typed_codec;
 
@@ -75,6 +76,50 @@ pub const PROFILE_MLS3D: &str = "mls-3d";
 pub const DEFAULT_PROFILE: &str = PROFILE_SIMPLE_2D;
 
 static NEXT_NAV_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 目标准入只需持有地图生命周期 fence 与唯一已提交地图权威。
+#[derive(Clone)]
+pub(crate) struct NavAdmissionContext {
+    pub(crate) mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
+}
+
+impl NavAdmissionContext {
+    pub(crate) fn new(
+        mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
+    ) -> Self {
+        Self {
+            mapping_lifecycle_lock,
+            committed_map_authority,
+        }
+    }
+}
+
+/// 目标准入所需的最小运行时 I/O（输入/输出）句柄。
+#[derive(Clone)]
+pub(crate) struct NavAdmissionIo {
+    shared_state: Arc<RwLock<SharedState>>,
+    transport: LcmTransport,
+    transport_backend_name: &'static str,
+    lcm_backend_available: bool,
+}
+
+impl NavAdmissionIo {
+    pub(crate) fn new(
+        shared_state: Arc<RwLock<SharedState>>,
+        transport: LcmTransport,
+        transport_backend_name: &'static str,
+        lcm_backend_available: bool,
+    ) -> Self {
+        Self {
+            shared_state,
+            transport,
+            transport_backend_name,
+            lcm_backend_available,
+        }
+    }
+}
 
 /// `/nav/goal` typed channel 平台级 channel name。
 pub const GOAL_CHANNEL_PLATFORM: &str = "NUWAX_LCM_CHANNEL_GOAL_POSE";
@@ -438,6 +483,17 @@ enum CancelStart {
     Rejected {
         goal_id: String,
         message: String,
+    },
+}
+
+/// 目标准入时重新读取的 producer epoch（生产者纪元）权威。
+#[derive(Clone)]
+pub(crate) enum GoalProducerEpochAuthority {
+    /// 公开导航使用当前导航运行时的 producer epoch。
+    PublicNavigation,
+    /// Wavefront 探索使用当前探索会话 generation。
+    Wavefront {
+        current_session_generation: Arc<AtomicU64>,
     },
 }
 
@@ -1707,6 +1763,111 @@ pub async fn compute_readiness(
     }
 }
 
+fn compute_admission_readiness<'a>(
+    io: &'a NavAdmissionIo,
+    state: &'a NavRuntimeState,
+) -> impl std::future::Future<Output = NavigationReadinessDetail> + 'a {
+    async move {
+        let profile = state.profile().await;
+        let profile_supported = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
+        let stack_health = state.stack_health_snapshot();
+        let observations = state.runtime_observation_snapshot();
+        let lcm_backend = io.lcm_backend_available;
+        let tf = observations.tf_fresh && observations.tf_complete;
+        let costmap = observations.planner_observed && observations.planner_fresh;
+        let cmd_vel_sink_ready = observations.motion_sink_fresh && observations.motion_sink_ready;
+        let planner = profile_supported
+            && stack_health.fresh
+            && observations.planner_fresh
+            && observations.planner_ready
+            && observations.planner_frame_matches
+            && costmap;
+        let backend = match io.transport_backend_name {
+            "real-lcm" | "real-lcm-unavailable" => "RealLcm",
+            other => {
+                warn!("nav readiness: 未知 transport_backend_name={}", other);
+                "Unknown"
+            }
+        };
+        let mut blockers = Vec::new();
+        if !lcm_backend {
+            blockers.push(NavigationReadinessCode::LcmBackendUnavailable);
+        }
+        if !observations.motion_sink_observed {
+            blockers.push(NavigationReadinessCode::MotionSinkUnobserved);
+        } else if !observations.motion_sink_fresh {
+            blockers.push(NavigationReadinessCode::MotionSinkStale);
+        } else if !observations.motion_sink_ready {
+            blockers.push(NavigationReadinessCode::MotionSinkNotReady);
+        }
+        if !stack_health.observed {
+            blockers.push(NavigationReadinessCode::StackStateUnobserved);
+        } else if !stack_health.fresh {
+            blockers.push(NavigationReadinessCode::StackStateStale);
+        }
+        if !observations.tf_observed {
+            blockers.push(NavigationReadinessCode::TfUnobserved);
+        } else if !observations.tf_fresh {
+            blockers.push(NavigationReadinessCode::TfStale);
+        } else if !observations.tf_complete {
+            blockers.push(NavigationReadinessCode::TfIncomplete);
+        }
+        if !observations.planner_observed {
+            blockers.push(NavigationReadinessCode::PlannerInputUnobserved);
+        } else if !observations.planner_fresh {
+            blockers.push(NavigationReadinessCode::PlannerInputStale);
+        } else {
+            if !observations.planner_frame_matches {
+                blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
+            }
+            if !observations.planner_ready {
+                blockers.push(NavigationReadinessCode::PlannerNotReady);
+            }
+        }
+        if !profile_supported {
+            blockers.push(NavigationReadinessCode::ProfileUnsupported);
+        }
+        let reason_code = blockers
+            .first()
+            .copied()
+            .unwrap_or(NavigationReadinessCode::Ready);
+        NavigationReadinessDetail {
+            ready: lcm_backend && tf && costmap && planner && cmd_vel_sink_ready,
+            reason: readiness_reason(reason_code).to_string(),
+            reason_code,
+            blockers,
+            lcm_backend,
+            tf,
+            costmap,
+            planner,
+            cmd_vel_sink: cmd_vel_sink_ready,
+            profile: profile.to_string(),
+            module_node_count: state.module_nodes().await.len(),
+            p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
+            backend: backend.to_string(),
+            tf_count: observations.tf_count,
+            costmap_revision: observations.map_revision,
+            cmd_vel_sink_ready,
+            active_profile: profile.to_string(),
+            stack_state_observed: stack_health.observed,
+            stack_state_fresh: stack_health.fresh,
+            stack_last_seen_age_ms: stack_health.age_ms,
+            stack_last_status: stack_health.status,
+            tf_generation: observations.tf_generation,
+            planner_generation: observations.planner_generation,
+            motion_sink_generation: observations.motion_sink_generation,
+            map_frame: observations.map_frame,
+            pose_frame: observations.pose_frame,
+            tf_observed: observations.tf_observed,
+            tf_fresh: observations.tf_fresh,
+            planner_input_observed: observations.planner_observed,
+            planner_input_fresh: observations.planner_fresh,
+            motion_sink_observed: observations.motion_sink_observed,
+            motion_sink_fresh: observations.motion_sink_fresh,
+        }
+    }
+}
+
 fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
     match code {
         NavigationReadinessCode::Unknown => "UNKNOWN: readiness payload lacks a typed code",
@@ -1913,7 +2074,7 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
 }
 
 async fn goal_intent_from_set_goal(
-    handle: &GeometryRuntimeHandle,
+    admission: &NavAdmissionContext,
     state: &NavRuntimeState,
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
@@ -1926,7 +2087,7 @@ async fn goal_intent_from_set_goal(
     }
     // 公开导航只观察 Geometry composition 已提交的 authority；候选事件/watch
     // 不得在 producer 侧提升权威性。
-    let committed_map = handle
+    let committed_map = admission
         .committed_map_authority
         .lock()
         .map_err(|_| "authoritative committed map state is unavailable".to_string())?
@@ -2023,23 +2184,48 @@ pub async fn set_goal_with_boundary(
     boundary: Option<GoalBoundaryConstraint>,
 ) -> SetGoalOutcome {
     let goal_id = input.goal_id.clone();
-    let intent = match goal_intent_from_set_goal(handle, state, input, boundary).await {
+    if input.owner_kind != schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV {
+        return rejected_goal_intent(
+            goal_id,
+            "public navigation adapter cannot assert a non-public producer epoch",
+        );
+    }
+    let admission = NavAdmissionContext::new(
+        handle.mapping_lifecycle_lock.clone(),
+        handle.committed_map_authority.clone(),
+    );
+    let io = NavAdmissionIo::new(
+        handle.state.clone(),
+        handle.transport.clone(),
+        handle.transport_backend_name,
+        handle.lcm_backend_available,
+    );
+    let intent = match goal_intent_from_set_goal(&admission, state, input, boundary).await {
         Ok(intent) => intent,
         Err(reason) => return rejected_goal_intent(goal_id, reason),
     };
-    admit_goal_intent(handle, state, intent).await
+    admit_goal_intent(
+        &admission,
+        &io,
+        state,
+        intent,
+        GoalProducerEpochAuthority::PublicNavigation,
+    )
+    .await
 }
 
 /// 校验共享 intent，并执行唯一目标租约 CAS 准入。
-pub async fn admit_goal_intent(
-    handle: &GeometryRuntimeHandle,
+pub(crate) async fn admit_goal_intent(
+    admission: &NavAdmissionContext,
+    io: &NavAdmissionIo,
     state: &NavRuntimeState,
     intent: schema::GoalIntent,
+    producer_authority: GoalProducerEpochAuthority,
 ) -> SetGoalOutcome {
     let goal_id = intent.session_id.clone();
     // Geometry 的生命周期 fence 同时是地图 authority 发布与 GoalLease CAS
     // 的唯一组装层顺序门；准入持门到租约安装完成，但不跨异步发布。
-    let map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
+    let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
     let producer_contract_valid = matches!(
         (intent.producer.as_str(), intent.owner_kind, intent.priority,),
         (
@@ -2052,8 +2238,20 @@ pub async fn admit_goal_intent(
             100
         )
     );
+    let authoritative_producer_epoch = match producer_authority {
+        GoalProducerEpochAuthority::PublicNavigation if intent.producer == "public-navigation" => {
+            state.producer_runtime_generation()
+        }
+        GoalProducerEpochAuthority::Wavefront {
+            current_session_generation,
+        } if intent.producer == "wavefront" => {
+            current_session_generation.load(AtomicOrdering::Acquire)
+        }
+        _ => 0,
+    };
     if !producer_contract_valid
-        || intent.producer_epoch <= 0
+        || authoritative_producer_epoch == 0
+        || i64::try_from(authoritative_producer_epoch).ok() != Some(intent.producer_epoch)
         || intent.goal_generation < 0
         || intent.cancel_generation < 0
         || intent.session_id.trim().is_empty()
@@ -2069,7 +2267,7 @@ pub async fn admit_goal_intent(
     if let Err(reason) = validate_committed_map_identity(&intent.committed_map) {
         return rejected_goal_intent(goal_id, reason);
     }
-    let current_map = match handle.committed_map_authority.lock() {
+    let current_map = match admission.committed_map_authority.lock() {
         Ok(authority) => authority.clone(),
         Err(_) => {
             return rejected_goal_intent(
@@ -2191,7 +2389,7 @@ pub async fn admit_goal_intent(
         },
     };
     admit_goal_input(
-        handle,
+        io,
         state,
         input,
         boundary,
@@ -2202,7 +2400,7 @@ pub async fn admit_goal_intent(
 }
 
 async fn admit_goal_input(
-    handle: &GeometryRuntimeHandle,
+    io: &NavAdmissionIo,
     state: &NavRuntimeState,
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
@@ -2276,7 +2474,7 @@ async fn admit_goal_input(
         };
     }
     // 1. readiness 校验。
-    let detail = compute_readiness(handle, state).await;
+    let detail = compute_admission_readiness(io, state).await;
     if !detail.ready {
         return SetGoalOutcome {
             state: NavState {
@@ -2287,7 +2485,8 @@ async fn admit_goal_input(
                     detail.reason,
                 ),
                 goal_id: input.goal_id.clone(),
-                distance_remaining: distance_to_target(handle, &input.target).await,
+                distance_remaining: distance_to_target_from_state(&io.shared_state, &input.target)
+                    .await,
                 timestamp_ns: now_ns(),
             },
             lease: None,
@@ -2442,7 +2641,7 @@ async fn admit_goal_input(
         path_payload_sha256: [0; 32],
     };
 
-    let distance_remaining = distance_to_target(handle, &input.target).await;
+    let distance_remaining = distance_to_target_from_state(&io.shared_state, &input.target).await;
     {
         let mut slot = state.inner.write().await;
         if let Some(active) = slot.goal.as_ref() {
@@ -2526,7 +2725,7 @@ async fn admit_goal_input(
     drop(map_goal_guard);
 
     // 2. publish sealed GoalEnvelope. Facade does not create a follower/cmd_vel.
-    if let Err(e) = publish_goal_frame(handle, &envelope).await {
+    if let Err(e) = publish_goal_frame_from_transport(&io.transport, &envelope).await {
         let failure_message = format!("SetNavigationGoal 失败:publish /nav/goal 错误: {e}");
         let mut slot = state.inner.write().await;
         if slot.goal.as_ref().is_some_and(|goal| goal.lease == lease) {
@@ -2784,12 +2983,19 @@ fn cancel_outcome_from_slot(
     }
 }
 
+async fn distance_to_target_from_state(
+    shared_state: &Arc<RwLock<SharedState>>,
+    target: &PoseState,
+) -> f32 {
+    let state = shared_state.read().await;
+    let dx = state.pose.x - target.x;
+    let dy = state.pose.y - target.y;
+    ((dx * dx + dy * dy) as f32).sqrt()
+}
+
 /// 计算当前位置到 target 的欧氏距离(2D 平面),给 `distance_remaining` 用。
 pub async fn distance_to_target(handle: &GeometryRuntimeHandle, target: &PoseState) -> f32 {
-    let s = handle.state.read().await;
-    let dx = s.pose.x - target.x;
-    let dy = s.pose.y - target.y;
-    ((dx * dx + dy * dy) as f32).sqrt()
+    distance_to_target_from_state(&handle.state, target).await
 }
 
 /// 生成或保留 goal_id。空字符串时生成 UUID v4。
@@ -2897,21 +3103,27 @@ pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
     strict_typed_binding(&channel, "nuwax_msgs.PathEnvelope")
 }
 
-/// publish `/nav/goal` typed frame。
-async fn publish_goal_frame(
-    handle: &GeometryRuntimeHandle,
+async fn publish_goal_frame_from_transport(
+    transport: &LcmTransport,
     envelope: &schema::GoalEnvelope,
 ) -> Result<(), String> {
     let (topic, msg_type) = goal_envelope_binding()?;
     let payload = typed_codec::encode_goal_envelope_payload(envelope)
         .map_err(|e| format!("GoalEnvelope LCM encode failed: {e}"))?;
     let frame: RawLcmFrame =
-        typed_codec::build_typed_frame(topic, msg_type, payload, seqno_for(handle).await);
-    handle
-        .transport
+        typed_codec::build_typed_frame(topic, msg_type, payload, now_ns() & 0x0000_FFFF_FFFF_FFFF);
+    transport
         .publish(frame)
         .await
         .map_err(|e| format!("LcmTransport::publish 失败: {}", e))
+}
+
+/// publish `/nav/goal` typed frame。
+async fn publish_goal_frame(
+    handle: &GeometryRuntimeHandle,
+    envelope: &schema::GoalEnvelope,
+) -> Result<(), String> {
+    publish_goal_frame_from_transport(&handle.transport, envelope).await
 }
 
 /// publish `/nav/cancel` typed frame。

@@ -2292,6 +2292,62 @@ fn start_topology_mapping(
 }
 
 #[cfg(test)]
+fn test_committed_map_identity(revision: u64) -> schema::CommittedMapIdentity {
+    schema::CommittedMapIdentity {
+        session_id: "exploration-test-map".to_string(),
+        session_generation: 1,
+        revision: i64::try_from(revision).expect("test committed map revision"),
+        payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
+        frame_id: "map".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn test_wavefront_goal_intent(
+    goal_id: &str,
+    parent_request_id: &str,
+    producer_epoch: u64,
+    cancel_generation: u64,
+    committed_map: schema::CommittedMapIdentity,
+) -> schema::GoalIntent {
+    let timestamp_ns = crate::explore_runtime::now_unix_nanos();
+    let goal = schema::PoseStamped {
+        header: schema::Header {
+            seq: 0,
+            stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000)
+                .expect("test goal timestamp seconds"),
+            stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+            frame_id: "map".to_string(),
+        },
+        pose: schema::Pose {
+            position: [1.0, 2.0, 0.0],
+            orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        },
+    };
+    let goal_sha256 = schema::goal_intent_goal_sha256(&goal).expect("test goal hash");
+    let motion_admission = crate::nav_runtime::test_motion_admission();
+    schema::GoalIntent {
+        producer: "wavefront".to_string(),
+        producer_epoch: i64::try_from(producer_epoch).expect("test producer epoch"),
+        priority: 100,
+        session_id: goal_id.to_string(),
+        owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+        parent_request_id: parent_request_id.to_string(),
+        goal_generation: 0,
+        cancel_generation: i64::try_from(cancel_generation).expect("test cancel generation"),
+        committed_map,
+        boundary_id: String::new(),
+        boundary_sha256: [0; 32],
+        boundary_points: Vec::new(),
+        motion_guard_generation: motion_admission.guard_generation as i64,
+        motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
+        motion_stop_generation: motion_admission.motion_stop_generation as i64,
+        goal_sha256,
+        goal,
+    }
+}
+
+#[cfg(test)]
 async fn start_topology_exploration_goal(
     handle: &GeometryRuntimeHandle,
     goal_id: &str,
@@ -2334,21 +2390,68 @@ async fn start_topology_exploration_goal(
             ready: true,
         })
         .expect("production topology motion-sink observation");
-    let outcome = crate::nav_runtime::set_goal(
-        handle,
-        &handle.nav,
-        crate::nav_runtime::SetGoalInput {
-            goal_id: goal_id.to_owned(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: "production-topology-exploration".to_owned(),
-            goal_generation: 0,
-            motion_admission: crate::nav_runtime::test_motion_admission(),
-            frame_id: "map".to_owned(),
-            target: PoseState {
-                x: 1.0,
-                y: 2.0,
-                ..PoseState::default()
+    let committed_map = test_committed_map_identity(1);
+    *handle
+        .committed_map_authority
+        .lock()
+        .expect("production topology committed map authority") = Some(committed_map.clone());
+    let mut grid = OccupancyGrid2D {
+        resolution: 0.5,
+        origin: Point2 { x: 0.0, y: 0.0 },
+        width: 12,
+        height: 12,
+        cells: vec![OccupancyCell::Unknown; 144],
+    };
+    for y in 2..=7 {
+        for x in 2..=7 {
+            grid.set(x, y, OccupancyCell::Free);
+        }
+    }
+    handle
+        .explore
+        .ingest_committed_costmap_snapshot(
+            crate::explore_runtime::ExploreCostmapSnapshot {
+                grid,
+                frame_id: "map".to_string(),
             },
+            committed_map,
+        )
+        .await
+        .expect("production topology committed costmap");
+    assert_eq!(
+        handle
+            .explore
+            .start("production-topology-exploration", "prefer_wavefront")
+            .await
+            .status,
+        crate::explore_runtime::STATUS_ACCEPTED
+    );
+    let producer_epoch_projection = handle.explore.producer_epoch_projection();
+    let producer_epoch = producer_epoch_projection.load(std::sync::atomic::Ordering::Acquire);
+    assert!(producer_epoch > 0);
+    let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+        handle.mapping_lifecycle_lock.clone(),
+        handle.committed_map_authority.clone(),
+    );
+    let admission_io = crate::nav_runtime::NavAdmissionIo::new(
+        handle.state.clone(),
+        handle.transport.clone(),
+        handle.transport_backend_name,
+        handle.lcm_backend_available,
+    );
+    let outcome = crate::nav_runtime::admit_goal_intent(
+        &admission_context,
+        &admission_io,
+        &handle.nav,
+        test_wavefront_goal_intent(
+            goal_id,
+            "production-topology-exploration",
+            producer_epoch,
+            handle.nav.cancel_snapshot().generation,
+            test_committed_map_identity(1),
+        ),
+        crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+            current_session_generation: producer_epoch_projection,
         },
     )
     .await;
@@ -4471,6 +4574,7 @@ struct ExploreNavigationBridge {
     lcm_backend_available: bool,
     cmd_vel_sink_ready: Arc<std::sync::atomic::AtomicBool>,
     nav: crate::nav_runtime::NavRuntimeState,
+    exploration_producer_epoch: Arc<std::sync::atomic::AtomicU64>,
     runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(not(test))]
     task_control: Option<GeometryRuntimeTaskControl>,
@@ -4695,9 +4799,26 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 ),
             );
         }
-        let facade = self.facade_handle();
-        let outcome =
-            crate::nav_runtime::admit_goal_intent(&facade, &self.nav, request.intent).await;
+        let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+            self.mapping_lifecycle_lock.clone(),
+            self.committed_map_authority.clone(),
+        );
+        let admission_io = crate::nav_runtime::NavAdmissionIo::new(
+            self.state.clone(),
+            self.transport.clone(),
+            self.transport_backend_name,
+            self.lcm_backend_available,
+        );
+        let outcome = crate::nav_runtime::admit_goal_intent(
+            &admission_context,
+            &admission_io,
+            &self.nav,
+            request.intent,
+            crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                current_session_generation: self.exploration_producer_epoch.clone(),
+            },
+        )
+        .await;
         let accepted = matches!(
             outcome.state.status.to_ascii_uppercase().as_str(),
             "ACCEPTED" | "PLANNING" | "RUNNING"
@@ -6947,6 +7068,7 @@ pub async fn spawn_geometry_runtime(
             lcm_backend_available: backend_available,
             cmd_vel_sink_ready,
             nav: handle.nav.clone(),
+            exploration_producer_epoch: explore_runtime.producer_epoch_projection(),
             runtime_observation_generation,
             #[cfg(not(test))]
             task_control: Some(task_control.clone()),
@@ -14816,6 +14938,7 @@ mod exploration_cancel_retry_tests {
             lcm_backend_available: true,
             cmd_vel_sink_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             nav: nav.clone(),
+            exploration_producer_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         };
         (bridge, backend)
@@ -15565,6 +15688,7 @@ mod exploration_lcm_smoke_tests {
             lcm_backend_available: true,
             cmd_vel_sink_ready: Arc::new(AtomicBool::new(true)),
             nav: nav.clone(),
+            exploration_producer_epoch: explore.producer_epoch_projection(),
             runtime_observation_generation: Arc::new(AtomicU64::new(1)),
         };
         explore.set_navigation_sink(Arc::new(bridge.clone()));

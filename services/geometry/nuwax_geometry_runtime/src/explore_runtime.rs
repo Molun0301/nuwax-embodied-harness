@@ -1519,6 +1519,10 @@ impl ExploreRuntimeHandle {
         self.expected_map_frame.as_ref()
     }
 
+    pub(crate) fn producer_epoch_projection(&self) -> Arc<AtomicU64> {
+        self.generation.clone()
+    }
+
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
         *self.navigation_sink.write() = Some(sink);
     }

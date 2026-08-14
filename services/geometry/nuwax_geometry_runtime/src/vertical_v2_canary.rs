@@ -325,6 +325,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         lcm_backend_available: true,
         cmd_vel_sink_ready: Arc::new(AtomicBool::new(true)),
         nav: nav.clone(),
+        exploration_producer_epoch: explore.producer_epoch_projection(),
         runtime_observation_generation: Arc::new(AtomicU64::new(1)),
     };
     explore.set_navigation_sink(Arc::new(bridge));

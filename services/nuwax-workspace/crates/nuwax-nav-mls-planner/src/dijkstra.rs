@@ -13,7 +13,7 @@ use crate::adjacency::{CellId, SurfaceCells, NO_CELL};
 use crate::voxel::VoxelKey;
 
 /// 可复用的 Dijkstra 状态:距离、前驱、源点与堆一次性分配。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DijkstraState {
     /// 每个 cell 距最近 source 的累计代价(米)。
     pub dist: Vec<f32>,
@@ -189,6 +189,7 @@ pub fn walk_preds(state: &DijkstraState, start: CellId) -> Vec<CellId> {
     cells
 }
 
+#[derive(Clone)]
 struct Scored(f32, VoxelKey, CellId);
 
 impl PartialEq for Scored {

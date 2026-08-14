@@ -10,17 +10,32 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, 
 }
 
 fn parse() -> Result<Option<WorkerOptions>, String> {
-    let mut options = WorkerOptions::default();
+    let mut options = WorkerOptions::from_env().map_err(|error| error.to_string())?;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
+        if flag == "--backend-generation" {
+            options.backend_generation = value(&mut args, &flag)?
+                .parse::<i64>()
+                .map_err(|_| format!("{flag} requires a positive integer"))?;
+            continue;
+        }
+        if flag == "--planning-timeout-ms" {
+            let timeout_ms = value(&mut args, &flag)?
+                .parse::<u64>()
+                .map_err(|_| format!("{flag} requires a positive integer"))?;
+            options.planning_timeout = std::time::Duration::from_millis(timeout_ms);
+            continue;
+        }
         let target = match flag.as_str() {
             "--provider" => &mut options.provider_url,
             "--global_map" | "--global-map" => &mut options.topics.global_map,
             "--local_map" | "--local-map" => &mut options.topics.local_map,
             "--region_bounds" | "--region-bounds" => &mut options.topics.region_bounds,
             "--start_pose" | "--start-pose" => &mut options.topics.start_pose,
-            "--goal_pose" | "--goal-pose" => &mut options.topics.goal_pose,
-            "--path" => &mut options.topics.path,
+            "--goal" => &mut options.topics.goal,
+            "--cancel" => &mut options.topics.cancel,
+            "--events" => &mut options.topics.events,
+            "--backend-id" => &mut options.backend_id,
             "--surface_map" | "--surface-map" => &mut options.topics.surface_map,
             "--nodes" => &mut options.topics.nodes,
             "--node_edges" | "--node-edges" => &mut options.topics.node_edges,
@@ -77,7 +92,8 @@ fn parse() -> Result<Option<WorkerOptions>, String> {
 fn print_usage() {
     println!(
         "usage: mls_planner_native [OPTIONS]\n\
-         typed ports: --global_map --local_map --region_bounds --start_pose --goal_pose \\\n         --path --surface_map --nodes --node_edges\n\
+         typed ports: --global_map --local_map --region_bounds --start_pose --goal \\\n         --cancel --events --surface_map --nodes --node_edges\n\
+         identity: --backend-id --backend-generation --planning-timeout-ms\n\
          transport: --provider <LCM_URL> (or NUWAX_LCM_URL)\n\
          planner: --world_frame --voxel_size --robot_height --surface_closing_radius \\\n         --node_spacing_m --wall_clearance_m --wall_buffer_m --wall_buffer_weight \\\n         --step_threshold_m --step_penalty_weight --goal_tolerance --viz_publish_hz"
     );

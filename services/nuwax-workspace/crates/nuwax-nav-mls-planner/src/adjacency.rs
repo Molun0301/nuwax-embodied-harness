@@ -42,7 +42,7 @@ pub struct Edge {
 }
 
 /// 可通行表面的 slot map:支持插入/复用 tombstone 槽位/生长。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SurfaceCells {
     coord: Vec<VoxelKey>,
     edges: Vec<Vec<Edge>>,

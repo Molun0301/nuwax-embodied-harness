@@ -39,7 +39,7 @@ pub struct NodeEdge {
 }
 
 /// 规划器使用的全局图状态:表面、节点、节点边、cell 状态、墙距。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PlannerGraph {
     /// 可通行表面图。
     pub cells: SurfaceCells,

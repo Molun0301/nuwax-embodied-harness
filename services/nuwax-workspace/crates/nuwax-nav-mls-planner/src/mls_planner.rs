@@ -114,7 +114,7 @@ impl RegionBounds {
 }
 
 /// 持有 MLS 图状态的规划器入口。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Planner {
     graph: PlannerGraph,
     voxel_map: AHashSet<VoxelKey>,

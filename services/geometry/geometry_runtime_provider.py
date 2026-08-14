@@ -6080,6 +6080,111 @@ class GeometryRuntimeProvider:
     #   accepted/goal_id/message → status/goal_id/message
     # - CancelNavigation 接受 CancelNavigationRequest（带 goal_id），返回 NavigationState
     # - NavigationReadiness 仅提供 ready + reason
+    def get_mapping_cloud_authority(self) -> Dict[str, Any]:
+        """读取 Geometry 服务端当前 finalized-map 与 committed-map 组合权威。"""
+
+        self._raise_if_stopping("get_mapping_cloud_authority")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        response = self._stub.GetMappingCloudAuthority(
+            pb2.Empty(), timeout=_read_deadline_sec()
+        )
+        return {
+            "map_name": str(response.map_name),
+            "map_frame_id": str(response.map_frame_id),
+            "asset_manifest_sha256": bytes(response.asset_manifest_sha256).hex(),
+            "asset_bundle_sha256": bytes(response.asset_bundle_sha256).hex(),
+            "activation_request_id": str(response.activation_request_id),
+            "activation_request_identity_sha256": bytes(
+                response.activation_request_identity_sha256
+            ).hex(),
+            "activation_identity_sha256": bytes(
+                response.activation_identity_sha256
+            ).hex(),
+            "target_receipt_sha256": bytes(response.target_receipt_sha256).hex(),
+            "runtime_generation": int(response.runtime_generation),
+            "lifecycle_epoch": int(response.lifecycle_epoch),
+            "mapping_session_id": str(response.mapping_session_id),
+            "mapping_session_generation": int(response.mapping_session_generation),
+            "backend_kind": str(response.backend_kind),
+            "backend_generation": int(response.backend_generation),
+            "committed_occupancy_revision": int(
+                response.committed_occupancy_revision
+            ),
+            "committed_occupancy_sha256": bytes(
+                response.committed_occupancy_sha256
+            ).hex(),
+            "owner_epoch": int(response.owner_epoch),
+        }
+
+    def submit_mapping_cloud_goal(
+        self,
+        *,
+        query_request_id: str,
+        query_text: str,
+        authority: Dict[str, Any],
+        georeference_json: bytes,
+        motion_admission: Dict[str, Any],
+        caller_timeout_ms: int = 15000,
+        provider_timeout_ms: int = 10000,
+    ) -> Dict[str, Any]:
+        """提交地点文本查询并等待唯一 GoalLease 准入终态。"""
+
+        self._raise_if_stopping("submit_mapping_cloud_goal")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry runtime 未连接。")
+        request = pb2.MappingCloudGoalRequest(
+            query_request_id=str(query_request_id),
+            query_text=str(query_text),
+            caller_timeout_ms=int(caller_timeout_ms),
+            provider_timeout_ms=int(provider_timeout_ms),
+            map_name=str(authority["map_name"]),
+            map_frame_id=str(authority["map_frame_id"]),
+            asset_manifest_sha256=bytes.fromhex(authority["asset_manifest_sha256"]),
+            asset_bundle_sha256=bytes.fromhex(authority["asset_bundle_sha256"]),
+            georeference_json=bytes(georeference_json),
+            activation_identity_sha256=bytes.fromhex(
+                authority["activation_identity_sha256"]
+            ),
+            runtime_generation=int(authority["runtime_generation"]),
+            mapping_session_id=str(authority["mapping_session_id"]),
+            mapping_session_generation=int(authority["mapping_session_generation"]),
+            committed_occupancy_revision=int(
+                authority["committed_occupancy_revision"]
+            ),
+            committed_occupancy_sha256=bytes.fromhex(
+                authority["committed_occupancy_sha256"]
+            ),
+            motion_guard_generation=int(motion_admission["guard_generation"]),
+            motion_guard_boot_nonce=bytes(motion_admission["guard_boot_nonce"]),
+            motion_stop_generation=int(motion_admission["motion_stop_generation"]),
+        )
+        response = self._stub.SubmitMappingCloudGoal(
+            request,
+            timeout=max(float(caller_timeout_ms) / 1000.0 + 1.0, 2.0),
+        )
+        navigation = response.navigation if response.HasField("navigation") else None
+        return {
+            "status": str(response.status),
+            "message": str(response.message),
+            "query_request_id": str(response.query_request_id),
+            "navigation": None
+            if navigation is None
+            else {
+                "status": str(navigation.status),
+                "message": str(navigation.message),
+                "goal_id": str(navigation.goal_id),
+                "owner_kind": int(navigation.owner_kind),
+                "goal_generation": int(navigation.goal_generation),
+                "producer_runtime_generation": int(
+                    navigation.producer_runtime_generation
+                ),
+                "goal_payload_sha256": bytes(
+                    navigation.goal_payload_sha256
+                ).hex(),
+            },
+        }
+
     def set_navigation_goal(
         self,
         x: float,

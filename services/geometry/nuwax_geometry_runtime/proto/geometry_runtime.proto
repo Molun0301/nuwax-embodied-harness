@@ -631,6 +631,54 @@ message PublishPointCloudRequest {
 }
 message PublishResult { bool success = 1; string message = 2; }
 
+message MappingCloudAuthority {
+  string map_name = 1;
+  string map_frame_id = 2;
+  bytes asset_manifest_sha256 = 3;
+  bytes asset_bundle_sha256 = 4;
+  string activation_request_id = 5;
+  bytes activation_request_identity_sha256 = 6;
+  bytes activation_identity_sha256 = 7;
+  bytes target_receipt_sha256 = 8;
+  uint64 runtime_generation = 9;
+  uint64 lifecycle_epoch = 10;
+  string mapping_session_id = 11;
+  uint64 mapping_session_generation = 12;
+  string backend_kind = 13;
+  uint64 backend_generation = 14;
+  uint64 committed_occupancy_revision = 15;
+  bytes committed_occupancy_sha256 = 16;
+  uint64 owner_epoch = 17;
+}
+
+message MappingCloudGoalRequest {
+  string query_request_id = 1;
+  string query_text = 2;
+  uint64 caller_timeout_ms = 3;
+  uint64 provider_timeout_ms = 4;
+  string map_name = 5;
+  string map_frame_id = 6;
+  bytes asset_manifest_sha256 = 7;
+  bytes asset_bundle_sha256 = 8;
+  bytes georeference_json = 9;
+  bytes activation_identity_sha256 = 10;
+  uint64 runtime_generation = 11;
+  string mapping_session_id = 12;
+  uint64 mapping_session_generation = 13;
+  uint64 committed_occupancy_revision = 14;
+  bytes committed_occupancy_sha256 = 15;
+  uint64 motion_guard_generation = 16;
+  bytes motion_guard_boot_nonce = 17;
+  uint64 motion_stop_generation = 18;
+}
+
+message MappingCloudGoalTerminal {
+  string status = 1;
+  string message = 2;
+  string query_request_id = 3;
+  NavigationState navigation = 4;
+}
+
 // ============================================================================
 // 服务定义：GeometryRuntime gRPC facade
 // ============================================================================
@@ -666,6 +714,8 @@ service GeometryRuntime {
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
+  rpc GetMappingCloudAuthority(Empty) returns (MappingCloudAuthority);
+  rpc SubmitMappingCloudGoal(MappingCloudGoalRequest) returns (MappingCloudGoalTerminal);
   rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
   rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
   rpc GetNavigationReadiness(Empty) returns (NavigationReadiness);

@@ -141,6 +141,16 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.NavigationGoal.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.NavigationState.FromString,
                 _registered_method=True)
+        self.GetMappingCloudAuthority = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetMappingCloudAuthority',
+                request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingCloudAuthority.FromString,
+                _registered_method=True)
+        self.SubmitMappingCloudGoal = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/SubmitMappingCloudGoal',
+                request_serializer=geometry__runtime__pb2.MappingCloudGoalRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MappingCloudGoalTerminal.FromString,
+                _registered_method=True)
         self.CancelNavigation = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/CancelNavigation',
                 request_serializer=geometry__runtime__pb2.CancelNavigationRequest.SerializeToString,
@@ -367,6 +377,18 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetMappingCloudAuthority(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SubmitMappingCloudGoal(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CancelNavigation(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -589,6 +611,16 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.SetNavigationGoal,
                     request_deserializer=geometry__runtime__pb2.NavigationGoal.FromString,
                     response_serializer=geometry__runtime__pb2.NavigationState.SerializeToString,
+            ),
+            'GetMappingCloudAuthority': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMappingCloudAuthority,
+                    request_deserializer=geometry__runtime__pb2.Empty.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingCloudAuthority.SerializeToString,
+            ),
+            'SubmitMappingCloudGoal': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitMappingCloudGoal,
+                    request_deserializer=geometry__runtime__pb2.MappingCloudGoalRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.MappingCloudGoalTerminal.SerializeToString,
             ),
             'CancelNavigation': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelNavigation,
@@ -1246,6 +1278,60 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/SetNavigationGoal',
             geometry__runtime__pb2.NavigationGoal.SerializeToString,
             geometry__runtime__pb2.NavigationState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMappingCloudAuthority(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetMappingCloudAuthority',
+            geometry__runtime__pb2.Empty.SerializeToString,
+            geometry__runtime__pb2.MappingCloudAuthority.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitMappingCloudGoal(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/SubmitMappingCloudGoal',
+            geometry__runtime__pb2.MappingCloudGoalRequest.SerializeToString,
+            geometry__runtime__pb2.MappingCloudGoalTerminal.FromString,
             options,
             channel_credentials,
             insecure,

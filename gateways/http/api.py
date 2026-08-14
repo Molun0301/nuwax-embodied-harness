@@ -924,6 +924,44 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             raise as_gateway_error(exc) from exc
         return _navigation_state_payload(context, fallback_goal_id=goal.goal_id)
 
+    @router.post("/api/navigation/place-goal")
+    async def api_navigation_place_goal(request: Request) -> Dict[str, Any]:
+        """将地点文本查询接入唯一 mapping-cloud owner 与 GoalLease。"""
+
+        access_manager.authenticate_http(request)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            payload = {}
+        query_text = str(payload.get("query_text") or "").strip()
+        query_request_id = str(
+            payload.get("query_request_id") or "place-{}".format(uuid.uuid4().hex)
+        ).strip()
+        if not query_text:
+            raise as_gateway_error(ValueError("query_text 不能为空。"))
+        try:
+            def submit_goal():
+                admission = runtime._admit_motion_request(
+                    "navigate_to_pose",
+                    request_id=query_request_id,
+                )
+                motion_admission = {
+                    "guard_generation": admission.generation,
+                    "guard_boot_nonce": admission.boot_nonce,
+                    "motion_stop_generation": admission.guard_motion_stop_generation,
+                }
+                return runtime._run_with_motion_admission(
+                    admission,
+                    lambda: runtime.map_workspace_service.submit_mapping_cloud_goal(
+                        query_request_id=query_request_id,
+                        query_text=query_text,
+                        motion_admission=motion_admission,
+                    ),
+                )
+
+            return to_jsonable(await run_in_threadpool(submit_goal))
+        except Exception as exc:
+            raise as_gateway_error(exc) from exc
+
     @router.get("/api/navigation/state")
     async def api_navigation_state(request: Request) -> StreamingResponse:
         """Stream authoritative ``navigation.state`` frames over SSE."""

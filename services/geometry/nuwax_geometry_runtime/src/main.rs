@@ -89,6 +89,10 @@ const STARTUP_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(test)]
 const PROCESS_STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const MAPPING_CLOUD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const MAPPING_CLOUD_STOP_TIMEOUT: Duration = Duration::from_millis(250);
 const FINAL_OWNER_ATTEMPT_LIMIT: usize = 3;
 #[cfg(not(test))]
 const FINAL_OWNER_ATTEMPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -598,6 +602,7 @@ struct GeometryProductionOwner {
     ingress_gate: Arc<lio_ingress::LioIngressRoutingGate>,
     correction_phase_a: correction_coordinator::CorrectionPhaseAControl,
     deferred_replay: Option<Arc<lio_ingress::NativeDeferredReplayControl>>,
+    mapping_cloud_owner: Option<Arc<nuwax_mapping_cloud::MappingCloudOwner>>,
     shutdown_events: Option<lio_owner::GeometryShutdownEventEmitter>,
     geometry_task_settlement: Option<lcm_runtime::GeometryTaskSettlement>,
     geometry_task_failure: Option<String>,
@@ -665,6 +670,7 @@ impl GeometryProductionOwner {
             ingress_gate,
             correction_phase_a,
             deferred_replay,
+            mapping_cloud_owner: None,
             shutdown_events: None,
             geometry_task_settlement: None,
             geometry_task_failure: None,
@@ -676,6 +682,14 @@ impl GeometryProductionOwner {
             #[cfg(test)]
             shutdown_attempts_for_tests: 0,
         }
+    }
+
+    fn with_mapping_cloud_owner(
+        mut self,
+        owner: Arc<nuwax_mapping_cloud::MappingCloudOwner>,
+    ) -> Self {
+        self.mapping_cloud_owner = Some(owner);
+        self
     }
 
     fn with_shutdown_events(mut self, events: lio_owner::GeometryShutdownEventEmitter) -> Self {
@@ -795,6 +809,27 @@ impl GeometryProductionOwner {
             self.shutdown_attempts_for_tests += 1;
         }
         self.close_ingress();
+        if let Some(mapping_cloud_owner) = &self.mapping_cloud_owner {
+            match mapping_cloud_owner
+                .shutdown(MAPPING_CLOUD_STOP_TIMEOUT)
+                .await
+            {
+                nuwax_mapping_cloud::MappingCloudShutdown::Settled => {
+                    self.mapping_cloud_owner = None;
+                }
+                nuwax_mapping_cloud::MappingCloudShutdown::Pending {
+                    request_id,
+                    owner_epoch,
+                } => {
+                    return Err(GeometryProductionShutdownFailure::unsettled(
+                        format!(
+                            "MappingCloud owner shutdown pending: request_id={request_id} owner_epoch={owner_epoch}"
+                        ),
+                        self,
+                    ));
+                }
+            }
+        }
         if self.geometry_task_settlement.is_none() {
             let task_outcome = self
                 .runtime
@@ -1885,6 +1920,8 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         rpc_point_cloud_binding,
         relocalization_ingress,
     );
+    let mapping_cloud_owner = service.mapping_cloud_owner();
+    runtime_owner = runtime_owner.with_mapping_cloud_owner(mapping_cloud_owner);
     let readiness_service = service.clone();
     let rpc_transport: Arc<dyn nuwax_rpc::RpcTransport> =
         Arc::new(nuwax_rpc::LcmRpcTransport::from_context(rpc_context));

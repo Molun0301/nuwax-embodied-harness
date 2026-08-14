@@ -47,6 +47,11 @@ use crate::proto::*;
 use crate::runtime_diagnostics::{self, RuntimeDiagnostics, ServiceState, SharedServiceState};
 use crate::typed_codec;
 use nuwax_exploration::{BoundarySegment, ExplorationBoundary};
+use nuwax_mapping_cloud::{
+    ActiveMapIdentityV1, CloudQueryIdentityV1, GeoreferenceBindingV1, MappingCloudOwner,
+    MappingCloudProvider, MappingCloudRequest, MappingCloudTerminal, OsmClient, Sha256Digest,
+    VerifiedGeoreferenceV1,
+};
 use nuwax_motion_safety_guard::{
     HeldRecoveryFenceProof, MotionGuardClient, ZeroConfirmation, DEFAULT_UDS_PATH,
 };
@@ -63,6 +68,7 @@ pub struct GeometryRuntimeService {
     deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl,
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
+    mapping_cloud_owner: Arc<MappingCloudOwner>,
     activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFence>>>,
     #[cfg(test)]
     activation_fault_after:
@@ -554,6 +560,21 @@ impl ShutdownListener {
 }
 
 impl GeometryRuntimeService {
+    fn start_mapping_cloud_owner(bridge: &GeometryRuntimeHandle) -> Arc<MappingCloudOwner> {
+        let owner_epoch = bridge.nav.producer_runtime_generation();
+        Arc::new(
+            MappingCloudOwner::start(
+                owner_epoch,
+                MappingCloudProvider::OsmNominatim(Arc::new(OsmClient::new())),
+            )
+            .expect("Geometry navigation runtime generation is a valid mapping-cloud owner epoch"),
+        )
+    }
+
+    pub(crate) fn mapping_cloud_owner(&self) -> Arc<MappingCloudOwner> {
+        Arc::clone(&self.mapping_cloud_owner)
+    }
+
     pub(crate) async fn run_if_running<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
         let state = self.state.read().await;
         if state.phase != "running" {
@@ -580,6 +601,7 @@ impl GeometryRuntimeService {
         bridge: GeometryRuntimeHandle,
         point_cloud_binding: (LcmTopic, LcmMessageType),
     ) -> Self {
+        let mapping_cloud_owner = Self::start_mapping_cloud_owner(&bridge);
         Self {
             state: Arc::new(RwLock::new(ServiceState::new_running(
                 "Geometry LCM runtime 已启动",
@@ -594,6 +616,7 @@ impl GeometryRuntimeService {
                 1,
             ),
             relocalization_ingress: None,
+            mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
             stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
@@ -635,6 +658,7 @@ impl GeometryRuntimeService {
             .unwrap_or_else(|| {
                 crate::correction_coordinator::ActivatedTargetReceiptControl::new(1)
             });
+        let mapping_cloud_owner = Self::start_mapping_cloud_owner(&bridge);
         Self {
             state: Arc::new(RwLock::new(ServiceState::new_running(
                 "Geometry LCM runtime 已启动",
@@ -647,6 +671,7 @@ impl GeometryRuntimeService {
             shutdown: Some(shutdown),
             activation_receipts,
             relocalization_ingress,
+            mapping_cloud_owner,
             activation_lifecycle_fence: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
@@ -5628,6 +5653,325 @@ impl GeometryRuntime for GeometryRuntimeService {
         let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
         let _ = self.bridge.nav_state_tx.send(update.clone());
         Ok(Response::new(nav_state_to_proto(update)))
+    }
+
+    async fn get_mapping_cloud_authority(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<MappingCloudAuthority>, Status> {
+        self.ensure_running_admission("GetMappingCloudAuthority")
+            .await?;
+        let sealed = self
+            .activation_receipts
+            .current_sealed_target_snapshot()
+            .ok_or_else(|| {
+                Status::failed_precondition("sealed finalized map authority is unavailable")
+            })?;
+        let committed = self
+            .bridge
+            .committed_map_authority
+            .lock()
+            .map_err(|_| Status::unavailable("committed map authority is unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
+        if sealed.session_id != committed.session_id
+            || i64::try_from(sealed.session_generation).ok() != Some(committed.session_generation)
+            || sealed.immutable_target.frame_id != committed.frame_id
+        {
+            return Err(Status::failed_precondition(
+                "sealed finalized map does not match committed map authority",
+            ));
+        }
+        let asset_manifest_sha256 = sealed
+            .asset_manifest_sha256
+            .ok_or_else(|| Status::failed_precondition("asset manifest identity is unavailable"))?;
+        let asset_bundle_sha256 = sealed
+            .asset_bundle_sha256
+            .ok_or_else(|| Status::failed_precondition("asset bundle identity is unavailable"))?;
+        let backend_kind = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .map(|adapter| format!("{:?}", adapter.lock().backend_kind()).to_ascii_lowercase())
+            .unwrap_or_default();
+        Ok(Response::new(MappingCloudAuthority {
+            map_name: sealed.map_name,
+            map_frame_id: committed.frame_id,
+            asset_manifest_sha256: asset_manifest_sha256.to_vec(),
+            asset_bundle_sha256: asset_bundle_sha256.to_vec(),
+            activation_request_id: sealed.activation_request_id,
+            activation_request_identity_sha256: sealed.activation_request_identity_sha256.to_vec(),
+            activation_identity_sha256: sealed.activation_identity_sha256.to_vec(),
+            target_receipt_sha256: sealed.target_receipt_sha256.to_vec(),
+            runtime_generation: sealed.runtime_generation,
+            lifecycle_epoch: sealed.lifecycle_epoch,
+            mapping_session_id: sealed.session_id,
+            mapping_session_generation: sealed.session_generation,
+            backend_kind,
+            backend_generation: sealed.backend_generation,
+            committed_occupancy_revision: u64::try_from(committed.revision)
+                .map_err(|_| Status::internal("committed revision is invalid"))?,
+            committed_occupancy_sha256: committed.payload_sha256.to_vec(),
+            owner_epoch: self.bridge.nav.producer_runtime_generation(),
+        }))
+    }
+
+    async fn submit_mapping_cloud_goal(
+        &self,
+        req: Request<MappingCloudGoalRequest>,
+    ) -> Result<Response<MappingCloudGoalTerminal>, Status> {
+        self.ensure_running_admission("SubmitMappingCloudGoal")
+            .await?;
+        let request = req.into_inner();
+        let digest = |field: &'static str, bytes: &[u8]| -> Result<Sha256Digest, Status> {
+            let value: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| Status::invalid_argument(format!("{field} must contain 32 bytes")))?;
+            Sha256Digest::from_bytes(value)
+                .map_err(|error| Status::invalid_argument(error.to_string()))
+        };
+        let sealed = self
+            .activation_receipts
+            .current_sealed_target_snapshot()
+            .ok_or_else(|| {
+                Status::failed_precondition("sealed finalized map authority is unavailable")
+            })?;
+        let asset_manifest_sha256 = sealed
+            .asset_manifest_sha256
+            .ok_or_else(|| Status::failed_precondition("asset manifest identity is unavailable"))?;
+        let asset_bundle_sha256 = sealed
+            .asset_bundle_sha256
+            .ok_or_else(|| Status::failed_precondition("asset bundle identity is unavailable"))?;
+        if sealed.map_name != request.map_name
+            || sealed.immutable_target.frame_id != request.map_frame_id
+            || asset_manifest_sha256.as_slice() != request.asset_manifest_sha256
+            || asset_bundle_sha256.as_slice() != request.asset_bundle_sha256
+            || sealed.activation_identity_sha256.as_slice() != request.activation_identity_sha256
+            || sealed.runtime_generation != request.runtime_generation
+            || sealed.session_id != request.mapping_session_id
+            || sealed.session_generation != request.mapping_session_generation
+        {
+            return Err(Status::failed_precondition(
+                "mapping-cloud request does not match current sealed map authority",
+            ));
+        }
+        let committed_map = self
+            .bridge
+            .committed_map_authority
+            .lock()
+            .map_err(|_| Status::unavailable("committed map authority is unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("committed map authority is unavailable"))?;
+        if committed_map.session_id != request.mapping_session_id
+            || u64::try_from(committed_map.session_generation).ok()
+                != Some(request.mapping_session_generation)
+            || u64::try_from(committed_map.revision).ok()
+                != Some(request.committed_occupancy_revision)
+            || committed_map.payload_sha256.as_slice() != request.committed_occupancy_sha256
+            || committed_map.frame_id != request.map_frame_id
+        {
+            return Err(Status::failed_precondition(
+                "mapping-cloud request does not match current committed map authority",
+            ));
+        }
+        let georeference = Arc::new(
+            VerifiedGeoreferenceV1::from_json(
+                &request.georeference_json,
+                &GeoreferenceBindingV1::for_document(&request.georeference_json),
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?,
+        );
+        if georeference.contract().map_name != sealed.map_name
+            || georeference.contract().map_frame_id != sealed.immutable_target.frame_id
+        {
+            return Err(Status::failed_precondition(
+                "mapping-cloud georeference does not match current sealed map authority",
+            ));
+        }
+        let owner_epoch = self.bridge.nav.producer_runtime_generation();
+        if request.runtime_generation != owner_epoch {
+            return Err(Status::failed_precondition(
+                "mapping-cloud request runtime generation is stale",
+            ));
+        }
+        let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+            self.bridge.mapping_lifecycle_lock.clone(),
+            self.bridge.committed_map_authority.clone(),
+        );
+        let active_map = ActiveMapIdentityV1 {
+            map_name: request.map_name,
+            map_frame_id: request.map_frame_id,
+            asset_manifest_sha256: digest("asset_manifest_sha256", &request.asset_manifest_sha256)?,
+            asset_bundle_sha256: digest("asset_bundle_sha256", &request.asset_bundle_sha256)?,
+            georeference_sha256: georeference.raw_sha256(),
+            activation_identity_sha256: digest(
+                "activation_identity_sha256",
+                &request.activation_identity_sha256,
+            )?,
+            runtime_generation: request.runtime_generation,
+            mapping_session_generation: request.mapping_session_generation,
+            committed_occupancy_revision: request.committed_occupancy_revision,
+            committed_occupancy_sha256: digest(
+                "committed_occupancy_sha256",
+                &request.committed_occupancy_sha256,
+            )?,
+        };
+        let query_request_id = request.query_request_id.trim().to_owned();
+        let cloud_request = MappingCloudRequest {
+            query_identity: CloudQueryIdentityV1 {
+                query_request_id: query_request_id.clone(),
+                producer: "mapping-cloud".to_owned(),
+                producer_epoch: owner_epoch,
+                source_timestamp_ns: i64::try_from(now_ns())
+                    .map_err(|_| Status::internal("source timestamp exceeds wire range"))?,
+            },
+            query_text: request.query_text,
+            active_map,
+            georeference,
+            caller_timeout: Duration::from_millis(request.caller_timeout_ms),
+            provider_timeout: Duration::from_millis(request.provider_timeout_ms),
+        };
+        self.mapping_cloud_owner
+            .submit(cloud_request)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let terminal = self
+            .mapping_cloud_owner
+            .await_terminal(&query_request_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let (status, message, navigation) = match terminal {
+            MappingCloudTerminal::Succeeded(intent) => {
+                intent
+                    .verify()
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                let map_position = intent.map_position();
+                let timestamp_ns = u64::try_from(intent.query().source_timestamp_ns)
+                    .map_err(|_| Status::internal("mapping-cloud timestamp is invalid"))?;
+                let goal = schema::PoseStamped {
+                    header: schema::Header {
+                        seq: 0,
+                        stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000).map_err(|_| {
+                            Status::internal("mapping-cloud timestamp exceeds wire range")
+                        })?,
+                        stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+                        frame_id: committed_map.frame_id.clone(),
+                    },
+                    pose: schema::Pose {
+                        position: [map_position.x_m, map_position.y_m, map_position.z_m],
+                        orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    },
+                };
+                let admission_io = crate::nav_runtime::NavAdmissionIo::new(
+                    self.bridge.state.clone(),
+                    self.bridge.transport.clone(),
+                    self.bridge.transport_backend_name,
+                    self.bridge.lcm_backend_available,
+                );
+                let outcome = crate::nav_runtime::admit_goal_intent(
+                    &admission_context,
+                    &admission_io,
+                    &self.bridge.nav,
+                    schema::GoalIntent {
+                        producer: "mapping-cloud".to_owned(),
+                        producer_epoch: i64::try_from(owner_epoch)
+                            .map_err(|_| Status::internal("owner epoch exceeds wire range"))?,
+                        priority: 0,
+                        session_id: query_request_id.clone(),
+                        owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                        parent_request_id: query_request_id.clone(),
+                        goal_generation: 0,
+                        cancel_generation: i64::try_from(
+                            self.bridge.nav.cancel_snapshot().generation,
+                        )
+                        .map_err(|_| Status::internal("cancel generation exceeds wire range"))?,
+                        committed_map,
+                        boundary_id: String::new(),
+                        boundary_sha256: [0; 32],
+                        boundary_points: Vec::new(),
+                        motion_guard_generation: i64::try_from(request.motion_guard_generation)
+                            .map_err(|_| {
+                                Status::invalid_argument(
+                                    "motion guard generation exceeds wire range",
+                                )
+                            })?,
+                        motion_guard_boot_nonce: request
+                            .motion_guard_boot_nonce
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| {
+                                Status::invalid_argument(
+                                    "motion_guard_boot_nonce must contain 16 bytes",
+                                )
+                            })?,
+                        motion_stop_generation: i64::try_from(request.motion_stop_generation)
+                            .map_err(|_| {
+                                Status::invalid_argument(
+                                    "motion stop generation exceeds wire range",
+                                )
+                            })?,
+                        goal_sha256: schema::goal_intent_goal_sha256(&goal)
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        goal,
+                    },
+                    crate::nav_runtime::GoalProducerEpochAuthority::MappingCloud,
+                )
+                .await;
+                let update = NavigationUpdate::from_local(
+                    outcome.state.clone(),
+                    &self.bridge.nav,
+                    outcome.lease,
+                )
+                .await;
+                let navigation = nav_state_to_proto(update);
+                let status = if matches!(
+                    navigation.status.as_str(),
+                    "ACCEPTED" | "PLANNING" | "RUNNING"
+                ) {
+                    "SUCCEEDED"
+                } else {
+                    "ADMISSION_REJECTED"
+                };
+                (
+                    status.to_owned(),
+                    navigation.message.clone(),
+                    Some(navigation),
+                )
+            }
+            MappingCloudTerminal::ProviderRejected => (
+                "PROVIDER_REJECTED".to_owned(),
+                "provider returned no result".to_owned(),
+                None,
+            ),
+            MappingCloudTerminal::ProviderFailed(error) => {
+                ("PROVIDER_FAILED".to_owned(), error, None)
+            }
+            MappingCloudTerminal::ProviderTimeout => (
+                "PROVIDER_TIMEOUT".to_owned(),
+                "provider deadline elapsed".to_owned(),
+                None,
+            ),
+            MappingCloudTerminal::CallerDeadline => (
+                "CALLER_DEADLINE".to_owned(),
+                "caller deadline elapsed".to_owned(),
+                None,
+            ),
+            MappingCloudTerminal::Cancelled => {
+                ("CANCELLED".to_owned(), "query cancelled".to_owned(), None)
+            }
+            MappingCloudTerminal::AdaptationFailed(error) => {
+                ("ADAPTATION_FAILED".to_owned(), error.to_string(), None)
+            }
+            MappingCloudTerminal::FinalizerFailed(error) => {
+                ("FINALIZER_FAILED".to_owned(), error, None)
+            }
+        };
+        Ok(Response::new(MappingCloudGoalTerminal {
+            status,
+            message,
+            query_request_id,
+            navigation,
+        }))
     }
 
     async fn cancel_navigation(

@@ -491,6 +491,8 @@ enum CancelStart {
 pub(crate) enum GoalProducerEpochAuthority {
     /// 公开导航使用当前导航运行时的 producer epoch。
     PublicNavigation,
+    /// MappingCloud 使用当前导航运行时的 producer epoch。
+    MappingCloud,
     /// Wavefront 探索使用当前探索会话 generation。
     Wavefront {
         current_session_generation: Arc<AtomicU64>,
@@ -2232,14 +2234,18 @@ pub(crate) async fn admit_goal_intent(
             "public-navigation",
             schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             0
-        ) | (
-            "wavefront",
-            schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            100
-        )
+        ) | ("mapping-cloud", schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV, 0)
+            | (
+                "wavefront",
+                schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                100
+            )
     );
     let authoritative_producer_epoch = match producer_authority {
         GoalProducerEpochAuthority::PublicNavigation if intent.producer == "public-navigation" => {
+            state.producer_runtime_generation()
+        }
+        GoalProducerEpochAuthority::MappingCloud if intent.producer == "mapping-cloud" => {
             state.producer_runtime_generation()
         }
         GoalProducerEpochAuthority::Wavefront {

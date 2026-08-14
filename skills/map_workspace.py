@@ -146,6 +146,86 @@ class MapWorkspaceService:
             )
         self._relocalization_startup_recovery = startup_recovery
 
+    def submit_mapping_cloud_goal(
+        self,
+        *,
+        query_request_id: str,
+        query_text: str,
+        motion_admission: Dict[str, object],
+    ) -> Dict[str, object]:
+        """解析 finalized authority 并提交唯一 mapping-cloud GoalIntent。"""
+
+        provider = self._geometry_runtime.get_geometry_runtime_provider()
+        if provider is None:
+            raise GatewayError("Geometry runtime 未连接，无法提交地点导航。")
+        authority = provider.get_mapping_cloud_authority()
+        from services.mapping.finalized_asset_authority import (
+            CommittedMapAuthority,
+            FinalizedAssetAuthorityResolver,
+            FinalizedMapRuntimeAuthority,
+            SealedFinalizedAssetIdentity,
+        )
+
+        def runtime_authority_provider():
+            current = provider.get_mapping_cloud_authority()
+            return FinalizedMapRuntimeAuthority(
+                sealed=SealedFinalizedAssetIdentity(
+                    map_name=current["map_name"],
+                    map_frame_id=current["map_frame_id"],
+                    asset_manifest_sha256=current["asset_manifest_sha256"],
+                    asset_bundle_sha256=current["asset_bundle_sha256"],
+                    activation_request_id=current["activation_request_id"],
+                    activation_request_identity_sha256=current[
+                        "activation_request_identity_sha256"
+                    ],
+                    activation_identity_sha256=current["activation_identity_sha256"],
+                    target_receipt_sha256=current["target_receipt_sha256"],
+                    runtime_generation=current["runtime_generation"],
+                    lifecycle_epoch=current["lifecycle_epoch"],
+                    session_id=current["mapping_session_id"],
+                    session_generation=current["mapping_session_generation"],
+                    backend_kind=current["backend_kind"],
+                    backend_generation=current["backend_generation"],
+                ),
+                committed_map=CommittedMapAuthority(
+                    session_id=current["mapping_session_id"],
+                    session_generation=current["mapping_session_generation"],
+                    revision=current["committed_occupancy_revision"],
+                    payload_sha256=current["committed_occupancy_sha256"],
+                    frame_id=current["map_frame_id"],
+                ),
+            )
+
+        resolved = FinalizedAssetAuthorityResolver(
+            asset_repository=self._asset_repository,
+            catalog_repository=self._repository,
+            runtime_authority_provider=runtime_authority_provider,
+            owner_epoch_provider=lambda: int(
+                provider.get_mapping_cloud_authority()["owner_epoch"]
+            ),
+        ).resolve()
+        if resolved.companion_sha256 == "":
+            raise GatewayError("finalized map authority companion 无效。")
+        authority = {
+            "map_name": resolved.map_name,
+            "map_frame_id": resolved.map_frame_id,
+            "asset_manifest_sha256": resolved.asset_manifest_sha256,
+            "asset_bundle_sha256": resolved.asset_bundle_sha256,
+            "activation_identity_sha256": resolved.activation_identity_sha256,
+            "runtime_generation": resolved.runtime_generation,
+            "mapping_session_id": resolved.session_id,
+            "mapping_session_generation": resolved.session_generation,
+            "committed_occupancy_revision": resolved.committed_revision,
+            "committed_occupancy_sha256": resolved.committed_payload_sha256,
+        }
+        return provider.submit_mapping_cloud_goal(
+            query_request_id=query_request_id,
+            query_text=query_text,
+            authority=authority,
+            georeference_json=resolved.georeference_bytes,
+            motion_admission=motion_admission,
+        )
+
     @property
     def catalog_root(self) -> str:
         return str(self._repository.root_dir)

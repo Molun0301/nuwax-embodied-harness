@@ -36,6 +36,7 @@ nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link
 # - nuwax-nav-stack:foundation + simple-2d + replanning-astar(P1 再开 native-*/explore)
 # - nuwax-exploration:wavefront + runtime(P1 再开 tare,terrain-map-ext,spec-summary)
 nuwax-mapping = { path = "../../nuwax-workspace/crates/nuwax-mapping" }
+nuwax-mapping-cloud = { path = "../../nuwax-workspace/crates/nuwax-mapping-cloud", features = ["cloud-enabled"] }
 nuwax-mapping-raytracing = { path = "../../nuwax-workspace/crates/nuwax-mapping-raytracing" }
 nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["foundation", "simple-2d", "replanning-astar"] }
 nuwax-nav-types-messages = { path = "../../nuwax-workspace/crates/nuwax-nav-types-messages" }

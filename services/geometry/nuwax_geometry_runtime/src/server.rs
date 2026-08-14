@@ -69,7 +69,7 @@ pub struct GeometryRuntimeService {
     activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl,
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
     mapping_cloud_owner: Arc<MappingCloudOwner>,
-    activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFence>>>,
+    activation_lifecycle_fence: Arc<parking_lot::Mutex<Option<ActivationLifecycleFenceSlot>>>,
     #[cfg(test)]
     activation_fault_after:
         Arc<parking_lot::Mutex<Option<crate::correction_coordinator::ActivationJournalStep>>>,
@@ -80,6 +80,14 @@ pub struct GeometryRuntimeService {
     #[cfg(test)]
     start_mapping_before_cloud_clear: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     #[cfg(test)]
+    stop_before_post_zero_lifecycle: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    retained_receipt_consume_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    retained_receipt_consumed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    stop_after_retained_receipt_consume: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
     stop_before_graceful: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
@@ -87,7 +95,21 @@ struct ActivationLifecycleFence {
     activation_request_id: String,
     activation_request_identity_sha256: [u8; 32],
     retained_global_map: Option<RetainedActivationGlobalMap>,
+    projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
     lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+enum ActivationLifecycleFenceSlot {
+    Held(ActivationLifecycleFence),
+    RestorePending(RestorePendingActivationLifecycleFence),
+}
+
+struct RestorePendingActivationLifecycleFence {
+    activation_request_id: String,
+    activation_request_identity_sha256: [u8; 32],
+    retained_global_map: Option<RetainedActivationGlobalMap>,
+    projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
+    reason: String,
 }
 
 struct RetainedActivationGlobalMap {
@@ -333,6 +355,8 @@ pub struct ShutdownCoordinator {
     geometry_tasks: Option<crate::lcm_runtime::GeometryRuntimeTaskControl>,
     stop_single_flight: Arc<tokio::sync::Mutex<()>>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    correction_settlement_blocker: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 pub struct ShutdownListener {
@@ -401,6 +425,8 @@ fn shutdown_channel_inner(
             geometry_tasks,
             stop_single_flight: Arc::new(tokio::sync::Mutex::new(())),
             mapping_transition,
+            #[cfg(test)]
+            correction_settlement_blocker: Arc::new(parking_lot::Mutex::new(None)),
         },
         ShutdownListener {
             request_rx,
@@ -494,7 +520,20 @@ impl ShutdownCoordinator {
         self.graceful_tx.send_replace(true);
     }
 
+    #[cfg(test)]
+    fn inject_correction_settlement_blocker(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.correction_settlement_blocker.lock() = Some(barrier);
+    }
+
     async fn wait_for_correction_settlement(&self) {
+        #[cfg(test)]
+        {
+            let blocker = self.correction_settlement_blocker.lock().take();
+            if let Some(barrier) = blocker {
+                barrier.wait().await;
+                std::future::pending::<()>().await;
+            }
+        }
         if let Some(correction_phase_a) = &self.correction_phase_a {
             correction_phase_a.wait_settled().await;
         }
@@ -622,6 +661,10 @@ impl GeometryRuntimeService {
             stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
             fail_start_mapping_stop_transition: Arc::new(AtomicBool::new(false)),
             start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
+            stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
+            retained_receipt_consume_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_receipt_consumed: Arc::new(tokio::sync::Notify::new()),
+            stop_after_retained_receipt_consume: Arc::new(parking_lot::Mutex::new(None)),
             stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -682,6 +725,14 @@ impl GeometryRuntimeService {
             #[cfg(test)]
             start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
+            stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            retained_receipt_consume_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            retained_receipt_consumed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            stop_after_retained_receipt_consume: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
             stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -716,18 +767,24 @@ impl GeometryRuntimeService {
         &self,
         activation_request_id: &str,
         activation_request_identity_sha256: [u8; 32],
-    ) -> Result<Option<ActivationLifecycleFence>, ()> {
+    ) -> Result<Option<ActivationLifecycleFence>, &'static str> {
         let mut fence = self.activation_lifecycle_fence.lock();
         match fence.as_ref() {
             None => Ok(None),
-            Some(existing)
+            Some(ActivationLifecycleFenceSlot::Held(existing))
                 if existing.activation_request_id == activation_request_id
                     && existing.activation_request_identity_sha256
                         == activation_request_identity_sha256 =>
             {
-                Ok(fence.take())
+                match fence.take() {
+                    Some(ActivationLifecycleFenceSlot::Held(fence)) => Ok(Some(fence)),
+                    _ => unreachable!("matched activation lifecycle fence changed while locked"),
+                }
             }
-            Some(_) => Err(()),
+            Some(ActivationLifecycleFenceSlot::Held(_)) => Err("ACTIVATE_MAP_LIFECYCLE_FENCE_BUSY"),
+            Some(ActivationLifecycleFenceSlot::RestorePending(_)) => {
+                Err("ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING")
+            }
         }
     }
 
@@ -736,30 +793,51 @@ impl GeometryRuntimeService {
         activation_request_id: &str,
         activation_request_identity_sha256: [u8; 32],
         retained_global_map: Option<RetainedActivationGlobalMap>,
+        projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<(), tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Result<
+        (),
+        (
+            crate::lcm_runtime::ExploreProjectionOwnedGuard,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+    > {
         let mut fence = self.activation_lifecycle_fence.lock();
         if fence.is_some() {
-            return Err(lifecycle_guard);
+            return Err((projection_guard, lifecycle_guard));
         }
-        *fence = Some(ActivationLifecycleFence {
-            activation_request_id: activation_request_id.to_owned(),
-            activation_request_identity_sha256,
-            retained_global_map,
-            lifecycle_guard,
-        });
+        *fence = Some(ActivationLifecycleFenceSlot::Held(
+            ActivationLifecycleFence {
+                activation_request_id: activation_request_id.to_owned(),
+                activation_request_identity_sha256,
+                retained_global_map,
+                projection_guard,
+                lifecycle_guard,
+            },
+        ));
         Ok(())
     }
 
-    fn take_any_activation_lifecycle_fence(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.activation_lifecycle_fence
-            .lock()
-            .take()
-            .map(|fence| fence.lifecycle_guard)
-    }
-
-    fn take_activation_lifecycle_fence(&self) -> Option<ActivationLifecycleFence> {
-        self.activation_lifecycle_fence.lock().take()
+    fn take_activation_lifecycle_fence(&self) -> Result<Option<ActivationLifecycleFence>, Status> {
+        let mut slot = self.activation_lifecycle_fence.lock();
+        match slot.as_ref() {
+            None => Ok(None),
+            Some(ActivationLifecycleFenceSlot::Held(_)) => match slot.take() {
+                Some(ActivationLifecycleFenceSlot::Held(fence)) => Ok(Some(fence)),
+                _ => unreachable!("matched activation lifecycle fence changed while locked"),
+            },
+            Some(ActivationLifecycleFenceSlot::RestorePending(pending)) => {
+                let _retained_projection_guard = &pending.projection_guard;
+                let _activation_request_identity_sha256 =
+                    &pending.activation_request_identity_sha256;
+                Err(Status::failed_precondition(format!(
+                    "ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING: activation_request_id={} retained_global_map={} reason={}",
+                    pending.activation_request_id,
+                    pending.retained_global_map.is_some(),
+                    pending.reason
+                )))
+            }
+        }
     }
 
     fn restore_activation_lifecycle_fence(&self, fence: ActivationLifecycleFence) {
@@ -768,11 +846,83 @@ impl GeometryRuntimeService {
             slot.is_none(),
             "activation lifecycle fence slot changed while Mapping transition was held"
         );
-        *slot = Some(fence);
+        *slot = Some(ActivationLifecycleFenceSlot::Held(fence));
+    }
+
+    fn restore_pending_activation_lifecycle_fence(
+        &self,
+        fence: RestorePendingActivationLifecycleFence,
+    ) {
+        let mut slot = self.activation_lifecycle_fence.lock();
+        assert!(
+            slot.is_none(),
+            "activation lifecycle fence slot changed while Mapping transition was held"
+        );
+        *slot = Some(ActivationLifecycleFenceSlot::RestorePending(fence));
     }
 
     fn has_activation_lifecycle_fence(&self) -> bool {
         self.activation_lifecycle_fence.lock().is_some()
+    }
+
+    fn consume_retained_activation_receipt_after_motion_terminal(
+        &self,
+        retained_metadata: Option<(String, [u8; 32], Option<RetainedActivationGlobalMap>)>,
+    ) {
+        #[cfg(test)]
+        let consumed_retained_receipt = retained_metadata.is_some();
+        drop(retained_metadata);
+        #[cfg(test)]
+        if consumed_retained_receipt {
+            self.retained_receipt_consume_count
+                .fetch_add(1, Ordering::AcqRel);
+            self.retained_receipt_consumed.notify_one();
+        }
+    }
+
+    async fn settle_process_stop_failure(
+        &self,
+        retained_metadata: Option<(String, [u8; 32], Option<RetainedActivationGlobalMap>)>,
+        projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
+        error: Status,
+    ) -> Status {
+        let Some((activation_request_id, activation_request_identity_sha256, retained_global_map)) =
+            retained_metadata
+        else {
+            return error;
+        };
+        match tokio::time::timeout(
+            STOP_LIFECYCLE_TIMEOUT,
+            self.bridge.mapping_lifecycle_lock.clone().lock_owned(),
+        )
+        .await
+        {
+            Ok(lifecycle_guard) => {
+                self.restore_activation_lifecycle_fence(ActivationLifecycleFence {
+                    activation_request_id,
+                    activation_request_identity_sha256,
+                    retained_global_map,
+                    projection_guard,
+                    lifecycle_guard,
+                });
+                error
+            }
+            Err(_) => {
+                let original_detail = error.message().to_owned();
+                self.restore_pending_activation_lifecycle_fence(
+                    RestorePendingActivationLifecycleFence {
+                        activation_request_id,
+                        activation_request_identity_sha256,
+                        retained_global_map,
+                        projection_guard,
+                        reason: original_detail.clone(),
+                    },
+                );
+                Status::deadline_exceeded(format!(
+                    "ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING: timed out restoring mapping lifecycle fence after Process Stop failure; original={original_detail}"
+                ))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -782,10 +932,16 @@ impl GeometryRuntimeService {
         adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
         snapshot: MappingSessionSnapshot,
         cloud_map_reservation: CloudMapSessionReservation,
+        mut projection_guard: crate::lcm_runtime::ExploreProjectionOwnedGuard,
         lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
         _mapping_transition: tokio::sync::OwnedMutexGuard<()>,
         mut cancellation_rx: watch::Receiver<bool>,
     ) -> Result<Response<MappingSessionState>, Status> {
+        self.bridge
+            .revoke_committed_map_projection_locked(&mut projection_guard)
+            .map_err(Status::unavailable)?;
+        drop(lifecycle_guard);
+
         #[cfg(test)]
         if self
             .fail_start_mapping_stop_transition
@@ -802,7 +958,11 @@ impl GeometryRuntimeService {
                     replay,
                     &adapter,
                     &self.bridge.mapping_lifecycle_lock,
-                    lifecycle_guard,
+                    self.bridge
+                        .mapping_lifecycle_lock
+                        .clone()
+                        .lock_owned()
+                        .await,
                     &snapshot,
                     None,
                     "deferred StartMapping RPC waiter cancelled before occupancy fencing",
@@ -828,7 +988,11 @@ impl GeometryRuntimeService {
                             replay,
                             &adapter,
                             &self.bridge.mapping_lifecycle_lock,
-                            lifecycle_guard,
+                            self.bridge
+                                .mapping_lifecycle_lock
+                                .clone()
+                                .lock_owned()
+                                .await,
                             &snapshot,
                             None,
                             format!(
@@ -840,7 +1004,11 @@ impl GeometryRuntimeService {
                     let outcome = finish_failed_mapping_start_rollback(
                         &adapter,
                         &self.bridge.mapping_lifecycle_lock,
-                        lifecycle_guard,
+                        self.bridge
+                            .mapping_lifecycle_lock
+                            .clone()
+                            .lock_owned()
+                            .await,
                         &snapshot,
                         None,
                         format!("occupancy SHM session fence failed: {error}"),
@@ -864,7 +1032,11 @@ impl GeometryRuntimeService {
                         replay,
                         &adapter,
                         &self.bridge.mapping_lifecycle_lock,
-                        lifecycle_guard,
+                        self.bridge
+                            .mapping_lifecycle_lock
+                            .clone()
+                            .lock_owned()
+                            .await,
                         &snapshot,
                         occupancy_fence.take(),
                         format!("deferred Mapping claim failed: {error}"),
@@ -885,7 +1057,11 @@ impl GeometryRuntimeService {
                         replay,
                         &adapter,
                         &self.bridge.mapping_lifecycle_lock,
-                        lifecycle_guard,
+                        self.bridge
+                            .mapping_lifecycle_lock
+                            .clone()
+                            .lock_owned()
+                            .await,
                         &snapshot,
                         occupancy_fence.take(),
                         "deferred StartMapping RPC waiter cancelled during cloud-map clear",
@@ -900,15 +1076,17 @@ impl GeometryRuntimeService {
                     replay,
                     &adapter,
                     &self.bridge.mapping_lifecycle_lock,
-                    lifecycle_guard,
+                    self.bridge
+                        .mapping_lifecycle_lock
+                        .clone()
+                        .lock_owned()
+                        .await,
                     &snapshot,
                     occupancy_fence.take(),
                     format!("deferred StartMapping cloud-map clear failed: {clear_error}"),
                 )
                 .await);
             }
-            drop(lifecycle_guard);
-
             if matches!(claim, crate::lio_ingress::DeferredSessionClaim::Claimed) {
                 let replay_result =
                     await_start_mapping_step(&mut cancellation_rx, replay.replay_claimed()).await;
@@ -1064,7 +1242,11 @@ impl GeometryRuntimeService {
             let outcome = finish_failed_mapping_start_rollback(
                 &adapter,
                 &self.bridge.mapping_lifecycle_lock,
-                lifecycle_guard,
+                self.bridge
+                    .mapping_lifecycle_lock
+                    .clone()
+                    .lock_owned()
+                    .await,
                 &snapshot,
                 occupancy_fence.take(),
                 detail,
@@ -1073,7 +1255,6 @@ impl GeometryRuntimeService {
             return Err(Status::unavailable(outcome.detail_with_diagnostics()));
         }
         drop(occupancy_fence.take());
-        drop(lifecycle_guard);
         Ok(Response::new(self.mapping_state_with_receipt(
             snapshot,
             "mapping session active",
@@ -1108,6 +1289,29 @@ impl GeometryRuntimeService {
     #[cfg(test)]
     fn inject_activate_map_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn inject_stop_before_post_zero_lifecycle_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.stop_before_post_zero_lifecycle.lock() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn inject_stop_after_retained_receipt_consume_barrier(
+        &self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.stop_after_retained_receipt_consume.lock() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn retained_receipt_consume_count(&self) -> usize {
+        self.retained_receipt_consume_count.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_retained_receipt_consume(&self) {
+        self.retained_receipt_consumed.notified().await;
     }
 
     #[cfg(test)]
@@ -1458,7 +1662,7 @@ fn immutable_target_from_checkpoint(
     let canonical_frame = if modern {
         checkpoint.frame_id.as_str()
     } else {
-        checkpoint.frame_id.trim().trim_start_matches('/')
+        checkpoint.frame_id.trim()
     };
     crate::pointcloud::decode_immutable_activated_target(
         canonical_frame,
@@ -1909,46 +2113,56 @@ async fn activate_map_r1(
         Status::deadline_exceeded("timed out joining the in-flight Mapping lifecycle transition")
     })?;
     let bridge = service.bridge.clone();
-    let (mut retained_global_map, mut lifecycle_guard, restore_fence_on_early_return) =
-        match service.take_matching_activation_lifecycle_fence(
-            identity_class.request_id(),
-            activation_request_identity_sha256,
-        ) {
-            Ok(Some(fence)) => (fence.retained_global_map, Some(fence.lifecycle_guard), true),
-            Ok(None) => (
-                None,
-                Some(bridge.mapping_lifecycle_lock.clone().lock_owned().await),
+    let (
+        mut retained_global_map,
+        mut projection_guard,
+        mut lifecycle_guard,
+        restore_fence_on_early_return,
+    ) = match service.take_matching_activation_lifecycle_fence(
+        identity_class.request_id(),
+        activation_request_identity_sha256,
+    ) {
+        Ok(Some(fence)) => (
+            fence.retained_global_map,
+            Some(fence.projection_guard),
+            Some(fence.lifecycle_guard),
+            true,
+        ),
+        Ok(None) => {
+            let projection = bridge.lock_explore_projection_owned().await;
+            let lifecycle = bridge.mapping_lifecycle_lock.clone().lock_owned().await;
+            (None, Some(projection), Some(lifecycle), false)
+        }
+        Err(fence_error_code) => {
+            let current = adapter.lock().snapshot();
+            let terminal = match service.activation_receipts.stage_or_replay(
+                seed.clone(),
+                mapping_session_state(current, fence_error_code),
                 false,
-            ),
-            Err(()) => {
-                let current = adapter.lock().snapshot();
-                let terminal = match service.activation_receipts.stage_or_replay(
-                    seed.clone(),
-                    mapping_session_state(current, "activation lifecycle fence conflict"),
-                    false,
-                ) {
-                    crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => {
-                        *state
+            ) {
+                crate::correction_coordinator::ActivationLedgerAdmission::Terminal(state) => *state,
+                crate::correction_coordinator::ActivationLedgerAdmission::Execute(_) => {
+                    MappingSessionState {
+                        success: false,
+                        message: fence_error_code.to_owned(),
+                        activation_receipt_disposition: ActivationReceiptDisposition::Conflict
+                            as i32,
+                        ..MappingSessionState::default()
                     }
-                    crate::correction_coordinator::ActivationLedgerAdmission::Execute(_) => {
-                        MappingSessionState {
-                            success: false,
-                            message: "ACTIVATE_MAP_LIFECYCLE_FENCE_BUSY".to_owned(),
-                            activation_receipt_disposition: ActivationReceiptDisposition::Conflict
-                                as i32,
-                            ..MappingSessionState::default()
-                        }
-                    }
-                };
-                return Ok(Response::new(terminal));
-            }
-        };
+                }
+            };
+            return Ok(Response::new(terminal));
+        }
+    };
     if let Err(status) = service.ensure_running_admission("ActivateMap").await {
         if restore_fence_on_early_return {
             service.restore_activation_lifecycle_fence(ActivationLifecycleFence {
                 activation_request_id: identity_class.request_id().to_owned(),
                 activation_request_identity_sha256,
                 retained_global_map,
+                projection_guard: projection_guard
+                    .take()
+                    .expect("ActivateMap early return owns projection guard"),
                 lifecycle_guard: lifecycle_guard
                     .take()
                     .expect("ActivateMap early return owns lifecycle guard"),
@@ -1963,6 +2177,9 @@ async fn activate_map_r1(
                 activation_request_id: identity_class.request_id().to_owned(),
                 activation_request_identity_sha256,
                 retained_global_map,
+                projection_guard: projection_guard
+                    .take()
+                    .expect("ActivateMap early return owns projection guard"),
                 lifecycle_guard: lifecycle_guard
                     .take()
                     .expect("ActivateMap early return owns lifecycle guard"),
@@ -1990,6 +2207,9 @@ async fn activate_map_r1(
                     activation_request_id: identity_class.request_id().to_owned(),
                     activation_request_identity_sha256,
                     retained_global_map,
+                    projection_guard: projection_guard
+                        .take()
+                        .expect("ActivateMap early return owns projection guard"),
                     lifecycle_guard: lifecycle_guard
                         .take()
                         .expect("ActivateMap early return owns lifecycle guard"),
@@ -2001,18 +2221,26 @@ async fn activate_map_r1(
     };
 
     if current.active {
+        let mut projection_guard = projection_guard
+            .take()
+            .expect("active ActivateMap owns projection guard");
         let mut lifecycle_guard = lifecycle_guard
             .take()
             .expect("active ActivateMap owns lifecycle guard");
         macro_rules! settle_current_failure {
             ($disposition:expr, $detail:expr) => {{
-                let detail = $detail;
+                let mut detail = $detail;
                 let failure_state =
                     mapping_session_state(adapter.lock().snapshot(), detail.clone());
                 let retirement = adapter.lock().abort_started_session_detached(
                     &current.session_id,
                     current.session_generation,
                 );
+                if let Err(error) =
+                    bridge.revoke_committed_map_projection_locked(&mut projection_guard)
+                {
+                    detail = format!("{detail}; projection revoke failed: {error}");
+                }
                 drop(lifecycle_guard);
                 let terminal = settle_failed_activation_retirement(
                     &service,
@@ -2088,11 +2316,13 @@ async fn activate_map_r1(
                             identity_class.request_id(),
                             activation_request_identity_sha256,
                             Some(retained),
+                            projection_guard,
                             lifecycle_guard,
                         ) {
                             Ok(()) => return Err(Status::internal(detail)),
-                            Err(guard) => {
-                                lifecycle_guard = guard;
+                            Err((returned_projection, returned_lifecycle)) => {
+                                projection_guard = returned_projection;
+                                lifecycle_guard = returned_lifecycle;
                                 settle_current_failure!(
                                     ActivationReceiptDisposition::OutcomeUnknown,
                                     format!("{detail}; lifecycle fence retention failed")
@@ -2130,11 +2360,13 @@ async fn activate_map_r1(
                     identity_class.request_id(),
                     activation_request_identity_sha256,
                     Some(retained_publication),
+                    projection_guard,
                     lifecycle_guard,
                 ) {
                     Ok(()) => return Err(Status::internal(detail)),
-                    Err(guard) => {
-                        lifecycle_guard = guard;
+                    Err((returned_projection, returned_lifecycle)) => {
+                        projection_guard = returned_projection;
+                        lifecycle_guard = returned_lifecycle;
                         settle_current_failure!(
                             ActivationReceiptDisposition::OutcomeUnknown,
                             format!("{detail}; lifecycle fence retention failed")
@@ -2202,6 +2434,9 @@ async fn activate_map_r1(
                     activation_request_id: identity_class.request_id().to_owned(),
                     activation_request_identity_sha256,
                     retained_global_map,
+                    projection_guard: projection_guard
+                        .take()
+                        .expect("ActivateMap early return owns projection guard"),
                     lifecycle_guard: lifecycle_guard
                         .take()
                         .expect("ActivateMap early return owns lifecycle guard"),
@@ -2358,11 +2593,18 @@ async fn activate_map_r1(
     };
     macro_rules! settle_started_failure {
         ($disposition:expr, $detail:expr) => {{
-            let detail = $detail;
+            let mut detail = $detail;
             let failure_state = mapping_session_state(adapter.lock().snapshot(), detail.clone());
             let retirement = adapter
                 .lock()
                 .abort_started_session_detached(&started.session_id, started.session_generation);
+            if let Err(error) = bridge.revoke_committed_map_projection_locked(
+                projection_guard
+                    .as_mut()
+                    .expect("active ActivateMap settlement owns projection guard"),
+            ) {
+                detail = format!("{detail}; projection revoke failed: {error}");
+            }
             drop(
                 lifecycle_guard
                     .take()
@@ -2755,7 +2997,13 @@ async fn activate_map_r1(
             "ACTIVATE_MAP_SHARED_STATE_JOURNAL_CAS_FAILED".to_owned()
         );
     }
-    bridge.map_revision_latest_tx.send_replace(None);
+    bridge
+        .revoke_committed_map_projection_locked(
+            projection_guard
+                .as_mut()
+                .expect("ActivateMap owns projection guard through cutover"),
+        )
+        .map_err(Status::unavailable)?;
     *bridge.occupancy_shm_current.write().await = None;
     if take_activation_fault_after(
         &service,
@@ -2855,13 +3103,17 @@ async fn activate_map_r1(
                     identity_class.request_id(),
                     activation_request_identity_sha256,
                     Some(retained_publication),
+                    projection_guard
+                        .take()
+                        .expect("ActivateMap publication retention owns projection guard"),
                     lifecycle_guard
                         .take()
                         .expect("ActivateMap publication retention owns lifecycle guard"),
                 ) {
                     Ok(()) => return Err(Status::internal(detail)),
-                    Err(guard) => {
-                        lifecycle_guard = Some(guard);
+                    Err((returned_projection, returned_lifecycle)) => {
+                        projection_guard = Some(returned_projection);
+                        lifecycle_guard = Some(returned_lifecycle);
                         settle_started_failure!(
                             ActivationReceiptDisposition::OutcomeUnknown,
                             format!("{detail}; lifecycle fence retention failed")
@@ -3158,7 +3410,7 @@ fn decode_checkpoint_grid(
     if !meta.resolution.is_finite() || meta.resolution <= 0.0 {
         return Err("checkpoint resolution must be finite and positive".to_string());
     }
-    let frame_id = meta.frame_id.trim().trim_start_matches('/');
+    let frame_id = meta.frame_id.trim();
     if frame_id != expected_map_frame_id {
         return Err(format!(
             "checkpoint frame must be {expected_map_frame_id}, received {}",
@@ -3293,7 +3545,7 @@ fn validate_cloud_checkpoint_metadata(
     checkpoint: &CloudMapCheckpoint,
     expected_map_frame_id: &str,
 ) -> Result<(), String> {
-    let frame_id = checkpoint.frame_id.trim().trim_start_matches('/');
+    let frame_id = checkpoint.frame_id.trim();
     if frame_id != expected_map_frame_id {
         return Err(format!(
             "cloud-map checkpoint frame must be {expected_map_frame_id}, received {}",
@@ -3635,7 +3887,7 @@ fn explore_config_from_request(
         }
         None
     } else {
-        if request.boundary_frame_id.trim().trim_start_matches('/') != expected_map_frame_id {
+        if request.boundary_frame_id.trim() != expected_map_frame_id {
             return Err(format!(
                 "exploration boundary_frame_id must be {expected_map_frame_id}"
             ));
@@ -3708,7 +3960,7 @@ async fn forward_map_revision(
             .await
             .is_ok();
     }
-    if event.frame_id.trim().trim_start_matches('/') != expected_map_frame_id {
+    if event.frame_id.trim() != expected_map_frame_id {
         return tx
             .send(Err(Status::failed_precondition(format!(
                 "global map subscriber requires frame={expected_map_frame_id}, received {}",
@@ -4173,33 +4425,66 @@ impl GeometryRuntimeService {
                 return Err(error);
             }
         };
-        let lifecycle_guard = match tokio::time::timeout(STOP_LIFECYCLE_TIMEOUT, async {
-            let guard = match self.take_any_activation_lifecycle_fence() {
-                Some(guard) => guard,
-                None => {
-                    self.bridge
-                        .mapping_lifecycle_lock
-                        .clone()
-                        .lock_owned()
-                        .await
+        let retained_fence = self.take_activation_lifecycle_fence()?;
+        let (projection_guard, lifecycle_guard, retained_metadata) = match retained_fence {
+            Some(fence) => (
+                fence.projection_guard,
+                fence.lifecycle_guard,
+                Some((
+                    fence.activation_request_id,
+                    fence.activation_request_identity_sha256,
+                    fence.retained_global_map,
+                )),
+            ),
+            None => match tokio::time::timeout(STOP_LIFECYCLE_TIMEOUT, async {
+                let projection = self.bridge.lock_explore_projection_owned().await;
+                let lifecycle = self
+                    .bridge
+                    .mapping_lifecycle_lock
+                    .clone()
+                    .lock_owned()
+                    .await;
+                (projection, lifecycle)
+            })
+            .await
+            {
+                Ok((projection, lifecycle)) => (projection, lifecycle, None),
+                Err(_) => {
+                    let error = Status::deadline_exceeded(
+                        "timed out acquiring mapping lifecycle fence during process Stop",
+                    );
+                    let mut state = self.state.write().await;
+                    state.phase = "failed".into();
+                    state.message = error.message().to_string();
+                    return Err(error);
                 }
-            };
-            shutdown.wait_for_correction_settlement().await;
-            guard
-        })
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                let error = Status::deadline_exceeded(
-                    "timed out acquiring mapping lifecycle lock or settling correction during process Stop",
-                );
+            },
+        };
+        drop(lifecycle_guard);
+        macro_rules! fail_before_motion_terminal {
+            ($error:expr) => {{
+                let error = self
+                    .settle_process_stop_failure(retained_metadata, projection_guard, $error)
+                    .await;
                 let mut state = self.state.write().await;
                 state.phase = "failed".into();
                 state.message = error.message().to_string();
                 return Err(error);
-            }
-        };
+            }};
+        }
+        if tokio::time::timeout(
+            STOP_LIFECYCLE_TIMEOUT,
+            shutdown.wait_for_correction_settlement(),
+        )
+        .await
+        .is_err()
+        {
+            let error =
+                Status::deadline_exceeded("timed out settling correction during process Stop");
+            fail_before_motion_terminal!(error);
+        }
+        // Process Stop 阶段 A 此时已成为不可逆 owner。取消 await 期间只持 P、不持 L；
+        // retained 元数据仅在下方精确运动 ownership 终态后消费。
 
         let request_id = self.bridge.explore.snapshot().request_id;
         let stop_snapshot = match tokio::time::timeout(
@@ -4224,19 +4509,13 @@ impl GeometryRuntimeService {
                         let error = Status::internal(format!(
                             "exploration scheduler shutdown failed during stop recovery: {error}"
                         ));
-                        let mut state = self.state.write().await;
-                        state.phase = "failed".into();
-                        state.message = error.message().to_string();
-                        return Err(error);
+                        fail_before_motion_terminal!(error);
                     }
                     Err(_) => {
                         let error = Status::deadline_exceeded(
                             "timed out shutting down exploration scheduler during stop recovery",
                         );
-                        let mut state = self.state.write().await;
-                        state.phase = "failed".into();
-                        state.message = error.message().to_string();
-                        return Err(error);
+                        fail_before_motion_terminal!(error);
                     }
                 };
                 match tokio::time::timeout(
@@ -4252,10 +4531,7 @@ impl GeometryRuntimeService {
                             "timed out dispatching exploration safety stop after scheduler recovery ({scheduler_detail}): request_id={} child_task_id={} status={}",
                             snapshot.request_id, snapshot.child_task_id, snapshot.status
                         ));
-                        let mut state = self.state.write().await;
-                        state.phase = "failed".into();
-                        state.message = error.message().to_string();
-                        return Err(error);
+                        fail_before_motion_terminal!(error);
                     }
                 }
             }
@@ -4263,6 +4539,10 @@ impl GeometryRuntimeService {
         let safety_wait = tokio::time::timeout(STOP_EXPLORATION_SAFETY_TIMEOUT, async {
             let mut snapshot = stop_snapshot;
             loop {
+                self.bridge
+                    .explore
+                    .reconcile_orphan_cancellations()
+                    .await;
                 if !self.bridge.explore.blocks_mapping_mutation().await {
                     return Ok(snapshot);
                 }
@@ -4284,10 +4564,7 @@ impl GeometryRuntimeService {
         match safety_wait {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                let mut state = self.state.write().await;
-                state.phase = "failed".into();
-                state.message = error.message().to_string();
-                return Err(error);
+                fail_before_motion_terminal!(error);
             }
             Err(_) => {
                 let snapshot = self.bridge.explore.snapshot();
@@ -4295,10 +4572,7 @@ impl GeometryRuntimeService {
                     "timed out waiting for exploration safety ownership release: request_id={} child_task_id={} status={}",
                     snapshot.request_id, snapshot.child_task_id, snapshot.status
                 ));
-                let mut state = self.state.write().await;
-                state.phase = "failed".into();
-                state.message = error.message().to_string();
-                return Err(error);
+                fail_before_motion_terminal!(error);
             }
         }
 
@@ -4330,10 +4604,7 @@ impl GeometryRuntimeService {
                         "timed out dispatching navigation safety stop: goal_id={} cancel_generation={} phase={:?}",
                         active_lease.session_id, cancel.generation, cancel.phase
                     ));
-                    let mut state = self.state.write().await;
-                    state.phase = "failed".into();
-                    state.message = error.message().to_string();
-                    return Err(error);
+                    fail_before_motion_terminal!(error);
                 }
             };
             {
@@ -4354,10 +4625,7 @@ impl GeometryRuntimeService {
                     cancel_after_dispatch.phase,
                     cancel_after_dispatch.message
                 ));
-                let mut state = self.state.write().await;
-                state.phase = "failed".into();
-                state.message = error.message().to_string();
-                return Err(error);
+                fail_before_motion_terminal!(error);
             }
 
             let navigation_wait =
@@ -4394,10 +4662,7 @@ impl GeometryRuntimeService {
             match navigation_wait {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let mut state = self.state.write().await;
-                    state.phase = "failed".into();
-                    state.message = error.message().to_string();
-                    return Err(error);
+                    fail_before_motion_terminal!(error);
                 }
                 Err(_) => {
                     let cancel = self.bridge.nav.cancel_snapshot();
@@ -4405,14 +4670,45 @@ impl GeometryRuntimeService {
                         "timed out waiting for navigation safety ownership release: goal_id={} cancel_generation={} phase={:?}",
                         active_lease.session_id, cancel.generation, cancel.phase
                     ));
-                    let mut state = self.state.write().await;
-                    state.phase = "failed".into();
-                    state.message = error.message().to_string();
-                    return Err(error);
+                    fail_before_motion_terminal!(error);
                 }
             }
         }
 
+        self.consume_retained_activation_receipt_after_motion_terminal(retained_metadata);
+        #[cfg(test)]
+        {
+            let barrier = self.stop_after_retained_receipt_consume.lock().take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+        #[cfg(test)]
+        {
+            let barrier = self.stop_before_post_zero_lifecycle.lock().take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+        let lifecycle_guard = match tokio::time::timeout(
+            STOP_LIFECYCLE_TIMEOUT,
+            self.bridge.mapping_lifecycle_lock.clone().lock_owned(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                let error = Status::deadline_exceeded(
+                    "timed out reacquiring mapping lifecycle fence after exact Process Stop motion terminal",
+                );
+                let mut state = self.state.write().await;
+                state.phase = "failed".into();
+                state.message = error.message().to_string();
+                return Err(error);
+            }
+        };
         match tokio::time::timeout(
             STOP_EXPLORATION_SCHEDULER_TIMEOUT,
             self.bridge.shutdown_explore_scheduler(),
@@ -4456,6 +4752,7 @@ impl GeometryRuntimeService {
             state.message = "gRPC listener 已关闭".into();
         }
         drop(lifecycle_guard);
+        drop(projection_guard);
         drop(mapping_transition);
         #[cfg(test)]
         {
@@ -4652,9 +4949,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             )
         })?;
         self.ensure_running_admission("StartMapping").await?;
-        if self.has_activation_lifecycle_fence() {
-            return Err(Status::unavailable("ACTIVATE_MAP_STAGED_LIFECYCLE_FENCE"));
-        }
         let adapter = self
             .bridge
             .mapping_adapter
@@ -4726,6 +5020,20 @@ impl GeometryRuntime for GeometryRuntimeService {
             }
         }
 
+        let retained_fence = self.take_activation_lifecycle_fence()?;
+        let fresh_guards = if retained_fence.is_none() {
+            let projection = self.bridge.lock_explore_projection_owned().await;
+            let lifecycle = self
+                .bridge
+                .mapping_lifecycle_lock
+                .clone()
+                .lock_owned()
+                .await;
+            Some((projection, lifecycle))
+        } else {
+            None
+        };
+
         let cloud_map_reservation = match self.bridge.reserve_cloud_map_session(true) {
             CloudMapSessionRegistration::Admitted(reservation) => reservation,
             CloudMapSessionRegistration::Rejected(admission) => {
@@ -4739,32 +5047,46 @@ impl GeometryRuntime for GeometryRuntimeService {
                         "cloud-map clear reservation returned an invalid admission".to_owned()
                     }
                 };
+                if let Some(fence) = retained_fence {
+                    self.restore_activation_lifecycle_fence(fence);
+                }
                 return Err(Status::unavailable(format!(
                     "StartMapping cloud-map clear registration failed: {detail}"
                 )));
             }
         };
 
-        let lifecycle_guard = match self.take_any_activation_lifecycle_fence() {
-            Some(guard) => guard,
-            None => {
-                self.bridge
-                    .mapping_lifecycle_lock
-                    .clone()
-                    .lock_owned()
-                    .await
+        if let Err(error) = self.ensure_running_admission("StartMapping").await {
+            if let Some(fence) = retained_fence {
+                self.restore_activation_lifecycle_fence(fence);
             }
-        };
-        self.ensure_running_admission("StartMapping").await?;
+            return Err(error);
+        }
 
-        self.activation_receipts
-            .retire_for_mapping_change()
-            .map_err(Status::resource_exhausted)?;
+        if let Err(error) = self.activation_receipts.retire_for_mapping_change() {
+            if let Some(fence) = retained_fence {
+                self.restore_activation_lifecycle_fence(fence);
+            }
+            return Err(Status::resource_exhausted(error));
+        }
 
-        let snapshot = adapter
+        let snapshot = match adapter
             .lock()
             .start_session(&request.session_id, &request.map_name)
-            .map_err(mapping_lifecycle_status)?;
+            .map_err(mapping_lifecycle_status)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if let Some(fence) = retained_fence {
+                    self.restore_activation_lifecycle_fence(fence);
+                }
+                return Err(error);
+            }
+        };
+        let (projection_guard, lifecycle_guard) = match retained_fence {
+            Some(fence) => (fence.projection_guard, fence.lifecycle_guard),
+            None => fresh_guards.expect("fresh StartMapping guards must be present"),
+        };
         let (cancellation_tx, cancellation_rx) = watch::channel(false);
         let mut waiter = StartMappingRpcWaiter::new(cancellation_tx);
         let transition_owner = self.clone();
@@ -4775,6 +5097,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     adapter,
                     snapshot,
                     cloud_map_reservation,
+                    projection_guard,
                     lifecycle_guard,
                     mapping_transition,
                     cancellation_rx,
@@ -4846,17 +5169,18 @@ impl GeometryRuntime for GeometryRuntimeService {
                 )));
             }
         }
-        let mut staged_fence = self.take_activation_lifecycle_fence();
-        let acquired_lifecycle_guard = if staged_fence.is_none() {
-            Some(
-                self.bridge
-                    .mapping_lifecycle_lock
-                    .clone()
-                    .lock_owned()
-                    .await,
-            )
+        let mut staged_fence = self.take_activation_lifecycle_fence()?;
+        let (mut acquired_projection_guard, acquired_lifecycle_guard) = if staged_fence.is_none() {
+            let projection = self.bridge.lock_explore_projection_owned().await;
+            let lifecycle = self
+                .bridge
+                .mapping_lifecycle_lock
+                .clone()
+                .lock_owned()
+                .await;
+            (Some(projection), Some(lifecycle))
         } else {
-            None
+            (None, None)
         };
         if staged_fence.is_none() && self.bridge.explore.blocks_mapping_mutation().await {
             let exploration = self.bridge.explore.snapshot();
@@ -4880,11 +5204,23 @@ impl GeometryRuntime for GeometryRuntimeService {
                 return Err(mapping_lifecycle_status(error));
             }
         };
-        let lifecycle_guard = staged_fence
-            .take()
-            .map(|fence| fence.lifecycle_guard)
-            .or(acquired_lifecycle_guard)
-            .expect("StopMapping owns one lifecycle guard after preflight");
+        let projection_guard = staged_fence
+            .as_mut()
+            .map(|fence| &mut fence.projection_guard)
+            .or(acquired_projection_guard.as_mut())
+            .expect("StopMapping owns one projection guard before mutation");
+        self.bridge
+            .revoke_committed_map_projection_locked(projection_guard)
+            .map_err(Status::unavailable)?;
+        let (projection_guard, lifecycle_guard) = match staged_fence.take() {
+            Some(fence) => (fence.projection_guard, fence.lifecycle_guard),
+            None => (
+                acquired_projection_guard
+                    .take()
+                    .expect("StopMapping owns acquired projection guard"),
+                acquired_lifecycle_guard.expect("StopMapping owns acquired lifecycle guard"),
+            ),
+        };
         #[cfg(test)]
         if self.stop_phase_a_after_detach.swap(false, Ordering::AcqRel) {
             if let Some(phase_a) = self
@@ -4903,6 +5239,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 .map(|_| ())
         };
         drop(lifecycle_guard);
+        drop(projection_guard);
         let backend_retirement = finish_backend_retirement(
             &adapter,
             &self.bridge.mapping_lifecycle_lock,
@@ -5034,6 +5371,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         ));
                     }
                 };
+                let mut projection_guard = bridge.lock_explore_projection_owned().await;
                 let lifecycle_guard = bridge.mapping_lifecycle_lock.lock().await;
                 let committed = adapter
                     .lock()
@@ -5082,7 +5420,11 @@ impl GeometryRuntime for GeometryRuntimeService {
                         .stop_session_detached(&token.session_id)
                         .ok()
                         .and_then(|transition| transition.retirement);
+                    bridge
+                        .revoke_committed_map_projection_locked(&mut projection_guard)
+                        .map_err(Status::unavailable)?;
                     drop(lifecycle_guard);
+                    drop(projection_guard);
                     if let Err(error) = finish_backend_retirement(
                         &adapter,
                         &bridge.mapping_lifecycle_lock,
@@ -5226,7 +5568,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     cloud_checkpoint_proto(cloud_snapshot, raw_map.frame_id.clone());
                 validate_cloud_checkpoint_metadata(
                     &canonical_cloud_checkpoint,
-                    raw_map.frame_id.trim().trim_start_matches('/'),
+                    raw_map.frame_id.trim(),
                 )
                 .map_err(Status::internal)?;
                 let receiver = client.export_checkpoint().map_err(|error| {
@@ -5633,7 +5975,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             frame_id,
             target,
         };
-        let _lifecycle_guard = self.bridge.mapping_lifecycle_lock.lock().await;
         self.ensure_running_admission("SetNavigationGoal").await?;
         if self.bridge.explore.blocks_mapping_mutation().await {
             let exploration = self.bridge.explore.snapshot();
@@ -7745,6 +8086,61 @@ mod cloud_map_update_tests {
 }
 
 #[cfg(test)]
+fn server_test_committed_map_identity(
+    revision: u64,
+    frame_id: &str,
+) -> schema::CommittedMapIdentity {
+    schema::CommittedMapIdentity {
+        session_id: "server-test-map".to_string(),
+        session_generation: 1,
+        revision: i64::try_from(revision).expect("server test map revision"),
+        payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
+        frame_id: frame_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn install_server_test_committed_map_in_frame(
+    handle: &GeometryRuntimeHandle,
+    revision: u64,
+    frame_id: &str,
+) {
+    *handle
+        .committed_map_authority
+        .lock()
+        .expect("server test committed map authority") =
+        Some(server_test_committed_map_identity(revision, frame_id));
+    let checksum = crate::map_checksum::sha256_hex(&[0]);
+    handle
+        .map_revision_latest_tx
+        .send_replace(Some(MapRevisionEvent {
+            session_id: "server-test-map".to_string(),
+            map_name: "server-test-map".to_string(),
+            session_generation: 1,
+            revision,
+            width: 1,
+            height: 1,
+            resolution: 0.1,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            frame_id: frame_id.to_string(),
+            timestamp_ns: revision,
+            data: vec![0].into(),
+            raw_data: Vec::<u8>::new().into(),
+            size: 1,
+            schema_version: 1,
+            checksum: checksum.clone(),
+            raw_checksum: checksum,
+            last_seen_ms: 0,
+        }));
+}
+
+#[cfg(test)]
+fn install_server_test_committed_map(handle: &GeometryRuntimeHandle, revision: u64) {
+    install_server_test_committed_map_in_frame(handle, revision, "map");
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use crate::explore_runtime::{
@@ -7980,12 +8376,14 @@ mod lifecycle_tests {
                 .retained_immutable_target_bytes(),
             retained_bytes
         );
+        let projection_guard = handle.lock_explore_projection_owned().await;
         let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
         assert!(service
             .retain_activation_lifecycle_fence(
                 "relocalize-r1-gate",
                 activation_request_identity_sha256,
                 None,
+                projection_guard,
                 lifecycle_guard,
             )
             .is_ok());
@@ -8050,7 +8448,7 @@ mod lifecycle_tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        drop(service.take_any_activation_lifecycle_fence());
+        drop(service.take_activation_lifecycle_fence());
         assert!(handle
             .mapping_lifecycle_lock
             .clone()
@@ -8857,27 +9255,88 @@ mod lifecycle_tests {
         ) -> Result<ChildNavigationTicket, ChildNavigationSubmitError> {
             let target = request.goal.target;
             let pose = target.pose;
-            let outcome = crate::nav_runtime::set_goal(
-                &self.facade,
+            let producer_epoch_projection = self.facade.explore.producer_epoch_projection();
+            let producer_epoch = producer_epoch_projection.load(Ordering::Acquire);
+            let committed_map = self
+                .facade
+                .committed_map_authority
+                .lock()
+                .expect("response-loss committed map authority")
+                .clone()
+                .ok_or_else(|| {
+                    ChildNavigationSubmitError::Rejected(
+                        "response-loss child is missing committed map authority".to_string(),
+                    )
+                })?;
+            let timestamp_ns = target.stamp.nanos.max(0) as u64;
+            let goal = schema::PoseStamped {
+                header: schema::Header {
+                    seq: 0,
+                    stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000).map_err(|_| {
+                        ChildNavigationSubmitError::Rejected(
+                            "response-loss child timestamp exceeds wire range".to_string(),
+                        )
+                    })?,
+                    stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+                    frame_id: committed_map.frame_id.clone(),
+                },
+                pose: schema::Pose {
+                    position: [pose.position.x, pose.position.y, pose.position.z],
+                    orientation_xyzw: [
+                        pose.orientation.x,
+                        pose.orientation.y,
+                        pose.orientation.z,
+                        pose.orientation.w,
+                    ],
+                },
+            };
+            let goal_sha256 = schema::goal_intent_goal_sha256(&goal)
+                .map_err(|error| ChildNavigationSubmitError::Rejected(error.to_string()))?;
+            let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+                self.facade.mapping_lifecycle_lock.clone(),
+                self.facade.committed_map_authority.clone(),
+                self.facade.map_revision_latest_tx.subscribe(),
+            );
+            let admission_io = crate::nav_runtime::NavAdmissionIo::new(
+                self.facade.state.clone(),
+                self.facade.transport.clone(),
+                self.facade.transport_backend_name,
+                self.facade.lcm_backend_available,
+            );
+            let outcome = crate::nav_runtime::admit_goal_intent(
+                &admission_context,
+                &admission_io,
                 &self.facade.nav,
-                crate::nav_runtime::SetGoalInput {
-                    goal_id: request.request_id,
-                    owner_kind: nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+                schema::GoalIntent {
+                    producer: "wavefront".to_string(),
+                    producer_epoch: i64::try_from(producer_epoch).map_err(|_| {
+                        ChildNavigationSubmitError::Rejected(
+                            "response-loss producer epoch exceeds wire range".to_string(),
+                        )
+                    })?,
+                    priority: 100,
+                    session_id: request.request_id,
+                    owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
                     parent_request_id: request.parent_request_id,
                     goal_generation: 0,
-                    motion_admission: request.motion_admission,
-                    frame_id: "map".to_string(),
-                    target: PoseState {
-                        x: pose.position.x,
-                        y: pose.position.y,
-                        z: pose.position.z,
-                        qx: pose.orientation.x,
-                        qy: pose.orientation.y,
-                        qz: pose.orientation.z,
-                        qw: pose.orientation.w,
-                        frame_id: "map".to_string(),
-                        timestamp_ns: target.stamp.nanos.max(0) as u64,
-                    },
+                    cancel_generation: i64::try_from(self.facade.nav.cancel_snapshot().generation)
+                        .map_err(|_| {
+                            ChildNavigationSubmitError::Rejected(
+                                "response-loss cancel generation exceeds wire range".to_string(),
+                            )
+                        })?,
+                    committed_map,
+                    boundary_id: String::new(),
+                    boundary_sha256: [0; 32],
+                    boundary_points: Vec::new(),
+                    motion_guard_generation: request.motion_admission.guard_generation as i64,
+                    motion_guard_boot_nonce: request.motion_admission.guard_boot_nonce,
+                    motion_stop_generation: request.motion_admission.motion_stop_generation as i64,
+                    goal_sha256,
+                    goal,
+                },
+                crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                    current_session_generation: producer_epoch_projection,
                 },
             )
             .await;
@@ -9017,6 +9476,208 @@ mod lifecycle_tests {
             grid,
             frame_id: "map".to_string(),
         }
+    }
+
+    async fn ingest_server_test_committed_costmap(handle: &GeometryRuntimeHandle, revision: u64) {
+        handle
+            .explore
+            .ingest_committed_costmap_snapshot(
+                frontier_costmap(revision),
+                server_test_committed_map_identity(revision, "map"),
+            )
+            .await
+            .expect("committed frontier costmap");
+    }
+
+    async fn retain_process_stop_activation_fence(
+        service: &GeometryRuntimeService,
+        handle: &GeometryRuntimeHandle,
+        activation_request_id: &str,
+        identity: [u8; 32],
+    ) {
+        let retained_global_map = RetainedActivationGlobalMap {
+            activation_request_identity_sha256: identity,
+            map_frame_id: "map".to_string(),
+            installed_cloud_revision: 7,
+            cloud_receipt: crate::mapping_commit::CloudCommitReceipt {
+                commit_id: crate::mapping_commit::MappingCommitId {
+                    boot_nonce: u128::from_be_bytes(identity[..16].try_into().unwrap()),
+                    sequence: 7,
+                },
+                session_generation: 1,
+                occupancy_revision: 6,
+                cloud_revision: 7,
+                source_timestamp_ns: 8,
+                point_count: 1,
+            },
+            frame: nuwax_protocol::RawLcmFrameBuilder::new(
+                LcmTopic::new("/global_map").expect("retained map topic"),
+                LcmMessageType::new("sensor_msgs.PointCloud2").expect("retained map message type"),
+            )
+            .payload(vec![identity[0]])
+            .seqno(7)
+            .build(),
+        };
+        let projection_guard = handle.lock_explore_projection_owned().await;
+        let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
+        assert!(
+            service
+                .retain_activation_lifecycle_fence(
+                    activation_request_id,
+                    identity,
+                    Some(retained_global_map),
+                    projection_guard,
+                    lifecycle_guard,
+                )
+                .is_ok(),
+            "retain process Stop activation fence"
+        );
+    }
+
+    fn assert_held_process_stop_activation_fence(
+        service: &GeometryRuntimeService,
+        activation_request_id: &str,
+        identity: [u8; 32],
+    ) {
+        let slot = service.activation_lifecycle_fence.lock();
+        let ActivationLifecycleFenceSlot::Held(fence) =
+            slot.as_ref().expect("retained activation lifecycle fence")
+        else {
+            panic!("activation lifecycle fence must be restored as Held");
+        };
+        assert_eq!(fence.activation_request_id, activation_request_id);
+        assert_eq!(fence.activation_request_identity_sha256, identity);
+        let retained = fence
+            .retained_global_map
+            .as_ref()
+            .expect("retained global-map receipt");
+        assert_eq!(retained.activation_request_identity_sha256, identity);
+        assert_eq!(retained.installed_cloud_revision, 7);
+        assert_eq!(retained.cloud_receipt.cloud_revision, 7);
+    }
+
+    #[tokio::test]
+    async fn process_stop_retained_correction_timeout_replays_restore_pending_failure() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let lio_gate = Arc::new(crate::lio_ingress::LioIngressRoutingGate::new(Arc::new(
+            PhaseALioSink::default(),
+        )));
+        let correction_phase_a =
+            crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
+        let (shutdown, mut listener) =
+            crate::server::production_shutdown_channel(lio_gate, correction_phase_a, None);
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        let identity = [0x51; 32];
+        retain_process_stop_activation_fence(
+            &service,
+            &handle,
+            "process-stop-restore-pending",
+            identity,
+        )
+        .await;
+        let correction_entered = Arc::new(tokio::sync::Barrier::new(2));
+        service
+            .shutdown
+            .as_ref()
+            .expect("production shutdown coordinator")
+            .inject_correction_settlement_blocker(correction_entered.clone());
+        let first = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), correction_entered.wait())
+            .await
+            .expect("first Stop must enter correction settlement");
+        let held_lifecycle = handle.mapping_lifecycle_lock.clone().lock_owned().await;
+        let duplicate = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first Stop correction/restore deadline")
+            .expect("first Stop join")
+            .expect_err("correction and restore timeout must fail first Stop");
+        let duplicate_error = tokio::time::timeout(Duration::from_secs(1), duplicate)
+            .await
+            .expect("duplicate Stop failure replay deadline")
+            .expect("duplicate Stop join")
+            .expect_err("duplicate Stop must replay first-owner failure");
+        assert_eq!(first_error.code(), tonic::Code::DeadlineExceeded);
+        assert!(first_error
+            .message()
+            .contains("ACTIVATION_LIFECYCLE_FENCE_RESTORE_PENDING"));
+        assert_eq!(duplicate_error.code(), tonic::Code::FailedPrecondition);
+        assert!(duplicate_error
+            .message()
+            .contains("first Process Stop attempt failed"));
+        let slot = service.activation_lifecycle_fence.lock();
+        let ActivationLifecycleFenceSlot::RestorePending(pending) =
+            slot.as_ref().expect("restore pending slot")
+        else {
+            panic!("restore timeout must preserve a RestorePending fence");
+        };
+        assert_eq!(
+            pending.activation_request_id,
+            "process-stop-restore-pending"
+        );
+        assert_eq!(pending.activation_request_identity_sha256, identity);
+        assert!(pending.retained_global_map.is_some());
+        drop(slot);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
+                .await
+                .is_err()
+        );
+        drop(held_lifecycle);
+    }
+
+    #[tokio::test]
+    async fn process_stop_post_zero_lifecycle_reacquire_timeout_is_bounded() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        retain_process_stop_activation_fence(
+            &service,
+            &handle,
+            "process-stop-post-zero-timeout",
+            [0x53; 32],
+        )
+        .await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.inject_stop_before_post_zero_lifecycle_barrier(barrier.clone());
+        let stop_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
+            })
+        };
+        barrier.wait().await;
+        let held_lifecycle = handle.mapping_lifecycle_lock.clone().lock_owned().await;
+        barrier.wait().await;
+        let error = stop_task
+            .await
+            .expect("post-ZERO Stop join")
+            .expect_err("post-ZERO lifecycle reacquire must time out");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(error
+            .message()
+            .contains("after exact Process Stop motion terminal"));
+        assert!(!service.has_activation_lifecycle_fence());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
+                .await
+                .is_err()
+        );
+        drop(held_lifecycle);
     }
 
     fn activation_request(session_id: &str, map_name: &str) -> ActivateMapRequest {
@@ -9332,6 +9993,7 @@ mod lifecycle_tests {
                 ready: true,
             })
             .expect("motion sink");
+        install_server_test_committed_map(handle, 1);
     }
 
     async fn start_public_navigation(
@@ -9386,6 +10048,7 @@ mod lifecycle_tests {
                 ready: true,
             })
             .expect("motion sink");
+        install_server_test_committed_map(handle, 1);
         GeometryRuntime::set_navigation_goal(
             service,
             Request::new(NavigationGoal {
@@ -9417,11 +10080,7 @@ mod lifecycle_tests {
         request_id: &str,
     ) -> (String, ChildNavigationLease) {
         handle.explore.set_navigation_sink(sink.clone());
-        handle
-            .explore
-            .ingest_costmap_snapshot(frontier_costmap(1))
-            .await
-            .expect("frontier costmap");
+        ingest_server_test_committed_costmap(&handle, 1).await;
         assert_eq!(
             handle
                 .explore
@@ -9600,11 +10259,28 @@ mod lifecycle_tests {
         let handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
+        let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        let accepted = start_public_navigation(&service, &handle, "process-stop-zero-public").await;
+        assert_eq!(accepted.status, "ACCEPTED");
+        let public_lease = handle
+            .nav
+            .active_goal_lease()
+            .await
+            .expect("active public navigation lease");
         let sink = Arc::new(LifecycleExploreSink::default());
         let (child_task_id, lease) =
             start_active_exploration(&handle, sink, "process-stop-zero").await;
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
+        let retained_identity = [0x52; 32];
+        retain_process_stop_activation_fence(
+            &service,
+            &handle,
+            "process-stop-exact-terminal-retained",
+            retained_identity,
+        )
+        .await;
+        let receipt_consume_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.inject_stop_after_retained_receipt_consume_barrier(receipt_consume_barrier.clone());
         let listener_requested = Arc::new(tokio::sync::Notify::new());
         let listener_task = {
             let listener_requested = listener_requested.clone();
@@ -9649,6 +10325,64 @@ mod lifecycle_tests {
             .await
             .expect("process Stop ZEROED proof");
 
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while handle.nav.cancel_snapshot().phase != crate::nav_runtime::CancelPhase::Pending {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process Stop must wait for public navigation ZERO");
+        assert_eq!(service.retained_receipt_consume_count(), 0);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(40),
+                service.wait_for_retained_receipt_consume(),
+            )
+            .await
+            .is_err(),
+            "retained receipt must not be consumed before public Nav ZERO"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
+                .await
+                .is_err(),
+            "retained receipt and listener must remain gated on public Nav ZERO"
+        );
+        let public_cancel = handle.nav.cancel_snapshot();
+        assert_eq!(public_cancel.lease.as_ref(), Some(&public_lease));
+        handle
+            .nav
+            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
+                cancel_generation: public_cancel.generation,
+                goal_id: public_lease.session_id.clone(),
+                owner_kind: public_lease.owner_kind,
+                parent_request_id: public_lease.parent_request_id.clone(),
+                goal_generation: public_lease.goal_generation,
+                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
+                message: "process Stop public navigation ZEROED".to_string(),
+            })
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.wait_for_retained_receipt_consume(),
+        )
+        .await
+        .expect("retained receipt consume must follow public Nav ZERO");
+        tokio::time::timeout(Duration::from_secs(1), receipt_consume_barrier.wait())
+            .await
+            .expect("Process Stop must pause immediately after retained receipt consume");
+        assert_eq!(service.retained_receipt_consume_count(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
+                .await
+                .is_err(),
+            "listener shutdown must not begin before the consume observation is verified"
+        );
+        tokio::time::timeout(Duration::from_secs(1), receipt_consume_barrier.wait())
+            .await
+            .expect("the test must release Process Stop after consume verification");
+
         let response = stop_task
             .await
             .expect("process Stop task")
@@ -9656,7 +10390,9 @@ mod lifecycle_tests {
             .into_inner();
         assert!(response.success);
         listener_task.await.expect("listener shutdown task");
+        assert_eq!(service.retained_receipt_consume_count(), 1);
         assert!(!handle.explore.blocks_mapping_mutation().await);
+        assert!(!service.has_activation_lifecycle_fence());
         assert_eq!(service.state.read().await.phase, "stopped");
     }
 
@@ -9673,6 +10409,14 @@ mod lifecycle_tests {
             .expect("lifecycle exploration sink lock") = Some("guard unavailable".to_string());
         let (shutdown, mut listener) = crate::server::shutdown_channel();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
+        let retained_identity = [0x41; 32];
+        retain_process_stop_activation_fence(
+            &service,
+            &handle,
+            "process-stop-explore-retained",
+            retained_identity,
+        )
+        .await;
 
         let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
             .await
@@ -9682,6 +10426,11 @@ mod lifecycle_tests {
         assert!(error.message().contains("safety ownership retained"));
         assert!(handle.explore.blocks_mapping_mutation().await);
         assert_eq!(service.state.read().await.phase, "failed");
+        assert_held_process_stop_activation_fence(
+            &service,
+            "process-stop-explore-retained",
+            retained_identity,
+        );
         tokio::time::timeout(
             Duration::from_millis(40),
             shutdown.wait_for_readiness_revocation(),
@@ -9805,18 +10554,13 @@ mod lifecycle_tests {
             .expect("real-lcm test handle");
         prime_navigation_runtime(&handle).await;
         let mut facade = handle.clone();
-        facade.explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
         facade.explore_scheduler = Arc::new(tokio::sync::Mutex::new(None));
         let sink = Arc::new(SubmitLeaseThenBlockSink {
             facade,
             entered: tokio::sync::Notify::new(),
         });
         handle.explore.set_navigation_sink(sink.clone());
-        handle
-            .explore
-            .ingest_costmap_snapshot(frontier_costmap(1))
-            .await
-            .expect("frontier costmap");
+        ingest_server_test_committed_costmap(&handle, 1).await;
         assert_eq!(
             handle
                 .explore
@@ -10181,17 +10925,26 @@ mod lifecycle_tests {
             .expect("real-lcm test handle");
         let backend = Arc::new(BlockingCancelPublishBackend::default());
         handle.transport = LcmTransport::new(backend.clone());
+        prime_navigation_runtime(&handle).await;
         let (shutdown, mut listener) = crate::server::shutdown_channel();
         let readiness = shutdown.clone();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
         let accepted =
             start_public_navigation(&service, &handle, "public-stop-cancel-timeout").await;
-        assert_eq!(accepted.status, "ACCEPTED");
+        assert_eq!(accepted.status, "ACCEPTED", "{}", accepted.message);
         let active_lease = handle
             .nav
             .active_goal_lease()
             .await
             .expect("active public lease");
+        let retained_identity = [0x42; 32];
+        retain_process_stop_activation_fence(
+            &service,
+            &handle,
+            "process-stop-public-nav-retained",
+            retained_identity,
+        )
+        .await;
 
         let error = tokio::time::timeout(
             Duration::from_secs(1),
@@ -10216,13 +10969,18 @@ mod lifecycle_tests {
         assert_eq!(state.phase, "failed");
         assert_eq!(state.message, error.message());
         drop(state);
+        assert_held_process_stop_activation_fence(
+            &service,
+            "process-stop-public-nav-retained",
+            retained_identity,
+        );
         tokio::time::timeout(
             Duration::from_secs(1),
             readiness.wait_for_readiness_revocation(),
         )
         .await
         .expect("failed Stop must revoke readiness");
-        assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());
+        assert!(handle.mapping_lifecycle_lock.try_lock().is_err());
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
                 .await
@@ -10505,11 +11263,7 @@ mod lifecycle_tests {
         start_mapping_session(&service, "parked-session", "warehouse-parked").await;
         let sink = Arc::new(LifecycleExploreSink::default());
         handle.explore.set_navigation_sink(sink.clone());
-        handle
-            .explore
-            .ingest_costmap_snapshot(frontier_costmap(1))
-            .await
-            .expect("frontier costmap");
+        ingest_server_test_committed_costmap(&handle, 1).await;
         assert_eq!(
             handle
                 .explore
@@ -13309,6 +14063,17 @@ mod lifecycle_tests {
             .as_ref()
             .expect("production shutdown coordinator")
             .has_shutdown_failed());
+        let duplicate_error = tokio::time::timeout(
+            Duration::from_millis(100),
+            GeometryRuntime::stop(&service, Request::new(StopRequest {})),
+        )
+        .await
+        .expect("duplicate Stop failure replay deadline")
+        .expect_err("duplicate Stop must replay first-owner failure");
+        assert_eq!(duplicate_error.code(), tonic::Code::FailedPrecondition);
+        assert!(duplicate_error
+            .message()
+            .contains("first Process Stop attempt failed"));
         let (_request_rx, _listener_closed_tx, graceful_rx) = listener.into_parts();
         assert!(!*graceful_rx.borrow());
     }
@@ -14476,7 +15241,7 @@ mod lifecycle_tests {
         .expect_err("held lifecycle lock must fail Stop");
 
         assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        assert!(error.message().contains("mapping lifecycle lock"));
+        assert!(error.message().contains("mapping lifecycle fence"));
         assert_eq!(service.state.read().await.phase, "failed");
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
@@ -14574,6 +15339,10 @@ mod exploration_contract_tests {
         };
 
         assert!(explore_config_from_request(&request, "robot/map").is_ok());
+        request.boundary_frame_id = "/robot/map".to_string();
+        let slash_error = explore_config_from_request(&request, "robot/map")
+            .expect_err("slash-prefixed frame must not bypass raw-exact boundary identity");
+        assert!(slash_error.contains("robot/map"));
         request.boundary_frame_id = "map".to_string();
         let error = explore_config_from_request(&request, "robot/map")
             .expect_err("literal map must not bypass the configured frame");
@@ -14759,6 +15528,7 @@ mod navigation_feedback_contract_tests {
                 ready: true,
             })
             .expect("motion sink");
+        install_server_test_committed_map_in_frame(&handle, 1, "robot/map");
         let service = GeometryRuntimeService::new(handle);
 
         let goal = GeometryRuntime::set_navigation_goal(
@@ -14838,6 +15608,7 @@ mod navigation_feedback_contract_tests {
                 ready: true,
             })
             .expect("motion sink");
+        install_server_test_committed_map(&handle, 1);
         let service = GeometryRuntimeService::new(handle);
         let goal = GeometryRuntime::set_navigation_goal(
             &service,

@@ -394,7 +394,9 @@ impl StartupPreflight {
         let mapping_backend =
             mapping_backend::MappingBackendSpec::from_env(match owner_profile.mapping() {
                 owner_profile::MappingBackend::Voxel => mapping_backend::MappingBackendKind::Voxel,
-                owner_profile::MappingBackend::Raytracing => mapping_backend::MappingBackendKind::Raytracing,
+                owner_profile::MappingBackend::Raytracing => {
+                    mapping_backend::MappingBackendKind::Raytracing
+                }
             })?;
         owner_profile
             .admit_production()
@@ -2920,6 +2922,117 @@ pub(crate) mod lifecycle_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn launcher_fixture_digest(bytes: &[u8]) -> String {
+        crate::map_checksum::sha256_bytes(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_launcher_test_release(
+        test_dir: &std::path::Path,
+        runtime_script: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_dir.join("release-generation");
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("launcher release artifact directory");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("launcher release generation permissions");
+        std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o700))
+            .expect("launcher release artifacts permissions");
+        let fixtures = vec![
+            (
+                "build_input_closure",
+                "build-inputs.json",
+                b"{}\n".to_vec(),
+                false,
+            ),
+            (
+                "geometry_runtime",
+                "geometry-runtime",
+                std::fs::read(runtime_script).expect("fake runtime bytes"),
+                true,
+            ),
+            (
+                "group_guardian",
+                "group-guardian",
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+                true,
+            ),
+            (
+                "native_lio_payload:device",
+                "native-lio-device",
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+                true,
+            ),
+            (
+                "native_pgo_payload",
+                "native-pgo-payload",
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+                true,
+            ),
+            (
+                "offline_mapping_cli",
+                "offline-mapping-cli",
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+                true,
+            ),
+        ];
+        let mut entries = Vec::new();
+        for (role, name, bytes, executable) in fixtures {
+            let path = artifacts.join(name);
+            std::fs::write(&path, &bytes).expect("launcher release artifact");
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if executable { 0o500 } else { 0o400 }),
+            )
+            .expect("launcher release artifact permissions");
+            entries.push(serde_json::json!({
+                "role": role,
+                "path": format!("artifacts/{name}"),
+                "size": bytes.len(),
+                "sha256": launcher_fixture_digest(&bytes),
+                "executable": executable,
+            }));
+        }
+        let mut entries_bytes = serde_json::to_vec(&entries).expect("canonical release entries");
+        entries_bytes.push(b'\n');
+        let manifest = serde_json::json!({
+            "schema_version": "nuwax.geometry.release.v1",
+            "generation": launcher_fixture_digest(&entries_bytes),
+            "native_lio_roles": ["device"],
+            "artifacts": entries,
+        });
+        let mut manifest_bytes = serde_json::to_vec(&manifest).expect("canonical release manifest");
+        manifest_bytes.push(b'\n');
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(&manifest_path, manifest_bytes).expect("launcher release manifest");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o400))
+            .expect("launcher release manifest permissions");
+
+        let verifier = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("geometry directory")
+            .join("release_manifest.py");
+        let check = std::process::Command::new("python3")
+            .arg(verifier)
+            .arg("check")
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .output()
+            .expect("release manifest verifier");
+        assert!(
+            check.status.success(),
+            "launcher release fixture verification failed: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        manifest_path
+    }
+
+    #[cfg(target_os = "linux")]
     fn wait_for_path_state(path: &std::path::Path, exists: bool, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while path.exists() != exists && std::time::Instant::now() < deadline {
@@ -4454,6 +4567,7 @@ pub(crate) mod lifecycle_tests {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&binary, permissions).expect("fake runtime executable");
+        let release_manifest = create_launcher_test_release(&guard.test_dir, &binary);
         let launcher_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -4463,12 +4577,13 @@ pub(crate) mod lifecycle_tests {
         guard.launcher = Some(
             std::process::Command::new("bash")
                 .arg(launcher_path)
-                .env("NUWAX_GEOMETRY_RUNTIME_BINARY", &binary)
+                .env("NUWAX_GEOMETRY_RELEASE_MANIFEST", &release_manifest)
                 .env("NUWAX_GEOMETRY_RUNTIME_READY_FILE", &ready)
                 .env("NUWAX_GEOMETRY_RUNTIME_PORT", "50051")
                 .env("NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT", "2")
                 .env("NUWAX_TEST_REVOKE_FILE", &revoke)
                 .env("NUWAX_TEST_RUNTIME_PID_FILE", &runtime_pid_path)
+                .env("NUWAX_GEOMETRY_LIO_BACKEND", "device")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

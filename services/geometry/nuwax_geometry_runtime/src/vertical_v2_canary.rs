@@ -180,10 +180,14 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
     let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
     let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
+    let explore_projection_gate = Arc::new(tokio::sync::Mutex::new(
+        super::ExploreProjectionGate::default(),
+    ));
     spawn_map_revision_fanout(
         map_revision_rx,
         map_revision_latest_tx,
         committed_map_authority.clone(),
+        explore_projection_gate.clone(),
         publisher.clone(),
         occupancy_topic.clone(),
         occupancy_type.clone(),
@@ -318,6 +322,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         frontiers_tx,
         map_revision_tx: map_revision_tx.clone(),
         map_revision_latest_tx: bridge_map_revision_latest_tx,
+        explore_projection_gate,
         committed_map_authority,
         mapping_lifecycle_lock: lifecycle_lock,
         transport: publisher.clone(),
@@ -327,6 +332,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         nav: nav.clone(),
         exploration_producer_epoch: explore.producer_epoch_projection(),
         runtime_observation_generation: Arc::new(AtomicU64::new(1)),
+        orphan_cancellations: explore.orphan_cancellation_registry(),
     };
     explore.set_navigation_sink(Arc::new(bridge));
     tokio::time::sleep(Duration::from_millis(75)).await;

@@ -11040,6 +11040,86 @@ mod preflight_only_contract {
 
         const COMMIT_NONCE: u128 = 0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001;
         const LEASE_NONCE: u128 = 0x8877_6655_4433_2211_1020_3040_5060_7080;
+        const VERIFIED_PGO_ENV: &str = "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE";
+        const VERIFIED_GUARDIAN_ENV: &str = "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE";
+        static VERIFIED_RELEASE_ENV_LOCK: tokio::sync::Mutex<()> =
+            tokio::sync::Mutex::const_new(());
+
+        struct VerifiedCorrectionReleaseEnv {
+            _lock: tokio::sync::MutexGuard<'static, ()>,
+            previous_pgo: Option<std::ffi::OsString>,
+            previous_guardian: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for VerifiedCorrectionReleaseEnv {
+            fn drop(&mut self) {
+                match self.previous_pgo.take() {
+                    Some(value) => std::env::set_var(VERIFIED_PGO_ENV, value),
+                    None => std::env::remove_var(VERIFIED_PGO_ENV),
+                }
+                match self.previous_guardian.take() {
+                    Some(value) => std::env::set_var(VERIFIED_GUARDIAN_ENV, value),
+                    None => std::env::remove_var(VERIFIED_GUARDIAN_ENV),
+                }
+            }
+        }
+
+        async fn verified_correction_release_env() -> VerifiedCorrectionReleaseEnv {
+            let lock = VERIFIED_RELEASE_ENV_LOCK.lock().await;
+            let injected_pgo = std::env::var_os(VERIFIED_PGO_ENV)
+                .expect("native PGO role must be injected by the exact release harness");
+            let injected_pgo_path = PathBuf::from(&injected_pgo)
+                .canonicalize()
+                .expect("verified native PGO role path");
+            let generation_root = injected_pgo_path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .expect("native PGO role belongs to a release generation");
+            let manifest_path = generation_root.join("manifest.json");
+            let checker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("geometry service directory")
+                .join("release_manifest.py");
+            let check = Command::new("python3")
+                .arg(&checker)
+                .arg("check")
+                .arg("--manifest")
+                .arg(&manifest_path)
+                .status()
+                .expect("release manifest verifier");
+            assert!(check.success(), "correction release manifest proof");
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&manifest_path).expect("verified release manifest"),
+            )
+            .expect("verified release manifest JSON");
+            let role_path = |role: &str| {
+                let relative = manifest["artifacts"]
+                    .as_array()
+                    .expect("verified release artifacts")
+                    .iter()
+                    .find(|artifact| artifact["role"].as_str() == Some(role))
+                    .and_then(|artifact| artifact["path"].as_str())
+                    .expect("required verified release role");
+                generation_root
+                    .join(relative)
+                    .canonicalize()
+                    .expect("verified release role path")
+            };
+            let verified_pgo = role_path("native_pgo_payload");
+            let verified_guardian = role_path("group_guardian");
+            assert_eq!(verified_pgo, injected_pgo_path);
+            let previous_pgo = std::env::var_os(VERIFIED_PGO_ENV);
+            let previous_guardian = std::env::var_os(VERIFIED_GUARDIAN_ENV);
+            std::env::set_var(VERIFIED_PGO_ENV, verified_pgo);
+            std::env::set_var(VERIFIED_GUARDIAN_ENV, verified_guardian);
+            VerifiedCorrectionReleaseEnv {
+                _lock: lock,
+                previous_pgo,
+                previous_guardian,
+            }
+        }
+
         const GENERATED_PAYLOAD_SHA256: [u8; 32] = [
             0xb9, 0xc5, 0xa8, 0x81, 0x10, 0xd9, 0x96, 0x8b, 0x19, 0x09, 0xa3, 0x63, 0xc8, 0x1e,
             0xa0, 0x61, 0xe8, 0x36, 0xc0, 0x16, 0x54, 0xc5, 0xb5, 0x9f, 0x51, 0xdc, 0xea, 0x3c,
@@ -15938,6 +16018,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn actual_native_owner_returns_typed_dispositions_and_direct_finalizes_candidate() {
+            let _release_env = verified_correction_release_env().await;
             let provider = crate::lcm_runtime::test_lcm_url();
             let sink = Arc::new(NativeFinalizingSink::default());
             let owner = CorrectionTransportOwner::start(
@@ -16018,6 +16099,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn native_finalizer_handoff_failure_cleans_waiter_stage_and_generation() {
+            let _release_env = verified_correction_release_env().await;
             let provider = crate::lcm_runtime::test_lcm_url();
             let sink = Arc::new(NativeFinalizingSink::default());
             let mut owner = CorrectionTransportOwner::start(

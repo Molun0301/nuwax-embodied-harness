@@ -891,7 +891,7 @@ mod tests {
         )
         .args([
             "-c",
-            "import pathlib,sys,tempfile,numpy as np; sys.path[:0]=[sys.argv[1],sys.argv[2]]; from pointcloud_map import write_pcd_binary_xyz,read_pcd_xyz; p=pathlib.Path(tempfile.mkstemp(suffix='.pcd')[1]); write_pcd_binary_xyz(p,np.asarray(__import__('json').loads(sys.argv[3]),dtype=np.float64)); read_pcd_xyz(p); sys.stdout.buffer.write(p.read_bytes()); p.unlink()",
+            "import pathlib,sys,tempfile,numpy as np; sys.path[:0]=[sys.argv[1],sys.argv[2]]; from services.geometry.pointcloud_map import write_pcd_binary_xyz,read_pcd_xyz; p=pathlib.Path(tempfile.mkstemp(suffix='.pcd')[1]); write_pcd_binary_xyz(p,np.asarray(__import__('json').loads(sys.argv[3]),dtype=np.float64)); read_pcd_xyz(p); sys.stdout.buffer.write(p.read_bytes()); p.unlink()",
             env!("CARGO_MANIFEST_DIR"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."),
             points_json,

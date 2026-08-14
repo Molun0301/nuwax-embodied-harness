@@ -660,6 +660,27 @@ fn map_event_matches_current_session(
 
 type GeometryTaskFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
 
+#[derive(Default)]
+pub(crate) struct ExploreProjectionGate {
+    pending_latest: Option<MapRevisionEvent>,
+}
+
+pub(crate) type ExploreProjectionOwnedGuard = tokio::sync::OwnedMutexGuard<ExploreProjectionGate>;
+
+fn newer_projection_event(current: &MapRevisionEvent, candidate: &MapRevisionEvent) -> bool {
+    candidate.session_generation > current.session_generation
+        || (candidate.session_generation == current.session_generation
+            && candidate.revision > current.revision)
+}
+
+fn same_projection_event(current: &MapRevisionEvent, candidate: &MapRevisionEvent) -> bool {
+    current.session_id == candidate.session_id
+        && current.map_name == candidate.map_name
+        && current.session_generation == candidate.session_generation
+        && current.revision == candidate.revision
+        && current.checksum == candidate.checksum
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GeometryTaskClass {
     Persistent,
@@ -2619,6 +2640,9 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
             .expect("production mapping adapter")
             .clone();
         let mapping_lifecycle_lock = handle.mapping_lifecycle_lock.clone();
+        let explore_projection_gate = handle.explore_projection_gate.clone();
+        let committed_map_authority = handle.committed_map_authority.clone();
+        let map_revision_latest_tx = handle.map_revision_latest_tx.clone();
         let cloud_map_writer = handle.cloud_map_writer.clone();
         let state = handle.state.clone();
         let task_control = handle
@@ -2628,6 +2652,9 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
             ingest_mapping_points_with_backend(
                 &mapping,
                 &mapping_lifecycle_lock,
+                &explore_projection_gate,
+                &committed_map_authority,
+                &map_revision_latest_tx,
                 &cloud_map_writer,
                 &[],
                 16,
@@ -2873,6 +2900,9 @@ pub struct GeometryRuntimeHandle {
     /// Latest-only revision stream. The broadcast sender above remains the
     /// adapter ingress ABI; one coalescer owns the broadcast -> watch bridge.
     pub map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    /// Explore committed-map projection gate P. All projection pending/revoke
+    /// transitions take P before the mapping lifecycle fence.
+    pub(crate) explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     /// Composition-owned authoritative committed-map identity. The mapping
     /// lifecycle fence is its sole mutation/admission gate.
     pub(crate) committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
@@ -2938,6 +2968,35 @@ impl GeometryRuntimeHandle {
         self.task_control.clone()
     }
 
+    fn revoke_committed_map_projection_parts_locked(
+        committed_map_authority: &Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+        map_revision_latest_tx: &watch::Sender<Option<MapRevisionEvent>>,
+    ) -> Result<(), String> {
+        let mut authority = committed_map_authority
+            .lock()
+            .map_err(|_| "committed-map authority state is unavailable".to_string())?;
+        *authority = None;
+        map_revision_latest_tx.send_replace(None);
+        Ok(())
+    }
+
+    /// 调用方必须按 P -> mapping_lifecycle_lock 持有两个 owner fence。
+    /// 同步撤销组合层 pending、authority 与 latest watch，不接管 backend retirement。
+    pub(crate) async fn lock_explore_projection_owned(&self) -> ExploreProjectionOwnedGuard {
+        self.explore_projection_gate.clone().lock_owned().await
+    }
+
+    pub(crate) fn revoke_committed_map_projection_locked(
+        &self,
+        projection: &mut ExploreProjectionOwnedGuard,
+    ) -> Result<(), String> {
+        projection.pending_latest = None;
+        Self::revoke_committed_map_projection_parts_locked(
+            &self.committed_map_authority,
+            &self.map_revision_latest_tx,
+        )
+    }
+
     pub fn subscribe_map_revisions(&self) -> watch::Receiver<Option<MapRevisionEvent>> {
         self.map_revision_latest_tx.subscribe()
     }
@@ -2952,8 +3011,6 @@ impl GeometryRuntimeHandle {
         let transport = self.transport.clone();
         let writer = self.cloud_map_writer.clone();
         let state = self.state.clone();
-        let map_revision_latest_tx = self.map_revision_latest_tx.clone();
-        let committed_map_authority = self.committed_map_authority.clone();
         let occupancy_shm_current = self.occupancy_shm_current.clone();
         let cloud_map_tx = self.cloud_map_tx.clone();
         let mapping_adapter = self.mapping_adapter.clone();
@@ -3001,12 +3058,6 @@ impl GeometryRuntimeHandle {
                     let mut shared = state.write().await;
                     shared.map = MapState::default();
                 }
-                if let Ok(mut authority) = committed_map_authority.lock() {
-                    *authority = None;
-                } else {
-                    return Err("committed-map authority state is unavailable".to_string());
-                }
-                map_revision_latest_tx.send_replace(None);
                 *occupancy_shm_current.write().await = None;
             }
             let _ = update_tx.send(CloudMapSessionAdmission::Registered(update));
@@ -4568,6 +4619,7 @@ struct ExploreNavigationBridge {
     frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     transport: LcmTransport,
@@ -4577,6 +4629,7 @@ struct ExploreNavigationBridge {
     nav: crate::nav_runtime::NavRuntimeState,
     exploration_producer_epoch: Arc<std::sync::atomic::AtomicU64>,
     runtime_observation_generation: Arc<std::sync::atomic::AtomicU64>,
+    orphan_cancellations: Arc<crate::explore_runtime::OrphanCancellationRegistry>,
     #[cfg(not(test))]
     task_control: Option<GeometryRuntimeTaskControl>,
 }
@@ -4643,6 +4696,7 @@ impl ExploreNavigationBridge {
             frontiers_tx: self.frontiers_tx.clone(),
             map_revision_tx: self.map_revision_tx.clone(),
             map_revision_latest_tx: self.map_revision_latest_tx.clone(),
+            explore_projection_gate: self.explore_projection_gate.clone(),
             committed_map_authority: self.committed_map_authority.clone(),
             transport: self.transport.clone(),
             transport_backend_name: self.transport_backend_name,
@@ -4788,6 +4842,16 @@ fn classify_exploration_submit_rejection(
 
 #[async_trait]
 impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
+    fn current_cancel_generation(&self) -> Result<u64, String> {
+        let snapshot = self.nav.cancel_snapshot();
+        if snapshot.phase == crate::nav_runtime::CancelPhase::Failed
+            && snapshot.message == "CANCEL_STATE_UNAVAILABLE"
+        {
+            return Err(snapshot.message);
+        }
+        Ok(snapshot.generation)
+    }
+
     fn current_map_name(&self) -> Result<String, String> {
         self.map_revision_latest_tx
             .borrow()
@@ -4947,6 +5011,96 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
             failure: retry_failure.or(terminal_failure),
         })
     }
+
+    fn retain_orphan_cancellation(
+        &self,
+        lease: crate::explore_runtime::ChildNavigationLease,
+    ) -> Result<(), String> {
+        self.orphan_cancellations.register(lease.clone());
+        if !self.orphan_cancellations.claim_owner(&lease) {
+            return Ok(());
+        }
+        let bridge = self.clone();
+        let registry = self.orphan_cancellations.clone();
+        let retained_lease = lease.clone();
+        let task = async move {
+            loop {
+                if crate::explore_runtime::ExploreNavigationSink::orphan_lease_is_terminal(
+                    &bridge,
+                    &retained_lease,
+                )
+                .await
+                {
+                    registry.remove_terminal(&retained_lease);
+                    return Ok(());
+                }
+                let should_cancel =
+                    match crate::explore_runtime::ExploreNavigationSink::recover_cancel_receipt(
+                        &bridge,
+                        &retained_lease,
+                    ) {
+                        Some(recovery) if recovery.failure.is_none() => {
+                            registry.mark_cancel_pending(&retained_lease);
+                            false
+                        }
+                        Some(_) | None => true,
+                    };
+                if should_cancel {
+                    match crate::explore_runtime::ExploreNavigationSink::cancel(
+                        &bridge,
+                        &retained_lease,
+                    )
+                    .await
+                    {
+                        Ok(_) => registry.mark_cancel_pending(&retained_lease),
+                        Err(error) => warn!(
+                            session_id = %retained_lease.session_id,
+                            %error,
+                            "orphan exploration lease cancellation retry failed"
+                        ),
+                    }
+                }
+                tokio::time::sleep(EXPLORATION_CANCEL_RETRY_INTERVAL).await;
+            }
+        };
+        let admission = if let Some(control) = self.geometry_task_control() {
+            control.register_retained("orphan-child-cancel", task)
+        } else {
+            tokio::spawn(async move {
+                let _ = task.await;
+            });
+            Ok(())
+        };
+        if let Err(error) = admission {
+            self.orphan_cancellations.release_owner(&lease);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn orphan_lease_is_terminal(
+        &self,
+        expected: &crate::explore_runtime::ChildNavigationLease,
+    ) -> bool {
+        if self
+            .nav
+            .active_goal_lease()
+            .await
+            .as_ref()
+            .is_some_and(|lease| exploration_child_lease(lease).matches(expected))
+        {
+            return false;
+        }
+        let cancel = self.nav.cancel_snapshot();
+        let matching_cancel = cancel.lease.as_ref().filter(|lease| {
+            lease.owner_kind == schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+                && exploration_child_lease(lease).matches(expected)
+        });
+        match matching_cancel {
+            Some(_) => cancel.phase == crate::nav_runtime::CancelPhase::Zeroed,
+            None => true,
+        }
+    }
 }
 
 fn cancel_phase_name(phase: crate::nav_runtime::CancelPhase) -> &'static str {
@@ -5003,70 +5157,6 @@ async fn apply_typed_navigation_feedback(
     mut update: NavigationUpdate,
 ) -> Option<NavigationUpdate> {
     normalize_pending_cancel_zero_ack_path_identity(nav, &mut update);
-    let correlated_lease = match nav
-        .correlate_navigation_state(
-            &update.state.goal_id,
-            update.feedback.owner_kind,
-            &update.feedback.parent_request_id,
-            update.feedback.goal_generation,
-            update.feedback.path_revision,
-            update.feedback.goal_payload_sha256,
-            update.feedback.path_payload_sha256,
-        )
-        .await
-    {
-        Ok(Some(lease)) => {
-            update.producer_runtime_generation = lease.producer_runtime_generation;
-            Some(lease)
-        }
-        Ok(None) => None,
-        Err(error) => {
-            let cancel = nav.cancel_snapshot();
-            let active = nav.active_goal_lease().await;
-            let (expected, expected_lease_source) = match (active.as_ref(), cancel.lease.as_ref()) {
-                (Some(active), _) => (Some(active), "active"),
-                (None, Some(cancel)) => (Some(cancel), "cancel"),
-                (None, None) => (None, "none"),
-            };
-            let zero_ack_present = !update.feedback.zero_ack_id.trim().is_empty();
-            let complete_zero_proof = update.feedback.cancel_generation > 0
-                && zero_ack_present
-                && update.feedback.zero_applied_monotonic_ns > 0;
-            warn!(
-                %error,
-                session_id = %update.state.goal_id,
-                received_path_revision = update.feedback.path_revision,
-                expected_lease_source,
-                expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
-                received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
-                expected_path_hash_zero = expected
-                    .is_none_or(|lease| lease.path_payload_sha256 == [0; 32]),
-                path_hash_matches = expected.is_some_and(|lease| {
-                    lease.path_payload_sha256 == update.feedback.path_payload_sha256
-                }),
-                received_cancel_generation = update.feedback.cancel_generation,
-                expected_cancel_generation = cancel.generation,
-                zero_ack_present,
-                zero_applied_monotonic_ns = update.feedback.zero_applied_monotonic_ns,
-                complete_zero_proof,
-                cancel_phase = ?cancel.phase,
-                cancel_goal_matches = cancel.goal_id == update.state.goal_id,
-                owner_matches = expected
-                    .is_some_and(|lease| lease.owner_kind == update.feedback.owner_kind),
-                parent_matches = expected.is_some_and(|lease| {
-                    lease.parent_request_id == update.feedback.parent_request_id
-                }),
-                goal_generation_matches = expected.is_some_and(|lease| {
-                    lease.goal_generation == update.feedback.goal_generation
-                }),
-                goal_hash_matches = expected.is_some_and(|lease| {
-                    lease.goal_payload_sha256 == update.feedback.goal_payload_sha256
-                }),
-                "typed navigation state rejected"
-            );
-            return None;
-        }
-    };
     let planner_observation = if update.feedback.runtime_generation > 0 {
         let map_frame = normalize_frame(&update.feedback.planner_map_frame);
         let pose_frame = normalize_frame(&update.feedback.planner_pose_frame);
@@ -5101,23 +5191,7 @@ async fn apply_typed_navigation_feedback(
         None
     };
 
-    update.state = if let Some(lease) = correlated_lease.as_ref() {
-        match nav
-            .observe_correlated_navigation_state(
-                update.state.clone(),
-                lease,
-                planner_observation,
-                motion_sink_observation,
-            )
-            .await
-        {
-            Ok(state) => state,
-            Err(error) => {
-                warn!(%error, session_id = %update.state.goal_id, "superseded navigation state rejected");
-                return None;
-            }
-        }
-    } else {
+    if update.state.goal_id.is_empty() {
         if let Some(observation) = planner_observation {
             if let Err(error) = nav.observe_planner_input(observation) {
                 warn!(?error, "typed planner observation rejected");
@@ -5132,8 +5206,54 @@ async fn apply_typed_navigation_feedback(
                 warn!(?error, "idle motion-sink observation rejected");
             }
         }
-        nav.observe_unowned_stack_heartbeat(update.state)
-    };
+        update.state = nav.observe_unowned_stack_heartbeat(update.state);
+    } else {
+        match nav
+            .apply_correlated_navigation_state(
+                update.state.clone(),
+                &update.state.goal_id,
+                update.feedback.owner_kind,
+                &update.feedback.parent_request_id,
+                update.feedback.goal_generation,
+                update.feedback.path_revision,
+                update.feedback.goal_payload_sha256,
+                update.feedback.path_payload_sha256,
+                planner_observation,
+                motion_sink_observation,
+            )
+            .await
+        {
+            Ok((state, lease)) => {
+                update.state = state;
+                update.producer_runtime_generation = lease.producer_runtime_generation;
+            }
+            Err(error) => {
+                let cancel = nav.cancel_snapshot();
+                let active = nav.active_goal_lease().await;
+                let (expected, expected_lease_source) =
+                    match (active.as_ref(), cancel.lease.as_ref()) {
+                        (Some(active), _) => (Some(active), "active"),
+                        (None, Some(cancel)) => (Some(cancel), "cancel"),
+                        (None, None) => (None, "none"),
+                    };
+                warn!(
+                    %error,
+                    session_id = %update.state.goal_id,
+                    received_path_revision = update.feedback.path_revision,
+                    expected_lease_source,
+                    expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
+                    received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
+                    expected_path_hash_zero = expected
+                        .map_or(true, |lease| lease.path_payload_sha256 == [0; 32]),
+                    path_hash_matches = expected.is_some_and(|lease| {
+                        lease.path_payload_sha256 == update.feedback.path_payload_sha256
+                    }),
+                    "typed navigation state rejected"
+                );
+                return None;
+            }
+        }
+    }
     let has_zero_proof = update.feedback.cancel_generation > 0
         || !update.feedback.zero_ack_id.is_empty()
         || update.feedback.zero_applied_monotonic_ns > 0;
@@ -5700,6 +5820,7 @@ fn spawn_map_revision_fanout(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5714,6 +5835,7 @@ fn spawn_map_revision_fanout(
         map_revision_rx,
         map_revision_latest_tx,
         committed_map_authority,
+        explore_projection_gate,
         transport,
         occupancy_topic,
         occupancy_msg_type,
@@ -5731,6 +5853,7 @@ fn spawn_map_revision_fanout_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5746,6 +5869,7 @@ fn spawn_map_revision_fanout_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
         committed_map_authority,
+        explore_projection_gate,
         transport,
         occupancy_topic,
         occupancy_msg_type,
@@ -5770,6 +5894,7 @@ fn map_revision_fanout_futures_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
     committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5842,51 +5967,161 @@ fn map_revision_fanout_futures_in_frame(
 
     let explore_mapping_adapter = mapping_adapter.clone();
     let explore_lifecycle_lock = mapping_lifecycle_lock.clone();
+    let explore_committed_map_authority = committed_map_authority.clone();
     let explore_expected_map_frame = expected_map_frame.clone();
     let explore_task: GeometryTaskFuture = Box::pin(async move {
-        while explore_rx.changed().await.is_ok() {
-            let Some(event) = explore_rx.borrow_and_update().clone() else {
-                continue;
+        loop {
+            let event = {
+                let mut projection = explore_projection_gate.lock().await;
+                if projection.pending_latest.is_none() {
+                    drop(projection);
+                    if explore_rx.changed().await.is_err() {
+                        break;
+                    }
+                    let observed = {
+                        let observed = explore_rx.borrow_and_update();
+                        observed.clone()
+                    };
+                    let Some(observed) = observed else {
+                        continue;
+                    };
+                    projection = explore_projection_gate.lock().await;
+                    if projection
+                        .pending_latest
+                        .as_ref()
+                        .map_or(true, |current| newer_projection_event(current, &observed))
+                    {
+                        projection.pending_latest = Some(observed);
+                    }
+                }
+                projection
+                    .pending_latest
+                    .clone()
+                    .expect("projection pending event initialized above")
             };
-            let claimed = {
-                let _lifecycle_guard = explore_lifecycle_lock.lock().await;
-                map_event_matches_current_session(&event, &explore_mapping_adapter)
-            };
-            if !claimed {
-                continue;
-            }
-            match exploration_costmap_from_revision_in_frame(
+
+            let snapshot = match exploration_costmap_from_revision_in_frame(
                 &event,
                 explore_expected_map_frame.as_ref(),
             ) {
-                Ok(snapshot) => {
-                    let committed_map = match committed_map_identity_from_revision(&event) {
-                        Ok(identity) => identity,
-                        Err(error) => {
-                            warn!(revision = event.revision, %error, "committed map identity rejected before exploration fanout");
-                            continue;
-                        }
-                    };
-                    match tokio::time::timeout(
-                        MAP_FANOUT_SINK_TIMEOUT,
-                        explore.ingest_committed_costmap_snapshot(snapshot, committed_map),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            warn!(revision = event.revision, %error, "exploration costmap fanout failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                revision = event.revision,
-                                "exploration costmap fanout timed out"
-                            );
-                        }
-                    }
-                }
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     warn!(revision = event.revision, %error, "exploration costmap conversion failed");
+                    let mut projection = explore_projection_gate.lock().await;
+                    if projection
+                        .pending_latest
+                        .as_ref()
+                        .is_some_and(|current| same_projection_event(current, &event))
+                    {
+                        projection.pending_latest = None;
+                    }
+                    continue;
+                }
+            };
+            let committed_map = match committed_map_identity_from_revision(&event) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn!(revision = event.revision, %error, "committed map identity rejected before exploration fanout");
+                    let mut projection = explore_projection_gate.lock().await;
+                    if projection
+                        .pending_latest
+                        .as_ref()
+                        .is_some_and(|current| same_projection_event(current, &event))
+                    {
+                        projection.pending_latest = None;
+                    }
+                    continue;
+                }
+            };
+
+            // P serializes projection apply with cutover. L is held only for
+            // exact-domain validation and never crosses Explore ingest await.
+            let mut projection = explore_projection_gate.lock().await;
+            if !projection
+                .pending_latest
+                .as_ref()
+                .is_some_and(|current| same_projection_event(current, &event))
+            {
+                continue;
+            }
+            let current = {
+                let _lifecycle_guard = explore_lifecycle_lock.lock().await;
+                let active_domain_matches =
+                    map_event_matches_current_session(&event, &explore_mapping_adapter);
+                let authority_matches = explore_committed_map_authority
+                    .lock()
+                    .ok()
+                    .and_then(|authority| authority.clone())
+                    .as_ref()
+                    .is_some_and(|authority| authority == &committed_map);
+                active_domain_matches && authority_matches
+            };
+            if !current {
+                projection.pending_latest = None;
+                continue;
+            }
+
+            let ingest_result = tokio::time::timeout(
+                MAP_FANOUT_SINK_TIMEOUT,
+                explore.ingest_committed_costmap_snapshot(snapshot, committed_map.clone()),
+            )
+            .await;
+            let still_current = {
+                let _lifecycle_guard = explore_lifecycle_lock.lock().await;
+                map_event_matches_current_session(&event, &explore_mapping_adapter)
+                    && explore_committed_map_authority
+                        .lock()
+                        .ok()
+                        .and_then(|authority| authority.clone())
+                        .as_ref()
+                        .is_some_and(|authority| authority == &committed_map)
+            };
+            let retry_pending = !matches!(&ingest_result, Ok(Ok(_)));
+            match ingest_result {
+                Ok(Ok(_)) if still_current => {
+                    projection.pending_latest = None;
+                }
+                Ok(Ok(_)) => {
+                    projection.pending_latest = None;
+                    warn!(
+                        revision = event.revision,
+                        "exploration costmap projection lost authority during apply"
+                    );
+                }
+                Ok(Err(error)) => {
+                    warn!(revision = event.revision, %error, "exploration costmap fanout failed; latest revision retained for retry");
+                }
+                Err(_) => {
+                    warn!(
+                        revision = event.revision,
+                        "exploration costmap fanout timed out; latest revision retained for retry"
+                    );
+                }
+            }
+            drop(projection);
+
+            if retry_pending {
+                tokio::select! {
+                    _ = tokio::time::sleep(MAP_FANOUT_SINK_TIMEOUT) => {}
+                    changed = explore_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let observed = {
+                            let observed = explore_rx.borrow_and_update();
+                            observed.clone()
+                        };
+                        if let Some(observed) = observed {
+                            let mut projection = explore_projection_gate.lock().await;
+                            if projection
+                                .pending_latest
+                                .as_ref()
+                                .map_or(true, |current| newer_projection_event(current, &observed))
+                            {
+                                projection.pending_latest = Some(observed);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6721,6 +6956,8 @@ pub async fn spawn_geometry_runtime(
     let (map_revision_tx, _) = broadcast::channel::<MapRevisionEvent>(16);
     let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
     let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
+    let explore_projection_gate =
+        Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default()));
     #[cfg(test)]
     let (task_control, task_registration_rx) =
         GeometryRuntimeTaskControl::channel_with_topology_control(topology_control);
@@ -6943,6 +7180,7 @@ pub async fn spawn_geometry_runtime(
         frontiers_tx: frontiers_tx.clone(),
         map_revision_tx: map_revision_tx.clone(),
         map_revision_latest_tx: map_revision_latest_tx.clone(),
+        explore_projection_gate: explore_projection_gate.clone(),
         committed_map_authority: committed_map_authority.clone(),
         transport: transport.clone(),
         transport_backend_name: backend_name,
@@ -7085,6 +7323,7 @@ pub async fn spawn_geometry_runtime(
             frontiers_tx,
             map_revision_tx: map_revision_tx.clone(),
             map_revision_latest_tx: map_revision_latest_tx.clone(),
+            explore_projection_gate: explore_projection_gate.clone(),
             committed_map_authority: committed_map_authority.clone(),
             mapping_lifecycle_lock: mapping_lifecycle_lock.clone(),
             transport: transport.clone(),
@@ -7094,6 +7333,7 @@ pub async fn spawn_geometry_runtime(
             nav: handle.nav.clone(),
             exploration_producer_epoch: explore_runtime.producer_epoch_projection(),
             runtime_observation_generation,
+            orphan_cancellations: explore_runtime.orphan_cancellation_registry(),
             #[cfg(not(test))]
             task_control: Some(task_control.clone()),
         };
@@ -7145,6 +7385,7 @@ pub async fn spawn_geometry_runtime(
         map_revision_fanout_rx,
         map_revision_latest_tx,
         committed_map_authority,
+        explore_projection_gate,
         transport.clone(),
         occ_topic,
         occ_msg_type,
@@ -7323,6 +7564,9 @@ pub(crate) struct CommittedMappingCloudMap {
 async fn ingest_mapping_points_with_backend(
     mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
     lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    explore_projection_gate: &Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
+    committed_map_authority: &Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    map_revision_latest_tx: &watch::Sender<Option<MapRevisionEvent>>,
     cloud_map_writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     points: &[nalgebra::Point3<f64>],
     point_step: u32,
@@ -7338,6 +7582,9 @@ async fn ingest_mapping_points_with_backend(
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let owned_mapping = mapping.clone();
     let owned_lifecycle_lock = lifecycle_lock.clone();
+    let owned_explore_projection_gate = explore_projection_gate.clone();
+    let owned_committed_map_authority = committed_map_authority.clone();
+    let owned_map_revision_latest_tx = map_revision_latest_tx.clone();
     let owned_cloud_map_writer = cloud_map_writer.clone();
     let owned_points = points.to_vec();
     let owned_frame_id = frame_id.to_owned();
@@ -7349,6 +7596,9 @@ async fn ingest_mapping_points_with_backend(
         let result = ingest_mapping_points_with_backend_owned(
             &owned_mapping,
             &owned_lifecycle_lock,
+            &owned_explore_projection_gate,
+            &owned_committed_map_authority,
+            &owned_map_revision_latest_tx,
             &owned_cloud_map_writer,
             &owned_points,
             point_step,
@@ -7394,6 +7644,9 @@ async fn ingest_mapping_points_with_backend(
 async fn ingest_mapping_points_with_backend_owned(
     mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
     lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    explore_projection_gate: &Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
+    committed_map_authority: &Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    map_revision_latest_tx: &watch::Sender<Option<MapRevisionEvent>>,
     cloud_map_writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     points: &[nalgebra::Point3<f64>],
     point_step: u32,
@@ -7466,10 +7719,16 @@ async fn ingest_mapping_points_with_backend_owned(
         Ok(receiver) => receiver,
         Err(error) => {
             let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
-            let retirement_error =
-                fence_failed_mapping_backend(mapping, lifecycle_lock, &token.session_id)
-                    .await
-                    .err();
+            let retirement_error = fence_failed_mapping_backend(
+                mapping,
+                lifecycle_lock,
+                explore_projection_gate,
+                committed_map_authority,
+                map_revision_latest_tx,
+                &token.session_id,
+            )
+            .await
+            .err();
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
                 source_frame_id: frame_id.to_owned(),
                 target_frame_id,
@@ -7486,10 +7745,16 @@ async fn ingest_mapping_points_with_backend_owned(
         Ok(Ok(completion)) => completion,
         Ok(Err(_)) | Err(_) => {
             let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
-            let retirement_error =
-                fence_failed_mapping_backend(mapping, lifecycle_lock, &token.session_id)
-                    .await
-                    .err();
+            let retirement_error = fence_failed_mapping_backend(
+                mapping,
+                lifecycle_lock,
+                explore_projection_gate,
+                committed_map_authority,
+                map_revision_latest_tx,
+                &token.session_id,
+            )
+            .await
+            .err();
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
                 source_frame_id: frame_id.to_owned(),
                 target_frame_id,
@@ -7510,6 +7775,7 @@ async fn ingest_mapping_points_with_backend_owned(
             Option<crate::mapping_adapter::MappingBackendRetirement>,
         ),
     > = {
+        let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let mut adapter = mapping.lock();
         let target_frame_id = adapter.configured_map_frame_id().to_owned();
@@ -7558,7 +7824,7 @@ async fn ingest_mapping_points_with_backend_owned(
         } else {
             None
         };
-        if let Some(fence_commit) = fence_commit {
+        let mut commit_result = if let Some(fence_commit) = fence_commit {
             fence_commit
         } else {
             match adapter.commit_backend_completion(
@@ -7642,7 +7908,22 @@ async fn ingest_mapping_points_with_backend_owned(
                     Err((target_frame_id, reason, retirement))
                 }
             }
+        };
+        if commit_result
+            .as_ref()
+            .is_err_and(|(_, _, retirement)| retirement.is_some())
+        {
+            projection_guard.pending_latest = None;
+            if let Err(error) = GeometryRuntimeHandle::revoke_committed_map_projection_parts_locked(
+                committed_map_authority,
+                map_revision_latest_tx,
+            ) {
+                if let Err((_, reason, _)) = &mut commit_result {
+                    *reason = format!("{reason}; authority revoke failed: {error}");
+                }
+            }
         }
+        commit_result
     };
     match commit_result {
         Ok(commit) => Ok(commit),
@@ -7681,19 +7962,30 @@ async fn finish_mapping_ingest_failure(
 async fn fence_failed_mapping_backend(
     mapping: &Arc<parking_lot::Mutex<MappingAdapter>>,
     lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    explore_projection_gate: &Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
+    committed_map_authority: &Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    map_revision_latest_tx: &watch::Sender<Option<MapRevisionEvent>>,
     session_id: &str,
 ) -> Result<(), String> {
     let retirement = {
+        let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let mut adapter = mapping.lock();
         let snapshot = adapter.snapshot();
         if !snapshot.active || snapshot.session_id != session_id {
             return Ok(());
         }
-        adapter
+        let retirement = adapter
             .stop_session_detached(session_id)
             .map_err(|error| error.to_string())?
-            .retirement
+            .retirement;
+        drop(adapter);
+        projection_guard.pending_latest = None;
+        GeometryRuntimeHandle::revoke_committed_map_projection_parts_locked(
+            committed_map_authority,
+            map_revision_latest_tx,
+        )?;
+        retirement
     };
     finish_backend_retirement(mapping, lifecycle_lock, retirement)
         .await
@@ -9461,6 +9753,9 @@ async fn commit_registered_lio_cloud_inner(
     let outcome = ingest_mapping_points_with_backend(
         mapping,
         &handle.mapping_lifecycle_lock,
+        &handle.explore_projection_gate,
+        &handle.committed_map_authority,
+        &handle.map_revision_latest_tx,
         &handle.cloud_map_writer,
         points,
         point_step,
@@ -9523,6 +9818,9 @@ fn spawn_mapping_feed_tasks(
     state: Arc<RwLock<SharedState>>,
     mapping_arc: Arc<parking_lot::Mutex<MappingAdapter>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    explore_projection_gate: Arc<tokio::sync::Mutex<ExploreProjectionGate>>,
     odom_binding: Option<(LcmTopic, LcmMessageType)>,
     pointcloud_binding: (LcmTopic, LcmMessageType),
     tf_binding: (LcmTopic, LcmMessageType),
@@ -9605,6 +9903,9 @@ fn spawn_mapping_feed_tasks(
     let mapping_lidar_frame = mapping_lidar.lock().configured_map_frame_id().to_string();
     let state_lidar = state.clone();
     let map_revision_lidar = map_revision_tx.clone();
+    let map_revision_latest_lidar = map_revision_latest_tx;
+    let committed_map_authority_lidar = committed_map_authority;
+    let explore_projection_gate_lidar = explore_projection_gate;
     tokio::spawn(async move {
         let mut stream = transport_lidar
             .subscribe(lidar_topic, Some(lidar_msg_type))
@@ -9669,6 +9970,9 @@ fn spawn_mapping_feed_tasks(
             let ingest_outcome = ingest_mapping_points_with_backend(
                 &mapping_lidar,
                 &mapping_lifecycle_lock,
+                &explore_projection_gate_lidar,
+                &committed_map_authority_lidar,
+                &map_revision_latest_lidar,
                 &cloud_map_writer,
                 &points,
                 parsed.point_step,
@@ -9772,6 +10076,8 @@ async fn build_handle_for_tests_with_cloud_writer(
     let map_revision_fanout_rx = map_revision_tx.subscribe();
     let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
     let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
+    let explore_projection_gate =
+        Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default()));
     let state = Arc::new(RwLock::new(SharedState::default()));
     static SEQUENCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence_state_path = std::env::temp_dir()
@@ -9822,6 +10128,7 @@ async fn build_handle_for_tests_with_cloud_writer(
         map_revision_fanout_rx,
         map_revision_latest_tx.clone(),
         committed_map_authority.clone(),
+        explore_projection_gate.clone(),
         transport.clone(),
         LcmTopic::new(&format!(
             "/test/geometry/occupancy/helper/{}",
@@ -9863,6 +10170,7 @@ async fn build_handle_for_tests_with_cloud_writer(
         frontiers_tx,
         map_revision_tx,
         map_revision_latest_tx,
+        explore_projection_gate,
         committed_map_authority,
         transport,
         transport_backend_name: "real-lcm",
@@ -10649,6 +10957,9 @@ mod mapping_feed_tests {
                 ingest_mapping_points_with_backend(
                     &mapping,
                     &lifecycle_lock,
+                    &Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
+                    &Arc::new(std::sync::Mutex::new(None)),
+                    &watch::channel(None).0,
                     &cloud_map_writer,
                     &[Point3::new(1.0, 0.0, 1.0)],
                     12,
@@ -10721,6 +11032,9 @@ mod mapping_feed_tests {
                 ingest_mapping_points_with_backend(
                     &mapping,
                     &lifecycle_lock,
+                    &Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
+                    &Arc::new(std::sync::Mutex::new(None)),
+                    &watch::channel(None).0,
                     &cloud_map_writer,
                     &[Point3::new(1.0, 0.0, 1.0)],
                     12,
@@ -12659,6 +12973,9 @@ mod mapping_feed_tests {
             state.clone(),
             mapping.clone(),
             map_revision_tx,
+            watch::channel(None).0,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             Some((odom_topic.clone(), odom_type.clone())),
             pointcloud_binding(),
             (tf_topic, tf_type),
@@ -12732,6 +13049,9 @@ mod mapping_feed_tests {
             state,
             mapping,
             map_revision_tx,
+            watch::channel(None).0,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             Some((odom_topic.clone(), odom_type.clone())),
             pointcloud_binding(),
             (tf_topic, tf_type),
@@ -12801,6 +13121,9 @@ mod mapping_feed_tests {
             state.clone(),
             mapping.clone(),
             map_revision_tx,
+            watch::channel(None).0,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             Some((odom_topic.clone(), odom_type.clone())),
             pointcloud_binding(),
             (tf_topic, tf_type),
@@ -13177,6 +13500,7 @@ mod mapping_feed_tests {
             rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             transport,
             topic,
             message_type,
@@ -13242,6 +13566,7 @@ mod mapping_feed_tests {
             rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/configured-frame/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13303,6 +13628,7 @@ mod mapping_feed_tests {
             rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             LcmTransport::new(Arc::new(backend)),
             LcmTopic::new("/test/commit-before-watch/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13369,6 +13695,7 @@ mod mapping_feed_tests {
             rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/failed-prepare/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13479,6 +13806,7 @@ mod mapping_feed_tests {
             rx,
             latest_tx,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default())),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/stopped-event/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13654,6 +13982,9 @@ mod mapping_feed_tests {
             ingest_mapping_points_with_backend(
                 &ingest_mapping,
                 &lifecycle_lock,
+                &handle.explore_projection_gate,
+                &handle.committed_map_authority,
+                &handle.map_revision_latest_tx,
                 &cloud_map_writer,
                 &[Point3::new(1.0, 2.0, 0.0)],
                 12,
@@ -14584,37 +14915,9 @@ mod typed_navigation_feedback_tests {
         stale_a.feedback.planner_pose_frame = "odom".into();
         stale_a.feedback.guard_generation = 99;
         stale_a.feedback.sink_ready = false;
-        let correlated_a = handle
-            .nav
-            .correlate_navigation_state(
-                &stale_a.state.goal_id,
-                stale_a.feedback.owner_kind,
-                &stale_a.feedback.parent_request_id,
-                stale_a.feedback.goal_generation,
-                stale_a.feedback.path_revision,
-                stale_a.feedback.goal_payload_sha256,
-                stale_a.feedback.path_payload_sha256,
-            )
-            .await
-            .expect("A feedback must correlate before the pause")
-            .expect("A lease");
-        assert_eq!(correlated_a, lease_a);
-
         let mut lease_b = lease_a.clone();
         lease_b.path_revision = 1;
         lease_b.path_payload_sha256 = [8; 32];
-        {
-            let inner = handle.nav.inner();
-            let mut slot = inner.write().await;
-            slot.phase = crate::nav_runtime::NavPhase::Running;
-            slot.goal = Some(crate::nav_runtime::ActiveGoal {
-                id: lease_b.session_id.clone(),
-                frame_id: "map".to_string(),
-                target: PoseState::default(),
-                accepted_at_ns: 2,
-                lease: lease_b.clone(),
-            });
-        }
 
         let stale_planner = crate::nav_runtime::PlannerInputObservation {
             generation: stale_a.feedback.runtime_generation,
@@ -14627,33 +14930,75 @@ mod typed_navigation_feedback_tests {
             generation: stale_a.feedback.guard_generation,
             ready: stale_a.feedback.sink_ready,
         };
-        let rejected = handle
+        let correlation_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        handle
             .nav
-            .observe_correlated_navigation_state(
-                stale_a.state,
-                &correlated_a,
-                Some(stale_planner),
-                Some(stale_sink),
-            )
-            .await;
+            .inject_transaction_after_correlation_barrier(correlation_barrier.clone());
+        let nav_a = handle.nav.clone();
+        let transaction_a = tokio::spawn(async move {
+            nav_a
+                .apply_correlated_navigation_state(
+                    stale_a.state.clone(),
+                    &stale_a.state.goal_id,
+                    stale_a.feedback.owner_kind,
+                    &stale_a.feedback.parent_request_id,
+                    stale_a.feedback.goal_generation,
+                    stale_a.feedback.path_revision,
+                    stale_a.feedback.goal_payload_sha256,
+                    stale_a.feedback.path_payload_sha256,
+                    Some(stale_planner),
+                    Some(stale_sink),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), correlation_barrier.wait())
+            .await
+            .expect("A transaction must reach the correlation/promotion boundary");
+
+        let replacement_goal = crate::nav_runtime::ActiveGoal {
+            id: lease_b.session_id.clone(),
+            frame_id: "map".to_string(),
+            target: PoseState::default(),
+            accepted_at_ns: 2,
+            lease: lease_b.clone(),
+        };
+        let nav_b = handle.nav.clone();
+        let mut replacement_b =
+            tokio::spawn(async move { nav_b.replace_active_goal_for_test(replacement_goal).await });
         assert!(
-            rejected.is_err(),
-            "the stale A terminal must fail its final active-incarnation CAS"
+            tokio::time::timeout(Duration::from_millis(50), &mut replacement_b)
+                .await
+                .is_err(),
+            "replacement B must queue behind A's single N transaction"
         );
+        tokio::time::timeout(Duration::from_secs(1), correlation_barrier.wait())
+            .await
+            .expect("the test must release A's final promotion");
+
+        let (applied_state, applied_lease) =
+            tokio::time::timeout(Duration::from_secs(1), transaction_a)
+                .await
+                .expect("A transaction must finish after barrier release")
+                .expect("A transaction task must not panic")
+                .expect("A terminal must commit before queued replacement B");
+        assert_eq!(applied_state.status, "FAILED");
+        assert_eq!(applied_lease, lease_a);
+        tokio::time::timeout(Duration::from_secs(1), replacement_b)
+            .await
+            .expect("replacement B must finish after A releases N")
+            .expect("replacement B task must not panic");
+
         let inner = handle.nav.inner();
         let slot = inner.read().await;
         assert_eq!(slot.phase, crate::nav_runtime::NavPhase::Running);
         assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
         drop(slot);
         let after = crate::nav_runtime::compute_readiness(&handle, &handle.nav).await;
-        assert_eq!(after.planner_generation, baseline.planner_generation);
-        assert_eq!(after.map_frame, baseline.map_frame);
-        assert_eq!(after.pose_frame, baseline.pose_frame);
-        assert_eq!(
-            after.motion_sink_generation,
-            baseline.motion_sink_generation
-        );
-        assert_eq!(after.cmd_vel_sink_ready, baseline.cmd_vel_sink_ready);
+        assert_eq!(after.planner_generation, 99);
+        assert_eq!(after.map_frame, "map");
+        assert_eq!(after.pose_frame, "odom");
+        assert_eq!(after.motion_sink_generation, 99);
+        assert!(!after.cmd_vel_sink_ready);
     }
 
     #[tokio::test]
@@ -14873,6 +15218,25 @@ mod exploration_cancel_retry_tests {
         }
     }
 
+    fn frontier_costmap() -> crate::explore_runtime::ExploreCostmapSnapshot {
+        let mut grid = OccupancyGrid2D {
+            resolution: 0.5,
+            origin: Point2 { x: 0.0, y: 0.0 },
+            width: 12,
+            height: 12,
+            cells: vec![OccupancyCell::Unknown; 144],
+        };
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        crate::explore_runtime::ExploreCostmapSnapshot {
+            grid,
+            frame_id: "map".to_string(),
+        }
+    }
+
     #[derive(Clone)]
     struct DelayedExploreBridge {
         inner: ExploreNavigationBridge,
@@ -14882,6 +15246,10 @@ mod exploration_cancel_retry_tests {
 
     #[async_trait]
     impl crate::explore_runtime::ExploreNavigationSink for DelayedExploreBridge {
+        fn current_cancel_generation(&self) -> Result<u64, String> {
+            crate::explore_runtime::ExploreNavigationSink::current_cancel_generation(&self.inner)
+        }
+
         fn current_map_name(&self) -> Result<String, String> {
             crate::explore_runtime::ExploreNavigationSink::current_map_name(&self.inner)
         }
@@ -14903,41 +15271,6 @@ mod exploration_cancel_retry_tests {
             lease: &crate::explore_runtime::ChildNavigationLease,
         ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
             crate::explore_runtime::ExploreNavigationSink::cancel(&self.inner, lease).await
-        }
-    }
-
-    fn goal_input(goal_id: &str) -> crate::nav_runtime::SetGoalInput {
-        crate::nav_runtime::SetGoalInput {
-            goal_id: goal_id.to_string(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: "exploration-retry-parent".to_string(),
-            goal_generation: 0,
-            motion_admission: crate::nav_runtime::test_motion_admission(),
-            frame_id: "map".to_string(),
-            target: PoseState {
-                x: 1.0,
-                y: 2.0,
-                ..PoseState::default()
-            },
-        }
-    }
-
-    fn frontier_costmap() -> crate::explore_runtime::ExploreCostmapSnapshot {
-        let mut grid = OccupancyGrid2D {
-            resolution: 0.5,
-            origin: Point2 { x: 0.0, y: 0.0 },
-            width: 12,
-            height: 12,
-            cells: vec![OccupancyCell::Unknown; 144],
-        };
-        for y in 2..=7 {
-            for x in 2..=7 {
-                grid.set(x, y, OccupancyCell::Free);
-            }
-        }
-        crate::explore_runtime::ExploreCostmapSnapshot {
-            grid,
-            frame_id: "map".to_string(),
         }
     }
 
@@ -14979,15 +15312,38 @@ mod exploration_cancel_retry_tests {
         let (nav_state_tx, _) = broadcast::channel(4);
         let (frontiers_tx, _) = broadcast::channel(4);
         let (map_revision_tx, _) = broadcast::channel(4);
-        let (map_revision_latest_tx, _) = watch::channel(None);
+        let (map_revision_latest_tx, _) = watch::channel(Some(MapRevisionEvent {
+            session_id: "exploration-test-map".to_string(),
+            map_name: "office".to_string(),
+            session_generation: 1,
+            revision: 1,
+            width: 12,
+            height: 12,
+            resolution: 0.5,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            frame_id: "map".to_string(),
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            data: Vec::<u8>::new().into(),
+            raw_data: Vec::<u8>::new().into(),
+            size: 0,
+            schema_version: 1,
+            checksum: crate::map_checksum::sha256_hex(&[]),
+            raw_checksum: crate::map_checksum::sha256_hex(&[]),
+            last_seen_ms: 0,
+        }));
+        let state = Arc::new(RwLock::new(SharedState::default()));
         let bridge = ExploreNavigationBridge {
-            state: Arc::new(RwLock::new(SharedState::default())),
+            state: state.clone(),
             expected_map_frame: Arc::from("map"),
             cloud_map_tx,
             nav_state_tx,
             frontiers_tx,
             map_revision_tx,
             map_revision_latest_tx,
+            explore_projection_gate: Arc::new(tokio::sync::Mutex::new(
+                ExploreProjectionGate::default(),
+            )),
             committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
             mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             transport,
@@ -14997,7 +15353,15 @@ mod exploration_cancel_retry_tests {
             nav: nav.clone(),
             exploration_producer_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             runtime_observation_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            orphan_cancellations: Arc::new(
+                crate::explore_runtime::OrphanCancellationRegistry::default(),
+            ),
         };
+        *bridge
+            .committed_map_authority
+            .lock()
+            .expect("exploration fixture committed map authority") =
+            Some(test_committed_map_identity(1));
         (bridge, backend)
     }
 
@@ -15009,9 +15373,42 @@ mod exploration_cancel_retry_tests {
         crate::nav_runtime::GoalLease,
     ) {
         let (bridge, backend) = configured_bridge().await;
-        let outcome =
-            crate::nav_runtime::set_goal(&bridge.facade_handle(), &bridge.nav, goal_input(goal_id))
-                .await;
+        let producer_epoch = bridge
+            .exploration_producer_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let committed_map = {
+            bridge
+                .committed_map_authority
+                .lock()
+                .expect("exploration fixture committed map authority")
+                .clone()
+                .expect("exploration fixture committed map identity")
+        };
+        let outcome = crate::nav_runtime::admit_goal_intent(
+            &crate::nav_runtime::NavAdmissionContext::new(
+                bridge.mapping_lifecycle_lock.clone(),
+                bridge.committed_map_authority.clone(),
+                bridge.map_revision_latest_tx.subscribe(),
+            ),
+            &crate::nav_runtime::NavAdmissionIo::new(
+                bridge.state.clone(),
+                bridge.transport.clone(),
+                bridge.transport_backend_name,
+                bridge.lcm_backend_available,
+            ),
+            &bridge.nav,
+            test_wavefront_goal_intent(
+                goal_id,
+                "exploration-retry-parent",
+                producer_epoch,
+                bridge.nav.cancel_snapshot().generation,
+                committed_map,
+            ),
+            crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                current_session_generation: bridge.exploration_producer_epoch.clone(),
+            },
+        )
+        .await;
         assert_eq!(
             outcome.state.status, "ACCEPTED",
             "{}",
@@ -15194,14 +15591,58 @@ mod exploration_cancel_retry_tests {
     }
 
     #[tokio::test]
+    async fn wavefront_intent_rejects_map_name_changed_before_bridge_submit() {
+        let (bridge, backend) = configured_bridge().await;
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        let submit_entered = Arc::new(tokio::sync::Notify::new());
+        let submit_release = Arc::new(tokio::sync::Notify::new());
+        explore.set_navigation_sink(Arc::new(DelayedExploreBridge {
+            inner: bridge.clone(),
+            submit_entered: submit_entered.clone(),
+            submit_release: submit_release.clone(),
+        }));
+        explore
+            .ingest_committed_costmap_snapshot(frontier_costmap(), test_committed_map_identity(1))
+            .await
+            .expect("committed frontier costmap");
+        assert_eq!(
+            explore.start("cross-map", "prefer_wavefront").await.status,
+            crate::explore_runtime::STATUS_ACCEPTED
+        );
+
+        let tick = {
+            let explore = explore.clone();
+            tokio::spawn(async move { explore.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), submit_entered.notified())
+            .await
+            .expect("wavefront intent did not reach delayed submit");
+        let mut hallway = bridge
+            .map_revision_latest_tx
+            .borrow()
+            .clone()
+            .expect("office map revision");
+        assert_eq!(hallway.map_name, "office");
+        hallway.map_name = "hallway".to_string();
+        bridge.map_revision_latest_tx.send_replace(Some(hallway));
+        submit_release.notify_one();
+
+        let snapshot = tick.await.expect("wavefront tick task");
+        assert_eq!(snapshot.status, crate::explore_runtime::STATUS_FAILED);
+        assert!(snapshot.message.contains("active map name changed"));
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_eq!(backend.frames.lock().expect("recorded frames").len(), 0);
+    }
+
+    #[tokio::test]
     async fn exact_zero_releases_exploration_while_telemetry_cache_is_busy() {
         let (bridge, backend) = configured_bridge().await;
         let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
         explore.set_navigation_sink(Arc::new(bridge.clone()));
         explore
-            .ingest_costmap_snapshot(frontier_costmap())
+            .ingest_committed_costmap_snapshot(frontier_costmap(), test_committed_map_identity(1))
             .await
-            .expect("frontier costmap");
+            .expect("committed frontier costmap");
         assert_eq!(
             explore
                 .start("telemetry-lock", "prefer_wavefront")
@@ -15301,10 +15742,32 @@ mod exploration_cancel_retry_tests {
     async fn exploration_cancel_retry_stays_stopped_when_next_goal_replaces_zeroed_lease() {
         let (bridge, backend, lease, ticket) = start_cancel("retry-before-replacement").await;
         wait_for_cancel_count(&backend, 2).await;
-        let blocked_replacement = crate::nav_runtime::set_goal(
-            &bridge.facade_handle(),
+        let producer_epoch = bridge
+            .exploration_producer_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let blocked_replacement = crate::nav_runtime::admit_goal_intent(
+            &crate::nav_runtime::NavAdmissionContext::new(
+                bridge.mapping_lifecycle_lock.clone(),
+                bridge.committed_map_authority.clone(),
+                bridge.map_revision_latest_tx.subscribe(),
+            ),
+            &crate::nav_runtime::NavAdmissionIo::new(
+                bridge.state.clone(),
+                bridge.transport.clone(),
+                bridge.transport_backend_name,
+                bridge.lcm_backend_available,
+            ),
             &bridge.nav,
-            goal_input("blocked-replacement-child"),
+            test_wavefront_goal_intent(
+                "blocked-replacement-child",
+                "exploration-retry-parent",
+                producer_epoch,
+                bridge.nav.cancel_snapshot().generation,
+                test_committed_map_identity(1),
+            ),
+            crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                current_session_generation: bridge.exploration_producer_epoch.clone(),
+            },
         )
         .await;
         assert_eq!(blocked_replacement.state.status, "FAILED");
@@ -15364,10 +15827,34 @@ mod exploration_cancel_retry_tests {
                 ready: true,
             })
             .expect("replacement motion sink observation");
-        let replacement = crate::nav_runtime::set_goal(
-            &bridge.facade_handle(),
+        let replacement_map = test_committed_map_identity(2);
+        *bridge
+            .committed_map_authority
+            .lock()
+            .expect("replacement committed map authority") = Some(replacement_map.clone());
+        let replacement = crate::nav_runtime::admit_goal_intent(
+            &crate::nav_runtime::NavAdmissionContext::new(
+                bridge.mapping_lifecycle_lock.clone(),
+                bridge.committed_map_authority.clone(),
+                bridge.map_revision_latest_tx.subscribe(),
+            ),
+            &crate::nav_runtime::NavAdmissionIo::new(
+                bridge.state.clone(),
+                bridge.transport.clone(),
+                bridge.transport_backend_name,
+                bridge.lcm_backend_available,
+            ),
             &bridge.nav,
-            goal_input("replacement-child"),
+            test_wavefront_goal_intent(
+                "replacement-child",
+                "exploration-retry-parent",
+                producer_epoch,
+                bridge.nav.cancel_snapshot().generation,
+                replacement_map,
+            ),
+            crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
+                current_session_generation: bridge.exploration_producer_epoch.clone(),
+            },
         )
         .await;
         assert_eq!(
@@ -15376,76 +15863,6 @@ mod exploration_cancel_retry_tests {
             replacement.state.message
         );
         assert_retry_stopped(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn wavefront_intent_rejects_map_name_changed_before_bridge_submit() {
-        let (bridge, backend) = configured_bridge().await;
-        let committed_map = test_committed_map_identity(1);
-        *bridge
-            .committed_map_authority
-            .lock()
-            .expect("committed map authority") = Some(committed_map.clone());
-        bridge
-            .map_revision_latest_tx
-            .send_replace(Some(MapRevisionEvent {
-                session_id: committed_map.session_id.clone(),
-                map_name: "office".to_string(),
-                session_generation: committed_map.session_generation as u64,
-                revision: committed_map.revision as u64,
-                width: 12,
-                height: 12,
-                resolution: 0.5,
-                origin_x: 0.0,
-                origin_y: 0.0,
-                frame_id: "map".to_string(),
-                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
-                data: Vec::<u8>::new().into(),
-                raw_data: Vec::<u8>::new().into(),
-                size: 0,
-                schema_version: 1,
-                checksum: crate::map_checksum::sha256_hex(&[]),
-                raw_checksum: crate::map_checksum::sha256_hex(&[]),
-                last_seen_ms: 0,
-            }));
-        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
-        let submit_entered = Arc::new(tokio::sync::Notify::new());
-        let submit_release = Arc::new(tokio::sync::Notify::new());
-        explore.set_navigation_sink(Arc::new(DelayedExploreBridge {
-            inner: bridge.clone(),
-            submit_entered: submit_entered.clone(),
-            submit_release: submit_release.clone(),
-        }));
-        explore
-            .ingest_committed_costmap_snapshot(frontier_costmap(), committed_map)
-            .await
-            .expect("committed frontier costmap");
-        assert_eq!(
-            explore.start("cross-map", "prefer_wavefront").await.status,
-            crate::explore_runtime::STATUS_ACCEPTED
-        );
-
-        let tick = {
-            let explore = explore.clone();
-            tokio::spawn(async move { explore.tick((2.0, 2.0)).await })
-        };
-        tokio::time::timeout(Duration::from_secs(2), submit_entered.notified())
-            .await
-            .expect("wavefront intent did not reach delayed submit");
-        let mut hallway = bridge
-            .map_revision_latest_tx
-            .borrow()
-            .clone()
-            .expect("office map revision");
-        hallway.map_name = "hallway".to_string();
-        bridge.map_revision_latest_tx.send_replace(Some(hallway));
-        submit_release.notify_one();
-
-        let snapshot = tick.await.expect("wavefront tick task");
-        assert_eq!(snapshot.status, crate::explore_runtime::STATUS_FAILED);
-        assert!(snapshot.message.contains("active map name changed"));
-        assert!(bridge.nav.active_goal_lease().await.is_none());
-        assert_eq!(backend.frames.lock().expect("recorded frames").len(), 0);
     }
 }
 
@@ -15809,6 +16226,13 @@ mod exploration_lcm_smoke_tests {
         let (frontiers_tx, _) = broadcast::channel(4);
         let (map_revision_tx, _) = broadcast::channel(4);
         let (map_revision_latest_tx, _) = watch::channel(None);
+        let committed_map = schema::CommittedMapIdentity {
+            session_id: "smoke-map".to_string(),
+            session_generation: 1,
+            revision: MAP_REVISION as i64,
+            payload_sha256: crate::map_checksum::sha256_bytes(&[]),
+            frame_id: map_frame.to_string(),
+        };
         let explore =
             crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame)
                 .expect("configured exploration runtime");
@@ -15820,7 +16244,10 @@ mod exploration_lcm_smoke_tests {
             frontiers_tx: frontiers_tx.clone(),
             map_revision_tx,
             map_revision_latest_tx,
-            committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
+            explore_projection_gate: Arc::new(tokio::sync::Mutex::new(
+                ExploreProjectionGate::default(),
+            )),
+            committed_map_authority: Arc::new(std::sync::Mutex::new(Some(committed_map.clone()))),
             mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             transport: publisher.clone(),
             transport_backend_name: "real-lcm",
@@ -15829,6 +16256,7 @@ mod exploration_lcm_smoke_tests {
             nav: nav.clone(),
             exploration_producer_epoch: explore.producer_epoch_projection(),
             runtime_observation_generation: Arc::new(AtomicU64::new(1)),
+            orphan_cancellations: explore.orphan_cancellation_registry(),
         };
         explore.set_navigation_sink(Arc::new(bridge.clone()));
         spawn_frontier_fanout_in_frame(
@@ -15841,7 +16269,10 @@ mod exploration_lcm_smoke_tests {
         );
 
         assert!(explore
-            .ingest_costmap_snapshot(smoke_costmap(MAP_REVISION, map_frame))
+            .ingest_committed_costmap_snapshot(
+                smoke_costmap(MAP_REVISION, map_frame),
+                committed_map,
+            )
             .await
             .expect("ingest smoke costmap"));
         let boundary = ExplorationBoundary::from_vertices(vec![
@@ -15962,30 +16393,48 @@ mod exploration_lcm_smoke_tests {
             ]
         );
 
-        let mut wrong_goal = nuwax_exploration::conversions::frontier_goal_to_navigation_goal(
+        let wrong_goal = nuwax_exploration::conversions::frontier_goal_to_navigation_goal(
             &frontier_snapshot.frontiers[0],
         );
-        wrong_goal.target.frame_id =
-            nuwax_nav_types_messages::frames::NavFrameId::Custom(map_frame.to_string());
+        let committed_map = bridge
+            .committed_map_authority
+            .lock()
+            .expect("smoke committed map authority")
+            .clone()
+            .expect("smoke committed map identity");
+        let mut wrong_intent = crate::explore_runtime::build_wavefront_goal_intent(
+            active.exploration_generation,
+            nav.cancel_snapshot().generation,
+            PARENT_REQUEST,
+            "wrong-semantic-frame",
+            &crate::nav_runtime::test_motion_admission(),
+            &wrong_goal,
+            None,
+            committed_map,
+        )
+        .expect("otherwise-valid wrong-frame intent fixture");
+        wrong_intent.goal.header.frame_id = "odom".to_string();
+        wrong_intent.goal_sha256 = schema::goal_intent_goal_sha256(&wrong_intent.goal)
+            .expect("rehash the deliberately wrong target frame");
         let rejection = crate::explore_runtime::ExploreNavigationSink::submit(
             &bridge,
             crate::explore_runtime::ChildNavigationRequest {
                 parent_request_id: PARENT_REQUEST.to_string(),
                 request_id: "wrong-semantic-frame".to_string(),
-                expected_map_name: "map".to_string(),
+                expected_map_name: "smoke-map".to_string(),
                 motion_admission: crate::nav_runtime::test_motion_admission(),
                 frontier_goal_id: "wrong-semantic-frontier".to_string(),
                 goal: wrong_goal,
                 boundary: None,
-                intent: schema::GoalIntent::default(),
+                intent: wrong_intent,
             },
         )
         .await
-        .expect_err("custom internal frame must fail closed before navigation submission");
+        .expect_err("wrong frozen intent frame must fail closed before lease CAS");
         assert!(matches!(
             rejection,
             crate::explore_runtime::ChildNavigationSubmitError::Rejected(message)
-                if message.contains("internal map-frame semantics")
+                if message == "SET_GOAL_REJECTED[GOAL_INTENT_INVALID]: goal header, frame, timestamp, or pose is invalid"
         ));
 
         let shared = state.read().await;

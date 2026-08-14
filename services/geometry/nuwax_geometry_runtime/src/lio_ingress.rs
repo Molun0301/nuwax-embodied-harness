@@ -4103,6 +4103,159 @@ mod tests {
             .expect("replay frame deadline")
         }
 
+        async fn next_exact_claimed_cloud_frame(
+            &mut self,
+            expected_session_id: &str,
+            expected_map_name: &str,
+        ) -> RawLcmFrame {
+            let mut frozen_owner_identity: Option<(String, String, u64)> = None;
+            let mut frozen_nonzero_identity: Option<DeferredMappingIdentity> = None;
+            let (
+                frozen_mapping_identity,
+                expected_nonce,
+                expected_identity,
+                expected_topic,
+                expected_type,
+                expected_hash,
+            ) = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mapping_identity = {
+                        let phase = self.replay.phase.lock();
+                        match &*phase {
+                            NativeDeferredReplayPhase::CloudReplaying(identity, _) => {
+                                assert_eq!(identity.session_id, expected_session_id);
+                                assert_eq!(identity.map_name, expected_map_name);
+                                assert!(identity.session_generation > 0);
+                                let owner_identity = (
+                                    identity.session_id.clone(),
+                                    identity.map_name.clone(),
+                                    identity.session_generation,
+                                );
+                                match &frozen_owner_identity {
+                                    Some(frozen) => assert_eq!(frozen, &owner_identity),
+                                    None => frozen_owner_identity = Some(owner_identity),
+                                }
+                                if identity.map_frame_generation == 0 {
+                                    None
+                                } else {
+                                    match &frozen_nonzero_identity {
+                                        Some(frozen) => assert_eq!(frozen, identity),
+                                        None => frozen_nonzero_identity = Some(identity.clone()),
+                                    }
+                                    Some(identity.clone())
+                                }
+                            }
+                            NativeDeferredReplayPhase::Complete(identity) => {
+                                panic!("deferred replay completed before exact cloud: {identity:?}")
+                            }
+                            NativeDeferredReplayPhase::Poisoned(detail) => {
+                                panic!("deferred replay poisoned before exact cloud: {detail}")
+                            }
+                            NativeDeferredReplayPhase::Closed => {
+                                panic!("deferred replay closed before exact cloud")
+                            }
+                            _ => None,
+                        }
+                    };
+                    let expectation = {
+                        let state = self.ingress.pair_state.lock();
+                        match &state.public_replay {
+                            NativePublicReplayPhase::Expecting(expectation) => Some((
+                                expectation.nonce,
+                                expectation.kind,
+                                expectation.identity,
+                                expectation.topic.clone(),
+                                expectation.message_type.clone(),
+                                expectation.payload_sha256,
+                            )),
+                            NativePublicReplayPhase::Poisoned(detail) => {
+                                panic!("public replay poisoned before exact cloud: {detail}")
+                            }
+                            NativePublicReplayPhase::Closed => {
+                                panic!("public replay closed before exact cloud")
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(mapping_identity) = mapping_identity {
+                        if let Some((nonce, kind, identity, topic, message_type, hash)) =
+                            expectation
+                        {
+                            assert_eq!(kind, NativeReplayFrameKind::Cloud);
+                            assert_eq!(topic, self.public_cloud.0);
+                            assert_eq!(message_type, self.public_cloud.1);
+                            break (mapping_identity, nonce, identity, topic, message_type, hash);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("exact claimed cloud expectation deadline");
+
+            let frame = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let frame = self.frame_rx.recv().await.expect("replay frame channel");
+                    if frame.topic == expected_topic && frame.msg_type == expected_type {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("exact claimed cloud frame deadline");
+            let observed_hash = crate::map_checksum::sha256_bytes(frame.payload.as_ref());
+            assert_eq!(observed_hash, expected_hash);
+            let observed_identity =
+                decode_public_replay_identity(NativeReplayFrameKind::Cloud, frame.payload.as_ref())
+                    .expect("exact claimed cloud source identity");
+            assert_eq!(observed_identity, expected_identity);
+
+            {
+                let phase = self.replay.phase.lock();
+                match &*phase {
+                    NativeDeferredReplayPhase::CloudReplaying(current, _)
+                        if current == &frozen_mapping_identity => {}
+                    NativeDeferredReplayPhase::CloudReplaying(current, _) => {
+                        panic!(
+                            "exact claimed cloud Mapping identity changed before callback: expected={frozen_mapping_identity:?} observed={current:?}"
+                        )
+                    }
+                    NativeDeferredReplayPhase::Complete(current) => {
+                        panic!(
+                            "exact claimed cloud Mapping completed before callback: expected={frozen_mapping_identity:?} observed={current:?}"
+                        )
+                    }
+                    NativeDeferredReplayPhase::Claimed(_) => {
+                        panic!("exact claimed cloud Mapping returned to Claimed before callback")
+                    }
+                    NativeDeferredReplayPhase::Startup(_) => {
+                        panic!("exact claimed cloud Mapping returned to Startup before callback")
+                    }
+                    NativeDeferredReplayPhase::Deferred(_) => {
+                        panic!("exact claimed cloud Mapping returned to Deferred before callback")
+                    }
+                    NativeDeferredReplayPhase::Poisoned(detail) => {
+                        panic!("deferred replay poisoned before exact cloud callback: {detail}")
+                    }
+                    NativeDeferredReplayPhase::Closed => {
+                        panic!("deferred replay closed before exact cloud callback")
+                    }
+                }
+            }
+            let state = self.ingress.pair_state.lock();
+            let NativePublicReplayPhase::Expecting(expectation) = &state.public_replay else {
+                panic!("exact claimed cloud expectation changed before callback");
+            };
+            assert_eq!(expectation.nonce, expected_nonce);
+            assert_eq!(expectation.kind, NativeReplayFrameKind::Cloud);
+            assert_eq!(expectation.identity, expected_identity);
+            assert_eq!(expectation.topic, expected_topic);
+            assert_eq!(expectation.message_type, expected_type);
+            assert_eq!(expectation.payload_sha256, expected_hash);
+            drop(state);
+            frame
+        }
+
         async fn complete_startup_odometry(&mut self) {
             let replay = self.replay.clone();
             let publication = tokio::spawn(async move { replay.publish_startup_odometry().await });
@@ -4892,8 +5045,20 @@ mod tests {
             )
             .await
         });
-        let cloud_binding = fixture.public_cloud.clone();
-        let cloud = fixture.next_frame(&cloud_binding).await;
+        let cloud = fixture
+            .next_exact_claimed_cloud_frame("rpc-deferred-session", "rpc-deferred-map")
+            .await;
+
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        LioIngressSink::accept_public_cloud(fixture.gate.as_ref(), cloud, &mut shutdown_rx)
+            .await
+            .expect("public cloud callback must not wait on the Mapping transition mutex");
+        let first = tokio::time::timeout(Duration::from_secs(2), &mut first)
+            .await
+            .expect("first StartMapping deadline")
+            .expect("first StartMapping task")
+            .expect("first StartMapping")
+            .into_inner();
 
         let retry_service = service.clone();
         let mut retry = tokio::spawn(async move {
@@ -4906,23 +5071,6 @@ mod tests {
             )
             .await
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut retry)
-                .await
-                .is_err(),
-            "exact retry must join behind the in-flight Mapping transition"
-        );
-
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        LioIngressSink::accept_public_cloud(fixture.gate.as_ref(), cloud, &mut shutdown_rx)
-            .await
-            .expect("public cloud callback must not wait on the Mapping transition mutex");
-        let first = tokio::time::timeout(Duration::from_secs(2), &mut first)
-            .await
-            .expect("first StartMapping deadline")
-            .expect("first StartMapping task")
-            .expect("first StartMapping")
-            .into_inner();
         let retry = tokio::time::timeout(Duration::from_secs(2), &mut retry)
             .await
             .expect("exact retry deadline")

@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -18,6 +19,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use nuwax_codec::lcm::schema;
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
 use nuwax_exploration::wavefront_adapter::WavefrontGoalSourceAdapter;
@@ -72,6 +74,15 @@ const SCHEDULER_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_millis(100);
+const ORPHAN_RECONCILE_BATCH_SIZE: usize = 32;
+#[cfg(not(test))]
+const ORPHAN_RECONCILE_PASS_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const ORPHAN_RECONCILE_PASS_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(test)]
+const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(10);
 
 pub fn parse_arbitration_policy(s: &str) -> ExplorationArbitrationPolicy {
     try_parse_arbitration_policy(s).unwrap_or(ExplorationArbitrationPolicy::PreferWavefront)
@@ -251,8 +262,9 @@ pub struct ChildNavigationRequest {
     pub intent: schema::GoalIntent,
 }
 
-fn build_wavefront_goal_intent(
+pub(crate) fn build_wavefront_goal_intent(
     producer_epoch: u64,
+    cancel_generation: u64,
     parent_request_id: &str,
     request_id: &str,
     motion_admission: &MotionAdmissionProof,
@@ -262,6 +274,9 @@ fn build_wavefront_goal_intent(
 ) -> Result<schema::GoalIntent, String> {
     if producer_epoch == 0 || producer_epoch > i64::MAX as u64 {
         return Err("wavefront producer epoch is outside the shared intent domain".to_string());
+    }
+    if cancel_generation > i64::MAX as u64 {
+        return Err("wavefront cancel generation is outside the shared intent domain".to_string());
     }
     if !matches!(&goal.target.frame_id, NavFrameId::Map) {
         return Err("wavefront goal is not in map-frame semantics".to_string());
@@ -320,7 +335,7 @@ fn build_wavefront_goal_intent(
         owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
         parent_request_id: parent_request_id.to_string(),
         goal_generation: 0,
-        cancel_generation: 0,
+        cancel_generation: cancel_generation as i64,
         committed_map,
         boundary_id,
         boundary_sha256,
@@ -475,6 +490,11 @@ fn take_early_cancel_terminal(
 
 #[async_trait]
 pub trait ExploreNavigationSink: Send + Sync {
+    /// Snapshot the authoritative navigation cancel generation for a frozen intent.
+    fn current_cancel_generation(&self) -> Result<u64, String> {
+        Ok(0)
+    }
+
     /// Capture the active map name when a child goal intent is formed.
     fn current_map_name(&self) -> Result<String, String> {
         Err("active map name unavailable".to_string())
@@ -498,6 +518,16 @@ pub trait ExploreNavigationSink: Send + Sync {
         _lease: &ChildNavigationLease,
     ) -> Option<ChildNavigationCancelRecovery> {
         None
+    }
+
+    /// Transfer an exact stale-success lease to a retained cancellation owner.
+    fn retain_orphan_cancellation(&self, _lease: ChildNavigationLease) -> Result<(), String> {
+        Err("retained orphan cancellation is unavailable".to_string())
+    }
+
+    /// 证明精确 orphan lease 已不再持有导航状态。
+    async fn orphan_lease_is_terminal(&self, _lease: &ChildNavigationLease) -> bool {
+        false
     }
 }
 
@@ -1484,6 +1514,176 @@ fn build_controller(
     controller
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrphanCancellationPhase {
+    OwnerRequired,
+    OwnerRegistered,
+    CancelPending,
+    CancelPendingOwnerRegistered,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExactOrphanLeaseKey {
+    session_id: String,
+    owner_kind: i32,
+    parent_request_id: String,
+    goal_generation: u64,
+    producer_runtime_generation: u64,
+    goal_payload_sha256: [u8; 32],
+}
+
+impl From<&ChildNavigationLease> for ExactOrphanLeaseKey {
+    fn from(lease: &ChildNavigationLease) -> Self {
+        Self {
+            session_id: lease.session_id.clone(),
+            owner_kind: lease.owner_kind,
+            parent_request_id: lease.parent_request_id.clone(),
+            goal_generation: lease.goal_generation,
+            producer_runtime_generation: lease.producer_runtime_generation,
+            goal_payload_sha256: lease.goal_payload_sha256,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OrphanCancellationEntry {
+    lease: ChildNavigationLease,
+    phase: OrphanCancellationPhase,
+    queue_token: u64,
+}
+
+#[derive(Clone, Debug)]
+struct OrphanCancellationQueueItem {
+    key: ExactOrphanLeaseKey,
+    token: u64,
+}
+
+#[derive(Default)]
+struct OrphanCancellationState {
+    entries: HashMap<ExactOrphanLeaseKey, OrphanCancellationEntry>,
+    queue: VecDeque<OrphanCancellationQueueItem>,
+    next_queue_token: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct OrphanCancellationRegistry {
+    state: SyncMutex<OrphanCancellationState>,
+}
+
+impl OrphanCancellationRegistry {
+    pub(crate) fn register(&self, lease: ChildNavigationLease) {
+        let key = ExactOrphanLeaseKey::from(&lease);
+        let mut state = self.state.lock();
+        if state.entries.contains_key(&key) {
+            return;
+        }
+        state.next_queue_token = state
+            .next_queue_token
+            .checked_add(1)
+            .expect("orphan queue token exhausted");
+        let token = state.next_queue_token;
+        state.entries.insert(
+            key.clone(),
+            OrphanCancellationEntry {
+                lease,
+                phase: OrphanCancellationPhase::OwnerRequired,
+                queue_token: token,
+            },
+        );
+        state
+            .queue
+            .push_back(OrphanCancellationQueueItem { key, token });
+    }
+
+    pub(crate) fn mark_cancel_pending(&self, lease: &ChildNavigationLease) {
+        let key = ExactOrphanLeaseKey::from(lease);
+        if let Some(entry) = self.state.lock().entries.get_mut(&key) {
+            entry.phase = match entry.phase {
+                OrphanCancellationPhase::OwnerRequired | OrphanCancellationPhase::CancelPending => {
+                    OrphanCancellationPhase::CancelPending
+                }
+                OrphanCancellationPhase::OwnerRegistered
+                | OrphanCancellationPhase::CancelPendingOwnerRegistered => {
+                    OrphanCancellationPhase::CancelPendingOwnerRegistered
+                }
+            };
+        }
+    }
+
+    pub(crate) fn claim_owner(&self, lease: &ChildNavigationLease) -> bool {
+        let key = ExactOrphanLeaseKey::from(lease);
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key) else {
+            return false;
+        };
+        entry.phase = match entry.phase {
+            OrphanCancellationPhase::OwnerRequired => OrphanCancellationPhase::OwnerRegistered,
+            OrphanCancellationPhase::CancelPending => {
+                OrphanCancellationPhase::CancelPendingOwnerRegistered
+            }
+            OrphanCancellationPhase::OwnerRegistered
+            | OrphanCancellationPhase::CancelPendingOwnerRegistered => return false,
+        };
+        true
+    }
+
+    pub(crate) fn release_owner(&self, lease: &ChildNavigationLease) {
+        let key = ExactOrphanLeaseKey::from(lease);
+        if let Some(entry) = self.state.lock().entries.get_mut(&key) {
+            entry.phase = match entry.phase {
+                OrphanCancellationPhase::OwnerRegistered => OrphanCancellationPhase::OwnerRequired,
+                OrphanCancellationPhase::CancelPendingOwnerRegistered => {
+                    OrphanCancellationPhase::CancelPending
+                }
+                phase => phase,
+            };
+        }
+    }
+
+    pub(crate) fn remove_terminal(&self, lease: &ChildNavigationLease) {
+        let retired_state = {
+            let mut state = self.state.lock();
+            state.entries.remove(&ExactOrphanLeaseKey::from(lease));
+            state
+                .entries
+                .is_empty()
+                .then(|| std::mem::take(&mut *state))
+        };
+        if let Some(retired_state) = retired_state {
+            let _cleanup = tokio::task::spawn_blocking(move || drop(retired_state));
+        }
+    }
+
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.state.lock().entries.is_empty()
+    }
+
+    pub(crate) fn next_batch(&self, limit: usize) -> Vec<ChildNavigationLease> {
+        let mut state = self.state.lock();
+        let probe_limit = state.queue.len().min(limit);
+        let mut batch = Vec::with_capacity(probe_limit);
+        for _ in 0..probe_limit {
+            let Some(item) = state.queue.pop_front() else {
+                break;
+            };
+            let live = state
+                .entries
+                .get(&item.key)
+                .filter(|entry| entry.queue_token == item.token)
+                .map(|entry| entry.lease.clone());
+            if let Some(lease) = live {
+                state.queue.push_back(item);
+                batch.push(lease);
+            }
+        }
+        batch
+    }
+
+    pub(crate) fn blocks_motion_mutation(&self) -> bool {
+        !self.state.lock().entries.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct ExploreRuntimeHandle {
     inner: Arc<Mutex<ExploreRuntimeInner>>,
@@ -1493,6 +1693,7 @@ pub struct ExploreRuntimeHandle {
     navigation_sink: Arc<RwLock<Option<Arc<dyn ExploreNavigationSink>>>>,
     frontier_tx: watch::Sender<FrontierSnapshot>,
     generation: Arc<AtomicU64>,
+    orphan_cancellations: Arc<OrphanCancellationRegistry>,
 }
 
 impl ExploreRuntimeHandle {
@@ -1526,6 +1727,7 @@ impl ExploreRuntimeHandle {
             navigation_sink: Arc::new(RwLock::new(None)),
             frontier_tx,
             generation: Arc::new(AtomicU64::new(0)),
+            orphan_cancellations: Arc::new(OrphanCancellationRegistry::default()),
         }
     }
 
@@ -1535,6 +1737,54 @@ impl ExploreRuntimeHandle {
 
     pub(crate) fn producer_epoch_projection(&self) -> Arc<AtomicU64> {
         self.generation.clone()
+    }
+
+    pub(crate) fn orphan_cancellation_registry(&self) -> Arc<OrphanCancellationRegistry> {
+        self.orphan_cancellations.clone()
+    }
+
+    async fn reconcile_orphan_cancellation(
+        &self,
+        sink: &Arc<dyn ExploreNavigationSink>,
+        lease: ChildNavigationLease,
+    ) {
+        if sink.orphan_lease_is_terminal(&lease).await {
+            self.orphan_cancellations.remove_terminal(&lease);
+            return;
+        }
+        let recovered = sink
+            .recover_cancel_receipt(&lease)
+            .is_some_and(|recovery| recovery.failure.is_none());
+        if recovered {
+            self.orphan_cancellations.mark_cancel_pending(&lease);
+        } else if sink.cancel(&lease).await.is_ok() {
+            self.orphan_cancellations.mark_cancel_pending(&lease);
+        }
+        let _ = sink.retain_orphan_cancellation(lease.clone());
+        if sink.orphan_lease_is_terminal(&lease).await {
+            self.orphan_cancellations.remove_terminal(&lease);
+        }
+    }
+
+    pub(crate) async fn reconcile_orphan_cancellations(&self) -> bool {
+        let leases = self
+            .orphan_cancellations
+            .next_batch(ORPHAN_RECONCILE_BATCH_SIZE);
+        let Some(sink) = self.navigation_sink.read().clone() else {
+            return leases.is_empty();
+        };
+        let mut pending = FuturesUnordered::new();
+        for lease in leases {
+            pending.push(tokio::time::timeout(
+                ORPHAN_RECONCILE_ENTRY_TIMEOUT,
+                self.reconcile_orphan_cancellation(&sink, lease),
+            ));
+        }
+        let _ = tokio::time::timeout(ORPHAN_RECONCILE_PASS_TIMEOUT, async {
+            while pending.next().await.is_some() {}
+        })
+        .await;
+        !self.orphan_cancellations.blocks_motion_mutation()
     }
 
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
@@ -2562,6 +2812,16 @@ impl ExploreRuntimeHandle {
             return self.snapshot();
         }
 
+        if self.orphan_cancellations.has_entries() {
+            let snapshot = guard.snapshot(
+                STATUS_PENDING,
+                "recovering orphan navigation ownership before child dispatch",
+            );
+            drop(guard);
+            self.reconcile_orphan_cancellations().await;
+            return self.store_snapshot(snapshot);
+        }
+
         if guard.pending_child_cancellation.is_some() {
             let snapshot = guard.snapshot(
                 STATUS_STOPPING,
@@ -2655,6 +2915,21 @@ impl ExploreRuntimeHandle {
                     self.publish_frontiers(frontier_update);
                     return self.store_snapshot(snapshot);
                 };
+                let cancel_generation = match self
+                    .navigation_sink
+                    .read()
+                    .as_ref()
+                    .ok_or_else(|| "navigation sink unavailable".to_string())
+                    .and_then(|sink| sink.current_cancel_generation())
+                {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        let snapshot = guard
+                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
+                        self.publish_frontiers(frontier_update);
+                        return self.store_snapshot(snapshot);
+                    }
+                };
                 let expected_map_name = match self
                     .navigation_sink
                     .read()
@@ -2672,6 +2947,7 @@ impl ExploreRuntimeHandle {
                 };
                 let intent = match build_wavefront_goal_intent(
                     guard.session_generation,
+                    cancel_generation,
                     &guard.last_request_id,
                     &child_request_id,
                     &config.motion_admission,
@@ -2785,10 +3061,15 @@ impl ExploreRuntimeHandle {
         let proposed_request_id = request.request_id.clone();
         let expected_parent_request_id = request.parent_request_id.clone();
         let frontier_goal_id = request.frontier_goal_id.clone();
+
+        // Freeze the exact request before releasing Explore state. Navigation
+        // admission is async and must never hold the Explore inner lock.
+        guard.pending_child_dispatch = Some(request.clone());
+        drop(guard);
+
         let ticket = match sink.submit(request.clone()).await {
             Ok(ticket) => ticket,
             Err(error) => {
-                drop(guard);
                 return self
                     .record_dispatch_failure(generation, request, error)
                     .await;
@@ -2804,7 +3085,6 @@ impl ExploreRuntimeHandle {
             || ticket.lease.producer_runtime_generation == 0
             || ticket.lease.goal_payload_sha256 == [0; 32]
         {
-            drop(guard);
             return self
                 .record_dispatch_failure(
                     generation,
@@ -2815,6 +3095,33 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         }
+
+        let mut guard = self.inner.lock().await;
+        let frozen_request_matches = guard
+            .pending_child_dispatch
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.request_id == request.request_id
+                    && pending.parent_request_id == request.parent_request_id
+                    && pending.intent == request.intent
+            });
+        if generation != guard.generation
+            || !guard.controller.is_active()
+            || !frozen_request_matches
+        {
+            drop(guard);
+            // Nav may already own the exact lease. Do not attach it to a newer
+            // Explore epoch. A failed immediate cancel must transfer ownership
+            // to a retained exact-lease recovery task or remain in Explore's
+            // persistent in-process orphan set for scheduler retry.
+            self.orphan_cancellations.register(ticket.lease.clone());
+            if sink.cancel(&ticket.lease).await.is_ok() {
+                self.orphan_cancellations.mark_cancel_pending(&ticket.lease);
+            }
+            let _ = sink.retain_orphan_cancellation(ticket.lease);
+            return self.snapshot();
+        }
+
         guard.pending_child_dispatch = None;
         let child_request_id = ticket.lease.session_id.clone();
         guard.active_child = Some(ActiveChildNavigation {
@@ -3283,6 +3590,7 @@ impl ExploreRuntimeHandle {
         guard.controller.is_active()
             || guard.active_child.is_some()
             || guard.pending_child_cancellation.is_some()
+            || self.orphan_cancellations.blocks_motion_mutation()
     }
 
     pub async fn readiness(&self, backend_available: bool) -> ExplorationReadinessDetail {
@@ -3436,7 +3744,7 @@ fn validate_expected_map_frame(frame_id: String) -> Result<Arc<str>, String> {
 }
 
 fn normalize_frame(frame_id: &str) -> &str {
-    frame_id.trim().trim_start_matches('/')
+    frame_id.trim()
 }
 
 fn evaluate_stop_conditions(
@@ -4246,8 +4554,7 @@ mod tests {
         ExploreRuntimeSnapshot,
     ) {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .expect("frontier costmap");
         handle.start(request_id, "prefer_wavefront").await;
@@ -4379,7 +4686,13 @@ mod tests {
 
         let sink = Arc::new(RecordingNavSink::default());
         handle.set_navigation_sink(sink.clone());
-        assert!(handle.ingest_costmap(frontier_costmap(1).grid).await);
+        let mut configured_costmap = frontier_costmap(1);
+        configured_costmap.frame_id = "robot/map".to_string();
+        assert!(
+            ingest_committed_costmap_fixture(&handle, configured_costmap, 1)
+                .await
+                .expect("configured committed costmap")
+        );
         assert_eq!(
             handle
                 .inner
@@ -4432,12 +4745,24 @@ mod tests {
         assert!(!readiness.costmap_input_ready);
         assert!(!readiness.ready);
 
+        let mut slash_configured_costmap = frontier_costmap(2);
+        slash_configured_costmap.frame_id = "/robot/map".to_string();
+        let slash_error = handle
+            .ingest_costmap_snapshot(slash_configured_costmap)
+            .await
+            .expect_err("slash-prefixed frame must not satisfy raw-exact robot/map");
+        assert!(
+            slash_error.contains("costmap frame=robot/map"),
+            "{slash_error}"
+        );
+
         let mut configured_costmap = frontier_costmap(2);
         configured_costmap.frame_id = "robot/map".to_string();
-        assert!(handle
-            .ingest_costmap_snapshot(configured_costmap)
-            .await
-            .expect("configured costmap"));
+        assert!(
+            ingest_committed_costmap_fixture(&handle, configured_costmap, 2)
+                .await
+                .expect("configured costmap")
+        );
         assert_eq!(
             handle
                 .start("req-wrong-pose", "prefer_wavefront")
@@ -4461,8 +4786,7 @@ mod tests {
     #[tokio::test]
     async fn tick_dispatches_real_child_and_feedback_advances_session() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         assert_eq!(
@@ -4499,8 +4823,7 @@ mod tests {
                 "MOTION_SINK_NOT_READY: test navigation chain is recovering".to_string(),
             )
         }));
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-readiness", "prefer_wavefront").await;
@@ -4513,8 +4836,7 @@ mod tests {
                 .contains("waiting for child navigation readiness"));
             assert!(waiting.child_task_id.is_empty());
             if attempt == 0 {
-                handle
-                    .ingest_costmap_snapshot(frontier_costmap(2))
+                ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
                     .await
                     .unwrap();
             }
@@ -4535,6 +4857,26 @@ mod tests {
 
         let diagnostics = handle.diagnostics().await;
         assert!(diagnostics.sources[0].last_error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_invalidated_dispatch_rejection_finishes_immediately() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors.lock().unwrap().push_back(
+            ChildNavigationSubmitError::SessionInvalidated(
+                "active map name changed before goal lease admission".to_string(),
+            ),
+        );
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+            .await
+            .unwrap();
+        handle.start("req-invalidated", "prefer_wavefront").await;
+
+        let failed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.message.contains("active map name changed"));
+        assert!(failed.child_task_id.is_empty());
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4587,8 +4929,7 @@ mod tests {
         ] {
             let (handle, sink) = configured_handle();
             *sink.lease_override.lock().unwrap() = Some(invalid_lease);
-            handle
-                .ingest_costmap_snapshot(frontier_costmap(1))
+            ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
                 .await
                 .unwrap();
             handle.start("req-invalid-lease", "prefer_wavefront").await;
@@ -4605,8 +4946,7 @@ mod tests {
     #[tokio::test]
     async fn stop_retains_child_until_correlated_zeroed_proof() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-stop", "prefer_wavefront").await;
@@ -4645,8 +4985,7 @@ mod tests {
     #[tokio::test]
     async fn stop_rejects_a_mismatched_parent_request_before_child_cancel() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-stop-owner", "prefer_wavefront").await;
@@ -4666,8 +5005,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_start_does_not_attach_the_active_child_to_the_new_parent() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-active-owner", "prefer_wavefront").await;
@@ -4688,8 +5026,7 @@ mod tests {
     #[tokio::test]
     async fn zeroed_proof_requires_exact_lease_generation_ack_and_time() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-proof", "prefer_wavefront").await;
@@ -4747,8 +5084,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_dispatch_failure_is_parent_failed_and_retains_safety_ownership() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-cancel-fail", "prefer_wavefront").await;
@@ -4767,8 +5103,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_error_retains_exact_receipt_for_late_zeroed_reconciliation() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -4808,8 +5143,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_dispatch_timeout_is_retryable_and_retains_safety_ownership() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -4837,8 +5171,7 @@ mod tests {
     #[tokio::test]
     async fn nav_runtime_rollover_requires_durable_guard_fence_before_releasing_child() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -4896,8 +5229,7 @@ mod tests {
     #[tokio::test]
     async fn rollover_recovery_rejects_wrong_child_and_nonfailed_cancellation() {
         let (handle, _sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-rollover-wrong", "prefer_wavefront").await;
@@ -5532,8 +5864,7 @@ mod tests {
     #[tokio::test]
     async fn failed_cancel_without_ticket_retries_only_for_the_exact_parent_request() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-cancel-retry", "prefer_wavefront").await;
@@ -5573,8 +5904,7 @@ mod tests {
     #[tokio::test]
     async fn failed_cancel_with_ticket_retries_with_a_new_generation() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-timeout-retry", "prefer_wavefront").await;
@@ -5626,8 +5956,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_old_cancel_failure_cannot_supersede_an_inflight_retry() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -5657,7 +5986,9 @@ mod tests {
             let handle = handle.clone();
             tokio::spawn(async move { handle.stop("req-retry-old-failure").await })
         };
-        sink.cancel_entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
+            .await
+            .expect("cancel submit did not enter within one second");
         let duplicate = handle
             .report_navigation_result(
                 &active.child_task_id,
@@ -5689,8 +6020,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_repeated_stop_dispatches_only_one_cancel_retry() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-single-retry", "prefer_wavefront").await;
@@ -5706,7 +6036,9 @@ mod tests {
             let handle = handle.clone();
             tokio::spawn(async move { handle.stop("req-single-retry").await })
         };
-        sink.cancel_entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
+            .await
+            .expect("cancel submit did not enter within one second");
 
         let concurrent = handle.stop("req-single-retry").await;
         assert_eq!(concurrent.status, STATUS_STOPPING);
@@ -5732,8 +6064,7 @@ mod tests {
     #[tokio::test]
     async fn zeroed_before_cancel_ticket_is_replayed_after_ticket_commit() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-early-zero", "prefer_wavefront").await;
@@ -5746,7 +6077,9 @@ mod tests {
             let handle = handle.clone();
             tokio::spawn(async move { handle.stop("req-early-zero").await })
         };
-        sink.cancel_entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
+            .await
+            .expect("cancel submit did not enter within one second");
 
         let buffered = handle
             .report_navigation_result(
@@ -5769,8 +6102,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_zero_ack_timeout_is_parent_failed_and_keeps_child_identity() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-cancel-timeout", "prefer_wavefront").await;
@@ -5817,8 +6149,7 @@ mod tests {
     #[tokio::test]
     async fn costmap_refresh_does_not_stop_active_exploration() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -5833,8 +6164,7 @@ mod tests {
         let active = handle.tick((2.0, 2.0)).await;
         let lease = active_child_lease(&handle).await;
 
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(2))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
             .await
             .unwrap();
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
@@ -5855,8 +6185,7 @@ mod tests {
     #[tokio::test]
     async fn child_request_carries_complete_map_boundary() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         let boundary = ExplorationBoundary::from_vertices(vec![
@@ -5907,8 +6236,7 @@ mod tests {
     #[tokio::test]
     async fn pure_snapshot_read_does_not_drive_controller() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-read", "prefer_wavefront").await;
@@ -5922,8 +6250,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_progresses_without_state_queries() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-scheduler", "prefer_wavefront").await;
@@ -5951,8 +6278,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_shutdown_settles_owner_cancelled_blocked_pose_provider() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-blocked-pose", "prefer_wavefront").await;
@@ -5976,8 +6302,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_shutdown_settles_blocked_submit_and_releases_runtime_lock() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-blocked-submit", "prefer_wavefront").await;
@@ -6038,8 +6363,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scheduler_panic_is_fatal_and_settled() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-panic", "prefer_wavefront").await;
@@ -6059,8 +6383,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scheduler_abort_join_timeout_retains_final_handle_and_reports_unsettled() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-unsettled", "prefer_wavefront").await;
@@ -6100,8 +6423,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scheduler_shutdown_cancellation_retains_monitor_for_retry() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle
@@ -6155,8 +6477,7 @@ mod tests {
     #[tokio::test]
     async fn stale_pose_with_active_child_enters_cancel_pending_immediately() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-stale-active", "prefer_wavefront").await;
@@ -6189,8 +6510,7 @@ mod tests {
     #[tokio::test]
     async fn stale_pose_without_child_has_bounded_grace_then_fails() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-stale-idle", "prefer_wavefront").await;
@@ -6226,8 +6546,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_requires_backend_costmap_controller_and_nav_sink() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-ready", "prefer_wavefront").await;
@@ -6240,15 +6559,13 @@ mod tests {
     #[tokio::test]
     async fn costmap_refresh_keeps_active_child_and_next_goal_progresses() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-map", "prefer_wavefront").await;
         let active = handle.tick((2.0, 2.0)).await;
         let lease = active_child_lease(&handle).await;
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(2))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
             .await
             .unwrap();
         let snapshot = handle.tick((2.0, 2.0)).await;
@@ -6275,8 +6592,7 @@ mod tests {
     #[tokio::test]
     async fn max_goals_waits_for_active_child_terminal_before_stopping() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         let accepted = handle
@@ -6322,8 +6638,7 @@ mod tests {
     #[tokio::test]
     async fn max_goals_does_not_count_failed_child_as_reached() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         let accepted = handle
@@ -6374,8 +6689,7 @@ mod tests {
     #[tokio::test]
     async fn costmap_refresh_during_submit_keeps_dispatched_child_active() {
         let (handle, sink) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-submit-race", "prefer_wavefront").await;
@@ -6385,10 +6699,14 @@ mod tests {
             let handle = handle.clone();
             tokio::spawn(async move { handle.tick((2.0, 2.0)).await })
         };
-        sink.submit_entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), sink.submit_entered.notified())
+            .await
+            .expect("navigation submit did not enter within one second");
         let ingesting = {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.ingest_costmap_snapshot(frontier_costmap(2)).await })
+            tokio::spawn(async move {
+                ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2).await
+            })
         };
         tokio::task::yield_now().await;
         release.notify_one();
@@ -6406,15 +6724,13 @@ mod tests {
     #[tokio::test]
     async fn user_stop_after_costmap_update_cancels_active_child() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-stop-replan", "prefer_wavefront").await;
         let active = handle.tick((2.0, 2.0)).await;
         let lease = active_child_lease(&handle).await;
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(2))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
             .await
             .unwrap();
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
@@ -6438,25 +6754,5 @@ mod tests {
         let adapter =
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
-    }
-
-    #[tokio::test]
-    async fn session_invalidated_dispatch_rejection_finishes_immediately() {
-        let (handle, sink) = configured_handle();
-        sink.submit_errors.lock().unwrap().push_back(
-            ChildNavigationSubmitError::SessionInvalidated(
-                "active map name changed before goal lease admission".to_string(),
-            ),
-        );
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-invalidated", "prefer_wavefront").await;
-
-        let failed = handle.tick((2.0, 2.0)).await;
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert!(failed.message.contains("active map name changed"));
-        assert!(failed.child_task_id.is_empty());
-        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
     }
 }

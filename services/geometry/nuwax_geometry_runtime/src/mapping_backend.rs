@@ -28,8 +28,6 @@ use nuwax_mapping_raytracing::voxel_ray_tracer::{
     MAX_REQUEST_RAY_STEPS, VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
 };
 
-
-
 const WORKER_QUEUE_CAPACITY: usize = 1;
 const WORKER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_RESOLUTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -1059,18 +1057,36 @@ impl MappingBackendClient {
 impl MappingBackendSpec {
     #[doc(hidden)]
     pub fn raytracing(
-        voxel_size: f32, max_range: f32, ray_subsample: u32, shadow_depth: f32,
-        grace_depth: f32, min_health: i32, max_health: i32, graze_cos: f32,
+        voxel_size: f32,
+        max_range: f32,
+        ray_subsample: u32,
+        shadow_depth: f32,
+        grace_depth: f32,
+        min_health: i32,
+        max_health: i32,
+        graze_cos: f32,
         recency_window: u32,
     ) -> Self {
-        Self::Raytracing(RaytracingBackendSpec { voxel_size, max_range, ray_subsample, shadow_depth, grace_depth, min_health, max_health, graze_cos, recency_window })
+        Self::Raytracing(RaytracingBackendSpec {
+            voxel_size,
+            max_range,
+            ray_subsample,
+            shadow_depth,
+            grace_depth,
+            min_health,
+            max_health,
+            graze_cos,
+            recency_window,
+        })
     }
 
     #[doc(hidden)]
     pub fn from_env(selected: MappingBackendKind) -> Result<Self, String> {
         match selected {
             MappingBackendKind::Voxel => Ok(Self::Voxel),
-            MappingBackendKind::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?)),
+            MappingBackendKind::Raytracing => {
+                Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?))
+            }
         }
     }
 
@@ -1081,9 +1097,9 @@ impl MappingBackendSpec {
     ) -> Result<Self, String> {
         match selected {
             MappingBackendKind::Voxel => Ok(Self::Voxel),
-            MappingBackendKind::Raytracing => Ok(Self::Raytracing(RaytracingBackendSpec::from_lookup(
-                lookup,
-            )?)),
+            MappingBackendKind::Raytracing => Ok(Self::Raytracing(
+                RaytracingBackendSpec::from_lookup(lookup)?,
+            )),
         }
     }
 

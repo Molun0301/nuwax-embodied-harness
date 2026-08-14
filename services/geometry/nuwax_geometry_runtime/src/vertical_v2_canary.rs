@@ -179,9 +179,11 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let bridge_map_revision_latest_tx = map_revision_latest_tx.clone();
     let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
     let lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
     spawn_map_revision_fanout(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority.clone(),
         publisher.clone(),
         occupancy_topic.clone(),
         occupancy_type.clone(),
@@ -190,7 +192,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         Arc::new(RwLock::new(None)),
         explore.clone(),
         mapping.clone(),
-        lifecycle_lock,
+        lifecycle_lock.clone(),
     );
 
     let source_timestamp_ns = crate::explore_runtime::now_unix_nanos();
@@ -316,6 +318,8 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         frontiers_tx,
         map_revision_tx: map_revision_tx.clone(),
         map_revision_latest_tx: bridge_map_revision_latest_tx,
+        committed_map_authority,
+        mapping_lifecycle_lock: lifecycle_lock,
         transport: publisher.clone(),
         transport_backend_name: "real-lcm",
         lcm_backend_available: true,

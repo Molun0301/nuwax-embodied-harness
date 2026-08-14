@@ -247,7 +247,6 @@ pub struct NavRuntimeState {
     stack_observation: Arc<StdMutex<StackObservation>>,
     runtime_observations: Arc<StdMutex<RuntimeObservations>>,
     cancel: Arc<StdMutex<CancelTracker>>,
-    goal_command_gate: Arc<RwLock<()>>,
     producer_runtime_generation: u64,
     next_goal_generation: Arc<AtomicU64>,
     next_cancel_generation: Arc<AtomicU64>,
@@ -531,7 +530,6 @@ impl NavRuntimeState {
             stack_observation: Arc::new(StdMutex::new(StackObservation::default())),
             runtime_observations: Arc::new(StdMutex::new(RuntimeObservations::default())),
             cancel: Arc::new(StdMutex::new(CancelTracker::default())),
-            goal_command_gate: Arc::new(RwLock::new(())),
             producer_runtime_generation,
             next_goal_generation: Arc::new(AtomicU64::new(0)),
             next_cancel_generation: Arc::new(AtomicU64::new(0)),
@@ -1884,6 +1882,127 @@ pub struct GoalBoundaryConstraint {
     pub points: Vec<[f64; 3]>,
 }
 
+fn validate_committed_map_identity(
+    committed_map: &schema::CommittedMapIdentity,
+) -> Result<(), String> {
+    if committed_map.session_id.trim().is_empty()
+        || committed_map.session_id.trim() != committed_map.session_id
+        || committed_map.session_generation <= 0
+        || committed_map.revision <= 0
+        || committed_map.payload_sha256 == [0; 32]
+        || committed_map.frame_id.trim().is_empty()
+        || committed_map.frame_id.trim() != committed_map.frame_id
+    {
+        return Err("COMMITTED_MAP_REJECTED: incomplete identity".to_string());
+    }
+    Ok(())
+}
+
+fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOutcome {
+    SetGoalOutcome {
+        state: NavState {
+            status: NavPhase::Failed.as_str().to_string(),
+            message: format!("SET_GOAL_REJECTED[GOAL_INTENT_INVALID]: {}", reason.into()),
+            goal_id,
+            distance_remaining: 0.0,
+            timestamp_ns: now_ns(),
+        },
+        lease: None,
+        retry_reason: None,
+    }
+}
+
+async fn goal_intent_from_set_goal(
+    handle: &GeometryRuntimeHandle,
+    state: &NavRuntimeState,
+    mut input: SetGoalInput,
+    boundary: Option<GoalBoundaryConstraint>,
+) -> Result<schema::GoalIntent, String> {
+    input.goal_id = input.goal_id.trim().to_string();
+    input.parent_request_id = input.parent_request_id.trim().to_string();
+    input.target.frame_id = input.frame_id.clone();
+    if input.target.timestamp_ns == 0 {
+        input.target.timestamp_ns = now_ns();
+    }
+    // 公开导航只观察 Geometry composition 已提交的 authority；候选事件/watch
+    // 不得在 producer 侧提升权威性。
+    let committed_map = handle
+        .committed_map_authority
+        .lock()
+        .map_err(|_| "authoritative committed map state is unavailable".to_string())?
+        .clone()
+        .ok_or_else(|| "authoritative committed map is unavailable".to_string())?;
+    let goal_generation = i64::try_from(input.goal_generation)
+        .map_err(|_| "goal_generation exceeds i64".to_string())?;
+    let cancel_generation = i64::try_from(state.cancel_snapshot().generation)
+        .map_err(|_| "cancel_generation exceeds i64".to_string())?;
+    let producer_epoch = i64::try_from(state.producer_runtime_generation)
+        .map_err(|_| "producer epoch exceeds i64".to_string())?;
+    let (producer, priority) = match input.owner_kind {
+        schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV => ("public-navigation", 0),
+        schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD => ("wavefront", 100),
+        _ => return Err("unsupported navigation owner kind".to_string()),
+    };
+    let goal = schema::PoseStamped {
+        header: schema::Header {
+            seq: 0,
+            stamp_sec: i32::try_from(input.target.timestamp_ns / 1_000_000_000)
+                .map_err(|_| "goal timestamp seconds exceed i32".to_string())?,
+            stamp_nsec: (input.target.timestamp_ns % 1_000_000_000) as i32,
+            frame_id: input.frame_id.clone(),
+        },
+        pose: schema::Pose {
+            position: [input.target.x, input.target.y, input.target.z],
+            orientation_xyzw: [
+                input.target.qx,
+                input.target.qy,
+                input.target.qz,
+                input.target.qw,
+            ],
+        },
+    };
+    let goal_sha256 = schema::goal_intent_goal_sha256(&goal).map_err(|error| error.to_string())?;
+    let (boundary_id, boundary_points, boundary_sha256) = match boundary {
+        Some(boundary) => {
+            if boundary.frame_id.trim().trim_start_matches('/')
+                != committed_map.frame_id.trim().trim_start_matches('/')
+            {
+                return Err(
+                    "GOAL_BOUNDARY_INVALID: boundary frame differs from committed map".to_string(),
+                );
+            }
+            let boundary_id = format!("{}:boundary", input.parent_request_id);
+            let boundary_sha256 = schema::goal_intent_boundary_sha256(
+                &committed_map.frame_id,
+                &boundary_id,
+                &boundary.points,
+            )
+            .map_err(|error| error.to_string())?;
+            (boundary_id, boundary.points, boundary_sha256)
+        }
+        None => (String::new(), Vec::new(), [0; 32]),
+    };
+    Ok(schema::GoalIntent {
+        producer: producer.to_string(),
+        producer_epoch,
+        priority,
+        session_id: input.goal_id,
+        owner_kind: input.owner_kind,
+        parent_request_id: input.parent_request_id,
+        goal_generation,
+        cancel_generation,
+        committed_map,
+        boundary_id,
+        boundary_sha256,
+        boundary_points,
+        motion_guard_generation: input.motion_admission.guard_generation as i64,
+        motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
+        motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
+        goal_sha256,
+        goal,
+    })
+}
+
 /// Submit one goal to the real stack.
 ///
 /// 失败时返回带 `status=FAILED` 的 NavState(但 `goal_id` 保留),
@@ -1896,13 +2015,199 @@ pub async fn set_goal(
     set_goal_with_boundary(handle, state, input, None).await
 }
 
-/// Submit a goal with an optional exploration boundary while preserving the
-/// public `set_goal` ABI for ordinary navigation callers.
+/// 将旧公开输入适配为共享不可变目标 intent。
 pub async fn set_goal_with_boundary(
+    handle: &GeometryRuntimeHandle,
+    state: &NavRuntimeState,
+    input: SetGoalInput,
+    boundary: Option<GoalBoundaryConstraint>,
+) -> SetGoalOutcome {
+    let goal_id = input.goal_id.clone();
+    let intent = match goal_intent_from_set_goal(handle, state, input, boundary).await {
+        Ok(intent) => intent,
+        Err(reason) => return rejected_goal_intent(goal_id, reason),
+    };
+    admit_goal_intent(handle, state, intent).await
+}
+
+/// 校验共享 intent，并执行唯一目标租约 CAS 准入。
+pub async fn admit_goal_intent(
+    handle: &GeometryRuntimeHandle,
+    state: &NavRuntimeState,
+    intent: schema::GoalIntent,
+) -> SetGoalOutcome {
+    let goal_id = intent.session_id.clone();
+    // Geometry 的生命周期 fence 同时是地图 authority 发布与 GoalLease CAS
+    // 的唯一组装层顺序门；准入持门到租约安装完成，但不跨异步发布。
+    let map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
+    let producer_contract_valid = matches!(
+        (intent.producer.as_str(), intent.owner_kind, intent.priority,),
+        (
+            "public-navigation",
+            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            0
+        ) | (
+            "wavefront",
+            schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+            100
+        )
+    );
+    if !producer_contract_valid
+        || intent.producer_epoch <= 0
+        || intent.goal_generation < 0
+        || intent.cancel_generation < 0
+        || intent.session_id.trim().is_empty()
+        || intent.session_id.trim() != intent.session_id
+        || intent.parent_request_id.trim().is_empty()
+        || intent.parent_request_id.trim() != intent.parent_request_id
+    {
+        return rejected_goal_intent(
+            goal_id,
+            "invalid producer, owner, priority, or generation identity",
+        );
+    }
+    if let Err(reason) = validate_committed_map_identity(&intent.committed_map) {
+        return rejected_goal_intent(goal_id, reason);
+    }
+    let current_map = match handle.committed_map_authority.lock() {
+        Ok(authority) => authority.clone(),
+        Err(_) => {
+            return rejected_goal_intent(
+                goal_id,
+                "authoritative committed map state is unavailable",
+            )
+        }
+    };
+    let Some(current_map) = current_map else {
+        return rejected_goal_intent(goal_id, "authoritative committed map is unavailable");
+    };
+    if current_map != intent.committed_map {
+        return rejected_goal_intent(goal_id, "stale or conflicting committed map identity");
+    }
+    if intent.goal.header.seq != 0
+        || intent.goal.header.frame_id != intent.committed_map.frame_id
+        || intent.goal.header.stamp_sec < 0
+        || !(0..1_000_000_000).contains(&intent.goal.header.stamp_nsec)
+        || (intent.goal.header.stamp_sec == 0 && intent.goal.header.stamp_nsec == 0)
+        || intent
+            .goal
+            .pose
+            .position
+            .iter()
+            .chain(intent.goal.pose.orientation_xyzw.iter())
+            .any(|value| !value.is_finite())
+    {
+        return rejected_goal_intent(goal_id, "goal header, frame, timestamp, or pose is invalid");
+    }
+    let motion_admission = MotionAdmissionProof {
+        guard_generation: match u64::try_from(intent.motion_guard_generation) {
+            Ok(value) => value,
+            Err(_) => return rejected_goal_intent(goal_id, "motion guard generation is invalid"),
+        },
+        guard_boot_nonce: intent.motion_guard_boot_nonce,
+        motion_stop_generation: match u64::try_from(intent.motion_stop_generation) {
+            Ok(value) => value,
+            Err(_) => return rejected_goal_intent(goal_id, "motion stop generation is invalid"),
+        },
+    };
+    if let Err(reason) = motion_admission.validate() {
+        return rejected_goal_intent(goal_id, reason);
+    }
+    let expected_goal_sha256 = match schema::goal_intent_goal_sha256(&intent.goal) {
+        Ok(hash) => hash,
+        Err(error) => return rejected_goal_intent(goal_id, error.to_string()),
+    };
+    if intent.goal_sha256 == [0; 32] || intent.goal_sha256 != expected_goal_sha256 {
+        return rejected_goal_intent(goal_id, "goal hash mismatch");
+    }
+    let boundary = if intent.boundary_points.is_empty() {
+        if !intent.boundary_id.is_empty() || intent.boundary_sha256 != [0; 32] {
+            return rejected_goal_intent(goal_id, "empty boundary carries non-empty identity");
+        }
+        None
+    } else {
+        if intent.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+            || intent.boundary_id != format!("{}:boundary", intent.parent_request_id)
+            || intent.boundary_points.len() < 3
+            || intent
+                .boundary_points
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+        {
+            return rejected_goal_intent(goal_id, "boundary identity or polygon is invalid");
+        }
+        let expected_boundary_sha256 = match schema::goal_intent_boundary_sha256(
+            &intent.committed_map.frame_id,
+            &intent.boundary_id,
+            &intent.boundary_points,
+        ) {
+            Ok(hash) => hash,
+            Err(error) => return rejected_goal_intent(goal_id, error.to_string()),
+        };
+        if intent.boundary_sha256 == [0; 32] || intent.boundary_sha256 != expected_boundary_sha256 {
+            return rejected_goal_intent(goal_id, "boundary hash mismatch");
+        }
+        Some(GoalBoundaryConstraint {
+            frame_id: intent.committed_map.frame_id.clone(),
+            points: intent.boundary_points.clone(),
+        })
+    };
+    let cancel = state.cancel_snapshot();
+    let cancel_matches = if intent.cancel_generation == 0 {
+        cancel.phase == CancelPhase::Idle
+    } else {
+        u64::try_from(intent.cancel_generation).ok() == Some(cancel.generation)
+            && cancel.phase == CancelPhase::Idle
+    };
+    if !cancel_matches {
+        return rejected_goal_intent(goal_id, "cancel generation changed before admission");
+    }
+    let timestamp_ns = if intent.goal.header.stamp_sec < 0 || intent.goal.header.stamp_nsec < 0 {
+        return rejected_goal_intent(goal_id, "goal timestamp is negative");
+    } else {
+        (intent.goal.header.stamp_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(intent.goal.header.stamp_nsec as u64)
+    };
+    let expected_map_revision = intent.committed_map.revision as u64;
+    let input = SetGoalInput {
+        goal_id: intent.session_id,
+        owner_kind: intent.owner_kind,
+        parent_request_id: intent.parent_request_id,
+        goal_generation: intent.goal_generation as u64,
+        motion_admission,
+        frame_id: intent.committed_map.frame_id,
+        target: PoseState {
+            x: intent.goal.pose.position[0],
+            y: intent.goal.pose.position[1],
+            z: intent.goal.pose.position[2],
+            qx: intent.goal.pose.orientation_xyzw[0],
+            qy: intent.goal.pose.orientation_xyzw[1],
+            qz: intent.goal.pose.orientation_xyzw[2],
+            qw: intent.goal.pose.orientation_xyzw[3],
+            frame_id: intent.goal.header.frame_id,
+            timestamp_ns,
+        },
+    };
+    admit_goal_input(
+        handle,
+        state,
+        input,
+        boundary,
+        expected_map_revision,
+        map_goal_guard,
+    )
+    .await
+}
+
+async fn admit_goal_input(
     handle: &GeometryRuntimeHandle,
     state: &NavRuntimeState,
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
+    expected_map_revision: u64,
+    map_goal_guard: tokio::sync::MutexGuard<'_, ()>,
 ) -> SetGoalOutcome {
     input.goal_id = input.goal_id.trim().to_string();
     input.parent_request_id = input.parent_request_id.trim().to_string();
@@ -1987,6 +2292,22 @@ pub async fn set_goal_with_boundary(
             },
             lease: None,
             retry_reason: Some(SetGoalRetryReason::NavigationNotReady(detail.reason_code)),
+        };
+    }
+    if detail.costmap_revision != expected_map_revision {
+        return SetGoalOutcome {
+            state: NavState {
+                status: NavPhase::Failed.as_str().to_string(),
+                message: format!(
+                    "SET_GOAL_REJECTED[COMMITTED_MAP_REVISION_MISMATCH]: intent={} planner={}",
+                    expected_map_revision, detail.costmap_revision,
+                ),
+                goal_id: input.goal_id.clone(),
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            },
+            lease: None,
+            retry_reason: None,
         };
     }
     if input.frame_id != detail.map_frame {
@@ -2121,7 +2442,6 @@ pub async fn set_goal_with_boundary(
         path_payload_sha256: [0; 32],
     };
 
-    let _goal_command_guard = state.goal_command_gate.write().await;
     let distance_remaining = distance_to_target(handle, &input.target).await;
     {
         let mut slot = state.inner.write().await;
@@ -2203,6 +2523,7 @@ pub async fn set_goal_with_boundary(
         });
         *cancel = CancelTracker::default();
     }
+    drop(map_goal_guard);
 
     // 2. publish sealed GoalEnvelope. Facade does not create a follower/cmd_vel.
     if let Err(e) = publish_goal_frame(handle, &envelope).await {
@@ -2266,8 +2587,10 @@ pub async fn cancel(
     state: &NavRuntimeState,
     input: CancelGoalInput,
 ) -> CancelOutcome {
-    let _goal_command_guard = state.goal_command_gate.read().await;
-    match state.begin_cancel(&input).await {
+    let map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
+    let cancel_start = state.begin_cancel(&input).await;
+    drop(map_goal_guard);
+    match cancel_start {
         CancelStart::Publish {
             lease,
             generation,

@@ -567,6 +567,33 @@ fn encode_occupancy_revision_in_frame(
     .map_err(|error| format!("encode occupancy revision failed: {error}"))
 }
 
+pub(crate) fn committed_map_identity_from_revision(
+    event: &MapRevisionEvent,
+) -> Result<schema::CommittedMapIdentity, String> {
+    let session_generation = i64::try_from(event.session_generation)
+        .map_err(|_| "committed map session_generation exceeds i64".to_string())?;
+    let revision = i64::try_from(event.revision)
+        .map_err(|_| "committed map revision exceeds i64".to_string())?;
+    if event.session_id.trim().is_empty()
+        || session_generation <= 0
+        || revision <= 0
+        || event.frame_id.trim().is_empty()
+    {
+        return Err("committed map identity is incomplete".to_string());
+    }
+    let payload_sha256 = crate::map_checksum::sha256_bytes(event.data.as_ref());
+    if crate::map_checksum::sha256_hex(event.data.as_ref()) != event.checksum {
+        return Err("committed map payload checksum mismatch".to_string());
+    }
+    Ok(schema::CommittedMapIdentity {
+        session_id: event.session_id.clone(),
+        session_generation,
+        revision,
+        payload_sha256,
+        frame_id: event.frame_id.clone(),
+    })
+}
+
 fn exploration_costmap_from_revision(
     event: &MapRevisionEvent,
 ) -> Result<crate::explore_runtime::ExploreCostmapSnapshot, String> {
@@ -2742,6 +2769,9 @@ pub struct GeometryRuntimeHandle {
     /// Latest-only revision stream. The broadcast sender above remains the
     /// adapter ingress ABI; one coalescer owns the broadcast -> watch bridge.
     pub map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    /// Composition-owned authoritative committed-map identity. The mapping
+    /// lifecycle fence is its sole mutation/admission gate.
+    pub(crate) committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     pub transport: LcmTransport,
     /// canonical LCM backend 名（HealthCheck / 日志 / diagnostics 用），
     /// 字段值固定为 `real-lcm`；
@@ -2819,6 +2849,7 @@ impl GeometryRuntimeHandle {
         let writer = self.cloud_map_writer.clone();
         let state = self.state.clone();
         let map_revision_latest_tx = self.map_revision_latest_tx.clone();
+        let committed_map_authority = self.committed_map_authority.clone();
         let occupancy_shm_current = self.occupancy_shm_current.clone();
         let cloud_map_tx = self.cloud_map_tx.clone();
         let mapping_adapter = self.mapping_adapter.clone();
@@ -2865,6 +2896,11 @@ impl GeometryRuntimeHandle {
                 {
                     let mut shared = state.write().await;
                     shared.map = MapState::default();
+                }
+                if let Ok(mut authority) = committed_map_authority.lock() {
+                    *authority = None;
+                } else {
+                    return Err("committed-map authority state is unavailable".to_string());
                 }
                 map_revision_latest_tx.send_replace(None);
                 *occupancy_shm_current.write().await = None;
@@ -4428,6 +4464,8 @@ struct ExploreNavigationBridge {
     frontiers_tx: broadcast::Sender<Vec<FrontierEntry>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+    mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     transport: LcmTransport,
     transport_backend_name: &'static str,
     lcm_backend_available: bool,
@@ -4500,6 +4538,7 @@ impl ExploreNavigationBridge {
             frontiers_tx: self.frontiers_tx.clone(),
             map_revision_tx: self.map_revision_tx.clone(),
             map_revision_latest_tx: self.map_revision_latest_tx.clone(),
+            committed_map_authority: self.committed_map_authority.clone(),
             transport: self.transport.clone(),
             transport_backend_name: self.transport_backend_name,
             lcm_backend_available: self.lcm_backend_available,
@@ -4510,7 +4549,7 @@ impl ExploreNavigationBridge {
             .expect("startup-validated map frame must remain valid"),
             nav: self.nav.clone(),
             mapping_adapter: None,
-            mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mapping_lifecycle_lock: self.mapping_lifecycle_lock.clone(),
             occupancy_shm: None,
             occupancy_shm_path: None,
             occupancy_shm_current: Arc::new(RwLock::new(None)),
@@ -4645,60 +4684,20 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         crate::explore_runtime::ChildNavigationSubmitError,
     > {
         let child_request_id = request.request_id.clone();
-        let parent_request_id = request.parent_request_id.clone();
-        let target = request.goal.target;
-        if !matches!(
-            &target.frame_id,
-            nuwax_nav_types_messages::frames::NavFrameId::Map
-        ) {
+        if request.intent.session_id != child_request_id
+            || request.intent.parent_request_id != request.parent_request_id
+            || request.intent.producer != "wavefront"
+            || request.intent.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+        {
             return Err(
-                crate::explore_runtime::ChildNavigationSubmitError::Rejected(format!(
-                    "exploration child goal requires internal map-frame semantics, received {}",
-                    target.frame_id.as_str(),
-                )),
+                crate::explore_runtime::ChildNavigationSubmitError::Rejected(
+                    "wavefront child request does not match its frozen GoalIntent".to_string(),
+                ),
             );
         }
-        let frame_id = self.expected_map_frame.to_string();
-        let pose = target.pose;
-        let target = PoseState {
-            x: pose.position.x,
-            y: pose.position.y,
-            z: pose.position.z,
-            qx: pose.orientation.x,
-            qy: pose.orientation.y,
-            qz: pose.orientation.z,
-            qw: pose.orientation.w,
-            frame_id: frame_id.clone(),
-            timestamp_ns: target.stamp.nanos.max(0) as u64,
-        };
         let facade = self.facade_handle();
-        let boundary =
-            request
-                .boundary
-                .as_ref()
-                .map(|boundary| crate::nav_runtime::GoalBoundaryConstraint {
-                    frame_id: self.expected_map_frame.to_string(),
-                    points: boundary
-                        .vertices()
-                        .iter()
-                        .map(|point| [point.x, point.y, 0.0])
-                        .collect(),
-                });
-        let outcome = crate::nav_runtime::set_goal_with_boundary(
-            &facade,
-            &self.nav,
-            crate::nav_runtime::SetGoalInput {
-                goal_id: child_request_id.clone(),
-                owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-                parent_request_id,
-                goal_generation: 0,
-                motion_admission: request.motion_admission,
-                frame_id,
-                target,
-            },
-            boundary,
-        )
-        .await;
+        let outcome =
+            crate::nav_runtime::admit_goal_intent(&facade, &self.nav, request.intent).await;
         let accepted = matches!(
             outcome.state.status.to_ascii_uppercase().as_str(),
             "ACCEPTED" | "PLANNING" | "RUNNING"
@@ -5309,12 +5308,14 @@ fn encode_frontier_snapshot_in_frame(
 fn spawn_map_revision_coalescer(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> JoinHandle<()> {
     spawn_map_revision_coalescer_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         mapping_adapter,
         mapping_lifecycle_lock,
         Arc::from("map"),
@@ -5335,6 +5336,7 @@ enum OccupancyShmCommitMode {
 fn spawn_map_revision_coalescer_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     expected_map_frame: Arc<str>,
@@ -5343,6 +5345,7 @@ fn spawn_map_revision_coalescer_in_frame(
     let future = map_revision_coalescer_future_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         mapping_adapter,
         mapping_lifecycle_lock,
         expected_map_frame,
@@ -5356,6 +5359,7 @@ fn spawn_map_revision_coalescer_in_frame(
 fn map_revision_coalescer_future_in_frame(
     mut map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     mapping_adapter: Arc<parking_lot::Mutex<MappingAdapter>>,
     mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     expected_map_frame: Arc<str>,
@@ -5498,8 +5502,41 @@ fn map_revision_coalescer_future_in_frame(
                             continue;
                         }
                     }
-                    drop(lifecycle_guard);
+                    let committed_map = match committed_map_identity_from_revision(&event) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            warn!(revision = event.revision, %error, "committed map identity rejected before authority publication");
+                            continue;
+                        }
+                    };
+                    let mut authority = match committed_map_authority.lock() {
+                        Ok(authority) => authority,
+                        Err(_) => {
+                            warn!(
+                                revision = event.revision,
+                                "committed map authority state is unavailable"
+                            );
+                            continue;
+                        }
+                    };
+                    if authority.as_ref().is_some_and(|current| {
+                        let same_domain = current.session_id == committed_map.session_id
+                            && current.session_generation == committed_map.session_generation;
+                        !same_domain
+                            || committed_map.revision < current.revision
+                            || (committed_map.revision == current.revision
+                                && committed_map != *current)
+                    }) {
+                        warn!(
+                            revision = event.revision,
+                            "stale, conflicting, or event-driven map domain switch rejected"
+                        );
+                        continue;
+                    }
+                    *authority = Some(committed_map);
                     map_revision_latest_tx.send_replace(Some(event));
+                    drop(authority);
+                    drop(lifecycle_guard);
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
@@ -5517,6 +5554,7 @@ fn map_revision_coalescer_future_in_frame(
 fn spawn_map_revision_fanout(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5530,6 +5568,7 @@ fn spawn_map_revision_fanout(
     spawn_map_revision_fanout_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         transport,
         occupancy_topic,
         occupancy_msg_type,
@@ -5546,6 +5585,7 @@ fn spawn_map_revision_fanout(
 fn spawn_map_revision_fanout_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5560,6 +5600,7 @@ fn spawn_map_revision_fanout_in_frame(
     map_revision_fanout_futures_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         transport,
         occupancy_topic,
         occupancy_msg_type,
@@ -5583,6 +5624,7 @@ fn spawn_map_revision_fanout_in_frame(
 fn map_revision_fanout_futures_in_frame(
     map_revision_rx: broadcast::Receiver<MapRevisionEvent>,
     map_revision_latest_tx: watch::Sender<Option<MapRevisionEvent>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
     transport: LcmTransport,
     occupancy_topic: LcmTopic,
     occupancy_msg_type: LcmMessageType,
@@ -5673,9 +5715,16 @@ fn map_revision_fanout_futures_in_frame(
                 explore_expected_map_frame.as_ref(),
             ) {
                 Ok(snapshot) => {
+                    let committed_map = match committed_map_identity_from_revision(&event) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            warn!(revision = event.revision, %error, "committed map identity rejected before exploration fanout");
+                            continue;
+                        }
+                    };
                     match tokio::time::timeout(
                         MAP_FANOUT_SINK_TIMEOUT,
-                        explore.ingest_costmap_snapshot(snapshot),
+                        explore.ingest_committed_costmap_snapshot(snapshot, committed_map),
                     )
                     .await
                     {
@@ -5702,6 +5751,7 @@ fn map_revision_fanout_futures_in_frame(
     let coalescer_task = map_revision_coalescer_future_in_frame(
         map_revision_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         mapping_adapter,
         mapping_lifecycle_lock,
         expected_map_frame,
@@ -6525,6 +6575,7 @@ pub async fn spawn_geometry_runtime(
     let (frontiers_tx, _) = broadcast::channel::<Vec<FrontierEntry>>(4);
     let (map_revision_tx, _) = broadcast::channel::<MapRevisionEvent>(16);
     let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
+    let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
     #[cfg(test)]
     let (task_control, task_registration_rx) =
         GeometryRuntimeTaskControl::channel_with_topology_control(topology_control);
@@ -6747,6 +6798,7 @@ pub async fn spawn_geometry_runtime(
         frontiers_tx: frontiers_tx.clone(),
         map_revision_tx: map_revision_tx.clone(),
         map_revision_latest_tx: map_revision_latest_tx.clone(),
+        committed_map_authority: committed_map_authority.clone(),
         transport: transport.clone(),
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
@@ -6888,6 +6940,8 @@ pub async fn spawn_geometry_runtime(
             frontiers_tx,
             map_revision_tx: map_revision_tx.clone(),
             map_revision_latest_tx: map_revision_latest_tx.clone(),
+            committed_map_authority: committed_map_authority.clone(),
+            mapping_lifecycle_lock: mapping_lifecycle_lock.clone(),
             transport: transport.clone(),
             transport_backend_name: backend_name,
             lcm_backend_available: backend_available,
@@ -6944,6 +6998,7 @@ pub async fn spawn_geometry_runtime(
     let map_revision_tasks = map_revision_fanout_futures_in_frame(
         map_revision_fanout_rx,
         map_revision_latest_tx,
+        committed_map_authority,
         transport.clone(),
         occ_topic,
         occ_msg_type,
@@ -9570,6 +9625,7 @@ async fn build_handle_for_tests_with_cloud_writer(
     let (map_revision_tx, _) = broadcast::channel::<MapRevisionEvent>(16);
     let map_revision_fanout_rx = map_revision_tx.subscribe();
     let (map_revision_latest_tx, _) = watch::channel::<Option<MapRevisionEvent>>(None);
+    let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
     let state = Arc::new(RwLock::new(SharedState::default()));
     static SEQUENCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence_state_path = std::env::temp_dir()
@@ -9619,6 +9675,7 @@ async fn build_handle_for_tests_with_cloud_writer(
     spawn_map_revision_fanout(
         map_revision_fanout_rx,
         map_revision_latest_tx.clone(),
+        committed_map_authority.clone(),
         transport.clone(),
         LcmTopic::new(&format!(
             "/test/geometry/occupancy/helper/{}",
@@ -9660,6 +9717,7 @@ async fn build_handle_for_tests_with_cloud_writer(
         frontiers_tx,
         map_revision_tx,
         map_revision_latest_tx,
+        committed_map_authority,
         transport,
         transport_backend_name: "real-lcm",
         lcm_backend_available: true,
@@ -12734,6 +12792,7 @@ mod mapping_feed_tests {
         spawn_map_revision_coalescer(
             ingress_rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             mapping_adapter,
             Arc::new(tokio::sync::Mutex::new(())),
         );
@@ -12971,6 +13030,7 @@ mod mapping_feed_tests {
         spawn_map_revision_fanout(
             rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             transport,
             topic,
             message_type,
@@ -13035,6 +13095,7 @@ mod mapping_feed_tests {
         spawn_map_revision_fanout_in_frame(
             rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/configured-frame/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13095,6 +13156,7 @@ mod mapping_feed_tests {
         spawn_map_revision_fanout_in_frame(
             rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             LcmTransport::new(Arc::new(backend)),
             LcmTopic::new("/test/commit-before-watch/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13160,6 +13222,7 @@ mod mapping_feed_tests {
         spawn_map_revision_fanout_in_frame(
             rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/failed-prepare/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -13269,6 +13332,7 @@ mod mapping_feed_tests {
         spawn_map_revision_fanout_in_frame(
             rx,
             latest_tx,
+            Arc::new(std::sync::Mutex::new(None)),
             LcmTransport::new(Arc::new(backend.clone())),
             LcmTopic::new("/test/stopped-event/occupancy").expect("occupancy topic"),
             LcmMessageType::new("nav_msgs.OccupancyGrid").expect("occupancy type"),
@@ -14745,6 +14809,8 @@ mod exploration_cancel_retry_tests {
             frontiers_tx,
             map_revision_tx,
             map_revision_latest_tx,
+            committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
+            mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             transport,
             transport_backend_name: "real-lcm",
             lcm_backend_available: true,
@@ -15492,6 +15558,8 @@ mod exploration_lcm_smoke_tests {
             frontiers_tx: frontiers_tx.clone(),
             map_revision_tx,
             map_revision_latest_tx,
+            committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
+            mapping_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             transport: publisher.clone(),
             transport_backend_name: "real-lcm",
             lcm_backend_available: true,
@@ -15645,6 +15713,7 @@ mod exploration_lcm_smoke_tests {
                 frontier_goal_id: "wrong-semantic-frontier".to_string(),
                 goal: wrong_goal,
                 boundary: None,
+                intent: schema::GoalIntent::default(),
             },
         )
         .await

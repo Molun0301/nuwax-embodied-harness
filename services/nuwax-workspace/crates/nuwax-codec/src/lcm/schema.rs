@@ -107,6 +107,89 @@ pub struct Path {
     pub poses: Vec<PoseStamped>,
 }
 
+/// 目标准入前冻结的权威已提交地图身份。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommittedMapIdentity {
+    /// 提交该快照的建图会话。
+    pub session_id: String,
+    /// 建图会话实例代次。
+    pub session_generation: i64,
+    /// 进程级已提交占据栅格修订号。
+    pub revision: i64,
+    /// 规范占据栅格载荷摘要。
+    pub payload_sha256: [u8; 32],
+    /// 已提交快照携带的规范规划坐标系。
+    pub frame_id: String,
+}
+
+/// 由唯一导航租约 owner 准入的共享 producer 请求。
+///
+/// 这是进程内合同，刻意不改变既有
+/// `GoalEnvelope` 或 `PathEnvelope` 线协议布局。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GoalIntent {
+    /// 稳定 producer 名称，例如 `public-navigation` 或 `wavefront`。
+    pub producer: String,
+    /// 首次创建该 intent 的 producer 实例代次。
+    pub producer_epoch: i64,
+    /// producer 冻结的仲裁优先级。
+    pub priority: i32,
+    /// 公开目标/会话标识。
+    pub session_id: String,
+    /// `NAVIGATION_OWNER_KIND_*` 常量之一。
+    pub owner_kind: i32,
+    /// 拥有该目标的公开请求。
+    pub parent_request_id: String,
+    /// 请求的目标代次；零表示委托租约 owner 分配。
+    pub goal_generation: i64,
+    /// producer 冻结 intent 时观察到的取消代次。
+    pub cancel_generation: i64,
+    /// 选择该目标时使用的权威已提交地图身份。
+    pub committed_map: CommittedMapIdentity,
+    /// 规范边界身份；无边界时为空。
+    pub boundary_id: String,
+    /// 规范边界字段的 SHA-256；无边界时全零。
+    pub boundary_sha256: [u8; 32],
+    /// 有序边界顶点；闭合边为隐式。
+    pub boundary_points: Vec<[f64; 3]>,
+    /// 请求级运动检查准入的 Guard 代次。
+    pub motion_guard_generation: i64,
+    /// 与 `motion_guard_generation` 一起准入的 Guard 启动 nonce。
+    pub motion_guard_boot_nonce: [u8; 16],
+    /// 请求级运动检查观察到的全局停止代次。
+    pub motion_stop_generation: i64,
+    /// 规范目标位姿字段的 SHA-256。
+    pub goal_sha256: [u8; 32],
+    /// 已提交地图坐标系中的目标位姿。
+    pub goal: PoseStamped,
+}
+
+/// 计算单个目标位姿的规范摘要。
+pub fn goal_intent_goal_sha256(goal: &PoseStamped) -> CodecResult<[u8; 32]> {
+    let canonical = encode_pose_stamped_body(goal)?;
+    Ok(crate::hash::sha256_bytes(&canonical))
+}
+
+/// 计算单个边界身份和多边形的规范摘要。
+pub fn goal_intent_boundary_sha256(
+    frame_id: &str,
+    boundary_id: &str,
+    points: &[[f64; 3]],
+) -> CodecResult<[u8; 32]> {
+    let mut canonical = Vec::new();
+    encode_string(frame_id, &mut canonical)?;
+    encode_string(boundary_id, &mut canonical)?;
+    let point_count = i32::try_from(points.len())
+        .map_err(|_| CodecError::LcmEncode("GoalIntent boundary exceeds int32".into()))?;
+    canonical.extend_from_slice(&point_count.to_be_bytes());
+    for point in points {
+        for coordinate in point {
+            canonical.extend_from_slice(&coordinate.to_bits().to_be_bytes());
+        }
+    }
+    Ok(crate::hash::sha256_bytes(&canonical))
+}
+
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {

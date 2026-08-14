@@ -247,6 +247,89 @@ pub struct ChildNavigationRequest {
     pub frontier_goal_id: String,
     pub goal: NavigationGoal,
     pub boundary: Option<ExplorationBoundary>,
+    pub intent: schema::GoalIntent,
+}
+
+fn build_wavefront_goal_intent(
+    producer_epoch: u64,
+    parent_request_id: &str,
+    request_id: &str,
+    motion_admission: &MotionAdmissionProof,
+    goal: &NavigationGoal,
+    boundary: Option<&ExplorationBoundary>,
+    committed_map: schema::CommittedMapIdentity,
+) -> Result<schema::GoalIntent, String> {
+    if producer_epoch == 0 || producer_epoch > i64::MAX as u64 {
+        return Err("wavefront producer epoch is outside the shared intent domain".to_string());
+    }
+    if !matches!(&goal.target.frame_id, NavFrameId::Map) {
+        return Err("wavefront goal is not in map-frame semantics".to_string());
+    }
+    motion_admission
+        .validate()
+        .map_err(|reason| format!("wavefront motion admission is invalid: {reason}"))?;
+    let timestamp_ns = goal.target.stamp.nanos;
+    if timestamp_ns <= 0 {
+        return Err("wavefront goal timestamp must be positive".to_string());
+    }
+    let goal_pose = schema::PoseStamped {
+        header: schema::Header {
+            seq: 0,
+            stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000)
+                .map_err(|_| "wavefront goal timestamp seconds exceed i32".to_string())?,
+            stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+            frame_id: committed_map.frame_id.clone(),
+        },
+        pose: schema::Pose {
+            position: [
+                goal.target.pose.position.x,
+                goal.target.pose.position.y,
+                goal.target.pose.position.z,
+            ],
+            orientation_xyzw: [
+                goal.target.pose.orientation.x,
+                goal.target.pose.orientation.y,
+                goal.target.pose.orientation.z,
+                goal.target.pose.orientation.w,
+            ],
+        },
+    };
+    let goal_sha256 =
+        schema::goal_intent_goal_sha256(&goal_pose).map_err(|error| error.to_string())?;
+    let (boundary_id, boundary_points, boundary_sha256) = match boundary {
+        Some(boundary) => {
+            let boundary_id = format!("{parent_request_id}:boundary");
+            let points = boundary
+                .vertices()
+                .iter()
+                .map(|point| [point.x, point.y, 0.0])
+                .collect::<Vec<_>>();
+            let digest =
+                schema::goal_intent_boundary_sha256(&committed_map.frame_id, &boundary_id, &points)
+                    .map_err(|error| error.to_string())?;
+            (boundary_id, points, digest)
+        }
+        None => (String::new(), Vec::new(), [0; 32]),
+    };
+    Ok(schema::GoalIntent {
+        producer: "wavefront".to_string(),
+        producer_epoch: producer_epoch as i64,
+        priority: 100,
+        session_id: request_id.to_string(),
+        owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
+        parent_request_id: parent_request_id.to_string(),
+        goal_generation: 0,
+        cancel_generation: 0,
+        committed_map,
+        boundary_id,
+        boundary_sha256,
+        boundary_points,
+        motion_guard_generation: motion_admission.guard_generation as i64,
+        motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
+        motion_stop_generation: motion_admission.motion_stop_generation as i64,
+        goal_sha256,
+        goal: goal_pose,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1231,6 +1314,7 @@ pub struct ExploreRuntimeInner {
     last_frontier_goal: Option<FrontierGoal>,
     last_poll: Option<ExplorationPoll>,
     costmap_input: Option<ExploreCostmapSnapshot>,
+    committed_map: Option<schema::CommittedMapIdentity>,
     active_config: Option<ExploreStartConfig>,
     active_child: Option<ActiveChildNavigation>,
     pending_child_dispatch: Option<ChildNavigationRequest>,
@@ -1261,6 +1345,7 @@ impl ExploreRuntimeInner {
             last_frontier_goal: None,
             last_poll: None,
             costmap_input: None,
+            committed_map: None,
             active_config: None,
             active_child: None,
             pending_child_dispatch: None,
@@ -2544,6 +2629,31 @@ impl ExploreRuntimeHandle {
                 let mut navigation_goal = frontier_goal_to_navigation_goal(&goal);
                 navigation_goal.id = child_request_id.clone();
                 let config = guard.active_config.clone().unwrap_or_default();
+                let Some(committed_map) = guard.committed_map.clone() else {
+                    let snapshot = guard.snapshot(
+                        STATUS_PENDING,
+                        "wavefront goal withheld: committed map identity unavailable",
+                    );
+                    self.publish_frontiers(frontier_update);
+                    return self.store_snapshot(snapshot);
+                };
+                let intent = match build_wavefront_goal_intent(
+                    guard.session_generation,
+                    &guard.last_request_id,
+                    &child_request_id,
+                    &config.motion_admission,
+                    &navigation_goal,
+                    config.boundary.as_ref(),
+                    committed_map,
+                ) {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        let snapshot = guard
+                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
+                        self.publish_frontiers(frontier_update);
+                        return self.store_snapshot(snapshot);
+                    }
+                };
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),
                     request_id: child_request_id,
@@ -2551,6 +2661,7 @@ impl ExploreRuntimeHandle {
                     frontier_goal_id: goal.id.clone(),
                     goal: navigation_goal,
                     boundary: config.boundary,
+                    intent,
                 };
                 let dispatching = guard.snapshot(
                     STATUS_PENDING,
@@ -2652,6 +2763,9 @@ impl ExploreRuntimeHandle {
         if ticket.lease.session_id != proposed_request_id
             || ticket.lease.parent_request_id != expected_parent_request_id
             || ticket.lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
+            || (request.intent.goal_generation > 0
+                && u64::try_from(request.intent.goal_generation).ok()
+                    != Some(ticket.lease.goal_generation))
             || ticket.lease.goal_generation == 0
             || ticket.lease.producer_runtime_generation == 0
             || ticket.lease.goal_payload_sha256 == [0; 32]
@@ -3034,11 +3148,55 @@ impl ExploreRuntimeHandle {
         &self,
         snapshot: ExploreCostmapSnapshot,
     ) -> Result<bool, String> {
+        self.ingest_costmap_with_identity(snapshot, None).await
+    }
+
+    pub async fn ingest_committed_costmap_snapshot(
+        &self,
+        snapshot: ExploreCostmapSnapshot,
+        committed_map: schema::CommittedMapIdentity,
+    ) -> Result<bool, String> {
+        self.ingest_costmap_with_identity(snapshot, Some(committed_map))
+            .await
+    }
+
+    async fn ingest_costmap_with_identity(
+        &self,
+        snapshot: ExploreCostmapSnapshot,
+        committed_map: Option<schema::CommittedMapIdentity>,
+    ) -> Result<bool, String> {
         validate_costmap_snapshot(&snapshot, self.expected_map_frame.as_ref())?;
+        if let Some(identity) = committed_map.as_ref() {
+            if identity.session_id.trim().is_empty()
+                || identity.session_generation <= 0
+                || identity.revision <= 0
+                || identity.payload_sha256 == [0; 32]
+                || normalize_frame(&identity.frame_id) != self.expected_map_frame.as_ref()
+            {
+                return Err(
+                    "committed costmap identity is incomplete or has wrong frame".to_string(),
+                );
+            }
+        }
         let mut guard = self.inner.lock().await;
-        if guard.costmap_input.as_ref() == Some(&snapshot) {
+        if guard.costmap_input.as_ref() == Some(&snapshot)
+            && guard.committed_map.as_ref() == committed_map.as_ref()
+        {
             return Ok(false);
         }
+        if let Some(identity) = committed_map.as_ref() {
+            if guard.committed_map.as_ref().is_some_and(|current| {
+                let same_session = identity.session_id == current.session_id
+                    && identity.session_generation == current.session_generation;
+                same_session
+                    && (identity.revision < current.revision
+                        || (identity.revision == current.revision && identity != current))
+            }) {
+                return Err("committed costmap identity is stale or conflicting".to_string());
+            }
+        }
+        // 缺少提交身份的输入必须清除旧身份，避免把未提交栅格冒充为已提交快照。
+        guard.committed_map = committed_map;
 
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(snapshot);

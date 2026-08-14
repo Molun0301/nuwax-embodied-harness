@@ -2091,6 +2091,12 @@ pub struct GoalBoundaryConstraint {
     pub points: Vec<[f64; 3]>,
 }
 
+/// 目标提交前冻结的取消终态，只允许稳定 idle 或已归零的旧租约被替换。
+struct GoalAdmissionCancelFence {
+    generation: u64,
+    replacement_lease: Option<GoalLease>,
+}
+
 fn validate_committed_map_identity(
     committed_map: &schema::CommittedMapIdentity,
 ) -> Result<(), String> {
@@ -2248,6 +2254,27 @@ pub async fn set_goal_with_boundary(
             goal_id,
             "public navigation adapter cannot assert a non-public producer epoch",
         );
+    }
+    let readiness = compute_readiness(handle, state).await;
+    if !input.frame_id.trim().is_empty()
+        && !readiness.map_frame.trim().is_empty()
+        && input.frame_id != readiness.map_frame
+    {
+        return SetGoalOutcome {
+            state: NavState {
+                status: NavPhase::Failed.as_str().to_string(),
+                message: format!(
+                    "SET_GOAL_REJECTED[GOAL_FRAME_MISMATCH]: goal_frame={} planner_map_frame={}",
+                    input.frame_id, readiness.map_frame,
+                ),
+                goal_id,
+                distance_remaining: 0.0,
+                timestamp_ns: now_ns(),
+            },
+            lease: None,
+            retry_reason: None,
+            reject_reason: None,
+        };
     }
     let admission = NavAdmissionContext::new(
         handle.mapping_lifecycle_lock.clone(),
@@ -2410,15 +2437,34 @@ pub(crate) async fn admit_goal_intent(
         })
     };
     let cancel = state.cancel_snapshot();
-    let cancel_matches = if intent.cancel_generation == 0 {
-        cancel.phase == CancelPhase::Idle
-    } else {
-        u64::try_from(intent.cancel_generation).ok() == Some(cancel.generation)
-            && cancel.phase == CancelPhase::Idle
-    };
-    if !cancel_matches {
+    let Some(intent_cancel_generation) = u64::try_from(intent.cancel_generation).ok() else {
         return rejected_goal_intent(goal_id, "cancel generation changed before admission");
-    }
+    };
+    let cancel_fence = match cancel.phase {
+        CancelPhase::Idle if intent_cancel_generation == cancel.generation => {
+            GoalAdmissionCancelFence {
+                generation: cancel.generation,
+                replacement_lease: None,
+            }
+        }
+        CancelPhase::Zeroed
+            if intent_cancel_generation == cancel.generation && cancel.lease.is_some() =>
+        {
+            if state.inner.read().await.goal.is_some() {
+                return rejected_goal_intent(
+                    goal_id,
+                    "zeroed replacement still retains the old active lease",
+                );
+            }
+            GoalAdmissionCancelFence {
+                generation: cancel.generation,
+                replacement_lease: cancel.lease,
+            }
+        }
+        _ => {
+            return rejected_goal_intent(goal_id, "cancel generation changed before admission");
+        }
+    };
     let timestamp_ns = if intent.goal.header.stamp_sec < 0 || intent.goal.header.stamp_nsec < 0 {
         return rejected_goal_intent(goal_id, "goal timestamp is negative");
     } else {
@@ -2445,7 +2491,7 @@ pub(crate) async fn admit_goal_intent(
             timestamp_ns,
         },
     };
-    admit_goal_input(io, state, input, boundary, admission).await
+    admit_goal_input(io, state, input, boundary, cancel_fence, admission).await
 }
 
 async fn admit_goal_input(
@@ -2453,6 +2499,7 @@ async fn admit_goal_input(
     state: &NavRuntimeState,
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
+    cancel_fence: GoalAdmissionCancelFence,
     admission: &NavAdmissionContext,
 ) -> SetGoalOutcome {
     input.goal_id = input.goal_id.trim().to_string();
@@ -2760,6 +2807,30 @@ async fn admit_goal_input(
                 reject_reason: None,
             };
         };
+        let cancel_fence_matches = cancel.generation == cancel_fence.generation
+            && match cancel_fence.replacement_lease.as_ref() {
+                None => cancel.phase == CancelPhase::Idle,
+                Some(old_lease) => {
+                    cancel.phase == CancelPhase::Zeroed
+                        && cancel.lease.as_ref() == Some(old_lease)
+                        && slot.goal.is_none()
+                }
+            };
+        if !cancel_fence_matches {
+            return SetGoalOutcome {
+                state: NavState {
+                    status: NavPhase::Failed.as_str().to_string(),
+                    message: "SET_GOAL_REJECTED[CANCEL_GENERATION_CHANGED]".to_string(),
+                    goal_id: lease.session_id.clone(),
+                    distance_remaining,
+                    timestamp_ns: now_ns(),
+                },
+                lease: Some(lease),
+                retry_reason: None,
+                reject_reason: None,
+            };
+        }
+        let admitted_cancel_generation = cancel.generation;
         slot.last_goal_generation = goal_generation;
         slot.phase = NavPhase::Accepted;
         slot.message = format!(
@@ -2773,7 +2844,10 @@ async fn admit_goal_input(
             accepted_at_ns: now_ns(),
             lease: lease.clone(),
         });
-        *cancel = CancelTracker::default();
+        *cancel = CancelTracker {
+            generation: admitted_cancel_generation,
+            ..CancelTracker::default()
+        };
     }
     drop(map_goal_guard);
 
@@ -3401,6 +3475,43 @@ mod tests {
             .expect("build test handle");
         install_committed_map_fixture(&handle, "map", true).await;
         handle
+    }
+
+    /// 用测试持有的 Wavefront 代次权威进入唯一 intent 准入，不绕过生产校验。
+    async fn set_exploration_goal_for_test(
+        handle: &GeometryRuntimeHandle,
+        state: &NavRuntimeState,
+        input: SetGoalInput,
+        boundary: Option<GoalBoundaryConstraint>,
+        current_session_generation: Arc<AtomicU64>,
+    ) -> SetGoalOutcome {
+        let goal_id = input.goal_id.clone();
+        let admission = NavAdmissionContext::new(
+            handle.mapping_lifecycle_lock.clone(),
+            handle.committed_map_authority.clone(),
+            handle.map_revision_latest_tx.subscribe(),
+        );
+        let io = NavAdmissionIo::new(
+            handle.state.clone(),
+            handle.transport.clone(),
+            handle.transport_backend_name,
+            handle.lcm_backend_available,
+        );
+        // current_session_generation 由调用测试在 intent 构造前独立持有，禁止从待验字段自签。
+        let intent = match goal_intent_from_set_goal(&admission, state, input, boundary).await {
+            Ok(intent) => intent,
+            Err(reason) => return rejected_goal_intent(goal_id, reason),
+        };
+        admit_goal_intent(
+            &admission,
+            &io,
+            state,
+            intent,
+            GoalProducerEpochAuthority::Wavefront {
+                current_session_generation,
+            },
+        )
+        .await
     }
 
     #[derive(Clone)]
@@ -4167,7 +4278,9 @@ mod tests {
             [0.0, 3.0, 0.0],
         ];
 
-        let outcome = set_goal_with_boundary(
+        let current_session_generation =
+            Arc::new(AtomicU64::new(state.producer_runtime_generation()));
+        let outcome = set_exploration_goal_for_test(
             &handle,
             &state,
             input,
@@ -4175,6 +4288,7 @@ mod tests {
                 frame_id: "/map".to_string(),
                 points: points.clone(),
             }),
+            current_session_generation,
         )
         .await;
 
@@ -4246,7 +4360,9 @@ mod tests {
         input.target.frame_id = "robot/map".to_string();
         let points = vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]];
 
-        let outcome = set_goal_with_boundary(
+        let current_session_generation =
+            Arc::new(AtomicU64::new(state.producer_runtime_generation()));
+        let outcome = set_exploration_goal_for_test(
             &handle,
             &state,
             input,
@@ -4254,6 +4370,7 @@ mod tests {
                 frame_id: "/robot/map".to_string(),
                 points: points.clone(),
             }),
+            current_session_generation,
         )
         .await;
 
@@ -4285,7 +4402,9 @@ mod tests {
         input.frame_id = "robot/map".to_string();
         input.target.frame_id = "robot/map".to_string();
 
-        let outcome = set_goal_with_boundary(
+        let current_session_generation =
+            Arc::new(AtomicU64::new(state.producer_runtime_generation()));
+        let outcome = set_exploration_goal_for_test(
             &handle,
             &state,
             input,
@@ -4293,6 +4412,7 @@ mod tests {
                 frame_id: "map".to_string(),
                 points: vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]],
             }),
+            current_session_generation,
         )
         .await;
 
@@ -4322,7 +4442,16 @@ mod tests {
         child.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
         child.parent_request_id = "explore-1".to_string();
         child.goal_generation = 11;
-        let child_rejected = set_goal(&handle, &public_state, child).await;
+        let current_session_generation =
+            Arc::new(AtomicU64::new(public_state.producer_runtime_generation()));
+        let child_rejected = set_exploration_goal_for_test(
+            &handle,
+            &public_state,
+            child,
+            None,
+            current_session_generation,
+        )
+        .await;
         assert_eq!(child_rejected.state.status, "FAILED");
         assert!(child_rejected.state.message.contains("GOAL_LEASE_BUSY"));
         assert_eq!(
@@ -4337,7 +4466,16 @@ mod tests {
         child.parent_request_id = "explore-2".to_string();
         child.goal_generation = 20;
         assert_eq!(
-            set_goal(&handle, &child_state, child).await.state.status,
+            set_exploration_goal_for_test(
+                &handle,
+                &child_state,
+                child,
+                None,
+                Arc::new(AtomicU64::new(child_state.producer_runtime_generation(),)),
+            )
+            .await
+            .state
+            .status,
             "ACCEPTED"
         );
         let mut public = test_goal_input("public-2");
@@ -4362,15 +4500,27 @@ mod tests {
             slot.phase = NavPhase::Running;
             slot.goal = Some(test_active_goal_with_lease(lease_a.clone()));
         }
-        assert!(matches!(
-            state.begin_cancel(&cancel_input(&lease_a)).await,
-            CancelStart::Publish { .. }
-        ));
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Cancelled;
-            slot.goal = None;
-        }
+        let CancelStart::Publish {
+            generation: cancel_generation_a,
+            ..
+        } = state.begin_cancel(&cancel_input(&lease_a)).await
+        else {
+            panic!("cancel A must reserve one exact generation");
+        };
+        let zeroed_a = state
+            .observe_cancel_ack(MotionSinkCancelAck {
+                cancel_generation: cancel_generation_a,
+                goal_id: lease_a.session_id.clone(),
+                owner_kind: lease_a.owner_kind,
+                parent_request_id: lease_a.parent_request_id.clone(),
+                goal_generation: lease_a.goal_generation,
+                status: MotionSinkCancelAckStatus::Zeroed,
+                message: "replacement fixture zeroed old lease".to_string(),
+            })
+            .await;
+        assert_eq!(zeroed_a.state.status, "CANCELLED");
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
+        assert!(state.active_goal_lease().await.is_none());
 
         let cancel_mutex = state.cancel.clone();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
@@ -5990,9 +6140,9 @@ mod tests {
             &handle,
             &state,
             SetGoalInput {
-                frame_id: "odom".into(),
+                frame_id: "/map".into(),
                 target: PoseState {
-                    frame_id: "odom".into(),
+                    frame_id: "/map".into(),
                     timestamp_ns: now_ns(),
                     ..PoseState::default()
                 },

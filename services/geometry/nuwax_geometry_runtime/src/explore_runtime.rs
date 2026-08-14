@@ -243,6 +243,7 @@ pub struct FrontierSnapshot {
 pub struct ChildNavigationRequest {
     pub parent_request_id: String,
     pub request_id: String,
+    pub expected_map_name: String,
     pub motion_admission: MotionAdmissionProof,
     pub frontier_goal_id: String,
     pub goal: NavigationGoal,
@@ -365,17 +366,25 @@ pub enum ChildNavigationSubmitError {
     RetryableReadiness(String),
     /// The request is permanently rejected and must enter goal-failure policy.
     Rejected(String),
+    /// The exploration session's frozen navigation authority is no longer valid.
+    SessionInvalidated(String),
 }
 
 impl ChildNavigationSubmitError {
     fn reason(&self) -> &str {
         match self {
-            Self::RetryableReadiness(reason) | Self::Rejected(reason) => reason,
+            Self::RetryableReadiness(reason)
+            | Self::Rejected(reason)
+            | Self::SessionInvalidated(reason) => reason,
         }
     }
 
     fn is_retryable(&self) -> bool {
         matches!(self, Self::RetryableReadiness(_))
+    }
+
+    fn is_session_fatal(&self) -> bool {
+        matches!(self, Self::SessionInvalidated(_))
     }
 }
 
@@ -466,6 +475,11 @@ fn take_early_cancel_terminal(
 
 #[async_trait]
 pub trait ExploreNavigationSink: Send + Sync {
+    /// Capture the active map name when a child goal intent is formed.
+    fn current_map_name(&self) -> Result<String, String> {
+        Err("active map name unavailable".to_string())
+    }
+
     async fn submit(
         &self,
         request: ChildNavigationRequest,
@@ -2641,6 +2655,21 @@ impl ExploreRuntimeHandle {
                     self.publish_frontiers(frontier_update);
                     return self.store_snapshot(snapshot);
                 };
+                let expected_map_name = match self
+                    .navigation_sink
+                    .read()
+                    .as_ref()
+                    .ok_or_else(|| "navigation sink unavailable".to_string())
+                    .and_then(|sink| sink.current_map_name())
+                {
+                    Ok(map_name) => map_name,
+                    Err(error) => {
+                        let snapshot = guard
+                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
+                        self.publish_frontiers(frontier_update);
+                        return self.store_snapshot(snapshot);
+                    }
+                };
                 let intent = match build_wavefront_goal_intent(
                     guard.session_generation,
                     &guard.last_request_id,
@@ -2661,6 +2690,7 @@ impl ExploreRuntimeHandle {
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),
                     request_id: child_request_id,
+                    expected_map_name,
                     motion_admission: config.motion_admission,
                     frontier_goal_id: goal.id.clone(),
                     goal: navigation_goal,
@@ -2821,6 +2851,16 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
         guard.pending_child_dispatch = None;
+        if error.is_session_fatal() {
+            drop(guard);
+            return self
+                .finish_session(
+                    None,
+                    ExplorationStopReason::ConsecutiveFailuresExceeded,
+                    reason,
+                )
+                .await;
+        }
         let _ = guard.controller.report_goal_feedback(
             &request.frontier_goal_id,
             ExplorationGoalFeedback::Failed(reason.clone()),
@@ -3925,6 +3965,10 @@ mod tests {
 
     #[async_trait]
     impl ExploreNavigationSink for RecordingNavSink {
+        fn current_map_name(&self) -> Result<String, String> {
+            Ok("map".to_string())
+        }
+
         async fn submit(
             &self,
             request: ChildNavigationRequest,
@@ -4079,6 +4123,30 @@ mod tests {
             },
             frame_id: "map".to_string(),
         }
+    }
+
+    fn committed_map_identity(revision: u64, frame_id: &str) -> schema::CommittedMapIdentity {
+        schema::CommittedMapIdentity {
+            session_id: "explore-test-map".to_string(),
+            session_generation: 1,
+            revision: revision as i64,
+            payload_sha256: crate::map_checksum::sha256_bytes(&revision.to_le_bytes()),
+            frame_id: frame_id.to_string(),
+        }
+    }
+
+    async fn ingest_committed_costmap_fixture(
+        handle: &ExploreRuntimeHandle,
+        snapshot: ExploreCostmapSnapshot,
+        revision: u64,
+    ) -> Result<bool, String> {
+        let frame_id = snapshot.frame_id.clone();
+        handle
+            .ingest_committed_costmap_snapshot(
+                snapshot,
+                committed_map_identity(revision, &frame_id),
+            )
+            .await
     }
 
     fn configured_handle() -> (ExploreRuntimeHandle, Arc<RecordingNavSink>) {
@@ -4478,8 +4546,7 @@ mod tests {
             .push_back(ChildNavigationSubmitError::Rejected(
                 "GOAL_BOUNDARY_INVALID: test permanent rejection".to_string(),
             ));
-        handle
-            .ingest_costmap_snapshot(frontier_costmap(1))
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-rejected", "prefer_wavefront").await;
@@ -6371,5 +6438,25 @@ mod tests {
         let adapter =
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
+    }
+
+    #[tokio::test]
+    async fn session_invalidated_dispatch_rejection_finishes_immediately() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors.lock().unwrap().push_back(
+            ChildNavigationSubmitError::SessionInvalidated(
+                "active map name changed before goal lease admission".to_string(),
+            ),
+        );
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+            .await
+            .unwrap();
+        handle.start("req-invalidated", "prefer_wavefront").await;
+
+        let failed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.message.contains("active map name changed"));
+        assert!(failed.child_task_id.is_empty());
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
     }
 }

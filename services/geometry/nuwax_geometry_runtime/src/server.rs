@@ -5794,9 +5794,11 @@ impl GeometryRuntime for GeometryRuntimeService {
                 "mapping-cloud request runtime generation is stale",
             ));
         }
-        let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+        let admission_context = crate::nav_runtime::NavAdmissionContext::with_expected_map_name(
             self.bridge.mapping_lifecycle_lock.clone(),
             self.bridge.committed_map_authority.clone(),
+            self.bridge.map_revision_latest_tx.subscribe(),
+            Some(sealed.map_name.clone()),
         );
         let active_map = ActiveMapIdentityV1 {
             map_name: request.map_name,
@@ -8766,6 +8768,10 @@ mod lifecycle_tests {
 
     #[async_trait::async_trait]
     impl ExploreNavigationSink for LifecycleExploreSink {
+        fn current_map_name(&self) -> Result<String, String> {
+            Ok("map".to_string())
+        }
+
         async fn submit(
             &self,
             request: ChildNavigationRequest,
@@ -8841,6 +8847,10 @@ mod lifecycle_tests {
 
     #[async_trait::async_trait]
     impl ExploreNavigationSink for SubmitLeaseThenBlockSink {
+        fn current_map_name(&self) -> Result<String, String> {
+            Ok("map".to_string())
+        }
+
         async fn submit(
             &self,
             request: ChildNavigationRequest,

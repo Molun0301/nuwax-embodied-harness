@@ -2432,6 +2432,7 @@ async fn start_topology_exploration_goal(
     let admission_context = crate::nav_runtime::NavAdmissionContext::new(
         handle.mapping_lifecycle_lock.clone(),
         handle.committed_map_authority.clone(),
+        handle.map_revision_latest_tx.subscribe(),
     );
     let admission_io = crate::nav_runtime::NavAdmissionIo::new(
         handle.state.clone(),
@@ -4748,10 +4749,17 @@ impl ExploreNavigationBridge {
 
 fn classify_exploration_submit_rejection(
     retry_reason: Option<crate::nav_runtime::SetGoalRetryReason>,
+    reject_reason: Option<crate::nav_runtime::SetGoalRejectReason>,
     message: String,
 ) -> crate::explore_runtime::ChildNavigationSubmitError {
-    use crate::nav_runtime::{NavigationReadinessCode, SetGoalRetryReason};
+    use crate::nav_runtime::{NavigationReadinessCode, SetGoalRejectReason, SetGoalRetryReason};
 
+    if matches!(
+        reject_reason,
+        Some(SetGoalRejectReason::ActiveMapNameChanged)
+    ) {
+        return crate::explore_runtime::ChildNavigationSubmitError::SessionInvalidated(message);
+    }
     let retryable = match retry_reason {
         Some(SetGoalRetryReason::NavigationNotReady(code)) => matches!(
             code,
@@ -4780,6 +4788,15 @@ fn classify_exploration_submit_rejection(
 
 #[async_trait]
 impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
+    fn current_map_name(&self) -> Result<String, String> {
+        self.map_revision_latest_tx
+            .borrow()
+            .as_ref()
+            .map(|revision| revision.map_name.clone())
+            .filter(|map_name| !map_name.trim().is_empty())
+            .ok_or_else(|| "active map name unavailable".to_string())
+    }
+
     async fn submit(
         &self,
         request: crate::explore_runtime::ChildNavigationRequest,
@@ -4799,9 +4816,11 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
                 ),
             );
         }
-        let admission_context = crate::nav_runtime::NavAdmissionContext::new(
+        let admission_context = crate::nav_runtime::NavAdmissionContext::with_expected_map_name(
             self.mapping_lifecycle_lock.clone(),
             self.committed_map_authority.clone(),
+            self.map_revision_latest_tx.subscribe(),
+            Some(request.expected_map_name.clone()),
         );
         let admission_io = crate::nav_runtime::NavAdmissionIo::new(
             self.state.clone(),
@@ -4826,9 +4845,14 @@ impl crate::explore_runtime::ExploreNavigationSink for ExploreNavigationBridge {
         let message = outcome.state.message.clone();
         let lease = outcome.lease.clone();
         let retry_reason = outcome.retry_reason;
+        let reject_reason = outcome.reject_reason;
         self.publish_state(outcome.state, outcome.lease).await;
         if !accepted {
-            return Err(classify_exploration_submit_rejection(retry_reason, message));
+            return Err(classify_exploration_submit_rejection(
+                retry_reason,
+                reject_reason,
+                message,
+            ));
         }
         let lease = lease.as_ref().map(exploration_child_lease).ok_or_else(|| {
             crate::explore_runtime::ChildNavigationSubmitError::Rejected(
@@ -14849,6 +14873,39 @@ mod exploration_cancel_retry_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DelayedExploreBridge {
+        inner: ExploreNavigationBridge,
+        submit_entered: Arc<tokio::sync::Notify>,
+        submit_release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::explore_runtime::ExploreNavigationSink for DelayedExploreBridge {
+        fn current_map_name(&self) -> Result<String, String> {
+            crate::explore_runtime::ExploreNavigationSink::current_map_name(&self.inner)
+        }
+
+        async fn submit(
+            &self,
+            request: crate::explore_runtime::ChildNavigationRequest,
+        ) -> Result<
+            crate::explore_runtime::ChildNavigationTicket,
+            crate::explore_runtime::ChildNavigationSubmitError,
+        > {
+            self.submit_entered.notify_one();
+            self.submit_release.notified().await;
+            crate::explore_runtime::ExploreNavigationSink::submit(&self.inner, request).await
+        }
+
+        async fn cancel(
+            &self,
+            lease: &crate::explore_runtime::ChildNavigationLease,
+        ) -> Result<crate::explore_runtime::ChildNavigationCancelTicket, String> {
+            crate::explore_runtime::ExploreNavigationSink::cancel(&self.inner, lease).await
+        }
+    }
+
     fn goal_input(goal_id: &str) -> crate::nav_runtime::SetGoalInput {
         crate::nav_runtime::SetGoalInput {
             goal_id: goal_id.to_string(),
@@ -15320,6 +15377,76 @@ mod exploration_cancel_retry_tests {
         );
         assert_retry_stopped(&backend).await;
     }
+
+    #[tokio::test]
+    async fn wavefront_intent_rejects_map_name_changed_before_bridge_submit() {
+        let (bridge, backend) = configured_bridge().await;
+        let committed_map = test_committed_map_identity(1);
+        *bridge
+            .committed_map_authority
+            .lock()
+            .expect("committed map authority") = Some(committed_map.clone());
+        bridge
+            .map_revision_latest_tx
+            .send_replace(Some(MapRevisionEvent {
+                session_id: committed_map.session_id.clone(),
+                map_name: "office".to_string(),
+                session_generation: committed_map.session_generation as u64,
+                revision: committed_map.revision as u64,
+                width: 12,
+                height: 12,
+                resolution: 0.5,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                frame_id: "map".to_string(),
+                timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+                data: Vec::<u8>::new().into(),
+                raw_data: Vec::<u8>::new().into(),
+                size: 0,
+                schema_version: 1,
+                checksum: crate::map_checksum::sha256_hex(&[]),
+                raw_checksum: crate::map_checksum::sha256_hex(&[]),
+                last_seen_ms: 0,
+            }));
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        let submit_entered = Arc::new(tokio::sync::Notify::new());
+        let submit_release = Arc::new(tokio::sync::Notify::new());
+        explore.set_navigation_sink(Arc::new(DelayedExploreBridge {
+            inner: bridge.clone(),
+            submit_entered: submit_entered.clone(),
+            submit_release: submit_release.clone(),
+        }));
+        explore
+            .ingest_committed_costmap_snapshot(frontier_costmap(), committed_map)
+            .await
+            .expect("committed frontier costmap");
+        assert_eq!(
+            explore.start("cross-map", "prefer_wavefront").await.status,
+            crate::explore_runtime::STATUS_ACCEPTED
+        );
+
+        let tick = {
+            let explore = explore.clone();
+            tokio::spawn(async move { explore.tick((2.0, 2.0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), submit_entered.notified())
+            .await
+            .expect("wavefront intent did not reach delayed submit");
+        let mut hallway = bridge
+            .map_revision_latest_tx
+            .borrow()
+            .clone()
+            .expect("office map revision");
+        hallway.map_name = "hallway".to_string();
+        bridge.map_revision_latest_tx.send_replace(Some(hallway));
+        submit_release.notify_one();
+
+        let snapshot = tick.await.expect("wavefront tick task");
+        assert_eq!(snapshot.status, crate::explore_runtime::STATUS_FAILED);
+        assert!(snapshot.message.contains("active map name changed"));
+        assert!(bridge.nav.active_goal_lease().await.is_none());
+        assert_eq!(backend.frames.lock().expect("recorded frames").len(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -15539,26 +15666,38 @@ mod exploration_lcm_smoke_tests {
     #[test]
     fn exploration_submit_rejection_classification_is_typed() {
         use crate::explore_runtime::ChildNavigationSubmitError;
-        use crate::nav_runtime::{NavigationReadinessCode, SetGoalRetryReason};
+        use crate::nav_runtime::{
+            NavigationReadinessCode, SetGoalRejectReason, SetGoalRetryReason,
+        };
 
         assert!(matches!(
             classify_exploration_submit_rejection(
                 Some(SetGoalRetryReason::NavigationNotReady(
                     NavigationReadinessCode::MotionSinkNotReady,
                 )),
+                None,
                 "motion sink unavailable".to_string(),
             ),
             ChildNavigationSubmitError::RetryableReadiness(_)
         ));
         assert!(matches!(
-            classify_exploration_submit_rejection(None, "invalid boundary".to_string(),),
+            classify_exploration_submit_rejection(None, None, "invalid boundary".to_string(),),
             ChildNavigationSubmitError::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_exploration_submit_rejection(
+                None,
+                Some(SetGoalRejectReason::ActiveMapNameChanged),
+                "active map changed".to_string(),
+            ),
+            ChildNavigationSubmitError::SessionInvalidated(_)
         ));
         assert!(matches!(
             classify_exploration_submit_rejection(
                 Some(SetGoalRetryReason::NavigationNotReady(
                     NavigationReadinessCode::ProfileUnsupported,
                 )),
+                None,
                 "unsupported profile".to_string(),
             ),
             ChildNavigationSubmitError::Rejected(_)
@@ -15833,6 +15972,7 @@ mod exploration_lcm_smoke_tests {
             crate::explore_runtime::ChildNavigationRequest {
                 parent_request_id: PARENT_REQUEST.to_string(),
                 request_id: "wrong-semantic-frame".to_string(),
+                expected_map_name: "map".to_string(),
                 motion_admission: crate::nav_runtime::test_motion_admission(),
                 frontier_goal_id: "wrong-semantic-frontier".to_string(),
                 goal: wrong_goal,

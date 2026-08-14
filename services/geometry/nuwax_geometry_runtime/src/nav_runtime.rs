@@ -77,22 +77,59 @@ pub const DEFAULT_PROFILE: &str = PROFILE_SIMPLE_2D;
 
 static NEXT_NAV_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// 目标准入只需持有地图生命周期 fence 与唯一已提交地图权威。
+/// 目标准入只需持有地图生命周期 fence、唯一已提交地图权威与只读地图名称投影。
 #[derive(Clone)]
 pub(crate) struct NavAdmissionContext {
     pub(crate) mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
+    map_revision_latest_rx:
+        tokio::sync::watch::Receiver<Option<crate::lcm_runtime::MapRevisionEvent>>,
+    expected_map_name: Option<String>,
 }
 
 impl NavAdmissionContext {
     pub(crate) fn new(
         mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
         committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
+        map_revision_latest_rx: tokio::sync::watch::Receiver<
+            Option<crate::lcm_runtime::MapRevisionEvent>,
+        >,
+    ) -> Self {
+        let expected_map_name = map_revision_latest_rx
+            .borrow()
+            .as_ref()
+            .map(|event| event.map_name.clone());
+        Self::with_expected_map_name(
+            mapping_lifecycle_lock,
+            committed_map_authority,
+            map_revision_latest_rx,
+            expected_map_name,
+        )
+    }
+
+    pub(crate) fn with_expected_map_name(
+        mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+        committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
+        map_revision_latest_rx: tokio::sync::watch::Receiver<
+            Option<crate::lcm_runtime::MapRevisionEvent>,
+        >,
+        expected_map_name: Option<String>,
     ) -> Self {
         Self {
             mapping_lifecycle_lock,
             committed_map_authority,
+            map_revision_latest_rx,
+            expected_map_name,
         }
+    }
+
+    fn map_name_unchanged(&self) -> bool {
+        self.expected_map_name.as_ref().is_some_and(|expected| {
+            self.map_revision_latest_rx
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current.map_name == *expected)
+        })
     }
 }
 
@@ -2003,6 +2040,13 @@ pub enum SetGoalRetryReason {
     NavigationNotReady(NavigationReadinessCode),
 }
 
+/// Machine-readable reason for a permanent navigation admission rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetGoalRejectReason {
+    /// The active map name no longer matches the producer's frozen map name.
+    ActiveMapNameChanged,
+}
+
 /// `set_goal` 的输出:成功时返回 `NavigationState(ACCEPTED)`,
 /// 失败时返回带 reason 的 `Failed` state。
 pub struct SetGoalOutcome {
@@ -2012,6 +2056,8 @@ pub struct SetGoalOutcome {
     pub lease: Option<GoalLease>,
     /// Retryable admission cause; `None` means accepted or permanently rejected.
     pub retry_reason: Option<SetGoalRetryReason>,
+    /// Typed permanent rejection cause; `None` means accepted or not specially classified.
+    pub reject_reason: Option<SetGoalRejectReason>,
 }
 
 /// Complete CAS identity required to cancel one goal lease.
@@ -2072,7 +2118,18 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
         },
         lease: None,
         retry_reason: None,
+        reject_reason: None,
     }
+}
+
+fn rejected_goal_intent_with_reason(
+    goal_id: String,
+    reason: impl Into<String>,
+    reject_reason: SetGoalRejectReason,
+) -> SetGoalOutcome {
+    let mut outcome = rejected_goal_intent(goal_id, reason);
+    outcome.reject_reason = Some(reject_reason);
+    outcome
 }
 
 async fn goal_intent_from_set_goal(
@@ -2195,6 +2252,7 @@ pub async fn set_goal_with_boundary(
     let admission = NavAdmissionContext::new(
         handle.mapping_lifecycle_lock.clone(),
         handle.committed_map_authority.clone(),
+        handle.map_revision_latest_tx.subscribe(),
     );
     let io = NavAdmissionIo::new(
         handle.state.clone(),
@@ -2225,9 +2283,6 @@ pub(crate) async fn admit_goal_intent(
     producer_authority: GoalProducerEpochAuthority,
 ) -> SetGoalOutcome {
     let goal_id = intent.session_id.clone();
-    // Geometry 的生命周期 fence 同时是地图 authority 发布与 GoalLease CAS
-    // 的唯一组装层顺序门；准入持门到租约安装完成，但不跨异步发布。
-    let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
     let producer_contract_valid = matches!(
         (intent.producer.as_str(), intent.owner_kind, intent.priority,),
         (
@@ -2282,12 +2337,9 @@ pub(crate) async fn admit_goal_intent(
             )
         }
     };
-    let Some(current_map) = current_map else {
+    let Some(_current_map) = current_map else {
         return rejected_goal_intent(goal_id, "authoritative committed map is unavailable");
     };
-    if current_map != intent.committed_map {
-        return rejected_goal_intent(goal_id, "stale or conflicting committed map identity");
-    }
     if intent.goal.header.seq != 0
         || intent.goal.header.frame_id != intent.committed_map.frame_id
         || intent.goal.header.stamp_sec < 0
@@ -2374,7 +2426,6 @@ pub(crate) async fn admit_goal_intent(
             .saturating_mul(1_000_000_000)
             .saturating_add(intent.goal.header.stamp_nsec as u64)
     };
-    let expected_map_revision = intent.committed_map.revision as u64;
     let input = SetGoalInput {
         goal_id: intent.session_id,
         owner_kind: intent.owner_kind,
@@ -2394,15 +2445,7 @@ pub(crate) async fn admit_goal_intent(
             timestamp_ns,
         },
     };
-    admit_goal_input(
-        io,
-        state,
-        input,
-        boundary,
-        expected_map_revision,
-        map_goal_guard,
-    )
-    .await
+    admit_goal_input(io, state, input, boundary, admission).await
 }
 
 async fn admit_goal_input(
@@ -2410,8 +2453,7 @@ async fn admit_goal_input(
     state: &NavRuntimeState,
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
-    expected_map_revision: u64,
-    map_goal_guard: tokio::sync::MutexGuard<'_, ()>,
+    admission: &NavAdmissionContext,
 ) -> SetGoalOutcome {
     input.goal_id = input.goal_id.trim().to_string();
     input.parent_request_id = input.parent_request_id.trim().to_string();
@@ -2441,6 +2483,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
     }
     if let Err(reason) = input.motion_admission.validate() {
@@ -2454,6 +2497,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
     }
     if input.goal_id.is_empty()
@@ -2477,6 +2521,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
     }
     // 1. readiness 校验。
@@ -2497,22 +2542,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: Some(SetGoalRetryReason::NavigationNotReady(detail.reason_code)),
-        };
-    }
-    if detail.costmap_revision != expected_map_revision {
-        return SetGoalOutcome {
-            state: NavState {
-                status: NavPhase::Failed.as_str().to_string(),
-                message: format!(
-                    "SET_GOAL_REJECTED[COMMITTED_MAP_REVISION_MISMATCH]: intent={} planner={}",
-                    expected_map_revision, detail.costmap_revision,
-                ),
-                goal_id: input.goal_id.clone(),
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            },
-            lease: None,
-            retry_reason: None,
+            reject_reason: None,
         };
     }
     if input.frame_id != detail.map_frame {
@@ -2532,7 +2562,17 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
+    }
+    let distance_remaining = distance_to_target_from_state(&io.shared_state, &input.target).await;
+    let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
+    if !admission.map_name_unchanged() {
+        return rejected_goal_intent_with_reason(
+            input.goal_id,
+            "active map name changed before goal lease admission",
+            SetGoalRejectReason::ActiveMapNameChanged,
+        );
     }
     let goal_generation = match state.reserve_goal_generation(input.goal_generation) {
         Ok(generation) => generation,
@@ -2547,6 +2587,7 @@ async fn admit_goal_input(
                 },
                 lease: None,
                 retry_reason: None,
+                reject_reason: None,
             };
         }
     };
@@ -2565,6 +2606,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
     }
     let stamp_sec = match i32::try_from(input.target.timestamp_ns / 1_000_000_000) {
@@ -2580,6 +2622,7 @@ async fn admit_goal_input(
                 },
                 lease: None,
                 retry_reason: None,
+                reject_reason: None,
             };
         }
     };
@@ -2634,6 +2677,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
+            reject_reason: None,
         };
     }
     let lease = GoalLease {
@@ -2647,7 +2691,6 @@ async fn admit_goal_input(
         path_payload_sha256: [0; 32],
     };
 
-    let distance_remaining = distance_to_target_from_state(&io.shared_state, &input.target).await;
     {
         let mut slot = state.inner.write().await;
         if let Some(active) = slot.goal.as_ref() {
@@ -2664,6 +2707,7 @@ async fn admit_goal_input(
                     },
                     lease: Some(active.lease.clone()),
                     retry_reason: None,
+                    reject_reason: None,
                 };
             }
             return SetGoalOutcome {
@@ -2682,6 +2726,7 @@ async fn admit_goal_input(
                 },
                 lease: Some(lease),
                 retry_reason: None,
+                reject_reason: None,
             };
         }
         if goal_generation <= slot.last_goal_generation {
@@ -2698,6 +2743,7 @@ async fn admit_goal_input(
                 },
                 lease: Some(lease),
                 retry_reason: None,
+                reject_reason: None,
             };
         }
         let Ok(mut cancel) = state.cancel.lock() else {
@@ -2711,6 +2757,7 @@ async fn admit_goal_input(
                 },
                 lease: Some(lease),
                 retry_reason: None,
+                reject_reason: None,
             };
         };
         slot.last_goal_generation = goal_generation;
@@ -2748,6 +2795,7 @@ async fn admit_goal_input(
                     },
                     lease: Some(lease),
                     retry_reason: None,
+                    reject_reason: None,
                 };
             };
             if cancel.lease.as_ref() == Some(&lease) {
@@ -2767,6 +2815,7 @@ async fn admit_goal_input(
             },
             lease: Some(lease),
             retry_reason: None,
+            reject_reason: None,
         };
     }
 
@@ -2780,6 +2829,7 @@ async fn admit_goal_input(
         },
         lease: Some(lease),
         retry_reason: None,
+        reject_reason: None,
     }
 }
 
@@ -6277,5 +6327,148 @@ mod tests {
                 .is_err(),
             "facade cancellation must not publish /cmd_vel; the guard UDS is the sole actuator ingress"
         );
+    }
+
+    #[tokio::test]
+    async fn same_map_name_allows_revision_and_hash_change_at_admission() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        observe_ready_execution_chain(&state).await;
+        let admission = NavAdmissionContext::new(
+            handle.mapping_lifecycle_lock.clone(),
+            handle.committed_map_authority.clone(),
+            handle.map_revision_latest_tx.subscribe(),
+        );
+        let intent = goal_intent_from_set_goal(
+            &admission,
+            &state,
+            test_goal_input("same-name-increment"),
+            None,
+        )
+        .await
+        .expect("same-name intent");
+        let mut increment = handle
+            .map_revision_latest_tx
+            .borrow()
+            .clone()
+            .expect("initial map revision");
+        increment.revision += 1;
+        increment.checksum = "f".repeat(64);
+        handle.map_revision_latest_tx.send_replace(Some(increment));
+
+        let outcome = admit_goal_intent(
+            &admission,
+            &NavAdmissionIo::new(
+                handle.state.clone(),
+                handle.transport.clone(),
+                handle.transport_backend_name,
+                handle.lcm_backend_available,
+            ),
+            &state,
+            intent,
+            GoalProducerEpochAuthority::PublicNavigation,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.state.status, "ACCEPTED",
+            "{}",
+            outcome.state.message
+        );
+        assert!(outcome.lease.is_some());
+        assert!(state.inner.read().await.goal.is_some());
+    }
+
+    #[tokio::test]
+    async fn changed_map_name_rejects_before_goal_lease_and_slot_cas() {
+        let (handle, backend) = make_blocking_handle([None]).await;
+        let state = NavRuntimeState::from_env();
+        observe_ready_execution_chain(&state).await;
+        let admission = NavAdmissionContext::new(
+            handle.mapping_lifecycle_lock.clone(),
+            handle.committed_map_authority.clone(),
+            handle.map_revision_latest_tx.subscribe(),
+        );
+        let intent =
+            goal_intent_from_set_goal(&admission, &state, test_goal_input("changed-name"), None)
+                .await
+                .expect("changed-name intent");
+        let mut replacement = handle
+            .map_revision_latest_tx
+            .borrow()
+            .clone()
+            .expect("initial map revision");
+        replacement.map_name = "hallway".to_string();
+        handle
+            .map_revision_latest_tx
+            .send_replace(Some(replacement));
+
+        let cancel_before = state.cancel_snapshot();
+        let next_cancel_before = state.next_cancel_generation.load(AtomicOrdering::Acquire);
+        let outcome = admit_goal_intent(
+            &admission,
+            &NavAdmissionIo::new(
+                handle.state.clone(),
+                handle.transport.clone(),
+                handle.transport_backend_name,
+                handle.lcm_backend_available,
+            ),
+            &state,
+            intent,
+            GoalProducerEpochAuthority::PublicNavigation,
+        )
+        .await;
+
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(outcome.state.message.contains("active map name changed"));
+        assert_eq!(
+            outcome.reject_reason,
+            Some(SetGoalRejectReason::ActiveMapNameChanged)
+        );
+        assert!(outcome.lease.is_none());
+        assert!(state.inner.read().await.goal.is_none());
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
+        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(
+            state.next_cancel_generation.load(AtomicOrdering::Acquire),
+            next_cancel_before
+        );
+        assert_eq!(backend.publish_count(), 0);
+    }
+
+    #[test]
+    fn mapping_cloud_frozen_name_survives_provider_wait_map_switch() {
+        let (map_tx, map_rx) =
+            tokio::sync::watch::channel(Some(crate::lcm_runtime::MapRevisionEvent {
+                session_id: "mapping-cloud-session".to_string(),
+                map_name: "office".to_string(),
+                session_generation: 1,
+                revision: 1,
+                width: 1,
+                height: 1,
+                resolution: 0.1,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                frame_id: "map".to_string(),
+                timestamp_ns: 1,
+                data: vec![0].into(),
+                raw_data: Vec::<u8>::new().into(),
+                size: 1,
+                schema_version: 1,
+                checksum: "a".repeat(64),
+                raw_checksum: "a".repeat(64),
+                last_seen_ms: 0,
+            }));
+        let admission = NavAdmissionContext::with_expected_map_name(
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(StdMutex::new(None)),
+            map_rx,
+            Some("office".to_string()),
+        );
+        let mut switched = map_tx.borrow().clone().expect("initial map");
+        switched.map_name = "hallway".to_string();
+        map_tx.send_replace(Some(switched));
+
+        assert!(!admission.map_name_unchanged());
     }
 }

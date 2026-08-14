@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "FAR Planner C++ native bridge — wraps result/bin/far_planner_native"
+description = "FAR Planner typed liblcm worker and native bridge"
 
 [dependencies]
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
@@ -15,6 +15,11 @@ nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+nuwax-codec = { path = "../nuwax-codec" }
+nuwax-protocol = { path = "../nuwax-protocol" }
+nuwax-transport = { path = "../nuwax-transport", features = ["real-lcm"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
@@ -26,3 +31,7 @@ serde_json = { workspace = true }
 [[bin]]
 name = "nuwax-far-planner-core"
 path = "src/bin/nuwax-far-planner-core.rs"
+
+[[bin]]
+name = "nuwax-far-planner-worker"
+path = "src/bin/nuwax-far-planner-worker.rs"

@@ -1,7 +1,7 @@
-//! FAR Planner native bridge spec
+//! FAR Planner typed worker native bridge spec
 //!
-//! 配置字段完整保留方案 §4.2 列表；C++ 历史拼写不一致的参数名
-//! （如 `robot_dim`）通过 `cli_name_override` 输出历史名。
+//! 配置字段完整保留方案 §4.2 列表；worker 继续接受历史 CLI 参数名，
+//! 但生产 I/O 已统一为 liblcm typed Goal/Cancel/Result/Event topic。
 //!
 //! 端口表:
 //! - In: `terrain_map_ext`、`terrain_map`、`registered_scan`、`odometry`、`goal`、`stop_movement`
@@ -203,9 +203,13 @@ pub struct FarPlannerBridgeConfig {
 impl Default for FarPlannerBridgeConfig {
     fn default() -> Self {
         Self {
-            executable: PathBuf::from("result/bin/far_planner_native"),
+            executable: PathBuf::from("nuwax-far-planner-worker"),
             cwd: None,
-            env: BTreeMap::new(),
+            env: BTreeMap::from([
+                ("NUWAX_PLANNER_GENERATION".into(), "1".into()),
+                ("NUWAX_FAR_BACKEND_ID".into(), "far-visibility-graph".into()),
+                ("NUWAX_FAR_PLAN_TIMEOUT_MS".into(), "2000".into()),
+            ]),
             build_command: None,
             restart_policy: FarPlannerRestartPolicy::Never,
 
@@ -453,11 +457,28 @@ impl FarPlannerBridge {
 /// 构造 `NativeProgramSpec`（不启动进程）。
 #[must_use]
 pub fn build_spec(config: FarPlannerBridgeConfig, topics: &FarPlannerTopics) -> NativeProgramSpec {
+    let mut typed_topics = topics.to_topic_map();
+    typed_topics.retain(|port, _| {
+        matches!(
+            port.as_str(),
+            "terrain_map_ext"
+                | "terrain_map"
+                | "registered_scan"
+                | "odometry"
+                | "goal"
+                | "stop_movement"
+                | "way_point"
+                | "goal_path"
+        )
+    });
     NativeProgramSpec {
         name: "far_planner".to_string(),
         executable: config.executable.clone(),
-        topics: topics.to_topic_map(),
-        args: to_native_args(&config),
+        topics: typed_topics,
+        args: cli_mapping().render_arg(
+            "robot_dimension",
+            Some(ConfigValue::F64(config.robot_dimension)),
+        ),
         env: config.env.clone(),
         cwd: config.cwd.clone(),
         restart: config.restart_policy.into(),
@@ -560,7 +581,7 @@ mod tests {
         };
         let bridge = FarPlannerBridge::new(cfg, &topics);
         let argv = bridge.argv();
-        assert!(argv[0].ends_with("far_planner_native"));
+        assert!(argv[0].ends_with("nuwax-far-planner-worker"));
     }
 
     #[test]

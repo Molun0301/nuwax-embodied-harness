@@ -1,8 +1,8 @@
-//! FAR Planner C++ native bridge
+//! FAR Planner typed native bridge
 //!
-//! 仅包装 `result/bin/far_planner_native` 进程，不重写算法。
-//! 端口（topic）与配置字段按方案 §4.2 完整保留；C++ 历史拼写不一致的参数名
-//! （如 `robot_dim`）通过 `cli_name_override` 输出历史名。
+//! 生产 worker 使用真实 liblcm 消费 `GoalEnvelope`/`CancelNavigation`，
+//! 仅向 FAR 私有 topic 发布算法结果和 typed worker event。canonical
+//! `PathEnvelope` 由 nav-stack 的唯一 integration owner 统一封装。
 //!
 //! 进程生命周期由 `nuwax-nav-native-runner` 统一管理，本 crate 不自带进程管理逻辑。
 
@@ -12,6 +12,8 @@
 /// Auditable standalone visibility-graph fallback core.
 pub mod core;
 pub mod spec;
+/// 真实 liblcm typed worker。
+pub mod worker;
 
 pub use spec::{
     build_spec, cli_exclude, cli_mapping, cli_name_override, to_native_args, FarPlannerBridge,

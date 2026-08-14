@@ -1633,10 +1633,14 @@ dependencies = [
 name = "nuwax-nav-far-planner-bridge"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "nuwax-codec",
  "nuwax-nav-base",
  "nuwax-nav-native-runner",
  "nuwax-nav-test-fixtures",
  "nuwax-nav-types-messages",
+ "nuwax-protocol",
+ "nuwax-transport",
  "pretty_assertions",
  "serde",
  "serde_json",

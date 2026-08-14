@@ -818,6 +818,7 @@ impl GeometryRuntimeService {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn take_activation_lifecycle_fence(&self) -> Result<Option<ActivationLifecycleFence>, Status> {
         let mut slot = self.activation_lifecycle_fence.lock();
         match slot.as_ref() {
@@ -940,6 +941,7 @@ impl GeometryRuntimeService {
         self.bridge
             .revoke_committed_map_projection_locked(&mut projection_guard)
             .map_err(Status::unavailable)?;
+        drop(projection_guard);
         drop(lifecycle_guard);
 
         #[cfg(test)]
@@ -9617,19 +9619,20 @@ mod lifecycle_tests {
         assert!(duplicate_error
             .message()
             .contains("first Process Stop attempt failed"));
-        let slot = service.activation_lifecycle_fence.lock();
-        let ActivationLifecycleFenceSlot::RestorePending(pending) =
-            slot.as_ref().expect("restore pending slot")
-        else {
-            panic!("restore timeout must preserve a RestorePending fence");
-        };
-        assert_eq!(
-            pending.activation_request_id,
-            "process-stop-restore-pending"
-        );
-        assert_eq!(pending.activation_request_identity_sha256, identity);
-        assert!(pending.retained_global_map.is_some());
-        drop(slot);
+        {
+            let slot = service.activation_lifecycle_fence.lock();
+            let ActivationLifecycleFenceSlot::RestorePending(pending) =
+                slot.as_ref().expect("restore pending slot")
+            else {
+                panic!("restore timeout must preserve a RestorePending fence");
+            };
+            assert_eq!(
+                pending.activation_request_id,
+                "process-stop-restore-pending"
+            );
+            assert_eq!(pending.activation_request_identity_sha256, identity);
+            assert!(pending.retained_global_map.is_some());
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
                 .await
@@ -10080,7 +10083,7 @@ mod lifecycle_tests {
         request_id: &str,
     ) -> (String, ChildNavigationLease) {
         handle.explore.set_navigation_sink(sink.clone());
-        ingest_server_test_committed_costmap(&handle, 1).await;
+        ingest_server_test_committed_costmap(handle, 1).await;
         assert_eq!(
             handle
                 .explore

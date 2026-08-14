@@ -262,6 +262,7 @@ pub struct ChildNavigationRequest {
     pub intent: schema::GoalIntent,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_wavefront_goal_intent(
     producer_epoch: u64,
     cancel_generation: u64,
@@ -1755,9 +1756,7 @@ impl ExploreRuntimeHandle {
         let recovered = sink
             .recover_cancel_receipt(&lease)
             .is_some_and(|recovery| recovery.failure.is_none());
-        if recovered {
-            self.orphan_cancellations.mark_cancel_pending(&lease);
-        } else if sink.cancel(&lease).await.is_ok() {
+        if recovered || sink.cancel(&lease).await.is_ok() {
             self.orphan_cancellations.mark_cancel_pending(&lease);
         }
         let _ = sink.retain_orphan_cancellation(lease.clone());

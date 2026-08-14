@@ -1,5 +1,7 @@
 //! Geometry-owned mapping kernels selected by the validated owner profile.
 
+#![allow(dead_code)]
+
 #[path = "mapping_backend_sidecar.rs"]
 mod sidecar;
 
@@ -101,7 +103,7 @@ pub(crate) const RAY_GRAZE_COS_ENV: &str = "NUWAX_MAPPING_RAYTRACING_GRAZE_COS";
 pub(crate) const RAY_RECENCY_WINDOW_ENV: &str = "NUWAX_MAPPING_RAYTRACING_RECENCY_WINDOW";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RaytracingBackendSpec {
+pub struct RaytracingBackendSpec {
     voxel_size: f32,
     max_range: f32,
     ray_subsample: u32,
@@ -1056,6 +1058,7 @@ impl MappingBackendClient {
 
 impl MappingBackendSpec {
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn raytracing(
         voxel_size: f32,
         max_range: f32,
@@ -1386,8 +1389,7 @@ impl RaytracingKernel {
             / VOXEL_MAP_CHECKPOINT_ENTRY_BYTES;
         if retained > max_voxels {
             return Err(format!(
-                "RAYTRACING_UPDATE_REJECTED: retained ray state cannot fit in the {}-byte checkpoint budget",
-                MAX_MAPPING_BACKEND_CHECKPOINT_BYTES
+                "RAYTRACING_UPDATE_REJECTED: retained ray state cannot fit in the {MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}-byte checkpoint budget"
             ));
         }
         Ok(())
@@ -1397,8 +1399,7 @@ impl RaytracingKernel {
         let encoded_len = mapping_backend_ray_checkpoint_encoded_len(self)?;
         if encoded_len > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES {
             return Err(format!(
-                "RAYTRACING_UPDATE_REJECTED: retained ray state requires {encoded_len} checkpoint bytes, limit is {}",
-                MAX_MAPPING_BACKEND_CHECKPOINT_BYTES
+                "RAYTRACING_UPDATE_REJECTED: retained ray state requires {encoded_len} checkpoint bytes, limit is {MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}"
             ));
         }
         Ok(())
@@ -1459,8 +1460,7 @@ fn mapping_backend_ray_checkpoint_encoded_len(ray: &RaytracingKernel) -> Result<
 fn allocate_mapping_checkpoint(encoded_len: usize) -> Result<Vec<u8>, String> {
     if encoded_len == 0 || encoded_len > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES {
         return Err(format!(
-            "MAPPING_BACKEND_CHECKPOINT_INVALID: payload size {encoded_len} is outside 1..={} bytes",
-            MAX_MAPPING_BACKEND_CHECKPOINT_BYTES
+            "MAPPING_BACKEND_CHECKPOINT_INVALID: payload size {encoded_len} is outside 1..={MAX_MAPPING_BACKEND_CHECKPOINT_BYTES} bytes"
         ));
     }
     let mut payload = Vec::new();

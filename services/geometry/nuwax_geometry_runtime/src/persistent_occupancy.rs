@@ -25,6 +25,7 @@ pub(crate) struct PersistentOccupancyGrid {
 }
 
 impl PersistentOccupancyGrid {
+    #[allow(dead_code)]
     pub(crate) fn stage_voxel(
         current: Option<&Self>,
         accumulated: &OccupancyGrid,
@@ -38,6 +39,7 @@ impl PersistentOccupancyGrid {
         Ok(staged)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stage_authoritative(grid: &OccupancyGrid) -> Result<Self, String> {
         Self::from_grid(grid.clone())
     }

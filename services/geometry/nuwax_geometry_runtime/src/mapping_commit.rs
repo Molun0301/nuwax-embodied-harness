@@ -6,6 +6,7 @@ pub(crate) struct MappingCommitId {
     pub(crate) sequence: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OccupancyCommitReceipt {
     pub(crate) commit_id: MappingCommitId,
@@ -17,6 +18,7 @@ pub(crate) struct OccupancyCommitReceipt {
     pub(crate) backend_generation: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CloudCommitReceipt {
     pub(crate) commit_id: MappingCommitId,

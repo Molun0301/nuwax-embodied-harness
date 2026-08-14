@@ -2324,6 +2324,37 @@ fn test_committed_map_identity(revision: u64) -> schema::CommittedMapIdentity {
 }
 
 #[cfg(test)]
+fn test_map_revision_authority(
+    session_id: &str,
+    map_name: &str,
+    frame_id: &str,
+    revision: u64,
+) -> MapRevisionEvent {
+    let data: Arc<[u8]> = vec![0].into();
+    let checksum = crate::map_checksum::sha256_hex(data.as_ref());
+    MapRevisionEvent {
+        session_id: session_id.to_string(),
+        map_name: map_name.to_string(),
+        session_generation: 1,
+        revision,
+        width: 1,
+        height: 1,
+        resolution: 0.1,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        frame_id: frame_id.to_string(),
+        timestamp_ns: revision,
+        data,
+        raw_data: Vec::<u8>::new().into(),
+        size: 1,
+        schema_version: 1,
+        checksum: checksum.clone(),
+        raw_checksum: checksum,
+        last_seen_ms: 0,
+    }
+}
+
+#[cfg(test)]
 fn test_wavefront_goal_intent(
     goal_id: &str,
     parent_request_id: &str,
@@ -2416,6 +2447,14 @@ async fn start_topology_exploration_goal(
         .committed_map_authority
         .lock()
         .expect("production topology committed map authority") = Some(committed_map.clone());
+    handle
+        .map_revision_latest_tx
+        .send_replace(Some(test_map_revision_authority(
+            &committed_map.session_id,
+            "exploration-test-map",
+            &committed_map.frame_id,
+            1,
+        )));
     let mut grid = OccupancyGrid2D {
         resolution: 0.5,
         origin: Point2 { x: 0.0, y: 0.0 },
@@ -4635,17 +4674,19 @@ struct ExploreNavigationBridge {
 }
 
 #[cfg(test)]
-static TEST_EXPLORE_BRIDGE_TASK_CONTROLS: LazyLock<
-    parking_lot::Mutex<
-        HashMap<
-            usize,
-            (
-                Weak<std::sync::atomic::AtomicU64>,
-                GeometryRuntimeTaskControl,
-            ),
-        >,
+type TestExploreBridgeTaskControls = parking_lot::Mutex<
+    HashMap<
+        usize,
+        (
+            Weak<std::sync::atomic::AtomicU64>,
+            GeometryRuntimeTaskControl,
+        ),
     >,
-> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+>;
+
+#[cfg(test)]
+static TEST_EXPLORE_BRIDGE_TASK_CONTROLS: LazyLock<TestExploreBridgeTaskControls> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 impl ExploreNavigationBridge {
     #[cfg(not(test))]
@@ -4658,9 +4699,7 @@ impl ExploreNavigationBridge {
         let key = Arc::as_ptr(&self.runtime_observation_generation) as usize;
         let mut controls = TEST_EXPLORE_BRIDGE_TASK_CONTROLS.lock();
         controls.retain(|_, (generation, _)| generation.upgrade().is_some());
-        let Some((generation, control)) = controls.get(&key) else {
-            return None;
-        };
+        let (generation, control) = controls.get(&key)?;
         if generation.upgrade().is_some_and(|generation| {
             Arc::ptr_eq(&generation, &self.runtime_observation_generation)
         }) {
@@ -5243,8 +5282,10 @@ async fn apply_typed_navigation_feedback(
                     expected_lease_source,
                     expected_path_revision = expected.map_or(0, |lease| lease.path_revision),
                     received_path_hash_zero = update.feedback.path_payload_sha256 == [0; 32],
-                    expected_path_hash_zero = expected
-                        .map_or(true, |lease| lease.path_payload_sha256 == [0; 32]),
+                    expected_path_hash_zero = match expected {
+                        Some(lease) => lease.path_payload_sha256 == [0; 32],
+                        None => true,
+                    },
                     path_hash_matches = expected.is_some_and(|lease| {
                         lease.path_payload_sha256 == update.feedback.path_payload_sha256
                     }),
@@ -5986,11 +6027,11 @@ fn map_revision_fanout_futures_in_frame(
                         continue;
                     };
                     projection = explore_projection_gate.lock().await;
-                    if projection
-                        .pending_latest
-                        .as_ref()
-                        .map_or(true, |current| newer_projection_event(current, &observed))
-                    {
+                    let pending_is_older = match projection.pending_latest.as_ref() {
+                        Some(current) => newer_projection_event(current, &observed),
+                        None => true,
+                    };
+                    if pending_is_older {
                         projection.pending_latest = Some(observed);
                     }
                 }
@@ -6113,11 +6154,11 @@ fn map_revision_fanout_futures_in_frame(
                         };
                         if let Some(observed) = observed {
                             let mut projection = explore_projection_gate.lock().await;
-                            if projection
-                                .pending_latest
-                                .as_ref()
-                                .map_or(true, |current| newer_projection_event(current, &observed))
-                            {
+                            let pending_is_older = match projection.pending_latest.as_ref() {
+                                Some(current) => newer_projection_event(current, &observed),
+                                None => true,
+                            };
+                            if pending_is_older {
                                 projection.pending_latest = Some(observed);
                             }
                         }
@@ -16233,6 +16274,12 @@ mod exploration_lcm_smoke_tests {
             payload_sha256: crate::map_checksum::sha256_bytes(&[]),
             frame_id: map_frame.to_string(),
         };
+        map_revision_latest_tx.send_replace(Some(test_map_revision_authority(
+            &committed_map.session_id,
+            "smoke-map",
+            map_frame,
+            MAP_REVISION,
+        )));
         let explore =
             crate::explore_runtime::ExploreRuntimeHandle::with_wavefront_map_frame(map_frame)
                 .expect("configured exploration runtime");

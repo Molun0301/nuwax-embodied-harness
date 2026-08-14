@@ -331,6 +331,7 @@ pub struct NavRuntimeState {
     cancel: Arc<StdMutex<CancelTracker>>,
     transaction_gate: Arc<tokio::sync::Mutex<()>>,
     publish_in_flight: Arc<StdMutex<Vec<PublishInFlight>>>,
+    publish_state_changed: Arc<tokio::sync::Notify>,
     next_publish_attempt: Arc<AtomicU64>,
     #[cfg(test)]
     transaction_after_correlation: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
@@ -649,6 +650,7 @@ impl NavRuntimeState {
             cancel: Arc::new(StdMutex::new(CancelTracker::default())),
             transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
             publish_in_flight: Arc::new(StdMutex::new(Vec::new())),
+            publish_state_changed: Arc::new(tokio::sync::Notify::new()),
             next_publish_attempt: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             transaction_after_correlation: Arc::new(StdMutex::new(None)),
@@ -751,7 +753,17 @@ impl NavRuntimeState {
             return false;
         };
         in_flight.remove(index);
+        drop(in_flight);
+        self.publish_state_changed.notify_waiters();
         true
+    }
+
+    fn goal_publish_in_flight(&self) -> bool {
+        self.publish_in_flight.lock().is_ok_and(|in_flight| {
+            in_flight
+                .iter()
+                .any(|current| current.kind == PublishKind::Goal)
+        })
     }
 
     fn publish_started_at(
@@ -2002,6 +2014,7 @@ pub async fn compute_readiness(
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 fn compute_admission_readiness<'a>(
     io: &'a NavAdmissionIo,
     state: &'a NavRuntimeState,
@@ -2654,6 +2667,12 @@ pub(crate) async fn admit_goal_intent(
                 replacement_lease: cancel.lease,
             }
         }
+        CancelPhase::Pending if state.inner.read().await.goal.is_some() => {
+            return rejected_goal_intent(
+                goal_id,
+                "GOAL_LEASE_BUSY: active goal is awaiting exact cancellation terminal",
+            );
+        }
         _ => {
             return rejected_goal_intent(goal_id, "cancel generation changed before admission");
         }
@@ -3156,9 +3175,18 @@ pub async fn cancel(
     state: &NavRuntimeState,
     input: CancelGoalInput,
 ) -> CancelOutcome {
-    let (cancel_start, publish_attempt) = {
-        let _transaction_guard = state.transaction_gate.lock().await;
+    let (cancel_start, publish_attempt) = loop {
+        let transaction_guard = state.transaction_gate.lock().await;
         let map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
+        if state.goal_publish_in_flight() {
+            let publish_state_changed = state.publish_state_changed.notified();
+            tokio::pin!(publish_state_changed);
+            publish_state_changed.as_mut().enable();
+            drop(map_goal_guard);
+            drop(transaction_guard);
+            publish_state_changed.await;
+            continue;
+        }
         let cancel_start = state.begin_cancel(&input).await;
         let publish_identity = match &cancel_start {
             CancelStart::Publish {
@@ -3201,7 +3229,8 @@ pub async fn cancel(
             None => None,
         };
         drop(map_goal_guard);
-        (cancel_start, publish_attempt)
+        drop(transaction_guard);
+        break (cancel_start, publish_attempt);
     };
 
     match cancel_start {
@@ -3378,13 +3407,11 @@ async fn finish_cancel_request(
         );
     }
     if let Err(error) = cancel_result {
-        warn!(
-            "initial cancel publish returned an error; transaction ownership remains pending: {}",
-            error
-        );
-        let message = format!("CANCEL_PENDING_RESPONSE_LOSS: {error}");
+        warn!("initial cancel publish failed: {error}");
+        let message = format!("CANCEL_PUBLISH_FAILED: {error}");
+        cancel.phase = CancelPhase::Failed;
         cancel.message = message.clone();
-        slot.phase = NavPhase::CancelPending;
+        slot.phase = NavPhase::Failed;
         slot.message = message.clone();
         return cancel_outcome_from_slot(&slot, goal_id, message, Some(lease));
     }
@@ -4693,12 +4720,26 @@ mod tests {
         input.target.frame_id = "robot/map".to_string();
         let points = vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]];
 
+        let slash_frame = set_exploration_goal_for_test(
+            &handle,
+            &state,
+            input.clone(),
+            Some(GoalBoundaryConstraint {
+                frame_id: "/robot/map".to_string(),
+                points: points.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(slash_frame.state.status, "FAILED");
+        assert!(slash_frame.state.message.contains("GOAL_BOUNDARY_INVALID"));
+        assert!(state.active_goal_lease().await.is_none());
+
         let outcome = set_exploration_goal_for_test(
             &handle,
             &state,
             input,
             Some(GoalBoundaryConstraint {
-                frame_id: "/robot/map".to_string(),
+                frame_id: "robot/map".to_string(),
                 points: points.clone(),
             }),
         )

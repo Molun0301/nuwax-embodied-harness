@@ -594,6 +594,7 @@ impl MappingRetiredCapability {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum MappingFinalOwner {
     WaitingLifecycleLock {
         adapter: Option<Arc<parking_lot::Mutex<MappingAdapter>>>,

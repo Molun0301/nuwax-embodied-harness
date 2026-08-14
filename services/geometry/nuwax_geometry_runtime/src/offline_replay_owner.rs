@@ -599,6 +599,7 @@ fn current_unix_time_ns() -> Result<u64, String> {
     Ok(timestamp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_checkpoint_projection(
     replay_id: &str,
     backend_kind: OfflineBackendKind,

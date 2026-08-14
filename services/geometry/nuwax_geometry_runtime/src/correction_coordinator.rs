@@ -4737,6 +4737,7 @@ mod preflight_only_contract {
         worker: Option<tokio::task::JoinHandle<Result<(), CorrectionRuntimeError>>>,
     }
 
+    #[allow(dead_code)]
     impl CorrectionCleanupSupervisor {
         fn start(sink: Arc<dyn CorrectionCandidateSink>) -> Self {
             let (sender, receiver) = mpsc::channel(CORRECTION_CLEANUP_QUEUE_CAPACITY);
@@ -5497,6 +5498,7 @@ mod preflight_only_contract {
         }
     }
 
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, Debug)]
     pub(crate) enum RelocalizationTerminalSnapshot {
         Terminal(crate::proto::RelocalizeResult),

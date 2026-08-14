@@ -3592,7 +3592,7 @@ pub(crate) mod lifecycle_tests {
             );
         })
         .await;
-        let mut fixture =
+        let fixture =
             lifecycle_production_fixture_with_setup(51, "reverse", true, topology_setup).await;
         fixture.topology_control().release_terminal();
         let geometry_task_failure = tokio::time::timeout(Duration::from_secs(2), async {

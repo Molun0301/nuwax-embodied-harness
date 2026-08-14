@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +32,47 @@ struct _nuwax_msgs_PathEnvelope
      */
     char*      parent_request_id;
     int64_t    goal_generation;
+
+    /**
+     * LCM Type: string
+     */
+    char*      producer;
+    int64_t    producer_epoch;
+    int64_t    producer_runtime_generation;
+
+    /**
+     * LCM Type: string
+     */
+    char*      committed_map_session_id;
+    int64_t    committed_map_session_generation;
+    int64_t    committed_map_revision;
+
+    /**
+     * LCM Type: byte[32]
+     */
+    uint8_t    committed_map_payload_sha256[32];
+
+    /**
+     * LCM Type: string
+     */
+    char*      committed_map_frame_id;
+
+    /**
+     * LCM Type: string
+     */
+    char*      boundary_id;
+
+    /**
+     * LCM Type: byte[32]
+     */
+    uint8_t    boundary_sha256[32];
+    int64_t    motion_guard_generation;
+
+    /**
+     * LCM Type: byte[16]
+     */
+    uint8_t    motion_guard_boot_nonce[16];
+    int64_t    motion_stop_generation;
     int64_t    planner_runtime_generation;
     int64_t    path_revision;
     int64_t    source_timestamp_ns;

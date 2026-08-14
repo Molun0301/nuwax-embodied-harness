@@ -20,9 +20,9 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x271f_9f3c_54c5_8999_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xe2dc_6882_37b9_a31b_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x9002_62a4_798f_7a6d_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0xf11d_70cc_600f_1ab1_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
@@ -45,7 +45,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 3;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 4;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -123,9 +123,6 @@ pub struct CommittedMapIdentity {
 }
 
 /// 由唯一导航租约 owner 准入的共享 producer 请求。
-///
-/// 这是进程内合同，刻意不改变既有
-/// `GoalEnvelope` 或 `PathEnvelope` 线协议布局。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalIntent {
     /// 稳定 producer 名称，例如 `public-navigation` 或 `wavefront`。
@@ -193,7 +190,7 @@ pub fn goal_intent_boundary_sha256(
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {
-    /// Wire schema version. Only version 3 is currently accepted.
+    /// Wire schema version. Only version 4 is currently accepted.
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -203,10 +200,28 @@ pub struct GoalEnvelope {
     pub parent_request_id: String,
     /// Monotonic generation for this owner's goal slot.
     pub goal_generation: i64,
-    /// Geometry runtime generation that produced the envelope.
+    /// Stable producer name copied from the admitted goal intent.
+    pub producer: String,
+    /// Producer instance generation copied from the admitted goal intent.
+    pub producer_epoch: i64,
+    /// Geometry runtime generation that sealed the envelope and owns cancellation.
     pub producer_runtime_generation: i64,
+    /// Committed mapping session that admitted the goal.
+    pub committed_map_session_id: String,
+    /// Committed mapping-session instance generation.
+    pub committed_map_session_generation: i64,
+    /// Committed map revision used for planning.
+    pub committed_map_revision: i64,
+    /// Canonical committed map payload digest.
+    pub committed_map_payload_sha256: [u8; 32],
+    /// Authoritative planning frame carried by the committed map.
+    pub committed_map_frame_id: String,
     /// Source timestamp in nanoseconds.
     pub source_timestamp_ns: i64,
+    /// Stable boundary identifier; empty when no boundary is active.
+    pub boundary_id: String,
+    /// Canonical boundary identity and polygon digest; zero when absent.
+    pub boundary_sha256: [u8; 32],
     /// Authoritative frame for all boundary points.
     pub boundary_frame_id: String,
     /// Optional closed navigation boundary, represented as XYZ points.
@@ -226,7 +241,7 @@ pub struct GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// Wire schema version. Only version 3 is currently accepted.
+    /// Wire schema version. Only version 4 is currently accepted.
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -236,7 +251,33 @@ pub struct PathEnvelope {
     pub parent_request_id: String,
     /// Goal generation copied from the goal envelope.
     pub goal_generation: i64,
-    /// Planner runtime generation that produced the path.
+    /// Stable producer name copied from the goal envelope.
+    pub producer: String,
+    /// Producer instance generation copied from the goal envelope.
+    pub producer_epoch: i64,
+    /// Geometry runtime generation copied from the goal envelope.
+    pub producer_runtime_generation: i64,
+    /// Committed mapping session copied from the goal envelope.
+    pub committed_map_session_id: String,
+    /// Committed mapping-session instance generation copied from the goal envelope.
+    pub committed_map_session_generation: i64,
+    /// Committed map revision copied from the goal envelope.
+    pub committed_map_revision: i64,
+    /// Committed map payload digest copied from the goal envelope.
+    pub committed_map_payload_sha256: [u8; 32],
+    /// Committed map frame copied from the goal envelope.
+    pub committed_map_frame_id: String,
+    /// Boundary identifier copied from the goal envelope.
+    pub boundary_id: String,
+    /// Boundary digest copied from the goal envelope.
+    pub boundary_sha256: [u8; 32],
+    /// Guard generation copied from the goal envelope.
+    pub motion_guard_generation: i64,
+    /// Guard boot nonce copied from the goal envelope.
+    pub motion_guard_boot_nonce: [u8; 16],
+    /// Global stop generation copied from the goal envelope.
+    pub motion_stop_generation: i64,
+    /// Planner restart generation that produced the path.
     pub planner_runtime_generation: i64,
     /// Monotonic path revision within the goal generation.
     pub path_revision: i64,
@@ -731,8 +772,17 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.owner_kind.to_be_bytes());
     encode_string(&message.parent_request_id, out)?;
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
+    encode_string(&message.producer, out)?;
+    out.extend_from_slice(&message.producer_epoch.to_be_bytes());
     out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
+    encode_string(&message.committed_map_session_id, out)?;
+    out.extend_from_slice(&message.committed_map_session_generation.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_revision.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_payload_sha256);
+    encode_string(&message.committed_map_frame_id, out)?;
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
+    encode_string(&message.boundary_id, out)?;
+    out.extend_from_slice(&message.boundary_sha256);
     encode_string(&message.boundary_frame_id, out)?;
     out.extend_from_slice(&boundary_points_length.to_be_bytes());
     for point in &message.boundary_points {
@@ -750,8 +800,23 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let owner_kind = cursor.read_i32()?;
     let parent_request_id = cursor.read_string()?;
     let goal_generation = cursor.read_i64()?;
+    let producer = cursor.read_string()?;
+    let producer_epoch = cursor.read_i64()?;
     let producer_runtime_generation = cursor.read_i64()?;
+    let committed_map_session_id = cursor.read_string()?;
+    let committed_map_session_generation = cursor.read_i64()?;
+    let committed_map_revision = cursor.read_i64()?;
+    let committed_map_payload_sha256 = cursor
+        .read_exact(32)?
+        .try_into()
+        .expect("32-byte committed map digest");
+    let committed_map_frame_id = cursor.read_string()?;
     let source_timestamp_ns = cursor.read_i64()?;
+    let boundary_id = cursor.read_string()?;
+    let boundary_sha256 = cursor
+        .read_exact(32)?
+        .try_into()
+        .expect("32-byte boundary digest");
     let boundary_frame_id = cursor.read_string()?;
     let boundary_points_length = cursor.read_nonnegative_len("boundary_points_length")?;
     if boundary_points_length > cursor.remaining() / 24 {
@@ -783,8 +848,17 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         owner_kind,
         parent_request_id,
         goal_generation,
+        producer,
+        producer_epoch,
         producer_runtime_generation,
+        committed_map_session_id,
+        committed_map_session_generation,
+        committed_map_revision,
+        committed_map_payload_sha256,
+        committed_map_frame_id,
         source_timestamp_ns,
+        boundary_id,
+        boundary_sha256,
         boundary_frame_id,
         boundary_points,
         motion_guard_generation,
@@ -807,9 +881,16 @@ fn validate_goal_envelope_semantics(
         message.goal_generation,
         message.source_timestamp_ns,
     )?;
-    if message.producer_runtime_generation <= 0 {
-        return Err("producer_runtime_generation must be positive".into());
-    }
+    validate_goal_authority_identity(
+        &message.producer,
+        message.producer_epoch,
+        message.producer_runtime_generation,
+        &message.committed_map_session_id,
+        message.committed_map_session_generation,
+        message.committed_map_revision,
+        &message.committed_map_payload_sha256,
+        &message.committed_map_frame_id,
+    )?;
     if message.motion_guard_generation <= 0 {
         return Err("motion_guard_generation must be positive".into());
     }
@@ -824,24 +905,8 @@ fn validate_goal_envelope_semantics(
         return Err("motion_stop_generation must be non-negative".into());
     }
     validate_navigation_frame_id(&message.goal.header.frame_id, "goal pose")?;
-    match message.owner_kind {
-        NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
-            if !message.boundary_frame_id.is_empty() || !message.boundary_points.is_empty() {
-                return Err("PUBLIC_NAV goal must not carry a navigation boundary".into());
-            }
-        }
-        NAVIGATION_OWNER_KIND_EXPLORATION_CHILD => {
-            if message.boundary_points.is_empty() {
-                if !message.boundary_frame_id.is_empty() {
-                    return Err("empty boundary must have an empty boundary_frame_id".into());
-                }
-            } else if message.boundary_frame_id != message.goal.header.frame_id {
-                return Err(
-                    "exploration boundary_frame_id must match the goal pose frame_id".into(),
-                );
-            }
-        }
-        _ => unreachable!("owner kind validated above"),
+    if message.goal.header.frame_id != message.committed_map_frame_id {
+        return Err("goal pose frame_id must match committed map frame_id".into());
     }
     if !pose_is_finite(&message.goal.pose)
         || message
@@ -851,6 +916,45 @@ fn validate_goal_envelope_semantics(
             .any(|value| !value.is_finite())
     {
         return Err("goal or boundary contains a non-finite coordinate".into());
+    }
+    match message.owner_kind {
+        NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
+            if !message.boundary_id.is_empty()
+                || message.boundary_sha256 != [0; 32]
+                || !message.boundary_frame_id.is_empty()
+                || !message.boundary_points.is_empty()
+            {
+                return Err("PUBLIC_NAV goal must not carry a navigation boundary".into());
+            }
+        }
+        NAVIGATION_OWNER_KIND_EXPLORATION_CHILD => {
+            if message.boundary_points.is_empty() {
+                if !message.boundary_id.is_empty()
+                    || message.boundary_sha256 != [0; 32]
+                    || !message.boundary_frame_id.is_empty()
+                {
+                    return Err("empty boundary must have empty identity and frame".into());
+                }
+            } else {
+                if message.boundary_id.trim().is_empty()
+                    || message.boundary_id.trim() != message.boundary_id
+                    || message.boundary_sha256 == [0; 32]
+                    || message.boundary_frame_id != message.committed_map_frame_id
+                {
+                    return Err("exploration boundary identity or frame is invalid".into());
+                }
+                let expected = goal_intent_boundary_sha256(
+                    &message.boundary_frame_id,
+                    &message.boundary_id,
+                    &message.boundary_points,
+                )
+                .map_err(|error| error.to_string())?;
+                if message.boundary_sha256 != expected {
+                    return Err("boundary_sha256 mismatch".into());
+                }
+            }
+        }
+        _ => unreachable!("owner kind validated above"),
     }
     if check_digest {
         let expected = goal_envelope_payload_sha256(message).map_err(|error| error.to_string())?;
@@ -922,6 +1026,19 @@ fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.owner_kind.to_be_bytes());
     encode_string(&message.parent_request_id, out)?;
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
+    encode_string(&message.producer, out)?;
+    out.extend_from_slice(&message.producer_epoch.to_be_bytes());
+    out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
+    encode_string(&message.committed_map_session_id, out)?;
+    out.extend_from_slice(&message.committed_map_session_generation.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_revision.to_be_bytes());
+    out.extend_from_slice(&message.committed_map_payload_sha256);
+    encode_string(&message.committed_map_frame_id, out)?;
+    encode_string(&message.boundary_id, out)?;
+    out.extend_from_slice(&message.boundary_sha256);
+    out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
+    out.extend_from_slice(&message.motion_guard_boot_nonce);
+    out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
@@ -935,6 +1052,28 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
     let owner_kind = cursor.read_i32()?;
     let parent_request_id = cursor.read_string()?;
     let goal_generation = cursor.read_i64()?;
+    let producer = cursor.read_string()?;
+    let producer_epoch = cursor.read_i64()?;
+    let producer_runtime_generation = cursor.read_i64()?;
+    let committed_map_session_id = cursor.read_string()?;
+    let committed_map_session_generation = cursor.read_i64()?;
+    let committed_map_revision = cursor.read_i64()?;
+    let committed_map_payload_sha256 = cursor
+        .read_exact(32)?
+        .try_into()
+        .expect("32-byte committed map digest");
+    let committed_map_frame_id = cursor.read_string()?;
+    let boundary_id = cursor.read_string()?;
+    let boundary_sha256 = cursor
+        .read_exact(32)?
+        .try_into()
+        .expect("32-byte boundary digest");
+    let motion_guard_generation = cursor.read_i64()?;
+    let motion_guard_boot_nonce = cursor
+        .read_exact(16)?
+        .try_into()
+        .expect("16-byte motion guard boot nonce");
+    let motion_stop_generation = cursor.read_i64()?;
     let planner_runtime_generation = cursor.read_i64()?;
     let path_revision = cursor.read_i64()?;
     let source_timestamp_ns = cursor.read_i64()?;
@@ -953,6 +1092,19 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
         owner_kind,
         parent_request_id,
         goal_generation,
+        producer,
+        producer_epoch,
+        producer_runtime_generation,
+        committed_map_session_id,
+        committed_map_session_generation,
+        committed_map_revision,
+        committed_map_payload_sha256,
+        committed_map_frame_id,
+        boundary_id,
+        boundary_sha256,
+        motion_guard_generation,
+        motion_guard_boot_nonce,
+        motion_stop_generation,
         planner_runtime_generation,
         path_revision,
         source_timestamp_ns,
@@ -974,6 +1126,35 @@ fn validate_path_envelope_semantics(
         message.goal_generation,
         message.source_timestamp_ns,
     )?;
+    validate_goal_authority_identity(
+        &message.producer,
+        message.producer_epoch,
+        message.producer_runtime_generation,
+        &message.committed_map_session_id,
+        message.committed_map_session_generation,
+        message.committed_map_revision,
+        &message.committed_map_payload_sha256,
+        &message.committed_map_frame_id,
+    )?;
+    if message.boundary_id.is_empty() != (message.boundary_sha256 == [0; 32]) {
+        return Err("path boundary identity and digest must be present together".into());
+    }
+    if message.owner_kind == NAVIGATION_OWNER_KIND_PUBLIC_NAV && !message.boundary_id.is_empty() {
+        return Err("PUBLIC_NAV path must not carry a navigation boundary".into());
+    }
+    if message.motion_guard_generation <= 0 {
+        return Err("motion_guard_generation must be positive".into());
+    }
+    if message
+        .motion_guard_boot_nonce
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err("motion_guard_boot_nonce must not be all zero".into());
+    }
+    if message.motion_stop_generation < 0 {
+        return Err("motion_stop_generation must be non-negative".into());
+    }
     if message.planner_runtime_generation <= 0 {
         return Err("planner_runtime_generation must be positive".into());
     }
@@ -984,6 +1165,9 @@ fn validate_path_envelope_semantics(
         return Err("goal_payload_sha256 must be populated".into());
     }
     validate_navigation_frame_id(&message.path.header.frame_id, "path")?;
+    if message.path.header.frame_id != message.committed_map_frame_id {
+        return Err("path frame_id must match committed map frame_id".into());
+    }
     if message.path.poses.is_empty() {
         return Err("path must contain at least one pose".into());
     }
@@ -1051,6 +1235,43 @@ fn validate_navigation_identity(
         return Err("source_timestamp_ns must be positive".into());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_goal_authority_identity(
+    producer: &str,
+    producer_epoch: i64,
+    producer_runtime_generation: i64,
+    committed_map_session_id: &str,
+    committed_map_session_generation: i64,
+    committed_map_revision: i64,
+    committed_map_payload_sha256: &[u8; 32],
+    committed_map_frame_id: &str,
+) -> Result<(), String> {
+    if producer.trim().is_empty() || producer.trim() != producer {
+        return Err("producer must be a non-empty canonical name".into());
+    }
+    if producer_epoch <= 0 {
+        return Err("producer_epoch must be positive".into());
+    }
+    if producer_runtime_generation <= 0 {
+        return Err("producer_runtime_generation must be positive".into());
+    }
+    if committed_map_session_id.trim().is_empty()
+        || committed_map_session_id.trim() != committed_map_session_id
+    {
+        return Err("committed_map_session_id must be non-empty and canonical".into());
+    }
+    if committed_map_session_generation <= 0 {
+        return Err("committed_map_session_generation must be positive".into());
+    }
+    if committed_map_revision <= 0 {
+        return Err("committed_map_revision must be positive".into());
+    }
+    if *committed_map_payload_sha256 == [0; 32] {
+        return Err("committed_map_payload_sha256 must be populated".into());
+    }
+    validate_navigation_frame_id(committed_map_frame_id, "committed map")
 }
 
 fn pose_is_finite(pose: &Pose) -> bool {
@@ -1900,16 +2121,29 @@ mod tests {
     }
 
     fn configured_frame_goal(frame_id: &str) -> GoalEnvelope {
+        let boundary_id = "configured-frame-exploration:boundary".to_string();
+        let boundary_points = vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let boundary_sha256 =
+            goal_intent_boundary_sha256(frame_id, &boundary_id, &boundary_points).unwrap();
         GoalEnvelope {
             schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             session_id: "configured-frame-goal".into(),
             owner_kind: NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
             parent_request_id: "configured-frame-exploration".into(),
             goal_generation: 2,
+            producer: "wavefront".into(),
+            producer_epoch: 5,
             producer_runtime_generation: 7,
+            committed_map_session_id: "configured-map-session".into(),
+            committed_map_session_generation: 3,
+            committed_map_revision: 9,
+            committed_map_payload_sha256: [0x31; 32],
+            committed_map_frame_id: frame_id.into(),
             source_timestamp_ns: 123_000_000_456,
+            boundary_id,
+            boundary_sha256,
             boundary_frame_id: frame_id.into(),
-            boundary_points: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            boundary_points,
             motion_guard_generation: 11,
             motion_guard_boot_nonce: [0x5a; 16],
             motion_stop_generation: 4,
@@ -1936,6 +2170,19 @@ mod tests {
             owner_kind: goal.owner_kind,
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
+            producer: goal.producer.clone(),
+            producer_epoch: goal.producer_epoch,
+            producer_runtime_generation: goal.producer_runtime_generation,
+            committed_map_session_id: goal.committed_map_session_id.clone(),
+            committed_map_session_generation: goal.committed_map_session_generation,
+            committed_map_revision: goal.committed_map_revision,
+            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_frame_id: goal.committed_map_frame_id.clone(),
+            boundary_id: goal.boundary_id.clone(),
+            boundary_sha256: goal.boundary_sha256,
+            motion_guard_generation: goal.motion_guard_generation,
+            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+            motion_stop_generation: goal.motion_stop_generation,
             planner_runtime_generation: 8,
             path_revision: 1,
             source_timestamp_ns: 124_000_000_000,
@@ -1984,7 +2231,7 @@ mod tests {
                 assert!(encode_goal_envelope(&stale_goal_frame)
                     .unwrap_err()
                     .to_string()
-                    .contains("payload_sha256 mismatch"));
+                    .contains("must match committed map frame_id"));
             }
 
             let mut path = configured_frame_path(&goal, frame_id);
@@ -2008,7 +2255,7 @@ mod tests {
                 assert!(encode_path_envelope(&stale_path_frame)
                     .unwrap_err()
                     .to_string()
-                    .contains("payload_sha256 mismatch"));
+                    .contains("must match committed map frame_id"));
             }
         }
 
@@ -2021,6 +2268,8 @@ mod tests {
         let mut goal = configured_frame_goal("robot/map");
         goal.owner_kind = NAVIGATION_OWNER_KIND_PUBLIC_NAV;
         goal.parent_request_id = "configured-frame-public".into();
+        goal.boundary_id.clear();
+        goal.boundary_sha256 = [0; 32];
         goal.boundary_frame_id.clear();
         goal.boundary_points.clear();
 
@@ -2036,7 +2285,7 @@ mod tests {
             assert!(seal_goal_envelope(&mut goal)
                 .unwrap_err()
                 .to_string()
-                .contains("goal pose frame_id is invalid"));
+                .contains("frame_id is invalid"));
         }
 
         let mut missing_boundary_frame = configured_frame_goal("robot/map");
@@ -2044,14 +2293,14 @@ mod tests {
         assert!(seal_goal_envelope(&mut missing_boundary_frame)
             .unwrap_err()
             .to_string()
-            .contains("boundary_frame_id must match"));
+            .contains("exploration boundary identity or frame is invalid"));
 
         let mut mismatched_boundary_frame = configured_frame_goal("robot/map");
         mismatched_boundary_frame.boundary_frame_id = "map".into();
         assert!(seal_goal_envelope(&mut mismatched_boundary_frame)
             .unwrap_err()
             .to_string()
-            .contains("boundary_frame_id must match"));
+            .contains("exploration boundary identity or frame is invalid"));
 
         let mut non_finite_goal = configured_frame_goal("robot/map");
         non_finite_goal.goal.pose.position[0] = f64::NAN;
@@ -2105,22 +2354,8 @@ mod tests {
                 orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
         };
-        let mut goal = GoalEnvelope {
-            schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: "goal-1".into(),
-            owner_kind: NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: "explore-1".into(),
-            goal_generation: 2,
-            producer_runtime_generation: 7,
-            source_timestamp_ns: 123_000_000_456,
-            boundary_frame_id: "map".into(),
-            boundary_points: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
-            motion_guard_generation: 11,
-            motion_guard_boot_nonce: [0x5a; 16],
-            motion_stop_generation: 4,
-            goal: pose.clone(),
-            ..GoalEnvelope::default()
-        };
+        let mut goal = configured_frame_goal("map");
+        goal.goal = pose.clone();
         seal_goal_envelope(&mut goal).unwrap();
         let encoded = encode_goal_envelope(&goal).unwrap();
         assert_eq!(&encoded[..8], &GOAL_ENVELOPE_FINGERPRINT);
@@ -2131,7 +2366,7 @@ mod tests {
         assert!(encode_goal_envelope(&mutated_goal)
             .unwrap_err()
             .to_string()
-            .contains("payload_sha256 mismatch"));
+            .contains("boundary_sha256 mismatch"));
 
         let mut mutated_proof = goal.clone();
         mutated_proof.motion_stop_generation += 1;
@@ -2160,6 +2395,19 @@ mod tests {
             owner_kind: goal.owner_kind,
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
+            producer: goal.producer.clone(),
+            producer_epoch: goal.producer_epoch,
+            producer_runtime_generation: goal.producer_runtime_generation,
+            committed_map_session_id: goal.committed_map_session_id.clone(),
+            committed_map_session_generation: goal.committed_map_session_generation,
+            committed_map_revision: goal.committed_map_revision,
+            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_frame_id: goal.committed_map_frame_id.clone(),
+            boundary_id: goal.boundary_id.clone(),
+            boundary_sha256: goal.boundary_sha256,
+            motion_guard_generation: goal.motion_guard_generation,
+            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+            motion_stop_generation: goal.motion_stop_generation,
             planner_runtime_generation: 8,
             path_revision: 1,
             source_timestamp_ns: 124_000_000_000,

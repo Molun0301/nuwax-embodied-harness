@@ -6,8 +6,17 @@ struct GoalEnvelope {
     int32_t owner_kind;
     string parent_request_id;
     int64_t goal_generation;
+    string producer;
+    int64_t producer_epoch;
     int64_t producer_runtime_generation;
+    string committed_map_session_id;
+    int64_t committed_map_session_generation;
+    int64_t committed_map_revision;
+    byte committed_map_payload_sha256[32];
+    string committed_map_frame_id;
     int64_t source_timestamp_ns;
+    string boundary_id;
+    byte boundary_sha256[32];
     string boundary_frame_id;
     int32_t boundary_points_length;
     geometry_msgs.Point boundary_points[boundary_points_length];

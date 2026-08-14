@@ -961,11 +961,14 @@ async fn run_guarded_nav_loop(
     mut cancels: LcmFrameStream,
     mut status: tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
 ) -> NavStackResult<()> {
+    let process_runtime_generation = runtime_generation();
+    let authoritative_planner_generation = saturating_i64(process_runtime_generation);
     let mut telemetry = GuardedNavTelemetry {
-        runtime_generation: runtime_generation(),
+        runtime_generation: process_runtime_generation,
         ..GuardedNavTelemetry::default()
     };
     let mut active_session: Option<schema::GoalEnvelope> = None;
+    let mut accepted_planner_generation: Option<([u8; 32], i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut applied_commands = 0_u64;
     let mut last_zero_ack_id: Option<String> = None;
@@ -1243,6 +1246,37 @@ async fn run_guarded_nav_loop(
                     ).await?;
                     continue;
                 }
+                if !planner_generation_matches_authority(
+                    path_envelope.planner_runtime_generation,
+                    authoritative_planner_generation,
+                ) {
+                    publish_guarded_rejection(
+                        transport,
+                        &node.outputs[1],
+                        scheduler.status(),
+                        &telemetry,
+                        "path",
+                        "PathEnvelope planner generation does not match the active nav-stack runtime",
+                    )
+                    .await?;
+                    continue;
+                }
+                if planner_generation_is_stale(
+                    accepted_planner_generation,
+                    active_goal.payload_sha256,
+                    path_envelope.planner_runtime_generation,
+                ) {
+                    publish_guarded_rejection(
+                        transport,
+                        &node.outputs[1],
+                        scheduler.status(),
+                        &telemetry,
+                        "path",
+                        "PathEnvelope planner generation is stale for the active goal",
+                    )
+                    .await?;
+                    continue;
+                }
                 let path = match path_from_schema(&path_envelope.path) {
                     Ok(path) => path,
                     Err(error) => {
@@ -1296,6 +1330,10 @@ async fn run_guarded_nav_loop(
                         OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                     }
                 } else {
+                    accepted_planner_generation = Some((
+                        active_goal.payload_sha256,
+                        path_envelope.planner_runtime_generation,
+                    ));
                     telemetry.path_revision = path_envelope.path_revision;
                     telemetry.path_payload_sha256 = path_envelope.path_payload_sha256;
                 }
@@ -1820,11 +1858,14 @@ async fn activate_guarded_goal(
 
 #[cfg(feature = "guard-runtime")]
 fn runtime_generation() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
+    static PROCESS_RUNTIME_GENERATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PROCESS_RUNTIME_GENERATION.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    })
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1887,6 +1928,22 @@ fn scheduler_session_is_active(
 }
 
 #[cfg(feature = "guard-runtime")]
+fn planner_generation_matches_authority(candidate: i64, authoritative: i64) -> bool {
+    candidate == authoritative
+}
+
+#[cfg(feature = "guard-runtime")]
+fn planner_generation_is_stale(
+    accepted: Option<([u8; 32], i64)>,
+    active_goal_digest: [u8; 32],
+    candidate_generation: i64,
+) -> bool {
+    accepted.is_some_and(|(goal_digest, generation)| {
+        goal_digest == active_goal_digest && candidate_generation < generation
+    })
+}
+
+#[cfg(feature = "guard-runtime")]
 fn validate_path_goal_correlation(
     path: &schema::PathEnvelope,
     goal: &schema::GoalEnvelope,
@@ -1895,6 +1952,19 @@ fn validate_path_goal_correlation(
         || path.owner_kind != goal.owner_kind
         || path.parent_request_id != goal.parent_request_id
         || path.goal_generation != goal.goal_generation
+        || path.producer != goal.producer
+        || path.producer_epoch != goal.producer_epoch
+        || path.producer_runtime_generation != goal.producer_runtime_generation
+        || path.committed_map_session_id != goal.committed_map_session_id
+        || path.committed_map_session_generation != goal.committed_map_session_generation
+        || path.committed_map_revision != goal.committed_map_revision
+        || path.committed_map_payload_sha256 != goal.committed_map_payload_sha256
+        || path.committed_map_frame_id != goal.committed_map_frame_id
+        || path.boundary_id != goal.boundary_id
+        || path.boundary_sha256 != goal.boundary_sha256
+        || path.motion_guard_generation != goal.motion_guard_generation
+        || path.motion_guard_boot_nonce != goal.motion_guard_boot_nonce
+        || path.motion_stop_generation != goal.motion_stop_generation
         || path.goal_payload_sha256 != goal.payload_sha256
     {
         return Err(
@@ -2937,7 +3007,19 @@ fn planner_goal_identity_matches(
         && left.owner_kind == right.owner_kind
         && left.parent_request_id == right.parent_request_id
         && left.goal_generation == right.goal_generation
+        && left.producer == right.producer
+        && left.producer_epoch == right.producer_epoch
         && left.producer_runtime_generation == right.producer_runtime_generation
+        && left.committed_map_session_id == right.committed_map_session_id
+        && left.committed_map_session_generation == right.committed_map_session_generation
+        && left.committed_map_revision == right.committed_map_revision
+        && left.committed_map_payload_sha256 == right.committed_map_payload_sha256
+        && left.committed_map_frame_id == right.committed_map_frame_id
+        && left.boundary_id == right.boundary_id
+        && left.boundary_sha256 == right.boundary_sha256
+        && left.motion_guard_generation == right.motion_guard_generation
+        && left.motion_guard_boot_nonce == right.motion_guard_boot_nonce
+        && left.motion_stop_generation == right.motion_stop_generation
 }
 
 #[cfg(any(
@@ -4810,13 +4892,26 @@ fn build_versioned_path_envelope(
         source_timestamp_ns / 1_000_000_000,
         (source_timestamp_ns % 1_000_000_000) as u32,
     );
-    let header = schema_header(stamp, NavFrameId::Map.as_str())?;
+    let header = schema_header(stamp, publication.goal.committed_map_frame_id.as_str())?;
     let mut envelope = schema::PathEnvelope {
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: publication.goal.session_id.clone(),
         owner_kind: publication.goal.owner_kind,
         parent_request_id: publication.goal.parent_request_id.clone(),
         goal_generation: publication.goal.goal_generation,
+        producer: publication.goal.producer.clone(),
+        producer_epoch: publication.goal.producer_epoch,
+        producer_runtime_generation: publication.goal.producer_runtime_generation,
+        committed_map_session_id: publication.goal.committed_map_session_id.clone(),
+        committed_map_session_generation: publication.goal.committed_map_session_generation,
+        committed_map_revision: publication.goal.committed_map_revision,
+        committed_map_payload_sha256: publication.goal.committed_map_payload_sha256,
+        committed_map_frame_id: publication.goal.committed_map_frame_id.clone(),
+        boundary_id: publication.goal.boundary_id.clone(),
+        boundary_sha256: publication.goal.boundary_sha256,
+        motion_guard_generation: publication.goal.motion_guard_generation,
+        motion_guard_boot_nonce: publication.goal.motion_guard_boot_nonce,
+        motion_stop_generation: publication.goal.motion_stop_generation,
         planner_runtime_generation: publication.planner_runtime_generation,
         path_revision: publication.path_revision,
         source_timestamp_ns,
@@ -4992,8 +5087,16 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
         owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
         parent_request_id: "explore-parent".into(),
         goal_generation,
+        producer: "wavefront".into(),
+        producer_epoch: 13,
         producer_runtime_generation: 17,
+        committed_map_session_id: "planner-test-map".into(),
+        committed_map_session_generation: 3,
+        committed_map_revision: 5,
+        committed_map_payload_sha256: [0x31; 32],
+        committed_map_frame_id: "map".into(),
         source_timestamp_ns: goal_generation * 1_000_000_000,
+        boundary_id: "explore-parent:boundary".into(),
         boundary_frame_id: "map".into(),
         boundary_points: vec![
             [0.0, 0.0, 0.0],
@@ -5019,6 +5122,12 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
         },
         ..schema::GoalEnvelope::default()
     };
+    goal.boundary_sha256 = schema::goal_intent_boundary_sha256(
+        &goal.boundary_frame_id,
+        &goal.boundary_id,
+        &goal.boundary_points,
+    )
+    .expect("hash planner test boundary");
     schema::seal_goal_envelope(&mut goal).expect("seal planner test goal");
     goal
 }
@@ -5631,7 +5740,14 @@ mod guarded_tests {
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             parent_request_id: "public-api-request-1".into(),
             goal_generation: 3,
+            producer: "public-navigation".into(),
+            producer_epoch: 7,
             producer_runtime_generation: 7,
+            committed_map_session_id: "guarded-test-map".into(),
+            committed_map_session_generation: 2,
+            committed_map_revision: 4,
+            committed_map_payload_sha256: [0x42; 32],
+            committed_map_frame_id: "map".into(),
             source_timestamp_ns: 1_000_000_000,
             motion_guard_generation: 7,
             motion_guard_boot_nonce: [7; 16],
@@ -5660,7 +5776,20 @@ mod guarded_tests {
             owner_kind: goal.owner_kind,
             parent_request_id: goal.parent_request_id.clone(),
             goal_generation: goal.goal_generation,
-            planner_runtime_generation: 9,
+            producer: goal.producer.clone(),
+            producer_epoch: goal.producer_epoch,
+            producer_runtime_generation: goal.producer_runtime_generation,
+            committed_map_session_id: goal.committed_map_session_id.clone(),
+            committed_map_session_generation: goal.committed_map_session_generation,
+            committed_map_revision: goal.committed_map_revision,
+            committed_map_payload_sha256: goal.committed_map_payload_sha256,
+            committed_map_frame_id: goal.committed_map_frame_id.clone(),
+            boundary_id: goal.boundary_id.clone(),
+            boundary_sha256: goal.boundary_sha256,
+            motion_guard_generation: goal.motion_guard_generation,
+            motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+            motion_stop_generation: goal.motion_stop_generation,
+            planner_runtime_generation: saturating_i64(runtime_generation()),
             path_revision: 1,
             source_timestamp_ns: 2_000_000_000,
             goal_payload_sha256: goal.payload_sha256,
@@ -6453,6 +6582,58 @@ mod guarded_tests {
     }
 
     #[tokio::test]
+    async fn guarded_loop_rejects_old_planner_generation_as_the_first_path() {
+        let harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+        let mut late = sealed_path(&goal);
+        late.planner_runtime_generation -= 1;
+        late.path_payload_sha256 = [0; 32];
+        schema::seal_path_envelope(&mut late).expect("seal old-generation late path");
+
+        harness.send_path(&late);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            harness.scheduler.status().path_revision,
+            0,
+            "old generation must be rejected before any current-generation path is accepted"
+        );
+
+        let current = sealed_path(&goal);
+        harness.send_path(&current);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().path_revision != 1 {
+                assert!(
+                    !harness.loop_task.is_finished(),
+                    "guarded loop exited early"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("current-generation path was not accepted");
+
+        let mut higher_revision = current;
+        higher_revision.path_revision = 2;
+        higher_revision.source_timestamp_ns += 1;
+        higher_revision.path_payload_sha256 = [0; 32];
+        schema::seal_path_envelope(&mut higher_revision)
+            .expect("seal same-generation higher-revision path");
+        harness.send_path(&higher_revision);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().path_revision != 2 {
+                assert!(
+                    !harness.loop_task.is_finished(),
+                    "guarded loop exited early"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same-generation higher path revision was not accepted");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn guarded_active_cancel_projects_pre_path_sentinel_with_zero_proof() {
         let mut harness = GuardedLoopHarness::spawn().await;
         let goal = activate_map_a(&harness).await;
@@ -6833,6 +7014,68 @@ mod guarded_tests {
         let mut foreign_path = path.clone();
         foreign_path.goal_payload_sha256[0] ^= 0xff;
         assert!(validate_path_goal_correlation(&foreign_path, &goal).is_err());
+
+        let mut wrong_revision = path.clone();
+        wrong_revision.committed_map_revision += 1;
+        assert!(validate_path_goal_correlation(&wrong_revision, &goal).is_err());
+        let mut wrong_map_hash = path.clone();
+        wrong_map_hash.committed_map_payload_sha256[0] ^= 0xff;
+        assert!(validate_path_goal_correlation(&wrong_map_hash, &goal).is_err());
+        let mut wrong_boundary = path.clone();
+        wrong_boundary.boundary_sha256[0] ^= 0xff;
+        assert!(validate_path_goal_correlation(&wrong_boundary, &goal).is_err());
+        let mut wrong_producer_generation = path.clone();
+        wrong_producer_generation.producer_runtime_generation += 1;
+        assert!(validate_path_goal_correlation(&wrong_producer_generation, &goal).is_err());
+
+        let authoritative = saturating_i64(runtime_generation());
+        assert_eq!(runtime_generation(), runtime_generation());
+        assert!(planner_generation_matches_authority(
+            authoritative,
+            authoritative
+        ));
+        assert!(!planner_generation_matches_authority(
+            authoritative - 1,
+            authoritative
+        ));
+        assert!(!planner_generation_matches_authority(
+            authoritative + 1,
+            authoritative
+        ));
+        assert!(
+            !planner_generation_matches_authority(authoritative - 1, authoritative)
+                && !planner_generation_is_stale(None, goal.payload_sha256, authoritative - 1),
+            "an old-process late path is rejected even when it arrives before the new generation"
+        );
+        assert!(
+            planner_generation_matches_authority(authoritative, authoritative)
+                && !planner_generation_is_stale(
+                    Some((goal.payload_sha256, authoritative)),
+                    goal.payload_sha256,
+                    authoritative,
+                ),
+            "same-generation higher path revisions remain eligible for scheduler ordering"
+        );
+
+        let accepted = Some((goal.payload_sha256, 12));
+        assert!(planner_generation_is_stale(
+            accepted,
+            goal.payload_sha256,
+            11
+        ));
+        assert!(!planner_generation_is_stale(
+            accepted,
+            goal.payload_sha256,
+            12
+        ));
+        assert!(!planner_generation_is_stale(
+            accepted,
+            goal.payload_sha256,
+            13
+        ));
+        let mut new_goal_digest = goal.payload_sha256;
+        new_goal_digest[0] ^= 0xff;
+        assert!(!planner_generation_is_stale(accepted, new_goal_digest, 1));
 
         let cancel = schema::CancelNavigation {
             session_id: goal.session_id.clone(),

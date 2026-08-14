@@ -15102,17 +15102,30 @@ mod typed_navigation_feedback_tests {
             owner_kind: lease.owner_kind,
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation as i64,
+            producer: "public-navigation".to_string(),
+            producer_epoch: lease.producer_runtime_generation as i64,
+            producer_runtime_generation: lease.producer_runtime_generation as i64,
+            committed_map_session_id: "path-lcm-map".to_string(),
+            committed_map_session_generation: 1,
+            committed_map_revision: 1,
+            committed_map_payload_sha256: [0x41; 32],
+            committed_map_frame_id: "map".to_string(),
+            motion_guard_generation: 1,
+            motion_guard_boot_nonce: [1; 16],
+            motion_stop_generation: 0,
             planner_runtime_generation: 1,
             path_revision: 1,
             source_timestamp_ns: 10,
             goal_payload_sha256: lease.goal_payload_sha256,
             path: schema::Path {
                 header: schema::Header {
+                    stamp_sec: 1,
                     frame_id: "map".to_string(),
                     ..schema::Header::default()
                 },
                 poses: vec![schema::PoseStamped {
                     header: schema::Header {
+                        stamp_sec: 1,
                         frame_id: "map".to_string(),
                         ..schema::Header::default()
                     },

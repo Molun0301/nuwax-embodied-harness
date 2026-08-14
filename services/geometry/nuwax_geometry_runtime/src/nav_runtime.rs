@@ -2246,6 +2246,15 @@ pub struct SetGoalInput {
     pub target: PoseState,
 }
 
+struct AdmittedGoalInput {
+    input: SetGoalInput,
+    producer: String,
+    producer_epoch: i64,
+    committed_map: schema::CommittedMapIdentity,
+    boundary_id: String,
+    boundary_sha256: [u8; 32],
+}
+
 /// Machine-readable reason that allows a navigation admission to be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetGoalRetryReason {
@@ -2570,9 +2579,15 @@ pub(crate) async fn admit_goal_intent(
             )
         }
     };
-    let Some(_current_map) = current_map else {
+    let Some(current_map) = current_map else {
         return rejected_goal_intent(goal_id, "authoritative committed map is unavailable");
     };
+    if intent.committed_map != current_map {
+        return rejected_goal_intent(
+            goal_id,
+            "committed map session, generation, revision, frame, or hash changed before admission",
+        );
+    }
     if intent.goal.header.seq != 0
         || intent.goal.header.frame_id != intent.committed_map.frame_id
         || intent.goal.header.stamp_sec < 0
@@ -2684,36 +2699,51 @@ pub(crate) async fn admit_goal_intent(
             .saturating_mul(1_000_000_000)
             .saturating_add(intent.goal.header.stamp_nsec as u64)
     };
-    let input = SetGoalInput {
-        goal_id: intent.session_id,
-        owner_kind: intent.owner_kind,
-        parent_request_id: intent.parent_request_id,
-        goal_generation: intent.goal_generation as u64,
-        motion_admission,
-        frame_id: intent.committed_map.frame_id,
-        target: PoseState {
-            x: intent.goal.pose.position[0],
-            y: intent.goal.pose.position[1],
-            z: intent.goal.pose.position[2],
-            qx: intent.goal.pose.orientation_xyzw[0],
-            qy: intent.goal.pose.orientation_xyzw[1],
-            qz: intent.goal.pose.orientation_xyzw[2],
-            qw: intent.goal.pose.orientation_xyzw[3],
-            frame_id: intent.goal.header.frame_id,
-            timestamp_ns,
+    let admitted = AdmittedGoalInput {
+        input: SetGoalInput {
+            goal_id: intent.session_id,
+            owner_kind: intent.owner_kind,
+            parent_request_id: intent.parent_request_id,
+            goal_generation: intent.goal_generation as u64,
+            motion_admission,
+            frame_id: intent.committed_map.frame_id.clone(),
+            target: PoseState {
+                x: intent.goal.pose.position[0],
+                y: intent.goal.pose.position[1],
+                z: intent.goal.pose.position[2],
+                qx: intent.goal.pose.orientation_xyzw[0],
+                qy: intent.goal.pose.orientation_xyzw[1],
+                qz: intent.goal.pose.orientation_xyzw[2],
+                qw: intent.goal.pose.orientation_xyzw[3],
+                frame_id: intent.goal.header.frame_id,
+                timestamp_ns,
+            },
         },
+        producer: intent.producer,
+        producer_epoch: intent.producer_epoch,
+        committed_map: intent.committed_map,
+        boundary_id: intent.boundary_id,
+        boundary_sha256: intent.boundary_sha256,
     };
-    admit_goal_input(io, state, input, boundary, cancel_fence, admission).await
+    admit_goal_input(io, state, admitted, boundary, cancel_fence, admission).await
 }
 
 async fn admit_goal_input(
     io: &NavAdmissionIo,
     state: &NavRuntimeState,
-    mut input: SetGoalInput,
+    admitted: AdmittedGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
     cancel_fence: GoalAdmissionCancelFence,
     admission: &NavAdmissionContext,
 ) -> SetGoalOutcome {
+    let AdmittedGoalInput {
+        mut input,
+        producer,
+        producer_epoch,
+        committed_map,
+        boundary_id,
+        boundary_sha256,
+    } = admitted;
     input.goal_id = input.goal_id.trim().to_string();
     input.parent_request_id = input.parent_request_id.trim().to_string();
     input.target.frame_id = input.frame_id.clone();
@@ -2895,8 +2925,17 @@ async fn admit_goal_input(
         owner_kind: input.owner_kind,
         parent_request_id: input.parent_request_id.clone(),
         goal_generation: goal_generation as i64,
+        producer,
+        producer_epoch,
         producer_runtime_generation: producer_runtime_generation as i64,
+        committed_map_session_id: committed_map.session_id,
+        committed_map_session_generation: committed_map.session_generation,
+        committed_map_revision: committed_map.revision,
+        committed_map_payload_sha256: committed_map.payload_sha256,
+        committed_map_frame_id: committed_map.frame_id,
         source_timestamp_ns: input.target.timestamp_ns as i64,
+        boundary_id,
+        boundary_sha256,
         motion_guard_generation: input.motion_admission.guard_generation as i64,
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
         motion_stop_generation: input.motion_admission.motion_stop_generation as i64,
@@ -4056,6 +4095,17 @@ mod tests {
             owner_kind: lease.owner_kind,
             parent_request_id: lease.parent_request_id.clone(),
             goal_generation: lease.goal_generation as i64,
+            producer: "public-navigation".to_string(),
+            producer_epoch: lease.producer_runtime_generation as i64,
+            producer_runtime_generation: lease.producer_runtime_generation as i64,
+            committed_map_session_id: "geometry-test-map".to_string(),
+            committed_map_session_generation: 1,
+            committed_map_revision: 1,
+            committed_map_payload_sha256: [0x41; 32],
+            committed_map_frame_id: "map".to_string(),
+            motion_guard_generation: 1,
+            motion_guard_boot_nonce: [1; 16],
+            motion_stop_generation: 0,
             planner_runtime_generation: 1,
             path_revision: path_revision as i64,
             source_timestamp_ns: now_ns() as i64,
@@ -4514,6 +4564,113 @@ mod tests {
             state.next_cancel_generation.load(AtomicOrdering::Acquire),
             next_cancel_before
         );
+        assert_eq!(backend.publish_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn changed_committed_map_revision_or_hash_rejects_intent_without_side_effects() {
+        for mutate_hash in [false, true] {
+            let (handle, backend) = make_blocking_handle([None]).await;
+            let state = NavRuntimeState::from_env();
+            observe_ready_execution_chain(&state).await;
+            let admission = NavAdmissionContext::new(
+                handle.mapping_lifecycle_lock.clone(),
+                handle.committed_map_authority.clone(),
+                handle.map_revision_latest_tx.subscribe(),
+            );
+            let intent = goal_intent_from_set_goal(
+                &admission,
+                &state,
+                test_goal_input(if mutate_hash {
+                    "changed-map-hash"
+                } else {
+                    "changed-map-revision"
+                }),
+                None,
+            )
+            .await
+            .expect("frozen committed-map intent");
+            {
+                let mut authority = handle
+                    .committed_map_authority
+                    .lock()
+                    .expect("committed map authority");
+                let current = authority.as_mut().expect("installed committed map");
+                if mutate_hash {
+                    current.payload_sha256[0] ^= 0xff;
+                } else {
+                    current.revision += 1;
+                }
+            }
+
+            let outcome = admit_goal_intent(
+                &admission,
+                &NavAdmissionIo::new(
+                    handle.state.clone(),
+                    handle.transport.clone(),
+                    handle.transport_backend_name,
+                    handle.lcm_backend_available,
+                ),
+                &state,
+                intent,
+                GoalProducerEpochAuthority::PublicNavigation,
+            )
+            .await;
+
+            assert_eq!(outcome.state.status, "FAILED");
+            assert!(outcome
+                .state
+                .message
+                .contains("committed map session, generation, revision, frame, or hash changed"));
+            assert!(outcome.lease.is_none());
+            assert!(state.inner.read().await.goal.is_none());
+            assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
+            assert_eq!(backend.publish_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_goal_producer_epoch_rejects_intent_without_side_effects() {
+        let (handle, backend) = make_blocking_handle([None]).await;
+        let state = NavRuntimeState::from_env();
+        observe_ready_execution_chain(&state).await;
+        let admission = NavAdmissionContext::new(
+            handle.mapping_lifecycle_lock.clone(),
+            handle.committed_map_authority.clone(),
+            handle.map_revision_latest_tx.subscribe(),
+        );
+        let mut intent = goal_intent_from_set_goal(
+            &admission,
+            &state,
+            test_goal_input("stale-producer-epoch"),
+            None,
+        )
+        .await
+        .expect("frozen producer intent");
+        intent.producer_epoch += 1;
+
+        let outcome = admit_goal_intent(
+            &admission,
+            &NavAdmissionIo::new(
+                handle.state.clone(),
+                handle.transport.clone(),
+                handle.transport_backend_name,
+                handle.lcm_backend_available,
+            ),
+            &state,
+            intent,
+            GoalProducerEpochAuthority::PublicNavigation,
+        )
+        .await;
+
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(outcome
+            .state
+            .message
+            .contains("invalid producer, owner, priority, or generation identity"));
+        assert!(outcome.lease.is_none());
+        assert!(state.inner.read().await.goal.is_none());
+        assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
         assert_eq!(backend.publish_count(), 0);
     }
 

@@ -30,6 +30,13 @@ use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
+#[cfg(feature = "native-runner")]
+use nuwax_nav_native_runner::{
+    prelude::RestartPolicy, RetainedNativeConfig, RetainedNativeOwner, RetainedNativeState,
+    SupervisedNativeCommand, SupervisedNativeConfig, SupervisedProcessIdentity,
+    TypedNativeReadiness, TypedReadyFuture, PLANNER_RESTART_GENERATION_ENV,
+};
+
 use crate::error::{NavStackError, NavStackResult};
 use crate::graph::{ModuleGraph, ModuleKind, ModuleNode};
 
@@ -159,12 +166,46 @@ where
     }
 }
 
+/// retained native supervisor 的节点级 deadline 与有界诊断配置。
+#[cfg(feature = "native-runner")]
+#[derive(Clone, Debug)]
+pub struct NativeLifecycleOptions {
+    /// 从 spawn 到类型化 READY 被接受的最长时间。
+    pub startup_timeout: Duration,
+    /// 正常关闭时从 SIGTERM 到 SIGKILL 的宽限期。
+    pub shutdown_grace: Duration,
+    /// 进程组 rollback 与诊断容量边界。
+    pub supervisor: SupervisedNativeConfig,
+}
+
+#[cfg(feature = "native-runner")]
+impl Default for NativeLifecycleOptions {
+    fn default() -> Self {
+        Self {
+            startup_timeout: Duration::from_secs(5),
+            shutdown_grace: Duration::from_secs(5),
+            supervisor: SupervisedNativeConfig::default(),
+        }
+    }
+}
+
+#[cfg(feature = "native-runner")]
+#[derive(Clone)]
+struct NativeLifecycleRegistration {
+    readiness: Arc<dyn TypedNativeReadiness>,
+    options: NativeLifecycleOptions,
+}
+
 /// Stack runtime owner for native processes and registered in-process nodes.
 pub struct StackRunner {
     graph: ModuleGraph,
     process_factory: Arc<dyn ProcessFactory>,
     in_process_factories: HashMap<String, Arc<dyn InProcessNodeFactory>>,
     processes: HashMap<String, Box<dyn ManagedProcess>>,
+    #[cfg(feature = "native-runner")]
+    native_lifecycles: HashMap<String, NativeLifecycleRegistration>,
+    #[cfg(feature = "native-runner")]
+    retained_processes: HashMap<String, RetainedNativeOwner>,
     in_process_nodes: HashMap<String, Box<dyn InProcessNode>>,
 }
 
@@ -176,6 +217,10 @@ impl StackRunner {
             process_factory: Arc::new(TokioProcessFactory),
             in_process_factories: HashMap::new(),
             processes: HashMap::new(),
+            #[cfg(feature = "native-runner")]
+            native_lifecycles: HashMap::new(),
+            #[cfg(feature = "native-runner")]
+            retained_processes: HashMap::new(),
             in_process_nodes: HashMap::new(),
         }
     }
@@ -186,6 +231,29 @@ impl StackRunner {
         F: ProcessFactory + 'static,
     {
         self.process_factory = Arc::new(factory);
+    }
+
+    /// 为一个 native graph 节点注册外部类型化 READY 边界。
+    ///
+    /// 回调会收到单调 restart generation 以及稳定 PID/PGID/guardian identity。
+    /// 实现必须拒绝旧代际和任何 backend/channel/schema 不匹配；stdout 永远不能
+    /// 作为 readiness 来源。
+    #[cfg(feature = "native-runner")]
+    pub fn register_native_readiness<F>(
+        &mut self,
+        node_id: impl Into<String>,
+        options: NativeLifecycleOptions,
+        readiness: F,
+    ) where
+        F: Fn(u64, SupervisedProcessIdentity) -> TypedReadyFuture + Send + Sync + 'static,
+    {
+        self.native_lifecycles.insert(
+            node_id.into(),
+            NativeLifecycleRegistration {
+                readiness: Arc::new(readiness),
+                options,
+            },
+        );
     }
 
     /// Register a concrete owner factory for one non-native graph node id.
@@ -213,6 +281,8 @@ impl StackRunner {
             .chain(self.in_process_nodes.keys())
             .cloned()
             .collect();
+        #[cfg(feature = "native-runner")]
+        ids.extend(self.retained_processes.keys().cloned());
         ids.sort();
         ids
     }
@@ -236,6 +306,10 @@ impl StackRunner {
                 ModuleKind::NativeBridge if launch_for(node).is_none() => {
                     Some(format!("{} (native bridge has no executable)", node.id))
                 }
+                #[cfg(feature = "native-runner")]
+                ModuleKind::NativeBridge if !self.native_lifecycles.contains_key(&node.id) => Some(
+                    format!("{} (native bridge has no typed readiness owner)", node.id),
+                ),
                 ModuleKind::NativeBridge => None,
                 _ if self.in_process_factories.contains_key(&node.id) => None,
                 _ => Some(format!("{} ({:?})", node.id, node.kind)),
@@ -250,7 +324,17 @@ impl StackRunner {
     /// is unowned, no process or task is started. A later startup failure
     /// triggers cleanup of every node that was already started.
     pub async fn spawn_all(&mut self) -> NavStackResult<()> {
-        if !self.processes.is_empty() || !self.in_process_nodes.is_empty() {
+        let owns_native = {
+            #[cfg(feature = "native-runner")]
+            {
+                !self.retained_processes.is_empty()
+            }
+            #[cfg(not(feature = "native-runner"))]
+            {
+                false
+            }
+        };
+        if !self.processes.is_empty() || !self.in_process_nodes.is_empty() || owns_native {
             return Err(NavStackError::AlreadyRunning);
         }
 
@@ -280,13 +364,57 @@ impl StackRunner {
                     launch_for(&node).ok_or_else(|| NavStackError::MissingRuntimeOwners {
                         nodes: vec![format!("{} (native bridge has no executable)", node.id)],
                     })?;
-                let process = self.process_factory.spawn(&launch).map_err(|source| {
-                    NavStackError::SpawnFailed {
-                        node: node.id.clone(),
-                        source,
+
+                #[cfg(feature = "native-runner")]
+                {
+                    let registration = self
+                        .native_lifecycles
+                        .get(&node.id)
+                        .expect("ownership preflight guarantees typed readiness")
+                        .clone();
+                    let mut command = SupervisedNativeCommand::new(&launch.program);
+                    command.args(&launch.args);
+                    command.envs(launch.env.iter());
+                    if let Some(cwd) = &launch.cwd {
+                        command.current_dir(cwd);
                     }
-                })?;
-                self.processes.insert(node.id, process);
+                    let restart = node
+                        .native_spec
+                        .as_ref()
+                        .map_or(RestartPolicy::Never, |summary| summary.spec.restart.clone());
+                    let config = RetainedNativeConfig {
+                        command,
+                        supervisor: registration.options.supervisor,
+                        startup_timeout: registration.options.startup_timeout,
+                        shutdown_grace: registration.options.shutdown_grace,
+                        restart_generation_env: PLANNER_RESTART_GENERATION_ENV.to_string(),
+                        restart,
+                    };
+                    let mut owner = RetainedNativeOwner::new(config, registration.readiness)
+                        .map_err(|source| NavStackError::NodeStartFailed {
+                            node: node.id.clone(),
+                            reason: source.to_string(),
+                        })?;
+                    owner
+                        .start()
+                        .await
+                        .map_err(|source| NavStackError::NodeStartFailed {
+                            node: node.id.clone(),
+                            reason: source.to_string(),
+                        })?;
+                    self.retained_processes.insert(node.id, owner);
+                }
+
+                #[cfg(not(feature = "native-runner"))]
+                {
+                    let process = self.process_factory.spawn(&launch).map_err(|source| {
+                        NavStackError::SpawnFailed {
+                            node: node.id.clone(),
+                            source,
+                        }
+                    })?;
+                    self.processes.insert(node.id, process);
+                }
                 continue;
             }
 
@@ -333,12 +461,69 @@ impl StackRunner {
         Ok(())
     }
 
+    /// 推进 retained native crash/restart 状态并检查其余 owner。
+    ///
+    /// `RestartBackoff` 仍处于受监督状态：旧进程组已经 reap，后续 tick 会启动
+    /// 新的单调代际。
+    #[cfg(feature = "native-runner")]
+    pub async fn reconcile_health(&mut self) -> NavStackResult<()> {
+        self.ensure_healthy()?;
+        for (node, owner) in &mut self.retained_processes {
+            let state =
+                owner
+                    .reconcile()
+                    .await
+                    .map_err(|source| NavStackError::NodeStartFailed {
+                        node: node.clone(),
+                        reason: source.to_string(),
+                    })?;
+            match state {
+                RetainedNativeState::Running(_) | RetainedNativeState::RestartBackoff { .. } => {}
+                RetainedNativeState::Exited { .. }
+                | RetainedNativeState::Failed { .. }
+                | RetainedNativeState::NotStarted
+                | RetainedNativeState::Shutdown => {
+                    return Err(NavStackError::RuntimeNodeExited { node: node.clone() });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 返回 retained native 节点当前的 restart generation。
+    #[cfg(feature = "native-runner")]
+    #[must_use]
+    pub fn native_restart_generation(&self, node_id: &str) -> Option<u64> {
+        self.retained_processes
+            .get(node_id)
+            .map(RetainedNativeOwner::restart_generation)
+    }
+
+    /// 校验 result/cancel ack 的代际仍属于指定 retained native child。
+    #[cfg(feature = "native-runner")]
+    #[must_use]
+    pub fn accepts_native_generation(&self, node_id: &str, restart_generation: u64) -> bool {
+        self.retained_processes
+            .get(node_id)
+            .is_some_and(|owner| owner.accepts_generation(restart_generation))
+    }
+
     /// Stop all in-process owners, terminate all children, and reap them.
     pub async fn shutdown_with(&mut self, grace: Duration) -> NavStackResult<()> {
         let mut first_error = None;
 
         for (node, mut owner) in self.in_process_nodes.drain() {
             if let Err(source) = owner.shutdown() {
+                first_error.get_or_insert_with(|| NavStackError::ShutdownFailed {
+                    node,
+                    reason: source.to_string(),
+                });
+            }
+        }
+
+        #[cfg(feature = "native-runner")]
+        for (node, mut owner) in self.retained_processes.drain() {
+            if let Err(source) = owner.shutdown_with(grace).await {
                 first_error.get_or_insert_with(|| NavStackError::ShutdownFailed {
                     node,
                     reason: source.to_string(),

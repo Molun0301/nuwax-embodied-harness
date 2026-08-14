@@ -296,7 +296,11 @@ where
         tokio::select! {
             result = &mut shutdown => break result,
             _ = health.tick() => {
-                if let Err(error) = runner.ensure_healthy() {
+                #[cfg(feature = "native-runner")]
+                let health_result = runner.reconcile_health().await;
+                #[cfg(not(feature = "native-runner"))]
+                let health_result = runner.ensure_healthy();
+                if let Err(error) = health_result {
                     break Err(error);
                 }
             }
@@ -488,6 +492,14 @@ mod tests {
                 .with_binary("/usr/bin/yes"),
         );
         let mut runner = StackRunner::from_graph(graph);
+        #[cfg(feature = "native-runner")]
+        runner.register_native_readiness(
+            "persistent",
+            crate::runner::NativeLifecycleOptions::default(),
+            |_generation, _identity| {
+                Box::pin(async { Ok(()) }) as nuwax_nav_native_runner::TypedReadyFuture
+            },
+        );
 
         supervise_runner_until(&mut runner, async {
             tokio::time::sleep(Duration::from_millis(30)).await;

@@ -15,12 +15,14 @@
 
 pub mod build;
 pub mod rendered_args;
+pub mod retained;
 pub mod runner;
 pub mod spec;
 pub mod supervised;
 
 pub use build::*;
 pub use rendered_args::*;
+pub use retained::*;
 pub use runner::*;
 pub use spec::*;
 pub use supervised::*;
@@ -29,6 +31,7 @@ pub use supervised::*;
 pub mod prelude {
     pub use crate::build::*;
     pub use crate::rendered_args::*;
+    pub use crate::retained::*;
     pub use crate::runner::*;
     pub use crate::spec::*;
     pub use nuwax_nav_base::native::*;

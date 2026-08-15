@@ -255,14 +255,17 @@ mod tests {
         let mut graph = crate::graph::ModuleGraph::new("far-contract-test");
         graph.push_node(planner);
         let planner = graph.find("far_planner").expect("FAR planner graph node");
-        let contract = match super::far_ready_contract(planner).expect("derived FAR READY contract")
-        {
+        let ready_contract =
+            super::far_ready_contract(planner).expect("derived FAR READY contract");
+        #[cfg(feature = "mls")]
+        let contract = match ready_contract {
             crate::lcm_dataflow::NativePlannerReadyContract::Far(contract) => contract,
-            #[cfg(feature = "mls")]
             crate::lcm_dataflow::NativePlannerReadyContract::Mls(_) => {
                 panic!("FAR node derived MLS contract")
             }
         };
+        #[cfg(not(feature = "mls"))]
+        let crate::lcm_dataflow::NativePlannerReadyContract::Far(contract) = ready_contract;
         let topics = &planner
             .native_spec
             .as_ref()

@@ -685,21 +685,43 @@ pub trait NavPlanner: Send + 'static {
     fn stop(&mut self);
 }
 
-impl NavPlanner for LocalPlanner {
+/// Production-qualified local execution backend selected at scheduler construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalExecutionBackendKind {
+    /// Run the deterministic basic local planner inside the scheduler task.
+    BasicInProcess,
+}
+
+struct BasicInProcessLocalBackend(LocalPlanner);
+
+impl BasicInProcessLocalBackend {
+    fn production() -> Self {
+        Self(LocalPlanner::with_config(
+            LocalPlannerConfig::default_config(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn kind(&self) -> LocalExecutionBackendKind {
+        LocalExecutionBackendKind::BasicInProcess
+    }
+}
+
+impl NavPlanner for BasicInProcessLocalBackend {
     fn replace_path(&mut self, path: Path2D) {
-        self.start_planning(path);
+        self.0.start_planning(path);
     }
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
-        self.handle_odom(odometry);
+        self.0.handle_odom(odometry);
     }
 
     fn update_costmap(&mut self, costmap: CostMap2D) {
-        LocalPlanner::update_costmap(self, costmap);
+        self.0.update_costmap(costmap);
     }
 
     fn step(&mut self, robot_width_m: f64) -> PlannerStep {
-        let (twist, stop) = LocalPlanner::step(self, robot_width_m);
+        let (twist, stop) = self.0.step(robot_width_m);
         match stop {
             None => PlannerStep::Command(twist),
             Some(StopMessage::Arrived) => PlannerStep::Succeeded,
@@ -709,7 +731,13 @@ impl NavPlanner for LocalPlanner {
     }
 
     fn stop(&mut self) {
-        self.stop_planning();
+        self.0.stop_planning();
+    }
+}
+
+fn production_local_backend(kind: LocalExecutionBackendKind) -> BasicInProcessLocalBackend {
+    match kind {
+        LocalExecutionBackendKind::BasicInProcess => BasicInProcessLocalBackend::production(),
     }
 }
 
@@ -1571,11 +1599,26 @@ pub async fn spawn_production_scheduler(
     socket_path: impl Into<PathBuf>,
     config: SchedulerConfig,
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
+    spawn_production_scheduler_with_backend(
+        socket_path,
+        config,
+        LocalExecutionBackendKind::BasicInProcess,
+    )
+    .await
+}
+
+/// Connect the production guard and freeze one local execution backend into
+/// the scheduler-owned task for its complete lifetime.
+pub async fn spawn_production_scheduler_with_backend(
+    socket_path: impl Into<PathBuf>,
+    config: SchedulerConfig,
+    backend_kind: LocalExecutionBackendKind,
+) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.message))?;
-    let planner = LocalPlanner::with_config(LocalPlannerConfig::default_config());
-    let scheduler = NavScheduler::new(motion, planner, config)?;
+    let backend = production_local_backend(backend_kind);
+    let scheduler = NavScheduler::new(motion, backend, config)?;
     Ok(spawn_scheduler(scheduler))
 }
 
@@ -2197,6 +2240,7 @@ mod tests {
         step: PlannerStep,
         costmap_updates: usize,
         odometry_updates: usize,
+        stops: usize,
     }
 
     impl FakePlanner {
@@ -2209,6 +2253,7 @@ mod tests {
                     }),
                     costmap_updates: 0,
                     odometry_updates: 0,
+                    stops: 0,
                 })),
             }
         }
@@ -2235,7 +2280,9 @@ mod tests {
             self.state.lock().expect("fake planner state").step.clone()
         }
 
-        fn stop(&mut self) {}
+        fn stop(&mut self) {
+            self.state.lock().expect("fake planner state").stops += 1;
+        }
     }
 
     fn test_scheduler(
@@ -2454,6 +2501,9 @@ mod tests {
         assert_eq!(terminal.last_terminal, Some(TerminalOutcome::Cancelled));
         assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert_eq!(terminal.session_id, None);
+        assert_eq!(terminal.path_revision, 0);
+        assert_eq!(planner_state.lock().expect("planner").stops, 3);
         let calls = motion_state.lock().expect("motion").calls.clone();
         assert!(calls.iter().any(|call| call.starts_with("twist:")));
         assert!(calls.iter().any(|call| call.starts_with("fence:")));
@@ -2463,12 +2513,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basic_in_process_backend_is_scheduler_owned_and_intent_gated() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let backend = production_local_backend(LocalExecutionBackendKind::BasicInProcess);
+        assert_eq!(backend.kind(), LocalExecutionBackendKind::BasicInProcess);
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::clone(&motion_state)),
+            backend,
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(5),
+                renew_interval: Duration::from_millis(200),
+                path_wait_timeout: Duration::from_secs(1),
+                robot_width_m: 0.3,
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+            },
+        )
+        .expect("basic in-process scheduler");
+        let (handle, task) = spawn_scheduler(scheduler);
+        wait_for_sink(&handle).await;
+
+        handle.update_odometry(map_pose()).await.expect("map pose");
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .expect("costmap");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(
+            motion_state
+                .lock()
+                .expect("motion")
+                .calls
+                .iter()
+                .all(|call| !call.starts_with("twist:")),
+            "the backend cannot bypass scheduler session and path admission"
+        );
+
+        handle.start_session(session()).await.expect("session");
+        handle.submit_path(path()).await.expect("qualified path");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if handle.status().applied_commands > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("actual basic planner APPLIED timeout");
+        let applied = handle
+            .status()
+            .last_applied_twist
+            .expect("actual basic planner twist");
+        assert_ne!(applied, Twist2::ZERO);
+
+        handle.cancel("goal-1").await.expect("verified cancel");
+        let terminal = handle.status();
+        assert_eq!(terminal.phase, SchedulerPhase::Idle);
+        assert_eq!(terminal.last_terminal, Some(TerminalOutcome::Cancelled));
+        assert_eq!(terminal.session_id, None);
+        assert_eq!(terminal.path_revision, 0);
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        let twist_count_after_cancel = motion_state
+            .lock()
+            .expect("motion")
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("twist:"))
+            .count();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            motion_state
+                .lock()
+                .expect("motion")
+                .calls
+                .iter()
+                .filter(|call| call.starts_with("twist:"))
+                .count(),
+            twist_count_after_cancel,
+            "cancelled backend must remain stopped beyond two controller ticks"
+        );
+        let late = handle
+            .submit_path(path())
+            .await
+            .expect_err("terminal scheduler must reject late path replay");
+        assert!(matches!(late, RuntimeError::PathRejected { .. }));
+
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("task result");
+        assert!(matches!(
+            handle.submit_path(path()).await,
+            Err(RuntimeError::SchedulerStopped)
+        ));
+    }
+
+    #[tokio::test]
     async fn same_revision_replay_is_idempotent_but_mutation_fences_motion() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) = test_scheduler(
-            FakeMotion(Arc::clone(&motion_state)),
-            FakePlanner::commanding(),
-        );
+        let planner = FakePlanner::commanding();
+        let planner_state = Arc::clone(&planner.state);
+        let (handle, task) = test_scheduler(FakeMotion(Arc::clone(&motion_state)), planner);
         wait_for_sink(&handle).await;
         handle.update_odometry(map_pose()).await.expect("map pose");
         handle
@@ -2506,6 +2650,7 @@ mod tests {
         assert_eq!(terminal.path_revision, 0);
         assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert_eq!(planner_state.lock().expect("planner").stops, 3);
 
         let twist_count_after_fence = motion_state
             .lock()

@@ -12,8 +12,6 @@ use std::time::Duration;
 #[cfg(feature = "guard-runtime")]
 use std::time::Instant;
 
-#[cfg(feature = "movement-manager")]
-use futures::future::pending;
 use futures::StreamExt;
 use nuwax_codec::lcm::schema;
 #[cfg(feature = "patrolling")]
@@ -41,7 +39,7 @@ use nuwax_nav_types_messages::Path2D;
 use nuwax_nav_types_messages::Point2;
 #[cfg(any(feature = "simple-2d", feature = "cmu-native", feature = "explore"))]
 use nuwax_nav_types_messages::PointCloud;
-#[cfg(any(feature = "simple-2d", feature = "movement-manager"))]
+#[cfg(feature = "simple-2d")]
 use nuwax_nav_types_messages::PointStamped;
 #[cfg(any(
     feature = "basic-path-follower",
@@ -63,8 +61,6 @@ use nuwax_nav_types_messages::PoseStamped;
     feature = "patrolling"
 ))]
 use nuwax_nav_types_messages::Twist2;
-#[cfg(feature = "movement-manager")]
-use nuwax_nav_types_messages::Twist3;
 use nuwax_nav_types_messages::{NavFrameId, Point3, Pose3, Quaternion, Timestamp};
 #[cfg(feature = "explore")]
 use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
@@ -474,16 +470,6 @@ fn module_input_error<T>(component: &str, error: nuwax_nav_base::NavError) -> Ow
 #[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
 fn module_tick_error(component: &str, error: nuwax_nav_base::NavError) -> NavStackError {
     module_error(component, error)
-}
-
-#[cfg(feature = "movement-manager")]
-async fn optional_next(
-    stream: &mut Option<LcmFrameStream>,
-) -> Option<TransportResult<RawLcmFrame>> {
-    match stream {
-        Some(stream) => stream.next().await,
-        None => pending().await,
-    }
 }
 
 fn signal_ready(ready: ReadySender) -> NavStackResult<()> {
@@ -4989,124 +4975,8 @@ async fn run_basic_path_follower(
     publish_twist2(&transport, &node.outputs[0], Twist2::ZERO).await
 }
 
-#[cfg(feature = "movement-manager")]
-pub(crate) fn movement_manager_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, node.inputs.len(), &[2, 4])?;
-    if !matches!(node.inputs.len(), 2 | 3) {
-        return Err(NavStackError::InvalidConfig(format!(
-            "movement_manager requires two or three inputs, got {}",
-            node.inputs.len()
-        )));
-    }
-    let node = node.clone();
-    Ok(boxed_owner(
-        "movement-manager",
-        Box::new(move |shutdown, ready| Box::pin(run_movement_manager(node, shutdown, ready))),
-    ))
-}
-
-#[cfg(feature = "movement-manager")]
-async fn run_movement_manager(
-    node: ModuleNode,
-    mut shutdown: oneshot::Receiver<()>,
-    ready: ReadySender,
-) -> NavStackResult<()> {
-    use nuwax_nav_movement_manager::module::{MovementManagerModule, MovementManagerModuleConfig};
-
-    let transport = lcm_transport()?;
-    let mut nav = typed_stream(&transport, &node.inputs[0], "geometry_msgs.Twist").await?;
-    let mut joy = typed_stream(&transport, &node.inputs[1], "geometry_msgs.Twist").await?;
-    let mut clicked = if node.inputs.len() == 3 {
-        Some(typed_stream(&transport, &node.inputs[2], "geometry_msgs.PointStamped").await?)
-    } else {
-        None
-    };
-    let mut module = MovementManagerModule::new(MovementManagerModuleConfig::default())
-        .map_err(|error| module_error("movement_manager", error))?;
-    let nav_input = module.nav_cmd_vel_input();
-    let teleop_input = module.tele_cmd_vel_input();
-    let click_input = module.clicked_point_input();
-    let mut commands = module.subscribe_cmd_vel();
-    let mut goals = module.subscribe_goal();
-    let mut waypoints = module.subscribe_way_point();
-    let mut stops = module.subscribe_stop_movement();
-    module
-        .start()
-        .map_err(|error| module_error("movement_manager", error))?;
-    signal_ready(ready)?;
-
-    let stop_topic = if node.outputs.len() == 4 {
-        &node.outputs[3]
-    } else {
-        &node.outputs[1]
-    };
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            message = nav.next() => {
-                let frame = required_frame(message, "movement_manager.nav_cmd_vel")?;
-                nav_input.send(decode_twist3_body(&frame.payload)?)
-                    .map_err(|_| NavStackError::Internal("movement_manager nav port closed".into()))?;
-            }
-            message = joy.next() => {
-                let frame = required_frame(message, "movement_manager.joy_cmd")?;
-                teleop_input.send(decode_twist3_body(&frame.payload)?)
-                    .map_err(|_| NavStackError::Internal("movement_manager teleop port closed".into()))?;
-            }
-            message = optional_next(&mut clicked) => {
-                let frame = required_frame(message, "movement_manager.clicked_point")?;
-                click_input.send(decode_point_body(&frame.payload)?)
-                    .map_err(|_| NavStackError::Internal("movement_manager click port closed".into()))?;
-            }
-            command = commands.recv() => {
-                let command = command.map_err(|error| NavStackError::Internal(format!(
-                    "movement_manager command port: {error}"
-                )))?;
-                publish_twist3(&transport, &node.outputs[0], command).await?;
-            }
-            goal = goals.recv() => {
-                let goal = goal.map_err(|error| NavStackError::Internal(format!(
-                    "movement_manager goal port: {error}"
-                )))?;
-                if node.outputs.len() == 4 {
-                    publish_point(&transport, &node.outputs[1], &goal).await?;
-                }
-            }
-            waypoint = waypoints.recv() => {
-                let waypoint = waypoint.map_err(|error| NavStackError::Internal(format!(
-                    "movement_manager waypoint port: {error}"
-                )))?;
-                if node.outputs.len() == 4 {
-                    publish_point(&transport, &node.outputs[2], &waypoint).await?;
-                }
-            }
-            stop = stops.recv() => {
-                let stop = stop.map_err(|error| NavStackError::Internal(format!(
-                    "movement_manager stop port: {error}"
-                )))?;
-                publish_bool(&transport, stop_topic, stop).await?;
-            }
-        }
-    }
-    module
-        .stop()
-        .map_err(|error| module_error("movement_manager.stop", error))?;
-    publish_twist3(&transport, &node.outputs[0], Twist3::ZERO).await
-}
-
 fn module_error(component: &str, error: impl std::fmt::Display) -> NavStackError {
     NavStackError::Internal(format!("{component}: {error}"))
-}
-
-#[cfg(feature = "movement-manager")]
-fn decode_point_body(body: &[u8]) -> NavStackResult<PointStamped> {
-    let point = schema::decode_point_stamped_body(body)
-        .map_err(|error| NavStackError::Internal(format!("PointStamped decode: {error}")))?;
-    Ok(PointStamped::new(
-        NavFrameId::from_static(&point.header.frame_id),
-        timestamp(&point.header)?,
-        Point3::new(point.point[0], point.point[1], point.point[2]),
-    ))
 }
 
 #[cfg(feature = "patrolling")]
@@ -5199,16 +5069,6 @@ fn path_from_schema(path: &schema::Path) -> NavStackResult<Path2D> {
             .map(|pose| Point2::new(pose.pose.position[0], pose.pose.position[1]))
             .collect(),
     ))
-}
-
-#[cfg(feature = "movement-manager")]
-fn decode_twist3_body(body: &[u8]) -> NavStackResult<Twist3> {
-    let twist = schema::decode_twist(&prefixed(schema::TWIST_FINGERPRINT, body))
-        .map_err(|error| NavStackError::Internal(format!("Twist decode: {error}")))?;
-    Ok(Twist3 {
-        linear: Point3::new(twist.linear[0], twist.linear[1], twist.linear[2]),
-        angular: Point3::new(twist.angular[0], twist.angular[1], twist.angular[2]),
-    })
 }
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -5520,7 +5380,7 @@ async fn publish_pose(
     publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await
 }
 
-#[cfg(any(feature = "simple-2d", feature = "movement-manager"))]
+#[cfg(feature = "simple-2d")]
 async fn publish_point(
     transport: &LcmTransport,
     channel: &str,
@@ -5653,6 +5513,12 @@ fn current_unix_timestamp_ns() -> NavStackResult<i64> {
         .map_err(|_| NavStackError::Internal("Unix timestamp exceeds int64 nanoseconds".into()))
 }
 
+#[cfg(any(
+    feature = "guard-runtime",
+    feature = "replanning-astar",
+    feature = "patrolling",
+    feature = "basic-path-follower"
+))]
 async fn publish_bool(transport: &LcmTransport, channel: &str, value: bool) -> NavStackResult<()> {
     publish_body(
         transport,
@@ -5683,24 +5549,6 @@ async fn publish_twist2(
         schema::encode_twist_body(&schema::Twist {
             linear: [twist.linear.x, twist.linear.y, 0.0],
             angular: [0.0, 0.0, twist.angular_z],
-        }),
-    )
-    .await
-}
-
-#[cfg(feature = "movement-manager")]
-async fn publish_twist3(
-    transport: &LcmTransport,
-    channel: &str,
-    twist: Twist3,
-) -> NavStackResult<()> {
-    publish_body(
-        transport,
-        channel,
-        "geometry_msgs.Twist",
-        schema::encode_twist_body(&schema::Twist {
-            linear: [twist.linear.x, twist.linear.y, twist.linear.z],
-            angular: [twist.angular.x, twist.angular.y, twist.angular.z],
         }),
     )
     .await

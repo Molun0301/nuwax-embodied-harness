@@ -125,12 +125,6 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
         crate::lcm_dataflow::basic_path_follower_owner,
     );
 
-    #[cfg(feature = "movement-manager")]
-    _runner.register_in_process_factory(
-        "movement_manager",
-        crate::lcm_dataflow::movement_manager_owner,
-    );
-
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     _runner.register_in_process_factory(
         "terrain_map_ext",
@@ -329,7 +323,10 @@ mod tests {
         let runner = NavStackBuilder::new(NavStackProfile::Mls3D)
             .build_runner()
             .unwrap();
-        assert!(runner.unowned_nodes().is_empty());
         assert_eq!(runner.native_bridge_ids(), vec!["mls_planner"]);
+        assert_eq!(
+            runner.unowned_nodes(),
+            vec!["movement_manager (Coordinator)"]
+        );
     }
 }

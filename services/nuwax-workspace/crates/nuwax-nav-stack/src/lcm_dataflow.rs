@@ -5103,9 +5103,6 @@ fn decode_odometry_pose_body(body: &[u8]) -> NavStackResult<PoseStamped> {
 
 #[cfg(any(
     feature = "basic-path-follower",
-    feature = "mls",
-    feature = "cmu-native",
-    feature = "explore",
     all(test, feature = "replanning-astar")
 ))]
 fn decode_path_body(body: &[u8]) -> NavStackResult<Path2D> {

@@ -294,14 +294,17 @@ mod tests {
             NavStackPreset::Mls.to_flags(),
         );
         let planner = graph.find("mls_planner").expect("MLS planner graph node");
-        let contract = match super::mls_ready_contract(planner).expect("derived MLS READY contract")
-        {
+        let ready_contract =
+            super::mls_ready_contract(planner).expect("derived MLS READY contract");
+        #[cfg(any(feature = "cmu-native", feature = "explore"))]
+        let contract = match ready_contract {
             crate::lcm_dataflow::NativePlannerReadyContract::Mls(contract) => contract,
-            #[cfg(any(feature = "cmu-native", feature = "explore"))]
             crate::lcm_dataflow::NativePlannerReadyContract::Far(_) => {
                 panic!("MLS node derived FAR contract")
             }
         };
+        #[cfg(not(any(feature = "cmu-native", feature = "explore")))]
+        let crate::lcm_dataflow::NativePlannerReadyContract::Mls(contract) = ready_contract;
         let topics = &planner
             .native_spec
             .as_ref()

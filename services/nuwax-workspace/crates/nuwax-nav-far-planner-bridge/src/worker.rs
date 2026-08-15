@@ -1,8 +1,8 @@
 //! FAR 规划器的真实 liblcm typed worker。
 //!
 //! worker 只消费版本化 `GoalEnvelope` 和精确关联的 `CancelNavigation`。
-//! 算法结果发布到 FAR 私有 `nav_msgs.Path` topic，由后续唯一 adapter 封装
-//! canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
+//! 算法结果通过 FAR 私有 `NavigationState` v2 合同发布，由后续唯一 adapter
+//! 封装 canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,8 +21,15 @@ const GOAL_TYPE: &str = "nuwax_msgs.GoalEnvelope";
 const CANCEL_TYPE: &str = "nuwax_msgs.CancelNavigation";
 const ODOMETRY_TYPE: &str = "nav_msgs.Odometry";
 const POINT_CLOUD_TYPE: &str = "sensor_msgs.PointCloud2";
-const RESULT_TYPE: &str = "nav_msgs.Path";
+const RESULT_TYPE: &str = "nuwax_msgs.NavigationState";
 const EVENT_TYPE: &str = "nuwax_msgs.NavigationState";
+const PRIVATE_RESULT_MAGIC: &[u8; 4] = b"FAR2";
+const PRIVATE_RESULT_VERSION: u8 = 2;
+const PRIVATE_RESULT_KIND_PATH: u8 = 1;
+const MAX_PRIVATE_PATH_BYTES: usize = 4 * 1024 * 1024;
+
+/// FAR 私有 result v2 的 READY 合同标记。
+pub const FAR_RESULT_V2_CONTRACT: &str = "far-private-result-v2";
 
 /// worker READY 事件。
 pub const FAR_EVENT_READY: i32 = 1;
@@ -73,6 +80,122 @@ impl Default for WorkerTopics {
     }
 }
 
+/// FAR READY v2 的完整结构化合同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FarReadyContract {
+    /// 固定 backend 身份。
+    pub backend: String,
+    /// supervisor 分配的单调 generation。
+    pub generation: i64,
+    /// GoalEnvelope 输入通道。
+    pub goal: String,
+    /// CancelNavigation 输入通道。
+    pub cancel: String,
+    /// Odometry 输入通道。
+    pub odometry: String,
+    /// 扩展地形点云输入通道。
+    pub terrain_map_ext: String,
+    /// 地形点云输入通道。
+    pub terrain_map: String,
+    /// 注册扫描点云输入通道。
+    pub registered_scan: String,
+    /// backend 私有结果通道。
+    pub planner_result: String,
+    /// worker 事件通道。
+    pub worker_event: String,
+    /// backend 私有结果合同。
+    pub result_contract: String,
+}
+
+impl FarReadyContract {
+    fn from_options(options: &WorkerOptions) -> Self {
+        Self {
+            backend: options.backend_id.clone(),
+            generation: options.planner_generation,
+            goal: options.topics.goal.clone(),
+            cancel: options.topics.cancel.clone(),
+            odometry: options.topics.odometry.clone(),
+            terrain_map_ext: options.topics.terrain_map_ext.clone(),
+            terrain_map: options.topics.terrain_map.clone(),
+            registered_scan: options.topics.registered_scan.clone(),
+            planner_result: options.topics.planner_result.clone(),
+            worker_event: options.topics.worker_event.clone(),
+            result_contract: FAR_RESULT_V2_CONTRACT.into(),
+        }
+    }
+
+    /// 编码唯一 canonical FAR READY v2 表示。
+    #[must_use]
+    pub fn encode_v2(&self) -> String {
+        format!(
+            "far-ready-v2;backend={};generation={};goal={}#{};cancel={}#{};odometry={}#{};terrain_ext={}#{};terrain={}#{};scan={}#{};result={}#{};event={}#{};result_contract={}",
+            self.backend,
+            self.generation,
+            self.goal,
+            GOAL_TYPE,
+            self.cancel,
+            CANCEL_TYPE,
+            self.odometry,
+            ODOMETRY_TYPE,
+            self.terrain_map_ext,
+            POINT_CLOUD_TYPE,
+            self.terrain_map,
+            POINT_CLOUD_TYPE,
+            self.registered_scan,
+            POINT_CLOUD_TYPE,
+            self.planner_result,
+            RESULT_TYPE,
+            self.worker_event,
+            EVENT_TYPE,
+            self.result_contract,
+        )
+    }
+}
+
+/// 严格解码 canonical FAR READY v2，拒绝尾随、重复及非 canonical 表示。
+pub fn decode_ready_contract_v2(message: &str) -> Result<FarReadyContract, WorkerError> {
+    let fields: Vec<&str> = message.split(';').collect();
+    if fields.len() != 12 || fields[0] != "far-ready-v2" {
+        return Err(WorkerError::Contract(
+            "FAR READY v2 field count or prefix mismatch".into(),
+        ));
+    }
+    let value = |index: usize, prefix: &str| {
+        fields[index].strip_prefix(prefix).ok_or_else(|| {
+            WorkerError::Contract(format!("FAR READY v2 field {index} is noncanonical"))
+        })
+    };
+    let typed = |index: usize, prefix: &str, type_name: &str| {
+        value(index, prefix)?
+            .strip_suffix(&format!("#{type_name}"))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                WorkerError::Contract(format!("FAR READY v2 typed field {index} mismatch"))
+            })
+    };
+    let contract = FarReadyContract {
+        backend: value(1, "backend=")?.to_owned(),
+        generation: value(2, "generation=")?
+            .parse()
+            .map_err(|_| WorkerError::Contract("FAR READY v2 generation is invalid".into()))?,
+        goal: typed(3, "goal=", GOAL_TYPE)?,
+        cancel: typed(4, "cancel=", CANCEL_TYPE)?,
+        odometry: typed(5, "odometry=", ODOMETRY_TYPE)?,
+        terrain_map_ext: typed(6, "terrain_ext=", POINT_CLOUD_TYPE)?,
+        terrain_map: typed(7, "terrain=", POINT_CLOUD_TYPE)?,
+        registered_scan: typed(8, "scan=", POINT_CLOUD_TYPE)?,
+        planner_result: typed(9, "result=", RESULT_TYPE)?,
+        worker_event: typed(10, "event=", EVENT_TYPE)?,
+        result_contract: value(11, "result_contract=")?.to_owned(),
+    };
+    if contract.generation <= 0 || contract.encode_v2() != message {
+        return Err(WorkerError::Contract(
+            "FAR READY v2 is not canonical".into(),
+        ));
+    }
+    Ok(contract)
+}
+
 /// FAR typed worker 配置。
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -115,6 +238,88 @@ pub enum WorkerError {
     /// liblcm transport 失败。
     #[error("FAR worker transport error: {0}")]
     Transport(String),
+}
+
+/// 严格解码 FAR 私有 result v2，并重算 Path body 摘要。
+pub fn decode_private_result_v2(state: &NavigationState) -> Result<Path, WorkerError> {
+    if state.state != FAR_EVENT_SUCCEEDED
+        || state.runtime_generation <= 0
+        || state.path_revision <= 0
+        || state.goal_payload_sha256 == [0; 32]
+        || state.path_payload_sha256 == [0; 32]
+    {
+        return Err(WorkerError::Codec(
+            "invalid private result correlation fields".into(),
+        ));
+    }
+    let private = hex_decode(&state.message)?;
+    let minimum = PRIVATE_RESULT_MAGIC.len() + 1 + 1 + 4;
+    if private.len() < minimum || &private[..4] != PRIVATE_RESULT_MAGIC {
+        return Err(WorkerError::Codec("invalid private result magic".into()));
+    }
+    if private[4] != PRIVATE_RESULT_VERSION || private[5] != PRIVATE_RESULT_KIND_PATH {
+        return Err(WorkerError::Codec(
+            "unsupported private result version or kind".into(),
+        ));
+    }
+    let declared = u32::from_be_bytes(
+        private[6..10]
+            .try_into()
+            .expect("private result length prefix bounds checked"),
+    ) as usize;
+    if declared > MAX_PRIVATE_PATH_BYTES || private.len() != minimum + declared {
+        return Err(WorkerError::Codec(
+            "private result length mismatch or exceeds limit".into(),
+        ));
+    }
+    let path_body = &private[minimum..];
+    if nuwax_codec::sha256_bytes(path_body) != state.path_payload_sha256 {
+        return Err(WorkerError::Codec(
+            "private result path digest mismatch".into(),
+        ));
+    }
+    let mut encoded = schema::PATH_FINGERPRINT.to_vec();
+    encoded.extend_from_slice(path_body);
+    schema::decode_path(&encoded)
+        .map_err(|error| WorkerError::Codec(format!("private result path codec:{error}")))
+}
+
+/// 将 Path 严格封入 FAR 私有 result v2 `NavigationState`。
+pub fn seal_private_result_v2(
+    mut state: NavigationState,
+    path: &Path,
+) -> Result<NavigationState, WorkerError> {
+    if state.state != FAR_EVENT_SUCCEEDED
+        || state.runtime_generation <= 0
+        || state.path_revision <= 0
+        || state.goal_payload_sha256 == [0; 32]
+    {
+        return Err(WorkerError::Codec(
+            "invalid private result correlation fields".into(),
+        ));
+    }
+    let path_body = schema::encode_path_body(path)
+        .map_err(|error| WorkerError::Codec(format!("private result path codec:{error}")))?;
+    if path_body.len() > MAX_PRIVATE_PATH_BYTES {
+        return Err(WorkerError::Codec(
+            "private result path exceeds size limit".into(),
+        ));
+    }
+    state.path_payload_sha256 = nuwax_codec::sha256_bytes(&path_body);
+    let mut private = Vec::with_capacity(10 + path_body.len());
+    private.extend_from_slice(PRIVATE_RESULT_MAGIC);
+    private.push(PRIVATE_RESULT_VERSION);
+    private.push(PRIVATE_RESULT_KIND_PATH);
+    private.extend_from_slice(&(path_body.len() as u32).to_be_bytes());
+    private.extend_from_slice(&path_body);
+    state.message = hex_encode(&private);
+    Ok(state)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathCorrelation {
+    revision: i64,
+    digest: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -250,6 +455,7 @@ pub async fn run_with_transport(
     let mut pending_completion: Option<PlanCompletion> = None;
     let mut cancelled: HashMap<GoalIdentity, i64> = HashMap::new();
     let mut terminal_watermarks: HashMap<GoalOwner, i64> = HashMap::new();
+    let mut next_path_revision = 1_i64;
 
     loop {
         // liblcm owner 保留数据报全序；biased select 再确保已排队 cancel 先于
@@ -493,17 +699,24 @@ pub async fn run_with_transport(
                 record_terminal(&mut terminal_watermarks, &current.goal);
                 match completion.outcome {
                     PlanOutcome::Path(path) => {
-                        publish_path(&transport, &options.topics.planner_result, path).await?;
-                        publish_event(
+                        let correlation = publish_private_result_v2(
                             &transport,
                             &options,
-                            FAR_EVENT_SUCCEEDED,
-                            Some(&current.goal),
-                            Some(completion.start),
-                            0,
-                            "succeeded:private-planner-result-published",
+                            &current.goal,
+                            completion.start,
+                            next_path_revision,
+                            path,
                         )
                         .await?;
+                        publish_success_event(
+                            &transport,
+                            &options,
+                            &current.goal,
+                            completion.start,
+                            correlation,
+                        )
+                        .await?;
+                        next_path_revision = next_path_revision.saturating_add(1);
                     }
                     PlanOutcome::Timeout => {
                         publish_event(
@@ -920,14 +1133,98 @@ async fn publish_rejected(
     .await
 }
 
-async fn publish_path(
+async fn publish_private_result_v2(
     transport: &LcmTransport,
-    channel: &str,
+    options: &WorkerOptions,
+    goal: &GoalEnvelope,
+    current: [f64; 3],
+    path_revision: i64,
     path: Path,
+) -> Result<PathCorrelation, WorkerError> {
+    let state = navigation_state(
+        options,
+        FAR_EVENT_SUCCEEDED,
+        Some(goal),
+        Some(current),
+        0,
+        PathCorrelation {
+            revision: path_revision,
+            digest: [0; 32],
+        },
+        String::new(),
+    );
+    let state = seal_private_result_v2(state, &path)?;
+    let correlation = PathCorrelation {
+        revision: state.path_revision,
+        digest: state.path_payload_sha256,
+    };
+    let body = schema::encode_navigation_state_body(&state)
+        .map_err(|error| WorkerError::Codec(error.to_string()))?;
+    publish(transport, &options.topics.planner_result, RESULT_TYPE, body).await?;
+    Ok(correlation)
+}
+
+async fn publish_success_event(
+    transport: &LcmTransport,
+    options: &WorkerOptions,
+    goal: &GoalEnvelope,
+    current: [f64; 3],
+    correlation: PathCorrelation,
 ) -> Result<(), WorkerError> {
-    let body =
-        schema::encode_path_body(&path).map_err(|error| WorkerError::Codec(error.to_string()))?;
-    publish(transport, channel, RESULT_TYPE, body).await
+    let state = navigation_state(
+        options,
+        FAR_EVENT_SUCCEEDED,
+        Some(goal),
+        Some(current),
+        0,
+        correlation,
+        "succeeded:private-result-v2-published".into(),
+    );
+    let body = schema::encode_navigation_state_body(&state)
+        .map_err(|error| WorkerError::Codec(error.to_string()))?;
+    publish(transport, &options.topics.worker_event, EVENT_TYPE, body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn navigation_state(
+    options: &WorkerOptions,
+    state: i32,
+    goal: Option<&GoalEnvelope>,
+    current: Option<[f64; 3]>,
+    cancel_generation: i64,
+    correlation: PathCorrelation,
+    message: String,
+) -> NavigationState {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    NavigationState {
+        session_id: goal.map_or_else(String::new, |value| value.session_id.clone()),
+        robot_frame: options.backend_id.clone(),
+        stamp_sec: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+        stamp_nsec: now.subsec_nanos() as i32,
+        state,
+        goal: goal.map_or([0.0; 3], |value| value.goal.pose.position),
+        current: current.unwrap_or([0.0; 3]),
+        progress: f64::from(state == FAR_EVENT_SUCCEEDED),
+        message,
+        runtime_generation: options.planner_generation,
+        guard_generation: goal.map_or(0, |value| value.motion_guard_generation),
+        sink_ready: i8::from(state == FAR_EVENT_READY),
+        planner_map_frame: goal
+            .map_or_else(String::new, |value| value.committed_map_frame_id.clone()),
+        planner_pose_frame: goal
+            .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
+        cancel_generation,
+        zero_ack_id: String::new(),
+        zero_applied_monotonic_ns: 0,
+        owner_kind: goal.map_or(0, |value| value.owner_kind),
+        parent_request_id: goal.map_or_else(String::new, |value| value.parent_request_id.clone()),
+        goal_generation: goal.map_or(0, |value| value.goal_generation),
+        path_revision: correlation.revision,
+        goal_payload_sha256: goal.map_or([0; 32], |value| value.payload_sha256),
+        path_payload_sha256: correlation.digest,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -940,21 +1237,11 @@ async fn publish_event(
     cancel_generation: i64,
     detail: &str,
 ) -> Result<(), WorkerError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let goal_position = goal.map_or([0.0; 3], |value| value.goal.pose.position);
-    let message = NavigationState {
-        session_id: goal.map_or_else(String::new, |value| value.session_id.clone()),
-        robot_frame: options.backend_id.clone(),
-        stamp_sec: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
-        stamp_nsec: now.subsec_nanos() as i32,
-        state,
-        goal: goal_position,
-        current: current.unwrap_or([0.0; 3]),
-        progress: f64::from(state == FAR_EVENT_SUCCEEDED),
-        message: format!(
-            "backend={};generation={};goal={}#{};cancel={}#{};odometry={}#{};terrain_ext={}#{};terrain={}#{};scan={}#{};result={}#{};event={}#{};{detail}",
+    let message = if state == FAR_EVENT_READY {
+        FarReadyContract::from_options(options).encode_v2()
+    } else {
+        format!(
+            "backend={};generation={};goal={}#{};cancel={}#{};odometry={}#{};terrain_ext={}#{};terrain={}#{};scan={}#{};result={}#{};result_contract={};event={}#{};{detail}",
             options.backend_id,
             options.planner_generation,
             options.topics.goal,
@@ -971,29 +1258,62 @@ async fn publish_event(
             POINT_CLOUD_TYPE,
             options.topics.planner_result,
             RESULT_TYPE,
+            FAR_RESULT_V2_CONTRACT,
             options.topics.worker_event,
             EVENT_TYPE,
-        ),
-        runtime_generation: options.planner_generation,
-        guard_generation: goal.map_or(0, |value| value.motion_guard_generation),
-        sink_ready: i8::from(state == FAR_EVENT_READY),
-        planner_map_frame: goal
-            .map_or_else(String::new, |value| value.committed_map_frame_id.clone()),
-        planner_pose_frame: goal
-            .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
-        cancel_generation,
-        zero_ack_id: String::new(),
-        zero_applied_monotonic_ns: 0,
-        owner_kind: goal.map_or(0, |value| value.owner_kind),
-        parent_request_id: goal.map_or_else(String::new, |value| value.parent_request_id.clone()),
-        goal_generation: goal.map_or(0, |value| value.goal_generation),
-        path_revision: 0,
-        goal_payload_sha256: goal.map_or([0; 32], |value| value.payload_sha256),
-        path_payload_sha256: [0; 32],
+        )
     };
+    let message = navigation_state(
+        options,
+        state,
+        goal,
+        current,
+        cancel_generation,
+        PathCorrelation {
+            revision: 0,
+            digest: [0; 32],
+        },
+        message,
+    );
     let body = schema::encode_navigation_state_body(&message)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
     publish(transport, &options.topics.worker_event, EVENT_TYPE, body).await
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, WorkerError> {
+    if value.len() % 2 != 0 || value.len() > (MAX_PRIVATE_PATH_BYTES + 10) * 2 {
+        return Err(WorkerError::Codec(
+            "invalid private result hex length".into(),
+        ));
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(value: u8) -> Result<u8, WorkerError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(WorkerError::Codec(
+            "private result hex must be lowercase canonical encoding".into(),
+        )),
+    }
 }
 
 async fn publish(
@@ -1065,6 +1385,42 @@ mod tests {
     }
 
     #[test]
+    fn ready_v2_decoder_rejects_trailing_duplicate_and_noncanonical_forms() {
+        let options = WorkerOptions::default();
+        let encoded = FarReadyContract::from_options(&options).encode_v2();
+        assert_eq!(
+            decode_ready_contract_v2(&encoded).expect("decode canonical READY"),
+            FarReadyContract::from_options(&options)
+        );
+
+        let invalid = [
+            format!("{encoded};trailing=value"),
+            encoded.replace(
+                ";cancel=",
+                ";goal=/duplicate#nuwax_msgs.GoalEnvelope;cancel=",
+            ),
+            encoded.replace("generation=1", "generation=01"),
+            encoded.replace(";goal=", ";cancel_alias="),
+            encoded.replace(";goal=", ";cancel="),
+            encoded.replace(
+                ";goal=/nav/far/goal#nuwax_msgs.GoalEnvelope;cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation",
+                ";cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation;goal=/nav/far/goal#nuwax_msgs.GoalEnvelope",
+            ),
+        ];
+        for message in invalid {
+            assert!(
+                decode_ready_contract_v2(&message).is_err(),
+                "non-canonical READY unexpectedly decoded: {message}"
+            );
+        }
+
+        assert!(decode_ready_contract_v2(
+            &encoded.replace("odometry=/nav/far/odometry", "odometry=/nav/far/wrong",)
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn boundary_gate_rejects_outside_point() {
         let boundary = vec![
             [0.0, 0.0, 0.0],
@@ -1074,5 +1430,45 @@ mod tests {
         ];
         assert!(inside_boundary(Point2 { x: 1.0, y: 1.0 }, &boundary));
         assert!(!inside_boundary(Point2 { x: 3.0, y: 1.0 }, &boundary));
+    }
+
+    #[test]
+    fn private_result_v2_recomputes_digest_and_rejects_trailing_bytes() {
+        let path = Path {
+            header: schema::Header {
+                seq: 1,
+                stamp_sec: 2,
+                stamp_nsec: 3,
+                frame_id: "map".into(),
+            },
+            poses: Vec::new(),
+        };
+        let state = NavigationState {
+            session_id: "session".into(),
+            robot_frame: "far-visibility-graph".into(),
+            state: FAR_EVENT_SUCCEEDED,
+            runtime_generation: 7,
+            owner_kind: 1,
+            parent_request_id: "request".into(),
+            goal_generation: 9,
+            path_revision: 2,
+            goal_payload_sha256: [0x11; 32],
+            ..NavigationState::default()
+        };
+        let sealed = seal_private_result_v2(state, &path).expect("seal private result v2");
+        assert_eq!(
+            decode_private_result_v2(&sealed).expect("decode private result v2"),
+            path
+        );
+
+        let mut wrong_digest = sealed.clone();
+        wrong_digest.path_payload_sha256[0] ^= 1;
+        assert!(decode_private_result_v2(&wrong_digest).is_err());
+
+        let mut trailing = sealed;
+        let mut private = hex_decode(&trailing.message).expect("decode private bytes");
+        private.push(0);
+        trailing.message = hex_encode(&private);
+        assert!(decode_private_result_v2(&trailing).is_err());
     }
 }

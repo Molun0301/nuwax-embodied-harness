@@ -387,7 +387,7 @@ impl StackRunner {
                         supervisor: registration.options.supervisor,
                         startup_timeout: registration.options.startup_timeout,
                         shutdown_grace: registration.options.shutdown_grace,
-                        restart_generation_env: PLANNER_RESTART_GENERATION_ENV.to_string(),
+                        restart_generation_env: planner_restart_generation_env(&node.id).into(),
                         restart,
                     };
                     let mut owner = RetainedNativeOwner::new(config, registration.readiness)
@@ -469,20 +469,26 @@ impl StackRunner {
     pub async fn reconcile_health(&mut self) -> NavStackResult<()> {
         self.ensure_healthy()?;
         for (node, owner) in &mut self.retained_processes {
-            let state =
-                owner
-                    .reconcile()
-                    .await
-                    .map_err(|source| NavStackError::NodeStartFailed {
+            let state = match owner.reconcile().await {
+                Ok(state) => state,
+                Err(source) => {
+                    invalidate_planner_generation(node);
+                    return Err(NavStackError::NodeStartFailed {
                         node: node.clone(),
                         reason: source.to_string(),
-                    })?;
+                    });
+                }
+            };
             match state {
-                RetainedNativeState::Running(_) | RetainedNativeState::RestartBackoff { .. } => {}
+                RetainedNativeState::Running(_) => {}
+                RetainedNativeState::RestartBackoff { .. } => {
+                    invalidate_planner_generation(node);
+                }
                 RetainedNativeState::Exited { .. }
                 | RetainedNativeState::Failed { .. }
                 | RetainedNativeState::NotStarted
                 | RetainedNativeState::Shutdown => {
+                    invalidate_planner_generation(node);
                     return Err(NavStackError::RuntimeNodeExited { node: node.clone() });
                 }
             }
@@ -567,6 +573,23 @@ impl StackRunner {
     /// Stop every owned node with a five-second grace period.
     pub async fn shutdown(&mut self) -> NavStackResult<()> {
         self.shutdown_with(Duration::from_secs(5)).await
+    }
+}
+
+#[cfg(feature = "native-runner")]
+fn invalidate_planner_generation(node_id: &str) {
+    #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
+    crate::lcm_dataflow::invalidate_native_planner_generation(node_id);
+    #[cfg(not(any(feature = "cmu-native", feature = "explore", feature = "mls")))]
+    let _ = node_id;
+}
+
+#[cfg(feature = "native-runner")]
+fn planner_restart_generation_env(node_id: &str) -> &'static str {
+    if node_id == "mls_planner" {
+        "NUWAX_MLS_BACKEND_GENERATION"
+    } else {
+        PLANNER_RESTART_GENERATION_ENV
     }
 }
 
@@ -690,6 +713,23 @@ mod tests {
             .with_binary("result/bin/far_planner_native");
         let argv = argv_for(&node).expect("argv present");
         assert_eq!(argv, vec!["result/bin/far_planner_native".to_string()]);
+    }
+
+    #[cfg(feature = "native-runner")]
+    #[test]
+    fn planner_restart_generation_env_is_backend_specific() {
+        assert_eq!(
+            planner_restart_generation_env("mls_planner"),
+            "NUWAX_MLS_BACKEND_GENERATION"
+        );
+        assert_eq!(
+            planner_restart_generation_env("far_planner"),
+            PLANNER_RESTART_GENERATION_ENV
+        );
+        assert_eq!(
+            planner_restart_generation_env("other_native"),
+            PLANNER_RESTART_GENERATION_ENV
+        );
     }
 
     #[tokio::test]

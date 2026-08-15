@@ -144,7 +144,12 @@ impl ProfileManifest {
                         "terrain_map_ext",
                         "terrain_map_ext",
                     ),
-                    slot("waypoint", "far_planner", "way_point", "way_point"),
+                    slot(
+                        "goal-path",
+                        "native_planner_path_adapter",
+                        "goal_path",
+                        "goal_path",
+                    ),
                     slot("local-path", "local_planner", "path", "path"),
                     slot(
                         "navigation-command",
@@ -172,7 +177,12 @@ impl ProfileManifest {
                         "wavefront_explorer",
                         crate::profiles::navigation_goal_topic(topics),
                     ),
-                    slot("waypoint", "far_planner", "way_point", "way_point"),
+                    slot(
+                        "goal-path",
+                        "native_planner_path_adapter",
+                        "goal_path",
+                        "goal_path",
+                    ),
                     slot("local-path", "local_planner", "path", "path"),
                     slot(
                         "navigation-command",
@@ -188,7 +198,12 @@ impl ProfileManifest {
                     blocker: "MLS planner and follower nodes do not have guard-backed production runtime owners",
                 },
                 vec![
-                    slot("goal-path", "mls_planner", "goal_path", "goal_path"),
+                    slot(
+                        "goal-path",
+                        "native_planner_path_adapter",
+                        "goal_path",
+                        "goal_path",
+                    ),
                     slot(
                         "navigation-command",
                         "basic_path_follower",

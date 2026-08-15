@@ -91,8 +91,9 @@ pub fn topic_map_for_node(node_id: &str, topics: &NavTopicConfig) -> Vec<(String
             ("local_map", "local_map", "local_map"),
             ("region_bounds", "region_bounds", "region_bounds"),
             ("start_pose", "start_pose", "start_pose"),
-            ("goal_pose", "goal_pose", "goal_pose"),
-            ("path", "goal_path", "goal_path"),
+            ("goal", "goal_pose", "goal_pose"),
+            ("cancel", "nav_cancel", "/nav/cancel"),
+            ("events", "mls_worker_event", "/nav/mls/worker_event"),
             ("surface_map", "surface_map", "mls_surface"),
             ("nodes", "nodes", "mls_nodes"),
             ("node_edges", "node_edges", "mls_node_edges"),
@@ -329,6 +330,29 @@ fn guarded_nav_scheduler(topics: &NavTopicConfig, planner: &str) -> ModuleNode {
     .depends_on_node("map_pose_adapter")
 }
 
+fn native_planner_path_adapter(
+    topics: &NavTopicConfig,
+    planner: &str,
+    goal: &str,
+    event: &str,
+    result: Option<&str>,
+) -> ModuleNode {
+    let mut node = ModuleNode::new(
+        "native_planner_path_adapter",
+        "Native Planner Canonical Path Adapter",
+        ModuleKind::Coordinator,
+    )
+    .with_feature("lcm-runtime")
+    .add_input(goal)
+    .add_input(event)
+    .add_output(topics.get_or("goal_path", "goal_path"))
+    .depends_on_node(planner);
+    if let Some(result) = result {
+        node = node.add_input(result);
+    }
+    node
+}
+
 // ---------- CmuNative ----------
 
 fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
@@ -438,9 +462,9 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             registered_scan: topic_for(topics, "registered_scan", "registered_scan"),
             odometry: topic_for(topics, "odometry", "odometry"),
             goal: Some(navigation_goal_topic(topics).to_string()),
-            stop_movement: topic_for(topics, "stop_movement", "stop_movement"),
-            way_point: topic_for(topics, "way_point", "way_point"),
-            goal_path: topic_for(topics, "goal_path", "goal_path"),
+            stop_movement: topic_for(topics, "nav_cancel", "/nav/cancel"),
+            way_point: topic_for(topics, "far_worker_event", "/nav/far/worker_event"),
+            goal_path: topic_for(topics, "far_planner_result", "/nav/far/planner_result"),
             graph_nodes: topic_for(topics, "graph_nodes", "graph_nodes"),
             graph_edges: topic_for(topics, "graph_edges", "graph_edges"),
             contour_polygons: topic_for(topics, "contour_polygons", "contour_polygons"),
@@ -469,9 +493,9 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("registered_scan", "registered_scan"))
             .add_input(topics.get_or("odometry", "odometry"))
             .add_input(navigation_goal_topic(topics))
-            .add_input(topics.get_or("stop_movement", "stop_movement"))
-            .add_output(topics.get_or("way_point", "way_point"))
-            .add_output(topics.get_or("goal_path", "goal_path"))
+            .add_input(topics.get_or("nav_cancel", "/nav/cancel"))
+            .add_output(topics.get_or("far_worker_event", "/nav/far/worker_event"))
+            .add_output(topics.get_or("far_planner_result", "/nav/far/planner_result"))
             .add_output(topics.get_or("nav_boundary", "nav_boundary"))
             .add_output(topics.get_or("graph_nodes", "graph_nodes"))
             .add_output(topics.get_or("graph_edges", "graph_edges"))
@@ -480,6 +504,21 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .depends_on_node("terrain_map_ext")
             .depends_on_node("pgo"),
     );
+
+    g.push_node(native_planner_path_adapter(
+        topics,
+        "far_planner",
+        navigation_goal_topic(topics),
+        topics.get_or("far_worker_event", "/nav/far/worker_event"),
+        Some(topics.get_or("far_planner_result", "/nav/far/planner_result")),
+    ));
+    g.push_edge(GraphEdge {
+        from: "far_planner".into(),
+        to: "native_planner_path_adapter".into(),
+        topic: topics
+            .get_or("far_planner_result", "/nav/far/planner_result")
+            .into(),
+    });
 
     // ---- local_planner ----
     #[cfg(all(feature = "native-runner", feature = "native-local"))]
@@ -599,11 +638,6 @@ fn build_cmu_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         from: "pgo".into(),
         to: "far_planner".into(),
         topic: "corrected_odometry".into(),
-    });
-    g.push_edge(GraphEdge {
-        from: "far_planner".into(),
-        to: "local_planner".into(),
-        topic: "way_point".into(),
     });
     g.push_edge(GraphEdge {
         from: "local_planner".into(),
@@ -746,11 +780,27 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
             .add_input(topics.get_or("region_bounds", "region_bounds"))
             .add_input(topics.get_or("start_pose", "start_pose"))
             .add_input(topics.get_or("goal_pose", "goal_pose"))
-            .add_output(topics.get_or("goal_path", "goal_path"))
+            .add_input(topics.get_or("nav_cancel", "/nav/cancel"))
+            .add_output(topics.get_or("mls_worker_event", "/nav/mls/worker_event"))
             .add_output(topics.get_or("surface_map", "mls_surface"))
             .add_output(topics.get_or("nodes", "mls_nodes"))
             .add_output(topics.get_or("node_edges", "mls_node_edges")),
     );
+
+    g.push_node(native_planner_path_adapter(
+        topics,
+        "mls_planner",
+        topics.get_or("goal_pose", "goal_pose"),
+        topics.get_or("mls_worker_event", "/nav/mls/worker_event"),
+        None,
+    ));
+    g.push_edge(GraphEdge {
+        from: "mls_planner".into(),
+        to: "native_planner_path_adapter".into(),
+        topic: topics
+            .get_or("mls_worker_event", "/nav/mls/worker_event")
+            .into(),
+    });
 
     g.push_node(
         ModuleNode::new(
@@ -779,12 +829,6 @@ fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
         .add_output(topics.get_or("stop_movement", "stop_movement"))
         .depends_on_node("basic_path_follower"),
     );
-
-    g.push_edge(GraphEdge {
-        from: "mls_planner".into(),
-        to: "basic_path_follower".into(),
-        topic: topics.get_or("goal_path", "goal_path").into(),
-    });
 }
 
 #[cfg(feature = "native-runner")]
@@ -899,7 +943,20 @@ mod tests {
                 .spec
                 .topics
                 .len(),
-            9
+            10
+        );
+        let planner = g.find("mls_planner").expect("MLS planner");
+        let adapter = g
+            .find("native_planner_path_adapter")
+            .expect("canonical adapter");
+        assert!(!planner.outputs.iter().any(|topic| topic == "goal_path"));
+        assert_eq!(adapter.outputs, vec!["goal_path"]);
+        assert_eq!(
+            g.nodes()
+                .iter()
+                .filter(|node| node.outputs.iter().any(|topic| topic == "goal_path"))
+                .count(),
+            1
         );
     }
 

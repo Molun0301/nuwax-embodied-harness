@@ -109,7 +109,12 @@ pub fn validate_guarded_profile(
         &mut report,
     );
 
-    for phantom in ["click_goal_router", "patrolling", "movement_manager"] {
+    for phantom in [
+        "click_goal_router",
+        "patrolling",
+        "basic_path_follower",
+        "movement_manager",
+    ] {
         if graph.find(phantom).is_some() {
             report.issues.push(ConformanceIssue {
                 check: "canonical-owner",
@@ -188,6 +193,7 @@ fn require_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{ModuleKind, ModuleNode};
     use crate::{NavFeatureFlags, NavStackBuilder};
     use nuwax_nav_test_fixtures::recorded_events::guarded_route_fixture;
 
@@ -208,6 +214,25 @@ mod tests {
                 "{profile} instantiated phantom nodes"
             );
         }
+    }
+
+    #[test]
+    fn raw_basic_follower_is_rejected_as_a_canonical_owner_bypass() {
+        let topics = NavTopicConfig::geometry_runtime_defaults();
+        let mut graph = NavStackBuilder::new(NavStackProfile::Simple2D)
+            .topics(topics.clone())
+            .build()
+            .expect("build profile");
+        graph.push_node(ModuleNode::new(
+            "basic_path_follower",
+            "Raw basic path follower",
+            ModuleKind::Coordinator,
+        ));
+
+        let report = validate_guarded_profile(NavStackProfile::Simple2D, &graph, &topics);
+        assert!(report.issues.iter().any(|issue| {
+            issue.check == "canonical-owner" && issue.detail.contains("basic_path_follower")
+        }));
     }
 
     #[test]

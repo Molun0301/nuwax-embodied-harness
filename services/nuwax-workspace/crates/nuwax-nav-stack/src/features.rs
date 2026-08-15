@@ -169,7 +169,7 @@ impl NavStackPreset {
     pub fn to_flags(self) -> NavFeatureFlags {
         match self {
             NavStackPreset::None => NavFeatureFlags::none(),
-            NavStackPreset::Simple => NavFeatureFlags::BASIC_FOLLOWER,
+            NavStackPreset::Simple => NavFeatureFlags::none(),
             NavStackPreset::Cmu => NavFeatureFlags::BASIC_FOLLOWER | NavFeatureFlags::MOVEMENT,
             NavStackPreset::Explore => {
                 NavFeatureFlags::BASIC_FOLLOWER
@@ -223,10 +223,11 @@ mod tests {
     }
 
     #[test]
-    fn preset_simple_enables_basic_follower() {
+    fn preset_simple_uses_the_canonical_guarded_scheduler_only() {
         let f = NavStackPreset::Simple.to_flags();
-        assert!(f.contains(NavFeatureFlags::BASIC_FOLLOWER));
-        assert!(!f.contains(NavFeatureFlags::MLS));
+        assert!(f.is_empty());
+        assert!(!f.contains(NavFeatureFlags::BASIC_FOLLOWER));
+        assert!(!f.contains(NavFeatureFlags::MOVEMENT));
     }
 
     #[test]

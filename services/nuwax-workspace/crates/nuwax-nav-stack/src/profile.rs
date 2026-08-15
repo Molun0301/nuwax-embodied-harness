@@ -16,8 +16,8 @@
 //!
 //! 方案 §6.8 规定 5 个 profile:
 //!
-//! - `Simple2D`:基于 `nuwax-nav-simple-planner` + `nuwax-nav-basic-path-follower`
-//!   的轻量纯 Rust pipeline。
+//! - `Simple2D`:基于 `nuwax-nav-simple-planner`，经 `guarded_nav_scheduler`
+//!   内部 `LocalPlanner` 接入 Motion Guard 的轻量纯 Rust pipeline。
 //! - `CmuNative`:基于 FAR + Local + PathFollower + PGO + `nuwax-nav-terrain-map-ext`
 //!   的 CMU stack,使用 native C++ bridge。
 //! - `ReplanningAStar`:基于 `nuwax-nav-astar` 的纯 Rust replanning pipeline。
@@ -96,7 +96,7 @@ impl NavStackProfile {
     pub fn description(&self) -> &'static str {
         match self {
             NavStackProfile::Simple2D => {
-                "纯 Rust 轻量 2D pipeline( simple-planner + basic-path-follower )"
+                "纯 Rust 轻量 2D pipeline(simple_planner -> guarded_nav_scheduler（内部 LocalPlanner）-> Motion Guard)"
             }
             NavStackProfile::CmuNative => {
                 "CMU 原生 native pipeline(FAR + Local + PathFollower + PGO + terrain-map-ext)"
@@ -137,6 +137,16 @@ mod tests {
             let parsed = NavStackProfile::from_cli_str(s).expect("parse");
             assert_eq!(*p, parsed);
         }
+    }
+
+    #[test]
+    fn simple2d_description_names_canonical_guarded_chain() {
+        let description = NavStackProfile::Simple2D.description();
+        assert!(description.contains("simple_planner"));
+        assert!(description.contains("guarded_nav_scheduler"));
+        assert!(description.contains("LocalPlanner"));
+        assert!(description.contains("Motion Guard"));
+        assert!(!description.contains("basic-path-follower"));
     }
 
     #[test]

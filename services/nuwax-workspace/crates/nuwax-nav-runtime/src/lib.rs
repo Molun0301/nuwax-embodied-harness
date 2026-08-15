@@ -1177,12 +1177,15 @@ where
                     path.session_id, path.path_revision
                 ),
             };
+            let qualified_cause = format!("SafetyFailed cause=PathMutation: {error}");
             self.finish_terminal(
                 status_tx,
                 TerminalOutcome::SafetyFailed,
                 SchedulerPhase::Failed,
             )
             .await?;
+            self.status.message = qualified_cause;
+            self.publish_status(status_tx);
             return Err(error);
         }
 
@@ -1226,6 +1229,7 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
         if let Some(reason) = self.stale_input_reason(Instant::now()) {
+            let qualified_cause = format!("SafetyFailed cause=StaleInput: {reason}");
             self.status.message = format!("planner input stale: {reason}; fencing");
             self.publish_status(status_tx);
             self.finish_terminal(
@@ -1234,6 +1238,8 @@ where
                 SchedulerPhase::Failed,
             )
             .await?;
+            self.status.message = qualified_cause;
+            self.publish_status(status_tx);
             return Ok(());
         }
         let step = self.planner.step(self.config.robot_width_m);
@@ -1275,6 +1281,7 @@ where
                     .await
             }
             LocalExecutionPayload::Failed(reason) => {
+                let qualified_cause = format!("PlannerFailed cause=LocalPlanner: {reason}");
                 self.status.message = format!("planner failed: {reason}; fencing");
                 self.publish_status(status_tx);
                 self.finish_terminal(
@@ -1282,7 +1289,10 @@ where
                     TerminalOutcome::PlannerFailed,
                     SchedulerPhase::Failed,
                 )
-                .await
+                .await?;
+                self.status.message = qualified_cause;
+                self.publish_status(status_tx);
+                Ok(())
             }
         }
     }
@@ -1377,6 +1387,20 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         original: RuntimeError,
     ) -> RuntimeError {
+        let cause_kind = match &original {
+            RuntimeError::InvalidInput { .. } => "InvalidInput",
+            RuntimeError::Busy(_) => "Busy",
+            RuntimeError::PathRejected { .. } => "PathRejected",
+            RuntimeError::PathMutation { .. } => "PathMutation",
+            RuntimeError::Motion(_) => "Motion",
+            RuntimeError::Planner(_) => "Planner",
+            RuntimeError::StaleInput(_) => "StaleInput",
+            RuntimeError::InvalidApplied(_) => "InvalidApplied",
+            RuntimeError::InvalidFence(_) => "InvalidFence",
+            RuntimeError::SchedulerStopped => "SchedulerStopped",
+            RuntimeError::SequenceExhausted => "SequenceExhausted",
+        };
+        let qualified_cause = format!("SafetyFailed cause={cause_kind}: {original}");
         match self
             .finish_terminal(
                 status_tx,
@@ -1385,7 +1409,11 @@ where
             )
             .await
         {
-            Ok(()) => original,
+            Ok(()) => {
+                self.status.message = qualified_cause;
+                self.publish_status(status_tx);
+                original
+            }
             Err(fence_error) => RuntimeError::Motion(format!(
                 "{original}; explicit fence also failed: {fence_error}"
             )),
@@ -2630,8 +2658,26 @@ mod tests {
             .submit_path(accepted.clone())
             .await
             .expect("exact same-revision replay is idempotent");
+        assert_eq!(handle.status().message, "versioned path accepted");
 
-        let mut mutation = accepted;
+        let mut wrong_identity = accepted.clone();
+        wrong_identity.session_id = "wrong-session".into();
+        wrong_identity.execution_identity.session_id = "wrong-session".into();
+        let rejected = handle
+            .submit_path(wrong_identity)
+            .await
+            .expect_err("wrong identity must be rejected without fencing");
+        assert!(matches!(rejected, RuntimeError::PathRejected { .. }));
+        assert_eq!(handle.status().phase, SchedulerPhase::Controlling);
+
+        let replacement = path_for("goal-1", 2);
+        handle
+            .submit_path(replacement.clone())
+            .await
+            .expect("higher revision replacement is accepted");
+        assert_eq!(handle.status().path_revision, 2);
+
+        let mut mutation = replacement;
         mutation.path = Path2D::stamped(
             NavFrameId::Map,
             Timestamp::default(),
@@ -2650,6 +2696,11 @@ mod tests {
         assert_eq!(terminal.path_revision, 0);
         assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert!(terminal
+            .message
+            .starts_with("SafetyFailed cause=PathMutation:"));
+        assert!(terminal.message.contains("path_revision=2"));
+        let terminal_cause = terminal.message.clone();
         assert_eq!(planner_state.lock().expect("planner").stops, 3);
 
         let twist_count_after_fence = motion_state
@@ -2679,6 +2730,11 @@ mod tests {
             .await
             .expect_err("terminal session must reject a late path replay");
         assert!(matches!(late, RuntimeError::PathRejected { .. }));
+        assert_eq!(handle.status().message, terminal_cause);
+        assert_eq!(
+            handle.status().last_zero_ack_id.as_deref(),
+            Some("zero-ack")
+        );
 
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
@@ -2765,7 +2821,13 @@ mod tests {
             .submit_path(path_for("retry-1", 1))
             .await
             .expect("first path");
-        wait_for_terminal(&handle, TerminalOutcome::PlannerFailed).await;
+        let terminal = wait_for_terminal(&handle, TerminalOutcome::PlannerFailed).await;
+        assert_eq!(
+            terminal.message,
+            "PlannerFailed cause=LocalPlanner: blocked"
+        );
+        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert!(!task.is_finished(), "planner failure must not stop owner");
 
         planner_state.lock().expect("planner").step = PlannerStep::Succeeded;
@@ -2918,6 +2980,11 @@ mod tests {
             "pose loss must park within TTL + one tick + fence"
         );
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+        assert!(terminal
+            .message
+            .starts_with("SafetyFailed cause=StaleInput:"));
+        assert!(terminal.message.contains("pose receipt age"));
         assert!(!terminal.planner_inputs_fresh);
         assert!(motion_state
             .lock()
@@ -3022,6 +3089,14 @@ mod tests {
             "ambiguous command failure must be fenced afterwards"
         );
         assert!(!handle.status().motion_sink_ready);
+        let terminal = handle.status();
+        assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
+        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert_eq!(
+            terminal.message,
+            "SafetyFailed cause=Motion: motion guard operation failed: injected APPLIED timeout"
+        );
     }
 
     #[tokio::test]

@@ -3170,6 +3170,11 @@ impl PlannerGoalBuffer {
         self.active_goal_sha256.is_some()
     }
 
+    #[cfg(feature = "simple-2d")]
+    fn clear_applied_goal(&mut self) {
+        self.active_goal_sha256 = None;
+    }
+
     fn cancelled_pending_goal(
         &self,
         cancel: &schema::CancelNavigation,
@@ -3192,6 +3197,21 @@ impl PlannerGoalBuffer {
         }
         matches
     }
+}
+
+#[cfg(feature = "simple-2d")]
+fn clear_simple_planner_active_projection(
+    goal_buffer: &mut PlannerGoalBuffer,
+    active_goal: &mut Option<schema::GoalEnvelope>,
+    active_boundary: &mut Option<NavigationBoundary>,
+    path_revision: &mut i64,
+    published_path_is_boundary_safe: &mut bool,
+) {
+    active_goal.take();
+    active_boundary.take();
+    *path_revision = 0;
+    *published_path_is_boundary_safe = false;
+    goal_buffer.clear_applied_goal();
 }
 
 #[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
@@ -4160,6 +4180,16 @@ async fn run_simple_planner(
                         }
                         OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                     }
+                }
+                if stop {
+                    // stop=true 只清理当前执行投影；保留 newest_goal 以便真实 replacement 继续按顺序准入。
+                    clear_simple_planner_active_projection(
+                        &mut goal_buffer,
+                        &mut active_goal,
+                        &mut active_boundary,
+                        &mut path_revision,
+                        &mut published_path_is_boundary_safe,
+                    );
                 }
             }
             _ = ticker.tick(), if goal_buffer.has_applied_goal() => {
@@ -6075,6 +6105,94 @@ mod simple_tests {
     }
 
     #[test]
+    fn simple_stop_clears_late_path_gate_and_accepts_real_replacement() {
+        let mut buffer = PlannerGoalBuffer::default();
+        assert!(buffer.observe_costmap().is_none());
+        let goal_a = planner_test_goal("simple-stop-a", 1);
+        let ready_a = match buffer.observe_goal(goal_a.clone()) {
+            PlannerGoalIngress::Ready(goal) => *goal,
+            outcome => panic!("goal A must be ready: {outcome:?}"),
+        };
+        assert!(buffer.mark_applied(&ready_a));
+
+        let mut active_goal = Some(ready_a);
+        let mut active_boundary =
+            Some(NavigationBoundary::new(&goal_a.boundary_points).expect("goal A boundary"));
+        let mut path_revision = 3_i64;
+        let mut published_path_is_boundary_safe = true;
+        assert!(active_goal.is_some());
+        assert!(active_boundary.is_some());
+        assert_eq!(path_revision, 3);
+        assert!(published_path_is_boundary_safe);
+
+        clear_simple_planner_active_projection(
+            &mut buffer,
+            &mut active_goal,
+            &mut active_boundary,
+            &mut path_revision,
+            &mut published_path_is_boundary_safe,
+        );
+
+        let mut module = SimplePlannerModule::new();
+        Module::start(&mut module).expect("start simple planner");
+        let mut robot_pose = PoseStamped::from_pose(Pose3::default(), NavFrameId::Map);
+        robot_pose.stamp = Timestamp::from_unix(30, 0);
+        Module::on_odometry(&mut module, robot_pose).expect("simple planner pose");
+        Module::on_stop_movement(&mut module, true).expect("first stop");
+        assert!(matches!(
+            Module::tick(&mut module).expect("first post-stop tick"),
+            ModuleOutput::SafetyHold {
+                reason: nuwax_nav_simple_planner::module::HoldReason::StopRequested,
+                ..
+            }
+        ));
+        assert!(
+            !buffer.has_applied_goal(),
+            "the first StopRequested hold must not be wrapped as a late PathEnvelope"
+        );
+        Module::on_stop_movement(&mut module, true).expect("repeated stop");
+        assert!(matches!(
+            Module::tick(&mut module).expect("repeated post-stop tick"),
+            ModuleOutput::SafetyHold {
+                reason: nuwax_nav_simple_planner::module::HoldReason::StopRequested,
+                ..
+            }
+        ));
+
+        assert!(
+            !buffer.has_applied_goal(),
+            "stop must gate every later tick"
+        );
+        assert!(active_goal.is_none());
+        assert!(active_boundary.is_none());
+        assert_eq!(path_revision, 0);
+        assert!(!published_path_is_boundary_safe);
+        assert_eq!(
+            buffer
+                .newest_goal
+                .as_ref()
+                .map(|goal| goal.session_id.as_str()),
+            Some("simple-stop-a"),
+            "stop retains the ordering watermark"
+        );
+
+        let goal_b = planner_test_goal("simple-stop-b", 2);
+        let ready_b = match buffer.observe_goal(goal_b.clone()) {
+            PlannerGoalIngress::Ready(goal) => *goal,
+            outcome => panic!("real replacement must be accepted: {outcome:?}"),
+        };
+        assert!(buffer.mark_applied(&ready_b));
+        assert!(buffer.has_applied_goal());
+        assert_eq!(
+            buffer
+                .newest_goal
+                .as_ref()
+                .map(|goal| goal.session_id.as_str()),
+            Some("simple-stop-b")
+        );
+    }
+
+    #[test]
     fn simple_new_goal_ignores_map_metadata_and_builds_correlated_path() {
         let mut planner = SimplePlannerModule::new();
         Module::start(&mut planner).expect("start simple planner");
@@ -7413,6 +7531,89 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn guarded_succeeded_terminal_rejects_late_path_without_losing_zero_ack() {
+        let harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+        let path = sealed_path(&goal);
+        harness.send_path(&path);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().path_revision != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("path accepted before success");
+
+        harness
+            .planner_succeeds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().last_terminal != Some(TerminalOutcome::Succeeded) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("scheduler success terminal");
+        let terminal = harness.scheduler.status();
+        assert_eq!(terminal.phase, SchedulerPhase::Idle);
+        let zero_ack = terminal
+            .last_zero_ack_id
+            .clone()
+            .expect("Succeeded terminal ZeroAck");
+        assert!(!zero_ack.is_empty());
+
+        harness.send_path(&path);
+        let mut wrong_identity = path.clone();
+        wrong_identity.session_id.push_str("-wrong");
+        schema::seal_path_envelope(&mut wrong_identity).expect("seal wrong identity path");
+        harness.send_path(&wrong_identity);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_late = harness.scheduler.status();
+        assert_eq!(after_late.phase, SchedulerPhase::Idle);
+        assert_eq!(after_late.last_terminal, Some(TerminalOutcome::Succeeded));
+        assert_eq!(
+            after_late.last_zero_ack_id.as_deref(),
+            Some(zero_ack.as_str())
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_active_same_revision_mutation_remains_safety_failed() {
+        let harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+        let path = sealed_path(&goal);
+        harness.send_path(&path);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().path_revision != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("original path accepted");
+
+        let mut mutation = path;
+        mutation.path.poses[0].pose.position[0] += 0.25;
+        schema::seal_path_envelope(&mut mutation).expect("seal same-revision mutation");
+        harness.send_path(&mutation);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.scheduler.status().last_terminal != Some(TerminalOutcome::SafetyFailed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same-revision mutation SafetyFailed");
+        let failed = harness.scheduler.status();
+        assert_eq!(failed.phase, SchedulerPhase::Failed);
+        assert!(!failed
+            .last_zero_ack_id
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        harness.shutdown().await;
+    }
+
     #[test]
     fn terminal_cleanup_allows_continuous_a_then_b_without_busy_preempt() {
         let mut active = Some(active_goal("goal-a"));
@@ -7450,6 +7651,30 @@ mod guarded_tests {
         let published =
             build_guarded_navigation_state(&rejected, &telemetry, None, Duration::from_secs(1));
         assert_eq!(published.state, 1, "rejection must not fabricate FAILED");
+    }
+
+    #[test]
+    fn terminal_cleanup_preserves_every_qualified_outcome() {
+        for (outcome, phase) in [
+            (TerminalOutcome::Cancelled, SchedulerPhase::Idle),
+            (TerminalOutcome::PlannerFailed, SchedulerPhase::Failed),
+            (TerminalOutcome::SafetyFailed, SchedulerPhase::Failed),
+            (TerminalOutcome::Shutdown, SchedulerPhase::Idle),
+        ] {
+            let mut active = Some(active_goal("terminal-matrix"));
+            let status = nuwax_nav_runtime::SchedulerStatus {
+                phase,
+                last_terminal: Some(outcome),
+                last_zero_ack_id: Some("matrix-zero-ack".into()),
+                last_fence_monotonic_ns: 42,
+                ..nuwax_nav_runtime::SchedulerStatus::default()
+            };
+            assert!(clear_terminal_active_session(&mut active, &status));
+            assert!(active.is_none());
+            assert_eq!(status.last_terminal, Some(outcome));
+            assert_eq!(status.last_zero_ack_id.as_deref(), Some("matrix-zero-ack"));
+            assert_eq!(status.last_fence_monotonic_ns, 42);
+        }
     }
 
     #[test]

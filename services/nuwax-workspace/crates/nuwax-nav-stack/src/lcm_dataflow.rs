@@ -826,6 +826,64 @@ struct GuardedNavTelemetry {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn guarded_goal_execution_identity(
+    goal: &schema::GoalEnvelope,
+) -> nuwax_nav_runtime::PathExecutionIdentity {
+    nuwax_nav_runtime::PathExecutionIdentity {
+        session_id: goal.session_id.clone(),
+        owner_kind: goal.owner_kind,
+        parent_request_id: goal.parent_request_id.clone(),
+        goal_generation: goal.goal_generation,
+        producer: goal.producer.clone(),
+        producer_epoch: goal.producer_epoch,
+        producer_runtime_generation: goal.producer_runtime_generation,
+        committed_map_session_id: goal.committed_map_session_id.clone(),
+        committed_map_session_generation: goal.committed_map_session_generation,
+        committed_map_revision: goal.committed_map_revision,
+        committed_map_payload_sha256: goal.committed_map_payload_sha256,
+        committed_map_frame_id: goal.committed_map_frame_id.clone(),
+        boundary_id: goal.boundary_id.clone(),
+        boundary_sha256: goal.boundary_sha256,
+        motion_guard_generation: goal.motion_guard_generation,
+        motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+        motion_stop_generation: goal.motion_stop_generation,
+        planner_runtime_generation: 0,
+        path_revision: 0,
+        goal_payload_sha256: goal.payload_sha256,
+        path_payload_sha256: [0; 32],
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+fn guarded_path_execution_identity(
+    path: &schema::PathEnvelope,
+) -> nuwax_nav_runtime::PathExecutionIdentity {
+    nuwax_nav_runtime::PathExecutionIdentity {
+        session_id: path.session_id.clone(),
+        owner_kind: path.owner_kind,
+        parent_request_id: path.parent_request_id.clone(),
+        goal_generation: path.goal_generation,
+        producer: path.producer.clone(),
+        producer_epoch: path.producer_epoch,
+        producer_runtime_generation: path.producer_runtime_generation,
+        committed_map_session_id: path.committed_map_session_id.clone(),
+        committed_map_session_generation: path.committed_map_session_generation,
+        committed_map_revision: path.committed_map_revision,
+        committed_map_payload_sha256: path.committed_map_payload_sha256,
+        committed_map_frame_id: path.committed_map_frame_id.clone(),
+        boundary_id: path.boundary_id.clone(),
+        boundary_sha256: path.boundary_sha256,
+        motion_guard_generation: path.motion_guard_generation,
+        motion_guard_boot_nonce: path.motion_guard_boot_nonce,
+        motion_stop_generation: path.motion_stop_generation,
+        planner_runtime_generation: path.planner_runtime_generation,
+        path_revision: u64::try_from(path.path_revision).expect("validated positive path revision"),
+        goal_payload_sha256: path.goal_payload_sha256,
+        path_payload_sha256: path.path_payload_sha256,
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 #[derive(Clone)]
 struct GuardedCancelTerminal {
     goal: schema::GoalEnvelope,
@@ -1451,6 +1509,7 @@ async fn run_guarded_nav_loop(
                 }
                 let result = scheduler.submit_path(nuwax_nav_runtime::VersionedPath {
                     session_id: path_envelope.session_id.clone(),
+                    execution_identity: guarded_path_execution_identity(&path_envelope),
                     path_revision: u64::try_from(path_envelope.path_revision)
                         .expect("validated positive path revision"),
                     payload_hash: path_envelope.path_payload_sha256,
@@ -1695,6 +1754,8 @@ async fn run_guarded_nav_loop(
                         let session_id = buffered_goal.session_id.clone();
                         let session = nuwax_nav_runtime::NavSession {
                             session_id: session_id.clone(),
+                            execution_identity: guarded_goal_execution_identity(&buffered_goal),
+                            local_owner_runtime_generation: process_runtime_generation,
                             motion_admission: nuwax_nav_runtime::NavMotionAdmission {
                                 guard_generation: u64::try_from(
                                     buffered_goal.motion_guard_generation,
@@ -1972,6 +2033,8 @@ async fn activate_guarded_goal(
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
             session_id: goal_envelope.session_id.clone(),
+            execution_identity: guarded_goal_execution_identity(&goal_envelope),
+            local_owner_runtime_generation: runtime_generation(),
             motion_admission: nuwax_nav_runtime::NavMotionAdmission {
                 guard_generation: u64::try_from(goal_envelope.motion_guard_generation)
                     .expect("validated positive motion_guard_generation"),
@@ -7135,6 +7198,8 @@ mod guarded_tests {
             .scheduler
             .start_session(nuwax_nav_runtime::NavSession {
                 session_id: blocker.session_id.clone(),
+                execution_identity: guarded_goal_execution_identity(&blocker),
+                local_owner_runtime_generation: runtime_generation(),
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
                     guard_generation: u64::try_from(blocker.motion_guard_generation)
                         .expect("positive blocker guard generation"),
@@ -7907,20 +7972,30 @@ mod guarded_tests {
             })
             .await
             .expect("map-a costmap");
+        let goal_a = sealed_goal("session-a");
+        let mut path_identity = guarded_goal_execution_identity(&goal_a);
+        path_identity.planner_runtime_generation = 1;
+        path_identity.path_revision = 1;
+        path_identity.path_payload_sha256 = [0x11; 32];
         handle
             .start_session(nuwax_nav_runtime::NavSession {
-                session_id: "session-a".into(),
+                session_id: goal_a.session_id.clone(),
+                execution_identity: guarded_goal_execution_identity(&goal_a),
+                local_owner_runtime_generation: runtime_generation(),
                 motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-                    guard_generation: 7,
-                    guard_boot_nonce: [7; 16],
-                    motion_stop_generation: 1,
+                    guard_generation: u64::try_from(goal_a.motion_guard_generation)
+                        .expect("positive guard generation"),
+                    guard_boot_nonce: goal_a.motion_guard_boot_nonce,
+                    motion_stop_generation: u64::try_from(goal_a.motion_stop_generation)
+                        .expect("non-negative stop generation"),
                 },
             })
             .await
             .expect("map-a session");
         handle
             .submit_path(nuwax_nav_runtime::VersionedPath {
-                session_id: "session-a".into(),
+                session_id: goal_a.session_id.clone(),
+                execution_identity: path_identity,
                 path_revision: 1,
                 payload_hash: [0x11; 32],
                 path: Path2D::stamped(
@@ -7947,7 +8022,6 @@ mod guarded_tests {
         .await
         .expect("map-a APPLIED command");
 
-        let goal_a = sealed_goal("session-a");
         let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         let mut goal_buffer = PlannerGoalBuffer::default();
         assert!(goal_buffer.observe_costmap().is_none());

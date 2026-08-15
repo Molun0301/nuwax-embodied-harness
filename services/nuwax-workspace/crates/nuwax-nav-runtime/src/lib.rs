@@ -71,11 +71,90 @@ pub struct NavMotionAdmission {
     pub motion_stop_generation: u64,
 }
 
+/// Complete in-process execution identity correlated from sealed goal and path envelopes.
+///
+/// This type is deliberately not a wire schema. Goal admission initializes the
+/// goal-level fields and leaves the planner/path fields at their neutral values;
+/// an accepted path carries the same goal-level fields plus its sealed planner
+/// generation, revision, and payload digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathExecutionIdentity {
+    /// Stable goal/session identifier.
+    pub session_id: String,
+    /// Lease owner kind.
+    pub owner_kind: i32,
+    /// Public request that owns the lease.
+    pub parent_request_id: String,
+    /// Monotonic goal generation.
+    pub goal_generation: i64,
+    /// Stable goal producer name.
+    pub producer: String,
+    /// Goal producer epoch.
+    pub producer_epoch: i64,
+    /// Runtime generation that sealed and owns the goal.
+    pub producer_runtime_generation: i64,
+    /// Committed mapping session identifier.
+    pub committed_map_session_id: String,
+    /// Committed mapping-session generation.
+    pub committed_map_session_generation: i64,
+    /// Committed map revision.
+    pub committed_map_revision: i64,
+    /// Committed map payload digest.
+    pub committed_map_payload_sha256: [u8; 32],
+    /// Authoritative committed map frame.
+    pub committed_map_frame_id: String,
+    /// Navigation boundary identifier.
+    pub boundary_id: String,
+    /// Navigation boundary digest.
+    pub boundary_sha256: [u8; 32],
+    /// Admitted Motion Guard generation.
+    pub motion_guard_generation: i64,
+    /// Admitted Motion Guard boot nonce.
+    pub motion_guard_boot_nonce: [u8; 16],
+    /// Admitted global stop generation.
+    pub motion_stop_generation: i64,
+    /// Planner runtime generation that produced the path; zero before path admission.
+    pub planner_runtime_generation: i64,
+    /// Monotonic path revision; zero before path admission.
+    pub path_revision: u64,
+    /// Canonical goal payload digest.
+    pub goal_payload_sha256: [u8; 32],
+    /// Canonical path payload digest; zero before path admission.
+    pub path_payload_sha256: [u8; 32],
+}
+
+impl PathExecutionIdentity {
+    fn has_same_goal_identity(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.owner_kind == other.owner_kind
+            && self.parent_request_id == other.parent_request_id
+            && self.goal_generation == other.goal_generation
+            && self.producer == other.producer
+            && self.producer_epoch == other.producer_epoch
+            && self.producer_runtime_generation == other.producer_runtime_generation
+            && self.committed_map_session_id == other.committed_map_session_id
+            && self.committed_map_session_generation == other.committed_map_session_generation
+            && self.committed_map_revision == other.committed_map_revision
+            && self.committed_map_payload_sha256 == other.committed_map_payload_sha256
+            && self.committed_map_frame_id == other.committed_map_frame_id
+            && self.boundary_id == other.boundary_id
+            && self.boundary_sha256 == other.boundary_sha256
+            && self.motion_guard_generation == other.motion_guard_generation
+            && self.motion_guard_boot_nonce == other.motion_guard_boot_nonce
+            && self.motion_stop_generation == other.motion_stop_generation
+            && self.goal_payload_sha256 == other.goal_payload_sha256
+    }
+}
+
 /// One navigation session and its request-level motion admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavSession {
     /// Stable goal/session identifier.
     pub session_id: String,
+    /// Complete sealed goal identity expected on every admitted path.
+    pub execution_identity: PathExecutionIdentity,
+    /// Runtime generation of the unique local-execution owner.
+    pub local_owner_runtime_generation: u64,
     /// Request-level motion admission proof transported with the goal.
     pub motion_admission: NavMotionAdmission,
 }
@@ -85,6 +164,8 @@ pub struct NavSession {
 pub struct VersionedPath {
     /// Goal/session identifier copied from the versioned goal envelope.
     pub session_id: String,
+    /// Complete identity copied from the sealed goal and path envelopes.
+    pub execution_identity: PathExecutionIdentity,
     /// Monotonic path revision within the active navigation session.
     pub path_revision: u64,
     /// Canonical payload digest supplied by the versioned codec.
@@ -575,6 +656,21 @@ pub enum PlannerStep {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct LocalExecutionCommandIntent {
+    identity: PathExecutionIdentity,
+    sequence: u64,
+    owner_runtime_generation: u64,
+    payload: LocalExecutionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LocalExecutionPayload {
+    Command(Twist2),
+    Succeeded,
+    Failed(String),
+}
+
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
     /// Replace the active plan after version validation.
@@ -654,6 +750,8 @@ pub struct NavScheduler<M, P> {
     current_path_revision: u64,
     current_payload_hash: Option<[u8; 32]>,
     current_path: Option<Path2D>,
+    current_execution_identity: Option<PathExecutionIdentity>,
+    local_intent_sequence: u64,
     path_wait_started_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
     costmap_receipt: Option<PlannerInputReceipt>,
@@ -689,6 +787,8 @@ where
             current_path_revision: 0,
             current_payload_hash: None,
             current_path: None,
+            current_execution_identity: None,
+            local_intent_sequence: 0,
             path_wait_started_at: None,
             pose_receipt: None,
             costmap_receipt: None,
@@ -934,6 +1034,8 @@ where
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
+        self.current_execution_identity = None;
+        self.local_intent_sequence = 0;
         self.path_wait_started_at = None;
         self.status = SchedulerStatus {
             phase: SchedulerPhase::Acquiring,
@@ -992,6 +1094,8 @@ where
                 self.current_path_revision = 0;
                 self.current_payload_hash = None;
                 self.current_path = None;
+                self.current_execution_identity = None;
+                self.local_intent_sequence = 0;
                 self.status.phase = SchedulerPhase::Failed;
                 self.status.session_id = None;
                 self.status.path_revision = 0;
@@ -1020,24 +1124,28 @@ where
         {
             return Err(path_rejected("active session is not accepting paths"));
         }
-        if path.session_id != session.session_id {
-            return Err(path_rejected(format!(
-                "session {} does not match active {}",
-                path.session_id, session.session_id
-            )));
+        if path.session_id != session.session_id
+            || !path
+                .execution_identity
+                .has_same_goal_identity(&session.execution_identity)
+        {
+            return Err(path_rejected(
+                "path execution identity does not match the active navigation session",
+            ));
         }
         if path.path_revision < self.current_path_revision {
             return Err(path_rejected("path revision is stale"));
         }
         if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
             let immutable = self.current_payload_hash == Some(path.payload_hash)
-                && self.current_path.as_ref() == Some(&path.path);
+                && self.current_path.as_ref() == Some(&path.path)
+                && self.current_execution_identity.as_ref() == Some(&path.execution_identity);
             if immutable {
                 return Ok(());
             }
             let error = RuntimeError::PathMutation {
                 reason: format!(
-                    "session={} path_revision={} changed payload",
+                    "session={} path_revision={} changed identity or payload",
                     path.session_id, path.path_revision
                 ),
             };
@@ -1054,6 +1162,7 @@ where
         self.current_path_revision = path.path_revision;
         self.current_payload_hash = Some(path.payload_hash);
         self.current_path = Some(path.path);
+        self.current_execution_identity = Some(path.execution_identity);
         self.path_wait_started_at = None;
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
@@ -1099,8 +1208,15 @@ where
             .await?;
             return Ok(());
         }
-        match self.planner.step(self.config.robot_width_m) {
-            PlannerStep::Command(twist) => {
+        let step = self.planner.step(self.config.robot_width_m);
+        let intent = self.wrap_local_intent(step)?;
+        if !self.local_intent_is_current(&intent) {
+            self.status.message = "stale local execution intent rejected".into();
+            self.publish_status(status_tx);
+            return Ok(());
+        }
+        match intent.payload {
+            LocalExecutionPayload::Command(twist) => {
                 if let Err(error) = validate_twist(twist) {
                     return Err(self.fail_closed(status_tx, error).await);
                 }
@@ -1126,11 +1242,11 @@ where
                 self.publish_status(status_tx);
                 Ok(())
             }
-            PlannerStep::Succeeded => {
+            LocalExecutionPayload::Succeeded => {
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
                     .await
             }
-            PlannerStep::Failed(reason) => {
+            LocalExecutionPayload::Failed(reason) => {
                 self.status.message = format!("planner failed: {reason}; fencing");
                 self.publish_status(status_tx);
                 self.finish_terminal(
@@ -1141,6 +1257,53 @@ where
                 .await
             }
         }
+    }
+
+    fn wrap_local_intent(
+        &mut self,
+        step: PlannerStep,
+    ) -> Result<LocalExecutionCommandIntent, RuntimeError> {
+        self.local_intent_sequence = self
+            .local_intent_sequence
+            .checked_add(1)
+            .ok_or(RuntimeError::SequenceExhausted)?;
+        let identity = self.current_execution_identity.clone().ok_or_else(|| {
+            RuntimeError::Planner("local planner produced an intent without an active path".into())
+        })?;
+        let owner_runtime_generation = self
+            .session
+            .as_ref()
+            .map(|session| session.local_owner_runtime_generation)
+            .ok_or_else(|| {
+                RuntimeError::Planner(
+                    "local planner produced an intent without an active session".into(),
+                )
+            })?;
+        let payload = match step {
+            PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
+            PlannerStep::Succeeded => LocalExecutionPayload::Succeeded,
+            PlannerStep::Failed(reason) => LocalExecutionPayload::Failed(reason),
+        };
+        Ok(LocalExecutionCommandIntent {
+            identity,
+            sequence: self.local_intent_sequence,
+            owner_runtime_generation,
+            payload,
+        })
+    }
+
+    fn local_intent_is_current(&self, intent: &LocalExecutionCommandIntent) -> bool {
+        self.lease_active
+            && self.status.phase == SchedulerPhase::Controlling
+            && intent.sequence != 0
+            && intent.sequence == self.local_intent_sequence
+            && self.current_execution_identity.as_ref() == Some(&intent.identity)
+            && self.session.as_ref().is_some_and(|session| {
+                session.local_owner_runtime_generation == intent.owner_runtime_generation
+                    && intent
+                        .identity
+                        .has_same_goal_identity(&session.execution_identity)
+            })
     }
 
     async fn session_tick(
@@ -1207,6 +1370,9 @@ where
         terminal: TerminalOutcome,
         phase_after: SchedulerPhase,
     ) -> Result<(), RuntimeError> {
+        self.current_execution_identity = None;
+        self.local_intent_sequence = 0;
+        self.planner.stop();
         let had_lease = self.lease_active;
         let mut verified_fence = None;
         if had_lease {
@@ -1241,6 +1407,8 @@ where
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
+        self.current_execution_identity = None;
+        self.local_intent_sequence = 0;
         self.path_wait_started_at = None;
         self.status.phase = phase_after;
         self.status.session_id = None;
@@ -1522,6 +1690,18 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
             reason: "must not be empty".into(),
         });
     }
+    if session.session_id != session.execution_identity.session_id {
+        return Err(RuntimeError::InvalidInput {
+            field: "execution_identity.session_id",
+            reason: "must equal session_id".into(),
+        });
+    }
+    if session.local_owner_runtime_generation == 0 {
+        return Err(RuntimeError::InvalidInput {
+            field: "local_owner_runtime_generation",
+            reason: "must be non-zero".into(),
+        });
+    }
     if session.motion_admission.guard_generation == 0 {
         return Err(RuntimeError::InvalidInput {
             field: "motion_admission.guard_generation",
@@ -1539,6 +1719,18 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
             reason: "must not be all zero".into(),
         });
     }
+    if session.execution_identity.motion_guard_generation
+        != i64::try_from(session.motion_admission.guard_generation).unwrap_or(i64::MAX)
+        || session.execution_identity.motion_guard_boot_nonce
+            != session.motion_admission.guard_boot_nonce
+        || session.execution_identity.motion_stop_generation
+            != i64::try_from(session.motion_admission.motion_stop_generation).unwrap_or(i64::MAX)
+    {
+        return Err(RuntimeError::InvalidInput {
+            field: "execution_identity.motion_admission",
+            reason: "must equal the request-level motion admission".into(),
+        });
+    }
     Ok(())
 }
 
@@ -1549,16 +1741,30 @@ fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
             reason: "must not be empty".into(),
         });
     }
-    if path.path_revision == 0 {
+    if path.session_id != path.execution_identity.session_id {
         return Err(RuntimeError::InvalidInput {
-            field: "path.revision",
-            reason: "path revision must be non-zero".into(),
+            field: "path.execution_identity.session_id",
+            reason: "must equal path.session_id".into(),
         });
     }
-    if path.payload_hash == [0; 32] {
+    if path.path_revision == 0 || path.path_revision != path.execution_identity.path_revision {
+        return Err(RuntimeError::InvalidInput {
+            field: "path.revision",
+            reason: "must be non-zero and equal the execution identity revision".into(),
+        });
+    }
+    if path.payload_hash == [0; 32]
+        || path.payload_hash != path.execution_identity.path_payload_sha256
+    {
         return Err(RuntimeError::InvalidInput {
             field: "path.payload_hash",
-            reason: "must not be all zero".into(),
+            reason: "must be non-zero and equal the execution identity digest".into(),
+        });
+    }
+    if path.execution_identity.planner_runtime_generation <= 0 {
+        return Err(RuntimeError::InvalidInput {
+            field: "path.execution_identity.planner_runtime_generation",
+            reason: "must be positive".into(),
         });
     }
     if path.path.is_empty() {
@@ -2066,9 +2272,41 @@ mod tests {
         spawn_scheduler(scheduler)
     }
 
+    fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
+        PathExecutionIdentity {
+            session_id: session_id.into(),
+            owner_kind: 1,
+            parent_request_id: format!("request-{session_id}"),
+            goal_generation: 1,
+            producer: "test-producer".into(),
+            producer_epoch: 1,
+            producer_runtime_generation: 1,
+            committed_map_session_id: "map-session".into(),
+            committed_map_session_generation: 1,
+            committed_map_revision: 1,
+            committed_map_payload_sha256: [3; 32],
+            committed_map_frame_id: "map".into(),
+            boundary_id: String::new(),
+            boundary_sha256: [0; 32],
+            motion_guard_generation: 7,
+            motion_guard_boot_nonce: [7; 16],
+            motion_stop_generation: 1,
+            planner_runtime_generation: i64::from(path_revision != 0),
+            path_revision,
+            goal_payload_sha256: [4; 32],
+            path_payload_sha256: if path_revision == 0 {
+                [0; 32]
+            } else {
+                [u8::try_from(path_revision).unwrap_or(u8::MAX); 32]
+            },
+        }
+    }
+
     fn session_for(session_id: &str) -> NavSession {
         NavSession {
             session_id: session_id.into(),
+            execution_identity: execution_identity_for(session_id, 0),
+            local_owner_runtime_generation: 1,
             motion_admission: NavMotionAdmission {
                 guard_generation: 7,
                 guard_boot_nonce: [7; 16],
@@ -2084,6 +2322,7 @@ mod tests {
     fn path_for(session_id: &str, path_revision: u64) -> VersionedPath {
         VersionedPath {
             session_id: session_id.into(),
+            execution_identity: execution_identity_for(session_id, path_revision),
             path_revision,
             payload_hash: [u8::try_from(path_revision).unwrap_or(u8::MAX); 32],
             path: Path2D::stamped(
@@ -2218,6 +2457,83 @@ mod tests {
         let calls = motion_state.lock().expect("motion").calls.clone();
         assert!(calls.iter().any(|call| call.starts_with("twist:")));
         assert!(calls.iter().any(|call| call.starts_with("fence:")));
+
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("task result");
+    }
+
+    #[tokio::test]
+    async fn same_revision_replay_is_idempotent_but_mutation_fences_motion() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) = test_scheduler(
+            FakeMotion(Arc::clone(&motion_state)),
+            FakePlanner::commanding(),
+        );
+        wait_for_sink(&handle).await;
+        handle.update_odometry(map_pose()).await.expect("map pose");
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .expect("costmap");
+        handle.start_session(session()).await.expect("session");
+
+        let accepted = path();
+        handle
+            .submit_path(accepted.clone())
+            .await
+            .expect("initial path");
+        handle
+            .submit_path(accepted.clone())
+            .await
+            .expect("exact same-revision replay is idempotent");
+
+        let mut mutation = accepted;
+        mutation.path = Path2D::stamped(
+            NavFrameId::Map,
+            Timestamp::default(),
+            vec![Point2::new(3.0, 0.0), Point2::new(4.0, 0.0)],
+        );
+        let error = handle
+            .submit_path(mutation)
+            .await
+            .expect_err("same-revision mutation must fail closed");
+        assert!(matches!(error, RuntimeError::PathMutation { .. }));
+
+        let terminal = handle.status();
+        assert_eq!(terminal.phase, SchedulerPhase::Failed);
+        assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
+        assert_eq!(terminal.session_id, None);
+        assert_eq!(terminal.path_revision, 0);
+        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+
+        let twist_count_after_fence = motion_state
+            .lock()
+            .expect("motion")
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("twist:"))
+            .count();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        {
+            let motion = motion_state.lock().expect("motion");
+            assert_eq!(
+                motion
+                    .calls
+                    .iter()
+                    .filter(|call| call.starts_with("twist:"))
+                    .count(),
+                twist_count_after_fence,
+                "the old path must not submit motion after its mutation fence"
+            );
+            assert!(motion.calls.iter().any(|call| call.starts_with("fence:")));
+        }
+
+        let late = handle
+            .submit_path(path())
+            .await
+            .expect_err("terminal session must reject a late path replay");
+        assert!(matches!(late, RuntimeError::PathRejected { .. }));
 
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");

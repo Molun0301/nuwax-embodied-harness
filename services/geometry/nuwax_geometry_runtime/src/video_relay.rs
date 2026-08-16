@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
@@ -400,6 +400,30 @@ impl StableDirectory {
             )
         };
         if result == 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(nix::libc::ENOENT | nix::libc::EPERM)
+        ) {
+            return Err(error);
+        }
+
+        // Jetson 5.10 的无特权进程不能用 AT_EMPTY_PATH 链接已打开的
+        // socket inode；procfd 仍指向同一身份，且目标端保持不覆盖语义。
+        let procfd = CString::new(format!("/proc/self/fd/{}", identity.as_raw_fd())).unwrap();
+        let fallback = unsafe {
+            nix::libc::linkat(
+                nix::libc::AT_FDCWD,
+                procfd.as_ptr(),
+                self.file.as_raw_fd(),
+                target.as_ptr(),
+                nix::libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        if fallback == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -527,6 +551,70 @@ enum EntryRole {
     Shm,
     Uds,
     Lease,
+}
+
+struct UnpublishedEntry {
+    directory: StableDirectory,
+    name: OsString,
+    public_path: PathBuf,
+    identity_file: Option<File>,
+    armed: bool,
+}
+
+impl UnpublishedEntry {
+    fn new(
+        directory: StableDirectory,
+        name: OsString,
+        public_path: PathBuf,
+        identity_file: File,
+    ) -> Self {
+        Self {
+            directory,
+            name,
+            public_path,
+            identity_file: Some(identity_file),
+            armed: true,
+        }
+    }
+
+    fn file(&self) -> &File {
+        self.identity_file.as_ref().unwrap()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnpublishedEntry {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(identity_file) = self.identity_file.take() else {
+            return;
+        };
+        let Ok(identity) = identity_file.metadata() else {
+            return;
+        };
+        let candidate_anchor = PathAnchor {
+            directory: self.directory.clone(),
+            name: self.name.clone(),
+            public_path: self.public_path.clone(),
+        };
+        let cleanup = OwnedEntry {
+            anchor: candidate_anchor,
+            name: self.name.clone(),
+            identity_file,
+            device: identity.dev(),
+            inode: identity.ino(),
+            role: EntryRole::Shm,
+        }
+        .cleanup();
+        if !cleanup.is_complete() {
+            error!(?cleanup, "清理未发布视频节点失败");
+        }
+    }
 }
 
 struct OwnedEntry {
@@ -1003,6 +1091,11 @@ mod process_helper {
     pub(super) const FAULT_PAUSE_AFTER_PARENT_TERMINAL: u64 = 1 << 21;
     pub(super) const FAULT_PAUSE_AFTER_UDS_BIND_BEFORE_IDENTITY: u64 = 1 << 22;
     pub(super) const FAULT_PAUSE_AFTER_UDS_IDENTITY_BEFORE_PUBLISH: u64 = 1 << 23;
+    pub(super) const FAULT_SHM_PERMISSIONS: u64 = 1 << 24;
+    pub(super) const FAULT_SHM_METADATA: u64 = 1 << 25;
+    pub(super) const FAULT_SHM_TRY_CLONE: u64 = 1 << 26;
+    pub(super) const FAULT_SHM_IDENTITY: u64 = 1 << 27;
+    pub(super) const FAULT_SHM_PUBLISH_REPLACEMENT: u64 = 1 << 28;
 
     const HELPER_CODE_STOP_REQUESTED: u32 = 1;
     const HELPER_CODE_INIT_SHM_FAILED: u32 = 2;
@@ -2156,27 +2249,48 @@ mod process_helper {
                 "视频 helper 父进程已退出，拒绝创建共享内存",
             ));
         }
-        let file = anchor.directory.create_new(&anchor.name)?;
-        let metadata = file.metadata()?;
+        let candidate_name = reserve_cleanup_name(&anchor.directory, EntryRole::Shm)?;
+        let file = anchor.directory.create_new(&candidate_name)?;
+        let mut unpublished = UnpublishedEntry::new(
+            anchor.directory.clone(),
+            candidate_name.clone(),
+            anchor.public_path.clone(),
+            file,
+        );
+        if session.control.take_test_fault(FAULT_SHM_METADATA) {
+            return Err(io::Error::other("注入 helper 共享内存 metadata 失败"));
+        }
+        let metadata = unpublished.file().metadata()?;
+        if session.control.take_test_fault(FAULT_SHM_TRY_CLONE) {
+            return Err(io::Error::other("注入 helper 共享内存 try_clone 失败"));
+        }
+        let identity_file = unpublished.file().try_clone()?;
+        if session.control.take_test_fault(FAULT_SHM_IDENTITY) {
+            return Err(io::Error::other("注入 helper 共享内存身份建立失败"));
+        }
+        let candidate_anchor = PathAnchor {
+            directory: anchor.directory.clone(),
+            name: candidate_name.clone(),
+            public_path: anchor.public_path.clone(),
+        };
         let owned = OwnedEntry::from_metadata(
-            anchor.clone(),
-            anchor.name.clone(),
+            candidate_anchor,
+            candidate_name.clone(),
             &metadata,
-            file.try_clone()?,
+            identity_file,
             EntryRole::Shm,
         )?;
-        session.shm = Some(owned);
-        let watchdog_entry = match session.shm.as_ref().unwrap().try_clone_exact() {
-            Ok(entry) => entry,
-            Err(error) => {
-                let _ = session.shm.take().unwrap().cleanup();
-                return Err(error);
-            }
-        };
-        watchdog.shm = Some(watchdog_entry);
-        drop(watchdog);
-        file.set_len(BUFFER_SIZE as u64)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        if session.control.take_test_fault(FAULT_SHM_PERMISSIONS) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "注入 helper 共享内存权限设置失败",
+            ));
+        }
+        unpublished
+            .file()
+            .set_permissions(std::fs::Permissions::from_mode(0o660))?;
+        unpublished.file().set_len(BUFFER_SIZE as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(unpublished.file())? };
         mmap[..HEADER_SIZE].fill(0);
         mmap[0..8].copy_from_slice(&SHM_MAGIC.to_le_bytes());
         mmap[8..12].copy_from_slice(&SHM_VERSION.to_le_bytes());
@@ -2186,6 +2300,27 @@ mod process_helper {
             return Err(io::Error::other("注入 helper 共享内存初始化刷新失败"));
         }
         mmap.flush_range(0, HEADER_SIZE)?;
+        anchor.directory.revalidate_public_path()?;
+        if session
+            .control
+            .take_test_fault(FAULT_SHM_PUBLISH_REPLACEMENT)
+        {
+            std::fs::write(&anchor.public_path, b"replacement-before-shm-publish")?;
+        }
+        anchor
+            .directory
+            .rename_noreplace(&candidate_name, &anchor.name)?;
+        session.shm = Some(owned.retarget(anchor.clone(), anchor.name.clone()));
+        let watchdog_entry = match session.shm.as_ref().unwrap().try_clone_exact() {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = session.shm.take().unwrap().cleanup();
+                return Err(error);
+            }
+        };
+        watchdog.shm = Some(watchdog_entry);
+        unpublished.disarm();
+        drop(watchdog);
         anchor.directory.sync()?;
         session.mmap = Some(mmap);
         Ok(())
@@ -2537,6 +2672,13 @@ mod process_helper {
                         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                             error!("视频 helper 客户端协议错误: {}", error);
                         }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::UnexpectedEof
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::BrokenPipe
+                            ) => {}
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
                         Err(error) => {
                             return (
@@ -2570,18 +2712,20 @@ mod process_helper {
         session: &mut HelperSession,
         committed_sequence: &mut u64,
     ) -> io::Result<()> {
-        let mut length_bytes = [0_u8; 4];
-        helper_read_exact(stream, &mut length_bytes, &session.control)?;
-        let frame_length = u32::from_le_bytes(length_bytes) as usize;
-        if frame_length == 0 || frame_length > MAX_FRAME_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("视频帧长度无效: {frame_length}"),
-            ));
+        loop {
+            let mut length_bytes = [0_u8; 4];
+            helper_read_exact(stream, &mut length_bytes, &session.control)?;
+            let frame_length = u32::from_le_bytes(length_bytes) as usize;
+            if frame_length == 0 || frame_length > MAX_FRAME_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("视频帧长度无效: {frame_length}"),
+                ));
+            }
+            let mut payload = vec![0_u8; frame_length];
+            helper_read_exact(stream, &mut payload, &session.control)?;
+            helper_commit_frame(session, &payload, committed_sequence)?;
         }
-        let mut payload = vec![0_u8; frame_length];
-        helper_read_exact(stream, &mut payload, &session.control)?;
-        helper_commit_frame(session, &payload, committed_sequence)
     }
 
     fn helper_read_exact(
@@ -3338,7 +3482,33 @@ mod process_helper {
                     CLOSE_RANGE_CLOEXEC,
                 );
                 if result != 0 {
-                    return Err(io::Error::last_os_error());
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(nix::libc::EINVAL | nix::libc::ENOSYS) => {
+                            // Jetson 旧内核可能没有 close_range，或不支持
+                            // CLOSE_RANGE_CLOEXEC；逐个标记以保持相同的 exec 边界。
+                            let mut limit: nix::libc::rlimit = std::mem::zeroed();
+                            if nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            let upper = limit.rlim_cur.min(nix::libc::c_int::MAX as _);
+                            let mut descriptor = 3;
+                            while (descriptor as nix::libc::rlim_t) < upper {
+                                let flags = nix::libc::fcntl(descriptor, nix::libc::F_GETFD);
+                                if flags >= 0
+                                    && nix::libc::fcntl(
+                                        descriptor,
+                                        nix::libc::F_SETFD,
+                                        flags | nix::libc::FD_CLOEXEC,
+                                    ) < 0
+                                {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                descriptor += 1;
+                            }
+                        }
+                        _ => return Err(error),
+                    }
                 }
                 for descriptor in inherited {
                     if nix::libc::fcntl(descriptor, nix::libc::F_SETFD, 0) < 0 {
@@ -4412,21 +4582,48 @@ fn init_shm(
             ),
         ));
     }
-    let file = leases
-        .shm_anchor
-        .directory
-        .create_new(&leases.shm_anchor.name)?;
-    let metadata = file.metadata()?;
-    ledger.shm = Some(OwnedEntry::from_metadata(
-        leases.shm_anchor.clone(),
-        leases.shm_anchor.name.clone(),
+    let candidate_name = reserve_cleanup_name(&leases.shm_anchor.directory, EntryRole::Shm)?;
+    let file = leases.shm_anchor.directory.create_new(&candidate_name)?;
+    let mut unpublished = UnpublishedEntry::new(
+        leases.shm_anchor.directory.clone(),
+        candidate_name.clone(),
+        leases.shm_anchor.public_path.clone(),
+        file,
+    );
+    if take_test_fault(fault_key, TestFaultPoint::ShmMetadata) {
+        return Err(io::Error::other("注入共享内存 metadata 失败"));
+    }
+    let metadata = unpublished.file().metadata()?;
+    if take_test_fault(fault_key, TestFaultPoint::ShmTryClone) {
+        return Err(io::Error::other("注入共享内存 try_clone 失败"));
+    }
+    let identity_file = unpublished.file().try_clone()?;
+    if take_test_fault(fault_key, TestFaultPoint::ShmIdentity) {
+        return Err(io::Error::other("注入共享内存身份建立失败"));
+    }
+    let candidate_anchor = PathAnchor {
+        directory: leases.shm_anchor.directory.clone(),
+        name: candidate_name.clone(),
+        public_path: leases.shm_anchor.public_path.clone(),
+    };
+    let owned = OwnedEntry::from_metadata(
+        candidate_anchor,
+        candidate_name.clone(),
         &metadata,
-        file.try_clone()?,
+        identity_file,
         EntryRole::Shm,
-    )?);
-    file.set_len(BUFFER_SIZE as u64)?;
-    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-    ledger.mmap_created = true;
+    )?;
+    if take_test_fault(fault_key, TestFaultPoint::ShmPermissions) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "注入共享内存权限设置失败",
+        ));
+    }
+    unpublished
+        .file()
+        .set_permissions(std::fs::Permissions::from_mode(0o660))?;
+    unpublished.file().set_len(BUFFER_SIZE as u64)?;
+    let mut mmap = unsafe { MmapMut::map_mut(unpublished.file())? };
     mmap[..HEADER_SIZE].fill(0);
     mmap[0..8].copy_from_slice(&SHM_MAGIC.to_le_bytes());
     mmap[8..12].copy_from_slice(&SHM_VERSION.to_le_bytes());
@@ -4434,6 +4631,20 @@ fn init_shm(
         return Err(io::Error::other("注入共享内存初始化刷新失败"));
     }
     mmap.flush_range(0, HEADER_SIZE)?;
+    leases.shm_anchor.directory.revalidate_public_path()?;
+    if take_test_fault(fault_key, TestFaultPoint::ShmPublishReplacement) {
+        std::fs::write(
+            &leases.shm_anchor.public_path,
+            b"replacement-before-shm-publish",
+        )?;
+    }
+    leases
+        .shm_anchor
+        .directory
+        .rename_noreplace(&candidate_name, &leases.shm_anchor.name)?;
+    ledger.shm = Some(owned.retarget(leases.shm_anchor.clone(), leases.shm_anchor.name.clone()));
+    unpublished.disarm();
+    ledger.mmap_created = true;
     leases.shm_anchor.directory.sync()?;
     Ok(mmap)
 }
@@ -4841,6 +5052,11 @@ enum TestFaultPoint {
     PauseAfterParentTerminal,
     PauseAfterUdsBindBeforeIdentity,
     PauseAfterUdsIdentityBeforePublish,
+    ShmPermissions,
+    ShmMetadata,
+    ShmTryClone,
+    ShmIdentity,
+    ShmPublishReplacement,
 }
 
 #[cfg(not(test))]
@@ -4880,6 +5096,11 @@ enum TestFaultPoint {
     PauseAfterParentTerminal,
     PauseAfterUdsBindBeforeIdentity,
     PauseAfterUdsIdentityBeforePublish,
+    ShmPermissions,
+    ShmMetadata,
+    ShmTryClone,
+    ShmIdentity,
+    ShmPublishReplacement,
 }
 
 #[cfg(test)]
@@ -4935,6 +5156,11 @@ fn helper_fault_mask(point: TestFaultPoint) -> u64 {
         TestFaultPoint::PauseAfterUdsIdentityBeforePublish => {
             process_helper::FAULT_PAUSE_AFTER_UDS_IDENTITY_BEFORE_PUBLISH
         }
+        TestFaultPoint::ShmPermissions => process_helper::FAULT_SHM_PERMISSIONS,
+        TestFaultPoint::ShmMetadata => process_helper::FAULT_SHM_METADATA,
+        TestFaultPoint::ShmTryClone => process_helper::FAULT_SHM_TRY_CLONE,
+        TestFaultPoint::ShmIdentity => process_helper::FAULT_SHM_IDENTITY,
+        TestFaultPoint::ShmPublishReplacement => process_helper::FAULT_SHM_PUBLISH_REPLACEMENT,
     }
 }
 
@@ -5006,8 +5232,72 @@ fn install_cleanup_gate(path: &Path) -> Arc<TestCommitGate> {
 }
 
 #[cfg(test)]
+struct LocalCleanupGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+fn local_cleanup_gates() -> &'static Mutex<std::collections::HashMap<PathBuf, Arc<LocalCleanupGate>>>
+{
+    static GATES: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, Arc<LocalCleanupGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_local_cleanup_gate(path: &Path) -> Arc<LocalCleanupGate> {
+    let gate = Arc::new(LocalCleanupGate {
+        state: Mutex::new((false, false)),
+        changed: Condvar::new(),
+    });
+    lock_unpoisoned(local_cleanup_gates()).insert(path.to_path_buf(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
 fn maybe_pause_before_cleanup_quarantine(path: &Path, role: EntryRole) {
-    let _ = (path, role);
+    if role != EntryRole::Shm {
+        return;
+    }
+    let gate = lock_unpoisoned(local_cleanup_gates()).remove(path);
+    let Some(gate) = gate else {
+        return;
+    };
+    let mut state = lock_unpoisoned(&gate.state);
+    state.0 = true;
+    gate.changed.notify_all();
+    while !state.1 {
+        state = gate
+            .changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+#[cfg(test)]
+impl LocalCleanupGate {
+    fn wait_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = lock_unpoisoned(&self.state);
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "本地清理 gate 未进入");
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            assert!(!timeout.timed_out() || state.0, "本地清理 gate 等待超时");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.1 = true;
+        self.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -5557,6 +5847,159 @@ mod tests {
         assert_eq!(error.primary.operation, "初始化视频共享内存");
         assert!(error.thread_started && error.thread_joined);
         assert!(error.terminal.is_clean());
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shm_prepublication_failures_leave_no_public_path_and_allow_recreate() {
+        for (label, point) in [
+            ("metadata", TestFaultPoint::ShmMetadata),
+            ("try-clone", TestFaultPoint::ShmTryClone),
+            ("identity", TestFaultPoint::ShmIdentity),
+            ("permissions", TestFaultPoint::ShmPermissions),
+        ] {
+            let paths = TestPaths::new(&format!("shm-prepublish-{label}"));
+            inject_test_fault(&paths.shm, point);
+            let error = expect_start_error(spawn_video_relay_owner(&paths.shm, &paths.uds));
+            assert_eq!(error.primary.operation, "初始化视频共享内存");
+            assert!(!paths.shm.exists());
+            assert!(error.thread_started && error.thread_joined);
+            assert!(error.terminal.is_clean(), "{label}: {error:?}");
+            assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+
+            let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
+            assert!(owner
+                .shutdown(Duration::from_secs(1))
+                .unwrap()
+                .is_expected_shutdown());
+            assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn shm_publish_replacement_is_preserved_and_candidate_is_cleaned() {
+        let paths = TestPaths::new("shm-publish-replacement");
+        inject_test_fault(&paths.shm, TestFaultPoint::ShmPublishReplacement);
+        let error = expect_start_error(spawn_video_relay_owner(&paths.shm, &paths.uds));
+        assert!(matches!(
+            error.primary.kind,
+            io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse
+        ));
+        assert_eq!(
+            std::fs::read(&paths.shm).unwrap(),
+            b"replacement-before-shm-publish"
+        );
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 1);
+        std::fs::remove_file(&paths.shm).unwrap();
+
+        let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
+        assert!(owner
+            .shutdown(Duration::from_secs(1))
+            .unwrap()
+            .is_expected_shutdown());
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compatibility_shm_prepublication_failures_and_replacement_are_bounded() {
+        for (label, point) in [
+            ("metadata", TestFaultPoint::ShmMetadata),
+            ("try-clone", TestFaultPoint::ShmTryClone),
+            ("identity", TestFaultPoint::ShmIdentity),
+            ("permissions", TestFaultPoint::ShmPermissions),
+        ] {
+            let paths = TestPaths::new(&format!("compat-shm-prepublish-{label}"));
+            let mut leases = PairLeases::acquire(&paths.shm, &paths.uds).unwrap();
+            let mut ledger = ResourceLedger::new();
+            inject_test_fault(&paths.shm, point);
+            assert!(init_shm(&leases, &mut ledger, &paths.shm).is_err());
+            assert!(ledger.shm.is_none());
+            assert!(!paths.shm.exists());
+            let (uds_lease, shm_lease) = leases.cleanup();
+            assert!(uds_lease.is_complete() && shm_lease.is_complete());
+            assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+
+            let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
+            assert!(owner
+                .shutdown(Duration::from_secs(1))
+                .unwrap()
+                .is_expected_shutdown());
+        }
+
+        let paths = TestPaths::new("compat-shm-publish-replacement");
+        let mut leases = PairLeases::acquire(&paths.shm, &paths.uds).unwrap();
+        let mut ledger = ResourceLedger::new();
+        inject_test_fault(&paths.shm, TestFaultPoint::ShmPublishReplacement);
+        assert!(init_shm(&leases, &mut ledger, &paths.shm).is_err());
+        assert!(ledger.shm.is_none());
+        assert_eq!(
+            std::fs::read(&paths.shm).unwrap(),
+            b"replacement-before-shm-publish"
+        );
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 3);
+        let (uds_lease, shm_lease) = leases.cleanup();
+        assert!(uds_lease.is_complete() && shm_lease.is_complete());
+        std::fs::remove_file(&paths.shm).unwrap();
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unpublished_guard_quarantines_before_identity_recheck_in_group_writable_directory() {
+        let paths = TestPaths::new("unpublished-cleanup-race");
+        std::fs::set_permissions(&paths.root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let mode = std::fs::metadata(&paths.root).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o770);
+        assert_eq!(mode & nix::libc::S_ISVTX as u32, 0);
+
+        let gate = install_local_cleanup_gate(&paths.shm);
+        inject_test_fault(&paths.shm, TestFaultPoint::ShmMetadata);
+        let shm = paths.shm.clone();
+        let uds = paths.uds.clone();
+        let runner = thread::spawn(move || {
+            let mut leases = PairLeases::acquire(&shm, &uds).unwrap();
+            let mut ledger = ResourceLedger::new();
+            let error = init_shm(&leases, &mut ledger, &shm).unwrap_err();
+            assert!(ledger.shm.is_none());
+            let (uds_lease, shm_lease) = leases.cleanup();
+            assert!(uds_lease.is_complete() && shm_lease.is_complete());
+            error
+        });
+
+        gate.wait_entered();
+        let candidate = std::fs::read_dir(&paths.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".nuwax-video-cleanup-")
+            })
+            .expect("guard 暂停时私有候选必须存在")
+            .path();
+        std::fs::remove_file(&candidate).unwrap();
+        std::fs::write(&candidate, b"private-candidate-replacement").unwrap();
+        let replacement_inode = std::fs::metadata(&candidate).unwrap().ino();
+        gate.release();
+
+        assert_eq!(runner.join().unwrap().kind(), io::ErrorKind::Other);
+        assert!(!paths.shm.exists());
+        assert_eq!(
+            std::fs::read(&candidate).unwrap(),
+            b"private-candidate-replacement"
+        );
+        assert_eq!(
+            std::fs::metadata(&candidate).unwrap().ino(),
+            replacement_inode
+        );
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 1);
+        std::fs::remove_file(&candidate).unwrap();
+
+        let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
+        assert!(owner
+            .shutdown(Duration::from_secs(1))
+            .unwrap()
+            .is_expected_shutdown());
         assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
     }
 

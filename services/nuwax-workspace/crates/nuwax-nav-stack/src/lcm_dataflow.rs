@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(feature = "guard-runtime")]
 use std::time::Instant;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use nuwax_codec::lcm::schema;
 #[cfg(feature = "patrolling")]
 use nuwax_nav_types_messages::GridSnapshot;
@@ -1139,6 +1139,157 @@ async fn run_guarded_nav_scheduler(
 }
 
 #[cfg(feature = "guard-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardedNavSource {
+    Pose,
+    Costmap,
+    Status,
+    Goal,
+    Path,
+    Cancel,
+}
+
+#[cfg(feature = "guard-runtime")]
+impl GuardedNavSource {
+    const ORDER: [Self; 6] = [
+        Self::Pose,
+        Self::Costmap,
+        Self::Status,
+        Self::Goal,
+        Self::Path,
+        Self::Cancel,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|source| *source == self)
+            .expect("guarded navigation source must belong to the source ring")
+    }
+
+    fn successor(self) -> Self {
+        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+enum GuardedNavEvent {
+    Pose(Option<TransportResult<RawLcmFrame>>),
+    Costmap(Option<TransportResult<RawLcmFrame>>),
+    Status(Result<(), tokio::sync::watch::error::RecvError>),
+    Goal(Option<TransportResult<RawLcmFrame>>),
+    Path(Option<TransportResult<RawLcmFrame>>),
+    Cancel(Option<TransportResult<RawLcmFrame>>),
+}
+
+#[cfg(feature = "guard-runtime")]
+impl GuardedNavEvent {
+    fn source(&self) -> GuardedNavSource {
+        match self {
+            Self::Pose(_) => GuardedNavSource::Pose,
+            Self::Costmap(_) => GuardedNavSource::Costmap,
+            Self::Status(_) => GuardedNavSource::Status,
+            Self::Goal(_) => GuardedNavSource::Goal,
+            Self::Path(_) => GuardedNavSource::Path,
+            Self::Cancel(_) => GuardedNavSource::Cancel,
+        }
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+struct GuardedNavArbiter {
+    cursor: GuardedNavSource,
+}
+
+#[cfg(feature = "guard-runtime")]
+impl Default for GuardedNavArbiter {
+    fn default() -> Self {
+        Self {
+            cursor: GuardedNavSource::Pose,
+        }
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+impl GuardedNavArbiter {
+    fn source_at(&self, offset: usize) -> GuardedNavSource {
+        GuardedNavSource::ORDER[(self.cursor.index() + offset) % GuardedNavSource::ORDER.len()]
+    }
+
+    fn record_dispatch(&mut self, source: GuardedNavSource) {
+        self.cursor = source.successor();
+    }
+
+    #[cfg(test)]
+    fn choose_ready(&mut self, ready: [bool; 6]) -> Option<GuardedNavSource> {
+        let winner = (0..GuardedNavSource::ORDER.len())
+            .map(|offset| self.source_at(offset))
+            .find(|source| ready[source.index()]);
+        if let Some(source) = winner {
+            self.record_dispatch(source);
+        }
+        winner
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+fn scan_guarded_nav_event(
+    arbiter: &GuardedNavArbiter,
+    goals: &mut LcmFrameStream,
+    poses: &mut LcmFrameStream,
+    paths: &mut LcmFrameStream,
+    costmaps: &mut LcmFrameStream,
+    cancels: &mut LcmFrameStream,
+    status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
+) -> Option<GuardedNavEvent> {
+    for offset in 0..GuardedNavSource::ORDER.len() {
+        let event = match arbiter.source_at(offset) {
+            GuardedNavSource::Pose => poses.next().now_or_never().map(GuardedNavEvent::Pose),
+            GuardedNavSource::Costmap => {
+                costmaps.next().now_or_never().map(GuardedNavEvent::Costmap)
+            }
+            GuardedNavSource::Status => {
+                status.changed().now_or_never().map(GuardedNavEvent::Status)
+            }
+            GuardedNavSource::Goal => goals.next().now_or_never().map(GuardedNavEvent::Goal),
+            GuardedNavSource::Path => paths.next().now_or_never().map(GuardedNavEvent::Path),
+            GuardedNavSource::Cancel => cancels.next().now_or_never().map(GuardedNavEvent::Cancel),
+        };
+        if event.is_some() {
+            return event;
+        }
+    }
+    None
+}
+
+#[cfg(feature = "guard-runtime")]
+async fn wait_guarded_nav_event(
+    goals: &mut LcmFrameStream,
+    poses: &mut LcmFrameStream,
+    paths: &mut LcmFrameStream,
+    costmaps: &mut LcmFrameStream,
+    cancels: &mut LcmFrameStream,
+    status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
+) -> GuardedNavEvent {
+    tokio::select! {
+        message = poses.next() => GuardedNavEvent::Pose(message),
+        message = costmaps.next() => GuardedNavEvent::Costmap(message),
+        changed = status.changed() => GuardedNavEvent::Status(changed),
+        message = goals.next() => GuardedNavEvent::Goal(message),
+        message = paths.next() => GuardedNavEvent::Path(message),
+        message = cancels.next() => GuardedNavEvent::Cancel(message),
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+fn guarded_nav_shutdown_requested(shutdown: &mut oneshot::Receiver<()>) -> bool {
+    match shutdown.try_recv() {
+        Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => true,
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 #[allow(clippy::too_many_arguments)]
 async fn run_guarded_nav_loop(
     node: &ModuleNode,
@@ -1179,11 +1330,42 @@ async fn run_guarded_nav_loop(
     )
     .await?;
 
+    let mut arbiter = GuardedNavArbiter::default();
     loop {
-        tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            changed = status.changed() => {
-                changed.map_err(|_| NavStackError::Internal("guard scheduler status stream closed".into()))?;
+        if guarded_nav_shutdown_requested(&mut shutdown) {
+            return Ok(());
+        }
+        let event = if let Some(event) = scan_guarded_nav_event(
+            &arbiter,
+            &mut goals,
+            &mut poses,
+            &mut paths,
+            &mut costmaps,
+            &mut cancels,
+            &mut status,
+        ) {
+            event
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => return Ok(()),
+                event = wait_guarded_nav_event(
+                    &mut goals,
+                    &mut poses,
+                    &mut paths,
+                    &mut costmaps,
+                    &mut cancels,
+                    &mut status,
+                ) => event,
+            }
+        };
+        let source = event.source();
+        arbiter.record_dispatch(source);
+        match event {
+            GuardedNavEvent::Status(changed) => {
+                changed.map_err(|_| {
+                    NavStackError::Internal("guard scheduler status stream closed".into())
+                })?;
                 let snapshot = status.borrow().clone();
                 if snapshot.applied_commands > applied_commands {
                     if let Some(twist) = snapshot.last_applied_twist {
@@ -1206,14 +1388,15 @@ async fn run_guarded_nav_loop(
                     snapshot.clone(),
                     &telemetry,
                     None,
-                ).await?;
+                )
+                .await?;
                 clear_terminal_session_after_publication(
                     &mut active_session,
                     &mut telemetry,
                     &snapshot,
                 );
             }
-            message = poses.next() => {
+            GuardedNavEvent::Pose(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.map_pose")?;
                 let input = match decode_guarded_pose_input(&frame.payload)? {
                     OwnerInput::Accepted(input) => input,
@@ -1230,7 +1413,9 @@ async fn run_guarded_nav_loop(
                             diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
                             continue;
                         }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
+                        OwnerInput::Accepted(()) => {
+                            unreachable!("error classifier accepted an error")
+                        }
                     }
                 }
                 telemetry = candidate_telemetry;
@@ -1253,14 +1438,15 @@ async fn run_guarded_nav_loop(
                     snapshot.clone(),
                     &telemetry,
                     Some(snapshot.planner_inputs_fresh),
-                ).await?;
+                )
+                .await?;
                 clear_terminal_session_after_publication(
                     &mut active_session,
                     &mut telemetry,
                     &snapshot,
                 );
             }
-            message = costmaps.next() => {
+            GuardedNavEvent::Costmap(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.costmap")?;
                 let input = match decode_guarded_costmap_input(&frame.payload)? {
                     OwnerInput::Accepted(input) => input,
@@ -1278,7 +1464,9 @@ async fn run_guarded_nav_loop(
                             diagnostics.reject("guarded_nav_scheduler.costmap", &reason);
                             continue;
                         }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
+                        OwnerInput::Accepted(()) => {
+                            unreachable!("error classifier accepted an error")
+                        }
                     }
                 }
                 telemetry = candidate_telemetry;
@@ -1302,14 +1490,15 @@ async fn run_guarded_nav_loop(
                     snapshot.clone(),
                     &telemetry,
                     Some(snapshot.planner_inputs_fresh),
-                ).await?;
+                )
+                .await?;
                 clear_terminal_session_after_publication(
                     &mut active_session,
                     &mut telemetry,
                     &snapshot,
                 );
             }
-            message = goals.next() => {
+            GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
                 let goal_envelope = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(envelope) => envelope,
@@ -1321,13 +1510,14 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "goal",
                             &format!("GoalEnvelope rejected: {error}"),
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
-                if let Err(error) = pose_from_schema(&goal_envelope.goal).and_then(|goal| {
-                    require_map_pose(&goal, "guarded_nav_scheduler.goal")
-                }) {
+                if let Err(error) = pose_from_schema(&goal_envelope.goal)
+                    .and_then(|goal| require_map_pose(&goal, "guarded_nav_scheduler.goal"))
+                {
                     publish_guarded_rejection(
                         transport,
                         &node.outputs[1],
@@ -1335,7 +1525,8 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         "goal",
                         &error.to_string(),
-                    ).await?;
+                    )
+                    .await?;
                     continue;
                 }
                 let goal_envelope = match goal_buffer.observe_goal(goal_envelope) {
@@ -1373,7 +1564,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "goal",
                             &format!("GoalEnvelope lease rejected: {reason:?}"),
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -1388,7 +1580,7 @@ async fn run_guarded_nav_loop(
                 )
                 .await?;
             }
-            message = paths.next() => {
+            GuardedNavEvent::Path(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.path")?;
                 let Some(active_goal) = active_session.as_ref() else {
                     publish_guarded_rejection(
@@ -1398,7 +1590,8 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         "path",
                         "no active versioned goal lease",
-                    ).await?;
+                    )
+                    .await?;
                     continue;
                 };
                 if !goal_buffer.has_applied_goal() {
@@ -1409,7 +1602,8 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         "path",
                         "active goal lease is fenced by a newer goal",
-                    ).await?;
+                    )
+                    .await?;
                     continue;
                 }
                 let path_envelope = match schema::decode_path_envelope_body(&frame.payload) {
@@ -1422,7 +1616,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "path",
                             &format!("PathEnvelope rejected: {error}"),
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -1434,7 +1629,8 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         "path",
                         &reason,
-                    ).await?;
+                    )
+                    .await?;
                     continue;
                 }
                 if !planner_generation_matches_authority(
@@ -1478,7 +1674,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "path",
                             &error.to_string(),
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -1489,18 +1686,24 @@ async fn run_guarded_nav_loop(
                         scheduler.status(),
                         &telemetry,
                         "path",
-                        &format!("scheduler path frame must be map, got {}", path.frame_id.as_str()),
-                    ).await?;
+                        &format!(
+                            "scheduler path frame must be map, got {}",
+                            path.frame_id.as_str()
+                        ),
+                    )
+                    .await?;
                     continue;
                 }
-                let result = scheduler.submit_path(nuwax_nav_runtime::VersionedPath {
-                    session_id: path_envelope.session_id.clone(),
-                    execution_identity: guarded_path_execution_identity(&path_envelope),
-                    path_revision: u64::try_from(path_envelope.path_revision)
-                        .expect("validated positive path revision"),
-                    payload_hash: path_envelope.path_payload_sha256,
-                    path,
-                }).await;
+                let result = scheduler
+                    .submit_path(nuwax_nav_runtime::VersionedPath {
+                        session_id: path_envelope.session_id.clone(),
+                        execution_identity: guarded_path_execution_identity(&path_envelope),
+                        path_revision: u64::try_from(path_envelope.path_revision)
+                            .expect("validated positive path revision"),
+                        payload_hash: path_envelope.path_payload_sha256,
+                        path,
+                    })
+                    .await;
                 if let Err(error) = result {
                     match runtime_input_error::<()>("guarded_nav_scheduler.path", error)? {
                         OwnerInput::Rejected(reason) => {
@@ -1511,7 +1714,8 @@ async fn run_guarded_nav_loop(
                                 &telemetry,
                                 "path",
                                 &reason,
-                            ).await?;
+                            )
+                            .await?;
                             let snapshot = scheduler.status();
                             clear_terminal_session_after_publication(
                                 &mut active_session,
@@ -1519,7 +1723,9 @@ async fn run_guarded_nav_loop(
                                 &snapshot,
                             );
                         }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
+                        OwnerInput::Accepted(()) => {
+                            unreachable!("error classifier accepted an error")
+                        }
                     }
                 } else {
                     accepted_planner_generation = Some((
@@ -1530,7 +1736,7 @@ async fn run_guarded_nav_loop(
                     telemetry.path_payload_sha256 = path_envelope.path_payload_sha256;
                 }
             }
-            message = cancels.next() => {
+            GuardedNavEvent::Cancel(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.cancel")?;
                 let cancel = match schema::decode_cancel_navigation_body(&frame.payload) {
                     Ok(cancel) => cancel,
@@ -1542,7 +1748,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "cancel",
                             &format!("CancelNavigation rejected: {error}"),
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -1557,7 +1764,8 @@ async fn run_guarded_nav_loop(
                         &telemetry,
                         "cancel",
                         "CancelNavigation.cancel_generation must be positive",
-                    ).await?;
+                    )
+                    .await?;
                     continue;
                 };
                 let mut candidate_telemetry = telemetry.clone();
@@ -1577,7 +1785,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "cancel",
                             &reason,
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                     if let Err(reason) = observe_guarded_cancel_generation(
@@ -1592,7 +1801,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "cancel",
                             &reason,
-                        ).await?;
+                        )
+                        .await?;
                         continue;
                     }
                     let session_id = active_goal.session_id.clone();
@@ -1606,7 +1816,8 @@ async fn run_guarded_nav_loop(
                                     &telemetry,
                                     "cancel",
                                     &reason,
-                                ).await?;
+                                )
+                                .await?;
                                 let snapshot = scheduler.status();
                                 clear_terminal_session_after_publication(
                                     &mut active_session,
@@ -1615,7 +1826,9 @@ async fn run_guarded_nav_loop(
                                 );
                                 continue;
                             }
-                            OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
+                            OwnerInput::Accepted(()) => {
+                                unreachable!("error classifier accepted an error")
+                            }
                         }
                     }
                     telemetry = candidate_telemetry;
@@ -1627,16 +1840,18 @@ async fn run_guarded_nav_loop(
                         snapshot.clone(),
                         &telemetry,
                         None,
-                    ).await?;
+                    )
+                    .await?;
                     goal_buffer.clear_pending_goal_for(&active_goal);
-                    last_cancel_terminal = goal_buffer.is_newest_goal(&active_goal).then(|| {
-                        GuardedCancelTerminal {
-                            goal: active_goal,
-                            cancel_generation,
-                            status: snapshot.clone(),
-                            telemetry: telemetry.clone(),
-                        }
-                    });
+                    last_cancel_terminal =
+                        goal_buffer
+                            .is_newest_goal(&active_goal)
+                            .then(|| GuardedCancelTerminal {
+                                goal: active_goal,
+                                cancel_generation,
+                                status: snapshot.clone(),
+                                telemetry: telemetry.clone(),
+                            });
                     clear_terminal_session_after_publication(
                         &mut active_session,
                         &mut telemetry,
@@ -1653,11 +1868,14 @@ async fn run_guarded_nav_loop(
                                 &telemetry,
                                 "cancel",
                                 &reason,
-                            ).await?;
+                            )
+                            .await?;
                             continue;
                         }
                     };
-                    let (goal_to_fence, goal_was_pending) = if let Some(buffered_goal) = buffered_goal {
+                    let (goal_to_fence, goal_was_pending) = if let Some(buffered_goal) =
+                        buffered_goal
+                    {
                         if let Err(reason) = observe_guarded_cancel_generation(
                             &mut cancel_generation_watermark,
                             &buffered_goal,
@@ -1670,12 +1888,14 @@ async fn run_guarded_nav_loop(
                                 &telemetry,
                                 "cancel",
                                 &reason,
-                            ).await?;
+                            )
+                            .await?;
                             continue;
                         }
                         (Some(*buffered_goal), true)
                     } else if let Some(terminal) = last_cancel_terminal.as_ref() {
-                        if let Err(reason) = validate_cancel_goal_correlation(&cancel, &terminal.goal)
+                        if let Err(reason) =
+                            validate_cancel_goal_correlation(&cancel, &terminal.goal)
                         {
                             publish_guarded_rejection(
                                 transport,
@@ -1684,7 +1904,8 @@ async fn run_guarded_nav_loop(
                                 &telemetry,
                                 "cancel",
                                 &reason,
-                            ).await?;
+                            )
+                            .await?;
                             continue;
                         }
                         if cancel_generation < terminal.cancel_generation {
@@ -1713,7 +1934,8 @@ async fn run_guarded_nav_loop(
                                 &telemetry,
                                 "cancel",
                                 &reason,
-                            ).await?;
+                            )
+                            .await?;
                             continue;
                         }
                         if cancel_generation == terminal.cancel_generation {
@@ -1724,7 +1946,8 @@ async fn run_guarded_nav_loop(
                                 terminal.status.clone(),
                                 &terminal.telemetry,
                                 None,
-                            ).await?;
+                            )
+                            .await?;
                             continue;
                         }
                         (Some(terminal.goal.clone()), false)
@@ -1767,7 +1990,8 @@ async fn run_guarded_nav_loop(
                                         &buffered_telemetry,
                                         "cancel",
                                         &reason,
-                                    ).await?;
+                                    )
+                                    .await?;
                                     continue;
                                 }
                                 OwnerInput::Accepted(()) => {
@@ -1775,9 +1999,7 @@ async fn run_guarded_nav_loop(
                                 }
                             }
                         }
-                        if goal_was_pending
-                            && !goal_buffer.clear_pending_goal_for(&buffered_goal)
-                        {
+                        if goal_was_pending && !goal_buffer.clear_pending_goal_for(&buffered_goal) {
                             return Err(NavStackError::Internal(
                                 "guarded scheduler acquired a superseded buffered cancellation goal"
                                     .into(),
@@ -1798,7 +2020,8 @@ async fn run_guarded_nav_loop(
                                         &telemetry,
                                         "cancel",
                                         &reason,
-                                    ).await?;
+                                    )
+                                    .await?;
                                     let snapshot = scheduler.status();
                                     clear_terminal_session_after_publication(
                                         &mut active_session,
@@ -1820,7 +2043,8 @@ async fn run_guarded_nav_loop(
                             snapshot.clone(),
                             &telemetry,
                             None,
-                        ).await?;
+                        )
+                        .await?;
                         last_cancel_terminal = Some(GuardedCancelTerminal {
                             goal: buffered_goal,
                             cancel_generation,
@@ -1840,7 +2064,8 @@ async fn run_guarded_nav_loop(
                             &telemetry,
                             "cancel",
                             "no active or buffered scheduler session",
-                        ).await?;
+                        )
+                        .await?;
                     }
                 }
             }
@@ -6369,6 +6594,491 @@ mod guarded_tests {
     use tokio::task::JoinHandle;
 
     #[test]
+    fn arbiter_rotates_all_simultaneously_ready_sources() {
+        let mut arbiter = GuardedNavArbiter::default();
+        let selected = (0..GuardedNavSource::ORDER.len())
+            .map(|_| arbiter.choose_ready([true; 6]).expect("ready source"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, GuardedNavSource::ORDER);
+        assert_eq!(arbiter.cursor, GuardedNavSource::Pose);
+    }
+
+    #[test]
+    fn arbiter_bounds_pose_and_costmap_under_continuous_status() {
+        let mut arbiter = GuardedNavArbiter::default();
+        let ready = [true, true, true, false, false, false];
+        let selected = (0..9)
+            .map(|_| arbiter.choose_ready(ready).expect("live planner input"))
+            .collect::<Vec<_>>();
+
+        for source in [
+            GuardedNavSource::Pose,
+            GuardedNavSource::Costmap,
+            GuardedNavSource::Status,
+        ] {
+            let positions = selected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, selected)| (*selected == source).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(positions.len(), 3);
+            assert!(positions.windows(2).all(|pair| pair[1] - pair[0] <= 3));
+        }
+    }
+
+    #[tokio::test]
+    async fn arbiter_keeps_status_twist_and_zero_live_under_continuous_inputs() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let goal = activate_map_a(&harness).await;
+        harness.send_path(&sealed_path(&goal));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut status = harness.scheduler.subscribe_status();
+            while status.borrow().path_revision != 1 {
+                status.changed().await.expect("active path status");
+            }
+        })
+        .await
+        .expect("active path");
+
+        while harness.commands.next().now_or_never().flatten().is_some() {}
+        while harness.states.next().now_or_never().flatten().is_some() {}
+        while harness.reached.next().now_or_never().flatten().is_some() {}
+        let applied_baseline = harness.scheduler.status().applied_commands;
+        let expected_twist = Twist2 {
+            linear: Point2::new(0.731, 0.0),
+            angular_z: -0.417,
+        };
+        *harness.planner_twist.lock().unwrap() = expected_twist;
+        let mut status = harness.scheduler.subscribe_status();
+        let feeder =
+            GuardedContentionFeeder::spawn(harness.poses.clone(), harness.costmaps.clone());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while status.borrow().applied_commands <= applied_baseline {
+                status
+                    .changed()
+                    .await
+                    .expect("post-baseline command status");
+            }
+        })
+        .await
+        .expect("post-baseline applied command");
+        let twist_ready_dispatch = feeder.dequeued();
+        let applied = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = harness
+                    .commands
+                    .next()
+                    .await
+                    .expect("command stream open")
+                    .expect("command frame");
+                let twist =
+                    schema::decode_twist(&prefixed(schema::TWIST_FINGERPRINT, &frame.payload))
+                        .expect("real status Twist");
+                if twist.linear[0] == expected_twist.linear.x
+                    && twist.linear[1] == expected_twist.linear.y
+                    && twist.angular[2] == expected_twist.angular_z
+                {
+                    return twist;
+                }
+            }
+        })
+        .await
+        .expect("bounded status Twist publication");
+        feeder.assert_ready_evidence("Twist");
+        assert!(
+            feeder.dequeued().saturating_sub(twist_ready_dispatch) <= 2,
+            "Status Twist exceeded the Pose/Costmap dispatch bound"
+        );
+        assert_eq!(applied.linear[0], expected_twist.linear.x);
+        assert_eq!(applied.linear[1], expected_twist.linear.y);
+        assert_eq!(applied.angular[2], expected_twist.angular_z);
+        assert!(harness.scheduler.status().applied_commands > applied_baseline);
+
+        harness
+            .planner_succeeds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while status.borrow().last_terminal != Some(TerminalOutcome::Succeeded) {
+                status.changed().await.expect("Succeeded status");
+            }
+        })
+        .await
+        .expect("Succeeded terminal status");
+        let terminal_ready_dispatch = feeder.dequeued();
+
+        let zero = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = harness
+                    .commands
+                    .next()
+                    .await
+                    .expect("command stream open")
+                    .expect("command frame");
+                let twist =
+                    schema::decode_twist(&prefixed(schema::TWIST_FINGERPRINT, &frame.payload))
+                        .expect("real status ZERO");
+                if twist.linear == [0.0; 3] && twist.angular == [0.0; 3] {
+                    return twist;
+                }
+            }
+        })
+        .await
+        .expect("bounded status ZERO publication");
+        feeder.assert_ready_evidence("ZERO");
+        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        assert_eq!(zero.linear, [0.0; 3]);
+        assert_eq!(zero.angular, [0.0; 3]);
+
+        let reached = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = harness
+                    .reached
+                    .next()
+                    .await
+                    .expect("reached stream open")
+                    .expect("reached frame");
+                let reached = schema::decode_bool_body(&frame.payload).expect("Succeeded bool");
+                if reached.data {
+                    return reached;
+                }
+            }
+        })
+        .await
+        .expect("bounded Succeeded bool publication");
+        feeder.assert_ready_evidence("Succeeded Bool");
+        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        assert!(reached.data);
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = harness
+                    .states
+                    .next()
+                    .await
+                    .expect("state stream open")
+                    .expect("state frame");
+                let state = schema::decode_navigation_state_body(&frame.payload)
+                    .expect("real status NavigationState");
+                if state.session_id == goal.session_id
+                    && !state.zero_ack_id.is_empty()
+                    && state.zero_applied_monotonic_ns > 0
+                {
+                    return state;
+                }
+            }
+        })
+        .await
+        .expect("bounded terminal NavigationState publication");
+        feeder.assert_ready_evidence("terminal NavigationState");
+        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        assert_eq!(
+            harness.scheduler.status().last_terminal,
+            Some(TerminalOutcome::Succeeded)
+        );
+        assert!(!terminal.zero_ack_id.is_empty());
+        assert!(
+            !harness.loop_task.is_finished(),
+            "single owner loop remains live"
+        );
+        feeder.stop().await.expect("contention feeder cleanup");
+        harness.shutdown().await;
+    }
+
+    #[test]
+    fn arbiter_bounds_every_ready_source() {
+        for target in GuardedNavSource::ORDER {
+            let mut arbiter = GuardedNavArbiter {
+                cursor: target.successor(),
+            };
+            let mut ready = [true; 6];
+            let mut preceding_dispatches = 0;
+            loop {
+                let selected = arbiter.choose_ready(ready).expect("ready source");
+                if selected == target {
+                    break;
+                }
+                ready[selected.index()] = false;
+                preceding_dispatches += 1;
+            }
+            assert!(
+                preceding_dispatches <= 5,
+                "{target:?} waited for {preceding_dispatches} handlers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn arbiter_allows_one_wake_race_then_restores_rotation() {
+        let (_goals_tx, mut goals) = guarded_test_stream();
+        let (_poses_tx, mut poses) = guarded_test_stream();
+        let (paths_tx, mut paths) = guarded_test_stream();
+        let (_costmaps_tx, mut costmaps) = guarded_test_stream();
+        let (_cancels_tx, mut cancels) = guarded_test_stream();
+        let (_status_tx, mut status) =
+            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+        let waiting = wait_guarded_nav_event(
+            &mut goals,
+            &mut poses,
+            &mut paths,
+            &mut costmaps,
+            &mut cancels,
+            &mut status,
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiting.as_mut())
+                .await
+                .is_err(),
+            "all-pending sources must await a wake"
+        );
+
+        send_guarded_test_body(&paths_tx, "nuwax_msgs.PathEnvelope", vec![0]);
+        let wake = tokio::time::timeout(Duration::from_secs(1), waiting.as_mut())
+            .await
+            .expect("path wake");
+        assert_eq!(wake.source(), GuardedNavSource::Path);
+
+        let mut arbiter = GuardedNavArbiter::default();
+        arbiter.record_dispatch(wake.source());
+        assert_eq!(
+            arbiter.choose_ready([true; 6]),
+            Some(GuardedNavSource::Cancel),
+            "the wake winner must move the next scan to its successor"
+        );
+        assert_eq!(
+            arbiter.choose_ready([true; 6]),
+            Some(GuardedNavSource::Pose)
+        );
+    }
+
+    #[test]
+    fn arbiter_shutdown_preempts_ready_work() {
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        shutdown_tx.send(()).expect("shutdown receiver");
+        let arbiter = GuardedNavArbiter::default();
+
+        assert!(guarded_nav_shutdown_requested(&mut shutdown_rx));
+        assert_eq!(
+            arbiter.cursor,
+            GuardedNavSource::Pose,
+            "ready inputs must not advance the cursor after shutdown"
+        );
+
+        let (closed_tx, mut closed_rx) = oneshot::channel::<()>();
+        drop(closed_tx);
+        assert!(guarded_nav_shutdown_requested(&mut closed_rx));
+    }
+
+    #[tokio::test]
+    async fn arbiter_propagates_required_stream_close() {
+        for source in GuardedNavSource::ORDER {
+            let (goals_tx, mut goals) = guarded_test_stream();
+            let (poses_tx, mut poses) = guarded_test_stream();
+            let (paths_tx, mut paths) = guarded_test_stream();
+            let (costmaps_tx, mut costmaps) = guarded_test_stream();
+            let (cancels_tx, mut cancels) = guarded_test_stream();
+            let (status_tx, mut status) =
+                tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+            let payload = vec![source.index() as u8 + 1];
+            match source {
+                GuardedNavSource::Pose => {
+                    send_guarded_test_body(&poses_tx, "geometry_msgs.PoseStamped", payload.clone())
+                }
+                GuardedNavSource::Costmap => {
+                    send_guarded_test_body(&costmaps_tx, "nav_msgs.OccupancyGrid", payload.clone())
+                }
+                GuardedNavSource::Status => status_tx
+                    .send(nuwax_nav_runtime::SchedulerStatus {
+                        message: "status-payload".into(),
+                        ..nuwax_nav_runtime::SchedulerStatus::default()
+                    })
+                    .expect("status receiver"),
+                GuardedNavSource::Goal => {
+                    send_guarded_test_body(&goals_tx, "nuwax_msgs.GoalEnvelope", payload.clone())
+                }
+                GuardedNavSource::Path => {
+                    send_guarded_test_body(&paths_tx, "nuwax_msgs.PathEnvelope", payload.clone())
+                }
+                GuardedNavSource::Cancel => send_guarded_test_body(
+                    &cancels_tx,
+                    "nuwax_msgs.CancelNavigation",
+                    payload.clone(),
+                ),
+            }
+            let arbiter = GuardedNavArbiter { cursor: source };
+            let event = scan_guarded_nav_event(
+                &arbiter,
+                &mut goals,
+                &mut poses,
+                &mut paths,
+                &mut costmaps,
+                &mut cancels,
+                &mut status,
+            )
+            .expect("ready source mapping");
+            assert_eq!(event.source(), source);
+            match event {
+                GuardedNavEvent::Pose(Some(Ok(frame)))
+                | GuardedNavEvent::Costmap(Some(Ok(frame)))
+                | GuardedNavEvent::Goal(Some(Ok(frame)))
+                | GuardedNavEvent::Path(Some(Ok(frame)))
+                | GuardedNavEvent::Cancel(Some(Ok(frame))) => assert_eq!(frame.payload, payload),
+                GuardedNavEvent::Status(Ok(())) => {
+                    assert_eq!(status.borrow().message, "status-payload")
+                }
+                _ => panic!("unexpected ready mapping for {source:?}"),
+            }
+        }
+
+        for source in [
+            GuardedNavSource::Pose,
+            GuardedNavSource::Costmap,
+            GuardedNavSource::Goal,
+            GuardedNavSource::Path,
+            GuardedNavSource::Cancel,
+        ] {
+            let (goals_tx, mut goals) = guarded_test_stream();
+            let (poses_tx, mut poses) = guarded_test_stream();
+            let (paths_tx, mut paths) = guarded_test_stream();
+            let (costmaps_tx, mut costmaps) = guarded_test_stream();
+            let (cancels_tx, mut cancels) = guarded_test_stream();
+            let (_status_tx, mut status) =
+                tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+            match source {
+                GuardedNavSource::Pose => poses_tx.close_channel(),
+                GuardedNavSource::Costmap => costmaps_tx.close_channel(),
+                GuardedNavSource::Goal => goals_tx.close_channel(),
+                GuardedNavSource::Path => paths_tx.close_channel(),
+                GuardedNavSource::Cancel => cancels_tx.close_channel(),
+                GuardedNavSource::Status => unreachable!("watch is covered separately"),
+            }
+            let event = scan_guarded_nav_event(
+                &GuardedNavArbiter { cursor: source },
+                &mut goals,
+                &mut poses,
+                &mut paths,
+                &mut costmaps,
+                &mut cancels,
+                &mut status,
+            )
+            .expect("closed stream is Ready");
+            assert_eq!(event.source(), source);
+            assert!(matches!(
+                event,
+                GuardedNavEvent::Pose(None)
+                    | GuardedNavEvent::Costmap(None)
+                    | GuardedNavEvent::Goal(None)
+                    | GuardedNavEvent::Path(None)
+                    | GuardedNavEvent::Cancel(None)
+            ));
+        }
+
+        let (_goals_tx, mut goals) = guarded_test_stream();
+        let (_poses_tx, mut poses) = guarded_test_stream();
+        let (_paths_tx, mut paths) = guarded_test_stream();
+        let (_costmaps_tx, mut costmaps) = guarded_test_stream();
+        let (_cancels_tx, mut cancels) = guarded_test_stream();
+        let (status_tx, mut status) =
+            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                wait_guarded_nav_event(
+                    &mut goals,
+                    &mut poses,
+                    &mut paths,
+                    &mut costmaps,
+                    &mut cancels,
+                    &mut status,
+                ),
+            )
+            .await
+            .is_err(),
+            "all sources must remain pending"
+        );
+        status_tx
+            .send(nuwax_nav_runtime::SchedulerStatus {
+                message: "rebuilt-watch".into(),
+                ..nuwax_nav_runtime::SchedulerStatus::default()
+            })
+            .expect("rebuilt watch receiver");
+        let rebuilt = wait_guarded_nav_event(
+            &mut goals,
+            &mut poses,
+            &mut paths,
+            &mut costmaps,
+            &mut cancels,
+            &mut status,
+        )
+        .await;
+        assert!(matches!(rebuilt, GuardedNavEvent::Status(Ok(()))));
+        assert_eq!(status.borrow().message, "rebuilt-watch");
+    }
+
+    #[tokio::test]
+    async fn arbiter_propagates_status_close() {
+        let (_goals_tx, mut goals) = guarded_test_stream();
+        let (_poses_tx, mut poses) = guarded_test_stream();
+        let (_paths_tx, mut paths) = guarded_test_stream();
+        let (_costmaps_tx, mut costmaps) = guarded_test_stream();
+        let (_cancels_tx, mut cancels) = guarded_test_stream();
+        let (status_tx, mut status) =
+            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
+        drop(status_tx);
+        let event = scan_guarded_nav_event(
+            &GuardedNavArbiter {
+                cursor: GuardedNavSource::Status,
+            },
+            &mut goals,
+            &mut poses,
+            &mut paths,
+            &mut costmaps,
+            &mut cancels,
+            &mut status,
+        )
+        .expect("closed watch is Ready");
+        assert!(matches!(event, GuardedNavEvent::Status(Err(_))));
+
+        for source in [
+            GuardedCloseSource::Pose,
+            GuardedCloseSource::Costmap,
+            GuardedCloseSource::Status,
+            GuardedCloseSource::Goal,
+            GuardedCloseSource::Path,
+            GuardedCloseSource::Cancel,
+        ] {
+            assert_guarded_close_exits(GuardedLoopHarness::spawn().await, source).await;
+        }
+    }
+
+    #[test]
+    fn arbiter_preserves_reject_and_fail_closed_paths() {
+        assert!(matches!(
+            runtime_input_error::<()>(
+                "guarded arbitration",
+                RuntimeError::StaleInput("old pose".into()),
+            )
+            .expect("stale external input remains rejectable"),
+            OwnerInput::Rejected(_)
+        ));
+        assert!(runtime_input_error::<()>(
+            "guarded arbitration",
+            RuntimeError::InvalidFence("missing zero proof".into()),
+        )
+        .is_err());
+        assert!(matches!(
+            decode_guarded_pose_input(&[0xff]).expect("bad pose remains external input"),
+            OwnerInput::Rejected(_)
+        ));
+        assert!(matches!(
+            decode_guarded_costmap_input(&[0xff]).expect("bad costmap remains external input"),
+            OwnerInput::Rejected(_)
+        ));
+    }
+
+    #[test]
     fn canonical_base_frame_value_precedes_legacy_alias() {
         assert_eq!(
             resolve_frame_alias(Some(" body "), Some("base_footprint"), "base_link"),
@@ -6486,6 +7196,22 @@ mod guarded_tests {
         goal.payload_sha256 = [0; 32];
         schema::seal_goal_envelope(&mut goal).expect("seal rollover goal");
         goal
+    }
+
+    fn guarded_pose_body(stamp_sec: i32) -> Vec<u8> {
+        schema::encode_pose_stamped_body(&schema::PoseStamped {
+            header: schema::Header {
+                seq: stamp_sec,
+                stamp_sec,
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            pose: schema::Pose {
+                position: [0.0, 0.0, 0.0],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        })
+        .expect("encode guarded test pose")
     }
 
     fn guarded_costmap_body(revision: i32) -> Vec<u8> {
@@ -6628,7 +7354,10 @@ mod guarded_tests {
         }
     }
 
-    struct CommandingPlanner(Arc<std::sync::atomic::AtomicBool>);
+    struct CommandingPlanner {
+        succeeds: Arc<std::sync::atomic::AtomicBool>,
+        twist: Arc<Mutex<Twist2>>,
+    }
 
     impl nuwax_nav_runtime::NavPlanner for CommandingPlanner {
         fn replace_path(&mut self, _path: Path2D) {}
@@ -6638,20 +7367,290 @@ mod guarded_tests {
         fn update_costmap(&mut self, _costmap: nuwax_nav_astar::navigation_map::CostMap2D) {}
 
         fn step(&mut self, _robot_width_m: f64) -> nuwax_nav_runtime::PlannerStep {
-            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .succeeds
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 return nuwax_nav_runtime::PlannerStep::Succeeded;
             }
-            nuwax_nav_runtime::PlannerStep::Command(Twist2 {
-                linear: Point2::new(0.2, 0.0),
-                angular_z: 0.1,
-            })
+            nuwax_nav_runtime::PlannerStep::Command(*self.twist.lock().unwrap())
         }
 
         fn stop(&mut self) {}
     }
 
-    type GuardedTestInput = (TransportResult<RawLcmFrame>, Option<oneshot::Sender<()>>);
+    #[derive(Default)]
+    struct GuardedDequeueLedger {
+        pending: std::sync::atomic::AtomicUsize,
+        dequeued: std::sync::atomic::AtomicUsize,
+    }
+
+    type GuardedTestInput = (
+        TransportResult<RawLcmFrame>,
+        Option<oneshot::Sender<()>>,
+        Option<Arc<GuardedDequeueLedger>>,
+    );
     type GuardedTestSender = UnboundedSender<GuardedTestInput>;
+
+    struct GuardedContentionFeeder {
+        stop: tokio::sync::watch::Sender<bool>,
+        tasks: Vec<JoinHandle<()>>,
+        pose_ledger: Arc<GuardedDequeueLedger>,
+        costmap_ledger: Arc<GuardedDequeueLedger>,
+    }
+
+    impl GuardedContentionFeeder {
+        fn spawn(poses: GuardedTestSender, costmaps: GuardedTestSender) -> Self {
+            const WINDOW: usize = 8;
+            let (stop, stop_rx) = tokio::sync::watch::channel(false);
+            let pose_ledger = Arc::new(GuardedDequeueLedger::default());
+            let costmap_ledger = Arc::new(GuardedDequeueLedger::default());
+
+            let pose_task = {
+                let ledger = Arc::clone(&pose_ledger);
+                let mut stop = stop_rx.clone();
+                tokio::spawn(async move {
+                    let mut stamp = 100_i32;
+                    let mut receipts = futures::stream::FuturesUnordered::new();
+                    for _ in 0..WINDOW {
+                        receipts.push(send_guarded_test_body_observed_with_ledger(
+                            &poses,
+                            "geometry_msgs.PoseStamped",
+                            guarded_pose_body(stamp),
+                            Some(Arc::clone(&ledger)),
+                        ));
+                        stamp += 1;
+                    }
+                    loop {
+                        if *stop.borrow() {
+                            break;
+                        }
+                        tokio::select! {
+                            biased;
+                            changed = stop.changed() => {
+                                if changed.is_err() || *stop.borrow() {
+                                    break;
+                                }
+                            }
+                            receipt = receipts.next() => {
+                                receipt.expect("pose receipt stream").expect("pose dequeued");
+                                if *stop.borrow() {
+                                    break;
+                                }
+                                receipts.push(send_guarded_test_body_observed_with_ledger(
+                                    &poses,
+                                    "geometry_msgs.PoseStamped",
+                                    guarded_pose_body(stamp),
+                                    Some(Arc::clone(&ledger)),
+                                ));
+                                stamp += 1;
+                            }
+                        }
+                    }
+                })
+            };
+            let costmap_task = {
+                let ledger = Arc::clone(&costmap_ledger);
+                let mut stop = stop_rx;
+                tokio::spawn(async move {
+                    let mut stamp = 200_i32;
+                    let mut receipts = futures::stream::FuturesUnordered::new();
+                    for _ in 0..WINDOW {
+                        receipts.push(send_guarded_test_body_observed_with_ledger(
+                            &costmaps,
+                            "nav_msgs.OccupancyGrid",
+                            guarded_costmap_body(stamp),
+                            Some(Arc::clone(&ledger)),
+                        ));
+                        stamp += 1;
+                    }
+                    loop {
+                        if *stop.borrow() {
+                            break;
+                        }
+                        tokio::select! {
+                            biased;
+                            changed = stop.changed() => {
+                                if changed.is_err() || *stop.borrow() {
+                                    break;
+                                }
+                            }
+                            receipt = receipts.next() => {
+                                receipt.expect("costmap receipt stream").expect("costmap dequeued");
+                                if *stop.borrow() {
+                                    break;
+                                }
+                                receipts.push(send_guarded_test_body_observed_with_ledger(
+                                    &costmaps,
+                                    "nav_msgs.OccupancyGrid",
+                                    guarded_costmap_body(stamp),
+                                    Some(Arc::clone(&ledger)),
+                                ));
+                                stamp += 1;
+                            }
+                        }
+                    }
+                })
+            };
+
+            Self {
+                stop,
+                tasks: vec![pose_task, costmap_task],
+                pose_ledger,
+                costmap_ledger,
+            }
+        }
+
+        fn assert_ready_evidence(&self, observation: &str) {
+            let pose = self
+                .pose_ledger
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let costmap = self
+                .costmap_ledger
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                pose > 0 || costmap > 0,
+                "{observation} lacked unresolved Pose/Costmap dequeue evidence"
+            );
+        }
+
+        fn dequeued(&self) -> usize {
+            self.pose_ledger
+                .dequeued
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + self
+                    .costmap_ledger
+                    .dequeued
+                    .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn stop(self) -> Result<(), String> {
+            let stop_error = self
+                .stop
+                .send(true)
+                .err()
+                .map(|_| "contention feeder stop receivers closed".to_string());
+            let reap_error = reap_guarded_tasks(self.tasks, Duration::from_secs(1))
+                .await
+                .err();
+            match (stop_error, reap_error) {
+                (None, None) => Ok(()),
+                (Some(error), None) | (None, Some(error)) => Err(error),
+                (Some(stop_error), Some(reap_error)) => Err(format!("{stop_error}; {reap_error}")),
+            }
+        }
+    }
+
+    async fn reap_guarded_tasks(
+        tasks: Vec<JoinHandle<()>>,
+        join_timeout: Duration,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for (index, mut task) in tasks.into_iter().enumerate() {
+            match tokio::time::timeout(join_timeout, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("task {index} join failed: {error}")),
+                Err(_) => {
+                    task.abort();
+                    match task.await {
+                        Ok(()) => errors.push(format!(
+                            "task {index} timed out after {join_timeout:?} but abort joined cleanly"
+                        )),
+                        Err(error) => errors.push(format!(
+                            "task {index} timed out after {join_timeout:?}; abort join: {error}"
+                        )),
+                    }
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    struct GuardedTaskExitProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for GuardedTaskExitProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn contention_feeder_reaps_every_task_before_reporting_failures() {
+        let first_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let later_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let panic_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tasks = vec![
+            {
+                let probe = GuardedTaskExitProbe(Arc::clone(&first_reaped));
+                tokio::spawn(async move {
+                    let _probe = probe;
+                    std::future::pending::<()>().await;
+                })
+            },
+            {
+                let probe = GuardedTaskExitProbe(Arc::clone(&later_reaped));
+                tokio::spawn(async move {
+                    let _probe = probe;
+                    std::future::pending::<()>().await;
+                })
+            },
+            {
+                let probe = GuardedTaskExitProbe(Arc::clone(&panic_reaped));
+                tokio::spawn(async move {
+                    let _probe = probe;
+                    panic!("intentional feeder join failure");
+                })
+            },
+            {
+                let completed = Arc::clone(&completed);
+                tokio::spawn(async move {
+                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            },
+        ];
+
+        let error = reap_guarded_tasks(tasks, Duration::from_millis(10))
+            .await
+            .expect_err("timeout and JoinError must be reported after full cleanup");
+        assert!(error.contains("task 0 timed out"), "{error}");
+        assert!(error.contains("task 1 timed out"), "{error}");
+        assert!(error.contains("task 2 join failed"), "{error}");
+        assert!(first_reaped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(later_reaped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(panic_reaped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let normal_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let normal_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        reap_guarded_tasks(
+            vec![
+                {
+                    let completed = Arc::clone(&normal_a);
+                    tokio::spawn(async move {
+                        completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                },
+                {
+                    let completed = Arc::clone(&normal_b);
+                    tokio::spawn(async move {
+                        completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                },
+            ],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("normal feeder cleanup");
+        assert!(normal_a.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(normal_b.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     struct GuardedLoopHarness {
         goals: GuardedTestSender,
@@ -6659,13 +7658,16 @@ mod guarded_tests {
         paths: GuardedTestSender,
         costmaps: GuardedTestSender,
         cancels: GuardedTestSender,
+        commands: LcmFrameStream,
         states: LcmFrameStream,
+        reached: LcmFrameStream,
         shutdown: Option<oneshot::Sender<()>>,
         loop_task: JoinHandle<NavStackResult<()>>,
         scheduler: NavSchedulerHandle,
         scheduler_task: JoinHandle<Result<(), RuntimeError>>,
         motion_calls: Arc<Mutex<Vec<String>>>,
         planner_succeeds: Arc<std::sync::atomic::AtomicBool>,
+        planner_twist: Arc<Mutex<Twist2>>,
     }
 
     impl GuardedLoopHarness {
@@ -6678,9 +7680,16 @@ mod guarded_tests {
                 .expect("guarded loop test LCM");
             let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
             let planner_succeeds = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let planner_twist = Arc::new(Mutex::new(Twist2 {
+                linear: Point2::new(0.2, 0.0),
+                angular_z: 0.1,
+            }));
             let scheduler = nuwax_nav_runtime::NavScheduler::new(
                 RecordingMotion(Arc::clone(&motion_calls)),
-                CommandingPlanner(Arc::clone(&planner_succeeds)),
+                CommandingPlanner {
+                    succeeds: Arc::clone(&planner_succeeds),
+                    twist: Arc::clone(&planner_twist),
+                },
                 nuwax_nav_runtime::SchedulerConfig {
                     tick_interval: Duration::from_millis(5),
                     renew_interval: Duration::from_millis(100),
@@ -6719,9 +7728,15 @@ mod guarded_tests {
                 format!("/test/guarded/{loop_id}/reached"),
                 format!("/test/guarded/{loop_id}/cancelled"),
             ];
+            let commands = typed_stream(&transport, &node.outputs[0], "geometry_msgs.Twist")
+                .await
+                .expect("guarded command test stream");
             let states = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.NavigationState")
                 .await
                 .expect("guarded state test stream");
+            let reached = typed_stream(&transport, &node.outputs[2], "std_msgs.Bool")
+                .await
+                .expect("guarded reached test stream");
             let loop_transport = transport.clone();
             let loop_task = tokio::spawn(async move {
                 run_guarded_nav_loop(
@@ -6745,13 +7760,16 @@ mod guarded_tests {
                 paths,
                 costmaps,
                 cancels,
+                commands,
                 states,
+                reached,
                 shutdown: Some(shutdown),
                 loop_task,
                 scheduler,
                 scheduler_task,
                 motion_calls,
                 planner_succeeds,
+                planner_twist,
             }
         }
 
@@ -6777,20 +7795,11 @@ mod guarded_tests {
         }
 
         fn send_pose(&self, stamp_sec: i32) {
-            let body = schema::encode_pose_stamped_body(&schema::PoseStamped {
-                header: schema::Header {
-                    seq: stamp_sec,
-                    stamp_sec,
-                    frame_id: "map".into(),
-                    ..schema::Header::default()
-                },
-                pose: schema::Pose {
-                    position: [0.0, 0.0, 0.0],
-                    orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                },
-            })
-            .expect("encode guarded test pose");
-            send_guarded_test_body(&self.poses, "geometry_msgs.PoseStamped", body);
+            send_guarded_test_body(
+                &self.poses,
+                "geometry_msgs.PoseStamped",
+                guarded_pose_body(stamp_sec),
+            );
         }
 
         fn send_costmap(&self, revision: i32) {
@@ -6985,9 +7994,66 @@ mod guarded_tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum GuardedCloseSource {
+        Pose,
+        Costmap,
+        Status,
+        Goal,
+        Path,
+        Cancel,
+    }
+
+    async fn assert_guarded_close_exits(
+        mut harness: GuardedLoopHarness,
+        source: GuardedCloseSource,
+    ) {
+        match source {
+            GuardedCloseSource::Pose => harness.poses.close_channel(),
+            GuardedCloseSource::Costmap => harness.costmaps.close_channel(),
+            GuardedCloseSource::Goal => harness.goals.close_channel(),
+            GuardedCloseSource::Path => harness.paths.close_channel(),
+            GuardedCloseSource::Cancel => harness.cancels.close_channel(),
+            GuardedCloseSource::Status => harness
+                .scheduler
+                .shutdown()
+                .await
+                .expect("scheduler shutdown command"),
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut harness.loop_task)
+            .await
+            .expect("closed source must terminate without busy-loop")
+            .expect("guarded loop join")
+            .expect_err("closed required source must fail closed");
+        assert!(
+            error.to_string().contains("closed"),
+            "unexpected close error: {error}"
+        );
+        if !matches!(source, GuardedCloseSource::Status) {
+            harness
+                .scheduler
+                .shutdown()
+                .await
+                .expect("scheduler shutdown command");
+        }
+        harness
+            .scheduler_task
+            .await
+            .expect("scheduler join")
+            .expect("scheduler result");
+    }
+
     fn guarded_test_stream() -> (GuardedTestSender, LcmFrameStream) {
         let (sender, receiver) = unbounded::<GuardedTestInput>();
-        let receiver = receiver.map(|(frame, dequeued)| {
+        let receiver = receiver.map(|(frame, dequeued, ledger)| {
+            if let Some(ledger) = ledger {
+                ledger
+                    .pending
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                ledger
+                    .dequeued
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if let Some(dequeued) = dequeued {
                 let _ = dequeued.send(());
             }
@@ -6997,7 +8063,7 @@ mod guarded_tests {
     }
 
     fn send_guarded_test_body(sender: &GuardedTestSender, type_name: &str, body: Vec<u8>) {
-        send_guarded_test_body_with_receipt(sender, type_name, body, None);
+        send_guarded_test_body_with_receipt(sender, type_name, body, None, None);
     }
 
     fn send_guarded_test_body_observed(
@@ -7005,8 +8071,22 @@ mod guarded_tests {
         type_name: &str,
         body: Vec<u8>,
     ) -> oneshot::Receiver<()> {
+        send_guarded_test_body_observed_with_ledger(sender, type_name, body, None)
+    }
+
+    fn send_guarded_test_body_observed_with_ledger(
+        sender: &GuardedTestSender,
+        type_name: &str,
+        body: Vec<u8>,
+        ledger: Option<Arc<GuardedDequeueLedger>>,
+    ) -> oneshot::Receiver<()> {
         let (dequeued, receipt) = oneshot::channel();
-        send_guarded_test_body_with_receipt(sender, type_name, body, Some(dequeued));
+        if let Some(ledger) = ledger.as_ref() {
+            ledger
+                .pending
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        send_guarded_test_body_with_receipt(sender, type_name, body, Some(dequeued), ledger);
         receipt
     }
 
@@ -7015,6 +8095,7 @@ mod guarded_tests {
         type_name: &str,
         body: Vec<u8>,
         dequeued: Option<oneshot::Sender<()>>,
+        ledger: Option<Arc<GuardedDequeueLedger>>,
     ) {
         let frame = RawLcmFrameBuilder::new(
             LcmTopic::new("/test/guarded/input").expect("guarded test topic"),
@@ -7023,7 +8104,7 @@ mod guarded_tests {
         .payload(body)
         .build();
         sender
-            .unbounded_send((Ok(frame), dequeued))
+            .unbounded_send((Ok(frame), dequeued, ledger))
             .expect("guarded test input stream open");
     }
 
@@ -8061,7 +9142,13 @@ mod guarded_tests {
         let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let scheduler = nuwax_nav_runtime::NavScheduler::new(
             RecordingMotion(Arc::clone(&motion_calls)),
-            CommandingPlanner(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            CommandingPlanner {
+                succeeds: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                twist: Arc::new(Mutex::new(Twist2 {
+                    linear: Point2::new(0.2, 0.0),
+                    angular_z: 0.1,
+                })),
+            },
             nuwax_nav_runtime::SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(100),

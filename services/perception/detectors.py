@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
@@ -362,6 +363,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._resolved_model_source = ""
         self._resolved_backend_kind = "yolo_world_tensorrt" if self._use_tensorrt else "yolo_world_pytorch"
         self._inference_worker = None
+        self._inference_worker_lock = threading.Lock()
         # vis-three-fixes 任务 3.4：worker 进程开关，默认 True；由配置/构造参数显式覆盖。
         self._use_worker_process = bool(use_worker_process)
         # 任务 3.9：最近一次 worker 推理耗时（毫秒），detect() 元数据透传。
@@ -436,28 +438,38 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
             kwargs["device"] = self._device
         return list(model.predict(image_bgr, **kwargs))
 
+    def start_inference_worker_nonblocking(self) -> bool:
+        """在当前线程创建 YOLO worker 进程，但不等待模型加载。"""
+        with self._inference_worker_lock:
+            if self._inference_worker is not None:
+                return True
+            try:
+                from services.perception.inference_worker import YoloInferenceWorker
+            except ImportError as exc:
+                DETECTOR_LOGGER.warning("无法导入 YoloInferenceWorker: %s", exc)
+                return False
+            worker = YoloInferenceWorker(
+                self._weights,
+                confidence_threshold=self._confidence_threshold,
+                iou_threshold=self._iou_threshold,
+                image_size=self._image_size,
+                max_detections=self._max_detections,
+                device=self._device,
+            )
+            if not worker.start_nonblocking():
+                return False
+            self._inference_worker = worker
+            return True
+
     def _get_inference_worker(self):
-        """获取（或懒加载启动）YOLO 推理 worker 进程。"""
-        if self._inference_worker is not None:
-            return self._inference_worker
-        try:
-            from services.perception.inference_worker import YoloInferenceWorker
-        except ImportError as exc:
-            DETECTOR_LOGGER.warning("无法导入 YoloInferenceWorker，回退到主线程推理: %s", exc)
+        """获取 YOLO 推理 worker，并在调用线程等待其完成加载。"""
+        if not self.start_inference_worker_nonblocking():
             self._use_worker_process = False
             return None
-        worker = YoloInferenceWorker(
-            self._weights,
-            confidence_threshold=self._confidence_threshold,
-            iou_threshold=self._iou_threshold,
-            image_size=self._image_size,
-            max_detections=self._max_detections,
-            device=self._device,
-        )
-        if worker.start():
-            self._inference_worker = worker
+        worker = self._inference_worker
+        if worker is not None and worker.wait_until_ready():
             return worker
-        # 启动失败，永久回退到主线程推理
+        self._inference_worker = None
         DETECTOR_LOGGER.warning("YOLO 推理 worker 启动失败，永久回退到主线程推理")
         self._use_worker_process = False
         return None

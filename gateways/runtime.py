@@ -862,11 +862,12 @@ class GatewayRuntime:
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
-        # vis-three-fixes 任务 2.4/2.5：装配期预热 YOLO-World，把模型加载 + 首帧 warmup
-        # 挪到启动期，消除探索 MCP 调用后的 5-10s 检测空窗。失败静默降级（不 raise），
-        # _prewarm_done=False 时后续 start_perception_runtime 仍走兜底懒加载。
+        # YOLO-World 模型由独立 worker 进程加载；这里只异步编排预热，
+        # 不允许模型启动阻塞 Gateway HTTP 主线程。
         self._prewarm_done = False
-        self._run_yolo_prewarm()
+        self._prewarm_thread: Optional[threading.Thread] = None
+        self._prewarm_lock = threading.Lock()
+        self._start_yolo_prewarm()
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
@@ -5393,6 +5394,30 @@ class GatewayRuntime:
             "task": self.get_task_snapshot(task_id),
         }
 
+    def _start_yolo_prewarm(self) -> None:
+        """主线程创建 YOLO worker，再异步等待预热完成。"""
+        with self._prewarm_lock:
+            thread = getattr(self, "_prewarm_thread", None)
+            if thread is not None and thread.is_alive():
+                return
+            from services.perception.prewarm import start_yolo_world_worker
+
+            prewarm_status = start_yolo_world_worker(
+                self.perception_service.detector_pipeline,
+                self.config,
+            )
+            self.perception_video_runtime.set_prewarm_status(prewarm_status)
+            if prewarm_status.get("status") != "starting":
+                self._prewarm_done = True
+                return
+            thread = threading.Thread(
+                target=self._run_yolo_prewarm,
+                name="nuwax-yolo-prewarm",
+                daemon=True,
+            )
+            self._prewarm_thread = thread
+            thread.start()
+
     def _run_yolo_prewarm(self) -> None:
         """启动期预热 YOLO-World（vis-three-fixes 任务 2.4/2.5）。
 
@@ -5420,9 +5445,9 @@ class GatewayRuntime:
 
     def _manual_perception_start(self) -> Dict[str, Any]:
         """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
-        # 任务 2.5：兜底——若装配期预热未完成（如失败或被跳过），首次手动启动前补一次。
+        # 预热尚未完成时只补发异步任务，不能阻塞 MCP（模型上下文协议）调用线程。
         if not getattr(self, "_prewarm_done", False):
-            self._run_yolo_prewarm()
+            self._start_yolo_prewarm()
         self._perception_exploration_coupled = False
         return self.perception_video_runtime.start()
 

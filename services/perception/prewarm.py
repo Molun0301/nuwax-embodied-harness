@@ -39,6 +39,26 @@ def _build_dummy_image_frame(imgsz: int, camera_id: str):
     )
 
 
+def start_yolo_world_worker(detector_pipeline, config) -> Dict[str, Any]:
+    """在调用线程创建 YOLO worker 进程，不等待模型加载。"""
+    try:
+        yolo_cfg = config.perception.yolo_world
+    except AttributeError as exc:
+        return {"status": "deferred", "reason": "config_missing:%s" % exc}
+    if not getattr(yolo_cfg, "enabled", False):
+        return {"status": "deferred", "reason": "yolo_world_disabled"}
+    getter = getattr(detector_pipeline, "get_backend", None)
+    backend = getter(getattr(yolo_cfg, "backend_name", None)) if callable(getter) else None
+    if backend is None:
+        return {"status": "deferred", "reason": "yolo_world_backend_not_registered"}
+    starter = getattr(backend, "start_inference_worker_nonblocking", None)
+    if not callable(starter):
+        return {"status": "deferred", "reason": "worker_process_not_supported"}
+    if not starter():
+        return {"status": "deferred", "reason": "worker_process_start_failed"}
+    return {"status": "starting", "backend": getattr(yolo_cfg, "backend_name", "yolo_world")}
+
+
 def prewarm_yolo_world(detector_pipeline, config, *, camera_id: str = "front_camera") -> Dict[str, Any]:
     """启动期预热 YOLO-World 检测后端。
 

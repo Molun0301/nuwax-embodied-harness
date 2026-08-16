@@ -986,7 +986,9 @@ where
             received_at: Instant::now(),
         });
         self.refresh_input_status(Instant::now());
-        self.status.message = "fresh map pose consumed".into();
+        if self.status.last_terminal.is_none() {
+            self.status.message = "fresh map pose consumed".into();
+        }
         self.publish_status(status_tx);
         Ok(())
     }
@@ -1007,7 +1009,9 @@ where
             received_at: Instant::now(),
         });
         self.refresh_input_status(Instant::now());
-        self.status.message = "fresh occupancy costmap consumed".into();
+        if self.status.last_terminal.is_none() {
+            self.status.message = "fresh occupancy costmap consumed".into();
+        }
         self.publish_status(status_tx);
         Ok(())
     }
@@ -2735,6 +2739,70 @@ mod tests {
             handle.status().last_zero_ack_id.as_deref(),
             Some("zero-ack")
         );
+
+        handle.shutdown().await.expect("shutdown");
+        task.await.expect("join").expect("task result");
+    }
+
+    #[tokio::test]
+    async fn post_terminal_receipts_preserve_qualified_cause() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let planner = FakePlanner::commanding();
+        let (handle, task) = test_scheduler(FakeMotion(motion_state), planner);
+        wait_for_sink(&handle).await;
+        handle
+            .update_odometry(map_pose_at(1))
+            .await
+            .expect("initial pose");
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .expect("initial costmap");
+        handle.start_session(session()).await.expect("session");
+
+        let accepted = path_for("goal-1", 1);
+        handle
+            .submit_path(accepted.clone())
+            .await
+            .expect("initial path");
+        let mut mutation = accepted;
+        mutation.path = Path2D::stamped(
+            NavFrameId::Map,
+            Timestamp::default(),
+            vec![Point2::new(3.0, 0.0), Point2::new(4.0, 0.0)],
+        );
+        let error = handle
+            .submit_path(mutation)
+            .await
+            .expect_err("same-revision mutation must fail closed");
+        assert!(matches!(error, RuntimeError::PathMutation { .. }));
+
+        let terminal = handle.status();
+        assert_eq!(terminal.phase, SchedulerPhase::Failed);
+        assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
+        assert!(terminal
+            .message
+            .starts_with("SafetyFailed cause=PathMutation:"));
+        let qualified_cause = terminal.message;
+
+        handle
+            .update_odometry(map_pose_at(2))
+            .await
+            .expect("post-terminal pose receipt");
+        handle
+            .update_costmap(costmap_at(2_000_000_000))
+            .await
+            .expect("post-terminal costmap receipt");
+        let after_receipts = handle.status();
+        assert_eq!(after_receipts.phase, SchedulerPhase::Failed);
+        assert_eq!(
+            after_receipts.last_terminal,
+            Some(TerminalOutcome::SafetyFailed)
+        );
+        assert_eq!(after_receipts.message, qualified_cause);
+        assert_eq!(after_receipts.pose_source_timestamp_ns, 2_000_000_000);
+        assert_eq!(after_receipts.costmap_source_timestamp_ns, 2_000_000_000);
+        assert!(after_receipts.planner_inputs_fresh);
 
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");

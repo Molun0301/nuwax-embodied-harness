@@ -2306,6 +2306,8 @@ fn build_guarded_navigation_state(
         } else {
             0
         },
+        pose_source_timestamp_ns: status.pose_source_timestamp_ns,
+        costmap_source_timestamp_ns: status.costmap_source_timestamp_ns,
         sink_ready: i8::from(status.motion_sink_ready),
         planner_map_frame: if include_planner_fields {
             telemetry.map_frame.clone()
@@ -7631,6 +7633,54 @@ mod guarded_tests {
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
         assert!(scheduler_session_is_active(&next, "goal-b"));
+    }
+
+    #[test]
+    fn guarded_navigation_state_receipt_projection_is_read_only() {
+        let telemetry = GuardedNavTelemetry {
+            public_session_id: "goal-a".into(),
+            ..GuardedNavTelemetry::default()
+        };
+        let baseline_status = nuwax_nav_runtime::SchedulerStatus {
+            phase: SchedulerPhase::AwaitingPath,
+            session_id: Some("goal-a".into()),
+            ..nuwax_nav_runtime::SchedulerStatus::default()
+        };
+        let baseline = build_guarded_navigation_state(
+            &baseline_status,
+            &telemetry,
+            None,
+            Duration::from_secs(1),
+        );
+        assert_eq!(baseline.pose_source_timestamp_ns, 0);
+        assert_eq!(baseline.costmap_source_timestamp_ns, 0);
+
+        let status = nuwax_nav_runtime::SchedulerStatus {
+            pose_source_timestamp_ns: 11,
+            costmap_source_timestamp_ns: 17,
+            ..baseline_status
+        };
+        let projected =
+            build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(1));
+        assert_eq!(projected.pose_source_timestamp_ns, 11);
+        assert_eq!(projected.costmap_source_timestamp_ns, 17);
+        assert_eq!(
+            build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(1)),
+            projected,
+            "replaying the same scheduler snapshot must not advance receipt identity",
+        );
+
+        let mut without_receipts = projected.clone();
+        without_receipts.pose_source_timestamp_ns = 0;
+        without_receipts.costmap_source_timestamp_ns = 0;
+        assert_eq!(
+            without_receipts, baseline,
+            "projection must change no other field"
+        );
+
+        let rejected = guarded_rejection_status(status, "path", "out-of-order candidate");
+        assert_eq!(rejected.pose_source_timestamp_ns, 11);
+        assert_eq!(rejected.costmap_source_timestamp_ns, 17);
     }
 
     #[test]

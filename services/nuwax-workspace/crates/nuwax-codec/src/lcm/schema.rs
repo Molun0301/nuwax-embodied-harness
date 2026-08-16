@@ -35,7 +35,7 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x402e_9704_f8d2_5156_u64.to_be_bytes();
+pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0xfabd_0ec7_0419_6a8d_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -371,6 +371,10 @@ pub struct NavigationState {
     pub runtime_generation: i64,
     /// Motion guard generation that acknowledged the command path.
     pub guard_generation: i64,
+    /// Source timestamp of the latest scheduler-consumed pose.
+    pub pose_source_timestamp_ns: i64,
+    /// Source timestamp of the latest scheduler-consumed costmap.
+    pub costmap_source_timestamp_ns: i64,
     /// Typed sink readiness flag (`0` false, nonzero true).
     pub sink_ready: i8,
     /// Planner map frame.
@@ -1595,6 +1599,8 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     encode_string(&message.message, &mut out)?;
     out.extend_from_slice(&message.runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.guard_generation.to_be_bytes());
+    out.extend_from_slice(&message.pose_source_timestamp_ns.to_be_bytes());
+    out.extend_from_slice(&message.costmap_source_timestamp_ns.to_be_bytes());
     out.push(message.sink_ready as u8);
     encode_string(&message.planner_map_frame, &mut out)?;
     encode_string(&message.planner_pose_frame, &mut out)?;
@@ -1640,6 +1646,8 @@ fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigati
         message: cursor.read_string()?,
         runtime_generation: cursor.read_i64()?,
         guard_generation: cursor.read_i64()?,
+        pose_source_timestamp_ns: cursor.read_i64()?,
+        costmap_source_timestamp_ns: cursor.read_i64()?,
         sink_ready: cursor.read_u8()? as i8,
         planner_map_frame: cursor.read_string()?,
         planner_pose_frame: cursor.read_string()?,
@@ -2626,6 +2634,8 @@ mod tests {
             message: "moving".into(),
             runtime_generation: 7,
             guard_generation: 11,
+            pose_source_timestamp_ns: 123_000_000_456,
+            costmap_source_timestamp_ns: 122_000_000_000,
             sink_ready: 1,
             planner_map_frame: "map".into(),
             planner_pose_frame: "map".into(),
@@ -2647,6 +2657,23 @@ mod tests {
                 .unwrap(),
             navigation
         );
+
+        let mut legacy_fingerprint = encoded.clone();
+        legacy_fingerprint[..8].copy_from_slice(&0x402e_9704_f8d2_5156_u64.to_be_bytes());
+        assert!(decode_navigation_state(&legacy_fingerprint).is_err());
+
+        let mut legacy_body = encode_navigation_state_body(&navigation).unwrap();
+        let receipt_bytes = [
+            navigation.pose_source_timestamp_ns.to_be_bytes(),
+            navigation.costmap_source_timestamp_ns.to_be_bytes(),
+        ]
+        .concat();
+        let receipt_offset = legacy_body
+            .windows(receipt_bytes.len())
+            .position(|window| window == receipt_bytes)
+            .expect("receipt fields in NavigationState body");
+        legacy_body.drain(receipt_offset..receipt_offset + receipt_bytes.len());
+        assert!(decode_navigation_state_body(&legacy_body).is_err());
 
         let cancel = CancelNavigation {
             session_id: "session-1".into(),

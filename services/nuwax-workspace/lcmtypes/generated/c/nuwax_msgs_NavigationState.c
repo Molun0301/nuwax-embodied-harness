@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationState_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x20174b827c6928abLL
+    uint64_t hash = (uint64_t)0xfd5e8763820cb546LL
          + __string_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -35,6 +35,8 @@ uint64_t __nuwax_msgs_NavigationState_hash_recursive(const __lcm_hash_ptr *p)
          + __double_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
@@ -114,6 +116,12 @@ int __nuwax_msgs_NavigationState_encode_array(void *buf, int offset, int maxlen,
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].guard_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].pose_source_timestamp_ns), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].costmap_source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].sink_ready), 1);
@@ -205,6 +213,10 @@ int __nuwax_msgs_NavigationState_encoded_array_size(const nuwax_msgs_NavigationS
 
         size += __int64_t_encoded_array_size(&(p[element].guard_generation), 1);
 
+        size += __int64_t_encoded_array_size(&(p[element].pose_source_timestamp_ns), 1);
+
+        size += __int64_t_encoded_array_size(&(p[element].costmap_source_timestamp_ns), 1);
+
         size += __int8_t_encoded_array_size(&(p[element].sink_ready), 1);
 
         size += __string_encoded_array_size(&(p[element].planner_map_frame), 1);
@@ -289,6 +301,12 @@ int __nuwax_msgs_NavigationState_decode_array(const void *buf, int offset, int m
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].guard_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].pose_source_timestamp_ns), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].costmap_source_timestamp_ns), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].sink_ready), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -364,6 +382,10 @@ int __nuwax_msgs_NavigationState_decode_array_cleanup(nuwax_msgs_NavigationState
         __int64_t_decode_array_cleanup(&(p[element].runtime_generation), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].guard_generation), 1);
+
+        __int64_t_decode_array_cleanup(&(p[element].pose_source_timestamp_ns), 1);
+
+        __int64_t_decode_array_cleanup(&(p[element].costmap_source_timestamp_ns), 1);
 
         __int8_t_decode_array_cleanup(&(p[element].sink_ready), 1);
 
@@ -448,6 +470,10 @@ int __nuwax_msgs_NavigationState_clone_array(const nuwax_msgs_NavigationState *p
         __int64_t_clone_array(&(p[element].runtime_generation), &(q[element].runtime_generation), 1);
 
         __int64_t_clone_array(&(p[element].guard_generation), &(q[element].guard_generation), 1);
+
+        __int64_t_clone_array(&(p[element].pose_source_timestamp_ns), &(q[element].pose_source_timestamp_ns), 1);
+
+        __int64_t_clone_array(&(p[element].costmap_source_timestamp_ns), &(q[element].costmap_source_timestamp_ns), 1);
 
         __int8_t_clone_array(&(p[element].sink_ready), &(q[element].sink_ready), 1);
 

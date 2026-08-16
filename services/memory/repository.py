@@ -1396,6 +1396,14 @@ class MemoryRepository:
                 )
                 """
             )
+            self._ensure_columns(
+                "navigation_trajectory_events",
+                {
+                    "map_name": "TEXT",
+                    "localization_session_id": "TEXT",
+                    "source_record_id": "TEXT",
+                },
+            )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_navigation_trajectory_events_kind ON navigation_trajectory_events(event_kind)"
             )
@@ -1424,6 +1432,13 @@ class MemoryRepository:
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_columns(
+                "semantic_graph_relations",
+                {
+                    "map_name": "TEXT",
+                    "localization_session_id": "TEXT",
+                },
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_kind ON semantic_graph_relations(relation_kind)"
@@ -1455,6 +1470,16 @@ class MemoryRepository:
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_columns(
+                "semantic_summary_nodes",
+                {
+                    "map_name": "TEXT",
+                    "localization_session_id": "TEXT",
+                    "scene_space_id": "TEXT",
+                    "semantic_region_id": "TEXT",
+                    "label": "TEXT",
+                },
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_kind ON semantic_summary_nodes(summary_kind)"

@@ -111,8 +111,19 @@ pub fn extract_bbox_from_response(response: &str) -> Option<BoundingBox2D> {
         .get("name")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let score = match parsed.get("score") {
+        Some(value) => {
+            let score = value.as_f64()?;
+            if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+                return None;
+            }
+            Some(score as f32)
+        }
+        None => None,
+    };
     let mut bbox = BoundingBox2D::from_xyxy(coords[0], coords[1], coords[2], coords[3])?;
     bbox.class_name = name;
+    bbox.score = score;
     Some(bbox)
 }
 
@@ -213,6 +224,21 @@ mod tests {
         assert_eq!(bbox.x1, 100.0);
         assert_eq!(bbox.x2, 200.0);
         assert_eq!(bbox.class_name.as_deref(), Some("chair"));
+    }
+
+    #[test]
+    fn worker_score_is_preserved_and_invalid_score_fails_closed() {
+        let bbox = extract_bbox_from_response(r#"{"name":"chair","bbox":[1,2,3,4],"score":0.75}"#)
+            .unwrap();
+        assert_eq!(bbox.score, Some(0.75));
+        assert!(
+            extract_bbox_from_response(r#"{"name":"chair","bbox":[1,2,3,4],"score":1.1}"#)
+                .is_none()
+        );
+        assert!(
+            extract_bbox_from_response(r#"{"name":"chair","bbox":[1,2,3,4],"score":"high"}"#)
+                .is_none()
+        );
     }
 
     #[test]

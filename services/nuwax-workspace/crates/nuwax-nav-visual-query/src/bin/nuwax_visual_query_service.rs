@@ -107,8 +107,9 @@ fn print_usage() {
         "Usage: nuwax-visual-query-service [OPTIONS]\n\
          \n\
          JSONL stdin commands:\n\
-           query    request_id, session_id, source_timestamp_ns, frame_id,\n\
-                    width, height, object_description, image\n\
+           query    request_id, session_id, target_id, source_timestamp_ns,\n\
+                    frame_id, calibration_id, camera_info, width, height,\n\
+                    object_description, image\n\
            cancel   request_id\n\
            shutdown\n\
          \n\

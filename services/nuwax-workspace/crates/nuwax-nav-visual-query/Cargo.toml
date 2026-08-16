@@ -11,6 +11,7 @@ description = "视觉查询 trait + JSON bbox parser（仅兼容边界，不持�
 # Foundation 共享类型 — 引入后允许跨 crate 共享 BoundingBox2D 协议语义
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
+nuwax-nav-bbox-tracker = { path = "../nuwax-nav-bbox-tracker" }
 
 nuwax-numeric = { path = "../nuwax-numeric" }
 serde = { workspace = true }

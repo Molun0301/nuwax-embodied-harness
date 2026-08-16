@@ -14,6 +14,8 @@
 
 /// Production perception worker configuration and preflight.
 pub mod perception;
+/// Public JSONL production entry and bounded worker lifecycle owner.
+pub mod service;
 /// Stateful visual-query session lifecycle.
 pub mod session;
 /// Configurable local-process model backend.

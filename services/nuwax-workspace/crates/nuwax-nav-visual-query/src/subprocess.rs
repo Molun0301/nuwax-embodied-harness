@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -105,8 +106,14 @@ struct QueryRequest<'a> {
     image: &'a [u8],
 }
 
-impl VlBBoxModel for SubprocessVlBBoxModel {
-    fn query(&self, image: ImageView<'_>, prompt: &str) -> Result<String, VisualQueryError> {
+impl SubprocessVlBBoxModel {
+    /// Query one image and terminate/reap the owned process tree when cancellation is requested.
+    pub fn query_with_cancel(
+        &self,
+        image: ImageView<'_>,
+        prompt: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<String, VisualQueryError> {
         if image.width == 0 || image.height == 0 {
             return Err(VisualQueryError::ModelFailed(
                 "image dimensions must be positive".into(),
@@ -168,13 +175,14 @@ impl VlBBoxModel for SubprocessVlBBoxModel {
 
         let mut command = Command::new(&self.config.program);
         command.args(&self.config.args);
-        let output = run_bounded_process(
+        let output = run_bounded_process_with_cancel(
             &mut command,
             request,
             self.config.timeout,
             self.config.max_response_bytes,
             STDERR_LIMIT,
             "model process",
+            cancelled,
         )?;
         if !output.status.success() {
             return Err(VisualQueryError::ModelFailed(format!(
@@ -185,6 +193,13 @@ impl VlBBoxModel for SubprocessVlBBoxModel {
         }
         String::from_utf8(output.stdout)
             .map_err(|error| VisualQueryError::ModelFailed(format!("model stdout: {error}")))
+    }
+}
+
+impl VlBBoxModel for SubprocessVlBBoxModel {
+    fn query(&self, image: ImageView<'_>, prompt: &str) -> Result<String, VisualQueryError> {
+        let cancelled = AtomicBool::new(false);
+        self.query_with_cancel(image, prompt, &cancelled)
     }
 }
 
@@ -202,6 +217,27 @@ pub(crate) fn run_bounded_process(
     stderr_limit: usize,
     label: &str,
 ) -> Result<BoundedProcessOutput, VisualQueryError> {
+    let cancelled = AtomicBool::new(false);
+    run_bounded_process_with_cancel(
+        command,
+        input,
+        timeout_duration,
+        stdout_limit,
+        stderr_limit,
+        label,
+        &cancelled,
+    )
+}
+
+fn run_bounded_process_with_cancel(
+    command: &mut Command,
+    input: Vec<u8>,
+    timeout_duration: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    label: &str,
+    cancelled: &AtomicBool,
+) -> Result<BoundedProcessOutput, VisualQueryError> {
     if timeout_duration.is_zero() {
         return Err(VisualQueryError::ModelFailed(format!(
             "{label} timeout must be positive"
@@ -215,6 +251,11 @@ pub(crate) fn run_bounded_process(
     if stdout_limit == usize::MAX || stderr_limit == usize::MAX {
         return Err(VisualQueryError::ModelFailed(format!(
             "{label} output limits are too large"
+        )));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(VisualQueryError::ModelFailed(format!(
+            "{label} cancelled before spawn"
         )));
     }
     let deadline = Instant::now()
@@ -246,6 +287,9 @@ pub(crate) fn run_bounded_process(
     let stderr_rx = read_bounded(stderr, stderr_limit);
 
     let status = loop {
+        if cancelled.load(Ordering::Acquire) {
+            return fail_with_cleanup(&mut child, format!("{label} cancelled"));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
@@ -260,11 +304,16 @@ pub(crate) fn run_bounded_process(
             }
         }
     };
-    let writer = receive_before_deadline(&writer_rx, deadline, "stdin writer panicked");
-    let stdout = receive_before_deadline(&stdout_rx, deadline, "stdout reader panicked");
-    let stderr = receive_before_deadline(&stderr_rx, deadline, "stderr reader panicked");
+    let writer = receive_before_deadline(&writer_rx, deadline, "stdin writer panicked", cancelled);
+    let stdout = receive_before_deadline(&stdout_rx, deadline, "stdout reader panicked", cancelled);
+    let stderr = receive_before_deadline(&stderr_rx, deadline, "stderr reader panicked", cancelled);
     let (writer, stdout, stderr) = match (writer, stdout, stderr) {
         (Ok(writer), Ok(stdout), Ok(stderr)) => (writer, stdout, stderr),
+        (Err(CompletionError::Cancelled), _, _)
+        | (_, Err(CompletionError::Cancelled), _)
+        | (_, _, Err(CompletionError::Cancelled)) => {
+            return fail_with_cleanup(&mut child, format!("{label} cancelled"));
+        }
         (Err(CompletionError::Failed(message)), _, _)
         | (_, Err(CompletionError::Failed(message)), _)
         | (_, _, Err(CompletionError::Failed(message))) => {
@@ -312,6 +361,7 @@ fn read_bounded(
 
 enum CompletionError {
     TimedOut,
+    Cancelled,
     Failed(&'static str),
 }
 
@@ -319,12 +369,23 @@ fn receive_before_deadline<T>(
     receiver: &Receiver<T>,
     deadline: Instant,
     disconnected_message: &'static str,
+    cancelled: &AtomicBool,
 ) -> Result<T, CompletionError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(value) => Ok(value),
-        Err(RecvTimeoutError::Timeout) => Err(CompletionError::TimedOut),
-        Err(RecvTimeoutError::Disconnected) => Err(CompletionError::Failed(disconnected_message)),
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CompletionError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CompletionError::TimedOut);
+        }
+        match receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CompletionError::Failed(disconnected_message));
+            }
+        }
     }
 }
 
@@ -364,7 +425,9 @@ fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
     };
     let wait_result = child.wait().map(|_| ());
     match (signal_error, wait_result) {
-        (None, result) => result,
+        (None, Ok(())) => Ok(()),
+        (None, Err(wait_error)) if wait_error.kind() == ErrorKind::InvalidInput => Ok(()),
+        (None, Err(wait_error)) => Err(wait_error),
         (Some(signal_error), Ok(())) => Err(signal_error),
         (Some(signal_error), Err(wait_error)) => Err(Error::other(format!(
             "process-group termination failed: {signal_error}; reap failed: {wait_error}"
@@ -385,5 +448,59 @@ fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
         (Err(kill_error), Err(wait_error)) => Err(std::io::Error::other(format!(
             "termination failed: {kill_error}; reap failed: {wait_error}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_reaps_the_owned_process_group() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "nuwax-visual-query-cancel-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("printf '%s' $$ > '{}'; sleep 10", pid_file.display());
+        let model = SubprocessVlBBoxModel::new(SubprocessModelConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from(script)],
+            timeout: Duration::from_secs(5),
+            max_response_bytes: 1024,
+            max_image_bytes: 1024,
+            max_image_pixels: 1024,
+            max_request_bytes: 4096,
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let query_cancelled = Arc::clone(&cancelled);
+        let handle = thread::spawn(move || {
+            model.query_with_cancel(
+                ImageView {
+                    width: 1,
+                    height: 1,
+                    data: &[0],
+                },
+                "find object",
+                &query_cancelled,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_file.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid = fs::read_to_string(&pid_file).expect("worker must publish its PID");
+        cancelled.store(true, Ordering::Release);
+        let error = handle.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(
+            !PathBuf::from(format!("/proc/{pid}")).exists(),
+            "cancelled child PID {pid} must be reaped"
+        );
+        fs::remove_file(pid_file).unwrap();
     }
 }

@@ -331,6 +331,7 @@ button{font-family:inherit;cursor:pointer}
 .config-row.changed .cfield input,.config-row.changed .cfield select{border-color:var(--robot);box-shadow:0 0 0 3px var(--warn-w)}
 .config-row.invalid .cfield input{border-color:var(--bad)}
 .config-err{color:var(--bad);font-size:10px}
+.config-help{color:var(--muted);font-size:10px;line-height:1.45}
 .config-badge{font-size:9px;font-weight:600;padding:1px 6px;border-radius:var(--pill);background:var(--inset-2);color:var(--muted)}
 .config-badge.adv{background:var(--warn-w);color:var(--warn)}
 .config-badge.sec{background:var(--bad-w);color:var(--bad)}
@@ -5677,10 +5678,18 @@ button{font-family:inherit;cursor:pointer}
         } else if (Array.isArray(f.choices) && f.choices.length) {
           input = document.createElement("select");
           const labels = Array.isArray(f.choice_labels) ? f.choice_labels : [];
+          const disabledReasons = f.choice_disabled_reasons || {};
           f.choices.forEach((opt, index) => {
             const o = document.createElement("option");
-            // value 始终提交稳定 raw 值，界面只展示中文标签。
-            o.value = opt; o.textContent = labels[index] || opt;
+            // value 始终提交稳定 raw 值，界面只展示中文标签和部署状态。
+            o.value = opt;
+            if (disabledReasons[opt]) {
+              o.disabled = true;
+              o.textContent = (labels[index] || opt) + "（暂不可用）";
+              o.title = disabledReasons[opt];
+            } else {
+              o.textContent = labels[index] || opt;
+            }
             input.appendChild(o);
           });
           if (!f.choices.includes(f.value) && f.value) {
@@ -5756,6 +5765,14 @@ button{font-family:inherit;cursor:pointer}
           };
           picker.addEventListener("input", applyPalette);
           picker.addEventListener("change", applyPalette);
+        }
+        const disabledReasons = f.choice_disabled_reasons || {};
+        const disabledEntries = Object.entries(disabledReasons);
+        if (disabledEntries.length) {
+          const deployNote = document.createElement("div");
+          deployNote.className = "config-help";
+          deployNote.textContent = disabledEntries.map(([raw, reason]) => raw + "：" + reason).join(" ");
+          cell.appendChild(deployNote);
         }
         const err = document.createElement("div");
         err.className = "config-err";

@@ -38,12 +38,14 @@ Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
 Environment=NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready
 Environment=NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime
+Environment=NUWAX_GEOMETRY_RELEASE_MANIFEST=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json
 Environment=NUWAX_GEOMETRY_RUNTIME_PORT=50051
 Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
 Environment=NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap
 Environment=NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap
 Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json
 Environment=NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH=/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json
+ExecStartPre=/usr/bin/env NUWAX_GEOMETRY_RELEASE_MANIFEST=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json /usr/bin/python3 @NUWAX_REPO_ROOT@/services/geometry/release_manifest.py check --manifest @NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json
 ExecStartPre=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
 ExecStartPre=/usr/bin/rm -f /tmp/nuwax_cloudmap.mmap /tmp/nuwax_occupancy.mmap
 ExecStartPre=/usr/bin/rm -f /run/nuwax/geometry/nuwax_geometry_runtime.ready /run/nuwax/geometry/nuwax_geometry_runtime.ready.runtime

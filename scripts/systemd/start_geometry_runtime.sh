@@ -4,8 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
+RELEASE_CHECKER="${REPO_ROOT}/services/geometry/release_manifest.py"
+RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${RUNTIME_BINARY%/*}/nuwax-geometry-release/manifest.json}"
 READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
+EXEC_PROOF_FILE="${READY_FILE}.release"
 PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 LIO_BACKEND="${NUWAX_GEOMETRY_LIO_BACKEND:-device}"
@@ -55,7 +58,8 @@ cleanup() {
   trap - EXIT
   stop_ready_monitor
   rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
-    "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" 2>/dev/null || true
+    "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" \
+    "${EXEC_PROOF_FILE}" 2>/dev/null || true
   stop_geometry_child || true
   exit "${status}"
 }
@@ -101,7 +105,7 @@ mkdir -p "$(dirname "${READY_FILE}")"
 [[ -x "${RUNTIME_BINARY}" && ! -L "${RUNTIME_BINARY}" ]] \
   || fail "Geometry runtime binary is not an executable regular file: ${RUNTIME_BINARY}"
 rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
-  "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp"
+  "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" "${EXEC_PROOF_FILE}"
 trap cleanup EXIT
 trap forward_shutdown INT TERM
 
@@ -113,7 +117,8 @@ printf 'nuwax-geometry-runtime launcher: owner profile lio=%s mapping=%s correct
 
 NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \
   NUWAX_GEOMETRY_RUNTIME_PORT="${PORT}" \
-  "${RUNTIME_BINARY}" &
+  PYTHONPATH="${REPO_ROOT}" python3 "${RELEASE_CHECKER}" exec \
+    --manifest "${RELEASE_MANIFEST}" --proof-output "${EXEC_PROOF_FILE}" &
 CHILD_PID="$!"
 
 attempts=$((HEALTH_TIMEOUT * 10 + 1))
@@ -131,6 +136,8 @@ done
 
 geometry_internal_health_ready \
   || fail "runtime did not publish the expected healthy port within ${HEALTH_TIMEOUT}s"
+[[ -f "${EXEC_PROOF_FILE}" && ! -L "${EXEC_PROOF_FILE}" ]] \
+  || fail "verified runtime did not publish its immutable release proof"
 printf 'pid=%s\nport=%s\n' "${CHILD_PID}" "${PORT}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 

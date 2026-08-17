@@ -2235,11 +2235,39 @@ mod process_helper {
 
     fn helper_init_shm(session: &mut HelperSession, anchor: PathAnchor) -> io::Result<()> {
         anchor.directory.revalidate_public_path()?;
-        if anchor.metadata()?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("拒绝替换既有视频共享内存: {}", anchor.public_path.display()),
-            ));
+        if let Some(metadata) = anchor.metadata()? {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "拒绝替换非普通文件视频共享内存: {}",
+                        anchor.public_path.display()
+                    ),
+                ));
+            }
+            // 父进程已经取得路径对的排他租约；能进入 helper 说明没有活动 owner。
+            // 按 inode 身份隔离删除上次异常退出留下的普通 SHM，禁止直接覆盖。
+            let identity_file = anchor.directory.open_at(
+                &anchor.name,
+                nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC,
+                None,
+            )?;
+            let stale = OwnedEntry::from_metadata(
+                anchor.clone(),
+                anchor.name.clone(),
+                &metadata,
+                identity_file,
+                EntryRole::Shm,
+            )?;
+            let cleanup = stale.cleanup();
+            if !matches!(
+                cleanup,
+                VideoRelayPathCleanup::Removed | VideoRelayPathCleanup::AlreadyAbsent
+            ) {
+                return Err(io::Error::other(format!(
+                    "清理失效视频共享内存未完成: {cleanup:?}"
+                )));
+            }
         }
         let watchdog_cleanup = session.watchdog_cleanup.clone();
         let mut watchdog = lock_unpoisoned(&watchdog_cleanup);
@@ -4573,14 +4601,39 @@ fn init_shm(
     ledger: &mut ResourceLedger,
     fault_key: &Path,
 ) -> io::Result<MmapMut> {
-    if leases.shm_anchor.metadata()?.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "拒绝删除或替换既有视频共享内存: {}",
-                leases.shm_anchor.public_path.display()
-            ),
-        ));
+    if let Some(metadata) = leases.shm_anchor.metadata()? {
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "拒绝替换非普通文件视频共享内存: {}",
+                    leases.shm_anchor.public_path.display()
+                ),
+            ));
+        }
+        // 已取得路径对的排他租约，说明没有活动中继拥有该 SHM；按 inode 身份
+        // 隔离并删除上次异常退出留下的普通文件，避免高频重启永久卡在 AlreadyExists。
+        let identity_file = leases.shm_anchor.directory.open_at(
+            &leases.shm_anchor.name,
+            nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC,
+            None,
+        )?;
+        let stale = OwnedEntry::from_metadata(
+            leases.shm_anchor.clone(),
+            leases.shm_anchor.name.clone(),
+            &metadata,
+            identity_file,
+            EntryRole::Shm,
+        )?;
+        let cleanup = stale.cleanup();
+        if !matches!(
+            cleanup,
+            VideoRelayPathCleanup::Removed | VideoRelayPathCleanup::AlreadyAbsent
+        ) {
+            return Err(io::Error::other(format!(
+                "清理失效视频共享内存未完成: {cleanup:?}"
+            )));
+        }
     }
     let candidate_name = reserve_cleanup_name(&leases.shm_anchor.directory, EntryRole::Shm)?;
     let file = leases.shm_anchor.directory.create_new(&candidate_name)?;
@@ -5773,15 +5826,17 @@ mod tests {
     }
 
     #[test]
-    fn existing_shm_is_never_deleted_even_with_a_different_uds() {
-        let paths = TestPaths::new("foreign-shm");
-        std::fs::write(&paths.shm, b"foreign-shm").unwrap();
+    fn stale_regular_shm_is_reclaimed_under_exclusive_pair_lease() {
+        let paths = TestPaths::new("stale-shm");
+        std::fs::write(&paths.shm, b"stale-shm").unwrap();
         let other_uds = paths.root.join("other.sock");
-        let error = expect_start_error(spawn_video_relay_owner(&paths.shm, &other_uds));
-        assert_eq!(error.primary.kind, io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&paths.shm).unwrap(), b"foreign-shm");
-        assert!(!other_uds.exists());
-        assert!(error.thread_joined && error.terminal.is_clean());
+        let mut owner = spawn_video_relay_owner(&paths.shm, &other_uds)
+            .expect("排他租约持有者应回收异常退出遗留 SHM");
+        assert_ne!(std::fs::read(&paths.shm).unwrap(), b"stale-shm");
+        assert!(other_uds.exists());
+        assert!(owner.shutdown(Duration::from_secs(1)).unwrap().is_clean());
+        assert!(!paths.shm.exists() && !other_uds.exists());
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
     }
 
     #[test]

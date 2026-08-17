@@ -44,20 +44,33 @@ _GEOMETRY_OWNER_KEYS = frozenset({
 _SENSITIVE_MASK = "********"
 _EFFECTIVE_VALUES_LOCK = threading.RLock()
 
-# Rust owner_profile.rs 明确接受的三个正交轴。当前没有跨轴排斥项，因此有效矩阵是 3×2×4。
+# Rust owner_profile.rs 明确接受的三个正交轴；Web 只暴露已完成 Go2 闭环验收的子集。
 _GEOMETRY_LIO_BACKENDS = ("device", "fastlio2", "pointlio")
 _GEOMETRY_MAPPING_BACKENDS = ("voxel", "raytracing")
 _GEOMETRY_CORRECTION_BACKENDS = ("none", "library_pgo", "native_pgo", "relocalization")
+_GEOMETRY_DISABLED_CHOICES = {
+    "NUWAX_GEOMETRY_LIO_BACKEND": {
+        "fastlio2": "Go2 完整 release 已恢复制品接线，但尚未完成实机闭环验收。",
+        "pointlio": "Go2 完整 release 已恢复制品接线，但尚未完成实机闭环验收。",
+    },
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND": {
+        "native_pgo": "原生 PGO 受控制品注入已恢复，但尚未完成 Go2 实机闭环验收。",
+        "relocalization": "status 3 已定位为视频 SHM 残留导致中继启动失败；修复尚待 Go2 闭环复验。",
+    },
+}
 
 
 def _geometry_backend_matrix() -> List[Dict[str, str]]:
-    """返回 Geometry Runtime 已实现并由生产预检接纳的 24 个组合。"""
+    """返回当前 Web 可部署的 Go2 后端组合。"""
 
+    disabled_lio = _GEOMETRY_DISABLED_CHOICES["NUWAX_GEOMETRY_LIO_BACKEND"]
+    disabled_correction = _GEOMETRY_DISABLED_CHOICES["NUWAX_GEOMETRY_CORRECTION_BACKEND"]
     return [
         {"lio": lio, "mapping": mapping, "correction": correction}
         for lio in _GEOMETRY_LIO_BACKENDS
         for mapping in _GEOMETRY_MAPPING_BACKENDS
         for correction in _GEOMETRY_CORRECTION_BACKENDS
+        if lio not in disabled_lio and correction not in disabled_correction
     ]
 
 
@@ -338,6 +351,7 @@ def build_schema() -> Dict[str, object]:
             "alias_of": f.alias_of,
             "choices": list(f.choices),
             "choice_labels": list(f.choice_labels),
+            "choice_disabled_reasons": dict(_GEOMETRY_DISABLED_CHOICES.get(f.key, {})),
             "value": display_value,
             "value_source": value_source,
             "is_set": raw_value is not None,
@@ -350,8 +364,8 @@ def build_schema() -> Dict[str, object]:
         "effect_note": "仅保存已修改项；保存后需重启网关和 Geometry Runtime 生效。",
         "geometry_backend_matrix": _geometry_backend_matrix(),
         "geometry_backend_matrix_note": (
-            "当前支持 3 种 LIO × 2 种建图 × 4 种校正，共 24 个有效组合；"
-            "原生 LIO/PGO 组合还需部署清单提供对应可执行制品。"
+            "当前 Web 仅开放已通过 Go2 闭环验收的 1 种 LIO × 2 种建图 × 2 种校正，"
+            "共 4 个可部署组合；其余选项已禁用并显示原因。"
         ),
     }
 
@@ -528,6 +542,10 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
             continue
         if field.choices and normalized not in field.choices:
             rejected[key] = f"值必须是以下之一：{', '.join(field.choices)}"
+            continue
+        disabled_reason = _GEOMETRY_DISABLED_CHOICES.get(key, {}).get(normalized)
+        if disabled_reason:
+            rejected[key] = disabled_reason
             continue
         target_file = _save_target(key, field.target_file)
         per_target.setdefault(target_file, {})[key] = normalized

@@ -1138,14 +1138,10 @@ impl CommonLioIngress {
         self.validate_registration_mode_token(registration_mode_token)?;
         self.check_identity(&state, identity)?;
         state.cloud.check(identity)?;
-        let latest_odometry = state
-            .odometry
-            .latest
-            .ok_or(LioIngressError::MissingOdometry)?;
-        if correlated_odometry != latest_odometry {
-            return Err(LioIngressError::OdometryCorrelationMismatch {
-                expected: latest_odometry,
-                actual: correlated_odometry,
+        if correlated_odometry.source_timestamp_ns > identity.source_timestamp_ns {
+            return Err(LioIngressError::NonCausalOdometryCorrelation {
+                cloud_timestamp_ns: identity.source_timestamp_ns,
+                odometry_timestamp_ns: correlated_odometry.source_timestamp_ns,
             });
         }
         let frozen_odom_from_body = state
@@ -1351,6 +1347,16 @@ impl CommonLioIngress {
             latest_cloud: state.cloud.latest,
             latest_adapter_timestamp_ns: state.latest_adapter_timestamp_ns,
         }
+    }
+
+    fn latest_causal_odometry(&self, cloud_timestamp_ns: i64) -> Option<CorrelatedOdometry> {
+        self.state
+            .lock()
+            .accepted_odometry_identities
+            .iter()
+            .rev()
+            .find(|odometry| odometry.source_timestamp_ns <= cloud_timestamp_ns)
+            .copied()
     }
 
     fn check_identity(
@@ -2926,8 +2932,7 @@ impl LioIngressSink for CommonLioIngress {
             .reserve_legacy_cloud_identity(source_timestamp_ns)
             .map_err(|error| error.to_string())?;
         let correlated_odometry = self
-            .snapshot()
-            .latest_odometry
+            .latest_causal_odometry(source_timestamp_ns)
             .ok_or_else(|| LioIngressError::MissingOdometry.to_string())?;
         let Some(_lifecycle_guard) = mapping_admission_guard(runtime, shutdown_rx).await else {
             return Ok(());
@@ -3659,10 +3664,12 @@ pub(crate) enum LioIngressError {
     MissingBaseAnchor,
     #[error("accepted odometry contains an invalid full-SE(3) pose")]
     InvalidOdometryPose,
-    #[error("cloud correlation mismatch: expected {expected:?}, got {actual:?}")]
-    OdometryCorrelationMismatch {
-        expected: CorrelatedOdometry,
-        actual: CorrelatedOdometry,
+    #[error(
+        "cloud correlation is non-causal: cloud timestamp {cloud_timestamp_ns}, odometry timestamp {odometry_timestamp_ns}"
+    )]
+    NonCausalOdometryCorrelation {
+        cloud_timestamp_ns: i64,
+        odometry_timestamp_ns: i64,
     },
     #[error("already-registered map cloud is not valid Device ingress")]
     AlreadyRegisteredMapCloud,

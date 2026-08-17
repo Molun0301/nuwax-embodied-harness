@@ -21,13 +21,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from services.geometry.release_manifest import (
-    ReleaseManifestError,
-    default_release_manifest_path,
-    verify_ready_release,
-    verify_release_manifest,
-)
-
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
 _DEFAULT_PORT = 50051
@@ -40,13 +33,6 @@ _ATTACHED_HEALTH_CHECK_TTL_SEC = 1.0
 _ATTACHED_HEALTH_CHECK_TIMEOUT_SEC = float(
     os.environ.get("NUWAX_GEOMETRY_RUNTIME_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
 )
-# 紧急跳过 attach gRPC 验活的 hotfix 开关；置 1 后退回旧的「仅端口探测」行为。
-# 默认关闭：attach 路径必须 RPC 验活，避免挂接已僵死的进程导致后续 UNAVAILABLE 死锁。
-_SKIP_ATTACH_HEALTH_CHECK = os.environ.get(
-    "NUWAX_GEOMETRY_RUNTIME_SKIP_HEALTH_CHECK", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
-
-
 class GeometryRuntimeSubprocess:
     """兼容旧类名的 attach-only nuwax-geometry-runtime 客户端。"""
 
@@ -82,8 +68,8 @@ class GeometryRuntimeSubprocess:
             if not self._is_port_open():
                 self._reset_attached_state_locked()
                 return False
-            if not self._verify_release_and_ready_locked():
-                self._last_error = "Geometry active release or ready identity changed"
+            if not self._verify_ready_locked():
+                self._last_error = "Geometry ready marker changed or became stale"
                 self._reset_attached_state_locked()
                 return False
             return self._check_attached_health_locked()
@@ -92,24 +78,43 @@ class GeometryRuntimeSubprocess:
     def last_error(self) -> Optional[str]:
         return self._last_error
 
-    def _verify_release_and_ready_locked(self) -> bool:
-        manifest = default_release_manifest_path()
-        ready = os.environ.get(
-            "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
-            str(
-                Path(__file__).resolve().parents[2]
-                / "runtime_data"
-                / "geometry"
-                / "nuwax_geometry_runtime.ready"
-            ),
+    def _verify_ready_locked(self) -> bool:
+        """校验 canonical launcher 发布的最小 ready 标记。"""
+        ready_path = Path(
+            os.environ.get(
+                "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "runtime_data"
+                    / "geometry"
+                    / "nuwax_geometry_runtime.ready"
+                ),
+            )
         )
         try:
-            proof = verify_release_manifest(manifest)
-            runtime = proof.artifact_for_role("geometry_runtime").path
-            proof = verify_release_manifest(manifest, expected_runtime=runtime)
-            verify_ready_release(Path(ready), proof)
-            return True
-        except (OSError, ReleaseManifestError):
+            if ready_path.is_symlink() or not ready_path.is_file():
+                return False
+            fields = {}
+            for line in ready_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator != "=" or key not in {"pid", "port"} or key in fields:
+                    return False
+                fields[key] = value
+            if set(fields) != {"pid", "port"}:
+                return False
+            pid = fields["pid"]
+            port = fields["port"]
+            if not (
+                pid.isascii()
+                and pid.isdecimal()
+                and not pid.startswith("0")
+                and port.isascii()
+                and port.isdecimal()
+                and not port.startswith("0")
+            ):
+                return False
+            return int(port) == self._port and Path("/proc", pid).is_dir()
+        except (OSError, UnicodeError):
             return False
 
     def _warn_if_video_relay_missing(self) -> None:
@@ -139,11 +144,11 @@ class GeometryRuntimeSubprocess:
             if self._started:
                 if (
                     self._attached
-                    and self._verify_release_and_ready_locked()
+                    and self._verify_ready_locked()
                     and self._check_attached_health_locked(force=True)
                 ):
                     return True
-                self._last_error = "Geometry active release, ready identity, or health changed"
+                self._last_error = "Geometry ready marker or health changed"
                 self._reset_attached_state_locked()
             if not self._is_port_open():
                 self._last_error = (
@@ -152,8 +157,8 @@ class GeometryRuntimeSubprocess:
                 )
                 LOGGER.error(self._last_error)
                 return False
-            if not self._verify_release_and_ready_locked():
-                self._last_error = "Geometry release proof or ready generation verification failed"
+            if not self._verify_ready_locked():
+                self._last_error = "Geometry ready marker verification failed"
                 self._reset_attached_state_locked()
                 return False
             if not self._verify_attached_runtime_locked():
@@ -206,8 +211,6 @@ class GeometryRuntimeSubprocess:
         用一次性 insecure_channel + GetStatus RPC 直接打 127.0.0.1:port。
         成功 → 返回 True（可挂接）。失败/超时/拒绝 → 返回 False。
         """
-        if _SKIP_ATTACH_HEALTH_CHECK:
-            return True
         try:
             import grpc  # 局部 import 避免拉起整个 gRPC 栈（无 grpc 也能跑非 gRPC 路径）
             from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
@@ -234,8 +237,6 @@ class GeometryRuntimeSubprocess:
         force=True 跳过缓存（仅用于 start() 顶部 zombie 自愈路径）。
         失败时清空 attach/started 状态，让下次 start() 重新执行双门验活。
         """
-        if _SKIP_ATTACH_HEALTH_CHECK:
-            return True
         now = time.monotonic()
         if not force and self._attached_health_check_ok and (
             now - self._attached_health_check_at

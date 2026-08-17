@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
 RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
@@ -11,13 +10,6 @@ PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 CHILD_PID=""
 READY_MONITOR_PID=""
-
-[[ -r "${IDENTITY_HELPER}" ]] || {
-  echo "nuwax-geometry-runtime launcher: process identity helper is unavailable: ${IDENTITY_HELPER}" >&2
-  exit 1
-}
-# shellcheck source=scripts/systemd/process_identity.sh
-source "${IDENTITY_HELPER}"
 
 fail() {
   echo "nuwax-geometry-runtime launcher: $*" >&2
@@ -105,9 +97,6 @@ esac
 mkdir -p "$(dirname "${READY_FILE}")"
 [[ -x "${RUNTIME_BINARY}" && ! -L "${RUNTIME_BINARY}" ]] \
   || fail "Geometry runtime binary is not an executable regular file: ${RUNTIME_BINARY}"
-RUNTIME_BINARY_SHA256="$(sha256sum "${RUNTIME_BINARY}" | cut -d' ' -f1)"
-[[ "${RUNTIME_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
-  || fail "cannot calculate Geometry runtime binary SHA-256"
 rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
   "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp"
 trap cleanup EXIT
@@ -133,13 +122,7 @@ done
 
 geometry_internal_health_ready \
   || fail "runtime did not publish the expected healthy port within ${HEALTH_TIMEOUT}s"
-BOOT_ID="$(nuwax_read_boot_id)" || fail "cannot read current boot identity"
-CHILD_STARTTIME="$(nuwax_read_proc_starttime "${CHILD_PID}")" \
-  || fail "cannot read child process starttime from /proc/${CHILD_PID}/stat"
-
-printf 'pid=%s\nboot_id=%s\nstarttime=%s\nport=%s\nhealth_ready=1\nruntime_binary_sha256=%s\n' \
-  "${CHILD_PID}" "${BOOT_ID}" "${CHILD_STARTTIME}" "${PORT}" \
-  "${RUNTIME_BINARY_SHA256}" > "${READY_FILE}.tmp"
+printf 'pid=%s\nport=%s\n' "${CHILD_PID}" "${PORT}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 
 monitor_geometry_ready_lease &

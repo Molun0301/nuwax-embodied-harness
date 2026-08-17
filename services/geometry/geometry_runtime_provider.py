@@ -4005,7 +4005,13 @@ class GeometryRuntimeProvider:
         try:
             activation_disposition_name = pb2.ActivationReceiptDisposition.Name(
                 activation_disposition
-            ).removeprefix("ACTIVATION_RECEIPT_DISPOSITION_").lower()
+            )
+            activation_disposition_prefix = "ACTIVATION_RECEIPT_DISPOSITION_"
+            if activation_disposition_name.startswith(activation_disposition_prefix):
+                activation_disposition_name = activation_disposition_name[
+                    len(activation_disposition_prefix) :
+                ]
+            activation_disposition_name = activation_disposition_name.lower()
         except ValueError:
             activation_disposition_name = "unknown"
         return {
@@ -4085,9 +4091,11 @@ class GeometryRuntimeProvider:
         _validate_relocalize_result_proofs(response)
         disposition = int(getattr(response, "disposition", 0) or 0)
         try:
-            disposition_name = pb2.RelocalizeDisposition.Name(disposition).removeprefix(
-                "RELOCALIZE_DISPOSITION_"
-            ).lower()
+            disposition_name = pb2.RelocalizeDisposition.Name(disposition)
+            disposition_prefix = "RELOCALIZE_DISPOSITION_"
+            if disposition_name.startswith(disposition_prefix):
+                disposition_name = disposition_name[len(disposition_prefix) :]
+            disposition_name = disposition_name.lower()
         except ValueError:
             disposition_name = "unknown"
         return {
@@ -4733,7 +4741,11 @@ class GeometryRuntimeProvider:
             current_checkpoint_provenance = self._mapping_checkpoint_provenance
         if activation_request_id is not None:
             session_id = str(activation_request_id or "").strip()
-            request_suffix = session_id.removeprefix("mapload:")
+            request_suffix = (
+                session_id[len("mapload:") :]
+                if session_id.startswith("mapload:")
+                else session_id
+            )
             if (
                 not session_id.startswith("mapload:")
                 or len(request_suffix) != 32

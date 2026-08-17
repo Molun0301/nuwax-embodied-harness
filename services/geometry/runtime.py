@@ -4606,8 +4606,16 @@ class PlatformGeometryRuntime:
             }
         )
         next_request_id = str(activation_request_id or "").strip()
-        previous_request_suffix = previous_identity[2].removeprefix("mapload:")
-        next_request_suffix = next_request_id.removeprefix("mapload:")
+        previous_request_suffix = (
+            previous_identity[2][len("mapload:") :]
+            if previous_identity[2].startswith("mapload:")
+            else previous_identity[2]
+        )
+        next_request_suffix = (
+            next_request_id[len("mapload:") :]
+            if next_request_id.startswith("mapload:")
+            else next_request_id
+        )
         previous_request_valid = bool(
             previous_identity[2].startswith("mapload:")
             and len(previous_request_suffix) == 32

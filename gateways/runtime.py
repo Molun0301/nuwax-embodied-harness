@@ -10634,9 +10634,7 @@ class GatewayRuntime:
                 or len(correlation) != len("exploration-global-stop:") + 64
                 or any(
                     ch not in "0123456789abcdef"
-                    for ch in correlation.removeprefix(
-                        "exploration-global-stop:"
-                    )
+                    for ch in correlation[len("exploration-global-stop:") :]
                 )
             ):
                 raise RuntimeError("global-stop reconciliation receipt identity mismatch")

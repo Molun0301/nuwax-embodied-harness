@@ -4442,6 +4442,7 @@ pub(crate) mod lifecycle_tests {
             &binary,
             "#!/usr/bin/env bash\n\
              set -euo pipefail\n\
+             if [[ \"$0\" == *start_geometry_runtime.sh ]]; then return 0; fi\n\
              printf '%s' \"$$\" > \"${NUWAX_TEST_RUNTIME_PID_FILE}\"\n\
              printf '%s' \"${NUWAX_GEOMETRY_RUNTIME_PORT}\" > \"${NUWAX_GEOMETRY_RUNTIME_READY_FILE}.tmp\"\n\
              mv -f \"${NUWAX_GEOMETRY_RUNTIME_READY_FILE}.tmp\" \"${NUWAX_GEOMETRY_RUNTIME_READY_FILE}\"\n\
@@ -4487,12 +4488,18 @@ entries.sort(key=lambda item: item['role'])
 generation = hashlib.sha256(canonical(entries)).hexdigest()
 manifest = {'schema_version': 'nuwax.geometry.release.v1', 'generation': generation,
             'native_lio_roles': ['fastlio2'], 'artifacts': entries}
-(root / 'manifest.json').write_bytes(canonical(manifest))
+manifest_path = root / 'manifest.json'
+manifest_path.write_bytes(canonical(manifest))
+manifest_path.chmod(0o644)
+for directory in root.rglob('*'):
+    if directory.is_dir():
+        directory.chmod(0o755)
+root.chmod(0o755)
 "#;
         let release_status = std::process::Command::new("python3")
             .arg("-c")
             .arg(prepare_release)
-            .arg(&binary)
+            .arg("/bin/bash")
             .arg(&release_root)
             .status()
             .expect("prepare fake release manifest");
@@ -4507,6 +4514,7 @@ manifest = {'schema_version': 'nuwax.geometry.release.v1', 'generation': generat
             std::process::Command::new("bash")
                 .arg(launcher_path)
                 .env("NUWAX_GEOMETRY_RUNTIME_BINARY", &binary)
+                .env("BASH_ENV", &binary)
                 .env("NUWAX_GEOMETRY_RELEASE_MANIFEST", &release_manifest)
                 .env("NUWAX_GEOMETRY_RUNTIME_READY_FILE", &ready)
                 .env("NUWAX_GEOMETRY_RUNTIME_PORT", "50051")

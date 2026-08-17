@@ -806,6 +806,7 @@ button{font-family:inherit;cursor:pointer}
         logs: [],
         logCursor: 0,
         streamSocket: null,
+        streamConnectionEpoch: 0,
         streamReconnectTimer: null,
         streamReconnectDelayMs: 1000,
         streamReconnectAttempt: 0,
@@ -858,6 +859,8 @@ button{font-family:inherit;cursor:pointer}
         lastLocalizationEnvelope: null,
         lastMapHeartbeatEnvelope: null,
         latestFrontierStream: null,
+        latestExplorationOverlayIdentity: null,
+        explorationOverlayRequiresCanonical: false,
         semanticInstances: [],
         showSemanticInstances: true,
         highlightTarget: null,
@@ -3253,17 +3256,39 @@ button{font-family:inherit;cursor:pointer}
           });
       }
       function syncPointcloud3dState() {
+        const navigationFrame = state.latestStreamFrames["navigation.state"];
+        const navigationContext = navigationFrame && navigationFrame.payload;
+        const navigationExplorationValidated = navigationGoalMatchesExploration(
+          navigationContext,
+          state.latestExplorationOverlayIdentity
+        );
         window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: state.latestPose || null }));
         window.dispatchEvent(new CustomEvent("stream:localization.trajectory", {
           detail: { trajectory: state.trajectory || [] },
         }));
         window.dispatchEvent(new CustomEvent("stream:exploration.frontier", {
-          detail: { frontiers: state.frontiers || [] },
+          detail: {
+            frontiers: state.frontiers || [],
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationExplorationValidated,
+            ...currentExplorationOverlayDetail(),
+          },
+        }));
+        window.dispatchEvent(new CustomEvent("stream:exploration.state", {
+          detail: {
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationExplorationValidated,
+            ...currentExplorationOverlayDetail(),
+          },
         }));
         window.dispatchEvent(new CustomEvent("stream:navigation.state", {
           detail: {
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationExplorationValidated,
+            ...currentExplorationOverlayDetail(),
           },
         }));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
@@ -4099,11 +4124,22 @@ button{font-family:inherit;cursor:pointer}
         const explorationContext = frontierCache && frontierCache.frontier_cleared === true && !explorationIsNewerThanClear
           ? null
           : data.exploration_context;
-        setPill(els.navigationStatus, status);
-        const frontierCount = data.frontier_count;
-        const waitingFor = data.waiting_for;
         const explorationState = explorationContext && explorationContext.exploration_state;
         const explorationMetadata = explorationState && explorationState.metadata ? explorationState.metadata : {};
+        const latestExplorationIdentity = state.latestExplorationOverlayIdentity;
+        if (
+          data.navigation_update_frame === true
+          && latestExplorationIdentity
+          && !navigationGoalMatchesExploration(
+            data.navigation_context,
+            latestExplorationIdentity
+          )
+        ) return;
+        setPill(els.navigationStatus, status);
+        const frontierCount = data.frontier_count !== undefined && data.frontier_count !== null
+          ? data.frontier_count
+          : explorationState && explorationState.frontier_count;
+        const waitingFor = data.waiting_for;
         let explorerStatus = data.explorer_status_text
           || explorationMetadata.status_text
           || explorationMetadata.explorer_status_text;
@@ -4125,7 +4161,39 @@ button{font-family:inherit;cursor:pointer}
         if (!state.navigationPath.length && Array.isArray(data.planned_path)) {
           state.navigationPath = data.planned_path.map(pathPointFromValue).filter(Boolean);
         }
+        const canonicalExploration = String(explorationMetadata.state_source || "").toLowerCase() === "geometry_runtime_grpc"
+          || String(explorationMetadata.exploration_mode || "").toLowerCase() === "nuwax_geometry_runtime";
+        const explorationStatus = String(explorationState && explorationState.status || "").toLowerCase();
+        const canonicalInactive = Boolean(latestExplorationIdentity && (
+          latestExplorationIdentity.terminal
+          || latestExplorationIdentity.status === "idle"
+          || latestExplorationIdentity.frontierCount === 0
+          || (
+            latestExplorationIdentity.sessionMode
+            && latestExplorationIdentity.sessionMode !== "explore"
+          )
+        )) || (canonicalExploration && (
+          explorationTerminal
+          || explorationStatus === "idle"
+          || (
+            explorationMetadata.geometry_session_mode
+            && String(explorationMetadata.geometry_session_mode).toLowerCase() !== "explore"
+          )
+        ));
         syncDebugNavGoalFromStream(data.navigation_context || data);
+        if (canonicalInactive) {
+          state.goalPose = null;
+          state.navigationPath = [];
+        } else if (
+          latestExplorationIdentity
+          && !navigationGoalMatchesExploration(
+            data.navigation_context,
+            latestExplorationIdentity
+          )
+        ) {
+          state.goalPose = null;
+          state.navigationPath = [];
+        }
         if (state.pendingNavGoal && state.pendingNavGoal.status === "accepted" && state.goalPose) {
           state.pendingNavGoal = null;
         }
@@ -4764,17 +4832,65 @@ button{font-family:inherit;cursor:pointer}
         "runtime.governance",
         "pointcloud_map.meta",
       ]);
+      function navigationGoalMatchesExploration(navigationContext, identity) {
+        const goal = navigationContext && navigationContext.current_goal;
+        const metadata = goal && goal.metadata || {};
+        if (!identity || !identity.requestId) return false;
+        return String(metadata.parent_request_id || "").trim() === identity.requestId
+          && normalizedStreamCursor(metadata.exploration_generation) === identity.generation;
+      }
+      function currentExplorationOverlayDetail() {
+        const frame = state.latestStreamFrames["exploration.state"];
+        const context = frame && frame.payload;
+        const exploration = context && context.exploration_state;
+        const metadata = exploration && exploration.metadata || {};
+        const identity = state.latestExplorationOverlayIdentity;
+        return {
+          canonical_exploration: isCanonicalExplorationFrame(frame),
+          exploration_identity: identity ? { ...identity } : null,
+          exploration_terminal: identity ? identity.terminal : metadata.exploration_terminal === true,
+          exploration_status: identity ? identity.status : String(exploration && exploration.status || "").toLowerCase(),
+          geometry_session_mode: identity ? identity.sessionMode : String(metadata.geometry_session_mode || "").toLowerCase(),
+          frontier_count: identity ? identity.frontierCount : exploration && exploration.frontier_count,
+        };
+      }
       function pointcloud3dStreamDetail(frame) {
         if (frame.topic === "localization.pose") return state.latestPose || null;
         if (frame.topic === "localization.trajectory") return { trajectory: state.trajectory || [] };
-        if (frame.topic === "navigation.state" || frame.topic === "exploration.state") {
-          return { planned_path: state.navigationPath || [], current_goal: state.goalPose || null };
+        if (frame.topic === "navigation.state") {
+          return {
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationGoalMatchesExploration(
+              frame.payload,
+              state.latestExplorationOverlayIdentity
+            ),
+            ...currentExplorationOverlayDetail(),
+          };
+        }
+        if (frame.topic === "exploration.state") {
+          const navigationFrame = state.latestStreamFrames["navigation.state"];
+          return {
+            planned_path: state.navigationPath || [],
+            current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationGoalMatchesExploration(
+              navigationFrame && navigationFrame.payload,
+              state.latestExplorationOverlayIdentity
+            ),
+            ...currentExplorationOverlayDetail(),
+          };
         }
         if (frame.topic === "exploration.frontier") {
+          const navigationFrame = state.latestStreamFrames["navigation.state"];
           return {
             frontiers: state.frontiers || [],
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_exploration_validated: navigationGoalMatchesExploration(
+              navigationFrame && navigationFrame.payload,
+              state.latestExplorationOverlayIdentity
+            ),
+            ...currentExplorationOverlayDetail(),
           };
         }
         return frame.payload || {};
@@ -4834,6 +4950,74 @@ button{font-family:inherit;cursor:pointer}
         }
         return next === current;
       }
+      function compareCanonicalInteger(left, right) {
+        if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+        if (left === right) return 0;
+        return left < right ? -1 : 1;
+      }
+      function isCanonicalExplorationFrame(frame) {
+        const exploration = frame && frame.payload && frame.payload.exploration_state;
+        const metadata = exploration && exploration.metadata;
+        if (!metadata) return false;
+        const stateSource = String(metadata.state_source || "").trim().toLowerCase();
+        const explorationMode = String(metadata.exploration_mode || "").trim().toLowerCase();
+        return stateSource === "geometry_runtime_grpc"
+          || explorationMode === "nuwax_geometry_runtime";
+      }
+      function canonicalExplorationFrameIdentity(frame) {
+        const context = frame && frame.payload;
+        const exploration = context && context.exploration_state;
+        const metadata = exploration && exploration.metadata;
+        if (!exploration || !metadata || !isCanonicalExplorationFrame(frame)) return null;
+        const generation = normalizedStreamCursor(metadata.exploration_generation);
+        const revision = normalizedStreamCursor(metadata.revision);
+        const timestampNs = normalizedStreamCursor(metadata.timestamp_ns);
+        if (generation === null || revision === null || timestampNs === null) return null;
+        return {
+          generation,
+          revision,
+          timestampNs,
+          requestId: String(exploration.current_request_id || metadata.request_id || "").trim(),
+          status: String(exploration.status || "").trim().toLowerCase(),
+          sessionMode: String(metadata.geometry_session_mode || "").trim().toLowerCase(),
+          terminal: metadata.exploration_terminal === true
+            || ["succeeded", "failed", "cancelled"].includes(String(exploration.status || "").trim().toLowerCase()),
+          frontierCount: Number.isSafeInteger(exploration.frontier_count) && exploration.frontier_count >= 0
+            ? exploration.frontier_count
+            : null,
+        };
+      }
+      function compareExplorationOverlayIdentity(left, right) {
+        const generationComparison = compareCanonicalInteger(left.generation, right.generation);
+        if (generationComparison !== 0) return generationComparison;
+        if (left.requestId !== right.requestId) return -1;
+        for (const key of ["revision", "timestampNs"]) {
+          const comparison = compareCanonicalInteger(left[key], right[key]);
+          if (comparison !== 0) return comparison;
+        }
+        return 0;
+      }
+      function acceptCanonicalExplorationFrame(frame) {
+        const canonical = isCanonicalExplorationFrame(frame);
+        const identity = canonicalExplorationFrameIdentity(frame);
+        if (identity === null) return !canonical && !state.explorationOverlayRequiresCanonical;
+        const current = state.latestExplorationOverlayIdentity;
+        if (current && compareExplorationOverlayIdentity(identity, current) <= 0) return false;
+        state.latestExplorationOverlayIdentity = identity;
+        state.explorationOverlayRequiresCanonical = false;
+        state.latestFrontierStream = null;
+        state.frontiers = [];
+        if (
+          identity.terminal
+          || identity.status === "idle"
+          || identity.frontierCount === 0
+          || (identity.sessionMode && identity.sessionMode !== "explore")
+        ) {
+          state.navigationPath = [];
+          state.goalPose = null;
+        }
+        return true;
+      }
       function routePointCloudMapBinary(buffer) {
         const bytes = new Uint8Array(buffer);
         const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x50, 0x43, 0x00];
@@ -4858,15 +5042,46 @@ button{font-family:inherit;cursor:pointer}
           detail: { reason },
         }));
       }
+      function resetExplorationOverlayConsumer(reason) {
+        state.latestExplorationOverlayIdentity = null;
+        state.explorationOverlayRequiresCanonical = true;
+        state.latestFrontierStream = null;
+        state.frontiers = [];
+        state.navigationPath = [];
+        state.goalPose = null;
+        state.highlightTarget = null;
+        for (const topic of ["exploration.state", "exploration.frontier", "navigation.state"]) {
+          delete state.latestStreamFrames[topic];
+          delete state.pendingStreamFrames[topic];
+        }
+        requestMapDraw(false);
+        window.dispatchEvent(new CustomEvent("stream:exploration.overlay-reset", {
+          detail: { reason },
+        }));
+      }
       window.addEventListener("stream:pointcloud_map.cursor-accepted", (event) => {
         updateLatestStreamCursor(event.detail?.cursor);
       });
       function connectStreams() {
-        if (state.streamSocket && state.streamSocket.readyState === WebSocket.OPEN) return;
+        if (
+          state.streamSocket
+          && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.streamSocket.readyState)
+        ) return;
+        if (state.streamReconnectTimer) {
+          window.clearTimeout(state.streamReconnectTimer);
+          state.streamReconnectTimer = null;
+        }
         const socket = new WebSocket(buildStreamUrl());
+        const epoch = state.streamConnectionEpoch + 1;
+        state.streamConnectionEpoch = epoch;
         socket.binaryType = "arraybuffer";
         state.streamSocket = socket;
+        const isCurrentConnection = () => (
+          socket === state.streamSocket
+          && epoch === state.streamConnectionEpoch
+        );
         socket.addEventListener("open", () => {
+          if (!isCurrentConnection()) return;
           const wasReconnect = state.streamReconnectAttempt > 0;
           state.streamReconnectAttempt = 0;
           state.streamReconnectDelayMs = 1000;
@@ -4877,6 +5092,7 @@ button{font-family:inherit;cursor:pointer}
           if (wasReconnect) loadInitialTasks();
         });
         socket.addEventListener("message", (event) => {
+          if (!isCurrentConnection()) return;
           if (event.data instanceof ArrayBuffer) {
             routePointCloudMapBinary(event.data);
             return;
@@ -4893,6 +5109,7 @@ button{font-family:inherit;cursor:pointer}
             );
             if (message.resync_required || message.replay_gap) {
               resetPointCloudMapBinaryConsumer("replay_gap");
+              resetExplorationOverlayConsumer("replay_gap");
               loadInitialTasks();
             }
             return;
@@ -4900,6 +5117,7 @@ button{font-family:inherit;cursor:pointer}
           if (message.type === "stream.gap") {
             updateLatestStreamCursor(message.latest_cursor);
             resetPointCloudMapBinaryConsumer("queue_gap");
+            resetExplorationOverlayConsumer("queue_gap");
             loadInitialTasks();
             return;
           }
@@ -4907,18 +5125,22 @@ button{font-family:inherit;cursor:pointer}
           handleStreamFrame(message.frame);
         });
         socket.addEventListener("close", () => {
+          if (!isCurrentConnection()) return;
           resetPointCloudMapBinaryConsumer("disconnect");
+          resetExplorationOverlayConsumer("disconnect");
           state.streamReconnectAttempt += 1;
-          scheduleStreamReconnect();
+          scheduleStreamReconnect(socket, epoch);
         });
         socket.addEventListener("error", () => {
+          if (!isCurrentConnection()) return;
           showPanelError("logs", "实时数据流连接异常，正在重连。");
         });
       }
-      function scheduleStreamReconnect() {
+      function scheduleStreamReconnect(socket, epoch) {
         const delayMs = Math.min(30000, Math.max(1000, state.streamReconnectDelayMs));
         if (state.streamReconnectTimer) return;
         state.streamReconnectTimer = window.setTimeout(() => {
+          if (socket !== state.streamSocket || epoch !== state.streamConnectionEpoch) return;
           state.streamReconnectTimer = null;
           connectStreams();
         }, delayMs);
@@ -4935,6 +5157,11 @@ button{font-family:inherit;cursor:pointer}
       }
       function handleStreamFrame(frame) {
         updateLatestStreamCursor(frame.cursor);
+        if (
+          frame.topic === "exploration.frontier"
+          && state.explorationOverlayRequiresCanonical
+        ) return;
+        if (frame.topic === "exploration.state" && !acceptCanonicalExplorationFrame(frame)) return;
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "logs.entry") {
           state.pendingLogFrames.push(frame);
@@ -4978,24 +5205,42 @@ button{font-family:inherit;cursor:pointer}
           const trajectory = frame.payload && Array.isArray(frame.payload.trajectory) ? frame.payload.trajectory : [];
           updateLocalization(envelopeFromFrame(frame, { pose: state.pose, trajectory }));
         } else if (frame.topic === "navigation.state") {
-          updateNavigation(envelopeFromFrame(frame, { navigation_context: frame.payload, exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload }));
+          updateNavigation(envelopeFromFrame(frame, {
+            navigation_context: frame.payload,
+            exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload,
+            navigation_update_frame: true,
+          }));
           const navCtx = frame.payload || {};
           const goal = navCtx.current_goal || null;
           const navStatus = String((navCtx.status && (navCtx.status.value || navCtx.status)) || "").toLowerCase();
           const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(navStatus);
-          if (goal && !terminal) {
+          const explorationIdentity = state.latestExplorationOverlayIdentity;
+          const canonicalGoalAllowed = !explorationIdentity
+            || navigationGoalMatchesExploration(navCtx, explorationIdentity);
+          if (goal && !terminal && canonicalGoalAllowed) {
             state.highlightTarget = {
               record_id: goal.metadata && goal.metadata.record_id || null,
               record_kind: goal.metadata && goal.metadata.record_kind || null,
               target_pose: goal.target_pose || null,
               target_name: goal.target_name || null,
             };
-          } else if (terminal) {
+          } else if (!explorationIdentity && terminal) {
             state.highlightTarget = null;
           }
           requestMapDraw(false);
         } else if (frame.topic === "exploration.state") {
-          updateNavigation(envelopeFromFrame(frame, { navigation_context: state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload, exploration_context: frame.payload }));
+          const navigationContext = state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload;
+          updateNavigation(envelopeFromFrame(frame, { navigation_context: navigationContext, exploration_context: frame.payload }));
+          const explorationIdentity = state.latestExplorationOverlayIdentity;
+          if (
+            explorationIdentity
+            && (
+              explorationIdentity.terminal
+              || explorationIdentity.status === "idle"
+              || explorationIdentity.frontierCount === 0
+              || !navigationGoalMatchesExploration(navigationContext, explorationIdentity)
+            )
+          ) state.highlightTarget = null;
         } else if (frame.topic === "exploration.frontier") {
           updateFrontierFrame(frame);
         } else if (frame.topic === "runtime.governance") {
@@ -5047,6 +5292,7 @@ button{font-family:inherit;cursor:pointer}
         return true;
       }
       function updateFrontierFrame(frame) {
+        if (state.explorationOverlayRequiresCanonical) return;
         const payload = frame.payload || {};
         const frameMetadata = frame.metadata || {};
         const cleared = payload.frontier_cleared === true || frameMetadata.frontier_cleared === true;

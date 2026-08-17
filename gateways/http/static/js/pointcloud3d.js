@@ -330,6 +330,61 @@ export function shouldAcceptPointCloudMapEnvelope(current, next) {
   return next.revisionOrdinal > current.revisionOrdinal;
 }
 
+function explorationOverlayInteger(value, fieldName) {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${fieldName} 必须是安全非负整数`);
+    return BigInt(value);
+  }
+  return pointCloudIdentityBigInt(value, fieldName);
+}
+
+export function parseExplorationOverlayIdentity(detail) {
+  const raw = detail?.exploration_identity;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  return {
+    generation: explorationOverlayInteger(raw.generation, 'exploration_generation'),
+    revision: explorationOverlayInteger(raw.revision, 'exploration_revision'),
+    timestampNs: explorationOverlayInteger(raw.timestampNs, 'exploration_timestamp_ns'),
+    requestId: String(raw.requestId || ''),
+  };
+}
+
+function compareExplorationOverlayIdentity(current, next) {
+  if (next.generation > current.generation) return 1;
+  if (next.generation < current.generation) return -1;
+  if (next.requestId !== current.requestId) return -1;
+  for (const key of ['revision', 'timestampNs']) {
+    if (next[key] > current[key]) return 1;
+    if (next[key] < current[key]) return -1;
+  }
+  return 0;
+}
+
+export function shouldAcceptExplorationOverlay(current, next) {
+  return !current || compareExplorationOverlayIdentity(current, next) > 0;
+}
+
+function explorationOverlayIsInactive(detail) {
+  const status = String(detail?.exploration_status || '').toLowerCase();
+  const sessionMode = String(detail?.geometry_session_mode || '').toLowerCase();
+  return detail?.exploration_terminal === true
+    || ['succeeded', 'failed', 'cancelled', 'idle'].includes(status)
+    || (sessionMode && sessionMode !== 'explore');
+}
+
+function navigationEventMatchesExploration(detail, identity) {
+  if (detail?.navigation_exploration_validated !== true || !identity) return false;
+  let eventIdentity;
+  try {
+    eventIdentity = parseExplorationOverlayIdentity(detail);
+  } catch (_) {
+    return false;
+  }
+  return eventIdentity !== null
+    && eventIdentity.generation === identity.generation
+    && eventIdentity.requestId === identity.requestId;
+}
+
 class PointCloud3DViewer {
   constructor() {
     this._container = null;
@@ -375,6 +430,10 @@ class PointCloud3DViewer {
     this._lastFrameTime = 0;
     this._allPositions = new Float32Array(0);
     this._pointCloudMapWatermark = null;
+    this._explorationOverlayWatermark = null;
+    this._explorationFrontierRenderedForWatermark = false;
+    this._explorationOverlayInactive = false;
+    this._explorationOverlayRequiresCanonical = false;
     this._hasPointCloudSnapshot = false;
     this._isLiveCloudMapSnapshot = false;
     this._pointCloudSourcePoints = null;
@@ -1829,6 +1888,11 @@ class PointCloud3DViewer {
     this._semanticRaycaster = null;
     this._semanticPointer = null;
     this._semanticZoomHidden = false;
+    this._pointCloudMapWatermark = null;
+    this._explorationOverlayWatermark = null;
+    this._explorationFrontierRenderedForWatermark = false;
+    this._explorationOverlayInactive = false;
+    this._explorationOverlayRequiresCanonical = false;
     this._rafId = null;
     this._hasFramedPointCloud = false;
     this._hasUserCameraInput = false;
@@ -1875,20 +1939,58 @@ function yawFromValue(value) {
 
 window.addEventListener('stream:exploration.frontier', (e) => {
   const data = e.detail;
+  let identity = null;
+  try {
+    identity = parseExplorationOverlayIdentity(data);
+  } catch (_) {
+    return;
+  }
+  const current = window.pointcloud3d._explorationOverlayWatermark;
+  if (
+    identity === null
+    && (
+      data?.canonical_exploration === true
+      || window.pointcloud3d._explorationOverlayRequiresCanonical
+    )
+  ) return;
+  if (current && identity === null) return;
+  if (current && identity) {
+    const comparison = compareExplorationOverlayIdentity(current, identity);
+    if (comparison < 0) return;
+    if (
+      comparison === 0
+      && window.pointcloud3d._explorationFrontierRenderedForWatermark
+    ) return;
+  }
+  if (identity) {
+    window.pointcloud3d._explorationOverlayWatermark = identity;
+    window.pointcloud3d._explorationFrontierRenderedForWatermark = true;
+    window.pointcloud3d._explorationOverlayRequiresCanonical = false;
+  }
+  window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(data);
+  if (window.pointcloud3d._explorationOverlayInactive || data?.frontier_count === 0) {
+    window.pointcloud3d.updateFrontiers([]);
+    window.pointcloud3d.updateNavigationPath([], null);
+    return;
+  }
   const rawFrontiers = Array.isArray(data) ? data
     : data?.latest_frontiers ?? data?.frontiers ?? [];
   const frontiers = rawFrontiers.map(pointFromValue).filter(Boolean);
   window.pointcloud3d.updateFrontiers(frontiers);
-  const rawPath = firstDefinedValue(data?.planned_path, data?.nav_path, data?.path);
+  const navigationCorrelated = !identity
+    || navigationEventMatchesExploration(data, identity);
+  const rawPath = navigationCorrelated
+    ? firstDefinedValue(data?.planned_path, data?.nav_path, data?.path)
+    : null;
   const path = rawPath === null ? []
     : Array.isArray(rawPath) ? rawPath.map(pointFromValue).filter(Boolean)
       : undefined;
-  const rawGoal = firstAvailableValue(
+  const rawGoal = navigationCorrelated ? firstAvailableValue(
     data?.current_goal,
     data?.selected_frontier,
     data?.current_frontier,
     data?.metadata?.current_frontier,
-  );
+  ) : null;
   const goalPoint = pointFromValue(rawGoal);
   const goal = rawGoal === undefined ? undefined
     : goalPoint ? { ...goalPoint, yaw: yawFromValue(rawGoal) }
@@ -1896,6 +1998,15 @@ window.addEventListener('stream:exploration.frontier', (e) => {
   if (path !== undefined || goal !== undefined) {
     window.pointcloud3d.updateNavigationPath(path, goal);
   }
+});
+
+window.addEventListener('stream:exploration.overlay-reset', () => {
+  window.pointcloud3d._explorationOverlayWatermark = null;
+  window.pointcloud3d._explorationFrontierRenderedForWatermark = false;
+  window.pointcloud3d._explorationOverlayInactive = false;
+  window.pointcloud3d._explorationOverlayRequiresCanonical = true;
+  window.pointcloud3d.updateFrontiers([]);
+  window.pointcloud3d.updateNavigationPath([], null);
 });
 
 window.addEventListener('stream:localization.pose', (e) => {
@@ -1922,11 +2033,62 @@ window.addEventListener('stream:localization.trajectory', (e) => {
 
 function updateNavigationOverlayFromEvent(e) {
   const d = e.detail;
-  const rawPath = firstDefinedValue(d?.planned_path, d?.nav_path, d?.path);
+  let explorationIdentity = window.pointcloud3d._explorationOverlayWatermark;
+  if (e.type === 'stream:exploration.state') {
+    let identity;
+    try {
+      identity = parseExplorationOverlayIdentity(d);
+    } catch (_) {
+      return;
+    }
+    if (identity === null) {
+      if (
+        d?.canonical_exploration === true
+        || explorationIdentity
+        || window.pointcloud3d._explorationOverlayRequiresCanonical
+      ) return;
+    } else {
+      if (!shouldAcceptExplorationOverlay(explorationIdentity, identity)) return;
+      window.pointcloud3d._explorationOverlayWatermark = identity;
+      window.pointcloud3d._explorationFrontierRenderedForWatermark = false;
+      window.pointcloud3d._explorationOverlayRequiresCanonical = false;
+      explorationIdentity = identity;
+      window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(d);
+      if (window.pointcloud3d._explorationOverlayInactive) {
+        window.pointcloud3d.updateFrontiers([]);
+        window.pointcloud3d.updateNavigationPath([], null);
+        return;
+      }
+      if (d?.frontier_count === 0) {
+        window.pointcloud3d.updateFrontiers([]);
+        window.pointcloud3d.updateNavigationPath([], null);
+        return;
+      }
+    }
+  } else {
+    if (
+      explorationIdentity
+      && !navigationEventMatchesExploration(d, explorationIdentity)
+    ) return;
+    if (
+      window.pointcloud3d._explorationOverlayRequiresCanonical
+      || window.pointcloud3d._explorationOverlayInactive
+    ) {
+      window.pointcloud3d.updateNavigationPath([], null);
+      return;
+    }
+  }
+  const navigationCorrelated = !explorationIdentity
+    || navigationEventMatchesExploration(d, explorationIdentity);
+  const rawPath = navigationCorrelated
+    ? firstDefinedValue(d?.planned_path, d?.nav_path, d?.path)
+    : null;
   const path = rawPath === null ? []
     : Array.isArray(rawPath) ? rawPath.map(pointFromValue).filter(Boolean)
       : undefined;
-  const rawGoal = firstAvailableValue(d?.current_goal, d?.goal_pose, d?.goal);
+  const rawGoal = navigationCorrelated
+    ? firstAvailableValue(d?.current_goal, d?.goal_pose, d?.goal)
+    : null;
   const goalPoint = pointFromValue(rawGoal);
   const goal = rawGoal === undefined ? undefined
     : goalPoint ? { ...goalPoint, yaw: yawFromValue(rawGoal) }

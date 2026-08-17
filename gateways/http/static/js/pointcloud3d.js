@@ -239,6 +239,97 @@ function forbiddenZoneEntry(value, preferredMapName = null) {
   };
 }
 
+const POINTCLOUD_BINARY_MAGIC = Object.freeze([0x4e, 0x55, 0x57, 0x41, 0x58, 0x50, 0x43, 0x00]);
+const POINTCLOUD_BINARY_VERSION = 1;
+const POINTCLOUD_BINARY_PREFIX_BYTES = 13;
+const POINTCLOUD_BINARY_MAX_HEADER_BYTES = 64 * 1024;
+const POINTCLOUD_MAX_U64 = 18446744073709551615n;
+const POINTCLOUD_BINARY_TOPICS = new Set(['pointcloud_map.snapshot', 'pointcloud_map.live_chunk']);
+
+function pointCloudIdentityBigInt(value, fieldName) {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${fieldName} 必须是规范十进制 u64 字符串`);
+  }
+  const parsed = BigInt(value);
+  if (parsed > POINTCLOUD_MAX_U64) {
+    throw new Error(`${fieldName} 超出 u64 范围`);
+  }
+  return parsed;
+}
+
+export function parsePointCloudMapBinaryEnvelope(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < POINTCLOUD_BINARY_PREFIX_BYTES) {
+    throw new Error('点云二进制信封被截断');
+  }
+  const bytes = new Uint8Array(buffer);
+  if (!POINTCLOUD_BINARY_MAGIC.every((value, index) => bytes[index] === value)) {
+    throw new Error('未知点云二进制 magic');
+  }
+  if (bytes[8] !== POINTCLOUD_BINARY_VERSION) {
+    throw new Error('不支持的点云二进制版本');
+  }
+  const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
+  if (headerLength <= 0 || headerLength > POINTCLOUD_BINARY_MAX_HEADER_BYTES) {
+    throw new Error('点云 JSON header 长度非法');
+  }
+  const payloadOffset = POINTCLOUD_BINARY_PREFIX_BYTES + headerLength;
+  if (payloadOffset > buffer.byteLength) throw new Error('点云 JSON header 被截断');
+  let header;
+  try {
+    header = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(
+      bytes.slice(POINTCLOUD_BINARY_PREFIX_BYTES, payloadOffset),
+    ));
+  } catch (_) {
+    throw new Error('点云 JSON header 非法');
+  }
+  if (!header || typeof header !== 'object' || !POINTCLOUD_BINARY_TOPICS.has(header.topic)) {
+    throw new Error('点云 binary topic 非法');
+  }
+  if (!['live', 'saved'].includes(header.source)) throw new Error('点云 source 非法');
+  if (typeof header.source_epoch !== 'string' || !header.source_epoch) throw new Error('点云 source_epoch 缺失');
+  if (typeof header.revision !== 'string' || !header.revision) throw new Error('点云 revision 缺失');
+  if (typeof header.frame_id !== 'string' || !header.frame_id) throw new Error('点云 frame_id 缺失');
+  if (header.format !== 'float32-xyz-le') throw new Error('点云 format 非法');
+  const cursor = pointCloudIdentityBigInt(header.cursor, 'cursor');
+  const streamGeneration = pointCloudIdentityBigInt(header.stream_generation, 'stream_generation');
+  const revisionOrdinal = pointCloudIdentityBigInt(header.revision_ordinal, 'revision_ordinal');
+  const sourceTimestampNs = pointCloudIdentityBigInt(header.source_timestamp_ns, 'source_timestamp_ns');
+  if (!Number.isSafeInteger(header.point_count) || header.point_count < 0 || header.point_count > MAX_POINTS) {
+    throw new Error('点云 point_count 非法');
+  }
+  if (!Number.isSafeInteger(header.payload_length) || header.payload_length < 0) {
+    throw new Error('点云 payload_length 非法');
+  }
+  const expectedPayloadLength = header.point_count * 12;
+  if (header.payload_length !== expectedPayloadLength) throw new Error('点云 header 点数与载荷长度不一致');
+  if (buffer.byteLength !== payloadOffset + header.payload_length) throw new Error('点云信封总长度不一致');
+  const payloadView = new DataView(buffer, payloadOffset, header.payload_length);
+  const xyz = new Float32Array(header.point_count * 3);
+  for (let index = 0; index < xyz.length; index += 1) {
+    const coordinate = payloadView.getFloat32(index * 4, true);
+    if (!Number.isFinite(coordinate)) throw new Error('点云 XYZ 坐标必须全部有限');
+    xyz[index] = coordinate;
+  }
+  return {
+    header,
+    cursor,
+    streamGeneration,
+    revisionOrdinal,
+    sourceTimestampNs,
+    xyz,
+  };
+}
+
+export function shouldAcceptPointCloudMapEnvelope(current, next) {
+  if (!current) return true;
+  if (next.streamGeneration > current.streamGeneration) return true;
+  if (next.streamGeneration < current.streamGeneration) return false;
+  if (next.header.source !== current.header.source || next.header.source_epoch !== current.header.source_epoch) {
+    return false;
+  }
+  return next.revisionOrdinal > current.revisionOrdinal;
+}
+
 class PointCloud3DViewer {
   constructor() {
     this._container = null;
@@ -283,6 +374,7 @@ class PointCloud3DViewer {
     this._rafId = null;
     this._lastFrameTime = 0;
     this._allPositions = new Float32Array(0);
+    this._pointCloudMapWatermark = null;
     this._hasPointCloudSnapshot = false;
     this._isLiveCloudMapSnapshot = false;
     this._pointCloudSourcePoints = null;
@@ -1025,17 +1117,12 @@ class PointCloud3DViewer {
     this._rebuildPointCloud();
   }
 
-  _replaceCloudMapBuffer(xyzArray, revision) {
-    this._lastCloudMapRevision = revision;
+  _replaceCloudMapBuffer(xyzArray, identity) {
+    this._lastCloudMapRevision = identity.header.revision;
+    this._pointCloudMapWatermark = identity;
     this._hasPointCloudSnapshot = true;
-    this._isLiveCloudMapSnapshot = true;
+    this._isLiveCloudMapSnapshot = identity.header.source === 'live';
     this._pointCloudSourcePoints = Math.floor(xyzArray.length / 3);
-
-    // 32MB 上限检查
-    if (xyzArray.byteLength > MAX_BUFFER_BYTES) {
-      const maxPoints = Math.floor(MAX_BUFFER_BYTES / 12);
-      xyzArray = xyzArray.slice(0, maxPoints * 3);
-    }
 
     this._allPositions = xyzArray;
     this._rebuildPointCloud();
@@ -1877,23 +1964,28 @@ window.addEventListener('stream:pointcloud_map.meta', (e) => {
   if (d?.url) window.pointcloud3d.loadPointCloud(d.url, d.lod ?? 'preview');
 });
 
-// 实时累积地图 binary 帧接收
+// 统一实时/保存点云 binary 信封接收
 window.addEventListener('stream:pointcloud_map.binary', (e) => {
   if (!window.pointcloud3d) return;
-  const buf = e.detail;
-  if (!buf || buf.byteLength < 8) return;
-
-  const header = new DataView(buf, 0, 8);
-  const revision = header.getUint32(0, true);
-  const pointCount = header.getUint32(4, true);
-
-  if (pointCount === 0) {
-    window.pointcloud3d._replaceCloudMapBuffer(new Float32Array(0), revision);
+  const buffer = e.detail?.buffer;
+  let envelope;
+  try {
+    envelope = parsePointCloudMapBinaryEnvelope(buffer);
+  } catch (error) {
+    window.dispatchEvent(new CustomEvent('pointcloud3d:status', {
+      detail: { state: 'error', message: error.message },
+    }));
     return;
   }
-  if (revision <= (window.pointcloud3d._lastCloudMapRevision || 0)) return;
+  // 完整信封通过严格解析后才确认 transport cursor；语义旧帧仍可确认传输进度。
+  window.dispatchEvent(new CustomEvent('stream:pointcloud_map.cursor-accepted', {
+    detail: { cursor: envelope.header.cursor },
+  }));
+  if (!shouldAcceptPointCloudMapEnvelope(window.pointcloud3d._pointCloudMapWatermark, envelope)) return;
+  window.pointcloud3d._replaceCloudMapBuffer(envelope.xyz, envelope);
+});
 
-  if (buf.byteLength < 8 + pointCount * 3 * Float32Array.BYTES_PER_ELEMENT) return;
-  const xyz = new Float32Array(buf, 8, pointCount * 3);
-  window.pointcloud3d._replaceCloudMapBuffer(xyz, revision);
+window.addEventListener('stream:pointcloud_map.reset', () => {
+  if (!window.pointcloud3d) return;
+  window.pointcloud3d._pointCloudMapWatermark = null;
 });

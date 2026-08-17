@@ -809,7 +809,7 @@ button{font-family:inherit;cursor:pointer}
         streamReconnectTimer: null,
         streamReconnectDelayMs: 1000,
         streamReconnectAttempt: 0,
-        latestStreamCursor: 0,
+        latestStreamCursor: "0",
         latestStreamFrames: {},
         pendingStreamFrames: {},
         pendingLogFrames: [],
@@ -4083,11 +4083,19 @@ button{font-family:inherit;cursor:pointer}
         const data = mergeLatestFrontierStream(envelope.data || {});
         const frontierCache = state.latestFrontierStream;
         const explorationFrame = state.latestStreamFrames["exploration.state"];
-        const frontierClearSequence = Number(frontierCache && frontierCache.sequence);
-        const explorationSequence = Number(explorationFrame && (explorationFrame.sequence ?? explorationFrame.cursor));
-        const explorationIsNewerThanClear = Number.isFinite(frontierClearSequence)
-          && Number.isFinite(explorationSequence)
-          && explorationSequence > frontierClearSequence;
+        const frontierClearSequence = normalizedStreamCursor(frontierCache && frontierCache.sequence);
+        const explorationSequence = normalizedStreamCursor(
+          explorationFrame && (explorationFrame.sequence ?? explorationFrame.cursor)
+        );
+        const explorationIsNewerThanClear = frontierClearSequence !== null
+          && explorationSequence !== null
+          && (
+            explorationSequence.length > frontierClearSequence.length
+            || (
+              explorationSequence.length === frontierClearSequence.length
+              && explorationSequence > frontierClearSequence
+            )
+          );
         const explorationContext = frontierCache && frontierCache.frontier_cleared === true && !explorationIsNewerThanClear
           ? null
           : data.exploration_context;
@@ -4736,7 +4744,7 @@ button{font-family:inherit;cursor:pointer}
         "exploration.frontier",
         "runtime.governance",
         "pointcloud_map.meta",
-        "pointcloud_map.live_chunk",
+        "pointcloud_map.snapshot",
         "pointcloud.frame",
         "video.frame",
         "video.detections",
@@ -4798,6 +4806,61 @@ button{font-family:inherit;cursor:pointer}
         if (apiAccessToken) url.searchParams.set("access_token", apiAccessToken);
         return url.toString();
       }
+      const STREAM_CURSOR_MAX_U64 = "18446744073709551615";
+      function normalizedStreamCursor(value) {
+        let normalized = null;
+        if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) {
+          normalized = value;
+        } else if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+          normalized = String(value);
+        }
+        if (normalized === null) return null;
+        if (
+          normalized.length > STREAM_CURSOR_MAX_U64.length
+          || (
+            normalized.length === STREAM_CURSOR_MAX_U64.length
+            && normalized > STREAM_CURSOR_MAX_U64
+          )
+        ) return null;
+        return normalized;
+      }
+      function updateLatestStreamCursor(value, allowReset = false) {
+        const next = normalizedStreamCursor(value);
+        if (next === null) return false;
+        const current = normalizedStreamCursor(state.latestStreamCursor) || "0";
+        if (allowReset || next.length > current.length || (next.length === current.length && next > current)) {
+          state.latestStreamCursor = next;
+          return true;
+        }
+        return next === current;
+      }
+      function routePointCloudMapBinary(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x50, 0x43, 0x00];
+        if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value)) return false;
+        if (bytes[8] !== 1) return false;
+        const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
+        if (headerLength <= 0 || headerLength > 64 * 1024 || 13 + headerLength > bytes.byteLength) return false;
+        let header;
+        try {
+          header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.slice(13, 13 + headerLength)));
+        } catch (_) {
+          return false;
+        }
+        if (!header || !["pointcloud_map.snapshot", "pointcloud_map.live_chunk"].includes(header.topic)) return false;
+        window.dispatchEvent(new CustomEvent("stream:pointcloud_map.binary", {
+          detail: { buffer, routingHeader: header },
+        }));
+        return true;
+      }
+      function resetPointCloudMapBinaryConsumer(reason) {
+        window.dispatchEvent(new CustomEvent("stream:pointcloud_map.reset", {
+          detail: { reason },
+        }));
+      }
+      window.addEventListener("stream:pointcloud_map.cursor-accepted", (event) => {
+        updateLatestStreamCursor(event.detail?.cursor);
+      });
       function connectStreams() {
         if (state.streamSocket && state.streamSocket.readyState === WebSocket.OPEN) return;
         const socket = new WebSocket(buildStreamUrl());
@@ -4815,23 +4878,28 @@ button{font-family:inherit;cursor:pointer}
         });
         socket.addEventListener("message", (event) => {
           if (event.data instanceof ArrayBuffer) {
-            window.dispatchEvent(new CustomEvent("stream:pointcloud_map.binary", { detail: event.data }));
+            routePointCloudMapBinary(event.data);
             return;
           }
           const message = JSON.parse(event.data);
           if (message.type === "keepalive") {
-            if (typeof message.cursor === "number") state.latestStreamCursor = message.cursor;
+            updateLatestStreamCursor(message.cursor);
             return;
           }
           if (message.type === "stream.replay") {
-            if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
+            updateLatestStreamCursor(
+              message.latest_cursor,
+              message.resync_required && message.gap_reason === "cursor_ahead_of_stream",
+            );
             if (message.resync_required || message.replay_gap) {
+              resetPointCloudMapBinaryConsumer("replay_gap");
               loadInitialTasks();
             }
             return;
           }
           if (message.type === "stream.gap") {
-            if (typeof message.latest_cursor === "number") state.latestStreamCursor = message.latest_cursor;
+            updateLatestStreamCursor(message.latest_cursor);
+            resetPointCloudMapBinaryConsumer("queue_gap");
             loadInitialTasks();
             return;
           }
@@ -4839,6 +4907,7 @@ button{font-family:inherit;cursor:pointer}
           handleStreamFrame(message.frame);
         });
         socket.addEventListener("close", () => {
+          resetPointCloudMapBinaryConsumer("disconnect");
           state.streamReconnectAttempt += 1;
           scheduleStreamReconnect();
         });
@@ -4865,7 +4934,7 @@ button{font-family:inherit;cursor:pointer}
         setText(els.lastReceive, `${Math.round(latencyMs)} ms`);
       }
       function handleStreamFrame(frame) {
-        state.latestStreamCursor = Math.max(state.latestStreamCursor || 0, Number(frame.cursor || 0));
+        updateLatestStreamCursor(frame.cursor);
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "logs.entry") {
           state.pendingLogFrames.push(frame);

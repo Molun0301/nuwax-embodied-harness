@@ -10,6 +10,7 @@ from enum import Enum
 import json
 import math
 from pathlib import Path
+import struct
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 from uuid import UUID
@@ -41,7 +42,30 @@ _STREAM_JSON_MAX_TOTAL_STRING_CHARS = 64 * 1024
 _STREAM_JSON_MAX_BYTES = 16 * 1024
 _STREAM_JSON_MAX_INTEGER_BITS = 256
 _STREAM_JSON_MAX_OCCUPANCY_CELLS = 2_000_000
-_LATEST_ONLY_STREAM_TOPICS = frozenset({"map.frame"})
+_POINTCLOUD_BINARY_MAGIC = b"NUWAXPC\x00"
+_POINTCLOUD_BINARY_VERSION = 1
+_POINTCLOUD_BINARY_PREFIX = struct.Struct("<8sBI")
+_POINTCLOUD_BINARY_MAX_HEADER_BYTES = 64 * 1024
+_MAX_U64 = (1 << 64) - 1
+_POINTCLOUD_BINARY_TOPICS = frozenset(
+    {"pointcloud_map.snapshot", "pointcloud_map.live_chunk"}
+)
+_WEBSOCKET_CURSOR_STATUS_FIELDS = frozenset(
+    {
+        "requested_after_cursor",
+        "effective_after_cursor",
+        "oldest_cursor",
+        "latest_cursor",
+        "first_dropped_cursor",
+        "last_dropped_cursor",
+    }
+)
+_WEBSOCKET_CURSOR_MAP_FIELDS = frozenset(
+    {"topic_oldest_cursors", "topic_evicted_through_cursors"}
+)
+_LATEST_ONLY_STREAM_TOPICS = frozenset(
+    {"map.frame", "pointcloud_map.snapshot", "pointcloud_map.live_chunk"}
+)
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {
         "task.succeeded",
@@ -142,6 +166,8 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
         str(field_name): getattr(frame, field_name)
         for field_name in model_fields
     }
+    if frame.cursor is not None:
+        values["cursor"] = _pointcloud_identity_integer(frame.cursor, "cursor")
     if frame.topic == "tasks.state":
         values["payload"] = build_public_runtime_event(frame.payload)
     return values
@@ -584,6 +610,121 @@ def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: 
     loop.call_soon_threadsafe(_push)
 
 
+def _pointcloud_identity_integer(value: object, field_name: str) -> str:
+    if isinstance(value, bool):
+        raise ValueError("%s 必须是 0..2^64-1 的整数。" % field_name)
+    if isinstance(value, int):
+        parsed = value
+    elif (
+        isinstance(value, str)
+        and value.isascii()
+        and (value == "0" or (value[:1] in "123456789" and value.isdigit()))
+    ):
+        parsed = int(value)
+    else:
+        raise ValueError("%s 必须是规范十进制 u64 字符串或整数。" % field_name)
+    if parsed < 0 or parsed > _MAX_U64:
+        raise ValueError("%s 必须位于 0..2^64-1。" % field_name)
+    return str(parsed)
+
+
+def _external_cursor_status(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    result = dict(payload)
+    for field_name in _WEBSOCKET_CURSOR_STATUS_FIELDS:
+        value = result.get(field_name)
+        if value is not None:
+            result[field_name] = _pointcloud_identity_integer(value, field_name)
+    for field_name in _WEBSOCKET_CURSOR_MAP_FIELDS:
+        values = result.get(field_name)
+        if isinstance(values, Mapping):
+            result[field_name] = {
+                str(topic): _pointcloud_identity_integer(cursor, field_name)
+                for topic, cursor in values.items()
+            }
+    return result
+
+
+def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
+    """把统一点云 XYZ 编码为版本化、自描述的 WebSocket 信封。"""
+
+    if frame.topic not in _POINTCLOUD_BINARY_TOPICS:
+        raise ValueError("不是受支持的点云二进制主题。")
+    if not isinstance(frame.payload, (bytes, bytearray)):
+        raise ValueError("点云二进制载荷必须是 bytes。")
+    metadata = dict(frame.metadata or {})
+    xyz_bytes = bytes(frame.payload)
+    if frame.topic == "pointcloud_map.live_chunk":
+        if len(xyz_bytes) < 8:
+            raise ValueError("旧 live compatibility 载荷头被截断。")
+        legacy_revision, legacy_point_count = struct.unpack("<II", xyz_bytes[:8])
+        del legacy_revision
+        xyz_bytes = xyz_bytes[8:]
+        if legacy_point_count != metadata.get("point_count"):
+            raise ValueError("旧 live compatibility 点数与统一身份不一致。")
+
+    source = str(metadata.get("source") or "")
+    source_epoch = str(metadata.get("source_epoch") or "")
+    revision = str(metadata.get("revision") or frame.revision or "")
+    frame_id = str(metadata.get("frame_id") or frame.frame_id or "")
+    point_format = str(metadata.get("format") or "")
+    if source not in {"live", "saved"}:
+        raise ValueError("点云 source 必须是 live 或 saved。")
+    if not source_epoch or not revision or not frame_id:
+        raise ValueError("点云信封身份字段不能为空。")
+    if point_format != "float32-xyz-le":
+        raise ValueError("点云信封仅支持 float32-xyz-le。")
+    point_count_text = _pointcloud_identity_integer(metadata.get("point_count"), "point_count")
+    point_count = int(point_count_text)
+    if len(xyz_bytes) != point_count * 12:
+        raise ValueError("点云 XYZ 长度与 point_count 不一致。")
+    if any(
+        not math.isfinite(coordinate)
+        for coordinate, in struct.iter_unpack("<f", xyz_bytes)
+    ):
+        raise ValueError("点云 XYZ 坐标必须全部为有限 float32。")
+
+    header = {
+        "topic": str(frame.topic),
+        "cursor": _pointcloud_identity_integer(frame.cursor, "cursor"),
+        "source": source,
+        "source_epoch": source_epoch,
+        "stream_generation": _pointcloud_identity_integer(
+            metadata.get("stream_generation"),
+            "stream_generation",
+        ),
+        "revision": revision,
+        "revision_ordinal": _pointcloud_identity_integer(
+            metadata.get("revision_ordinal"),
+            "revision_ordinal",
+        ),
+        "frame_id": frame_id,
+        "source_timestamp_ns": _pointcloud_identity_integer(
+            metadata.get("source_timestamp_ns"),
+            "source_timestamp_ns",
+        ),
+        "point_count": point_count,
+        "format": point_format,
+        "payload_length": len(xyz_bytes),
+    }
+    header_bytes = json.dumps(
+        header,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(header_bytes) > _POINTCLOUD_BINARY_MAX_HEADER_BYTES:
+        raise ValueError("点云信封 JSON header 超过上限。")
+    return (
+        _POINTCLOUD_BINARY_PREFIX.pack(
+            _POINTCLOUD_BINARY_MAGIC,
+            _POINTCLOUD_BINARY_VERSION,
+            len(header_bytes),
+        )
+        + header_bytes
+        + xyz_bytes
+    )
+
+
 def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
     """构造实时数据流路由。"""
 
@@ -624,7 +765,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     emitted += 1
                     if max_frames is not None and emitted >= max_frames:
                         return
-                yield _format_sse("stream.replay", replay_status)
+                yield _format_sse("stream.replay", _external_cursor_status(replay_status))
                 while True:
                     if await request.is_disconnected():
                         break
@@ -636,7 +777,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         if gap_notice is not None:
                             yield _format_sse(
                                 "stream.gap",
-                                gap_notice,
+                                _external_cursor_status(gap_notice),
                             )
                         yield _format_sse_payload(frame)
                         emitted += 1
@@ -736,7 +877,10 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
                     continue  # binary 帧不回放
                 await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
-            await _send_ws_json(websocket, {"type": "stream.replay", **replay_status})
+            await _send_ws_json(
+                websocket,
+                {"type": "stream.replay", **_external_cursor_status(replay_status)},
+            )
             while True:
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.ws_ping_interval_sec)
@@ -744,15 +888,43 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         continue
                     gap_notice = _take_queue_gap_notice(queue, runtime)
                     if gap_notice is not None:
-                        await _send_ws_json(websocket, {"type": "stream.gap", **gap_notice})
+                        await _send_ws_json(
+                            websocket,
+                            {"type": "stream.gap", **_external_cursor_status(gap_notice)},
+                        )
                     if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
-                        await websocket.send_bytes(frame.payload)
+                        if frame.topic in _POINTCLOUD_BINARY_TOPICS:
+                            try:
+                                binary_payload = _encode_pointcloud_binary_frame(frame)
+                            except (TypeError, ValueError) as exc:
+                                await _send_ws_json(
+                                    websocket,
+                                    {
+                                        "type": "stream.binary_rejected",
+                                        "topic": frame.topic,
+                                        "cursor": _pointcloud_identity_integer(
+                                            frame.cursor,
+                                            "cursor",
+                                        ),
+                                        "reason": str(exc),
+                                    },
+                                )
+                                continue
+                            await websocket.send_bytes(binary_payload)
+                        else:
+                            await websocket.send_bytes(frame.payload)
                     else:
                         await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
                 except asyncio.TimeoutError:
                     await _send_ws_json(
                         websocket,
-                        {"type": "keepalive", "cursor": runtime.stream_bus.latest_cursor()},
+                        {
+                            "type": "keepalive",
+                            "cursor": _pointcloud_identity_integer(
+                                runtime.stream_bus.latest_cursor(),
+                                "cursor",
+                            ),
+                        },
                     )
         except WebSocketDisconnect:
             return
@@ -786,13 +958,18 @@ def _format_sse_payload(frame: StreamFrame) -> str:
 
 
 def _format_sse_keepalive(cursor: int) -> str:
-    return _format_sse("keepalive", {"cursor": cursor})
+    return _format_sse(
+        "keepalive",
+        {"cursor": _pointcloud_identity_integer(cursor, "cursor")},
+    )
 
 
 def _format_sse(event_name: str, payload: object, *, cursor: Optional[object] = None) -> str:
     lines = []
     if cursor is not None:
-        lines.append(f"id: {cursor}")
+        lines.append(
+            "id: %s" % _pointcloud_identity_integer(cursor, "cursor")
+        )
     lines.append(f"event: {event_name}")
     lines.append(f"data: {_strict_json_dumps(payload)}")
     lines.append("")

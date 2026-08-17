@@ -459,6 +459,45 @@ def verify_ready_release(ready_path: Path, proof: ReleaseProof) -> None:
         raise ReleaseManifestError("Geometry ready generation 与本地 release 不一致")
 
 
+def verify_exec_proof(proof_path: Path, pid: int, proof: ReleaseProof) -> None:
+    """验证 launcher 收到的 exec 身份证明属于当前进程和 generation。"""
+
+    values: Dict[str, str] = {}
+    try:
+        metadata = proof_path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseManifestError("exec proof 必须是非 symlink regular file")
+        for line in proof_path.read_text(encoding="ascii").splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or not key or key in values:
+                raise ReleaseManifestError("exec proof 字段无效或重复")
+            values[key] = value
+    except OSError as exc:
+        raise ReleaseManifestError("exec proof 不可读取") from exc
+    required = {
+        "RUNTIME_BINARY_SHA256",
+        "RELEASE_MANIFEST_SHA256",
+        "RELEASE_GENERATION",
+    }
+    if set(values) != required:
+        raise ReleaseManifestError("exec proof 字段集合不精确")
+    runtime = proof.artifact_for_role("geometry_runtime")
+    if values["RUNTIME_BINARY_SHA256"] != runtime.sha256:
+        raise ReleaseManifestError("exec proof runtime digest 不一致")
+    if values["RELEASE_MANIFEST_SHA256"] != proof.manifest_sha256:
+        raise ReleaseManifestError("exec proof manifest digest 不一致")
+    if values["RELEASE_GENERATION"] != proof.generation:
+        raise ReleaseManifestError("exec proof generation 不一致")
+    if pid <= 0:
+        raise ReleaseManifestError("exec proof PID 无效")
+    try:
+        loaded_executable = Path("/proc/%d/exe" % pid).resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseManifestError("无法解析 exec proof PID executable") from exc
+    if loaded_executable != runtime.path:
+        raise ReleaseManifestError("exec proof PID executable 不属于已验证 generation")
+
+
 def _write_exec_proof(path: Path, proof: ReleaseProof) -> None:
     runtime = proof.artifact_for_role("geometry_runtime")
     encoded = (
@@ -513,11 +552,12 @@ def exec_verified_release(manifest_path: Optional[Path], proof_output: Path) -> 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="校验 Geometry immutable release artifact set")
-    parser.add_argument("action", choices=("check", "proof", "runtime", "exec"))
+    parser.add_argument("action", choices=("check", "proof", "runtime", "exec", "exec-proof"))
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--runtime", type=Path, default=None)
     parser.add_argument("--ready", type=Path, default=None)
     parser.add_argument("--proof-output", type=Path, default=None)
+    parser.add_argument("--pid", type=int, default=None)
     return parser
 
 
@@ -530,6 +570,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             exec_verified_release(args.manifest, args.proof_output)
             raise ReleaseManifestError("受控 runtime exec 意外返回")
         proof = verify_release_manifest(args.manifest, expected_runtime=args.runtime)
+        if args.action == "exec-proof":
+            if args.proof_output is None or args.pid is None:
+                raise ReleaseManifestError("exec-proof 必须提供 --proof-output 和 --pid")
+            verify_exec_proof(args.proof_output, args.pid, proof)
         if args.ready is not None:
             verify_ready_release(args.ready, proof)
     except ReleaseManifestError as exc:

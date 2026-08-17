@@ -3188,6 +3188,68 @@ def _mark_recovery_rolling_back(context: "ExecutionContext") -> None:
     )
 
 
+def _install_geometry_release(context: "ExecutionContext", release_dir: Path) -> None:
+    contract = context.profile.metadata.get("geometry_release")
+    if not isinstance(contract, dict):
+        return
+    installed_manifest = contract.get("installed_manifest")
+    if not isinstance(installed_manifest, str):
+        raise DeploymentError("geometry_release.installed_manifest is required")
+    manifest_relative = PurePosixPath(installed_manifest)
+    if (
+        manifest_relative.is_absolute()
+        or manifest_relative.name != "manifest.json"
+        or any(part in {"", ".", ".."} for part in manifest_relative.parts)
+    ):
+        raise DeploymentError("geometry_release.installed_manifest must be a safe manifest path")
+
+    build_parent = context.options.build_dir / "geometry-release"
+    build_active = build_parent / "nuwax-geometry-release"
+    try:
+        active_metadata = build_active.lstat()
+    except OSError as exc:
+        raise DeploymentError("verified Geometry release build output is missing") from exc
+    if not stat.S_ISLNK(active_metadata.st_mode):
+        raise DeploymentError("verified Geometry release active path must be a symlink")
+    active_target = PurePosixPath(os.readlink(build_active))
+    if (
+        active_target.is_absolute()
+        or len(active_target.parts) != 2
+        or active_target.parts[0] != "nuwax-geometry-releases"
+        or not re.fullmatch(r"[0-9a-f]{64}", active_target.parts[1])
+    ):
+        raise DeploymentError("verified Geometry release active target is invalid")
+
+    source_generation = build_parent.joinpath(*active_target.parts)
+    if source_generation.is_symlink() or not source_generation.is_dir():
+        raise DeploymentError("verified Geometry release generation is unsafe")
+    destination_active = release_dir.joinpath(*manifest_relative.parent.parts)
+    destination_parent = destination_active.parent
+    destination_generations = destination_parent / "nuwax-geometry-releases"
+    destination_generation = destination_generations / active_target.parts[1]
+    if destination_active.exists() or destination_active.is_symlink():
+        raise DeploymentError("candidate Geometry release active path already exists")
+    if destination_generation.exists() or destination_generation.is_symlink():
+        raise DeploymentError("candidate Geometry release generation already exists")
+    _copy_tree_normalized(source_generation, destination_generation)
+    os.symlink(
+        PurePosixPath("nuwax-geometry-releases", active_target.parts[1]).as_posix(),
+        destination_active,
+    )
+
+    checker = release_dir / "services" / "geometry" / "release_manifest.py"
+    context.runner.run(
+        (
+            str(_venv_python(context)),
+            str(checker),
+            "check",
+            "--manifest",
+            str(destination_active / "manifest.json"),
+        ),
+        timeout=300,
+    )
+
+
 def install_release(context: "ExecutionContext") -> None:
     options = context.options
     release_dir = options.release_dir
@@ -3247,6 +3309,7 @@ def install_release(context: "ExecutionContext") -> None:
         )
         binary_hashes[build.binary] = _sha256(destination)
         binary_metadata[build.binary] = _validate_release_binary(destination)
+    _install_geometry_release(context, release_dir)
     models = options.build_dir / "models"
     if models.is_dir():
         _copy_tree_normalized(models, release_dir / "models")

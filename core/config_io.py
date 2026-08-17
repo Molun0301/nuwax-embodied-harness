@@ -55,7 +55,7 @@ _GEOMETRY_DISABLED_CHOICES = {
     },
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": {
         "native_pgo": "原生 PGO 受控制品注入已恢复，但尚未完成 Go2 实机闭环验收。",
-        "relocalization": "status 3 已定位为视频 SHM 残留导致中继启动失败；修复尚待 Go2 闭环复验。",
+        "relocalization": "status 3 仅能确认视频中继启动失败；已修复可证明的 SHM 残留路径，仍待 Go2 闭环复验。",
     },
 }
 

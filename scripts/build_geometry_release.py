@@ -1203,6 +1203,12 @@ def _build_parser():
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--native-lio", action="append", default=[], metavar="/ABS/PATH")
     parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument(
+        "--installer-output-root",
+        type=Path,
+        default=None,
+        help="部署安装器普通构建用户专用的隔离输出目录",
+    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--stage-only", type=Path, metavar="PARENT")
     modes.add_argument("--finalize-existing-stage", type=Path, metavar="EXACT_STAGE_DIR")
@@ -1211,14 +1217,20 @@ def _build_parser():
 
 def _validate_mode_arguments(parser, args):
     # type: (argparse.ArgumentParser, argparse.Namespace) -> None
+    if args.output_root is not None and args.installer_output_root is not None:
+        parser.error("--output-root 与 --installer-output-root 不能同时提供")
+    if args.installer_output_root is not None and not args.installer_output_root.is_absolute():
+        parser.error("--installer-output-root 必须提供绝对路径")
     if args.stage_only is not None:
-        if args.output_root is not None:
-            parser.error("--stage-only 不得与 --output-root 组合")
+        if args.output_root is not None or args.installer_output_root is not None:
+            parser.error("--stage-only 不得与输出目录参数组合")
         if not args.stage_only.is_absolute():
             parser.error("--stage-only 必须提供绝对 parent path")
     elif args.finalize_existing_stage is not None:
         if args.native_lio:
             parser.error("--finalize-existing-stage 不得提供 --native-lio 或重新 build 输入")
+        if args.installer_output_root is not None:
+            parser.error("--finalize-existing-stage 不得使用 --installer-output-root")
         if not args.finalize_existing_stage.is_absolute():
             parser.error("--finalize-existing-stage 必须提供 exact absolute stage directory")
 
@@ -1270,8 +1282,8 @@ def main(argv=None):
     if args.finalize_existing_stage is not None:
         return _finalize_existing_stage(args, manifests)
 
-    # legacy 是 root 私有一体化发布；必须在任何真实 build 前完成 gate。
-    if args.stage_only is None and os.geteuid() != 0:
+    # legacy 是 root 私有一体化发布；安装器模式则仅写入普通构建用户隔离目录。
+    if args.stage_only is None and args.installer_output_root is None and os.geteuid() != 0:
         raise RuntimeError("legacy 一体化发布必须由 root owner 执行")
     profile_contract = _profile_native_lio_contract(_PROFILE_PATH)
     native_lio = _parse_native_lio(args.native_lio, profile_contract)
@@ -1282,13 +1294,18 @@ def main(argv=None):
 
     default_output = (REPO_ROOT / "services" / "geometry" / "nuwax_geometry_runtime"
                       / "target" / "release" / "nuwax-geometry-releases")
-    output_root = (args.output_root or default_output).absolute()
+    output_root = (args.installer_output_root or args.output_root or default_output).absolute()
+    args.output_root = output_root
     stage_parent = output_root.parent
     stage_parent.mkdir(parents=True, exist_ok=True)
     stage = _build_and_stage(args, native_lio, manifests, stage_parent)
     args.finalize_existing_stage = stage
     try:
-        result = _finalize_existing_stage(args, manifests, private_stage=True)
+        result = _finalize_existing_stage(
+            args,
+            manifests,
+            private_stage=args.installer_output_root is None,
+        )
         _make_tree_removable(stage)
         shutil.rmtree(str(stage))
         return result

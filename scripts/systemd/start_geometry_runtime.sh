@@ -138,6 +138,11 @@ geometry_internal_health_ready \
   || fail "runtime did not publish the expected healthy port within ${HEALTH_TIMEOUT}s"
 [[ -f "${EXEC_PROOF_FILE}" && ! -L "${EXEC_PROOF_FILE}" ]] \
   || fail "verified runtime did not publish its immutable release proof"
+python3 "${RELEASE_CHECKER}" exec-proof \
+  --manifest "${RELEASE_MANIFEST}" \
+  --proof-output "${EXEC_PROOF_FILE}" \
+  --pid "${CHILD_PID}" \
+  || fail "verified runtime proof does not match the running release"
 printf 'pid=%s\nport=%s\n' "${CHILD_PID}" "${PORT}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 

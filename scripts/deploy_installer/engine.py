@@ -494,6 +494,75 @@ def _cargo_metadata_action(
     )
 
 
+def _geometry_release_action(
+    profile: DeploymentProfile,
+    options: DeploymentOptions,
+) -> Optional[Action]:
+    contract = profile.metadata.get("geometry_release")
+    if not isinstance(contract, dict):
+        return None
+    native_payloads = contract.get("native_lio_payloads")
+    if not isinstance(native_payloads, list) or not native_payloads:
+        raise ValueError("geometry_release.native_lio_payloads must be a non-empty list")
+
+    builds_by_binary = {build.binary: build for build in profile.rust.builds if build.binary}
+    native_paths: List[Path] = []
+    for item in native_payloads:
+        if not isinstance(item, dict) or set(item) != {"role", "source"}:
+            raise ValueError("geometry_release native LIO entries must contain role and source")
+        source = item.get("source")
+        build = builds_by_binary.get(source) if isinstance(source, str) else None
+        if build is None:
+            raise ValueError(f"geometry_release source has no Rust build: {source}")
+        native_paths.append(options.rust_target_dir(build.manifest) / "release" / source)
+
+    cargo = str(options.toolchain_bin / "cargo")
+    env = _cargo_environment(
+        options,
+        options.build_dir / "geometry-release" / "isolated-target",
+    )
+    env.update(
+        {
+            "RUSTUP_HOME": str(options.rustup_home),
+            "RUSTUP_TOOLCHAIN": profile.rust.toolchain,
+        }
+    )
+    if options.offline_bundle:
+        cargo = str(options.offline_bundle / "cargo-bin" / "cargo")
+        env["CARGO_NET_OFFLINE"] = "true"
+        env["CARGO_SOURCE_CRATES_IO_REPLACE_WITH"] = "vendored-sources"
+        env["CARGO_SOURCE_VENDORED_SOURCES_DIRECTORY"] = str(
+            options.offline_bundle / "cargo-vendor"
+        )
+        env["PATH"] = (
+            f"{options.offline_bundle / 'cargo-bin'}:"
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        )
+        env["RUSTUP_HOME"] = str(options.offline_rustup_home)
+
+    output_root = options.build_dir / "geometry-release" / "nuwax-geometry-releases"
+    argv: List[str] = [
+        options.python_bin,
+        str(options.source_root / "scripts" / "build_geometry_release.py"),
+        "--cargo",
+        cargo,
+        "--installer-output-root",
+        str(output_root),
+    ]
+    for path in native_paths:
+        argv.extend(("--native-lio", str(path)))
+    return Action.command(
+        "build-geometry-release",
+        "build verified Geometry release manifest and artifact generation",
+        argv,
+        cwd=options.source_root,
+        env=env,
+        as_build_user=True,
+        network_isolated=bool(options.offline_bundle),
+        timeout=7200,
+    )
+
+
 def build_deployment_plan(
     profile: DeploymentProfile,
     options: DeploymentOptions,
@@ -522,6 +591,9 @@ def build_deployment_plan(
     rust_actions = tuple(
         _cargo_metadata_action(profile, options, manifest, index) for index, manifest in enumerate(manifests, start=1)
     ) + tuple(_cargo_action(profile, options, build) for build in profile.rust.builds)
+    geometry_release_action = _geometry_release_action(profile, options)
+    if geometry_release_action is not None:
+        rust_actions += (geometry_release_action,)
 
     admission_actions: List[Action] = []
     if options.offline_bundle:

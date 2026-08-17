@@ -1,5 +1,9 @@
 //! 公共视觉查询 JSONL（逐行 JSON）生产入口与 worker 生命周期 owner。
 
+use crate::goal_transport::{
+    AdmittedGoalLease, GeometryGoalTransport, GoalTransportConfig, NavigationAdmission,
+    NavigationOutcome,
+};
 use crate::perception::PerceptionWorkerConfig;
 use crate::session::{
     TargetObservation, TargetObservationState, VisualQueryFrameIdentity, VisualQuerySession,
@@ -30,6 +34,8 @@ pub struct VisualQueryServiceConfig {
     pub session: VisualQuerySessionConfig,
     /// BBox 到相机姿态的投影配置。
     pub tracker: BBoxTrackerConfig,
+    /// Batch02 唯一 GoalIntent 准入 transport。
+    pub goal_transport: GoalTransportConfig,
     /// 单条 JSONL 命令的硬字节上限。
     pub max_command_bytes: usize,
 }
@@ -43,6 +49,7 @@ impl VisualQueryServiceConfig {
             worker,
             session: VisualQuerySessionConfig::default(),
             tracker: BBoxTrackerConfig::default(),
+            goal_transport: GoalTransportConfig::default(),
             max_command_bytes,
         }
     }
@@ -86,6 +93,8 @@ struct QueryRequest {
     height: u32,
     object_description: String,
     image: Vec<u8>,
+    #[serde(default)]
+    navigation: Option<NavigationAdmission>,
 }
 
 impl QueryRequest {
@@ -131,6 +140,8 @@ struct ServiceEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     observation: Option<&'a TargetObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    navigation: Option<&'a NavigationOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
 }
 
@@ -146,6 +157,7 @@ impl<'a> ServiceEvent<'a> {
             calibration_id: None,
             bbox: None,
             observation: None,
+            navigation: None,
             error: None,
         }
     }
@@ -210,6 +222,10 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
     let mut session = VisualQuerySession::new(session_model, config.session);
     let mut tracker = BBoxTracker::new(config.tracker.clone())
         .map_err(|error| service_error(format!("bbox tracker: {error}")))?;
+    let goal_transport = GeometryGoalTransport::new(config.goal_transport.clone())
+        .map_err(|error| service_error(format!("goal transport: {error}")))?;
+    let tracker_swaps_axes = config.tracker.swap_axes;
+    let mut active_goal: Option<AdmittedGoalLease> = None;
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -317,6 +333,55 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
                     Some(current) if current.request_id == request_id => {
                         current.cancelled.store(true, Ordering::Release);
                     }
+                    _ if active_goal
+                        .as_ref()
+                        .is_some_and(|lease| lease.goal_id == request_id) =>
+                    {
+                        let lease = active_goal.take().expect("matched active goal lease");
+                        match goal_transport.cancel(&lease) {
+                            Ok(terminal) => {
+                                let stopped = session.stop_matching(&lease.parent_request_id);
+                                if let Some(observation) = stopped.as_ref() {
+                                    write_observation_event(&mut output, observation, None)?;
+                                    write_navigation_event(
+                                        &mut output,
+                                        "navigation_cancelled",
+                                        observation,
+                                        &terminal,
+                                        None,
+                                    )?;
+                                } else {
+                                    write_navigation_terminal(
+                                        &mut output,
+                                        "navigation_cancelled",
+                                        &terminal,
+                                        None,
+                                    )?;
+                                }
+                            }
+                            Err(error) => {
+                                active_goal = Some(lease.clone());
+                                write_navigation_terminal(
+                                    &mut output,
+                                    "navigation_cancel_failed",
+                                    &NavigationOutcome {
+                                        status: "FAILED".into(),
+                                        reason_code: "TRANSPORT_ERROR".into(),
+                                        message: error,
+                                        goal_id: lease.goal_id.clone(),
+                                        parent_request_id: lease.parent_request_id.clone(),
+                                        goal_generation: lease.goal_generation,
+                                        producer_runtime_generation: lease
+                                            .producer_runtime_generation,
+                                        cancel_phase: String::new(),
+                                        actuator_zeroed: false,
+                                    },
+                                    Some("navigation cancel transport failed"),
+                                )?;
+                            }
+                        }
+                        output.flush().map_err(io_error)?;
+                    }
                     _ => {
                         let event = ServiceEvent {
                             event: "error",
@@ -328,6 +393,7 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
                             calibration_id: None,
                             bbox: None,
                             observation: None,
+                            navigation: None,
                             error: Some("no matching active query"),
                         };
                         write_event(&mut output, &event)?;
@@ -352,6 +418,7 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
                     calibration_id: None,
                     bbox: None,
                     observation: None,
+                    navigation: None,
                     error: Some(&message),
                 };
                 write_event(&mut output, &event)?;
@@ -367,6 +434,9 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
                 &mut active,
                 &mut session,
                 &mut tracker,
+                &goal_transport,
+                &mut active_goal,
+                tracker_swaps_axes,
                 &mut output,
             )?;
         }
@@ -375,6 +445,18 @@ pub fn run_stdio_service(config: VisualQueryServiceConfig) -> Result<(), VisualQ
     if let Some(mut current) = active.take() {
         current.cancel_and_join()?;
         let _ = result_rx.try_recv();
+    }
+    if let Some(lease) = active_goal.take() {
+        match goal_transport.cancel(&lease) {
+            Ok(terminal) => {
+                write_navigation_terminal(&mut output, "navigation_cancelled", &terminal, None)?
+            }
+            Err(error) => {
+                return Err(service_error(format!(
+                    "failed to cancel active navigation during shutdown: {error}"
+                )));
+            }
+        }
     }
     if let Some(stopped) = session.stop_active() {
         write_observation_event(&mut output, &stopped, None)?;
@@ -420,7 +502,13 @@ fn validate_query(request: &QueryRequest) -> Result<(), String> {
             return Err("camera_info must be valid and match image dimensions".into());
         }
     }
-    request.identity().map(|_| ())
+    let identity = request.identity()?;
+    if request.navigation.is_some() && identity.is_none() {
+        return Err(
+            "navigation requires target_id, calibration_id, and camera_info strict identity".into(),
+        );
+    }
+    Ok(())
 }
 
 fn run_query(
@@ -449,6 +537,9 @@ fn drain_query_result(
     active: &mut Option<ActiveQuery>,
     session: &mut VisualQuerySession,
     tracker: &mut BBoxTracker,
+    goal_transport: &GeometryGoalTransport,
+    active_goal: &mut Option<AdmittedGoalLease>,
+    tracker_swaps_axes: bool,
     output: &mut impl Write,
 ) -> Result<(), VisualQueryError> {
     let result = match result_rx.try_recv() {
@@ -479,7 +570,41 @@ fn drain_query_result(
             Ok(Some(bbox)) => match project_bbox(tracker, &identity, &bbox)
                 .and_then(|pose| session.complete_request(&identity, Some(bbox), Some(pose)))
             {
-                Ok(observation) => write_observation_event(output, &observation, None)?,
+                Ok(observation) => {
+                    write_observation_event(output, &observation, None)?;
+                    if let Some(admission) = result.request.navigation.as_ref() {
+                        if let Some(previous) = active_goal.take() {
+                            match goal_transport.cancel(&previous) {
+                                Ok(terminal) => write_navigation_event(
+                                    output,
+                                    "navigation_replaced",
+                                    &observation,
+                                    &terminal,
+                                    None,
+                                )?,
+                                Err(error) => {
+                                    *active_goal = Some(previous);
+                                    write_navigation_error(output, &observation, &error)?;
+                                    output.flush().map_err(io_error)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        match goal_transport.submit(&observation, admission, tracker_swaps_axes) {
+                            Ok((lease, admitted)) => {
+                                *active_goal = Some(lease);
+                                write_navigation_event(
+                                    output,
+                                    "goal_admitted",
+                                    &observation,
+                                    &admitted,
+                                    None,
+                                )?;
+                            }
+                            Err(error) => write_navigation_error(output, &observation, &error)?,
+                        }
+                    }
+                }
                 Err(error) => write_failed_result(output, session, &result.request, error)?,
             },
             Ok(None) => match session.complete_request(&identity, None, None) {
@@ -566,6 +691,79 @@ fn write_observation_event(
             calibration_id: Some(&observation.calibration_id),
             bbox: observation.bbox.as_ref(),
             observation: Some(observation),
+            navigation: None,
+            error,
+        },
+    )
+}
+
+fn write_navigation_event(
+    output: &mut impl Write,
+    event: &str,
+    observation: &TargetObservation,
+    navigation: &NavigationOutcome,
+    error: Option<&str>,
+) -> Result<(), VisualQueryError> {
+    write_event(
+        output,
+        &ServiceEvent {
+            event,
+            request_id: Some(&observation.request_id),
+            session_id: Some(&observation.session_id),
+            target_id: Some(&observation.target_id),
+            source_timestamp_ns: Some(observation.source_timestamp_ns),
+            frame_id: Some(observation.camera_frame.as_str()),
+            calibration_id: Some(&observation.calibration_id),
+            bbox: observation.bbox.as_ref(),
+            observation: Some(observation),
+            navigation: Some(navigation),
+            error,
+        },
+    )
+}
+
+fn write_navigation_error(
+    output: &mut impl Write,
+    observation: &TargetObservation,
+    error: &str,
+) -> Result<(), VisualQueryError> {
+    write_event(
+        output,
+        &ServiceEvent {
+            event: "goal_rejected",
+            request_id: Some(&observation.request_id),
+            session_id: Some(&observation.session_id),
+            target_id: Some(&observation.target_id),
+            source_timestamp_ns: Some(observation.source_timestamp_ns),
+            frame_id: Some(observation.camera_frame.as_str()),
+            calibration_id: Some(&observation.calibration_id),
+            bbox: observation.bbox.as_ref(),
+            observation: Some(observation),
+            navigation: None,
+            error: Some(error),
+        },
+    )
+}
+
+fn write_navigation_terminal(
+    output: &mut impl Write,
+    event: &str,
+    navigation: &NavigationOutcome,
+    error: Option<&str>,
+) -> Result<(), VisualQueryError> {
+    write_event(
+        output,
+        &ServiceEvent {
+            event,
+            request_id: Some(&navigation.goal_id),
+            session_id: Some(&navigation.parent_request_id),
+            target_id: None,
+            source_timestamp_ns: None,
+            frame_id: None,
+            calibration_id: None,
+            bbox: None,
+            observation: None,
+            navigation: Some(navigation),
             error,
         },
     )
@@ -590,6 +788,7 @@ fn write_request_event(
             calibration_id: request.calibration_id.as_deref(),
             bbox: observation.and_then(|value| value.bbox.as_ref()),
             observation,
+            navigation: None,
             error,
         },
     )
@@ -614,6 +813,7 @@ fn write_legacy_event(
             calibration_id: None,
             bbox,
             observation: None,
+            navigation: None,
             error,
         },
     )
@@ -694,6 +894,7 @@ mod tests {
             height: 1,
             object_description: "chair".into(),
             image: vec![0],
+            navigation: None,
         }
     }
 
@@ -743,6 +944,21 @@ mod tests {
         assert_eq!(value["bbox"]["x2"], 1.0);
         assert!(value.get("observation").is_none());
         assert!(value.get("target_id").is_none());
+    }
+
+    #[test]
+    fn v1_query_cannot_enable_navigation() {
+        let command: ServiceCommand = serde_json::from_str(
+            r#"{"type":"query","request_id":"request-v1","session_id":"session-v1","source_timestamp_ns":42,"frame_id":"legacy_camera","width":1,"height":1,"object_description":"chair","image":[0],"navigation":{"transform":{"source_frame_id":"camera_optical_frame","target_frame_id":"map","source_timestamp_ns":42,"calibration_id":"calibration-1","translation_xyz":[0.0,0.0,0.0],"rotation_xyzw":[0.0,0.0,0.0,1.0]},"motion_guard_generation":1,"motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff","motion_stop_generation":0}}"#,
+        )
+        .unwrap();
+        let ServiceCommand::Query(request) = command else {
+            panic!("expected query command");
+        };
+        assert_eq!(
+            validate_query(&request).unwrap_err(),
+            "navigation requires target_id, calibration_id, and camera_info strict identity"
+        );
     }
 
     #[test]
@@ -824,12 +1040,17 @@ mod tests {
             handle: Some(thread::spawn(|| {})),
         });
         let mut tracker = BBoxTracker::new(BBoxTrackerConfig::default()).unwrap();
+        let goal_transport = GeometryGoalTransport::new(GoalTransportConfig::default()).unwrap();
+        let mut active_goal = None;
         let mut output = Vec::new();
         drain_query_result(
             &result_rx,
             &mut active,
             &mut session,
             &mut tracker,
+            &goal_transport,
+            &mut active_goal,
+            true,
             &mut output,
         )
         .unwrap();

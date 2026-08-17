@@ -29,6 +29,8 @@ fn parse_config(
     let mut weights = None;
     let mut device = None;
     let mut timeout_ms = None;
+    let mut geometry_endpoint = None;
+    let mut goal_rpc_timeout_ms = None;
     let mut max_command_bytes = None;
 
     for argument in args {
@@ -46,6 +48,12 @@ fn parse_config(
             "--device" => device = Some(value.to_string()),
             "--timeout-ms" => {
                 timeout_ms = Some(parse_positive_u64(name, value)?);
+            }
+            "--geometry-endpoint" => {
+                geometry_endpoint = Some(required_value(name, value)?.to_string());
+            }
+            "--goal-rpc-timeout-ms" => {
+                goal_rpc_timeout_ms = Some(parse_positive_u64(name, value)?);
             }
             "--max-command-bytes" => {
                 max_command_bytes = Some(parse_positive_usize(name, value)?);
@@ -68,6 +76,12 @@ fn parse_config(
         worker.timeout = Duration::from_millis(value);
     }
     let mut service = VisualQueryServiceConfig::new(worker);
+    if let Some(value) = geometry_endpoint {
+        service.goal_transport.endpoint = value;
+    }
+    if let Some(value) = goal_rpc_timeout_ms {
+        service.goal_transport.rpc_timeout = Duration::from_millis(value);
+    }
     if let Some(value) = max_command_bytes {
         service.max_command_bytes = value;
     }
@@ -119,6 +133,8 @@ fn print_usage() {
            --weights=PATH_OR_NAME    YOLO-World weights\n\
            --device=DEVICE           Ultralytics device selector\n\
            --timeout-ms=N            Per-query and preflight hard deadline\n\
+           --geometry-endpoint=URI    Geometry Runtime gRPC endpoint\n\
+           --goal-rpc-timeout-ms=N    Goal admission/cancel RPC deadline\n\
            --max-command-bytes=N     Maximum JSONL command bytes\n\
            -h, --help                Show this help"
     );

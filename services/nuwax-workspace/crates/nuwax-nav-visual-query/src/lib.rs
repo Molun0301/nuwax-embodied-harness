@@ -12,6 +12,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Production Geometry GoalIntent transport and fail-closed adapter.
+pub mod goal_transport;
 /// Production perception worker configuration and preflight.
 pub mod perception;
 /// Public JSONL production entry and bounded worker lifecycle owner.
@@ -20,6 +22,11 @@ pub mod service;
 pub mod session;
 /// Configurable local-process model backend.
 pub mod subprocess;
+
+#[doc(hidden)]
+pub mod geometry_proto {
+    tonic::include_proto!("nuwax.geometry");
+}
 
 // Foundation 协议面：BoundingBox2D / ImageEncoding 等强类型
 pub use nuwax_nav_types_messages::BoundingBox2D;

@@ -12,6 +12,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import struct
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -89,7 +90,6 @@ from services.geometry.runtime_input_bridge import (
     build_default_runtime_input_bridge,
 )
 from services.geometry import (
-    CloudMapMmapReader,
     PlatformGeometryRuntime,
     PointCloudMapCache,
     PointCloudMapError,
@@ -100,7 +100,16 @@ from services.geometry.geometry_runtime_provider import (
     _exploration_child_lease_fingerprint,
     resolve_direct_static_calibration_edge,
 )
-from services.geometry.pointcloud_map import WEB_POINTCLOUD_MAX_POINTS
+from services.geometry.pointcloud_map import (
+    WEB_POINTCLOUD_MAX_POINTS,
+    CloudMapMmapReader,
+    LivePointCloudMapSource,
+    PointCloudMapSnapshot,
+    PointCloudMapSource,
+    PointCloudMapSourceError,
+    PointCloudMapSourceSwitch,
+    SavedPointCloudMapSource,
+)
 from services.localization import LocalizationService
 from services.mapping import MappingService
 from skills.map_workspace import MapWorkspaceService
@@ -692,6 +701,144 @@ def _build_perception_components(config: NuwaxRobotBridgeConfig) -> Dict[str, An
     return build_platform_perception_components(config)
 
 
+class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
+    """按 Geometry 权威摘要动态绑定当前保存点云资产。"""
+
+    source = "saved"
+
+    def __init__(
+        self,
+        summary_provider: Callable[[], Dict[str, object]],
+        *,
+        cache: PointCloudMapCache,
+        default_frame_id: str,
+    ) -> None:
+        self._summary_provider = summary_provider
+        self._cache = cache
+        self._default_frame_id = str(default_frame_id or DEFAULT_MAP_FRAME)
+        self._delegate: Optional[SavedPointCloudMapSource] = None
+        self._delegate_key: Optional[Tuple[object, ...]] = None
+        self._opened = False
+        self._cancelled = False
+        self._closed = False
+
+    def open(self) -> None:
+        if self._closed or self._opened:
+            return
+        self._cancelled = False
+        self._opened = True
+
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+            return None
+        self.open()
+        try:
+            summary = dict(self._summary_provider() or {})
+        except Exception as exc:
+            raise PointCloudMapSourceError(
+                "saved_summary_failed",
+                str(exc),
+                source=self.source,
+                retryable=True,
+            ) from exc
+        path_value = summary.get("pcd_path") or summary.get("path")
+        if not path_value or not bool(summary.get("available")):
+            self._replace_delegate(None, None)
+            raise PointCloudMapSourceError(
+                "saved_unavailable",
+                str(summary.get("reason") or "保存点云资产不可用。"),
+                source=self.source,
+                retryable=True,
+            )
+        path = Path(str(path_value)).expanduser().resolve(strict=False)
+        frame_id = str(summary.get("frame_id") or self._default_frame_id)
+        source_kind = str(summary.get("source_kind") or "configured_pcd_root")
+        manifest_sha256 = str(summary.get("asset_manifest_sha256") or "").strip().lower() or None
+        asset_sha256 = str(summary.get("asset_sha256") or "").strip().lower() or None
+        map_name = str(summary.get("map_name")) if summary.get("map_name") is not None else None
+        delegate_key = (
+            str(path),
+            frame_id,
+            source_kind,
+            map_name,
+            manifest_sha256,
+            asset_sha256,
+        )
+        if self._delegate is None or self._delegate_key != delegate_key:
+            delegate = SavedPointCloudMapSource(
+                path,
+                cache=self._cache,
+                frame_id=frame_id,
+                source_kind=source_kind,
+                map_name=map_name,
+                asset_manifest_sha256=manifest_sha256,
+                asset_sha256=asset_sha256,
+                provenance={
+                    "geometry_stack": summary.get("geometry_stack"),
+                    "mapping_database_path": summary.get("mapping_database_path"),
+                    "summary_priority": summary.get("priority"),
+                },
+            )
+            self._replace_delegate(delegate, delegate_key)
+        assert self._delegate is not None
+        return self._delegate.read(cancel_event)
+
+    def _replace_delegate(
+        self,
+        delegate: Optional[SavedPointCloudMapSource],
+        delegate_key: Optional[Tuple[object, ...]],
+    ) -> None:
+        previous = self._delegate
+        self._delegate = delegate
+        self._delegate_key = delegate_key
+        if previous is not None:
+            previous.close()
+
+    def cancel(self) -> None:
+        if self._closed or self._cancelled:
+            return
+        self._cancelled = True
+        if self._delegate is not None:
+            self._delegate.cancel()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._cancelled = True
+        self._opened = False
+        self._replace_delegate(None, None)
+
+
+class _GatewayObservedPointCloudMapSource(PointCloudMapSource):
+    """记录来源错误，同时保持 T1 来源合同与 switch 选择语义。"""
+
+    def __init__(
+        self,
+        source: PointCloudMapSource,
+        error_observer: Callable[[PointCloudMapSourceError], None],
+    ) -> None:
+        self._source = source
+        self.source = source.source
+        self._error_observer = error_observer
+
+    def open(self) -> None:
+        self._source.open()
+
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        try:
+            return self._source.read(cancel_event)
+        except PointCloudMapSourceError as exc:
+            self._error_observer(exc)
+            raise
+
+    def cancel(self) -> None:
+        self._source.cancel()
+
+    def close(self) -> None:
+        self._source.close()
+
+
 class GatewayRuntime:
     """宿主机能力运行时。"""
 
@@ -946,14 +1093,21 @@ class GatewayRuntime:
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
-        self._cloud_map_mmap_reader = CloudMapMmapReader(
-            os.environ.get("NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap")
+        self._cloud_map_shm_path = os.environ.get(
+            "NUWAX_CLOUDMAP_SHM_PATH",
+            "/tmp/nuwax_cloudmap.mmap",
         )
-        self._cloud_map_mmap_poll_stop = threading.Event()
-        self._cloud_map_mmap_poll_thread: Optional[threading.Thread] = None
-        self._cloud_map_last_revision: int = 0
+        self._pointcloud_map_source_switch: Optional[PointCloudMapSourceSwitch] = None
+        self._pointcloud_map_stream_stop = threading.Event()
+        self._pointcloud_map_stream_thread: Optional[threading.Thread] = None
+        self._pointcloud_map_current_snapshot: Optional[PointCloudMapSnapshot] = None
+        self._pointcloud_map_pending_source_error: Optional[PointCloudMapSourceError] = None
+        self._pointcloud_map_refresh_requested = False
+        self._pointcloud_map_stop_pending = False
+        self._pointcloud_map_last_runtime_error: Optional[str] = None
+        self._pointcloud_map_last_error_key: Optional[Tuple[str, str]] = None
+        self._pointcloud_map_last_publish_at: Optional[float] = None
         self._task_status_last_polled_at: Dict[str, float] = {}
-        self._start_cloud_map_mmap_poll()
         # 性能监控（CPU/内存/进程）采集线程，启停由数据流源聚合入口统一编排。
         self._system_telemetry_stop = threading.Event()
         self._system_telemetry_thread: Optional[threading.Thread] = None
@@ -1397,7 +1551,7 @@ class GatewayRuntime:
         providers = getattr(self.robot, "providers", None)
 
         self._publish_runtime_governance_stream_frame()
-        self._publish_pointcloud_map_stream_frame(reason="runtime_stream_start")
+        self._start_pointcloud_map_stream()
         self._start_navigation_status_refresh_stream()
         try:
             self._start_system_telemetry_stream()
@@ -1543,77 +1697,388 @@ class GatewayRuntime:
                     RUNTIME_LOGGER.debug("性能监控降级帧推送失败。", exc_info=True)
 
 
-    _CLOUD_MAP_MMAP_POLL_INTERVAL_SEC = 0.1
-    _CLOUD_MAP_MMAP_PUBLISH_INTERVAL_SEC = 1.0
+    _POINTCLOUD_MAP_POLL_INTERVAL_SEC = 0.1
+    _POINTCLOUD_MAP_HEARTBEAT_INTERVAL_SEC = 2.0
+    _POINTCLOUD_MAP_ERROR_BACKOFF_MAX_SEC = 2.0
+    _POINTCLOUD_MAP_STOP_JOIN_TIMEOUT_SEC = 5.0
 
-    def _start_cloud_map_mmap_poll(self) -> None:
-        if self._cloud_map_mmap_poll_thread is not None:
-            return
-        self._cloud_map_mmap_poll_stop.clear()
-        thread = threading.Thread(
-            target=self._run_cloud_map_mmap_poll,
-            name="nuwax-cloud-map-mmap-poll",
-            daemon=True,
+    def _observe_pointcloud_map_source_error(self, exc: PointCloudMapSourceError) -> None:
+        with self._lock:
+            self._pointcloud_map_pending_source_error = exc
+
+    def _build_pointcloud_map_source_switch(self) -> PointCloudMapSourceSwitch:
+        live_source = _GatewayObservedPointCloudMapSource(
+            LivePointCloudMapSource(
+                CloudMapMmapReader(self._cloud_map_shm_path),
+                frame_id=self.config.geometry.frames.map_frame,
+                max_points=WEB_POINTCLOUD_MAX_POINTS,
+            ),
+            self._observe_pointcloud_map_source_error,
         )
-        self._cloud_map_mmap_poll_thread = thread
-        thread.start()
-        RUNTIME_LOGGER.info("cloud_map mmap 轮询线程已启动 alive=%s", thread.is_alive())
+        saved_source = _GatewayObservedPointCloudMapSource(
+            _GatewaySavedPointCloudMapSource(
+                self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary,
+                cache=self._pointcloud_map_cache,
+                default_frame_id=self.config.geometry.frames.map_frame,
+            ),
+            self._observe_pointcloud_map_source_error,
+        )
+        return PointCloudMapSourceSwitch(live_source, saved_source)
 
-    def _stop_cloud_map_mmap_poll(self) -> None:
-        thread = self._cloud_map_mmap_poll_thread
-        if thread is None:
-            return
-        self._cloud_map_mmap_poll_stop.set()
-        if thread.is_alive():
-            thread.join(timeout=self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC + 1.0)
-        self._cloud_map_mmap_poll_thread = None
-        self._cloud_map_mmap_reader.close()
+    def _start_pointcloud_map_stream(self) -> None:
+        with self._lock:
+            thread = self._pointcloud_map_stream_thread
+            if thread is not None and thread.is_alive():
+                return
+            if thread is not None or self._pointcloud_map_source_switch is not None:
+                raise RuntimeError("pointcloud map 上一生命周期尚未完成清理。")
 
-    # 心跳重发间隔：每 N 次轮询（N*100ms）重发一次最新帧，
-    # 保证后连接的客户端在 revision 静止时也能拿到当前地图（参考 map.heartbeat）。
-    _CLOUD_MAP_HEARTBEAT_TICKS = 20
-
-    def _run_cloud_map_mmap_poll(self) -> None:
-        ticks_since_publish = 0
-        last_publish_at: Optional[float] = None
-        while not self._cloud_map_mmap_poll_stop.wait(self._CLOUD_MAP_MMAP_POLL_INTERVAL_SEC):
+            source_switch = self._build_pointcloud_map_source_switch()
             try:
-                header = self._cloud_map_mmap_reader.read_header()
-                if header is None:
-                    continue
-                revision = int(header[5])
-                if revision == 0:
-                    continue  # mmap 尚无有效数据
-                ticks_since_publish += 1
-                changed = revision != self._cloud_map_last_revision
-                heartbeat_due = ticks_since_publish >= self._CLOUD_MAP_HEARTBEAT_TICKS
-                now = time.monotonic()
-                change_publish_due = changed and (
-                    last_publish_at is None
-                    or now - last_publish_at >= self._CLOUD_MAP_MMAP_PUBLISH_INTERVAL_SEC
+                source_switch.open()
+            except Exception:
+                try:
+                    source_switch.close()
+                except Exception:
+                    RUNTIME_LOGGER.exception("pointcloud map 启动回滚关闭来源失败。")
+                raise
+
+            self._pointcloud_map_stream_stop.clear()
+            self._pointcloud_map_current_snapshot = None
+            self._pointcloud_map_pending_source_error = None
+            self._pointcloud_map_refresh_requested = False
+            self._pointcloud_map_stop_pending = False
+            self._pointcloud_map_last_runtime_error = None
+            self._pointcloud_map_last_error_key = None
+            self._pointcloud_map_last_publish_at = None
+            thread = threading.Thread(
+                target=self._run_pointcloud_map_stream,
+                args=(source_switch,),
+                name="nuwax-pointcloud-map-source",
+                daemon=True,
+            )
+            self._pointcloud_map_source_switch = source_switch
+            self._pointcloud_map_stream_thread = thread
+            try:
+                thread.start()
+            except Exception:
+                self._pointcloud_map_stream_stop.set()
+                self._pointcloud_map_source_switch = None
+                self._pointcloud_map_stream_thread = None
+                self._pointcloud_map_stop_pending = False
+                try:
+                    source_switch.cancel()
+                finally:
+                    source_switch.close()
+                raise
+        RUNTIME_LOGGER.info("pointcloud map 单一来源线程已启动 alive=%s", thread.is_alive())
+
+    def _stop_pointcloud_map_stream(self) -> None:
+        with self._lock:
+            thread = self._pointcloud_map_stream_thread
+            source_switch = self._pointcloud_map_source_switch
+            if thread is None and source_switch is None:
+                return
+            self._pointcloud_map_stream_stop.set()
+            self._pointcloud_map_refresh_requested = False
+            self._pointcloud_map_stop_pending = True
+
+        if source_switch is not None:
+            try:
+                source_switch.cancel()
+            except Exception as exc:
+                with self._lock:
+                    self._pointcloud_map_last_runtime_error = "cancel_failed:%s" % exc
+                RUNTIME_LOGGER.exception("pointcloud map 取消来源失败。")
+
+        if thread is threading.current_thread():
+            return
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._POINTCLOUD_MAP_STOP_JOIN_TIMEOUT_SEC)
+        if thread is not None and thread.is_alive():
+            with self._lock:
+                self._pointcloud_map_last_runtime_error = "stop_join_timeout"
+            RUNTIME_LOGGER.error(
+                "pointcloud map 单一来源线程尚未停止，保留来源供 poll finally 清理。"
+            )
+
+    def _finalize_pointcloud_map_stream(
+        self,
+        source_switch: PointCloudMapSourceSwitch,
+        thread: threading.Thread,
+    ) -> None:
+        close_error = None
+        try:
+            source_switch.close()
+        except Exception as exc:
+            close_error = exc
+            RUNTIME_LOGGER.exception("pointcloud map 来源关闭失败。")
+        with self._lock:
+            if self._pointcloud_map_source_switch is source_switch:
+                self._pointcloud_map_source_switch = None
+            if self._pointcloud_map_stream_thread is thread:
+                self._pointcloud_map_stream_thread = None
+            self._pointcloud_map_current_snapshot = None
+            self._pointcloud_map_pending_source_error = None
+            self._pointcloud_map_refresh_requested = False
+            self._pointcloud_map_stop_pending = False
+            self._pointcloud_map_last_error_key = None
+            self._pointcloud_map_last_publish_at = None
+            if close_error is not None:
+                self._pointcloud_map_last_runtime_error = "close_failed:%s" % close_error
+
+    def _run_pointcloud_map_stream(self, source_switch: PointCloudMapSourceSwitch) -> None:
+        error_backoff_sec = self._POINTCLOUD_MAP_POLL_INTERVAL_SEC
+        thread = threading.current_thread()
+        try:
+            while not self._pointcloud_map_stream_stop.is_set():
+                iteration_failed = False
+                source_error = None
+                try:
+                    snapshot = source_switch.read(self._pointcloud_map_stream_stop)
+                    with self._lock:
+                        source_error = self._pointcloud_map_pending_source_error
+                        self._pointcloud_map_pending_source_error = None
+                    if source_error is not None:
+                        if not self._publish_pointcloud_map_source_error(source_error):
+                            iteration_failed = True
+
+                    now = time.monotonic()
+                    if snapshot is not None:
+                        with self._lock:
+                            if self._pointcloud_map_stream_stop.is_set():
+                                break
+                            self._pointcloud_map_current_snapshot = snapshot
+                            if source_error is None:
+                                self._pointcloud_map_last_error_key = None
+                        self._publish_pointcloud_map_snapshot(snapshot, reason="source_update")
+                        with self._lock:
+                            self._pointcloud_map_refresh_requested = False
+                    else:
+                        with self._lock:
+                            current_snapshot = self._pointcloud_map_current_snapshot
+                            last_publish_at = self._pointcloud_map_last_publish_at
+                            refresh_requested = self._pointcloud_map_refresh_requested
+                        heartbeat_due = (
+                            current_snapshot is not None
+                            and (
+                                last_publish_at is None
+                                or now - last_publish_at >= self._POINTCLOUD_MAP_HEARTBEAT_INTERVAL_SEC
+                            )
+                        )
+                        if heartbeat_due:
+                            self._publish_pointcloud_map_snapshot(
+                                current_snapshot,
+                                reason=("requested_heartbeat" if refresh_requested else "heartbeat"),
+                            )
+                            with self._lock:
+                                self._pointcloud_map_refresh_requested = False
+                except PointCloudMapSourceError as exc:
+                    if self._pointcloud_map_stream_stop.is_set():
+                        break
+                    with self._lock:
+                        self._pointcloud_map_pending_source_error = None
+                    source_error = exc
+                    iteration_failed = not self._publish_pointcloud_map_source_error(exc)
+                except Exception as exc:
+                    if self._pointcloud_map_stream_stop.is_set():
+                        break
+                    iteration_failed = True
+                    with self._lock:
+                        self._pointcloud_map_last_runtime_error = (
+                            "stream_iteration_failed:%s" % exc
+                        )
+                    RUNTIME_LOGGER.warning(
+                        "pointcloud map 单一来源周期失败，将有界退避后重试: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    diagnostic = PointCloudMapSourceError(
+                        "gateway_stream_iteration_failed",
+                        str(exc),
+                        source="gateway",
+                        retryable=True,
+                    )
+                    self._publish_pointcloud_map_source_error(diagnostic)
+
+                retryable_source_error = source_error is not None and source_error.retryable
+                if iteration_failed or retryable_source_error:
+                    wait_sec = error_backoff_sec
+                    error_backoff_sec = min(
+                        self._POINTCLOUD_MAP_ERROR_BACKOFF_MAX_SEC,
+                        max(self._POINTCLOUD_MAP_POLL_INTERVAL_SEC, error_backoff_sec * 2.0),
+                    )
+                else:
+                    wait_sec = self._POINTCLOUD_MAP_POLL_INTERVAL_SEC
+                    error_backoff_sec = self._POINTCLOUD_MAP_POLL_INTERVAL_SEC
+                if self._pointcloud_map_stream_stop.wait(wait_sec):
+                    break
+        finally:
+            self._finalize_pointcloud_map_stream(source_switch, thread)
+
+    def _publish_pointcloud_map_source_error(self, exc: PointCloudMapSourceError) -> bool:
+        if self._pointcloud_map_stream_stop.is_set():
+            return True
+        error_key = (str(exc.source), str(exc.code))
+        with self._lock:
+            if self._pointcloud_map_last_error_key == error_key:
+                return True
+        try:
+            self.stream_bus.publish(
+                "pointcloud_map.snapshot",
+                source="pointcloud_map_source_switch",
+                payload_kind=StreamPayloadKind.DIAGNOSTIC,
+                payload={
+                    "status": "error",
+                    "source": exc.source,
+                    "code": exc.code,
+                    "message": str(exc),
+                    "retryable": exc.retryable,
+                    "terminal": exc.terminal,
+                },
+                status="error",
+                metadata={
+                    "source": exc.source,
+                    "code": exc.code,
+                    "retryable": exc.retryable,
+                    "terminal": exc.terminal,
+                },
+            )
+        except Exception as publish_exc:
+            with self._lock:
+                self._pointcloud_map_last_runtime_error = (
+                    "error_diagnostic_publish_failed:%s" % publish_exc
                 )
-                if not change_publish_due and not heartbeat_due:
-                    continue
-                frame_bytes = self._cloud_map_mmap_reader.build_binary_frame(
-                    max_points=WEB_POINTCLOUD_MAX_POINTS,
-                )
-                if frame_bytes is None:
-                    continue
-                self._cloud_map_last_revision = revision
-                ticks_since_publish = 0
-                last_publish_at = now
-                from contracts.streams import StreamPayloadKind
-                self.stream_bus.publish(
-                    "pointcloud_map.live_chunk",
-                    source="cloud_map_mmap",
-                    payload_kind=StreamPayloadKind.BINARY,
-                    payload=frame_bytes,
-                )
-            except Exception as _e:
-                RUNTIME_LOGGER.warning("cloud_map mmap 轮询异常: %s", _e, exc_info=True)
+            RUNTIME_LOGGER.warning(
+                "pointcloud map 错误诊断发布失败，将继续有界重试: %s",
+                publish_exc,
+                exc_info=True,
+            )
+            return False
+        with self._lock:
+            self._pointcloud_map_last_error_key = error_key
+        return True
+
+    def _publish_pointcloud_map_snapshot(
+        self,
+        snapshot: PointCloudMapSnapshot,
+        *,
+        reason: str,
+    ) -> None:
+        if self._pointcloud_map_stream_stop.is_set():
+            return
+        identity_metadata = {
+            "source": snapshot.source,
+            "source_epoch": snapshot.source_epoch,
+            "revision": snapshot.revision,
+            "revision_ordinal": snapshot.revision_ordinal,
+            "frame_id": snapshot.frame_id,
+            "source_timestamp_ns": snapshot.source_timestamp_ns,
+            "point_count": snapshot.point_count,
+            "format": snapshot.format,
+            "stream_generation": snapshot.stream_generation,
+            "provenance": dict(snapshot.provenance),
+            "refresh_reason": reason,
+            "not_sensor_scan": True,
+            "not_fallback_to_sensor_scan": True,
+        }
+        if self._pointcloud_map_stream_stop.is_set():
+            return
+        self.stream_bus.publish(
+            "pointcloud_map.snapshot",
+            source="pointcloud_map_source_switch",
+            payload_kind=StreamPayloadKind.BINARY,
+            payload=snapshot.xyz_bytes,
+            frame_id=snapshot.frame_id,
+            sequence=snapshot.revision_ordinal,
+            revision=snapshot.revision,
+            status="available",
+            metadata=identity_metadata,
+        )
+        if self._pointcloud_map_stream_stop.is_set():
+            return
+        self._publish_pointcloud_map_compatibility(snapshot, identity_metadata)
+        with self._lock:
+            self._pointcloud_map_last_publish_at = time.monotonic()
+
+    def _publish_pointcloud_map_compatibility(
+        self,
+        snapshot: PointCloudMapSnapshot,
+        identity_metadata: Dict[str, object],
+    ) -> None:
+        if snapshot.source == "live":
+            payload = struct.pack(
+                "<II",
+                snapshot.revision_ordinal & 0xFFFFFFFF,
+                snapshot.point_count,
+            ) + snapshot.xyz_bytes
+            self.stream_bus.publish(
+                "pointcloud_map.live_chunk",
+                source="pointcloud_map_source_switch",
+                payload_kind=StreamPayloadKind.BINARY,
+                payload=payload,
+                frame_id=snapshot.frame_id,
+                sequence=snapshot.revision_ordinal,
+                revision=snapshot.revision,
+                status="available",
+                metadata=dict(identity_metadata),
+            )
+            return
+
+        payload_bytes = len(snapshot.xyz_bytes)
+        meta_payload = {
+            "map_name": snapshot.provenance.get("map_name"),
+            "revision": snapshot.revision,
+            "frame_id": snapshot.frame_id,
+            "source": snapshot.source,
+            "source_epoch": snapshot.source_epoch,
+            "source_kind": snapshot.provenance.get("source_kind"),
+            "pcd_path": snapshot.provenance.get("asset_path"),
+            "point_count": snapshot.point_count,
+            "format": "float32-xyz",
+            "payload_bytes": payload_bytes,
+            "stream_generation": snapshot.stream_generation,
+            "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
+            "metadata": dict(identity_metadata),
+        }
+        self.stream_bus.publish(
+            "pointcloud_map.meta",
+            source="pointcloud_map_source_switch",
+            payload=meta_payload,
+            frame_id=snapshot.frame_id,
+            sequence=snapshot.revision_ordinal,
+            revision=snapshot.revision,
+            status="available",
+            metadata=dict(identity_metadata),
+        )
+        if self._pointcloud_map_stream_stop.is_set():
+            return
+        self.stream_bus.publish(
+            "pointcloud_map.chunk",
+            source="pointcloud_map_source_switch",
+            payload_kind=StreamPayloadKind.BINARY,
+            payload={
+                "revision": snapshot.revision,
+                "frame_id": snapshot.frame_id,
+                "lod": "preview",
+                "chunk_index": 0,
+                "chunk_count": 1,
+                "format": "float32-xyz",
+                "encoding": "base64",
+                "data": base64.b64encode(snapshot.xyz_bytes).decode("ascii"),
+                "point_count": snapshot.point_count,
+                "source_kind": snapshot.provenance.get("source_kind"),
+                "metadata": dict(identity_metadata),
+            },
+            frame_id=snapshot.frame_id,
+            sequence=snapshot.revision_ordinal,
+            revision=snapshot.revision,
+            status="available",
+            metadata=dict(identity_metadata),
+        )
 
     def _stop_data_frame_stream_sources(self) -> None:
-        self._stop_cloud_map_mmap_poll()
+        self._stop_pointcloud_map_stream()
         self._stop_navigation_status_refresh_stream()
         self._stop_system_telemetry_stream()
         if self._pointcloud_map_stream_subscription_id is not None:
@@ -1711,211 +2176,17 @@ class GatewayRuntime:
         return getattr(pointcloud_map, "points_xyz", None)
 
     def _publish_pointcloud_map_stream_frame(self, *, reason: str = "manual_refresh") -> None:
-        source_summary = self.platform_geometry_runtime.get_live_pointcloud_map_asset_summary()
-        pcd_path = source_summary.get("pcd_path") or source_summary.get("path")
-        frame_id = str(source_summary.get("frame_id") or self.config.geometry.frames.map_frame)
-        source_kind = str(source_summary.get("source_kind") or "configured_pcd_root")
-        if not pcd_path or not bool(source_summary.get("available")):
-            self._publish_pointcloud_map_diagnostic(
-                source_summary,
-                status="missing",
-                reason=str(source_summary.get("reason") or "pointcloud_map_pcd_missing"),
-                frame_id=frame_id,
-                refresh_reason=reason,
-            )
-            return
-        try:
-            pointcloud_map = self._pointcloud_map_cache.load_pcd(
-                pcd_path if isinstance(pcd_path, Path) else Path(str(pcd_path)),
-                frame_id=frame_id,
-                source_kind=source_kind,
-            )
-        except UnsupportedPointCloudMapError as exc:
-            self._publish_pointcloud_map_diagnostic(
-                source_summary,
-                status="unsupported",
-                reason="unsupported_pcd_format",
-                frame_id=frame_id,
-                refresh_reason=reason,
-                error=str(exc),
-            )
-            return
-        except PointCloudMapError as exc:
-            self._publish_pointcloud_map_diagnostic(
-                source_summary,
-                status="error",
-                reason="pcd_load_failed",
-                frame_id=frame_id,
-                refresh_reason=reason,
-                error=str(exc),
-            )
-            return
-
-        payload = self._build_pointcloud_map_meta_payload(pointcloud_map, source_summary, refresh_reason=reason)
-        self.stream_bus.publish(
-            "pointcloud_map.meta",
-            source="pointcloud_map_cache",
-            payload=payload,
-            frame_id=pointcloud_map.frame_id,
-            revision=pointcloud_map.revision,
-            status="available",
-            metadata={
-                "source_kind": pointcloud_map.source_kind,
-                "pcd_path": pointcloud_map.path,
-                "point_count": pointcloud_map.point_count,
-                "not_sensor_scan": True,
-                "not_fallback_to_sensor_scan": True,
-                "refresh_reason": reason,
-            },
-        )
-        self._publish_pointcloud_map_preview_chunk(pointcloud_map, source_summary, refresh_reason=reason)
-
-    def _build_pointcloud_map_meta_payload(self, pointcloud_map: Any, source_summary: Dict[str, object], *, refresh_reason: str) -> Dict[str, object]:
-        payload_bytes = int(pointcloud_map.point_count) * 3 * 4
-        lods = []
-        for item in pointcloud_map.lods():
-            lods.append(
-                {
-                    **dict(item),
-                    "stream_topic": "pointcloud_map.chunk",
-                    "format": "float32-xyz",
-                    "payload_kind": "binary",
-                }
-            )
-        return {
-            "map_name": source_summary.get("map_name"),
-            "revision": pointcloud_map.revision,
-            "frame_id": pointcloud_map.frame_id,
-            "source": "pointcloud_map_cache",
-            "source_kind": pointcloud_map.source_kind,
-            "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "mapping_database_path": source_summary.get("mapping_database_path"),
-            "pcd_path": pointcloud_map.path,
-            "point_count": pointcloud_map.point_count,
-            "fields": [
-                {"name": "x", "datatype": "float32", "offset": 0},
-                {"name": "y", "datatype": "float32", "offset": 4},
-                {"name": "z", "datatype": "float32", "offset": 8},
-            ],
-            "bounds": {"min": list(pointcloud_map.bounds_min), "max": list(pointcloud_map.bounds_max)},
-            "lods": lods,
-            "format": "float32-xyz",
-            "payload_bytes": payload_bytes,
-            "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
-            "metadata": {
-                "not_sensor_scan": True,
-                "not_fallback_to_sensor_scan": True,
-                "source_timestamp": pointcloud_map.source_timestamp,
-                "loaded_at": pointcloud_map.loaded_at,
-                "header_data": getattr(pointcloud_map.header, "data", None),
-                "refresh_reason": refresh_reason,
-                "expected_candidates": source_summary.get("expected_candidates") or [],
-            },
-            "metrics": {
-                "load_ms": pointcloud_map.load_ms,
-                "payload_bytes": payload_bytes,
-                "preview_point_count": lods[0]["point_count"] if lods else 0,
-            },
-        }
-
-    def _publish_pointcloud_map_preview_chunk(self, pointcloud_map: Any, source_summary: Dict[str, object], *, refresh_reason: str) -> None:
-        chunk_key = (str(pointcloud_map.path), str(pointcloud_map.revision))
-        if self._last_pointcloud_map_chunk_key == chunk_key:
-            return
-        preview_bytes = pointcloud_map.binary_xyz("preview")
-        preview_point_count = len(preview_bytes) // (3 * 4)
-        self.stream_bus.publish(
-            "pointcloud_map.chunk",
-            source="pointcloud_map_cache",
-            payload_kind=StreamPayloadKind.BINARY,
-            payload={
-                "revision": pointcloud_map.revision,
-                "frame_id": pointcloud_map.frame_id,
-                "lod": "preview",
-                "chunk_index": 0,
-                "chunk_count": 1,
-                "format": "float32-xyz",
-                "encoding": "base64",
-                "data": base64.b64encode(preview_bytes).decode("ascii"),
-                "point_count": preview_point_count,
-                "source_kind": pointcloud_map.source_kind,
-                "metadata": {
-                    "not_sensor_scan": True,
-                    "not_fallback_to_sensor_scan": True,
-                    "pcd_path": pointcloud_map.path,
-                    "refresh_reason": refresh_reason,
-                    "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-                },
-            },
-            frame_id=pointcloud_map.frame_id,
-            revision=pointcloud_map.revision,
-            status="available",
-            metadata={
-                "source_kind": pointcloud_map.source_kind,
-                "lod": "preview",
-                "format": "float32-xyz",
-                "encoding": "base64",
-                "point_count": preview_point_count,
-                "payload_bytes": len(preview_bytes),
-                "not_sensor_scan": True,
-                "not_fallback_to_sensor_scan": True,
-            },
-        )
-        self._last_pointcloud_map_chunk_key = chunk_key
-
-    def _publish_pointcloud_map_diagnostic(
-        self,
-        source_summary: Dict[str, object],
-        *,
-        status: str,
-        reason: str,
-        frame_id: str,
-        refresh_reason: str,
-        error: Optional[str] = None,
-    ) -> None:
-        payload = {
-            "map_name": source_summary.get("map_name"),
-            "revision": None,
-            "frame_id": frame_id,
-            "source": "pointcloud_map_cache",
-            "source_kind": source_summary.get("source_kind") or "configured_pcd_root",
-            "geometry_stack": source_summary.get("geometry_stack") or self.config.geometry.stack,
-            "mapping_database_path": source_summary.get("mapping_database_path"),
-            "pcd_path": source_summary.get("pcd_path") or source_summary.get("path"),
-            "point_count": 0,
-            "fields": [],
-            "bounds": None,
-            "lods": [],
-            "format": "float32-xyz",
-            "payload_bytes": 0,
-            "stream_topics": ["pointcloud_map.meta"],
-            "metadata": {
-                "not_sensor_scan": True,
-                "not_fallback_to_sensor_scan": True,
-                "reason": reason,
-                "refresh_reason": refresh_reason,
-                "expected_candidates": source_summary.get("expected_candidates") or [],
-                "source_available": bool(source_summary.get("available")),
-            },
-            "metrics": {"payload_bytes": 0},
-        }
-        if error:
-            payload["metadata"]["error"] = error
-        self.stream_bus.publish(
-            "pointcloud_map.meta",
-            source="pointcloud_map_cache",
-            payload=payload,
-            frame_id=frame_id,
-            status=status,
-            metadata={
-                "source_kind": payload["source_kind"],
-                "pcd_path": payload["pcd_path"],
-                "reason": reason,
-                "not_sensor_scan": True,
-                "not_fallback_to_sensor_scan": True,
-                "refresh_reason": refresh_reason,
-            },
-        )
+        del reason
+        with self._lock:
+            thread = self._pointcloud_map_stream_thread
+            if (
+                thread is None
+                or not thread.is_alive()
+                or self._pointcloud_map_current_snapshot is None
+                or self._pointcloud_map_stream_stop.is_set()
+            ):
+                return
+            self._pointcloud_map_refresh_requested = True
 
     def _publish_runtime_governance_stream_frame(self) -> None:
         self.stream_bus.publish(
@@ -12539,22 +12810,11 @@ class GatewayRuntime:
         )
 
     def _person_follow_required_cloud_revision(self) -> int:
-        reader = getattr(self, "_cloud_map_mmap_reader", None)
-        if reader is None:
-            revision = max(0, int(getattr(self, "_cloud_map_last_revision", 0) or 0))
-        else:
-            revision = 0
-            try:
-                header = reader.read_header()
-            except Exception as exc:
-                raise GatewayError(
-                    "PersonFollow 无法读取当前 cloud map revision。",
-                    error_code="person_follow_cloud_unavailable",
-                    http_status=503,
-                    jsonrpc_code=-32010,
-                ) from exc
-            if header is not None and int(header[3]) > 0:
-                revision = max(0, int(header[5]))
+        with self._lock:
+            snapshot = self._pointcloud_map_current_snapshot
+        revision = 0
+        if snapshot is not None and snapshot.source == "live" and snapshot.point_count > 0:
+            revision = max(0, int(snapshot.revision_ordinal))
         if revision <= 0:
             raise GatewayError(
                 "PersonFollow 需要已发布的非空 global map。",

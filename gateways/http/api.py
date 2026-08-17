@@ -514,7 +514,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "rejected": result.rejected,
             "backups": {k: bool(v) for k, v in result.backups.items()},
             "restart_required": bool(result.written),
-            "effect_note": "已写入配置文件，需重启网关生效（非热重载）。",
+            "effect_note": "已写入 systemd 共用配置文件；后端组合需重启网关和 Geometry Runtime 生效（非热重载）。",
         }
 
 

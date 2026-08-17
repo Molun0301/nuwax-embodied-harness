@@ -1069,6 +1069,28 @@ impl CommonLioIngress {
         adapter: &MappingAdapter,
         registration_mode_token: RegistrationModeToken,
     ) -> Result<PreparedRegisteredCloud, LioIngressError> {
+        self.register_cloud_with_mode_token_and_frozen_odometry(
+            identity,
+            correlated_odometry,
+            adapter_clock_ns,
+            cloud,
+            adapter,
+            registration_mode_token,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_cloud_with_mode_token_and_frozen_odometry(
+        &self,
+        identity: SourceIdentity,
+        correlated_odometry: CorrelatedOdometry,
+        adapter_clock_ns: i64,
+        cloud: PointCloud2,
+        adapter: &MappingAdapter,
+        registration_mode_token: RegistrationModeToken,
+        frozen_odom_from_body: Option<Isometry3<f64>>,
+    ) -> Result<PreparedRegisteredCloud, LioIngressError> {
         let source_points = parse_odom_xyz_cloud(&cloud, &self.spec)?;
         let source_point_count = source_points.len();
         self.register_odom_points_with_mode_token(
@@ -1079,6 +1101,7 @@ impl CommonLioIngress {
             source_points,
             adapter,
             registration_mode_token,
+            frozen_odom_from_body,
         )
     }
 
@@ -1102,6 +1125,7 @@ impl CommonLioIngress {
             odom_points,
             adapter,
             registration_mode_token,
+            None,
         )
     }
 
@@ -1115,6 +1139,7 @@ impl CommonLioIngress {
         odom_points: Vec<Point3<f64>>,
         adapter: &MappingAdapter,
         registration_mode_token: RegistrationModeToken,
+        frozen_odom_from_body: Option<Isometry3<f64>>,
     ) -> Result<PreparedRegisteredCloud, LioIngressError> {
         let source_point_count_i64 =
             i64::try_from(source_point_count).map_err(|_| LioIngressError::PointCountOverflow)?;
@@ -1144,14 +1169,17 @@ impl CommonLioIngress {
                 odometry_timestamp_ns: correlated_odometry.source_timestamp_ns,
             });
         }
-        let frozen_odom_from_body = state
-            .accepted_odometry_poses
-            .get(&(
-                correlated_odometry.source_sequence,
-                correlated_odometry.source_timestamp_ns,
-            ))
-            .cloned()
-            .ok_or(LioIngressError::MissingFrozenOdometry)?;
+        let frozen_odom_from_body = match frozen_odom_from_body {
+            Some(frozen) => frozen,
+            None => state
+                .accepted_odometry_poses
+                .get(&(
+                    correlated_odometry.source_sequence,
+                    correlated_odometry.source_timestamp_ns,
+                ))
+                .cloned()
+                .ok_or(LioIngressError::MissingFrozenOdometry)?,
+        };
         let registered = adapter
             .register_odom_cloud_to_map(&odom_points, &self.spec.odom_frame_id)
             .map_err(|error| LioIngressError::Registration(error.to_string()))?;
@@ -1349,14 +1377,22 @@ impl CommonLioIngress {
         }
     }
 
-    fn latest_causal_odometry(&self, cloud_timestamp_ns: i64) -> Option<CorrelatedOdometry> {
-        self.state
-            .lock()
+    fn latest_causal_odometry(
+        &self,
+        cloud_timestamp_ns: i64,
+    ) -> Option<(CorrelatedOdometry, Isometry3<f64>)> {
+        let state = self.state.lock();
+        let identity = state
             .accepted_odometry_identities
             .iter()
             .rev()
             .find(|odometry| odometry.source_timestamp_ns <= cloud_timestamp_ns)
-            .copied()
+            .copied()?;
+        let frozen = state
+            .accepted_odometry_poses
+            .get(&(identity.source_sequence, identity.source_timestamp_ns))
+            .cloned()?;
+        Some((identity, frozen))
     }
 
     fn check_identity(
@@ -1599,6 +1635,7 @@ impl NativeLioIngress {
                     odom_points,
                     &adapter,
                     pair.cloud.registration_mode_token,
+                    None,
                 )
                 .map_err(|error| error.to_string())?
         };
@@ -2217,6 +2254,7 @@ impl NativeDeferredReplayControl {
                                     claimed.pair.registered_odom_points.as_ref().to_vec(),
                                     &adapter,
                                     registration_mode_token,
+                                    None,
                                 )
                                 .map(|prepared| (map_frame_generation, prepared))
                                 .map_err(|error| {
@@ -2931,7 +2969,7 @@ impl LioIngressSink for CommonLioIngress {
         let identity = self
             .reserve_legacy_cloud_identity(source_timestamp_ns)
             .map_err(|error| error.to_string())?;
-        let correlated_odometry = self
+        let (correlated_odometry, frozen_odom_from_body) = self
             .latest_causal_odometry(source_timestamp_ns)
             .ok_or_else(|| LioIngressError::MissingOdometry.to_string())?;
         let Some(_lifecycle_guard) = mapping_admission_guard(runtime, shutdown_rx).await else {
@@ -2944,13 +2982,14 @@ impl LioIngressSink for CommonLioIngress {
             .ok_or_else(|| "mapping adapter is unavailable".to_string())?;
         let prepared = {
             let adapter = mapping.lock();
-            self.register_cloud_with_mode_token(
+            self.register_cloud_with_mode_token_and_frozen_odometry(
                 identity,
                 correlated_odometry,
                 0,
                 cloud,
                 &adapter,
                 registration_mode_token,
+                Some(frozen_odom_from_body),
             )
             .map_err(|error| error.to_string())?
         };

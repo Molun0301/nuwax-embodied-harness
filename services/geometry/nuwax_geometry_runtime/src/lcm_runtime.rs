@@ -7931,21 +7931,19 @@ async fn ingest_mapping_points_with_backend_owned(
                     }
                 }
                 Ok(None) => {
-                    let retirement = if adapter.snapshot().active
-                        && adapter.snapshot().session_id == token.session_id
-                    {
-                        adapter
-                            .stop_session_detached(&token.session_id)
-                            .ok()
-                            .and_then(|transition| transition.retirement)
-                    } else {
-                        None
-                    };
-                    Err((
-                        target_frame_id,
-                        "mapping backend completion became stale".to_owned(),
-                        retirement,
-                    ))
+                    let session_generation = adapter.snapshot().session_generation;
+                    Ok(MappingIngestCommit {
+                        outcome: MappingIngestOutcome {
+                            accepted_map_points: Vec::new(),
+                            occupancy_event: None,
+                            occupancy_receipt: None,
+                            #[cfg(test)]
+                            occupancy_committed: false,
+                            session_generation,
+                            source_timestamp_ns,
+                        },
+                        cloud_commit: None,
+                    })
                 }
                 Err(reason) => {
                     let retirement = adapter

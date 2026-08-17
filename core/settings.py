@@ -881,6 +881,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
         lcm_url=_cfg_str("NUWAX_LCM_URL", build_default_lcm_url()),
         # LCM backend 只允许生产值 real-lcm。
         lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "real-lcm")),
+        # Geometry Runtime owner profile；枚举与组合由 Web 配置和 Rust 启动预检双重校验。
+        lio_backend=_cfg_str("NUWAX_GEOMETRY_LIO_BACKEND", "device"),
+        mapping_backend=_cfg_str("NUWAX_GEOMETRY_MAPPING_BACKEND", "voxel"),
+        correction_backend=_cfg_str("NUWAX_GEOMETRY_CORRECTION_BACKEND", "none"),
         nuwax_workspace_dir=_cfg_str(
             "NUWAX_NUWAX_WORKSPACE_DIR",
             build_default_nuwax_workspace_dir(),

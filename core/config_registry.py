@@ -293,6 +293,8 @@ _REGULAR_KEYS = frozenset({
     "NUWAX_GATEWAY_TELEMETRY_ENABLED", "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC",
     "NUWAX_LOG_LEVEL",
     "NUWAX_GEOMETRY_ENABLED",
+    "NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND",
     "NUWAX_MAPPING_PROFILE_NAME", "NUWAX_MAPPING_PROFILE_ENABLED",
     "NUWAX_GEOMETRY_EXTERNAL_ENABLED",
     "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED", "NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE",
@@ -309,6 +311,9 @@ _REGULAR_KEYS = frozenset({
 # 枚举型键的可选值（用于前端下拉）。
 _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_LOG_LEVEL": ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+    "NUWAX_GEOMETRY_LIO_BACKEND": ("device", "fastlio2", "pointlio"),
+    "NUWAX_GEOMETRY_MAPPING_BACKEND": ("voxel", "raytracing"),
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("none", "library_pgo", "native_pgo", "relocalization"),
     "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar"),
     "NUWAX_EXPLORE_ARBITRATION": ("prefer_wavefront",),
 }
@@ -393,6 +398,9 @@ _ZH_NAMES: Dict[str, str] = {
 
     # 几何引擎·话题与坐标系
     "NUWAX_GEOMETRY_ENABLED": "启用几何引擎",
+    "NUWAX_GEOMETRY_LIO_BACKEND": "LIO（激光雷达惯性里程计）后端",
+    "NUWAX_GEOMETRY_MAPPING_BACKEND": "建图后端",
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND": "位姿校正后端",
     "NUWAX_BASE_FRAME": "机器人基座坐标系",
     "NUWAX_MAP_FRAME": "地图坐标系",
     "NUWAX_GEOMETRY_PLATFORM_BRIDGE_CMD_VEL_ENABLED": "启用平台 cmd_vel 桥",

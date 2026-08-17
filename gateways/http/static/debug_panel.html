@@ -5559,7 +5559,10 @@ button{font-family:inherit;cursor:pointer}
           renderConfigSchema(schema);
           configState.loaded = true;
           setPill(status, "available", "配置");
-          document.getElementById("configEffectNote").textContent = schema.effect_note || "";
+          document.getElementById("configEffectNote").textContent = [
+            schema.effect_note || "",
+            schema.geometry_backend_matrix_note || "",
+          ].filter(Boolean).join(" ");
           updateConfigDirty();
         } catch (err) {
           setPill(status, "error", "配置");

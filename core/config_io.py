@@ -37,6 +37,36 @@ _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
 _SENSITIVE_MASK = "********"
 _EFFECTIVE_VALUES_LOCK = threading.RLock()
 
+# Rust owner_profile.rs 明确接受的三个正交轴。当前没有跨轴排斥项，因此有效矩阵是 3×2×4。
+_GEOMETRY_LIO_BACKENDS = ("device", "fastlio2", "pointlio")
+_GEOMETRY_MAPPING_BACKENDS = ("voxel", "raytracing")
+_GEOMETRY_CORRECTION_BACKENDS = ("none", "library_pgo", "native_pgo", "relocalization")
+
+
+def _geometry_backend_matrix() -> List[Dict[str, str]]:
+    """返回 Geometry Runtime 已实现并由生产预检接纳的 24 个组合。"""
+
+    return [
+        {"lio": lio, "mapping": mapping, "correction": correction}
+        for lio in _GEOMETRY_LIO_BACKENDS
+        for mapping in _GEOMETRY_MAPPING_BACKENDS
+        for correction in _GEOMETRY_CORRECTION_BACKENDS
+    ]
+
+
+def _core_env_path() -> Path:
+    """返回网关与 systemd 共用的核心环境文件。"""
+
+    explicit = os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", "").strip()
+    return Path(explicit).expanduser() if explicit else _CORE_ENV
+
+
+def _go2_env_path() -> Path:
+    """返回网关与 systemd 共用的 Go2 数据面环境文件。"""
+
+    explicit = os.environ.get("GO2_DATA_PLANE_ENV_FILE", "").strip()
+    return Path(explicit).expanduser() if explicit else _GO2_ENV
+
 
 def _pointcloud3d_env_path() -> Path:
     """返回 Web 可写的点云显示配置文件路径。"""
@@ -56,7 +86,7 @@ def _pointcloud3d_env_path() -> Path:
 def _target_path(target_file: str) -> Path:
     if target_file == _POINTCLOUD3D_TARGET:
         return _pointcloud3d_env_path()
-    return _GO2_ENV if target_file == R.TARGET_GO2 else _CORE_ENV
+    return _go2_env_path() if target_file == R.TARGET_GO2 else _core_env_path()
 
 
 def _save_target(key: str, registry_target: str) -> str:
@@ -98,10 +128,10 @@ def _current_value(key: str) -> str:
             return pointcloud3d[key]
     if key in os.environ:
         return os.environ[key]
-    core = _read_env_values(_CORE_ENV)
+    core = _read_env_values(_core_env_path())
     if key in core:
         return core[key]
-    go2 = _read_env_values(_GO2_ENV)
+    go2 = _read_env_values(_go2_env_path())
     return go2.get(key, "")
 
 
@@ -239,8 +269,8 @@ def _collect_effective_values_locked(core_vals: Dict[str, str], go2_vals: Dict[s
 def build_schema() -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 
-    core_vals = _read_env_values(_CORE_ENV)
-    go2_vals = _read_env_values(_GO2_ENV)
+    core_vals = _read_env_values(_core_env_path())
+    go2_vals = _read_env_values(_go2_env_path())
     pointcloud3d_vals = _read_env_values(_pointcloud3d_env_path())
     effective_core_vals = dict(core_vals)
     effective_core_vals.update(pointcloud3d_vals)
@@ -286,7 +316,12 @@ def build_schema() -> Dict[str, object]:
     return {
         "sections": ordered,
         "field_count": len(R.build_registry()),
-        "effect_note": "仅保存已修改项；保存后需重启网关生效。",
+        "effect_note": "仅保存已修改项；保存后需重启网关和 Geometry Runtime 生效。",
+        "geometry_backend_matrix": _geometry_backend_matrix(),
+        "geometry_backend_matrix_note": (
+            "当前支持 3 种 LIO × 2 种建图 × 4 种校正，共 24 个有效组合；"
+            "原生 LIO/PGO 组合还需部署清单提供对应可执行制品。"
+        ),
     }
 
 

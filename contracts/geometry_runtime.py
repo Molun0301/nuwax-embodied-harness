@@ -366,6 +366,10 @@ class PlatformGeometryConfig:
     runtime_start_script: str = field(default_factory=build_default_geometry_runtime_start_script)
     lcm_url: str = field(default_factory=build_default_lcm_url)
     lcm_backend: str = "real-lcm"
+    # Geometry Runtime owner profile 三个正交选择轴；Rust 启动预检会再次严格校验。
+    lio_backend: str = "device"
+    mapping_backend: str = "voxel"
+    correction_backend: str = "none"
     nuwax_workspace_dir: str = field(default_factory=build_default_nuwax_workspace_dir)
     topics: GeometryTopicsConfig = field(default_factory=GeometryTopicsConfig)
     frames: GeometryFrameConfig = field(default_factory=GeometryFrameConfig)
@@ -385,6 +389,11 @@ class PlatformGeometryConfig:
             "runtime_ready_file": self.runtime_ready_file,
             "lcm_url": self.lcm_url,
             "lcm_backend": self.lcm_backend,
+            "owner_profile": {
+                "lio": self.lio_backend,
+                "mapping": self.mapping_backend,
+                "correction": self.correction_backend,
+            },
             "nuwax_workspace_dir": self.nuwax_workspace_dir,
             "profile": {
                 "name": self.mapping.profile_name,

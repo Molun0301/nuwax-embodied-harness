@@ -1671,6 +1671,21 @@ else:
     )
 
 
+def _existing_rust_proxy(toolchain_bin: Path, proxy: str) -> Path:
+    candidate = toolchain_bin / proxy
+    rustup = toolchain_bin / "rustup"
+    if proxy == "rustup":
+        return _require_file(candidate, "build user rustup")
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        raise DeploymentError(f"build user {proxy} is missing: {candidate}") from exc
+    if not stat.S_ISLNK(metadata.st_mode) or os.readlink(candidate) != "rustup":
+        raise DeploymentError(f"build user {proxy} must be the standard rustup proxy: {candidate}")
+    _require_file(rustup, "build user rustup")
+    return candidate
+
+
 def ensure_rust_toolchain(context: "ExecutionContext") -> None:
     toolchain = context.profile.rust.toolchain
     build_account = resolve_build_account()
@@ -1685,12 +1700,6 @@ def ensure_rust_toolchain(context: "ExecutionContext") -> None:
         os.chown(target.parent, 0, build_gid)
         os.chmod(target.parent, 0o750)
         _prepare_mutable_build_tree(target, build_uid, build_gid, "Rust target directory")
-    cargo_home = _prepare_mutable_build_tree(
-        context.options.cargo_home,
-        build_uid,
-        build_gid,
-        "Cargo home",
-    )
     build_home = _prepare_mutable_build_tree(
         context.options.build_home,
         build_uid,
@@ -1698,6 +1707,12 @@ def ensure_rust_toolchain(context: "ExecutionContext") -> None:
         "Build home",
     )
     if context.options.offline_bundle:
+        cargo_home = _prepare_mutable_build_tree(
+            context.options.cargo_home,
+            build_uid,
+            build_gid,
+            "Cargo home",
+        )
         bundle = context.options.offline_bundle
         rustup_home = _prepare_offline_rustup_home(context, build_uid, build_gid)
         env = {
@@ -1729,106 +1744,57 @@ def ensure_rust_toolchain(context: "ExecutionContext") -> None:
                 network_isolated=True,
             )
         return
-    rustup_home = context.options.rustup_home
+    cargo_home = Path(build_account.pw_dir) / ".cargo"
+    rustup_home = Path(build_account.pw_dir) / ".rustup"
+    toolchain_bin = cargo_home / "bin"
+    if cargo_home.is_symlink() or not cargo_home.is_dir():
+        raise DeploymentError(f"build user Cargo home is missing or unsafe: {cargo_home}")
+    if rustup_home.is_symlink() or not rustup_home.is_dir():
+        raise DeploymentError(f"build user Rustup home is missing or unsafe: {rustup_home}")
     env = {
         "CARGO_HOME": str(cargo_home),
-        "HOME": str(build_home),
+        "CARGO_NET_OFFLINE": "true",
+        "HOME": build_account.pw_dir,
         "RUSTUP_HOME": str(rustup_home),
         "RUSTUP_TOOLCHAIN": toolchain,
         "RUSTC_WRAPPER": "",
         "RUSTC_WORKSPACE_WRAPPER": "",
         "RUSTFLAGS": "",
     }
-    toolchain_bin = context.options.toolchain_bin
-    if toolchain_bin.is_symlink() or (toolchain_bin.exists() and not toolchain_bin.is_dir()):
-        raise DeploymentError(f"immutable toolchain bin is unsafe: {toolchain_bin}")
-    if toolchain_bin.is_dir():
-        if rustup_home.is_symlink() or not rustup_home.is_dir():
-            raise DeploymentError(f"immutable Rustup home is missing or unsafe: {rustup_home}")
-        _freeze_toolchain_tree(rustup_home, build_gid)
-        _freeze_toolchain_tree(toolchain_bin, build_gid)
-        for proxy in ("rustup", "rustc", "cargo"):
-            _validate_rust_proxy(
-                context,
-                proxy,
-                _require_file(toolchain_bin / proxy, f"immutable {proxy}"),
-                env,
-                network_isolated=False,
-            )
-        return
-    rustup_home = _prepare_mutable_build_tree(
-        rustup_home,
-        build_uid,
-        build_gid,
-        "Rustup home",
-    )
-    rustup = cargo_home / "bin" / "rustup"
-    if not rustup.is_file():
-        bootstrap = context.profile.rust.bootstrap
-        url = bootstrap.get("url")
-        expected = bootstrap.get("sha256")
-        if not isinstance(url, str) or not url.startswith("https://"):
-            raise DeploymentError("Rust bootstrap requires a profile-pinned HTTPS URL")
-        if not isinstance(expected, str) and not context.options.allow_unverified_third_party:
-            raise DeploymentError("Rust bootstrap SHA-256 is unresolved")
-        destination = context.options.cache_dir / "downloads" / "rustup-init"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink():
-            raise DeploymentError(f"Rust bootstrap cache is a symlink: {destination}")
-        if not destination.is_file():
-            temporary = destination.with_name(f".{destination.name}.{os.getpid()}")
-            try:
-                with urllib.request.urlopen(url, timeout=120) as response, temporary.open("wb") as handle:
-                    shutil.copyfileobj(response, handle)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, destination)
-            except Exception:
-                temporary.unlink(missing_ok=True)
-                raise
-        actual = _sha256(destination)
-        if isinstance(expected, str) and actual != expected:
-            raise DeploymentError("downloaded rustup-init SHA-256 does not match profile")
-        os.chmod(destination, 0o755)
-        context.runner.run(
-            (str(destination), "-y", "--profile", "minimal", "--default-toolchain", "none"),
-            env=env,
-            as_build_user=True,
-            timeout=900,
-        )
-    context.runner.run(
-        (str(rustup), "toolchain", "install", toolchain, "--profile", "minimal"),
-        env=env,
-        as_build_user=True,
-        timeout=1800,
-    )
-    for proxy in ("rustup", "rustc", "cargo"):
+    proxies = {
+        proxy: _existing_rust_proxy(toolchain_bin, proxy)
+        for proxy in ("rustup", "rustc", "cargo")
+    }
+    for proxy, executable in proxies.items():
         _validate_rust_proxy(
             context,
             proxy,
-            cargo_home / "bin" / proxy,
+            executable,
             env,
-            network_isolated=False,
+            network_isolated=True,
         )
-    staging_bin = Path(tempfile.mkdtemp(prefix=".toolchain-bin.staging-", dir=context.options.build_dir))
-    try:
-        _copy_rustup_proxies(cargo_home, staging_bin, build_uid)
-        _freeze_toolchain_tree(staging_bin, build_gid)
-        if toolchain_bin.exists() or toolchain_bin.is_symlink():
-            raise DeploymentError(f"immutable toolchain bin target is unsafe: {toolchain_bin}")
-        os.replace(staging_bin, toolchain_bin)
-    finally:
-        if staging_bin.exists():
-            shutil.rmtree(staging_bin, ignore_errors=True)
-    _freeze_toolchain_tree(rustup_home, build_gid)
-    frozen_env = dict(env)
+    immutable_bin = context.options.toolchain_bin
+    if immutable_bin.is_symlink() or (immutable_bin.exists() and not immutable_bin.is_dir()):
+        raise DeploymentError(f"immutable toolchain bin is unsafe: {immutable_bin}")
+    if not immutable_bin.exists():
+        staging_bin = Path(tempfile.mkdtemp(
+            prefix=".toolchain-bin.staging-", dir=context.options.build_dir
+        ))
+        try:
+            _copy_rustup_proxies(cargo_home, staging_bin, build_uid)
+            _freeze_toolchain_tree(staging_bin, build_gid)
+            os.replace(staging_bin, immutable_bin)
+        finally:
+            if staging_bin.exists():
+                shutil.rmtree(staging_bin, ignore_errors=True)
+    _freeze_toolchain_tree(immutable_bin, build_gid)
     for proxy in ("rustup", "rustc", "cargo"):
         _validate_rust_proxy(
             context,
             proxy,
-            toolchain_bin / proxy,
-            frozen_env,
-            network_isolated=False,
+            _require_file(immutable_bin / proxy, f"immutable {proxy}"),
+            env,
+            network_isolated=True,
         )
 
 

@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .model import DeploymentOptions
 from .profile import DeploymentProfile
-from .runner import Runner, source_user_command, source_user_environment
+from .runner import Runner, resolve_build_account, source_user_command, source_user_environment
 from .state import StateStore
 
 
@@ -339,20 +339,30 @@ def _fingerprint(profile: DeploymentProfile, options: DeploymentOptions) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _build_user_rust_paths() -> Tuple[Path, Path, Path]:
+    account = resolve_build_account()
+    cargo_home = Path(account.pw_dir) / ".cargo"
+    rustup_home = Path(account.pw_dir) / ".rustup"
+    return cargo_home, rustup_home, cargo_home / "bin"
+
+
 def _cargo_environment(options: DeploymentOptions, target_dir: Path) -> Dict[str, str]:
+    cargo_home, rustup_home, toolchain_bin = _build_user_rust_paths()
     return {
         "AR": "/usr/bin/ar",
         "CC": "/usr/bin/cc",
         "CXX": "/usr/bin/c++",
         "CARGO_BUILD_RUSTC_WRAPPER": "",
         "CARGO_ENCODED_RUSTFLAGS": "",
-        "CARGO_HOME": str(options.cargo_home),
+        "CARGO_HOME": str(cargo_home),
         "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true",
         "CARGO_TARGET_DIR": str(target_dir),
         "HOME": str(options.build_home),
         "PATH": (f"{options.toolchain_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         "PKG_CONFIG": "/usr/bin/pkg-config",
         "PROTOC": "/usr/bin/protoc",
+        "RUSTUP_HOME": str(rustup_home),
         "RUSTC_WRAPPER": "",
         "RUSTC_WORKSPACE_WRAPPER": "",
         "RUSTDOCFLAGS": "",
@@ -362,11 +372,12 @@ def _cargo_environment(options: DeploymentOptions, target_dir: Path) -> Dict[str
 
 def _cargo_action(profile: DeploymentProfile, options: DeploymentOptions, build) -> Action:
     toolchain = profile.rust.toolchain
+    _cargo_home, rustup_home, _build_user_bin = _build_user_rust_paths()
     cargo = str(options.toolchain_bin / "cargo")
     env = _cargo_environment(options, options.rust_target_dir(build.manifest))
     env.update(
         {
-            "RUSTUP_HOME": str(options.rustup_home),
+            "RUSTUP_HOME": str(rustup_home),
             "RUSTUP_TOOLCHAIN": toolchain,
         }
     )
@@ -375,6 +386,7 @@ def _cargo_action(profile: DeploymentProfile, options: DeploymentOptions, build)
         vendor = options.offline_bundle / "cargo-vendor"
         env.update(
             {
+                "CARGO_HOME": str(options.cargo_home),
                 "CARGO_NET_OFFLINE": "true",
                 "PATH": (
                     f"{options.offline_bundle / 'cargo-bin'}:"
@@ -427,7 +439,7 @@ def _cargo_action(profile: DeploymentProfile, options: DeploymentOptions, build)
         cwd=options.source_root,
         env=env,
         as_build_user=True,
-        network_isolated=bool(options.offline_bundle),
+        network_isolated=profile.production or bool(options.offline_bundle),
         timeout=7200,
     )
 
@@ -439,11 +451,12 @@ def _cargo_metadata_action(
     index: int,
 ) -> Action:
     toolchain = profile.rust.toolchain
+    _cargo_home, rustup_home, _build_user_bin = _build_user_rust_paths()
     cargo = str(options.toolchain_bin / "cargo")
     env = _cargo_environment(options, options.rust_target_dir(manifest))
     env.update(
         {
-            "RUSTUP_HOME": str(options.rustup_home),
+            "RUSTUP_HOME": str(rustup_home),
             "RUSTUP_TOOLCHAIN": toolchain,
         }
     )
@@ -453,6 +466,7 @@ def _cargo_metadata_action(
         vendor = options.offline_bundle / "cargo-vendor"
         env.update(
             {
+                "CARGO_HOME": str(options.cargo_home),
                 "CARGO_NET_OFFLINE": "true",
                 "PATH": (
                     f"{options.offline_bundle / 'cargo-bin'}:"
@@ -489,7 +503,7 @@ def _cargo_metadata_action(
         cwd=options.source_root,
         env=env,
         as_build_user=True,
-        network_isolated=bool(options.offline_bundle),
+        network_isolated=profile.production or bool(options.offline_bundle),
         timeout=300,
     )
 
@@ -516,6 +530,7 @@ def _geometry_release_action(
             raise ValueError(f"geometry_release source has no Rust build: {source}")
         native_paths.append(options.rust_target_dir(build.manifest) / "release" / source)
 
+    _cargo_home, rustup_home, _build_user_bin = _build_user_rust_paths()
     cargo = str(options.toolchain_bin / "cargo")
     env = _cargo_environment(
         options,
@@ -523,12 +538,13 @@ def _geometry_release_action(
     )
     env.update(
         {
-            "RUSTUP_HOME": str(options.rustup_home),
+            "RUSTUP_HOME": str(rustup_home),
             "RUSTUP_TOOLCHAIN": profile.rust.toolchain,
         }
     )
     if options.offline_bundle:
         cargo = str(options.offline_bundle / "cargo-bin" / "cargo")
+        env["CARGO_HOME"] = str(options.cargo_home)
         env["CARGO_NET_OFFLINE"] = "true"
         env["CARGO_SOURCE_CRATES_IO_REPLACE_WITH"] = "vendored-sources"
         env["CARGO_SOURCE_VENDORED_SOURCES_DIRECTORY"] = str(
@@ -558,7 +574,7 @@ def _geometry_release_action(
         cwd=options.source_root,
         env=env,
         as_build_user=True,
-        network_isolated=bool(options.offline_bundle),
+        network_isolated=profile.production or bool(options.offline_bundle),
         timeout=7200,
     )
 

@@ -4,11 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
-RELEASE_CHECKER="${REPO_ROOT}/services/geometry/release_manifest.py"
-RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json}"
+RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
-EXEC_PROOF_FILE="${READY_FILE}.release"
 PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
 CHILD_PID=""
@@ -62,8 +60,7 @@ cleanup() {
   trap - EXIT
   stop_ready_monitor
   rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
-    "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" \
-    "${EXEC_PROOF_FILE}" 2>/dev/null || true
+    "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" 2>/dev/null || true
   stop_geometry_child || true
   exit "${status}"
 }
@@ -106,15 +103,19 @@ esac
 [[ "${HEALTH_TIMEOUT}" -gt 0 ]] \
   || fail "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT must be greater than zero"
 mkdir -p "$(dirname "${READY_FILE}")"
+[[ -x "${RUNTIME_BINARY}" && ! -L "${RUNTIME_BINARY}" ]] \
+  || fail "Geometry runtime binary is not an executable regular file: ${RUNTIME_BINARY}"
+RUNTIME_BINARY_SHA256="$(sha256sum "${RUNTIME_BINARY}" | cut -d' ' -f1)"
+[[ "${RUNTIME_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || fail "cannot calculate Geometry runtime binary SHA-256"
 rm -f "${READY_FILE}" "${READY_FILE}.tmp" \
-  "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp" "${EXEC_PROOF_FILE}"
+  "${INTERNAL_READY_FILE}" "${INTERNAL_READY_FILE}.tmp"
 trap cleanup EXIT
 trap forward_shutdown INT TERM
 
 NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \
   NUWAX_GEOMETRY_RUNTIME_PORT="${PORT}" \
-  PYTHONPATH="${REPO_ROOT}" python3 "${RELEASE_CHECKER}" exec \
-    --manifest "${RELEASE_MANIFEST}" --proof-output "${EXEC_PROOF_FILE}" &
+  "${RUNTIME_BINARY}" &
 CHILD_PID="$!"
 
 attempts=$((HEALTH_TIMEOUT * 10 + 1))
@@ -132,21 +133,13 @@ done
 
 geometry_internal_health_ready \
   || fail "runtime did not publish the expected healthy port within ${HEALTH_TIMEOUT}s"
-[[ -f "${EXEC_PROOF_FILE}" && ! -L "${EXEC_PROOF_FILE}" ]] \
-  || fail "verified runtime did not publish its immutable release proof"
-# shellcheck disable=SC1090
-source "${EXEC_PROOF_FILE}"
-[[ "${RELEASE_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ \
-  && "${RELEASE_GENERATION:-}" =~ ^[0-9a-f]{64}$ \
-  && "${RUNTIME_BINARY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
-  || fail "invalid immutable Geometry release proof output"
 BOOT_ID="$(nuwax_read_boot_id)" || fail "cannot read current boot identity"
 CHILD_STARTTIME="$(nuwax_read_proc_starttime "${CHILD_PID}")" \
   || fail "cannot read child process starttime from /proc/${CHILD_PID}/stat"
 
-printf 'pid=%s\nboot_id=%s\nstarttime=%s\nport=%s\nhealth_ready=1\nruntime_binary_sha256=%s\nrelease_manifest_sha256=%s\nrelease_generation=%s\n' \
+printf 'pid=%s\nboot_id=%s\nstarttime=%s\nport=%s\nhealth_ready=1\nruntime_binary_sha256=%s\n' \
   "${CHILD_PID}" "${BOOT_ID}" "${CHILD_STARTTIME}" "${PORT}" \
-  "${RUNTIME_BINARY_SHA256}" "${RELEASE_MANIFEST_SHA256}" "${RELEASE_GENERATION}" > "${READY_FILE}.tmp"
+  "${RUNTIME_BINARY_SHA256}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 
 monitor_geometry_ready_lease &

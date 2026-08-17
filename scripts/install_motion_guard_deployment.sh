@@ -377,9 +377,9 @@ check_systemd_owned_invariants() {
   grep -qF 'NUWAX_NAV_STACK_BINARY=@NUWAX_BIN_DIR@/nuwax-nav-stack' \
     "${NAV_UNIT_SOURCE}" \
     || fail "nav ExecStart does not pin the installed release binary"
-  grep -qF 'NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime' \
+  grep -qF 'NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime' \
     "${GEOMETRY_UNIT_SOURCE}" \
-    || fail "geometry ExecStart does not pin the installed release binary"
+    || fail "geometry ExecStart does not pin the canonical runtime binary"
   grep -qF 'NUWAX_PERSON_FOLLOW_BINARY=@NUWAX_BIN_DIR@/nuwax-person-follow' \
     "${PERSON_FOLLOW_UNIT_SOURCE}" \
     || fail "person-follow ExecStart does not pin the installed release binary"
@@ -548,10 +548,13 @@ check_sources() {
     || fail "motion guard source is not a Python interpreter template"
   grep -qF '@NUWAX_PYTHON_BIN@' "${VIDEO_STREAMER_UNIT_SOURCE}" \
     || fail "Go2 video streamer source is not a Python interpreter template"
-  for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" "${PERSON_FOLLOW_UNIT_SOURCE}"; do
+  for unit in "${NAV_UNIT_SOURCE}" "${PERSON_FOLLOW_UNIT_SOURCE}"; do
     grep -qF '@NUWAX_BIN_DIR@' "${unit}" \
       || fail "Rust service source is not a release bin template: ${unit}"
   done
+  grep -qF '@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime' \
+    "${GEOMETRY_UNIT_SOURCE}" \
+    || fail "Geometry service source does not pin the canonical runtime binary"
   bash -n \
     "${REPO_ROOT}/scripts/systemd/check_motion_guard_python.sh" \
     "${REPO_ROOT}/scripts/systemd/start_nav_stack.sh" \

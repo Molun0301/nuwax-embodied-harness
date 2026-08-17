@@ -5,7 +5,9 @@ from __future__ import annotations
 import atexit
 import logging
 import multiprocessing as mp
+import os
 import queue
+import sys
 import threading
 import time
 from multiprocessing import resource_tracker, shared_memory
@@ -14,6 +16,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_spawn_executable() -> None:
+    """确保修改进程标题后仍能启动 multiprocessing 子进程。"""
+    executable = (sys.executable or "").strip()
+    if not executable and sys.platform.startswith("linux"):
+        try:
+            executable = os.path.realpath("/proc/self/exe")
+        except OSError:
+            executable = ""
+    if not executable or not os.path.isfile(executable):
+        raise RuntimeError("无法确定 YOLO worker 使用的 Python 解释器")
+    mp.set_executable(executable)
 
 
 def _worker_loop(
@@ -202,7 +217,9 @@ class YoloInferenceWorker:
                     return False
             try:
                 # resource_tracker 和 spawn 必须在 Gateway 主线程创建；模型加载与
-                # 推理仍全部留在 worker 进程，调用方可异步等待 ready。
+                # 推理仍全部留在 worker 进程，调用方可异步等待 ready。exec -a 会让
+                # Python 3.8 的 sys.executable 变为空，先从 /proc 恢复真实解释器。
+                _configure_spawn_executable()
                 resource_tracker.ensure_running()
                 context = mp.get_context("spawn")
                 self._request_queue = context.Queue(maxsize=2)

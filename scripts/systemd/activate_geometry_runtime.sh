@@ -11,8 +11,7 @@ NAV_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-/run/nuwax/navigation/nuwax_nav_st
 GEOMETRY_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nuwax_geometry_runtime.ready}"
 PERSON_FOLLOW_READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-/run/nuwax/person-follow/nuwax_person_follow.ready}"
 GEOMETRY_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
-GEOMETRY_RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-release/manifest.json}"
-GEOMETRY_RELEASE_CHECKER="${REPO_ROOT}/services/geometry/release_manifest.py"
+GEOMETRY_RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 LAST_STAGE="starting"
 LAST_UNIT=""
 ACTIVATION_LEVEL="motion"
@@ -276,9 +275,8 @@ fi
 if [[ "${ACTIVATION_LEVEL}" == "geometry" \
   || "${ACTIVATION_LEVEL}" == "motion" \
   || "${ACTIVATION_LEVEL}" == "person_follow" ]]; then
-  LAST_STAGE="geometry_release_proof"
-  /usr/bin/python3 "${GEOMETRY_RELEASE_CHECKER}" check \
-    --manifest "${GEOMETRY_RELEASE_MANIFEST}"
+  LAST_STAGE="geometry_binary_check"
+  [[ -x "${GEOMETRY_RUNTIME_BINARY}" && ! -L "${GEOMETRY_RUNTIME_BINARY}" ]]
   check_cancel
   write_result activating "starting geometry component"
   LAST_STAGE="geometry"

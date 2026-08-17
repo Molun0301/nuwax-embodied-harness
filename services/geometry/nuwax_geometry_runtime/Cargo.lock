@@ -1511,6 +1511,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-bbox-tracker"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-base",
+ "nuwax-nav-types-messages",
+ "nuwax-numeric",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "nuwax-nav-click-goal-bridge"
 version = "0.1.0"
 dependencies = [
@@ -1640,11 +1651,17 @@ name = "nuwax-nav-visual-query"
 version = "0.1.0"
 dependencies = [
  "nuwax-nav-base",
+ "nuwax-nav-bbox-tracker",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
+ "prost",
+ "prost-build",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

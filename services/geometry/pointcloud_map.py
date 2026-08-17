@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import math
 import mmap
+import os
 from pathlib import Path
 import struct
 import threading
@@ -43,6 +46,106 @@ class PointCloudMapError(RuntimeError):
 
 class UnsupportedPointCloudMapError(PointCloudMapError):
     """当前解析器不支持的点云地图格式。"""
+
+
+class PointCloudMapSourceError(PointCloudMapError):
+    """统一点云来源打开、读取或关闭错误。"""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        source: str,
+        retryable: bool = False,
+        terminal: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.source = str(source)
+        self.retryable = bool(retryable)
+        self.terminal = bool(terminal)
+
+
+@dataclass(frozen=True)
+class PointCloudMapSnapshot:
+    """Batch03 规范点云在只读观察边界上的统一快照。"""
+
+    source: str
+    source_epoch: str
+    revision: str
+    revision_ordinal: int
+    frame_id: str
+    source_timestamp_ns: int
+    point_count: int
+    format: str
+    xyz_bytes: bytes
+    stream_generation: int
+    provenance: Dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.source not in {"live", "saved"}:
+            raise ValueError("pointcloud source 必须是 live 或 saved。")
+        if not self.source_epoch or not self.revision or not self.frame_id:
+            raise ValueError("pointcloud snapshot 身份字段不能为空。")
+        if self.revision_ordinal < 0 or self.source_timestamp_ns < 0 or self.stream_generation < 0:
+            raise ValueError("pointcloud snapshot 序号与时间必须非负。")
+        if self.point_count < 0 or len(self.xyz_bytes) != self.point_count * 12:
+            raise ValueError("pointcloud snapshot 点数与 XYZ 字节长度不一致。")
+        if self.format != "float32-xyz-le":
+            raise ValueError("pointcloud snapshot 仅支持 float32-xyz-le。")
+
+
+class PointCloudMapSource(ABC):
+    """实时与保存点云来源共享的同步只读生命周期合同。"""
+
+    source: str
+
+    @abstractmethod
+    def open(self) -> None:
+        """幂等打开来源。"""
+
+    @abstractmethod
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        """读取当前稳定快照；没有可用快照时返回 None。"""
+
+    @abstractmethod
+    def cancel(self) -> None:
+        """幂等取消当前生命周期。"""
+
+    @abstractmethod
+    def close(self) -> None:
+        """幂等关闭；关闭后 read 必须保持静默。"""
+
+
+@dataclass(frozen=True)
+class CloudMapMmapSnapshot:
+    """Rust cloud-map mmap v2 的稳定只读快照。"""
+
+    source_epoch: str
+    version: int
+    active_buffer: int
+    revision: int
+    point_count: int
+    timestamp_ns: int
+    voxel_size: float
+    xyz_bytes: bytes
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    ctime_ns: int
+    size: int
+
+    @property
+    def epoch(self) -> str:
+        return "dev:%d:ino:%d:ctime:%d" % (
+            self.device,
+            self.inode,
+            self.ctime_ns,
+        )
 
 
 @dataclass(frozen=True)
@@ -113,11 +216,25 @@ class PointCloudMap:
 
 
 class PointCloudMapCache:
-    """按 PCD 路径、mtime 和大小缓存累计点云地图。"""
+    """按点云资产路径、mtime 和大小缓存只读地图。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._items: Dict[Tuple[str, int, int], PointCloudMap] = {}
+
+    def load(
+        self,
+        path: Path,
+        *,
+        frame_id: str = DEFAULT_MAP_FRAME,
+        source_kind: str = "map_asset",
+    ) -> PointCloudMap:
+        suffix = path.suffix.strip().lower()
+        if suffix == ".pcd":
+            return self.load_pcd(path, frame_id=frame_id, source_kind=source_kind)
+        if suffix == ".ply":
+            return self.load_ply(path, frame_id=frame_id, source_kind=source_kind)
+        raise UnsupportedPointCloudMapError("不支持的点云地图扩展名：%s" % (suffix or "<empty>"))
 
     def load_pcd(
         self,
@@ -126,33 +243,71 @@ class PointCloudMapCache:
         frame_id: str = DEFAULT_MAP_FRAME,
         source_kind: str = "map_asset_pcd",
     ) -> PointCloudMap:
+        return self._load_asset(
+            path,
+            frame_id=frame_id,
+            source_kind=source_kind,
+            expected_suffix=".pcd",
+            reader=read_pcd_xyz,
+        )
+
+    def load_ply(
+        self,
+        path: Path,
+        *,
+        frame_id: str = DEFAULT_MAP_FRAME,
+        source_kind: str = "map_asset_ply",
+    ) -> PointCloudMap:
+        return self._load_asset(
+            path,
+            frame_id=frame_id,
+            source_kind=source_kind,
+            expected_suffix=".ply",
+            reader=read_ply_xyz,
+        )
+
+    def _load_asset(
+        self,
+        path: Path,
+        *,
+        frame_id: str,
+        source_kind: str,
+        expected_suffix: str,
+        reader,
+    ) -> PointCloudMap:
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.exists() or not resolved.is_file():
-            raise PointCloudMapError("PCD 点云地图不存在：%s" % resolved)
-        stat = resolved.stat()
-        key = (str(resolved), int(stat.st_mtime_ns), int(stat.st_size))
+            raise PointCloudMapError("点云地图不存在：%s" % resolved)
+        if resolved.suffix.lower() != expected_suffix:
+            raise UnsupportedPointCloudMapError(
+                "点云地图扩展名不匹配：expected=%s actual=%s"
+                % (expected_suffix, resolved.suffix.lower())
+            )
+        stat_result = resolved.stat()
+        key = (str(resolved), int(stat_result.st_mtime_ns), int(stat_result.st_size))
         with self._lock:
             cached = self._items.get(key)
             if cached is not None:
                 return cached
         started_at = time.perf_counter()
-        header, points_xyz = read_pcd_xyz(resolved)
+        header, points_xyz = reader(resolved)
         if points_xyz.size == 0:
-            raise PointCloudMapError("PCD 点云地图没有可用 x/y/z 点。")
+            raise PointCloudMapError("点云地图没有可用 x/y/z 点。")
         finite_mask = np.isfinite(points_xyz).all(axis=1)
         if not bool(finite_mask.all()):
             points_xyz = points_xyz[finite_mask]
         if points_xyz.size == 0:
-            raise PointCloudMapError("PCD 点云地图全部点均为非有限数。")
+            raise PointCloudMapError("点云地图全部点均为非有限数。")
         points_xyz = np.asarray(points_xyz, dtype=np.float32, order="C")
         bounds_min_arr = points_xyz.min(axis=0)
         bounds_max_arr = points_xyz.max(axis=0)
-        source_timestamp = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        source_timestamp = datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
+        content_revision = "sha256:%s" % _sha256_file(resolved)
         loaded = PointCloudMap(
             path=str(resolved),
-            revision="pcd:%d:%d" % (int(stat.st_mtime_ns), int(stat.st_size)),
+            revision=content_revision,
             frame_id=str(frame_id or DEFAULT_MAP_FRAME),
-            source_kind=str(source_kind or "map_asset_pcd"),
+            source_kind=str(source_kind or "map_asset"),
             point_count=int(points_xyz.shape[0]),
             points_xyz=points_xyz,
             bounds_min=tuple(float(value) for value in bounds_min_arr),
@@ -237,12 +392,30 @@ def read_ply_xyz(path: Path) -> Tuple[PcdHeader, np.ndarray]:
         if vertex_count <= 0:
             raise PointCloudMapError("PLY 文件缺少 vertex 数量。")
         if "binary_little_endian" in format_line:
+            ply_types = {
+                "char": "i1",
+                "uchar": "u1",
+                "int8": "i1",
+                "uint8": "u1",
+                "short": "<i2",
+                "ushort": "<u2",
+                "int16": "<i2",
+                "uint16": "<u2",
+                "int": "<i4",
+                "uint": "<u4",
+                "int32": "<i4",
+                "uint32": "<u4",
+                "float": "<f4",
+                "float32": "<f4",
+                "double": "<f8",
+                "float64": "<f8",
+            }
             dtype_fields = []
             for kind, name in properties:
-                if kind != "float":
-                    raise UnsupportedPointCloudMapError("PLY 仅支持 float 顶点属性。")
-                size = 8 if name == "double" else 4
-                dtype_fields.append((name, "<f%d" % size))
+                numpy_type = ply_types.get(kind)
+                if numpy_type is None:
+                    raise UnsupportedPointCloudMapError("PLY 不支持顶点属性类型：%s" % kind)
+                dtype_fields.append((name, numpy_type))
             if not dtype_fields:
                 raise PointCloudMapError("PLY 顶点没有属性定义。")
             vertex_dtype = np.dtype(dtype_fields)
@@ -473,6 +646,33 @@ def _parse_positive_int(value: Optional[str], *, default: int) -> int:
         parsed = default
     return max(0, parsed)
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_identity(path: Path) -> Optional[_FileIdentity]:
+    try:
+        stat_result = path.stat()
+    except (FileNotFoundError, OSError):
+        return None
+    if not path.is_file():
+        return None
+    return _FileIdentity(
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+        ctime_ns=int(stat_result.st_ctime_ns),
+        size=int(stat_result.st_size),
+    )
+
+
 class CloudMapMmapReader:
     """读取 Rust bridge 写入的累积地图双缓冲 mmap。"""
 
@@ -490,20 +690,73 @@ class CloudMapMmapReader:
         self._path = Path(shm_path)
         self._mm: Optional[mmap.mmap] = None
         self._fd = None
+        self._opened_identity: Optional[_FileIdentity] = None
+        self._open_generation = 0
+        self._source_epoch: Optional[str] = None
+
+    @property
+    def source_epoch(self) -> Optional[str]:
+        return self._source_epoch
 
     def is_available(self) -> bool:
-        if not self._path.exists():
+        current_identity = _file_identity(self._path)
+        if current_identity is None:
+            self.close()
             return False
+        if self._mm is not None:
+            if self._fd is None:
+                self.close()
+            else:
+                try:
+                    descriptor_stat = os.fstat(self._fd.fileno())
+                except (OSError, ValueError):
+                    self.close()
+                else:
+                    if (
+                        int(descriptor_stat.st_dev) != current_identity.device
+                        or int(descriptor_stat.st_ino) != current_identity.inode
+                    ):
+                        self.close()
         if self._mm is None:
             try:
                 self._open()
             except Exception:
+                self.close()
                 return False
         return self._mm is not None
 
     def _open(self) -> None:
-        self._fd = open(self._path, "rb")
-        self._mm = mmap.mmap(self._fd.fileno(), 0, access=mmap.ACCESS_READ)
+        self.close()
+        fd = open(self._path, "rb")
+        try:
+            descriptor_stat = os.fstat(fd.fileno())
+            descriptor_identity = _FileIdentity(
+                device=int(descriptor_stat.st_dev),
+                inode=int(descriptor_stat.st_ino),
+                ctime_ns=int(descriptor_stat.st_ctime_ns),
+                size=int(descriptor_stat.st_size),
+            )
+            named_identity = _file_identity(self._path)
+            if (
+                named_identity is None
+                or named_identity.device != descriptor_identity.device
+                or named_identity.inode != descriptor_identity.inode
+            ):
+                raise PointCloudMapError("cloud-map mmap 在打开期间被替换。")
+            mm = mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            fd.close()
+            raise
+        self._open_generation += 1
+        self._fd = fd
+        self._mm = mm
+        self._opened_identity = descriptor_identity
+        self._source_epoch = "dev:%d:ino:%d:opened:%d:generation:%d" % (
+            descriptor_identity.device,
+            descriptor_identity.inode,
+            descriptor_identity.ctime_ns,
+            self._open_generation,
+        )
 
     def close(self) -> None:
         if self._mm is not None:
@@ -512,6 +765,8 @@ class CloudMapMmapReader:
         if self._fd is not None:
             self._fd.close()
             self._fd = None
+        self._opened_identity = None
+        self._source_epoch = None
 
     def read_header(self) -> Optional[Tuple]:
         if not self.is_available():
@@ -533,48 +788,57 @@ class CloudMapMmapReader:
         revision, point_count = struct.unpack(self.SLOT_METADATA_FMT, raw)
         return int(revision), int(point_count)
 
-    def read_stable(
+    def read_stable_snapshot(
         self,
         max_points: int = WEB_POINTCLOUD_MAX_POINTS,
-    ) -> Optional[Tuple[int, int, bytes]]:
-        """读取最新已发布的点云数据。返回 (revision, point_count, xyz_bytes) 或 None。
+    ) -> Optional[CloudMapMmapSnapshot]:
+        """读取包含完整 v2 身份与时间字段的稳定点云快照。"""
 
-        v2 使用 global revision 推算 slot，并在读数据前后验证该 slot 的
-        revision 与 global revision 相同。slot 自带 point_count，因此不会把
-        下一帧抢跑写入的全局 point_count 误用到已发布 buffer。v1 仍保留
-        原 global revision + point_count 双读逻辑。
-        """
         for _ in range(3):
-            header = self.read_header()
-            if header is None:
+            if not self.is_available():
                 return None
-            _, version, _active_buf, legacy_point_count, _, revision, _ = header
-            if revision == 0:
+            source_epoch = self.source_epoch
+            mm = self._mm
+            if source_epoch is None or mm is None:
                 return None
-            read_buf = (revision - 1) % 2
+            header_raw = bytes(mm[0:self.HEADER_STRUCT_SIZE])
+            if len(header_raw) != self.HEADER_STRUCT_SIZE:
+                return None
+            header = struct.unpack(self.HEADER_FMT, header_raw)
+            magic, version, active_buffer, legacy_point_count, timestamp_ns, revision, voxel_size = header
+            if magic != self.MAGIC:
+                return None
+            revision = int(revision)
+            active_buffer = int(active_buffer)
+            if revision == 0 or active_buffer not in (0, 1):
+                return None
+            read_buf = active_buffer
             slot_metadata = None
             if version >= self.SLOT_METADATA_VERSION:
+                if read_buf != (revision - 1) % 2:
+                    continue
                 slot_metadata = self._read_slot_metadata(read_buf)
                 if slot_metadata is None or slot_metadata[0] != revision:
                     continue
                 point_count = slot_metadata[1]
+                if int(legacy_point_count) != point_count:
+                    continue
             else:
-                point_count = legacy_point_count
+                point_count = int(legacy_point_count)
                 if point_count == 0:
                     return None
 
             max_buffer_points = self.SINGLE_BUFFER_SIZE // (3 * 4)
             if point_count > max_buffer_points:
                 return None
-            max_points = min(max(1, int(max_points)), max_buffer_points)
+            selected_max_points = min(max(1, int(max_points)), max_buffer_points)
             buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
-            assert self._mm is not None
             if point_count == 0:
                 actual_count = 0
                 xyz_bytes = b""
-            elif point_count > max_points:
+            elif point_count > selected_max_points:
                 points = np.frombuffer(
-                    self._mm,
+                    mm,
                     dtype="<f4",
                     count=point_count * 3,
                     offset=buf_offset,
@@ -582,34 +846,53 @@ class CloudMapMmapReader:
                 sample_indices = np.linspace(
                     0,
                     point_count - 1,
-                    num=max_points,
+                    num=selected_max_points,
                     dtype=np.intp,
                 )
                 sampled = np.ascontiguousarray(points[sample_indices], dtype="<f4")
-                actual_count = max_points
+                del points
+                actual_count = selected_max_points
                 xyz_bytes = sampled.tobytes(order="C")
             else:
                 data_size = point_count * 12
-                xyz_bytes = bytes(self._mm[buf_offset:buf_offset + data_size])
+                xyz_bytes = bytes(mm[buf_offset:buf_offset + data_size])
+                if len(xyz_bytes) != data_size:
+                    return None
                 actual_count = point_count
-            slot_metadata_after = None
-            if version >= self.SLOT_METADATA_VERSION:
-                slot_metadata_after = self._read_slot_metadata(read_buf)
-            header_after = self.read_header()
-            if header_after is None:
+
+            if not self.is_available():
                 return None
-            if header_after[5] != revision:
+            if self.source_epoch != source_epoch or self._mm is not mm:
+                continue
+            header_raw_after = bytes(mm[0:self.HEADER_STRUCT_SIZE])
+            if header_raw_after != header_raw:
                 continue
             if version >= self.SLOT_METADATA_VERSION:
-                if (
-                    slot_metadata_after is None
-                    or slot_metadata_after[0] != header_after[5]
-                    or slot_metadata_after[1] != point_count
-                ):
+                slot_metadata_after = self._read_slot_metadata(read_buf)
+                if slot_metadata_after != slot_metadata:
                     continue
-            return (revision, actual_count, xyz_bytes)
-        # 连续 3 次都被写者抢占，放弃本轮（上层轮询下次重试）。
+            return CloudMapMmapSnapshot(
+                source_epoch=source_epoch,
+                version=int(version),
+                active_buffer=active_buffer,
+                revision=revision,
+                point_count=actual_count,
+                timestamp_ns=int(timestamp_ns),
+                voxel_size=float(voxel_size),
+                xyz_bytes=xyz_bytes,
+            )
         return None
+
+    def read_stable(
+        self,
+        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+    ) -> Optional[Tuple[int, int, bytes]]:
+        """兼容旧调用方，返回完整 u64 revision、点数与 XYZ 字节。"""
+
+        snapshot = self.read_stable_snapshot(max_points=max_points)
+        if snapshot is None:
+            return None
+        return snapshot.revision, snapshot.point_count, snapshot.xyz_bytes
 
     def build_binary_frame(
         self,
@@ -623,3 +906,365 @@ class CloudMapMmapReader:
         import struct as _struct
         header_bytes = _struct.pack("<II", revision & 0xFFFFFFFF, point_count)
         return header_bytes + xyz_bytes
+
+
+class LivePointCloudMapSource(PointCloudMapSource):
+    """把 Batch03 cloud-map mmap 适配为统一只读来源。"""
+
+    source = "live"
+
+    def __init__(
+        self,
+        reader: CloudMapMmapReader,
+        *,
+        frame_id: str = DEFAULT_MAP_FRAME,
+        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+    ) -> None:
+        self._reader = reader
+        self._frame_id = str(frame_id or DEFAULT_MAP_FRAME)
+        self._max_points = max(1, int(max_points))
+        self._opened = False
+        self._cancelled = False
+        self._closed = False
+        self._observed_open_epoch: Optional[str] = None
+        self._last_revision: Optional[int] = None
+        self._restart_generation = 0
+
+    def open(self) -> None:
+        if self._closed or self._opened:
+            return
+        self._cancelled = False
+        self._opened = True
+
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+            return None
+        self.open()
+        if not self._reader.is_available():
+            raise PointCloudMapSourceError(
+                "live_unavailable",
+                "实时 cloud-map mmap 不可用。",
+                source=self.source,
+                retryable=True,
+            )
+        try:
+            snapshot = self._reader.read_stable_snapshot(max_points=self._max_points)
+        except Exception as exc:
+            raise PointCloudMapSourceError(
+                "live_read_failed",
+                str(exc),
+                source=self.source,
+                retryable=True,
+            ) from exc
+        if snapshot is None:
+            try:
+                header = self._reader.read_header()
+            except Exception as exc:
+                raise PointCloudMapSourceError(
+                    "live_header_failed",
+                    str(exc),
+                    source=self.source,
+                    retryable=True,
+                ) from exc
+            if header is None:
+                raise PointCloudMapSourceError(
+                    "live_invalid_header",
+                    "实时 cloud-map mmap 头无效。",
+                    source=self.source,
+                    retryable=True,
+                )
+            return None
+        reader_epoch = snapshot.source_epoch
+        if self._observed_open_epoch != reader_epoch:
+            self._observed_open_epoch = reader_epoch
+            self._last_revision = None
+            self._restart_generation = 0
+        elif self._last_revision is not None:
+            if snapshot.revision == self._last_revision:
+                return None
+            if snapshot.revision < self._last_revision:
+                self._restart_generation += 1
+                self._last_revision = None
+        source_epoch = reader_epoch
+        if self._restart_generation > 0:
+            source_epoch = "%s:observed-restart:%d" % (
+                reader_epoch,
+                self._restart_generation,
+            )
+        result = PointCloudMapSnapshot(
+            source=self.source,
+            source_epoch=source_epoch,
+            revision="cloud:%d" % snapshot.revision,
+            revision_ordinal=snapshot.revision,
+            frame_id=self._frame_id,
+            source_timestamp_ns=snapshot.timestamp_ns,
+            point_count=snapshot.point_count,
+            format="float32-xyz-le",
+            xyz_bytes=snapshot.xyz_bytes,
+            stream_generation=0,
+            provenance={
+                "canonical_owner": "nuwax_geometry_runtime",
+                "canonical_revision": True,
+                "mmap_version": snapshot.version,
+                "active_buffer": snapshot.active_buffer,
+                "voxel_size": snapshot.voxel_size,
+                "shm_path": str(self._reader._path),
+                "observer_restart_generation": self._restart_generation,
+                "writer_session_id_available": False,
+            },
+        )
+        self._last_revision = snapshot.revision
+        return result
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._cancelled = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._cancelled = True
+        self._opened = False
+        self._reader.close()
+
+
+class SavedPointCloudMapSource(PointCloudMapSource):
+    """把 Geometry 保存的 PCD/PLY 资产适配为统一只读来源。"""
+
+    source = "saved"
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        cache: Optional[PointCloudMapCache] = None,
+        frame_id: str = DEFAULT_MAP_FRAME,
+        source_kind: str = "map_asset",
+        map_name: Optional[str] = None,
+        asset_manifest_sha256: Optional[str] = None,
+        asset_sha256: Optional[str] = None,
+        provenance: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self._path = path.expanduser().resolve(strict=False)
+        self._cache = cache or PointCloudMapCache()
+        self._frame_id = str(frame_id or DEFAULT_MAP_FRAME)
+        self._source_kind = str(source_kind or "map_asset")
+        self._map_name = str(map_name) if map_name is not None else None
+        self._asset_manifest_sha256 = str(asset_manifest_sha256 or "").strip().lower() or None
+        self._asset_sha256 = str(asset_sha256 or "").strip().lower() or None
+        self._provenance = dict(provenance or {})
+        self._opened = False
+        self._cancelled = False
+        self._closed = False
+
+    def open(self) -> None:
+        if self._closed or self._opened:
+            return
+        self._cancelled = False
+        self._opened = True
+
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+            return None
+        self.open()
+        identity = _file_identity(self._path)
+        if identity is None:
+            raise PointCloudMapSourceError(
+                "saved_unavailable",
+                "保存点云资产不可用：%s" % self._path,
+                source=self.source,
+                retryable=True,
+            )
+        try:
+            pointcloud_map = self._cache.load(
+                self._path,
+                frame_id=self._frame_id,
+                source_kind=self._source_kind,
+            )
+        except UnsupportedPointCloudMapError as exc:
+            raise PointCloudMapSourceError(
+                "saved_format_unsupported",
+                str(exc),
+                source=self.source,
+                terminal=True,
+            ) from exc
+        except (PointCloudMapError, OSError) as exc:
+            raise PointCloudMapSourceError(
+                "saved_read_failed",
+                str(exc),
+                source=self.source,
+                retryable=True,
+            ) from exc
+        computed_sha256 = pointcloud_map.revision.partition(":")[2]
+        identity_after = _file_identity(self._path)
+        if identity_after is None or identity_after != identity:
+            raise PointCloudMapSourceError(
+                "saved_replaced_during_read",
+                "保存点云资产在读取期间被替换。",
+                source=self.source,
+                retryable=True,
+            )
+        if self._asset_sha256 and self._asset_sha256 != computed_sha256:
+            raise PointCloudMapSourceError(
+                "saved_asset_hash_mismatch",
+                "保存点云资产摘要与 Geometry 元数据不一致。",
+                source=self.source,
+                terminal=True,
+            )
+        if self._asset_manifest_sha256:
+            revision = "manifest:%s" % self._asset_manifest_sha256
+            revision_kind = "asset_manifest_sha256"
+            canonical_identity = True
+        elif self._asset_sha256:
+            revision = "asset:%s" % self._asset_sha256
+            revision_kind = "asset_sha256"
+            canonical_identity = True
+        else:
+            revision = "asset:%s" % computed_sha256
+            revision_kind = "computed_asset_sha256"
+            canonical_identity = False
+        return PointCloudMapSnapshot(
+            source=self.source,
+            source_epoch="path:%s:%s" % (str(self._path), identity.epoch),
+            revision=revision,
+            revision_ordinal=max(0, int(identity.ctime_ns)),
+            frame_id=pointcloud_map.frame_id,
+            source_timestamp_ns=int(pointcloud_map.source_timestamp.timestamp() * 1_000_000_000),
+            point_count=pointcloud_map.point_count,
+            format="float32-xyz-le",
+            xyz_bytes=pointcloud_map.binary_xyz("full"),
+            stream_generation=0,
+            provenance={
+                **self._provenance,
+                "canonical_owner": "nuwax_geometry_runtime",
+                "canonical_revision": canonical_identity,
+                "revision_kind": revision_kind,
+                "map_name": self._map_name,
+                "source_kind": pointcloud_map.source_kind,
+                "asset_path": pointcloud_map.path,
+                "asset_format": self._path.suffix.lower().lstrip("."),
+                "asset_sha256": computed_sha256,
+                "cache_key_mtime_ns": int(pointcloud_map.source_timestamp.timestamp() * 1_000_000_000),
+                "cache_key_size": identity_after.size,
+                "load_ms": pointcloud_map.load_ms,
+            },
+        )
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._cancelled = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._cancelled = True
+        self._opened = False
+
+
+class PointCloudMapSourceSwitch:
+    """串行选择 live/saved，并独占观察侧来源与修订水位。"""
+
+    def __init__(
+        self,
+        live_source: PointCloudMapSource,
+        saved_source: PointCloudMapSource,
+    ) -> None:
+        self._live_source = live_source
+        self._saved_source = saved_source
+        self._active_source: Optional[str] = None
+        self._active_epoch: Optional[str] = None
+        self._stream_generation = 0
+        self._watermarks: Dict[Tuple[str, str], int] = {}
+        self._opened = False
+        self._cancelled = False
+        self._closed = False
+        self._lock = threading.RLock()
+
+    @property
+    def active_source(self) -> Optional[str]:
+        with self._lock:
+            return self._active_source
+
+    @property
+    def stream_generation(self) -> int:
+        with self._lock:
+            return self._stream_generation
+
+    def open(self) -> None:
+        with self._lock:
+            if self._closed or self._opened:
+                return
+            self._cancelled = False
+            self._live_source.open()
+            self._saved_source.open()
+            self._opened = True
+
+    def read(self, cancel_event: Optional[threading.Event] = None) -> Optional[PointCloudMapSnapshot]:
+        with self._lock:
+            if self._closed or self._cancelled or (cancel_event is not None and cancel_event.is_set()):
+                return None
+            self.open()
+            live_snapshot, live_usable = self._try_read(self._live_source, cancel_event)
+            if live_snapshot is not None:
+                return self._accept(live_snapshot)
+            if live_usable and self._active_source == self._live_source.source:
+                return None
+            saved_snapshot, _ = self._try_read(self._saved_source, cancel_event)
+            if saved_snapshot is None:
+                return None
+            return self._accept(saved_snapshot)
+
+    @staticmethod
+    def _try_read(
+        source: PointCloudMapSource,
+        cancel_event: Optional[threading.Event],
+    ) -> Tuple[Optional[PointCloudMapSnapshot], bool]:
+        try:
+            return source.read(cancel_event), True
+        except PointCloudMapSourceError as exc:
+            if not exc.retryable:
+                raise
+            return None, False
+
+    def _accept(self, snapshot: PointCloudMapSnapshot) -> Optional[PointCloudMapSnapshot]:
+        key = (snapshot.source, snapshot.source_epoch)
+        previous = self._watermarks.get(key)
+        source_changed = (
+            self._active_source != snapshot.source
+            or self._active_epoch != snapshot.source_epoch
+        )
+        if previous is not None:
+            if snapshot.revision_ordinal < previous:
+                return None
+            if snapshot.revision_ordinal == previous and not source_changed:
+                return None
+        if source_changed:
+            self._stream_generation += 1
+            self._active_source = snapshot.source
+            self._active_epoch = snapshot.source_epoch
+        self._watermarks[key] = snapshot.revision_ordinal
+        return replace(snapshot, stream_generation=self._stream_generation)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._closed or self._cancelled:
+                return
+            self._cancelled = True
+            self._live_source.cancel()
+            self._saved_source.cancel()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._cancelled = True
+            self._opened = False
+            self._live_source.close()
+            self._saved_source.close()
+            self._active_source = None
+            self._active_epoch = None

@@ -10,7 +10,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import json
 import logging
+import math
 import os
 import stat
 import tempfile
@@ -48,30 +52,270 @@ _EFFECTIVE_VALUES_LOCK = threading.RLock()
 _GEOMETRY_LIO_BACKENDS = ("device", "fastlio2", "pointlio")
 _GEOMETRY_MAPPING_BACKENDS = ("voxel", "raytracing")
 _GEOMETRY_CORRECTION_BACKENDS = ("none", "library_pgo", "native_pgo", "relocalization")
-_GEOMETRY_DISABLED_CHOICES = {
-    "NUWAX_GEOMETRY_LIO_BACKEND": {
-        "fastlio2": "Go2 L2 点云/IMU RPC 静态链已通过；部署仍须提供 IMU→body 标定并完成 native child 实机闭环验收。",
-        "pointlio": "Go2 L2 点云/IMU RPC 静态链已通过；部署仍须提供 IMU→body 标定并完成 native child 实机闭环验收。",
-    },
-    "NUWAX_GEOMETRY_CORRECTION_BACKEND": {
-        "native_pgo": "原生 PGO 受控制品注入已恢复，但尚未完成 Go2 实机闭环验收。",
-        "relocalization": "status 3 仅能确认视频中继启动失败；已修复可证明的 SHM 残留路径，仍待 Go2 闭环复验。",
-    },
-}
+_GEOMETRY_ACCEPTANCE_LEDGER_ENV = "NUWAX_GEOMETRY_ACCEPTANCE_LEDGER"
+_DEFAULT_GEOMETRY_ACCEPTANCE_LEDGER = _REPO_ROOT / "runtime_data" / "geometry_acceptance_ledger.json"
+_NATIVE_LIO_ROLE_PREFIX = "native_lio_payload:"
+_BODY_FROM_SENSOR_ENV = "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR"
+_BODY_FROM_IMU_ENV = "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU"
+_NATIVE_HOST_IP_ENV = "NUWAX_GEOMETRY_NATIVE_LIO_HOST_IP"
+_NATIVE_LIDAR_IP_ENV = "NUWAX_GEOMETRY_NATIVE_LIO_LIDAR_IP"
 
 
-def _geometry_backend_matrix() -> List[Dict[str, str]]:
-    """返回当前 Web 可部署的 Go2 后端组合。"""
+@dataclass(frozen=True)
+class GeometryCombinationStatus:
+    lio: str
+    mapping: str
+    correction: str
+    prerequisites_ready: bool
+    accepted: bool
+    enabled: bool
+    reason: str
 
-    disabled_lio = _GEOMETRY_DISABLED_CHOICES["NUWAX_GEOMETRY_LIO_BACKEND"]
-    disabled_correction = _GEOMETRY_DISABLED_CHOICES["NUWAX_GEOMETRY_CORRECTION_BACKEND"]
-    return [
-        {"lio": lio, "mapping": mapping, "correction": correction}
-        for lio in _GEOMETRY_LIO_BACKENDS
-        for mapping in _GEOMETRY_MAPPING_BACKENDS
-        for correction in _GEOMETRY_CORRECTION_BACKENDS
-        if lio not in disabled_lio and correction not in disabled_correction
-    ]
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "lio": self.lio,
+            "mapping": self.mapping,
+            "correction": self.correction,
+            "prerequisites_ready": self.prerequisites_ready,
+            "accepted": self.accepted,
+            "enabled": self.enabled,
+            "reason": self.reason,
+        }
+
+
+def _geometry_acceptance_ledger_path() -> Path:
+    configured = os.environ.get(_GEOMETRY_ACCEPTANCE_LEDGER_ENV, "").strip()
+    return Path(configured).expanduser() if configured else _DEFAULT_GEOMETRY_ACCEPTANCE_LEDGER
+
+
+def _valid_rotation_calibration(raw: str) -> bool:
+    try:
+        payload = json.loads(raw)
+        translation = payload["translation_m"]
+        rotation = payload["rotation_row_major"]
+        values = [float(value) for value in translation] + [float(value) for value in rotation]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if len(translation) != 3 or len(rotation) != 9 or not all(math.isfinite(value) for value in values):
+        return False
+    rows = [rotation[0:3], rotation[3:6], rotation[6:9]]
+    for index, row in enumerate(rows):
+        if abs(sum(float(value) ** 2 for value in row) - 1.0) > 1.0e-6:
+            return False
+        for other in rows[index + 1:]:
+            if abs(sum(float(a) * float(b) for a, b in zip(row, other))) > 1.0e-6:
+                return False
+    determinant = (
+        float(rotation[0]) * (float(rotation[4]) * float(rotation[8]) - float(rotation[5]) * float(rotation[7]))
+        - float(rotation[1]) * (float(rotation[3]) * float(rotation[8]) - float(rotation[5]) * float(rotation[6]))
+        + float(rotation[2]) * (float(rotation[3]) * float(rotation[7]) - float(rotation[4]) * float(rotation[6]))
+    )
+    return abs(determinant - 1.0) <= 1.0e-6
+
+
+def _valid_network_parameter(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return (
+        address.version == 4
+        and not address.is_unspecified
+        and not address.is_multicast
+        and not address.is_loopback
+    )
+
+
+def _release_capabilities() -> Dict[str, object]:
+    try:
+        from services.geometry.release_manifest import verify_release_manifest
+
+        proof = verify_release_manifest()
+    except Exception as exc:
+        return {"valid": False, "generation": "", "roles": set(), "reason": str(exc)}
+    try:
+        return {
+            "valid": True,
+            "generation": proof.generation,
+            "roles": {artifact.role for artifact in proof.artifacts},
+            "executable_roles": {
+                artifact.role for artifact in proof.artifacts if artifact.executable
+            },
+            "reason": "",
+        }
+    finally:
+        proof.close()
+
+
+def _accepted_combinations() -> Dict[tuple, Dict[str, object]]:
+    path = _geometry_acceptance_ledger_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return {}
+    raw_records = payload.get("records", [])
+    if not isinstance(raw_records, list):
+        return {}
+    records: Dict[tuple, Dict[str, object]] = {}
+    for item in raw_records:
+        if not isinstance(item, dict) or item.get("passed") is not True:
+            continue
+        required_strings = (
+            "lio",
+            "mapping",
+            "correction",
+            "release_generation",
+            "archive",
+            "archive_sha256",
+        )
+        if any(not isinstance(item.get(name), str) for name in required_strings):
+            continue
+        if len(item["archive_sha256"]) != 64:
+            continue
+        key = (item["lio"], item["mapping"], item["correction"])
+        checked = dict(item)
+        archive_path = Path(str(item.get("archive", "")))
+        archive_error = ""
+        try:
+            archive_bytes = archive_path.read_bytes()
+            if hashlib.sha256(archive_bytes).hexdigest() != str(item.get("archive_sha256", "")):
+                raise ValueError("归档摘要不匹配")
+            archive = json.loads(archive_bytes.decode("utf-8"))
+            if not isinstance(archive, dict):
+                raise ValueError("归档根节点不是对象")
+            combination = archive.get("combination", {})
+            if not isinstance(combination, dict):
+                raise ValueError("归档 combination 不是对象")
+            if archive.get("passed") is not True:
+                raise ValueError("归档未通过")
+            if tuple(str(combination.get(name, "")) for name in ("lio", "mapping", "correction")) != key:
+                raise ValueError("归档组合与 ledger 不一致")
+            if str(archive.get("release_generation", "")) != str(item.get("release_generation", "")):
+                raise ValueError("归档 release generation 与 ledger 不一致")
+            result = archive.get("result", {})
+            if not isinstance(result, dict):
+                raise ValueError("归档 result 不是对象")
+            steps = result.get("steps", [])
+            if not isinstance(steps, list):
+                raise ValueError("归档 steps 不是数组")
+            step_names = {
+                str(step.get("name", ""))
+                for step in steps
+                if isinstance(step, dict)
+            }
+            if not {"activate", "start", "revision", "stop"}.issubset(step_names):
+                raise ValueError("归档缺少完整 MCP 生命周期证据")
+            if not result.get("final_systemd") or not result.get("owner_profile_logs"):
+                raise ValueError("归档缺少 systemd 或 owner profile 日志证据")
+        except (
+            AttributeError,
+            OSError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            archive_error = str(exc)
+        checked["archive_error"] = archive_error
+        records[key] = checked
+    return records
+
+
+def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
+    """依据本机 release、配置和验收 ledger 计算全部 24 种组合。"""
+
+    release = _release_capabilities()
+    roles = release["roles"] if release["valid"] else set()
+    executable_roles = release.get("executable_roles", set()) if release["valid"] else set()
+    generation = str(release.get("generation", ""))
+    accepted_records = _accepted_combinations()
+    host_ip = os.environ.get(_NATIVE_HOST_IP_ENV, "").strip()
+    lidar_ip = os.environ.get(_NATIVE_LIDAR_IP_ENV, "").strip()
+    statuses: List[GeometryCombinationStatus] = []
+    for lio in _GEOMETRY_LIO_BACKENDS:
+        for mapping in _GEOMETRY_MAPPING_BACKENDS:
+            for correction in _GEOMETRY_CORRECTION_BACKENDS:
+                prerequisite_reasons = []
+                if not release["valid"]:
+                    prerequisite_reasons.append("本机 Geometry release manifest 未通过校验")
+                if lio in {"fastlio2", "pointlio"}:
+                    native_role = _NATIVE_LIO_ROLE_PREFIX + lio
+                    if native_role not in roles:
+                        prerequisite_reasons.append("release manifest 缺少 %s" % native_role)
+                    elif native_role not in executable_roles:
+                        prerequisite_reasons.append("release manifest 中 %s 不是可执行制品" % native_role)
+                    if not _valid_rotation_calibration(os.environ.get(_BODY_FROM_SENSOR_ENV, "")):
+                        prerequisite_reasons.append("未提供有效的 LiDAR→body 显式标定")
+                    if not _valid_rotation_calibration(os.environ.get(_BODY_FROM_IMU_ENV, "")):
+                        prerequisite_reasons.append("未提供有效的 IMU→body 显式标定")
+                    if not _valid_network_parameter(host_ip):
+                        prerequisite_reasons.append("native LIO host IP 未显式配置为可用 IPv4")
+                    if not _valid_network_parameter(lidar_ip):
+                        prerequisite_reasons.append("native LIO lidar IP 未显式配置为可用 IPv4")
+                    if host_ip and lidar_ip and host_ip == lidar_ip:
+                        prerequisite_reasons.append("native LIO host IP 与 lidar IP 不能相同")
+                if correction == "native_pgo" and "native_pgo_payload" not in roles:
+                    prerequisite_reasons.append("release manifest 缺少 native_pgo_payload")
+                if correction == "relocalization":
+                    prerequisite_reasons.append("relocalization 仍需地图资产与 Go2 实机闭环证据")
+
+                record = accepted_records.get((lio, mapping, correction))
+                accepted = bool(
+                    record is not None
+                    and not record.get("archive_error")
+                    and generation
+                    and str(record.get("release_generation", "")) == generation
+                )
+                reasons = list(prerequisite_reasons)
+                if record is None:
+                    reasons.append("无该组合的历史 Go2 实机验收记录")
+                elif record.get("archive_error"):
+                    reasons.append("历史验收归档无效：%s" % record["archive_error"])
+                elif not accepted:
+                    reasons.append("历史验收记录不属于当前 release generation")
+                prerequisites_ready = not prerequisite_reasons
+                statuses.append(
+                    GeometryCombinationStatus(
+                        lio=lio,
+                        mapping=mapping,
+                        correction=correction,
+                        prerequisites_ready=prerequisites_ready,
+                        accepted=accepted,
+                        enabled=prerequisites_ready and accepted,
+                        reason="；".join(reasons),
+                    )
+                )
+    return statuses
+
+
+def _geometry_backend_matrix() -> List[Dict[str, object]]:
+    """返回当前本机真实可部署的组合，而非静态白名单。"""
+
+    return [status.as_dict() for status in geometry_backend_statuses() if status.enabled]
+
+
+def _geometry_choice_disabled_reasons(statuses: List[GeometryCombinationStatus]) -> Dict[str, Dict[str, str]]:
+    dimensions = {
+        "NUWAX_GEOMETRY_LIO_BACKEND": ("lio", _GEOMETRY_LIO_BACKENDS),
+        "NUWAX_GEOMETRY_MAPPING_BACKEND": ("mapping", _GEOMETRY_MAPPING_BACKENDS),
+        "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("correction", _GEOMETRY_CORRECTION_BACKENDS),
+    }
+    result: Dict[str, Dict[str, str]] = {}
+    for key, (attribute, values) in dimensions.items():
+        result[key] = {}
+        for value in values:
+            candidates = [status for status in statuses if getattr(status, attribute) == value]
+            if any(status.enabled for status in candidates):
+                continue
+            unique_reasons = []
+            for status in candidates:
+                for reason in status.reason.split("；"):
+                    if reason and reason not in unique_reasons:
+                        unique_reasons.append(reason)
+            result[key][value] = "；".join(unique_reasons)
+    return result
 
 
 def _core_env_path() -> Path:
@@ -330,6 +574,8 @@ def build_schema() -> Dict[str, object]:
             return src[key]
         return None
 
+    geometry_statuses = geometry_backend_statuses()
+    geometry_choice_reasons = _geometry_choice_disabled_reasons(geometry_statuses)
     sections: Dict[str, Dict[str, object]] = {}
     for sid, title in R.SECTIONS:
         sections[sid] = {"section_id": sid, "section_title": title, "fields": []}
@@ -351,7 +597,7 @@ def build_schema() -> Dict[str, object]:
             "alias_of": f.alias_of,
             "choices": list(f.choices),
             "choice_labels": list(f.choice_labels),
-            "choice_disabled_reasons": dict(_GEOMETRY_DISABLED_CHOICES.get(f.key, {})),
+            "choice_disabled_reasons": dict(geometry_choice_reasons.get(f.key, {})),
             "value": display_value,
             "value_source": value_source,
             "is_set": raw_value is not None,
@@ -362,10 +608,11 @@ def build_schema() -> Dict[str, object]:
         "sections": ordered,
         "field_count": len(R.build_registry()),
         "effect_note": "仅保存已修改项；保存后需重启网关和 Geometry Runtime 生效。",
-        "geometry_backend_matrix": _geometry_backend_matrix(),
+        "geometry_backend_structure_matrix": [status.as_dict() for status in geometry_statuses],
+        "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
         "geometry_backend_matrix_note": (
-            "当前 Web 仅开放已通过 Go2 闭环验收的 1 种 LIO × 2 种建图 × 2 种校正，"
-            "共 4 个可部署组合；其余选项已禁用并显示原因。"
+            "结构矩阵固定覆盖 3 种 LIO × 2 种建图 × 4 种校正共 24 个组合；"
+            "当前可部署矩阵由本机 release、显式标定、native 配置和当前 generation 的实机验收 ledger 动态计算。"
         ),
     }
 
@@ -543,12 +790,37 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         if field.choices and normalized not in field.choices:
             rejected[key] = f"值必须是以下之一：{', '.join(field.choices)}"
             continue
-        disabled_reason = _GEOMETRY_DISABLED_CHOICES.get(key, {}).get(normalized)
-        if disabled_reason:
-            rejected[key] = disabled_reason
-            continue
         target_file = _save_target(key, field.target_file)
         per_target.setdefault(target_file, {})[key] = normalized
+
+    geometry_updates = {
+        key: value
+        for values in per_target.values()
+        for key, value in values.items()
+        if key in _GEOMETRY_OWNER_KEYS
+    }
+    if geometry_updates:
+        selected = _read_env_values(_geometry_owner_env_path())
+        selected.update(geometry_updates)
+        combination = (
+            selected.get("NUWAX_GEOMETRY_LIO_BACKEND", "device"),
+            selected.get("NUWAX_GEOMETRY_MAPPING_BACKEND", "voxel"),
+            selected.get("NUWAX_GEOMETRY_CORRECTION_BACKEND", "none"),
+        )
+        status = next(
+            (
+                item for item in geometry_backend_statuses()
+                if (item.lio, item.mapping, item.correction) == combination
+            ),
+            None,
+        )
+        if status is None or not status.enabled:
+            reason = status.reason if status is not None else "未知 Geometry 后端组合"
+            for key in geometry_updates:
+                rejected[key] = reason
+            for values in per_target.values():
+                for key in geometry_updates:
+                    values.pop(key, None)
 
     backups: Dict[str, str] = {}
     for target_file, kv in per_target.items():

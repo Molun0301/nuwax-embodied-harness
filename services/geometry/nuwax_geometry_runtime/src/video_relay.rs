@@ -894,6 +894,7 @@ impl ResourceLease {
     }
 
     fn cleanup(mut self) -> VideoRelayPathCleanup {
+        // 正常 owner 仍持有 flock，先按 inode 身份删除租约路径，再释放锁不会与接管者并发。
         let result = self
             .entry
             .take()
@@ -1664,8 +1665,12 @@ mod process_helper {
             let uds_public = Self::cleanup_exact(self.uds_public, "公共 UDS");
             let uds_candidate = Self::cleanup_exact(self.uds_candidate, "UDS candidate");
             let uds = merge_path_cleanup(uds_public, uds_candidate);
-            let shm_lease = Self::cleanup_exact(self.shm_lease, "SHM lease");
-            let uds_lease = Self::cleanup_exact(self.uds_lease, "UDS lease");
+            // lease 是跨 owner 代际复用的协调 inode。旧 helper 只能关闭身份句柄，
+            // 不能在新 owner 已接管同一 inode 后 unlink 路径。
+            drop(self.shm_lease);
+            drop(self.uds_lease);
+            let shm_lease = VideoRelayPathCleanup::AlreadyAbsent;
+            let uds_lease = VideoRelayPathCleanup::AlreadyAbsent;
             VideoRelayCleanup {
                 mmap: VideoRelayMmapCleanup::NotCreated,
                 uds,
@@ -6733,13 +6738,13 @@ mod tests {
                 !process_exists(helper_pid)
                     && !paths.shm.exists()
                     && !paths.uds.exists()
-                    && !shm_lease.exists()
-                    && !uds_lease.exists()
+                    && shm_lease.exists()
+                    && uds_lease.exists()
             },
             Duration::from_secs(3)
         ));
         std::fs::remove_file(paths.root.join("helper.pid")).unwrap();
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 2);
 
         let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds)
             .expect("新 owner 应能在 watchdog 零残留后启动");
@@ -6783,14 +6788,14 @@ mod tests {
                 !process_exists(helper_pid)
                     && !paths.shm.exists()
                     && !paths.uds.exists()
-                    && !shm_lease.exists()
-                    && !uds_lease.exists()
+                    && shm_lease.exists()
+                    && uds_lease.exists()
             },
             Duration::from_secs(3)
         ));
         assert!(started.elapsed() < Duration::from_secs(4));
         std::fs::remove_file(paths.root.join("helper.pid")).unwrap();
-        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 2);
 
         let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds)
             .expect("MsyncHang 父死亡后下一 owner 应能复用同路径");

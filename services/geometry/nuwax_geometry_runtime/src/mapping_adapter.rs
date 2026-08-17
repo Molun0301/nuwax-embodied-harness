@@ -1987,7 +1987,7 @@ impl MappingAdapter {
     pub(crate) fn commit_backend_completion(
         &mut self,
         completion: MappingBackendCompletion,
-        state: &Arc<RwLock<SharedState>>,
+        shared: &mut SharedState,
     ) -> Result<Option<CommittedMappingCandidate>, String> {
         let MappingBackendCompletion {
             token,
@@ -2033,7 +2033,7 @@ impl MappingAdapter {
             self.in_flight_compute = None;
             return Err(error);
         }
-        match self.commit_backend_candidate(token, candidate, resolution, state) {
+        match self.commit_backend_candidate(token, candidate, resolution, shared) {
             Ok(committed) => Ok(Some(committed)),
             Err(error) => {
                 self.in_flight_compute = None;
@@ -2090,7 +2090,7 @@ impl MappingAdapter {
         token: MappingComputeToken,
         candidate: MappingBackendCandidate,
         resolution: MappingBackendCommitHandle,
-        state: &Arc<RwLock<SharedState>>,
+        shared: &mut SharedState,
     ) -> Result<CommittedMappingCandidate, String> {
         let mut next_persistent = if candidate.backend_kind == MappingBackendKind::Raytracing {
             PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy.clone())?
@@ -2109,9 +2109,6 @@ impl MappingAdapter {
             )?;
         }
         let grid = next_persistent.grid.clone();
-        let mut shared = state.try_write().map_err(|_| {
-            "SharedState.try_write failed during mapping candidate commit".to_owned()
-        })?;
         let revision_floor = shared
             .map
             .revision
@@ -2154,7 +2151,6 @@ impl MappingAdapter {
             MapRevisionEvent::from_effective_and_raw(&shared.map, &raw_map, &self.lifecycle);
         self.last_occupancy_commit_receipt = Some(occupancy_receipt.clone());
         self.raw_map = Some(raw_map);
-        drop(shared);
         Ok(CommittedMappingCandidate {
             token: token.clone(),
             resolution,
@@ -4914,13 +4910,13 @@ mod tests {
             .expect("submit first frame")
             .blocking_recv()
             .expect("worker completion");
-        let state = Arc::new(RwLock::new(SharedState::default()));
+        let mut state = SharedState::default();
         assert!(adapter
-            .commit_backend_completion(completion, &state)
+            .commit_backend_completion(completion, &mut state)
             .expect("first completion")
             .is_some());
         assert!(adapter
-            .commit_backend_completion(duplicate, &state)
+            .commit_backend_completion(duplicate, &mut state)
             .expect("duplicate is dropped, not fatal")
             .is_none());
         assert_eq!(adapter.stale_completion_count, 1);
@@ -4947,15 +4943,15 @@ mod tests {
             .expect("submit frame")
             .blocking_recv()
             .expect("completion");
-        let state = Arc::new(RwLock::new(SharedState::default()));
-        state.blocking_write().map.revision = 7;
+        let mut state = SharedState::default();
+        state.map.revision = 7;
         let error = adapter
-            .commit_backend_completion(completion, &state)
+            .commit_backend_completion(completion, &mut state)
             .expect_err("changed base revision must reject candidate");
         assert!(error.contains("base occupancy revision changed"));
         assert_eq!(adapter.current_revision(), 0);
         assert_eq!(adapter.global_revision(), 0);
-        assert_eq!(state.blocking_read().map.revision, 7);
+        assert_eq!(state.map.revision, 7);
     }
 
     #[test]
@@ -4992,9 +4988,9 @@ mod tests {
         adapter
             .complete_backend_retirement(generation, result)
             .expect("acknowledge destroyed worker");
-        let state = Arc::new(RwLock::new(SharedState::default()));
+        let mut state = SharedState::default();
         assert!(adapter
-            .commit_backend_completion(late, &state)
+            .commit_backend_completion(late, &mut state)
             .expect("late completion is dropped")
             .is_none());
         let started = adapter

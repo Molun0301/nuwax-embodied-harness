@@ -5375,9 +5375,13 @@ impl GeometryRuntime for GeometryRuntimeService {
                 };
                 let mut projection_guard = bridge.lock_explore_projection_owned().await;
                 let lifecycle_guard = bridge.mapping_lifecycle_lock.lock().await;
-                let committed = adapter
-                    .lock()
-                    .commit_backend_completion(completion, &bridge.state)
+                let mut shared = bridge.state.write().await;
+                let committed_result = {
+                    let mut adapter_guard = adapter.lock();
+                    adapter_guard.commit_backend_completion(completion, &mut shared)
+                };
+                drop(shared);
+                let committed = committed_result
                     .map_err(Status::failed_precondition)?
                     .ok_or_else(|| {
                         Status::failed_precondition(

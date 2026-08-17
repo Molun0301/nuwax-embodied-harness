@@ -7818,6 +7818,7 @@ async fn ingest_mapping_points_with_backend_owned(
     > = {
         let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
+        let mut shared_guard = Some(state.write().await);
         let mut adapter = mapping.lock();
         let target_frame_id = adapter.configured_map_frame_id().to_owned();
         let mut completion = Some(completion);
@@ -7829,6 +7830,7 @@ async fn ingest_mapping_points_with_backend_owned(
             _ => false,
         };
         let fence_commit = if fence_violation {
+            drop(shared_guard.take());
             let completion = completion
                 .take()
                 .expect("mapping completion is present before relocalization fence");
@@ -7868,10 +7870,14 @@ async fn ingest_mapping_points_with_backend_owned(
         let mut commit_result = if let Some(fence_commit) = fence_commit {
             fence_commit
         } else {
-            match adapter.commit_backend_completion(
+            let completion_result = adapter.commit_backend_completion(
                 completion.expect("mapping completion is present without a relocalization fence"),
-                state,
-            ) {
+                &mut *shared_guard
+                    .as_mut()
+                    .expect("shared state guard is present before mapping commit"),
+            );
+            drop(shared_guard.take());
+            match completion_result {
                 Ok(Some(committed)) => {
                     let crate::mapping_adapter::CommittedMappingCandidate {
                         token: committed_token,

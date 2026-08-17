@@ -2644,10 +2644,10 @@ fn take_best_native_pair(
         }
 
         // A cloud cannot be paired with an older odometry immediately: an
-        // exact (or closer) odometry may still be in flight. Once the strictly
-        // increasing odometry watermark reaches the cloud timestamp, future
-        // odometry can only be farther away and the nearest cached sample is
-        // final.
+        // exact (or closer causal) odometry may still be in flight. Once the
+        // strictly increasing odometry watermark reaches the cloud timestamp,
+        // the newest retained odometry at or before the cloud is final. A
+        // later pose is not a valid correlated-odometry proof for that cloud.
         let odometry_watermark = state
             .odometry
             .back()
@@ -2662,6 +2662,9 @@ fn take_best_native_pair(
             .iter()
             .enumerate()
             .filter_map(|(odometry_index, odometry)| {
+                if odometry.identity.source_timestamp_ns > cloud.identity.source_timestamp_ns {
+                    return None;
+                }
                 let skew = cloud
                     .identity
                     .source_timestamp_ns

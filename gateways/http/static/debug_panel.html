@@ -5676,11 +5676,13 @@ button{font-family:inherit;cursor:pointer}
           input.value = String(f.value).toLowerCase() === "true" ? "true" : "false";
         } else if (Array.isArray(f.choices) && f.choices.length) {
           input = document.createElement("select");
-          for (const opt of f.choices) {
+          const labels = Array.isArray(f.choice_labels) ? f.choice_labels : [];
+          f.choices.forEach((opt, index) => {
             const o = document.createElement("option");
-            o.value = opt; o.textContent = opt;
+            // value 始终提交稳定 raw 值，界面只展示中文标签。
+            o.value = opt; o.textContent = labels[index] || opt;
             input.appendChild(o);
-          }
+          });
           if (!f.choices.includes(f.value) && f.value) {
             const o = document.createElement("option");
             o.value = f.value; o.textContent = f.value + "（当前）";
@@ -5814,7 +5816,9 @@ button{font-family:inherit;cursor:pointer}
           } else {
             const written = result.written || {};
             const writtenCount = Object.values(written).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
-            note.textContent = writtenCount ? "已保存配置，重启网关后生效。" : "配置已是最新，无需写入。";
+            note.textContent = writtenCount
+              ? (result.effect_note || "已保存配置，重启网关和 Geometry Runtime 后生效。")
+              : "配置已是最新，无需写入。";
             setPill(status, "available", "配置");
           }
           await loadConfigSchema();

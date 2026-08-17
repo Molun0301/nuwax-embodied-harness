@@ -27,6 +27,8 @@ Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
 Environment="NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope"
 Environment="NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope"
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
+# Web 保存的 Geometry owner 选择后置覆盖基础配置，文件由共享组以只读方式提供。
+EnvironmentFile=-/var/lib/nuwax_robot_bridge/geometry-owner.env
 # EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
 # Production profile 必须显式启用 real-lcm 并打开 fail-fast 硬约束。
 # 缺 liblcm / 缺 udpm multicast 应当作真实失败,由 systemd 触发 Restart=on-failure。

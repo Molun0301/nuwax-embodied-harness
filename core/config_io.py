@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -33,6 +34,12 @@ _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
 _POINTCLOUD3D_KEY_PREFIX = "NUWAX_GATEWAY_POINTCLOUD3D_"
 _POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
 _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
+_GEOMETRY_OWNER_TARGET = "geometry_owner_profile_env"
+_GEOMETRY_OWNER_KEYS = frozenset({
+    "NUWAX_GEOMETRY_LIO_BACKEND",
+    "NUWAX_GEOMETRY_MAPPING_BACKEND",
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND",
+})
 
 _SENSITIVE_MASK = "********"
 _EFFECTIVE_VALUES_LOCK = threading.RLock()
@@ -68,6 +75,16 @@ def _go2_env_path() -> Path:
     return Path(explicit).expanduser() if explicit else _GO2_ENV
 
 
+def _geometry_owner_env_path() -> Path:
+    """返回受 systemd 沙箱允许写入、Geometry Runtime 可读取的后端选择文件。"""
+
+    explicit = os.environ.get("NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    # 本地开发不经过 systemd，继续写仓库 .env，避免产生额外运行文件。
+    return _CORE_ENV
+
+
 def _pointcloud3d_env_path() -> Path:
     """返回 Web 可写的点云显示配置文件路径。"""
 
@@ -86,10 +103,14 @@ def _pointcloud3d_env_path() -> Path:
 def _target_path(target_file: str) -> Path:
     if target_file == _POINTCLOUD3D_TARGET:
         return _pointcloud3d_env_path()
+    if target_file == _GEOMETRY_OWNER_TARGET:
+        return _geometry_owner_env_path()
     return _go2_env_path() if target_file == R.TARGET_GO2 else _core_env_path()
 
 
 def _save_target(key: str, registry_target: str) -> str:
+    if key in _GEOMETRY_OWNER_KEYS:
+        return _GEOMETRY_OWNER_TARGET
     if key.startswith(_POINTCLOUD3D_KEY_PREFIX):
         return _POINTCLOUD3D_TARGET
     return registry_target
@@ -120,8 +141,12 @@ def _read_env_values(path: Path) -> Dict[str, str]:
 
 
 def _current_value(key: str) -> str:
-    """当前值：点云覆盖优先，其次进程环境、core .env 和 go2 env。"""
+    """当前值：专用覆盖文件优先，其次进程环境、core .env 和 go2 env。"""
 
+    if key in _GEOMETRY_OWNER_KEYS:
+        owner_values = _read_env_values(_geometry_owner_env_path())
+        if key in owner_values:
+            return owner_values[key]
     if key.startswith(_POINTCLOUD3D_KEY_PREFIX):
         pointcloud3d = _read_env_values(_pointcloud3d_env_path())
         if key in pointcloud3d:
@@ -271,12 +296,17 @@ def build_schema() -> Dict[str, object]:
 
     core_vals = _read_env_values(_core_env_path())
     go2_vals = _read_env_values(_go2_env_path())
+    geometry_owner_vals = _read_env_values(_geometry_owner_env_path())
     pointcloud3d_vals = _read_env_values(_pointcloud3d_env_path())
     effective_core_vals = dict(core_vals)
+    effective_core_vals.update(geometry_owner_vals)
     effective_core_vals.update(pointcloud3d_vals)
     effective_vals = _collect_effective_values(effective_core_vals, go2_vals)
 
     def explicit_value(key: str, target_file: str) -> Optional[str]:
+        if key in _GEOMETRY_OWNER_KEYS and key in geometry_owner_vals:
+            # 保存后尚未重启时，文件中的新选择必须优先于进程继承的旧环境值回显。
+            return geometry_owner_vals[key]
         if key.startswith(_POINTCLOUD3D_KEY_PREFIX) and key in pointcloud3d_vals:
             # 保存后尚未重启时，覆盖文件必须优先于进程中的旧环境值回显。
             return pointcloud3d_vals[key]
@@ -307,6 +337,7 @@ def build_schema() -> Dict[str, object]:
             "default_repr": f.default_repr,
             "alias_of": f.alias_of,
             "choices": list(f.choices),
+            "choice_labels": list(f.choice_labels),
             "value": display_value,
             "value_source": value_source,
             "is_set": raw_value is not None,
@@ -437,22 +468,30 @@ def _target_lock(path: Path):
 
 
 def _atomic_write(path: Path, content: str) -> str:
-    """原子写：临时文件 + os.replace；写前只保留一个固定 .bak 备份。
-
-    返回备份路径（无原文件则空串）。固定 .bak 每次覆盖，避免反复点击保存产生大量
-    .bak.<timestamp> 文件。
-    """
+    """原子写并保持目标文件 owner/group/mode，只保留一个固定备份。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.stat() if path.exists() else None
+    target_uid = existing.st_uid if existing is not None else os.geteuid()
+    target_gid = existing.st_gid if existing is not None else path.parent.stat().st_gid
+    target_mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o640
+
     backup = ""
-    if path.exists():
+    if existing is not None:
         backup = str(path) + ".bak"
-        original = path.read_text(encoding="utf-8")
-        Path(backup).write_text(original, encoding="utf-8")
+        backup_path = Path(backup)
+        backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        os.chmod(str(backup_path), target_mode)
+        os.chown(str(backup_path), target_uid, target_gid)
+
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg_", suffix=".tmp")
     try:
+        os.fchmod(fd, target_mode)
+        os.fchown(fd, target_uid, target_gid)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):

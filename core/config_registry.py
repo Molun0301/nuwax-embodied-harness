@@ -48,6 +48,7 @@ class ConfigField:
     default_repr: str  # 源码解析出的默认值文本（仅展示，不作运行时来源）
     alias_of: Optional[str] = None
     choices: Tuple[str, ...] = field(default_factory=tuple)
+    choice_labels: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -316,6 +317,13 @@ _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("none", "library_pgo", "native_pgo", "relocalization"),
     "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar"),
     "NUWAX_EXPLORE_ARBITRATION": ("prefer_wavefront",),
+}
+
+
+_CHOICE_LABELS: Dict[str, Tuple[str, ...]] = {
+    "NUWAX_GEOMETRY_LIO_BACKEND": ("设备里程计", "FastLIO2", "Point-LIO"),
+    "NUWAX_GEOMETRY_MAPPING_BACKEND": ("体素窗口", "射线追踪"),
+    "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("不启用校正", "库内 PGO", "原生 PGO", "重定位"),
 }
 
 
@@ -774,6 +782,7 @@ def build_registry() -> Tuple[ConfigField, ...]:
             default_repr=rk.default_repr,
             alias_of=rk.alias_of,
             choices=_CHOICES.get(key, ()),
+            choice_labels=_CHOICE_LABELS.get(key, ()),
         ))
     section_order = {sid: i for i, (sid, _t) in enumerate(SECTIONS)}
     fields.sort(key=lambda f: (section_order.get(f.section_id, 999), f.advanced, f.key))

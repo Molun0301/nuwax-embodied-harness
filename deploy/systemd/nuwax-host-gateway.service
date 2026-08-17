@@ -23,7 +23,10 @@ UMask=0007
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
+# Web 仅写共享状态目录中的三项 Geometry owner 选择；后置加载覆盖只读基础配置。
+EnvironmentFile=-/var/lib/nuwax_robot_bridge/geometry-owner.env
 # EnvironmentFile wins over Environment; Exec* /usr/bin/env assignments below are authoritative.
+Environment=NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/geometry-owner.env
 Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
 Environment=NUWAX_LCM_BACKEND=real-lcm

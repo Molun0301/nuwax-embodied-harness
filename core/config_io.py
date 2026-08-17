@@ -50,8 +50,8 @@ _GEOMETRY_MAPPING_BACKENDS = ("voxel", "raytracing")
 _GEOMETRY_CORRECTION_BACKENDS = ("none", "library_pgo", "native_pgo", "relocalization")
 _GEOMETRY_DISABLED_CHOICES = {
     "NUWAX_GEOMETRY_LIO_BACKEND": {
-        "fastlio2": "Go2 完整 release 已恢复制品接线，但尚未完成实机闭环验收。",
-        "pointlio": "Go2 完整 release 已恢复制品接线，但尚未完成实机闭环验收。",
+        "fastlio2": "Go2 L2 点云/IMU RPC 静态链已通过；部署仍须提供 IMU→body 标定并完成 native child 实机闭环验收。",
+        "pointlio": "Go2 L2 点云/IMU RPC 静态链已通过；部署仍须提供 IMU→body 标定并完成 native child 实机闭环验收。",
     },
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": {
         "native_pgo": "原生 PGO 受控制品注入已恢复，但尚未完成 Go2 实机闭环验收。",

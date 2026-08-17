@@ -187,6 +187,23 @@ def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
     )
 
 
+def _unitree_stamp_to_datetime_ns(stamp: object, label: str) -> Tuple[datetime, int]:
+    try:
+        sec = int(getattr(stamp, "sec"))
+        nanosec = int(getattr(stamp, "nanosec"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} stamp.sec/nanosec 非法：{exc}") from exc
+    if sec < 0 or not 0 <= nanosec < 1_000_000_000:
+        raise ValueError(f"{label} stamp 越界：sec={sec} nanosec={nanosec}")
+    try:
+        timestamp = datetime.fromtimestamp(sec, tz=timezone.utc).replace(
+            microsecond=nanosec // 1_000
+        )
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"{label} stamp 无法转换：{exc}") from exc
+    return timestamp, (sec * 1_000_000_000) + nanosec
+
+
 def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
     sdk_path = str(getattr(config, "sdk_path", "") or "").strip()
     if sdk_path:
@@ -253,6 +270,7 @@ class Go2DirectDdsBridge:
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
         self._latest_pose_generation: Optional[int] = None
         self._latest_imu_generation: Optional[int] = None
+        self._latest_imu_source_timestamp_ns: Optional[int] = None
         self._latest_point_cloud_generation: Optional[int] = None
         self._last_accepted_point_cloud_source_timestamp_ns: Optional[int] = None
         self._latest_pose_source = ""
@@ -482,6 +500,7 @@ class Go2DirectDdsBridge:
         self._latest_imu_state_from_dds = None
         self._latest_pose_generation = None
         self._latest_imu_generation = None
+        self._latest_imu_source_timestamp_ns = None
         self._latest_pose_source = ""
         self._latest_imu_source_topic = ""
         self._direct_pose_ready = False
@@ -817,6 +836,9 @@ class Go2DirectDdsBridge:
             return
         pose = self._build_pose_from_sport_mode_state(message)
         imu_state = self._build_imu_from_sport_mode_state(message)
+        _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
+            getattr(message, "stamp", None), "Go2 SportModeState"
+        )
         frame_tree = FrameTree(root_frame_id=pose.frame_id)
         metadata = {
             "source_topic": str(source_topic or ""),
@@ -866,6 +888,9 @@ class Go2DirectDdsBridge:
                 self._latest_imu_state_from_dds = imu_state
                 self._latest_pose_generation = generation
                 self._latest_imu_generation = generation if imu_state is not None else None
+                self._latest_imu_source_timestamp_ns = (
+                    imu_source_timestamp_ns if imu_state is not None else None
+                )
                 self._direct_pose_ready = True
                 self._direct_imu_ready = imu_state is not None
                 self._latest_pose_source = str(source_topic or "")
@@ -924,7 +949,11 @@ class Go2DirectDdsBridge:
                 "Go2DataPlaneConfig.expected_imu_frame 必须由 assembly.defaults.frame_ids['imu'] 注入；"
                 "禁止使用硬编码兜底字符串。"
             )
+        timestamp, _timestamp_ns = _unitree_stamp_to_datetime_ns(
+            getattr(message, "stamp", None), "Go2 SportModeState"
+        )
         return IMUState(
+            timestamp=timestamp,
             frame_id=expected_imu_frame,
             orientation=quaternion,
             angular_velocity_rad_s=Vector3(
@@ -1037,24 +1066,13 @@ class Go2DirectDdsBridge:
             reject("PointCloud2 header.stamp 缺失")
             return
         try:
-            source_sec = int(getattr(stamp, "sec"))
-            source_nanosec = int(getattr(stamp, "nanosec"))
-        except (AttributeError, TypeError, ValueError) as exc:
-            reject(f"PointCloud2 header.stamp.sec/nanosec 非法：{exc}")
-            return
-        if source_sec < 0 or not 0 <= source_nanosec < 1_000_000_000:
-            reject(
-                f"PointCloud2 header.stamp 越界：sec={source_sec} nanosec={source_nanosec}"
+            source_timestamp, source_timestamp_ns = _unitree_stamp_to_datetime_ns(
+                stamp,
+                "PointCloud2 header.stamp",
             )
+        except ValueError as exc:
+            reject(str(exc))
             return
-        try:
-            source_timestamp = datetime.fromtimestamp(source_sec, tz=timezone.utc).replace(
-                microsecond=source_nanosec // 1_000
-            )
-        except (OverflowError, OSError, ValueError) as exc:
-            reject(f"PointCloud2 header.stamp 无法转换：{exc}")
-            return
-        source_timestamp_ns = (source_sec * 1_000_000_000) + source_nanosec
 
         try:
             data = bytes(getattr(message, "data", b"") or b"")
@@ -1099,7 +1117,7 @@ class Go2DirectDdsBridge:
         coordinate_fields = {}
         for raw_field in fields:
             name = str(getattr(raw_field, "name", "") or "").strip().lower()
-            if name not in ("x", "y", "z"):
+            if name not in ("x", "y", "z", "intensity", "offset_ns"):
                 continue
             if name in coordinate_fields:
                 reject(f"PointCloud2 {name} 字段重复")
@@ -1114,6 +1132,12 @@ class Go2DirectDdsBridge:
             dtype_spec = _POINT_FIELD_DTYPES.get(datatype)
             if dtype_spec is None:
                 reject(f"PointCloud2 {name} 字段 datatype={datatype} 不被支持")
+                return
+            if name in ("x", "y", "z") and datatype not in (7, 8):
+                reject(f"PointCloud2 {name} 字段必须为 FLOAT32/FLOAT64，实际 datatype={datatype}")
+                return
+            if name == "offset_ns" and datatype not in (2, 4, 6):
+                reject(f"PointCloud2 offset_ns 字段必须为无符号整数，实际 datatype={datatype}")
                 return
             if count != 1:
                 reject(f"PointCloud2 {name} 字段 count 必须为 1，实际为 {count}")
@@ -1161,6 +1185,31 @@ class Go2DirectDdsBridge:
                 )
                 xyz_array[:, column] = np.ravel(values, order="C")
             xyz_array = np.ascontiguousarray(xyz_array)
+            source_xyz_array = xyz_array.copy()
+            intensity_array = np.zeros(height * width, dtype=np.float32)
+            if "intensity" in coordinate_fields:
+                intensity_spec = coordinate_fields["intensity"]
+                intensity_values = np.ndarray(
+                    shape=(height, width),
+                    dtype=intensity_spec["numpy_dtype"],
+                    buffer=data,
+                    offset=int(intensity_spec["offset"]),
+                    strides=(row_step, point_step),
+                )
+                intensity_array[:] = np.ravel(intensity_values, order="C")
+            offset_ns_array = np.zeros(height * width, dtype=np.uint32)
+            if "offset_ns" in coordinate_fields:
+                offset_spec = coordinate_fields["offset_ns"]
+                offset_values = np.ndarray(
+                    shape=(height, width),
+                    dtype=offset_spec["numpy_dtype"],
+                    buffer=data,
+                    offset=int(offset_spec["offset"]),
+                    strides=(row_step, point_step),
+                )
+                offset_ns_array[:] = np.ravel(offset_values, order="C")
+            intensity_array = np.ascontiguousarray(intensity_array)
+            offset_ns_array = np.ascontiguousarray(offset_ns_array)
         except (TypeError, ValueError) as exc:
             reject(f"PointCloud2 ndarray 解析失败：{exc}")
             return
@@ -1268,6 +1317,29 @@ class Go2DirectDdsBridge:
                 yaw_stabilization_applied = True
                 yaw_stabilization_origin_xy = [origin_x, origin_y]
 
+        go2_l2_imu_sample = None
+        with self._lock:
+            if (
+                self._latest_imu_generation == generation
+                and self._latest_imu_state_from_dds is not None
+                and self._latest_imu_source_timestamp_ns is not None
+            ):
+                latest_imu = self._latest_imu_state_from_dds
+                go2_l2_imu_sample = {
+                    "timestamp_ns": int(self._latest_imu_source_timestamp_ns),
+                    "frame_id": latest_imu.frame_id,
+                    "accel_mps2": [
+                        float(latest_imu.linear_acceleration_m_s2.x),
+                        float(latest_imu.linear_acceleration_m_s2.y),
+                        float(latest_imu.linear_acceleration_m_s2.z),
+                    ],
+                    "gyro_rps": [
+                        float(latest_imu.angular_velocity_rad_s.x),
+                        float(latest_imu.angular_velocity_rad_s.y),
+                        float(latest_imu.angular_velocity_rad_s.z),
+                    ],
+                }
+
         try:
             point_cloud = PointCloudFrame(
                 timestamp=source_timestamp,
@@ -1281,7 +1353,8 @@ class Go2DirectDdsBridge:
                         datatype=coordinate_fields[name]["contract_datatype"],
                         count=int(coordinate_fields[name]["count"]),
                     )
-                    for name in ("x", "y", "z")
+                    for name in ("x", "y", "z", "intensity", "offset_ns")
+                    if name in coordinate_fields
                 ],
                 points=[],
                 points_xyz_array=xyz_array,
@@ -1289,8 +1362,8 @@ class Go2DirectDdsBridge:
                 metadata={
                     "source_topic": source_topic,
                     "source_frame": source_frame,
-                    "source_timestamp_sec": source_sec,
-                    "source_timestamp_nanosec": source_nanosec,
+                    "source_timestamp_sec": source_timestamp_ns // 1_000_000_000,
+                    "source_timestamp_nanosec": source_timestamp_ns % 1_000_000_000,
                     "source_timestamp_ns": source_timestamp_ns,
                     "width": width,
                     "height": height,
@@ -1303,8 +1376,17 @@ class Go2DirectDdsBridge:
                             "datatype": int(coordinate_fields[name]["datatype"]),
                             "count": int(coordinate_fields[name]["count"]),
                         }
-                        for name in ("x", "y", "z")
+                        for name in ("x", "y", "z", "intensity", "offset_ns")
+                        if name in coordinate_fields
                     ],
+                    "go2_l2_source_xyz_array": source_xyz_array,
+                    "go2_l2_intensity_array": intensity_array,
+                    "go2_l2_offset_ns_array": offset_ns_array,
+                    "go2_l2_optional_field_defaults": {
+                        "intensity": "source" if "intensity" in coordinate_fields else "zero",
+                        "offset_ns": "source" if "offset_ns" in coordinate_fields else "zero",
+                    },
+                    "go2_l2_imu_sample": go2_l2_imu_sample,
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
                     "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
                     "registration_assertion": registration_assertion,

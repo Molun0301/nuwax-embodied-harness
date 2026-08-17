@@ -1678,7 +1678,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                     body_from_sensor: native_runtime.body_from_sensor,
                     pair_max_skew: native_runtime.pair_max_skew,
                 },
-                None,
+                Some(lio_bindings.legacy_cloud.clone()),
             )
         }
     };

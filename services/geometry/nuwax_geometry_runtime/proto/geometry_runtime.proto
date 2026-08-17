@@ -620,6 +620,16 @@ message PointCloudField {
   uint32 datatype = 3;      // sensor_msgs/PointField numeric datatype
   uint32 count = 4;
 }
+message LioImuSample {
+  uint64 timestamp_ns = 1;
+  string frame_id = 2;
+  double accel_mps2_x = 3;
+  double accel_mps2_y = 4;
+  double accel_mps2_z = 5;
+  double gyro_rps_x = 6;
+  double gyro_rps_y = 7;
+  double gyro_rps_z = 8;
+}
 message PublishPointCloudRequest {
   bytes points = 1;          // canonical PointCloud2 data bytes（保留 field tag 兼容旧 client）
   uint32 point_step = 2;
@@ -628,6 +638,7 @@ message PublishPointCloudRequest {
   repeated PointCloudField fields = 5;
   uint32 point_count = 6;
   bool is_dense = 7;
+  repeated LioImuSample imu_samples = 8;
 }
 message PublishResult { bool success = 1; string message = 2; }
 

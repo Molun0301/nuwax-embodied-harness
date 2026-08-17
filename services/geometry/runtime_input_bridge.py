@@ -50,7 +50,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -77,6 +77,10 @@ _CANONICAL_XYZ_FIELDS = (
     {"name": "y", "offset": 4, "datatype": 7, "count": 1},
     {"name": "z", "offset": 8, "datatype": 7, "count": 1},
 )
+_GO2_L2_FIELDS = _CANONICAL_XYZ_FIELDS + (
+    {"name": "intensity", "offset": 12, "datatype": 7, "count": 1},
+    {"name": "offset_ns", "offset": 16, "datatype": 6, "count": 1},
+)
 
 
 def _datetime_to_unix_ns(value: datetime) -> int:
@@ -90,6 +94,14 @@ def _datetime_to_unix_ns(value: datetime) -> int:
         (delta.days * 86_400 + delta.seconds) * 1_000_000_000
         + delta.microseconds * 1_000
     )
+
+
+@dataclass(frozen=True)
+class LioImuSample:
+    timestamp_ns: int
+    frame_id: str
+    accel_mps2: Tuple[float, float, float]
+    gyro_rps: Tuple[float, float, float]
 
 
 @dataclass
@@ -216,10 +228,9 @@ class RuntimeInputBridge:
             时不会阻止 ``start()``，但 ``is_ready()`` 在订阅两者都失败时返回 ``False``。
         """
         selected_lio_backend = os.environ.get(_LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND)
-        if selected_lio_backend != _DEVICE_LIO_BACKEND:
+        if selected_lio_backend not in {_DEVICE_LIO_BACKEND, "fastlio2", "pointlio"}:
             self._record_error(
-                "RuntimeInputBridge 仅允许 device LIO owner；"
-                f"拒绝为 {_LIO_BACKEND_ENV}={selected_lio_backend!r} 启动 DirectDDS/provider forwarding"
+                f"拒绝未知 {_LIO_BACKEND_ENV}={selected_lio_backend!r} 的 provider forwarding"
             )
             return False
         with self._lock:
@@ -416,6 +427,9 @@ class RuntimeInputBridge:
         is_go2_point_cloud = (
             point_cloud_metadata.get("source") == "go2_direct_dds_pointcloud"
         )
+        native_lio_backend = os.environ.get(
+            _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
+        ) in {"fastlio2", "pointlio"}
         if is_go2_point_cloud:
             source_frame = str(point_cloud_metadata.get("source_frame") or "").strip()
             registered_frame = str(
@@ -424,23 +438,64 @@ class RuntimeInputBridge:
             registered_to_odom = (
                 point_cloud_metadata.get("point_cloud_xyz_registered_to_odom") is True
             )
-            if not registered_to_odom:
+            if native_lio_backend:
+                source_xyz = point_cloud_metadata.get("go2_l2_source_xyz_array")
+                if (
+                    not source_frame
+                    or not isinstance(source_xyz, np.ndarray)
+                    or source_xyz.ndim != 2
+                    or source_xyz.shape[1] < 3
+                ):
+                    self.counters.dropped_pointcloud_count += 1
+                    self._record_error(
+                        "拒绝缺少 Go2 L2 原始传感器帧的 native LIO 点云"
+                    )
+                    return
+                frame_id = source_frame
+            else:
+                if not registered_to_odom:
+                    self.counters.dropped_pointcloud_count += 1
+                    self._record_error(
+                        "拒绝 Go2 未注册传感器帧点云："
+                        f"source_frame={source_frame or frame_id or '<empty>'}; "
+                        "需要可靠外参在上游完成 XYZ 注册并显式声明"
+                    )
+                    return
+                if not source_frame or not registered_frame or frame_id != registered_frame:
+                    self.counters.dropped_pointcloud_count += 1
+                    self._record_error(
+                        "拒绝 Go2 点云注册断言不一致："
+                        f"source_frame={source_frame or '<empty>'} "
+                        f"frame_id={frame_id or '<empty>'} "
+                        f"registered_frame={registered_frame or '<empty>'}"
+                    )
+                    return
+
+        imu_samples = []
+        if native_lio_backend:
+            raw_imu = point_cloud_metadata.get("go2_l2_imu_sample")
+            if not isinstance(raw_imu, dict):
                 self.counters.dropped_pointcloud_count += 1
-                self._record_error(
-                    "拒绝 Go2 未注册传感器帧点云："
-                    f"source_frame={source_frame or frame_id or '<empty>'}; "
-                    "需要可靠外参在上游完成 XYZ 注册并显式声明"
-                )
+                self._record_error("拒绝缺少 Go2 L2 IMU 样本的 native LIO 点云")
                 return
-            if not source_frame or not registered_frame or frame_id != registered_frame:
+            try:
+                accel = tuple(float(value) for value in raw_imu["accel_mps2"])
+                gyro = tuple(float(value) for value in raw_imu["gyro_rps"])
+                if len(accel) != 3 or len(gyro) != 3:
+                    raise ValueError("IMU accel/gyro 必须各含 3 个轴")
+                imu_sample = LioImuSample(
+                    timestamp_ns=int(raw_imu["timestamp_ns"]),
+                    frame_id=str(raw_imu["frame_id"]),
+                    accel_mps2=accel,
+                    gyro_rps=gyro,
+                )
+                if imu_sample.timestamp_ns < 0 or not imu_sample.frame_id.strip():
+                    raise ValueError("IMU timestamp_ns/frame_id 非法")
+            except (KeyError, TypeError, ValueError) as exc:
                 self.counters.dropped_pointcloud_count += 1
-                self._record_error(
-                    "拒绝 Go2 点云注册断言不一致："
-                    f"source_frame={source_frame or '<empty>'} "
-                    f"frame_id={frame_id or '<empty>'} "
-                    f"registered_frame={registered_frame or '<empty>'}"
-                )
+                self._record_error(f"拒绝非法 Go2 L2 IMU 样本：{exc}")
                 return
+            imu_samples.append(imu_sample)
 
         publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
         if not callable(publisher):
@@ -483,9 +538,10 @@ class RuntimeInputBridge:
             metadata = {
                 "frame_id": frame_id,
                 "timestamp_ns": timestamp_ns,
-                "fields": _CANONICAL_XYZ_FIELDS,
+                "fields": _GO2_L2_FIELDS if point_step == 20 else _CANONICAL_XYZ_FIELDS,
                 "point_count": len(bytes_payload) // point_step,
                 "is_dense": bool(getattr(payload, "is_dense", True)),
+                "imu_samples": imu_samples,
             }
             try:
                 inspect.signature(publisher).bind(bytes_payload, point_step, **metadata)
@@ -533,15 +589,26 @@ class RuntimeInputBridge:
             stride = max(1, int(np.ceil(arr.shape[0] / float(target))))
             downsampled = arr[::stride][:target]
             try:
+                metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+                for key in (
+                    "go2_l2_source_xyz_array",
+                    "go2_l2_intensity_array",
+                    "go2_l2_offset_ns_array",
+                ):
+                    values = metadata.get(key)
+                    if isinstance(values, np.ndarray) and values.shape[0] == arr.shape[0]:
+                        metadata[key] = np.ascontiguousarray(values[::stride][:target])
+                metadata.update(
+                    {
+                        "downsampled": True,
+                        "downsample_target": int(target),
+                    }
+                )
                 return point_cloud.model_copy(
                     update={
                         "point_count": int(downsampled.shape[0]),
                         "points_xyz_array": downsampled,
-                        "metadata": {
-                            **dict(getattr(point_cloud, "metadata", {}) or {}),
-                            "downsampled": True,
-                            "downsample_target": int(target),
-                        },
+                        "metadata": metadata,
                     },
                     deep=False,
                 )
@@ -571,8 +638,19 @@ class RuntimeInputBridge:
 
     @staticmethod
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:
-        # sensor_msgs/PointCloud2 标准字段：x/y/z float32 = 12 bytes；
-        # 本桥不引入 fields 推断逻辑，避免对 PointField metadata 假设过强。
+        arr = getattr(point_cloud, "points_xyz_array", None)
+        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        intensity = metadata.get("go2_l2_intensity_array")
+        offset_ns = metadata.get("go2_l2_offset_ns_array")
+        if (
+            isinstance(arr, np.ndarray)
+            and arr.ndim == 2
+            and isinstance(intensity, np.ndarray)
+            and intensity.shape == (arr.shape[0],)
+            and isinstance(offset_ns, np.ndarray)
+            and offset_ns.shape == (arr.shape[0],)
+        ):
+            return 20
         return 12
 
     @staticmethod
@@ -583,12 +661,44 @@ class RuntimeInputBridge:
         因此本桥只产出 ``raw bytes``（不含 4-byte point_step），由调用方在
         ``publish_point_cloud(bytes, point_step)`` 内合并；这里避免重复打包。
         """
+        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
         arr = getattr(point_cloud, "points_xyz_array", None)
+        if os.environ.get(_LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND) in {
+            "fastlio2",
+            "pointlio",
+        }:
+            source_xyz = metadata.get("go2_l2_source_xyz_array")
+            if isinstance(source_xyz, np.ndarray):
+                arr = source_xyz
         if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] >= 3:
-            # 强制 float32 little-endian 与 sensor_msgs/PointCloud2 对齐
-            if arr.dtype != np.float32:
-                arr = arr.astype(np.float32, copy=False)
-            return np.ascontiguousarray(arr[:, :3]).tobytes()
+            xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
+            intensity = metadata.get("go2_l2_intensity_array")
+            offset_ns = metadata.get("go2_l2_offset_ns_array")
+            if (
+                isinstance(intensity, np.ndarray)
+                and intensity.shape == (xyz.shape[0],)
+                and isinstance(offset_ns, np.ndarray)
+                and offset_ns.shape == (xyz.shape[0],)
+            ):
+                packed = np.empty(
+                    xyz.shape[0],
+                    dtype=np.dtype(
+                        [
+                            ("x", "<f4"),
+                            ("y", "<f4"),
+                            ("z", "<f4"),
+                            ("intensity", "<f4"),
+                            ("offset_ns", "<u4"),
+                        ]
+                    ),
+                )
+                packed["x"] = xyz[:, 0]
+                packed["y"] = xyz[:, 1]
+                packed["z"] = xyz[:, 2]
+                packed["intensity"] = intensity
+                packed["offset_ns"] = offset_ns
+                return packed.tobytes()
+            return xyz.tobytes()
         points = getattr(point_cloud, "points", None) or []
         if not points:
             return None

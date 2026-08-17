@@ -8411,6 +8411,7 @@ class GeometryRuntimeProvider:
         fields: Optional[List[Dict[str, Any]]] = None,
         point_count: int = 0,
         is_dense: bool = True,
+        imu_samples: Optional[List[Any]] = None,
     ) -> bool:
         """Publish normalized PointCloud2 data through the Rust gRPC facade.
 
@@ -8438,6 +8439,25 @@ class GeometryRuntimeProvider:
                 )
             )
 
+        proto_imu_samples = []
+        for sample in imu_samples or []:
+            accel = tuple(getattr(sample, "accel_mps2"))
+            gyro = tuple(getattr(sample, "gyro_rps"))
+            if len(accel) != 3 or len(gyro) != 3:
+                return False
+            proto_imu_samples.append(
+                pb2.LioImuSample(
+                    timestamp_ns=max(0, int(getattr(sample, "timestamp_ns"))),
+                    frame_id=str(getattr(sample, "frame_id")),
+                    accel_mps2_x=float(accel[0]),
+                    accel_mps2_y=float(accel[1]),
+                    accel_mps2_z=float(accel[2]),
+                    gyro_rps_x=float(gyro[0]),
+                    gyro_rps_y=float(gyro[1]),
+                    gyro_rps_z=float(gyro[2]),
+                )
+            )
+
         try:
             request = pb2.PublishPointCloudRequest(
                 points=bytes(payload),
@@ -8447,6 +8467,7 @@ class GeometryRuntimeProvider:
                 fields=proto_fields,
                 point_count=max(0, int(point_count)),
                 is_dense=bool(is_dense),
+                imu_samples=proto_imu_samples,
             )
             response = self._stub.PublishPointCloud(
                 request,

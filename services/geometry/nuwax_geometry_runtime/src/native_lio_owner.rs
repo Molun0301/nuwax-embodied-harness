@@ -67,13 +67,17 @@ impl BodyFromSensorTransform {
     }
 
     pub(crate) fn from_json(raw: &str) -> Result<Self, String> {
+        Self::from_json_for_env(raw, BODY_FROM_SENSOR_ENV)
+    }
+
+    pub(crate) fn from_json_for_env(raw: &str, env_name: &str) -> Result<Self, String> {
         if raw.is_empty() || raw != raw.trim() {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={BODY_FROM_SENSOR_ENV} value_is_empty_or_padded"
+                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} value_is_empty_or_padded"
             ));
         }
         let parsed: BodyFromSensorJson = serde_json::from_str(raw).map_err(|error| {
-            format!("NATIVE_LIO_PREFLIGHT_FAILED env={BODY_FROM_SENSOR_ENV} invalid_json: {error}")
+            format!("NATIVE_LIO_PREFLIGHT_FAILED env={env_name} invalid_json: {error}")
         })?;
         if !parsed.translation_m.iter().all(|value| value.is_finite())
             || !parsed
@@ -82,7 +86,7 @@ impl BodyFromSensorTransform {
                 .all(|value| value.is_finite())
         {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={BODY_FROM_SENSOR_ENV} values_must_be_finite"
+                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} values_must_be_finite"
             ));
         }
 
@@ -97,7 +101,7 @@ impl BodyFromSensorTransform {
         let determinant = rotation.determinant();
         if !orthonormal || (determinant - 1.0).abs() > ROTATION_TOLERANCE {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={BODY_FROM_SENSOR_ENV} rotation_must_be_proper_orthonormal determinant={determinant}"
+                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} rotation_must_be_proper_orthonormal determinant={determinant}"
             ));
         }
 
@@ -113,11 +117,16 @@ impl BodyFromSensorTransform {
         Point3::from(self.data.rotation * sensor_point.coords + self.data.translation_m)
     }
 
-    fn translation_m(&self) -> [f64; 3] {
+    pub(crate) fn rotate_vector(&self, sensor_vector: [f64; 3]) -> [f64; 3] {
+        let rotated = self.data.rotation * Vector3::from_row_slice(&sensor_vector);
+        [rotated[0], rotated[1], rotated[2]]
+    }
+
+    pub(crate) fn translation_m(&self) -> [f64; 3] {
         std::array::from_fn(|index| self.data.translation_m[index])
     }
 
-    fn rotation_row_major(&self) -> [f64; 9] {
+    pub(crate) fn rotation_row_major(&self) -> [f64; 9] {
         std::array::from_fn(|index| self.data.rotation[(index / 3, index % 3)])
     }
 }

@@ -9,6 +9,7 @@ from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
 from providers.pointcloud import PointCloudProvider, StreamingPointCloudProvider
+from providers.sensors import SensorDescriptorProvider, StreamingSensorSampleProvider
 from providers.safety import SafetyProvider
 from providers.state import StateProvider, StreamingStateProvider
 
@@ -22,8 +23,10 @@ __all__ = [
     "MotionControl",
     "NavigationProvider",
     "PointCloudProvider",
+    "SensorDescriptorProvider",
     "SafetyProvider",
     "StateProvider",
+    "StreamingSensorSampleProvider",
     "StreamingStateProvider",
     "StreamingPointCloudProvider",
     "StreamingLocalizationProvider",

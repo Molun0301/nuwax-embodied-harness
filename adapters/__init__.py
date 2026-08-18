@@ -8,10 +8,14 @@ from adapters.base import (
     AdapterLifecycleState,
 )
 
+from adapters.sensors import LioMeasurementAssembler, LioMeasurementAssemblerError
+
 __all__ = [
     "AdapterBase",
     "AdapterCategory",
     "AdapterConfig",
     "AdapterHealthStatus",
     "AdapterLifecycleState",
+    "LioMeasurementAssembler",
+    "LioMeasurementAssemblerError",
 ]

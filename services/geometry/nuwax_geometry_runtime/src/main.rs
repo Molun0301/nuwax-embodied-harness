@@ -1596,10 +1596,14 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     };
     let relocalization_mode_fence =
         Arc::new(correction_coordinator::RelocalizationModeFence::default());
-    let (lio_spec, pending_ingress, rpc_point_cloud_binding): (
+    let (lio_spec, pending_ingress, rpc_point_cloud_binding, rpc_native_raw_input_binding): (
         lio_owner::LioOwnerSpec,
         PendingLioIngress,
         Option<(nuwax_protocol::LcmTopic, nuwax_protocol::LcmMessageType)>,
+        Option<(
+            (nuwax_protocol::LcmTopic, nuwax_protocol::LcmMessageType),
+            (nuwax_protocol::LcmTopic, nuwax_protocol::LcmMessageType),
+        )>,
     ) = match lio_source {
         LioStartupPreflight::Device => {
             let ingress_spec = match lio_ingress::DeviceLioIngressSpec::new(
@@ -1624,6 +1628,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                     probe,
                 },
                 rpc_point_cloud_binding,
+                None,
             )
         }
         LioStartupPreflight::Native(native_preflight) => {
@@ -1679,6 +1684,10 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                     pair_max_skew: native_runtime.pair_max_skew,
                 },
                 Some(lio_bindings.legacy_cloud.clone()),
+                Some((
+                    native_runtime.channels.input_cloud.clone(),
+                    native_runtime.channels.input_imu.clone(),
+                )),
             )
         }
     };
@@ -1920,6 +1929,8 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         bridge,
         shutdown.clone(),
         rpc_point_cloud_binding,
+        rpc_native_raw_input_binding,
+        Some(lio_bindings.sensor_frame.clone()),
         relocalization_ingress,
     );
     let mapping_cloud_owner = service.mapping_cloud_owner();

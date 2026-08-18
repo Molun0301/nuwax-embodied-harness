@@ -629,6 +629,12 @@ message LioImuSample {
   double gyro_rps_x = 6;
   double gyro_rps_y = 7;
   double gyro_rps_z = 8;
+  // 姿态不是所有 IMU 源都提供；false 时必须按 unknown 处理，禁止伪造单位四元数。
+  bool orientation_valid = 9;
+  double orientation_x = 10;
+  double orientation_y = 11;
+  double orientation_z = 12;
+  double orientation_w = 13;
 }
 message PublishPointCloudRequest {
   bytes points = 1;          // canonical PointCloud2 data bytes（保留 field tag 兼容旧 client）

@@ -135,6 +135,9 @@ impl BodyFromSensorTransform {
 pub(crate) struct NativePrivateChannels {
     pub(crate) source_odometry: (LcmTopic, LcmMessageType),
     pub(crate) source_cloud: (LcmTopic, LcmMessageType),
+    /// Generation-private canonical raw sensor ingress consumed by the native child.
+    pub(crate) input_cloud: (LcmTopic, LcmMessageType),
+    pub(crate) input_imu: (LcmTopic, LcmMessageType),
 }
 
 #[derive(Clone, Debug)]
@@ -221,11 +224,20 @@ impl NativeLioPreflight {
         let channels = NativePrivateChannels {
             source_odometry: typed_binding(&format!("{channel_root}/o"), "nav_msgs.Odometry")?,
             source_cloud: typed_binding(&format!("{channel_root}/c"), "sensor_msgs.PointCloud2")?,
+            input_cloud: typed_binding(&format!("{channel_root}/ic"), "sensor_msgs.PointCloud2")?,
+            input_imu: typed_binding(&format!("{channel_root}/ii"), "sensor_msgs.Imu")?,
         };
 
         let odometry_pattern = typed_pattern(&channels.source_odometry);
         let cloud_pattern = typed_pattern(&channels.source_cloud);
-        for (stream, pattern) in [("odometry", &odometry_pattern), ("cloud", &cloud_pattern)] {
+        let input_cloud_pattern = typed_pattern(&channels.input_cloud);
+        let input_imu_pattern = typed_pattern(&channels.input_imu);
+        for (stream, pattern) in [
+            ("odometry", &odometry_pattern),
+            ("cloud", &cloud_pattern),
+            ("input_cloud", &input_cloud_pattern),
+            ("input_imu", &input_imu_pattern),
+        ] {
             if pattern.len() > LCM_MAX_CHANNEL_NAME_BYTES {
                 return Err(format!(
                     "NATIVE_LIO_BIND_FAILED private {stream} typed channel exceeds libLCM limit bytes={} maximum={LCM_MAX_CHANNEL_NAME_BYTES}",
@@ -237,20 +249,10 @@ impl NativeLioPreflight {
         let mut config = NativeLioConfig::for_backend(self.backend);
         config.lidar_topic = cloud_pattern;
         config.odometry_topic = odometry_pattern;
-        let input_cloud = crate::channel_registry::channel_for_with_suffix(
-            crate::channel_registry::ChannelKey::PointCloud,
-        );
-        let input_imu = crate::channel_registry::channel_for_with_suffix(
-            crate::channel_registry::ChannelKey::Imu,
-        );
-        let input_cloud_type = input_cloud.1.as_deref().ok_or_else(|| {
-            "NATIVE_LIO_BIND_FAILED canonical point cloud channel has no type".to_owned()
-        })?;
-        let input_imu_type = input_imu.1.as_deref().ok_or_else(|| {
-            "NATIVE_LIO_BIND_FAILED canonical imu channel has no type".to_owned()
-        })?;
-        config.input_lidar_topic = Some(input_cloud.0.as_subscription_pattern(input_cloud_type));
-        config.input_imu_topic = Some(input_imu.0.as_subscription_pattern(input_imu_type));
+        let input_cloud_pattern = typed_pattern(&channels.input_cloud);
+        let input_imu_pattern = typed_pattern(&channels.input_imu);
+        config.input_lidar_topic = Some(input_cloud_pattern);
+        config.input_imu_topic = Some(input_imu_pattern);
         config.sensor_frame_id = sensor_frame.into();
         config.child_frame_id = body_frame.into();
         config.frame_id = odom_frame.into();

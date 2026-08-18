@@ -67,6 +67,9 @@ pub struct GeometryRuntimeService {
     bridge: GeometryRuntimeHandle,
     base_frame_id: String,
     point_cloud_binding: Option<(LcmTopic, LcmMessageType)>,
+    /// Native mode publishes raw cloud and IMU to generation-private channels.
+    native_raw_input_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
+    native_raw_sensor_frame: Option<String>,
     lio_input_backend: Option<Arc<parking_lot::Mutex<LioBackendSlot>>>,
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
@@ -664,6 +667,8 @@ impl GeometryRuntimeService {
             bridge,
             base_frame_id: configured_base_frame(),
             point_cloud_binding: Some(point_cloud_binding),
+            native_raw_input_binding: None,
+            native_raw_sensor_frame: None,
             lio_input_backend: configured_lio_input_backend(),
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -709,6 +714,8 @@ impl GeometryRuntimeService {
         bridge: GeometryRuntimeHandle,
         shutdown: ShutdownCoordinator,
         point_cloud_binding: Option<(LcmTopic, LcmMessageType)>,
+        native_raw_input_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
+        native_raw_sensor_frame: Option<String>,
         relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
     ) -> Self {
         let activation_receipts = shutdown
@@ -726,6 +733,8 @@ impl GeometryRuntimeService {
             bridge,
             base_frame_id: configured_base_frame(),
             point_cloud_binding,
+            native_raw_input_binding,
+            native_raw_sensor_frame,
             lio_input_backend: configured_lio_input_backend(),
             mapping_transition: shutdown.mapping_transition.clone(),
             deferred_replay: shutdown.deferred_replay.clone(),
@@ -4434,6 +4443,84 @@ fn encode_lio_output_payload(output: &LioOutputFrame) -> CodecResult<Vec<u8>> {
     encode_pointcloud_request_payload(&request)
 }
 
+fn validate_native_raw_pointcloud_fields(request: &PublishPointCloudRequest) -> CodecResult<()> {
+    if request.fields.is_empty() {
+        return Err(CodecError::LcmEncode(
+            "native raw PointCloud2 requires explicit fields; fields cannot be inferred".into(),
+        ));
+    }
+    validate_runtime_point_fields(&request.fields, request.point_step)?;
+    let offset = request
+        .fields
+        .iter()
+        .find(|field| field.name == "offset_ns");
+    if !matches!(offset, Some(field) if field.datatype == 6 && field.count == 1) {
+        return Err(CodecError::LcmEncode(
+            "native raw PointCloud2 requires offset_ns UINT32 field".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_native_imu_payload(sample: &LioImuSample) -> CodecResult<Vec<u8>> {
+    let values = [
+        sample.accel_mps2_x,
+        sample.accel_mps2_y,
+        sample.accel_mps2_z,
+        sample.gyro_rps_x,
+        sample.gyro_rps_y,
+        sample.gyro_rps_z,
+    ];
+    if sample.frame_id.is_empty() || sample.frame_id.trim() != sample.frame_id {
+        return Err(CodecError::LcmEncode(
+            "native raw IMU frame_id must be non-empty without surrounding whitespace".into(),
+        ));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(CodecError::LcmEncode(
+            "native raw IMU acceleration and gyro values must be finite".into(),
+        ));
+    }
+    let timestamp_ns = sample.timestamp_ns;
+    let stamp_sec = i32::try_from(timestamp_ns / 1_000_000_000)
+        .map_err(|_| CodecError::LcmEncode("IMU timestamp seconds exceed int32".into()))?;
+    let orientation = if sample.orientation_valid {
+        let q = [
+            sample.orientation_x,
+            sample.orientation_y,
+            sample.orientation_z,
+            sample.orientation_w,
+        ];
+        if q.iter().any(|value| !value.is_finite()) {
+            return Err(CodecError::LcmEncode(
+                "native raw IMU orientation must be finite when orientation_valid".into(),
+            ));
+        }
+        (q, [0.0; 9])
+    } else {
+        // sensor_msgs/Imu convention: orientation_covariance[0] == -1 means unknown.
+        ([0.0; 4], [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    };
+    Ok(schema::encode_imu_body(&schema::Imu {
+        header: schema::Header {
+            seq: 0,
+            stamp_sec,
+            stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
+            frame_id: sample.frame_id.clone(),
+        },
+        orientation_xyzw: orientation.0,
+        orientation_covariance: orientation.1,
+        angular_velocity: [sample.gyro_rps_x, sample.gyro_rps_y, sample.gyro_rps_z],
+        angular_velocity_covariance: [0.0; 9],
+        linear_acceleration: [
+            sample.accel_mps2_x,
+            sample.accel_mps2_y,
+            sample.accel_mps2_z,
+        ],
+        linear_acceleration_covariance: [0.0; 9],
+    }))
+}
+
 fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> CodecResult<Vec<u8>> {
     if request.frame_id.is_empty() || request.frame_id.trim() != request.frame_id {
         return Err(CodecError::LcmEncode(
@@ -7262,9 +7349,74 @@ impl GeometryRuntime for GeometryRuntimeService {
                     .to_string(),
             }));
         };
-        // Phase 4:channel 走 channel_registry::channel_for(PointCloud)，
-        // 不再硬编码 `/go2/lidar/points`。
         let pcr = req.get_ref();
+        let lcm_transport = self.bridge.transport.clone();
+        if let Some((cloud_binding, imu_binding)) = self.native_raw_input_binding.clone() {
+            if pcr.imu_samples.is_empty() {
+                return Ok(Response::new(PublishResult {
+                    success: false,
+                    message: "native raw ingress requires at least one IMU sample".to_string(),
+                }));
+            }
+            if let Some(expected_frame) = self.native_raw_sensor_frame.as_deref() {
+                if pcr.frame_id != expected_frame
+                    || pcr
+                        .imu_samples
+                        .iter()
+                        .any(|sample| sample.frame_id != expected_frame)
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "native raw cloud and IMU frame_id must equal configured sensor frame {expected_frame:?}"
+                    )));
+                }
+            }
+            validate_native_raw_pointcloud_fields(pcr).map_err(|error| {
+                Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
+            })?;
+            let cloud_payload = encode_pointcloud_request_payload(pcr).map_err(|error| {
+                Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
+            })?;
+            let imu_payloads = pcr
+                .imu_samples
+                .iter()
+                .map(encode_native_imu_payload)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    Status::invalid_argument(format!("native raw IMU rejected: {error}"))
+                })?;
+            lcm_transport
+                .publish(typed_codec::build_typed_frame(
+                    cloud_binding.0,
+                    cloud_binding.1,
+                    cloud_payload,
+                    0,
+                ))
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!("native cloud publish failed: {error}"))
+                })?;
+            for imu_payload in imu_payloads {
+                lcm_transport
+                    .publish(typed_codec::build_typed_frame(
+                        imu_binding.0.clone(),
+                        imu_binding.1.clone(),
+                        imu_payload,
+                        0,
+                    ))
+                    .await
+                    .map_err(|error| {
+                        Status::unavailable(format!("native IMU publish failed: {error}"))
+                    })?;
+            }
+            return Ok(Response::new(PublishResult {
+                success: true,
+                message: format!(
+                    "native raw PointCloud2+Imu LCM publish 已接受（backend={}）",
+                    self.bridge.transport_backend_name
+                ),
+            }));
+        }
+
         let payload = if pcr.imu_samples.is_empty() {
             encode_pointcloud_request_payload(pcr)
         } else {
@@ -7300,7 +7452,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
 
         let frame = typed_codec::build_typed_frame(topic, msg_type, payload, 0);
-        let lcm_transport = self.bridge.transport.clone();
         match lcm_transport.publish(frame).await {
             Ok(()) => Ok(Response::new(PublishResult {
                 success: true,
@@ -7656,6 +7807,7 @@ mod pointcloud_request_tests {
             gyro_rps_x: 0.1,
             gyro_rps_y: -0.2,
             gyro_rps_z: 0.3,
+            ..LioImuSample::default()
         });
 
         let frame = adapt_go2_l2_request(&request, "body").expect("adapt Go2 L2 request");
@@ -15963,6 +16115,8 @@ mod relocalization_terminal_query_tests {
         GeometryRuntimeService::new_with_shutdown_and_point_cloud_binding(
             handle,
             shutdown,
+            None,
+            None,
             None,
             Some(ingress),
         )

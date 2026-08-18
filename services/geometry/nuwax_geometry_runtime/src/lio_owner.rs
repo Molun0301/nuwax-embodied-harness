@@ -2004,6 +2004,14 @@ mod tests {
                     LEGACY_ODOMETRY_TYPE,
                 ),
                 source_cloud: binding(&format!("{channel_root}/cloud"), LEGACY_CLOUD_TYPE),
+                input_cloud: binding(
+                    &format!("{channel_root}/input_cloud"),
+                    LEGACY_CLOUD_TYPE,
+                ),
+                input_imu: binding(
+                    &format!("{channel_root}/input_imu"),
+                    "sensor_msgs.Imu",
+                ),
             },
             runtime: Box::new(NativeRuntimeSpec {
                 backend: NativeBackend::FastLio2,

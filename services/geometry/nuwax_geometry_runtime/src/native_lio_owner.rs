@@ -237,6 +237,20 @@ impl NativeLioPreflight {
         let mut config = NativeLioConfig::for_backend(self.backend);
         config.lidar_topic = cloud_pattern;
         config.odometry_topic = odometry_pattern;
+        let input_cloud = crate::channel_registry::channel_for_with_suffix(
+            crate::channel_registry::ChannelKey::PointCloud,
+        );
+        let input_imu = crate::channel_registry::channel_for_with_suffix(
+            crate::channel_registry::ChannelKey::Imu,
+        );
+        let input_cloud_type = input_cloud.1.as_deref().ok_or_else(|| {
+            "NATIVE_LIO_BIND_FAILED canonical point cloud channel has no type".to_owned()
+        })?;
+        let input_imu_type = input_imu.1.as_deref().ok_or_else(|| {
+            "NATIVE_LIO_BIND_FAILED canonical imu channel has no type".to_owned()
+        })?;
+        config.input_lidar_topic = Some(input_cloud.0.as_subscription_pattern(input_cloud_type));
+        config.input_imu_topic = Some(input_imu.0.as_subscription_pattern(input_imu_type));
         config.sensor_frame_id = sensor_frame.into();
         config.child_frame_id = body_frame.into();
         config.frame_id = odom_frame.into();

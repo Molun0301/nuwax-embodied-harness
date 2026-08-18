@@ -6,3 +6,4 @@ lcm-gen 1.5.2
 
 from .PointField import PointField as PointField
 from .PointCloud2 import PointCloud2 as PointCloud2
+from .Imu import Imu as Imu

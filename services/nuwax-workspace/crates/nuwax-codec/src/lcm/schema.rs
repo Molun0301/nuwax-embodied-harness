@@ -29,6 +29,8 @@ pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_
 pub const ODOMETRY_FINGERPRINT: [u8; 8] = 0x94e1_7f94_648c_f0e4_u64.to_be_bytes();
 /// `sensor_msgs.PointCloud2` fingerprint from `dimos-lcm==0.1.3`.
 pub const POINT_CLOUD2_FINGERPRINT: [u8; 8] = 0xf5eb_3da1_c285_3175_u64.to_be_bytes();
+/// `sensor_msgs.Imu` fingerprint from the canonical DimOS nested Quaternion/Vector3 schema.
+pub const IMU_FINGERPRINT: [u8; 8] = 0x31ab_205c_8dd5_7aa8_u64.to_be_bytes();
 /// `tf2_msgs.TFMessage` fingerprint from `dimos-lcm==0.1.3`.
 pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_bytes();
 
@@ -540,6 +542,25 @@ pub struct PointCloud2 {
     pub data: Vec<u8>,
     /// Whether the cloud contains no invalid points.
     pub is_dense: bool,
+}
+
+/// LCM representation of `sensor_msgs.Imu`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Imu {
+    /// Header with source timestamp and frame.
+    pub header: Header,
+    /// Orientation quaternion `(x, y, z, w)`.
+    pub orientation_xyzw: [f64; 4],
+    /// Orientation covariance.
+    pub orientation_covariance: [f64; 9],
+    /// Angular velocity `(x, y, z)`.
+    pub angular_velocity: [f64; 3],
+    /// Angular velocity covariance.
+    pub angular_velocity_covariance: [f64; 9],
+    /// Linear acceleration `(x, y, z)`.
+    pub linear_acceleration: [f64; 3],
+    /// Linear acceleration covariance.
+    pub linear_acceleration_covariance: [f64; 9],
 }
 
 /// Encode a top-level `geometry_msgs.Pose` exactly like generated `lcm_encode()`.
@@ -1539,6 +1560,53 @@ pub fn decode_point_cloud2(encoded: &[u8]) -> CodecResult<PointCloud2> {
     })
 }
 
+/// Encode a top-level `sensor_msgs.Imu` generated message.
+pub fn encode_imu(message: &Imu) -> Vec<u8> {
+    with_fingerprint(IMU_FINGERPRINT, encode_imu_body(message))
+}
+
+/// Encode only the generated `Imu._encode_one()` body.
+pub fn encode_imu_body(message: &Imu) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_header(&message.header, &mut out).expect("Header frame_id length must fit");
+    encode_f64_array(&message.orientation_xyzw, &mut out);
+    encode_f64_array(&message.orientation_covariance, &mut out);
+    encode_f64_array(&message.angular_velocity, &mut out);
+    encode_f64_array(&message.angular_velocity_covariance, &mut out);
+    encode_f64_array(&message.linear_acceleration, &mut out);
+    encode_f64_array(&message.linear_acceleration_covariance, &mut out);
+    out
+}
+
+/// Decode a top-level `sensor_msgs.Imu` generated message.
+pub fn decode_imu(encoded: &[u8]) -> CodecResult<Imu> {
+    let mut cursor = Cursor::new(encoded);
+    cursor.expect_fingerprint(IMU_FINGERPRINT, "sensor_msgs.Imu")?;
+    let message = decode_imu_from(&mut cursor)?;
+    cursor.finish("sensor_msgs.Imu")?;
+    Ok(message)
+}
+
+/// Decode only a generated `Imu._encode_one()` body.
+pub fn decode_imu_body(encoded: &[u8]) -> CodecResult<Imu> {
+    let mut cursor = Cursor::new(encoded);
+    let message = decode_imu_from(&mut cursor)?;
+    cursor.finish("sensor_msgs.Imu body")?;
+    Ok(message)
+}
+
+fn decode_imu_from(cursor: &mut Cursor<'_>) -> CodecResult<Imu> {
+    Ok(Imu {
+        header: decode_header(cursor)?,
+        orientation_xyzw: cursor.read_f64_array()?,
+        orientation_covariance: cursor.read_f64_array()?,
+        angular_velocity: cursor.read_f64_array()?,
+        angular_velocity_covariance: cursor.read_f64_array()?,
+        linear_acceleration: cursor.read_f64_array()?,
+        linear_acceleration_covariance: cursor.read_f64_array()?,
+    })
+}
+
 /// Encode a top-level `geometry_msgs.Transform` message.
 pub fn encode_geometry_transform(message: &Transform) -> Vec<u8> {
     with_fingerprint(
@@ -2057,6 +2125,20 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imu_round_trip_preserves_typed_sensor_sample() {
+        let mut message = Imu::default();
+        message.header.frame_id = "imu_link".into();
+        message.header.stamp_sec = 12;
+        message.header.stamp_nsec = 34;
+        message.orientation_xyzw = [0.0, 0.0, 0.1, 0.99];
+        message.angular_velocity = [1.0, 2.0, 3.0];
+        message.linear_acceleration = [4.0, 5.0, 6.0];
+        let encoded = encode_imu(&message);
+        assert_eq!(decode_imu(&encoded).unwrap(), message);
+        assert_eq!(&encoded[..8], &IMU_FINGERPRINT);
+    }
+
     use super::*;
 
     #[test]

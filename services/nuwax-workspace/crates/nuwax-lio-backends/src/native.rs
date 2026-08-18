@@ -77,6 +77,10 @@ pub struct NativeLioConfig {
     pub backend: NativeBackend,
     pub lidar_topic: String,
     pub odometry_topic: String,
+    /// Optional canonical raw sensor ingress. When set, the child subscribes
+    /// to typed PointCloud2/Imu channels and does not open Livox callbacks.
+    pub input_lidar_topic: Option<String>,
+    pub input_imu_topic: Option<String>,
     pub frame_id: String,
     pub child_frame_id: String,
     pub sensor_frame_id: String,
@@ -96,6 +100,8 @@ impl NativeLioConfig {
             backend,
             lidar_topic: LIDAR_TOPIC.into(),
             odometry_topic: ODOMETRY_TOPIC.into(),
+            input_lidar_topic: None,
+            input_imu_topic: None,
             frame_id: ODOM_FRAME.into(),
             child_frame_id: BODY_FRAME.into(),
             sensor_frame_id: SENSOR_FRAME.into(),
@@ -113,6 +119,15 @@ impl NativeLioConfig {
     pub fn validate(&self) -> Result<(), String> {
         validate_typed_topic(&self.lidar_topic, "sensor_msgs.PointCloud2", "lidar_topic")?;
         validate_typed_topic(&self.odometry_topic, "nav_msgs.Odometry", "odometry_topic")?;
+        if let Some(topic) = &self.input_lidar_topic {
+            validate_typed_topic(topic, "sensor_msgs.PointCloud2", "input_lidar_topic")?;
+        }
+        if let Some(topic) = &self.input_imu_topic {
+            validate_typed_topic(topic, "sensor_msgs.Imu", "input_imu_topic")?;
+        }
+        if self.input_imu_topic.is_some() != self.input_lidar_topic.is_some() {
+            return Err("input_lidar_topic and input_imu_topic must be configured together".into());
+        }
         validate_frame(&self.frame_id, "frame_id")?;
         validate_frame(&self.child_frame_id, "child_frame_id")?;
         validate_frame(&self.sensor_frame_id, "sensor_frame_id")?;
@@ -139,7 +154,7 @@ impl NativeLioConfig {
 
     pub fn render_args(&self) -> Result<Vec<String>, String> {
         self.validate()?;
-        Ok(vec![
+        let mut args = vec![
             "--lidar".into(),
             self.lidar_topic.clone(),
             "--odometry".into(),
@@ -166,7 +181,18 @@ impl NativeLioConfig {
             render_number(self.odometry_frequency_hz),
             "--debug".into(),
             self.debug.to_string(),
-        ])
+        ];
+        if let (Some(input_lidar), Some(input_imu)) =
+            (&self.input_lidar_topic, &self.input_imu_topic)
+        {
+            args.extend([
+                "--input_lidar".into(),
+                input_lidar.clone(),
+                "--input_imu".into(),
+                input_imu.clone(),
+            ]);
+        }
+        Ok(args)
     }
 
     pub fn contract(&self, crate_root: impl AsRef<Path>) -> Result<NativeContractSpec, String> {

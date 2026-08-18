@@ -312,6 +312,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nav_msgs.Odometry", 0x4a70_bfca_3246_7872_u64),
     ("nav_msgs.OccupancyGrid", 0xf3ef_e8bc_e6fe_1db2_u64),
     ("sensor_msgs.PointCloud2", 0xfaf5_9ed0_e142_98ba_u64),
+    ("sensor_msgs.Imu", 0x18d5_902e_46ea_bd54_u64),
     ("std_msgs.Bool", 0x0f5f_7835_284a_871f_u64),
     ("tf2_msgs.TFMessage", 0x615c_50e1_9d44_91f6_u64),
     ("nuwax_msgs.GoalEnvelope", 0xf16e_3441_1bdc_d18d_u64),

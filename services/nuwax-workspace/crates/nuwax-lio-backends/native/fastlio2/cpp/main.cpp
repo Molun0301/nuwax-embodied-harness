@@ -62,6 +62,9 @@ static std::string g_odometry_topic;
 static std::string g_frame_id;  // required via --frame_id
 static std::string g_child_frame_id;  // required via --child_frame_id
 static std::string g_sensor_frame_id;  // required via --sensor_frame_id
+static std::string g_input_lidar_topic;
+static std::string g_input_imu_topic;
+static bool g_external_input = false;
 static float g_frequency = 10.0f;
 
 // Frame accumulator (Livox SDK raw → CustomMsg)
@@ -225,7 +228,145 @@ static void publish_odometry(const nav_msgs::Odometry& msg) {
 }
 
 
-// Livox SDK callbacks
+// Canonical typed sensor ingress. Supplying both input channels disables all
+// Livox callbacks; outputs remain the private --lidar/--odometry channels.
+static const sensor_msgs::PointField* find_typed_field(
+    const sensor_msgs::PointCloud2* msg, const std::string& name
+) {
+    const sensor_msgs::PointField* result = nullptr;
+    for (const auto& field : msg->fields) {
+        if (field.name != name) { continue; }
+        if (result != nullptr) { return nullptr; }
+        result = &field;
+    }
+    return result;
+}
+
+static bool read_float32_field(
+    const sensor_msgs::PointCloud2* msg, const sensor_msgs::PointField* field,
+    size_t base, float& value
+) {
+    if (!msg || !field || field->datatype != 7 || field->count != 1 ||
+        field->offset < 0 || static_cast<size_t>(field->offset) > msg->point_step ||
+        base + static_cast<size_t>(field->offset) + sizeof(float) > msg->data.size()) {
+        return false;
+    }
+    std::memcpy(&value, msg->data.data() + base + static_cast<size_t>(field->offset), sizeof(float));
+    return std::isfinite(value);
+}
+
+static bool read_offset_ns(
+    const sensor_msgs::PointCloud2* msg, const sensor_msgs::PointField* field,
+    size_t base, uint64_t& value
+) {
+    if (!msg || !field || field->datatype != 6 || field->count != 1 ||
+        field->offset < 0 || static_cast<size_t>(field->offset) > msg->point_step ||
+        base + static_cast<size_t>(field->offset) + sizeof(uint32_t) > msg->data.size()) {
+        return false;
+    }
+    uint32_t raw = 0;
+    std::memcpy(&raw, msg->data.data() + base + static_cast<size_t>(field->offset), sizeof(raw));
+    value = raw;
+    return true;
+}
+
+static bool typed_field_fits(const sensor_msgs::PointField* field, int point_step, int datatype_size) {
+    return field != nullptr && field->count == 1 && field->offset >= 0 &&
+           field->offset <= point_step && datatype_size <= point_step - field->offset;
+}
+
+static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::PointCloud2* msg) {
+    if (!g_running.load() || !g_external_input || !msg) { return; }
+    if (msg->header.frame_id.empty() || msg->header.frame_id != g_sensor_frame_id ||
+        msg->header.stamp.sec < 0 || msg->header.stamp.nsec < 0 ||
+        msg->header.stamp.nsec >= static_cast<int32_t>(NANOS_PER_SECOND) || msg->is_bigendian) {
+        fprintf(stderr, "[fastlio2] reject typed cloud: invalid frame, timestamp, or endianness\\n");
+        return;
+    }
+    if (msg->width <= 0 || msg->height <= 0 || msg->point_step < 12 || msg->row_step < 0) {
+        fprintf(stderr, "[fastlio2] reject typed cloud: invalid dimensions\\n");
+        return;
+    }
+    const auto* x_field = find_typed_field(msg, "x");
+    const auto* y_field = find_typed_field(msg, "y");
+    const auto* z_field = find_typed_field(msg, "z");
+    const auto* time_field = find_typed_field(msg, "offset_ns");
+    if (!typed_field_fits(x_field, msg->point_step, 4) || x_field->datatype != 7 ||
+        !typed_field_fits(y_field, msg->point_step, 4) || y_field->datatype != 7 ||
+        !typed_field_fits(z_field, msg->point_step, 4) || z_field->datatype != 7 ||
+        !typed_field_fits(time_field, msg->point_step, 4) || time_field->datatype != 6) {
+        fprintf(stderr, "[fastlio2] reject typed cloud: require float32 xyz and uint32 offset_ns\\n");
+        return;
+    }
+    const size_t width = static_cast<size_t>(msg->width);
+    const size_t height = static_cast<size_t>(msg->height);
+    const size_t point_step = static_cast<size_t>(msg->point_step);
+    const size_t row_step = static_cast<size_t>(msg->row_step);
+    if (width > SIZE_MAX / point_step || row_step < width * point_step ||
+        height > SIZE_MAX / row_step || msg->data.size() < height * row_step ||
+        height > SIZE_MAX / width || width * height > 2'000'000) {
+        fprintf(stderr, "[fastlio2] reject typed cloud: row/data bounds invalid\\n");
+        return;
+    }
+    const uint64_t stamp_ns = static_cast<uint64_t>(msg->header.stamp.sec) * NANOS_PER_SECOND +
+        static_cast<uint64_t>(msg->header.stamp.nsec);
+    std::vector<custom_messages::CustomPoint> accepted_points;
+    accepted_points.reserve(width * height);
+    for (size_t row = 0; row < height; ++row) {
+        for (size_t column = 0; column < width; ++column) {
+            const size_t base = row * row_step + column * point_step;
+            float x, y, z;
+            uint64_t offset_ns;
+            if (!read_float32_field(msg, x_field, base, x) || !read_float32_field(msg, y_field, base, y) ||
+                !read_float32_field(msg, z_field, base, z) || !read_offset_ns(msg, time_field, base, offset_ns)) {
+                fprintf(stderr, "[fastlio2] reject typed cloud: non-finite or malformed point\\n");
+                return;
+            }
+            custom_messages::CustomPoint point;
+            point.x = x; point.y = y; point.z = z;
+            point.reflectivity = 0; point.tag = 0; point.line = 0;
+            point.offset_time = static_cast<uli>(offset_ns);
+            accepted_points.push_back(point);
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_pc_mutex);
+    g_frame_start_ns = stamp_ns;
+    g_frame_has_timestamp = true;
+    g_accumulated_points.insert(g_accumulated_points.end(), accepted_points.begin(), accepted_points.end());
+}
+
+static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::Imu* msg) {
+    if (!g_running.load() || !g_external_input || !msg || !g_fastlio) return;
+    const auto& stamp = msg->header.stamp;
+    const auto finite_array = [](const auto& values) {
+        for (const auto value : values) {
+            if (!std::isfinite(value)) return false;
+        }
+        return true;
+    };
+    if (msg->header.frame_id.empty() || msg->header.frame_id != g_sensor_frame_id ||
+        stamp.sec < 0 || stamp.nsec < 0 || stamp.nsec >= static_cast<int32_t>(NANOS_PER_SECOND) ||
+        !std::isfinite(msg->orientation.x) || !std::isfinite(msg->orientation.y) ||
+        !std::isfinite(msg->orientation.z) || !std::isfinite(msg->orientation.w) ||
+        !std::isfinite(msg->angular_velocity.x) || !std::isfinite(msg->angular_velocity.y) ||
+        !std::isfinite(msg->angular_velocity.z) || !std::isfinite(msg->linear_acceleration.x) ||
+        !std::isfinite(msg->linear_acceleration.y) || !std::isfinite(msg->linear_acceleration.z) ||
+        !finite_array(msg->orientation_covariance) || !finite_array(msg->angular_velocity_covariance) ||
+        !finite_array(msg->linear_acceleration_covariance)) {
+        fprintf(stderr, "[fastlio2] reject typed IMU: invalid frame, timestamp, or non-finite value\\n");
+        return;
+    }
+    auto imu_msg = boost::make_shared<custom_messages::Imu>();
+    imu_msg->header = msg->header;
+    imu_msg->orientation.x = msg->orientation.x; imu_msg->orientation.y = msg->orientation.y;
+    imu_msg->orientation.z = msg->orientation.z; imu_msg->orientation.w = msg->orientation.w;
+    imu_msg->angular_velocity.x = msg->angular_velocity.x;
+    imu_msg->angular_velocity.y = msg->angular_velocity.y; imu_msg->angular_velocity.z = msg->angular_velocity.z;
+    imu_msg->linear_acceleration.x = msg->linear_acceleration.x;
+    imu_msg->linear_acceleration.y = msg->linear_acceleration.y; imu_msg->linear_acceleration.z = msg->linear_acceleration.z;
+    std::lock_guard<std::mutex> lock(g_lio_mutex);
+    g_fastlio->feed_imu(imu_msg);
+}
 
 static void on_point_cloud(const uint32_t /*handle*/, const uint8_t /*dev_type*/, LivoxLidarEthernetPacket* data, void* /*client_data*/) {
     if (!g_running.load() || data == nullptr) { return; }
@@ -469,6 +610,13 @@ int main(int argc, char** argv) {
     g_frame_id = mod.arg_required("frame_id");
     g_child_frame_id = mod.arg_required("child_frame_id");
     g_sensor_frame_id = mod.arg_required("sensor_frame_id");
+    g_input_lidar_topic = mod.arg("input_lidar", "");
+    g_input_imu_topic = mod.arg("input_imu", "");
+    g_external_input = !g_input_lidar_topic.empty() || !g_input_imu_topic.empty();
+    if (g_external_input && (g_input_lidar_topic.empty() || g_input_imu_topic.empty())) {
+        fprintf(stderr, "Error: --input_lidar and --input_imu must be supplied together\\n");
+        return 1;
+    }
     float pointcloud_freq = mod.arg_float("pointcloud_freq", 5.0f);
     float odom_freq = mod.arg_float("odom_freq", 50.0f);
 
@@ -537,20 +685,25 @@ int main(int argc, char** argv) {
     uint64_t last_output_source_timestamp_ns = 0;
     bool has_last_output_source_timestamp = false;
 
-    // The Livox SDK opens UDP sockets and dispatches via its own callback
-    // threads; the main loop below consumes what's queued.
-    if (!livox_common::init_livox_sdk(host_ip, lidar_ip, ports, debug)) {
-        return 1;
+    bool sdk_started = false;
+    if (g_external_input) {
+        lcm.subscribe(g_input_lidar_topic, on_typed_cloud);
+        lcm.subscribe(g_input_imu_topic, on_typed_imu);
+        if (debug) { printf("[fastlio2] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
+    } else {
+        // Direct Livox mode is retained for device deployments.
+        if (!livox_common::init_livox_sdk(host_ip, lidar_ip, ports, debug)) return 1;
+        SetLivoxLidarPointCloudCallBack(on_point_cloud, nullptr);
+        SetLivoxLidarImuDataCallback(on_imu_data, nullptr);
+        SetLivoxLidarInfoChangeCallback(on_info_change, nullptr);
+        if (!LivoxLidarSdkStart()) {
+            fprintf(stderr, "Error: LivoxLidarSdkStart failed\\n");
+            LivoxLidarSdkUninit();
+            return 1;
+        }
+        sdk_started = true;
+        if (debug) { printf("[fastlio2] SDK started, waiting for device...\\n"); }
     }
-    SetLivoxLidarPointCloudCallBack(on_point_cloud, nullptr);
-    SetLivoxLidarImuDataCallback(on_imu_data, nullptr);
-    SetLivoxLidarInfoChangeCallback(on_info_change, nullptr);
-    if (!LivoxLidarSdkStart()) {
-        fprintf(stderr, "Error: LivoxLidarSdkStart failed\n");
-        LivoxLidarSdkUninit();
-        return 1;
-    }
-    if (debug) { printf("[fastlio2] SDK started, waiting for device...\n"); }
 
     while (g_running.load()) {
         auto loop_start = std::chrono::high_resolution_clock::now();
@@ -585,7 +738,7 @@ int main(int argc, char** argv) {
     // clearing the globals the callbacks read, so a late on_point/on_imu can't
     // race the assignment and dereference a null g_fastlio / g_lcm.
     if (debug) { printf("[fastlio2] Shutting down...\n"); }
-    LivoxLidarSdkUninit();
+    if (sdk_started) LivoxLidarSdkUninit();
     g_fastlio = nullptr;
     g_lcm = nullptr;
 

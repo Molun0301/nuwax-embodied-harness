@@ -1,0 +1,13 @@
+package sensor_msgs;
+
+// Canonical raw IMU input for native LIO children.
+// This matches the DimOS sensor_msgs.Imu wire schema.
+struct Imu {
+    std_msgs.Header header;
+    geometry_msgs.Quaternion orientation;
+    double orientation_covariance[9];
+    geometry_msgs.Vector3 angular_velocity;
+    double angular_velocity_covariance[9];
+    geometry_msgs.Vector3 linear_acceleration;
+    double linear_acceleration_covariance[9];
+}

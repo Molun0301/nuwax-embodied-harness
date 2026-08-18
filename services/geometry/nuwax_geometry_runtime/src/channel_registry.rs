@@ -57,6 +57,7 @@ pub enum ChannelKey {
     Odom,
     Tf,
     PointCloud,
+    Imu,
     CloudMap,
     Occupancy,
     CmdVel,
@@ -67,10 +68,11 @@ pub enum ChannelKey {
 }
 
 impl ChannelKey {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Odom,
         Self::Tf,
         Self::PointCloud,
+        Self::Imu,
         Self::CloudMap,
         Self::Occupancy,
         Self::CmdVel,
@@ -85,6 +87,7 @@ impl ChannelKey {
             Self::Odom => "odom",
             Self::Tf => "tf",
             Self::PointCloud => "pointcloud",
+            Self::Imu => "imu",
             Self::CloudMap => "cloud_map",
             Self::Occupancy => "occupancy",
             Self::CmdVel => "cmd_vel",
@@ -121,6 +124,13 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
         "NUWAX_LCM_CHANNEL_POINTCLOUD",
         "/go2/lidar/points",
         "sensor_msgs.PointCloud2",
+    ),
+    (
+        ChannelKey::Imu,
+        "NUWAX_GEOMETRY_RUNTIME_IMU_CHANNEL",
+        "NUWAX_LCM_CHANNEL_IMU",
+        "/imu/data",
+        "sensor_msgs.Imu",
     ),
     (
         ChannelKey::CloudMap,

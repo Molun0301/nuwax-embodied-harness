@@ -93,6 +93,7 @@ mod tests {
             ("nav_msgs.Odometry", 0x94e1_7f94_648c_f0e4),
             ("nav_msgs.OccupancyGrid", 0xe7df_d179_cdfc_3b65),
             ("sensor_msgs.PointCloud2", 0xf5eb_3da1_c285_3175),
+            ("sensor_msgs.Imu", 0x31ab_205c_8dd5_7aa8),
             ("std_msgs.Bool", 0x1ebe_f06a_5095_0e3e),
             ("tf2_msgs.TFMessage", 0xc2b8_a1c3_3a89_23ec),
             ("nuwax_msgs.GoalEnvelope", 0xe2dc_6882_37b9_a31b),

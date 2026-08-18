@@ -17,6 +17,7 @@
 
 #include <lcm/lcm-cpp.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <boost/make_shared.hpp>
 #include <chrono>
@@ -73,6 +74,15 @@ static std::mutex g_lio_mutex;
 static std::vector<custom_messages::CustomPoint> g_accumulated_points;
 static uint64_t g_frame_start_ns = 0;
 static bool g_frame_has_timestamp = false;
+static uint64_t g_last_typed_cloud_stamp_ns = 0;
+static bool g_has_last_typed_cloud_stamp = false;
+static uint64_t g_last_typed_imu_stamp_ns = 0;
+static bool g_has_last_typed_imu_stamp = false;
+struct TypedImuSample {
+    uint64_t timestamp_ns;
+    boost::shared_ptr<custom_messages::Imu> message;
+};
+static std::vector<TypedImuSample> g_typed_imu_samples;
 
 // Helpers
 
@@ -275,6 +285,13 @@ static bool typed_field_fits(const sensor_msgs::PointField* field, int point_ste
            field->offset <= point_step && datatype_size <= point_step - field->offset;
 }
 
+static bool typed_imu_covers_scan(uint64_t scan_start_ns, uint64_t scan_end_ns) {
+    std::lock_guard<std::mutex> lock(g_lio_mutex);
+    return !g_typed_imu_samples.empty() &&
+           g_typed_imu_samples.front().timestamp_ns <= scan_start_ns &&
+           g_typed_imu_samples.back().timestamp_ns >= scan_end_ns;
+}
+
 static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::PointCloud2* msg) {
     if (!g_running.load() || !g_external_input || !msg) { return; }
     if (msg->header.frame_id.empty() || msg->header.frame_id != g_sensor_frame_id ||
@@ -312,6 +329,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
         static_cast<uint64_t>(msg->header.stamp.nsec);
     std::vector<custom_messages::CustomPoint> accepted_points;
     accepted_points.reserve(width * height);
+    uint64_t max_offset_ns = 0;
     for (size_t row = 0; row < height; ++row) {
         for (size_t column = 0; column < width; ++column) {
             const size_t base = row * row_step + column * point_step;
@@ -322,6 +340,11 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
                 fprintf(stderr, "[fastlio2] reject typed cloud: non-finite or malformed point\\n");
                 return;
             }
+            if (!accepted_points.empty() && offset_ns <= accepted_points.back().offset_time) {
+                fprintf(stderr, "[%s] reject typed cloud: point offsets must increase\n", "fastlio2");
+                return;
+            }
+            max_offset_ns = offset_ns;
             custom_messages::CustomPoint point;
             point.x = x; point.y = y; point.z = z;
             point.reflectivity = 0; point.tag = 0; point.line = 0;
@@ -329,10 +352,23 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
             accepted_points.push_back(point);
         }
     }
+    if (stamp_ns > UINT64_MAX - max_offset_ns ||
+        !typed_imu_covers_scan(stamp_ns, stamp_ns + max_offset_ns)) {
+        fprintf(stderr, "[%s] reject typed cloud: IMU does not cover scan window\n", "fastlio2");
+        return;
+    }
+    // A PointCloud2 message is one scan. Replace the pending frame atomically;
+    // never append a later scan to the prior scan's timebase.
     std::lock_guard<std::mutex> lock(g_pc_mutex);
+    if (g_has_last_typed_cloud_stamp && stamp_ns <= g_last_typed_cloud_stamp_ns) {
+        fprintf(stderr, "[%s] reject typed cloud: source timestamp must increase\n", "fastlio2");
+        return;
+    }
+    g_last_typed_cloud_stamp_ns = stamp_ns;
+    g_has_last_typed_cloud_stamp = true;
     g_frame_start_ns = stamp_ns;
     g_frame_has_timestamp = true;
-    g_accumulated_points.insert(g_accumulated_points.end(), accepted_points.begin(), accepted_points.end());
+    g_accumulated_points = std::move(accepted_points);
 }
 
 static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::Imu* msg) {
@@ -356,16 +392,26 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
         fprintf(stderr, "[fastlio2] reject typed IMU: invalid frame, timestamp, or non-finite value\\n");
         return;
     }
-    auto imu_msg = boost::make_shared<custom_messages::Imu>();
-    imu_msg->header = msg->header;
-    imu_msg->orientation.x = msg->orientation.x; imu_msg->orientation.y = msg->orientation.y;
-    imu_msg->orientation.z = msg->orientation.z; imu_msg->orientation.w = msg->orientation.w;
-    imu_msg->angular_velocity.x = msg->angular_velocity.x;
-    imu_msg->angular_velocity.y = msg->angular_velocity.y; imu_msg->angular_velocity.z = msg->angular_velocity.z;
-    imu_msg->linear_acceleration.x = msg->linear_acceleration.x;
-    imu_msg->linear_acceleration.y = msg->linear_acceleration.y; imu_msg->linear_acceleration.z = msg->linear_acceleration.z;
-    std::lock_guard<std::mutex> lock(g_lio_mutex);
-    g_fastlio->feed_imu(imu_msg);
+    const uint64_t timestamp_ns = static_cast<uint64_t>(stamp.sec) * NANOS_PER_SECOND +
+        static_cast<uint64_t>(stamp.nsec);
+    {
+        std::lock_guard<std::mutex> lock(g_lio_mutex);
+        if (g_has_last_typed_imu_stamp && timestamp_ns <= g_last_typed_imu_stamp_ns) {
+            fprintf(stderr, "[%s] reject typed IMU: source timestamp must increase\n", "fastlio2");
+            return;
+        }
+        auto imu_msg = boost::make_shared<custom_messages::Imu>();
+        imu_msg->header = msg->header;
+        imu_msg->orientation.x = msg->orientation.x; imu_msg->orientation.y = msg->orientation.y;
+        imu_msg->orientation.z = msg->orientation.z; imu_msg->orientation.w = msg->orientation.w;
+        imu_msg->angular_velocity.x = msg->angular_velocity.x;
+        imu_msg->angular_velocity.y = msg->angular_velocity.y; imu_msg->angular_velocity.z = msg->angular_velocity.z;
+        imu_msg->linear_acceleration.x = msg->linear_acceleration.x;
+        imu_msg->linear_acceleration.y = msg->linear_acceleration.y; imu_msg->linear_acceleration.z = msg->linear_acceleration.z;
+        g_typed_imu_samples.push_back({timestamp_ns, std::move(imu_msg)});
+        g_last_typed_imu_stamp_ns = timestamp_ns;
+        g_has_last_typed_imu_stamp = true;
+    }
 }
 
 static void on_point_cloud(const uint32_t /*handle*/, const uint8_t /*dev_type*/, LivoxLidarEthernetPacket* data, void* /*client_data*/) {
@@ -513,6 +559,18 @@ static void run_main_iter(
         // SDK IMU callbacks and the main loop share the estimator. Snapshot
         // odometry and cloud under one lock, then release it before LCM I/O.
         std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
+        if (g_external_input && !points.empty()) {
+            const uint64_t scan_end_ns = frame_start + static_cast<uint64_t>(points.back().offset_time);
+            for (const auto& sample : g_typed_imu_samples) {
+                if (sample.timestamp_ns > scan_end_ns) { break; }
+                fast_lio.feed_imu(sample.message);
+            }
+            g_typed_imu_samples.erase(
+                std::remove_if(g_typed_imu_samples.begin(), g_typed_imu_samples.end(),
+                    [scan_end_ns](const TypedImuSample& sample) { return sample.timestamp_ns <= scan_end_ns; }),
+                g_typed_imu_samples.end());
+        }
+
         if (!points.empty()) {
             auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
             lidar_msg->header.seq = 0;

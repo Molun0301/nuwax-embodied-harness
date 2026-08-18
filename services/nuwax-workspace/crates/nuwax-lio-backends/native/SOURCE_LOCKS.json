@@ -59,7 +59,7 @@
     "fastlio2/cpp/CMakeLists.txt": "57e9019cf418721aa93410128bb178b9558c2d8cecc88bc1da31085a8cfff85c",
     "fastlio2/cpp/flake.lock": "d8e1d7516c50dca353234912d7a9d23ee1b80a02ad519ecdabd7145e0fe057d3",
     "fastlio2/cpp/flake.nix": "94a95cd0f350d8811cdf2df914725e19b730f1faf6079b3ea7a881ae89b844fb",
-    "fastlio2/cpp/main.cpp": "61a71d5d7ab3fbbb79738a32e824f0067433c3dd0d4100d0362262978a95265d",
+    "fastlio2/cpp/main.cpp": "4eff4cc0fd7228deb687082e1c4f06a73220e5e586d51ea8de9c1f3d2b3b849f",
     "livox/cpp/CMakeLists.txt": "2526265217e7fcf4f71d729e9d0a3528bdcc6c61598ec5fa08f526f27be70417",
     "livox/cpp/README.md": "3077f45bcaacda21cf6d333a12c30cc486904e1d1bbaf9affddb1c393129af01",
     "livox/cpp/flake.lock": "6eb4dab6274c46d0ad69b58bbb0ba1758e36997296deb9f1af598c5355ad25a5",
@@ -70,6 +70,6 @@
     "pointlio/cpp/fastlio-resize-darwin.patch": "4f5f8d5ce0ec03216f2dcd7a20ec74528b6f768aa78a0d074d1b3321718ddc90",
     "pointlio/cpp/flake.lock": "deb8de950eef7420e4d16689b4d8f12111086afd7142ce981066cc7a811504b0",
     "pointlio/cpp/flake.nix": "43592054daa81241394de21b3e167264abe3078d8a76c037b6d20aee42689eb9",
-    "pointlio/cpp/main.cpp": "a89c915c1c62acedd8a348316d50f0697070c03b3db29fd60b7299c05cd60944"
+    "pointlio/cpp/main.cpp": "5576ff1fea04b1b6b2e371f633166b62d221f97749efef7b69fa155b4ddb60b5"
   }
 }

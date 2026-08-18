@@ -541,6 +541,32 @@ mod tests {
     }
 
     #[test]
+    fn typed_input_topics_are_paired_and_rendered() {
+        let mut only_lidar = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+        only_lidar.input_lidar_topic = Some("/raw/cloud#sensor_msgs.PointCloud2".into());
+        assert!(only_lidar.render_args().is_err());
+
+        let mut only_imu = NativeLioConfig::for_backend(NativeBackend::PointLio);
+        only_imu.input_imu_topic = Some("/raw/imu#sensor_msgs.Imu".into());
+        assert!(only_imu.render_args().is_err());
+
+        let mut typed = NativeLioConfig::for_backend(NativeBackend::PointLio);
+        typed.input_lidar_topic = Some("/raw/cloud#sensor_msgs.PointCloud2".into());
+        typed.input_imu_topic = Some("/raw/imu#sensor_msgs.Imu".into());
+        let args = typed.render_args().expect("paired typed inputs must render");
+        assert_arg_value(&args, "--input_lidar", "/raw/cloud#sensor_msgs.PointCloud2");
+        assert_arg_value(&args, "--input_imu", "/raw/imu#sensor_msgs.Imu");
+
+        let direct = NativeLioConfig::for_backend(NativeBackend::FastLio2)
+            .render_args()
+            .expect("direct Livox mode must remain valid");
+        assert!(!direct.iter().any(|argument| argument == "--input_lidar"));
+        assert!(!direct.iter().any(|argument| argument == "--input_imu"));
+        assert_arg_value(&direct, "--host_ip", "192.168.1.5");
+        assert_arg_value(&direct, "--lidar_ip", "192.168.1.155");
+    }
+
+    #[test]
     fn non_identity_extrinsic_argv_is_stable() {
         let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
         config.extrinsic_translation_m = [0.125, -0.25, 1.5];
@@ -583,11 +609,11 @@ mod tests {
         assert_eq!(files.len(), 17);
         assert_eq!(
             files["fastlio2/cpp/main.cpp"],
-            "61a71d5d7ab3fbbb79738a32e824f0067433c3dd0d4100d0362262978a95265d"
+            "4eff4cc0fd7228deb687082e1c4f06a73220e5e586d51ea8de9c1f3d2b3b849f"
         );
         assert_eq!(
             files["pointlio/cpp/main.cpp"],
-            "a89c915c1c62acedd8a348316d50f0697070c03b3db29fd60b7299c05cd60944"
+            "5576ff1fea04b1b6b2e371f633166b62d221f97749efef7b69fa155b4ddb60b5"
         );
         assert_eq!(
             files["livox/cpp/README.md"],
@@ -659,6 +685,17 @@ mod tests {
                 source.contains("std::memcpy(pc.data.data() + byte_offset + 12"),
                 "{backend} must serialize point fields with alignment-safe copies"
             );
+            assert!(
+                source.contains("g_accumulated_points = std::move(accepted_points);"),
+                "{backend} must replace, never merge, pending typed scans"
+            );
+            assert!(
+                !source.contains("g_accumulated_points.insert(g_accumulated_points.end(), accepted_points.begin(), accepted_points.end())"),
+                "{backend} must not append independent typed scans"
+            );
+            assert!(source.contains("point offsets must increase"), "{backend}");
+            assert!(source.contains("source timestamp must increase"), "{backend}");
+            assert!(source.contains("typed_imu_covers_scan"), "{backend}");
 
             let paired_publish = source
                 .split_once(PAIRING_MARKER)

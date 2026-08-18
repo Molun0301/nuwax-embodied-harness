@@ -13,6 +13,7 @@ from typing import Literal, Optional, Tuple
 
 from contracts.base import ContractModel
 from contracts.compat import StrEnum
+from contracts.frame_semantics import infer_frame_role
 from contracts.naming import validate_frame_id
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -56,6 +57,9 @@ class SensorErrorCode(StrEnum):
 
     LIO_NOT_READY = "lio_not_ready"
     CLOCK_MISMATCH = "clock_mismatch"
+    FRAME_MISMATCH = "frame_mismatch"
+    REGISTRATION_MISMATCH = "registration_mismatch"
+    CALIBRATION_MISMATCH = "calibration_mismatch"
     TIME_REGRESSION = "time_regression"
 
 
@@ -153,8 +157,11 @@ class SensorSample(ContractModel):
     timestamp_ns: int = Field(ge=0, description="帧起始或样本时间。")
     clock_domain: SensorClockDomain
     clock_id: Optional[str] = None
-    frame_id: str
+    frame_id: str = Field(description="产生原始观测的源传感器坐标系。")
     registration_state: RegistrationState
+    registration_frame_id: str = Field(
+        description="registration_state 对应的公共目标坐标系；不同源 frame 可共享该目标。"
+    )
     calibration_ref: Optional[str] = None
     payload_ownership: PayloadOwnership = PayloadOwnership.INLINE
 
@@ -166,7 +173,7 @@ class SensorSample(ContractModel):
             raise ValueError("sensor_id 不能为空")
         return value
 
-    @field_validator("frame_id")
+    @field_validator("frame_id", "registration_frame_id")
     @classmethod
     def _validate_frame_id(cls, value: str) -> str:
         return validate_frame_id(value)
@@ -182,6 +189,20 @@ class SensorSample(ContractModel):
     def _validate_clock(self) -> "SensorSample":
         if self.clock_domain == SensorClockDomain.DEVICE_NS and not self.clock_id:
             raise ValueError("device_ns 必须提供 clock_id")
+        expected_registration_role = {
+            RegistrationState.SENSOR: "source",
+            RegistrationState.BODY: "base",
+            RegistrationState.ODOM: "odom",
+            RegistrationState.MAP: "map",
+        }[self.registration_state]
+        if self.registration_state == RegistrationState.SENSOR:
+            if self.registration_frame_id != self.frame_id:
+                raise ValueError("sensor registration 的 registration_frame_id 必须匹配源 frame_id")
+        elif infer_frame_role(self.registration_frame_id) != expected_registration_role:
+            raise ValueError(
+                "%s registration 必须使用对应语义的 registration_frame_id"
+                % self.registration_state.value
+            )
         return self
 
 
@@ -322,6 +343,17 @@ class CanonicalLioMeasurement(ContractModel):
         key = (self.lidar.clock_domain, self.lidar.clock_id)
         if any((sample.clock_domain, sample.clock_id) != key for sample in self.imu_samples):
             raise ValueError("LiDAR 与 IMU 必须使用同一 clock domain/clock_id")
+        registration_frame_id = self.lidar.registration_frame_id
+        registration_state = self.lidar.registration_state
+        calibration_ref = self.lidar.calibration_ref
+        if not calibration_ref or any(sample.calibration_ref is None for sample in self.imu_samples):
+            raise ValueError("LiDAR 与 IMU 必须提供 calibration_ref")
+        if any(sample.registration_frame_id != registration_frame_id for sample in self.imu_samples):
+            raise ValueError("LiDAR 与 IMU 必须使用同一 registration_frame_id")
+        if any(sample.registration_state != registration_state for sample in self.imu_samples):
+            raise ValueError("LiDAR 与 IMU 必须使用同一 registration_state")
+        if any(sample.calibration_ref != calibration_ref for sample in self.imu_samples):
+            raise ValueError("LiDAR 与 IMU 必须使用同一 calibration_ref")
         if self.imu_samples[0].timestamp_ns > self.scan_begin_timestamp_ns:
             raise ValueError("IMU 队列必须覆盖扫描开始时间")
         if self.imu_samples[-1].timestamp_ns < self.scan_end_timestamp_ns:

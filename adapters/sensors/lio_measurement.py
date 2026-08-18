@@ -11,6 +11,7 @@ from contracts.sensors import (
     CanonicalLidarFrame,
     CanonicalLioMeasurement,
     PayloadOwnership,
+    RegistrationState,
     SensorErrorCode,
 )
 
@@ -35,6 +36,8 @@ class LioMeasurementAssembler:
         self._lidar_frames: Deque[CanonicalLidarFrame] = deque()
         self._imu_samples: Deque[CanonicalImuSample] = deque()
         self._clock_key: Optional[Tuple[object, Optional[str]]] = None
+        self._registration_key: Optional[Tuple[str, RegistrationState]] = None
+        self._calibration_ref: Optional[str] = None
         self._last_lidar_identity: Optional[Tuple[int, int]] = None
         self._last_imu_identity: Optional[Tuple[int, int]] = None
         self.dropped_lidar_count = 0
@@ -61,6 +64,11 @@ class LioMeasurementAssembler:
                     SensorErrorCode.LIO_NOT_READY,
                     "3D LIO 输入必须提供 calibration_ref",
                 )
+            self._admit_compatibility(
+                frame.registration_frame_id,
+                frame.registration_state,
+                frame.calibration_ref,
+            )
             self._admit_clock(frame.clock_domain, frame.clock_id)
             self._last_lidar_identity = self._admit_monotonic(
                 "LiDAR", self._last_lidar_identity, frame.source_sequence, frame.timestamp_ns
@@ -81,6 +89,11 @@ class LioMeasurementAssembler:
                     SensorErrorCode.LIO_NOT_READY,
                     "LIO IMU 输入必须提供 calibration_ref",
                 )
+            self._admit_compatibility(
+                sample.registration_frame_id,
+                sample.registration_state,
+                sample.calibration_ref,
+            )
             self._admit_clock(sample.clock_domain, sample.clock_id)
             self._last_imu_identity = self._admit_monotonic(
                 "IMU", self._last_imu_identity, sample.source_sequence, sample.timestamp_ns
@@ -145,6 +158,8 @@ class LioMeasurementAssembler:
             self._lidar_frames.clear()
             self._imu_samples.clear()
             self._clock_key = None
+            self._registration_key = None
+            self._calibration_ref = None
             self._last_lidar_identity = None
             self._last_imu_identity = None
 
@@ -168,6 +183,33 @@ class LioMeasurementAssembler:
             raise LioMeasurementAssemblerError(
                 SensorErrorCode.CLOCK_MISMATCH,
                 "LiDAR 与 IMU 的 clock domain/clock_id 不一致",
+            )
+
+    def _admit_compatibility(
+        self,
+        registration_frame_id: str,
+        registration_state: RegistrationState,
+        calibration_ref: str,
+    ) -> None:
+        registration_key = (registration_frame_id, registration_state)
+        if self._registration_key is None:
+            self._registration_key = registration_key
+        elif self._registration_key[1] != registration_state:
+            raise LioMeasurementAssemblerError(
+                SensorErrorCode.REGISTRATION_MISMATCH,
+                "LiDAR 与 IMU 的 registration_state 不一致",
+            )
+        elif self._registration_key[0] != registration_frame_id:
+            raise LioMeasurementAssemblerError(
+                SensorErrorCode.FRAME_MISMATCH,
+                "LiDAR 与 IMU 的 registration_frame_id 不一致",
+            )
+        if self._calibration_ref is None:
+            self._calibration_ref = calibration_ref
+        elif self._calibration_ref != calibration_ref:
+            raise LioMeasurementAssemblerError(
+                SensorErrorCode.CALIBRATION_MISMATCH,
+                "LiDAR 与 IMU 的 calibration_ref 不一致",
             )
 
     @staticmethod

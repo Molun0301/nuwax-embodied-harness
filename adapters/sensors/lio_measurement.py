@@ -10,6 +10,7 @@ from contracts.sensors import (
     CanonicalImuSample,
     CanonicalLidarFrame,
     CanonicalLioMeasurement,
+    PayloadOwnership,
     SensorErrorCode,
 )
 
@@ -44,11 +45,15 @@ class LioMeasurementAssembler:
         """加入 LiDAR 帧，并在 IMU 已覆盖扫描窗口时立即输出。"""
 
         with self._lock:
-            if frame.time_offset_ns_le is None or frame.scan_duration_ns is None:
+            if frame.payload_ownership == PayloadOwnership.INLINE:
+                has_per_point_time = frame.time_offset_ns_le is not None
+            else:
+                has_per_point_time = "time_offset_ns_le" in frame.payload_layout
+            if not has_per_point_time or frame.scan_duration_ns is None:
                 self.dropped_lidar_count += 1
                 raise LioMeasurementAssemblerError(
                     SensorErrorCode.LIO_NOT_READY,
-                    "3D LIO 输入必须提供真实逐点时间和 scan_duration_ns",
+                    "3D LIO 输入必须声明真实逐点时间和 scan_duration_ns",
                 )
             if not frame.calibration_ref:
                 self.dropped_lidar_count += 1

@@ -186,17 +186,22 @@ class SensorSample(ContractModel):
 
 
 class CanonicalLidarFrame(SensorSample):
-    """规范化 3D LiDAR 帧；高频字段使用 little-endian bytes。"""
+    """规范化 3D LiDAR 帧；高频字段使用 little-endian bytes 或外置载荷引用。"""
 
     sample_kind: Literal[SensorKind.LIDAR_3D] = SensorKind.LIDAR_3D
     point_count: int = Field(ge=0)
-    xyz_f32_le: bytes = Field(description="N*3 个 little-endian float32 XYZ。")
+    xyz_f32_le: Optional[bytes] = Field(default=None, description="N*3 个 little-endian float32 XYZ。")
     intensity_f32_le: Optional[bytes] = None
     ring_u16_le: Optional[bytes] = None
     time_offset_ns_le: Optional[bytes] = None
     scan_duration_ns: Optional[int] = Field(default=None, ge=0)
     is_dense: bool = True
     transform_provenance: str = Field(description="坐标变换来源；不得隐式假定 frame。")
+    payload_ref: Optional[str] = Field(default=None, description="SHM 或制品载荷的稳定引用。")
+    payload_size_bytes: Optional[int] = Field(default=None, gt=0, description="外置载荷的完整字节数。")
+    payload_layout: Tuple[
+        Literal["xyz_f32_le", "intensity_f32_le", "ring_u16_le", "time_offset_ns_le"], ...
+    ] = Field(default=(), description="外置载荷中的规范数组及其排列顺序。")
 
     @field_validator("transform_provenance")
     @classmethod
@@ -208,23 +213,66 @@ class CanonicalLidarFrame(SensorSample):
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "CanonicalLidarFrame":
-        if self.payload_ownership != PayloadOwnership.INLINE:
-            raise ValueError("CanonicalLidarFrame v1 仅支持 inline bytes 载荷")
-        if len(self.xyz_f32_le) != self.point_count * 12:
-            raise ValueError("xyz_f32_le 长度必须等于 point_count * 12")
-        if self.intensity_f32_le is not None and len(self.intensity_f32_le) != self.point_count * 4:
-            raise ValueError("intensity_f32_le 长度必须等于 point_count * 4")
-        if self.ring_u16_le is not None and len(self.ring_u16_le) != self.point_count * 2:
-            raise ValueError("ring_u16_le 长度必须等于 point_count * 2")
-        if self.time_offset_ns_le is not None and len(self.time_offset_ns_le) != self.point_count * 8:
-            raise ValueError("time_offset_ns_le 长度必须等于 point_count * 8")
-        for x, y, z in struct.iter_unpack("<fff", self.xyz_f32_le):
-            if not all(math.isfinite(value) for value in (x, y, z)):
-                raise ValueError("XYZ 必须全部为有限值")
-        if self.time_offset_ns_le is not None:
-            offsets = struct.unpack("<%dQ" % self.point_count, self.time_offset_ns_le) if self.point_count else ()
-            if self.scan_duration_ns is not None and offsets and max(offsets) > self.scan_duration_ns:
-                raise ValueError("逐点时间偏移不能超过 scan_duration_ns")
+        inline_fields = {
+            "xyz_f32_le": self.xyz_f32_le,
+            "intensity_f32_le": self.intensity_f32_le,
+            "ring_u16_le": self.ring_u16_le,
+            "time_offset_ns_le": self.time_offset_ns_le,
+        }
+        has_external_ref = self.payload_ownership in (PayloadOwnership.SHM, PayloadOwnership.ARTIFACT)
+        if self.payload_ownership == PayloadOwnership.INLINE:
+            if self.payload_ref is not None or self.payload_size_bytes is not None or self.payload_layout:
+                raise ValueError("inline 载荷不得同时提供 payload_ref、payload_size_bytes 或 payload_layout")
+            if self.xyz_f32_le is None:
+                raise ValueError("inline 载荷必须提供 xyz_f32_le")
+            expected_lengths = {
+                "xyz_f32_le": self.point_count * 12,
+                "intensity_f32_le": self.point_count * 4,
+                "ring_u16_le": self.point_count * 2,
+                "time_offset_ns_le": self.point_count * 8,
+            }
+            for field_name, value in inline_fields.items():
+                if value is not None and len(value) != expected_lengths[field_name]:
+                    raise ValueError("%s 长度与 point_count 不匹配" % field_name)
+            for x, y, z in struct.iter_unpack("<fff", self.xyz_f32_le):
+                if not all(math.isfinite(value) for value in (x, y, z)):
+                    raise ValueError("XYZ 必须全部为有限值")
+            if self.time_offset_ns_le is not None:
+                offsets = (
+                    struct.unpack("<%dQ" % self.point_count, self.time_offset_ns_le)
+                    if self.point_count
+                    else ()
+                )
+                if self.scan_duration_ns is not None and offsets and max(offsets) > self.scan_duration_ns:
+                    raise ValueError("逐点时间偏移不能超过 scan_duration_ns")
+            return self
+
+        if not has_external_ref:
+            raise ValueError("payload_ownership 必须是 inline、shm 或 artifact")
+        if any(value is not None for value in inline_fields.values()):
+            raise ValueError("外置载荷不得同时携带 inline bytes")
+        if self.payload_ref is None or any(character.isspace() for character in self.payload_ref):
+            raise ValueError("外置载荷必须提供不含空白的 payload_ref")
+        expected_prefix = "shm://" if self.payload_ownership == PayloadOwnership.SHM else "artifact://"
+        if not self.payload_ref.startswith(expected_prefix) or len(self.payload_ref) == len(expected_prefix):
+            raise ValueError("payload_ref 必须使用与 ownership 匹配的 %s 引用" % expected_prefix)
+        if self.payload_size_bytes is None:
+            raise ValueError("外置载荷必须提供 payload_size_bytes")
+        if not self.payload_layout or self.payload_layout[0] != "xyz_f32_le":
+            raise ValueError("外置载荷 payload_layout 必须以 xyz_f32_le 开始")
+        if len(set(self.payload_layout)) != len(self.payload_layout):
+            raise ValueError("外置载荷 payload_layout 不得重复字段")
+        field_sizes = {
+            "xyz_f32_le": 12,
+            "intensity_f32_le": 4,
+            "ring_u16_le": 2,
+            "time_offset_ns_le": 8,
+        }
+        expected_size = self.point_count * sum(field_sizes[field] for field in self.payload_layout)
+        if self.payload_size_bytes != expected_size:
+            raise ValueError("payload_size_bytes 必须匹配 payload_layout 与 point_count")
+        if "time_offset_ns_le" in self.payload_layout and self.scan_duration_ns is None:
+            raise ValueError("外置逐点时间载荷必须提供 scan_duration_ns")
         return self
 
     @property

@@ -81,7 +81,7 @@ _DEFAULT_ODOM_FRAME = "odom"
 _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
 _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
-_DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
+_DEFAULT_LIO_SENSOR_FRAME = "go2_base_link"
 _MAX_LIO_PUBLISH_QUEUE_SIZE = 4
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 
@@ -846,12 +846,21 @@ class RuntimeInputBridge:
             self._record_error("runtime_provider.publish_point_cloud 不存在")
             return
 
-        # 背压：点 > 阈值时降采样（保留 ndarray 路径）。
+        # canonical LiDAR 是 BODY registration，仅供 native LIO；非 native/device
+        # 仍沿上游已注册的 odom 点云发布，不能让 BODY bytes 冒充 odom。
         downsampled = False
         original_count = int(getattr(point_cloud, "point_count", 0) or 0)
-        payload = point_cloud
+        if isinstance(canonical_lidar, CanonicalLidarFrame):
+            payload_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+            payload_metadata.pop("canonical_lidar_frame", None)
+            payload = point_cloud.model_copy(
+                update={"metadata": payload_metadata},
+                deep=False,
+            )
+        else:
+            payload = point_cloud
         if original_count > self.max_points_before_downsample:
-            payload = self._downsample_point_cloud(point_cloud)
+            payload = self._downsample_point_cloud(payload)
             downsampled = True
             self._increment_counter("downsampled_pointcloud_count")
 
@@ -1300,14 +1309,24 @@ class RuntimeInputBridge:
                         metadata[key] = np.ascontiguousarray(values[::stride][:target])
                 canonical_lidar = metadata.get("canonical_lidar_frame")
                 if isinstance(canonical_lidar, CanonicalLidarFrame):
-                    sampled_xyz = metadata.get("source_xyz_array")
-                    sampled_intensity = metadata.get("intensity_array")
-                    sampled_offsets = metadata.get("offset_ns_array")
+                    canonical_xyz = np.frombuffer(
+                        canonical_lidar.xyz_f32_le or b"", dtype="<f4"
+                    )
+                    canonical_xyz = canonical_xyz.reshape((-1, 3))
+                    canonical_intensity = np.frombuffer(
+                        canonical_lidar.intensity_f32_le or b"", dtype="<f4"
+                    )
+                    canonical_offsets = np.frombuffer(
+                        canonical_lidar.time_offset_ns_le or b"", dtype="<u8"
+                    )
                     if (
-                        isinstance(sampled_xyz, np.ndarray)
-                        and isinstance(sampled_intensity, np.ndarray)
-                        and isinstance(sampled_offsets, np.ndarray)
+                        canonical_xyz.shape[0] == arr.shape[0]
+                        and canonical_intensity.shape == (arr.shape[0],)
+                        and canonical_offsets.shape == (arr.shape[0],)
                     ):
+                        sampled_xyz = canonical_xyz[::stride][:target]
+                        sampled_intensity = canonical_intensity[::stride][:target]
+                        sampled_offsets = canonical_offsets[::stride][:target]
                         metadata["canonical_lidar_frame"] = canonical_lidar.model_copy(
                             update={
                                 "point_count": int(sampled_xyz.shape[0]),
@@ -1358,6 +1377,18 @@ class RuntimeInputBridge:
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
         if isinstance(metadata.get("canonical_lidar_frame"), CanonicalLidarFrame):
+            return 20
+        arr = getattr(point_cloud, "points_xyz_array", None)
+        intensity = metadata.get("intensity_array")
+        offsets = metadata.get("offset_ns_array")
+        if (
+            isinstance(arr, np.ndarray)
+            and arr.ndim == 2
+            and isinstance(intensity, np.ndarray)
+            and intensity.shape == (arr.shape[0],)
+            and isinstance(offsets, np.ndarray)
+            and offsets.shape == (arr.shape[0],)
+        ):
             return 20
         return 12
 

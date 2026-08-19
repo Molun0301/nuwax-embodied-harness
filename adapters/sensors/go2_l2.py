@@ -20,6 +20,7 @@ from contracts.sensors import (
     RegistrationState,
     SensorClockDomain,
 )
+from adapters.sensors.go2_calibration import GO2_CALIBRATION_PROFILE
 
 
 _POINT_FIELD_DTYPES = {
@@ -177,24 +178,32 @@ def adapt_go2_l2_lidar(
     offsets_u64 = np.ascontiguousarray(decoded.offset_ns_array, dtype="<u8")
     if decoded.intensity_array is None:
         raise Go2L2DecodeError("Go2 L2 canonical 映射要求实测 intensity")
+    if not np.all(np.isfinite(decoded.intensity_array)):
+        raise Go2L2DecodeError("Go2 L2 intensity 必须为有限值")
+    if decoded.source_frame != GO2_CALIBRATION_PROFILE.lidar_source_frame:
+        raise Go2L2DecodeError(
+            "Go2 L2 LiDAR source frame 不在权威标定 profile：%s"
+            % decoded.source_frame
+        )
+    transformed_xyz = GO2_CALIBRATION_PROFILE.transform_lidar_xyz(decoded.xyz_array)
     scan_duration_ns = int(offsets_u64.max()) if offsets_u64.size else 0
     return CanonicalLidarFrame(
         sensor_id="go2_l2",
         source_sequence=source_sequence,
         timestamp_ns=timestamp_ns,
         clock_domain=SensorClockDomain.UNIX_NS,
-        frame_id=decoded.source_frame,
-        registration_state=RegistrationState.SENSOR,
-        registration_frame_id=decoded.source_frame,
-        calibration_ref=None,
+        frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        registration_state=RegistrationState.BODY,
+        registration_frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        calibration_ref=GO2_CALIBRATION_PROFILE.calibration_ref,
         payload_ownership=PayloadOwnership.INLINE,
-        point_count=int(decoded.xyz_array.shape[0]),
-        xyz_f32_le=np.ascontiguousarray(decoded.xyz_array, dtype="<f4").tobytes(),
+        point_count=int(transformed_xyz.shape[0]),
+        xyz_f32_le=np.ascontiguousarray(transformed_xyz, dtype="<f4").tobytes(),
         intensity_f32_le=np.ascontiguousarray(decoded.intensity_array, dtype="<f4").tobytes(),
         time_offset_ns_le=offsets_u64.tobytes(),
         scan_duration_ns=scan_duration_ns,
         is_dense=decoded.is_dense,
-        transform_provenance="raw_sensor_frame",
+        transform_provenance="calibration_applied:%s" % GO2_CALIBRATION_PROFILE.calibration_ref,
     )
 
 
@@ -206,20 +215,29 @@ def adapt_go2_l2_imu(
     gyro_rps: tuple,
     source_sequence: int,
 ) -> CanonicalImuSample:
-    """把已验证的 Go2 IMU SI 单位样本映射到 canonical IMU 合同。"""
+    """把已验证的 Go2 IMU SI 单位样本变换并映射到 canonical IMU 合同。"""
 
+    try:
+        transformed_accel = GO2_CALIBRATION_PROFILE.transform_imu_vector(
+            accel_mps2, frame_id
+        )
+        transformed_gyro = GO2_CALIBRATION_PROFILE.transform_imu_vector(
+            gyro_rps, frame_id
+        )
+    except ValueError as exc:
+        raise Go2L2DecodeError("Go2 IMU 标定变换失败：%s" % exc) from exc
     return CanonicalImuSample(
         sensor_id="go2_imu",
         source_sequence=source_sequence,
         timestamp_ns=timestamp_ns,
         clock_domain=SensorClockDomain.UNIX_NS,
-        frame_id=frame_id,
-        registration_state=RegistrationState.SENSOR,
-        registration_frame_id=frame_id,
-        calibration_ref=None,
+        frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        registration_state=RegistrationState.BODY,
+        registration_frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        calibration_ref=GO2_CALIBRATION_PROFILE.calibration_ref,
         payload_ownership=PayloadOwnership.INLINE,
-        accel_mps2=accel_mps2,
-        gyro_rps=gyro_rps,
+        accel_mps2=transformed_accel,
+        gyro_rps=transformed_gyro,
     )
 
 

@@ -21,6 +21,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CH
 
 import numpy as np
 
+from adapters.sensors.go2_calibration import GO2_CALIBRATION_PROFILE
 from adapters.sensors.go2_l2 import (
     Go2L2DecodeError,
     adapt_go2_l2_imu,
@@ -42,9 +43,9 @@ LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
 
 _STATIONARY_YAW_RATE_FILTER_TAU_SEC = 0.5
 _MAX_STATIONARY_YAW_SAMPLE_GAP_SEC = 1.0
-_GO2_UTLIDAR_FRAME = "utlidar_lidar"
-_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M = (0.28945, 0.0, -0.046825)
-_GO2_BODY_FROM_UTLIDAR_PITCH_RAD = 2.8782025850555556
+_GO2_UTLIDAR_FRAME = GO2_CALIBRATION_PROFILE.lidar_source_frame
+_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M = GO2_CALIBRATION_PROFILE.lidar_translation_m
+_GO2_BODY_FROM_UTLIDAR_PITCH_RAD = GO2_CALIBRATION_PROFILE.lidar_rpy_rad[1]
 _POINT_CLOUD_POSE_HISTORY_SIZE = 256
 _MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
 
@@ -1107,10 +1108,14 @@ class Go2DirectDdsBridge:
         intensity_array = decoded.intensity_array
         offset_ns_array = decoded.offset_ns_array
         try:
-            canonical_lidar_frame = adapt_go2_l2_lidar(
-                decoded,
-                timestamp_ns=source_timestamp_ns,
-                source_sequence=source_timestamp_ns,
+            canonical_lidar_frame = (
+                adapt_go2_l2_lidar(
+                    decoded,
+                    timestamp_ns=source_timestamp_ns,
+                    source_sequence=source_timestamp_ns,
+                )
+                if source_frame == _GO2_UTLIDAR_FRAME
+                else None
             )
         except (Go2L2DecodeError, ValueError) as exc:
             reject(f"Go2 L2 canonical LiDAR 映射失败：{exc}")

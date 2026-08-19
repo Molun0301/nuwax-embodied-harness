@@ -830,12 +830,33 @@ class Go2DirectDdsBridge:
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
         )
+        canonical_imu_sample = None
+        if imu_state is not None:
+            try:
+                canonical_imu_sample = adapt_go2_l2_imu(
+                    timestamp_ns=int(imu_source_timestamp_ns),
+                    frame_id=imu_state.frame_id,
+                    accel_mps2=(
+                        float(imu_state.linear_acceleration_m_s2.x),
+                        float(imu_state.linear_acceleration_m_s2.y),
+                        float(imu_state.linear_acceleration_m_s2.z),
+                    ),
+                    gyro_rps=(
+                        float(imu_state.angular_velocity_rad_s.x),
+                        float(imu_state.angular_velocity_rad_s.y),
+                        float(imu_state.angular_velocity_rad_s.z),
+                    ),
+                    source_sequence=int(imu_source_timestamp_ns),
+                )
+            except ValueError:
+                LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
         frame_tree = FrameTree(root_frame_id=pose.frame_id)
         metadata = {
             "source_topic": str(source_topic or ""),
             "imu_source_topic": f"{source_topic}#imu_state" if source_topic else "",
             "dds_pose_ready": True,
             "dds_imu_ready": imu_state is not None,
+            "canonical_imu_sample": canonical_imu_sample,
         }
         with self._lifecycle_lock:
             with self._lock:
@@ -1198,34 +1219,6 @@ class Go2DirectDdsBridge:
                 yaw_stabilization_applied = True
                 yaw_stabilization_origin_xy = [origin_x, origin_y]
 
-        imu_sample = None
-        with self._lock:
-            if (
-                self._latest_imu_generation == generation
-                and self._latest_imu_state_from_dds is not None
-                and self._latest_imu_source_timestamp_ns is not None
-            ):
-                latest_imu = self._latest_imu_state_from_dds
-                try:
-                    imu_sample = adapt_go2_l2_imu(
-                        timestamp_ns=int(self._latest_imu_source_timestamp_ns),
-                        frame_id=latest_imu.frame_id,
-                        accel_mps2=(
-                            float(latest_imu.linear_acceleration_m_s2.x),
-                            float(latest_imu.linear_acceleration_m_s2.y),
-                            float(latest_imu.linear_acceleration_m_s2.z),
-                        ),
-                        gyro_rps=(
-                            float(latest_imu.angular_velocity_rad_s.x),
-                            float(latest_imu.angular_velocity_rad_s.y),
-                            float(latest_imu.angular_velocity_rad_s.z),
-                        ),
-                        source_sequence=int(self._latest_imu_source_timestamp_ns),
-                    )
-                except ValueError:
-                    LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
-                    imu_sample = None
-
         try:
             point_cloud = PointCloudFrame(
                 timestamp=source_timestamp,
@@ -1269,7 +1262,6 @@ class Go2DirectDdsBridge:
                     "intensity_array": intensity_array,
                     "offset_ns_array": offset_ns_array,
                     "canonical_lidar_frame": canonical_lidar_frame,
-                    "canonical_imu_sample": imu_sample,
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
                     "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
                     "registration_assertion": registration_assertion,

@@ -48,15 +48,24 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import numpy as np
 
+from adapters.sensors.lio_measurement import (
+    LioMeasurementAssembler,
+    LioMeasurementAssemblerError,
+)
 from contracts.geometry import FrameTree, Pose
 from contracts.pointcloud import PointCloudFrame
-from contracts.sensors import CanonicalImuSample, CanonicalLidarFrame
+from contracts.sensors import (
+    CanonicalImuSample,
+    CanonicalLidarFrame,
+    CanonicalLioMeasurement,
+)
 from providers.localization import StreamingLocalizationProvider
 from providers.pointcloud import StreamingPointCloudProvider
 
@@ -71,6 +80,10 @@ SHM_PAYLOAD_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
 _DEFAULT_ODOM_FRAME = "odom"
 _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
+_LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
+_DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
+_MAX_LIO_PUBLISH_QUEUE_SIZE = 4
+_APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 
 # sensor_msgs/PointField constants for the normalized XYZ float32 payload emitted below.
 _CANONICAL_XYZ_FIELDS = (
@@ -114,6 +127,8 @@ class BridgeCounters:
     # 兼容旧诊断键。Python bridge 不拥有 TF publisher，因此该值恒为 0。
     published_tf_count: int = 0
     published_pointcloud_count: int = 0
+    emitted_lio_measurement_count: int = 0
+    lio_not_ready_count: int = 0
     dropped_odom_count: int = 0
     dropped_pointcloud_count: int = 0
     downsampled_pointcloud_count: int = 0
@@ -132,6 +147,8 @@ class BridgeCounters:
             "tf_owner": "rust_canonical",
             "tf_observation_semantics": "observed_not_published",
             "published_pointcloud_count": self.published_pointcloud_count,
+            "emitted_lio_measurement_count": self.emitted_lio_measurement_count,
+            "lio_not_ready_count": self.lio_not_ready_count,
             "dropped_odom_count": self.dropped_odom_count,
             "dropped_pointcloud_count": self.dropped_pointcloud_count,
             "downsampled_pointcloud_count": self.downsampled_pointcloud_count,
@@ -170,8 +187,49 @@ class RuntimeInputBridge:
     max_points_after_downsample: int = MAX_POINTS_AFTER_DOWNSAMPLE
 
     counters: BridgeCounters = field(default_factory=BridgeCounters)
+    _lio_measurement_assembler: LioMeasurementAssembler = field(
+        default_factory=LioMeasurementAssembler,
+        init=False,
+        repr=False,
+    )
+    _lio_condition: threading.Condition = field(
+        default_factory=threading.Condition,
+        init=False,
+        repr=False,
+    )
+    _lio_publish_queue: Deque[Tuple[int, CanonicalLioMeasurement]] = field(
+        default_factory=deque,
+        init=False,
+        repr=False,
+    )
+    _lio_generation: int = field(default=0, init=False)
+    _lio_accepting: bool = field(default=False, init=False)
+    _lio_sensor_frame: str = field(
+        default=_DEFAULT_LIO_SENSOR_FRAME,
+        init=False,
+    )
+    _lio_publish_owner_active: bool = field(default=False, init=False)
+    _lio_publish_owner_thread_id: Optional[int] = field(default=None, init=False)
+    _lio_in_flight_count: int = field(default=0, init=False)
+    _callback_in_flight_count: int = field(default=0, init=False)
+    _callback_in_flight_by_thread: Dict[int, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _lio_reset_pending_generation: Optional[int] = field(default=None, init=False)
 
     # === lifecycle state ===
+    _lifecycle_operation_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+    _counter_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _started: bool = False
     _localization_subscription_id: Optional[int] = None
@@ -228,30 +286,99 @@ class RuntimeInputBridge:
             ``True`` 表示至少 ``LocalizationProvider`` 订阅成功。pointcloud 不可用
             时不会阻止 ``start()``，但 ``is_ready()`` 在订阅两者都失败时返回 ``False``。
         """
-        selected_lio_backend = os.environ.get(_LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND)
-        if selected_lio_backend not in {_DEVICE_LIO_BACKEND, "fastlio2", "pointlio"}:
+        current_thread_id = threading.get_ident()
+        while True:
+            with self._lio_condition:
+                if self._lio_reset_pending_generation is not None:
+                    if (
+                        self._callback_in_flight_by_thread.get(
+                            current_thread_id,
+                            0,
+                        )
+                        > 0
+                        or self._lio_publish_owner_thread_id
+                        == current_thread_id
+                    ):
+                        self._record_error(
+                            "拒绝在尚未退出的 provider callback 内重启 "
+                            "RuntimeInputBridge"
+                        )
+                        return False
+                    while self._lio_reset_pending_generation is not None:
+                        if self._reset_lio_assembler_if_quiescent_locked():
+                            break
+                        self._lio_condition.wait()
+            with self._lifecycle_operation_lock:
+                with self._lio_condition:
+                    if self._lio_reset_pending_generation is not None:
+                        continue
+                return self._start_new_generation_locked()
+
+    def _start_new_generation_locked(self) -> bool:
+        """在 lifecycle operation lock 内启动一个新的 bridge generation。"""
+
+        selected_lio_backend = os.environ.get(
+            _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
+        )
+        if selected_lio_backend not in {
+            _DEVICE_LIO_BACKEND,
+            "fastlio2",
+            "pointlio",
+        }:
             self._record_error(
-                f"拒绝未知 {_LIO_BACKEND_ENV}={selected_lio_backend!r} 的 provider forwarding"
+                f"拒绝未知 {_LIO_BACKEND_ENV}={selected_lio_backend!r} "
+                "的 provider forwarding"
             )
             return False
         with self._lock:
             if self._started:
                 return True
             if not self.ensure_runtime_connected(timeout_sec=0.0):
-                LOGGER.warning("RuntimeInputBridge.start: runtime 未连，不订 provider。")
+                LOGGER.warning(
+                    "RuntimeInputBridge.start: runtime 未连，不订 provider。"
+                )
                 return False
             self._started = True
             self._localization_subscription_id = None
             self._point_cloud_subscription_id = None
+        with self._lio_condition:
+            self._lio_generation += 1
+            lio_generation = self._lio_generation
+            self._lio_accepting = True
+            self._lio_reset_pending_generation = None
+            self._lio_publish_owner_thread_id = None
+            self._lio_sensor_frame = os.environ.get(
+                _LIO_SENSOR_FRAME_ENV,
+                _DEFAULT_LIO_SENSOR_FRAME,
+            ).strip()
+            self._lio_publish_queue.clear()
+            self._lio_measurement_assembler.reset()
 
-        localization_ok = self._subscribe_localization()
-        point_cloud_ok = self._subscribe_point_cloud()
+        localization_ok = self._subscribe_localization(lio_generation)
+        if localization_ok:
+            point_cloud_ok = self._subscribe_point_cloud(lio_generation)
+        else:
+            # localization 订阅可能在 provider 内同步 delivery 时重入 stop；
+            # 此时 generation 已失效，禁止继续创建第二个订阅。
+            point_cloud_ok = False
+        with self._lock:
+            started_after_subscribe = self._started
+        with self._lio_condition:
+            generation_after_subscribe = (
+                self._lio_generation == lio_generation
+                and self._lio_accepting
+            )
+        if not started_after_subscribe or not generation_after_subscribe:
+            localization_ok = False
+            point_cloud_ok = False
         with self._lock:
             self._missing_localization_provider = not localization_ok
             self._missing_point_cloud_provider = not point_cloud_ok
 
         if not localization_ok and not point_cloud_ok:
-            self._record_error("LocalizationProvider 与 PointCloudProvider 均不可用")
+            self._record_error(
+                "LocalizationProvider 与 PointCloudProvider 均不可用"
+            )
             LOGGER.warning("RuntimeInputBridge.start: 两个 provider 都不可用。")
             # 不回滚 _started：让调用方通过 is_ready() 看到 False，并显式 stop() 释放。
             return False
@@ -262,26 +389,113 @@ class RuntimeInputBridge:
         return True
 
     def stop(self) -> None:
-        """注销 callback，刷新 counters 标记。"""
+        """注销 callback；外部调用等待 drain，callback 重入由最后 release 延迟 reset。"""
+        stopping_thread_id = threading.get_ident()
         with self._lock:
-            if not self._started:
-                return
-            self._started = False
-            loc_id = self._localization_subscription_id
-            pc_id = self._point_cloud_subscription_id
-            self._localization_subscription_id = None
-            self._point_cloud_subscription_id = None
+            started_snapshot = self._started
+        with self._lio_condition:
+            pending_stop = self._lio_reset_pending_generation is not None
+            current_callback_count = (
+                self._callback_in_flight_by_thread.get(
+                    stopping_thread_id,
+                    0,
+                )
+            )
+            current_owns_publish = (
+                self._lio_publish_owner_active
+                and self._lio_publish_owner_thread_id
+                == stopping_thread_id
+            )
+        if (
+            not started_snapshot
+            and pending_stop
+            and (current_callback_count > 0 or current_owns_publish)
+        ):
+            return
 
-        if loc_id is not None and self.localization_provider is not None:
-            try:
-                self.localization_provider.unsubscribe_localization(loc_id)
-            except Exception as exc:
-                LOGGER.debug("注销 LocalizationProvider 订阅失败：%s", exc)
-        if pc_id is not None and self.point_cloud_provider is not None:
-            try:
-                self.point_cloud_provider.unsubscribe_point_cloud(pc_id)
-            except Exception as exc:
-                LOGGER.debug("注销 PointCloudProvider 订阅失败：%s", exc)
+        with self._lifecycle_operation_lock:
+            with self._lock:
+                transitioned = self._started
+                if transitioned:
+                    self._started = False
+                    loc_id = self._localization_subscription_id
+                    pc_id = self._point_cloud_subscription_id
+                    self._localization_subscription_id = None
+                    self._point_cloud_subscription_id = None
+                else:
+                    loc_id = None
+                    pc_id = None
+
+            if transitioned:
+                with self._lio_condition:
+                    self._lio_accepting = False
+                    self._lio_generation += 1
+                    self._lio_reset_pending_generation = (
+                        self._lio_generation
+                    )
+                    self._lio_publish_queue.clear()
+
+                if (
+                    loc_id is not None
+                    and self.localization_provider is not None
+                ):
+                    try:
+                        self.localization_provider.unsubscribe_localization(
+                            loc_id
+                        )
+                    except Exception as exc:
+                        LOGGER.debug(
+                            "注销 LocalizationProvider 订阅失败：%s",
+                            exc,
+                        )
+                if (
+                    pc_id is not None
+                    and self.point_cloud_provider is not None
+                ):
+                    try:
+                        self.point_cloud_provider.unsubscribe_point_cloud(
+                            pc_id
+                        )
+                    except Exception as exc:
+                        LOGGER.debug(
+                            "注销 PointCloudProvider 订阅失败：%s",
+                            exc,
+                        )
+
+        with self._lio_condition:
+            current_callback_count = (
+                self._callback_in_flight_by_thread.get(
+                    stopping_thread_id,
+                    0,
+                )
+            )
+            current_owns_publish = (
+                self._lio_publish_owner_active
+                and self._lio_publish_owner_thread_id
+                == stopping_thread_id
+            )
+            should_drain = (
+                self._lio_reset_pending_generation is not None
+                or self._lio_publish_owner_active
+                or self._lio_in_flight_count > 0
+                or self._callback_in_flight_count > 0
+            )
+        if current_callback_count > 0 or current_owns_publish:
+            return
+        if should_drain:
+            self._wait_for_stop_drain()
+
+    def _wait_for_stop_drain(self) -> None:
+        """等待外部 stop 的全部 callback/native delivery 退出。"""
+
+        with self._lio_condition:
+            while (
+                self._lio_publish_owner_active
+                or self._lio_in_flight_count > 0
+                or self._callback_in_flight_count > 0
+            ):
+                self._lio_condition.wait()
+            self._reset_lio_assembler_if_quiescent_locked()
 
     def is_started(self) -> bool:
         with self._lock:
@@ -302,14 +516,27 @@ class RuntimeInputBridge:
     # subscription helpers
     # ------------------------------------------------------------------
 
-    def _subscribe_localization(self) -> bool:
+    def _subscribe_localization(self, lio_generation: int) -> bool:
         if self.localization_provider is None:
             return False
         subscriber = getattr(self.localization_provider, "subscribe_localization", None)
         if not callable(subscriber):
             return False
+
+        def callback(
+            pose: Pose,
+            frame_tree: Optional[FrameTree],
+            metadata: Optional[Dict[str, Any]],
+        ) -> None:
+            self._on_localization(
+                pose,
+                frame_tree,
+                metadata,
+                _lio_generation=lio_generation,
+            )
+
         try:
-            subscription_id = subscriber(self._on_localization)
+            subscription_id = subscriber(callback)
         except Exception as exc:
             self._record_error(f"LocalizationProvider.subscribe_localization 抛异常：{exc}")
             return False
@@ -317,22 +544,73 @@ class RuntimeInputBridge:
             self._record_error("LocalizationProvider.subscribe_localization 返回 None")
             return False
         with self._lock:
+            generation_current = self._started
+            generation_current = generation_current and (
+                self._localization_subscription_id is None
+                or self._localization_subscription_id == int(subscription_id)
+            )
+        with self._lio_condition:
+            generation_current = generation_current and (
+                self._lio_generation == lio_generation
+                and self._lio_accepting
+            )
+        if not generation_current:
+            try:
+                self.localization_provider.unsubscribe_localization(
+                    int(subscription_id)
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "清理失效 LocalizationProvider 订阅失败：%s",
+                    exc,
+                )
+            return False
+        with self._lock:
             self._localization_subscription_id = int(subscription_id)
         return True
 
-    def _subscribe_point_cloud(self) -> bool:
+    def _subscribe_point_cloud(self, lio_generation: int) -> bool:
         if self.point_cloud_provider is None:
             return False
         subscriber = getattr(self.point_cloud_provider, "subscribe_point_cloud", None)
         if not callable(subscriber):
             return False
+
+        def callback(point_cloud: PointCloudFrame) -> None:
+            self._on_point_cloud(
+                point_cloud,
+                _lio_generation=lio_generation,
+            )
+
         try:
-            subscription_id = subscriber(self._on_point_cloud)
+            subscription_id = subscriber(callback)
         except Exception as exc:
             self._record_error(f"PointCloudProvider.subscribe_point_cloud 抛异常：{exc}")
             return False
         if subscription_id is None:
             self._record_error("PointCloudProvider.subscribe_point_cloud 返回 None")
+            return False
+        with self._lock:
+            generation_current = self._started
+            generation_current = generation_current and (
+                self._point_cloud_subscription_id is None
+                or self._point_cloud_subscription_id == int(subscription_id)
+            )
+        with self._lio_condition:
+            generation_current = generation_current and (
+                self._lio_generation == lio_generation
+                and self._lio_accepting
+            )
+        if not generation_current:
+            try:
+                self.point_cloud_provider.unsubscribe_point_cloud(
+                    int(subscription_id)
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "清理失效 PointCloudProvider 订阅失败：%s",
+                    exc,
+                )
             return False
         with self._lock:
             self._point_cloud_subscription_id = int(subscription_id)
@@ -347,20 +625,60 @@ class RuntimeInputBridge:
         pose: Pose,
         frame_tree: Optional[FrameTree],
         metadata: Optional[Dict[str, Any]],
+        *,
+        _lio_generation: Optional[int] = None,
+        _callback_admitted: bool = False,
     ) -> None:
-        if not self.is_started():
+        if not _callback_admitted:
+            if not self._admit_bridge_callback(_lio_generation):
+                return
+            try:
+                self._on_localization(
+                    pose,
+                    frame_tree,
+                    metadata,
+                    _lio_generation=_lio_generation,
+                    _callback_admitted=True,
+                )
+            finally:
+                self._release_bridge_callback()
             return
         if pose is None:
-            self.counters.dropped_odom_count += 1
+            self._increment_counter("dropped_odom_count")
             self._record_error("localization callback 收到 None pose")
             return
 
+        callback_metadata = dict(metadata or {})
+        native_lio_backend = os.environ.get(
+            _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
+        ) in {"fastlio2", "pointlio"}
+        if native_lio_backend:
+            canonical_imu = callback_metadata.get("canonical_imu_sample")
+            if isinstance(canonical_imu, CanonicalImuSample):
+                should_drain = False
+                with self._lio_condition:
+                    if not self._lio_callback_is_current(_lio_generation):
+                        return
+                    try:
+                        measurement = self._lio_measurement_assembler.add_imu(
+                            canonical_imu
+                        )
+                    except LioMeasurementAssemblerError as exc:
+                        self._record_lio_assembler_error(exc)
+                    else:
+                        should_drain = self._enqueue_ready_lio_measurements(
+                            measurement,
+                            self._lio_generation,
+                        )
+                if should_drain:
+                    self._drain_native_lio_measurements()
+
         if frame_tree is not None and getattr(frame_tree, "transforms", None):
-            self.counters.observed_frame_tree_count += 1
+            self._increment_counter("observed_frame_tree_count")
 
         publisher = getattr(self.runtime_provider, "publish_odom", None)
         if not callable(publisher):
-            self.counters.dropped_odom_count += 1
+            self._increment_counter("dropped_odom_count")
             self._record_error("runtime_provider.publish_odom 不存在")
             return
 
@@ -392,26 +710,44 @@ class RuntimeInputBridge:
             else:
                 success = bool(publisher(*args, **metadata))
         except Exception as exc:
-            self.counters.dropped_odom_count += 1
+            self._increment_counter("dropped_odom_count")
             self._record_error(f"publish_odom 抛异常：{exc}")
             return
         latency_ms = (time.monotonic() - start) * 1000.0
         if not success:
-            self.counters.dropped_odom_count += 1
+            self._increment_counter("dropped_odom_count")
             self._record_error("publish_odom 返回 False（runtime 未连或 RPC 失败）")
             return
 
-        self.counters.published_odom_count += 1
-        self.counters.last_publish_latency_ms = latency_ms
-        self.counters.last_publish_at_monotonic = time.monotonic()
+        self._increment_counter("published_odom_count")
+        self._update_counters(
+            last_publish_latency_ms=latency_ms,
+            last_publish_at_monotonic=time.monotonic(),
+        )
 
         # TF 发布权属于 Rust canonical owner；Python 仅记录输入侧观测。
 
-    def _on_point_cloud(self, point_cloud: PointCloudFrame) -> None:
-        if not self.is_started():
+    def _on_point_cloud(
+        self,
+        point_cloud: PointCloudFrame,
+        *,
+        _lio_generation: Optional[int] = None,
+        _callback_admitted: bool = False,
+    ) -> None:
+        if not _callback_admitted:
+            if not self._admit_bridge_callback(_lio_generation):
+                return
+            try:
+                self._on_point_cloud(
+                    point_cloud,
+                    _lio_generation=_lio_generation,
+                    _callback_admitted=True,
+                )
+            finally:
+                self._release_bridge_callback()
             return
         if point_cloud is None:
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error("point_cloud callback 收到 None")
             return
 
@@ -419,7 +755,7 @@ class RuntimeInputBridge:
         raw_frame_id = str(getattr(point_cloud, "frame_id", "") or "")
         frame_id = raw_frame_id.strip()
         if not frame_id or frame_id != raw_frame_id:
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error(
                 "拒绝缺失或带首尾空白的 PointCloud frame_id："
                 f"frame_id={raw_frame_id or '<empty>'!r}"
@@ -450,7 +786,7 @@ class RuntimeInputBridge:
                 frame_id = source_frame
             else:
                 if not registered_to_odom:
-                    self.counters.dropped_pointcloud_count += 1
+                    self._increment_counter("dropped_pointcloud_count")
                     self._record_error(
                         "拒绝 Go2 未注册传感器帧点云："
                         f"source_frame={source_frame or frame_id or '<empty>'}; "
@@ -458,7 +794,7 @@ class RuntimeInputBridge:
                     )
                     return
                 if not registered_frame or frame_id != registered_frame:
-                    self.counters.dropped_pointcloud_count += 1
+                    self._increment_counter("dropped_pointcloud_count")
                     self._record_error(
                         "拒绝 Go2 点云注册断言不一致："
                         f"source_frame={source_frame or '<empty>'} "
@@ -467,25 +803,46 @@ class RuntimeInputBridge:
                     )
                     return
 
-        imu_samples = []
         if native_lio_backend:
-            canonical_imu = point_cloud_metadata.get("canonical_imu_sample")
-            if not isinstance(canonical_imu, CanonicalImuSample):
-                self.counters.dropped_pointcloud_count += 1
-                self._record_error("拒绝缺少 canonical IMU 样本的 native LIO 点云")
-                return
-            imu_samples.append(
-                LioImuSample(
-                    timestamp_ns=canonical_imu.timestamp_ns,
-                    frame_id=canonical_imu.frame_id,
-                    accel_mps2=canonical_imu.accel_mps2,
-                    gyro_rps=canonical_imu.gyro_rps,
+            should_drain = False
+            with self._lio_condition:
+                if not self._lio_callback_is_current(_lio_generation):
+                    return
+                if not isinstance(canonical_lidar, CanonicalLidarFrame):
+                    self._increment_counter("dropped_pointcloud_count")
+                    self._increment_counter("lio_not_ready_count")
+                    self._record_error(
+                        "lio_not_ready: native LIO 点云缺少 canonical LiDAR 帧"
+                    )
+                    return
+                try:
+                    measurement = self._lio_measurement_assembler.add_lidar(
+                        canonical_lidar
+                    )
+                except LioMeasurementAssemblerError as exc:
+                    self._increment_counter("dropped_pointcloud_count")
+                    self._record_lio_assembler_error(exc)
+                    return
+                if measurement is None:
+                    self._increment_counter("lio_not_ready_count")
+                    self._record_error(
+                        "lio_not_ready: IMU 尚未覆盖 LiDAR 扫描开始与末端，"
+                        "保留有界等待窗口"
+                    )
+                    return
+                should_drain = self._enqueue_ready_lio_measurements(
+                    measurement,
+                    self._lio_generation,
                 )
-            )
+            if should_drain:
+                self._drain_native_lio_measurements()
+            return
+
+        imu_samples = []
 
         publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
         if not callable(publisher):
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error("runtime_provider.publish_point_cloud 不存在")
             return
 
@@ -496,12 +853,12 @@ class RuntimeInputBridge:
         if original_count > self.max_points_before_downsample:
             payload = self._downsample_point_cloud(point_cloud)
             downsampled = True
-            self.counters.downsampled_pointcloud_count += 1
+            self._increment_counter("downsampled_pointcloud_count")
 
         point_step = self._resolve_point_step(payload)
         bytes_payload = self._encode_point_cloud_bytes(payload)
         if bytes_payload is None:
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error(
                 f"PointCloud 编码失败：frame={payload.frame_id} count={payload.point_count}"
             )
@@ -539,22 +896,24 @@ class RuntimeInputBridge:
             else:
                 result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error(f"publish_point_cloud 抛异常：{exc}")
             return
         latency_ms = (time.monotonic() - start) * 1000.0
 
         success = bool(result)
         if not success:
-            self.counters.dropped_pointcloud_count += 1
+            self._increment_counter("dropped_pointcloud_count")
             self._record_error("publish_point_cloud 返回 False（runtime 未连或 RPC 失败）")
             return
 
-        self.counters.published_pointcloud_count += 1
-        self.counters.last_publish_latency_ms = latency_ms
-        self.counters.last_publish_at_monotonic = time.monotonic()
-        self.counters.last_published_point_count = int(payload.point_count)
-        self.counters.last_published_point_step = int(point_step)
+        self._increment_counter("published_pointcloud_count")
+        self._update_counters(
+            last_publish_latency_ms=latency_ms,
+            last_publish_at_monotonic=time.monotonic(),
+            last_published_point_count=int(payload.point_count),
+            last_published_point_step=int(point_step),
+        )
 
         if downsampled:
             LOGGER.debug(
@@ -567,6 +926,361 @@ class RuntimeInputBridge:
     # ------------------------------------------------------------------
     # payload helpers
     # ------------------------------------------------------------------
+
+    def _admit_bridge_callback(self, generation: Optional[int]) -> bool:
+        """原子登记当前代 callback，供 stop 按 delivery thread 排空。"""
+
+        callback_thread_id = threading.get_ident()
+        with self._lio_condition:
+            if not self._lio_callback_is_current(generation):
+                return False
+            self._callback_in_flight_count += 1
+            self._callback_in_flight_by_thread[callback_thread_id] = (
+                self._callback_in_flight_by_thread.get(callback_thread_id, 0)
+                + 1
+            )
+            return True
+
+    def _release_bridge_callback(self) -> None:
+        callback_thread_id = threading.get_ident()
+        with self._lio_condition:
+            thread_count = self._callback_in_flight_by_thread.get(
+                callback_thread_id,
+                0,
+            )
+            if thread_count <= 0 or self._callback_in_flight_count <= 0:
+                self._record_error(
+                    "RuntimeInputBridge callback in-flight 释放不匹配"
+                )
+                self._lio_condition.notify_all()
+                return
+            if thread_count == 1:
+                self._callback_in_flight_by_thread.pop(
+                    callback_thread_id,
+                    None,
+                )
+            else:
+                self._callback_in_flight_by_thread[callback_thread_id] = (
+                    thread_count - 1
+                )
+            self._callback_in_flight_count -= 1
+            self._reset_lio_assembler_if_quiescent_locked()
+            self._lio_condition.notify_all()
+
+    def _reset_lio_assembler_if_quiescent_locked(self) -> bool:
+        """在 condition 内延迟完成 stop reset，避免重入 callback 等待自身。"""
+
+        if (
+            self._lio_reset_pending_generation is None
+            or self._lio_reset_pending_generation != self._lio_generation
+            or self._lio_publish_owner_active
+            or self._lio_in_flight_count > 0
+            or self._callback_in_flight_count > 0
+        ):
+            return False
+        self._lio_measurement_assembler.reset()
+        self._lio_reset_pending_generation = None
+        return True
+
+    def _increment_counter(self, name: str, amount: int = 1) -> None:
+        with self._counter_lock:
+            setattr(self.counters, name, getattr(self.counters, name) + amount)
+
+    def _update_counters(self, **values: Any) -> None:
+        with self._counter_lock:
+            for name, value in values.items():
+                setattr(self.counters, name, value)
+
+    def _prepare_native_lio_measurement(
+        self,
+        measurement: CanonicalLioMeasurement,
+    ) -> Optional[CanonicalLioMeasurement]:
+        """验证 raw RPC 的 frame/provenance，并执行 canonical 有界采样。"""
+
+        calibration_ref = measurement.lidar.calibration_ref
+        expected_provenance = (
+            _APPLIED_TRANSFORM_PROVENANCE_PREFIX + calibration_ref
+            if calibration_ref
+            and calibration_ref == calibration_ref.strip()
+            else None
+        )
+        if (
+            expected_provenance is None
+            or measurement.lidar.transform_provenance
+            != expected_provenance
+        ):
+            self._increment_counter("dropped_pointcloud_count")
+            self._increment_counter("lio_not_ready_count")
+            self._record_error(
+                "lio_not_ready: canonical LiDAR 缺少与 calibration_ref "
+                "精确绑定的已应用坐标变换 provenance；拒绝 raw/unapplied "
+                "payload 进入 native raw RPC"
+            )
+            return None
+
+        registration_frame = measurement.lidar.registration_frame_id
+        expected_frame = self._lio_sensor_frame
+        if (
+            not expected_frame
+            or registration_frame != expected_frame
+            or measurement.lidar.frame_id != registration_frame
+            or any(
+                sample.frame_id != registration_frame
+                for sample in measurement.imu_samples
+            )
+        ):
+            self._increment_counter("dropped_pointcloud_count")
+            self._increment_counter("lio_not_ready_count")
+            self._record_error(
+                "lio_not_ready: canonical payload 尚未变换到共享且已配置的 "
+                "registration frame；现有 native raw RPC 不承载 "
+                "calibration/registration 变换"
+            )
+            return None
+        if (
+            measurement.lidar.point_count <= self.max_points_before_downsample
+            or measurement.lidar.point_count <= self.max_points_after_downsample
+        ):
+            return measurement
+        downsampled = self._downsample_canonical_lidar(measurement.lidar)
+        if downsampled is None:
+            self._increment_counter("dropped_pointcloud_count")
+            self._increment_counter("lio_not_ready_count")
+            self._record_error(
+                "lio_not_ready: canonical LiDAR 无法在保留扫描末端语义时有界降采样"
+            )
+            return None
+        self._increment_counter("downsampled_pointcloud_count")
+        return CanonicalLioMeasurement(
+            lidar=downsampled,
+            imu_samples=measurement.imu_samples,
+            scan_begin_timestamp_ns=measurement.scan_begin_timestamp_ns,
+            scan_end_timestamp_ns=measurement.scan_end_timestamp_ns,
+        )
+
+    def _downsample_canonical_lidar(
+        self,
+        lidar: CanonicalLidarFrame,
+    ) -> Optional[CanonicalLidarFrame]:
+        """同步采样 XYZ/intensity/time，并强制保留首尾点与最大时间偏移。"""
+
+        if (
+            lidar.xyz_f32_le is None
+            or lidar.intensity_f32_le is None
+            or lidar.time_offset_ns_le is None
+            or lidar.point_count <= 0
+        ):
+            return None
+        target = min(self.max_points_after_downsample, lidar.point_count)
+        if target <= 0:
+            return None
+        try:
+            xyz = np.frombuffer(lidar.xyz_f32_le, dtype="<f4").reshape((-1, 3))
+            intensity = np.frombuffer(lidar.intensity_f32_le, dtype="<f4")
+            offsets = np.frombuffer(lidar.time_offset_ns_le, dtype="<u8")
+            required = {
+                0,
+                lidar.point_count - 1,
+                int(np.argmax(offsets)),
+            }
+            if len(required) > target:
+                return None
+            selected = set(
+                int(index)
+                for index in np.linspace(
+                    0,
+                    lidar.point_count - 1,
+                    num=target,
+                    dtype=np.int64,
+                )
+            )
+            selected.update(required)
+            for index in sorted(selected - required, reverse=True):
+                if len(selected) <= target:
+                    break
+                selected.remove(index)
+            if len(selected) < target:
+                for index in range(lidar.point_count):
+                    selected.add(index)
+                    if len(selected) == target:
+                        break
+            indices = np.asarray(sorted(selected), dtype=np.int64)
+            values = lidar.model_dump()
+            values.update(
+                point_count=int(indices.size),
+                xyz_f32_le=np.ascontiguousarray(xyz[indices], dtype="<f4").tobytes(),
+                intensity_f32_le=np.ascontiguousarray(
+                    intensity[indices], dtype="<f4"
+                ).tobytes(),
+                time_offset_ns_le=np.ascontiguousarray(
+                    offsets[indices], dtype="<u8"
+                ).tobytes(),
+            )
+            if lidar.ring_u16_le is not None:
+                ring = np.frombuffer(lidar.ring_u16_le, dtype="<u2")
+                values["ring_u16_le"] = np.ascontiguousarray(
+                    ring[indices], dtype="<u2"
+                ).tobytes()
+            return CanonicalLidarFrame(**values)
+        except (TypeError, ValueError):
+            return None
+
+    def _enqueue_ready_lio_measurements(
+        self,
+        measurement: Optional[CanonicalLioMeasurement],
+        generation: int,
+    ) -> bool:
+        """在 condition 内按 FIFO 排空 assembler，并选出唯一发布 owner。"""
+
+        while measurement is not None:
+            prepared = self._prepare_native_lio_measurement(measurement)
+            if prepared is not None:
+                if len(self._lio_publish_queue) >= _MAX_LIO_PUBLISH_QUEUE_SIZE:
+                    self._lio_publish_queue.popleft()
+                    self._increment_counter("dropped_pointcloud_count")
+                    self._record_error(
+                        "native LIO publish FIFO 已满，丢弃最旧 ready measurement"
+                    )
+                self._lio_publish_queue.append((generation, prepared))
+            measurement = self._lio_measurement_assembler.pop_ready()
+        if not self._lio_publish_queue or self._lio_publish_owner_active:
+            return False
+        self._lio_publish_owner_active = True
+        self._lio_publish_owner_thread_id = threading.get_ident()
+        return True
+
+    def _drain_native_lio_measurements(self) -> None:
+        """由单一 owner 在 condition 外顺序执行 native publish RPC。"""
+
+        while True:
+            with self._lio_condition:
+                while self._lio_publish_queue:
+                    generation, measurement = self._lio_publish_queue.popleft()
+                    if self._lio_callback_is_current(generation):
+                        self._lio_in_flight_count += 1
+                        break
+                else:
+                    self._lio_publish_owner_active = False
+                    self._lio_publish_owner_thread_id = None
+                    self._reset_lio_assembler_if_quiescent_locked()
+                    self._lio_condition.notify_all()
+                    return
+            try:
+                self._publish_native_lio_measurement(measurement)
+            except Exception as exc:
+                self._increment_counter("dropped_pointcloud_count")
+                self._record_error(
+                    "publish canonical LIO measurement 未处理异常：%s" % exc
+                )
+            finally:
+                with self._lio_condition:
+                    self._lio_in_flight_count -= 1
+                    self._reset_lio_assembler_if_quiescent_locked()
+                    self._lio_condition.notify_all()
+
+    def _lio_callback_is_current(self, generation: Optional[int]) -> bool:
+        """在 LIO condition 内拒绝 stop/restart 前创建的 callback。"""
+
+        return self._lio_accepting and (
+            generation is None or generation == self._lio_generation
+        )
+
+    def _record_lio_assembler_error(self, error: LioMeasurementAssemblerError) -> None:
+        """记录 LIO 准入拒绝；不把 UNKNOWN 标定伪装成 ready。"""
+
+        self._increment_counter("lio_not_ready_count")
+        self._record_error("%s: %s" % (error.code.value, str(error)))
+
+    def _publish_native_lio_measurement(
+        self, measurement: CanonicalLioMeasurement
+    ) -> None:
+        """仅发布扫描末端已被 IMU 覆盖的 canonical measurement。"""
+
+        publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
+        if not callable(publisher):
+            self._increment_counter("dropped_pointcloud_count")
+            self._record_error("runtime_provider.publish_point_cloud 不存在")
+            return
+        bytes_payload = self._encode_canonical_lidar_bytes(measurement.lidar)
+        if bytes_payload is None:
+            self._increment_counter("dropped_pointcloud_count")
+            self._increment_counter("lio_not_ready_count")
+            self._record_error("lio_not_ready: canonical LiDAR payload 编码失败")
+            return
+        registration_frame = measurement.lidar.registration_frame_id
+        imu_samples = tuple(
+            LioImuSample(
+                timestamp_ns=sample.timestamp_ns,
+                frame_id=registration_frame,
+                accel_mps2=sample.accel_mps2,
+                gyro_rps=sample.gyro_rps,
+            )
+            for sample in measurement.imu_samples
+        )
+        metadata = {
+            "frame_id": registration_frame,
+            "timestamp_ns": measurement.scan_begin_timestamp_ns,
+            "fields": _GO2_L2_FIELDS,
+            "point_count": measurement.lidar.point_count,
+            "is_dense": measurement.lidar.is_dense,
+            "imu_samples": imu_samples,
+        }
+        start = time.monotonic()
+        try:
+            result = publisher(bytes_payload, 20, **metadata)
+        except Exception as exc:
+            self._increment_counter("dropped_pointcloud_count")
+            self._record_error("publish canonical LIO measurement 抛异常：%s" % exc)
+            return
+        if not bool(result):
+            self._increment_counter("dropped_pointcloud_count")
+            self._record_error("publish canonical LIO measurement 返回 False")
+            return
+        self._increment_counter("published_pointcloud_count")
+        self._increment_counter("emitted_lio_measurement_count")
+        self._update_counters(
+            last_publish_latency_ms=(time.monotonic() - start) * 1000.0,
+            last_published_point_count=measurement.lidar.point_count,
+            last_published_point_step=20,
+            last_publish_at_monotonic=time.monotonic(),
+        )
+
+    @staticmethod
+    def _encode_canonical_lidar_bytes(
+        lidar: CanonicalLidarFrame,
+    ) -> Optional[bytes]:
+        """将已通过 canonical 合同校验的 LiDAR bytes 编为 native 点布局。"""
+
+        if (
+            lidar.xyz_f32_le is None
+            or lidar.intensity_f32_le is None
+            or lidar.time_offset_ns_le is None
+        ):
+            return None
+        try:
+            xyz = np.frombuffer(lidar.xyz_f32_le, dtype="<f4").reshape((-1, 3))
+            intensity = np.frombuffer(lidar.intensity_f32_le, dtype="<f4")
+            offsets_u64 = np.frombuffer(lidar.time_offset_ns_le, dtype="<u8")
+            if np.any(offsets_u64 > np.iinfo(np.uint32).max):
+                return None
+            packed = np.empty(
+                lidar.point_count,
+                dtype=np.dtype(
+                    [
+                        ("x", "<f4"),
+                        ("y", "<f4"),
+                        ("z", "<f4"),
+                        ("intensity", "<f4"),
+                        ("offset_ns", "<u4"),
+                    ]
+                ),
+            )
+            packed["x"], packed["y"], packed["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+            packed["intensity"] = intensity
+            packed["offset_ns"] = offsets_u64.astype("<u4")
+            return packed.tobytes()
+        except (TypeError, ValueError):
+            return None
 
     def _downsample_point_cloud(self, point_cloud: PointCloudFrame) -> PointCloudFrame:
         target = self.max_points_after_downsample
@@ -659,28 +1373,7 @@ class RuntimeInputBridge:
         canonical_lidar = metadata.get("canonical_lidar_frame")
         arr = getattr(point_cloud, "points_xyz_array", None)
         if isinstance(canonical_lidar, CanonicalLidarFrame):
-            if (
-                canonical_lidar.xyz_f32_le is None
-                or canonical_lidar.intensity_f32_le is None
-                or canonical_lidar.time_offset_ns_le is None
-            ):
-                return None
-            xyz = np.frombuffer(canonical_lidar.xyz_f32_le, dtype="<f4").reshape((-1, 3))
-            intensity = np.frombuffer(canonical_lidar.intensity_f32_le, dtype="<f4")
-            offsets_u64 = np.frombuffer(canonical_lidar.time_offset_ns_le, dtype="<u8")
-            if np.any(offsets_u64 > np.iinfo(np.uint32).max):
-                return None
-            packed = np.empty(
-                canonical_lidar.point_count,
-                dtype=np.dtype([
-                    ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                    ("intensity", "<f4"), ("offset_ns", "<u4"),
-                ]),
-            )
-            packed["x"], packed["y"], packed["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-            packed["intensity"] = intensity
-            packed["offset_ns"] = offsets_u64.astype("<u4")
-            return packed.tobytes()
+            return RuntimeInputBridge._encode_canonical_lidar_bytes(canonical_lidar)
         if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] >= 3:
             xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
             intensity = metadata.get("intensity_array")
@@ -726,21 +1419,35 @@ class RuntimeInputBridge:
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
-            return {
-                "started": self._started,
-                "ready": self.is_ready(),
-                "runtime_unavailable": self._runtime_unavailable,
-                "missing_localization_provider": self._missing_localization_provider,
-                "missing_point_cloud_provider": self._missing_point_cloud_provider,
-                "localization_subscription_id": self._localization_subscription_id,
-                "point_cloud_subscription_id": self._point_cloud_subscription_id,
-                "counters": self.counters.as_dict(),
-            }
+            started = self._started
+            ready = (
+                self._started
+                and not self._runtime_unavailable
+                and not self._missing_localization_provider
+            )
+            runtime_unavailable = self._runtime_unavailable
+            missing_localization_provider = self._missing_localization_provider
+            missing_point_cloud_provider = self._missing_point_cloud_provider
+            localization_subscription_id = self._localization_subscription_id
+            point_cloud_subscription_id = self._point_cloud_subscription_id
+        with self._counter_lock:
+            counters = self.counters.as_dict()
+        return {
+            "started": started,
+            "ready": ready,
+            "runtime_unavailable": runtime_unavailable,
+            "missing_localization_provider": missing_localization_provider,
+            "missing_point_cloud_provider": missing_point_cloud_provider,
+            "localization_subscription_id": localization_subscription_id,
+            "point_cloud_subscription_id": point_cloud_subscription_id,
+            "counters": counters,
+        }
 
     def _record_error(self, message: str) -> None:
-        with self._lock:
-            self.counters.last_error = message
-            self.counters.last_error_at_monotonic = time.monotonic()
+        self._update_counters(
+            last_error=message,
+            last_error_at_monotonic=time.monotonic(),
+        )
         LOGGER.debug("RuntimeInputBridge: %s", message)
 
 

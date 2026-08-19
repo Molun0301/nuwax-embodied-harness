@@ -38,6 +38,31 @@ if(NOT FASTLIO_DIR)
   set(FASTLIO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fast-lio-non-ros)
 endif()
 
+# flake 输入是锁定的上游源码；不同版本的检出根目录可能变化，不能假定单一布局。
+set(FASTLIO_SOURCE_DIR "")
+foreach(CANDIDATE
+  "${FASTLIO_DIR}"
+  "${FASTLIO_DIR}/pointlio"
+  "${FASTLIO_DIR}/src"
+)
+  if(EXISTS "${CANDIDATE}/src/preprocess.cpp")
+    set(FASTLIO_SOURCE_DIR "${CANDIDATE}")
+    break()
+  endif()
+endforeach()
+if(NOT FASTLIO_SOURCE_DIR)
+  message(FATAL_ERROR
+    "FASTLIO_DIR does not contain src/preprocess.cpp: ${FASTLIO_DIR}. "
+    "Pass -DFASTLIO_DIR to the locked Point-LIO source checkout.")
+endif()
+
+foreach(REQUIRED_SOURCE preprocess.cpp Estimator.cpp parameters.cpp)
+  if(NOT EXISTS "${FASTLIO_SOURCE_DIR}/src/${REQUIRED_SOURCE}")
+    message(FATAL_ERROR
+      "Point-LIO source is missing src/${REQUIRED_SOURCE} under ${FASTLIO_SOURCE_DIR}")
+  endif()
+endforeach()
+
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
   GIT_TAG main
@@ -53,8 +78,35 @@ find_package(Eigen3 REQUIRED)
 # PCL (only components we need — avoid full PCL which drags in VTK via io)
 find_package(PCL 1.8 REQUIRED COMPONENTS common filters)
 
-# glog (iVox map backend — include/ivox/ivox3d.h needs glog)
-find_package(glog REQUIRED)
+# glog 由 Nix 提供，可能暴露 CMake 包，也可能只暴露 pkg-config/库接口。
+# 下面两条路径都必须解析为真实 glog 目标。
+find_package(glog CONFIG QUIET)
+if(TARGET glog::glog)
+  set(NUWAX_GLOG_TARGET glog::glog)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GLOG QUIET IMPORTED_TARGET libglog)
+  if(NOT TARGET PkgConfig::GLOG)
+    pkg_check_modules(GLOG QUIET IMPORTED_TARGET glog)
+  endif()
+  if(TARGET PkgConfig::GLOG)
+    set(NUWAX_GLOG_TARGET PkgConfig::GLOG)
+  else()
+    find_path(GLOG_INCLUDE_DIR NAMES glog/logging.h PATH_SUFFIXES include)
+    find_library(GLOG_LIBRARY NAMES glog)
+    if(GLOG_INCLUDE_DIR AND GLOG_LIBRARY)
+      add_library(nuwax_glog UNKNOWN IMPORTED)
+      set_target_properties(nuwax_glog PROPERTIES
+        IMPORTED_LOCATION "${GLOG_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${GLOG_INCLUDE_DIR}")
+      set(NUWAX_GLOG_TARGET nuwax_glog)
+    else()
+      message(FATAL_ERROR
+        "glog CMake package and pkg-config provider unavailable; "
+        "install the locked Nix glog dependency")
+    endif()
+  endif()
+endif()
 
 find_library(LIVOX_SDK livox_lidar_sdk_shared)
 if(NOT LIVOX_SDK)
@@ -66,9 +118,9 @@ set(LIVOX_SDK_INCLUDE_DIR ${LIVOX_SDK_PREFIX}/include)
 
 add_executable(pointlio_native
   main.cpp
-  ${FASTLIO_DIR}/src/preprocess.cpp
-  ${FASTLIO_DIR}/src/Estimator.cpp
-  ${FASTLIO_DIR}/src/parameters.cpp
+  ${FASTLIO_SOURCE_DIR}/src/preprocess.cpp
+  ${FASTLIO_SOURCE_DIR}/src/Estimator.cpp
+  ${FASTLIO_SOURCE_DIR}/src/parameters.cpp
 )
 
 if(NOT LIVOX_COMMON_DIR)
@@ -76,9 +128,9 @@ if(NOT LIVOX_COMMON_DIR)
 endif()
 
 target_include_directories(pointlio_native PRIVATE
-  ${FASTLIO_DIR}/include
-  ${FASTLIO_DIR}/include/IKFoM/IKFoM_toolkit
-  ${FASTLIO_DIR}/src
+  ${FASTLIO_SOURCE_DIR}/include
+  ${FASTLIO_SOURCE_DIR}/include/IKFoM/IKFoM_toolkit
+  ${FASTLIO_SOURCE_DIR}/src
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
   ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
@@ -92,7 +144,7 @@ target_link_libraries(pointlio_native PRIVATE
   ${LCM_LIBRARIES}
   ${LIVOX_SDK}
   ${PCL_LIBRARIES}
-  glog::glog
+  ${NUWAX_GLOG_TARGET}
 )
 
 if(OpenMP_CXX_FOUND)

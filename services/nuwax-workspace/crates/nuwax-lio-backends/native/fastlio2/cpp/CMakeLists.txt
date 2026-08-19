@@ -39,6 +39,41 @@ if(NOT FASTLIO_DIR)
   set(FASTLIO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fast-lio-non-ros)
 endif()
 
+# flake 输入是锁定的上游源码；不同版本的检出根目录可能变化，不能假定单一布局。
+set(FASTLIO_SOURCE_DIR "")
+foreach(CANDIDATE
+  "${FASTLIO_DIR}"
+  "${FASTLIO_DIR}/fastlio2"
+  "${FASTLIO_DIR}/fast_lio"
+  "${FASTLIO_DIR}/src"
+)
+  if(EXISTS "${CANDIDATE}/src/preprocess.cpp")
+    set(FASTLIO_SOURCE_DIR "${CANDIDATE}")
+    break()
+  endif()
+endforeach()
+if(NOT FASTLIO_SOURCE_DIR)
+  message(FATAL_ERROR
+    "FASTLIO_DIR does not contain src/preprocess.cpp: ${FASTLIO_DIR}. "
+    "Pass -DFASTLIO_DIR to the locked FAST-LIO source checkout.")
+endif()
+
+set(FASTLIO_IKD_TREE_SOURCE "")
+foreach(CANDIDATE
+  "${FASTLIO_SOURCE_DIR}/include/ikd-Tree/ikd_Tree.cpp"
+  "${FASTLIO_SOURCE_DIR}/src/ikd-Tree/ikd_Tree.cpp"
+  "${FASTLIO_SOURCE_DIR}/src/ikd_Tree.cpp"
+)
+  if(EXISTS "${CANDIDATE}")
+    set(FASTLIO_IKD_TREE_SOURCE "${CANDIDATE}")
+    break()
+  endif()
+endforeach()
+if(NOT FASTLIO_IKD_TREE_SOURCE)
+  message(FATAL_ERROR
+    "FAST-LIO source is missing ikd_Tree.cpp under ${FASTLIO_SOURCE_DIR}")
+endif()
+
 # dimos-lcm C++ message headers
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
@@ -68,8 +103,8 @@ set(LIVOX_SDK_INCLUDE_DIR ${LIVOX_SDK_PREFIX}/include)
 
 add_executable(fastlio2_native
   main.cpp
-  ${FASTLIO_DIR}/src/preprocess.cpp
-  ${FASTLIO_DIR}/include/ikd-Tree/ikd_Tree.cpp
+  ${FASTLIO_SOURCE_DIR}/src/preprocess.cpp
+  ${FASTLIO_IKD_TREE_SOURCE}
 )
 
 # Shared Livox common headers (livox_sdk_config.hpp etc.)
@@ -78,8 +113,8 @@ if(NOT LIVOX_COMMON_DIR)
 endif()
 
 target_include_directories(fastlio2_native PRIVATE
-  ${FASTLIO_DIR}/include
-  ${FASTLIO_DIR}/src
+  ${FASTLIO_SOURCE_DIR}/include
+  ${FASTLIO_SOURCE_DIR}/src
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
   ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}

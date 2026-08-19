@@ -78,8 +78,8 @@ find_package(Eigen3 REQUIRED)
 # PCL (only components we need — avoid full PCL which drags in VTK via io)
 find_package(PCL 1.8 REQUIRED COMPONENTS common filters)
 
-# glog 由 Nix 提供，可能暴露 CMake 包，也可能只暴露 pkg-config/库接口。
-# 下面两条路径都必须解析为真实 glog 目标。
+# glog 由 Nix 提供；只接受其 CMake 包或 pkg-config 导入目标，禁止从裸头文件和
+# 任意同名库拼装目标，以免配置阶段接受不匹配的头库组合。
 find_package(glog CONFIG QUIET)
 if(TARGET glog::glog)
   set(NUWAX_GLOG_TARGET glog::glog)
@@ -92,19 +92,9 @@ else()
   if(TARGET PkgConfig::GLOG)
     set(NUWAX_GLOG_TARGET PkgConfig::GLOG)
   else()
-    find_path(GLOG_INCLUDE_DIR NAMES glog/logging.h PATH_SUFFIXES include)
-    find_library(GLOG_LIBRARY NAMES glog)
-    if(GLOG_INCLUDE_DIR AND GLOG_LIBRARY)
-      add_library(nuwax_glog UNKNOWN IMPORTED)
-      set_target_properties(nuwax_glog PROPERTIES
-        IMPORTED_LOCATION "${GLOG_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${GLOG_INCLUDE_DIR}")
-      set(NUWAX_GLOG_TARGET nuwax_glog)
-    else()
-      message(FATAL_ERROR
-        "glog CMake package and pkg-config provider unavailable; "
-        "install the locked Nix glog dependency")
-    endif()
+    message(FATAL_ERROR
+      "glog CMake package and pkg-config provider unavailable; "
+      "install the locked Nix glog dependency")
   endif()
 endif()
 

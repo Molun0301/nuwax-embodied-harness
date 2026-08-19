@@ -66,7 +66,7 @@
     "livox/cpp/flake.nix": "0774cf9424c0a20cf466b9d3c1a4e31150afef4c0916a7baeda038f5d1270fbc",
     "livox/cpp/livox-sdk2-darwin.patch": "5389baf969af55f3b40d64a55a84fbb68d87404e3528398ff68791070820f175",
     "livox/cpp/main.cpp": "267beb7726d2388b42562715635272b7e88a0fddba6aa2657e47f9fc6091d456",
-    "pointlio/cpp/CMakeLists.txt": "c8f502c4743a1b419eb7929dcf6db4fdb0682d320e4d30910556d8c34f02f436",
+    "pointlio/cpp/CMakeLists.txt": "c84099fb8494f4e388d696456187bdff07b01484df8d23d7d1fa4ef4aa80f100",
     "pointlio/cpp/fastlio-resize-darwin.patch": "4f5f8d5ce0ec03216f2dcd7a20ec74528b6f768aa78a0d074d1b3321718ddc90",
     "pointlio/cpp/flake.lock": "deb8de950eef7420e4d16689b4d8f12111086afd7142ce981066cc7a811504b0",
     "pointlio/cpp/flake.nix": "43592054daa81241394de21b3e167264abe3078d8a76c037b6d20aee42689eb9",

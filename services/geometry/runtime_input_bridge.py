@@ -56,6 +56,7 @@ import numpy as np
 
 from contracts.geometry import FrameTree, Pose
 from contracts.pointcloud import PointCloudFrame
+from contracts.sensors import CanonicalImuSample, CanonicalLidarFrame
 from providers.localization import StreamingLocalizationProvider
 from providers.pointcloud import StreamingPointCloudProvider
 
@@ -424,14 +425,21 @@ class RuntimeInputBridge:
                 f"frame_id={raw_frame_id or '<empty>'!r}"
             )
             return
-        is_go2_point_cloud = (
-            point_cloud_metadata.get("source") == "go2_direct_dds_pointcloud"
-        )
+        canonical_lidar = point_cloud_metadata.get("canonical_lidar_frame")
+        has_raw_sensor_payload = isinstance(canonical_lidar, CanonicalLidarFrame)
+        legacy_registered_metadata = point_cloud_metadata.get("source") in {
+            "direct_pointcloud",
+            "go2_direct_dds_pointcloud",
+        }
         native_lio_backend = os.environ.get(
             _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
         ) in {"fastlio2", "pointlio"}
-        if is_go2_point_cloud:
-            source_frame = str(point_cloud_metadata.get("source_frame") or "").strip()
+        if has_raw_sensor_payload or legacy_registered_metadata:
+            source_frame = (
+                canonical_lidar.frame_id
+                if has_raw_sensor_payload
+                else str(point_cloud_metadata.get("source_frame") or "").strip()
+            )
             registered_frame = str(
                 point_cloud_metadata.get("registered_frame") or ""
             ).strip()
@@ -439,18 +447,6 @@ class RuntimeInputBridge:
                 point_cloud_metadata.get("point_cloud_xyz_registered_to_odom") is True
             )
             if native_lio_backend:
-                source_xyz = point_cloud_metadata.get("go2_l2_source_xyz_array")
-                if (
-                    not source_frame
-                    or not isinstance(source_xyz, np.ndarray)
-                    or source_xyz.ndim != 2
-                    or source_xyz.shape[1] < 3
-                ):
-                    self.counters.dropped_pointcloud_count += 1
-                    self._record_error(
-                        "拒绝缺少 Go2 L2 原始传感器帧的 native LIO 点云"
-                    )
-                    return
                 frame_id = source_frame
             else:
                 if not registered_to_odom:
@@ -461,7 +457,7 @@ class RuntimeInputBridge:
                         "需要可靠外参在上游完成 XYZ 注册并显式声明"
                     )
                     return
-                if not source_frame or not registered_frame or frame_id != registered_frame:
+                if not registered_frame or frame_id != registered_frame:
                     self.counters.dropped_pointcloud_count += 1
                     self._record_error(
                         "拒绝 Go2 点云注册断言不一致："
@@ -473,29 +469,19 @@ class RuntimeInputBridge:
 
         imu_samples = []
         if native_lio_backend:
-            raw_imu = point_cloud_metadata.get("go2_l2_imu_sample")
-            if not isinstance(raw_imu, dict):
+            canonical_imu = point_cloud_metadata.get("canonical_imu_sample")
+            if not isinstance(canonical_imu, CanonicalImuSample):
                 self.counters.dropped_pointcloud_count += 1
-                self._record_error("拒绝缺少 Go2 L2 IMU 样本的 native LIO 点云")
+                self._record_error("拒绝缺少 canonical IMU 样本的 native LIO 点云")
                 return
-            try:
-                accel = tuple(float(value) for value in raw_imu["accel_mps2"])
-                gyro = tuple(float(value) for value in raw_imu["gyro_rps"])
-                if len(accel) != 3 or len(gyro) != 3:
-                    raise ValueError("IMU accel/gyro 必须各含 3 个轴")
-                imu_sample = LioImuSample(
-                    timestamp_ns=int(raw_imu["timestamp_ns"]),
-                    frame_id=str(raw_imu["frame_id"]),
-                    accel_mps2=accel,
-                    gyro_rps=gyro,
+            imu_samples.append(
+                LioImuSample(
+                    timestamp_ns=canonical_imu.timestamp_ns,
+                    frame_id=canonical_imu.frame_id,
+                    accel_mps2=canonical_imu.accel_mps2,
+                    gyro_rps=canonical_imu.gyro_rps,
                 )
-                if imu_sample.timestamp_ns < 0 or not imu_sample.frame_id.strip():
-                    raise ValueError("IMU timestamp_ns/frame_id 非法")
-            except (KeyError, TypeError, ValueError) as exc:
-                self.counters.dropped_pointcloud_count += 1
-                self._record_error(f"拒绝非法 Go2 L2 IMU 样本：{exc}")
-                return
-            imu_samples.append(imu_sample)
+            )
 
         publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
         if not callable(publisher):
@@ -591,13 +577,31 @@ class RuntimeInputBridge:
             try:
                 metadata = dict(getattr(point_cloud, "metadata", {}) or {})
                 for key in (
-                    "go2_l2_source_xyz_array",
-                    "go2_l2_intensity_array",
-                    "go2_l2_offset_ns_array",
+                    "source_xyz_array",
+                    "intensity_array",
+                    "offset_ns_array",
                 ):
                     values = metadata.get(key)
                     if isinstance(values, np.ndarray) and values.shape[0] == arr.shape[0]:
                         metadata[key] = np.ascontiguousarray(values[::stride][:target])
+                canonical_lidar = metadata.get("canonical_lidar_frame")
+                if isinstance(canonical_lidar, CanonicalLidarFrame):
+                    sampled_xyz = metadata.get("source_xyz_array")
+                    sampled_intensity = metadata.get("intensity_array")
+                    sampled_offsets = metadata.get("offset_ns_array")
+                    if (
+                        isinstance(sampled_xyz, np.ndarray)
+                        and isinstance(sampled_intensity, np.ndarray)
+                        and isinstance(sampled_offsets, np.ndarray)
+                    ):
+                        metadata["canonical_lidar_frame"] = canonical_lidar.model_copy(
+                            update={
+                                "point_count": int(sampled_xyz.shape[0]),
+                                "xyz_f32_le": np.ascontiguousarray(sampled_xyz, dtype="<f4").tobytes(),
+                                "intensity_f32_le": np.ascontiguousarray(sampled_intensity, dtype="<f4").tobytes(),
+                                "time_offset_ns_le": np.ascontiguousarray(sampled_offsets, dtype="<u8").tobytes(),
+                            }
+                        )
                 metadata.update(
                     {
                         "downsampled": True,
@@ -638,18 +642,8 @@ class RuntimeInputBridge:
 
     @staticmethod
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:
-        arr = getattr(point_cloud, "points_xyz_array", None)
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-        intensity = metadata.get("go2_l2_intensity_array")
-        offset_ns = metadata.get("go2_l2_offset_ns_array")
-        if (
-            isinstance(arr, np.ndarray)
-            and arr.ndim == 2
-            and isinstance(intensity, np.ndarray)
-            and intensity.shape == (arr.shape[0],)
-            and isinstance(offset_ns, np.ndarray)
-            and offset_ns.shape == (arr.shape[0],)
-        ):
+        if isinstance(metadata.get("canonical_lidar_frame"), CanonicalLidarFrame):
             return 20
         return 12
 
@@ -662,18 +656,35 @@ class RuntimeInputBridge:
         ``publish_point_cloud(bytes, point_step)`` 内合并；这里避免重复打包。
         """
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        canonical_lidar = metadata.get("canonical_lidar_frame")
         arr = getattr(point_cloud, "points_xyz_array", None)
-        if os.environ.get(_LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND) in {
-            "fastlio2",
-            "pointlio",
-        }:
-            source_xyz = metadata.get("go2_l2_source_xyz_array")
-            if isinstance(source_xyz, np.ndarray):
-                arr = source_xyz
+        if isinstance(canonical_lidar, CanonicalLidarFrame):
+            if (
+                canonical_lidar.xyz_f32_le is None
+                or canonical_lidar.intensity_f32_le is None
+                or canonical_lidar.time_offset_ns_le is None
+            ):
+                return None
+            xyz = np.frombuffer(canonical_lidar.xyz_f32_le, dtype="<f4").reshape((-1, 3))
+            intensity = np.frombuffer(canonical_lidar.intensity_f32_le, dtype="<f4")
+            offsets_u64 = np.frombuffer(canonical_lidar.time_offset_ns_le, dtype="<u8")
+            if np.any(offsets_u64 > np.iinfo(np.uint32).max):
+                return None
+            packed = np.empty(
+                canonical_lidar.point_count,
+                dtype=np.dtype([
+                    ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                    ("intensity", "<f4"), ("offset_ns", "<u4"),
+                ]),
+            )
+            packed["x"], packed["y"], packed["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+            packed["intensity"] = intensity
+            packed["offset_ns"] = offsets_u64.astype("<u4")
+            return packed.tobytes()
         if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] >= 3:
             xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
-            intensity = metadata.get("go2_l2_intensity_array")
-            offset_ns = metadata.get("go2_l2_offset_ns_array")
+            intensity = metadata.get("intensity_array")
+            offset_ns = metadata.get("offset_ns_array")
             if (
                 isinstance(intensity, np.ndarray)
                 and intensity.shape == (xyz.shape[0],)

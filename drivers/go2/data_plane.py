@@ -21,8 +21,14 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CH
 
 import numpy as np
 
+from adapters.sensors.go2_l2 import (
+    Go2L2DecodeError,
+    adapt_go2_l2_imu,
+    adapt_go2_l2_lidar,
+    decode_go2_l2_pointcloud,
+)
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
-from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
+from contracts.pointcloud import PointCloudFrame, PointField
 from contracts.robot_state import IMUState
 from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 
@@ -33,16 +39,6 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
 LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
 
-
-_POINT_FIELD_DTYPES = {
-    2: (np.dtype("u1"), PointFieldDataType.UINT8),
-    3: (np.dtype("<i2"), PointFieldDataType.INT16),
-    4: (np.dtype("<u2"), PointFieldDataType.UINT16),
-    5: (np.dtype("<i4"), PointFieldDataType.INT32),
-    6: (np.dtype("<u4"), PointFieldDataType.UINT32),
-    7: (np.dtype("<f4"), PointFieldDataType.FLOAT32),
-    8: (np.dtype("<f8"), PointFieldDataType.FLOAT64),
-}
 
 _STATIONARY_YAW_RATE_FILTER_TAU_SEC = 0.5
 _MAX_STATIONARY_YAW_SAMPLE_GAP_SEC = 1.0
@@ -169,22 +165,17 @@ def _transform_utlidar_xyz_to_odom(
 
 def _unitree_wxyz_quaternion_to_contract(values: Sequence[float]) -> Quaternion:
     raw_values = [float(item) for item in list(values or [])[:4]]
-    while len(raw_values) < 4:
-        raw_values.append(0.0)
-    if all(abs(item) < 1e-6 for item in raw_values):
-        return Quaternion(w=1.0)
+    if len(raw_values) != 4:
+        raise ValueError("Unitree quaternion 必须提供完整四元数")
+    if not all(math.isfinite(item) for item in raw_values):
+        raise ValueError("Unitree quaternion 不能包含 NaN/Inf")
 
     w, x, y, z = raw_values
     norm = float(np.sqrt((w * w) + (x * x) + (y * y) + (z * z)))
     if norm <= 1e-12:
-        return Quaternion(w=1.0)
+        raise ValueError("Unitree quaternion 模长不能为零")
     inv_norm = 1.0 / norm
-    return Quaternion(
-        x=x * inv_norm,
-        y=y * inv_norm,
-        z=z * inv_norm,
-        w=w * inv_norm,
-    )
+    return Quaternion(x=x * inv_norm, y=y * inv_norm, z=z * inv_norm, w=w * inv_norm)
 
 
 def _unitree_stamp_to_datetime_ns(stamp: object, label: str) -> Tuple[datetime, int]:
@@ -908,9 +899,10 @@ class Go2DirectDdsBridge:
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)
-        quaternion = _unitree_wxyz_quaternion_to_contract(
-            getattr(imu_state, "quaternion", [1.0, 0.0, 0.0, 0.0]) or [1.0, 0.0, 0.0, 0.0]
-        )
+        quaternion_values = getattr(imu_state, "quaternion", None)
+        if imu_state is None or quaternion_values is None:
+            raise ValueError("Go2 输入缺少实测 quaternion")
+        quaternion = _unitree_wxyz_quaternion_to_contract(quaternion_values)
         position = list(getattr(message, "position", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
         while len(position) < 3:
             position.append(0.0)
@@ -928,15 +920,18 @@ class Go2DirectDdsBridge:
 
     def _build_imu_from_sport_mode_state(self, message: object) -> IMUState:
         imu_state = getattr(message, "imu_state", None)
-        quaternion = _unitree_wxyz_quaternion_to_contract(
-            getattr(imu_state, "quaternion", [1.0, 0.0, 0.0, 0.0]) or [1.0, 0.0, 0.0, 0.0]
-        )
-        gyroscope = list(getattr(imu_state, "gyroscope", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
-        accelerometer = list(getattr(imu_state, "accelerometer", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
-        while len(gyroscope) < 3:
-            gyroscope.append(0.0)
-        while len(accelerometer) < 3:
-            accelerometer.append(0.0)
+        quaternion_values = getattr(imu_state, "quaternion", None)
+        if imu_state is None or quaternion_values is None:
+            raise ValueError("Go2 输入缺少实测 quaternion")
+        quaternion = _unitree_wxyz_quaternion_to_contract(quaternion_values)
+        gyroscope_values = getattr(imu_state, "gyroscope", None)
+        accelerometer_values = getattr(imu_state, "accelerometer", None)
+        if gyroscope_values is None or accelerometer_values is None:
+            raise ValueError("Go2 输入缺少实测 gyroscope/accelerometer")
+        gyroscope = list(gyroscope_values)
+        accelerometer = list(accelerometer_values)
+        if len(gyroscope) != 3 or len(accelerometer) != 3:
+            raise ValueError("Go2 gyroscope/accelerometer 必须各含 3 个轴")
         angular_velocity = [float(value) for value in gyroscope[:3]]
         gyro_deadband_rps = float(self.config.direct_dds.gyro_deadband_rps)
         angular_velocity = [
@@ -1075,143 +1070,29 @@ class Go2DirectDdsBridge:
             return
 
         try:
-            data = bytes(getattr(message, "data", b"") or b"")
-            point_step = int(getattr(message, "point_step", 0) or 0)
-            row_step = int(getattr(message, "row_step", 0) or 0)
-            width = int(getattr(message, "width", 0) or 0)
-            height = int(getattr(message, "height", 0) or 0)
-            fields = list(getattr(message, "fields", None) or [])
-        except (TypeError, ValueError) as exc:
-            reject(f"PointCloud2 基础布局字段非法：{exc}")
+            decoded = decode_go2_l2_pointcloud(message)
+        except Go2L2DecodeError as exc:
+            reject(str(exc))
             return
-        is_bigendian = bool(getattr(message, "is_bigendian", False))
-        is_dense = bool(getattr(message, "is_dense", True))
-
-        if is_bigendian:
-            reject(
-                f"PointCloud2 is_bigendian=True 不被支持，跳过 frame topic={source_topic}"
-            )
-            return
-        if not data:
-            reject("PointCloud2 message.data 为空")
-            return
-        if width <= 0 or height <= 0 or point_step <= 0 or row_step <= 0:
-            reject(
-                "PointCloud2 布局维度必须为正："
-                f"width={width} height={height} point_step={point_step} row_step={row_step}"
-            )
-            return
-        minimum_row_step = width * point_step
-        if row_step < minimum_row_step:
-            reject(
-                f"PointCloud2 row_step 小于 width*point_step：row_step={row_step} minimum={minimum_row_step}"
-            )
-            return
-        expected_data_size = height * row_step
-        if len(data) != expected_data_size:
-            reject(
-                f"PointCloud2 data 长度与 height*row_step 不一致：data={len(data)} expected={expected_data_size}"
-            )
-            return
-
-        coordinate_fields = {}
-        for raw_field in fields:
-            name = str(getattr(raw_field, "name", "") or "").strip().lower()
-            if name not in ("x", "y", "z", "intensity", "offset_ns"):
-                continue
-            if name in coordinate_fields:
-                reject(f"PointCloud2 {name} 字段重复")
-                return
-            try:
-                offset = int(getattr(raw_field, "offset"))
-                datatype = int(getattr(raw_field, "datatype"))
-                count = int(getattr(raw_field, "count"))
-            except (AttributeError, TypeError, ValueError) as exc:
-                reject(f"PointCloud2 {name} 字段布局非法：{exc}")
-                return
-            dtype_spec = _POINT_FIELD_DTYPES.get(datatype)
-            if dtype_spec is None:
-                reject(f"PointCloud2 {name} 字段 datatype={datatype} 不被支持")
-                return
-            if name in ("x", "y", "z") and datatype not in (7, 8):
-                reject(f"PointCloud2 {name} 字段必须为 FLOAT32/FLOAT64，实际 datatype={datatype}")
-                return
-            if name == "offset_ns" and datatype not in (2, 4, 6):
-                reject(f"PointCloud2 offset_ns 字段必须为无符号整数，实际 datatype={datatype}")
-                return
-            if count != 1:
-                reject(f"PointCloud2 {name} 字段 count 必须为 1，实际为 {count}")
-                return
-            numpy_dtype, contract_datatype = dtype_spec
-            field_end = offset + (numpy_dtype.itemsize * count)
-            if offset < 0 or field_end > point_step:
-                reject(
-                    f"PointCloud2 {name} 字段越过 point_step："
-                    f"offset={offset} size={numpy_dtype.itemsize} point_step={point_step}"
-                )
-                return
-            coordinate_fields[name] = {
-                "offset": offset,
-                "datatype": datatype,
-                "count": count,
-                "numpy_dtype": numpy_dtype,
-                "contract_datatype": contract_datatype,
-                "end": field_end,
-            }
-
-        missing_fields = [name for name in ("x", "y", "z") if name not in coordinate_fields]
-        if missing_fields:
-            reject(f"PointCloud2 缺少坐标字段：{','.join(missing_fields)}")
-            return
-        ranges = [(name, int(spec["offset"]), int(spec["end"])) for name, spec in coordinate_fields.items()]
-        for index, (name, start, end) in enumerate(ranges):
-            for other_name, other_start, other_end in ranges[index + 1 :]:
-                if start < other_end and other_start < end:
-                    reject(
-                        f"PointCloud2 坐标字段重叠：{name}[{start}:{end}] 与 {other_name}[{other_start}:{other_end}]"
-                    )
-                    return
-
+        source_frame = decoded.source_frame
+        width = decoded.width
+        height = decoded.height
+        point_step = decoded.point_step
+        row_step = decoded.row_step
+        is_dense = decoded.is_dense
+        coordinate_fields = decoded.fields
+        xyz_array = decoded.xyz_array
+        source_xyz_array = xyz_array.copy()
+        intensity_array = decoded.intensity_array
+        offset_ns_array = decoded.offset_ns_array
         try:
-            xyz_array = np.empty((height * width, 3), dtype=np.float32)
-            for column, name in enumerate(("x", "y", "z")):
-                spec = coordinate_fields[name]
-                values = np.ndarray(
-                    shape=(height, width),
-                    dtype=spec["numpy_dtype"],
-                    buffer=data,
-                    offset=int(spec["offset"]),
-                    strides=(row_step, point_step),
-                )
-                xyz_array[:, column] = np.ravel(values, order="C")
-            xyz_array = np.ascontiguousarray(xyz_array)
-            source_xyz_array = xyz_array.copy()
-            intensity_array = np.zeros(height * width, dtype=np.float32)
-            if "intensity" in coordinate_fields:
-                intensity_spec = coordinate_fields["intensity"]
-                intensity_values = np.ndarray(
-                    shape=(height, width),
-                    dtype=intensity_spec["numpy_dtype"],
-                    buffer=data,
-                    offset=int(intensity_spec["offset"]),
-                    strides=(row_step, point_step),
-                )
-                intensity_array[:] = np.ravel(intensity_values, order="C")
-            offset_ns_array = np.zeros(height * width, dtype=np.uint32)
-            if "offset_ns" in coordinate_fields:
-                offset_spec = coordinate_fields["offset_ns"]
-                offset_values = np.ndarray(
-                    shape=(height, width),
-                    dtype=offset_spec["numpy_dtype"],
-                    buffer=data,
-                    offset=int(offset_spec["offset"]),
-                    strides=(row_step, point_step),
-                )
-                offset_ns_array[:] = np.ravel(offset_values, order="C")
-            intensity_array = np.ascontiguousarray(intensity_array)
-            offset_ns_array = np.ascontiguousarray(offset_ns_array)
-        except (TypeError, ValueError) as exc:
-            reject(f"PointCloud2 ndarray 解析失败：{exc}")
+            canonical_lidar_frame = adapt_go2_l2_lidar(
+                decoded,
+                timestamp_ns=source_timestamp_ns,
+                source_sequence=source_timestamp_ns,
+            )
+        except (Go2L2DecodeError, ValueError) as exc:
+            reject(f"Go2 L2 canonical LiDAR 映射失败：{exc}")
             return
 
         registered_to_odom = False
@@ -1317,7 +1198,7 @@ class Go2DirectDdsBridge:
                 yaw_stabilization_applied = True
                 yaw_stabilization_origin_xy = [origin_x, origin_y]
 
-        go2_l2_imu_sample = None
+        imu_sample = None
         with self._lock:
             if (
                 self._latest_imu_generation == generation
@@ -1325,20 +1206,25 @@ class Go2DirectDdsBridge:
                 and self._latest_imu_source_timestamp_ns is not None
             ):
                 latest_imu = self._latest_imu_state_from_dds
-                go2_l2_imu_sample = {
-                    "timestamp_ns": int(self._latest_imu_source_timestamp_ns),
-                    "frame_id": latest_imu.frame_id,
-                    "accel_mps2": [
-                        float(latest_imu.linear_acceleration_m_s2.x),
-                        float(latest_imu.linear_acceleration_m_s2.y),
-                        float(latest_imu.linear_acceleration_m_s2.z),
-                    ],
-                    "gyro_rps": [
-                        float(latest_imu.angular_velocity_rad_s.x),
-                        float(latest_imu.angular_velocity_rad_s.y),
-                        float(latest_imu.angular_velocity_rad_s.z),
-                    ],
-                }
+                try:
+                    imu_sample = adapt_go2_l2_imu(
+                        timestamp_ns=int(self._latest_imu_source_timestamp_ns),
+                        frame_id=latest_imu.frame_id,
+                        accel_mps2=(
+                            float(latest_imu.linear_acceleration_m_s2.x),
+                            float(latest_imu.linear_acceleration_m_s2.y),
+                            float(latest_imu.linear_acceleration_m_s2.z),
+                        ),
+                        gyro_rps=(
+                            float(latest_imu.angular_velocity_rad_s.x),
+                            float(latest_imu.angular_velocity_rad_s.y),
+                            float(latest_imu.angular_velocity_rad_s.z),
+                        ),
+                        source_sequence=int(self._latest_imu_source_timestamp_ns),
+                    )
+                except ValueError:
+                    LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
+                    imu_sample = None
 
         try:
             point_cloud = PointCloudFrame(
@@ -1379,14 +1265,11 @@ class Go2DirectDdsBridge:
                         for name in ("x", "y", "z", "intensity", "offset_ns")
                         if name in coordinate_fields
                     ],
-                    "go2_l2_source_xyz_array": source_xyz_array,
-                    "go2_l2_intensity_array": intensity_array,
-                    "go2_l2_offset_ns_array": offset_ns_array,
-                    "go2_l2_optional_field_defaults": {
-                        "intensity": "source" if "intensity" in coordinate_fields else "zero",
-                        "offset_ns": "source" if "offset_ns" in coordinate_fields else "zero",
-                    },
-                    "go2_l2_imu_sample": go2_l2_imu_sample,
+                    "source_xyz_array": source_xyz_array,
+                    "intensity_array": intensity_array,
+                    "offset_ns_array": offset_ns_array,
+                    "canonical_lidar_frame": canonical_lidar_frame,
+                    "canonical_imu_sample": imu_sample,
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
                     "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
                     "registration_assertion": registration_assertion,
@@ -1408,7 +1291,7 @@ class Go2DirectDdsBridge:
                     "yaw_stabilization_offset_rad": yaw_stabilization_offset_rad,
                     "yaw_stabilization_origin_xy": yaw_stabilization_origin_xy,
                     "stationary_yaw_locked": stationary_yaw_locked,
-                    "source": "go2_direct_dds_pointcloud",
+                    "source": "direct_pointcloud",
                 },
             )
         except Exception as exc:

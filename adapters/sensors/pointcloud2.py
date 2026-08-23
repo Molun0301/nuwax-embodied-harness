@@ -105,6 +105,39 @@ def _parse_integer(value: object, name: str) -> int:
         raise GenericPointCloud2DecodeError("PointCloud2 %s 非法" % name) from exc
 
 
+def _coerce_data(raw_data: object) -> bytes:
+    """只接受字节缓冲区或明确的 uint8 序列。"""
+
+    if raw_data is None:
+        return b""
+    if isinstance(raw_data, (bool, int, float, complex)):
+        raise GenericPointCloud2DecodeError("PointCloud2 data 必须是字节序列")
+    if isinstance(raw_data, (bytes, bytearray)):
+        return bytes(raw_data)
+    if isinstance(raw_data, memoryview):
+        if raw_data.ndim != 1 or raw_data.format != "B" or raw_data.itemsize != 1:
+            raise GenericPointCloud2DecodeError("PointCloud2 data 必须是 uint8 字节序列")
+        return raw_data.tobytes()
+    if isinstance(raw_data, (list, tuple)):
+        for item in raw_data:
+            if isinstance(item, (bool, np.bool_)) or not isinstance(item, (int, np.integer)):
+                raise GenericPointCloud2DecodeError(
+                    "PointCloud2 data 序列必须只包含 uint8"
+                )
+            if item < 0 or item > 255:
+                raise GenericPointCloud2DecodeError(
+                    "PointCloud2 data 序列必须只包含 uint8"
+                )
+        return bytes(raw_data)
+    try:
+        view = memoryview(raw_data)
+    except TypeError as exc:
+        raise GenericPointCloud2DecodeError("PointCloud2 data 不是字节序列") from exc
+    if view.ndim != 1 or view.format != "B" or view.itemsize != 1:
+        raise GenericPointCloud2DecodeError("PointCloud2 data 必须是 uint8 字节序列")
+    return view.tobytes()
+
+
 def _read_field(raw_field: object, index: int) -> Dict[str, Any]:
     name_value = _member(raw_field, "name", None)
     name = str(name_value or "").strip().lower()
@@ -209,10 +242,7 @@ def decode_generic_pointcloud2(
         )
 
     raw_data = _member(message, "data", None)
-    try:
-        data = bytes(raw_data if raw_data is not None else b"")
-    except (TypeError, ValueError) as exc:
-        raise GenericPointCloud2DecodeError("PointCloud2 data 不是字节序列") from exc
+    data = _coerce_data(raw_data)
     if len(data) > payload_limit:
         raise GenericPointCloud2DecodeError(
             "PointCloud2 payload 超过上限：bytes=%d limit=%d"

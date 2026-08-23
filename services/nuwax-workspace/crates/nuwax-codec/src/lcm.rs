@@ -44,6 +44,8 @@ use thiserror::Error;
 
 use crate::CodecResult;
 
+/// Canonical LiDAR/IMU measurement admission.
+pub mod canonical_measurement;
 /// Versioned LIO ingress envelope codecs.
 pub mod lio;
 /// Versioned native-PGO request, result, and owner-status codecs.

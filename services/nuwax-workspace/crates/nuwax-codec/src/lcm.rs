@@ -54,6 +54,8 @@ pub mod person_follow;
 pub mod person_follow_command;
 /// Codecs generated from the locked DimOS LCM schemas.
 pub mod schema;
+/// Canonical sensor input wire codecs.
+pub mod sensors;
 
 // ============================================================================
 // LCM frame 字节布局常量(本地定义,避免与 nuwax-protocol 形成循环)

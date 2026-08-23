@@ -11,6 +11,7 @@ pub const SENSOR_WIRE_HEADER_BYTES: usize = 12;
 pub const SENSOR_WIRE_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const SENSOR_WIRE_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const SENSOR_WIRE_MAX_STRING_BYTES: usize = 255;
+pub const SENSOR_WIRE_MAX_REF_BYTES: usize = 255;
 pub const SENSOR_WIRE_MAX_LAYOUT_FIELDS: usize = 8;
 
 /// 仅用于文档/配置引用；不表示已经实现 Livox 原始帧解码。
@@ -41,6 +42,7 @@ pub struct SensorIdentity {
     pub frame_id: String,
     pub registration_state: String,
     pub registration_frame_id: String,
+    pub payload_ownership: PayloadOwnership,
     pub calibration_ref: Option<String>,
 }
 
@@ -180,12 +182,14 @@ pub fn decode(bytes: &[u8]) -> CodecResult<SensorFrame> {
             let point_count = reader.u32()?;
             let scan_duration_ns = reader.u64()?;
             let payload = decode_cloud_payload(&mut reader, point_count, scan_duration_ns)?;
-            SensorFrame::Cloud(CanonicalCloudFrame {
+            let cloud = CanonicalCloudFrame {
                 identity,
                 point_count,
                 scan_duration_ns,
                 payload,
-            })
+            };
+            validate_cloud(&cloud)?;
+            SensorFrame::Cloud(cloud)
         }
         KIND_IMU => {
             let identity = decode_identity(&mut reader)?;
@@ -196,11 +200,13 @@ pub fn decode(bytes: &[u8]) -> CodecResult<SensorFrame> {
                     return decode_error("IMU vector contains NaN or infinity");
                 }
             }
-            SensorFrame::Imu(CanonicalImuFrame {
+            let imu = CanonicalImuFrame {
                 identity,
                 accel_mps2: [values[0], values[1], values[2]],
                 gyro_rps: [values[3], values[4], values[5]],
-            })
+            };
+            validate_imu(&imu)?;
+            SensorFrame::Imu(imu)
         }
         _ => return decode_error("unknown sensor wire frame kind"),
     };
@@ -219,6 +225,7 @@ fn encode_identity(writer: &mut Writer, identity: &SensorIdentity) -> CodecResul
     writer.string(&identity.frame_id)?;
     writer.string(&identity.registration_state)?;
     writer.string(&identity.registration_frame_id)?;
+    writer.u8(ownership_code(identity.payload_ownership));
     match &identity.calibration_ref {
         Some(value) => {
             writer.u8(CALIBRATION_PRESENT);
@@ -239,6 +246,7 @@ fn decode_identity(reader: &mut Reader<'_>) -> CodecResult<SensorIdentity> {
         frame_id: reader.string()?,
         registration_state: reader.string()?,
         registration_frame_id: reader.string()?,
+        payload_ownership: ownership_from_code(reader.u8()?)?,
         calibration_ref: match reader.u8()? {
             CALIBRATION_ABSENT => None,
             CALIBRATION_PRESENT => Some(reader.string()?),
@@ -390,6 +398,13 @@ fn validate_cloud(cloud: &CanonicalCloudFrame) -> CodecResult<()> {
     if cloud.point_count == 0 {
         return encode_error("cloud point_count must be positive");
     }
+    let payload_ownership = match &cloud.payload {
+        CloudPayload::Inline { .. } => PayloadOwnership::Inline,
+        CloudPayload::External { ownership, .. } => *ownership,
+    };
+    if cloud.identity.payload_ownership != payload_ownership {
+        return encode_error("cloud identity ownership does not match payload");
+    }
     match &cloud.payload {
         CloudPayload::Inline { .. } => {
             validate_inline_payload(&cloud.payload, cloud.point_count, cloud.scan_duration_ns)
@@ -401,6 +416,9 @@ fn validate_cloud(cloud: &CanonicalCloudFrame) -> CodecResult<()> {
 }
 
 fn validate_imu(imu: &CanonicalImuFrame) -> CodecResult<()> {
+    if imu.identity.payload_ownership != PayloadOwnership::Inline {
+        return encode_error("IMU payload ownership must be inline");
+    }
     if imu
         .accel_mps2
         .iter()
@@ -477,6 +495,7 @@ fn validate_external_payload(
     };
     if !payload_ref.starts_with(prefix)
         || payload_ref.len() == prefix.len()
+        || payload_ref.len() > SENSOR_WIRE_MAX_REF_BYTES
         || payload_ref.chars().any(char::is_whitespace)
     {
         return encode_error("external payload reference does not match ownership");
@@ -560,9 +579,10 @@ fn ownership_code(value: PayloadOwnership) -> u8 {
 }
 fn ownership_from_code(value: u8) -> CodecResult<PayloadOwnership> {
     match value {
+        OWNERSHIP_INLINE => Ok(PayloadOwnership::Inline),
         OWNERSHIP_SHM => Ok(PayloadOwnership::Shm),
         OWNERSHIP_ARTIFACT => Ok(PayloadOwnership::Artifact),
-        _ => decode_error("invalid external ownership"),
+        _ => decode_error("invalid payload ownership"),
     }
 }
 fn encode_error<T>(message: &str) -> CodecResult<T> {
@@ -676,6 +696,7 @@ mod tests {
             frame_id: "go2_base_link".into(),
             registration_state: "body".into(),
             registration_frame_id: "go2_base_link".into(),
+            payload_ownership: PayloadOwnership::Inline,
             calibration_ref: Some("go2-urdf-base-v1".into()),
         }
     }
@@ -724,8 +745,10 @@ mod tests {
     }
     #[test]
     fn external_reference_must_match_ownership_and_lease() {
+        let mut bad_identity = identity();
+        bad_identity.payload_ownership = PayloadOwnership::Shm;
         let bad = SensorFrame::Cloud(CanonicalCloudFrame {
-            identity: identity(),
+            identity: bad_identity,
             point_count: 1,
             scan_duration_ns: 1,
             payload: CloudPayload::External {
@@ -735,6 +758,24 @@ mod tests {
                 payload_size_bytes: 12,
                 lease_epoch: 0,
                 expiry_ns: 1,
+            },
+        });
+        assert!(encode(&bad).is_err());
+    }
+
+    #[test]
+    fn identity_ownership_must_match_cloud_section() {
+        let mut bad_identity = identity();
+        bad_identity.payload_ownership = PayloadOwnership::Artifact;
+        let bad = SensorFrame::Cloud(CanonicalCloudFrame {
+            identity: bad_identity,
+            point_count: 1,
+            scan_duration_ns: 1,
+            payload: CloudPayload::Inline {
+                xyz_f32_le: vec![0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64],
+                intensity_f32_le: None,
+                ring_u16_le: None,
+                time_offset_ns_le: None,
             },
         });
         assert!(encode(&bad).is_err());

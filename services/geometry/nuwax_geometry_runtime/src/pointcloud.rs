@@ -240,6 +240,8 @@ pub(crate) struct CommittedCloudMapSnapshot {
     pub voxel_size: f32,
     pub session_generation: u64,
     pub xyz_f32_le: Vec<u8>,
+    /// Exact SHA-256 identity of the packed XYZ payload.
+    pub xyz_sha256: [u8; 32],
 }
 
 pub(crate) struct CorrelatedCloudMapCommit {
@@ -516,12 +518,15 @@ impl CloudMapShmWriter {
         }
         let start = CM_HEADER_SIZE + active_buf * CM_SINGLE_BUFFER_SIZE;
         let end = start.checked_add(data_size)?;
+        let xyz_f32_le = self.mmap.get(start..end)?.to_vec();
+        let xyz_sha256 = crate::map_checksum::sha256_bytes(&xyz_f32_le);
         Some(CommittedCloudMapSnapshot {
             revision: self.revision,
             point_count,
             voxel_size,
             session_generation: self.session_generation,
-            xyz_f32_le: self.mmap.get(start..end)?.to_vec(),
+            xyz_f32_le,
+            xyz_sha256,
         })
     }
 
@@ -1063,6 +1068,10 @@ mod tests {
         assert_eq!(restored.snapshot.revision, 1);
         assert_eq!(restored.snapshot.point_count, 2);
         assert_eq!(restored.snapshot.voxel_size, VOXEL_SIZE);
+        assert_eq!(
+            restored.snapshot.xyz_sha256,
+            crate::map_checksum::sha256_bytes(&restored.snapshot.xyz_f32_le)
+        );
         assert_eq!(restored.receipt.commit_id, occupancy_receipt.commit_id);
         assert_eq!(restored.receipt.occupancy_revision, 11);
         assert_eq!(restored.receipt.cloud_revision, 1);

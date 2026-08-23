@@ -4521,6 +4521,45 @@ fn encode_native_imu_payload(sample: &LioImuSample) -> CodecResult<Vec<u8>> {
     }))
 }
 
+/// 发布一个 native raw measurement 的 typed 输入对。
+///
+/// LIO child 在收到 cloud callback 时会立即检查 IMU 是否覆盖整个扫描窗口，
+/// 因而必须先发完本次 measurement 的全部 IMU，再发 cloud。LCM 没有跨消息
+/// 事务；中途失败时保留已经成功发布的 IMU 前缀，但绝不提前发布 cloud。
+async fn publish_native_raw_pair(
+    transport: &nuwax_transport::LcmTransport,
+    cloud_binding: &(LcmTopic, LcmMessageType),
+    imu_binding: &(LcmTopic, LcmMessageType),
+    cloud_payload: Vec<u8>,
+    imu_payloads: Vec<Vec<u8>>,
+) -> Result<(), Status> {
+    for (index, imu_payload) in imu_payloads.into_iter().enumerate() {
+        transport
+            .publish(typed_codec::build_typed_frame(
+                imu_binding.0.clone(),
+                imu_binding.1.clone(),
+                imu_payload,
+                0,
+            ))
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "native IMU publish failed at sample {index}: {error}"
+                ))
+            })?;
+    }
+
+    transport
+        .publish(typed_codec::build_typed_frame(
+            cloud_binding.0.clone(),
+            cloud_binding.1.clone(),
+            cloud_payload,
+            0,
+        ))
+        .await
+        .map_err(|error| Status::unavailable(format!("native cloud publish failed: {error}")))
+}
+
 fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> CodecResult<Vec<u8>> {
     if request.frame_id.is_empty() || request.frame_id.trim() != request.frame_id {
         return Err(CodecError::LcmEncode(
@@ -7384,30 +7423,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                 .map_err(|error| {
                     Status::invalid_argument(format!("native raw IMU rejected: {error}"))
                 })?;
-            lcm_transport
-                .publish(typed_codec::build_typed_frame(
-                    cloud_binding.0,
-                    cloud_binding.1,
-                    cloud_payload,
-                    0,
-                ))
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!("native cloud publish failed: {error}"))
-                })?;
-            for imu_payload in imu_payloads {
-                lcm_transport
-                    .publish(typed_codec::build_typed_frame(
-                        imu_binding.0.clone(),
-                        imu_binding.1.clone(),
-                        imu_payload,
-                        0,
-                    ))
-                    .await
-                    .map_err(|error| {
-                        Status::unavailable(format!("native IMU publish failed: {error}"))
-                    })?;
-            }
+            publish_native_raw_pair(
+                &lcm_transport,
+                &cloud_binding,
+                &imu_binding,
+                cloud_payload,
+                imu_payloads,
+            )
+            .await?;
             return Ok(Response::new(PublishResult {
                 success: true,
                 message: format!(
@@ -7723,6 +7746,8 @@ mod occupancy_rpc_tests {
 mod pointcloud_request_tests {
     use super::*;
     use crate::mapping_adapter::MappingReadiness;
+    use nuwax_transport::{TransportError, TransportResult};
+    use std::sync::Mutex as StdMutex;
     use tokio_stream::StreamExt;
 
     fn request() -> PublishPointCloudRequest {
@@ -7758,6 +7783,115 @@ mod pointcloud_request_tests {
             is_dense: true,
             imu_samples: Vec::new(),
         }
+    }
+
+    #[derive(Clone)]
+    struct NativeRawPublishBackend {
+        frames: Arc<StdMutex<Vec<RawLcmFrame>>>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        fail_at: Option<usize>,
+    }
+
+    impl NativeRawPublishBackend {
+        fn new(fail_at: Option<usize>) -> Self {
+            Self {
+                frames: Arc::new(StdMutex::new(Vec::new())),
+                attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_at,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl nuwax_transport::LcmBackend for NativeRawPublishBackend {
+        async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_at == Some(attempt) {
+                return Err(TransportError::LcmBackend(format!(
+                    "injected native raw publish failure at attempt {attempt}"
+                )));
+            }
+            self.frames
+                .lock()
+                .expect("native raw published frames")
+                .push(frame);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _topic: LcmTopic,
+            _msg_type: Option<LcmMessageType>,
+        ) -> nuwax_transport::LcmFrameStream {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn name(&self) -> &str {
+            "native-raw-publish-test"
+        }
+    }
+
+    fn native_raw_bindings() -> ((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType)) {
+        (
+            (
+                LcmTopic::new("/test/native/cloud").expect("cloud topic"),
+                LcmMessageType::new("sensor_msgs.PointCloud2").expect("cloud type"),
+            ),
+            (
+                LcmTopic::new("/test/native/imu").expect("IMU topic"),
+                LcmMessageType::new("sensor_msgs.Imu").expect("IMU type"),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn native_raw_pair_publishes_all_imu_before_cloud() {
+        let backend = NativeRawPublishBackend::new(None);
+        let transport = nuwax_transport::LcmTransport::new(Arc::new(backend.clone()));
+        let (cloud_binding, imu_binding) = native_raw_bindings();
+
+        publish_native_raw_pair(
+            &transport,
+            &cloud_binding,
+            &imu_binding,
+            vec![0xc0, 0xde],
+            vec![vec![0x01], vec![0x02]],
+        )
+        .await
+        .expect("native raw pair should publish");
+
+        let frames = backend.frames.lock().expect("native raw published frames");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].msg_type, imu_binding.1);
+        assert_eq!(frames[1].msg_type, imu_binding.1);
+        assert_eq!(frames[2].msg_type, cloud_binding.1);
+        assert_eq!(frames[2].payload, vec![0xc0, 0xde]);
+    }
+
+    #[tokio::test]
+    async fn native_raw_pair_failure_keeps_cloud_unpublished() {
+        let backend = NativeRawPublishBackend::new(Some(1));
+        let transport = nuwax_transport::LcmTransport::new(Arc::new(backend.clone()));
+        let (cloud_binding, imu_binding) = native_raw_bindings();
+
+        let error = publish_native_raw_pair(
+            &transport,
+            &cloud_binding,
+            &imu_binding,
+            vec![0xc0, 0xde],
+            vec![vec![0x01], vec![0x02]],
+        )
+        .await
+        .expect_err("second IMU publication should fail");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("sample 1"));
+        let frames = backend.frames.lock().expect("native raw published frames");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].msg_type, imu_binding.1);
+        assert_ne!(frames[0].msg_type, cloud_binding.1);
     }
 
     #[test]

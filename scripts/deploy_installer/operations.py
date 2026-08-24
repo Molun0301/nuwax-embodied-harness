@@ -3419,7 +3419,7 @@ def _backup_config(context: "ExecutionContext", path: Path) -> None:
 
 def _secure_config_owner(path: Path) -> None:
     try:
-        gid = grp.getgrnam("nuwax-motion-clients").gr_gid
+        gid = grp.getgrnam("nuwax").gr_gid
     except KeyError:
         return
     if path.is_symlink():
@@ -3629,9 +3629,9 @@ def install_systemd(context: "ExecutionContext") -> None:
     context.runner.run(("bash", str(script), "install"), env=_deployment_env(context), timeout=900)
     context.notes["systemd_unchanged"] = not (_systemd_backup_dir(context) / "sources.changed").is_file()
     try:
-        gid = grp.getgrnam("nuwax-motion-clients").gr_gid
+        gid = grp.getgrnam("nuwax").gr_gid
     except KeyError as exc:
-        raise DeploymentError("systemd install did not create nuwax-motion-clients") from exc
+        raise DeploymentError("systemd install did not create nuwax project group") from exc
     for path in (context.options.config_dir / "nuwax.env", context.options.config_dir / "go2-data-plane.env"):
         if path.exists():
             os.chown(path, 0, gid)

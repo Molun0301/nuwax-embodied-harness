@@ -3,8 +3,6 @@
 //! - `pose_fill.py` → `nuwax-mapping-cli pose-fill`
 //! - `summary.py` → `nuwax-mapping-cli summary`
 //! - `map.py` → `nuwax-mapping-cli map`
-//! - `replay.py` → `nuwax-mapping-cli replay`
-//! - `replay_marker.py` → `nuwax-mapping-cli replay-marker`
 
 use clap::Parser;
 use nuwax_mapping_cli::{run, Cli};

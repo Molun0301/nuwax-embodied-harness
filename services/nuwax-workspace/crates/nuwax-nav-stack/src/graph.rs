@@ -38,11 +38,9 @@ pub enum ModuleKind {
     NativeBridge,
     /// 纯 Rust 算法 crate。
     RustAlgorithm,
-    /// 可视化节点(rerun / foxglove 等,可选,不影响核心规划)。
+    /// 可视化节点(可选,不影响核心规划)。
     Visualizer,
-    /// 录制节点(消费 topic,产出日志或 memory map)。
-    Recorder,
-    /// 目标源(click / agent / patrol / frontier / replay 等)。
+    /// 目标源(click / agent / patrol / frontier 等)。
     GoalSource,
     /// 探索节点(仅当 `explore` Cargo feature 启用)。
     Explorer,

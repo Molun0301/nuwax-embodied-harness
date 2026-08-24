@@ -17,8 +17,6 @@
 //! 本 crate 不持有算法,所以错误只反映编排问题(profile / feature / topic 配置不正确),
 //! 不混入 `NavError`(那是 `nuwax-nav-base` 的领域)。
 
-use std::path::PathBuf;
-
 use thiserror::Error;
 
 /// Stack 操作的统一错误类型。
@@ -36,14 +34,6 @@ pub enum NavStackError {
         /// 缺失的 feature。
         feature: String,
     },
-
-    /// 提供的 path 不存在或无法访问。
-    #[error("path not found: {0}")]
-    PathNotFound(PathBuf),
-
-    /// rosbag / fixture 解析失败。
-    #[error("replay fixture error: {0}")]
-    Replay(String),
 
     /// serde / JSON / 序列化错误。
     #[error("serialization error: {0}")]

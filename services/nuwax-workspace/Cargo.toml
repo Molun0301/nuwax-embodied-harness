@@ -96,7 +96,6 @@ members = [
     # - 视觉伺服：2D bbox + 3D detection navigation（TF trait）
     # - 视觉查询：VLM JSON bbox trait + parser
     # - bbox 中心 → 相机 frame goal
-    # - 导航录制 profile（不持有 recorder 实现）
     "crates/nuwax-nav-basic-path-follower",
     "crates/nuwax-nav-movement-manager",
     "crates/nuwax-nav-click-goal-bridge",
@@ -104,7 +103,6 @@ members = [
     "crates/nuwax-nav-visual-servoing",
     "crates/nuwax-nav-visual-query",
     "crates/nuwax-nav-bbox-tracker",
-    "crates/nuwax-nav-record",
     # ---- Phase 9 MLS Planner(lane-stack-mls)----
     # 纯 Rust 多层表面 3D 路径规划器,迁移自 dimos/navigation/nav_3d/mls_planner/rust/。
     # 脱钩 dimos-module / lcm-msgs / pyo3 / numpy,不再做 Python binding。

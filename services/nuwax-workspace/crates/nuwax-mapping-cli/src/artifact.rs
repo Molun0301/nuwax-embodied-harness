@@ -30,8 +30,6 @@ pub(crate) enum ArtifactFormat {
     DatasetJsonLines,
     #[allow(dead_code)]
     MapPgm,
-    ReplayJson,
-    MarkerReplayJson,
     SummaryJson,
     Memory2Sqlite,
 }
@@ -41,8 +39,6 @@ impl ArtifactFormat {
         match self {
             Self::DatasetJsonLines => "dataset-jsonl",
             Self::MapPgm => "map-pgm",
-            Self::ReplayJson => "replay-json",
-            Self::MarkerReplayJson => "marker-replay-json",
             Self::SummaryJson => "summary-json",
             Self::Memory2Sqlite => "memory2-sqlite",
         }
@@ -52,9 +48,7 @@ impl ArtifactFormat {
         match self {
             Self::DatasetJsonLines => matches!(extension, Some("jsonl" | "ndjson")),
             Self::MapPgm => extension == Some("pgm"),
-            Self::ReplayJson | Self::MarkerReplayJson | Self::SummaryJson => {
-                extension == Some("json")
-            }
+            Self::SummaryJson => extension == Some("json"),
             Self::Memory2Sqlite => extension == Some("db"),
         }
     }
@@ -63,7 +57,7 @@ impl ArtifactFormat {
         match self {
             Self::DatasetJsonLines => ".jsonl or .ndjson",
             Self::MapPgm => ".pgm",
-            Self::ReplayJson | Self::MarkerReplayJson | Self::SummaryJson => ".json",
+            Self::SummaryJson => ".json",
             Self::Memory2Sqlite => ".db",
         }
     }
@@ -71,11 +65,7 @@ impl ArtifactFormat {
     fn sqlite_sidecars(self) -> &'static [&'static str] {
         match self {
             Self::Memory2Sqlite => &SQLITE_SIDECAR_SUFFIXES,
-            Self::DatasetJsonLines
-            | Self::MapPgm
-            | Self::ReplayJson
-            | Self::MarkerReplayJson
-            | Self::SummaryJson => &[],
+            Self::DatasetJsonLines | Self::MapPgm | Self::SummaryJson => &[],
         }
     }
 }
@@ -2489,12 +2479,6 @@ mod tests {
                 "dataset.jsonl",
             ),
             (ArtifactFormat::MapPgm, "map-pgm", "map.pgm"),
-            (ArtifactFormat::ReplayJson, "replay-json", "replay.json"),
-            (
-                ArtifactFormat::MarkerReplayJson,
-                "marker-replay-json",
-                "markers.json",
-            ),
             (ArtifactFormat::SummaryJson, "summary-json", "summary.json"),
             (
                 ArtifactFormat::Memory2Sqlite,
@@ -2716,11 +2700,12 @@ mod tests {
         let output = directory.0.join("artifact.json");
         let exact = dead_stage(&output, ArtifactFormat::SummaryJson);
         let exact_name = exact.file_name().unwrap().to_string_lossy();
-        let other_label_name = dead_stage(&output, ArtifactFormat::ReplayJson)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let other_label_name = format!(
+            "{}-replay-json-{:016x}-{:016x}.tmp.json",
+            stage_prefix(&output, ArtifactFormat::SummaryJson),
+            absent_process_id(),
+            2_u64
+        );
         let absent_process = absent_process_id();
         fs::write(&exact, b"exact stale staging").unwrap();
         let hostile_names = [

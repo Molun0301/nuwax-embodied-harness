@@ -372,9 +372,7 @@ _ZH_NAMES: Dict[str, str] = {
     # 网关与服务
     "NUWAX_GATEWAY_HOST": "网关监听地址",
     "NUWAX_GATEWAY_PORT": "网关端口",
-    "NUWAX_GATEWAY_AGENT_HIGH_RISK_ALLOWLIST": "网关旧能力高风险白名单",
     "NUWAX_GATEWAY_ARTIFACT_DIR": "网关制品目录",
-    "NUWAX_GATEWAY_HIGH_RISK_ALLOWLIST": "网关高风险能力白名单",
     "NUWAX_GATEWAY_PUBLIC_BASE_URL": "网关公开访问地址",
     "NUWAX_GATEWAY_SSE_KEEPALIVE_SEC": "网关 SSE 保活间隔（秒）",
     "NUWAX_GATEWAY_WS_PING_INTERVAL_SEC": "网关 WebSocket 心跳间隔（秒）",
@@ -497,8 +495,6 @@ _ZH_NAMES: Dict[str, str] = {
     "NUWAX_NAV_LOOP_CLOSURE_THRESHOLD": "闭环判据计数阈值",
     "NUWAX_NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC": "闭环判据轮询间隔（秒）",
     "NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED": "启用建图数据库闭环回退",
-    "NUWAX_NAV_PROXY_GRPC_PORT": "导航代理 gRPC 端口",
-    "NUWAX_NAV_PROXY_PENDING_QUEUE_MAX_SIZE": "导航代理 PENDING 队列上限",
     # Phase 6:新增 nav profile / explore arbitration / real-lcm 硬约束。
     # 三者均对接 nuwax-geometry-runtime（Rust）装配面。
     "NUWAX_NAV_PROFILE": "导航 profile（simple-2d / replanning-astar；默认 simple-2d）",

@@ -11,7 +11,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 import uuid
 
 from .constants import EPOCH_SCHEMA_VERSION, MAX_GENERATION, PROVISION_SCHEMA_VERSION
@@ -26,7 +26,22 @@ class SingleInstanceError(EpochError):
 
 
 PROVISION_FIELDS = ("instance_id", "schema_version")
+# Schema v4 is the first single-user durable format. Legacy field tuples are
+# retained only to verify and migrate existing v1-v3 checksummed records.
 EPOCH_FIELDS = (
+    "schema_version",
+    "generation",
+    "boot_nonce_hex",
+    "lease_state",
+    "last_zero_ack_id",
+    "actuator_symbols_sha256",
+    "fenced",
+    "startup_zero_confirmed",
+    "recovery_fence_token_hex",
+    "recovery_fence_correlation_sha256",
+    "created_at",
+)
+V3_EPOCH_FIELDS = (
     "schema_version",
     "generation",
     "boot_nonce_hex",
@@ -42,7 +57,7 @@ EPOCH_FIELDS = (
 )
 V2_EPOCH_FIELDS = tuple(
     field
-    for field in EPOCH_FIELDS
+    for field in V3_EPOCH_FIELDS
     if field
     not in {"recovery_fence_token_hex", "recovery_fence_correlation_sha256"}
 )
@@ -59,31 +74,14 @@ V1_EPOCH_FIELDS = (
     "fenced",
     "created_at",
 )
-EXPECTED_USERS = (
-    "nuwax-motion-guard",
-    "nuwax-navigation",
-    "nuwax-geometry",
-    "nuwax-gateway",
-)
-V2_EXPECTED_USERS = (
-    "nuwax-motion-guard",
-    "nuwax-navigation",
-    "nuwax-gateway",
-)
-V1_EXPECTED_USER_SETS = (
-    (
-        "nuwax-motion-guard",
-        "nuwax-motion-admin",
-        "nuwax-navigation",
-        "nuwax-gateway",
-    ),
-    (
-        "nuwax-motion-guard",
-        "nuwax-motion-admin",
-        "nuwax-geometry",
-        "nuwax-gateway",
-    ),
-)
+
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    document: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate JSON key: {key}")
+        document[key] = value
+    return document
 
 
 def _canonical_bytes(document: Mapping[str, Any], fields: Tuple[str, ...]) -> bytes:
@@ -115,6 +113,44 @@ def _verify_checksum(
         raise EpochError(f"{label} checksum mismatch")
 
 
+def _field(document: Mapping[str, Any], name: str, label: str) -> Any:
+    try:
+        return document[name]
+    except KeyError as exc:
+        raise EpochError(f"{label} record is missing field {name}") from exc
+
+
+def _strict_int(value: Any, name: str, label: str) -> int:
+    if type(value) is not int:
+        raise EpochError(f"{label} field {name} must be a JSON integer")
+    return value
+
+
+def _strict_bool(value: Any, name: str, label: str) -> bool:
+    if type(value) is not bool:
+        raise EpochError(f"{label} field {name} must be a JSON boolean")
+    return value
+
+
+def _strict_str(value: Any, name: str, label: str) -> str:
+    if type(value) is not str:
+        raise EpochError(f"{label} field {name} must be a JSON string")
+    return value
+
+
+def _strict_list(value: Any, name: str, label: str) -> list:
+    if type(value) is not list:
+        raise EpochError(f"{label} field {name} must be a JSON array")
+    return value
+
+
+def _strict_string_list(value: Any, name: str, label: str) -> list:
+    values = _strict_list(value, name, label)
+    if any(type(item) is not str for item in values):
+        raise EpochError(f"{label} field {name} must contain only JSON strings")
+    return values
+
+
 @dataclass(frozen=True)
 class ProvisionRecord:
     instance_id: str
@@ -139,14 +175,24 @@ class ProvisionRecord:
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "ProvisionRecord":
         _verify_checksum(document, fields=PROVISION_FIELDS, label="provision")
-        try:
-            record = cls(
-                schema_version=int(document["schema_version"]),
-                instance_id=str(document["instance_id"]),
-                checksum=str(document["checksum"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise EpochError("invalid provision record") from exc
+        schema_version = _strict_int(
+            _field(document, "schema_version", "provision"),
+            "schema_version",
+            "provision",
+        )
+        instance_id = _strict_str(
+            _field(document, "instance_id", "provision"),
+            "instance_id",
+            "provision",
+        )
+        checksum = _strict_str(
+            _field(document, "checksum", "provision"), "checksum", "provision"
+        )
+        record = cls(
+            schema_version=schema_version,
+            instance_id=instance_id,
+            checksum=checksum,
+        )
         if record.schema_version != PROVISION_SCHEMA_VERSION:
             raise EpochError("unsupported provision schema_version")
         try:
@@ -172,7 +218,6 @@ class EpochRecord:
     boot_nonce_hex: str
     lease_state: str
     last_zero_ack_id: str
-    peer_uid_allowlist: Tuple[str, ...]
     actuator_symbols_sha256: str
     fenced: bool
     startup_zero_confirmed: bool
@@ -195,7 +240,6 @@ class EpochRecord:
             "boot_nonce_hex": "",
             "lease_state": "Idle",
             "last_zero_ack_id": "",
-            "peer_uid_allowlist": EXPECTED_USERS,
             "actuator_symbols_sha256": actuator_symbols_sha256,
             "fenced": True,
             "startup_zero_confirmed": False,
@@ -214,74 +258,134 @@ class EpochRecord:
         allow_empty_nonce: bool = True,
     ) -> "EpochRecord":
         _verify_checksum(document, fields=EPOCH_FIELDS, label="epoch")
-        try:
-            raw = {
-                "schema_version": int(document["schema_version"]),
-                "generation": int(document["generation"]),
-                "boot_nonce_hex": str(document["boot_nonce_hex"]),
-                "lease_state": str(document["lease_state"]),
-                "last_zero_ack_id": str(document["last_zero_ack_id"]),
-                "peer_uid_allowlist": tuple(document["peer_uid_allowlist"]),
-                "actuator_symbols_sha256": str(document["actuator_symbols_sha256"]),
-                "fenced": bool(document["fenced"]),
-                "startup_zero_confirmed": document["startup_zero_confirmed"],
-                "recovery_fence_token_hex": str(
-                    document["recovery_fence_token_hex"]
-                ),
-                "recovery_fence_correlation_sha256": str(
-                    document["recovery_fence_correlation_sha256"]
-                ),
-                "created_at": str(document["created_at"]),
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            raise EpochError("invalid epoch record") from exc
+        raw = {
+            "schema_version": _strict_int(
+                _field(document, "schema_version", "epoch"),
+                "schema_version",
+                "epoch",
+            ),
+            "generation": _strict_int(
+                _field(document, "generation", "epoch"), "generation", "epoch"
+            ),
+            "boot_nonce_hex": _strict_str(
+                _field(document, "boot_nonce_hex", "epoch"),
+                "boot_nonce_hex",
+                "epoch",
+            ),
+            "lease_state": _strict_str(
+                _field(document, "lease_state", "epoch"), "lease_state", "epoch"
+            ),
+            "last_zero_ack_id": _strict_str(
+                _field(document, "last_zero_ack_id", "epoch"),
+                "last_zero_ack_id",
+                "epoch",
+            ),
+            "actuator_symbols_sha256": _strict_str(
+                _field(document, "actuator_symbols_sha256", "epoch"),
+                "actuator_symbols_sha256",
+                "epoch",
+            ),
+            "fenced": _strict_bool(
+                _field(document, "fenced", "epoch"), "fenced", "epoch"
+            ),
+            "startup_zero_confirmed": _strict_bool(
+                _field(document, "startup_zero_confirmed", "epoch"),
+                "startup_zero_confirmed",
+                "epoch",
+            ),
+            "recovery_fence_token_hex": _strict_str(
+                _field(document, "recovery_fence_token_hex", "epoch"),
+                "recovery_fence_token_hex",
+                "epoch",
+            ),
+            "recovery_fence_correlation_sha256": _strict_str(
+                _field(document, "recovery_fence_correlation_sha256", "epoch"),
+                "recovery_fence_correlation_sha256",
+                "epoch",
+            ),
+            "created_at": _strict_str(
+                _field(document, "created_at", "epoch"), "created_at", "epoch"
+            ),
+        }
+        if raw["schema_version"] != EPOCH_SCHEMA_VERSION:
+            raise EpochError("unsupported epoch schema_version")
         cls._validate_fields(raw, allow_empty_nonce=allow_empty_nonce)
-        return cls(checksum=str(document["checksum"]), **raw)
+        return cls(checksum=document["checksum"], **raw)
 
     @classmethod
     def from_v1_document(cls, document: Mapping[str, Any]) -> "EpochRecord":
         _verify_checksum(document, fields=V1_EPOCH_FIELDS, label="epoch v1")
-        try:
-            users = tuple(document["peer_uid_allowlist"])
-            if users not in V1_EXPECTED_USER_SETS:
-                raise EpochError("epoch v1 peer_uid_allowlist drift")
-            raw = {
-                "schema_version": EPOCH_SCHEMA_VERSION,
-                "generation": int(document["generation"]),
-                "boot_nonce_hex": str(document["boot_nonce_hex"]),
-                "lease_state": str(document["lease_state"]),
-                "last_zero_ack_id": str(document["last_zero_ack_id"]),
-                "peer_uid_allowlist": EXPECTED_USERS,
-                "actuator_symbols_sha256": str(
-                    document["actuator_symbols_sha256"]
-                ),
-                "fenced": bool(document["fenced"]),
-                "startup_zero_confirmed": False,
-                "recovery_fence_token_hex": "",
-                "recovery_fence_correlation_sha256": "",
-                "created_at": str(document["created_at"]),
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            raise EpochError("invalid epoch v1 record") from exc
+        label = "epoch v1"
+        schema_version = _strict_int(_field(document, "schema_version", label), "schema_version", label)
+        if schema_version != 1:
+            raise EpochError("epoch v1 schema_version is invalid")
+        _strict_string_list(_field(document, "peer_uid_allowlist", label), "peer_uid_allowlist", label)
+        raw = {
+            "schema_version": EPOCH_SCHEMA_VERSION,
+            "generation": _strict_int(_field(document, "generation", label), "generation", label),
+            "boot_nonce_hex": _strict_str(_field(document, "boot_nonce_hex", label), "boot_nonce_hex", label),
+            "lease_state": _strict_str(_field(document, "lease_state", label), "lease_state", label),
+            "last_zero_ack_id": _strict_str(_field(document, "last_zero_ack_id", label), "last_zero_ack_id", label),
+            "actuator_symbols_sha256": _strict_str(_field(document, "actuator_symbols_sha256", label), "actuator_symbols_sha256", label),
+            "fenced": _strict_bool(_field(document, "fenced", label), "fenced", label),
+            "startup_zero_confirmed": False,
+            "recovery_fence_token_hex": "",
+            "recovery_fence_correlation_sha256": "",
+            "created_at": _strict_str(_field(document, "created_at", label), "created_at", label),
+        }
+        _strict_int(_field(document, "reset_generation", label), "reset_generation", label)
         cls._validate_fields(raw, allow_empty_nonce=True)
         return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
 
     @classmethod
     def from_v2_document(cls, document: Mapping[str, Any]) -> "EpochRecord":
         _verify_checksum(document, fields=V2_EPOCH_FIELDS, label="epoch v2")
-        if tuple(document.get("peer_uid_allowlist", ())) != V2_EXPECTED_USERS:
-            raise EpochError("epoch v2 peer_uid_allowlist drift")
+        label = "epoch v2"
+        schema_version = _strict_int(_field(document, "schema_version", label), "schema_version", label)
+        if schema_version != 2:
+            raise EpochError("epoch v2 schema_version is invalid")
+        _strict_string_list(_field(document, "peer_uid_allowlist", label), "peer_uid_allowlist", label)
         raw = {
-            field: document[field]
-            for field in V2_EPOCH_FIELDS
-            if field != "schema_version"
+            "schema_version": EPOCH_SCHEMA_VERSION,
+            "generation": _strict_int(_field(document, "generation", label), "generation", label),
+            "boot_nonce_hex": _strict_str(_field(document, "boot_nonce_hex", label), "boot_nonce_hex", label),
+            "lease_state": _strict_str(_field(document, "lease_state", label), "lease_state", label),
+            "last_zero_ack_id": _strict_str(_field(document, "last_zero_ack_id", label), "last_zero_ack_id", label),
+            "actuator_symbols_sha256": _strict_str(_field(document, "actuator_symbols_sha256", label), "actuator_symbols_sha256", label),
+            "fenced": _strict_bool(_field(document, "fenced", label), "fenced", label),
+            "startup_zero_confirmed": _strict_bool(_field(document, "startup_zero_confirmed", label), "startup_zero_confirmed", label),
+            "recovery_fence_token_hex": "",
+            "recovery_fence_correlation_sha256": "",
+            "created_at": _strict_str(_field(document, "created_at", label), "created_at", label),
         }
-        raw.update(
-            schema_version=EPOCH_SCHEMA_VERSION,
-            peer_uid_allowlist=EXPECTED_USERS,
-            recovery_fence_token_hex="",
-            recovery_fence_correlation_sha256="",
-        )
+        cls._validate_fields(raw, allow_empty_nonce=True)
+        return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
+
+    @classmethod
+    def from_v3_document(cls, document: Mapping[str, Any]) -> "EpochRecord":
+        _verify_checksum(document, fields=V3_EPOCH_FIELDS, label="epoch v3")
+        label = "epoch v3"
+        schema_version = _strict_int(_field(document, "schema_version", label), "schema_version", label)
+        if schema_version != 3:
+            raise EpochError("epoch v3 schema_version is invalid")
+        _strict_string_list(_field(document, "peer_uid_allowlist", label), "peer_uid_allowlist", label)
+        raw = {
+            "schema_version": EPOCH_SCHEMA_VERSION,
+            "generation": _strict_int(_field(document, "generation", label), "generation", label),
+            "boot_nonce_hex": _strict_str(_field(document, "boot_nonce_hex", label), "boot_nonce_hex", label),
+            "lease_state": _strict_str(_field(document, "lease_state", label), "lease_state", label),
+            "last_zero_ack_id": _strict_str(_field(document, "last_zero_ack_id", label), "last_zero_ack_id", label),
+            "actuator_symbols_sha256": _strict_str(_field(document, "actuator_symbols_sha256", label), "actuator_symbols_sha256", label),
+            "fenced": _strict_bool(_field(document, "fenced", label), "fenced", label),
+            "startup_zero_confirmed": _strict_bool(_field(document, "startup_zero_confirmed", label), "startup_zero_confirmed", label),
+            "recovery_fence_token_hex": _strict_str(_field(document, "recovery_fence_token_hex", label), "recovery_fence_token_hex", label),
+            "recovery_fence_correlation_sha256": _strict_str(
+                _field(document, "recovery_fence_correlation_sha256", label),
+                "recovery_fence_correlation_sha256",
+                label,
+            ),
+            "created_at": _strict_str(_field(document, "created_at", label), "created_at", label),
+        }
         cls._validate_fields(raw, allow_empty_nonce=True)
         return cls(checksum=_checksum(raw, EPOCH_FIELDS), **raw)
 
@@ -291,12 +395,14 @@ class EpochRecord:
         *,
         allow_empty_nonce: bool,
     ) -> None:
-        if raw["schema_version"] != EPOCH_SCHEMA_VERSION:
+        if type(raw["schema_version"]) is not int or raw["schema_version"] != EPOCH_SCHEMA_VERSION:
             raise EpochError("unsupported epoch schema_version")
-        generation = int(raw["generation"])
-        if generation < 0 or generation > MAX_GENERATION:
+        generation = raw["generation"]
+        if type(generation) is not int or generation < 0 or generation > MAX_GENERATION:
             raise EpochError("generation is outside u64 range")
-        nonce = str(raw["boot_nonce_hex"])
+        nonce = raw["boot_nonce_hex"]
+        if type(nonce) is not str:
+            raise EpochError("boot_nonce_hex must be a JSON string")
         if nonce or not allow_empty_nonce:
             try:
                 nonce_bytes = bytes.fromhex(nonce)
@@ -304,22 +410,21 @@ class EpochRecord:
                 raise EpochError("boot_nonce_hex is not valid hexadecimal") from exc
             if len(nonce_bytes) != 16:
                 raise EpochError("boot_nonce_hex must be exactly 128 bits")
-        if raw["lease_state"] not in {"Idle", "Active", "Pausing", "Revoking"}:
+        if type(raw["lease_state"]) is not str or raw["lease_state"] not in {"Idle", "Active", "Pausing", "Revoking"}:
             raise EpochError("invalid lease_state")
-        peer_uid_allowlist = tuple(raw["peer_uid_allowlist"])
-        if peer_uid_allowlist != EXPECTED_USERS:
-            raise EpochError("peer_uid_allowlist drift")
-        digest = str(raw["actuator_symbols_sha256"])
-        if not digest.startswith("sha256:") or len(digest) != 71:
+        digest = raw["actuator_symbols_sha256"]
+        if type(digest) is not str or not digest.startswith("sha256:") or len(digest) != 71:
             raise EpochError("actuator_symbols_sha256 is invalid")
         if any(character not in "0123456789abcdef" for character in digest[7:]):
             raise EpochError("actuator_symbols_sha256 is invalid")
-        if not isinstance(raw["fenced"], bool):
+        if type(raw["fenced"]) is not bool:
             raise EpochError("fenced must be a boolean")
-        if not isinstance(raw["startup_zero_confirmed"], bool):
+        if type(raw["startup_zero_confirmed"]) is not bool:
             raise EpochError("startup_zero_confirmed must be a boolean")
-        token_hex = str(raw["recovery_fence_token_hex"])
-        correlation_sha256 = str(raw["recovery_fence_correlation_sha256"])
+        token_hex = raw["recovery_fence_token_hex"]
+        correlation_sha256 = raw["recovery_fence_correlation_sha256"]
+        if type(token_hex) is not str or type(correlation_sha256) is not str:
+            raise EpochError("recovery fence fields must be JSON strings")
         if bool(token_hex) != bool(correlation_sha256):
             raise EpochError("recovery fence token and correlation must be paired")
         if token_hex:
@@ -334,7 +439,7 @@ class EpochRecord:
                 for character in correlation_sha256
             ):
                 raise EpochError("recovery_fence_correlation_sha256 is invalid")
-        if not str(raw["created_at"]):
+        if type(raw["created_at"]) is not str or not raw["created_at"]:
             raise EpochError("created_at is required")
 
     def with_updates(self, **updates: Any) -> "EpochRecord":
@@ -354,7 +459,6 @@ class EpochRecord:
             "boot_nonce_hex": self.boot_nonce_hex,
             "lease_state": self.lease_state,
             "last_zero_ack_id": self.last_zero_ack_id,
-            "peer_uid_allowlist": list(self.peer_uid_allowlist),
             "actuator_symbols_sha256": self.actuator_symbols_sha256,
             "fenced": self.fenced,
             "startup_zero_confirmed": self.startup_zero_confirmed,
@@ -423,14 +527,14 @@ class EpochStore:
             stream = os.fdopen(fd, "r", encoding="ascii", closefd=True)
             fd = -1
             with stream:
-                document = json.load(stream)
+                document = json.load(stream, object_pairs_hook=_reject_duplicate_keys)
         except FileNotFoundError as exc:
             raise EpochError(f"{label} record is missing: {path}") from exc
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                 raise EpochError(f"{label} record must be a non-symlink regular file") from exc
             raise EpochError(f"cannot read {label} record") from exc
-        except (UnicodeError, json.JSONDecodeError) as exc:
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise EpochError(f"invalid {label} JSON") from exc
         finally:
             if fd >= 0:
@@ -454,12 +558,12 @@ class EpochStore:
             label="epoch",
         )
         schema_version = document.get("schema_version")
-        if schema_version in {1, 2}:
-            migrated = (
-                EpochRecord.from_v1_document(document)
-                if schema_version == 1
-                else EpochRecord.from_v2_document(document)
-            )
+        if schema_version in {1, 2, 3}:
+            migrated = {
+                1: EpochRecord.from_v1_document,
+                2: EpochRecord.from_v2_document,
+                3: EpochRecord.from_v3_document,
+            }[schema_version](document)
             backup_path = self.epoch_path.with_name(
                 self.epoch_path.name + f".v{schema_version}.bak"
             )

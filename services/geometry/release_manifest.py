@@ -14,17 +14,59 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 _SCHEMA_VERSION = "nuwax.geometry.release.v1"
 _REQUIRED_SINGLETON_ROLES = {
     "geometry_runtime",
-    "native_pgo_payload",
-    "group_guardian",
-    "offline_mapping_cli",
     "build_input_closure",
 }
+_OPTIONAL_STANDALONE_ROLES = {"offline_mapping_cli"}
 _NATIVE_LIO_ROLE_PREFIX = "native_lio_payload:"
+_SUPPORTED_LIO_BACKENDS = {"device", "fastlio2", "pointlio"}
+_SUPPORTED_MAPPING_BACKENDS = {"voxel", "raytracing"}
+_SUPPORTED_CORRECTION_BACKENDS = {
+    "none",
+    "library_pgo",
+    "native_pgo",
+    "relocalization",
+}
 _HEX_DIGEST_LENGTH = 64
 _VERIFIED_PGO_ENV = "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE"
 _VERIFIED_GUARDIAN_ENV = "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE"
 _NATIVE_LIO_ENV = "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE"
 _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
+_MAPPING_BACKEND_ENV = "NUWAX_GEOMETRY_MAPPING_BACKEND"
+_CORRECTION_BACKEND_ENV = "NUWAX_GEOMETRY_CORRECTION_BACKEND"
+
+
+def _selected_backend(environment: Mapping[str, str], name: str, default: str) -> str:
+    value = environment.get(name, default)
+    if not isinstance(value, str):
+        raise ReleaseManifestError("Geometry backend 配置必须是字符串: %s" % name)
+    value = value.strip()
+    supported = {
+        _LIO_BACKEND_ENV: _SUPPORTED_LIO_BACKENDS,
+        _MAPPING_BACKEND_ENV: _SUPPORTED_MAPPING_BACKENDS,
+        _CORRECTION_BACKEND_ENV: _SUPPORTED_CORRECTION_BACKENDS,
+    }[name]
+    if value not in supported:
+        raise ReleaseManifestError("Geometry backend 不受支持: %s=%s" % (name, value))
+    return value
+
+
+def _selected_backends(environment: Optional[Mapping[str, str]] = None) -> Tuple[str, str, str]:
+    values = environment if environment is not None else os.environ
+    return (
+        _selected_backend(values, _LIO_BACKEND_ENV, "device"),
+        _selected_backend(values, _MAPPING_BACKEND_ENV, "voxel"),
+        _selected_backend(values, _CORRECTION_BACKEND_ENV, "none"),
+    )
+
+
+def _selected_artifact_roles(environment: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+    lio, _mapping, correction = _selected_backends(environment)
+    roles = []
+    if lio != "device":
+        roles.append(_NATIVE_LIO_ROLE_PREFIX + lio)
+    if correction == "native_pgo":
+        roles.extend(("native_pgo_payload", "group_guardian"))
+    return tuple(sorted(roles))
 
 
 class ReleaseManifestError(RuntimeError):
@@ -252,8 +294,9 @@ def verify_release_manifest(
     *,
     expected_runtime: Optional[Path] = None,
     retain_artifact_fds: bool = False,
+    require_selected_artifacts: bool = False,
 ) -> ReleaseProof:
-    """验证完整 artifact set；受控执行时保留同一已验证文件实例。"""
+    """验证 release artifact set；可选地执行当前 Geometry profile 准入。"""
 
     resolved_manifest, manifest_bytes, payload = _load_canonical_manifest(
         Path(manifest_path) if manifest_path is not None else default_release_manifest_path()
@@ -265,14 +308,32 @@ def verify_release_manifest(
     generation = str(payload.get("generation") or "")
     if not _is_hex_digest(generation):
         raise ReleaseManifestError("release generation 必须是 64 位小写十六进制摘要")
+    configured_artifact_roles = set(_selected_artifact_roles())
+    selected_artifact_roles = configured_artifact_roles if require_selected_artifacts else set()
+    expected_lio_names = tuple(
+        sorted(
+            role[len(_NATIVE_LIO_ROLE_PREFIX):]
+            for role in selected_artifact_roles
+            if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
+        )
+    )
     raw_lio_roles = payload.get("native_lio_roles")
     if (
         not isinstance(raw_lio_roles, list)
-        or not raw_lio_roles
-        or any(not isinstance(role, str) or not role for role in raw_lio_roles)
+        or any(
+            not isinstance(role, str)
+            or role not in _SUPPORTED_LIO_BACKENDS - {"device"}
+            for role in raw_lio_roles
+        )
         or raw_lio_roles != sorted(set(raw_lio_roles))
+        or (
+            require_selected_artifacts
+            and tuple(raw_lio_roles) != expected_lio_names
+        )
     ):
-        raise ReleaseManifestError("release manifest native_lio_roles 必须是非空有序精确集合")
+        raise ReleaseManifestError(
+            "release manifest native_lio_roles 与当前选中 LIO profile 不一致"
+        )
     expected_lio_roles = tuple(_NATIVE_LIO_ROLE_PREFIX + role for role in raw_lio_roles)
     raw_artifacts = payload.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
@@ -352,9 +413,51 @@ def verify_release_manifest(
             raise ReleaseManifestError(
                 "release manifest 缺少固定角色: %s" % ",".join(sorted(missing_roles))
             )
-        actual_lio_roles = tuple(sorted(role for role in seen_roles if role.startswith(_NATIVE_LIO_ROLE_PREFIX)))
-        if actual_lio_roles != expected_lio_roles:
-            raise ReleaseManifestError("release manifest native LIO artifact 集合与生成合同不精确一致")
+        allowed_roles = (
+            _REQUIRED_SINGLETON_ROLES
+            | _OPTIONAL_STANDALONE_ROLES
+            | {"native_pgo_payload", "group_guardian"}
+            | {
+                role
+                for role in seen_roles
+                if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
+            }
+        )
+        unexpected_roles = seen_roles - allowed_roles
+        if unexpected_roles:
+            raise ReleaseManifestError(
+                "release manifest 含未声明 artifact role: %s"
+                % ",".join(sorted(unexpected_roles))
+            )
+        actual_lio_roles = tuple(
+            sorted(role for role in seen_roles if role.startswith(_NATIVE_LIO_ROLE_PREFIX))
+        )
+        if actual_lio_roles != tuple(
+            sorted(_NATIVE_LIO_ROLE_PREFIX + role for role in raw_lio_roles)
+        ):
+            raise ReleaseManifestError("release manifest native LIO artifact 集合不精确")
+        conditional_roles = seen_roles & {"native_pgo_payload", "group_guardian"}
+        if conditional_roles not in (set(), {"native_pgo_payload", "group_guardian"}):
+            raise ReleaseManifestError(
+                "release manifest native PGO 与 group guardian 必须成对出现"
+            )
+        if require_selected_artifacts:
+            missing_selected = set(selected_artifact_roles) - seen_roles
+            if missing_selected:
+                raise ReleaseManifestError(
+                    "release manifest 缺少当前选中制品: %s"
+                    % ",".join(sorted(missing_selected))
+                )
+            selected_conditional_roles = {
+                role for role in seen_roles
+                if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
+                or role in {"native_pgo_payload", "group_guardian"}
+            }
+            if selected_conditional_roles != selected_artifact_roles:
+                raise ReleaseManifestError(
+                    "release manifest 含未选中的条件制品: %s"
+                    % ",".join(sorted(selected_conditional_roles - selected_artifact_roles))
+                )
         if generation != _artifact_set_generation(normalized_entries):
             raise ReleaseManifestError("release generation 与 artifact set 不一致")
 
@@ -518,20 +621,32 @@ def _write_exec_proof(path: Path, proof: ReleaseProof) -> None:
 def exec_verified_release(manifest_path: Optional[Path], proof_output: Path) -> None:
     """以同一组已验证 FD 执行 runtime，并注入 generation 内 native payload。"""
 
-    proof = verify_release_manifest(manifest_path, retain_artifact_fds=True)
+    proof = verify_release_manifest(
+        manifest_path,
+        retain_artifact_fds=True,
+        require_selected_artifacts=True,
+    )
     try:
         by_role = {artifact.role: artifact for artifact in proof.artifacts}
+        runtime = by_role["geometry_runtime"]
+        if runtime.fd is None:
+            raise ReleaseManifestError("受控执行未保留 geometry runtime artifact FD")
+        environment = dict(os.environ)
+        selected_roles = set(_selected_artifact_roles(environment))
+        inheritable_roles = {"geometry_runtime"} | selected_roles
         for artifact in proof.artifacts:
             if artifact.fd is not None:
-                os.set_inheritable(artifact.fd, True)
-        runtime = by_role["geometry_runtime"]
-        pgo = by_role["native_pgo_payload"]
-        guardian = by_role["group_guardian"]
-        if runtime.fd is None or pgo.fd is None or guardian.fd is None:
-            raise ReleaseManifestError("受控执行未保留必要 artifact FD")
-        environment = dict(os.environ)
-        environment[_VERIFIED_PGO_ENV] = "/proc/self/fd/%d" % pgo.fd
-        environment[_VERIFIED_GUARDIAN_ENV] = "/proc/self/fd/%d" % guardian.fd
+                os.set_inheritable(artifact.fd, artifact.role in inheritable_roles)
+        if "native_pgo_payload" in selected_roles:
+            pgo = by_role.get("native_pgo_payload")
+            guardian = by_role.get("group_guardian")
+            if pgo is None or guardian is None or pgo.fd is None or guardian.fd is None:
+                raise ReleaseManifestError("受控执行未保留选中的 native PGO artifact FD")
+            environment[_VERIFIED_PGO_ENV] = "/proc/self/fd/%d" % pgo.fd
+            environment[_VERIFIED_GUARDIAN_ENV] = "/proc/self/fd/%d" % guardian.fd
+        else:
+            environment.pop(_VERIFIED_PGO_ENV, None)
+            environment.pop(_VERIFIED_GUARDIAN_ENV, None)
         backend = environment.get(_LIO_BACKEND_ENV, "device").strip()
         if backend in proof.native_lio_roles:
             lio = by_role[_NATIVE_LIO_ROLE_PREFIX + backend]
@@ -569,7 +684,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise ReleaseManifestError("exec 必须提供 --proof-output")
             exec_verified_release(args.manifest, args.proof_output)
             raise ReleaseManifestError("受控 runtime exec 意外返回")
-        proof = verify_release_manifest(args.manifest, expected_runtime=args.runtime)
+        proof = verify_release_manifest(
+            args.manifest,
+            expected_runtime=args.runtime,
+            require_selected_artifacts=True,
+        )
         if args.action == "exec-proof":
             if args.proof_output is None or args.pid is None:
                 raise ReleaseManifestError("exec-proof 必须提供 --proof-output 和 --pid")

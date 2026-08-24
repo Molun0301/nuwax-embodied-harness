@@ -838,9 +838,9 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
 
         [Service]
         Type=simple
-        User=nuwax-gateway
-        Group=nuwax-gateway
-        SupplementaryGroups=nuwax-motion-clients
+        User=nuwax
+        Group=nuwax
+        SupplementaryGroups=video render
         WorkingDirectory={PROJECT_ROOT}
         RuntimeDirectory=nuwax/gateway
         RuntimeDirectoryMode=0750

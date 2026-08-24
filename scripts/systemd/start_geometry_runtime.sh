@@ -101,6 +101,18 @@ case "${HEALTH_TIMEOUT}" in
 esac
 [[ "${HEALTH_TIMEOUT}" -gt 0 ]] \
   || fail "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT must be greater than zero"
+case "${LIO_BACKEND}" in
+  device|fastlio2|pointlio) ;;
+  *) fail "NUWAX_GEOMETRY_LIO_BACKEND must be device, fastlio2, or pointlio" ;;
+esac
+case "${MAPPING_BACKEND}" in
+  voxel|raytracing) ;;
+  *) fail "NUWAX_GEOMETRY_MAPPING_BACKEND must be voxel or raytracing" ;;
+esac
+case "${CORRECTION_BACKEND}" in
+  none|library_pgo|native_pgo|relocalization) ;;
+  *) fail "NUWAX_GEOMETRY_CORRECTION_BACKEND must be none, library_pgo, native_pgo, or relocalization" ;;
+esac
 mkdir -p "$(dirname "${READY_FILE}")"
 [[ -x "${RUNTIME_BINARY}" && ! -L "${RUNTIME_BINARY}" ]] \
   || fail "Geometry runtime binary is not an executable regular file: ${RUNTIME_BINARY}"

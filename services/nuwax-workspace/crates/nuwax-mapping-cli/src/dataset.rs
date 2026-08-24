@@ -136,7 +136,7 @@ pub enum RecordPayload {
 }
 
 impl RecordPayload {
-    /// Stable payload type name used by summaries and replay manifests.
+    /// Stable payload type name used by summaries and map artifacts.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {

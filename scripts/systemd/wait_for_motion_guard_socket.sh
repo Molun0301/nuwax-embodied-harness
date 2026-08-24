@@ -4,8 +4,8 @@ set -euo pipefail
 ACTION="${1:-wait}"
 SOCKET_PATH="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
 TIMEOUT_SEC="${NUWAX_MOTION_GUARD_START_TIMEOUT_SEC:-15}"
-EXPECTED_USER="${2:-nuwax-motion-guard}"
-EXPECTED_GROUP="${3:-nuwax-motion-clients}"
+EXPECTED_USER="${2:-nuwax}"
+EXPECTED_GROUP="${3:-nuwax}"
 
 case "${TIMEOUT_SEC}" in
   ''|*[!0-9]*)

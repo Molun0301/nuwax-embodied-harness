@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import grp
 import os
 from pathlib import Path
 import signal
@@ -18,7 +17,6 @@ from .constants import (
 from .core import MotionGuardCore
 from .epoch import EpochStore, SingleInstanceLock
 from .go2_actuator import ActuatorError, Go2Actuator
-from .peer_auth import PeerAuthorizer
 from .server import MotionGuardUnixServer
 
 
@@ -34,11 +32,6 @@ def run() -> None:
         "NUWAX_MOTION_GUARD_PROVISIONED",
         DEFAULT_PROVISION_PATH,
     )
-    client_group = os.environ.get(
-        "NUWAX_MOTION_GUARD_CLIENT_GROUP",
-        "nuwax-motion-clients",
-    )
-
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -62,12 +55,11 @@ def run() -> None:
             epoch=epoch,
             epoch_store=epoch_store,
             actuator=actuator,
-            authorizer=PeerAuthorizer.from_system_identities(),
         )
         if not core.startup_configured:
             raise RuntimeError(core.startup_reason)
         core.initialize_zero_fence()
-        socket_gid = grp.getgrnam(client_group).gr_gid
+        socket_gid = os.getegid()
         server = MotionGuardUnixServer(
             socket_path=socket_path,
             actor=GuardActor(core),

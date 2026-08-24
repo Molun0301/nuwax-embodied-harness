@@ -23,7 +23,7 @@ from .constants import (
 )
 from .epoch import EpochError, EpochRecord, EpochStore, MAX_GENERATION
 from .go2_actuator import ActuatorBackend, ActuatorError
-from .peer_auth import AuthorizationError, PeerAuthorizer, PeerCredentials
+from .peer_auth import PeerCredentials
 from .wire import (
     WireContractError,
     operation_envelope,
@@ -48,7 +48,6 @@ class OperationRecord:
     key: Tuple[object, ...]
     operation_id: str
     payload_sha256: bytes
-    peer_uid: int
     source: str
     lease_id: int
     response_bytes: bytes
@@ -121,7 +120,6 @@ class MotionGuardCore:
         epoch: EpochRecord,
         epoch_store: EpochStore,
         actuator: ActuatorBackend,
-        authorizer: PeerAuthorizer,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         lease_id_factory: Optional[Callable[[], int]] = None,
         dedup_capacity: int = DEDUP_CAPACITY_DEFAULT,
@@ -131,7 +129,6 @@ class MotionGuardCore:
         self.epoch = epoch
         self._epoch_store = epoch_store
         self._actuator = actuator
-        self._authorizer = authorizer
         self._monotonic_ns = monotonic_ns
         self._lease_id_factory = lease_id_factory or (
             lambda: secrets.randbits(64) or 1
@@ -148,7 +145,6 @@ class MotionGuardCore:
         self.lease_state = pb.LEASE_STATE_IDLE
         self._startup_zero_confirmed = bool(epoch.startup_zero_confirmed)
         self._active_lease_id = 0
-        self._active_peer_uid = -1
         self._active_source = ""
         self._last_sequence = 0
         self._lease_deadline_ns = 0
@@ -198,11 +194,11 @@ class MotionGuardCore:
             )
         try:
             source = request_source_name(request)
-            self._authorizer.authorize(
-                peer.uid,
-                source,
-                operation=operation,
-            )
+            if source not in _SOURCE_ACTION_POLICY:
+                raise GuardFailure(
+                    "PERMISSION_DENIED",
+                    "claimed source is unspecified or unsupported",
+                )
             if request.api_version != API_VERSION:
                 raise GuardFailure(
                     "UNSUPPORTED_API_VERSION",
@@ -210,8 +206,6 @@ class MotionGuardCore:
                 )
             handler = getattr(self, f"_handle_{operation}")
             return handler(request, peer, source)
-        except AuthorizationError as exc:
-            return self._error_response(request, "PERMISSION_DENIED", str(exc))
         except (WireContractError, ProtocolViolation) as exc:
             return self._error_response(request, "INVALID_ARGUMENT", str(exc))
         except GuardFailure as exc:
@@ -418,7 +412,6 @@ class MotionGuardCore:
             if lease_id <= 0 or lease_id > MAX_GENERATION:
                 raise GuardFailure("INTERNAL", "lease_id factory returned an invalid u64")
             self._active_lease_id = lease_id
-            self._active_peer_uid = peer.uid
             self._active_source = source
             self._last_sequence = 0
             self._lease_deadline_ns = now + LEASE_ABSOLUTE_NS
@@ -750,21 +743,11 @@ class MotionGuardCore:
         response, outcome = self._response(request)
         outcome.target_operation_id = operation_id
         records = self._operation_index.get(operation_id, ())
-        recovery_verifier = bool(
-            namespace == "global_stop"
-            and source == "GATEWAY_MANUAL"
-            and self._authorizer.is_recovery_verifier(peer.uid)
-        )
         record = next(
             (
                 candidate
                 for candidate in records
-                if (
-                    candidate.peer_uid == peer.uid
-                    or recovery_verifier
-                )
-                and candidate.source == source
-                and candidate.namespace == namespace
+                if candidate.source == source and candidate.namespace == namespace
             ),
             None,
         )
@@ -892,8 +875,8 @@ class MotionGuardCore:
             or token.lease_id != self._active_lease_id
         ):
             raise GuardFailure("OUTCOME_UNKNOWN", "lease is inactive or already closed")
-        if peer.uid != self._active_peer_uid or source != self._active_source:
-            raise GuardFailure("PERMISSION_DENIED", "peer/source does not own the lease")
+        if source != self._active_source:
+            raise GuardFailure("PERMISSION_DENIED", "source does not own the lease")
         if now >= self._owner_deadline_ns or now >= self._lease_deadline_ns:
             self.tick(now)
             raise GuardFailure("OUTCOME_UNKNOWN", "lease liveness deadline expired")
@@ -920,7 +903,6 @@ class MotionGuardCore:
             if (
                 self.lease_state != pb.LEASE_STATE_ACTIVE
                 or envelope.tuple.lease_id != self._active_lease_id
-                or peer.uid != self._active_peer_uid
                 or source != self._active_source
             ):
                 raise GuardFailure(
@@ -1087,7 +1069,6 @@ class MotionGuardCore:
 
     def _clear_lease(self) -> None:
         self._active_lease_id = 0
-        self._active_peer_uid = -1
         self._active_source = ""
         self._last_sequence = 0
         self._lease_deadline_ns = 0
@@ -1112,7 +1093,6 @@ class MotionGuardCore:
         if namespace == "global_stop":
             return (
                 namespace,
-                peer.uid,
                 source,
                 envelope.operation_id,
             )
@@ -1120,13 +1100,11 @@ class MotionGuardCore:
             return (
                 namespace,
                 bytes(envelope.tuple.boot_nonce),
-                peer.uid,
                 source,
                 envelope.operation_id,
             )
         return (
             namespace,
-            peer.uid,
             source,
             envelope.tuple.generation,
             bytes(envelope.tuple.boot_nonce),
@@ -1170,7 +1148,6 @@ class MotionGuardCore:
             key=key,
             operation_id=envelope.operation_id,
             payload_sha256=bytes(envelope.payload_sha256),
-            peer_uid=peer.uid,
             source=source,
             lease_id=(
                 outcome.lease_tuple.lease_id

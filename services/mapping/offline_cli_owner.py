@@ -163,8 +163,6 @@ class OfflineCliCommandKind(str, Enum):
     MAP = "map"
     POSE_FILL = "pose-fill"
     RENAME = "rename"
-    REPLAY = "replay"
-    REPLAY_MARKER = "replay-marker"
     SUMMARY = "summary"
 
 
@@ -227,23 +225,6 @@ class RenameCommand:
 
 
 @dataclass(frozen=True)
-class ReplayCommand:
-    input_path: str
-    output_path: str
-    start_offset: float = 0.0
-    rate: float = 1.0
-    kind: ClassVar[OfflineCliCommandKind] = OfflineCliCommandKind.REPLAY
-
-
-@dataclass(frozen=True)
-class ReplayMarkerCommand:
-    input_path: str
-    output_path: str
-    family: str = "tag36h11"
-    kind: ClassVar[OfflineCliCommandKind] = OfflineCliCommandKind.REPLAY_MARKER
-
-
-@dataclass(frozen=True)
 class SummaryCommand:
     input_path: str
     output_path: str
@@ -254,8 +235,6 @@ OfflineCliCommand = Union[
     MapCommand,
     PoseFillCommand,
     RenameCommand,
-    ReplayCommand,
-    ReplayMarkerCommand,
     SummaryCommand,
 ]
 
@@ -664,67 +643,6 @@ def _command_contract(command: OfflineCliCommand) -> Tuple[Dict[str, object], Li
             argv.extend(["--duration", repr(duration)])
         return payload, argv
 
-    if type(command) is ReplayCommand:
-        input_path = "/".join(_relative_parts(command.input_path, "replay input_path"))
-        output_path = "/".join(_relative_parts(command.output_path, "replay output_path"))
-        _require_extension(input_path, (".jsonl", ".ndjson", ".db"), "replay input_path")
-        _require_extension(output_path, (".json",), "replay output_path")
-        start_offset = _require_finite(
-            command.start_offset,
-            "replay start_offset",
-            minimum=0.0,
-            maximum=MAX_TIMEOUT_SECONDS,
-        )
-        rate = _require_finite(
-            command.rate,
-            "replay rate",
-            minimum=1e-9,
-            maximum=1e9,
-            allow_zero=False,
-        )
-        payload = {
-            "kind": command.kind.value,
-            "input_path": input_path,
-            "output_path": output_path,
-            "start_offset": start_offset,
-            "rate": rate,
-        }
-        argv = [
-            command.kind.value,
-            "--bag",
-            input_path,
-            "--output",
-            output_path,
-            "--start-offset",
-            repr(start_offset),
-            "--rate",
-            repr(rate),
-        ]
-        return payload, argv
-
-    if type(command) is ReplayMarkerCommand:
-        input_path = "/".join(_relative_parts(command.input_path, "replay-marker input_path"))
-        output_path = "/".join(_relative_parts(command.output_path, "replay-marker output_path"))
-        _require_extension(input_path, (".jsonl", ".ndjson"), "replay-marker input_path")
-        _require_extension(output_path, (".json",), "replay-marker output_path")
-        family = _require_token(command.family, "replay-marker family")
-        payload = {
-            "kind": command.kind.value,
-            "input_path": input_path,
-            "output_path": output_path,
-            "family": family,
-        }
-        argv = [
-            command.kind.value,
-            "--bag",
-            input_path,
-            "--output",
-            output_path,
-            "--family",
-            family,
-        ]
-        return payload, argv
-
     if type(command) is SummaryCommand:
         input_path = "/".join(_relative_parts(command.input_path, "summary input_path"))
         output_path = "/".join(_relative_parts(command.output_path, "summary output_path"))
@@ -872,33 +790,6 @@ def _durable_command_contract(payload: object) -> Dict[str, object]:
                 drops=tuple(raw_drops),
                 seek=payload["seek"],
                 duration=payload["duration"],
-            )
-        elif kind == OfflineCliCommandKind.REPLAY:
-            expected = {
-                "kind",
-                "input_path",
-                "output_path",
-                "start_offset",
-                "rate",
-            }
-            if set(payload) != expected:
-                raise OfflineCliRecoveryError("durable replay command shape is invalid")
-            command = ReplayCommand(
-                input_path=payload["input_path"],
-                output_path=payload["output_path"],
-                start_offset=payload["start_offset"],
-                rate=payload["rate"],
-            )
-        elif kind == OfflineCliCommandKind.REPLAY_MARKER:
-            expected = {"kind", "input_path", "output_path", "family"}
-            if set(payload) != expected:
-                raise OfflineCliRecoveryError(
-                    "durable replay-marker command shape is invalid"
-                )
-            command = ReplayMarkerCommand(
-                input_path=payload["input_path"],
-                output_path=payload["output_path"],
-                family=payload["family"],
             )
         else:
             expected = {"kind", "input_path", "output_path"}

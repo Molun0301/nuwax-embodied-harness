@@ -25,7 +25,6 @@
 //! nuwax-nav-stack --profile=cmu-native --dry-run
 //! nuwax-nav-stack --list-features
 //! nuwax-nav-stack --profile=simple-2d --preset=all --json
-//! nuwax-nav-stack --profile=replanning-astar --replay path/to/fixture.json
 //! ```
 
 use nuwax_nav_stack::bin_support::{self, CliOptions};

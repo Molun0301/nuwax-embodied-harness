@@ -1,105 +1,44 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import logging
+from typing import Dict, Tuple
 
-from contracts.capabilities import CapabilityDescriptor, CapabilityRiskLevel
-from gateways.errors import AccessDeniedError
+from contracts.capabilities import CapabilityDescriptor
 from core.settings import GatewayServerConfig
-from starlette.requests import Request
-from starlette.websockets import WebSocket
-from typing import Dict, Optional, Tuple
-
-
-AUTH_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway.auth")
-
-
-@dataclass(frozen=True)
-class AccessContext:
-    """访问上下文（个人机器狗：不鉴权，统一匿名本机身份）。
-
-    保留 principal 字段仅供审计/`requested_by` 标注，不再承载任何权限语义。
-    """
-
-    principal: str
-    source_host: Optional[str]
+from gateways.errors import AccessDeniedError
 
 
 class GatewayAccessManager:
-    """宿主机网关访问控制器。
+    """宿主机网关能力暴露策略。
 
-    个人机器狗场景：不做任何用户鉴权（无令牌、无角色、无来源网段限制），
-    任何能连到网关的调用方都被视为同一匿名本机身份。仅保留「能力风险门控」
-    （capability risk gating）——它约束的是自主 LLM（大语言模型）能否擅自触发
-    高危动作（如后空翻），与用户身份无关。
+    宿主机网关不建立用户、令牌或来源网段身份层。能力调用入口只依据能力描述中的
+    ``exposed_to_agent`` 标记决定是否向智能体开放；请求上下文中的固定 principal
+    仅用于审计和 ``requested_by`` 标注。
     """
 
-    _ANONYMOUS = AccessContext(principal="local", source_host=None)
-
     def __init__(self, config: GatewayServerConfig) -> None:
+        # 保留配置参数以维持网关装配接口；请求访问不读取任何鉴权配置。
         self._config = config
-        # 高危能力白名单：仅此清单内的 HIGH 风险能力允许被（含 LLM 的）能力调用入口触发。
-        self._high_risk_allowlist = frozenset(config.capability_high_risk_allowlist)
-
-    def _anonymous(self, source_host: Optional[str]) -> AccessContext:
-        if source_host is None:
-            return self._ANONYMOUS
-        return AccessContext(principal="local", source_host=source_host)
-
-    def authenticate_http(self, request: Request) -> AccessContext:
-        """HTTP 请求放行（不鉴权）。"""
-
-        source_host = request.client.host if request.client is not None else None
-        return self._anonymous(source_host)
-
-    def authenticate_local_debug_page(self, request: Request) -> AccessContext:
-        """本机调试页放行（不鉴权）。"""
-
-        return self.authenticate_http(request)
-
-    def authenticate_websocket(self, websocket: WebSocket) -> AccessContext:
-        """WebSocket（网页套接字）请求放行（不鉴权）。"""
-
-        source_host = websocket.client.host if websocket.client is not None else None
-        return self._anonymous(source_host)
 
     def filter_capabilities(
         self,
-        access: AccessContext,
         descriptors: Tuple[CapabilityDescriptor, ...],
     ) -> Tuple[CapabilityDescriptor, ...]:
-        """过滤当前调用方可见的能力。"""
+        """只返回明确向智能体暴露的能力。"""
 
-        return tuple(descriptor for descriptor in descriptors if self.can_access_capability(access, descriptor))
+        return tuple(descriptor for descriptor in descriptors if descriptor.exposed_to_agent)
 
-    def can_access_capability(self, access: AccessContext, descriptor: CapabilityDescriptor) -> bool:
-        """判断某能力是否允许通过能力调用入口被触发。
+    def can_access_capability(self, descriptor: CapabilityDescriptor) -> bool:
+        """判断能力是否明确向智能体暴露。"""
 
-        不再有用户角色之分；门控只取决于能力自身的风险等级与暴露标记，
-        用于约束自主 LLM（大语言模型）擅自触发高危动作：
-        - 未暴露给智能体的能力：拒绝（仅供内部/直连入口使用）。
-        - LOW / MEDIUM：放行。
-        - HIGH：仅当在高危白名单内才放行。
-        """
+        return bool(descriptor.exposed_to_agent)
 
-        if not descriptor.exposed_to_agent:
-            return False
+    def authorize_capability(self, descriptor: CapabilityDescriptor) -> None:
+        """执行唯一的能力暴露标记检查。"""
 
-        if descriptor.risk_level in {CapabilityRiskLevel.LOW, CapabilityRiskLevel.MEDIUM}:
-            return True
-
-        if descriptor.risk_level == CapabilityRiskLevel.HIGH:
-            return descriptor.name in self._high_risk_allowlist
-
-        return False
-
-    def authorize_capability(self, access: AccessContext, descriptor: CapabilityDescriptor) -> None:
-        """执行能力风险门控。"""
-
-        if self.can_access_capability(access, descriptor):
+        if self.can_access_capability(descriptor):
             return
         raise AccessDeniedError(
-            f"能力 {descriptor.name} 被风险门控拦截（高危能力需加入白名单）。",
+            f"能力 {descriptor.name} 未向智能体暴露。",
             details={
                 "capability_name": descriptor.name,
                 "risk_level": descriptor.risk_level.value,
@@ -107,15 +46,13 @@ class GatewayAccessManager:
         )
 
     def export_policy(self) -> Dict[str, object]:
-        """导出访问策略摘要（不鉴权，仅暴露能力风险门控配置）。"""
+        """导出当前能力暴露策略摘要。"""
 
         return {
             "auth": "disabled",
-            "capability_high_risk_allowlist": sorted(self._high_risk_allowlist),
+            "capability_policy": "仅检查 exposed_to_agent",
             "risk_policy": {
-                "low": "放行",
-                "medium": "放行",
-                "high": "仅高危白名单内能力可被能力调用入口触发",
-                "exposed_to_agent_false": "不经能力调用入口暴露",
+                "exposed_to_agent_true": "允许通过统一能力调用入口触发",
+                "exposed_to_agent_false": "不经统一能力调用入口暴露",
             },
         }

@@ -48,7 +48,8 @@ _GEOMETRY_OWNER_KEYS = frozenset({
 _SENSITIVE_MASK = "********"
 _EFFECTIVE_VALUES_LOCK = threading.RLock()
 
-# Rust owner_profile.rs 明确接受的三个正交轴；Web 只暴露已完成 Go2 闭环验收的子集。
+# Rust owner_profile.rs 明确接受的三个正交轴；Web 展示完整结构矩阵，
+# 仅把当前运行前置不满足的组合禁用，历史验收不再作为写入门。
 _GEOMETRY_LIO_BACKENDS = ("device", "fastlio2", "pointlio")
 _GEOMETRY_MAPPING_BACKENDS = ("voxel", "raytracing")
 _GEOMETRY_CORRECTION_BACKENDS = ("none", "library_pgo", "native_pgo", "relocalization")
@@ -69,6 +70,10 @@ class GeometryCombinationStatus:
     prerequisites_ready: bool
     accepted: bool
     enabled: bool
+    prerequisite_reason: str
+    acceptance_status: str
+    acceptance_rating: str
+    acceptance_reason: str
     reason: str
 
     def as_dict(self) -> Dict[str, object]:
@@ -79,6 +84,10 @@ class GeometryCombinationStatus:
             "prerequisites_ready": self.prerequisites_ready,
             "accepted": self.accepted,
             "enabled": self.enabled,
+            "prerequisite_reason": self.prerequisite_reason,
+            "acceptance_status": self.acceptance_status,
+            "acceptance_rating": self.acceptance_rating,
+            "acceptance_reason": self.acceptance_reason,
             "reason": self.reason,
         }
 
@@ -93,22 +102,36 @@ def _valid_rotation_calibration(raw: str) -> bool:
         payload = json.loads(raw)
         translation = payload["translation_m"]
         rotation = payload["rotation_row_major"]
-        values = [float(value) for value in translation] + [float(value) for value in rotation]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    if len(translation) != 3 or len(rotation) != 9 or not all(math.isfinite(value) for value in values):
+    if not isinstance(translation, (list, tuple)) or not isinstance(rotation, (list, tuple)):
         return False
-    rows = [rotation[0:3], rotation[3:6], rotation[6:9]]
+    if len(translation) != 3 or len(rotation) != 9:
+        return False
+    values = list(translation) + list(rotation)
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in values
+    ):
+        return False
+    try:
+        numeric_translation = [float(value) for value in translation]
+        numeric_rotation = [float(value) for value in rotation]
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in numeric_translation + numeric_rotation):
+        return False
+    rows = [numeric_rotation[0:3], numeric_rotation[3:6], numeric_rotation[6:9]]
     for index, row in enumerate(rows):
-        if abs(sum(float(value) ** 2 for value in row) - 1.0) > 1.0e-6:
+        if abs(sum(value ** 2 for value in row) - 1.0) > 1.0e-6:
             return False
         for other in rows[index + 1:]:
-            if abs(sum(float(a) * float(b) for a, b in zip(row, other))) > 1.0e-6:
+            if abs(sum(a * b for a, b in zip(row, other))) > 1.0e-6:
                 return False
     determinant = (
-        float(rotation[0]) * (float(rotation[4]) * float(rotation[8]) - float(rotation[5]) * float(rotation[7]))
-        - float(rotation[1]) * (float(rotation[3]) * float(rotation[8]) - float(rotation[5]) * float(rotation[6]))
-        + float(rotation[2]) * (float(rotation[3]) * float(rotation[7]) - float(rotation[4]) * float(rotation[6]))
+        numeric_rotation[0] * (numeric_rotation[4] * numeric_rotation[8] - numeric_rotation[5] * numeric_rotation[7])
+        - numeric_rotation[1] * (numeric_rotation[3] * numeric_rotation[8] - numeric_rotation[5] * numeric_rotation[6])
+        + numeric_rotation[2] * (numeric_rotation[3] * numeric_rotation[7] - numeric_rotation[4] * numeric_rotation[6])
     )
     return abs(determinant - 1.0) <= 1.0e-6
 
@@ -224,7 +247,11 @@ def _accepted_combinations() -> Dict[tuple, Dict[str, object]]:
 
 
 def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
-    """依据本机 release、配置和验收 ledger 计算全部 24 种组合。"""
+    """计算 24 个结构组合的当前前置状态和历史验收证据。
+
+    ``prerequisites_ready`` 是配置写入和启动部署的硬门；``accepted`` 只表示当前
+    release generation 是否有完整 Go2 闭环记录，不能反向阻止用户保存待验收组合。
+    """
 
     release = _release_capabilities()
     roles = release["roles"] if release["valid"] else set()
@@ -237,9 +264,13 @@ def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
     for lio in _GEOMETRY_LIO_BACKENDS:
         for mapping in _GEOMETRY_MAPPING_BACKENDS:
             for correction in _GEOMETRY_CORRECTION_BACKENDS:
-                prerequisite_reasons = []
+                prerequisite_reasons: List[str] = []
                 if not release["valid"]:
                     prerequisite_reasons.append("本机 Geometry release manifest 未通过校验")
+                elif "geometry_runtime" not in roles:
+                    prerequisite_reasons.append("release manifest 缺少 geometry_runtime")
+                elif "geometry_runtime" not in executable_roles:
+                    prerequisite_reasons.append("release manifest 中 geometry_runtime 不是可执行制品")
                 if lio in {"fastlio2", "pointlio"}:
                     native_role = _NATIVE_LIO_ROLE_PREFIX + lio
                     if native_role not in roles:
@@ -258,9 +289,8 @@ def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
                         prerequisite_reasons.append("native LIO host IP 与 lidar IP 不能相同")
                 if correction == "native_pgo" and "native_pgo_payload" not in roles:
                     prerequisite_reasons.append("release manifest 缺少 native_pgo_payload")
-                if correction == "relocalization":
-                    prerequisite_reasons.append("relocalization 仍需地图资产与 Go2 实机闭环证据")
-
+                # 重定位地图资产和实际闭环由启动/激活运行时确认；历史证据只作为本地状态，
+                # 不在保存配置时把“尚未验收”提升为静态前置失败。
                 record = accepted_records.get((lio, mapping, correction))
                 accepted = bool(
                     record is not None
@@ -268,14 +298,27 @@ def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
                     and generation
                     and str(record.get("release_generation", "")) == generation
                 )
-                reasons = list(prerequisite_reasons)
-                if record is None:
-                    reasons.append("无该组合的历史 Go2 实机验收记录")
+                if accepted:
+                    acceptance_status = "accepted"
+                    acceptance_rating = "verified"
+                    acceptance_reason = "当前 release generation 已有完整 Go2 实机验收记录"
+                elif record is None:
+                    acceptance_status = "unaccepted"
+                    acceptance_rating = "unverified"
+                    acceptance_reason = "无该组合的历史 Go2 实机验收记录"
                 elif record.get("archive_error"):
-                    reasons.append("历史验收归档无效：%s" % record["archive_error"])
-                elif not accepted:
-                    reasons.append("历史验收记录不属于当前 release generation")
+                    acceptance_status = "invalid"
+                    acceptance_rating = "invalid"
+                    acceptance_reason = "历史验收归档无效：%s" % record["archive_error"]
+                else:
+                    acceptance_status = "stale"
+                    acceptance_rating = "stale"
+                    acceptance_reason = "历史验收记录不属于当前 release generation"
                 prerequisites_ready = not prerequisite_reasons
+                prerequisite_reason = "；".join(prerequisite_reasons)
+                reasons = list(prerequisite_reasons)
+                if not accepted:
+                    reasons.append(acceptance_reason)
                 statuses.append(
                     GeometryCombinationStatus(
                         lio=lio,
@@ -283,7 +326,11 @@ def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
                         correction=correction,
                         prerequisites_ready=prerequisites_ready,
                         accepted=accepted,
-                        enabled=prerequisites_ready and accepted,
+                        enabled=prerequisites_ready,
+                        prerequisite_reason=prerequisite_reason,
+                        acceptance_status=acceptance_status,
+                        acceptance_rating=acceptance_rating,
+                        acceptance_reason=acceptance_reason,
                         reason="；".join(reasons),
                     )
                 )
@@ -297,6 +344,8 @@ def _geometry_backend_matrix() -> List[Dict[str, object]]:
 
 
 def _geometry_choice_disabled_reasons(statuses: List[GeometryCombinationStatus]) -> Dict[str, Dict[str, str]]:
+    """只返回当前真实前置失败的禁用原因，不把未验收混入禁用门。"""
+
     dimensions = {
         "NUWAX_GEOMETRY_LIO_BACKEND": ("lio", _GEOMETRY_LIO_BACKENDS),
         "NUWAX_GEOMETRY_MAPPING_BACKEND": ("mapping", _GEOMETRY_MAPPING_BACKENDS),
@@ -307,14 +356,51 @@ def _geometry_choice_disabled_reasons(statuses: List[GeometryCombinationStatus])
         result[key] = {}
         for value in values:
             candidates = [status for status in statuses if getattr(status, attribute) == value]
-            if any(status.enabled for status in candidates):
+            if any(status.prerequisites_ready for status in candidates):
                 continue
-            unique_reasons = []
+            unique_reasons: List[str] = []
             for status in candidates:
-                for reason in status.reason.split("；"):
+                for reason in status.prerequisite_reason.split("；"):
                     if reason and reason not in unique_reasons:
                         unique_reasons.append(reason)
-            result[key][value] = "；".join(unique_reasons)
+            result[key][value] = "；".join(unique_reasons) or "当前运行前置条件未满足"
+    return result
+
+
+def _geometry_choice_warnings(
+    statuses: List[GeometryCombinationStatus],
+) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """为仍可选的下拉项提供验收状态/评级/原因，历史证据不改变可选性。"""
+
+    dimensions = {
+        "NUWAX_GEOMETRY_LIO_BACKEND": "lio",
+        "NUWAX_GEOMETRY_MAPPING_BACKEND": "mapping",
+        "NUWAX_GEOMETRY_CORRECTION_BACKEND": "correction",
+    }
+    result: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for key, attribute in dimensions.items():
+        result[key] = {}
+        values = sorted({getattr(status, attribute) for status in statuses})
+        for value in values:
+            candidates = [
+                status for status in statuses
+                if getattr(status, attribute) == value and status.prerequisites_ready and not status.accepted
+            ]
+            if not candidates:
+                continue
+            acceptance_statuses = sorted({status.acceptance_status for status in candidates})
+            acceptance_ratings = sorted({status.acceptance_rating for status in candidates})
+            result[key][value] = {
+                "acceptance_status": (
+                    acceptance_statuses[0] if len(acceptance_statuses) == 1 else "mixed"
+                ),
+                "acceptance_rating": (
+                    acceptance_ratings[0] if len(acceptance_ratings) == 1 else "mixed"
+                ),
+                "reason": "；".join(
+                    sorted({status.acceptance_reason for status in candidates if status.acceptance_reason})
+                ),
+            }
     return result
 
 
@@ -576,6 +662,7 @@ def build_schema() -> Dict[str, object]:
 
     geometry_statuses = geometry_backend_statuses()
     geometry_choice_reasons = _geometry_choice_disabled_reasons(geometry_statuses)
+    geometry_choice_warnings = _geometry_choice_warnings(geometry_statuses)
     sections: Dict[str, Dict[str, object]] = {}
     for sid, title in R.SECTIONS:
         sections[sid] = {"section_id": sid, "section_title": title, "fields": []}
@@ -598,6 +685,7 @@ def build_schema() -> Dict[str, object]:
             "choices": list(f.choices),
             "choice_labels": list(f.choice_labels),
             "choice_disabled_reasons": dict(geometry_choice_reasons.get(f.key, {})),
+            "choice_warnings": dict(geometry_choice_warnings.get(f.key, {})),
             "value": display_value,
             "value_source": value_source,
             "is_set": raw_value is not None,
@@ -612,7 +700,8 @@ def build_schema() -> Dict[str, object]:
         "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
         "geometry_backend_matrix_note": (
             "结构矩阵固定覆盖 3 种 LIO × 2 种建图 × 4 种校正共 24 个组合；"
-            "当前可部署矩阵由本机 release、显式标定、native 配置和当前 generation 的实机验收 ledger 动态计算。"
+            "当前可选性只由本机 release、显式标定和 native 配置等启动前置决定；"
+            "历史 Go2 实机验收只显示已验收/未验收警告和评级，不阻止结构合法组合保存。"
         ),
     }
 
@@ -814,13 +903,20 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
             ),
             None,
         )
-        if status is None or not status.enabled:
-            reason = status.reason if status is not None else "未知 Geometry 后端组合"
+        if status is None or not status.prerequisites_ready:
+            reason = (
+                status.prerequisite_reason
+                if status is not None and status.prerequisite_reason
+                else "未知 Geometry 后端组合"
+            )
             for key in geometry_updates:
                 rejected[key] = reason
             for values in per_target.values():
                 for key in geometry_updates:
                     values.pop(key, None)
+            for target_file in list(per_target):
+                if not per_target[target_file]:
+                    del per_target[target_file]
 
     backups: Dict[str, str] = {}
     for target_file, kv in per_target.items():

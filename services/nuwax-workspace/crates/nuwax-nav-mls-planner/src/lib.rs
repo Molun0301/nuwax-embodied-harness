@@ -47,7 +47,6 @@ pub mod mesh_fixture;
 pub mod mls_planner;
 pub mod nodes;
 pub mod planner;
-pub mod rerun;
 pub mod scenarios;
 pub mod stamp_pair;
 pub mod surfaces;

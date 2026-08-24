@@ -737,7 +737,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         after_cursor: int = 0,
         max_frames: Optional[int] = None,
     ) -> StreamingResponse:
-        access_manager.authenticate_http(request)
         topic_filter = _parse_topics(topics)
         resume_after_cursor = int(after_cursor or 0)
         if resume_after_cursor <= 0:
@@ -796,7 +795,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         camera_id: Optional[str] = None,
         fps: float = 15.0,
     ):
-        access_manager.authenticate_http(request)
         video_available = False
         if VideoShmReader is not None:
             import os as _os
@@ -847,7 +845,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.websocket("/streams/ws")
     async def websocket_streams(websocket: WebSocket) -> None:
         try:
-            access_manager.authenticate_websocket(websocket)
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
         except Exception as exc:

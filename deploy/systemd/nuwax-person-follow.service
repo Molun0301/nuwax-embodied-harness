@@ -12,8 +12,8 @@ Type=simple
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-User=nuwax-navigation
-Group=nuwax-motion-clients
+User=nuwax
+Group=nuwax
 WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/person-follow
 RuntimeDirectoryMode=0750
@@ -33,7 +33,7 @@ Environment=NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL=/global_map
 Environment=NUWAX_PERSON_FOLLOW_TF_CHANNEL=/tf
 Environment=NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL=/gateway/person_follow_cmd_vel
 ExecStartPre=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
-ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh check
+ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh check nuwax nuwax
 ExecStartPre=/usr/bin/env NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_NAV_STACK_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_nav_stack_ready.sh wait
 ExecStartPre=/usr/bin/env NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_geometry_runtime_ready.sh wait
 ExecStartPre=/usr/bin/rm -f /run/nuwax/person-follow/nuwax_person_follow.ready /run/nuwax/person-follow/nuwax_person_follow.ready.runtime

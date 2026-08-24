@@ -332,6 +332,7 @@ button{font-family:inherit;cursor:pointer}
 .config-row.invalid .cfield input{border-color:var(--bad)}
 .config-err{color:var(--bad);font-size:10px}
 .config-help{color:var(--muted);font-size:10px;line-height:1.45}
+.config-acceptance-warning{color:var(--warn)}
 .config-badge{font-size:9px;font-weight:600;padding:1px 6px;border-radius:var(--pill);background:var(--inset-2);color:var(--muted)}
 .config-badge.adv{background:var(--warn-w);color:var(--warn)}
 .config-badge.sec{background:var(--bad-w);color:var(--bad)}
@@ -722,9 +723,6 @@ button{font-family:inherit;cursor:pointer}
 </div>
   <script>
     (() => {
-      const DEBUG_ACCESS_TOKEN = "__DEBUG_ACCESS_TOKEN__";
-      const urlAccessToken = new URLSearchParams(window.location.search).get("access_token") || "";
-      const apiAccessToken = urlAccessToken || DEBUG_ACCESS_TOKEN;
       const CANVAS_THEME = {
         mapBackground: "#020617",
         mapUnknown: [51, 65, 85],
@@ -1220,13 +1218,6 @@ button{font-family:inherit;cursor:pointer}
         const err = envelope && envelope.error;
         return (err && (err.message || err.code)) || fallback || "数据不可用。";
       }
-      function withAccessToken(path) {
-        if (!apiAccessToken) return path;
-        const url = new URL(path, window.location.origin);
-        url.searchParams.set("access_token", apiAccessToken);
-        return `${url.pathname}${url.search}`;
-      }
-      window.__nuwaxWithAccessToken = withAccessToken;
       function buildOverview() {
         els.overviewGrid.replaceChildren();
         for (const name of overviewNames) {
@@ -1805,7 +1796,7 @@ button{font-family:inherit;cursor:pointer}
       }
       async function loadInitialTasks() {
         try {
-          const response = await fetch(withAccessToken("/api/tasks?history_limit=20"));
+          const response = await fetch("/api/tasks?history_limit=20");
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           replaceTaskStore(await response.json());
         } catch (err) {
@@ -1818,7 +1809,7 @@ button{font-family:inherit;cursor:pointer}
       }
       async function loadInitialHealth() {
         try {
-          const response = await fetch(withAccessToken("/api/health"));
+          const response = await fetch("/api/health");
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           updateHealth(await response.json());
         } catch (err) {
@@ -2474,7 +2465,7 @@ button{font-family:inherit;cursor:pointer}
         const controller = new AbortController();
         const requestTimeout = window.setTimeout(() => controller.abort(), 5000);
         try {
-          const response = await fetch(withAccessToken("/api/debug/navigation/goal"), {
+          const response = await fetch("/api/debug/navigation/goal", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -2541,7 +2532,7 @@ button{font-family:inherit;cursor:pointer}
         const distanceLabel = distanceM === null ? "" : ` · 距机器人 ${distanceM.toFixed(2)}m`;
         updateGoalPickStatus(`发布 /clicked_point ${formatMapPoint(mapPoint)}${distanceLabel} · ${frameId}`, "pending");
         try {
-          const response = await fetch(withAccessToken("/api/debug/map/clicked_point"), {
+          const response = await fetch("/api/debug/map/clicked_point", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -2587,7 +2578,7 @@ button{font-family:inherit;cursor:pointer}
         const distanceLabel = distanceM === null ? "" : ` · 距当前位姿 ${distanceM.toFixed(2)}m`;
         updateGoalPickStatus(`发布 /initialpose ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${frameId}`, "pending");
         try {
-          const response = await fetch(withAccessToken("/api/debug/map/initial_pose"), {
+          const response = await fetch("/api/debug/map/initial_pose", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -4236,7 +4227,6 @@ button{font-family:inherit;cursor:pointer}
         if (data.stream_url) {
           const url = new URL(data.stream_url, window.location.origin);
           if (!url.searchParams.get("fps")) url.searchParams.set("fps", "15");
-          if (apiAccessToken && !url.searchParams.get("access_token")) url.searchParams.set("access_token", apiAccessToken);
           return url.toString();
         }
         return data.data_uri || data.uri || "";
@@ -4920,7 +4910,6 @@ button{font-family:inherit;cursor:pointer}
         const url = new URL(`${protocol}//${window.location.host}/streams/ws`);
         url.searchParams.set("topics", STREAM_TOPICS.join(","));
         if (state.latestStreamCursor) url.searchParams.set("after_cursor", String(state.latestStreamCursor));
-        if (apiAccessToken) url.searchParams.set("access_token", apiAccessToken);
         return url.toString();
       }
       const STREAM_CURSOR_MAX_U64 = "18446744073709551615";
@@ -5548,10 +5537,26 @@ button{font-family:inherit;cursor:pointer}
         picker.title = label;
         return picker;
       }
+      function configAcceptanceDetail(warning) {
+        return warning && typeof warning === "object"
+          ? warning
+          : { reason: warning == null ? "" : String(warning) };
+      }
+      function configAcceptanceWarning(raw, warning) {
+        const detail = configAcceptanceDetail(warning);
+        const status = detail.acceptance_status || "unaccepted";
+        const rating = detail.acceptance_rating || "unverified";
+        const reason = detail.reason || "无验收说明";
+        return raw + "：未验收警告（状态=" + status + "，评级=" + rating + "）：" + reason;
+      }
+      function configAcceptanceLabel(warning) {
+        const detail = configAcceptanceDetail(warning);
+        return (detail.acceptance_status || "unaccepted") + "/" + (detail.acceptance_rating || "unverified");
+      }
       async function loadConfigSchema() {
         const status = document.getElementById("configStatus");
         try {
-          const resp = await fetch(withAccessToken("/api/config/schema"));
+          const resp = await fetch("/api/config/schema");
           if (!resp.ok) throw new Error("HTTP " + resp.status);
           const schema = await resp.json();
           configState.fields.clear();
@@ -5679,14 +5684,18 @@ button{font-family:inherit;cursor:pointer}
           input = document.createElement("select");
           const labels = Array.isArray(f.choice_labels) ? f.choice_labels : [];
           const disabledReasons = f.choice_disabled_reasons || {};
+          const choiceWarnings = f.choice_warnings || {};
           f.choices.forEach((opt, index) => {
             const o = document.createElement("option");
-            // value 始终提交稳定 raw 值，界面只展示中文标签和部署状态。
+            // value 始终提交稳定 raw 值；未验收只显示警告，不禁用合法选项。
             o.value = opt;
             if (disabledReasons[opt]) {
               o.disabled = true;
-              o.textContent = (labels[index] || opt) + "（暂不可用）";
+              o.textContent = (labels[index] || opt) + "（前置未就绪）";
               o.title = disabledReasons[opt];
+            } else if (choiceWarnings[opt]) {
+              o.textContent = (labels[index] || opt) + "（未验收：" + configAcceptanceLabel(choiceWarnings[opt]) + "）";
+              o.title = configAcceptanceWarning(opt, choiceWarnings[opt]);
             } else {
               o.textContent = labels[index] || opt;
             }
@@ -5767,12 +5776,22 @@ button{font-family:inherit;cursor:pointer}
           picker.addEventListener("change", applyPalette);
         }
         const disabledReasons = f.choice_disabled_reasons || {};
+        const warningReasons = f.choice_warnings || {};
         const disabledEntries = Object.entries(disabledReasons);
+        const warningEntries = Object.entries(warningReasons);
         if (disabledEntries.length) {
           const deployNote = document.createElement("div");
           deployNote.className = "config-help";
-          deployNote.textContent = disabledEntries.map(([raw, reason]) => raw + "：" + reason).join(" ");
+          deployNote.textContent = disabledEntries.map(([raw, reason]) => raw + "：前置未就绪：" + reason).join(" ");
           cell.appendChild(deployNote);
+        }
+        if (warningEntries.length) {
+          const acceptanceNote = document.createElement("div");
+          acceptanceNote.className = "config-help config-acceptance-warning";
+          acceptanceNote.textContent = warningEntries
+            .map(([raw, warning]) => configAcceptanceWarning(raw, warning))
+            .join(" ");
+          cell.appendChild(acceptanceNote);
         }
         const err = document.createElement("div");
         err.className = "config-err";
@@ -5807,7 +5826,7 @@ button{font-family:inherit;cursor:pointer}
         if (!Object.keys(updates).length) { updateConfigDirty(); return; }
         try {
           setPill(status, "stale", "保存中");
-          const resp = await fetch(withAccessToken("/api/config/save"), {
+          const resp = await fetch("/api/config/save", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ updates }),

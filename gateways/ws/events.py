@@ -61,7 +61,6 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
         event_types: Optional[str] = None,
         max_events: Optional[int] = None,
     ) -> StreamingResponse:
-        access_manager.authenticate_http(request)
         category_filter = _parse_categories(categories)
         event_type_filter = _parse_event_types(event_types)
 
@@ -110,7 +109,6 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
     @router.websocket("/events/ws")
     async def websocket_events(websocket: WebSocket) -> None:
         try:
-            access_manager.authenticate_websocket(websocket)
             category_filter = _parse_categories(websocket.query_params.get("categories"))
             event_type_filter = _parse_event_types(websocket.query_params.get("event_types"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))

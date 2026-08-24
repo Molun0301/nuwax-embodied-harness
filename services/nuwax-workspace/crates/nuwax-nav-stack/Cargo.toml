@@ -24,7 +24,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-description = "Navigation stack orchestration for the nuwax robot platform (profiles + module graph + dry-run + replay/smoke entry)."
+description = "Navigation stack orchestration for the nuwax robot platform (profiles + module graph + dry-run)."
 
 # ============================================================
 # 默认 features: 空
@@ -106,7 +106,6 @@ visual-servoing = ["dep:nuwax-nav-visual-servoing"]
 visual-query = ["dep:nuwax-nav-visual-query"]
 bbox-tracker = ["dep:nuwax-nav-bbox-tracker"]
 click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
-record = ["dep:nuwax-nav-record"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
@@ -136,12 +135,7 @@ cmu-native = [
     "dep:nuwax-nav-terrain-map-ext",
 ]
 
-# ---- Stack 行为开关(全部默认关闭)----
-replay = []                 # 启用 replay/smoke 入口,加载 rosbag fixture
-viewer = []                 # 启用可视化模块(rerun / foxglove 等),不影响核心规划
-record-profile = ["record"] # 导航 topic 录制 profile
-
-# ---- 实用聚合:一键启用完整 navigation stack(不含 explore / viewer)----
+# ---- 实用聚合:一键启用完整 navigation stack(不含 explore)----
 # 注意:即使 all-in-one 也不引入 DDS / ROS2 / CUDA
 full = [
     "foundation",
@@ -158,7 +152,6 @@ full = [
     "visual-query",
     "bbox-tracker",
     "click-goal",
-    "record",
     "mls",
     "cmu-native",
 ]
@@ -205,8 +198,6 @@ nuwax-nav-patrolling = { path = "../nuwax-nav-patrolling", optional = true }
 nuwax-nav-visual-servoing = { path = "../nuwax-nav-visual-servoing", optional = true }
 nuwax-nav-visual-query = { path = "../nuwax-nav-visual-query", optional = true }
 nuwax-nav-bbox-tracker = { path = "../nuwax-nav-bbox-tracker", optional = true }
-nuwax-nav-record = { path = "../nuwax-nav-record", optional = true }
-
 # ---- MLS Planner(可选)----
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 
@@ -230,7 +221,7 @@ nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner" }
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 
 [[bin]]
-# 默认 CLI:提供 --profile / --dry-run / --replay / --list-features 入口
+# 默认 CLI:提供 --profile / --dry-run / --list-features 入口
 name = "nuwax-nav-stack"
 path = "src/bin/nuwax_nav_stack.rs"
 required-features = []

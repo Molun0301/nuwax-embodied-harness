@@ -5,7 +5,7 @@ from contracts.compat import StrEnum
 
 from pydantic import Field, model_validator
 
-from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
+from contracts.base import MetadataDict, TimestampedContract, utc_now
 from contracts.geometry import Pose
 from typing import List, Optional, Tuple
 
@@ -135,65 +135,3 @@ class ExplorationState(TimestampedContract):
     message: Optional[str] = Field(default=None, description="状态说明。")
     updated_at: datetime = Field(default_factory=utc_now, description="状态更新时间。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
-
-
-# =====================================================================
-# V2：navigation_proxy gRPC 契约对齐（design.md 附录 K）
-# =====================================================================
-
-
-class NavigationFailureCode(StrEnum):
-    """导航错误码（与 protos/navigation_proxy.proto NAVIGATION_FAILURE_* 一一对应）。
-
-    7 种枚举值覆盖：未知/超时/障碍物/无路径/取消/队列满/代理不可达。
-    """
-
-    UNKNOWN = "unknown"
-    TIMEOUT = "timeout"
-    OBSTACLE = "obstacle"
-    NO_PATH = "no_path"
-    CANCELED = "canceled"
-    QUEUE_FULL = "queue_full"
-    PROXY_UNAVAILABLE = "proxy_unavailable"
-
-
-class NavigateToPoseRequest(TimestampedContract):
-    """navigation_proxy gRPC NavigateToPoseRequest 的 platform 侧 dataclass。
-
-    与 ``protos/navigation_proxy.proto`` 字段一一对应（除 timestamp_ms 由 server 侧注入）。
-    """
-
-    request_id: str = Field(description="全局唯一 request_id（UUID v4）。")
-    pose: Pose = Field(description="目标位姿 Pose2D。")
-    timeout_sec: int = Field(default=60, ge=1, description="超时秒数（默认 60s）。")
-
-
-class NavigationStateUpdate(TimestampedContract):
-    """navigation_proxy gRPC NavigationStateUpdate 的 platform 侧 dataclass。
-
-    双向流的载荷；server 每次状态变化推送一条。
-    """
-
-    request_id: str = Field(description="关联 NavigateToPoseRequest.request_id。")
-    status: NavigationStatus = Field(default=NavigationStatus.IDLE, description="导航状态。")
-    current_pose: Optional[Pose] = Field(default=None, description="当前位姿（最新）。")
-    failure_code: Optional[NavigationFailureCode] = Field(
-        default=None,
-        description="终态失败时的错误码；非终态为 None。",
-    )
-    failure_message: Optional[str] = Field(default=None, description="终态错误消息。")
-    failure_recoverable: bool = Field(default=False, description="是否可恢复。")
-    timestamp_ms: Optional[int] = Field(default=None, ge=0, description="UTC 毫秒时间戳（server 侧注入）。")
-    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
-
-
-class NavigationError(ContractModel):
-    """结构化导航错误（与 MCP/HTTP 错误体字段对齐）。
-
-    MCP/HTTP MUST 返回 ``{"ok": false, "error": {"code", "message", "recoverable"}}``。
-    """
-
-    code: NavigationFailureCode = Field(description="错误码枚举值。")
-    message: str = Field(description="人类可读错误消息。")
-    recoverable: bool = Field(default=False, description="是否可恢复（重试/取消/降级）。")
-    metadata: MetadataDict = Field(default_factory=dict, description="附加错误元数据。")

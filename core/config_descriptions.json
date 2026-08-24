@@ -2,7 +2,6 @@
   "GO2_DATA_PLANE_ENABLED": "是否启用 Go2 设备侧数据面",
   "NUWAX_ACTIVE_MAP_RESTORE_ON_START": "启动网关时不自动恢复/加载地图；由 Agent 通过 MCP 显式 activate_map",
   "NUWAX_ARTIFACT_RETENTION_DAYS": "制品保留天数；超过该天数的历史制品可被清理。",
-  "NUWAX_GATEWAY_HIGH_RISK_ALLOWLIST": "个人机器狗：网关不鉴权（无 agent/admin 令牌、无来源网段限制）。 仅保留能力风险门控白名单：列出的 HIGH 风险能力才允许被能力调用入口（含 LLM）触发，逗号分隔。",
   "NUWAX_GATEWAY_POINTCLOUD3D_COLOR": "3D 点云的基础/单色显示颜色，使用 #RRGGBB。",
   "NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR": "3D 点云地面语义颜色，使用 #RRGGBB。",
   "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS": "3D 点云高度渐变颜色，从低到高填写 5 个 #RRGGBB，逗号分隔。",

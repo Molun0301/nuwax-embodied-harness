@@ -102,6 +102,7 @@ def _load_release_manifest_module():
             required_symbols = (
                 "_artifact_set_generation",
                 "_canonical_json_bytes",
+                "_selected_artifact_roles",
                 "verify_release_manifest",
             )
             missing = [name for name in required_symbols if not hasattr(module, name)]
@@ -121,6 +122,7 @@ def _load_release_manifest_module():
 _release_manifest = _load_release_manifest_module()
 _artifact_set_generation = _release_manifest._artifact_set_generation
 _canonical_json_bytes = _release_manifest._canonical_json_bytes
+_selected_artifact_roles = _release_manifest._selected_artifact_roles
 verify_release_manifest = _release_manifest.verify_release_manifest
 
 _SCHEMA_VERSION = "nuwax.geometry.release.v1"
@@ -383,6 +385,15 @@ def _profile_native_lio_contract(profile_path):
 def _parse_native_lio(values, profile_contract):
     # type: (Sequence[str], Sequence[Tuple[str, str]]) -> List[Tuple[str, Path]]
     by_source = {source: role for role, source in profile_contract}
+    selected_roles = set(_selected_artifact_roles())
+    selected_names = {
+        role[len("native_lio_payload:"):]
+        for role in selected_roles
+        if role.startswith("native_lio_payload:")
+    }
+    selected_sources = {
+        source for role, source in profile_contract if role in selected_names
+    }
     resolved = []
     seen_sources = set()
     for raw_path in values:
@@ -396,11 +407,12 @@ def _parse_native_lio(values, profile_contract):
         if source in seen_sources:
             raise ValueError("--native-lio source 重复: %s" % source)
         seen_sources.add(source)
-        resolved.append((role, path))
-    expected_sources = set(by_source)
-    if seen_sources != expected_sources:
-        raise ValueError("--native-lio path 集合必须覆盖发布 profile 全部 source: expected=%s actual=%s"
-                         % (",".join(sorted(expected_sources)), ",".join(sorted(seen_sources))))
+        if role in selected_names:
+            resolved.append((role, path))
+    missing_sources = selected_sources - seen_sources
+    if missing_sources:
+        raise ValueError("--native-lio path 集合缺少当前选中 source: %s"
+                         % ",".join(sorted(missing_sources)))
     return sorted(resolved, key=lambda item: item[0])
 
 
@@ -511,8 +523,14 @@ def _fsync_stage_payload(directory_fd):
     os.fsync(directory_fd)
 
 
-def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs):
-    # type: (Path, Sequence[Tuple[str, Path]], Path, Path, Mapping[str, object]) -> Path
+def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, environment=None):
+    # type: (Path, Sequence[Tuple[str, Path]], Path, Path, Mapping[str, object], Optional[Mapping[str, str]]) -> Path
+    selected_roles = set(_selected_artifact_roles(environment))
+    selected_lio_roles = {
+        role[len("native_lio_payload:"):]
+        for role in selected_roles
+        if role.startswith("native_lio_payload:")
+    }
     parent_fd = _open_absolute_directory(parent)
     stage_fd = None  # type: Optional[int]
     basename = ""
@@ -540,8 +558,13 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs):
         try:
             sources = [("geometry_runtime", runtime, True),
                        ("offline_mapping_cli", mapping_cli, True)]
-            sources.extend((role, path, True) for role, path in _embedded_artifacts(runtime))
-            sources.extend(("native_lio_payload:%s" % name, path, True) for name, path in native_lio)
+            if "native_pgo_payload" in selected_roles:
+                sources.extend((role, path, True) for role, path in _embedded_artifacts(runtime))
+            sources.extend(
+                ("native_lio_payload:%s" % name, path, True)
+                for name, path in native_lio
+                if name in selected_lio_roles
+            )
             if len({role for role, _, _ in sources}) != len(sources):
                 raise RuntimeError("release artifact role 重复")
             if len({path.resolve(strict=True) for _, path, _ in sources}) != len(sources):
@@ -559,7 +582,7 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs):
             entries.sort(key=lambda item: str(item["role"]))
             generation = _artifact_set_generation(entries)
             manifest = {"schema_version": _SCHEMA_VERSION, "generation": generation,
-                        "native_lio_roles": sorted(name for name, _ in native_lio),
+                        "native_lio_roles": sorted(selected_lio_roles),
                         "artifacts": entries}
             manifest_bytes = _canonical_json_bytes(manifest)
             (generation_root / "manifest.json").write_bytes(manifest_bytes)
@@ -925,7 +948,10 @@ def _verify_manifest_with_stable_root(manifest_path, root_fd, expected_generatio
             raise RuntimeError("pathname checker 未指向固定 generation FD")
     finally:
         os.close(path_root_fd)
-    proof = verify_release_manifest(manifest_path)
+    proof = verify_release_manifest(
+        manifest_path,
+        require_selected_artifacts=True,
+    )
     after = _identity(root_fd)
     if before != after:
         raise RuntimeError("checker 前后固定 generation FD identity 变化")
@@ -958,7 +984,12 @@ def _manifest_role_contract(manifest):
 
 def _verify_profile_roles(manifest, profile_contract):
     # type: (Mapping[str, object], Sequence[Tuple[str, str]]) -> Tuple[str, ...]
-    expected_by_role = {role: source for role, source in profile_contract}
+    selected_roles = set(_selected_artifact_roles())
+    expected_by_role = {
+        role: source
+        for role, source in profile_contract
+        if "native_lio_payload:%s" % role in selected_roles
+    }
     expected_roles = tuple(sorted(expected_by_role))
     roles, artifact_roles = _manifest_role_contract(manifest)
     expected_artifacts = tuple("native_lio_payload:%s" % role for role in expected_roles)
@@ -1252,7 +1283,14 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
                                    "geometry_runtime", executable=True)
         mapping_cli = _validate_source(cli_target / "release" / "nuwax-mapping-cli",
                                        "offline_mapping_cli", executable=True)
-        stage = _create_stage(stage_parent, native_lio, runtime, mapping_cli, before)
+        stage = _create_stage(
+            stage_parent,
+            native_lio,
+            runtime,
+            mapping_cli,
+            before,
+            environment=build_env,
+        )
         try:
             after = _capture_build_input_closure(args.cargo, manifests, env=build_env)
             if _canonical_json_bytes(after) != _canonical_json_bytes(before):

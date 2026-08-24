@@ -312,6 +312,8 @@ def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, D
                 continue
             if not availability.supported:
                 continue
+        if not descriptor.exposed_to_agent:
+            continue
         layer = _tool_layer(descriptor)
         for collection_name, config in _MCP_COLLECTIONS.items():
             if layer in config["layers"]:
@@ -602,11 +604,6 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
     @router.get("/mcp")
     async def mcp_stream(request: Request) -> Response:
-        try:
-            access_manager.authenticate_http(request)
-        except GatewayError as exc:
-            return _public_gateway_error_response(request, exc)
-
         async def event_generator():
             yield _format_sse("endpoint", {"endpoint": "/mcp", "protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS)})
             while not await request.is_disconnected():
@@ -617,11 +614,6 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
 
     @router.post("/mcp")
     async def mcp_endpoint(request: Request) -> Response:
-        try:
-            access = access_manager.authenticate_http(request)
-        except GatewayError as exc:
-            return _public_gateway_error_response(request, exc)
-
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -745,7 +737,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                     "mcp_method": method,
                     "tool_name": name,
                     "capability_name": function_name,
-                    "requested_by": access.principal,
+                    "requested_by": "local",
                 }
                 MCP_LOGGER.debug("MCP 工具调用开始", extra=log_extra)
                 try:
@@ -753,7 +745,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         lambda: runtime.invoke_tool(
                             function_name,
                             function_arguments,
-                            requested_by=access.principal,
+                            requested_by="local",
                             request_context=request_context,
                         )
                     )

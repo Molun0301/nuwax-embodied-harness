@@ -21,11 +21,9 @@
 //! 2. **多 profile**:根据 `NavStackProfile` 选择 simple / CMU native / A* / exploration / MLS pipeline。
 //! 3. **配置驱动**:`NavTopicConfig` + `NavFeatureFlags` 决定 module graph。
 //! 4. **可观测**:每个 profile 输出 module graph,可 dry-run 打印,便于 e2e 验收。
-//! 5. **可选可视化**:`--viewer` / rerun / foxglove 只作为可选模块,不影响核心规划。
-//! 6. **replay/smoke**:`--replay <rosbag>` 与 fixture 驱动 stack smoke test。
-//! 7. **依赖隔离**:默认 features 为空,所有 planner / bridge / visual / explore 都走可选 feature,
+//! 5. **依赖隔离**:默认 features 为空,所有 planner / bridge / visual / explore 都走可选 feature,
 //!    避免 stack 默认强依赖探索或其他板块。
-//! 8. **运行时 owner(rework22 / P0-07)**:`StackRunner` 持有 native 子进程,
+//! 6. **运行时 owner(rework22 / P0-07)**:`StackRunner` 持有 native 子进程,
 //!    并要求 Rust / Coordinator 节点注册具体的 in-process lifecycle owner。
 //!    未注册节点会显式阻止启动,不会被静默跳过。
 //!
@@ -44,7 +42,7 @@
 //! pub struct NavStackBuilder     { profile, topics, features }
 //! pub struct ModuleGraph         { nodes: Vec<ModuleNode> }
 //! pub struct ModuleNode          { id, kind, feature_gate, binary, inputs, outputs, depends_on }
-//! pub enum ModuleKind            { NativeBridge, RustAlgorithm, Visualizer, Recorder, GoalSource, Explorer }
+//! pub enum ModuleKind            { NativeBridge, RustAlgorithm, Visualizer, GoalSource, Explorer }
 //! pub struct StackRunner         { graph, processes, in_process_nodes }
 //! ```
 //!
@@ -56,7 +54,7 @@
 //! 4. 调用 `builder.build_runner()` 得到 `StackRunner`(P0-07),
 //!    注册进程内 owner 后以 `.spawn_all().await` 拉起整个 graph,
 //!    `.shutdown().await` 优雅关闭。
-//! 5. 调用 `nav_stack_bin::run()` 启动 CLI,支持 `--dry-run` / `--replay <path>` / `--list-features`。
+//! 5. 调用 `nav_stack_bin::run()` 启动 CLI,支持 `--dry-run` / `--list-features`。
 //!
 //! ## 错误类型
 //!
@@ -79,7 +77,6 @@ pub mod manifest;
 mod map_pose;
 pub mod profile;
 pub mod profiles;
-pub mod replay;
 pub mod runner;
 mod runtime_owners;
 pub mod topics;

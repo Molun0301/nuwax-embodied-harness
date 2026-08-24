@@ -16,10 +16,10 @@
 //!
 //! 与 Cargo features 形成双重门控:
 //! - **Cargo feature**:控制能否 *编译进* crate(防止编译期引入不需要的依赖)。
-//! - **`NavFeatureFlags`**:控制运行时是否 *启用* 某行为(可视化、replay、record 等)。
+//! - **`NavFeatureFlags`**:控制运行时是否 *启用* 某行为。
 //!
 //! 这种分层的好处:
-//! - 默认 `cargo build` 不会拉入任何 visualizer / rerun / foxglove / record / explore 依赖。
+//! - 默认 `cargo build` 不会拉入任何 explore 依赖。
 //! - 即使所有 Cargo feature 都关闭,`NavStackBuilder` 仍可 dry-run,只是实际启动能力受限。
 
 use serde::{Deserialize, Serialize};
@@ -31,12 +31,6 @@ bitflags::bitflags! {
     /// 实际生效仍需要对应的 Cargo feature 也已启用(编译期门控)。
     #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct NavFeatureFlags: u32 {
-        /// 启用 replay/smoke 入口(rosbag fixture 驱动 stack)。
-        const REPLAY          = 1 << 0;
-        /// 启用可视化模块(rerun / foxglove 等)。
-        const VIEWER          = 1 << 1;
-        /// 启用导航 topic 录制 profile(必须配合 `record` Cargo feature)。
-        const RECORD          = 1 << 2;
         /// 启用 MLS 3D pipeline(必须配合 `mls` Cargo feature)。
         const MLS             = 1 << 3;
         /// 启用探索目标源(必须配合 `explore` Cargo feature)。
@@ -65,10 +59,7 @@ impl NavFeatureFlags {
     /// 命名上避免与 `bitflags!` 自动生成的 `all()`(返回 "all bits set" 即 u32::MAX)
     /// 冲突。`bitflags!` 已经在 Self 上生成了 `all()` 方法,直接同名覆盖会导致歧义。
     pub fn all_enabled() -> Self {
-        Self::REPLAY
-            | Self::VIEWER
-            | Self::RECORD
-            | Self::MLS
+        Self::MLS
             | Self::EXPLORE
             | Self::CLICK_GOAL
             | Self::PATROLLING
@@ -101,9 +92,6 @@ impl Serialize for NavFeatureFlags {
 /// 用于序列化、dry-run 输出与 CLI preset 字符串对齐。
 pub fn flag_to_kebab(name: &str) -> &'static str {
     match name {
-        "REPLAY" => "replay",
-        "VIEWER" => "viewer",
-        "RECORD" => "record",
         "MLS" => "mls",
         "EXPLORE" => "explore",
         "CLICK_GOAL" => "click-goal",
@@ -122,9 +110,6 @@ impl<'de> Deserialize<'de> for NavFeatureFlags {
         let mut out = NavFeatureFlags::empty();
         for name in names {
             let flag = match name.as_str() {
-                "replay" => NavFeatureFlags::REPLAY,
-                "viewer" => NavFeatureFlags::VIEWER,
-                "record" => NavFeatureFlags::RECORD,
                 "mls" => NavFeatureFlags::MLS,
                 "explore" => NavFeatureFlags::EXPLORE,
                 "click-goal" => NavFeatureFlags::CLICK_GOAL,
@@ -238,10 +223,9 @@ mod tests {
 
     #[test]
     fn flags_serialize_to_kebab_case() {
-        let f = NavFeatureFlags::REPLAY | NavFeatureFlags::MLS;
+        let f = NavFeatureFlags::MLS;
         let s = serde_json::to_string(&f).unwrap();
         // 位标志序列化为数组
-        assert!(s.contains("\"replay\""));
         assert!(s.contains("\"mls\""));
     }
 }

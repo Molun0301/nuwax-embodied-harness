@@ -1,5 +1,5 @@
-f44730585c703cb783441c9ec647bb1f2a95b3139554c257a5686a6d472c625a  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/Cargo.toml
-454e0fdd18f42ca5e49db328f1a47c370e0c0f0376b8c9b1700d578b364d7d96  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/Cargo.lock
+e8c3a71f1db0a259034a05539010ae35afaae59a72916b6a452c8e966dcc45ec  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/Cargo.toml
+ab8f74f9f587e6c56e40b9894e9f4d762c8b6a1c09fe5ec6f32e5d670112170e  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/Cargo.lock
 840606f0a100ce4a3ab3227b5dd979375b1d43199eb4c0f3a536cb1aa7489e37  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-codec/Cargo.toml
 c8f2ddf359bf3d42017d8aaa968c85f51866424e72f0eed1b4278cf75645dda8  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-core/Cargo.toml
 0251ee6d16b0399c8791745994bd27c47528e18ae8954ea08781a76fd3afaa7d  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-exploration/Cargo.toml
@@ -26,9 +26,8 @@ e90ffbbdee7f24849949f691eafffdd5bcd36d06c0339df55cb21b6f23a2c5ed  /home/ml/Deepr
 b30e87b0b6c8be604e1351195370bf10ca3f96d4761732e3a18a6d95601c9906  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-path-follower-bridge/Cargo.toml
 5b20dfe6488f8089e502b4cbb75b829de3d7c3bc3ec0546a525dc5e9f32cbf7b  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-patrolling/Cargo.toml
 23e6e23df2c80a230fcb20cb6632060dcbf5a3e1d9da92833bf54cf8d737e2c5  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-pgo-bridge/Cargo.toml
-7bc5dfdf04620efdc0fea171798506733fc275e748798cda4ca23e0f8d40d75d  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-record/Cargo.toml
 6af78f780db6ed6d6f0b74619797d0343a2630221d0ba3ac6aa1268cb7d00d73  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-simple-planner/Cargo.toml
-428407cd378fefd49c47cf4e475ff332903a7fd8f69a56a478042c7b9d029527  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-stack/Cargo.toml
+19bf5f27b8fb108cc077275604651b455ea442a07610d82648f66982291b3555  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-stack/Cargo.toml
 de010f2b434956f098b158ec25e19ddb40eef6ec7c075a42fcefa3c586edc7a5  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-terrain-map-ext/Cargo.toml
 9aeac76e1ecb25951a936bdbda371f2113134d46303491141df548c68e5b6d42  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-test-fixtures/Cargo.toml
 ac8549802af935e712a79362f1505edc1b75b5419b364caaf000480071285613  /home/ml/Deeprob/nuwax_robot_bridge/services/nuwax-workspace/crates/nuwax-nav-types-messages/Cargo.toml

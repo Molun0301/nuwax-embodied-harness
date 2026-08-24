@@ -7,9 +7,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ProtectHome=read-only
-User=nuwax-gateway
-Group=nuwax-gateway
-SupplementaryGroups=nuwax-motion-clients video render
+User=nuwax
+Group=nuwax
+SupplementaryGroups=video render
 WorkingDirectory=@NUWAX_REPO_ROOT@
 RuntimeDirectory=nuwax/gateway
 RuntimeDirectoryMode=0750

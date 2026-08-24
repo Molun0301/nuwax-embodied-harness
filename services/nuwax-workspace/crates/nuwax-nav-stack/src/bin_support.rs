@@ -47,8 +47,6 @@ pub struct CliOptions {
     pub preset: Option<NavStackPreset>,
     /// 是否 dry-run。
     pub dry_run: bool,
-    /// 可选 replay fixture 路径。
-    pub replay: Option<String>,
     /// 是否列出 feature。
     pub list_features: bool,
     /// 是否输出 JSON 形式的 module graph(供机器消费)。
@@ -62,7 +60,6 @@ impl CliOptions {
     /// - `--profile=<name>` / `--profile <name>`
     /// - `--preset=<name>`
     /// - `--dry-run`
-    /// - `--replay <path>`
     /// - `--list-features`
     /// - `--json`
     /// - `--help` / `-h`
@@ -70,7 +67,6 @@ impl CliOptions {
         let mut profile: Option<NavStackProfile> = None;
         let mut preset: Option<NavStackPreset> = None;
         let mut dry_run = false;
-        let mut replay: Option<String> = None;
         let mut list_features = false;
         let mut json = false;
 
@@ -95,10 +91,6 @@ impl CliOptions {
                 }
                 "--dry-run" => {
                     dry_run = true;
-                }
-                "--replay" => {
-                    let v = require_value("--replay", key_value(args, &mut i, value))?;
-                    replay = Some(v);
                 }
                 "--list-features" => {
                     list_features = true;
@@ -129,7 +121,6 @@ impl CliOptions {
             profile,
             preset,
             dry_run,
-            replay,
             list_features,
             json,
         })
@@ -195,7 +186,6 @@ fn print_help() {
          -p, --profile <NAME>   select stack profile (simple-2d | cmu-native | replanning-astar | exploration-native | mls-3d)\n\
              --preset <NAME>    apply feature preset (none | simple | cmu | explore | mls | all)\n\
              --dry-run         render module graph and exit (no process spawn)\n\
-             --replay <PATH>   run smoke replay using the given fixture manifest\n\
              --list-features   list available features and exit\n\
              --launcher-contract  print the launcher readiness contract and exit\n\
              --json            emit module graph as JSON instead of YAML-like text\n\
@@ -259,11 +249,6 @@ where
         println!("{s}");
     } else {
         println!("{}", crate::dry_run::render(runner.graph()));
-    }
-
-    // 真实 replay:仅在显式指定 fixture 时执行,fixture 缺失立即报错
-    if let Some(path) = opts.replay {
-        crate::replay::run_smoke(std::path::PathBuf::from(path))?;
     }
 
     supervise_runner_until(&mut runner, shutdown).await
@@ -389,7 +374,6 @@ pub fn list_features() {
         ("visual-query", "enable nuwax-nav-visual-query"),
         ("bbox-tracker", "enable nuwax-nav-bbox-tracker"),
         ("click-goal", "enable nuwax-nav-click-goal-bridge"),
-        ("record", "enable nuwax-nav-record"),
         (
             "mls",
             "enable nuwax-nav-mls-planner (3D MLS planner pipeline)",
@@ -398,9 +382,6 @@ pub fn list_features() {
             "explore",
             "enable nuwax-explore-wavefront + tare + terrain bridges",
         ),
-        ("replay", "enable --replay smoke entry (compile-time)"),
-        ("viewer", "enable visualization modules (compile-time)"),
-        ("record-profile", "alias: record"),
         (
             "full",
             "convenience preset covering most navigation features",
@@ -442,15 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_dry_run_and_replay() {
-        let opts = CliOptions::parse(&[
-            "--dry-run".into(),
-            "--replay".into(),
-            "/tmp/foo.json".into(),
-        ])
-        .unwrap();
+    fn parse_dry_run() {
+        let opts = CliOptions::parse(&["--dry-run".into()]).unwrap();
         assert!(opts.dry_run);
-        assert_eq!(opts.replay.as_deref(), Some("/tmp/foo.json"));
     }
 
     #[test]
@@ -521,7 +496,6 @@ mod tests {
                 profile,
                 preset: None,
                 dry_run: false,
-                replay: None,
                 list_features: false,
                 json: false,
             };

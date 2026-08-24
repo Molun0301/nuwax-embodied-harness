@@ -28,10 +28,6 @@ pub enum Command {
     PoseFill(cmd::pose_fill::PoseFillArgs),
     /// Persist logical stream renames and drops
     Rename(cmd::rename::RenameArgs),
-    /// Build a deterministic replay schedule
-    Replay(cmd::replay::ReplayArgs),
-    /// Export persisted marker observations
-    ReplayMarker(cmd::replay_marker::ReplayMarkerArgs),
     /// Print exact dataset counts and time ranges
     Summary(cmd::summary::SummaryArgs),
 }
@@ -41,8 +37,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Map(args) => cmd::map::run(args).await,
         Command::PoseFill(args) => cmd::pose_fill::run(args).await,
         Command::Rename(args) => cmd::rename::run(args).await,
-        Command::Replay(args) => cmd::replay::run(args).await,
-        Command::ReplayMarker(args) => cmd::replay_marker::run(args).await,
         Command::Summary(args) => cmd::summary::run(args).await,
     }
 }

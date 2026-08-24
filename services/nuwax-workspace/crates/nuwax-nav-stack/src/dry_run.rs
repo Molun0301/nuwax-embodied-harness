@@ -88,7 +88,6 @@ pub fn kind_str(k: ModuleKind) -> &'static str {
         ModuleKind::NativeBridge => "native-bridge",
         ModuleKind::RustAlgorithm => "rust-algorithm",
         ModuleKind::Visualizer => "visualizer",
-        ModuleKind::Recorder => "recorder",
         ModuleKind::GoalSource => "goal-source",
         ModuleKind::Explorer => "explorer",
         ModuleKind::Coordinator => "coordinator",

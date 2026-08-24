@@ -108,15 +108,12 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/debug", response_class=HTMLResponse)
     @router.get("/debug/", response_class=HTMLResponse)
     async def debug_page(request: Request) -> HTMLResponse:
-        access_manager.authenticate_local_debug_page(request)
-        # 个人机器狗：网关不鉴权，前端无需注入访问令牌（保留空串占位，沿用现有 fetch 逻辑）。
         pointcloud3d_config = getattr(getattr(runtime.config, "gateway", None), "pointcloud3d", None)
-        return HTMLResponse(_render_debug_page("", pointcloud3d_config))
+        return HTMLResponse(_render_debug_page(pointcloud3d_config))
 
     @router.get("/api/debug/overview")
     @router.get("/api/debug/snapshot")
     async def debug_overview(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response(
             'robot.state',
             'map.frame',
@@ -136,55 +133,46 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     @router.get("/api/debug/map")
     @router.get("/api/debug/map/frame/latest")
     async def debug_map(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('map.frame')
 
     @router.get("/api/debug/localization")
     @router.get("/api/debug/localization/pose/latest")
     @router.get("/api/debug/localization/trajectory")
     async def debug_localization(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('localization.pose', 'localization.frame_tree', 'localization.trajectory')
 
     @router.get("/api/debug/navigation")
     @router.get("/api/debug/exploration/frontier/latest")
     async def debug_navigation(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/debug/pointcloud-map/latest/meta")
     async def debug_pointcloud_map_meta(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('pointcloud_map.meta')
 
     @router.get("/api/debug/pointcloud-map/latest.bin")
     async def debug_pointcloud_map_binary(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('pointcloud_map.chunk', 'pointcloud_map.frame')
 
     @router.get("/api/debug/pointcloud/latest")
     @router.get("/api/debug/pointcloud/frame/latest")
     @router.get("/api/debug/pointcloud/frame/latest/meta")
     async def debug_pointcloud_latest(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('pointcloud.frame')
 
     @router.get("/api/debug/video/latest")
     @router.get("/api/debug/video/frame/latest")
     async def debug_video_latest(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('video.frame')
 
     @router.get("/api/debug/logs/tail")
     async def debug_logs_tail(request: Request) -> JSONResponse:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('logs.entry')
 
     @router.post("/api/debug/navigation/goal")
     async def debug_navigation_goal(request: Request) -> JSONResponse:
         """Debug 面板 2D Goal：RViz SetGoal 直通，发布 /goal_pose → bt_navigator。"""
 
-        access_manager.authenticate_http(request)
         body = await request.json()
         arguments = dict(body or {})
         try:
@@ -199,7 +187,6 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     async def debug_map_clicked_point(request: Request) -> JSONResponse:
         """Debug 面板 RViz Publish Point：发布 /clicked_point，不导航。"""
 
-        access_manager.authenticate_http(request)
         body = await request.json()
         arguments = dict(body or {})
         try:
@@ -214,7 +201,6 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     async def debug_map_initial_pose(request: Request) -> JSONResponse:
         """Debug 面板 2D Pose Estimate 直通：发布初始位姿并触发重定位。"""
 
-        access_manager.authenticate_http(request)
         body = await request.json()
         arguments = dict(body or {})
         try:
@@ -228,7 +214,7 @@ def build_debug_panel_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     return router
 
 
-def _render_debug_page(access_token: str, pointcloud3d_config: Any = None) -> str:
+def _render_debug_page(pointcloud3d_config: Any = None) -> str:
     """Serve the debug panel from the standalone static HTML file.
 
     The page markup/styles/script live in ``static/debug_panel.html`` so the
@@ -237,7 +223,6 @@ def _render_debug_page(access_token: str, pointcloud3d_config: Any = None) -> st
     injecting runtime values into quoted placeholders (kept quoted so the raw
     file remains valid JS when previewed directly).
     """
-    debug_access_token = json.dumps(access_token)
     pointcloud3d_payload = (
         to_jsonable(pointcloud3d_config)
         if pointcloud3d_config is not None
@@ -249,10 +234,7 @@ def _render_debug_page(access_token: str, pointcloud3d_config: Any = None) -> st
         separators=(",", ":"),
     ).replace("</", "<\\/")
     html = _DEBUG_PANEL_HTML_PATH.read_text(encoding="utf-8")
-    return (
-        html.replace('"__DEBUG_ACCESS_TOKEN__"', debug_access_token)
-        .replace('"__POINTCLOUD3D_CONFIG__"', pointcloud3d_json)
-    )
+    return html.replace('"__POINTCLOUD3D_CONFIG__"', pointcloud3d_json)
 
 
 def _envelope(

@@ -8,9 +8,9 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=nuwax-motion-guard
-Group=nuwax-motion-guard
-SupplementaryGroups=nuwax-motion-clients
+User=nuwax
+Group=nuwax
+SupplementaryGroups=video render
 WorkingDirectory=@NUWAX_REPO_ROOT@
 # /run/nuwax is shared and provisioned by nuwax-motion.conf tmpfiles. This
 # unit must not claim the parent as RuntimeDirectory: systemd would recursively
@@ -31,14 +31,14 @@ Environment=NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json
 Environment=NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json
 Environment=NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json
 Environment=NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15
-ExecStartPre=/usr/bin/chgrp nuwax-motion-clients /run/nuwax
+ExecStartPre=/usr/bin/chgrp nuwax /run/nuwax
 ExecStartPre=/usr/bin/chmod 0750 /run/nuwax
 ExecStartPre=/usr/bin/env NUWAX_REPO_ROOT_OVERRIDE=@NUWAX_REPO_ROOT@ NUWAX_PYTHON_BIN=@NUWAX_PYTHON_BIN@ PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_BACKEND=unitree_sdk2py NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_motion_guard_python.sh
 ExecStartPre=/usr/bin/test -r /var/lib/nuwax/motion-guard/provisioned.json
 ExecStartPre=/usr/bin/test -r /var/lib/nuwax/motion-guard/epoch.json
 ExecStartPre=/usr/bin/rm -f /run/nuwax/motion-guard.sock
 ExecStart=/usr/bin/env PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ PYTHONNOUSERSITE=1 NUWAX_MOTION_GUARD_BACKEND=unitree_sdk2py NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_LOCK=/run/nuwax/motion-guard.lock NUWAX_MOTION_GUARD_EPOCH=/var/lib/nuwax/motion-guard/epoch.json NUWAX_MOTION_GUARD_PROVISIONED=/var/lib/nuwax/motion-guard/provisioned.json NUWAX_ACTUATOR_SYMBOLS_FILE=@NUWAX_CONFIG_DIR@/actuator/actuator-symbols.json NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 @NUWAX_PYTHON_BIN@ -m services.navigation.motion_safety_guard
-ExecStartPost=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh wait
+ExecStartPost=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh wait nuwax nuwax
 ExecStopPost=/usr/bin/rm -f /run/nuwax/motion-guard.sock
 Restart=on-failure
 RestartSec=1

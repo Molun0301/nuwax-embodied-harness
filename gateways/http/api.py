@@ -399,7 +399,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         <h2>安全策略</h2>
         <ul>
           <li><span>鉴权</span><span class="mono">{security_policy["auth"]}</span></li>
-          <li><span>高危能力白名单</span><span class="mono">{", ".join(security_policy["capability_high_risk_allowlist"]) or "空"}</span></li>
+          <li><span>能力策略</span><span class="mono">{security_policy["capability_policy"]}</span></li>
         </ul>
       </section>
       <section class="card">
@@ -444,14 +444,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/health")
     async def api_health(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return await run_in_threadpool(lambda: to_jsonable(runtime.get_health_summary()))
 
     @router.get("/api/health/full")
     async def api_health_full(request: Request) -> Dict[str, Any]:
         """Return the authoritative runtime service-health aggregation."""
 
-        access_manager.authenticate_http(request)
         try:
             summary = await run_in_threadpool(runtime.get_health_summary)
         except Exception as exc:
@@ -463,9 +461,8 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         exposed_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
         descriptors = await run_in_threadpool(lambda: runtime.list_capabilities(exposed_only=exposed_only))
-        allowed = access_manager.filter_capabilities(access, descriptors)
+        allowed = access_manager.filter_capabilities(descriptors)
         return {"capabilities": [descriptor.model_dump(mode="json") for descriptor in allowed]}
 
     @router.get("/api/tools")
@@ -473,11 +470,9 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         include_unsupported: bool = False,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
-        # 个人机器狗不鉴权：工具清单全量展示（exposed_only=None）。
         views = await run_in_threadpool(
             lambda: runtime.list_tools(
-                exposed_only=None,
+                exposed_only=True,
                 include_unsupported=include_unsupported,
             )
         )
@@ -485,21 +480,18 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/security/policy")
     async def api_security_policy(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return access_manager.export_policy()
 
     @router.get("/api/config/schema")
     async def api_config_schema(request: Request) -> Dict[str, Any]:
         """返回全量配置 schema（按板块分组，敏感项脱敏）。"""
 
-        access_manager.authenticate_http(request)
         return await run_in_threadpool(config_io.build_schema)
 
     @router.post("/api/config/save")
     async def api_config_save(request: Request) -> Dict[str, Any]:
         """批量写回配置项到对应 env 文件（原子写 + 备份）。重启后生效。"""
 
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             raise as_gateway_error(ValueError("请求体必须为对象 {key: value}"))
@@ -520,17 +512,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/deployment/layout")
     async def api_deployment_layout(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _build_layout_snapshot()
 
     @router.get("/api/runtime/governance")
     async def api_runtime_governance(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {"runtime_governance": to_jsonable(runtime.get_runtime_governance_summary())}
 
     @router.get("/ops", response_class=HTMLResponse)
     async def ops_page(request: Request) -> HTMLResponse:
-        access_manager.authenticate_http(request)
         return HTMLResponse(_render_ops_page())
 
     def _resolve_client_host(request: Request) -> str:
@@ -569,20 +558,20 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         body: CapabilityInvokeRequest,
         request: Request,
     ) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
         descriptor = runtime.capability_registry.get_descriptor(capability_name)
-        access_manager.authorize_capability(access, descriptor)
+        access_manager.authorize_capability(descriptor)
+        requested_by = "local"
         request_context = _build_capability_request_context(
             request,
             capability_name=capability_name,
-            requested_by=access.principal,
+            requested_by=requested_by,
         )
         try:
             result = await run_in_threadpool(
                 lambda: runtime.invoke_capability(
                     capability_name,
                     body.arguments,
-                    requested_by=access.principal,
+                    requested_by=requested_by,
                     request_context=request_context,
                 )
             )
@@ -599,7 +588,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         history_limit: int = 20,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         bounded_history_limit = min(max(int(history_limit), 0), 100)
 
         def _summary_for_status(status: Any) -> Dict[str, Any]:
@@ -635,7 +623,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/tasks/{task_id}")
     async def api_task_status(task_id: str, request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         try:
             return to_jsonable(runtime.get_task_snapshot(task_id))
         except Exception as exc:
@@ -643,37 +630,34 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/tasks/{task_id}/cancel")
     async def api_cancel_task(task_id: str, request: Request) -> Dict[str, Any]:
-        access = access_manager.authenticate_http(request)
         try:
             return to_jsonable(
-                runtime._handle_cancel_task({"task_id": task_id}, requested_by=access.principal)
+                runtime._handle_cancel_task(
+                    {"task_id": task_id},
+                    requested_by="local",
+                )
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 
     @router.get("/api/legacy/tcp_policy")
     async def api_tcp_policy(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return to_jsonable(build_tcp_legacy_policy())
 
     @router.get("/api/state/latest")
     async def api_state_latest(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('robot.state')
 
     @router.get("/api/state/history")
     async def api_state_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('robot.state')
 
     @router.get("/api/state/diagnostics")
     async def api_state_diagnostics(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('robot.state')
 
     @router.get("/api/observations/latest")
     async def api_observations_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('video.frame', 'pointcloud.frame')
 
     @router.get("/api/observations/history")
@@ -682,17 +666,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         camera_id: Optional[str] = None,
         limit: int = 20,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('video.frame', 'pointcloud.frame')
 
     @router.get("/api/artifacts/summary")
     async def api_artifacts_summary(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return to_jsonable(runtime.artifact_service.get_summary())
 
     @router.get("/api/perception/latest")
     async def api_perception_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('video.frame')
 
     @router.get("/api/perception/history")
@@ -701,32 +682,26 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         camera_id: Optional[str] = None,
         limit: int = 20,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('video.frame')
 
     @router.get("/api/perception/runtime")
     async def api_perception_runtime(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {"perception_runtime": to_jsonable(runtime.perception_video_runtime.get_status())}
 
     @router.post("/api/perception/runtime/start")
     async def api_perception_runtime_start(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {"perception_runtime": to_jsonable(runtime._manual_perception_start())}
 
     @router.post("/api/perception/runtime/stop")
     async def api_perception_runtime_stop(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {"perception_runtime": to_jsonable(runtime._manual_perception_stop())}
 
     @router.get("/api/localization/latest")
     async def api_localization_latest(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('localization.pose', 'localization.frame_tree', 'localization.trajectory')
 
     @router.get("/api/localization/session")
     async def api_localization_session(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         try:
             return to_jsonable(
                 localization_skills.handle_get_localization_session(
@@ -740,7 +715,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/localization/relocalize")
     async def api_localization_relocalize(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -757,17 +731,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/localization/history")
     async def api_localization_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('localization.pose', 'localization.trajectory')
 
     @router.get("/api/maps/latest")
     async def api_maps_latest(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('map.frame')
 
     @router.get("/api/maps/catalog")
     async def api_maps_catalog(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {
             "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
@@ -775,7 +746,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/catalog")
     async def api_maps_catalog_create(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -797,7 +767,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         delete_memory_library: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         delete_result = runtime.map_workspace_service.delete_map(
             map_name=map_name,
             delete_memory_library=(
@@ -816,7 +785,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/activate")
     async def api_maps_activate(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -837,14 +805,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/maps/active")
     async def api_maps_active(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
         }
 
     @router.post("/api/maps/finalize")
     async def api_maps_finalize(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -862,7 +828,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/navigation/latest")
     async def api_navigation_latest(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/navigation/forbidden-zones")
@@ -870,7 +835,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         map_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         try:
             envelope = await run_in_threadpool(
                 runtime.navigation_service.list_forbidden_zones,
@@ -885,7 +849,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         body: ReplaceForbiddenZonesRequest,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         try:
             envelope = await run_in_threadpool(
                 runtime.navigation_service.replace_forbidden_zones,
@@ -901,7 +864,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_goal(request: Request, goal: NavigationGoalRequest) -> Dict[str, Any]:
         """Submit a goal through the singleton production navigation service."""
 
-        access_manager.authenticate_http(request)
         try:
             navigation_goal = _build_navigation_goal(goal)
 
@@ -928,7 +890,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_place_goal(request: Request) -> Dict[str, Any]:
         """将地点文本查询接入唯一 mapping-cloud owner 与 GoalLease。"""
 
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -966,7 +927,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_state(request: Request) -> StreamingResponse:
         """Stream authoritative ``navigation.state`` frames over SSE."""
 
-        access_manager.authenticate_http(request)
         try:
             initial_context = await run_in_threadpool(
                 runtime.navigation_service.refresh_navigation
@@ -1015,7 +975,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/navigation/semantic_context")
     async def api_navigation_semantic_context(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {
             "navigation_semantic_context": to_jsonable(
                 runtime.memory_service.get_navigation_semantic_context(
@@ -1029,7 +988,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/navigation/history")
     async def api_navigation_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.post("/api/navigation/cancel")
@@ -1038,7 +996,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     ) -> Dict[str, Any]:
         """Request cancellation without claiming terminal before actuator zero ack."""
 
-        access_manager.authenticate_http(request)
         try:
             current_context = await run_in_threadpool(
                 runtime.navigation_service.refresh_navigation
@@ -1085,12 +1042,10 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/memory/summary")
     async def api_memory_summary(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {"memory_summary": to_jsonable(runtime.memory_service.get_summary())}
 
     @router.get("/api/memory/libraries")
     async def api_memory_libraries(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {
             "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
@@ -1098,7 +1053,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/memory/libraries")
     async def api_create_memory_library(request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -1111,7 +1065,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.delete("/api/memory/libraries/{library_name}")
     async def api_delete_memory_library(library_name: str, request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         active_workspace = runtime.map_workspace_service.get_active_workspace()
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:
@@ -1128,7 +1081,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/memory/locations")
     async def api_memory_locations(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         # 未启用 active 库时返回空列表（避免跨库串数据），service 已默认按 active 库过滤。
         return {
             "locations": to_jsonable(
@@ -1142,7 +1094,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/memory/semantic")
     async def api_memory_semantic(request: Request, limit: int = 20) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return {
             "entries": to_jsonable(
                 runtime.memory_service.list_semantic_memories(
@@ -1159,7 +1110,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         library_name: Optional[str] = None,
         label: Optional[str] = None,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         # list_semantic_instances 已默认按 active 库过滤；前端显式传 library_name 时透传。
         result = await run_in_threadpool(
             lambda: runtime.invoke_capability(
@@ -1188,7 +1138,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         localization_session_id: Optional[str] = None,
         review_status: Optional[str] = None,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         arguments: Dict[str, Any] = {"limit": limit}
         for key, value in {
             "scene_space_id": scene_space_id,
@@ -1211,7 +1160,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         review_status: Optional[str] = None,
         max_distance_m: Optional[float] = None,
     ) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         arguments: Dict[str, Any] = {
             "query": query,
             "limit": limit,
@@ -1229,7 +1177,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/memory/scene_spaces/{scene_space_id}")
     async def api_memory_scene_space(scene_space_id: str, request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         return to_jsonable(
             memory_skills.handle_get_scene_space(
                 runtime._skill_ctx,
@@ -1240,7 +1187,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/artifacts/{artifact_id}/meta")
     async def api_artifact_meta(artifact_id: str, request: Request) -> Dict[str, Any]:
-        access_manager.authenticate_http(request)
         try:
             return runtime.artifact_store.get_ref(artifact_id).model_dump(mode="json")
         except Exception as exc:
@@ -1248,7 +1194,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/artifacts/{artifact_id}")
     async def api_artifact_raw(artifact_id: str, request: Request) -> FileResponse:
-        access_manager.authenticate_http(request)
         try:
             ref = runtime.artifact_store.get_ref(artifact_id)
             path = runtime.artifact_store.get_file_path(artifact_id)

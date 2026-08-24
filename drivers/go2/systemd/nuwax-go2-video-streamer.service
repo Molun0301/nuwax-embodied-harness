@@ -9,9 +9,9 @@ Type=simple
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-User=nuwax-gateway
-Group=nuwax-gateway
-SupplementaryGroups=nuwax-motion-clients video render
+User=nuwax
+Group=nuwax
+SupplementaryGroups=video render
 WorkingDirectory=@NUWAX_REPO_ROOT@
 UMask=0007
 Environment=PYTHONUNBUFFERED=1

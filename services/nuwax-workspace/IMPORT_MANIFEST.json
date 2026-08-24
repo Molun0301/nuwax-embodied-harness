@@ -2,7 +2,7 @@
   "snapshotted_at_utc": "2026-07-07T05:55:46Z",
   "source_git_commit": "cc730ac82aec1f267b754e51f182ce16203d2041",
   "crate_count_on_disk": 50,
-  "crate_count_in_workspace_members": 40,
+  "crate_count_in_workspace_members": 39,
   "crate_count": 50,
   "excludes": [
     "target/",
@@ -38,7 +38,6 @@
     "nuwax-nav-path-follower-bridge",
     "nuwax-nav-patrolling",
     "nuwax-nav-pgo-bridge",
-    "nuwax-nav-record",
     "nuwax-nav-simple-planner",
     "nuwax-nav-stack",
     "nuwax-nav-terrain-map-ext",
@@ -127,8 +126,8 @@
     }
   },
   "lockfile_sha256": {
-    "Cargo.toml": "f44730585c703cb783441c9ec647bb1f2a95b3139554c257a5686a6d472c625a",
-    "Cargo.lock": "454e0fdd18f42ca5e49db328f1a47c370e0c0f0376b8c9b1700d578b364d7d96"
+    "Cargo.toml": "e8c3a71f1db0a259034a05539010ae35afaae59a72916b6a452c8e966dcc45ec",
+    "Cargo.lock": "ab8f74f9f587e6c56e40b9894e9f4d762c8b6a1c09fe5ec6f32e5d670112170e"
   },
   "refresh_command": "bash scripts/import_nuwax_workspace_snapshot.sh --source <path>",
   "snapshot_script": "scripts/import_nuwax_workspace_snapshot.sh",

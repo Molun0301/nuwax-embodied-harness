@@ -52,12 +52,15 @@ RENDER_SDK_PATH="${NUWAX_RENDER_GO2_SDK_PATH:-${SDK_PATH}}"
 INSTALLED_ACTUATOR_SYMBOLS_FILE="${CONFIG_DIR}/actuator/actuator-symbols.json"
 SYSTEMD_BACKUP_DIR="${NUWAX_SYSTEMD_BACKUP_DIR:-}"
 PERSON_FOLLOW_AUTOSTART_MODE=""
-SERVICE_IDENTITY_USERS=(
+PROJECT_USER=nuwax
+PROJECT_GROUP=nuwax
+LEGACY_USERS=(
   nuwax-motion-guard
   nuwax-navigation
   nuwax-geometry
   nuwax-gateway
 )
+LEGACY_GROUP=nuwax-motion-clients
 GATEWAY_WRITE_DIRS=(
   /var/lib/nuwax/gateway/artifacts
   /var/lib/nuwax/gateway/maps
@@ -148,78 +151,31 @@ apply_systemd_tmpfiles() {
   fi
 }
 
-check_service_uid_collisions() {
+check_project_identity() {
   local source="${1:-system}"
-  local passwd_file=""
   local rendered_root=""
-  local user=""
-  local uid=""
-  local prior_user=""
-  local passwd_entry=""
-  declare -A user_by_uid=()
-  declare -A requested_user_by_uid=()
-  declare -A actual_user_by_uid=()
-
   if [[ "${source}" == "system" ]]; then
-    passwd_file=""
-  else
-    while read -r record_type user uid _rest; do
-      [[ "${record_type}" == "u" && "${uid}" =~ ^[0-9]+$ ]] || continue
-      case " ${SERVICE_IDENTITY_USERS[*]} " in
-        *" ${user} "*) ;;
-        *) continue ;;
-      esac
-      prior_user="${requested_user_by_uid[${uid}]:-}"
-      if [[ -n "${prior_user}" ]]; then
-        fail "service identity UID collision in sysusers source: ${prior_user}, ${user} request UID ${uid}"
-      fi
-      requested_user_by_uid["${uid}"]="${user}"
-    done < "${source}"
-    rendered_root="$(mktemp -d)"
-    mkdir -p "${rendered_root}/etc"
-    if ! systemd-sysusers --root="${rendered_root}" "${source}" >/dev/null; then
-      rm -rf "${rendered_root}"
-      fail "cannot render sysusers source for UID collision validation: ${source}"
-    fi
-    passwd_file="${rendered_root}/etc/passwd"
+    getent passwd "${PROJECT_USER}" >/dev/null \
+      || fail "missing project user ${PROJECT_USER}"
+    getent group "${PROJECT_GROUP}" >/dev/null \
+      || fail "missing project group ${PROJECT_GROUP}"
+    return 0
   fi
-
-  for user in "${SERVICE_IDENTITY_USERS[@]}"; do
-    if [[ -n "${passwd_file}" ]]; then
-      uid="$(awk -F: -v expected="${user}" '$1 == expected { print $3; found=1; exit } END { if (!found) exit 1 }' "${passwd_file}")" \
-        || { rm -rf "${rendered_root}"; fail "sysusers source did not render ${user}"; }
-    else
-      uid="$(getent passwd "${user}" | awk -F: 'NR == 1 { print $3 }')"
-      [[ -n "${uid}" ]] \
-        || { rm -rf "${rendered_root}"; fail "missing service identity ${user}"; }
-    fi
-    [[ "${uid}" =~ ^[0-9]+$ ]] \
-      || { rm -rf "${rendered_root}"; fail "invalid numeric UID for ${user}: ${uid}"; }
-    prior_user="${user_by_uid[${uid}]:-}"
-    if [[ -n "${prior_user}" ]]; then
-      rm -rf "${rendered_root}"
-      fail "service identity UID collision: ${prior_user}, ${user} share UID ${uid}"
-    fi
-    user_by_uid["${uid}"]="${user}"
-  done
+  ! grep -Eq 'nuwax-(motion-guard|navigation|geometry|gateway|motion-clients)' "${source}" \
+    || fail "legacy multi-user identity remains in sysusers source"
+  rendered_root="$(mktemp -d)"
+  mkdir -p "${rendered_root}/etc"
+  if ! systemd-sysusers --root="${rendered_root}" "${source}" >/dev/null; then
+    rm -rf "${rendered_root}"
+    fail "cannot render sysusers source: ${source}"
+  fi
+  awk -F: -v expected="${PROJECT_USER}" '$1 == expected { found=1 } END { exit(found ? 0 : 1) }' \
+    "${rendered_root}/etc/passwd" \
+    || { rm -rf "${rendered_root}"; fail "sysusers source did not render ${PROJECT_USER}"; }
+  awk -F: -v expected="${PROJECT_GROUP}" '$1 == expected { found=1 } END { exit(found ? 0 : 1) }' \
+    "${rendered_root}/etc/group" \
+    || { rm -rf "${rendered_root}"; fail "sysusers source did not render ${PROJECT_GROUP}"; }
   rm -rf "${rendered_root}"
-
-  if [[ "${source}" != "system" ]]; then
-    for user in "${SERVICE_IDENTITY_USERS[@]}"; do
-      passwd_entry="$(getent passwd "${user}" || true)"
-      [[ -n "${passwd_entry}" ]] || continue
-      uid="$(printf '%s\n' "${passwd_entry}" | awk -F: 'NR == 1 { print $3 }')"
-      [[ "${uid}" =~ ^[0-9]+$ ]] || fail "invalid installed numeric UID for ${user}: ${uid}"
-      prior_user="${requested_user_by_uid[${uid}]:-}"
-      if [[ -n "${prior_user}" && "${prior_user}" != "${user}" ]]; then
-        fail "service identity UID collision across sysusers/NSS: ${prior_user}, ${user} share UID ${uid}"
-      fi
-      prior_user="${actual_user_by_uid[${uid}]:-}"
-      [[ -z "${prior_user}" ]] \
-        || fail "installed service identity UID collision: ${prior_user}, ${user} share UID ${uid}"
-      actual_user_by_uid["${uid}"]="${user}"
-    done
-  fi
 }
 
 resolve_person_follow_autostart() {
@@ -348,6 +304,10 @@ check_systemd_owned_invariants() {
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
               "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
+    grep -qx 'User=nuwax' "${unit}" \
+      || fail "production service must run as nuwax: ${unit}"
+    grep -qx 'Group=nuwax' "${unit}" \
+      || fail "production service must run with group nuwax: ${unit}"
     grep -qx 'WorkingDirectory=@NUWAX_REPO_ROOT@' "${unit}" \
       || fail "production service must start from the rendered repository root: ${unit}"
     grep -qx 'ProtectHome=read-only' "${unit}" \
@@ -407,9 +367,9 @@ check_systemd_owned_invariants() {
     grep -qF 'EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env' "${unit}" \
       || fail "Go2-facing service does not use the managed data-plane config: ${unit}"
   done
-  grep -qF 'SupplementaryGroups=nuwax-motion-clients video render' "${GATEWAY_UNIT_SOURCE}" \
+  grep -qF 'SupplementaryGroups=video render' "${GATEWAY_UNIT_SOURCE}" \
     || fail "Gateway unit must include Jetson video/render device groups"
-  grep -qF 'SupplementaryGroups=nuwax-motion-clients video render' "${VIDEO_STREAMER_UNIT_SOURCE}" \
+  grep -qF 'SupplementaryGroups=video render' "${VIDEO_STREAMER_UNIT_SOURCE}" \
     || fail "Go2 video streamer unit must include Jetson video/render device groups"
   grep -qx 'Wants=network-online.target nuwax-geometry-runtime.service' \
     "${VIDEO_STREAMER_UNIT_SOURCE}" \
@@ -533,7 +493,7 @@ check_sources() {
     "${REPO_ROOT}/services/navigation/proto/motion_guard.proto" \
     || fail "retired motion gate/reset messages remain in the v2 proto"
   validate_sysusers_source
-  check_service_uid_collisions "${SYSUSERS_SOURCE}"
+  check_project_identity "${SYSUSERS_SOURCE}"
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
               "${VIDEO_STREAMER_UNIT_SOURCE}"; do
@@ -587,8 +547,8 @@ check_runtime_config() {
 check_runtime_config_permissions() {
   local path=""
   for path in "${NUWAX_ENV_FILE}" "${GO2_DATA_PLANE_ENV_FILE}"; do
-    [[ "$(stat -c '%U:%G %a' "${path}")" == "root:nuwax-motion-clients 640" ]] \
-      || fail "runtime config must be root:nuwax-motion-clients 0640: ${path}"
+    [[ "$(stat -c '%U:%G %a' "${path}")" == "root:nuwax 640" ]] \
+      || fail "runtime config must be root:nuwax 0640: ${path}"
   done
 }
 
@@ -596,7 +556,7 @@ secure_runtime_config_permissions() {
   local path=""
   check_runtime_config
   for path in "${NUWAX_ENV_FILE}" "${GO2_DATA_PLANE_ENV_FILE}"; do
-    chown root:nuwax-motion-clients "${path}"
+    chown root:nuwax "${path}"
     chmod 0640 "${path}"
   done
   check_runtime_config_permissions
@@ -631,8 +591,8 @@ check_installed_actuator_manifest() {
     && ! -L "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
     && -s "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" ]] \
     || fail "installed actuator symbols manifest is missing, empty, non-regular, or a symlink"
-  [[ "$(stat -c '%U:%G %a' "${INSTALLED_ACTUATOR_SYMBOLS_FILE}")" == "root:nuwax-motion-clients 640" ]] \
-    || fail "installed actuator symbols manifest must be root:nuwax-motion-clients 0640"
+  [[ "$(stat -c '%U:%G %a' "${INSTALLED_ACTUATOR_SYMBOLS_FILE}")" == "root:nuwax 640" ]] \
+    || fail "installed actuator symbols manifest must be root:nuwax 0640"
 }
 
 check_identity_write_access() {
@@ -657,8 +617,73 @@ ensure_gateway_device_groups() {
   for group in video render; do
     getent group "${group}" >/dev/null \
       || fail "Jetson device group is missing: ${group}"
-    usermod -a -G "${group}" nuwax-gateway
+    usermod -a -G "${group}" "${PROJECT_USER}"
   done
+}
+
+legacy_identity_present() {
+  local user=""
+  for user in "${LEGACY_USERS[@]}"; do
+    getent passwd "${user}" >/dev/null && return 0
+  done
+  getent group "${LEGACY_GROUP}" >/dev/null && return 0
+  return 1
+}
+
+stop_legacy_services() {
+  local unit=""
+  local owner=""
+  local user=""
+  for unit in "${DEPLOYMENT_UNITS[@]}"; do
+    owner="$(systemctl show -p User --value "${unit}" 2>/dev/null || true)"
+    for user in "${LEGACY_USERS[@]}"; do
+      if [[ "${owner}" == "${user}" ]] && systemctl is-active --quiet "${unit}"; then
+        systemctl stop "${unit}"
+        break
+      fi
+    done
+  done
+}
+
+migrate_legacy_ownership() {
+  local path=""
+  for path in /run/nuwax /var/lib/nuwax /var/lib/nuwax_robot_bridge /var/log/nuwax; do
+    [[ -e "${path}" && ! -L "${path}" ]] || continue
+    find -P "${path}" -xdev -exec chown -h "${PROJECT_USER}:${PROJECT_GROUP}" {} +
+  done
+}
+
+remove_legacy_identities() {
+  local user=""
+  local pids=""
+  local members=""
+  for user in "${LEGACY_USERS[@]}"; do
+    if getent passwd "${user}" >/dev/null; then
+      pids="$(pgrep -u "${user}" || true)"
+      [[ -z "${pids}" ]] || fail "legacy identity ${user} still owns running processes: ${pids}"
+      userdel "${user}" || fail "cannot remove legacy identity ${user}"
+    fi
+  done
+  if getent group "${LEGACY_GROUP}" >/dev/null; then
+    members="$(getent group "${LEGACY_GROUP}" | awk -F: '{print $4}')"
+    [[ -z "${members}" ]] || fail "legacy group ${LEGACY_GROUP} still has members: ${members}"
+    groupdel "${LEGACY_GROUP}" || fail "cannot remove legacy group ${LEGACY_GROUP}"
+  fi
+  for user in "${LEGACY_USERS[@]}"; do
+    ! getent passwd "${user}" >/dev/null || fail "legacy identity remains in NSS: ${user}"
+  done
+  ! getent group "${LEGACY_GROUP}" >/dev/null \
+    || fail "legacy group remains in NSS: ${LEGACY_GROUP}"
+}
+
+assert_legacy_identities_absent() {
+  local user=""
+  for user in "${LEGACY_USERS[@]}"; do
+    ! getent passwd "${user}" >/dev/null \
+      || fail "legacy identity remains in NSS: ${user}"
+  done
+  ! getent group "${LEGACY_GROUP}" >/dev/null \
+    || fail "legacy group remains in NSS: ${LEGACY_GROUP}"
 }
 
 secure_runtime_data_permissions() {
@@ -668,16 +693,16 @@ secure_runtime_data_permissions() {
     unsafe="$(find -P "${directory}" -xdev ! -type d ! -type f -print -quit)"
     [[ -z "${unsafe}" ]] \
       || fail "gateway writable tree contains a link or special file: ${unsafe}"
-    chown -hR nuwax-gateway:nuwax-gateway "${directory}"
+    chown -hR "${PROJECT_USER}:${PROJECT_GROUP}" "${directory}"
     find "${directory}" -xdev -type d -exec chmod 0750 {} +
     find "${directory}" -xdev -type f -exec chmod 0640 {} +
   done
-  chown root:nuwax-motion-clients /var/lib/nuwax_robot_bridge
+  chown "${PROJECT_USER}:${PROJECT_GROUP}" /var/lib/nuwax_robot_bridge
   chmod 2770 /var/lib/nuwax_robot_bridge
   [[ -f /tmp/cdds.LOG && ! -L /tmp/cdds.LOG ]] \
     || fail "/tmp/cdds.LOG must be a regular non-symlink created by systemd-tmpfiles"
-  [[ "$(stat -c '%U:%G:%a' /tmp/cdds.LOG)" == "root:nuwax-motion-clients:660" ]] \
-    || fail "/tmp/cdds.LOG must be root:nuwax-motion-clients 0660"
+  [[ "$(stat -c '%U:%G:%a' /tmp/cdds.LOG)" == "nuwax:nuwax:660" ]] \
+    || fail "/tmp/cdds.LOG must be nuwax:nuwax 0660"
 }
 
 snapshot_systemd_state() {
@@ -827,80 +852,67 @@ install_actuator_manifest() {
     cmp -s "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}" \
       || fail "refusing to overwrite installed actuator symbols manifest with different content"
   else
-    install -D -o root -g nuwax-motion-clients -m 0640 \
+    install -D -o root -g nuwax -m 0640 \
       "${ACTUATOR_SYMBOLS_FILE}" "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   fi
-  chown root:nuwax-motion-clients "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
+  chown root:nuwax "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   chmod 0640 "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_installed_actuator_manifest
 }
 
 check_service_access() {
-  local user=""
-  for user in nuwax-motion-guard nuwax-navigation nuwax-geometry nuwax-gateway; do
-    runuser -u "${user}" -- test -x "${CONFIG_DIR}" \
-      || fail "${user} cannot traverse runtime config directory ${CONFIG_DIR}"
-    runuser -u "${user}" -- test -r "${NUWAX_ENV_FILE}" \
-      || fail "${user} cannot read runtime config ${NUWAX_ENV_FILE}"
-  done
-  runuser -u nuwax-motion-guard -- test -r "${GO2_DATA_PLANE_ENV_FILE}" \
-    || fail "nuwax-motion-guard cannot read ${GO2_DATA_PLANE_ENV_FILE}"
-  runuser -u nuwax-gateway -- test -r "${GO2_DATA_PLANE_ENV_FILE}" \
-    || fail "nuwax-gateway cannot read ${GO2_DATA_PLANE_ENV_FILE}"
-  runuser -u nuwax-motion-guard -- test -x "${REPO_ROOT}" \
-    || fail "nuwax-motion-guard cannot traverse ${REPO_ROOT}"
-  runuser -u nuwax-motion-guard -- test -r "${GUARD_MODULE}" \
-    || fail "nuwax-motion-guard cannot read ${GUARD_MODULE}"
-  runuser -u nuwax-motion-guard -- test -x "${PYTHON_BIN}" \
-    || fail "nuwax-motion-guard cannot execute ${PYTHON_BIN}"
-  runuser -u nuwax-motion-guard -- test -x "${SDK_PATH}" \
-    || fail "nuwax-motion-guard cannot traverse ${SDK_PATH}"
-  runuser -u nuwax-motion-guard -- env \
+  local user="${PROJECT_USER}"
+  runuser -u "${user}" -- test -x "${CONFIG_DIR}" \
+    || fail "${user} cannot traverse runtime config directory ${CONFIG_DIR}"
+  runuser -u "${user}" -- test -r "${NUWAX_ENV_FILE}" \
+    || fail "${user} cannot read runtime config ${NUWAX_ENV_FILE}"
+  runuser -u "${user}" -- test -r "${GO2_DATA_PLANE_ENV_FILE}" \
+    || fail "${user} cannot read ${GO2_DATA_PLANE_ENV_FILE}"
+  runuser -u "${user}" -- test -x "${REPO_ROOT}" \
+    || fail "${user} cannot traverse ${REPO_ROOT}"
+  runuser -u "${user}" -- test -r "${GUARD_MODULE}" \
+    || fail "${user} cannot read ${GUARD_MODULE}"
+  runuser -u "${user}" -- test -x "${PYTHON_BIN}" \
+    || fail "${user} cannot execute ${PYTHON_BIN}"
+  runuser -u "${user}" -- test -x "${SDK_PATH}" \
+    || fail "${user} cannot traverse ${SDK_PATH}"
+  runuser -u "${user}" -- env \
     NUWAX_REPO_ROOT_OVERRIDE="${REPO_ROOT}" \
     NUWAX_GO2_SDK_PATH="${SDK_PATH}" \
     NUWAX_PYTHON_BIN="${PYTHON_BIN}" \
     PYTHONPATH="${REPO_ROOT}:${SDK_PATH}" \
     bash "${REPO_ROOT}/scripts/systemd/check_motion_guard_python.sh" \
-    || fail "nuwax-motion-guard cannot import protobuf/SDK/production module"
-  runuser -u nuwax-navigation -- test -x "${NAV_BINARY}" \
-    || fail "nuwax-navigation cannot traverse/read/execute ${NAV_BINARY}"
-  runuser -u nuwax-navigation -- test -r "${REPO_ROOT}/scripts/systemd/start_nav_stack.sh" \
-    || fail "nuwax-navigation cannot read start_nav_stack.sh"
-  runuser -u nuwax-geometry -- test -r "${GEOMETRY_LAUNCHER}" \
-    || fail "nuwax-geometry cannot read start_geometry_runtime.sh"
-  for user in nuwax-navigation nuwax-geometry nuwax-gateway; do
-    runuser -u "${user}" -- test -r "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" \
-      || fail "${user} cannot read wait_for_nav_stack_ready.sh"
-    runuser -u "${user}" -- test -r "${PROCESS_IDENTITY_HELPER}" \
-      || fail "${user} cannot read process_identity.sh"
-    runuser -u "${user}" -- test -r "${GEOMETRY_READY_HELPER}" \
-      || fail "${user} cannot read wait_for_geometry_runtime_ready.sh"
+    || fail "${user} cannot import protobuf/SDK/production module"
+  runuser -u "${user}" -- test -x "${NAV_BINARY}" \
+    || fail "${user} cannot traverse/read/execute ${NAV_BINARY}"
+  runuser -u "${user}" -- test -r "${REPO_ROOT}/scripts/systemd/start_nav_stack.sh" \
+    || fail "${user} cannot read start_nav_stack.sh"
+  runuser -u "${user}" -- test -r "${GEOMETRY_LAUNCHER}" \
+    || fail "${user} cannot read start_geometry_runtime.sh"
+  for path in "${REPO_ROOT}/scripts/systemd/wait_for_nav_stack_ready.sh" "${PROCESS_IDENTITY_HELPER}" "${GEOMETRY_READY_HELPER}"; do
+    runuser -u "${user}" -- test -r "${path}" \
+      || fail "${user} cannot read ${path}"
   done
   if person_follow_autostart_enabled; then
-    runuser -u nuwax-navigation -- test -x "${PERSON_FOLLOW_BINARY}" \
-      || fail "nuwax-navigation cannot traverse/read/execute ${PERSON_FOLLOW_BINARY}"
-    runuser -u nuwax-navigation -- test -r "${PERSON_FOLLOW_LAUNCHER}" \
-      || fail "nuwax-navigation cannot read start_person_follow.sh"
-    runuser -u nuwax-navigation -- test -r "${PERSON_FOLLOW_READY_HELPER}" \
-      || fail "nuwax-navigation cannot read wait_for_person_follow_ready.sh"
+    runuser -u "${user}" -- test -x "${PERSON_FOLLOW_BINARY}" \
+      || fail "${user} cannot traverse/read/execute ${PERSON_FOLLOW_BINARY}"
+    runuser -u "${user}" -- test -r "${PERSON_FOLLOW_LAUNCHER}" \
+      || fail "${user} cannot read start_person_follow.sh"
+    runuser -u "${user}" -- test -r "${PERSON_FOLLOW_READY_HELPER}" \
+      || fail "${user} cannot read wait_for_person_follow_ready.sh"
   fi
-  runuser -u nuwax-geometry -- test -x "${GEOMETRY_BINARY}" \
-    || fail "nuwax-geometry cannot traverse/read/execute ${GEOMETRY_BINARY}"
-  runuser -u nuwax-gateway -- test -x "${REPO_ROOT}" \
-    || fail "nuwax-gateway cannot traverse ${REPO_ROOT}"
-  runuser -u nuwax-gateway -- test -x "${PYTHON_BIN}" \
-    || fail "nuwax-gateway cannot execute ${PYTHON_BIN}"
-  runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/scripts/start_gateway.sh" \
-    || fail "nuwax-gateway cannot read start_gateway.sh"
-  runuser -u nuwax-gateway -- test -r "${REPO_ROOT}/drivers/go2/video_streamer.py" \
-    || fail "nuwax-gateway cannot read the Go2 video streamer"
-  check_identity_write_access nuwax-geometry /var/lib/nuwax_robot_bridge
-  check_identity_write_access nuwax-gateway /var/lib/nuwax_robot_bridge
+  runuser -u "${user}" -- test -x "${GEOMETRY_BINARY}" \
+    || fail "${user} cannot traverse/read/execute ${GEOMETRY_BINARY}"
+  runuser -u "${user}" -- test -r "${REPO_ROOT}/scripts/start_gateway.sh" \
+    || fail "${user} cannot read start_gateway.sh"
+  runuser -u "${user}" -- test -r "${REPO_ROOT}/drivers/go2/video_streamer.py" \
+    || fail "${user} cannot read the Go2 video streamer"
+  check_identity_write_access "${user}" /var/lib/nuwax_robot_bridge
   for directory in "${GATEWAY_WRITE_DIRS[@]}"; do
-    check_identity_write_access nuwax-gateway "${directory}"
+    check_identity_write_access "${user}" "${directory}"
   done
-  runuser -u nuwax-gateway -- test -w /tmp/cdds.LOG \
-    || fail "nuwax-gateway cannot write /tmp/cdds.LOG"
+  runuser -u "${user}" -- test -w /tmp/cdds.LOG \
+    || fail "${user} cannot write /tmp/cdds.LOG"
 }
 
 check_record() {
@@ -911,7 +923,7 @@ check_record() {
   actual_mode="$(stat -c '%a' "${path}")"
   [[ "${actual_mode}" == "${expected_mode}" ]] \
     || fail "invalid mode for ${path}: ${actual_mode}, expected ${expected_mode}"
-  [[ "$(stat -c '%U:%G' "${path}")" == "nuwax-motion-guard:nuwax-motion-guard" ]] \
+  [[ "$(stat -c '%U:%G' "${path}")" == "${PROJECT_USER}:${PROJECT_GROUP}" ]] \
     || fail "invalid owner for ${path}"
 }
 
@@ -920,19 +932,10 @@ verify_installed() {
   local installed_unit=""
   local unit_file=""
   local unit_name=""
-  getent passwd nuwax-motion-guard >/dev/null || fail "missing user nuwax-motion-guard"
-  getent passwd nuwax-navigation >/dev/null || fail "missing user nuwax-navigation"
-  getent passwd nuwax-geometry >/dev/null || fail "missing user nuwax-geometry"
-  getent passwd nuwax-gateway >/dev/null || fail "missing user nuwax-gateway"
-  check_service_uid_collisions system
-  getent group nuwax-motion-clients >/dev/null || fail "missing group nuwax-motion-clients"
-  for user in nuwax-motion-guard nuwax-navigation nuwax-geometry nuwax-gateway; do
-    id -nG "${user}" | tr ' ' '\n' | grep -qx nuwax-motion-clients \
-      || fail "${user} is not a member of nuwax-motion-clients"
-  done
+  check_project_identity system
   for group in video render; do
-    id -nG nuwax-gateway | tr ' ' '\n' | grep -qx "${group}" \
-      || fail "nuwax-gateway is not a member of ${group}"
+    id -nG "${PROJECT_USER}" | tr ' ' '\n' | grep -qx "${group}" \
+      || fail "${PROJECT_USER} is not a member of ${group}"
   done
   check_runtime_config
   check_runtime_config_permissions
@@ -978,7 +981,7 @@ verify_installed() {
     [[ -S "${GUARD_SOCKET}" ]] || fail "motion guard socket is absent: ${GUARD_SOCKET}"
     [[ -f "${GUARD_LOCK}" && ! -L "${GUARD_LOCK}" ]] \
       || fail "motion guard lock is absent, non-regular, or a symlink: ${GUARD_LOCK}"
-    [[ "$(stat -c '%U:%G %a' "${GUARD_LOCK}")" == "nuwax-motion-guard:nuwax-motion-guard 600" ]] \
+    [[ "$(stat -c '%U:%G %a' "${GUARD_LOCK}")" == "${PROJECT_USER}:${PROJECT_GROUP} 600" ]] \
       || fail "motion guard lock owner/mode drift: ${GUARD_LOCK}"
     NUWAX_MOTION_GUARD_SOCKET="${GUARD_SOCKET}" \
       bash "${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh" check
@@ -1000,7 +1003,7 @@ verify_installed() {
         /var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap; do
       [[ -f "${path}" && ! -L "${path}" ]] \
         || fail "geometry shared-memory file is missing or unsafe: ${path}"
-      [[ "$(stat -c '%U:%G %a' "${path}")" == "nuwax-geometry:nuwax-motion-clients 660" ]] \
+      [[ "$(stat -c '%U:%G %a' "${path}")" == "${PROJECT_USER}:${PROJECT_GROUP} 660" ]] \
         || fail "geometry shared-memory owner/mode drift: ${path}"
     done
   fi
@@ -1039,7 +1042,11 @@ install_sources() {
     install -D -m 0644 "${TMPFILES_SOURCE}" /usr/lib/tmpfiles.d/nuwax-motion.conf
   fi
   systemd-sysusers /usr/lib/sysusers.d/nuwax-motion.conf
-  check_service_uid_collisions system
+  check_project_identity system
+  stop_legacy_services
+  migrate_legacy_ownership
+  remove_legacy_identities
+  assert_legacy_identities_absent
   ensure_gateway_device_groups
   secure_runtime_config_permissions
   apply_systemd_tmpfiles /usr/lib/tmpfiles.d/nuwax-motion.conf
@@ -1090,7 +1097,7 @@ start_stack() {
   "${PROVISIONER}" verify \
     --state-dir "${GUARD_STATE_DIR}" \
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
-  check_service_uid_collisions system
+  check_project_identity system
   check_service_access
 
   systemctl stop nuwax-go2-video-streamer.service

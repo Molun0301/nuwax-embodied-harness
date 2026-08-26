@@ -385,15 +385,6 @@ def _profile_native_lio_contract(profile_path):
 def _parse_native_lio(values, profile_contract):
     # type: (Sequence[str], Sequence[Tuple[str, str]]) -> List[Tuple[str, Path]]
     by_source = {source: role for role, source in profile_contract}
-    selected_roles = set(_selected_artifact_roles())
-    selected_names = {
-        role[len("native_lio_payload:"):]
-        for role in selected_roles
-        if role.startswith("native_lio_payload:")
-    }
-    selected_sources = {
-        source for role, source in profile_contract if role in selected_names
-    }
     resolved = []
     seen_sources = set()
     for raw_path in values:
@@ -407,12 +398,13 @@ def _parse_native_lio(values, profile_contract):
         if source in seen_sources:
             raise ValueError("--native-lio source 重复: %s" % source)
         seen_sources.add(source)
-        if role in selected_names:
-            resolved.append((role, path))
-    missing_sources = selected_sources - seen_sources
-    if missing_sources:
-        raise ValueError("--native-lio path 集合缺少当前选中 source: %s"
-                         % ",".join(sorted(missing_sources)))
+        # 一次 generation 封存 profile 声明的全部 native LIO；
+        # 当前选择只决定启动时注入，不丢弃未选中的 payload。
+        resolved.append((role, path))
+    expected_sources = set(by_source)
+    if seen_sources != expected_sources:
+        raise ValueError("--native-lio path 集合必须覆盖发布 profile 全部 source: expected=%s actual=%s"
+                         % (",".join(sorted(expected_sources)), ",".join(sorted(seen_sources))))
     return sorted(resolved, key=lambda item: item[0])
 
 
@@ -560,10 +552,10 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, env
                        ("offline_mapping_cli", mapping_cli, True)]
             if "native_pgo_payload" in selected_roles:
                 sources.extend((role, path, True) for role, path in _embedded_artifacts(runtime))
+            # generation 封存 profile 声明的全部 native LIO；运行时再按 selected 角色注入。
             sources.extend(
                 ("native_lio_payload:%s" % name, path, True)
                 for name, path in native_lio
-                if name in selected_lio_roles
             )
             if len({role for role, _, _ in sources}) != len(sources):
                 raise RuntimeError("release artifact role 重复")
@@ -581,9 +573,14 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, env
                             "sha256": _sha256_file(closure_path), "executable": False})
             entries.sort(key=lambda item: str(item["role"]))
             generation = _artifact_set_generation(entries)
-            manifest = {"schema_version": _SCHEMA_VERSION, "generation": generation,
-                        "native_lio_roles": sorted(selected_lio_roles),
-                        "artifacts": entries}
+            available_lio_roles = sorted(name for name, _ in native_lio)
+            manifest = {
+                "schema_version": _SCHEMA_VERSION,
+                "generation": generation,
+                "available_native_lio_roles": available_lio_roles,
+                "selected_native_lio_roles": sorted(selected_lio_roles),
+                "artifacts": entries,
+            }
             manifest_bytes = _canonical_json_bytes(manifest)
             (generation_root / "manifest.json").write_bytes(manifest_bytes)
             receipt = {
@@ -971,7 +968,7 @@ def _verify_manifest_with_stable_root(manifest_path, root_fd, expected_generatio
 
 def _manifest_role_contract(manifest):
     # type: (Mapping[str, object]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]
-    raw_roles = manifest.get("native_lio_roles")
+    raw_roles = manifest.get("available_native_lio_roles")
     raw_artifacts = manifest.get("artifacts")
     if not isinstance(raw_roles, list) or not isinstance(raw_artifacts, list):
         raise RuntimeError("manifest native LIO 合同无效")
@@ -984,12 +981,7 @@ def _manifest_role_contract(manifest):
 
 def _verify_profile_roles(manifest, profile_contract):
     # type: (Mapping[str, object], Sequence[Tuple[str, str]]) -> Tuple[str, ...]
-    selected_roles = set(_selected_artifact_roles())
-    expected_by_role = {
-        role: source
-        for role, source in profile_contract
-        if "native_lio_payload:%s" % role in selected_roles
-    }
+    expected_by_role = {role: source for role, source in profile_contract}
     expected_roles = tuple(sorted(expected_by_role))
     roles, artifact_roles = _manifest_role_contract(manifest)
     expected_artifacts = tuple("native_lio_payload:%s" % role for role in expected_roles)

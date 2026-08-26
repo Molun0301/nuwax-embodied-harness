@@ -4498,7 +4498,8 @@ add('build_input_closure', 'build-inputs.json', False, b'{}\n')
 entries.sort(key=lambda item: item['role'])
 generation = hashlib.sha256(canonical(entries)).hexdigest()
 manifest = {'schema_version': 'nuwax.geometry.release.v1', 'generation': generation,
-            'native_lio_roles': ['fastlio2'], 'artifacts': entries}
+            'available_native_lio_roles': ['fastlio2'], 'selected_native_lio_roles': [],
+            'artifacts': entries}
 manifest_path = root / 'manifest.json'
 manifest_path.write_bytes(canonical(manifest))
 manifest_path.chmod(0o644)

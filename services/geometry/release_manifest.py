@@ -92,8 +92,15 @@ class ReleaseProof:
     manifest_path: Path
     manifest_sha256: str
     generation: str
-    native_lio_roles: Tuple[str, ...]
+    available_native_lio_roles: Tuple[str, ...]
+    selected_native_lio_roles: Tuple[str, ...]
     artifacts: Tuple[ReleaseArtifact, ...]
+
+    @property
+    def native_lio_roles(self) -> Tuple[str, ...]:
+        """兼容旧调用方读取全量 native LIO role。"""
+
+        return self.available_native_lio_roles
 
     def artifact_for_role(self, role: str) -> ReleaseArtifact:
         for artifact in self.artifacts:
@@ -301,7 +308,13 @@ def verify_release_manifest(
     resolved_manifest, manifest_bytes, payload = _load_canonical_manifest(
         Path(manifest_path) if manifest_path is not None else default_release_manifest_path()
     )
-    if set(payload) != {"schema_version", "generation", "native_lio_roles", "artifacts"}:
+    if set(payload) != {
+        "schema_version",
+        "generation",
+        "available_native_lio_roles",
+        "selected_native_lio_roles",
+        "artifacts",
+    }:
         raise ReleaseManifestError("release manifest 顶层字段集合不精确")
     if payload.get("schema_version") != _SCHEMA_VERSION:
         raise ReleaseManifestError("release manifest schema_version 不受支持")
@@ -310,31 +323,32 @@ def verify_release_manifest(
         raise ReleaseManifestError("release generation 必须是 64 位小写十六进制摘要")
     configured_artifact_roles = set(_selected_artifact_roles())
     selected_artifact_roles = configured_artifact_roles if require_selected_artifacts else set()
-    expected_lio_names = tuple(
-        sorted(
-            role[len(_NATIVE_LIO_ROLE_PREFIX):]
-            for role in selected_artifact_roles
-            if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
-        )
-    )
-    raw_lio_roles = payload.get("native_lio_roles")
+    raw_available_lio_roles = payload.get("available_native_lio_roles")
+    raw_selected_lio_roles = payload.get("selected_native_lio_roles")
     if (
-        not isinstance(raw_lio_roles, list)
+        not isinstance(raw_available_lio_roles, list)
+        or not raw_available_lio_roles
         or any(
             not isinstance(role, str)
             or role not in _SUPPORTED_LIO_BACKENDS - {"device"}
-            for role in raw_lio_roles
+            for role in raw_available_lio_roles
         )
-        or raw_lio_roles != sorted(set(raw_lio_roles))
-        or (
-            require_selected_artifacts
-            and tuple(raw_lio_roles) != expected_lio_names
+        or raw_available_lio_roles != sorted(set(raw_available_lio_roles))
+        or not isinstance(raw_selected_lio_roles, list)
+        or any(
+            not isinstance(role, str)
+            or role not in _SUPPORTED_LIO_BACKENDS - {"device"}
+            for role in raw_selected_lio_roles
         )
+        or raw_selected_lio_roles != sorted(set(raw_selected_lio_roles))
+        or not set(raw_selected_lio_roles).issubset(set(raw_available_lio_roles))
     ):
         raise ReleaseManifestError(
-            "release manifest native_lio_roles 与当前选中 LIO profile 不一致"
+            "release manifest native LIO available/selected roles 合同无效"
         )
-    expected_lio_roles = tuple(_NATIVE_LIO_ROLE_PREFIX + role for role in raw_lio_roles)
+    expected_lio_roles = tuple(
+        _NATIVE_LIO_ROLE_PREFIX + role for role in raw_available_lio_roles
+    )
     raw_artifacts = payload.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
         raise ReleaseManifestError("release manifest artifacts 必须是非空数组")
@@ -432,10 +446,8 @@ def verify_release_manifest(
         actual_lio_roles = tuple(
             sorted(role for role in seen_roles if role.startswith(_NATIVE_LIO_ROLE_PREFIX))
         )
-        if actual_lio_roles != tuple(
-            sorted(_NATIVE_LIO_ROLE_PREFIX + role for role in raw_lio_roles)
-        ):
-            raise ReleaseManifestError("release manifest native LIO artifact 集合不精确")
+        if actual_lio_roles != tuple(sorted(expected_lio_roles)):
+            raise ReleaseManifestError("release manifest native LIO available artifact 集合不精确")
         conditional_roles = seen_roles & {"native_pgo_payload", "group_guardian"}
         if conditional_roles not in (set(), {"native_pgo_payload", "group_guardian"}):
             raise ReleaseManifestError(
@@ -453,10 +465,10 @@ def verify_release_manifest(
                 if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
                 or role in {"native_pgo_payload", "group_guardian"}
             }
-            if selected_conditional_roles != selected_artifact_roles:
+            if not selected_artifact_roles.issubset(selected_conditional_roles):
                 raise ReleaseManifestError(
-                    "release manifest 含未选中的条件制品: %s"
-                    % ",".join(sorted(selected_conditional_roles - selected_artifact_roles))
+                    "release manifest 缺少当前选中的条件制品: %s"
+                    % ",".join(sorted(selected_artifact_roles - selected_conditional_roles))
                 )
         if generation != _artifact_set_generation(normalized_entries):
             raise ReleaseManifestError("release generation 与 artifact set 不一致")
@@ -480,7 +492,8 @@ def verify_release_manifest(
             manifest_path=resolved_manifest,
             manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
             generation=generation,
-            native_lio_roles=tuple(raw_lio_roles),
+            available_native_lio_roles=tuple(raw_available_lio_roles),
+            selected_native_lio_roles=tuple(raw_selected_lio_roles),
             artifacts=tuple(verified),
         )
         if expected_runtime is not None:

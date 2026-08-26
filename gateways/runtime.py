@@ -701,6 +701,28 @@ def _build_perception_components(config: NuwaxRobotBridgeConfig) -> Dict[str, An
     return build_platform_perception_components(config)
 
 
+def _handle_get_latest_observation(
+    ctx: SkillContext,
+    payload: Dict[str, Any],
+    *,
+    requested_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """读取最新观察；空缓存返回准确的业务错误。"""
+
+    del requested_by
+    camera_id = str(payload.get("camera_id") or "").strip() or None
+    observation_context = ctx.observation_service.get_latest_observation(camera_id)
+    if observation_context is None:
+        raise GatewayError(
+            "当前还没有可用的观察缓存。",
+            error_code="observation_not_available",
+            http_status=404,
+            jsonrpc_code=-32004,
+            details={"camera_id": camera_id} if camera_id else {},
+        )
+    return {"observation_context": observation_context}
+
+
 class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
     """按 Geometry 权威摘要动态绑定当前保存点云资产。"""
 
@@ -2970,6 +2992,43 @@ class GatewayRuntime:
                 cancel_supported=True,
             ),
             _descriptor(
+                "cancel_navigation",
+                "取消导航",
+                "取消当前活动导航目标，或按 request_id 取消指定目标。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"request_id": {"type": "string"}}),
+                output_schema=_schema_object(
+                    {
+                        "ok": {"type": "boolean"},
+                        "alias_of": {"type": "string"},
+                        "request_id": {"type": ["string", "null"]},
+                        "error_code": {"type": "string"},
+                        "unavailable_reason": {"type": "string"},
+                        "message": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    }
+                ),
+            ),
+            _descriptor(
+                "get_navigation_state",
+                "读取导航状态",
+                "读取当前导航状态快照；导航运行时未就绪时返回明确不可用状态。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object(
+                    {
+                        "ok": {"type": "boolean"},
+                        "alias_of": {"type": "string"},
+                        "navigation_state": {"type": "object"},
+                        "error_code": {"type": "string"},
+                        "unavailable_reason": {"type": "string"},
+                        "message": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    }
+                ),
+            ),
+            _descriptor(
                 "navigate_to_named_location",
                 "导航到命名位置",
                 "只查询已标记地点和已入库语义记忆目标，把自然语言目标解析成已知导航目标；不触发现场开放词汇识别。",
@@ -3239,7 +3298,10 @@ class GatewayRuntime:
             "capture_image": partial(perception_skills.handle_capture_image, self._skill_ctx),
             "get_joint_state": partial(perception_skills.handle_get_joint_state, self._skill_ctx),
             "get_imu_state": partial(perception_skills.handle_get_imu_state, self._skill_ctx),
-            "get_latest_observation": partial(perception_skills.handle_get_latest_observation, self._skill_ctx),
+            "get_latest_observation": partial(
+                _handle_get_latest_observation,
+                self._skill_ctx,
+            ),
             "perceive_current_scene": partial(perception_skills.handle_perceive_current_scene, self._skill_ctx),
             "describe_current_scene": partial(perception_skills.handle_describe_current_scene, self._skill_ctx),
             "get_latest_perception": partial(perception_skills.handle_get_latest_perception, self._skill_ctx),
@@ -3701,8 +3763,10 @@ class GatewayRuntime:
                 name="cancel_navigation",
                 display_name="取消导航",
                 description=(
-                    "取消当前 ACTIVE 导航目标；可选 request_id 参数指定具体目标。"
-                    "返回 CancelResponse；nuwax-geometry-runtime 不可达时回退 PROXY_UNAVAILABLE。"
+                    "导航运行时尚未接通；调用不会取消导航，而是返回 ok=false、"
+                    "error_code=RUNTIME_NOT_READY 和 "
+                    "unavailable_reason=navigation_runtime_dispatch_not_ready。"
+                    "可选 request_id 仅在响应中回显。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="cancel_navigation",
@@ -3711,8 +3775,10 @@ class GatewayRuntime:
                 name="get_navigation_state",
                 display_name="读取导航状态",
                 description=(
-                    "读取当前导航状态快照（status/current_pose/remaining_distance_m 等）；"
-                    "无入参。MCP 暴露的同步 tool。"
+                    "导航运行时尚未接通；无入参。调用返回 ok=false、"
+                    "navigation_state.status=UNAVAILABLE、error_code=RUNTIME_NOT_READY 和 "
+                    "unavailable_reason=navigation_runtime_dispatch_not_ready，"
+                    "不提供真实导航状态。"
                 ),
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_state",

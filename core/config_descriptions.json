@@ -1,5 +1,9 @@
 {
   "GO2_DATA_PLANE_ENABLED": "是否启用 Go2 设备侧数据面",
+  "GO2_ROBOT_IP": "Go2 局域网 IP 地址；视频推流优先使用此值，留空时回退通用 ROBOT_IP。",
+  "GO2_VIDEO_STREAM_ENABLED": "是否启动 Go2 WebRTC 持续视频轨道并将 JPEG 帧送入 Rust 视频中转。",
+  "GO2_VIDEO_STREAM_RECONNECT_SEC": "WebRTC 视频轨道或 UDS 中转连接中断后的重连间隔（秒）。",
+  "GO2_WEBRTC_AES_128_KEY": "新固件所需的每设备 AES-128 key，填写 32 位十六进制字符；旧固件不需要时留空。",
   "NUWAX_ACTIVE_MAP_RESTORE_ON_START": "启动网关时不自动恢复/加载地图；由 Agent 通过 MCP 显式 activate_map",
   "NUWAX_ARTIFACT_RETENTION_DAYS": "制品保留天数；超过该天数的历史制品可被清理。",
   "NUWAX_GATEWAY_POINTCLOUD3D_COLOR": "3D 点云的基础/单色显示颜色，使用 #RRGGBB。",

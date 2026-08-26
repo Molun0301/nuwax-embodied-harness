@@ -97,16 +97,11 @@ def _prefer_platform_str(platform_value: str, legacy_name: str, default: str) ->
 
 @dataclass
 class Go2VideoStreamConfig:
-    """Go2 端侧主动视频推流配置。"""
+    """Go2 端侧 WebRTC 持续视频推流配置。"""
 
     enabled: bool = True
-    gateway_url: str = "ws://127.0.0.1:8766/streams/video.ingest"
-    access_token: str = ""
-    fps: float = 15.0
-    camera_id: str = "front_camera"
-    frame_id: str = GO2_DEFAULT_FRAME_IDS["camera_front"]
-    width_px: int = 1280
-    height_px: int = 720
+    robot_ip: str = ""
+    aes_128_key: str = ""
     reconnect_sec: float = 1.0
 
 
@@ -208,13 +203,11 @@ def load_go2_data_plane_config(
         ),
         video_stream=Go2VideoStreamConfig(
             enabled=_cfg_bool("GO2_VIDEO_STREAM_ENABLED", True),
-            gateway_url=_cfg_str("GO2_VIDEO_STREAM_GATEWAY_URL", "ws://127.0.0.1:8766/streams/video.ingest"),
-            access_token=_cfg_str("GO2_VIDEO_STREAM_ACCESS_TOKEN", ""),
-            fps=max(1.0, _cfg_float("GO2_VIDEO_STREAM_FPS", 15.0)),
-            camera_id=_cfg_str("GO2_VIDEO_STREAM_CAMERA_ID", "front_camera"),
-            frame_id=_cfg_str("GO2_VIDEO_STREAM_FRAME_ID", GO2_DEFAULT_FRAME_IDS["camera_front"]),
-            width_px=max(1, _cfg_int("GO2_VIDEO_STREAM_WIDTH_PX", 1280)),
-            height_px=max(1, _cfg_int("GO2_VIDEO_STREAM_HEIGHT_PX", 720)),
+            robot_ip=(
+                _cfg_str("GO2_ROBOT_IP", "")
+                or _raw_value("ROBOT_IP", "").strip()
+            ),
+            aes_128_key=_cfg_str("GO2_WEBRTC_AES_128_KEY", ""),
             reconnect_sec=max(0.1, _cfg_float("GO2_VIDEO_STREAM_RECONNECT_SEC", 1.0)),
         ),
     )

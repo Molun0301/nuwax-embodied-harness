@@ -7,3 +7,5 @@
 
 unitree_sdk2py==1.0.1
 cyclonedds==0.10.2
+unitree-webrtc-connect==2.2.0
+aiortc==1.9.0

@@ -1288,6 +1288,15 @@ def preflight(context: "ExecutionContext") -> None:
         raise DeploymentError("--allow-unverified-third-party may only run from a root-owned controlled session")
     if profile.production and options.allow_unsupported_host:
         raise DeploymentError("production profiles cannot bypass OS, architecture, or Python compatibility")
+    if (
+        profile.robot == "go2"
+        and "nuwax-go2-video-streamer.service" in profile.services
+        and not options.go2_robot_ip
+    ):
+        raise DeploymentError(
+            "Go2 deployment with the always-on video streamer requires "
+            "--go2-robot-ip <address>"
+        )
     if not options.source_root.is_dir():
         raise DeploymentError(f"source root does not exist: {options.source_root}")
     if options.release_dir.is_symlink():
@@ -3577,6 +3586,8 @@ def write_configuration(context: "ExecutionContext") -> None:
             "GO2_DATA_PLANE_ENABLED": "true",
             "GO2_DIRECT_DDS_ENABLED": "true",
             "GO2_OFFICIAL_BACKEND_ENABLED": "true",
+            "GO2_ROBOT_IP": options.go2_robot_ip,
+            "GO2_VIDEO_STREAM_ENABLED": "true",
         }
         if options.dds_interface:
             go2_managed["GO2_DATA_PLANE_DDS_IFACE"] = options.dds_interface

@@ -1,5 +1,5 @@
 [Unit]
-# Template: install with scripts/install_motion_guard_deployment.sh.
+# 模板：通过 scripts/install_motion_guard_deployment.sh 安装。
 Description=nuwax_robot_bridge Go2 camera video streamer
 After=network-online.target nuwax-geometry-runtime.service
 Wants=network-online.target nuwax-geometry-runtime.service
@@ -17,9 +17,9 @@ UMask=0007
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
-# The video sender is independent from GO2_DATA_PLANE_ENABLED.  It only needs
-# the official SDK, the camera DDS interface, and the geometry-owned UDS relay.
-ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@ GO2_SDK_PATH=@NUWAX_GO2_SDK_PATH@ NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer
+# 视频发送器不依赖 GO2_DATA_PLANE_ENABLED；它只依赖锁定的 WebRTC 包、
+# Go2 IP/key 配置和 geometry runtime 提供的 UDS 中转。
+ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@ NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

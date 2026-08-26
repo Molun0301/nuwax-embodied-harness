@@ -100,7 +100,7 @@ curl http://127.0.0.1:8766/api/tools
 http://127.0.0.1:8766/debug
 ```
 
-页面会从网关已加载的 `.env` 配置自动使用 `NUWAX_GATEWAY_AGENT_TOKENS` 中的 agent token（代理令牌）请求 `/api/debug/*` 只读接口。通过 SSH（安全外壳协议）隧道访问 Go2 时也继续打开本机地址：
+调试页和 `/api/debug/*` 只读接口不要求网关令牌。通过 SSH（安全外壳协议）隧道访问 Go2 时继续打开本机地址：
 
 ```bash
 ssh -L 8766:127.0.0.1:8766 unitree@<Go2_IP>
@@ -110,10 +110,10 @@ ssh -L 8766:127.0.0.1:8766 unitree@<Go2_IP>
 http://127.0.0.1:8766/debug
 ```
 
-如果网关运行在 Go2 真机上，并从同一局域网电脑直接访问 Go2 地址，请把 `127.0.0.1` 换成 Go2 的 IP（网络地址），并携带实际 agent token：
+如果网关运行在 Go2 真机上，也可以直接访问 Go2 的网关地址：
 
 ```text
-http://<Go2_IP>:8766/debug?access_token=<实际 agent token>
+http://<Go2_IP>:8766/debug
 ```
 
 该页面是只读调试面板，不包含运动控制、导航目标下发、探索启停、地图保存/删除等控制功能。面板会展示服务状态、运行事件/日志、2D SLAM（同步定位与建图）栅格、机器人位姿与轨迹、navigation/frontier（导航/探索前沿）摘要、点云元数据，以及数据时间戳、延迟和 stale（过期）状态。

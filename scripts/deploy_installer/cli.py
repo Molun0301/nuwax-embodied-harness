@@ -91,6 +91,11 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     cyclone.add_argument("--cyclonedds-wheel", type=Path)
     parser.add_argument("--actuator-manifest", type=Path)
     parser.add_argument("--dds-interface", default="")
+    parser.add_argument(
+        "--go2-robot-ip",
+        default="",
+        help="Go2 局域网 IP；启用常驻视频流的 Go2 部署必须显式提供",
+    )
     parser.add_argument("--offline", action="store_true", help="禁止联网并只使用签名 bundle")
     parser.add_argument("--bundle", "--offline-bundle", dest="offline_bundle", type=Path)
     parser.add_argument("--bundle-public-key", type=Path)
@@ -223,6 +228,7 @@ def _options(args: argparse.Namespace, *, dry_run: bool) -> DeploymentOptions:
         cyclonedds_wheel=(args.cyclonedds_wheel.expanduser().resolve() if args.cyclonedds_wheel else None),
         actuator_manifest=(args.actuator_manifest.expanduser().resolve() if args.actuator_manifest else None),
         dds_interface=args.dds_interface,
+        go2_robot_ip=str(args.go2_robot_ip or "").strip(),
         gateway_host=gateway_host,
         offline_bundle=offline_bundle,
         bundle_public_key=(args.bundle_public_key.expanduser().resolve() if args.bundle_public_key else None),
@@ -365,6 +371,20 @@ def _execute(
     resume: bool = False,
 ) -> int:
     options = _options(args, dry_run=dry_run)
+    if options.offline_bundle is not None:
+        validate_identifier(args.profile, "offline profile name")
+        profile = load_named_profile(args.profile, _trusted_profile_root(options))
+    else:
+        profile = _load_profile_argument(args.profile, _trusted_profile_root(options))
+    if (
+        profile.robot == "go2"
+        and "nuwax-go2-video-streamer.service" in profile.services
+        and not options.go2_robot_ip
+    ):
+        raise ProfileError(
+            "Go2 deployment with the always-on video streamer requires "
+            "--go2-robot-ip <address>"
+        )
     if not dry_run and not preflight_only and not verify_only and os.geteuid() != 0:
         print("部署需要 root；请使用 ./install.sh deploy ...", file=sys.stderr)
         return 77
@@ -372,10 +392,6 @@ def _execute(
         from .operations import validate_protected_paths
 
         validate_protected_paths(options)
-    profile = None
-    if options.offline_bundle is not None:
-        validate_identifier(args.profile, "offline profile name")
-        profile = load_named_profile(args.profile, _trusted_profile_root(options))
     if options.offline_bundle is not None:
         from .operations import (
             stage_verified_bundle,
@@ -402,8 +418,6 @@ def _execute(
                 offline_bundle=staged_bundle,
                 source_root=staged_bundle / "source",
             )
-    if profile is None:
-        profile = _load_profile_argument(args.profile, _trusted_profile_root(options))
     if (
         options.offline_bundle is None
         and profile.production

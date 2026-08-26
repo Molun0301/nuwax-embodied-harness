@@ -328,6 +328,7 @@ def _fingerprint(profile: DeploymentProfile, options: DeploymentOptions) -> str:
         "bundle_public_key": _path_identity(options.bundle_public_key),
         "legacy_config": _path_identity(options.legacy_config),
         "dds_interface": options.dds_interface,
+        "go2_robot_ip": options.go2_robot_ip,
         "gateway_host": options.gateway_host,
         "allow_unverified_third_party": options.allow_unverified_third_party,
         "allow_dirty_source": options.allow_dirty_source,

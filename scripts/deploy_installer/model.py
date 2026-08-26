@@ -39,6 +39,7 @@ class DeploymentOptions:
     cyclonedds_wheel: Optional[Path] = None
     actuator_manifest: Optional[Path] = None
     dds_interface: str = ""
+    go2_robot_ip: str = ""
     gateway_host: str = "127.0.0.1"
     offline_bundle: Optional[Path] = None
     bundle_public_key: Optional[Path] = None

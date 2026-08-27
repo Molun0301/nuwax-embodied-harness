@@ -14,6 +14,7 @@ __pycache__/
 *.pyc
 .omc/
 .omx/
+.claude-hud/
 .claude/
 openspec/
 .codex/

@@ -701,7 +701,7 @@ _ZH_NAMES: Dict[str, str] = {
 
     # Go2 数据面·视频推流
     "GO2_VIDEO_STREAM_ENABLED": "启用视频推流",
-    "GO2_ROBOT_IP": "Go2 机器人 IP 地址",
+    "GO2_ROBOT_IP": "Go2 本体 WebRTC 信令 IPv4 地址",
     "GO2_WEBRTC_AES_128_KEY": "Go2 WebRTC AES-128 密钥",
     "GO2_VIDEO_STREAM_RECONNECT_SEC": "Go2 视频重连间隔（秒）",
 

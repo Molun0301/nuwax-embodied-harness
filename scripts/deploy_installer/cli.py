@@ -94,7 +94,10 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--go2-robot-ip",
         default="",
-        help="Go2 局域网 IP；启用常驻视频流的 Go2 部署必须显式提供",
+        help=(
+            "Go2 本体 WebRTC 信令 IPv4 地址，不是部署 Jetson 的 SSH 地址；"
+            "启用常驻视频流时必须显式提供"
+        ),
     )
     parser.add_argument("--offline", action="store_true", help="禁止联网并只使用签名 bundle")
     parser.add_argument("--bundle", "--offline-bundle", dest="offline_bundle", type=Path)

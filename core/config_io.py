@@ -653,6 +653,9 @@ def build_schema() -> Dict[str, object]:
         if key.startswith(_POINTCLOUD3D_KEY_PREFIX) and key in pointcloud3d_vals:
             # 保存后尚未重启时，覆盖文件必须优先于进程中的旧环境值回显。
             return pointcloud3d_vals[key]
+        if key == "GO2_ROBOT_IP" and key in go2_vals:
+            # 清空专属覆盖后，持久化空值必须屏蔽进程继承的旧地址。
+            return go2_vals[key]
         if key in os.environ:
             return os.environ[key]
         src = go2_vals if target_file == R.TARGET_GO2 else core_vals

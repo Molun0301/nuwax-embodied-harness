@@ -231,13 +231,6 @@ def handle_activate_map(
 ) -> Dict[str, Any]:
     map_name = params.require_str(payload, "map_name")
     ctx.ensure_geometry_runtime_started("activate_map")
-    exploration_context = ctx.navigation_service.get_latest_exploration_context()
-    exploration_status = getattr(getattr(exploration_context, "exploration_state", None), "status", None)
-    if getattr(exploration_status, "value", exploration_status) in {"accepted", "running"}:
-        try:
-            ctx.navigation_service.stop_exploration()
-        except Exception:
-            _LOGGER.debug("activate_map 前 stop_exploration 忽略异常", exc_info=True)
     active_workspace = ctx.map_workspace_service.activate_map(
         map_name=map_name,
         create_if_missing=False,
@@ -245,25 +238,16 @@ def handle_activate_map(
         reset_memory_library=bool(payload.get("reset_memory_library", False)),
         metadata={"requested_by": requested_by or "unknown"},
     )
-    has_finalized_bundle = bool(
-        active_workspace is not None
-        and active_workspace.map_asset is not None
-        and active_workspace.map_asset.finalized
-    )
-    if has_finalized_bundle:
-        ctx.refresh_workspace_snapshots(refresh_localization=False)
-        ctx.publish_pointcloud_map_stream_frame(reason="activate_map")
-        ctx.publish_runtime_governance_stream_frame()
-    else:
-        ctx.refresh_workspace_snapshots(refresh_localization=False)
+    # 只刷一次状态摘要；当前 MCP 流程不需要重复发布点云/治理流帧，
+    # 这些流帧由后续 mapping session 状态变化自动推送。
+    ctx.refresh_workspace_snapshots(refresh_localization=False)
     ctx.sync_perception_runtime_for_memory_state(enabled=True)
-    active_workspace = ctx.map_workspace_service.get_active_workspace(refresh_localization=False) or active_workspace
-    geometry_stack = ctx.geometry_stack_summary()
     return {
         "active_workspace": active_workspace,
-        "memory_summary": ctx.memory_service.get_summary(),
-        "geometry_stack": geometry_stack,
-        "next_step_hint": geometry_stack.get("agent_guidance"),
+        "next_step_hint": (
+            "地图已激活。直接调用 start_mapping 即可开始建图。"
+            "若已存在 finalized 资产包，加载通常 < 1s；首次建图或重新建图按需稍等。"
+        ),
     }
 
 

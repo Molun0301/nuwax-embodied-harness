@@ -458,6 +458,7 @@ _MOTION_ADMISSION_BYPASS_CAPABILITY_NAMES = frozenset(
         "stop_all_motion",
         "cancel_task",
         "cancel_navigation",
+        "start_mapping",
         "stop_mapping",
         "stop_exploration",
     }
@@ -11154,10 +11155,8 @@ class GatewayRuntime:
             return False
         if descriptor.name in _MOTION_ADMISSION_CAPABILITY_NAMES:
             return True
-        return any(
-            resource in _MOTION_ADMISSION_RESOURCE_NAMES
-            for resource in descriptor.required_resources
-        )
+        # 资源互斥不等于能力具有运动副作用。
+        return False
 
     @staticmethod
     def _motion_admission_source(capability_name: str) -> int:

@@ -85,14 +85,19 @@ _DEFAULT_LIO_SENSOR_FRAME = "go2_base_link"
 _MAX_LIO_PUBLISH_QUEUE_SIZE = 4
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 
-# sensor_msgs/PointField constants for the normalized XYZ float32 payload emitted below.
+# 下游发布使用的标准 PointField 布局；可选字段只在真实存在时进入字段表。
 _CANONICAL_XYZ_FIELDS = (
     {"name": "x", "offset": 0, "datatype": 7, "count": 1},
     {"name": "y", "offset": 4, "datatype": 7, "count": 1},
     {"name": "z", "offset": 8, "datatype": 7, "count": 1},
 )
-_GO2_L2_FIELDS = _CANONICAL_XYZ_FIELDS + (
+_CANONICAL_XYZI_FIELDS = _CANONICAL_XYZ_FIELDS + (
     {"name": "intensity", "offset": 12, "datatype": 7, "count": 1},
+)
+_CANONICAL_XYZ_OFFSET_FIELDS = _CANONICAL_XYZ_FIELDS + (
+    {"name": "offset_ns", "offset": 12, "datatype": 6, "count": 1},
+)
+_GO2_L2_FIELDS = _CANONICAL_XYZI_FIELDS + (
     {"name": "offset_ns", "offset": 16, "datatype": 6, "count": 1},
 )
 
@@ -865,6 +870,7 @@ class RuntimeInputBridge:
             self._increment_counter("downsampled_pointcloud_count")
 
         point_step = self._resolve_point_step(payload)
+        fields = self._resolve_point_fields(payload)
         bytes_payload = self._encode_point_cloud_bytes(payload)
         if bytes_payload is None:
             self._increment_counter("dropped_pointcloud_count")
@@ -890,7 +896,7 @@ class RuntimeInputBridge:
             metadata = {
                 "frame_id": frame_id,
                 "timestamp_ns": timestamp_ns,
-                "fields": _GO2_L2_FIELDS if point_step == 20 else _CANONICAL_XYZ_FIELDS,
+                "fields": fields,
                 "point_count": len(bytes_payload) // point_step,
                 "is_dense": bool(getattr(payload, "is_dense", True)),
                 "imu_samples": imu_samples,
@@ -1005,6 +1011,14 @@ class RuntimeInputBridge:
         measurement: CanonicalLioMeasurement,
     ) -> Optional[CanonicalLioMeasurement]:
         """验证 raw RPC 的 frame/provenance，并执行 canonical 有界采样。"""
+
+        if measurement.lidar.intensity_f32_le is None:
+            self._increment_counter("dropped_pointcloud_count")
+            self._increment_counter("lio_not_ready_count")
+            self._record_error(
+                "lio_not_ready: native 固定 XYZI+offset wire layout 缺少真实 intensity"
+            )
+            return None
 
         calibration_ref = measurement.lidar.calibration_ref
         expected_provenance = (
@@ -1376,21 +1390,32 @@ class RuntimeInputBridge:
     @staticmethod
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-        if isinstance(metadata.get("canonical_lidar_frame"), CanonicalLidarFrame):
+        canonical_lidar = metadata.get("canonical_lidar_frame")
+        if isinstance(canonical_lidar, CanonicalLidarFrame):
             return 20
-        arr = getattr(point_cloud, "points_xyz_array", None)
         intensity = metadata.get("intensity_array")
         offsets = metadata.get("offset_ns_array")
-        if (
-            isinstance(arr, np.ndarray)
-            and arr.ndim == 2
-            and isinstance(intensity, np.ndarray)
-            and intensity.shape == (arr.shape[0],)
-            and isinstance(offsets, np.ndarray)
-            and offsets.shape == (arr.shape[0],)
-        ):
+        if intensity is not None and offsets is not None:
             return 20
+        if intensity is not None or offsets is not None:
+            return 16
         return 12
+
+    @staticmethod
+    def _resolve_point_fields(point_cloud: PointCloudFrame) -> Tuple[Dict[str, Any], ...]:
+        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+        canonical_lidar = metadata.get("canonical_lidar_frame")
+        if isinstance(canonical_lidar, CanonicalLidarFrame):
+            return _GO2_L2_FIELDS
+        has_intensity = metadata.get("intensity_array") is not None
+        has_offsets = metadata.get("offset_ns_array") is not None
+        if has_intensity and has_offsets:
+            return _GO2_L2_FIELDS
+        if has_intensity:
+            return _CANONICAL_XYZI_FIELDS
+        if has_offsets:
+            return _CANONICAL_XYZ_OFFSET_FIELDS
+        return _CANONICAL_XYZ_FIELDS
 
     @staticmethod
     def _encode_point_cloud_bytes(point_cloud: PointCloudFrame) -> Optional[bytes]:
@@ -1409,12 +1434,19 @@ class RuntimeInputBridge:
             xyz = np.ascontiguousarray(arr[:, :3], dtype="<f4")
             intensity = metadata.get("intensity_array")
             offset_ns = metadata.get("offset_ns_array")
-            if (
+            if intensity is not None and not (
                 isinstance(intensity, np.ndarray)
                 and intensity.shape == (xyz.shape[0],)
-                and isinstance(offset_ns, np.ndarray)
+            ):
+                return None
+            if offset_ns is not None and not (
+                isinstance(offset_ns, np.ndarray)
                 and offset_ns.shape == (xyz.shape[0],)
             ):
+                return None
+            if intensity is None and offset_ns is None:
+                return xyz.tobytes()
+            if intensity is not None and offset_ns is not None:
                 packed = np.empty(
                     xyz.shape[0],
                     dtype=np.dtype(
@@ -1427,13 +1459,38 @@ class RuntimeInputBridge:
                         ]
                     ),
                 )
-                packed["x"] = xyz[:, 0]
-                packed["y"] = xyz[:, 1]
-                packed["z"] = xyz[:, 2]
                 packed["intensity"] = intensity
                 packed["offset_ns"] = offset_ns
-                return packed.tobytes()
-            return xyz.tobytes()
+            elif intensity is not None:
+                packed = np.empty(
+                    xyz.shape[0],
+                    dtype=np.dtype(
+                        [
+                            ("x", "<f4"),
+                            ("y", "<f4"),
+                            ("z", "<f4"),
+                            ("intensity", "<f4"),
+                        ]
+                    ),
+                )
+                packed["intensity"] = intensity
+            else:
+                packed = np.empty(
+                    xyz.shape[0],
+                    dtype=np.dtype(
+                        [
+                            ("x", "<f4"),
+                            ("y", "<f4"),
+                            ("z", "<f4"),
+                            ("offset_ns", "<u4"),
+                        ]
+                    ),
+                )
+                packed["offset_ns"] = offset_ns
+            packed["x"] = xyz[:, 0]
+            packed["y"] = xyz[:, 1]
+            packed["z"] = xyz[:, 2]
+            return packed.tobytes()
         points = getattr(point_cloud, "points", None) or []
         if not points:
             return None

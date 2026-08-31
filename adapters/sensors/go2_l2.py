@@ -2,7 +2,7 @@
 
 本模块只负责把 Go2 官方 ``sensor_msgs/PointCloud2`` 原始帧解析为
 设备无关的数组和布局结果；坐标注册、provider 生命周期和 runtime 转发不在此处。
-缺少逐点时间或存在非法布局时 fail-closed，不用默认值伪造字段。
+可选字段缺失时保持不可用，存在非法布局时 fail-closed，不用默认值伪造字段。
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class Go2L2DecodedPointCloud:
     fields: Mapping[str, Mapping[str, Any]]
     xyz_array: np.ndarray
     intensity_array: Optional[np.ndarray]
-    offset_ns_array: np.ndarray
+    offset_ns_array: Optional[np.ndarray]
 
 
 class Go2L2DecodeError(ValueError):
@@ -121,11 +121,14 @@ def decode_go2_l2_pointcloud(message: object) -> Go2L2DecodedPointCloud:
                 f"PointCloud2 {name} 字段越过 point_step：offset={offset} size={numpy_dtype.itemsize} point_step={point_step}"
             )
         parsed[name] = {
-            "offset": offset, "datatype": datatype, "count": count,
-            "numpy_dtype": numpy_dtype, "contract_datatype": contract_datatype,
+            "offset": offset,
+            "datatype": datatype,
+            "count": count,
+            "numpy_dtype": numpy_dtype,
+            "contract_datatype": contract_datatype,
             "end": field_end,
         }
-    missing = [name for name in ("x", "y", "z", "intensity", "offset_ns") if name not in parsed]
+    missing = [name for name in ("x", "y", "z") if name not in parsed]
     if missing:
         raise Go2L2DecodeError(f"PointCloud2 缺少 Go2 L2 必需字段：{','.join(missing)}")
     ranges = [(name, spec["offset"], spec["end"]) for name, spec in parsed.items()]
@@ -141,28 +144,61 @@ def decode_go2_l2_pointcloud(message: object) -> Go2L2DecodedPointCloud:
         for column, name in enumerate(("x", "y", "z")):
             spec = parsed[name]
             values = np.ndarray(
-                shape=(height, width), dtype=spec["numpy_dtype"], buffer=data,
-                offset=spec["offset"], strides=(row_step, point_step),
+                shape=(height, width),
+                dtype=spec["numpy_dtype"],
+                buffer=data,
+                offset=spec["offset"],
+                strides=(row_step, point_step),
             )
             xyz[:, column] = np.ravel(values, order="C")
         intensity = None
         if "intensity" in parsed:
             spec = parsed["intensity"]
-            intensity = np.ascontiguousarray(np.ravel(np.ndarray(
-                shape=(height, width), dtype=spec["numpy_dtype"], buffer=data,
-                offset=spec["offset"], strides=(row_step, point_step),
-            ), order="C"), dtype=np.float32)
-        spec = parsed["offset_ns"]
-        offsets = np.ascontiguousarray(np.ravel(np.ndarray(
-            shape=(height, width), dtype=spec["numpy_dtype"], buffer=data,
-            offset=spec["offset"], strides=(row_step, point_step),
-        ), order="C"), dtype=np.uint32)
+            intensity = np.ascontiguousarray(
+                np.ravel(
+                    np.ndarray(
+                        shape=(height, width),
+                        dtype=spec["numpy_dtype"],
+                        buffer=data,
+                        offset=spec["offset"],
+                        strides=(row_step, point_step),
+                    ),
+                    order="C",
+                ),
+                dtype=np.float32,
+            )
+            if not np.all(np.isfinite(intensity)):
+                raise Go2L2DecodeError("Go2 L2 intensity 必须为有限值")
+        offsets = None
+        if "offset_ns" in parsed:
+            spec = parsed["offset_ns"]
+            offsets = np.ascontiguousarray(
+                np.ravel(
+                    np.ndarray(
+                        shape=(height, width),
+                        dtype=spec["numpy_dtype"],
+                        buffer=data,
+                        offset=spec["offset"],
+                        strides=(row_step, point_step),
+                    ),
+                    order="C",
+                ),
+                dtype=np.uint32,
+            )
+    except Go2L2DecodeError:
+        raise
     except (TypeError, ValueError) as exc:
         raise Go2L2DecodeError(f"PointCloud2 ndarray 解析失败：{exc}") from exc
     return Go2L2DecodedPointCloud(
-        source_frame=source_frame, width=width, height=height,
-        point_step=point_step, row_step=row_step, is_dense=bool(getattr(message, "is_dense", True)),
-        fields=parsed, xyz_array=np.ascontiguousarray(xyz), intensity_array=intensity,
+        source_frame=source_frame,
+        width=width,
+        height=height,
+        point_step=point_step,
+        row_step=row_step,
+        is_dense=bool(getattr(message, "is_dense", True)),
+        fields=parsed,
+        xyz_array=np.ascontiguousarray(xyz),
+        intensity_array=intensity,
         offset_ns_array=offsets,
     )
 
@@ -175,10 +211,9 @@ def adapt_go2_l2_lidar(
 ) -> CanonicalLidarFrame:
     """把已验证的 L2 原始帧映射到设备无关 canonical LiDAR 合同。"""
 
-    offsets_u64 = np.ascontiguousarray(decoded.offset_ns_array, dtype="<u8")
-    if decoded.intensity_array is None:
-        raise Go2L2DecodeError("Go2 L2 canonical 映射要求实测 intensity")
-    if not np.all(np.isfinite(decoded.intensity_array)):
+    if decoded.intensity_array is not None and not np.all(
+        np.isfinite(decoded.intensity_array)
+    ):
         raise Go2L2DecodeError("Go2 L2 intensity 必须为有限值")
     if decoded.source_frame != GO2_CALIBRATION_PROFILE.lidar_source_frame:
         raise Go2L2DecodeError(
@@ -186,7 +221,18 @@ def adapt_go2_l2_lidar(
             % decoded.source_frame
         )
     transformed_xyz = GO2_CALIBRATION_PROFILE.transform_lidar_xyz(decoded.xyz_array)
-    scan_duration_ns = int(offsets_u64.max()) if offsets_u64.size else 0
+    intensity_bytes = (
+        np.ascontiguousarray(decoded.intensity_array, dtype="<f4").tobytes()
+        if decoded.intensity_array is not None
+        else None
+    )
+    if decoded.offset_ns_array is None:
+        offset_bytes = None
+        scan_duration_ns = None
+    else:
+        offsets_u64 = np.ascontiguousarray(decoded.offset_ns_array, dtype="<u8")
+        offset_bytes = offsets_u64.tobytes()
+        scan_duration_ns = int(offsets_u64.max()) if offsets_u64.size else 0
     return CanonicalLidarFrame(
         sensor_id="go2_l2",
         source_sequence=source_sequence,
@@ -199,8 +245,8 @@ def adapt_go2_l2_lidar(
         payload_ownership=PayloadOwnership.INLINE,
         point_count=int(transformed_xyz.shape[0]),
         xyz_f32_le=np.ascontiguousarray(transformed_xyz, dtype="<f4").tobytes(),
-        intensity_f32_le=np.ascontiguousarray(decoded.intensity_array, dtype="<f4").tobytes(),
-        time_offset_ns_le=offsets_u64.tobytes(),
+        intensity_f32_le=intensity_bytes,
+        time_offset_ns_le=offset_bytes,
         scan_duration_ns=scan_duration_ns,
         is_dense=decoded.is_dense,
         transform_provenance="calibration_applied:%s" % GO2_CALIBRATION_PROFILE.calibration_ref,

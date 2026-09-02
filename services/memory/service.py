@@ -4656,12 +4656,13 @@ class MemoryService:
     def _select_deferred_refine_targets(self, *, max_targets: int) -> List[str]:
         """挑选待精化实例 id：pending 待定位 + 非动态 + 有延迟投影缓存。
 
-        用 list() 取 GIL 原子快照迭代，避免主 ingest 路径并发改写导致
-        "dictionary changed size during iteration"。
+        基于现有有界实例条目快照选择目标，在快照上锁外筛选；不直接遍历
+        原字典，以保持并发写入时的访问边界。
         """
 
         targets: List[str] = []
-        snapshot = list(self._semantic_instances_by_id.items())
+        with self._instances_lock:
+            snapshot = list(self._semantic_instances_by_id.items())
         for instance_id, instance in snapshot:
             metadata = instance.metadata or {}
             if metadata.get("pending_localization") is not True:
@@ -4698,6 +4699,14 @@ class MemoryService:
             return
         if cloud_xyz is None or getattr(cloud_xyz, "shape", (0,))[0] == 0:
             return
+        # 同一轮目标共享一份规范化数组，避免每个 project_cone 调用重复做
+        # float64 转换；不改变点顺序、点数或筛选参数。
+        try:
+            cloud_xyz = np.asarray(cloud_xyz, dtype=np.float64)
+        except (TypeError, ValueError):
+            return
+        if cloud_xyz.ndim != 2 or cloud_xyz.shape[1] != 3 or cloud_xyz.shape[0] == 0:
+            return
         for instance_id in target_ids:
             if self._deferred_refine_stop_event.is_set():
                 break
@@ -4713,17 +4722,17 @@ class MemoryService:
             instance = self._semantic_instances_by_id.get(instance_id)
             if instance is None:
                 return
-            cache = list(instance.deferred_projection_cache or [])
+            # 仅反向遍历寻找最近有效射线，不复制整个有界缓存。
+            entry = None
+            for candidate in reversed(instance.deferred_projection_cache or ()):
+                if (
+                    candidate.ray_origin_map
+                    and candidate.ray_dir_map
+                    and candidate.cone_half_angle_rad is not None
+                ):
+                    entry = candidate
+                    break
         # 取最近一条带射线 + 半角的缓存条目。
-        entry = None
-        for candidate in reversed(cache):
-            if (
-                candidate.ray_origin_map
-                and candidate.ray_dir_map
-                and candidate.cone_half_angle_rad is not None
-            ):
-                entry = candidate
-                break
         if entry is None:
             return
         min_points = int(getattr(self._deferred_projection_config, "delayed_pc_min_points", 5))

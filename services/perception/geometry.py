@@ -9,7 +9,7 @@ from contracts.geometry import FrameTree, Pose, Vector3
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D
 from contracts.pointcloud import PointCloudFrame
-from services.localization.frame_tree_ops import transform_points_to_frame
+from services.localization.frame_tree_ops import resolve_frame_transform, transform_points_to_frame
 
 
 class DetectionGeometryAugmentor:
@@ -101,27 +101,43 @@ class DetectionGeometryAugmentor:
         frame_tree: Optional[FrameTree],
         map_frame_id: Optional[str],
     ) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[str]]]:
-        point_samples = tuple(point_cloud.points) if point_cloud.points else ()
-        if not point_samples and point_cloud.points_xyz_array is not None:
-            # 从 ndarray 高性能路径构造 Vector3 元组（感知模块需要逐点访问）
-            arr = point_cloud.points_xyz_array
-            point_samples = tuple(
-                Vector3(x=float(arr[i, 0]), y=float(arr[i, 1]), z=float(arr[i, 2]))
-                for i in range(arr.shape[0])
-            )
-        if not point_samples:
-            return None
-
-        camera_points = self._resolve_points_to_frame(
-            points=point_samples,
-            source_frame_id=point_cloud.frame_id,
-            target_frame_id=camera_info.frame_id,
-            frame_tree=frame_tree,
+        source_array = None
+        if point_cloud.points_xyz_array is not None:
+            # ndarray 是契约里的高性能表示，优先直连投影路径。
+            candidate = np.asarray(point_cloud.points_xyz_array)
+            if candidate.ndim == 2 and candidate.shape[1] >= 3 and candidate.shape[0] > 0:
+                source_array = np.asarray(candidate[:, :3], dtype=np.float64)
+        # 只有 ndarray 不可用时才实体化内联 Vector3 点集，避免每帧白建一份元组。
+        point_samples = (
+            ()
+            if source_array is not None
+            else (tuple(point_cloud.points) if point_cloud.points else ())
         )
-        if camera_points is None:
+        if not point_samples and source_array is None:
             return None
 
-        camera_array = np.asarray([[float(item.x), float(item.y), float(item.z)] for item in camera_points], dtype=np.float64)
+        if source_array is not None:
+            camera_array = self._resolve_array_to_frame(
+                points_xyz=source_array,
+                source_frame_id=point_cloud.frame_id,
+                target_frame_id=camera_info.frame_id,
+                frame_tree=frame_tree,
+            )
+            if camera_array is None:
+                return None
+        else:
+            camera_points = self._resolve_points_to_frame(
+                points=point_samples,
+                source_frame_id=point_cloud.frame_id,
+                target_frame_id=camera_info.frame_id,
+                frame_tree=frame_tree,
+            )
+            if camera_points is None:
+                return None
+            camera_array = np.asarray(
+                [[float(item.x), float(item.y), float(item.z)] for item in camera_points],
+                dtype=np.float64,
+            )
         if camera_array.size == 0:
             return None
 
@@ -150,17 +166,27 @@ class DetectionGeometryAugmentor:
 
         map_array = None
         if map_frame_id:
-            resolved_map_points = self._resolve_points_to_frame(
-                points=point_samples,
-                source_frame_id=point_cloud.frame_id,
-                target_frame_id=map_frame_id,
-                frame_tree=frame_tree,
-            )
-            if resolved_map_points is not None:
-                map_array = np.asarray(
-                    [[float(item.x), float(item.y), float(item.z)] for item in resolved_map_points],
-                    dtype=np.float64,
-                )[valid_depth_mask][in_view_mask]
+            if source_array is not None:
+                map_array = self._resolve_array_to_frame(
+                    points_xyz=source_array,
+                    source_frame_id=point_cloud.frame_id,
+                    target_frame_id=map_frame_id,
+                    frame_tree=frame_tree,
+                )
+                if map_array is not None:
+                    map_array = map_array[valid_depth_mask][in_view_mask]
+            else:
+                resolved_map_points = self._resolve_points_to_frame(
+                    points=point_samples,
+                    source_frame_id=point_cloud.frame_id,
+                    target_frame_id=map_frame_id,
+                    frame_tree=frame_tree,
+                )
+                if resolved_map_points is not None:
+                    map_array = np.asarray(
+                        [[float(item.x), float(item.y), float(item.z)] for item in resolved_map_points],
+                        dtype=np.float64,
+                    )[valid_depth_mask][in_view_mask]
         return projected_pixels, camera_array, map_array, map_frame_id
 
     def _augment_segmentation_attributes(
@@ -311,7 +337,7 @@ class DetectionGeometryAugmentor:
         projection_status = "bbox_depth_support" if bbox_support_count else "bbox_no_depth_support"
         polygon_support_count = 0
         if polygon:
-            polygon_mask = np.asarray([self._point_in_polygon(float(x), float(y), polygon) for x, y in projected_pixels], dtype=bool)
+            polygon_mask = self._points_in_polygon(projected_pixels, polygon)
             polygon_support_count = int(np.count_nonzero(polygon_mask))
             if polygon_support_count:
                 support_mask = polygon_mask
@@ -430,6 +456,29 @@ class DetectionGeometryAugmentor:
             target_frame_id=target_frame_id,
         )
 
+    def _resolve_array_to_frame(
+        self,
+        *,
+        points_xyz: np.ndarray,
+        source_frame_id: str,
+        target_frame_id: str,
+        frame_tree: Optional[FrameTree],
+    ) -> Optional[np.ndarray]:
+        """用一次矩阵运算变换 ndarray 点集，保持点顺序和坐标语义。"""
+
+        if frame_ids_semantically_equal(source_frame_id, target_frame_id):
+            return points_xyz
+        resolved = resolve_frame_transform(
+            frame_tree,
+            source_frame_id=source_frame_id,
+            target_frame_id=target_frame_id,
+        )
+        if resolved is None:
+            return None
+        rotation = resolved.matrix[:3, :3]
+        translation = resolved.matrix[:3, 3]
+        return points_xyz @ rotation.T + translation
+
     def _serialize_points(self, points: np.ndarray) -> Tuple[Dict[str, float], ...]:
         return tuple(
             {
@@ -516,18 +565,28 @@ class DetectionGeometryAugmentor:
                 continue
         return tuple(points)
 
-    def _point_in_polygon(self, x_px: float, y_px: float, polygon: Tuple[Tuple[float, float], ...]) -> bool:
-        inside = False
-        count = len(polygon)
-        if count < 3:
-            return False
+    def _points_in_polygon(
+        self,
+        projected_pixels: np.ndarray,
+        polygon: Tuple[Tuple[float, float], ...],
+    ) -> np.ndarray:
+        """批量执行射线法多边形判断，只按多边形边数迭代。"""
+
+        if len(polygon) < 3 or projected_pixels.size == 0:
+            return np.zeros(projected_pixels.shape[0], dtype=bool)
+        x_px = projected_pixels[:, 0]
+        y_px = projected_pixels[:, 1]
+        inside = np.zeros(projected_pixels.shape[0], dtype=bool)
         previous_x, previous_y = polygon[-1]
         for current_x, current_y in polygon:
-            intersects = ((current_y > y_px) != (previous_y > y_px)) and (
-                x_px < (previous_x - current_x) * (y_px - current_y) / ((previous_y - current_y) or 1e-9) + current_x
+            intersects = ((current_y > y_px) != (previous_y > y_px)) & (
+                x_px
+                < (previous_x - current_x)
+                * (y_px - current_y)
+                / ((previous_y - current_y) or 1e-9)
+                + current_x
             )
-            if intersects:
-                inside = not inside
+            inside ^= intersects
             previous_x, previous_y = current_x, current_y
         return inside
 

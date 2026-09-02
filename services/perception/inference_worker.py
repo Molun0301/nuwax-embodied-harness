@@ -81,18 +81,17 @@ def _worker_loop(
             shm = shared_memory.SharedMemory(name=shm_name)
             image_bgr = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=shm.buf)
 
-            results = list(model.predict(image_bgr, **predict_kwargs))
+            # 当前协议只返回首个结果，直接消费迭代器，避免为后续结果建立列表。
+            result = next(iter(model.predict(image_bgr, **predict_kwargs)), None)
 
             # 提取原始检测结果为可序列化格式
-            raw_detections: List[Any] = []
             xyxy_np: Optional[np.ndarray] = None
             conf_np: Optional[np.ndarray] = None
             cls_np: Optional[np.ndarray] = None
             names: Optional[Dict[int, str]] = None
             masks_data: Optional[List[np.ndarray]] = None
 
-            if results:
-                result = results[0]
+            if result is not None:
                 boxes = getattr(result, "boxes", None)
                 if boxes is not None:
                     xyxy = getattr(boxes, "xyxy", None)

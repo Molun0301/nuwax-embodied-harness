@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -658,7 +659,7 @@ pub enum PlannerStep {
 
 #[derive(Debug, Clone, PartialEq)]
 struct LocalExecutionCommandIntent {
-    identity: PathExecutionIdentity,
+    identity: Arc<PathExecutionIdentity>,
     sequence: u64,
     owner_runtime_generation: u64,
     payload: LocalExecutionPayload,
@@ -778,7 +779,7 @@ pub struct NavScheduler<M, P> {
     current_path_revision: u64,
     current_payload_hash: Option<[u8; 32]>,
     current_path: Option<Path2D>,
-    current_execution_identity: Option<PathExecutionIdentity>,
+    current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     local_intent_sequence: u64,
     path_wait_started_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
@@ -1061,8 +1062,11 @@ where
                 "active session must be fenced before replacement".into(),
             ));
         }
+        let session_id = session.session_id.clone();
+        let motion_admission = session.motion_admission;
+        let guard_generation = motion_admission.guard_generation;
         self.planner.stop();
-        self.session = Some(session.clone());
+        self.session = Some(session);
         self.current_path_revision = 0;
         self.current_payload_hash = None;
         self.current_path = None;
@@ -1071,12 +1075,12 @@ where
         self.path_wait_started_at = None;
         self.status = SchedulerStatus {
             phase: SchedulerPhase::Acquiring,
-            session_id: Some(session.session_id.clone()),
+            session_id: Some(session_id),
             path_revision: 0,
             applied_commands: 0,
             last_applied_twist: None,
             motion_sink_ready: true,
-            guard_generation: session.motion_admission.guard_generation,
+            guard_generation,
             planner_inputs_fresh: self.status.planner_inputs_fresh,
             pose_source_timestamp_ns: self.status.pose_source_timestamp_ns,
             costmap_source_timestamp_ns: self.status.costmap_source_timestamp_ns,
@@ -1090,14 +1094,10 @@ where
         self.publish_status(status_tx);
 
         let operation_id = self.next_operation_id("acquire")?;
-        match self
-            .motion
-            .acquire(&operation_id, &session.motion_admission)
-            .await
-        {
+        match self.motion.acquire(&operation_id, &motion_admission).await {
             Ok(proof)
                 if proof.lease_id != 0
-                    && proof.guard_generation == session.motion_admission.guard_generation =>
+                    && proof.guard_generation == motion_admission.guard_generation =>
             {
                 self.lease_active = true;
                 self.status.motion_sink_ready = true;
@@ -1171,7 +1171,10 @@ where
         if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
             let immutable = self.current_payload_hash == Some(path.payload_hash)
                 && self.current_path.as_ref() == Some(&path.path)
-                && self.current_execution_identity.as_ref() == Some(&path.execution_identity);
+                && self
+                    .current_execution_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.as_ref() == &path.execution_identity);
             if immutable {
                 return Ok(());
             }
@@ -1193,11 +1196,18 @@ where
             return Err(error);
         }
 
-        self.planner.replace_path(path.path.clone());
-        self.current_path_revision = path.path_revision;
-        self.current_payload_hash = Some(path.payload_hash);
-        self.current_path = Some(path.path);
-        self.current_execution_identity = Some(path.execution_identity);
+        let VersionedPath {
+            path: planner_path,
+            execution_identity,
+            path_revision,
+            payload_hash,
+            ..
+        } = path;
+        self.planner.replace_path(planner_path.clone());
+        self.current_path_revision = path_revision;
+        self.current_payload_hash = Some(payload_hash);
+        self.current_path = Some(planner_path);
+        self.current_execution_identity = Some(Arc::new(execution_identity));
         self.path_wait_started_at = None;
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
@@ -1309,9 +1319,9 @@ where
             .local_intent_sequence
             .checked_add(1)
             .ok_or(RuntimeError::SequenceExhausted)?;
-        let identity = self.current_execution_identity.clone().ok_or_else(|| {
+        let identity = Arc::clone(self.current_execution_identity.as_ref().ok_or_else(|| {
             RuntimeError::Planner("local planner produced an intent without an active path".into())
-        })?;
+        })?);
         let owner_runtime_generation = self
             .session
             .as_ref()
@@ -1339,7 +1349,10 @@ where
             && self.status.phase == SchedulerPhase::Controlling
             && intent.sequence != 0
             && intent.sequence == self.local_intent_sequence
-            && self.current_execution_identity.as_ref() == Some(&intent.identity)
+            && self
+                .current_execution_identity
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &intent.identity))
             && self.session.as_ref().is_some_and(|session| {
                 session.local_owner_runtime_generation == intent.owner_runtime_generation
                     && intent

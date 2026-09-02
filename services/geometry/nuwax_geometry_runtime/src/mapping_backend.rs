@@ -18,9 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use nalgebra::Point3;
-use nuwax_mapping::cost_mapper::{
-    CostAlgoSelector, CostMapper, OccupancyConfig, SimplePointCloud2,
-};
+use nuwax_mapping::cost_mapper::{CostAlgoSelector, CostMapper, OccupancyConfig, PointCloud2Like};
 use nuwax_mapping::pointclouds::occupancy::PointCloudOccConfig;
 use nuwax_mapping::OccupancyGrid;
 use nuwax_mapping_raytracing::voxel_ray_tracer::{
@@ -1992,21 +1990,46 @@ fn occupancy_config(config: MappingBackendComputeConfig) -> OccupancyConfig {
     }
 }
 
+struct BorrowedBackendCloud<'a> {
+    points: &'a [Point3<f64>],
+    sensor_origin: Point3<f64>,
+    frame_id: &'a str,
+    timestamp: f64,
+}
+
+impl PointCloud2Like for BorrowedBackendCloud<'_> {
+    fn points(&self) -> &[Point3<f64>] {
+        self.points
+    }
+
+    fn sensor_origin(&self) -> Point3<f64> {
+        self.sensor_origin
+    }
+
+    fn frame_id(&self) -> &str {
+        self.frame_id
+    }
+
+    fn timestamp(&self) -> f64 {
+        self.timestamp
+    }
+}
+
 fn build_occupancy(
     points: &[Point3<f64>],
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<OccupancyGrid, String> {
-    let cloud = SimplePointCloud2::with_metadata(
-        points.to_vec(),
-        nalgebra::point![
+    let cloud = BorrowedBackendCloud {
+        points,
+        sensor_origin: nalgebra::point![
             input.sensor_origin_map[0],
             input.sensor_origin_map[1],
             input.sensor_origin_map[2]
         ],
-        input.registered_frame_id.clone(),
-        input.source_timestamp_ns as f64 / 1_000_000_000.0,
-    );
+        frame_id: &input.registered_frame_id,
+        timestamp: input.source_timestamp_ns as f64 / 1_000_000_000.0,
+    };
     CostMapper::from_pointcloud_auto(&cloud, &occupancy_config(config), config.resolution)
         .map(|(_, occupancy, _)| occupancy)
         .map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))

@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import logging
 import threading
-from typing import Callable, DefaultDict, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Callable, DefaultDict, Deque, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.streams import StreamFrame, StreamPayloadKind
 
@@ -45,7 +45,7 @@ class StreamBus:
 
     def __init__(self, retention_limit: int = 1000) -> None:
         self._retention_limit = max(1, retention_limit)
-        self._frames: List[StreamFrame] = []
+        self._frames: Deque[StreamFrame] = collections.deque(maxlen=self._retention_limit)
         self._subscriptions: Dict[str, StreamSubscription] = {}
         self._latest_by_topic: Dict[str, StreamFrame] = {}
         self._evicted_through_by_topic: Dict[str, int] = {}
@@ -216,20 +216,17 @@ class StreamBus:
                 self._latest_by_topic[stored_diagnostic.topic] = stored_diagnostic
 
     def _retain_frame_locked(self, frame: StreamFrame) -> None:
+        evicted_frame = (
+            self._frames[0] if len(self._frames) == self._retention_limit else None
+        )
         self._frames.append(frame)
-        overflow = len(self._frames) - self._retention_limit
-        if overflow <= 0:
+        if evicted_frame is None or evicted_frame.cursor is None:
             return
-        evicted = self._frames[:overflow]
-        self._frames = self._frames[overflow:]
-        for evicted_frame in evicted:
-            if evicted_frame.cursor is None:
-                continue
-            previous = self._evicted_through_by_topic.get(evicted_frame.topic, 0)
-            self._evicted_through_by_topic[evicted_frame.topic] = max(
-                previous,
-                int(evicted_frame.cursor),
-            )
+        previous = self._evicted_through_by_topic.get(evicted_frame.topic, 0)
+        self._evicted_through_by_topic[evicted_frame.topic] = max(
+            previous,
+            int(evicted_frame.cursor),
+        )
 
     def publish_dropped(self, topic: str, *, source: str, dropped_count: int = 1) -> StreamFrame:
         with self._lock:

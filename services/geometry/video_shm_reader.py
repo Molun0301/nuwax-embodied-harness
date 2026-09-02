@@ -88,6 +88,21 @@ class VideoShmReader:
 
     def _ensure_mapping(self) -> bool:
         """把路径原子切换到当前 inode，并保留其 fd 与映射。"""
+        # 稳定帧路径只需检查路径身份；仅在 inode 或大小变化时重新打开 fd。
+        if self._fd is not None and self._backing_identity is not None:
+            try:
+                stat_result = os.stat(self._path)
+                current_identity = (
+                    int(stat_result.st_dev),
+                    int(stat_result.st_ino),
+                    int(stat_result.st_size),
+                )
+            except OSError:
+                self._drop_mapping(reset_identity=True)
+                return False
+            if current_identity == self._backing_identity:
+                return True
+
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         try:
             candidate_fd = os.open(self._path, flags)
@@ -136,20 +151,28 @@ class VideoShmReader:
         fd = self._fd
         if fd is None or size < 0 or offset < 0:
             return None
-        chunks = []
-        remaining = size
-        cursor = offset
+        if size == 0:
+            return b""
         try:
-            while remaining:
-                chunk = os.pread(fd, remaining, cursor)
+            # 正常 regular-file 读取通常一次完成，直接返回 os.pread 结果，
+            # 避免每个视频帧都创建 chunks 列表并 join 一次。
+            first = os.pread(fd, size, offset)
+            if len(first) == size:
+                return first
+            if not first:
+                return None
+            snapshot = bytearray(size)
+            snapshot[: len(first)] = first
+            filled = len(first)
+            while filled < size:
+                chunk = os.pread(fd, size - filled, offset + filled)
                 if not chunk:
                     return None
-                chunks.append(chunk)
-                cursor += len(chunk)
-                remaining -= len(chunk)
+                snapshot[filled : filled + len(chunk)] = chunk
+                filled += len(chunk)
+            return bytes(snapshot)
         except OSError:
             return None
-        return b"".join(chunks)
 
     @staticmethod
     def _parse_header(header: bytes) -> Optional[Tuple[bytes, int, int, int, int]]:

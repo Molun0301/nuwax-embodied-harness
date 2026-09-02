@@ -1264,8 +1264,29 @@ class PerceptionService:
                 },
             )
 
+        def _has_usable_point_cloud(frame) -> bool:
+            if frame is None:
+                return False
+            points = getattr(frame, "points", None)
+            try:
+                if points is not None and len(points) > 0:
+                    return True
+            except TypeError:
+                pass
+            array = getattr(frame, "points_xyz_array", None)
+            shape = getattr(array, "shape", ())
+            try:
+                return (
+                    array is not None
+                    and len(shape) == 2
+                    and shape[0] > 0
+                    and shape[1] >= 3
+                )
+            except (TypeError, IndexError):
+                return False
+
         point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
-        if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
+        if not _has_usable_point_cloud(point_cloud_frame):
             point_cloud_frame = self._get_latest_point_cloud_optional()
 
         frame_tree = self._latest_stream_payload("localization.frame_tree")
@@ -1300,7 +1321,7 @@ class PerceptionService:
             frame_tree=frame_tree,
             current_pose=current_pose,
         )
-        if point_cloud_frame is None or not getattr(point_cloud_frame, "points", None):
+        if not _has_usable_point_cloud(point_cloud_frame):
             geometry_metadata = {
                 **dict(geometry_metadata),
                 "geometry_projection_status": "pointcloud_unavailable",
@@ -1317,7 +1338,7 @@ class PerceptionService:
             )
         support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
         degraded_reason = str(geometry_metadata.get("geometry_degraded_reason") or "")
-        if support_count <= 0 and point_cloud_frame is not None and getattr(point_cloud_frame, "points", None):
+        if support_count <= 0 and _has_usable_point_cloud(point_cloud_frame):
             degraded_reason = degraded_reason or "pointcloud_projection_failed"
         return detection_bundle.__class__(
             detections_2d=detections_2d,

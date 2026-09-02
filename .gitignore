@@ -36,6 +36,10 @@ scripts/ci/*
 **/tests/
 **/integration-tests/
 **/benches/
+# 占据栅格算法基准需要入库，目录内其他基准仍忽略。
+!/services/nuwax-workspace/crates/nuwax-mapping/benches/
+/services/nuwax-workspace/crates/nuwax-mapping/benches/*
+!/services/nuwax-workspace/crates/nuwax-mapping/benches/occupancy_algorithms.rs
 **/test_*.py
 **/*_test.py
 **/tests.cpp

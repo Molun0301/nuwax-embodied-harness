@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import threading
 from typing import Any, Callable, Optional, Tuple, TypeVar
 
 from drivers.common.video_uds_sender import VideoUdsSender
@@ -144,18 +145,41 @@ async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs:
     return await loop.run_in_executor(None, lambda: callable_obj(*args, **kwargs))
 
 
+def _encode_and_send_frame(
+    frame: Any,
+    uds_sender: VideoUdsSender,
+    cancel_requested: threading.Event,
+) -> Optional[bool]:
+    """在线程池中连续完成单帧编码和发送，避免两次 executor 边界。"""
+
+    payload = _encode_jpeg_frame(frame)
+    if cancel_requested.is_set():
+        return None
+    if len(payload) > _MAX_JPEG_PAYLOAD_BYTES:
+        raise RuntimeError("JPEG 帧超过 512 KiB UDS 载荷上限。")
+    return uds_sender.send_frame(payload)
+
+
 async def _consume_video_track(
     track: Any,
     uds_sender: VideoUdsSender,
     first_frame: asyncio.Event,
+    cancel_requested: threading.Event,
 ) -> None:
     try:
         while True:
             frame = await track.recv()
-            payload = await _run_blocking(_encode_jpeg_frame, frame)
-            if len(payload) > _MAX_JPEG_PAYLOAD_BYTES:
-                raise RuntimeError("JPEG 帧超过 512 KiB UDS 载荷上限。")
-            if not await _run_blocking(uds_sender.send_frame, payload):
+            # 取消时线程池任务无法中断，由 _encode_and_send_frame 在编码结束、
+            # 发送开始之前检查 cancel_requested，跳过这一帧即可。
+            sent = await _run_blocking(
+                _encode_and_send_frame,
+                frame,
+                uds_sender,
+                cancel_requested,
+            )
+            if sent is None:
+                raise asyncio.CancelledError
+            if not sent:
                 raise RuntimeError("UDS 发送失败，Rust 视频中转连接已断开。")
             first_frame.set()
     except asyncio.CancelledError:
@@ -164,7 +188,11 @@ async def _consume_video_track(
         raise RuntimeError(f"Go2 WebRTC 视频轨道中断: {exc}") from exc
 
 
-async def _cancel_and_wait_consumer(task: asyncio.Task) -> bool:
+async def _cancel_and_wait_consumer(
+    task: asyncio.Task,
+    cancel_requested: threading.Event,
+) -> bool:
+    cancel_requested.set()
     if not task.done():
         task.cancel()
     done, _ = await asyncio.wait(
@@ -193,6 +221,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
     channel_enabled = False
     accepting_track = True
     consumer_task: Optional[asyncio.Task] = None
+    consumer_cancel_requested = threading.Event()
     first_frame_waiter: Optional[asyncio.Task] = None
 
     try:
@@ -230,7 +259,12 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
             if not accepting_track or consumer_task is not None:
                 return
             consumer_task = asyncio.create_task(
-                _consume_video_track(track, uds_sender, first_frame),
+                _consume_video_track(
+                    track,
+                    uds_sender,
+                    first_frame,
+                    consumer_cancel_requested,
+                ),
                 name="go2-video-track-consumer",
             )
             track_registered.set()
@@ -273,7 +307,10 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
             await asyncio.gather(first_frame_waiter, return_exceptions=True)
         consumer_stopped = True
         if consumer_task is not None:
-            consumer_stopped = await _cancel_and_wait_consumer(consumer_task)
+            consumer_stopped = await _cancel_and_wait_consumer(
+                consumer_task,
+                consumer_cancel_requested,
+            )
         if channel_enabled and video_channel is not None:
             try:
                 video_channel.switchVideoChannel(False)

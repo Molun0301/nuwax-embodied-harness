@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import date, datetime
@@ -9,8 +10,10 @@ from decimal import Decimal
 from enum import Enum
 import json
 import math
+import os
 from pathlib import Path
 import struct
+import threading
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 from uuid import UUID
@@ -534,6 +537,106 @@ def _frame_priority(frame: StreamFrame) -> int:
     return 40
 
 
+class _ClientStreamQueue:
+    """单客户端发送队列：按槽位替换最新帧，按优先级分桶丢弃。
+
+    替代原来的 `asyncio.Queue`。原实现每收到一帧 latest-only/BINARY 帧就要排空
+    整个队列过滤同主题旧帧再逐项塞回，队列满时再排空一次做全扫描找最低优先级项，
+    容量 200 时点云和视频每帧都是 O(n)。这里改为：
+
+    - 交付顺序仍是严格 FIFO，优先级只用于选择丢弃对象，不改变发送次序；
+    - latest-only/BINARY 帧按槽位键直接覆盖，覆盖后移到队尾（与原实现一致）；
+    - 每个优先级维护一个插入有序的键索引，满时取最低优先级里最早的一项，
+      优先级取值只有 7 种，因此选择丢弃对象是 O(1)。
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = int(maxsize)
+        # 槽位键 -> (帧, 优先级)，插入序即交付序。
+        self._items = collections.OrderedDict()
+        # 优先级 -> 该优先级下的槽位键（插入有序），用于 O(1) 选丢弃对象。
+        self._keys_by_priority = {}
+        self._sequence = 0
+        self._waiter = None
+
+    @staticmethod
+    def _slot_key(frame: StreamFrame) -> Optional[Tuple[str, str]]:
+        """返回可被后续同类帧覆盖的槽位键；None 表示该帧独占一个位置。
+
+        与原过滤条件等价：latest-only 主题按主题整体收敛；其余主题只有 BINARY
+        帧之间互相收敛，同主题的非 BINARY 帧不受影响。
+        """
+
+        if frame.topic in _LATEST_ONLY_STREAM_TOPICS:
+            return ("topic", frame.topic)
+        if frame.payload_kind == StreamPayloadKind.BINARY:
+            return ("binary", frame.topic)
+        return None
+
+    def _discard_key(self, key: object, priority: int) -> None:
+        self._items.pop(key, None)
+        bucket = self._keys_by_priority.get(priority)
+        if bucket is not None:
+            bucket.pop(key, None)
+            if not bucket:
+                del self._keys_by_priority[priority]
+
+    def _lowest_priority_key(self) -> Tuple[object, int]:
+        priority = min(self._keys_by_priority)
+        return next(iter(self._keys_by_priority[priority])), priority
+
+    def put(self, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+        priority = _frame_priority(frame)
+        key = self._slot_key(frame)
+        if key is None:
+            self._sequence += 1
+            key = ("seq", self._sequence)
+        else:
+            existing = self._items.get(key)
+            if existing is not None:
+                # 被新帧取代的旧帧不是拥塞丢弃，不计入 gap 通知。
+                self._discard_key(key, existing[1])
+
+        if len(self._items) >= self._maxsize:
+            drop_key, drop_priority = self._lowest_priority_key()
+            if drop_priority > priority:
+                # 队列里全是更高优先级的帧，改为丢弃新到帧。
+                _record_queue_drop(self, frame)
+                return
+            _record_queue_drop(self, self._items[drop_key][0])
+            self._discard_key(drop_key, drop_priority)
+
+        self._items[key] = (frame, priority)
+        self._keys_by_priority.setdefault(priority, collections.OrderedDict())[key] = None
+
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    def empty(self) -> bool:
+        return not self._items
+
+    def get_nowait(self) -> StreamFrame:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        key, (frame, priority) = self._items.popitem(last=False)
+        self._discard_key(key, priority)
+        return frame
+
+    async def get(self) -> StreamFrame:
+        while not self._items:
+            waiter = asyncio.get_running_loop().create_future()
+            self._waiter = waiter
+            try:
+                await waiter
+            finally:
+                if self._waiter is waiter:
+                    self._waiter = None
+        key, (frame, priority) = self._items.popitem(last=False)
+        self._discard_key(key, priority)
+        return frame
+
+
 def _record_queue_drop(queue: asyncio.Queue, frame: StreamFrame) -> None:
     state = getattr(queue, "_nuwax_drop_state", None)
     if not isinstance(state, dict):
@@ -570,42 +673,14 @@ def _take_queue_gap_notice(queue: asyncio.Queue, runtime: GatewayRuntime) -> Opt
     return notice
 
 
-def _safe_enqueue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+def _safe_enqueue(
+    loop: asyncio.AbstractEventLoop,
+    queue: _ClientStreamQueue,
+    frame: StreamFrame,
+    runtime: GatewayRuntime,
+) -> None:
     def _push() -> None:
-        if (
-            frame.payload_kind == StreamPayloadKind.BINARY
-            or frame.topic in _LATEST_ONLY_STREAM_TOPICS
-        ):
-            retained = []
-            while not queue.empty():
-                queued = queue.get_nowait()
-                if queued.topic == frame.topic and (
-                    frame.topic in _LATEST_ONLY_STREAM_TOPICS
-                    or queued.payload_kind == StreamPayloadKind.BINARY
-                ):
-                    continue
-                retained.append(queued)
-            for queued in retained:
-                queue.put_nowait(queued)
-        if queue.full():
-            queued_frames = []
-            while not queue.empty():
-                queued_frames.append(queue.get_nowait())
-            incoming_priority = _frame_priority(frame)
-            drop_index = min(
-                range(len(queued_frames)),
-                key=lambda index: (_frame_priority(queued_frames[index]), index),
-            )
-            if _frame_priority(queued_frames[drop_index]) > incoming_priority:
-                for queued in queued_frames:
-                    queue.put_nowait(queued)
-                _record_queue_drop(queue, frame)
-                return
-            dropped = queued_frames.pop(drop_index)
-            _record_queue_drop(queue, dropped)
-            for queued in queued_frames:
-                queue.put_nowait(queued)
-        queue.put_nowait(frame)
+        queue.put(frame, runtime)
 
     loop.call_soon_threadsafe(_push)
 
@@ -744,7 +819,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         async def frame_generator():
             loop = asyncio.get_running_loop()
-            queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+            queue = _ClientStreamQueue(maxsize=_STREAM_QUEUE_MAXSIZE)
             emitted = 0
             subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
@@ -797,8 +872,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     ):
         video_available = False
         if VideoShmReader is not None:
-            import os as _os
-            _shm_path = _os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            _shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
             _probe = VideoShmReader(_shm_path)
             video_available = _probe.has_new_frame()
             _probe.close()
@@ -817,24 +891,25 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 24.0)
 
         async def frame_generator():
-            shm_reader = None
-            if VideoShmReader is not None:
-                import os
-                shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
-                shm_reader = VideoShmReader(shm_path)
-
-            while not await request.is_disconnected():
-                started_at = time.monotonic()
-                frame_data = None
-                if shm_reader is not None:
-                    result = shm_reader.read_latest()
-                    if result is not None:
-                        frame_data, _, _ = result
-                if frame_data is not None:
-                    yield _format_mjpeg_frame(frame_data)
-                elapsed = time.monotonic() - started_at
-                if elapsed < frame_interval_sec:
-                    await asyncio.sleep(frame_interval_sec - elapsed)
+            shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            attached = _SHARED_MJPEG_SOURCE.acquire(shm_path)
+            last_sent_sequence = -1
+            try:
+                while not await request.is_disconnected():
+                    started_at = time.monotonic()
+                    if attached:
+                        multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
+                        # 与原来每连接一个 reader 等价：同一帧只发一次。
+                        if multipart is not None and sequence != last_sent_sequence:
+                            last_sent_sequence = sequence
+                            yield multipart
+                    elapsed = time.monotonic() - started_at
+                    if elapsed < frame_interval_sec:
+                        await asyncio.sleep(frame_interval_sec - elapsed)
+            finally:
+                if attached:
+                    # 原实现从不关闭 reader，每个连接泄漏一个 fd 和一份 mmap。
+                    _SHARED_MJPEG_SOURCE.release()
 
         return StreamingResponse(
             frame_generator(),
@@ -854,7 +929,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        queue = _ClientStreamQueue(maxsize=_STREAM_QUEUE_MAXSIZE)
         subscription_id: Optional[str] = None
 
         try:
@@ -938,6 +1013,66 @@ def _positive_int(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return int(default)
     return parsed if parsed > 0 else int(default)
+
+
+class _SharedMjpegFrameSource:
+    """进程内共享的最新 MJPEG 帧。
+
+    原实现每个 MJPEG 连接各开一个 SHM reader，各自 pread、各自拼 bytes、各自格式化
+    multipart，N 个客户端就是 N 倍读取和 N 倍拼装，而且 reader 从不关闭，每个连接
+    泄漏一个 fd 和一份 mmap。这里一帧只读一次、只格式化一次，所有连接引用同一份
+    不可变 bytes；最后一个消费者离开时关闭 reader。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reader = None
+        self._shm_path = None
+        self._consumers = 0
+        self._cached_multipart = None
+        self._cached_sequence = -1
+
+    def acquire(self, shm_path: str) -> bool:
+        if VideoShmReader is None:
+            return False
+        with self._lock:
+            if self._reader is not None and self._shm_path != shm_path and self._consumers == 0:
+                self._reset_locked()
+            if self._reader is None:
+                self._reader = VideoShmReader(shm_path)
+                self._shm_path = shm_path
+            self._consumers += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._consumers = max(0, self._consumers - 1)
+            if self._consumers == 0:
+                self._reset_locked()
+
+    def _reset_locked(self) -> None:
+        if self._reader is not None:
+            self._reader.close()
+        self._reader = None
+        self._shm_path = None
+        self._cached_multipart = None
+        self._cached_sequence = -1
+
+    def latest_multipart(self) -> Tuple[Optional[bytes], int]:
+        """返回 (已格式化的 multipart 帧, 序号)。没有新帧时返回上一帧的同一份缓存。"""
+
+        with self._lock:
+            if self._reader is None:
+                return None, -1
+            result = self._reader.read_latest()
+            if result is not None:
+                frame_data, sequence, _ = result
+                self._cached_multipart = _format_mjpeg_frame(frame_data)
+                self._cached_sequence = sequence
+            return self._cached_multipart, self._cached_sequence
+
+
+_SHARED_MJPEG_SOURCE = _SharedMjpegFrameSource()
 
 
 def _format_mjpeg_frame(data: bytes) -> bytes:

@@ -101,6 +101,26 @@ _GO2_L2_FIELDS = _CANONICAL_XYZI_FIELDS + (
     {"name": "offset_ns", "offset": 16, "datatype": 6, "count": 1},
 )
 
+# 点云布局固定；将 dtype（数据类型描述）对象提升到模块级，避免每帧重复构造。
+_XYZ_DTYPE = np.dtype(
+    [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+)
+_XYZI_DTYPE = np.dtype(
+    [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4")]
+)
+_XYZ_OFFSET_DTYPE = np.dtype(
+    [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("offset_ns", "<u4")]
+)
+_GO2_L2_DTYPE = np.dtype(
+    [
+        ("x", "<f4"),
+        ("y", "<f4"),
+        ("z", "<f4"),
+        ("intensity", "<f4"),
+        ("offset_ns", "<u4"),
+    ]
+)
+
 
 def _datetime_to_unix_ns(value: datetime) -> int:
     """Convert a contract timestamp exactly at Python's microsecond precision."""
@@ -223,6 +243,16 @@ class RuntimeInputBridge:
         repr=False,
     )
     _lio_reset_pending_generation: Optional[int] = field(default=None, init=False)
+    _point_cloud_publisher_signature_key: Optional[Tuple[int, int]] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _point_cloud_publisher_accepts_metadata: Optional[bool] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     # === lifecycle state ===
     _lifecycle_operation_lock: threading.RLock = field(
@@ -869,8 +899,7 @@ class RuntimeInputBridge:
             downsampled = True
             self._increment_counter("downsampled_pointcloud_count")
 
-        point_step = self._resolve_point_step(payload)
-        fields = self._resolve_point_fields(payload)
+        point_step, fields = self._resolve_point_layout(payload)
         bytes_payload = self._encode_point_cloud_bytes(payload)
         if bytes_payload is None:
             self._increment_counter("dropped_pointcloud_count")
@@ -901,15 +930,12 @@ class RuntimeInputBridge:
                 "is_dense": bool(getattr(payload, "is_dense", True)),
                 "imu_samples": imu_samples,
             }
-            try:
-                inspect.signature(publisher).bind(bytes_payload, point_step, **metadata)
-            except (TypeError, ValueError) as exc:
+            if not self._publisher_accepts_metadata(publisher):
                 raise TypeError(
                     "pointcloud publisher 必须接受 "
                     "frame_id/timestamp_ns/fields/point_count/is_dense metadata"
-                ) from exc
-            else:
-                result = publisher(bytes_payload, point_step, **metadata)
+                )
+            result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:
             self._increment_counter("dropped_pointcloud_count")
             self._record_error(f"publish_point_cloud 抛异常：{exc}")
@@ -1286,21 +1312,10 @@ class RuntimeInputBridge:
             offsets_u64 = np.frombuffer(lidar.time_offset_ns_le, dtype="<u8")
             if np.any(offsets_u64 > np.iinfo(np.uint32).max):
                 return None
-            packed = np.empty(
-                lidar.point_count,
-                dtype=np.dtype(
-                    [
-                        ("x", "<f4"),
-                        ("y", "<f4"),
-                        ("z", "<f4"),
-                        ("intensity", "<f4"),
-                        ("offset_ns", "<u4"),
-                    ]
-                ),
-            )
+            packed = np.empty(lidar.point_count, dtype=_GO2_L2_DTYPE)
             packed["x"], packed["y"], packed["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
             packed["intensity"] = intensity
-            packed["offset_ns"] = offsets_u64.astype("<u4")
+            packed["offset_ns"] = offsets_u64
             return packed.tobytes()
         except (TypeError, ValueError):
             return None
@@ -1389,33 +1404,70 @@ class RuntimeInputBridge:
 
     @staticmethod
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:
-        metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-        canonical_lidar = metadata.get("canonical_lidar_frame")
-        if isinstance(canonical_lidar, CanonicalLidarFrame):
-            return 20
-        intensity = metadata.get("intensity_array")
-        offsets = metadata.get("offset_ns_array")
-        if intensity is not None and offsets is not None:
-            return 20
-        if intensity is not None or offsets is not None:
-            return 16
-        return 12
+        return RuntimeInputBridge._resolve_point_layout(point_cloud)[0]
 
     @staticmethod
     def _resolve_point_fields(point_cloud: PointCloudFrame) -> Tuple[Dict[str, Any], ...]:
+        return RuntimeInputBridge._resolve_point_layout(point_cloud)[1]
+
+    @staticmethod
+    def _resolve_point_layout(
+        point_cloud: PointCloudFrame,
+    ) -> Tuple[int, Tuple[Dict[str, Any], ...]]:
+        """一次解析点云字段布局，返回固定 point step 与字段表。"""
+
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
         canonical_lidar = metadata.get("canonical_lidar_frame")
         if isinstance(canonical_lidar, CanonicalLidarFrame):
-            return _GO2_L2_FIELDS
+            return 20, _GO2_L2_FIELDS
         has_intensity = metadata.get("intensity_array") is not None
         has_offsets = metadata.get("offset_ns_array") is not None
         if has_intensity and has_offsets:
-            return _GO2_L2_FIELDS
+            return 20, _GO2_L2_FIELDS
         if has_intensity:
-            return _CANONICAL_XYZI_FIELDS
+            return 16, _CANONICAL_XYZI_FIELDS
         if has_offsets:
-            return _CANONICAL_XYZ_OFFSET_FIELDS
-        return _CANONICAL_XYZ_FIELDS
+            return 16, _CANONICAL_XYZ_OFFSET_FIELDS
+        return 12, _CANONICAL_XYZ_FIELDS
+
+    @staticmethod
+    def _publisher_signature_cache_key(publisher: Any) -> Tuple[int, int]:
+        """为函数、绑定方法和 callable 对象生成稳定的签名缓存键。"""
+
+        owner = getattr(publisher, "__self__", None)
+        function = getattr(publisher, "__func__", None)
+        if owner is not None and function is not None:
+            return id(owner), id(function)
+        return id(publisher), id(type(publisher))
+
+    def _publisher_accepts_metadata(self, publisher: Any) -> bool:
+        """缓存 publisher 参数合同，避免每帧重复执行 inspect.signature。"""
+
+        key = self._publisher_signature_cache_key(publisher)
+        with self._lock:
+            if self._point_cloud_publisher_signature_key == key:
+                return bool(self._point_cloud_publisher_accepts_metadata)
+
+        try:
+            inspect.signature(publisher).bind(
+                b"",
+                0,
+                frame_id="",
+                timestamp_ns=0,
+                fields=(),
+                point_count=0,
+                is_dense=True,
+                imu_samples=(),
+            )
+        except (TypeError, ValueError):
+            accepts_metadata = False
+        else:
+            accepts_metadata = True
+
+        with self._lock:
+            self._point_cloud_publisher_signature_key = key
+            self._point_cloud_publisher_accepts_metadata = accepts_metadata
+        return accepts_metadata
 
     @staticmethod
     def _encode_point_cloud_bytes(point_cloud: PointCloudFrame) -> Optional[bytes]:
@@ -1445,47 +1497,17 @@ class RuntimeInputBridge:
             ):
                 return None
             if intensity is None and offset_ns is None:
-                return xyz.tobytes()
+                # XYZ 数组已经连续且 little-endian；仅建立结构化视图，不再复制。
+                return xyz.view(_XYZ_DTYPE).reshape(-1).tobytes()
             if intensity is not None and offset_ns is not None:
-                packed = np.empty(
-                    xyz.shape[0],
-                    dtype=np.dtype(
-                        [
-                            ("x", "<f4"),
-                            ("y", "<f4"),
-                            ("z", "<f4"),
-                            ("intensity", "<f4"),
-                            ("offset_ns", "<u4"),
-                        ]
-                    ),
-                )
+                packed = np.empty(xyz.shape[0], dtype=_GO2_L2_DTYPE)
                 packed["intensity"] = intensity
                 packed["offset_ns"] = offset_ns
             elif intensity is not None:
-                packed = np.empty(
-                    xyz.shape[0],
-                    dtype=np.dtype(
-                        [
-                            ("x", "<f4"),
-                            ("y", "<f4"),
-                            ("z", "<f4"),
-                            ("intensity", "<f4"),
-                        ]
-                    ),
-                )
+                packed = np.empty(xyz.shape[0], dtype=_XYZI_DTYPE)
                 packed["intensity"] = intensity
             else:
-                packed = np.empty(
-                    xyz.shape[0],
-                    dtype=np.dtype(
-                        [
-                            ("x", "<f4"),
-                            ("y", "<f4"),
-                            ("z", "<f4"),
-                            ("offset_ns", "<u4"),
-                        ]
-                    ),
-                )
+                packed = np.empty(xyz.shape[0], dtype=_XYZ_OFFSET_DTYPE)
                 packed["offset_ns"] = offset_ns
             packed["x"] = xyz[:, 0]
             packed["y"] = xyz[:, 1]

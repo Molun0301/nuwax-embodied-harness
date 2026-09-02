@@ -1036,6 +1036,12 @@ mod process_helper {
     const CONTROL_HELPER_PHASE_OFFSET: usize = 48;
     const CONTROL_TEST_FAULTS_OFFSET: usize = 56;
     const CONTROL_TEST_RESUME_OFFSET: usize = 64;
+    #[cfg(test)]
+    const CONTROL_TEST_PAYLOAD_POINTER_OFFSET: usize = 72;
+    #[cfg(test)]
+    const CONTROL_TEST_PAYLOAD_CAPACITY_OFFSET: usize = 80;
+    #[cfg(test)]
+    const CONTROL_TEST_PAYLOAD_OBSERVATIONS_OFFSET: usize = 88;
 
     const IPC_KIND_OFFSET: usize = 12;
     const IPC_GENERATION_HIGH_OFFSET: usize = 16;
@@ -1320,6 +1326,33 @@ mod process_helper {
             debug_assert_eq!(offset % std::mem::align_of::<AtomicU64>(), 0);
             unsafe { &*self.mmap.as_ptr().add(offset).cast::<AtomicU64>() }
         }
+    }
+
+    #[cfg(test)]
+    fn record_payload_buffer_for_test(control: &ControlPage, pointer: *const u8, capacity: usize) {
+        control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_POINTER_OFFSET)
+            .store(pointer as usize as u64, Ordering::Relaxed);
+        control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_CAPACITY_OFFSET)
+            .store(capacity as u64, Ordering::Relaxed);
+        control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_OBSERVATIONS_OFFSET)
+            .fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn payload_buffer_observation_for_test(control: &ControlPage) -> (u64, u64, u64) {
+        let observations = control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_OBSERVATIONS_OFFSET)
+            .load(Ordering::Acquire);
+        let pointer = control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_POINTER_OFFSET)
+            .load(Ordering::Acquire);
+        let capacity = control
+            .atomic_u64(CONTROL_TEST_PAYLOAD_CAPACITY_OFFSET)
+            .load(Ordering::Acquire);
+        (pointer, capacity, observations)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2745,8 +2778,10 @@ mod process_helper {
         session: &mut HelperSession,
         committed_sequence: &mut u64,
     ) -> io::Result<()> {
+        let mut length_bytes = [0_u8; 4];
+        // 单个连接串行提交帧，复用 payload 容量，避免每帧重新分配和释放。
+        let mut payload = Vec::new();
         loop {
-            let mut length_bytes = [0_u8; 4];
             helper_read_exact(stream, &mut length_bytes, &session.control)?;
             let frame_length = u32::from_le_bytes(length_bytes) as usize;
             if frame_length == 0 || frame_length > MAX_FRAME_SIZE {
@@ -2755,7 +2790,9 @@ mod process_helper {
                     format!("视频帧长度无效: {frame_length}"),
                 ));
             }
-            let mut payload = vec![0_u8; frame_length];
+            payload.resize(frame_length, 0);
+            #[cfg(test)]
+            record_payload_buffer_for_test(&session.control, payload.as_ptr(), payload.capacity());
             helper_read_exact(stream, &mut payload, &session.control)?;
             helper_commit_frame(session, &payload, committed_sequence)?;
         }
@@ -6158,6 +6195,68 @@ mod tests {
             Duration::from_secs(1)
         ));
         assert!(owner.shutdown(Duration::from_secs(1)).unwrap().is_clean());
+    }
+
+    #[test]
+    fn same_connection_reuses_helper_payload_buffer_for_varying_frames_and_stops_cleanly() {
+        let paths = TestPaths::new("same-connection-payload-reuse");
+        let mut owner = spawn_video_relay_owner(&paths.shm, &paths.uds).unwrap();
+        let helper_pid = owner.helper_pid();
+        let handle = owner.handle();
+        let control = owner.helper_control();
+        let reader = unsafe { memmap2::Mmap::map(&File::open(&paths.shm).unwrap()).unwrap() };
+        let generation = mapped_generation(&reader);
+        let mut sender = UnixStream::connect(&paths.uds).unwrap();
+        let frames = [
+            vec![0x11; 192],
+            (0_u8..17).collect::<Vec<_>>(),
+            vec![0x33; 128],
+        ];
+        assert!(frames[1].len() < frames[0].len());
+        assert!(frames[2].len() > frames[1].len() && frames[2].len() < frames[0].len());
+
+        let mut observations = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            sender
+                .write_all(&(frame.len() as u32).to_le_bytes())
+                .unwrap();
+            sender.write_all(frame).unwrap();
+            let expected_sequence = index as u64 + 1;
+            assert!(wait_until(
+                || handle.sequence.load(Ordering::Acquire) == expected_sequence,
+                Duration::from_secs(1)
+            ));
+            let (sequence, payload, timestamp_ns) =
+                mapped_snapshot(&reader).expect("连续帧必须发布到 SHM");
+            assert_eq!(sequence, expected_sequence);
+            assert_eq!(payload, *frame);
+            assert!(timestamp_ns > 0);
+            let observation = process_helper::payload_buffer_observation_for_test(&control);
+            assert_eq!(observation.2, expected_sequence);
+            observations.push(observation);
+        }
+
+        let first = observations[0];
+        assert_ne!(first.0, 0);
+        assert!(first.1 >= frames[0].len() as u64);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.0 == first.0 && observation.1 == first.1),
+            "同一 helper 连接的 payload 指针和容量必须跨缩短、再次增长保持复用: {observations:?}"
+        );
+
+        assert!(owner.stop());
+        let terminal = owner.join(Duration::from_secs(1)).unwrap();
+        drop(sender);
+        assert!(terminal.is_expected_shutdown(), "{terminal:?}");
+        assert!(!process_exists(helper_pid));
+        assert_eq!(handle.sequence.load(Ordering::Acquire), 0);
+        assert_eq!(mapped_sequence(&reader), 0);
+        assert_eq!(mapped_generation(&reader), generation);
+        assert!(mapped_snapshot(&reader).is_none());
+        assert!(!paths.shm.exists() && !paths.uds.exists());
+        assert_eq!(std::fs::read_dir(&paths.root).unwrap().count(), 0);
     }
 
     #[test]

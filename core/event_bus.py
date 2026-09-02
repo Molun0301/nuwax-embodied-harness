@@ -4,7 +4,7 @@ import collections
 from dataclasses import dataclass
 import logging
 import threading
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.base import MetadataDict
 from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSeverity
@@ -57,12 +57,24 @@ class PreparedEventPublication:
     subscriptions: Tuple[EventSubscription, ...]
 
 
+@dataclass(frozen=True)
+class EventReplaySnapshot:
+    events: Tuple[RuntimeEvent, ...]
+    requested_after_cursor: int
+    effective_after_cursor: int
+    oldest_cursor: int
+    latest_cursor: int
+    replay_gap: bool
+    gap_reason: Optional[str]
+    resync_required: bool
+
+
 class EventBus:
     """支持游标续播的内存事件总线。"""
 
     def __init__(self, retention_limit: int = 1000) -> None:
         self._retention_limit = max(1, retention_limit)
-        self._events: List[RuntimeEvent] = []
+        self._events: Deque[RuntimeEvent] = collections.deque(maxlen=self._retention_limit)
         self._subscriptions: Dict[str, EventSubscription] = {}
         self._next_cursor = 1
         self._next_subscription_seq = 1
@@ -130,8 +142,6 @@ class EventBus:
             stored_event = event.model_copy(update={"cursor": self._next_cursor})
             self._next_cursor += 1
             self._events.append(stored_event)
-            if len(self._events) > self._retention_limit:
-                self._events = self._events[-self._retention_limit :]
             publication = PreparedEventPublication(
                 stored_event=stored_event,
                 subscriptions=tuple(self._subscriptions.values()),
@@ -385,6 +395,65 @@ class EventBus:
             )
             self._subscriptions[subscription_id] = subscription
             return subscription_id
+
+    def subscribe_with_replay(
+        self,
+        callback: Callable[[RuntimeEvent], None],
+        *,
+        after_cursor: int = 0,
+        limit: Optional[int] = None,
+        categories: Optional[Iterable[RuntimeEventCategory]] = None,
+        event_types: Optional[Iterable[str]] = None,
+        async_dispatch: bool = False,
+    ) -> Tuple[str, EventReplaySnapshot]:
+        """原子注册订阅并截取回放，消除 replay/live 交接窗口。"""
+
+        category_filter = frozenset(categories) if categories is not None else None
+        event_type_filter = frozenset(event_types) if event_types is not None else None
+        requested_after_cursor = max(0, int(after_cursor or 0))
+        with self._lock:
+            latest_cursor = self._next_cursor - 1
+            oldest_cursor = int(self._events[0].cursor or 0) if self._events else 0
+            effective_after_cursor = (
+                0 if requested_after_cursor > latest_cursor else requested_after_cursor
+            )
+            gap_reason: Optional[str] = None
+            if requested_after_cursor > latest_cursor and requested_after_cursor > 0:
+                gap_reason = "cursor_ahead_of_stream"
+            elif (
+                requested_after_cursor > 0
+                and oldest_cursor > 0
+                and requested_after_cursor < oldest_cursor - 1
+            ):
+                gap_reason = "cursor_expired"
+
+            subscription_id = self.subscribe(
+                callback,
+                categories=category_filter,
+                event_types=event_type_filter,
+                async_dispatch=async_dispatch,
+            )
+            try:
+                events = self.replay(
+                    after_cursor=effective_after_cursor,
+                    limit=limit,
+                    categories=category_filter,
+                    event_types=event_type_filter,
+                )
+                snapshot = EventReplaySnapshot(
+                    events=events,
+                    requested_after_cursor=requested_after_cursor,
+                    effective_after_cursor=effective_after_cursor,
+                    oldest_cursor=oldest_cursor,
+                    latest_cursor=latest_cursor,
+                    replay_gap=gap_reason is not None,
+                    gap_reason=gap_reason,
+                    resync_required=gap_reason is not None,
+                )
+            except BaseException:
+                self._subscriptions.pop(subscription_id, None)
+                raise
+            return subscription_id, snapshot
 
     def unsubscribe(self, subscription_id: str) -> None:
         """取消订阅。"""

@@ -5,6 +5,8 @@
 //! terrain-gradient `HeightCost`, dilated-ground `General`, and rounded-cell
 //! `Simple`. All public entry points dispatch through the same kernels.
 
+use std::borrow::Cow;
+
 use crate::cost_mapper::PointCloud2Like;
 use crate::models::{Costmap, MapMeta};
 use nalgebra::geometry::Translation;
@@ -225,36 +227,45 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
     cfg: &PointCloudOccConfig,
 ) -> Result<crate::occupancy::types::OccupancyGrid, MappingError> {
     cfg.validate(resolution)?;
-    let points: Vec<Point3<f64>> = cloud
-        .points()
-        .iter()
-        .copied()
-        .filter(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite())
-        .collect();
+    let source_points = cloud.points();
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut has_finite_point = false;
+    let mut all_points_finite = true;
+    // 首次扫描同时收集自动边界；全有限输入直接借用源切片，异常输入才过滤复制。
+    for &point in source_points {
+        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+            all_points_finite = false;
+            continue;
+        }
+        has_finite_point = true;
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
 
-    if points.is_empty() {
+    if !has_finite_point {
         let mut grid = crate::occupancy::types::OccupancyGrid::new(1, 1, resolution);
         grid.frame_id = cloud.frame_id().to_string();
         grid.ts = cloud.timestamp();
         return Ok(grid);
     }
 
-    let min_x = points
-        .iter()
-        .map(|point| point.x)
-        .fold(f64::INFINITY, f64::min);
-    let max_x = points
-        .iter()
-        .map(|point| point.x)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_y = points
-        .iter()
-        .map(|point| point.y)
-        .fold(f64::INFINITY, f64::min);
-    let max_y = points
-        .iter()
-        .map(|point| point.y)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let points: Cow<'_, [Point3<f64>]> = if all_points_finite {
+        Cow::Borrowed(source_points)
+    } else {
+        Cow::Owned(
+            source_points
+                .iter()
+                .copied()
+                .filter(|point| point.x.is_finite() && point.y.is_finite() && point.z.is_finite())
+                .collect(),
+        )
+    };
+
     // Keep the auto-bounds origin on the resolution lattice.  Without this
     // quantization, millimetre-level edge noise changes the cell phase and
     // reprojects the entire map on every frame.
@@ -496,17 +507,24 @@ impl PointCloudOccupancyBuilder {
         use crate::occupancy::types::OccupancyValue;
         let mut grid = self.empty_grid();
         for &point in points {
-            if point.z < cfg.min_height_m {
-                if let Some((row, col)) = self.world_to_cell_rounded(point) {
-                    grid.set(row, col, OccupancyValue::Free);
+            let value = if point.z < cfg.min_height_m {
+                OccupancyValue::Free
+            } else if point.z <= cfg.max_height_m {
+                OccupancyValue::Occupied
+            } else {
+                continue;
+            };
+            let Some((row, col)) = self.world_to_cell_rounded(point) else {
+                continue;
+            };
+            let index = (row * self.width + col) as usize;
+            if value == OccupancyValue::Free {
+                // 占据点优先，等价于原始地面扫描后再执行障碍扫描。
+                if grid.data[index] != OccupancyValue::Occupied as i8 {
+                    grid.data[index] = OccupancyValue::Free as i8;
                 }
-            }
-        }
-        for &point in points {
-            if point.z >= cfg.min_height_m && point.z <= cfg.max_height_m {
-                if let Some((row, col)) = self.world_to_cell_rounded(point) {
-                    grid.set(row, col, OccupancyValue::Occupied);
-                }
+            } else {
+                grid.data[index] = OccupancyValue::Occupied as i8;
             }
         }
         grid
@@ -551,38 +569,42 @@ impl PointCloudOccupancyBuilder {
             observed[idx] = true;
         }
 
-        if cfg.smoothing_sigma > 0.0 && observed.iter().any(|value| *value) {
-            let weights: Vec<f32> = observed
-                .iter()
-                .map(|value| if *value { 1.0 } else { 0.0 })
-                .collect();
-            let height_map_filled: Vec<f32> = heights
-                .iter()
-                .zip(&observed)
-                .map(|(value, is_observed)| if *is_observed { *value } else { 0.0 })
-                .collect();
+        if !observed.iter().any(|value| *value) {
+            return grid;
+        }
+
+        if cfg.smoothing_sigma > 0.0 {
+            // 高度和权重的输入都已不再需要 min/max；直接复用 min_height 和 heights，
+            // 避免为两份整图输入再分配 height_map_filled/weights。
+            for idx in 0..len {
+                if observed[idx] {
+                    min_height[idx] = 1.0;
+                } else {
+                    min_height[idx] = 0.0;
+                    heights[idx] = 0.0;
+                }
+            }
             let smoothed_heights =
-                gaussian_filter_reflect(&height_map_filled, width, height, cfg.smoothing_sigma);
+                gaussian_filter_reflect(&heights, width, height, cfg.smoothing_sigma);
             let smoothed_weights =
-                gaussian_filter_reflect(&weights, width, height, cfg.smoothing_sigma);
+                gaussian_filter_reflect(&min_height, width, height, cfg.smoothing_sigma);
             for idx in 0..len {
                 if !observed[idx] && smoothed_weights[idx] > 0.01 {
                     heights[idx] = smoothed_heights[idx] / smoothed_weights[idx];
                     observed[idx] = true;
                 }
             }
+        } else {
+            // Sobel 输入必须把未观测 cell 视为 0，与原 height_for_gradient 相同。
+            for idx in 0..len {
+                if !observed[idx] {
+                    heights[idx] = 0.0;
+                }
+            }
         }
 
-        if !observed.iter().any(|value| *value) {
-            return grid;
-        }
-        let height_for_gradient: Vec<f32> = heights
-            .iter()
-            .zip(&observed)
-            .map(|(value, is_observed)| if *is_observed { *value } else { 0.0 })
-            .collect();
-        let sobel_x = sobel_axis(&height_for_gradient, width, height, 1);
-        let sobel_y = sobel_axis(&height_for_gradient, width, height, 0);
+        let sobel_x = sobel_axis(&heights, width, height, 1);
+        let sobel_y = sobel_axis(&heights, width, height, 0);
         let resolution = self.resolution as f32;
         let gradient_scale = 8.0 * resolution;
 
@@ -729,5 +751,56 @@ mod tests {
             (first.width, first.height),
             (jittered.width, jittered.height)
         );
+    }
+
+    #[test]
+    fn auto_bounds_borrow_and_filter_paths_preserve_grid_output() {
+        let resolution = 0.1;
+        let finite_points = vec![
+            Point3::new(-0.4, -0.4, 0.0),
+            Point3::new(0.0, 0.0, 0.2),
+            Point3::new(0.4, 0.4, 0.8),
+        ];
+        let mut points_with_invalid = vec![finite_points[0]];
+        points_with_invalid.push(Point3::new(f64::NAN, 0.0, 0.0));
+        points_with_invalid.push(finite_points[1]);
+        points_with_invalid.push(Point3::new(0.0, f64::INFINITY, 0.0));
+        points_with_invalid.push(finite_points[2]);
+
+        for algo in [
+            PointCloudOccAlgo::General,
+            PointCloudOccAlgo::Simple,
+            PointCloudOccAlgo::HeightCost,
+        ] {
+            let config = PointCloudOccConfig {
+                algo,
+                smoothing_sigma: 0.0,
+                ..PointCloudOccConfig::default()
+            };
+            let clean = SimplePointCloud2::with_metadata(
+                finite_points.clone(),
+                Point3::origin(),
+                "map",
+                7.0,
+            );
+            let filtered = SimplePointCloud2::with_metadata(
+                points_with_invalid.clone(),
+                Point3::origin(),
+                "map",
+                7.0,
+            );
+            let clean_grid =
+                build_occupancy_auto(&clean, resolution, &config).expect("finite cloud must build");
+            let filtered_grid = build_occupancy_auto(&filtered, resolution, &config)
+                .expect("non-finite points must be filtered");
+            assert_eq!(clean_grid.origin, filtered_grid.origin);
+            assert_eq!(
+                (clean_grid.width, clean_grid.height),
+                (filtered_grid.width, filtered_grid.height)
+            );
+            assert_eq!(clean_grid.data, filtered_grid.data);
+            assert_eq!(clean_grid.frame_id, filtered_grid.frame_id);
+            assert_eq!(clean_grid.ts, filtered_grid.ts);
+        }
     }
 }

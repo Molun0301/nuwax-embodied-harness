@@ -40,5 +40,6 @@ proptest = { workspace = true }
 approx = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 
-# [[bench]] removed: benches/occupancy.rs not yet implemented
-# Re-add when benchmark file is created
+[[bench]]
+name = "occupancy_algorithms"
+harness = false

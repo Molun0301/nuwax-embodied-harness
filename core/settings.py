@@ -661,7 +661,8 @@ class GatewayServerConfig:
     sse_keepalive_sec: float = 10.0
     ws_ping_interval_sec: float = 15.0
     # 性能监控（CPU/内存/进程）采集配置（平台侧，通用不绑定机器人）。
-    telemetry_enabled: bool = True
+    # 默认关闭：14% CPU 空转（Jetson profile 实测），仅在需要调试性能时手动开启。
+    telemetry_enabled: bool = False
     telemetry_interval_sec: float = 2.0
     telemetry_process_keywords: Tuple[str, ...] = (
         "gateway",
@@ -1092,7 +1093,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         artifact_dir=_cfg_str("NUWAX_GATEWAY_ARTIFACT_DIR", str(BASE_DIR / "artifacts")),
         sse_keepalive_sec=_cfg_float("NUWAX_GATEWAY_SSE_KEEPALIVE_SEC", 10.0),
         ws_ping_interval_sec=_cfg_float("NUWAX_GATEWAY_WS_PING_INTERVAL_SEC", 15.0),
-        telemetry_enabled=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_ENABLED", True),
+        telemetry_enabled=_cfg_bool("NUWAX_GATEWAY_TELEMETRY_ENABLED", False),
         telemetry_interval_sec=max(0.5, _cfg_float("NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC", 2.0)),
         telemetry_process_keywords=_cfg_csv(
             "NUWAX_GATEWAY_TELEMETRY_PROCESS_KEYWORDS",

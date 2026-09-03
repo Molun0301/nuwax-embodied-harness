@@ -8,6 +8,12 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+try:
+    import orjson
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    _HAS_ORJSON = False
 import json
 import math
 import os
@@ -51,7 +57,7 @@ _POINTCLOUD_BINARY_PREFIX = struct.Struct("<8sBI")
 _POINTCLOUD_BINARY_MAX_HEADER_BYTES = 64 * 1024
 _MAX_U64 = (1 << 64) - 1
 _POINTCLOUD_BINARY_TOPICS = frozenset(
-    {"pointcloud_map.snapshot", "pointcloud_map.live_chunk"}
+    {"pointcloud_map.snapshot", "pointcloud_map.live_chunk", "map.frame"}
 )
 _WEBSOCKET_CURSOR_STATUS_FIELDS = frozenset(
     {
@@ -389,12 +395,16 @@ def _strict_json_dumps(value: object, *, compact: bool = False) -> str:
         set(),
         depth=0,
     )
-    return json.dumps(
-        projected,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":") if compact else None,
-    )
+
+    if _HAS_ORJSON:
+        return orjson.dumps(projected).decode("utf-8")
+    else:
+        return json.dumps(
+            projected,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":") if compact else None,
+        )
 
 
 async def _send_ws_json(websocket: WebSocket, payload: object) -> None:
@@ -800,6 +810,70 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
     )
 
 
+_MAP_BINARY_MAGIC = b"NUWAXMAP"
+_MAP_BINARY_VERSION = 1
+
+
+def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
+    """编码occupancy grid地图为二进制格式
+
+    格式: 魔术字(8) + 版本(1) + 宽(4) + 高(4) + 分辨率(4) + 数据(width×height×1)
+
+    occupancy_grid.data: List[int], 取值范围 -1(未知), 0-100(占用概率)
+    二进制编码为 int8: -1, 0-100
+    """
+    import numpy as np
+
+    payload = frame.payload
+
+    # 从MapSnapshot中提取occupancy_grid
+    occupancy_grid = None
+    if hasattr(payload, "occupancy_grid"):
+        occupancy_grid = payload.occupancy_grid
+    elif isinstance(payload, dict):
+        occupancy_grid = payload.get("occupancy_grid")
+
+    if occupancy_grid is None:
+        raise ValueError("map.frame payload缺少occupancy_grid")
+
+    # 提取字段
+    if hasattr(occupancy_grid, "width"):
+        width = occupancy_grid.width
+        height = occupancy_grid.height
+        resolution = getattr(occupancy_grid, "resolution_m", 0.05)
+        data = occupancy_grid.data
+    elif isinstance(occupancy_grid, dict):
+        width = occupancy_grid["width"]
+        height = occupancy_grid["height"]
+        resolution = occupancy_grid.get("resolution_m", 0.05)
+        data = occupancy_grid["data"]
+    else:
+        raise ValueError("occupancy_grid格式不支持")
+
+    # 验证数据
+    if not isinstance(width, int) or not isinstance(height, int):
+        raise ValueError(f"地图宽高必须是整数: width={width}, height={height}")
+
+    expected_cells = width * height
+    if len(data) != expected_cells:
+        raise ValueError(f"地图数据长度不匹配: 期望{expected_cells}, 实际{len(data)}")
+
+    # 转换为numpy int8数组
+    data_array = np.array(data, dtype=np.int8)
+
+    # 构造header
+    header = struct.pack(
+        "<8sBIIf",  # 魔术字(8), 版本(1), 宽(4), 高(4), 分辨率(4)
+        _MAP_BINARY_MAGIC,
+        _MAP_BINARY_VERSION,
+        width,
+        height,
+        resolution
+    )
+
+    return header + data_array.tobytes()
+
+
 def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
     """构造实时数据流路由。"""
 
@@ -825,6 +899,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
                 after_cursor=resume_after_cursor,
                 topics=topic_filter,
+                async_dispatch=True,
             )
             try:
                 replay_status, replay_frames = _build_replay_batch(
@@ -937,6 +1012,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
                 after_cursor=after_cursor,
                 topics=topic_filter,
+                async_dispatch=True,
             )
             replay_status, replay_frames = _build_replay_batch(
                 runtime,
@@ -986,6 +1062,15 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         else:
                             await websocket.send_bytes(frame.payload)
                     else:
+                        # 对于非BINARY的map.frame，尝试转换为二进制
+                        if frame.topic == "map.frame" and frame.payload is not None:
+                            try:
+                                binary_payload = _encode_map_binary_frame(frame)
+                                await websocket.send_bytes(binary_payload)
+                                continue
+                            except (TypeError, ValueError, AttributeError):
+                                # 编码失败，降级为JSON
+                                pass
                         await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
                 except asyncio.TimeoutError:
                     await _send_ws_json(

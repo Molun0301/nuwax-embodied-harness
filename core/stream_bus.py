@@ -170,10 +170,15 @@ class StreamBus:
         frame: StreamFrame,
         subscriptions: Iterable[StreamSubscription],
     ) -> None:
+        import time
+        dispatch_start = time.perf_counter()
+        dispatch_count = 0
+
         failures: List[Tuple[StreamSubscription, Exception]] = []
         for subscription in subscriptions:
             if not self._matches(subscription, frame):
                 continue
+            dispatch_count += 1
             if subscription.async_dispatch:
                 self._async_queue.append((subscription.callback, frame))
                 self._async_event.set()
@@ -184,6 +189,15 @@ class StreamBus:
                     failures.append((subscription, exc))
         if failures:
             self._record_subscription_failures(frame, failures)
+
+        dispatch_elapsed = time.perf_counter() - dispatch_start
+        if dispatch_elapsed > 0.005:  # > 5ms
+            _logger.warning(
+                "[PERF] 帧分发耗时: %.2fms topic=%s subs=%d",
+                dispatch_elapsed * 1000,
+                frame.topic,
+                dispatch_count
+            )
 
     def _record_subscription_failures(
         self,

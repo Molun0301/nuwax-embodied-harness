@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 try:
     import orjson
-    _HAS_ORJSON = True
+    _HAS_ORJSON = False  # 临时禁用orjson，调试完成后改回True
 except ImportError:
     import json
     _HAS_ORJSON = False

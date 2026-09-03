@@ -15,6 +15,7 @@ except ImportError:
     import json
     _HAS_ORJSON = False
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -23,6 +24,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 from uuid import UUID
+
+_logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -73,7 +76,13 @@ _WEBSOCKET_CURSOR_MAP_FIELDS = frozenset(
     {"topic_oldest_cursors", "topic_evicted_through_cursors"}
 )
 _LATEST_ONLY_STREAM_TOPICS = frozenset(
-    {"map.frame", "pointcloud_map.snapshot", "pointcloud_map.live_chunk"}
+    {
+        "map.frame",
+        "pointcloud_map.snapshot",
+        "pointcloud_map.live_chunk",
+        "robot.state",  # 机器人状态只需要最新帧
+        "pointcloud.frame",  # 点云也只需要最新帧
+    }
 )
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {
@@ -689,6 +698,21 @@ def _safe_enqueue(
     frame: StreamFrame,
     runtime: GatewayRuntime,
 ) -> None:
+    import time
+    from datetime import datetime, timezone
+
+    # 计算从数据产生到入队的延迟
+    enqueue_time = datetime.now(timezone.utc)
+    if hasattr(frame, 'timestamp') and frame.timestamp:
+        delay_ms = (enqueue_time - frame.timestamp).total_seconds() * 1000
+        if delay_ms > 50:  # 超过50ms记录警告
+            _logger.warning(
+                "[PERF] 入队延迟过高: %.1fms topic=%s cursor=%s",
+                delay_ms,
+                frame.topic,
+                getattr(frame, 'cursor', None)
+            )
+
     def _push() -> None:
         queue.put(frame, runtime)
 
@@ -920,6 +944,20 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         break
                     try:
                         frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.sse_keepalive_sec)
+
+                        # 性能监控：计算端到端延迟
+                        from datetime import datetime, timezone
+                        send_time = datetime.now(timezone.utc)
+                        if hasattr(frame, 'timestamp') and frame.timestamp:
+                            e2e_delay_ms = (send_time - frame.timestamp).total_seconds() * 1000
+                            if e2e_delay_ms > 100:  # 超过100ms记录
+                                _logger.warning(
+                                    "[PERF] SSE发送延迟: %.1fms topic=%s cursor=%s",
+                                    e2e_delay_ms,
+                                    frame.topic,
+                                    getattr(frame, 'cursor', None)
+                                )
+
                         if frame.cursor is not None and frame.cursor <= replay_latest_cursor:
                             continue
                         gap_notice = _take_queue_gap_notice(queue, runtime)
@@ -1032,6 +1070,20 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             while True:
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.ws_ping_interval_sec)
+
+                    # 性能监控：计算端到端延迟
+                    from datetime import datetime, timezone
+                    send_time = datetime.now(timezone.utc)
+                    if hasattr(frame, 'timestamp') and frame.timestamp:
+                        e2e_delay_ms = (send_time - frame.timestamp).total_seconds() * 1000
+                        if e2e_delay_ms > 100:  # 超过100ms记录
+                            _logger.warning(
+                                "[PERF] WS发送延迟: %.1fms topic=%s cursor=%s",
+                                e2e_delay_ms,
+                                frame.topic,
+                                getattr(frame, 'cursor', None)
+                            )
+
                     if frame.cursor is not None and frame.cursor <= replay_latest_cursor:
                         continue
                     gap_notice = _take_queue_gap_notice(queue, runtime)

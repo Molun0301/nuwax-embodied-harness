@@ -12,6 +12,7 @@ path = "src/lib.rs"
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。
 
 [dependencies]
+nuwax-core = { path = "../../nuwax-workspace/crates/nuwax-core" }
 # nuwax-workspace path deps（LCM-first）。
 #
 # - `nuwax-transport/real-lcm` 是唯一 backend(workspace `default = ["real-lcm"]`),
@@ -58,7 +59,7 @@ prost = "0.13"
 prost-types = "0.13"
 memmap2 = "0.9"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

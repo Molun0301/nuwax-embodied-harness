@@ -157,6 +157,7 @@ full = [
 ]
 
 [dependencies]
+nuwax-core = { path = "../nuwax-core" }
 # ---- Foundation(协议层与基础类型):不直接使用,留给上游 crate 各自引用
 # stack 是纯数据编排 + dry-run,不消费 Foundation 的具体类型
 # 因此保持 optional + 不强制打开,foundation 修复后再按需启用

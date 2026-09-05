@@ -2031,11 +2031,6 @@ async fn activate_map_r1(
         .map_err(Status::invalid_argument)?;
 
     let cloud_checkpoint = request.cloud_checkpoint.take();
-    if identity_class.is_modern() && cloud_checkpoint.is_none() {
-        return Err(Status::invalid_argument(
-            "ACTIVATE_MAP_CLOUD_CHECKPOINT_REQUIRED",
-        ));
-    }
     let immutable_target = cloud_checkpoint
         .as_ref()
         .map(|checkpoint| {
@@ -4526,6 +4521,7 @@ fn encode_native_imu_payload(sample: &LioImuSample) -> CodecResult<Vec<u8>> {
 /// LIO child 在收到 cloud callback 时会立即检查 IMU 是否覆盖整个扫描窗口，
 /// 因而必须先发完本次 measurement 的全部 IMU，再发 cloud。LCM 没有跨消息
 /// 事务；中途失败时保留已经成功发布的 IMU 前缀，但绝不提前发布 cloud。
+/// 整帧只向原通信线程提交一次并等待一次确认，避免逐样本累计空队列等待。
 async fn publish_native_raw_pair(
     transport: &nuwax_transport::LcmTransport,
     cloud_binding: &(LcmTopic, LcmMessageType),
@@ -4533,31 +4529,25 @@ async fn publish_native_raw_pair(
     cloud_payload: Vec<u8>,
     imu_payloads: Vec<Vec<u8>>,
 ) -> Result<(), Status> {
-    for (index, imu_payload) in imu_payloads.into_iter().enumerate() {
-        transport
-            .publish(typed_codec::build_typed_frame(
-                imu_binding.0.clone(),
-                imu_binding.1.clone(),
-                imu_payload,
-                0,
-            ))
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "native IMU publish failed at sample {index}: {error}"
-                ))
-            })?;
-    }
-
-    transport
-        .publish(typed_codec::build_typed_frame(
-            cloud_binding.0.clone(),
-            cloud_binding.1.clone(),
-            cloud_payload,
+    let mut frames = Vec::with_capacity(imu_payloads.len() + 1);
+    for imu_payload in imu_payloads {
+        frames.push(typed_codec::build_typed_frame(
+            imu_binding.0.clone(),
+            imu_binding.1.clone(),
+            imu_payload,
             0,
-        ))
+        ));
+    }
+    frames.push(typed_codec::build_typed_frame(
+        cloud_binding.0.clone(),
+        cloud_binding.1.clone(),
+        cloud_payload,
+        0,
+    ));
+    transport
+        .publish_batch(frames)
         .await
-        .map_err(|error| Status::unavailable(format!("native cloud publish failed: {error}")))
+        .map_err(|error| Status::unavailable(format!("native input batch publish failed: {error}")))
 }
 
 fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> CodecResult<Vec<u8>> {
@@ -10282,15 +10272,16 @@ mod lifecycle_tests {
     ) -> ActivateMapRequest {
         let occupancy_sha256 =
             canonical_occupancy_sha256(request.checkpoint.as_ref().unwrap()).unwrap();
-        let cloud = request.cloud_checkpoint.as_ref().unwrap();
-        let target = immutable_target_from_checkpoint(cloud, "map", true).unwrap();
-        let cloud_sha256 = canonical_cloud_sha256(&target).unwrap();
+        let cloud_sha256 = request.cloud_checkpoint.as_ref().map(|cloud| {
+            let target = immutable_target_from_checkpoint(cloud, "map", true).unwrap();
+            canonical_cloud_sha256(&target).unwrap()
+        });
         let asset_manifest_sha256 = [0x5a; 32];
         let asset_bundle_sha256 =
             crate::map_checksum::sha256_bytes(&canonical_asset_bundle_preimage(
                 asset_manifest_sha256,
                 occupancy_sha256,
-                Some(cloud_sha256),
+                cloud_sha256,
                 None,
             ));
         request.activation_request_id = activation_request_id.to_owned();
@@ -12889,7 +12880,8 @@ mod lifecycle_tests {
             )
             .await
             .expect("seed registered ray handoff");
-            assert_eq!(committed, sequence == 3);
+            assert!(committed, "每帧点必须接纳，栅格发布另行判断");
+            assert_eq!(source_handle.state.read().await.map.revision > 0, sequence == 3);
         }
         let source_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &source_service,
@@ -13129,7 +13121,8 @@ mod lifecycle_tests {
             )
             .await
             .expect("seed export-race ray state");
-            assert_eq!(committed, sequence == 3);
+            assert!(committed, "每帧点必须接纳，栅格发布另行判断");
+            assert_eq!(handle.state.read().await.map.revision > 0, sequence == 3);
         }
         let seeded_checkpoint =
             GeometryRuntime::export_mapping_backend_checkpoint(&service, Request::new(Empty {}))
@@ -13364,7 +13357,7 @@ mod lifecycle_tests {
         assert!(!handoff_task.is_finished());
 
         gate.release();
-        assert!(!tokio::time::timeout(Duration::from_secs(1), handoff_task)
+        assert!(tokio::time::timeout(Duration::from_secs(1), handoff_task)
             .await
             .expect("cancelled-export handoff timeout")
             .expect("cancelled-export handoff join")
@@ -13605,6 +13598,58 @@ mod lifecycle_tests {
         assert_eq!(service.activation_receipts.lifecycle_epoch(), epoch);
         assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
         assert_eq!(handle.state.read().await.map.revision, 0);
+        let _ = std::fs::remove_file(cloud_path);
+    }
+
+    #[tokio::test]
+    async fn modern_2d_activation_seals_and_replays_without_relocalization_target() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("real-lcm test handle");
+        let cloud_path = std::env::temp_dir().join(format!(
+            "nuwax-activation-2d-{}-{}.mmap",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        *handle.cloud_map_writer.lock() = Some(
+            crate::pointcloud::CloudMapShmWriter::new(&cloud_path).expect("empty cloud writer"),
+        );
+        let service = GeometryRuntimeService::new(handle.clone());
+        let request = modern_activation_request(
+            activation_request("mapload:two-d", "warehouse-2d"),
+            "act-modern-2d",
+            1,
+        );
+        assert!(request.cloud_checkpoint.is_none());
+        assert!(request.mapping_backend_checkpoint.is_none());
+        let activated = GeometryRuntime::activate_map(&service, Request::new(request.clone()))
+            .await
+            .expect("ordinary 2D activation")
+            .into_inner();
+        assert!(activated.success && activated.active);
+        assert_eq!(activated.activation_receipt_disposition, ActivationReceiptDisposition::Sealed as i32);
+        assert_eq!(activated.activation_identity_sha256.len(), 32);
+        assert!(activated.revision > 0);
+        assert!(!activated.relocalization_target_available);
+        assert!(activated.target_receipt_sha256.is_empty());
+        assert!(service.activation_receipts.current_sealed_target_snapshot().is_none());
+        assert_eq!(handle.state.read().await.map.data, vec![-1, 0, 100, 50]);
+        let cleared = handle.cloud_map_writer.lock().as_ref().unwrap()
+            .committed_snapshot().expect("2D activation clears the previous cloud session");
+        assert_eq!(cleared.point_count, 0);
+        assert!(cleared.xyz_f32_le.is_empty());
+        let replay = GeometryRuntime::activate_map(&service, Request::new(request))
+            .await
+            .expect("2D activation replay")
+            .into_inner();
+        assert!(replay.success && replay.idempotent_replay);
+        assert_eq!(replay.revision, activated.revision);
+        assert!(!replay.relocalization_target_available);
+        assert!(replay.target_receipt_sha256.is_empty());
+        GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
+            session_id: "mapload:two-d".to_owned(),
+            reason: "2D test complete".to_owned(),
+        })).await.expect("2D stop");
         let _ = std::fs::remove_file(cloud_path);
     }
 

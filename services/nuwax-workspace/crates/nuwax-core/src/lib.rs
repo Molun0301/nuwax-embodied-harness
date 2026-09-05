@@ -15,6 +15,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 
+pub mod logging;
+
 mod runtime;
 
 pub use runtime::{

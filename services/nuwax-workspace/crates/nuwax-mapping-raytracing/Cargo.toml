@@ -8,30 +8,10 @@ authors = ["Nuwax Team <build@nuwax.dev>"]
 description = "nuwax Mapping Ray Tracing crate"
 publish = false
 
-# 说明（2026-07-02 v3 复核修复）：
-# 原 dimos-voxel-ray-tracing crate（共 2066 行）已 1:1 迁移到本仓库。
-# 但 main.rs / python.rs 依赖外部上游 crate：
-#   - dimos-module（过程宏） / lcm-msgs（协议栈） → 这些 crate 在本 nuwax workspace 内尚未提供。
-#   - pyo3 / numpy → 跨语言绑定，引入会让 MSRV / aarch64 矩阵额外复杂。
-#
-# 当前阶段（板块 1）的处理策略：
-#   1. src/lib.rs + src/voxel_ray_tracer.rs（1318 行核心 RayCasting 算法）作为 standalone crate，
-#      默认 features = [] 即可 cargo check / clippy / build / test 通过。
-#   2. 原 511 行 main.rs（Module 框架 + LCM transport + 协议适配）原样保留在 migration/ 下，
-#      未来阶段 0 实装 nuwax-core 兼容 shim 与 nuwax-protocol 覆盖 lcm-msgs 后，
-#      通过 `cp migration/*.rs src/` 直接恢复并启用。
-#   3. 原 231 行 python.rs（pyo3 绑定）同样保留在 migration/ 下。
-#
-# 这条策略对应 v3 复核报告建议（方案 b）：
-#   "作为迁移资产：文档中不要称 standalone 修复完成，只称 metadata 可解析，编译待 shim。"
-#   本轮升级为"核心算法 standalone 可编译 + bridge 文件保留为 migration 资产"。
+# 独立工作区：提供体素射线算法、标准模块适配和 JSON（数据交换格式）进程入口。
 
 [features]
 default = []
-# 待阶段 0 完成后续启用：
-# python = ["dep:pyo3", "dep:numpy"]
-# lcm-bridge = ["dep:dimos-module-shim", "dep:lcm-msgs"]
-
 [dependencies]
 nuwax-types = { path = "../nuwax-types" }
 nuwax-numeric = { path = "../nuwax-numeric" }
@@ -48,12 +28,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
-
-# 已迁移但暂未启用的可选依赖（documented for future stage-0 integration）
-# pyo3 = { version = "0.22", optional = true }
-# numpy = { version = "0.22", optional = true }
-# dimos-module-shim = { path = "../nuwax-core", optional = true }
-# lcm-msgs = { git = "...", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

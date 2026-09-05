@@ -17,8 +17,12 @@ class SensorDescriptorProvider(BaseProvider, Protocol):
 
 
 @runtime_checkable
-class StreamingSensorSampleProvider(SensorDescriptorProvider, Protocol):
-    """规范化传感器样本的源头流式接口。"""
+class StreamingSensorSampleProvider(BaseProvider, Protocol):
+    """规范化传感器样本的源头流式接口。
+
+    一个设备装配可同时提供 LiDAR 和 IMU，不要求它伪装成单个传感器描述。
+    单传感器的描述查询仍由独立的 SensorDescriptorProvider 提供。
+    """
 
     def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
         """订阅规范化传感器样本。"""

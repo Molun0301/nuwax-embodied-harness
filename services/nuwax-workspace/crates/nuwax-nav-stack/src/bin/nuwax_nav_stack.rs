@@ -30,6 +30,7 @@
 use nuwax_nav_stack::bin_support::{self, CliOptions};
 
 fn main() {
+    nuwax_core::logging::init_component_logging("nuwax-nav-stack", "info");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if bin_support::launcher_contract_requested(&args) {
         println!("{}", bin_support::LAUNCHER_CONTRACT);
@@ -38,14 +39,14 @@ fn main() {
     let opts = match CliOptions::parse(&args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("error: {e}");
+            nuwax_core::logging::process_error("nuwax-nav-stack", &e);
             eprintln!();
             eprintln!("Try `--help` for usage.");
             std::process::exit(2);
         }
     };
     if let Err(e) = bin_support::run(opts) {
-        eprintln!("error: {e}");
+        nuwax_core::logging::process_error("nuwax-nav-stack", &e);
         std::process::exit(1);
     }
 }

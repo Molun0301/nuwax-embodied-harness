@@ -1300,10 +1300,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "nix",
  "nuwax-types",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1343,6 +1345,7 @@ dependencies = [
  "nalgebra",
  "nix",
  "nuwax-codec",
+ "nuwax-core",
  "nuwax-exploration",
  "nuwax-explore-wavefront",
  "nuwax-lio-backends",
@@ -1605,6 +1608,7 @@ dependencies = [
  "bitflags",
  "futures",
  "nuwax-codec",
+ "nuwax-core",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-click-goal-bridge",
@@ -1669,6 +1673,7 @@ name = "nuwax-nav-visual-servoing"
 version = "0.1.0"
 dependencies = [
  "nuwax-codec",
+ "nuwax-core",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "nuwax-nav-visual-query",
@@ -2839,6 +2844,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2848,12 +2863,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

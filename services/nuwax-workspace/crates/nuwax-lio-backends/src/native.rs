@@ -140,10 +140,12 @@ impl NativeLioConfig {
         validate_extrinsic_translation(&self.extrinsic_translation_m)?;
         validate_extrinsic_rotation(&self.extrinsic_rotation_row_major)?;
 
-        let host_ip = validate_ipv4(&self.host_ip, "host_ip")?;
-        let lidar_ip = validate_ipv4(&self.lidar_ip, "lidar_ip")?;
-        if host_ip == lidar_ip {
-            return Err("host_ip and lidar_ip must be distinct".into());
+        if self.input_lidar_topic.is_none() {
+            let host_ip = validate_ipv4(&self.host_ip, "host_ip")?;
+            let lidar_ip = validate_ipv4(&self.lidar_ip, "lidar_ip")?;
+            if host_ip == lidar_ip {
+                return Err("host_ip and lidar_ip must be distinct".into());
+            }
         }
 
         validate_frequency(self.lidar_frequency_hz, "lidar_frequency_hz")?;
@@ -169,10 +171,6 @@ impl NativeLioConfig {
             render_numbers(&self.extrinsic_translation_m),
             "--extrinsic_r".into(),
             render_numbers(&self.extrinsic_rotation_row_major),
-            "--host_ip".into(),
-            self.host_ip.clone(),
-            "--lidar_ip".into(),
-            self.lidar_ip.clone(),
             "--frequency".into(),
             render_number(self.lidar_frequency_hz),
             "--pointcloud_freq".into(),
@@ -190,6 +188,12 @@ impl NativeLioConfig {
                 input_lidar.clone(),
                 "--input_imu".into(),
                 input_imu.clone(),
+            ]);
+        } else {
+            // 只有直连硬件驱动需要网络地址；标准传感器通道与雷达厂商无关。
+            args.extend([
+                "--host_ip".into(), self.host_ip.clone(),
+                "--lidar_ip".into(), self.lidar_ip.clone(),
             ]);
         }
         Ok(args)
@@ -553,9 +557,12 @@ mod tests {
         let mut typed = NativeLioConfig::for_backend(NativeBackend::PointLio);
         typed.input_lidar_topic = Some("/raw/cloud#sensor_msgs.PointCloud2".into());
         typed.input_imu_topic = Some("/raw/imu#sensor_msgs.Imu".into());
+        typed.host_ip.clear();
+        typed.lidar_ip.clear();
         let args = typed.render_args().expect("paired typed inputs must render");
         assert_arg_value(&args, "--input_lidar", "/raw/cloud#sensor_msgs.PointCloud2");
         assert_arg_value(&args, "--input_imu", "/raw/imu#sensor_msgs.Imu");
+        assert!(!args.iter().any(|argument| argument == "--host_ip" || argument == "--lidar_ip"));
 
         let direct = NativeLioConfig::for_backend(NativeBackend::FastLio2)
             .render_args()

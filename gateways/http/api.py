@@ -10,7 +10,6 @@ from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse
-from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -22,7 +21,6 @@ from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable
-from gateways.tcp_legacy.policy import build_tcp_legacy_policy
 from core import config_io
 from skills.handlers import localization_skills
 from skills.handlers import memory_skills
@@ -211,25 +209,10 @@ def _full_health_payload(summary: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _stream_migration_response(*topics: str) -> JSONResponse:
-    topic_list = [topic for topic in topics if topic]
-    query = ",".join(topic_list)
-    ws_stream_path = "/streams/ws" + (f"?topics={query}" if query else "")
-    sse_stream_path = "/streams/sse" + (f"?topics={query}" if query else "")
-    return JSONResponse(
-        status_code=410,
-        content={
-            "code": "stream_required",
-            "message": "实时数据 HTTP 快照入口已下线，请订阅实时流。",
-            "stream": ws_stream_path,
-            "streams": {"websocket": ws_stream_path, "sse": sse_stream_path},
-            "topics": topic_list,
-        },
-    )
 
 
 def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
-    """构造 HTTP 调试与管理接口。"""
+    """构造 HTTP（超文本传输协议）业务与管理接口。"""
 
     router = APIRouter()
 
@@ -640,49 +623,16 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 
-    @router.get("/api/legacy/tcp_policy")
-    async def api_tcp_policy(request: Request) -> Dict[str, Any]:
-        return to_jsonable(build_tcp_legacy_policy())
 
-    @router.get("/api/state/latest")
-    async def api_state_latest(request: Request) -> Dict[str, Any]:
-        return _stream_migration_response('robot.state')
 
-    @router.get("/api/state/history")
-    async def api_state_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        return _stream_migration_response('robot.state')
 
-    @router.get("/api/state/diagnostics")
-    async def api_state_diagnostics(request: Request, limit: int = 20) -> Dict[str, Any]:
-        return _stream_migration_response('robot.state')
 
-    @router.get("/api/observations/latest")
-    async def api_observations_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
-        return _stream_migration_response('video.frame', 'pointcloud.frame')
-
-    @router.get("/api/observations/history")
-    async def api_observations_history(
-        request: Request,
-        camera_id: Optional[str] = None,
-        limit: int = 20,
-    ) -> Dict[str, Any]:
-        return _stream_migration_response('video.frame', 'pointcloud.frame')
 
     @router.get("/api/artifacts/summary")
     async def api_artifacts_summary(request: Request) -> Dict[str, Any]:
         return to_jsonable(runtime.artifact_service.get_summary())
 
-    @router.get("/api/perception/latest")
-    async def api_perception_latest(request: Request, camera_id: Optional[str] = None) -> Dict[str, Any]:
-        return _stream_migration_response('video.frame')
 
-    @router.get("/api/perception/history")
-    async def api_perception_history(
-        request: Request,
-        camera_id: Optional[str] = None,
-        limit: int = 20,
-    ) -> Dict[str, Any]:
-        return _stream_migration_response('video.frame')
 
     @router.get("/api/perception/runtime")
     async def api_perception_runtime(request: Request) -> Dict[str, Any]:
@@ -696,9 +646,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_perception_runtime_stop(request: Request) -> Dict[str, Any]:
         return {"perception_runtime": to_jsonable(runtime._manual_perception_stop())}
 
-    @router.get("/api/localization/latest")
-    async def api_localization_latest(request: Request) -> Dict[str, Any]:
-        return _stream_migration_response('localization.pose', 'localization.frame_tree', 'localization.trajectory')
 
     @router.get("/api/localization/session")
     async def api_localization_session(request: Request) -> Dict[str, Any]:
@@ -729,13 +676,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 
-    @router.get("/api/localization/history")
-    async def api_localization_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        return _stream_migration_response('localization.pose', 'localization.trajectory')
 
-    @router.get("/api/maps/latest")
-    async def api_maps_latest(request: Request) -> Dict[str, Any]:
-        return _stream_migration_response('map.frame')
 
     @router.get("/api/maps/catalog")
     async def api_maps_catalog(request: Request) -> Dict[str, Any]:
@@ -826,9 +767,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "active_workspace": to_jsonable(result["active_workspace"]),
         }
 
-    @router.get("/api/navigation/latest")
-    async def api_navigation_latest(request: Request) -> Dict[str, Any]:
-        return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.get("/api/navigation/forbidden-zones")
     async def api_navigation_forbidden_zones_get(
@@ -986,9 +924,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             )
         }
 
-    @router.get("/api/navigation/history")
-    async def api_navigation_history(request: Request, limit: int = 20) -> Dict[str, Any]:
-        return _stream_migration_response('navigation.state', 'exploration.state', 'exploration.frontier')
 
     @router.post("/api/navigation/cancel")
     async def api_navigation_cancel(

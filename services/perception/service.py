@@ -25,7 +25,7 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -33,14 +33,15 @@ if TYPE_CHECKING:
 VideoFrameSink = Callable[[object], Optional[object]]
 
 
+@runtime_checkable
 class VideoFrameSource(Protocol):
-    """平台已接收视频流抽帧源。"""
+    """平台已接收的标准图像源，不执行硬件抓拍。"""
 
-    def get_latest_image(self, camera_id: Optional[str] = None) -> Optional[object]:
-        """返回端侧推流接收缓冲中的最近图像。"""
+    def get_latest_image(self, camera_id: Optional[str] = None) -> Optional["ImageFrame"]:
+        """返回指定相机的只读最近帧；未收到或已停止时返回空。"""
 
     def status_snapshot(self) -> Dict[str, Any]:
-        """返回端侧推流接收状态。"""
+        """返回接收状态，available 表示已能读取图像。"""
 
 
 class PerceptionService:
@@ -1180,8 +1181,7 @@ class PerceptionService:
 
         return self._video_frame_source_status()
 
-    @staticmethod
-    def _camera_info_from_video_frame(image_frame):
+    def _camera_info_from_video_frame(self, image_frame):
         from contracts.image import CameraInfo
 
         metadata = dict(getattr(image_frame, "metadata", {}) or {})
@@ -1193,6 +1193,15 @@ class PerceptionService:
                 return CameraInfo(**camera_info_payload)
             except Exception:
                 return None
+        # 标准提供器可以独立缓存内参，图像读取不必每次复制像素或元数据。
+        getter = getattr(self._video_frame_source, "get_camera_info", None)
+        if callable(getter):
+            try:
+                camera_info = getter(image_frame.camera_id)
+            except Exception:
+                return None
+            if isinstance(camera_info, CameraInfo):
+                return camera_info
         return None
 
     def _get_localization_provider_optional(self) -> Optional[LocalizationProvider]:

@@ -31,6 +31,7 @@ from adapters.sensors.go2_l2 import (
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField
 from contracts.robot_state import IMUState
+from contracts.sensors import RegistrationState
 from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 
 if TYPE_CHECKING:
@@ -843,11 +844,20 @@ class Go2DirectDdsBridge:
                         float(imu_state.linear_acceleration_m_s2.z),
                     ),
                     gyro_rps=(
-                        float(imu_state.angular_velocity_rad_s.x),
-                        float(imu_state.angular_velocity_rad_s.y),
-                        float(imu_state.angular_velocity_rad_s.z),
+                        tuple(float(value) for value in message.imu_state.gyroscope[:3])
+                        if self.config.lio_backend in {"fastlio2", "pointlio"}
+                        else (
+                            float(imu_state.angular_velocity_rad_s.x),
+                            float(imu_state.angular_velocity_rad_s.y),
+                            float(imu_state.angular_velocity_rad_s.z),
+                        )
                     ),
                     source_sequence=int(imu_source_timestamp_ns),
+                    registration_state=(
+                        RegistrationState.SENSOR
+                        if self.config.lio_backend in {"fastlio2", "pointlio"}
+                        else RegistrationState.BODY
+                    ),
                 )
             except ValueError:
                 LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
@@ -1113,6 +1123,11 @@ class Go2DirectDdsBridge:
                     decoded,
                     timestamp_ns=source_timestamp_ns,
                     source_sequence=source_timestamp_ns,
+                    registration_state=(
+                        RegistrationState.SENSOR
+                        if self.config.lio_backend in {"fastlio2", "pointlio"}
+                        else RegistrationState.BODY
+                    ),
                 )
                 if source_frame == _GO2_UTLIDAR_FRAME
                 else None

@@ -351,9 +351,16 @@ class StreamBus:
             frames = [
                 frame
                 for frame in self._latest_by_topic.values()
-                if topic_filter is None or frame.topic in topic_filter
+                if frame.topic != "logs.entry" and (topic_filter is None or frame.topic in topic_filter)
             ]
+            # 日志是事件序列，新连接也需要近期历史；状态快照仍只取最新帧。
+            frames.extend(
+                frame for frame in self._frames
+                if frame.topic == "logs.entry" and (topic_filter is None or frame.topic in topic_filter)
+            )
             frames.sort(key=lambda frame: frame.cursor or 0)
+            if limit is not None:
+                frames = frames[-max(0, int(limit)):] if int(limit) > 0 else []
         else:
             frames = [
                 frame

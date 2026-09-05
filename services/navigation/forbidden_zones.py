@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 import json
 import os
 from pathlib import Path
@@ -35,7 +37,7 @@ class ForbiddenZoneStore:
     ) -> None:
         configured_path = path
         if configured_path is None:
-            configured_path = os.environ.get(FORBIDDEN_ZONES_PATH_ENV) or DEFAULT_FORBIDDEN_ZONES_PATH
+            configured_path = runtime_value(FORBIDDEN_ZONES_PATH_ENV) or DEFAULT_FORBIDDEN_ZONES_PATH
         self._path = Path(configured_path).expanduser()
         self._lock = threading.RLock()
         self._signature_factory = signature_factory or (

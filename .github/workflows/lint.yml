@@ -1,7 +1,6 @@
 name: lint
 
-# 平台分层守门 + Py3.8.10 兼容 + fixture 不入仓 + 旧运行时残留守门。
-# 与 openspec/changes/navigation-and-exploration-boundary/specs/ci-guardrails/spec.md 对齐。
+# 平台分层、设备 Python 兼容与真实部署构建检查。
 #
 # 业务代码和配置的旧运行时残留统一由 scripts/ci/no_ros2_residual.sh
 # 与 scripts/check_layering.sh 检查。
@@ -50,8 +49,8 @@ jobs:
         with:
           python-version: '3.8'
 
-      - name: 安装部署契约测试工具
-        run: python3 -m pip install 'pytest==8.3.5' 'ruff==0.9.10' 'pydantic==2.10.6'
+      - name: 安装部署检查工具
+        run: python3 -m pip install 'ruff==0.9.10' 'pydantic==2.10.6'
 
       - name: 安装 native build 前置依赖
         run: |

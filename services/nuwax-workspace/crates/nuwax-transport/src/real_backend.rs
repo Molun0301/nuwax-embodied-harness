@@ -177,39 +177,23 @@ impl RealLcmBackend {
 #[async_trait]
 impl LcmBackend for RealLcmBackend {
     async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
-        // 1. 包装成 `LcmMessageBytes`(Phase 2 lane-2 强类型合约)。
-        //    `build_lcm_message_bytes` 用 STRUCT_SEEDS 计算 upstream lcm-gen 兼容
-        //    fingerprint;它**不**拼装 envelope —— envelope 由 liblcm 自己
-        //    在 wire 上加。seqno 由 caller 在 builder 上设定,这里直接透传。
-        //    任何一步失败都按 `TransportError::Protocol` 抛出(例如 msg_type 未在
-        //    STRUCT_SEEDS 注册时,这里就 fail-fast,绝不悄悄降级)。
-        //
-        // 2026-07-09 B3 修正:`frame.header.seqno` 已由 u64 收紧到 u32(wire format),
-        // `build_lcm_message_bytes` 仍接 u64(进程内 sequence metadata,不对应 wire
-        // envelope),这里显式 cast 出去。
-        let msg_bytes = build_lcm_message_bytes(
-            frame.topic.channel(),
-            frame.msg_type.fqn(),
-            &frame.payload,
-            u64::from(frame.header.seqno),
-        )
-        .map_err(|e| {
-            TransportError::Protocol(nuwax_protocol::ProtocolError::LcmEncode(e.to_string()))
-        })?;
-
-        // 2. 通过 owner thread 调 liblcm `lcm_publish(channel, payload_bytes)`。
-        //    liblcm 会在 wire 上**自己**加 8 字节 preamble(magic BE 4 + seqno BE 4)
-        //    —— 2026-07-09 B3 修正后,real LCM wire format 不再是 28 字节 envelope。
-        //    所以我们只能传 **payload 部分** —— 也就是 `LcmMessageBytes::as_slice()`。
-        //    绝对不能传 `frame.encode()` 的产物,否则 liblcm 会再叠一层 envelope,
-        //    receiver 端 callback 拿到 N+8+N+8 字节垃圾(§12.2 第 2 项硬约束)。
-        let wire_payload: &[u8] = msg_bytes.as_slice();
-        let typed_channel = frame.topic.fqn(frame.msg_type.fqn());
+        let (typed_channel, payload) = encode_publish_frame(frame)?;
         self.context
-            .publish(&typed_channel, Bytes::copy_from_slice(wire_payload))
+            .publish(&typed_channel, payload)
             .await
             .map_err(|e| TransportError::LcmBackend(format!("lcm_publish 失败: {e}")))?;
         Ok(())
+    }
+
+    async fn publish_batch(&self, frames: Vec<RawLcmFrame>) -> TransportResult<()> {
+        let messages = frames
+            .into_iter()
+            .map(encode_publish_frame)
+            .collect::<TransportResult<Vec<_>>>()?;
+        self.context
+            .publish_batch(messages)
+            .await
+            .map_err(|error| TransportError::LcmBackend(format!("lcm_publish batch 失败: {error}")))
     }
 
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
@@ -237,6 +221,23 @@ impl LcmBackend for RealLcmBackend {
     fn shared_lcm_context(&self) -> Option<Arc<LcmContext>> {
         Some(Arc::clone(&self.context))
     }
+}
+
+fn encode_publish_frame(frame: RawLcmFrame) -> TransportResult<(String, Bytes)> {
+    // 只补充生成消息的类型指纹；传输包头仍由原 liblcm 唯一生成。
+    let message = build_lcm_message_bytes(
+        frame.topic.channel(),
+        frame.msg_type.fqn(),
+        &frame.payload,
+        u64::from(frame.header.seqno),
+    )
+    .map_err(|error| {
+        TransportError::Protocol(nuwax_protocol::ProtocolError::LcmEncode(error.to_string()))
+    })?;
+    Ok((
+        frame.topic.fqn(frame.msg_type.fqn()),
+        Bytes::copy_from_slice(message.as_slice()),
+    ))
 }
 
 fn subscription_pattern(topic: &LcmTopic, msg_type: Option<&LcmMessageType>) -> String {
@@ -403,6 +404,84 @@ mod tests {
         let real = crate::LcmTransport::new_real("udpm://239.255.76.67:7667?ttl=1")
             .expect("real-lcm backend 启动需 liblcm-dev 1.3~1.5");
         assert_eq!(check_name(&real), "real-lcm");
+    }
+
+    #[tokio::test]
+    async fn real_lcm_batch_delivers_ordered_imu_before_cloud() {
+        use nuwax_codec::lcm::schema;
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let provider = format!("udpm://239.255.76.67:{port}?ttl=0");
+        let transport = crate::LcmTransport::new_real(&provider).unwrap();
+        let receiver = LcmContext::new(&provider).unwrap();
+        let mut subscription = receiver.subscribe("/test/ordered-input/.*").await.unwrap();
+        let imu_topic = LcmTopic::new("/test/ordered-input/imu").unwrap();
+        let imu_type = LcmMessageType::new("sensor_msgs.Imu").unwrap();
+        let cloud_topic = LcmTopic::new("/test/ordered-input/cloud").unwrap();
+        let cloud_type = LcmMessageType::new("sensor_msgs.PointCloud2").unwrap();
+        let mut frames = Vec::new();
+        for index in 0..20 {
+            let imu = schema::Imu {
+                header: schema::Header {
+                    seq: index,
+                    stamp_sec: 1,
+                    stamp_nsec: index * 1_000_000,
+                    frame_id: "sensor".into(),
+                },
+                linear_acceleration: [0.0, 0.0, 9.81],
+                ..schema::Imu::default()
+            };
+            frames.push(
+                RawLcmFrameBuilder::new(imu_topic.clone(), imu_type.clone())
+                    .payload(schema::encode_imu_body(&imu))
+                    .build(),
+            );
+        }
+        let cloud = schema::PointCloud2 {
+            header: schema::Header {
+                seq: 20,
+                frame_id: "sensor".into(),
+                ..schema::Header::default()
+            },
+            ..schema::PointCloud2::default()
+        };
+        frames.push(
+            RawLcmFrameBuilder::new(cloud_topic.clone(), cloud_type.clone())
+                .payload(schema::encode_point_cloud2_body(&cloud).unwrap())
+                .build(),
+        );
+        let started = std::time::Instant::now();
+        transport.publish_batch(frames).await.unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("真实组播21条输入批量发布耗时：{elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "传输转发不可退回逐条确认：{elapsed:?}"
+        );
+        for index in 0..=20 {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                subscription.receiver.recv(),
+            )
+            .await
+            .expect("有序批次接收超时")
+            .unwrap();
+            if index < 20 {
+                assert_eq!(message.channel, imu_topic.fqn(imu_type.fqn()));
+                let imu = schema::decode_imu_body(&message.payload[8..]).unwrap();
+                assert_eq!(imu.header.seq, index);
+            } else {
+                assert_eq!(message.channel, cloud_topic.fqn(cloud_type.fqn()));
+                assert_eq!(
+                    &message.payload[8..],
+                    schema::encode_point_cloud2_body(&cloud).unwrap()
+                );
+            }
+        }
+        receiver.shutdown().await.unwrap();
     }
 
     /// 验证 subscription_error_stream 立即产出一条 error,然后 None

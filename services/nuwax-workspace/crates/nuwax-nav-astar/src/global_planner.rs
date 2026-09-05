@@ -485,11 +485,16 @@ impl GlobalPlanner {
 
     fn _find_safe_goal(&self, goal: Point2) -> Option<Point2> {
         let binary = self.navigation_map.binary_costmap().ok()?;
-        // 简化：UNKNONW 视为 free（与 Python cell_value==UNKNOWN 时直接返回 goal 的行为一致）
-        if binary.is_unknown(
-            binary.world_to_cell(goal).0.max(0) as usize,
-            binary.world_to_cell(goal).1.max(0) as usize,
-        ) {
+        self.find_safe_goal_on_map(&binary, goal)
+    }
+
+    fn find_safe_goal_on_map(&self, binary: &CostMap2D, goal: Point2) -> Option<Point2> {
+        let (x, y) = binary.world_to_cell(goal);
+        if !binary.in_bounds(x, y) {
+            return None;
+        }
+        // 未知目标保留给 A* 的未知区域代价策略处理。
+        if binary.is_unknown(x as usize, y as usize) {
             return Some(goal);
         }
         let opts = GoalValidatorOptions {
@@ -498,7 +503,7 @@ impl GlobalPlanner {
             max_search_distance: self.cfg.safe_goal_tolerance,
             connectivity_check_radius: 3,
         };
-        find_safe_goal_bfs_contiguous(&binary, goal, &opts)
+        find_safe_goal_bfs_contiguous(binary, goal, &opts)
             .ok()
             .flatten()
     }
@@ -510,8 +515,11 @@ impl GlobalPlanner {
         } else {
             &self.navigation_map_near
         };
-        let costmap = map.make_gradient_costmap(1.1)?;
+        Self::find_path_on_map(map, goal, robot_pos)
+    }
 
+    fn find_path_on_map(map: &NavigationMap, goal: Point2, robot_pos: Point2) -> Option<Path2D> {
+        let costmap = map.make_gradient_costmap(1.1)?;
         let opts = crate::astar::AStarOptions::default();
         let r = crate::astar::min_cost_astar(&costmap, robot_pos, goal, &opts).ok()?;
         r.path
@@ -524,16 +532,22 @@ impl GlobalPlanner {
         goal: PoseStamped,
         costmap: &CostMap2D,
     ) -> PlannerResult {
-        let _ = costmap;
         let (gx, gy, _) = pose_xy_yaw(&goal);
         let (sx, sy, _) = pose_xy_yaw(&start);
-        let safe = match self._find_safe_goal(Point2::new(gx, gy)) {
+        let safe = match self.find_safe_goal_on_map(costmap, Point2::new(gx, gy)) {
             Some(g) => g,
             None => {
                 return PlannerResult::failure(crate::helpers::PlannerFailure::GoalBlocked, 0);
             }
         };
-        let path = self._find_wide_path(safe, Point2::new(sx, sy));
+        let strategy = if (safe.x - sx).hypot(safe.y - sy) > 1.5 {
+            GradientStrategy::Voronoi
+        } else {
+            GradientStrategy::Gradient
+        };
+        let mut map = NavigationMap::new(self.cfg.robot_width, strategy);
+        map.update(costmap.clone());
+        let path = Self::find_path_on_map(&map, safe, Point2::new(sx, sy));
         match path {
             Some(p) => {
                 let cost = p.length();
@@ -560,6 +574,44 @@ mod tests {
         let gp = GlobalPlanner::new(GlobalPlannerConfig::default());
         assert_eq!(gp.status(), NavigationStatus::Idle);
         assert!(!gp.is_goal_reached());
+    }
+
+    #[test]
+    fn single_plan_uses_supplied_map_and_preserves_running_state() {
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let free = CostMap2D::new_all_free("map", 40, 40, 0.1);
+        let start = make_pose_stamped("map", 0.75, 1.75, 0.0);
+        let goal = make_pose_stamped("map", 3.25, 1.75, 0.0);
+        assert!(gp
+            .plan_once(start.clone(), goal.clone(), &free)
+            .path
+            .is_some());
+
+        gp.handle_global_costmap(free.clone());
+        gp.handle_odom(start.clone());
+        gp.handle_goal_request(goal.clone());
+        let previous_status = gp.status();
+        let previous_path = gp.last_published_path.clone();
+        let mut blocked = free.clone();
+        for y in 0..blocked.height() {
+            blocked.set(20, y, OCCUPIED);
+        }
+        assert!(gp.plan_once(start, goal, &blocked).path.is_none());
+        assert_eq!(gp.status(), previous_status);
+        assert_eq!(gp.last_published_path, previous_path);
+        assert_eq!(gp.navigation_map.binary_costmap().unwrap().get(20, 17), 0);
+    }
+
+    #[test]
+    fn out_of_bounds_goal_returns_failure_without_panicking() {
+        let cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
+        for (x, y) in [(-1.0, 1.0), (4.0, 1.0), (1.0, -1.0), (1.0, 4.0)] {
+            let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+            gp.handle_global_costmap(cm.clone());
+            gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
+            gp.handle_goal_request(make_pose_stamped("map", x, y, 0.0));
+            assert_eq!(gp.tick(&cm).event, Some(GlobalPlannerEvent::PlanningFailed));
+        }
     }
 
     #[test]

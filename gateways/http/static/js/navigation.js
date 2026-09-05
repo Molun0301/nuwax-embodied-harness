@@ -5,7 +5,7 @@
 //   - 状态轮询 2Hz
 //   - WS 订阅 navigation.state 流
 //   - 状态显示区
-// 本模块是 debug_panel.html 的拆模块；不堆业务到主 html。
+// 控制台导航交互模块，通过统一网关接口提交任务。
 
 (function () {
   'use strict';

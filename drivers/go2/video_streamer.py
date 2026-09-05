@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 import asyncio
 import importlib
 import importlib.metadata
@@ -211,7 +213,7 @@ async def _cancel_and_wait_consumer(
 
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
-    uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
+    uds_path = runtime_value("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
     uds_sender = VideoUdsSender(
         uds_path,
         reconnect_interval=max(0.1, float(stream_config.reconnect_sec)),
@@ -222,6 +224,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
     accepting_track = True
     consumer_task: Optional[asyncio.Task] = None
     consumer_cancel_requested = threading.Event()
+    track_registered_waiter: Optional[asyncio.Task] = None
     first_frame_waiter: Optional[asyncio.Task] = None
 
     try:
@@ -273,15 +276,20 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
         switch_video_channel(True)
         channel_enabled = True
 
-        try:
-            await asyncio.wait_for(
-                track_registered.wait(),
-                timeout=max(0.0, first_frame_deadline - loop.time()),
-            )
-        except asyncio.TimeoutError:
+        track_registered_waiter = asyncio.create_task(
+            track_registered.wait(), name="go2-video-track-registration",
+        )
+        # 显式等待任务：部分Python版本的wait_for会在事件已完成时吞掉外层取消。
+        # 这里保留原有首帧期限，并让取消直接进入统一清理路径。
+        done, _ = await asyncio.wait(
+            (track_registered_waiter,),
+            timeout=max(0.0, first_frame_deadline - loop.time()),
+        )
+        if track_registered_waiter not in done:
             raise RuntimeError(
                 f"Go2 WebRTC 已连接，但 {_FIRST_FRAME_TIMEOUT_SEC:.0f} 秒内未收到视频轨道。"
-            ) from None
+            )
+        await track_registered_waiter
         if consumer_task is None:
             raise RuntimeError("Go2 WebRTC 视频轨道未登记 consumer Task。")
 
@@ -302,9 +310,11 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
         await consumer_task
     finally:
         accepting_track = False
-        if first_frame_waiter is not None and not first_frame_waiter.done():
-            first_frame_waiter.cancel()
-            await asyncio.gather(first_frame_waiter, return_exceptions=True)
+        for waiter in (track_registered_waiter, first_frame_waiter):
+            if waiter is not None:
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
         consumer_stopped = True
         if consumer_task is not None:
             consumer_stopped = await _cancel_and_wait_consumer(
@@ -354,7 +364,9 @@ async def run_forever(config: Go2DataPlaneConfig) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.environ.get("GO2_VIDEO_STREAM_LOG_LEVEL", "INFO"))
+    from core.settings import configure_component_logging
+    configure_component_logging("nuwax-video")
+    LOGGER.setLevel(runtime_value("GO2_VIDEO_STREAM_LOG_LEVEL", "INFO"))
     config = load_go2_data_plane_config()
     try:
         asyncio.run(run_forever(config))

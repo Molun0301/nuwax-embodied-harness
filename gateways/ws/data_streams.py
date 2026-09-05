@@ -8,12 +8,9 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-try:
-    import orjson
-    _HAS_ORJSON = False  # 临时禁用orjson，调试完成后改回True
-except ImportError:
-    import json
-    _HAS_ORJSON = False
+# 暂时禁用orjson，先验证async_dispatch优化效果
+_HAS_ORJSON = False
+_orjson = None
 import json
 import logging
 import math
@@ -82,6 +79,10 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
         "pointcloud_map.live_chunk",
         "robot.state",  # 机器人状态只需要最新帧
         "pointcloud.frame",  # 点云也只需要最新帧
+        "localization.pose",  # 定位姿态只需要最新帧
+        "localization.frame_tree",  # 坐标树只需要最新帧
+        "localization.trajectory",  # 轨迹只需要最新帧
+        "map.heartbeat",  # 地图心跳只需要最新帧
     }
 )
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
@@ -301,6 +302,13 @@ def _project_json_value(
                 active_ids,
                 depth=depth + 1,
             )
+            # 平台日志已在写入时脱敏；不要再次把异常栈截成 8KB 的消息片段。
+            if value.topic == "logs.entry" and isinstance(value.payload, dict) and isinstance(projected_frame, dict):
+                projected_payload = projected_frame.get("payload")
+                if isinstance(projected_payload, dict):
+                    for key in ("message", "exception"):
+                        if isinstance(value.payload.get(key), str):
+                            projected_payload[key] = value.payload[key]
             occupancy_data = _complete_map_occupancy_data(value)
             if occupancy_data is not None and isinstance(projected_frame, dict):
                 projected_payload = projected_frame.get("payload")
@@ -406,7 +414,7 @@ def _strict_json_dumps(value: object, *, compact: bool = False) -> str:
     )
 
     if _HAS_ORJSON:
-        return orjson.dumps(projected).decode("utf-8")
+        return _orjson.dumps(projected).decode("utf-8")
     else:
         return json.dumps(
             projected,
@@ -487,7 +495,14 @@ def _build_replay_batch(
     frame_limit = max(1, int(limit))
     truncated = len(frames) > frame_limit
     if truncated:
-        frames = frames[-frame_limit:]
+        if requested_after_cursor <= 0 or requested_after_cursor > latest_cursor:
+            # 首次订阅先保留各状态主题，日志填充剩余容量；历史仍可用日志接口继续翻页。
+            states = [frame for frame in frames if frame.topic != "logs.entry"][-frame_limit:]
+            remaining = frame_limit - len(states)
+            logs = [frame for frame in frames if frame.topic == "logs.entry"][-remaining:] if remaining else []
+            frames = tuple(sorted([*states, *logs], key=lambda frame: frame.cursor or 0))
+        else:
+            frames = frames[-frame_limit:]
 
     frames = tuple(
         frame
@@ -990,6 +1005,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             video_available = _probe.has_new_frame()
             _probe.close()
         if not video_available:
+            request.state.error_category = "not_ready"
             return JSONResponse(
                 status_code=503,
                 content={

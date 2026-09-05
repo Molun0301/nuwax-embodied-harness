@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 import base64
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
@@ -81,7 +83,7 @@ from gateways.person_follow import (
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
 from providers import ImageProvider, StateProvider
-from providers import StreamingLocalizationProvider, StreamingPointCloudProvider
+from providers import StreamingLocalizationProvider, StreamingPointCloudProvider, StreamingSensorSampleProvider
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
 # Sensor producer -> GeometryRuntimeProvider gRPC publisher lifecycle wiring.
@@ -119,6 +121,7 @@ from services.navigation.motion_guard_client import MotionGuardError
 from services.navigation.proto_gen import motion_guard_pb2 as motion_guard_pb
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
+from services.perception.service import VideoFrameSource
 from services.robot_state_service import RobotStateService
 from services.telemetry import SystemMetricsCollector
 from skills import SkillRegistry
@@ -507,7 +510,7 @@ def _runtime_activation_timeout_sec() -> float:
         return max(
             1.0,
             float(
-                os.environ.get(
+                runtime_value(
                     "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC",
                     str(_RUNTIME_ACTIVATION_TIMEOUT_SEC),
                 )
@@ -561,7 +564,6 @@ _SERVICE_HEALTH_ATTENTION_STATUSES = frozenset(
 
 _OPS_DEBUG_CAPABILITY_NAMES = frozenset(
     {
-        "capture_image",
         "get_joint_state",
         "get_imu_state",
         "get_localization_snapshot",
@@ -888,6 +890,8 @@ class GatewayRuntime:
         self.skill_registry = SkillRegistry()
         self.event_bus = event_bus or EventBus()
         self.stream_bus = stream_bus or StreamBus()
+        self._owns_event_bus = event_bus is None
+        self._owns_stream_bus = stream_bus is None
         self._log_stream_handler = StreamBusLogHandler(self.stream_bus, level=logging.DEBUG)
         self._log_stream_handler.setFormatter(logging.Formatter("%(message)s"))
         self._log_stream_handler.addFilter(DropPatternLogFilter())
@@ -972,8 +976,10 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             video_frame_sink=None,
-            video_frame_source=_ShmVideoFrameSource(
-                os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
+            video_frame_source=getattr(robot, "providers", None)
+            if isinstance(getattr(robot, "providers", None), VideoFrameSource)
+            else _ShmVideoFrameSource(
+                runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
                 camera_info_provider=getattr(robot, "providers", None),
                 fallback_frame_id=robot.defaults.frame_ids.get(
                     "camera_front", f"world/{robot.manifest.robot_name}/camera_front"
@@ -1089,6 +1095,9 @@ class GatewayRuntime:
             map_delete_also_delete_library=lambda: self.config.runtime_data.map_delete_also_delete_library,
             geometry_stack_summary=self._geometry_stack_summary,
         )
+        # 启停等待组件退出时不占用数据锁，避免与点云读取回调形成锁反转。
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
         self._lock = threading.RLock()
         self._started = False
         # 探索感知耦合标志（替代旧 _exploration_started_perception）。
@@ -1116,7 +1125,7 @@ class GatewayRuntime:
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
-        self._cloud_map_shm_path = os.environ.get(
+        self._cloud_map_shm_path = runtime_value(
             "NUWAX_CLOUDMAP_SHM_PATH",
             "/tmp/nuwax_cloudmap.mmap",
         )
@@ -1216,7 +1225,9 @@ class GatewayRuntime:
     def start(self) -> None:
         """启动宿主机运行时。"""
 
-        with self._lock:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("网关运行时已关闭；再次启动请创建新的运行时实例。")
             if self._started:
                 RUNTIME_LOGGER.info("宿主机运行时已在运行，忽略重复启动请求。")
                 return
@@ -1359,14 +1370,23 @@ class GatewayRuntime:
         stop_error: Optional[Exception] = None
         relocalization_stop_error: Optional[GatewayError] = None
         relocalization_pending: Dict[str, object] = {}
-        with self._lock:
+        with self._lifecycle_lock:
             if not self._started:
-                RUNTIME_LOGGER.info("宿主机运行时未启动，忽略停止请求。")
+                if not self._closed:
+                    self.task_manager.shutdown(wait=True)
+                    self._close_dispatch_resources()
+                    self._closed = True
                 return
             RUNTIME_LOGGER.info("宿主机运行时开始停止。")
             self._stop_safety_watchdog_loop()
             try:
-                stop_result = self.safety_guard.stop_all_motion("宿主机网关关闭。")
+                # 只读网关没有建立过运动连接时，关闭不应反向启动运动服务。
+                # 曾建立连接后故障仍须停车，不能仅用当前 started 判断。
+                stop_result = (
+                    self.safety_guard.stop_all_motion("宿主机网关关闭。")
+                    if getattr(self.motion_guard, "has_connected", True)
+                    else None
+                )
                 if (
                     isinstance(stop_result, dict)
                     and (
@@ -1411,6 +1431,7 @@ class GatewayRuntime:
                 ("audio service", self.audio_service.stop),
                 ("data frame streams", self._stop_data_frame_stream_sources),
                 ("perception video runtime", self.perception_video_runtime.stop),
+                ("memory background workers", self.memory_service.disable_memory_library),
                 ("robot", self.robot.stop),
             )
             for component_name, cleanup in cleanup_steps:
@@ -1440,36 +1461,50 @@ class GatewayRuntime:
                     "motion guard client failed to close with a verified fence"
                 )
             self._started = False
+            self._closed = True
 
-        owner_settled = relocalization_stop_error is None
-        event_payload: Dict[str, object] = {
-            "success": stop_error is None and owner_settled,
-            "relocalization_owner_settled": owner_settled,
-            "stop_error_code": (
-                relocalization_stop_error.error_code
-                if relocalization_stop_error is not None
-                else None
-            ),
-        }
-        event_payload.update(relocalization_pending)
-        self.event_bus.publish(
-            self.event_bus.build_event(
-                "system.gateway_stopped",
-                category=RuntimeEventCategory.SYSTEM,
-                source="gateway_runtime",
-                severity=(
-                    RuntimeEventSeverity.INFO
-                    if event_payload["success"]
-                    else RuntimeEventSeverity.ERROR
+            owner_settled = relocalization_stop_error is None
+            event_payload: Dict[str, object] = {
+                "success": stop_error is None and owner_settled,
+                "relocalization_owner_settled": owner_settled,
+                "stop_error_code": (
+                    relocalization_stop_error.error_code
+                    if relocalization_stop_error is not None
+                    else None
                 ),
-                message="宿主机网关运行时已停止。",
-                payload=event_payload,
+            }
+            event_payload.update(relocalization_pending)
+            self.event_bus.publish(
+                self.event_bus.build_event(
+                    "system.gateway_stopped",
+                    category=RuntimeEventCategory.SYSTEM,
+                    source="gateway_runtime",
+                    severity=(
+                        RuntimeEventSeverity.INFO
+                        if event_payload["success"]
+                        else RuntimeEventSeverity.ERROR
+                    ),
+                    message="宿主机网关运行时已停止。",
+                    payload=event_payload,
+                )
             )
-        )
-        if relocalization_stop_error is not None:
-            raise relocalization_stop_error
-        if stop_error is not None:
-            raise stop_error
+            self._close_dispatch_resources()
+            if relocalization_stop_error is not None:
+                raise relocalization_stop_error
+            if stop_error is not None:
+                raise stop_error
+
+    def _close_dispatch_resources(self) -> None:
+        """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
+
+        log_handler = getattr(self, "_log_stream_handler", None)
+        if log_handler is not None:
+            logging.getLogger().removeHandler(log_handler)
+            log_handler.close()
+        if getattr(self, "_owns_event_bus", False):
+            self.event_bus.shutdown()
+        if getattr(self, "_owns_stream_bus", False):
+            self.stream_bus.shutdown()
 
     def get_live_map_stream_status(self) -> Dict[str, object]:
         return {
@@ -1728,6 +1763,10 @@ class GatewayRuntime:
     def _observe_pointcloud_map_source_error(self, exc: PointCloudMapSourceError) -> None:
         with self._lock:
             self._pointcloud_map_pending_source_error = exc
+            snapshot = self._pointcloud_map_current_snapshot
+            if snapshot is not None and snapshot.source == exc.source:
+                self._pointcloud_map_current_snapshot = None
+                self._pointcloud_map_last_publish_at = None
 
     def _build_pointcloud_map_source_switch(self) -> PointCloudMapSourceSwitch:
         live_source = _GatewayObservedPointCloudMapSource(
@@ -1899,6 +1938,7 @@ class GatewayRuntime:
                 except PointCloudMapSourceError as exc:
                     if self._pointcloud_map_stream_stop.is_set():
                         break
+                    self._observe_pointcloud_map_source_error(exc)
                     with self._lock:
                         self._pointcloud_map_pending_source_error = None
                     source_error = exc
@@ -3004,6 +3044,9 @@ class GatewayRuntime:
                         "ok": {"type": "boolean"},
                         "alias_of": {"type": "string"},
                         "request_id": {"type": ["string", "null"]},
+                        "navigation_state": {"type": "object"},
+                        "cancellation_requested": {"type": "boolean"},
+                        "completed": {"type": "boolean"},
                         "error_code": {"type": "string"},
                         "unavailable_reason": {"type": "string"},
                         "message": {"type": "string"},
@@ -3764,10 +3807,9 @@ class GatewayRuntime:
                 name="cancel_navigation",
                 display_name="取消导航",
                 description=(
-                    "导航运行时尚未接通；调用不会取消导航，而是返回 ok=false、"
-                    "error_code=RUNTIME_NOT_READY 和 "
-                    "unavailable_reason=navigation_runtime_dispatch_not_ready。"
-                    "可选 request_id 仅在响应中回显。"
+                    "通过平台导航服务取消目标。可选 request_id 指定目标，省略时取消当前活动目标。"
+                    "返回真实 navigation_state；completed=false 表示已请求取消、尚未结束。"
+                    "没有活动目标时直接返回当前状态，不启动导航运行时。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="cancel_navigation",
@@ -3776,10 +3818,8 @@ class GatewayRuntime:
                 name="get_navigation_state",
                 display_name="读取导航状态",
                 description=(
-                    "导航运行时尚未接通；无入参。调用返回 ok=false、"
-                    "navigation_state.status=UNAVAILABLE、error_code=RUNTIME_NOT_READY 和 "
-                    "unavailable_reason=navigation_runtime_dispatch_not_ready，"
-                    "不提供真实导航状态。"
+                    "读取平台导航服务的真实状态，包括当前目标、位姿和剩余距离；无入参。"
+                    "后端未连接时返回业务错误，查询本身不启动导航运行时。"
                 ),
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_state",
@@ -3992,7 +4032,7 @@ class GatewayRuntime:
             requested_by=requested_by,
         )
         payload = dict(arguments or {})
-        set_correlation_context(
+        correlation_tokens = set_correlation_context(
             request_id=context.get("request_id", ""),
             capability_name=descriptor.name,
         )
@@ -4074,6 +4114,10 @@ class GatewayRuntime:
             failed_context = dict(context)
             failed_context["duration_ms"] = duration_ms
             failed_context["error_category"] = self._classify_capability_error(exc)
+            RUNTIME_LOGGER.exception(
+                "能力调用失败",
+                extra={"event": "capability.execution.failed", **failed_context},
+            )
             error_code = self._extract_error_code(exc)
             self._publish_capability_invocation_event(
                 "capability.invocation.failed",
@@ -4089,7 +4133,7 @@ class GatewayRuntime:
             )
             raise
         finally:
-            clear_correlation_context()
+            clear_correlation_context(correlation_tokens)
 
     @staticmethod
     def _build_capability_request_context(
@@ -4897,7 +4941,7 @@ class GatewayRuntime:
                 summary=perception_summary,
                 evidence=f"相机 {self._payload_get(perception_runtime, 'camera_id') or '--'}，已处理 {processed_frames if processed_frames is not None else '--'} 帧",
                 source="perception_video_runtime",
-                advice="视频或感知异常时检查 Go2 推流、模型配置和感知日志",
+                advice="视频或感知异常时检查相机推流、模型配置和感知日志",
                 order=70,
                 updated_at=utc_now(),
                 reason="last_error" if perception_error else None,
@@ -4985,7 +5029,7 @@ class GatewayRuntime:
         entries.append(
             self._make_service_health_entry(
                 service_id="robot_data_plane",
-                display_name="Go2 数据面服务",
+                display_name="机器人数据接入",
                 group="机器人数据",
                 status=ServiceHealthStatus.AVAILABLE if robot_available else ServiceHealthStatus.DEGRADED,
                 summary="机器人数据面可访问" if robot_available else "机器人数据面状态未上报",
@@ -5091,7 +5135,7 @@ class GatewayRuntime:
                 "process_sampled_at": process_sampled_at,
                 # 任务 5.1：process_evidence 元数据一致性 —— 与 _service_process_evidence 内部 sampled_at 同一 source_ts，
                 # 便于前端对账 telemetry collector 的采样时刻。
-                # 注意：SystemMetricsSnapshot.sampled_at 是 float（Unix 秒，见 contracts/debug_views.py），
+                # 注意：SystemMetricsSnapshot.sampled_at 是 float（Unix 秒，见 contracts/telemetry.py），
                 # 不是 datetime；需用 _iso_from_sampled_at 安全转换，避免 'float' object has no attribute 'isoformat'。
                 "process_evidence_source": "system.metrics",
                 "process_sampled_at_iso": self._iso_from_sampled_at(process_sampled_at),
@@ -6104,7 +6148,7 @@ class GatewayRuntime:
             "next_step_hint": "探索与其子导航已停止；建图会话保持运行。",
         }
 
-    def dispatch_debug_navigation_goal(
+    def dispatch_console_navigation_goal(
         self,
         arguments: Dict[str, Any],
         *,
@@ -6157,7 +6201,7 @@ class GatewayRuntime:
             "dispatch_mode": "geometry_runtime_set_navigation_goal",
         }
         result["target_pose"] = pose.model_dump(mode="json")
-        result["requested_by"] = requested_by or "debug_panel"
+        result["requested_by"] = requested_by or "console"
         if not bool(result.get("published")):
             raise GatewayError(
                 str(result.get("message") or "发布 /goal_pose 失败。"),
@@ -6202,7 +6246,7 @@ class GatewayRuntime:
             )
         return result
 
-    def dispatch_debug_clicked_point(
+    def dispatch_console_clicked_point(
         self,
         arguments: Dict[str, Any],
         *,
@@ -6233,7 +6277,7 @@ class GatewayRuntime:
             "message": "Publish Point 已落到 nuwax-geometry-runtime 决策点（本版本仅记录，不触发导航）。",
         }
         result["target_pose"] = pose.model_dump(mode="json")
-        result["requested_by"] = requested_by or "debug_panel"
+        result["requested_by"] = requested_by or "console"
         if not bool(result.get("published")):
             raise GatewayError(
                 str(result.get("message") or "发布 /clicked_point 失败。"),
@@ -6267,7 +6311,7 @@ class GatewayRuntime:
         )
         return result
 
-    def dispatch_debug_initial_pose(
+    def dispatch_console_initial_pose(
         self,
         arguments: Dict[str, Any],
         *,
@@ -6314,7 +6358,7 @@ class GatewayRuntime:
             "message": "已通过 nuwax-localization._publish_initialpose 触发 relocalize。",
         }
         result["target_pose"] = pose.model_dump(mode="json")
-        result["requested_by"] = requested_by or "debug_panel"
+        result["requested_by"] = requested_by or "console"
         if not bool(result.get("published")):
             raise GatewayError(
                 str(result.get("message") or "发布 /initialpose 失败。"),
@@ -6464,31 +6508,40 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ) -> Dict[str, Any]:
-        """取消导航（同步 tool）。
+        """通过唯一导航服务定向取消，返回后端状态，不把受理当作已停车。"""
 
-        - request_id 缺省：取消当前 ACTIVE 目标；
-        - request_id 给出：取消指定 request_id 的目标。
-
-        当前 nuwax-nav-stack LCM channel 未接通（B7 blocker），返回明确 UNAVAILABLE
-        而非 ok=True 假成功，避免上层 caller 误以为已实际取消。
-        """
-        request_id = str(arguments.get("request_id", "")).strip() or None
+        del request_context
+        request_id = str(arguments.get("request_id") or "").strip() or None
+        cancellation_requested = True
+        if request_id is None:
+            navigation_context = self.navigation_service.refresh_navigation()
+            state = navigation_context.navigation_state
+            cancellation_requested = state.status in {
+                NavigationStatus.ACCEPTED,
+                NavigationStatus.PLANNING,
+                NavigationStatus.RUNNING,
+            }
+            request_id = state.current_goal_id
+            if cancellation_requested and not request_id:
+                raise GatewayError(
+                    "活动导航状态缺少目标标识，无法定向取消。",
+                    error_code="navigation_goal_identity_unavailable",
+                    http_status=503,
+                )
+        if cancellation_requested:
+            navigation_context = self.navigation_service.cancel_goal(request_id=request_id)
+        state = navigation_context.navigation_state
         return {
-            "ok": False,
+            "ok": True,
             "alias_of": "cancel_navigation",
             "request_id": request_id,
-            "error_code": "RUNTIME_NOT_READY",
-            "unavailable_reason": (
-                "navigation_runtime_dispatch_not_ready"
-            ),
-            "message": (
-                "导航 RPC 尚未接通 nuwax-nav-stack LCM channel（参见 B7 blocker），"
-                "无法执行 cancel_navigation。"
-            ),
+            "navigation_state": to_jsonable(state),
+            "cancellation_requested": cancellation_requested,
+            "completed": not cancellation_requested or state.status == NavigationStatus.CANCELLED,
+            "message": state.message or ("导航取消请求已受理。" if cancellation_requested else "当前没有活动导航目标。"),
             "metadata": {
                 "requested_by": requested_by or "unknown",
-                "stub": False,
-                "capability_available": False,
+                "backend_name": navigation_context.backend_name,
             },
         }
 
@@ -6499,34 +6552,17 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ) -> Dict[str, Any]:
-        """读取当前导航状态（同步 tool，无入参）。
+        """读取与网页和导航任务共用的后端状态；不可用时传播真实业务错误。"""
 
-        当前 nuwax-nav-stack LCM channel 未接通（B7 blocker），返回明确 UNAVAILABLE
-        而非固定 idle stub，避免上层 caller 把"无真实数据"误读为"已 idle"。
-        """
         del arguments, request_context
+        navigation_context = self.navigation_service.refresh_navigation()
         return {
-            "ok": False,
+            "ok": True,
             "alias_of": "get_navigation_state",
-            "navigation_state": {
-                "status": "UNAVAILABLE",
-                "message": (
-                    "导航运行时未就绪（参见 B7 blocker），"
-                    "当前无法提供真实导航状态。"
-                ),
-            },
-            "error_code": "RUNTIME_NOT_READY",
-            "unavailable_reason": (
-                "navigation_runtime_dispatch_not_ready"
-            ),
-            "message": (
-                "导航 RPC 尚未接通 nuwax-nav-stack LCM channel（参见 B7 blocker），"
-                "无法提供 get_navigation_state。"
-            ),
+            "navigation_state": to_jsonable(navigation_context.navigation_state),
             "metadata": {
                 "requested_by": requested_by or "unknown",
-                "stub": False,
-                "capability_available": False,
+                "backend_name": navigation_context.backend_name,
             },
         }
 
@@ -10212,10 +10248,12 @@ class GatewayRuntime:
         point_cloud_provider = providers if providers is not None and isinstance(
             providers, StreamingPointCloudProvider
         ) else None
+        sensor_sample_provider = providers if isinstance(providers, StreamingSensorSampleProvider) else None
         bridge = build_default_runtime_input_bridge(
             runtime_provider=remote_provider,
             localization_provider=localization_provider,
             point_cloud_provider=point_cloud_provider,
+            sensor_sample_provider=sensor_sample_provider,
         )
         if not bridge.start():
             status = bridge.get_status()
@@ -13487,7 +13525,7 @@ class GatewayRuntime:
                 except Exception:
                     RUNTIME_LOGGER.debug("探索 finalize 前 refresh_exploration 忽略异常", exc_info=True)
                 try:
-                    delay_sec = max(0.0, float(os.environ.get("NUWAX_EXPLORE_FINALIZE_DELAY_SEC", "8")))
+                    delay_sec = max(0.0, float(runtime_value("NUWAX_EXPLORE_FINALIZE_DELAY_SEC", "8")))
                 except (TypeError, ValueError):
                     delay_sec = 8.0
                 if delay_sec > 0.0:
@@ -13891,7 +13929,19 @@ class GatewayRuntime:
 
     def _has_provider(self, provider_type: type) -> bool:
         providers = getattr(self.robot, "providers", None)
-        return providers is not None and isinstance(providers, provider_type)
+        if providers is None or not isinstance(providers, provider_type):
+            return False
+        # 组合提供器可以先接入状态、后接入图像；接口存在不代表该类数据已可用。
+        availability_method = {
+            ImageProvider: "is_image_available",
+            StateProvider: "is_state_available",
+        }.get(provider_type)
+        probe = getattr(providers, availability_method, None) if availability_method else None
+        try:
+            return bool(probe()) if callable(probe) else True
+        except Exception:
+            RUNTIME_LOGGER.debug("设备能力状态读取失败：%s", availability_method, exc_info=True)
+            return False
 
     def _build_pose_from_arguments(self, arguments: Dict[str, Any]) -> Pose:
         frame_id = str(self._require_str(arguments, "frame_id")).strip().lstrip("/") or "map"

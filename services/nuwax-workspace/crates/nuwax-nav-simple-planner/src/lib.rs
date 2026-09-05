@@ -6,7 +6,7 @@
 //! - Costmap(带历史最大高度与脏标记)、膨胀、A*、Stuck 升级、waypoint lookahead、
 //!   点云分类等核心算法。
 //!
-//! 不提供 stream/RPC 适配器(请启用 `module` feature 后查看 `module.rs` 骨架)。
+//! 启用 `module` 特性后提供同步模块适配器；消息传输与调度由导航编排层负责。
 //!
 //! # 用法示例
 //!

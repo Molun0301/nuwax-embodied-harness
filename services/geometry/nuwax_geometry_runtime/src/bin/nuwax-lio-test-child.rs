@@ -69,6 +69,8 @@ impl NativeChildArgs {
             }
             match flag {
                 "--lidar" => config.lidar_topic = value.to_owned(),
+                "--input_lidar" => config.input_lidar_topic = Some(value.to_owned()),
+                "--input_imu" => config.input_imu_topic = Some(value.to_owned()),
                 "--odometry" => config.odometry_topic = value.to_owned(),
                 "--frame_id" => config.frame_id = value.to_owned(),
                 "--child_frame_id" => config.child_frame_id = value.to_owned(),
@@ -106,15 +108,17 @@ impl NativeChildArgs {
             "--extrinsic_t",
             "--frame_id",
             "--frequency",
-            "--host_ip",
             "--lidar",
-            "--lidar_ip",
             "--odometry",
             "--odom_freq",
             "--pointcloud_freq",
             "--sensor_frame_id",
         ];
-        if seen.len() != expected_flags.len()
+        let input_flags = usize::from(config.input_lidar_topic.is_some())
+            + usize::from(config.input_imu_topic.is_some());
+        let network_flags = usize::from(seen.contains("--host_ip"))
+            + usize::from(seen.contains("--lidar_ip"));
+        if seen.len() != expected_flags.len() + input_flags + network_flags
             || expected_flags.iter().any(|flag| !seen.contains(*flag))
         {
             return Err(format!("native argv is incomplete: flags={seen:?}"));
@@ -543,6 +547,12 @@ async fn run_native_lio_test_child() -> Result<(), String> {
     let transport = LcmTransport::new_real(&lcm_url)
         .map_err(|error| format!("create real LCM transport failed: {error}"))?;
 
+    if args.config.input_lidar_topic.is_some() && playback.is_none()
+        && publish_permit_file.is_none()
+    {
+        return run_raw_input_test_child(&transport, &args, &lcm_url, &contract_path).await;
+    }
+
     write_marker(PID_FILE_ENV, std::process::id().to_string())?;
     let mut published_pair_count = 0_u32;
     let mut last_published_sequence = 0_u32;
@@ -622,6 +632,79 @@ async fn run_native_lio_test_child() -> Result<(), String> {
             }
         }
     }
+}
+
+/// 离线生命周期替身：只在收到真实传输的原始输入后生成测试输出，不模拟算法精度。
+async fn run_raw_input_test_child(
+    transport: &LcmTransport,
+    args: &NativeChildArgs,
+    lcm_url: &str,
+    contract_path: &Path,
+) -> Result<(), String> {
+    use nuwax_codec::lcm::schema;
+    let cloud_binding = typed_binding(
+        args.config.input_lidar_topic.as_deref().ok_or("missing input cloud")?,
+        POINT_CLOUD_TYPE,
+    )?;
+    let imu_binding = typed_binding(
+        args.config.input_imu_topic.as_deref().ok_or("missing input IMU")?,
+        "sensor_msgs.Imu",
+    )?;
+    let mut clouds = transport.subscribe_owned(cloud_binding.0, Some(cloud_binding.1))
+        .await.map_err(|error| error.to_string())?;
+    let mut imus = transport.subscribe_owned(imu_binding.0, Some(imu_binding.1))
+        .await.map_err(|error| error.to_string())?;
+    write_marker(PID_FILE_ENV, std::process::id().to_string())?;
+    let mut count = 0_u32;
+    let mut imu_count = 0_u32;
+    let mut report = contract_value(args, lcm_url, None, None, None, count, count);
+    report["raw_subscriptions_ready"] = json!(true);
+    write_contract_atomic(contract_path, &report)?;
+    let termination = wait_for_test_termination();
+    tokio::pin!(termination);
+    let result = loop {
+        tokio::select! {
+            biased;
+            marker = &mut termination => {
+                write_marker(TERM_FILE_ENV, marker?)?;
+                break Ok(());
+            }
+            frame = imus.recv() => {
+                let frame = frame.map_err(|error| error.to_string())?;
+                let mut bytes = schema::IMU_FINGERPRINT.to_vec();
+                bytes.extend_from_slice(&frame.payload);
+                schema::decode_imu(&bytes).map_err(|error| error.to_string())?;
+                imu_count += 1;
+            }
+            frame = clouds.recv() => {
+                let frame = frame.map_err(|error| error.to_string())?;
+                if imu_count == 0 { return Err("cloud arrived before any IMU".into()); }
+                let mut bytes = schema::POINT_CLOUD2_FINGERPRINT.to_vec();
+                bytes.extend_from_slice(&frame.payload);
+                let mut cloud = schema::decode_point_cloud2(&bytes)
+                    .map_err(|error| error.to_string())?;
+                count += 1;
+                cloud.header.seq = count as i32;
+                cloud.header.frame_id = args.config.sensor_frame_id.clone();
+                let mut odometry = Odometry::default();
+                odometry.header = cloud.header.clone();
+                odometry.header.frame_id = args.config.frame_id.clone();
+                odometry.child_frame_id = args.config.child_frame_id.clone();
+                odometry.pose.orientation_xyzw[3] = 1.0;
+                let pair = EncodedPair {
+                    odometry: encode_odometry_body(&odometry).map_err(|error| error.to_string())?,
+                    cloud: encode_point_cloud2_body(&cloud).map_err(|error| error.to_string())?,
+                };
+                publish_pair(transport, args, count, &pair).await?;
+                report["published_pair_count"] = json!(count);
+                report["raw_imu_count"] = json!(imu_count);
+                write_contract_atomic(contract_path, &report)?;
+            }
+        }
+    };
+    clouds.unsubscribe().await.map_err(|error| error.to_string())?;
+    imus.unsubscribe().await.map_err(|error| error.to_string())?;
+    result
 }
 
 fn main() -> ExitCode {

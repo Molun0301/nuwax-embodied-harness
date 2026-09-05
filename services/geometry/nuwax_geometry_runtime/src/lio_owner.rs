@@ -1354,7 +1354,7 @@ async fn run_supervisor(
     info!(
         runtime_generation,
         backend = spec.backend_code(),
-        "LIO owner READY after subscription ACKs and source readiness"
+        "LIO owner READY after subscription ACKs and ingress admission"
     );
 
     let terminal_failure = loop {

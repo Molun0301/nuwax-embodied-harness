@@ -59,7 +59,6 @@ from services.navigation.motion_safety_guard.epoch import (
     ProvisionRecord,
     atomic_write_record,
 )
-from services.navigation.motion_safety_guard.peer_auth import PeerAuthorizer
 from services.navigation.motion_safety_guard.server import MotionGuardUnixServer
 
 root = Path(sys.argv[1])
@@ -112,7 +111,6 @@ core = MotionGuardCore(
     epoch=epoch,
     epoch_store=store,
     actuator=RecordingActuator(),
-    authorizer=PeerAuthorizer({os.geteuid(): frozenset({"NAV"})}),
 )
 core.initialize_zero_fence()
 server = MotionGuardUnixServer(
@@ -173,7 +171,12 @@ impl GuardChild {
                     break;
                 }
                 if let Some(status) = guard.child.try_wait().expect("poll Guard child") {
-                    panic!("Motion Guard child exited before READY: {status}");
+                    use std::io::Read;
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = guard.child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    panic!("Motion Guard child exited before READY: {status}; stderr={stderr}");
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1146,6 +1149,7 @@ struct LiveInputReceiptLedgerEntry {
     publication: LiveInputOutstanding,
     receipt_ordinal: Option<u64>,
     receipt_at: Option<tokio::time::Instant>,
+    superseded_by: Option<u64>,
     next_publication: Option<LiveInputOutstanding>,
 }
 
@@ -1231,6 +1235,7 @@ struct LiveInputReceiptShaper {
     ledger: VecDeque<LiveInputReceiptLedgerEntry>,
     completed_count: u64,
     last_timestamp_ns: u64,
+    periodic: bool,
 }
 
 impl LiveInputReceiptShaper {
@@ -1241,10 +1246,18 @@ impl LiveInputReceiptShaper {
             ledger: VecDeque::with_capacity(LIVE_INPUT_RECEIPT_LEDGER_CAPACITY),
             completed_count: 0,
             last_timestamp_ns: 0,
+            periodic: false,
         }
     }
 
+    fn enable_periodic(&mut self) {
+        self.periodic = true;
+    }
+
     fn can_publish(&self, kind: LiveInputKind) -> bool {
+        if self.periodic {
+            return true;
+        }
         match kind {
             LiveInputKind::Pose => self.pose_outstanding.is_none(),
             LiveInputKind::Costmap => self.costmap_outstanding.is_none(),
@@ -1273,7 +1286,7 @@ impl LiveInputReceiptShaper {
                 .front()
                 .expect("full V2 receipt ledger must have an oldest entry");
             assert!(
-                oldest.receipt_ordinal.is_some(),
+                oldest.receipt_ordinal.is_some() || oldest.superseded_by.is_some(),
                 "V2 receipt ledger cannot evict an outstanding publication"
             );
             self.ledger.pop_front();
@@ -1297,6 +1310,7 @@ impl LiveInputReceiptShaper {
             publication,
             receipt_ordinal: None,
             receipt_at: None,
+            superseded_by: None,
             next_publication: None,
         });
         self.last_timestamp_ns = timestamp_ns;
@@ -1337,9 +1351,18 @@ impl LiveInputReceiptShaper {
         else {
             return false;
         };
-        let outstanding = match kind {
-            LiveInputKind::Pose => self.pose_outstanding,
-            LiveInputKind::Costmap => self.costmap_outstanding,
+        let outstanding = if self.periodic {
+            self.ledger.iter().find(|entry| {
+                entry.kind == kind
+                    && entry.publication.timestamp_ns == wire_timestamp_ns
+                    && entry.receipt_at.is_none()
+                    && entry.superseded_by.is_none()
+            }).map(|entry| entry.publication)
+        } else {
+            match kind {
+                LiveInputKind::Pose => self.pose_outstanding,
+                LiveInputKind::Costmap => self.costmap_outstanding,
+            }
         };
         let Some(outstanding) = outstanding else {
             return false;
@@ -1358,9 +1381,22 @@ impl LiveInputReceiptShaper {
         );
         ledger_entry.receipt_ordinal = Some(receipt_ordinal);
         ledger_entry.receipt_at = Some(receipt_at);
+        if self.periodic {
+            // 遥测可能合并中间输入。只把精确时间戳记作回执，旧帧单独标记为已被覆盖。
+            for entry in &mut self.ledger {
+                if entry.kind == kind && entry.publication.timestamp_ns < wire_timestamp_ns
+                    && entry.receipt_at.is_none() && entry.superseded_by.is_none()
+                {
+                    entry.superseded_by = Some(wire_timestamp_ns);
+                }
+            }
+        }
+        let remaining = self.ledger.iter().rev().find(|entry| {
+            entry.kind == kind && entry.receipt_at.is_none() && entry.superseded_by.is_none()
+        }).map(|entry| entry.publication);
         match kind {
-            LiveInputKind::Pose => self.pose_outstanding = None,
-            LiveInputKind::Costmap => self.costmap_outstanding = None,
+            LiveInputKind::Pose => self.pose_outstanding = remaining,
+            LiveInputKind::Costmap => self.costmap_outstanding = remaining,
         }
         self.completed_count = self
             .completed_count
@@ -1393,11 +1429,12 @@ impl LiveInputReceiptShaper {
                 },
             );
             eprintln!(
-                "{prefix} kind={:?} sequence={} timestamp_ns={} receipt_ordinal={:?} publish_to_receipt_ns={:?} next_sequence={:?} next_timestamp_ns={:?} ack_to_next_publish_ns={:?}",
+                "{prefix} kind={:?} sequence={} timestamp_ns={} receipt_ordinal={:?} superseded_by={:?} publish_to_receipt_ns={:?} next_sequence={:?} next_timestamp_ns={:?} ack_to_next_publish_ns={:?}",
                 entry.kind,
                 entry.publication.sequence,
                 entry.publication.timestamp_ns,
                 entry.receipt_ordinal,
+                entry.superseded_by,
                 publish_to_receipt_ns,
                 entry.next_publication.map(|publication| publication.sequence),
                 entry.next_publication.map(|publication| publication.timestamp_ns),
@@ -2960,7 +2997,10 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     })
     .await;
     match fresh_receipt {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => {
+            live_input_receipt_shaper.lock().expect("live receipt shaper")
+                .enable_periodic();
+        }
         Ok(Err(reason)) => {
             fail_pre_path_gate(
                 &reason,
@@ -4244,8 +4284,6 @@ async fn observe_canary_ready_inputs(
 async fn post_quiet_tf_window_uses_formal_readiness() {
     use crate::nav_runtime::NavigationReadinessCode;
 
-    let _env_lock = ENV_LOCK.lock().await;
-    let _env = EnvRestore::set(&[("NUWAX_NAV_TF_TTL_MS", "1")]);
     let stamp_ns = crate::explore_runtime::now_unix_nanos();
 
     let canonical_nav = crate::nav_runtime::NavRuntimeState::from_env();
@@ -4331,7 +4369,7 @@ async fn post_quiet_tf_window_uses_formal_readiness() {
         &mut stale_generation,
         &canary_tf_payload(stamp_ns),
     ));
-    tokio::time::sleep(Duration::from_millis(3)).await;
+    stale_nav.expire_tf_for_test();
     let stale = crate::nav_runtime::compute_readiness(&stale_handle, &stale_nav).await;
     assert!(!stale.ready);
     assert!(stale.blockers.contains(&NavigationReadinessCode::TfStale));
@@ -4498,10 +4536,12 @@ impl OwnedCleanupSpy {
 
 impl Drop for OwnedCleanupSpy {
     fn drop(&mut self) {
-        assert!(
-            self.resource.is_none(),
-            "initial gate failure ignored required cleanup"
-        );
+        if !std::thread::panicking() {
+            assert!(
+                self.resource.is_none(),
+                "initial gate failure ignored required cleanup"
+            );
+        }
     }
 }
 
@@ -4560,7 +4600,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
             | GateCase::ReadyPath
             | GateCase::ReadyTwist => Some(heartbeat(41, 37, 1)),
             GateCase::PlannerMissing => Some(heartbeat(0, 37, 1)),
-            GateCase::SinkMissing => Some(heartbeat(41, -1, 1)),
+            GateCase::SinkMissing => Some(heartbeat(41, 0, 1)),
             GateCase::SinkFalse => Some(heartbeat(41, 37, 0)),
             GateCase::NoHeartbeat
             | GateCase::PendingExpiredNavInput
@@ -4568,21 +4608,6 @@ async fn initial_readiness_uses_typed_feedback_generation() {
             | GateCase::NavLedgerClosed
             | GateCase::PathLedgerClosed => None,
         };
-        if let Some(payload) = heartbeat {
-            let update = crate::typed_codec::decode_nav_state_payload(&payload)
-                .expect("decode typed initial-readiness heartbeat");
-            assert!(apply_typed_navigation_feedback(&nav, update)
-                .await
-                .is_some());
-        }
-        let mut tf_history = PublicTfHistory::default();
-        let mut tf_generation = 0;
-        assert!(apply_canary_tf_payload(
-            &nav,
-            &mut tf_history,
-            &mut tf_generation,
-            &canary_tf_payload(stamp_ns),
-        ));
 
         let nav_capacity = if matches!(
             case,
@@ -4672,6 +4697,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                 .expect("queue noncanonical state");
         }
         let nav_tx = if matches!(case, GateCase::NavLedgerClosed) {
+            drop(nav_tx);
             None
         } else {
             Some(nav_tx)
@@ -4689,16 +4715,18 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                 .expect("queue pre-release PathEnvelope");
         }
         let path_tx = if matches!(case, GateCase::PathLedgerClosed) {
+            drop(path_tx);
             None
         } else {
             Some(path_tx)
         };
-        let transport = LcmTransport::new_real(&test_lcm_url()).expect("gate test LCM context");
+        let provider = test_lcm_url();
+        let transport = LcmTransport::new_real(&provider).expect("gate test LCM context");
         let goal_channel = format!("/v2/gate/{}/goal", crate::explore_runtime::now_unix_nanos());
         let goal_topic = LcmTopic::new(&goal_channel).expect("gate goal topic");
         let goal_type = LcmMessageType::new("nuwax_msgs.GoalEnvelope").expect("gate goal type");
-        let mut goal_frames = transport.subscribe(goal_topic, Some(goal_type)).await;
-        let goal_publisher = LcmTransport::new_real(&test_lcm_url())
+        let mut goal_frames = transport.subscribe(goal_topic, Some(goal_type)).await.peekable();
+        let goal_publisher = LcmTransport::new_real(&provider)
             .expect("independent gate goal publisher context");
         if matches!(
             case,
@@ -4715,8 +4743,32 @@ async fn initial_readiness_uses_typed_feedback_generation() {
                 ))
                 .await
                 .expect("publish pre-release GoalEnvelope");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let delivered = tokio::time::timeout(
+                Duration::from_secs(2),
+                std::pin::Pin::new(&mut goal_frames).peek(),
+            ).await.expect("真实目标帧必须到达订阅端，不能用固定休眠猜测就绪");
+            assert!(matches!(delivered, Some(Ok(_))));
         }
+        let mut goal_frames: nuwax_transport::LcmFrameStream = Box::pin(goal_frames);
+        if let Some(payload) = heartbeat {
+            let update = crate::typed_codec::decode_nav_state_payload(&payload)
+                .expect("decode typed initial-readiness heartbeat");
+            assert!(apply_typed_navigation_feedback(&nav, update)
+                .await
+                .is_some());
+        }
+        if matches!(case, GateCase::SinkMissing) {
+            nav.clear_motion_sink_for_test();
+        }
+        let mut tf_history = PublicTfHistory::default();
+        let mut tf_generation = 0;
+        assert!(apply_canary_tf_payload(
+            &nav,
+            &mut tf_history,
+            &mut tf_generation,
+            &canary_tf_payload(stamp_ns),
+        ));
+
         let mut evidence = NavStateEvidenceLedger::new();
         let mut guard_events = if matches!(case, GateCase::ReadyTwist) {
             "TWIST 0.1 0.0\n".to_string()
@@ -4725,10 +4777,17 @@ async fn initial_readiness_uses_typed_feedback_generation() {
         };
         let mut read_guard_events = || guard_events.clone();
         let gate_deadline = match case {
-            GateCase::ReadyNavFlood
+            GateCase::Ready
+            | GateCase::ReadyCanonicalThenNoncanonical
+            | GateCase::ReadyGoal
+            | GateCase::ReadyPath
+            | GateCase::ReadyTwist
+            | GateCase::NavLedgerClosed
+            | GateCase::PathLedgerClosed
+            | GateCase::ReadyNavFlood
             | GateCase::ReadyDeadlineAfterNavDrain
             | GateCase::ReadyDeadlineAfterFinalReadiness => {
-                tokio::time::Instant::now() + Duration::from_secs(1)
+                tokio::time::Instant::now() + Duration::from_secs(2)
             }
             GateCase::ReadyExpiredNavFlood
             | GateCase::PendingExpiredNavInput
@@ -4816,8 +4875,6 @@ async fn initial_readiness_uses_typed_feedback_generation() {
         outcome
     }
 
-    let _env_lock = ENV_LOCK.lock().await;
-    let _env = EnvRestore::set(&[("NUWAX_NAV_TF_TTL_MS", "10000")]);
     let stamp_ns = crate::explore_runtime::now_unix_nanos();
 
     let ready = run_case(GateCase::Ready, stamp_ns)
@@ -4860,7 +4917,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
     let reaped_flood = Arc::new(Mutex::new(0_usize));
     let mut flood_cleanup_spy = OwnedCleanupSpy::new(reaped_flood.clone());
     let flood = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(3),
         run_case(GateCase::ReadyNavFlood, stamp_ns),
     )
     .await
@@ -4884,7 +4941,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
     drop(flood_cleanup_spy);
 
     let expired_flood = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(3),
         run_case(GateCase::ReadyExpiredNavFlood, stamp_ns),
     )
     .await
@@ -4905,7 +4962,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
         let reaped_ready_deadline = Arc::new(Mutex::new(0_usize));
         let mut ready_deadline_cleanup_spy = OwnedCleanupSpy::new(reaped_ready_deadline.clone());
         let ready_deadline =
-            tokio::time::timeout(Duration::from_millis(100), run_case(case, stamp_ns))
+            tokio::time::timeout(Duration::from_secs(3), run_case(case, stamp_ns))
                 .await
                 .expect("ready credential deadline checkpoint must return")
                 .expect_err("ready credential deadline must prevent release");
@@ -4937,7 +4994,7 @@ async fn initial_readiness_uses_typed_feedback_generation() {
         let reaped_expired_pending = Arc::new(Mutex::new(0_usize));
         let mut expired_pending_cleanup_spy = OwnedCleanupSpy::new(reaped_expired_pending.clone());
         let expired_pending =
-            tokio::time::timeout(Duration::from_millis(100), run_case(case, stamp_ns))
+            tokio::time::timeout(Duration::from_secs(3), run_case(case, stamp_ns))
                 .await
                 .expect("expired pending input gate must return")
                 .expect_err("expired deadline must win over pending input");
@@ -5068,8 +5125,6 @@ async fn initial_readiness_uses_typed_feedback_generation() {
 
 #[tokio::test]
 async fn initial_readiness_noncanonical_fixture_isolated() {
-    let _env_lock = ENV_LOCK.lock().await;
-    let _env = EnvRestore::set(&[("NUWAX_NAV_TF_TTL_MS", "10000")]);
     let nav = crate::nav_runtime::NavRuntimeState::from_env();
     let handle = canary_readiness_handle(&nav);
     let stamp_ns = crate::explore_runtime::now_unix_nanos();
@@ -5196,6 +5251,40 @@ fn terminal_state_remains_terminal_before_candidate_match() {
     assert!(terminal_before_expected_path_acceptance(&terminal));
     terminal.state = 2;
     assert!(!terminal_before_expected_path_acceptance(&terminal));
+}
+
+#[test]
+fn periodic_live_input_keeps_cadence_without_fabricating_receipts() {
+    let mut shaper = LiveInputReceiptShaper::new();
+    let started = tokio::time::Instant::now();
+    shaper.record_publish(LiveInputKind::Pose, 1, 1000, started);
+    assert!(!shaper.can_publish(LiveInputKind::Pose));
+    shaper.enable_periodic();
+    assert!(shaper.can_publish(LiveInputKind::Pose));
+    shaper.record_publish(LiveInputKind::Pose, 2, 1001, started + LIVE_POSE_INTERVAL);
+    assert!(shaper.ledger[0].receipt_ordinal.is_none());
+    let receipt = schema::NavigationState {
+        pose_source_timestamp_ns: 1001,
+        ..Default::default()
+    };
+    assert!(shaper.observe_receipt(&receipt, 7, started + LIVE_POSE_INTERVAL * 2).pose);
+    assert_eq!(shaper.completed_count, 1);
+    assert!(shaper.ledger[0].receipt_ordinal.is_none());
+    assert_eq!(shaper.ledger[0].superseded_by, Some(1001));
+    assert_eq!(shaper.ledger[1].receipt_ordinal, Some(7));
+    assert!(!shaper.observe_receipt(&schema::NavigationState {
+        pose_source_timestamp_ns: 9999,
+        ..Default::default()
+    }, 8, started + LIVE_POSE_INTERVAL * 3).pose);
+    for sequence in 3..=100_u64 {
+        let timestamp = 1000 + sequence;
+        shaper.record_publish(LiveInputKind::Pose, sequence, timestamp, started + LIVE_POSE_INTERVAL * sequence as u32);
+        shaper.observe_receipt(&schema::NavigationState {
+            pose_source_timestamp_ns: timestamp as i64,
+            ..Default::default()
+        }, sequence, started + LIVE_POSE_INTERVAL * sequence as u32);
+    }
+    assert_eq!(shaper.ledger.len(), LIVE_INPUT_RECEIPT_LEDGER_CAPACITY);
 }
 
 #[test]

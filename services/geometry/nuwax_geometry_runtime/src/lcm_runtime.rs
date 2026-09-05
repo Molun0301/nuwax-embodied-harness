@@ -42,7 +42,7 @@ use nuwax_transport::LcmTransport;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mapping_adapter::{
     finish_backend_retirement, MappingAdapter, MappingAdapterConfig, MappingBackendRetirement,
@@ -2892,8 +2892,11 @@ async fn geometry_runtime_blocking_revision_prepare_settles_before_resource_clea
 
     let pending = first_blocked_production_shutdown(&mut fixture, "revision-prepare").await;
     fixture.topology_control().release_revision_prepare();
+    wait_for_topology_condition("occupancy preparation actually returned", || {
+        fixture.topology_control().events().iter().any(|event| event == "revision-prepare-finished")
+    }).await;
+    fixture.assert_downstream_held_before_task_settlement();
     finish_clean_production_shutdown(pending, &fixture, "revision-prepare").await;
-    assert!(handle.occupancy_shm_current.read().await.is_some());
 }
 
 #[cfg(test)]
@@ -5722,6 +5725,12 @@ fn map_revision_coalescer_future_in_frame(
                                     writer.prepare_occupancy(&map)
                                 })
                             };
+                            #[cfg(test)]
+                            if let Some(control) = topology_test_control() {
+                                if control.revision_prepare_entered() {
+                                    control.record("revision-prepare-finished");
+                                }
+                            }
                             match prepare_result {
                                 Ok(prepared) => Some(prepared),
                                 Err(error) => {
@@ -8995,8 +9004,8 @@ async fn handoff_lio_odometry_inner(
     }
 }
 
-/// Commit one already-registered map-frame LIO cloud through the existing
-/// MappingAdapter map/revision/SHM fanout boundary.
+/// 接纳已注册到地图坐标的实时LIO点云；返回值表示点被接纳，不表示本帧一定发布新修订。
+/// 发布节流期间仍保留已接纳点，等后续候选按原有地图/共享内存边界发布。
 ///
 /// `adapter_timestamp_ns` belongs to the adapter's monotonic freshness domain;
 /// `source_timestamp_ns` remains the public source identity and output metadata.
@@ -9126,7 +9135,18 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     .await?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
     if !occupancy_committed {
-        return Ok(false);
+        let accepted = !commit.outcome.accepted_map_points.is_empty();
+        if accepted {
+            debug!(
+                event = "lio.cloud.accepted_without_revision",
+                reason = "publication_cadence",
+                accepted_points = commit.outcome.accepted_map_points.len(),
+                source_timestamp_ns,
+                map_frame,
+                "实时点云已接纳，等待下一次地图发布"
+            );
+        }
+        return Ok(accepted);
     }
 
     let lifecycle_guard = handle.mapping_lifecycle_lock.clone().lock_owned().await;
@@ -9775,8 +9795,19 @@ async fn handoff_registered_lio_cloud_inner(
     )
     .await?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
+    let accepted = occupancy_committed || !commit.outcome.accepted_map_points.is_empty();
     publish_registered_lio_commit(handle, map_frame, &commit).await?;
-    Ok(occupancy_committed)
+    if accepted && !occupancy_committed {
+        debug!(
+            event = "lio.cloud.accepted_without_revision",
+            reason = "publication_cadence",
+            accepted_points = commit.outcome.accepted_map_points.len(),
+            source_timestamp_ns,
+            map_frame,
+            "实时点云已接纳，等待下一次地图发布"
+        );
+    }
+    Ok(accepted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12820,6 +12851,29 @@ mod mapping_feed_tests {
         drop(shared);
         drop(frames);
 
+        // 高频样本已经进入后端，但未到栅格发布周期；不能误记拒绝或制造校正收据。
+        let before_revision = handle.state.read().await.map.revision;
+        let before_cloud_revision = handle.state.read().await.cloud_map_revision;
+        let mut throttled_binding = binding.clone();
+        throttled_binding.cloud_source_sequence += 1;
+        assert!(handoff_registered_lio_cloud_with_correction(
+            &handle,
+            &map_points,
+            12,
+            source_timestamp_ns + 2,
+            source_timestamp_ns + 1,
+            "map",
+            "base_link",
+            &throttled_binding,
+            &correction,
+        )
+        .await
+        .expect("live cloud is accepted during publication cadence"));
+        assert!(revision_rx.try_recv().is_err());
+        assert_eq!(sink.staged.lock().await.len(), 1);
+        assert_eq!(handle.state.read().await.map.revision, before_revision);
+        assert_eq!(handle.state.read().await.cloud_map_revision, before_cloud_revision);
+
         // A read-only relocalization payload may only be republished while
         // its exact committed receipt is still current.  Advancing the
         // observable cloud revision makes the frozen publication fail closed.
@@ -14142,7 +14196,7 @@ mod mapping_feed_tests {
     }
 
     #[tokio::test]
-    async fn handoff_lio_cloud_zero_revision_is_reported_false() {
+    async fn handoff_lio_cloud_accepted_without_new_revision() {
         let mut handle = build_handle_for_tests().await.expect("test runtime handle");
         let mut adapter = MappingAdapter::new_with_frames(mapping_config(), "map", "odom");
         adapter
@@ -14176,7 +14230,7 @@ mod mapping_feed_tests {
         )
         .await
         .expect("first revision"));
-        assert!(!handoff_registered_lio_cloud(
+        assert!(handoff_registered_lio_cloud(
             &handle,
             &[Point3::new(1.0, 0.0, 0.0)],
             12,

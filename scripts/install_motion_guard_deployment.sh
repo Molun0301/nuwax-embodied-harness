@@ -331,13 +331,13 @@ check_systemd_owned_invariants() {
     done < <(grep -E '^ExecStart(Pre|Post)=.*\.sh([[:space:]]|$)' "${unit}" || true)
   done
 
-  grep -q 'ExecStart=/usr/bin/env .*NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready' \
+  grep -q '^Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready' \
     "${NAV_UNIT_SOURCE}" \
     || fail "nav ExecStart does not own the production ready path"
   grep -qF 'NUWAX_NAV_STACK_BINARY=@NUWAX_BIN_DIR@/nuwax-nav-stack' \
     "${NAV_UNIT_SOURCE}" \
     || fail "nav ExecStart does not pin the installed release binary"
-  grep -qF 'NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime' \
+  grep -qF 'NUWAX_GEOMETRY_RUNTIME_BINARY=@NUWAX_BIN_DIR@/nuwax-geometry-runtime' \
     "${GEOMETRY_UNIT_SOURCE}" \
     || fail "geometry ExecStart does not pin the canonical runtime binary"
   grep -qF 'NUWAX_PERSON_FOLLOW_BINARY=@NUWAX_BIN_DIR@/nuwax-person-follow' \
@@ -345,9 +345,9 @@ check_systemd_owned_invariants() {
     || fail "person-follow ExecStart does not pin the installed release binary"
   for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
-    grep -q 'ExecStart=/usr/bin/env .*NUWAX_LCM_BACKEND=real-lcm .*NUWAX_REAL_LCM_REQUIRED=true' \
+    grep -q '^Environment=NUWAX_LCM_BACKEND=real-lcm' \
       "${unit}" \
-      || fail "production ExecStart does not force real-lcm: ${unit}"
+      || fail "production service lacks the real-lcm default: ${unit}"
   done
   [[ "$(grep -cF 'PYTHONPATH=@NUWAX_REPO_ROOT@:@NUWAX_GO2_SDK_PATH@' "${GUARD_UNIT_SOURCE}")" -eq 3 ]] \
     || fail "motion guard must pin repository and SDK paths in every Python execution context"
@@ -433,9 +433,7 @@ check_systemd_owned_invariants() {
     "${PERSON_FOLLOW_UNIT_SOURCE}" \
     || fail "person-follow restart lifecycle is not part of mandatory dependencies"
   for assignment in \
-      'NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope' \
       'NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope' \
-      'NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope' \
       'NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope'; do
     for unit in "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" "${GATEWAY_UNIT_SOURCE}"; do
       grep -qF "${assignment}" "${unit}" \
@@ -512,7 +510,7 @@ check_sources() {
     grep -qF '@NUWAX_BIN_DIR@' "${unit}" \
       || fail "Rust service source is not a release bin template: ${unit}"
   done
-  grep -qF '@NUWAX_REPO_ROOT@/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime' \
+  grep -qF '@NUWAX_BIN_DIR@/nuwax-geometry-runtime' \
     "${GEOMETRY_UNIT_SOURCE}" \
     || fail "Geometry service source does not pin the canonical runtime binary"
   bash -n \

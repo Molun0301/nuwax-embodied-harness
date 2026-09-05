@@ -35,7 +35,7 @@ ROBOT_DRIVER_REGISTRY: Dict[str, RobotDriverRegistration] = {
         package="drivers.customrobot",
         factory_name="create_customrobot_assembly",
         private_capabilities_module="drivers.customrobot.private_capabilities",
-        description="用户自定义机器人入口骨架。",
+        description="通用标准数据输入装配，运动执行与标定由接入方注入。",
     ),
     "raspi_lidar_robot": RobotDriverRegistration(
         robot_name="raspi_lidar_robot",

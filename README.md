@@ -1,191 +1,96 @@
 # nuwax_robot_bridge
 
-`nuwax_robot_bridge` 是部署在机器人宿主机上的具身能力运行时。
+通用机器人能力平台：机器人提供标准传感器数据、标定与运动执行，平台实现建图、定位、导航、探索、视觉和空间记忆，通过 MCP（模型上下文协议）供智能体调用。
 
-它负责把机器人连接、状态采集、视觉感知、地图定位、导航、记忆、音频与制品通道整理成统一能力，并通过稳定接口提供给上层系统调用。
+平台计算核心位于 `services/nuwax-workspace/`，由 Rust（系统编程语言）实现；`services/geometry/nuwax_geometry_runtime/` 负责几何运行编排，Python（编程语言）服务和网关组合这些能力。ROS2（机器人操作系统第二版）不再是当前平台计算主链。
 
-当前首个黄金路径是 Go2；`scripts/bootstrap.py` 已为 `go2`、`g1`、`customrobot` 预留统一部署入口。
+## 开发机验证
 
-## 快速开始
-
-### 1. 克隆仓库并进入目录
+先使用已安装项目依赖的 Python 环境，在仓库根执行：
 
 ```bash
-git clone <your-repo-url>
-cd nuwax_robot_bridge
+python scripts/diagnostics/offline_platform_smoke.py
 ```
 
-### 2. 先做分层检查
+命令使用显式模拟的静止状态和图像，启动真实本机 HTTP（超文本传输协议）网关，完成 MCP 初始化、发现、状态、抓图、制品下载、感知编排、地图创建和查询，最后关闭进程与后台线程。不会连接机器人，也不会下载或加载识别模型。
+
+保留本次产物：
 
 ```bash
-python3 scripts/bootstrap.py check \
-  --robot go2 \
-  --tier full \
-  --geometry \
-  --data-plane \
-  --memory-mode cloud \
-  --perception-mode hybrid \
-  --mcp-mode auto
+python scripts/diagnostics/offline_platform_smoke.py --output-dir runtime_data/offline-check
 ```
 
-`check` 会按当前机器人和能力组合检查 Python、pip、MCP 模板等前置条件；默认项目 `.venv` 还会检查 `venv/ensurepip`。启用 geometry 或构建 geometry 工作区时才会额外检查 ROS2 与 CycloneDDS；启用 Go2 + geometry 时还会检查 Go2SLAM 工作区 `install/setup.bash`、源码新鲜度和关键 ROS2 包；启用 Go2 data plane 时则会检查 Go2 数据面模板。
-
-### 3. 选择部署方式
-
-交互式向导：
+公共 Rust 工作区的开发验证：
 
 ```bash
-python3 scripts/bootstrap.py wizard
+cargo test --manifest-path services/nuwax-workspace/Cargo.toml --workspace --lib
+cargo build --manifest-path services/geometry/nuwax_geometry_runtime/Cargo.toml --release --bin nuwax-geometry-runtime
+cargo build --manifest-path services/nuwax-workspace/Cargo.toml --release -p nuwax-nav-stack --features simple-2d,replanning-astar
 ```
 
-向导会按选择直接执行部署动作；默认会创建项目 `.venv` 并让 `scripts/start_gateway.sh` 使用它。启用 Go2 + geometry 时会构建平台 geometry 工作区和 Go2SLAM 嵌套工作区；如果选择安装 `NuwaxClaw` Docker 客户端，还会继续询问宿主机根目录挂载模式和个人密钥。
-
-无交互执行：
+两种原生定位程序编译完成后，可用相同的合成传感器场景验证真实算法及进程关闭：
 
 ```bash
-python3 scripts/bootstrap.py apply --non-interactive \
-  --robot go2 \
-  --tier full \
-  --geometry \
-  --data-plane \
-  --memory-mode cloud \
-  --perception-mode hybrid \
-  --systemd \
-  --mcp-mode auto
+python scripts/diagnostics/native_lio_smoke.py --backend all --gateway \
+  --runtime-binary services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime
 ```
 
-如果同时要安装 `NuwaxClaw` Docker 客户端，可追加：
+该验证不连接硬件。图像链验证使用元数据检测后端，不代表视觉模型准确率。
 
-```bash
-  --install-nuwaclaw-docker \
-  --nuwaclaw-host-mount ro \
-  --nuwaclaw-saved-key <你的个人密钥>
+公共工作区声明的 Rust 最低版本为 1.88。原生计算库还需要对应系统开发依赖；完整依赖由构建错误和各库构建文件说明。不要用虚构发布清单或摘要绕过构建问题。
+
+## 接入机器人
+
+`drivers/customrobot/` 提供可用的标准数据装配。接入代码创建装配后发布 `RobotState`（机器人状态）、`ImageFrame`（图像帧）、`CanonicalLidarFrame`（规范雷达帧）与 `CanonicalImuSample`（规范惯性样本）；标定和坐标系必须与实际设备一致。缺少某类数据时对应能力显示不可用。
+
+```python
+from drivers.customrobot import create_customrobot_assembly
+
+robot = create_customrobot_assembly(config, sensor_topology=topology)
+robot.start()
+robot.providers.publish_robot_state(state)
+robot.providers.publish_image(image, camera_info)
+robot.providers.publish_imu(imu_sample)
+robot.providers.publish_point_cloud(lidar_frame)
 ```
 
-脚本会自动附加 `--add-host=host.docker.internal:host-gateway`，并暴露 `6080`、`60005`、`60006` 端口。
+机器人运动只需实现 `providers.motion.MotionControl` 的速度和停止操作。使用 `NUWAX_MOTION_GUARD_BACKEND=motion_control` 与 `NUWAX_MOTION_CONTROL_FACTORY=模块:工厂`，将执行器接入现有运动仲裁服务。Go2（宇树四足机器人）保留官方设备执行后端；G1（宇树人形机器人）等注册入口仍需相应设备实现。
 
-执行完成后会按当前选择生成：
+摄像头数据可用于观察和抓图；物体识别需要配置对应模型。原生定位需要符合后端要求的雷达、惯性数据和外参。导航进一步需要可用定位、地图和运动执行。不能仅凭硬件名称宣称全部能力已经可用。
 
-- 根配置 `.env`，包含 `NUWAX_PYTHON_BIN` 与检测到的 `NUWAX_ROS_SETUP_SCRIPT`
-- Go2 专属配置 `drivers/go2/data_plane.env`
-- 默认项目虚拟环境 `.venv`
-- 可选 `systemd` 示例
-- 可选 MCP 配置文件
-- 可选 `NuwaxClaw` Docker 客户端容器
+## 配置与运行
 
-实机如果从 `main` 切换到 `go2_inner_slam`，或更新了 Go2SLAM launch/config/package 源码，必须重新构建 ROS2 工作区；不要复用旧分支留下的 `install/setup.bash`。
-
-### 4. 手工启动网关
+本地运行时复制 `.env.example` 为 `.env`，按机器人能力选择需要的配置。`NUWAX_BOOTSTRAP_ENV_FILE` 可显式选择平台配置文件，`GO2_DATA_PLANE_ENV_FILE` 可选择 Go2 数据面配置文件；Python 与启动脚本共用读取规则，显式进程环境变量优先。设置页面会显示实际来源与保存位置。
 
 ```bash
 bash scripts/start_gateway.sh
 ```
 
-`scripts/start_gateway.sh` 会读取根 `.env`，按 `NUWAX_PYTHON_BIN` 选择 Python 解释器，按 `NUWAX_ACTIVE_ROBOT` 加载机器人运行环境，并在启用 geometry 时加载平台 geometry 运行环境。
+部署命令说明可通过 `python scripts/bootstrap.py --help` 查看。生产服务共用 `/var/lib/nuwax_robot_bridge/settings.env` 作为用户设置覆盖文件，由 `NUWAX_USER_CONFIG_ENV_FILE` 指明；控制台保存到这里，各服务在基础配置之后读取。原来的几何、点云专用配置只保留读取兼容。没有指定统一覆盖文件的本地运行仍保存到已有配置来源，不需要修改系统目录权限。
 
-### 5. 验证接口
+几何启动器 `scripts/systemd/start_geometry_runtime.sh` 直接运行本地构建，不要求 SHA（安全散列算法）摘要或历史验收记录。只有显式设置 `NUWAX_GEOMETRY_RELEASE_MANIFEST` 时才使用已有发布包检查。合法算法组合可以先保存后构建，页面只提示当前缺少的程序或标定。
 
-```bash
-# 网关已完全移除鉴权，无需 Authorization header，直接 curl 即可
-curl http://127.0.0.1:8766/api/health
+开发构建的几何程序位于 `services/geometry/nuwax_geometry_runtime/target/release/`，它使用独立构建清单；部署安装器将程序放入所选发布目录的 `bin/`。不要混用公共工作区与独立几何运行时的输出目录。
 
-curl http://127.0.0.1:8766/api/tools
-```
+网关默认端口为 8766，主要入口：
 
-### 6. 打开本机只读 Web 调试面板
+- `/mcp`：工具发现与调用。
+- `/api/health`、`/api/tools`：状态与能力。
+- `/console`：Nuwax 机器人控制台，提供机器人状态、地图、结构化日志和统一设置；旧 `/debug` 地址跳转到此处。
+- `/api/logs`、`/api/logs/export`：日志查询和导出。
+- `/api/config/schema`、`/api/config/save`：设置目录和保存。
+- `/events/stream`、`/streams/sse`、`/streams/ws`：事件与数据流。
 
-启动宿主机网关后，可以在浏览器打开本机调试页：
+`cancel_navigation` 与 `get_navigation_state` 使用真实导航服务。取消受理与取消完成分别表达；工具不再固定返回“尚未接通”。`capture_image` 返回标准图像制品。
 
-```text
-http://127.0.0.1:8766/debug
-```
+## 控制台、日志和设置
 
-调试页和 `/api/debug/*` 只读接口不要求网关令牌。通过 SSH（安全外壳协议）隧道访问 Go2 时继续打开本机地址：
+打开 `http://127.0.0.1:8766/console`。设置项上方显示中文名称，下方显示对应键名，可选值使用中文标签，保存的机器值保持规范名称。编辑值、程序默认值、当前进程已读取值以及生效范围分别展示；保存后按提示重启对应服务，外部进程尚未确认的值不会显示为已确认生效。
 
-```bash
-ssh -L 8766:127.0.0.1:8766 unitree@<Go2_IP>
-```
+日志页面按时间、级别、来源和组件组织记录，支持文本搜索、请求或任务筛选、展开异常与结构字段、单条或整页复制，以及文本或 JSONL（逐行结构化文本）导出。网关和独立 Rust、视频、运动组件的日志在同一页面查询。
 
-```text
-http://127.0.0.1:8766/debug
-```
+`NUWAX_LOG_DIR` 指定共同日志目录，默认 `runtime_data/logs`；`NUWAX_LOG_FILE` 指定网关主文件，独立组件使用各自的 `nuwax-*.log` 文件。`NUWAX_LOG_MAX_BYTES` 和 `NUWAX_LOG_BACKUP_COUNT` 控制容量轮转。`NUWAX_LOG_LEVEL` 与 `NUWAX_LOG_LEVEL_*` 控制平台日志级别，`RUST_LOG` 控制 Rust 运行进程的过滤。文件始终保存结构化记录，`NUWAX_LOG_FORMAT` 只改变终端格式；目录不可写时会记录原因并回退到可用输出。
 
-如果网关运行在 Go2 真机上，也可以直接访问 Go2 的网关地址：
+## 验证边界
 
-```text
-http://<Go2_IP>:8766/debug
-```
-
-该页面是只读调试面板，不包含运动控制、导航目标下发、探索启停、地图保存/删除等控制功能。面板会展示服务状态、运行事件/日志、2D SLAM（同步定位与建图）栅格、机器人位姿与轨迹、navigation/frontier（导航/探索前沿）摘要、点云元数据，以及数据时间戳、延迟和 stale（过期）状态。
-
-常用只读调试 API（应用程序接口）：
-
-```text
-http://127.0.0.1:8766/api/debug/overview
-http://127.0.0.1:8766/api/debug/map
-http://127.0.0.1:8766/api/debug/localization
-http://127.0.0.1:8766/api/debug/navigation
-http://127.0.0.1:8766/api/debug/pointcloud/latest
-http://127.0.0.1:8766/api/debug/logs/tail
-```
-
-兼容别名：
-
-```text
-http://127.0.0.1:8766/api/debug/snapshot
-http://127.0.0.1:8766/api/debug/map/frame/latest
-http://127.0.0.1:8766/api/debug/localization/pose/latest
-http://127.0.0.1:8766/api/debug/localization/trajectory
-http://127.0.0.1:8766/api/debug/exploration/frontier/latest
-http://127.0.0.1:8766/api/debug/pointcloud/frame/latest/meta
-```
-
-真机上的地图/frontier P95（第 95 百分位延迟）、真实点云性能和 frontier 几何高亮仍需要在 Go2 环境中验收。
-
-## 常见部署组合
-
-### Go2 全量能力
-
-```bash
-python3 scripts/bootstrap.py apply --non-interactive \
-  --robot go2 \
-  --tier full \
-  --geometry \
-  --data-plane \
-  --memory-mode cloud \
-  --perception-mode hybrid \
-  --systemd \
-  --mcp-mode auto
-```
-
-### Go2 轻量能力
-
-```bash
-python3 scripts/bootstrap.py apply --non-interactive \
-  --robot go2 \
-  --tier lite \
-  --no-geometry \
-  --no-data-plane \
-  --memory-mode disabled \
-  --perception-mode local \
-  --mcp-mode config-only
-```
-
-### 自定义机器人最小入口
-
-```bash
-python3 scripts/bootstrap.py apply --non-interactive \
-  --robot customrobot \
-  --tier lite \
-  --no-geometry \
-  --memory-mode disabled \
-  --perception-mode disabled \
-  --mcp-mode skip
-```
-
-## 更多文档
-
-- [部署文档.md](docs/公开文档/部署文档.md)
-- [文档导航.md](docs/公开介绍文档/文档导航.md)
-- [平台架构说明.md](docs/公开介绍文档/平台架构说明.md)
-- [宿主机与容器通信说明.md](docs/公开介绍文档/宿主机与容器通信说明.md)
+无实机测试覆盖输入适配、算法场景、真实本机通信、地图读写和生命周期。它不代表实机运动、真实场景识别准确率或建图精度已验收。`--gateway` 场景经 MCP 控制建图，并从正式HTTP事件流读取完整地图。

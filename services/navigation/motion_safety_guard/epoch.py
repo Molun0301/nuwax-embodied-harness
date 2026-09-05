@@ -508,6 +508,24 @@ class EpochStore:
         self.provision_path = Path(provision_path)
         self.epoch_path = Path(epoch_path)
 
+    def initialize_standard_control(self) -> None:
+        """在持有实例锁时初始化标准执行器缺失的记录，保留已有代际。
+
+        标准接口没有厂商符号清单；新实例使用现有 EpochRecord 的默认兼容
+        身份。已有记录仍由 advance_boot 原路径读取与校验，不覆盖或重置。
+        """
+
+        if not self.provision_path.exists() and not self.provision_path.is_symlink():
+            self.provision_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_write_record(
+                self.provision_path,
+                ProvisionRecord.create(instance_id=str(uuid.uuid4())).to_document(),
+                mode=0o400,
+            )
+        if not self.epoch_path.exists() and not self.epoch_path.is_symlink():
+            self.epoch_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_write_record(self.epoch_path, EpochRecord.initial().to_document(), mode=0o600)
+
     @staticmethod
     def _load_document(path: Path, *, expected_mode: int, label: str) -> Dict[str, Any]:
         flags = os.O_RDONLY | os.O_CLOEXEC

@@ -383,12 +383,17 @@ def _load_verified_records(
     return uid, gid, provisioned, epoch
 
 
-def provision(state_dir: Path, manifest: Path, owner: str) -> None:
+def provision(
+    state_dir: Path, manifest: Optional[Path], owner: str, *, backend: str = "unitree_sdk2py",
+) -> None:
+    if manifest is None and backend != "motion_control":
+        raise ValueError("Go2 provisioning requires --actuator-symbols-file")
     uid, gid = _owner_ids(owner)
     _ensure_state_dir(state_dir, uid, gid)
     provision_path = state_dir / "provisioned.json"
     epoch_path = state_dir / "epoch.json"
-    actuator_digest = _manifest_digest(manifest)
+    # 标准执行接口没有厂商清单，新实例只使用旧记录格式的内部兼容值。
+    actuator_digest = _manifest_digest(manifest) if manifest is not None else "sha256:" + "0" * 64
 
     if provision_path.exists():
         _load_record(provision_path, PROVISION_FIELDS)
@@ -402,7 +407,7 @@ def provision(state_dir: Path, manifest: Path, owner: str) -> None:
             _validate_legacy_epoch_for_guard_migration(epoch)
         else:
             _validate_epoch_semantics(epoch)
-        if epoch["actuator_symbols_sha256"] != actuator_digest:
+        if manifest is not None and epoch["actuator_symbols_sha256"] != actuator_digest:
             raise ValueError("existing epoch actuator_symbols_sha256 does not match supplied manifest")
     else:
         created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -433,6 +438,11 @@ def _parser() -> argparse.ArgumentParser:
         )
         child.add_argument("--owner", default="nuwax")
         child.add_argument("--actuator-symbols-file", type=Path)
+        child.add_argument(
+            "--backend", choices=("unitree_sdk2py", "motion_control"),
+            default=os.environ.get("NUWAX_MOTION_GUARD_BACKEND", "").strip() or "unitree_sdk2py",
+            help="motion_control 使用标准接口，不需要厂商符号清单。",
+        )
     return parser
 
 
@@ -440,10 +450,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "provision":
-            if args.actuator_symbols_file is None:
-                raise ValueError(f"{args.command} requires --actuator-symbols-file")
-        if args.command == "provision":
-            provision(args.state_dir, args.actuator_symbols_file, args.owner)
+            provision(args.state_dir, args.actuator_symbols_file, args.owner, backend=args.backend)
         else:
             verify(args.state_dir, args.actuator_symbols_file, args.owner)
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as error:

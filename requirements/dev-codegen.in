@@ -4,7 +4,3 @@ pytest==8.3.5
 grpcio-tools==1.70.0
 ruff==0.9.10
 PyYAML==6.0.2
-
-# 旧 scripts/installer 仅供迁移期诊断；新 deploy_installer 不依赖交互 UI。
-questionary==2.1.0
-rich==13.9.4

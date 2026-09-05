@@ -122,6 +122,13 @@ where
             if is_blocked(nb.0, nb.1) {
                 continue;
             }
+            // 对角线两侧必须可通行，不能从接触的障碍格之间穿过。
+            if dx != 0
+                && dy != 0
+                && (is_blocked(current.0 + dx, current.1) || is_blocked(current.0, current.1 + dy))
+            {
+                continue;
+            }
             let tentative = cur_g + step;
             let existing = g_score.get(&nb).copied().unwrap_or(f64::INFINITY);
             if tentative < existing {
@@ -139,4 +146,15 @@ where
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagonal_cannot_escape_through_blocked_corners() {
+        let blocked = |x, y| !matches!((x, y), (0, 0) | (1, 1));
+        assert!(astar((0, 0), (1, 1), blocked, 100).is_none());
+    }
 }

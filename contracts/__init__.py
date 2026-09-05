@@ -8,20 +8,7 @@ from contracts.artifacts import (
     ArtifactStorageSummary,
 )
 from contracts.base import ContractModel, MetadataDict, TimestampedContract, utc_now
-from contracts.debug_views import (
-    DebugDataStatus,
-    DebugEnvelope,
-    DebugError,
-    DebugLocalizationView,
-    DebugLogEntry,
-    DebugLogsTailView,
-    DebugMapView,
-    DebugNavigationView,
-    DebugOverviewView,
-    DebugPointCloudMapView,
-    DebugPointCloudView,
-    DebugSourceSummary,
-)
+
 from contracts.capabilities import (
     CapabilityAvailability,
     CapabilityDescriptor,
@@ -165,18 +152,6 @@ __all__ = [
     "CanonicalLioMeasurement",
     "ContractModel",
     "CostMap",
-    "DebugDataStatus",
-    "DebugEnvelope",
-    "DebugError",
-    "DebugLocalizationView",
-    "DebugLogEntry",
-    "DebugLogsTailView",
-    "DebugMapView",
-    "DebugNavigationView",
-    "DebugOverviewView",
-    "DebugPointCloudMapView",
-    "DebugPointCloudView",
-    "DebugSourceSummary",
     "EvaluationGateResult",
     "EvaluationRunSummary",
     "EvaluationSliceKey",

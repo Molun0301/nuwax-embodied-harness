@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 import logging
 import os
 import socket
@@ -31,7 +33,7 @@ _ATTACHED_HEALTH_CHECK_TTL_SEC = 1.0
 # attach 验活/GetStatus 单次 RPC 超时。复用 _read_deadline_sec 默认值 2.0s；
 # 单独定义便于测试时压低到 0.5s。
 _ATTACHED_HEALTH_CHECK_TIMEOUT_SEC = float(
-    os.environ.get("NUWAX_GEOMETRY_RUNTIME_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
+    runtime_value("NUWAX_GEOMETRY_RUNTIME_ATTACH_HEALTH_TIMEOUT_SEC", "2.0")
 )
 class GeometryRuntimeSubprocess:
     """兼容旧类名的 attach-only nuwax-geometry-runtime 客户端。"""
@@ -81,7 +83,7 @@ class GeometryRuntimeSubprocess:
     def _verify_ready_locked(self) -> bool:
         """校验 canonical launcher 发布的最小 ready 标记。"""
         ready_path = Path(
-            os.environ.get(
+            runtime_value(
                 "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
                 str(
                     Path(__file__).resolve().parents[2]
@@ -123,8 +125,8 @@ class GeometryRuntimeSubprocess:
         若挂接到的旧 runtime 未启用 video_relay，则 /tmp/nuwax_video.sock 与
         .shm 不存在，感知视频源将永远 available=False 且静默失败，故显式告警。
         """
-        shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
-        uds_path = os.environ.get("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
+        shm_path = runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+        uds_path = runtime_value("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
         shm_ok = os.path.exists(shm_path)
         uds_ok = os.path.exists(uds_path)
         if not (shm_ok and uds_ok):

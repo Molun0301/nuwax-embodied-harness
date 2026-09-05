@@ -11,9 +11,11 @@ use nuwax_mapping_cli::{run, Cli};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    nuwax_core::logging::init_component_logging("nuwax-mapping-cli", "info");
 
-    run(cli).await
+    let result = run(cli).await;
+    if let Err(error) = &result {
+        nuwax_core::logging::process_error("nuwax-mapping-cli", error);
+    }
+    result
 }

@@ -77,6 +77,14 @@ pub enum LcmError {
         /// 出错的 channel 名
         channel: String,
     },
+    /// 批量发布中某条消息失败；其后的消息未发送。
+    #[error("LCM batch publish failed at sample {index}: {source}")]
+    PublishBatch {
+        /// 失败消息在批次内的零基序号。
+        index: usize,
+        /// 底层发布错误。
+        source: Box<LcmError>,
+    },
     /// subscribe 失败
     #[error("lcm_subscribe 失败 (channel={channel})")]
     Subscribe {
@@ -188,6 +196,11 @@ enum Command {
         /// payload bytes
         payload: Bytes,
         /// reply:成功 / 失败 via oneshot(rework22 P0-04:让 caller 拿到 publish 真错误)
+        reply: oneshot::Sender<Result<(), LcmError>>,
+    },
+    /// 同一批消息按给定顺序发布，整批只确认一次。
+    PublishBatch {
+        messages: Vec<(CString, Bytes)>,
         reply: oneshot::Sender<Result<(), LcmError>>,
     },
     /// 注册一条订阅。owner thread 调 lcm_subscribe + 装一个 broadcast sender
@@ -429,6 +442,22 @@ impl OwnerThread {
                 reply,
             } => {
                 let result = self.publish(&channel, &payload);
+                let _ = reply.send(result);
+                (false, None)
+            }
+            Command::PublishBatch { messages, reply } => {
+                let result =
+                    messages
+                        .iter()
+                        .enumerate()
+                        .try_for_each(|(index, (channel, payload))| {
+                            self.publish(channel, payload).map_err(|source| {
+                                LcmError::PublishBatch {
+                                    index,
+                                    source: Box::new(source),
+                                }
+                            })
+                        });
                 let _ = reply.send(result);
                 (false, None)
             }
@@ -705,6 +734,36 @@ impl LcmContext {
         })?
     }
 
+    /// 将一个有序批次交给原有线程连续发布，完成整批后返回一次确认。
+    ///
+    /// 中途失败立即停止；已发布的前缀不会撤回。确认仅表示本地发布完成。
+    pub async fn publish_batch(&self, messages: Vec<(String, Bytes)>) -> Result<(), LcmError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let messages = messages
+            .into_iter()
+            .map(|(channel, payload)| {
+                to_cstring(&channel)
+                    .map(|channel| (channel, payload))
+                    .map_err(|_| LcmError::NulByte(channel))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::PublishBatch {
+                messages,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|error| LcmError::OwnerThreadDown {
+                detail: error.to_string(),
+            })?;
+        reply_rx.await.map_err(|error| LcmError::OwnerThreadDown {
+            detail: error.to_string(),
+        })?
+    }
+
     /// 注册一个 subscription。
     ///
     /// 返回一个 [`LcmSubscription`],caller 通过其 `receiver` 拉消息。
@@ -843,6 +902,33 @@ mod tests {
         assert!(alive.load(Ordering::Acquire));
         drop(context);
         assert!(!alive.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn measurement_publication_does_not_wait_per_imu_sample() {
+        let context = LcmContext::new("memq://").expect("真实 liblcm 内存传输");
+        let started = std::time::Instant::now();
+        context
+            .publish_batch(
+                (0_u64..21)
+                    .map(|index| {
+                        (
+                            "/test/measurement".to_owned(),
+                            Bytes::copy_from_slice(&index.to_le_bytes()),
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("21 条输入消息发布耗时：{elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "同帧输入不应累计逐条等待：{elapsed:?}"
+        );
+        context.publish_batch(Vec::new()).await.unwrap();
+        context.shutdown().await.unwrap();
     }
 
     #[cfg(feature = "link-liblcm")]

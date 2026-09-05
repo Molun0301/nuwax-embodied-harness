@@ -18,12 +18,6 @@
 //! - typed suffix: `LcmTopic::as_subscription_pattern` 与
 //!   `parse_subscription_pattern` 在 pub/sub 边界统一。
 //!
-//! ## 历史占位（标记为 deprecated）
-//!
-//! `UdpTransport` / `ShmTransport` 仍存在以保留 `nuwax-transport::Transport`
-//! trait(下游 crate 可能用到);它们走 `MessageEnvelope` 兼容层,不再是
-//! 默认协议层。`bytes_to_vec` 保留为 codec 互转 helper。
-//!
 //! ## P0 foundation 边界
 //!
 //! - 完成:LCM trait / real backend / typed suffix 支持 / 错误类型；
@@ -38,8 +32,6 @@ use futures::Stream;
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use std::sync::Arc;
 use thiserror::Error;
-
-pub mod compat;
 
 /// real-lcm backend(Phase 3,2026-07-07 实装;仅在 `real-lcm` feature 开启时编译)。
 #[cfg(feature = "real-lcm")]
@@ -92,6 +84,19 @@ pub type LcmFrameStream =
 pub trait LcmBackend: Send + Sync {
     /// 异步发布一帧
     async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()>;
+    /// 按输入顺序发布一批消息，失败后不再发送后续消息。
+    ///
+    /// 真实后端用单次线程命令完成，默认实现保留其它后端的逐条兼容。
+    async fn publish_batch(&self, frames: Vec<RawLcmFrame>) -> TransportResult<()> {
+        for (index, frame) in frames.into_iter().enumerate() {
+            self.publish(frame).await.map_err(|error| {
+                TransportError::LcmBackend(format!(
+                    "batch publish failed at sample {index}: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
     /// 异步订阅 topic 帧流
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream;
     /// 后端名称（诊断 / 日志用）
@@ -164,6 +169,11 @@ impl LcmTransport {
         self.backend.publish(frame).await
     }
 
+    /// 发布一个有序批次，等待后端完成整个批次的本地发送。
+    pub async fn publish_batch(&self, frames: Vec<RawLcmFrame>) -> TransportResult<()> {
+        self.backend.publish_batch(frames).await
+    }
+
     /// 订阅 topic 帧流
     pub async fn subscribe(
         &self,
@@ -217,6 +227,9 @@ impl LcmBackend for LcmTransport {
     async fn publish(&self, frame: RawLcmFrame) -> TransportResult<()> {
         self.backend.publish(frame).await
     }
+    async fn publish_batch(&self, frames: Vec<RawLcmFrame>) -> TransportResult<()> {
+        self.backend.publish_batch(frames).await
+    }
     async fn subscribe(&self, topic: LcmTopic, msg_type: Option<LcmMessageType>) -> LcmFrameStream {
         self.backend.subscribe(topic, msg_type).await
     }
@@ -227,86 +240,6 @@ impl LcmBackend for LcmTransport {
     #[cfg(feature = "real-lcm")]
     fn shared_lcm_context(&self) -> Option<Arc<nuwax_lcm::LcmContext>> {
         self.backend.shared_lcm_context()
-    }
-}
-
-// ============================================================================
-// 兼容层（历史 UDP/SHM 抽象 + MessageEnvelope 旧 API）
-// ============================================================================
-//
-// 总纲修订后,UDP/SHM 不再是默认传输层;它们仅保留以避免破坏下游 crate
-// 中 `use nuwax_transport::Transport` / `use nuwax_transport::UdpTransport`
-// 等导入。`Transport` trait / `UdpTransport` / `ShmTransport` 标记为
-// deprecated,业务层请改用 LCM-first API。
-
-/// 旧协议层信封（protobuf 兼容路径）
-#[allow(deprecated)]
-pub use nuwax_protocol::MessageEnvelope;
-
-/// 旧传输抽象（**deprecated**:请改用 [`LcmBackend`] / [`LcmTransport`]）
-#[deprecated(
-    since = "0.2.0",
-    note = "UDP/SHM 旧 API 已被 LcmBackend 取代;仅在 protobuf 兼容边界使用"
-)]
-#[allow(deprecated)] // trait 内部使用 MessageEnvelope 是预期行为
-#[async_trait]
-pub trait Transport: Send + Sync {
-    /// 发布一条消息
-    async fn publish(&self, envelope: MessageEnvelope) -> TransportResult<()>;
-    /// 订阅某个 topic,yield 流式消息
-    async fn subscribe(
-        &self,
-        topic: &str,
-    ) -> TransportResult<Box<dyn futures::Stream<Item = MessageEnvelope> + Send + Unpin>>;
-}
-
-/// UDP 多播传输（**deprecated**:历史占位,新代码请走 LCM-first）
-#[deprecated(
-    since = "0.2.0",
-    note = "UDP 多播已被 LCM-first 取代;仅在 protobuf 兼容边界使用"
-)]
-#[allow(dead_code)]
-pub struct UdpTransport {
-    /// 本地绑定地址
-    pub bind_addr: String,
-    /// 多播组地址
-    pub multicast_group: String,
-}
-
-#[allow(deprecated)]
-impl UdpTransport {
-    /// 构造 UDP 多播传输（**deprecated**:仅在 protobuf 兼容边界使用）
-    #[must_use]
-    pub fn new(bind_addr: impl Into<String>, multicast_group: impl Into<String>) -> Self {
-        Self {
-            bind_addr: bind_addr.into(),
-            multicast_group: multicast_group.into(),
-        }
-    }
-}
-
-/// 共享内存传输（**deprecated**:历史占位,新代码请走 LCM-first）
-#[deprecated(
-    since = "0.2.0",
-    note = "SHM 已被 LCM-first 取代;仅在 protobuf 兼容边界使用"
-)]
-#[allow(dead_code)]
-pub struct ShmTransport {
-    /// 共享内存文件路径
-    pub path: String,
-    /// 容量（字节）
-    pub capacity: usize,
-}
-
-#[allow(deprecated)]
-impl ShmTransport {
-    /// 构造共享内存传输（**deprecated**:仅在 protobuf 兼容边界使用）
-    #[must_use]
-    pub fn new(path: impl Into<String>, capacity: usize) -> Self {
-        Self {
-            path: path.into(),
-            capacity,
-        }
     }
 }
 
@@ -342,22 +275,6 @@ mod tests {
         fn name(&self) -> &str {
             "contextless-test"
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn udp_transport_construct_compat() {
-        let t = UdpTransport::new("0.0.0.0:0", "239.255.0.1");
-        assert_eq!(t.bind_addr, "0.0.0.0:0");
-        assert_eq!(t.multicast_group, "239.255.0.1");
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn shm_transport_construct_compat() {
-        let t = ShmTransport::new("/tmp/nuwax.shm", 1024);
-        assert_eq!(t.path, "/tmp/nuwax.shm");
-        assert_eq!(t.capacity, 1024);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
+from uuid import uuid4
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -18,10 +20,8 @@ DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 DEFAULT_EXTRA_VALUE_MAX_LENGTH = 240
 DEFAULT_PREVIEW_MAX_LENGTH = 600
 DEFAULT_LOG_DETAILS_TOTAL_MAX_LENGTH = 2000
-DEFAULT_LOG_MESSAGE_MAX_LENGTH = 4000
-DEFAULT_FORMATTED_LOG_MAX_LENGTH = 20_000
-DEFAULT_JSON_LOG_MAX_LENGTH = 20_000
-DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH = 800
+DEFAULT_LOG_MESSAGE_MAX_LENGTH = 64_000
+DEFAULT_FORMATTED_LOG_MAX_LENGTH = 128_000
 DEFAULT_JSON_EXTRA_MAX_FIELDS = 48
 DEFAULT_LOG_KEY_MAX_LENGTH = 120
 DEFAULT_LOGGER_NAME_MAX_LENGTH = 240
@@ -304,57 +304,6 @@ def _redact_and_compact_log_value(
     )
 
 
-def _compact_log_value(value: Any, *, max_depth: int, max_items: int) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, bool) or isinstance(value, (int, float)):
-        return value
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return f"<bytes len={len(value)}>"
-    if max_depth <= 0:
-        return f"<{type(value).__name__}>"
-    if isinstance(value, Mapping):
-        items = list(value.items())
-        compacted = {
-            str(key): _compact_log_value(item, max_depth=max_depth - 1, max_items=max_items)
-            for key, item in items[:max_items]
-        }
-        if len(items) > max_items:
-            compacted["..."] = f"+{len(items) - max_items} keys"
-        return compacted
-    if isinstance(value, (list, tuple, set, frozenset)):
-        items = list(value)
-        compacted_items = [
-            _compact_log_value(item, max_depth=max_depth - 1, max_items=max_items)
-            for item in items[:max_items]
-        ]
-        if len(items) > max_items:
-            compacted_items.append(f"...(+{len(items) - max_items} items)")
-        return compacted_items
-    return str(value)
-
-
-def compact_log_value(
-    value: Any,
-    *,
-    max_length: int = DEFAULT_EXTRA_VALUE_MAX_LENGTH,
-    max_depth: int = 2,
-    max_items: int = 8,
-) -> str:
-    compacted = _compact_log_value(value, max_depth=max_depth, max_items=max_items)
-    if compacted is None:
-        return "-"
-    if isinstance(compacted, str):
-        return _truncate_text(compacted, max_length)
-    try:
-        rendered = json.dumps(compacted, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    except TypeError:
-        rendered = str(compacted)
-    return _truncate_text(rendered, max_length)
-
-
 def compact_log_detail_value(
     value: Any,
     *,
@@ -616,22 +565,47 @@ _capability_name_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
-def set_correlation_context(*, request_id: str = "", capability_name: str = "") -> None:
-    if request_id:
-        _correlation_id.set(request_id)
-    if capability_name:
-        _capability_name_ctx.set(capability_name)
+_task_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("task_id", default="")
 
 
-def clear_correlation_context() -> None:
-    _correlation_id.set("")
-    _capability_name_ctx.set("")
+@contextmanager
+def correlation_context(*, request_id: str = "", task_id: str = "", capability_name: str = ""):
+    """在请求或工作线程内绑定关联信息，退出后恢复外层上下文。"""
+    tokens = []
+    for variable, value in ((_correlation_id, request_id), (_task_id_ctx, task_id), (_capability_name_ctx, capability_name)):
+        if value:
+            tokens.append((variable, variable.set(value)))
+    try:
+        yield
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+
+
+def set_correlation_context(*, request_id: str = "", capability_name: str = "", task_id: str = "") -> list:
+    tokens = []
+    for variable, value in ((_correlation_id, request_id), (_capability_name_ctx, capability_name), (_task_id_ctx, task_id)):
+        if value:
+            tokens.append((variable, variable.set(value)))
+    return tokens
+
+
+def clear_correlation_context(tokens=None) -> None:
+    if tokens is not None:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+    else:
+        _task_id_ctx.set("")
+        _correlation_id.set("")
+        _capability_name_ctx.set("")
 
 
 class CorrelationContextFilter(logging.Filter):
     """自动将 correlation context 注入每条 LogRecord。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if not getattr(record, "task_id", "") and _task_id_ctx.get():
+            record.task_id = _task_id_ctx.get()
         cid = _correlation_id.get("")
         request_id = (
             getattr(record, "request_id", "")
@@ -690,7 +664,8 @@ class DeduplicatingLogFilter(logging.Filter):
         if record.levelno >= logging.ERROR:
             return True
         try:
-            msg_key = record.getMessage()[:120]
+            msg_key = (record.name, record.levelno, getattr(record, "request_id", ""),
+                       getattr(record, "task_id", ""), getattr(record, "event", ""), record.getMessage())
         except Exception:
             return True
         now = time.monotonic()
@@ -714,153 +689,71 @@ class DeduplicatingLogFilter(logging.Filter):
 # ---------------------------------------------------------------------------
 
 
+def structured_log_entry(record: logging.LogRecord) -> Dict[str, Any]:
+    """磁盘、历史查询和实时流共用同一条结构日志，保留异常栈与关联字段。"""
+    cached = getattr(record, "_nuwax_log_entry", None)
+    if cached is not None:
+        return cached
+    CorrelationContextFilter().filter(record)
+    details = {}
+    budget = _LogProjectionBudget()
+    for index, (key, value) in enumerate(_iter_extra_items(record)):
+        if index >= DEFAULT_JSON_EXTRA_MAX_FIELDS or budget.remaining_nodes <= 0:
+            details["_omitted"] = "扩展字段超过日志容量"
+            break
+        details[key] = _redact_and_compact_log_value(
+            value, key=key, max_depth=6, max_items=24,
+            max_string_length=4_000, _budget=budget,
+        )
+    raw_source = _safe_log_field(getattr(record, "source", "python")) or "python"
+    source = raw_source if raw_source in {"python", "rust", "native"} else "python"
+    if raw_source != source:
+        details["origin"] = raw_source
+    details["location"] = {"file": record.pathname, "line": record.lineno, "function": record.funcName}
+    details["thread"] = record.threadName
+    details["process_id"] = record.process
+    entry = {
+        "id": uuid4().hex,
+        "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="microseconds"),
+        "level": _normalized_log_level(record).lower(),
+        "source": source,
+        "component": _safe_log_field(record.name, max_length=DEFAULT_LOGGER_NAME_MAX_LENGTH),
+        "event": _safe_log_field(getattr(record, "event", None), max_length=160),
+        "message": _bounded_redact_text(record.getMessage(), max_length=DEFAULT_LOG_MESSAGE_MAX_LENGTH),
+        "request_id": _safe_log_field(getattr(record, "request_id", None)),
+        "task_id": _safe_log_field(getattr(record, "task_id", None)),
+        "capability_name": _safe_log_field(getattr(record, "capability_name", None)),
+        "exception": None,
+        "details": details,
+    }
+    if record.exc_info and record.exc_info[1]:
+        entry["exception"] = _redact_sensitive_text(logging.Formatter().formatException(record.exc_info))
+    elif record.exc_text:
+        entry["exception"] = _redact_sensitive_text(record.exc_text)
+    if record.stack_info:
+        details["stack"] = _redact_sensitive_text(record.stack_info)
+    for key in ("source", "event", "request_id", "task_id", "capability_name", "correlation_id"):
+        details.pop(key, None)
+    record._nuwax_log_entry = entry
+    return entry
+
+
 class JsonLineFormatter(logging.Formatter):
-    """输出 JSON Lines 格式日志。"""
+    """磁盘使用一行一个事件的结构格式，异常换行编码在同一记录内。"""
 
     def format(self, record: logging.LogRecord) -> str:
-        request_id = getattr(record, "request_id", "") or getattr(record, "correlation_id", "")
-        payload: Dict[str, Any] = {
-            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
-            "level": _normalized_log_level(record),
-            "logger": _safe_log_field(record.name, max_length=DEFAULT_LOGGER_NAME_MAX_LENGTH) or "-",
-            "msg": _truncate_text(
-                _bounded_redact_text(
-                    record.getMessage(),
-                    max_length=DEFAULT_LOG_MESSAGE_MAX_LENGTH,
-                ),
-                DEFAULT_LOG_MESSAGE_MAX_LENGTH,
-            ),
-        }
-        if request_id:
-            payload["request_id"] = _truncate_text(_redact_sensitive_text(str(request_id)), 160)
-        cid = getattr(record, "correlation_id", "")
-        if cid:
-            payload["correlation_id"] = _truncate_text(_redact_sensitive_text(str(cid)), 160)
-        budget = _LogProjectionBudget()
-        extra_count = 0
-        for key, value in _iter_extra_items(record):
-            if extra_count >= DEFAULT_JSON_EXTRA_MAX_FIELDS:
-                payload["_extra_fields_omitted"] = True
-                budget.truncated = True
-                break
-            if key in _PROTECTED_JSON_LOG_FIELDS or key in payload:
-                continue
-            payload[key] = _redact_and_compact_log_value(
-                value,
-                key=key,
-                max_depth=4,
-                max_items=12,
-                max_string_length=DEFAULT_EXTRA_VALUE_MAX_LENGTH,
-                _budget=budget,
-            )
-            extra_count += 1
-            if budget.remaining_nodes <= 0 or budget.remaining_chars <= 0:
-                payload["_extra_fields_omitted"] = True
-                budget.truncated = True
-                break
-        if budget.truncated:
-            payload["projection_truncated"] = True
-        if record.exc_info and record.exc_info[1]:
-            payload["exception"] = _truncate_text(
-                _redact_sensitive_text(self.formatException(record.exc_info)),
-                8_000,
-            )
-        rendered = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-            allow_nan=False,
-        )
-        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
-            return rendered
-
-        payload["truncated"] = True
-        if "exception" in payload:
-            payload["exception"] = _truncate_text(str(payload["exception"]), 3_000)
-        payload["msg"] = _truncate_text(str(payload["msg"]), 1_200)
-        protected = {
-            "ts",
-            "level",
-            "logger",
-            "msg",
-            "request_id",
-            "correlation_id",
-            "event",
-            "task_id",
-            "capability_name",
-            "duration_ms",
-            "error_category",
-            "exception",
-            "projection_truncated",
-            "truncated",
-        }
-        for key in reversed(tuple(payload)):
-            if key in protected:
-                continue
-            payload.pop(key, None)
-            rendered = json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-                allow_nan=False,
-            )
-            if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
-                return rendered
-        rendered = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-            allow_nan=False,
-        )
-        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
-            return rendered
-        fallback = {
-            "ts": payload["ts"],
-            "level": payload["level"],
-            "logger": _truncate_text(str(payload["logger"]), DEFAULT_LOGGER_NAME_MAX_LENGTH),
-            "msg": _truncate_text(str(payload["msg"]), 600),
-            "request_id": payload.get("request_id"),
-            "correlation_id": payload.get("correlation_id"),
-            "task_id": payload.get("task_id"),
-            "capability_name": payload.get("capability_name"),
-            "event": payload.get("event"),
-            "error_category": payload.get("error_category"),
-            "truncated": True,
-        }
-        rendered = json.dumps(
-            fallback,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-            allow_nan=False,
-        )
-        if len(rendered.encode("utf-8")) <= DEFAULT_JSON_LOG_MAX_LENGTH:
-            return rendered
-        return json.dumps(
-            {
-                "ts": _truncate_text(str(fallback.get("ts") or ""), 64),
-                "level": _truncate_text(str(fallback.get("level") or "UNKNOWN"), DEFAULT_LOG_LEVEL_MAX_LENGTH),
-                "logger": _truncate_text(str(fallback.get("logger") or "-"), 120),
-                "msg": _truncate_text(str(fallback.get("msg") or "-"), 240),
-                "truncated": True,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
+        return json.dumps(structured_log_entry(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 class StreamBusLogHandler(logging.Handler):
-    """将 Python 日志记录发布到 StreamBus 的 logs.entry topic。"""
+    """发布与磁盘一致的结构日志；兼容字段只用于旧流客户端。"""
 
     def __init__(self, stream_bus, level=logging.NOTSET):
         super().__init__(level)
         self._stream_bus = stream_bus
         self._sequence = 0
         self._emit_state = threading.local()
+        self.addFilter(CorrelationContextFilter())
 
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(self._emit_state, "active", False):
@@ -868,80 +761,27 @@ class StreamBusLogHandler(logging.Handler):
         self._emit_state.active = True
         try:
             self._sequence += 1
-            severity = _normalized_log_level(record).lower()
-            if severity == "warning":
-                severity = "warn"
-            raw_message = record.getMessage()
-            message = _safe_log_field(
-                raw_message,
-                max_length=DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH,
-            ) or "-"
-            details = _build_details_compact(record)
-            extra: Dict[str, Any] = {}
-            for key in _EXTRA_FIELD_ORDER:
-                value = getattr(record, key, None)
-                if value is not None:
-                    extra[key] = value
-            timestamp_iso = datetime.fromtimestamp(record.created, timezone.utc).isoformat()
-            request_id = extra.get("request_id") or getattr(record, "correlation_id", None)
-            runtime_message = _safe_log_field(
-                extra.get("runtime_message"),
-                max_length=DEFAULT_STREAM_LOG_MESSAGE_MAX_LENGTH,
-            )
-            runtime_event_type = _safe_log_field(extra.get("runtime_event_type"), max_length=160)
-            display_message = runtime_message or (
-                runtime_event_type if raw_message == "运行时事件" else message
-            )
-            event_type = _safe_log_field(extra.get("event"), max_length=160)
-            capability_name = _safe_log_field(extra.get("capability_name"), max_length=160)
-            error_category = _safe_log_field(extra.get("error_category"), max_length=80)
-            task_id = _safe_log_field(extra.get("task_id"), max_length=160)
-            category = _safe_log_field(extra.get("category"), max_length=120)
-            subject_id = _safe_log_field(extra.get("subject_id"), max_length=160)
-            source = _safe_log_field(record.name, max_length=DEFAULT_LOGGER_NAME_MAX_LENGTH) or "-"
+            payload = dict(structured_log_entry(record))
+            details = payload["details"]
+            payload.update({
+                "timestamp_unix_sec": record.created,
+                "timestamp_iso": payload["timestamp"],
+                "timestamp_text": _format_record_time_text(record),
+                "severity": payload["level"],
+                "event_type": payload["event"],
+                "display_message": details.get("runtime_message") or payload["message"],
+                "details_compact": _build_details_compact(record),
+            })
+            for key in ("runtime_event_type", "runtime_message", "payload_preview", "metadata_preview",
+                        "duration_ms", "error_category", "suppressed_count", "category", "subject_id"):
+                payload[key] = details.get(key)
             self._stream_bus.publish(
-                "logs.entry",
-                source=source,
-                payload={
-                    "timestamp": record.created,
-                    "timestamp_unix_sec": record.created,
-                    "timestamp_iso": timestamp_iso,
-                    "timestamp_text": _format_record_time_text(record),
-                    "severity": severity,
-                    "level": severity,
-                    "source": source,
-                    "message": message,
-                    "display_message": display_message,
-                    "event_type": event_type,
-                    "runtime_event_type": runtime_event_type,
-                    "runtime_message": runtime_message,
-                    "payload_preview": details.get("payload_preview"),
-                    "metadata_preview": details.get("metadata_preview"),
-                    "details_compact": details,
-                    "request_id": _safe_log_field(request_id, max_length=160),
-                    "task_id": task_id,
-                    "capability_name": capability_name,
-                    "duration_ms": _safe_log_field(extra.get("duration_ms")),
-                    "error_category": error_category,
-                    "suppressed_count": _safe_log_field(extra.get("suppressed_count")),
-                    "category": category,
-                    "subject_id": subject_id,
-                },
-                sequence=self._sequence,
-                status="available",
-                metadata={
-                    "severity": severity,
-                    "request_id": _safe_log_field(request_id, max_length=160),
-                },
+                "logs.entry", source=payload["component"], payload=payload,
+                sequence=self._sequence, status="available",
+                metadata={"severity": payload["level"], "request_id": payload["request_id"]},
             )
         except Exception as exc:
             if logging.raiseExceptions:
-                try:
-                    sys.stderr.write(
-                        "StreamBusLogHandler publish failed "
-                        f"({exc.__class__.__name__})\n"
-                    )
-                except Exception:
-                    pass
+                sys.stderr.write(f"日志流发布失败（{exc.__class__.__name__}）\n")
         finally:
             self._emit_state.active = False

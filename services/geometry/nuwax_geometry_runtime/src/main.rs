@@ -294,19 +294,7 @@ enum PendingLioIngress {
 
 enum PreparedLioIngress {
     Device(Arc<lio_ingress::CommonLioIngress>),
-    Native {
-        ingress: Arc<lio_ingress::NativeLioIngress>,
-        pair: Box<lio_ingress::ValidatedStartupPair>,
-    },
-}
-
-enum BoundLioIngress {
-    Device(Arc<dyn lio_owner::LioIngressSink>),
-    Native {
-        sink: Arc<dyn lio_owner::LioIngressSink>,
-        ingress: Arc<lio_ingress::NativeLioIngress>,
-        pair: Box<lio_ingress::ValidatedStartupPair>,
-    },
+    Native(Arc<lio_ingress::NativeLioIngress>),
 }
 
 impl PendingLioIngress {
@@ -336,11 +324,10 @@ impl PendingLioIngress {
             ))),
             Self::Native {
                 spec,
-                probe,
                 body_from_sensor,
                 pair_max_skew,
+                ..
             } => {
-                let pair = probe.take_validated_startup_pair()?;
                 lio_ingress::NativeLioIngress::with_runtime(
                     spec,
                     handle,
@@ -350,10 +337,7 @@ impl PendingLioIngress {
                     body_from_sensor,
                     pair_max_skew,
                 )
-                .map(|ingress| PreparedLioIngress::Native {
-                    ingress: Arc::new(ingress),
-                    pair: Box::new(pair),
-                })
+                .map(|ingress| PreparedLioIngress::Native(Arc::new(ingress)))
                 .map_err(|error| error.to_string())
             }
         }
@@ -365,24 +349,22 @@ impl PreparedLioIngress {
         self,
         correction_ingress: correction_coordinator::CorrectionFrameIngress,
         correction_applier: Arc<lcm_runtime::GeometryCanonicalCorrectionApplier>,
-    ) -> BoundLioIngress {
+    ) -> Arc<dyn lio_owner::LioIngressSink> {
         match self {
             Self::Device(inner) => {
-                BoundLioIngress::Device(Arc::new(lio_ingress::CorrectionAwareLioIngress::device(
+                Arc::new(lio_ingress::CorrectionAwareLioIngress::device(
                     inner,
                     correction_ingress,
                     correction_applier,
-                )))
+                ))
             }
-            Self::Native { ingress, pair } => BoundLioIngress::Native {
-                sink: Arc::new(lio_ingress::CorrectionAwareLioIngress::native(
-                    ingress.clone(),
+            Self::Native(ingress) => {
+                Arc::new(lio_ingress::CorrectionAwareLioIngress::native(
+                    ingress,
                     correction_ingress,
                     correction_applier,
-                )),
-                ingress,
-                pair,
-            },
+                ))
+            }
         }
     }
 }
@@ -1020,7 +1002,7 @@ async fn rollback_geometry_startup_and_lio(
 ) -> ExitCode {
     let (error, rollback_owner) = failure.into_parts();
     error!("{}", error);
-    eprintln!("{error}");
+    error!(event = "process.failed", "{error}");
     let mut rollback_failed = false;
     if let Some(rollback_owner) = rollback_owner {
         let mut rollback_owner = *rollback_owner;
@@ -1412,7 +1394,7 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
         return None;
     }
     if args.next().is_some() {
-        eprintln!("--print-release-artifacts 不接受其它参数");
+        error!(event = "process.failed", "--print-release-artifacts 不接受其它参数");
         return Some(ExitCode::from(2));
     }
 
@@ -1435,13 +1417,17 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
             Some(ExitCode::SUCCESS)
         }
         Err(error) => {
-            eprintln!("序列化 release artifact discovery 失败: {error}");
+            error!(event = "process.failed", "序列化 release artifact discovery 失败: {error}");
             Some(ExitCode::from(2))
         }
     }
 }
 
 fn main() -> ExitCode {
+    nuwax_core::logging::init_component_logging(
+        "nuwax-geometry-runtime",
+        "nuwax_geometry_runtime=info,nuwax_core=info,nuwax_protocol=warn,nuwax_transport=warn,nuwax_codec=warn,nuwax_tf=warn",
+    );
     if let Some(exit_code) = print_requested_release_artifacts() {
         return exit_code;
     }
@@ -1450,7 +1436,7 @@ fn main() -> ExitCode {
         Ok(true) => return ExitCode::SUCCESS,
         Ok(false) => {}
         Err(error) => {
-            eprintln!("视频中转 helper 失败: {error}");
+            error!(event = "process.failed", "视频中转 helper 失败: {error}");
             return ExitCode::from(1);
         }
     }
@@ -1459,7 +1445,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("{error}");
+                error!(event = "process.failed", "{error}");
                 ExitCode::from(1)
             }
         };
@@ -1468,7 +1454,7 @@ fn main() -> ExitCode {
     let lcm_backend = match lcm_runtime::LcmBackendKind::from_env() {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("{error}");
+            error!(event = "process.failed", "{error}");
             return ExitCode::from(1);
         }
     };
@@ -1476,7 +1462,7 @@ fn main() -> ExitCode {
     let preflight = match StartupPreflight::from_env() {
         Ok(preflight) => preflight,
         Err(error) => {
-            eprintln!("{error}");
+            error!(event = "process.failed", "{error}");
             return ExitCode::from(1);
         }
     };
@@ -1484,7 +1470,7 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("geometry runtime 初始化 Tokio 失败: {error}");
+            error!(event = "process.failed", "geometry runtime 初始化 Tokio 失败: {error}");
             return ExitCode::from(2);
         }
     };
@@ -1505,10 +1491,6 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         lio_source,
     } = preflight;
     let tf_binding = channel_bindings.binding(channel_registry::ChannelKey::Tf);
-    tracing_subscriber::fmt()
-        .with_env_filter("nuwax_geometry_runtime=info,nuwax_protocol=warn,nuwax_transport=warn,nuwax_codec=warn,nuwax_tf=warn")
-        .with_target(false)
-        .init();
     #[cfg(unix)]
     let unix_shutdown_signals = match UnixShutdownSignals::register() {
         Ok(signals) => signals,
@@ -1575,7 +1557,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         Ok(prepared) => prepared,
         Err(e) => {
             error!("{}", e);
-            eprintln!("{e}");
+            error!(event = "process.failed", "{e}");
             return ExitCode::from(4);
         }
     };
@@ -1807,75 +1789,23 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     };
     let bound_ingress =
         prepared_ingress.bind_correction(correction_owner.ingress(), correction_applier.clone());
-    let deferred_replay = match bound_ingress {
-        BoundLioIngress::Device(ingress) => {
-            if let Err(error) = ingress_gate.bind_and_open(ingress) {
-                error!("Geometry LIO routing gate 激活失败: {}", error);
-                return shutdown_runtime_owner(
-                    GeometryProductionOwner::new(
-                        runtime_owner,
-                        correction_owner,
-                        ingress_gate,
-                        correction_phase_a,
-                        None,
-                    ),
-                    ExitCode::from(4),
-                )
-                .await;
-            }
-            None
-        }
-        BoundLioIngress::Native {
-            sink,
-            ingress,
-            pair,
-        } => {
-            let token = match ingress_gate.bind_deferred(sink) {
-                Ok(token) => token,
-                Err(error) => {
-                    error!("Geometry native LIO deferred gate 绑定失败: {}", error);
-                    return shutdown_runtime_owner(
-                        GeometryProductionOwner::new(
-                            runtime_owner,
-                            correction_owner,
-                            ingress_gate,
-                            correction_phase_a,
-                            None,
-                        ),
-                        ExitCode::from(4),
-                    )
-                    .await;
-                }
-            };
-            let replay = lio_ingress::NativeDeferredReplayControl::new(
-                ingress,
-                ingress_gate.clone(),
-                correction_owner.ingress(),
-                correction_applier,
-                correction_phase_a.clone(),
-                token,
-                *pair,
-            );
-            if let Err(error) = replay.publish_startup_odometry().await {
-                error!(
-                    "Geometry native LIO startup odometry handoff 失败: {}",
-                    error
-                );
-                return shutdown_runtime_owner(
-                    GeometryProductionOwner::new(
-                        runtime_owner,
-                        correction_owner,
-                        ingress_gate,
-                        correction_phase_a,
-                        Some(replay),
-                    ),
-                    ExitCode::from(4),
-                )
-                .await;
-            }
-            Some(replay)
-        }
-    };
+    // 原始输入经后续 gRPC 到达，先开放正式 ingress，避免首帧与服务启动互相等待。
+    // 此时尚未接收传感器帧，不需要预取首对数据或启动重放 owner。
+    if let Err(error) = ingress_gate.bind_and_open(bound_ingress) {
+        error!("Geometry LIO routing gate 激活失败: {}", error);
+        return shutdown_runtime_owner(
+            GeometryProductionOwner::new(
+                runtime_owner,
+                correction_owner,
+                ingress_gate,
+                correction_phase_a,
+                None,
+            ),
+            ExitCode::from(4),
+        )
+        .await;
+    }
+    let deferred_replay = None;
     let mut runtime_owner = GeometryProductionOwner::new(
         runtime_owner,
         correction_owner,
@@ -2497,7 +2427,7 @@ pub(crate) mod lifecycle_tests {
         )
         .await
         .expect("LIO READY before Geometry production topology startup");
-        assert!(ingress.ready_seen.load(Ordering::Acquire));
+        assert!(!ingress.ready_seen.load(Ordering::Acquire));
         let shutdown = lio.shutdown_control_for_tests();
         (lio, shutdown)
     }
@@ -2598,7 +2528,7 @@ pub(crate) mod lifecycle_tests {
         )
         .await
         .expect("LIO subscription ACK and READY before later owners");
-        assert!(lio_probe.ready_seen.load(Ordering::Acquire));
+        assert!(!lio_probe.ready_seen.load(Ordering::Acquire));
         let lio_shutdown = lio.shutdown_control_for_tests();
 
         let mut geometry_topology = match topology_setup.spawn().await {
@@ -3944,7 +3874,7 @@ pub(crate) mod lifecycle_tests {
         )
         .await
         .expect("LIO READY before bare Mapping/LIO rollback fixture");
-        assert!(lio_probe.ready_seen.load(Ordering::Acquire));
+        assert!(!lio_probe.ready_seen.load(Ordering::Acquire));
         let lio_shutdown = lio.shutdown_control_for_tests();
         let mut topology = match setup.spawn().await {
             Ok(topology) => topology,
@@ -4227,7 +4157,7 @@ pub(crate) mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lio_ready_failure_does_not_start_mapping_or_correction() {
+    async fn lio_closed_gate_failure_does_not_start_mapping_or_correction() {
         let handle = lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-LCM Geometry handle");
@@ -4239,6 +4169,7 @@ pub(crate) mod lifecycle_tests {
         let occupancy_path = handle.occupancy_shm_path.clone().map(PathBuf::from);
         let lio_sink = Arc::new(PreCorrectionLioSink::new(true));
         let ingress_gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(lio_sink.clone()));
+        lio_owner::LioIngressSink::close(ingress_gate.as_ref());
 
         let error = lio_owner::LioOwnerHandle::start(
             handle.transport.clone(),
@@ -4247,10 +4178,10 @@ pub(crate) mod lifecycle_tests {
             ingress_gate,
         )
         .await
-        .expect_err("injected LIO READY failure");
+        .expect_err("closed LIO gate must reject startup");
 
-        assert!(error.contains("before Mapping/Correction startup"));
-        assert!(lio_sink.ready_seen.load(Ordering::Acquire));
+        assert!(error.contains("gate closed before startup readiness"));
+        assert!(!lio_sink.ready_seen.load(Ordering::Acquire));
         assert!(lio_sink.closed.load(Ordering::Acquire));
         assert!(!mapping.lock().snapshot().active);
         assert_eq!(mapping.lock().snapshot().session_generation, 0);

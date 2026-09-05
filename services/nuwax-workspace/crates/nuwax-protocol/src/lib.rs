@@ -5,7 +5,7 @@
 //! - 本 crate 把 **LCM** 作为默认消息协议层；wire format 与 `lcm_msgs`
 //!   (Python/C++/Rust) 保持 byte-for-byte 兼容。
 //! - `protobuf / prost / tonic / gRPC` **不**作为默认协议层；它们仅在
-//!   "确有上游 protobuf 兼容需求"的边界被显式启用（见 `compat` 模块）。
+//!   "确有上游 protobuf 兼容需求"的边界被显式启用。
 //! - LCM 消息以 **8 字节 preamble**(4 字节 magic `0x4c433032` = `"LC02"` 大端
 //!   网络序 + 4 字节 seqno 大端)+ payload 组成。Fingerprint **不**写入
 //!   wire —— 由 LCM channel typed suffix(`/topic#pkg.Msg`)在订阅端承担
@@ -38,10 +38,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub mod compat;
 pub mod lcm;
 
 /// 协议错误（保留为顶级 alias：避免破坏依赖 `nuwax_protocol::ProtocolError`
@@ -67,9 +65,6 @@ pub enum ProtocolError {
     },
 }
 
-/// 协议版本（保留常量为兼容层；默认协议走 LCM）
-pub const PROTOCOL_VERSION: u32 = 1;
-
 // ============================================================================
 // LCM-first 公共 API
 // ============================================================================
@@ -85,81 +80,17 @@ pub use lcm::{
     LCM_PROTOCOL_MINOR, LCM_TOPIC_TYPED_SUFFIX_SEP,
 };
 
-/// `nuwax-protocol` 占位 re-export：避免下游 crate `use nuwax_protocol::*` 时空集合。
-/// 默认协议层为 LCM；compat/protobuf 路径请显式 `use nuwax_protocol::compat::*`。
+/// 消息主题、类型、帧与错误的常用导出。
 pub mod prelude {
     pub use crate::{
         LcmFrameHeader, LcmMessageType, LcmTopic, ProtocolError, RawLcmFrame, LCM_MAGIC,
-        PROTOCOL_VERSION,
     };
-}
-
-// ============================================================================
-// 兼容层（deprecated / protobuf）
-// ============================================================================
-//
-// 总纲要求：protobuf 不再是默认协议层；这些类型仅用于"确有上游 protobuf
-// 兼容需求"的边界。下游 crate 默认走 LCM-first API。
-//
-// 标记为 deprecated 以提醒 review 代码使用 LCM-first 替代。该类型仍
-// 保留为 `pub`（带 `#[deprecated]`）以避免硬破坏，但不再出现在 `prelude`
-// 默认导出中。
-
-/// 通用消息信封（protobuf 兼容路径）。
-///
-/// **DEPRECATED**:默认协议层已迁移到 LCM。请改用
-/// [`RawLcmFrame`] / [`LcmTopic`]。
-/// 该类型仅在"确有上游 protobuf 兼容需求"的边界被启用。
-#[deprecated(
-    since = "0.2.0",
-    note = "nuwax-protocol 已迁移到 LCM-first;protobuf 仅作为 compat 路径,请改用 LcmTopic/RawLcmFrame"
-)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageEnvelope {
-    /// 协议版本
-    pub version: u32,
-    /// 消息类型（e.g. "geometry_msgs/PointStamped"）
-    pub msg_type: String,
-    /// 消息体（protobuf 字节）
-    pub payload: Vec<u8>,
-    /// 时间戳
-    pub stamp: nuwax_types::Timestamp,
-}
-
-#[allow(deprecated)]
-impl MessageEnvelope {
-    /// 构造新信封（仅在 protobuf 兼容路径中使用）
-    #[must_use]
-    pub fn new(msg_type: impl Into<String>, payload: Vec<u8>) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            msg_type: msg_type.into(),
-            payload,
-            stamp: nuwax_types::Timestamp::now(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RawLcmFrameBuilder;
-
-    #[test]
-    #[allow(deprecated)]
-    fn envelope_roundtrip_serde_compat_only() {
-        let env = MessageEnvelope::new("geometry_msgs/Pose", vec![1, 2, 3, 4]);
-        let json = serde_json::to_string(&env).unwrap();
-        let back: MessageEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.msg_type, "geometry_msgs/Pose");
-        assert_eq!(back.payload, vec![1, 2, 3, 4]);
-        assert_eq!(back.version, PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn protocol_version_constant() {
-        assert_eq!(PROTOCOL_VERSION, 1);
-    }
 
     #[test]
     fn lcm_magic_is_lc02() {

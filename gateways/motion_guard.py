@@ -106,6 +106,14 @@ class GatewayMotionGuard:
         self._lock = threading.RLock()
         self._client: Optional[MotionGuardClient] = None
         self._last_error: Optional[BaseException] = None
+        self._has_connected = False
+
+    @property
+    def has_connected(self) -> bool:
+        """本实例是否曾建立运动连接；断连不能抹掉已有运动责任。"""
+
+        with self._lock:
+            return self._has_connected
 
     @property
     def started(self) -> bool:
@@ -144,6 +152,7 @@ class GatewayMotionGuard:
                     f"motion guard is unavailable at {self.socket_path}: {exc}"
                 ) from exc
             self._client = client
+            self._has_connected = True
             self._last_error = None
 
     connect = start

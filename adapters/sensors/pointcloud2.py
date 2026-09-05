@@ -22,8 +22,11 @@ _POINT_FIELD_DTYPES = {
     6: np.dtype("<u4"),
     7: np.dtype("<f4"),
     8: np.dtype("<f8"),
+    9: np.dtype("<i8"),
+    10: np.dtype("<u8"),
+    11: np.dtype("?"),
 }
-_INTEGER_DATATYPES = frozenset((1, 2, 3, 4, 5, 6))
+_INTEGER_DATATYPES = frozenset((1, 2, 3, 4, 5, 6, 9, 10))
 
 
 def _member(value: object, name: str, default: Any = None) -> Any:
@@ -138,7 +141,7 @@ def _coerce_data(raw_data: object) -> bytes:
     return view.tobytes()
 
 
-def _read_field(raw_field: object, index: int) -> Dict[str, Any]:
+def _read_field(raw_field: object, index: int, *, bigendian: bool = False) -> Dict[str, Any]:
     name_value = _member(raw_field, "name", None)
     name = str(name_value or "").strip().lower()
     if not name:
@@ -151,22 +154,23 @@ def _read_field(raw_field: object, index: int) -> Dict[str, Any]:
     count = _parse_integer(_member(raw_field, "count", None), "%s.count" % name)
     if offset < 0:
         raise GenericPointCloud2DecodeError("PointCloud2 %s.offset 不能为负数" % name)
-    if count != 1:
+    if count < 1:
         raise GenericPointCloud2DecodeError(
-            "PointCloud2 %s 字段 count 必须为 1，实际为 %d" % (name, count)
+            "PointCloud2 %s 字段 count 必须为正数，实际为 %d" % (name, count)
         )
     dtype = _POINT_FIELD_DTYPES.get(datatype)
     if dtype is None:
         raise GenericPointCloud2DecodeError(
             "PointCloud2 %s 字段 datatype=%d 不被支持" % (name, datatype)
         )
+    dtype = dtype.newbyteorder(">" if bigendian else "<")
     return {
         "name": name,
         "offset": offset,
         "datatype": datatype,
         "count": count,
         "itemsize": int(dtype.itemsize),
-        "end": offset + int(dtype.itemsize),
+        "end": offset + int(dtype.itemsize) * count,
         "numpy_dtype": dtype,
     }
 
@@ -181,6 +185,8 @@ def _extract_values(
 ) -> np.ndarray:
     """按 PointCloud2 的行步长和点步长展开一个标量字段。"""
 
+    if height == 0 or width == 0:
+        return np.empty(0, dtype=spec["numpy_dtype"])
     try:
         values = np.ndarray(
             shape=(height, width),
@@ -201,11 +207,11 @@ def decode_generic_pointcloud2(
     max_points: int = 250000,
     max_payload_bytes: int = 4194304,
 ) -> GenericPointCloud2Decoded:
-    """严格解码一帧 little-endian PointCloud2 消息。
+    """按消息声明的大小端和布局解码一帧 PointCloud2 消息。
 
     ``xyz_array`` 始终是 ``N*3`` 的 float32 数组；可选字段缺失时对应数组为
     ``None``。返回值不携带任何坐标变换或 IMU 能力，因此 ``supports_lio`` 恒为
-    ``False``。
+    ``False``。非稠密输入保留无效点及其原始位置，由算法适配层决定过滤方式。
     """
 
     point_limit = _positive_limit(max_points, "max_points")
@@ -217,16 +223,15 @@ def decode_generic_pointcloud2(
     source_frame = str(_member(header, "frame_id", "") or "").strip()
     if not source_frame:
         raise GenericPointCloud2DecodeError("PointCloud2 header.frame_id 为空")
-    if bool(_member(message, "is_bigendian", False)):
-        raise GenericPointCloud2DecodeError("PointCloud2 is_bigendian=True 不被支持")
+    bigendian = bool(_member(message, "is_bigendian", False))
 
     width = _parse_integer(_member(message, "width", None), "width")
     height = _parse_integer(_member(message, "height", None), "height")
     point_step = _parse_integer(_member(message, "point_step", None), "point_step")
     row_step = _parse_integer(_member(message, "row_step", None), "row_step")
-    if width <= 0 or height <= 0 or point_step <= 0 or row_step <= 0:
+    if width < 0 or height < 0 or point_step <= 0 or row_step < 0:
         raise GenericPointCloud2DecodeError(
-            "PointCloud2 布局维度必须为正：width=%d height=%d point_step=%d row_step=%d"
+            "PointCloud2 布局维度非法：width=%d height=%d point_step=%d row_step=%d"
             % (width, height, point_step, row_step)
         )
     point_count = width * height
@@ -262,7 +267,7 @@ def decode_generic_pointcloud2(
         raise GenericPointCloud2DecodeError("PointCloud2 fields 不是可迭代序列") from exc
     parsed: Dict[str, Dict[str, Any]] = {}
     for index, raw_field in enumerate(field_items):
-        spec = _read_field(raw_field, index)
+        spec = _read_field(raw_field, index, bigendian=bigendian)
         name = spec["name"]
         if name in parsed:
             raise GenericPointCloud2DecodeError("PointCloud2 %s 字段重复" % name)
@@ -273,28 +278,23 @@ def decode_generic_pointcloud2(
             )
         parsed[name] = spec
 
-    ranges = list(
-        (name, spec["offset"], spec["end"]) for name, spec in parsed.items()
-    )
-    for index, (name, start, end) in enumerate(ranges):
-        for other_name, other_start, other_end in ranges[index + 1 :]:
-            if start < other_end and other_start < end:
-                raise GenericPointCloud2DecodeError(
-                    "PointCloud2 字段重叠：%s[%d:%d] 与 %s[%d:%d]"
-                    % (name, start, end, other_name, other_start, other_end)
-                )
-
     missing = [name for name in ("x", "y", "z") if name not in parsed]
     if missing:
         raise GenericPointCloud2DecodeError(
             "PointCloud2 缺少必需字段：%s" % ",".join(missing)
         )
 
+    # 仅被读取为标量的字段要求 count=1；法线等附加数组以及字段别名合法。
+    for name in ("x", "y", "z", "intensity", "ring", "time_offset_ns"):
+        if name in parsed and parsed[name]["count"] != 1:
+            raise GenericPointCloud2DecodeError("PointCloud2 %s 字段必须为标量" % name)
+
     xyz = np.empty((point_count, 3), dtype=np.float32)
     for column, name in enumerate(("x", "y", "z")):
         values = _extract_values(data, height, width, row_step, point_step, parsed[name])
         xyz[:, column] = values.astype(np.float32, copy=False)
-    if not np.all(np.isfinite(xyz)):
+    is_dense = bool(_member(message, "is_dense", True))
+    if is_dense and not np.all(np.isfinite(xyz)):
         raise GenericPointCloud2DecodeError("PointCloud2 XYZ 必须全部为有限值")
     xyz = np.ascontiguousarray(xyz, dtype=np.float32)
 
@@ -304,8 +304,6 @@ def decode_generic_pointcloud2(
             _extract_values(data, height, width, row_step, point_step, parsed["intensity"])
             .astype(np.float32, copy=False)
         )
-        if not np.all(np.isfinite(intensity)):
-            raise GenericPointCloud2DecodeError("PointCloud2 intensity 必须全部为有限值")
 
     ring = None
     if "ring" in parsed:
@@ -347,7 +345,7 @@ def decode_generic_pointcloud2(
         fields=parsed,
         has_per_point_time=time_offset_ns is not None,
         supports_lio=False,
-        is_dense=bool(_member(message, "is_dense", True)),
+        is_dense=is_dense,
     )
 
 

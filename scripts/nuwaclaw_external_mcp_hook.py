@@ -509,9 +509,6 @@ def _build_default_payload() -> dict:
         "mcpServers": {
             "nuwax_robot_bridge": {
                 "url": "http://host.docker.internal:8766/mcp",
-                "headers": {
-                    "Authorization": "Bearer agent-robot-bridge-token",
-                },
             }
         }
     }

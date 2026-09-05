@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import logging
+from core.config_values import runtime_value
 from pathlib import Path
 import signal
-import sys
 from typing import Optional
 import threading
 
@@ -17,11 +18,13 @@ from .constants import (
 from .core import MotionGuardCore
 from .epoch import EpochStore, SingleInstanceLock
 from .go2_actuator import ActuatorError, Go2Actuator
+from .motion_control_actuator import MotionControlActuator
 from .server import MotionGuardUnixServer
 
 
 def _path_from_env(name: str, default: str) -> Path:
-    return Path(os.environ.get(name, default)).expanduser().resolve()
+    value = runtime_value(name, default) if name == "NUWAX_MOTION_GUARD_SOCKET" else os.environ.get(name, default)
+    return Path(value).expanduser().resolve()
 
 
 def run() -> None:
@@ -49,8 +52,16 @@ def run() -> None:
             provision_path=provision_path,
             epoch_path=epoch_path,
         )
+        standard_control = runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip() == "motion_control"
+        if standard_control:
+            epoch_store.initialize_standard_control()
         epoch = epoch_store.advance_boot()
-        actuator = Go2Actuator.from_environment()
+        if standard_control:
+            actuator = MotionControlActuator.from_environment(
+                actuator_symbols_sha256=epoch.actuator_symbols_sha256,
+            )
+        else:
+            actuator = Go2Actuator.from_environment()
         core = MotionGuardCore(
             epoch=epoch,
             epoch_store=epoch_store,
@@ -77,16 +88,16 @@ def run() -> None:
 
 
 def main() -> int:
+    from core.settings import configure_component_logging
+    configure_component_logging("nuwax-motion-guard")
+    logger = logging.getLogger("nuwax_robot_bridge.motion_guard")
     try:
         run()
     except ActuatorError as exc:
-        print(
-            f"motion safety guard startup failed [{exc.code}]: {exc.message}",
-            file=sys.stderr,
-        )
+        logger.exception("运动控制启动失败: %s", exc.message, extra={"error_code": exc.code})
         return 1
     except Exception as exc:
-        print(f"motion safety guard startup failed: {exc}", file=sys.stderr)
+        logger.exception("运动控制启动失败: %s", exc)
         return 1
     return 0
 

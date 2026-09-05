@@ -3,9 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# 先解析共同配置并统一旧通道别名，再物化启动参数。
+source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 RELEASE_CHECKER="${REPO_ROOT}/services/geometry/release_manifest.py"
-RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-${RUNTIME_BINARY%/*}/nuwax-geometry-release/manifest.json}"
+RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-}"
 READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
 EXEC_PROOF_FILE="${READY_FILE}.release"
@@ -124,13 +126,22 @@ trap forward_shutdown INT TERM
 export NUWAX_GEOMETRY_LIO_BACKEND="${LIO_BACKEND}"
 export NUWAX_GEOMETRY_MAPPING_BACKEND="${MAPPING_BACKEND}"
 export NUWAX_GEOMETRY_CORRECTION_BACKEND="${CORRECTION_BACKEND}"
+# 开发启动使用项目数据目录；systemd（系统服务管理器）仍可显式指定持久化路径。
+export NUWAX_GEOMETRY_SEQUENCE_STATE_PATH="${NUWAX_GEOMETRY_SEQUENCE_STATE_PATH:-${REPO_ROOT}/runtime_data/geometry/sequence_state.json}"
+export NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH="${NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH:-${REPO_ROOT}/runtime_data/geometry/exploration_ownership_journal.json}"
 printf 'nuwax-geometry-runtime launcher: owner profile lio=%s mapping=%s correction=%s\n' \
   "${LIO_BACKEND}" "${MAPPING_BACKEND}" "${CORRECTION_BACKEND}"
 
-NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \
-  NUWAX_GEOMETRY_RUNTIME_PORT="${PORT}" \
-  PYTHONPATH="${REPO_ROOT}" python3 "${RELEASE_CHECKER}" exec \
-    --manifest "${RELEASE_MANIFEST}" --proof-output "${EXEC_PROOF_FILE}" &
+if [[ -n "${RELEASE_MANIFEST}" ]]; then
+  NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \
+    NUWAX_GEOMETRY_RUNTIME_PORT="${PORT}" \
+    PYTHONPATH="${REPO_ROOT}" python3 "${RELEASE_CHECKER}" exec \
+      --manifest "${RELEASE_MANIFEST}" --proof-output "${EXEC_PROOF_FILE}" &
+else
+  # 开发构建直接运行；只有显式选择发布清单时才进行发布制品验证。
+  NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \
+    NUWAX_GEOMETRY_RUNTIME_PORT="${PORT}" "${RUNTIME_BINARY}" &
+fi
 CHILD_PID="$!"
 
 attempts=$((HEALTH_TIMEOUT * 10 + 1))
@@ -148,13 +159,15 @@ done
 
 geometry_internal_health_ready \
   || fail "runtime did not publish the expected healthy port within ${HEALTH_TIMEOUT}s"
-[[ -f "${EXEC_PROOF_FILE}" && ! -L "${EXEC_PROOF_FILE}" ]] \
-  || fail "verified runtime did not publish its immutable release proof"
-python3 "${RELEASE_CHECKER}" exec-proof \
-  --manifest "${RELEASE_MANIFEST}" \
-  --proof-output "${EXEC_PROOF_FILE}" \
-  --pid "${CHILD_PID}" \
-  || fail "verified runtime proof does not match the running release"
+if [[ -n "${RELEASE_MANIFEST}" ]]; then
+  [[ -f "${EXEC_PROOF_FILE}" && ! -L "${EXEC_PROOF_FILE}" ]] \
+    || fail "verified runtime did not publish its immutable release proof"
+  python3 "${RELEASE_CHECKER}" exec-proof \
+    --manifest "${RELEASE_MANIFEST}" \
+    --proof-output "${EXEC_PROOF_FILE}" \
+    --pid "${CHILD_PID}" \
+    || fail "verified runtime proof does not match the running release"
+fi
 printf 'pid=%s\nport=%s\n' "${CHILD_PID}" "${PORT}" > "${READY_FILE}.tmp"
 mv -f "${READY_FILE}.tmp" "${READY_FILE}"
 

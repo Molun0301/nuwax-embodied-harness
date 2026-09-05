@@ -1620,6 +1620,23 @@ impl NavRuntimeState {
     }
 
     #[cfg(test)]
+    pub(crate) fn expire_tf_for_test(&self) {
+        // 只让当前测试实例的坐标变换观察过期，不修改进程共享的TTL配置。
+        if let Ok(mut runtime) = self.runtime_observations.lock() {
+            runtime.tf.observed_at =
+                Instant::now().checked_sub(tf_ttl() + Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_motion_sink_for_test(&self) {
+        // 单独模拟未收到执行端观察；零代际仍是合法的空闲状态。
+        if let Ok(mut runtime) = self.runtime_observations.lock() {
+            runtime.motion_sink = TimedObservation::default();
+        }
+    }
+
+    #[cfg(test)]
     fn expire_motion_sink_for_test(&self) {
         if let Ok(mut runtime) = self.runtime_observations.lock() {
             runtime.motion_sink.observed_at =
@@ -4809,7 +4826,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.state.status, "ACCEPTED");
+        assert_eq!(
+            outcome.state.status, "ACCEPTED",
+            "{}",
+            outcome.state.message
+        );
         let frame = tokio::time::timeout(Duration::from_secs(1), goals.next())
             .await
             .expect("goal was not published")

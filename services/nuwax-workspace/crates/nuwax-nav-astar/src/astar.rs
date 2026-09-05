@@ -3,17 +3,17 @@
 //! 对应 Python 源 `dimos/navigation/replanning_a_star/min_cost_astar.py`（不依赖 C++ extension）。
 //!
 //! 严格语义：
-//! - 8 邻接网格，4 邻接 cost=1.0，对角 cost=1.42。
-//! - heuristic = octile distance：`(dx + dy) + (diag - 2*straight) * min(dx, dy)`。
+//! - 8 邻接网格，默认直行 cost=1.0，对角 cost=1.42，实际步长遵循选项。
+//! - 对角移动要求相邻两个直行格均可通行，避免跨过障碍角点。
+//! - 启发值使用与步长一致的距离下界。
 //! - `cost_threshold` 默认 100；cell cost `>= threshold` 不可走。
 //! - UNKNOWN cell 用 `unknown_penalty * cost_threshold`；若仍 `>= threshold` 不可走。
-//! - 优先级保留双键 tie-break：(累计 cell cost + h, 累计 dist + h, node)。
-//!   与 Python `(priority_cost, priority_dist, neighbor)` 完全一致。
+//! - 优先级按累计格子代价、累计距离加启发值、节点坐标依次比较。
+//!   优先降低累计格子代价，代价相同时选择更短的路线。
 //! - goal 越界返回 `Err(NavError::GoalOutOfBounds)`；无路径返回 `Ok(None)`。
 //! - path 重建包含 start 与 goal cell center。
 //!
-//! 注意：本实现当前使用本 crate 的 `CostMap2D`（u8 占据值）；Foundation 完成后切换为
-//! `nuwax-nav-types-messages::OccupancyGrid2D`。
+//! 本实现使用本 crate 的 `CostMap2D`（u8 占据值），对外路径使用共享导航消息类型。
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -22,15 +22,15 @@ use crate::helpers::{make_path2d, NavError, Path2D, PlannerDiagnostics, Point2};
 use crate::navigation_map::CostMap2D;
 
 /// 8 邻接方向：4 直 + 4 对角
-const DIRECTIONS: [(i32, i32, f32); 8] = [
-    (0, 1, 1.0),
-    (1, 0, 1.0),
-    (0, -1, 1.0),
-    (-1, 0, 1.0),
-    (1, 1, 1.42),
-    (1, -1, 1.42),
-    (-1, 1, 1.42),
-    (-1, -1, 1.42),
+const DIRECTIONS: [(i32, i32); 8] = [
+    (0, 1),
+    (1, 0),
+    (0, -1),
+    (-1, 0),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
 ];
 
 /// A* 选项
@@ -42,7 +42,7 @@ pub struct AStarOptions {
     pub unknown_penalty: f32,
     /// 对角 cost（默认 1.42）
     pub diagonal_cost: f32,
-    /// 直行 cost（默认 1.0；理论上固定，不应修改，但留接口便于测试 boundary）
+    /// 直行 cost（默认 1.0）
     pub straight_cost: f32,
     /// 最大扩展节点数（超过返回 no-path）
     pub max_expansions: Option<usize>,
@@ -80,10 +80,15 @@ pub fn heuristic(
     diagonal_cost: f32,
     straight_cost: f32,
 ) -> f32 {
-    let dx = (x2 - x1).unsigned_abs() as f32;
-    let dy = (y2 - y1).unsigned_abs() as f32;
+    let dx = x2.abs_diff(x1) as f32;
+    let dy = y2.abs_diff(y1) as f32;
+    if diagonal_cost < straight_cost {
+        // 对角步更便宜时可用折线替代直行，采用棋盘距离下界避免高估。
+        return dx.max(dy) * diagonal_cost;
+    }
     let diag_min = dx.min(dy);
-    (dx + dy) + (diagonal_cost - 2.0 * straight_cost) * diag_min
+    let diagonal_cost = diagonal_cost.min(2.0 * straight_cost);
+    (dx + dy) * straight_cost + (diagonal_cost - 2.0 * straight_cost) * diag_min
 }
 
 /// 计算 cell 通行代价。
@@ -194,7 +199,22 @@ pub fn min_cost_astar(
         return Err(NavError::GoalOutOfBounds);
     }
 
-    // start 和 goal 在同一 cell 时直接返回单点 path
+    let (raw, is_unknown) = costmap.cell_value_with_unknown(gx as usize, gy as usize);
+    if cell_cost(
+        raw,
+        is_unknown,
+        options.cost_threshold,
+        options.unknown_penalty,
+    )
+    .is_none()
+    {
+        return Ok(AStarResult {
+            path: None,
+            diagnostics: PlannerDiagnostics::default(),
+        });
+    }
+
+    // 只有可通行目标格才能返回单点路径。
     if sx == gx && sy == gy {
         return Ok(AStarResult {
             path: Some(make_path2d(vec![
@@ -275,7 +295,7 @@ pub fn min_cost_astar(
         let current_cost = cost_score[(item.y * width + item.x) as usize];
         let current_dist = dist_score[(item.y * width + item.x) as usize];
 
-        for &(dx, dy, move_cost) in &DIRECTIONS {
+        for &(dx, dy) in &DIRECTIONS {
             let nx = item.x + dx;
             let ny = item.y + dy;
 
@@ -292,6 +312,20 @@ pub fn min_cost_astar(
                 Some(v) => v,
                 None => continue,
             };
+
+            let diagonal = dx != 0 && dy != 0;
+            if diagonal
+                && [(item.x + dx, item.y), (item.x, item.y + dy)]
+                    .into_iter()
+                    .any(|(x, y)| {
+                        let (raw, unknown) =
+                            costmap.cell_value_with_unknown(x as usize, y as usize);
+                        cell_cost(raw, unknown, threshold, unknown_penalty).is_none()
+                    })
+            {
+                continue;
+            }
+            let move_cost = if diagonal { diag_cost } else { straight_cost };
 
             let tentative_cost = current_cost + c;
             let tentative_dist = current_dist + move_cost;
@@ -401,6 +435,49 @@ mod tests {
     }
 
     #[test]
+    fn blocked_goal_in_start_cell_has_no_path() {
+        let cm = CostMap2D::new_all_occupied("map", 2, 2, 1.0);
+        let pos = Point2::new(0.5, 0.5);
+        let result = min_cost_astar(&cm, pos, pos, &AStarOptions::default()).unwrap();
+        assert!(result.path.is_none());
+    }
+
+    #[test]
+    fn diagonal_cannot_cross_blocked_cell_corners() {
+        let mut cm = CostMap2D::new_all_free("map", 2, 2, 1.0);
+        cm.set(1, 0, 100);
+        cm.set(0, 1, 100);
+        let result = min_cost_astar(
+            &cm,
+            Point2::new(0.5, 0.5),
+            Point2::new(1.5, 1.5),
+            &AStarOptions::default(),
+        )
+        .unwrap();
+        assert!(result.path.is_none());
+    }
+
+    #[test]
+    fn configured_movement_costs_choose_the_shortest_route() {
+        let cm = CostMap2D::new_all_free("map", 3, 3, 1.0);
+        for (straight_cost, diagonal_cost, expected_steps) in
+            [(0.1, 1.42, 4), (1.0, 3.0, 4), (1.0, 1.0, 2)]
+        {
+            let options = AStarOptions {
+                straight_cost,
+                diagonal_cost,
+                ..AStarOptions::default()
+            };
+            let path = min_cost_astar(&cm, Point2::new(0.5, 0.5), Point2::new(2.5, 2.5), &options)
+                .unwrap()
+                .path
+                .unwrap();
+            assert_eq!(path.points.len() - 1, expected_steps, "{options:?}");
+        }
+        assert!((heuristic(0, 0, 3, 4, 2.84, 2.0) - 10.52).abs() < 1e-3);
+    }
+
+    #[test]
     fn straight_line_finds_path() {
         let cm = empty_costmap(20, 20);
         let opts = AStarOptions::default();
@@ -472,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn tie_break_matches_python_full_cell_sequence() {
+    fn tie_break_is_deterministic_without_cutting_obstacle_corners() {
         let mut cm = CostMap2D::new_all_free("map", 7, 7, 1.0);
         cm.set(3, 3, 100);
         let path = min_cost_astar(
@@ -489,7 +566,7 @@ mod tests {
             .iter()
             .map(|point| cm.world_to_cell(*point))
             .collect();
-        assert_eq!(cells, vec![(1, 3), (2, 3), (3, 2), (4, 2), (5, 3)]);
+        assert_eq!(cells, vec![(1, 3), (2, 2), (3, 2), (4, 2), (5, 3)]);
     }
 
     #[test]

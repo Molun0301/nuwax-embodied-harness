@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "livox_sdk_config.hpp"
+#include "imu_frame_transform.hpp"
 
 #include "dimos_native_module.hpp"
 
@@ -66,6 +67,7 @@ static std::string g_sensor_frame_id;  // required via --sensor_frame_id
 static std::string g_input_lidar_topic;
 static std::string g_input_imu_topic;
 static bool g_external_input = false;
+static std::array<double, 9> g_body_from_sensor_rotation{1, 0, 0, 0, 1, 0, 0, 0, 1};
 static float g_frequency = 10.0f;
 
 // Frame accumulator (Livox SDK raw → CustomMsg)
@@ -292,7 +294,7 @@ static bool typed_imu_covers_scan(uint64_t scan_start_ns, uint64_t scan_end_ns) 
            g_typed_imu_samples.back().timestamp_ns >= scan_end_ns;
 }
 
-static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::PointCloud2* msg) {
+static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::PointCloud2* msg, void*) {
     if (!g_running.load() || !g_external_input || !msg) { return; }
     if (msg->header.frame_id.empty() || msg->header.frame_id != g_sensor_frame_id ||
         msg->header.stamp.sec < 0 || msg->header.stamp.nsec < 0 ||
@@ -371,7 +373,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
     g_accumulated_points = std::move(accepted_points);
 }
 
-static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::Imu* msg) {
+static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::Imu* msg, void*) {
     if (!g_running.load() || !g_external_input || !msg || !g_fastlio) return;
     const auto& stamp = msg->header.stamp;
     const auto finite_array = [](const auto& values) {
@@ -401,13 +403,20 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
             return;
         }
         auto imu_msg = boost::make_shared<custom_messages::Imu>();
-        imu_msg->header = msg->header;
+        imu_msg->header.seq = msg->header.seq;
+        imu_msg->header.stamp.sec = msg->header.stamp.sec;
+        imu_msg->header.stamp.nsecs = msg->header.stamp.nsec;
         imu_msg->orientation.x = msg->orientation.x; imu_msg->orientation.y = msg->orientation.y;
         imu_msg->orientation.z = msg->orientation.z; imu_msg->orientation.w = msg->orientation.w;
-        imu_msg->angular_velocity.x = msg->angular_velocity.x;
-        imu_msg->angular_velocity.y = msg->angular_velocity.y; imu_msg->angular_velocity.z = msg->angular_velocity.z;
-        imu_msg->linear_acceleration.x = msg->linear_acceleration.x;
-        imu_msg->linear_acceleration.y = msg->linear_acceleration.y; imu_msg->linear_acceleration.z = msg->linear_acceleration.z;
+        const auto gyro = nuwax_lio::rotate_imu_to_body(g_body_from_sensor_rotation,
+            msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+        const auto accel = nuwax_lio::rotate_imu_to_body(g_body_from_sensor_rotation,
+            msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
+        imu_msg->header.frame_id = g_child_frame_id;
+        imu_msg->angular_velocity.x = gyro[0];
+        imu_msg->angular_velocity.y = gyro[1]; imu_msg->angular_velocity.z = gyro[2];
+        imu_msg->linear_acceleration.x = accel[0];
+        imu_msg->linear_acceleration.y = accel[1]; imu_msg->linear_acceleration.z = accel[2];
         g_typed_imu_samples.push_back({timestamp_ns, std::move(imu_msg)});
         g_last_typed_imu_stamp_ns = timestamp_ns;
         g_has_last_typed_imu_stamp = true;
@@ -671,6 +680,13 @@ int main(int argc, char** argv) {
     g_input_lidar_topic = mod.arg("input_lidar", "");
     g_input_imu_topic = mod.arg("input_imu", "");
     g_external_input = !g_input_lidar_topic.empty() || !g_input_imu_topic.empty();
+    if (g_external_input) {
+        if (params.extrinsic_R.size() != g_body_from_sensor_rotation.size()) {
+            fprintf(stderr, "Error: typed IMU requires a 3x3 body-from-sensor rotation\n");
+            return 1;
+        }
+        std::copy(params.extrinsic_R.begin(), params.extrinsic_R.end(), g_body_from_sensor_rotation.begin());
+    }
     if (g_external_input && (g_input_lidar_topic.empty() || g_input_imu_topic.empty())) {
         fprintf(stderr, "Error: --input_lidar and --input_imu must be supplied together\\n");
         return 1;
@@ -745,8 +761,8 @@ int main(int argc, char** argv) {
 
     bool sdk_started = false;
     if (g_external_input) {
-        lcm.subscribe(g_input_lidar_topic, on_typed_cloud);
-        lcm.subscribe(g_input_imu_topic, on_typed_imu);
+        lcm.subscribeFunction(g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
+        lcm.subscribeFunction(g_input_imu_topic, on_typed_imu, static_cast<void*>(nullptr));
         if (debug) { printf("[fastlio2] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
     } else {
         // Direct Livox mode is retained for device deployments.

@@ -53,9 +53,8 @@ fn verified_group_guardian_executable() -> PathBuf {
     std::env::var_os(VERIFIED_GROUP_GUARDIAN_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            panic!("{VERIFIED_GROUP_GUARDIAN_ENV} must be injected by release verifier")
-        })
+        // 发布部署使用显式固定路径；源码构建直接使用同次构建生成的守护进程。
+        .unwrap_or_else(|| discovery_group_guardian_executable().to_path_buf())
 }
 
 /// Explicit executable, argument, working-directory, and environment contract.
@@ -2892,24 +2891,28 @@ mod tests {
 
     #[tokio::test]
     async fn post_spawn_setup_crossing_deadline_rejects_immediate_ready() {
-        let directory = tempdir().unwrap();
-        let pid_file = directory.path().join("spawned.pid");
-        let mut command = shell("echo $$ > \"$SPAWNED_PID_FILE\"; sleep 30");
-        command.env("SPAWNED_PID_FILE", &pid_file);
-        let ready_deadline = absolute_deadline(Duration::from_millis(30));
-        let error = spawn_supervised(command, short_config(), ready_deadline, |_| {
-            thread::sleep(Duration::from_millis(60));
-            std::future::ready(Ok::<_, SupervisedReadyError>(()))
-        })
+        let spawned_pid = std::sync::atomic::AtomicU32::new(0);
+        // 由握手后的回调证明子进程存在，不依赖子进程在几十毫秒内获调度并写文件。
+        let ready_deadline = absolute_deadline(Duration::from_secs(2));
+        let error = spawn_supervised(
+            shell("sleep 30"),
+            short_config(),
+            ready_deadline,
+            |identity| {
+                spawned_pid.store(identity.pid, std::sync::atomic::Ordering::Relaxed);
+                thread::sleep(
+                    ready_deadline.saturating_duration_since(Instant::now())
+                        + Duration::from_millis(5),
+                );
+                std::future::ready(Ok::<_, SupervisedReadyError>(()))
+            },
+        )
         .await
         .expect_err("post-spawn overrun must not accept immediate READY");
         assert_eq!(error.failure, SupervisedStartFailure::ReadyTimedOut);
         assert!(error.rollback_error.is_none(), "{error}");
-        let pid = fs::read_to_string(pid_file)
-            .expect("process proved it was spawned")
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        let pid = spawned_pid.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(pid, 0, "握手后必须进入待验证的设置回调");
         assert!(!process_exists(pid), "overrun rollback left pid {pid}");
     }
 

@@ -28,6 +28,14 @@ runtime_data/
 /tests/deployment/__pycache__/
 /tests/deployment/**/*.pyc
 scripts/ci/*
+# 已跟踪的工作流依赖这些检查入口，不能随本地试验脚本一起忽略。
+!scripts/ci/no_ros2_residual.sh
+!scripts/ci/check_pep604.py
+!scripts/ci/check_deployment_installer.sh
+!scripts/ci/release_gates/
+scripts/ci/release_gates/*
+!scripts/ci/release_gates/common.py
+!scripts/ci/release_gates/static_neg_gate.py
 
 # 文档与测试仅保留在本地工作区，不进入 Git 变更区。
 /docs/开发文档/
@@ -159,3 +167,6 @@ htmlcov/
 *.gcno
 *.rrd
 *.snap
+
+# 原生定位本机构建产物；源代码与公共转换头文件仍进入仓库。
+services/nuwax-workspace/crates/nuwax-lio-backends/native/*/cpp/result/

@@ -23,6 +23,13 @@ fi
   echo "motion guard service UID cannot read production entrypoint" >&2
   exit 1
 }
+# 标准运动提供者由运行入口加载；不要求安装 Go2 驱动依赖。
+if [[ "${NUWAX_MOTION_GUARD_BACKEND:-}" == "motion_control" ]]; then
+  export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  export PYTHONNOUSERSITE=1
+  exec "${PYTHON_BIN}" -c 'import services.navigation.motion_safety_guard.motion_control_actuator'
+fi
+
 [[ -n "${SDK_PATH}" && -d "${SDK_PATH}" && -x "${SDK_PATH}" ]] || {
   echo "GO2_SDK_PATH/NUWAX_GO2_SDK_PATH is missing or inaccessible: ${SDK_PATH:-<unset>}" >&2
   exit 1

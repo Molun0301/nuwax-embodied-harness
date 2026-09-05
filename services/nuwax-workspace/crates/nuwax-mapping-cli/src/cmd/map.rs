@@ -35,15 +35,15 @@ pub struct MapArgs {
     /// Canonical frame shared by the dataset and bundle.
     #[arg(long)]
     pub frame_id: String,
-    /// Verified immutable release generation.
+    /// 可选发布版本身份；源码离线建图无需提供。
     #[arg(long)]
-    pub release_generation: String,
-    /// SHA-256 of the verified release manifest.
+    pub release_generation: Option<String>,
+    /// 可选发布清单摘要，提供时记录到地图来源。
     #[arg(long)]
-    pub release_manifest_sha256: String,
-    /// SHA-256 of the verified offline mapping CLI artifact.
+    pub release_manifest_sha256: Option<String>,
+    /// 可选建图程序摘要，提供时记录到地图来源。
     #[arg(long)]
-    pub artifact_sha256: String,
+    pub artifact_sha256: Option<String>,
     /// Display theme label retained for CLI compatibility.
     #[arg(long, default_value = "default")]
     pub theme: String,
@@ -62,9 +62,11 @@ pub async fn run(args: MapArgs) -> anyhow::Result<()> {
     }
     let map_name = require_identity(&args.map_name, "map-name")?;
     let frame_id = require_identity(&args.frame_id, "frame-id")?;
-    require_digest(&args.release_generation, "release-generation")?;
-    require_digest(&args.release_manifest_sha256, "release-manifest-sha256")?;
-    require_digest(&args.artifact_sha256, "artifact-sha256")?;
+    producer_metadata(
+        args.release_generation.as_deref(),
+        args.release_manifest_sha256.as_deref(),
+        args.artifact_sha256.as_deref(),
+    )?;
     if !args.output_parent.is_dir() {
         anyhow::bail!(
             "output parent must be an existing directory: {}",
@@ -98,9 +100,9 @@ pub async fn run(args: MapArgs) -> anyhow::Result<()> {
         dataset_size,
         input_format,
         &costmap,
-        &args.release_generation,
-        &args.release_manifest_sha256,
-        &args.artifact_sha256,
+        args.release_generation.as_deref(),
+        args.release_manifest_sha256.as_deref(),
+        args.artifact_sha256.as_deref(),
     )?;
     publish_map_bundle(
         &output,
@@ -110,9 +112,9 @@ pub async fn run(args: MapArgs) -> anyhow::Result<()> {
                 staging,
                 map_name,
                 frame_id,
-                &args.release_generation,
-                &args.release_manifest_sha256,
-                &args.artifact_sha256,
+                args.release_generation.as_deref(),
+                args.release_manifest_sha256.as_deref(),
+                args.artifact_sha256.as_deref(),
             )
         },
     )?;
@@ -258,6 +260,26 @@ fn costmap_from_point_records(
     Ok(costmap)
 }
 
+fn producer_metadata(
+    release_generation: Option<&str>,
+    release_manifest_sha256: Option<&str>,
+    artifact_sha256: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut producer = json!({"role": "offline_mapping_cli"});
+    // 缺失的发布身份保持缺失，不以地图内容或源码摘要冒充发布来源。
+    for (name, value) in [
+        ("release_generation", release_generation),
+        ("release_manifest_sha256", release_manifest_sha256),
+        ("artifact_sha256", artifact_sha256),
+    ] {
+        if let Some(value) = value {
+            require_digest(value, name)?;
+            producer[name] = Value::String(value.to_string());
+        }
+    }
+    Ok(producer)
+}
+
 fn canonical_asset(
     map_name: &str,
     frame_id: &str,
@@ -265,9 +287,9 @@ fn canonical_asset(
     dataset_size: u64,
     input_format: &str,
     costmap: &nuwax_mapping::Costmap,
-    release_generation: &str,
-    release_manifest_sha256: &str,
-    artifact_sha256: &str,
+    release_generation: Option<&str>,
+    release_manifest_sha256: Option<&str>,
+    artifact_sha256: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
     let translation = costmap.metadata.origin.translation.vector;
     let (_, _, yaw) = costmap.metadata.origin.rotation.euler_angles();
@@ -288,12 +310,7 @@ fn canonical_asset(
             "encoding": PGM_ENCODING,
             "path": "map.pgm"
         },
-        "producer": {
-            "role": "offline_mapping_cli",
-            "release_generation": release_generation,
-            "release_manifest_sha256": release_manifest_sha256,
-            "artifact_sha256": artifact_sha256
-        }
+        "producer": producer_metadata(release_generation, release_manifest_sha256, artifact_sha256)?
     }))
 }
 
@@ -439,9 +456,9 @@ fn validate_bundle(
     staging: &Path,
     map_name: &str,
     frame_id: &str,
-    release_generation: &str,
-    release_manifest_sha256: &str,
-    artifact_sha256: &str,
+    release_generation: Option<&str>,
+    release_manifest_sha256: Option<&str>,
+    artifact_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
     let expected: HashSet<&str> = ["asset.json", "manifest.json", "map.pgm"]
         .into_iter()
@@ -555,25 +572,8 @@ fn validate_bundle(
         anyhow::bail!("map asset grid is invalid");
     }
 
-    let producer = exact_object(
-        &asset["producer"],
-        &[
-            "role",
-            "release_generation",
-            "release_manifest_sha256",
-            "artifact_sha256",
-        ],
-        "map asset producer",
-    )?;
-    if producer.get("role") != Some(&Value::String("offline_mapping_cli".to_string()))
-        || producer.get("release_generation")
-            != Some(&Value::String(release_generation.to_string()))
-        || producer.get("release_manifest_sha256")
-            != Some(&Value::String(release_manifest_sha256.to_string()))
-        || producer.get("artifact_sha256") != Some(&Value::String(artifact_sha256.to_string()))
-        || require_digest(release_generation, "release-generation").is_err()
-        || require_digest(release_manifest_sha256, "release-manifest-sha256").is_err()
-        || require_digest(artifact_sha256, "artifact-sha256").is_err()
+    if asset["producer"]
+        != producer_metadata(release_generation, release_manifest_sha256, artifact_sha256)?
     {
         anyhow::bail!("map asset producer proof is inconsistent");
     }

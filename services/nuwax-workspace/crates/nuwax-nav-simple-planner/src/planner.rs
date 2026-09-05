@@ -296,6 +296,9 @@ impl SimplePlanner {
             Some(self.effective_inflation),
         );
         self.last_plan_time = mono_now;
+        // 只有本次规划成功才能继续发布路线；失败时旧路线已经失效。
+        self.cached_path = None;
+        self.current_wp = None;
         match path {
             Ok(Some(p)) => {
                 self.cached_path = Some(p.clone());
@@ -357,5 +360,58 @@ impl SimplePlanner {
                 orientation: Quaternion::IDENTITY,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_replan_stops_old_waypoints_and_recovers_after_obstacle_removal() {
+        let mut planner = SimplePlanner::new(SimplePlannerConfig {
+            cell_size: 1.0,
+            inflation_radius: 0.0,
+            max_expansions: 100,
+            replan_cooldown: 1.0,
+            ..SimplePlannerConfig::default()
+        })
+        .unwrap();
+        planner.update_odometry(Pose3 {
+            position: Point3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            },
+            orientation: Quaternion::IDENTITY,
+        });
+        planner.set_goal(
+            Point3 {
+                x: 5.5,
+                y: 0.5,
+                z: 0.0,
+            },
+            0.0,
+        );
+        assert!(matches!(planner.replan_once(0.0), (Some(Some(_)), true, _)));
+        assert!(planner.update_waypoint().is_some());
+
+        for x in -1..=1 {
+            for y in -1..=1 {
+                if (x, y) != (0, 0) {
+                    planner
+                        .costmap_mut()
+                        .update(x as f64 + 0.5, y as f64 + 0.5, 1.0);
+                }
+            }
+        }
+        assert!(matches!(planner.replan_once(2.0), (Some(None), true, _)));
+        assert!(planner.cached_path().is_none());
+        assert!(planner.current_waypoint().is_none());
+        assert!(planner.update_waypoint().is_none());
+
+        planner.costmap_mut().clear();
+        assert!(matches!(planner.replan_once(2.1), (Some(Some(_)), true, _)));
+        assert!(planner.update_waypoint().is_some());
     }
 }

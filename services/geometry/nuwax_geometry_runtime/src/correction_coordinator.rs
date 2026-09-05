@@ -3191,6 +3191,7 @@ mod preflight_only_contract {
     struct PermanentActivationRecord {
         seed: ActivationReceiptSeed,
         immutable_target: Option<crate::pointcloud::ImmutableActivatedTarget>,
+        cloud_target_required: bool,
         epoch: u64,
         state: PermanentActivationState,
         activation_identity_sha256: Option<[u8; 32]>,
@@ -3519,6 +3520,7 @@ mod preflight_only_contract {
                 request_id.clone(),
                 PermanentActivationRecord {
                     seed,
+                    cloud_target_required: immutable_target.is_some(),
                     immutable_target,
                     epoch,
                     state: PermanentActivationState::Staged,
@@ -3776,7 +3778,13 @@ mod preflight_only_contract {
             self.with_staged_record_mut(token, |record| {
                 record.target_receipt_sha256 = target_receipt_sha256;
                 let modern = record.seed.modern;
-                if modern && !Self::has_complete_target_proof(record) {
+                // 二维资产仍须完整激活身份；原本携带三维目标的请求不能靠丢失目标降级成功。
+                if modern
+                    && (record.session_generation == 0
+                        || record.backend_generation == 0
+                        || record.activation_identity_sha256.is_none()
+                        || (record.cloud_target_required && !Self::has_complete_target_proof(record)))
+                {
                     return None;
                 }
                 record.state = PermanentActivationState::Sealed;
@@ -5574,6 +5582,8 @@ mod preflight_only_contract {
         owner_token: Arc<String>,
         _owner_lease: Arc<RelocalizationTerminalOwnerLease>,
         state: Arc<parking_lot::Mutex<RelocalizationTerminalStoreState>>,
+        #[cfg(test)]
+        _test_root: Option<Arc<tests::RelocalizationTerminalTestRoot>>,
     }
 
     fn encode_hex(bytes: &[u8]) -> String {
@@ -5643,16 +5653,15 @@ mod preflight_only_contract {
         explicit: Option<OsString>,
         state_directory: Option<OsString>,
         runtime_data: Option<OsString>,
+        current_directory: impl FnOnce() -> std::io::Result<PathBuf>,
     ) -> Result<PathBuf, String> {
-        if let Some(value) = explicit {
+        let root = if let Some(value) = explicit {
             let root = PathBuf::from(value);
-            return if root.is_absolute() {
-                Ok(root)
-            } else {
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
-            };
-        }
-        if let Some(value) = state_directory {
+            if root.as_os_str().is_empty() {
+                return Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned());
+            }
+            root
+        } else if let Some(value) = state_directory {
             let root = std::env::split_paths(&value)
                 .next()
                 .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())?;
@@ -5661,16 +5670,20 @@ mod preflight_only_contract {
             } else {
                 Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
             };
+        } else {
+            let root = PathBuf::from(runtime_data.unwrap_or_else(|| OsString::from("runtime_data")));
+            if root.as_os_str().is_empty() {
+                return Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned());
+            }
+            root.join("geometry").join("relocalization_terminals_v1")
+        };
+        if root.is_absolute() {
+            return Ok(root);
         }
-        if let Some(value) = runtime_data {
-            let root = PathBuf::from(value);
-            return if root.is_absolute() {
-                Ok(root.join("geometry").join("relocalization_terminals_v1"))
-            } else {
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
-            };
-        }
-        Err("RELOCALIZATION_TERMINAL_STORE_PATH_UNAVAILABLE".to_owned())
+        // 仅相对路径需要当前目录；绝对部署路径不增加工作目录可访问性的前置。
+        let current_directory = current_directory()
+            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_CWD_UNAVAILABLE:{error}"))?;
+        Ok(current_directory.join(root))
     }
 
     fn terminal_store_root() -> Result<PathBuf, String> {
@@ -5678,6 +5691,7 @@ mod preflight_only_contract {
             std::env::var_os(RELOCALIZATION_TERMINAL_STORE_DIR_ENV),
             std::env::var_os("STATE_DIRECTORY"),
             std::env::var_os("NUWAX_RUNTIME_DATA_DIR"),
+            std::env::current_dir,
         )
     }
 
@@ -5945,8 +5959,17 @@ mod preflight_only_contract {
     }
 
     impl RelocalizationTerminalStore {
+        #[cfg(not(test))]
         fn open() -> Result<Self, String> {
             Self::open_at(terminal_store_root()?)
+        }
+
+        #[cfg(test)]
+        fn open() -> Result<Self, String> {
+            let root = Arc::new(tests::RelocalizationTerminalTestRoot::new());
+            let mut store = Self::open_at(root.path().to_path_buf())?;
+            store._test_root = Some(root);
+            Ok(store)
         }
 
         fn open_at(root: PathBuf) -> Result<Self, String> {
@@ -6070,6 +6093,8 @@ mod preflight_only_contract {
                     terminals,
                     pending: HashMap::new(),
                 })),
+                #[cfg(test)]
+                _test_root: None,
             })
         }
 
@@ -11042,83 +11067,38 @@ mod preflight_only_contract {
 
         const COMMIT_NONCE: u128 = 0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001;
         const LEASE_NONCE: u128 = 0x8877_6655_4433_2211_1020_3040_5060_7080;
-        const VERIFIED_PGO_ENV: &str = "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE";
-        const VERIFIED_GUARDIAN_ENV: &str = "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE";
-        static VERIFIED_RELEASE_ENV_LOCK: tokio::sync::Mutex<()> =
+        static NATIVE_CORRECTION_TEST_LOCK: tokio::sync::Mutex<()> =
             tokio::sync::Mutex::const_new(());
 
-        struct VerifiedCorrectionReleaseEnv {
-            _lock: tokio::sync::MutexGuard<'static, ()>,
-            previous_pgo: Option<std::ffi::OsString>,
-            previous_guardian: Option<std::ffi::OsString>,
+        async fn native_correction_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+            // 直接使用同次构建的 PGO 程序；发布清单由专门的发布测试覆盖。
+            NATIVE_CORRECTION_TEST_LOCK.lock().await
         }
 
-        impl Drop for VerifiedCorrectionReleaseEnv {
-            fn drop(&mut self) {
-                match self.previous_pgo.take() {
-                    Some(value) => std::env::set_var(VERIFIED_PGO_ENV, value),
-                    None => std::env::remove_var(VERIFIED_PGO_ENV),
-                }
-                match self.previous_guardian.take() {
-                    Some(value) => std::env::set_var(VERIFIED_GUARDIAN_ENV, value),
-                    None => std::env::remove_var(VERIFIED_GUARDIAN_ENV),
-                }
+        pub(super) struct RelocalizationTerminalTestRoot(PathBuf);
+
+        impl RelocalizationTerminalTestRoot {
+            pub(super) fn new() -> Self {
+                Self(std::env::temp_dir().join(format!(
+                    "nuwax-relocalization-test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4(),
+                )))
+            }
+
+            pub(super) fn path(&self) -> &Path {
+                &self.0
             }
         }
 
-        async fn verified_correction_release_env() -> VerifiedCorrectionReleaseEnv {
-            let lock = VERIFIED_RELEASE_ENV_LOCK.lock().await;
-            let injected_pgo = std::env::var_os(VERIFIED_PGO_ENV)
-                .expect("native PGO role must be injected by the exact release harness");
-            let injected_pgo_path = PathBuf::from(&injected_pgo)
-                .canonicalize()
-                .expect("verified native PGO role path");
-            let generation_root = injected_pgo_path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-                .expect("native PGO role belongs to a release generation");
-            let manifest_path = generation_root.join("manifest.json");
-            let checker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("geometry service directory")
-                .join("release_manifest.py");
-            let check = Command::new("python3")
-                .arg(&checker)
-                .arg("check")
-                .arg("--manifest")
-                .arg(&manifest_path)
-                .status()
-                .expect("release manifest verifier");
-            assert!(check.success(), "correction release manifest proof");
-            let manifest: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&manifest_path).expect("verified release manifest"),
-            )
-            .expect("verified release manifest JSON");
-            let role_path = |role: &str| {
-                let relative = manifest["artifacts"]
-                    .as_array()
-                    .expect("verified release artifacts")
-                    .iter()
-                    .find(|artifact| artifact["role"].as_str() == Some(role))
-                    .and_then(|artifact| artifact["path"].as_str())
-                    .expect("required verified release role");
-                generation_root
-                    .join(relative)
-                    .canonicalize()
-                    .expect("verified release role path")
-            };
-            let verified_pgo = role_path("native_pgo_payload");
-            let verified_guardian = role_path("group_guardian");
-            assert_eq!(verified_pgo, injected_pgo_path);
-            let previous_pgo = std::env::var_os(VERIFIED_PGO_ENV);
-            let previous_guardian = std::env::var_os(VERIFIED_GUARDIAN_ENV);
-            std::env::set_var(VERIFIED_PGO_ENV, verified_pgo);
-            std::env::set_var(VERIFIED_GUARDIAN_ENV, verified_guardian);
-            VerifiedCorrectionReleaseEnv {
-                _lock: lock,
-                previous_pgo,
-                previous_guardian,
+        impl Drop for RelocalizationTerminalTestRoot {
+            fn drop(&mut self) {
+                // 存储的最后一份共享引用释放租约后，才删除该测试独占的终态目录。
+                if let Err(error) = fs::remove_dir_all(&self.0) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%error, "重定位测试终态目录清理失败");
+                    }
+                }
             }
         }
 
@@ -11158,12 +11138,14 @@ mod preflight_only_contract {
         }
 
         #[test]
-        fn relocalization_terminal_store_root_uses_absolute_deployment_ssot() {
+        fn relocalization_terminal_store_root_resolves_deployment_and_local_paths() {
+            let current_directory = || Ok(PathBuf::from("/workspace"));
             assert_eq!(
                 terminal_store_root_from(
                     Some(OsString::from("/override/store")),
                     Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
                     Some(OsString::from("/runtime-data")),
+                    || panic!("绝对终态目录不应读取当前工作目录"),
                 ),
                 Ok(PathBuf::from("/override/store"))
             );
@@ -11172,13 +11154,19 @@ mod preflight_only_contract {
                     None,
                     Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
                     Some(OsString::from("/runtime-data")),
+                    || panic!("绝对部署目录不应读取当前工作目录"),
                 ),
                 Ok(PathBuf::from(
                     "/var/lib/nuwax/geometry-runtime/relocalization_terminals_v1"
                 ))
             );
             assert_eq!(
-                terminal_store_root_from(None, None, Some(OsString::from("/runtime-data"))),
+                terminal_store_root_from(
+                    None,
+                    None,
+                    Some(OsString::from("/runtime-data")),
+                    || panic!("绝对运行数据目录不应读取当前工作目录"),
+                ),
                 Ok(PathBuf::from(
                     "/runtime-data/geometry/relocalization_terminals_v1"
                 ))
@@ -11188,17 +11176,108 @@ mod preflight_only_contract {
                     Some(OsString::from("relative")),
                     Some(OsString::from("/state")),
                     Some(OsString::from("/runtime-data")),
+                    current_directory,
+                ),
+                Ok(PathBuf::from("/workspace/relative"))
+            );
+            assert_eq!(
+                terminal_store_root_from(
+                    None,
+                    Some(OsString::from("relative:/state")),
+                    None,
+                    current_directory,
                 ),
                 Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
             );
             assert_eq!(
-                terminal_store_root_from(None, Some(OsString::from("relative:/state")), None),
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
+                terminal_store_root_from(None, None, None, current_directory),
+                Ok(PathBuf::from(
+                    "/workspace/runtime_data/geometry/relocalization_terminals_v1"
+                ))
             );
             assert_eq!(
-                terminal_store_root_from(None, None, None),
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_UNAVAILABLE".to_owned())
+                terminal_store_root_from(
+                    None,
+                    None,
+                    Some(OsString::from("relative-data")),
+                    current_directory,
+                ),
+                Ok(PathBuf::from(
+                    "/workspace/relative-data/geometry/relocalization_terminals_v1"
+                ))
             );
+            assert_eq!(
+                terminal_store_root_from(
+                    Some(OsString::new()),
+                    None,
+                    None,
+                    current_directory,
+                ),
+                Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())
+            );
+        }
+
+        #[test]
+        fn relocalization_default_and_relative_roots_persist_and_reopen() {
+            for (explicit, runtime_data, expected) in [
+                (
+                    None,
+                    None,
+                    "runtime_data/geometry/relocalization_terminals_v1",
+                ),
+                (Some("relative-terminals"), None, "relative-terminals"),
+                (
+                    None,
+                    Some("relative-data"),
+                    "relative-data/geometry/relocalization_terminals_v1",
+                ),
+            ] {
+                let current_directory = RelocalizationTerminalTestRoot::new();
+                let root = terminal_store_root_from(
+                    explicit.map(OsString::from),
+                    None,
+                    runtime_data.map(OsString::from),
+                    || Ok(current_directory.path().to_path_buf()),
+                )
+                .expect("默认和相对目录必须按当前工作目录解析");
+                assert_eq!(root, current_directory.path().join(expected));
+                let request_identity = [3_u8; 32];
+                let activation_identity = [5_u8; 32];
+                let result = crate::proto::RelocalizeResult {
+                    schema_version: 1,
+                    request_id: "req-relative-store-reopen".to_owned(),
+                    request_identity_sha256: request_identity.to_vec(),
+                    activation_identity_sha256: activation_identity.to_vec(),
+                    disposition: crate::proto::RelocalizeDisposition::Applied as i32,
+                    terminal_proof_sha256: vec![7; 32],
+                    ..Default::default()
+                };
+                {
+                    // 直接覆盖生产解析结果与真实存储，不经过测试专用的默认存储夹具。
+                    let store = RelocalizationTerminalStore::open_at(root.clone())
+                        .expect("按生产解析目录打开终态存储");
+                    store
+                        .persist_terminal(
+                            &result.request_id,
+                            request_identity,
+                            activation_identity,
+                            &StoredRelocalizationResult::new(result.clone()),
+                        )
+                        .expect("真实落盘重定位终态");
+                }
+                let reopened = RelocalizationTerminalStore::open_at(root)
+                    .expect("释放后重新打开同一生产解析目录");
+                match reopened.snapshot(
+                    &result.request_id,
+                    request_identity,
+                    activation_identity,
+                ) {
+                    RelocalizationTerminalSnapshot::Terminal(replayed) => {
+                        assert_eq!(replayed.encode_to_vec(), result.encode_to_vec());
+                    }
+                    other => panic!("重新打开终态不一致：{other:?}"),
+                }
+            }
         }
 
         #[test]
@@ -14668,6 +14747,36 @@ mod preflight_only_contract {
         }
 
         #[test]
+        fn activation_ledger_distinguishes_2d_from_lost_3d_target() {
+            for has_target in [false, true] {
+                let control = ActivatedTargetReceiptControl::new(7);
+                let seed = if has_target {
+                    activation_seed_with_target("act-1", 1, 1)
+                } else {
+                    activation_seed("act-1", 1)
+                };
+                let token = match control.stage_or_replay(seed, activation_base_state(), true) {
+                    ActivationLedgerAdmission::Execute(token) => token,
+                    _ => panic!("first admission must execute"),
+                };
+                let token = control.reserve_backend_generation(&token, 13).unwrap();
+                let token = control.bind_activation_identity(&token, [4; 32], 11).unwrap();
+                if has_target {
+                    control.with_staged_record_mut(&token, |record| record.immutable_target = None);
+                }
+                let sealed = control.seal(&token, None, activation_base_state());
+                if has_target {
+                    assert!(sealed.is_none(), "丢失三维目标不能降级为二维激活成功");
+                } else {
+                    let sealed = sealed.expect("二维资产可封存独立激活身份");
+                    assert!(sealed.success);
+                    assert!(!sealed.relocalization_target_available);
+                    assert!(sealed.target_receipt_sha256.is_empty());
+                }
+            }
+        }
+
+        #[test]
         fn activation_ledger_seals_replays_conflicts_and_permanently_retires() {
             let control = ActivatedTargetReceiptControl::new(7);
             let seed = activation_seed_with_target("act-1", 1, 1);
@@ -16020,7 +16129,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn actual_native_owner_returns_typed_dispositions_and_direct_finalizes_candidate() {
-            let _release_env = verified_correction_release_env().await;
+            let _release_env = native_correction_test_guard().await;
             let provider = crate::lcm_runtime::test_lcm_url();
             let sink = Arc::new(NativeFinalizingSink::default());
             let owner = CorrectionTransportOwner::start(
@@ -16101,7 +16210,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn native_finalizer_handoff_failure_cleans_waiter_stage_and_generation() {
-            let _release_env = verified_correction_release_env().await;
+            let _release_env = native_correction_test_guard().await;
             let provider = crate::lcm_runtime::test_lcm_url();
             let sink = Arc::new(NativeFinalizingSink::default());
             let mut owner = CorrectionTransportOwner::start(

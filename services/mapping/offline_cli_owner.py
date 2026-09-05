@@ -2547,7 +2547,7 @@ def _inspect_output(
 
 
 class OfflineMappingCliOwner:
-    """Single-capacity owner for the six offline mapping CLI commands."""
+    """四个离线建图命令的单任务进程宿主。"""
 
     def __init__(
         self,
@@ -3266,6 +3266,8 @@ class OfflineMappingCliOwner:
                 raise OfflineCliValidationError(
                     "offline CLI handshake conflicts with a standard descriptor"
                 )
+            from core.settings import component_logging_environment
+
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -3284,6 +3286,7 @@ class OfflineMappingCliOwner:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=component_logging_environment(),
                 cwd=os.sep,
                 close_fds=True,
                 pass_fds=(

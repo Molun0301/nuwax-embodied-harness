@@ -3539,15 +3539,9 @@ def write_configuration(context: "ExecutionContext") -> None:
         "NUWAX_PYTHON_BIN": str(options.current_link / ".venv" / "bin" / "python"),
         "NUWAX_GATEWAY_HOST": options.gateway_host,
         "NUWAX_NUWAX_WORKSPACE_DIR": str(options.current_link / "services" / "nuwax-workspace"),
-        "NUWAX_GEOMETRY_RUNTIME_BINARY": str(
-            options.current_link
-            / "services"
-            / "geometry"
-            / "nuwax_geometry_runtime"
-            / "target"
-            / "release"
-            / "nuwax-geometry-runtime"
-        ),
+        "NUWAX_GEOMETRY_RUNTIME_BINARY": str(options.current_link / "bin" / "nuwax-geometry-runtime"),
+        "NUWAX_NAV_STACK_BINARY": str(options.current_link / "bin" / "nuwax-nav-stack"),
+        "NUWAX_PERSON_FOLLOW_BINARY": str(options.current_link / "bin" / "nuwax-person-follow"),
         "NUWAX_GATEWAY_ARTIFACT_DIR": "/var/lib/nuwax/gateway/artifacts",
         "NUWAX_MAP_CATALOG_ROOT": "/var/lib/nuwax/gateway/maps",
         "NUWAX_MAPPING_DATABASE_ROOT": "/var/lib/nuwax/gateway/geometry/mapping",

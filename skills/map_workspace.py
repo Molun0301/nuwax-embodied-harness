@@ -3346,7 +3346,7 @@ class MapWorkspaceService:
                 "loaded_from_current_bundle": True,
             }
             activation_result = dict(
-                getattr(self._geometry_runtime, "_last_activation_result", None) or {}
+                runtime_metadata.get("geometry_activation") or {}
             )
             runtime_metadata["geometry_activation"] = activation_result
             self._ensure_backend_asset_activation_applied(

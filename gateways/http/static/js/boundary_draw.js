@@ -260,8 +260,11 @@
 
   function refreshStatus() {
     if (state.busy) return;
-    const mapName = state.mapName || '未绑定地图';
-    setStatus(mapName + ' · ' + state.zones.length + ' 个 · G' + state.generation, state.mapName ? 'ready' : 'warning');
+    if (!state.mapName) {
+      setStatus('请先选择地图，再查看或编辑禁行区。', 'warning');
+      return;
+    }
+    setStatus(state.mapName + ' · ' + state.zones.length + ' 个 · G' + state.generation, 'ready');
   }
 
   function setBusy(busy, message) {
@@ -322,8 +325,21 @@
   async function loadZones(mapName) {
     const serial = ++state.requestSerial;
     const requestedMapName = String(mapName || '').trim() || null;
-    const preservingCurrentSnapshot = requestedMapName === null || requestedMapName === state.mapName;
-    if (requestedMapName) state.mapName = requestedMapName;
+    if (!requestedMapName) {
+      state.mapName = null;
+      state.generation = 0;
+      state.signature = null;
+      state.updatedAt = null;
+      state.zones = [];
+      clearDraft();
+      setBusy(false);
+      redrawOverlay();
+      emitZonesUpdated();
+      setStatus('请先选择地图，再查看或编辑禁行区。', 'warning');
+      return;
+    }
+    const preservingCurrentSnapshot = requestedMapName === state.mapName;
+    state.mapName = requestedMapName;
     if (!preservingCurrentSnapshot) {
       state.generation = 0;
       state.signature = null;
@@ -334,16 +350,14 @@
     renderList();
     redrawOverlay();
     if (!preservingCurrentSnapshot) emitZonesUpdated();
-    setBusy(true, requestedMapName ? '加载 ' + requestedMapName : '解析当前地图');
-    const url = requestedMapName
-      ? API_URL + '?map_name=' + encodeURIComponent(requestedMapName)
-      : API_URL;
+    setBusy(true, '加载 ' + requestedMapName);
+    const url = API_URL + '?map_name=' + encodeURIComponent(requestedMapName);
     try {
       const raw = await fetchJson(url, { headers: { Accept: 'application/json' } });
       if (serial !== state.requestSerial) return;
       const entry = entryFromEnvelope(raw, requestedMapName);
       if (!entry) throw new Error('服务端未返回禁行区地图条目');
-      if (requestedMapName && entry.mapName !== requestedMapName) {
+      if (entry.mapName !== requestedMapName) {
         throw new Error('服务端返回了错误的 map_name');
       }
       applyEntry(entry);
@@ -406,7 +420,7 @@
 
   function syncMapName(force, raw) {
     const resolved = currentMapName(raw);
-    if (!force && (!resolved || (state.mapNameInitialized && resolved === state.observedMapName))) return;
+    if (!force && state.mapNameInitialized && resolved === state.observedMapName) return;
     state.mapNameInitialized = true;
     state.observedMapName = resolved;
     if (!force && resolved === state.mapName) return;
@@ -902,7 +916,7 @@
     if (!state.zones.length) {
       const empty = document.createElement('li');
       empty.className = 'forbidden-zone-empty';
-      empty.textContent = '当前地图暂无禁行区。';
+      empty.textContent = state.mapName ? '当前地图暂无禁行区。' : '请先选择地图。';
       state.listEl.appendChild(empty);
       return;
     }
@@ -944,7 +958,7 @@
       enabled: !state.enabledSelect || state.enabledSelect.value !== 'false',
       metadata: {
         name,
-        created_by: 'debug_panel',
+        created_by: 'console',
       },
     });
   }

@@ -1,4 +1,3 @@
-// Phase 6 (codex-round3 R3-4)：TYPED_CHANNELS / resolve_all / strip_env_prefix
 // 是 platform API 预留入口（Phase 3 mapping / Phase 5 explore 调用面未全部接通）。
 // 在不破坏 contract 前提下用 file-level allow 标注；P2 收口期 Phase 6 后期再清理。
 #![allow(dead_code)]
@@ -460,76 +459,6 @@ fn strict_binding_from_pattern(
     })
 }
 
-/// 标准 typed channel 集合(Phase 1 + Phase 2 收敛版)。
-///
-/// `(&str, &str, &str)` = (env_alias_runtime, env_alias_platform, default)
-/// 三元组按顺序探测。
-pub const TYPED_CHANNELS: &[(&str, &str, &str)] = &[
-    // occupancy grid —— Phase 0
-    (
-        "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
-        "NUWAX_LCM_CHANNEL_OCCUPANCY",
-        "/map/occupancy#nav_msgs.OccupancyGrid",
-    ),
-    // tf —— Phase 0
-    (
-        "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
-        "NUWAX_LCM_CHANNEL_TF",
-        "/tf#tf2_msgs.TFMessage",
-    ),
-    // cloud map (cumulative point cloud) —— R-N5a 修复:默认与 start.sh + .env.example
-    // 对齐 `/cloud_map`(累积点云地图),与 POINTCLOUD 实时流 `/go2/lidar/points` 区分。
-    (
-        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
-        "NUWAX_LCM_CHANNEL_POINTCLOUD",
-        "/go2/lidar/points#sensor_msgs.PointCloud2",
-    ),
-    (
-        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
-        "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-        "/cloud_map#sensor_msgs.PointCloud2",
-    ),
-    // navigation state
-    // Phase 4 修复：platform alias 由 `NUWAX_LCM_CHANNEL_GOAL_POSE` 改为
-    // `NUWAX_LCM_CHANNEL_NAV_STATE` —— 历史误用 goal_pose env 解析 nav_state
-    // 是 alias 错位，会让运维修改 nav_state channel 时改到 goal_pose env。
-    (
-        "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
-        "NUWAX_LCM_CHANNEL_NAV_STATE",
-        "/nav/state#nuwax_msgs.NavigationState",
-    ),
-    // exploration frontiers
-    (
-        "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
-        "NUWAX_LCM_CHANNEL_FRONTIER",
-        "/explore/frontiers#nuwax_msgs.FrontierList",
-    ),
-    // odometry (Phase 1)
-    (
-        "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
-        "NUWAX_LCM_CHANNEL_ODOM",
-        "/odom#nav_msgs.Odometry",
-    ),
-    // cmd vel (Phase 1)
-    (
-        "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
-        "NUWAX_LCM_CHANNEL_CMD_VEL",
-        "/cmd_vel#geometry_msgs.Twist",
-    ),
-    // versioned navigation goal
-    (
-        crate::nav_runtime::GOAL_CHANNEL_RUNTIME,
-        crate::nav_runtime::GOAL_CHANNEL_PLATFORM,
-        crate::nav_runtime::GOAL_CHANNEL_DEFAULT,
-    ),
-    // nav cancel (Phase 1)
-    (
-        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
-        "NUWAX_LCM_CHANNEL_NAV_CANCEL",
-        "/nav/cancel#nuwax_msgs.CancelNavigation",
-    ),
-];
-
 /// 探测 `runtime-alias → platform-alias → default`,返回第一个非空字符串。
 ///
 /// 不校验 channel 是否为合法 LCM typed format;校验由调用方在拿到
@@ -554,37 +483,6 @@ pub fn resolve_channel(runtime_alias: &str, platform_alias: &str, default: &str)
         warn!("{} 设置为空字符串；回退到 default", platform_alias);
     }
     default.to_string()
-}
-
-/// 解析所有 typed channel,返回 `(name, channel_string)` 列表。
-///
-/// 调用方负责把 channel 字符串喂给 `LcmTopic::new`;本函数只做 env 探测
-/// + 默认值兜底。
-pub fn resolve_all() -> Vec<(&'static str, String)> {
-    TYPED_CHANNELS
-        .iter()
-        .map(|(runtime, platform, default)| {
-            // TYPED_CHANNELS 的 runtime alias 已经包含规范名(用作输出标识)
-            let canonical = strip_env_prefix(runtime);
-            let value = resolve_channel(runtime, platform, default);
-            (canonical, value)
-        })
-        .collect()
-}
-
-/// 把 `NUWAX_GEOMETRY_RUNTIME_FOO_CHANNEL` 简化成 `FOO`(用于日志/registry
-/// 标识)。不是通用 env 工具函数,只服务本模块 TYPED_CHANNELS。
-///
-/// 不使用 `unsafe transmute`:运行时 alias env key 全是字面量,但要用
-/// `Box::leak` 重建字符串;考虑到本函数只在 `resolve_all` 被调用一次,
-/// 实际只对 10 类 typed channel 调用 10 次,可接受微小分配。
-fn strip_env_prefix(name: &str) -> &'static str {
-    let stripped = name
-        .strip_prefix("NUWAX_GEOMETRY_RUNTIME_")
-        .unwrap_or(name)
-        .strip_suffix("_CHANNEL")
-        .unwrap_or(name);
-    Box::leak(stripped.to_string().into_boxed_str())
 }
 
 #[cfg(test)]
@@ -785,6 +683,14 @@ mod tests {
             crate::nav_runtime::GOAL_CHANNEL_DEFAULT
         );
         assert_eq!(expected_type, "nuwax_msgs.GoalEnvelope");
-        assert_eq!(TYPED_CHANNELS.len(), ChannelKey::ALL.len());
+        assert_eq!(CHANNEL_KEY_TABLE.len(), ChannelKey::ALL.len());
+        let keys: std::collections::HashSet<_> = CHANNEL_KEY_TABLE.iter().map(|row| row.0).collect();
+        assert_eq!(keys.len(), ChannelKey::ALL.len());
+        for key in ChannelKey::ALL {
+            assert!(keys.contains(&key), "每个生产通道必须出现在唯一表中：{key:?}");
+            let (_, _, _, channel, message_type) = lookup(key);
+            strict_binding_from_pattern(key, &format!("{channel}#{message_type}"), message_type)
+                .expect("生产默认通道必须具备正确消息类型");
+        }
     }
 }

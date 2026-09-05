@@ -3,14 +3,10 @@
 //! 对应 Python 源 `dimos/navigation/replanning_a_star/navigation_map.py`。
 //!
 //! 设计：
-//! - `CostMap2D`：u8 占据栅格。`0=FREE`, `100=OCCUPIED`, `255=UNKNOWN`（自定义 sentinel，
-//!   与 Python `CostValues.UNKNOWN` 语义一致；Foundation 切换为 `nuwax-nav-types-messages`
-//!   后应使用统一 sentinel）。
+//! - `CostMap2D`：u8 占据栅格，`0=FREE`, `100=OCCUPIED`, `255=UNKNOWN`。
 //! - `NavigationMap`：缓存最近一次 binary costmap，提供 `make_gradient_costmap` 接口。
-//!   梯度扩展（inflate obstacle + voronoi/gradient 距离场）本阶段提供占位实现：
-//!   保留接口与签名，调用真正的 distance transform 留待后续 PR 与 mapping crate 协作。
-//!   Phase 1 单元测试只断言 API 形状、缓存与 binary 切换；gradient 具体算法在 Phase 1 完成后
-//!   与 mapping 板块联合完成。
+//!   障碍膨胀和距离代价统一调用 `nuwax-mapping::occupancy::gradient`，
+//!   支持普通梯度与 Voronoi（泰森多边形）策略。
 
 use crate::helpers::Point2;
 
@@ -228,9 +224,7 @@ pub enum GradientStrategy {
 /// 设计说明：
 /// - `update(costmap)` 缓存 binary。
 /// - `make_gradient_costmap(robot_increase)`：构造 obstacle inflate + 距离梯度 costmap。
-///   Phase 1 提供稳定 API 形状；具体 distance transform 算法（Chamfer / EDT / Voronoi）本阶段
-///   使用 4-邻接 BFS 简单实现，能保证 binary -> gradient 的转换可工作、可测，但**非生产级精度**。
-///   与 mapping 板块协作时将由 `nuwax-mapping::occupancy::gradient` 提供更精确实现替换。
+///   代价生成由 `nuwax-mapping::occupancy::gradient` 负责，本类型处理栅格转换与缓存。
 pub struct NavigationMap {
     robot_width: f64,
     #[allow(dead_code)] // 策略参数供运行时切换 gradient 行为,Binary 矩阵调用方暂未查询

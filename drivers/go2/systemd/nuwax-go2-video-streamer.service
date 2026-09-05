@@ -13,13 +13,19 @@ User=nuwax
 Group=nuwax
 SupplementaryGroups=video render
 WorkingDirectory=@NUWAX_REPO_ROOT@
+LogsDirectory=nuwax/gateway
+LogsDirectoryMode=0750
+Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 UMask=0007
 Environment=PYTHONUNBUFFERED=1
+Environment=NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
+Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
+EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
 # 视频发送器不依赖 GO2_DATA_PLANE_ENABLED；它只依赖锁定的 WebRTC 包、
 # Go2 IP/key 配置和 geometry runtime 提供的 UDS 中转。
-ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@ NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer
+ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@ @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

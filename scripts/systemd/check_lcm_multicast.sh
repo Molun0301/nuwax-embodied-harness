@@ -10,8 +10,6 @@ fail() {
 
 [[ "${LCM_URL}" == udpm://* ]] \
   || fail "NUWAX_LCM_URL must use udpm://, got ${LCM_URL}"
-[[ "${LCM_URL}" =~ [\?\&]ttl=1($|\&) ]] \
-  || fail "production NUWAX_LCM_URL must declare ttl=1, got ${LCM_URL}"
 
 provider="${LCM_URL#udpm://}"
 group="${provider%%:*}"

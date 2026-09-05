@@ -24,7 +24,7 @@ import grpc
 
 from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
-from core.logging_utils import StreamBusLogHandler
+from core.logging_utils import JsonLineFormatter
 from contracts.map_workspace import (
     MapAssetBundle,
     MapGeometryAssetBinding,
@@ -237,6 +237,7 @@ def _live_map_layer_descriptor(
     layer: object,
     *,
     mapping_identity_override: object = _MAPPING_IDENTITY_OVERRIDE_UNSET,
+    content_revision: Optional[int] = None,
 ) -> Dict[str, object]:
     if layer is None:
         return {"revision": 0, "content_hash": None, "mapping_identity": None}
@@ -245,6 +246,7 @@ def _live_map_layer_descriptor(
     map_id = str(getattr(layer, "map_id", "") or "").strip()
     revision = 0
     for candidate in (
+        content_revision,
         getattr(layer, "content_revision", None),
         getattr(layer, "revision", None),
         metadata.get("content_revision"),
@@ -256,11 +258,6 @@ def _live_map_layer_descriptor(
             continue
         if revision > 0:
             break
-    if revision <= 0:
-        revision_match = re.search(r"(?:^|[:/_-])(\d+)$", map_id)
-        if revision_match is not None:
-            revision = int(revision_match.group(1))
-
     content_hash = str(
         metadata.get("content_hash")
         or getattr(layer, "content_hash", "")
@@ -284,9 +281,6 @@ def _live_map_layer_descriptor(
             hasher.update(str(value).encode("ascii", errors="backslashreplace"))
             hasher.update(b"\0")
         content_hash = hasher.hexdigest()
-    if revision <= 0:
-        revision = max(1, int(content_hash[:15], 16))
-
     if mapping_identity_override is _MAPPING_IDENTITY_OVERRIDE_UNSET:
         mapping_identity = _mapping_context_snapshot_token(
             {
@@ -631,47 +625,39 @@ def _project_log_file() -> Path:
     return log_dir / "nuwax_robot_bridge.log"
 
 
-def _format_main_log_line(logger_name: str, message: str, *, level: str = "INFO") -> str:
-    now = datetime.now()
-    asctime = now.strftime("%Y-%m-%d %H:%M:%S") + ",%03d" % (now.microsecond // 1000)
-    return "%s [%s] [%s] %s\n" % (asctime, level, logger_name, message)
-
-
-def _publish_main_log_stream(logger_name: str, message: str, *, level: str = "INFO") -> None:
-    """将 go2.sh 子进程行推送到 StreamBus logs.entry（不经 file handler，避免重复写盘）。"""
-
-    record = logging.LogRecord(
-        name=str(logger_name or _GO2_SH_MAIN_LOG_LOGGER),
-        level=_main_log_level_to_logging(level),
-        pathname=__file__,
-        lineno=0,
-        msg=str(message or ""),
-        args=(),
-        exc_info=None,
-    )
-    for handler in logging.getLogger().handlers:
-        if not isinstance(handler, StreamBusLogHandler):
-            continue
-        try:
-            if handler.filter(record):
-                handler.emit(record)
-        except Exception:
-            LOGGER.debug("go2.sh 日志推送到 StreamBus 失败。", exc_info=True)
-        return
-
-
 def _append_main_log_line(logger_name: str, message: str) -> None:
+    """子进程输出进入统一日志链，保留 Rust 事件字段与原始等级。"""
     text = str(message or "").rstrip("\r\n")
     if not text:
         return
     level, normalized = _normalize_subprocess_log_line(text)
-    path = _project_log_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = _format_main_log_line(logger_name, normalized, level=level)
-    with _MAIN_LOG_APPEND_LOCK:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-    _publish_main_log_stream(logger_name, normalized, level=level)
+    extra = {"source": "native", "event": "process.output"}
+    try:
+        native = json.loads(text)
+    except (ValueError, TypeError):
+        native = None
+    if isinstance(native, dict) and "fields" in native:
+        fields = dict(native.get("fields") or {})
+        normalized = str(fields.pop("message", text))
+        logger_name = str(native.get("target") or logger_name)
+        level = str(native.get("level") or level).upper()
+        extra.update(fields)
+        for span in [*(native.get("spans") or []), native.get("span") or {}]:
+            if isinstance(span, dict):
+                for key in ("request_id", "task_id", "capability_name"):
+                    if span.get(key):
+                        extra.setdefault(key, span[key])
+        extra.update(source="rust", process_timestamp=native.get("timestamp"))
+    logger = logging.getLogger(logger_name)
+    # 工作区脚本可能单独调用本函数；未初始化平台日志时仍留下结构化记录。
+    if not logging.getLogger().handlers:
+        path = _project_log_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = logger.makeRecord(logger.name, _main_log_level_to_logging(level), __file__, 0, normalized, (), None, extra=extra)
+        with _MAIN_LOG_APPEND_LOCK, path.open("a", encoding="utf-8") as handle:
+            handle.write(JsonLineFormatter().format(record) + "\n")
+        return
+    logger.log(_main_log_level_to_logging(level), normalized, extra=extra)
 
 
 @dataclass
@@ -3703,7 +3689,6 @@ class PlatformGeometryRuntime:
                 != active_bundle.map_name
                 or str(activation.get("asset_manifest_sha256") or "").strip().lower()
                 != str(active_bundle.manifest_sha256 or "").strip().lower()
-                or not bool(activation.get("relocalization_target_available"))
             ):
                 raise RuntimeError("当前运行态没有匹配资产的 sealed 激活凭据。")
             fields = (
@@ -5219,6 +5204,11 @@ class PlatformGeometryRuntime:
         *,
         bundle_root: Path,
     ) -> bool:
+        geometry_asset = bundle.geometry_asset
+        if geometry_asset is not None and not geometry_asset.pcd_path:
+            database = geometry_asset.quality_metrics.get("database")
+            if isinstance(database, dict) and database.get("required") is False:
+                return bundle.snapshot.occupancy_grid is not None
         db_path = self._resolve_existing_bundle_mapping_db(
             bundle,
             bundle_root=bundle_root,
@@ -5812,13 +5802,25 @@ class PlatformGeometryRuntime:
                 if callable(cost_map_reader):
                     live_cost_map = cost_map_reader()
             occupancy_mapping_identity = _MAPPING_IDENTITY_OVERRIDE_UNSET
+            occupancy_content_revision = None
             if live_occupancy is not None and backend is not None:
+                descriptor_reader = getattr(backend, "get_occupancy_grid_descriptor", None)
                 occupancy_identity_reader = getattr(
                     backend,
                     "get_occupancy_grid_identity",
                     None,
                 )
-                if callable(occupancy_identity_reader):
+                if callable(descriptor_reader):
+                    try:
+                        descriptor = descriptor_reader(live_occupancy)
+                        if descriptor is None:
+                            continue
+                        occupancy_mapping_identity = descriptor["mapping_identity"]
+                        occupancy_content_revision = int(descriptor["revision"])
+                    except Exception:
+                        LOGGER.warning("读取栅格修订和会话失败，重新获取一致快照。", exc_info=True)
+                        continue
+                elif callable(occupancy_identity_reader):
                     try:
                         occupancy_mapping_identity = occupancy_identity_reader(
                             live_occupancy
@@ -5852,6 +5854,7 @@ class PlatformGeometryRuntime:
                 occupancy_descriptor = _live_map_layer_descriptor(
                     live_occupancy,
                     mapping_identity_override=occupancy_mapping_identity,
+                    content_revision=occupancy_content_revision,
                 )
             cost_map_descriptor = _live_map_layer_descriptor(live_cost_map)
             layer_identities = {
@@ -7592,40 +7595,23 @@ class PlatformGeometryRuntime:
                     if isinstance(geometry_asset.metadata, dict)
                     else None
                 )
-                if not isinstance(checkpoint_identity, dict) or (
-                    checkpoint_identity.get("present") is not True
-                ):
-                    raise ValueError(
-                        "finalized map asset is missing mapping backend checkpoint identity"
-                    )
-                expected_backend_kind = str(
-                    checkpoint_identity.get("backend_kind") or ""
-                ).strip()
-                expected_checkpoint_manifest_sha256 = str(
-                    checkpoint_identity.get("manifest_sha256") or ""
-                ).strip()
-                expected_checkpoint_object_sha256 = str(
-                    checkpoint_identity.get("object_sha256") or ""
-                ).strip()
-                if expected_backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS:
-                    raise ValueError(
-                        "mapping backend checkpoint identity has unsupported backend_kind"
-                    )
-                for field_name, value in (
-                    (
-                        "manifest_sha256",
-                        expected_checkpoint_manifest_sha256,
-                    ),
-                    ("object_sha256", expected_checkpoint_object_sha256),
-                ):
-                    if len(value) != 64 or any(
-                        character not in "0123456789abcdef"
-                        for character in value
-                    ):
+                expected_backend_kind = None
+                expected_checkpoint_manifest_sha256 = None
+                expected_checkpoint_object_sha256 = None
+                if isinstance(checkpoint_identity, dict) and checkpoint_identity.get("present") is True:
+                    expected_backend_kind = str(checkpoint_identity.get("backend_kind") or "").strip()
+                    expected_checkpoint_manifest_sha256 = str(checkpoint_identity.get("manifest_sha256") or "").strip()
+                    expected_checkpoint_object_sha256 = str(checkpoint_identity.get("object_sha256") or "").strip()
+                    if expected_backend_kind not in _SUPPORTED_MAPPING_BACKEND_KINDS:
                         raise ValueError(
-                            "mapping backend checkpoint identity has invalid %s"
-                            % field_name
+                            "mapping backend checkpoint identity has unsupported backend_kind"
                         )
+                    for field_name, value in (
+                        ("manifest_sha256", expected_checkpoint_manifest_sha256),
+                        ("object_sha256", expected_checkpoint_object_sha256),
+                    ):
+                        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                            raise ValueError("mapping backend checkpoint identity has invalid %s" % field_name)
                 nav2_map_metadata = self._resolve_nav2_map_metadata(bundle)
                 nav2_yaml_path = self._resolve_existing_nav2_map_yaml_path(
                     bundle,
@@ -8070,9 +8056,7 @@ class PlatformGeometryRuntime:
             for asset_ref in geometry_asset.assets:
                 if asset_ref.asset_type != MapGeometryAssetType.NAVIGATION_MAP:
                     continue
-                asset_metadata = dict(asset_ref.metadata or {})
-                if asset_metadata.get("state_kind") == "navigation_map_yaml":
-                    candidates.append(asset_ref.path)
+                candidates.append(asset_ref.path)
                 candidates.append(asset_ref.quality_metrics.get("yaml_path"))
         candidates.append(nav2_map_metadata.get("yaml_path"))
         candidates.append(

@@ -485,17 +485,21 @@ mod tests {
                 Box::pin(std::future::pending()) as TypedReadyFuture
             });
         let mut lifecycle = config(shell("exec sleep 30"), RestartPolicy::Never);
-        lifecycle.startup_timeout = Duration::from_millis(30);
+        // 预留实际子进程握手时间，再验证永不就绪的超时和回收。
+        lifecycle.startup_timeout = Duration::from_secs(2);
         let mut owner = RetainedNativeOwner::new(lifecycle, readiness).expect("owner");
         let error = owner.start().await.expect_err("startup must time out");
-        assert!(matches!(
-            error,
-            RetainedNativeError::Startup(error)
-                if matches!(
-                    error.failure,
-                    crate::supervised::SupervisedStartFailure::ReadyTimedOut
-                ) && error.rollback_error.is_none()
-        ));
+        assert!(
+            matches!(
+                &error,
+                RetainedNativeError::Startup(error)
+                    if matches!(
+                        &error.failure,
+                        crate::supervised::SupervisedStartFailure::ReadyTimedOut
+                    ) && error.rollback_error.is_none()
+            ),
+            "{error:?}"
+        );
         let identity = seen
             .lock()
             .expect("identity lock")

@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nuwax 机器人控制台</title>
+  <link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+<button class="tt glass" id="themeToggle" title="切换主题">🌙</button>
+<div class="app" id="app">
+  <header class="vitals card">
+    <div class="brand">
+      <span class="dot"></span>
+      <div><div class="nm">Nuwax 机器人控制台</div><div class="md"><span id="robotName">机器人未连接</span> · <span id="robotModel">型号 --</span></div></div>
+    </div>
+    <div class="vstats">
+      <div class="vstat"><div class="v" id="connectionText">缺失</div><div class="l">网关</div></div>
+      <div class="vstat"><div class="v" id="runtimeMode">--</div><div class="l">运行模式</div></div>
+      <div class="vstat"><div class="v" id="batteryMetric">--</div><div class="l">电池</div></div>
+      <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
+      <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">运存</div></div>
+      <div class="vstat"><div class="v mono" id="clockNow">--:--:--</div><div class="l">时间</div></div>
+      <div class="vstat"><div class="v mono" id="lastReceive">--</div><div class="l">接收延迟</div></div>
+    </div>
+    <span class="pill idle" id="motionStatus">运动状态</span>
+    <div class="seg">
+      <button class="view-switch-btn active" id="viewSwitchMonitor" type="button" data-view-target="monitor-view">监控</button>
+      <button class="view-switch-btn" id="viewSwitchLogs" type="button" data-view-target="logs-view">日志</button>
+      <button class="view-switch-btn" id="viewSwitchConfig" type="button" data-view-target="config-view">设置</button>
+    </div>
+  </header>
+  <div id="view-host">
+    <div id="monitor-view" class="view-pane active">
+      <div class="mission-layout"><div class="mission-content">
+        <div class="workspace">
+          <section id="live-map" class="map-panel hero card rise">
+            <div class="canvas-wrap">
+              <canvas id="mapCanvas" width="1400" height="900"></canvas>
+              <div id="map3dContainer" style="display:none;"></div>
+              <div class="hud map-toolbar" aria-label="地图视图与交互控制">
+                <div class="map-tool-row">
+                  <div id="mapViewControls" class="map-tool-group glass" aria-label="地图视图">
+                    <button id="mapModeToggle" class="tool" type="button" data-map-view="2d" aria-pressed="false" title="切换 2D / 3D 地图">切换 3D</button>
+                    <button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
+                  </div>
+                  <div id="map2dCameraControls" class="map-tool-group glass" data-map-view="2d" aria-label="2D 地图视角">
+                    <button id="mapZoomOut" class="tool" type="button" title="缩小 2D 地图">–</button>
+                    <span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span>
+                    <button id="mapZoomIn" class="tool" type="button" title="放大 2D 地图">+</button>
+                    <button id="mapZoomReset" class="tool" type="button" title="复位 2D 地图视角">复位</button>
+                    <button id="mapCenterRobot" class="tool" type="button" title="2D 视图居中到机器人" hidden>机器人</button>
+                  </div>
+                  <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
+                    <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、三轴平移和缩放">自由视角</button>
+                    <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器人">跟随机器人</button>
+                    <label class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
+                      <span class="sw" aria-hidden="true"></span>
+                      <select id="map3dPointStyle" aria-label="3D 点云显示样式">
+                        <option value="height" selected>高度</option>
+                        <option value="singleFloor">单层</option>
+                        <option value="ground">地面</option>
+                        <option value="structure">结构</option>
+                        <option value="mono">单色</option>
+                      </select>
+                    </label>
+                    <span class="map-tool-separator" aria-hidden="true"></span>
+                    <button id="map3dZoomOut" class="tool" type="button" title="缩小 3D 地图">–</button>
+                    <span id="map3dZoomValue" class="tool" aria-live="polite">100%</span>
+                    <button id="map3dZoomIn" class="tool" type="button" title="放大 3D 地图">+</button>
+                    <button id="map3dResetView" class="tool" type="button" title="复位当前 3D 视角">复位视角</button>
+                    <button id="map3dCenterRobot" class="tool" type="button" title="将 3D 视角定位到机器人" disabled>定位机器人</button>
+                  </div>
+                  <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
+                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品；3D 远距缩小时自动隐藏">
+                      <input id="showSemanticInstances" type="checkbox" checked>
+                      <span class="sw" style="background:#f59e0b"></span>物品
+                    </label>
+                    <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
+                  </div>
+                </div>
+                <div id="map2dActionControls" class="map-tool-row" data-map-view="2d" aria-label="2D 地图交互">
+                  <div class="map-tool-group glass">
+                    <button id="mapInitialPoseToggle" class="tool pose-tool" type="button" title="2D Pose Estimate：发布 /initialpose">2D Pose</button>
+                    <button id="mapGoalToggle" class="tool" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
+                    <button id="mapPublishPointToggle" class="tool" type="button" title="Publish Point：发布 /clicked_point">选点</button>
+                  </div>
+                  <div class="map-tool-group glass">
+                    <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
+                    <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
+                  </div>
+                </div>
+              </div>
+              <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
+                <div class="forbidden-zone-head">
+                  <span class="forbidden-zone-title">导航禁行区</span>
+                  <span class="forbidden-zone-status" data-role="boundary-status">等待地图</span>
+                </div>
+                <div class="forbidden-zone-grid">
+                  <label class="forbidden-zone-field wide">名称
+                    <input data-role="boundary-name" type="text" maxlength="80" value="禁行区 1" autocomplete="off">
+                  </label>
+                  <label class="forbidden-zone-field">形状
+                    <select data-role="boundary-shape">
+                      <option value="line">直线</option>
+                      <option value="rectangle">矩形</option>
+                      <option value="circle">圆形</option>
+                      <option value="custom">自定义多边形</option>
+                    </select>
+                  </label>
+                  <label class="forbidden-zone-field">禁行方向
+                    <select data-role="boundary-mode">
+                      <option value="inside">内部禁行</option>
+                      <option value="outside">外部禁行</option>
+                    </select>
+                  </label>
+                  <label class="forbidden-zone-field">边界宽度（米）
+                    <input data-role="boundary-width" type="number" min="0.02" max="5" step="0.01" value="0.25">
+                  </label>
+                  <label class="forbidden-zone-field">状态
+                    <select data-role="boundary-enabled">
+                      <option value="true">启用</option>
+                      <option value="false">停用</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="forbidden-zone-actions">
+                  <button data-role="boundary-toggle" type="button">开始绘制</button>
+                  <button data-role="boundary-finish" type="button" hidden>完成多边形</button>
+                  <button data-role="boundary-undo" type="button" hidden>撤销顶点</button>
+                  <button data-role="boundary-submit" class="primary" type="button">保存禁行区</button>
+                  <button data-role="boundary-draft-clear" type="button">取消草稿</button>
+                  <button data-role="boundary-clear" type="button">清空全部</button>
+                </div>
+                <div class="forbidden-zone-hint" data-role="boundary-hint">直线、矩形和圆形用鼠标拖拽；自定义多边形逐点单击后完成。</div>
+                <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
+              </div>
+              <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
+              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip">等待地图首帧</span>
+              <div class="lgnd glass legend">
+                <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
+                <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
+                <span class="lg"><span class="sw" style="background:var(--traj)"></span>轨迹</span>
+                <span class="lg"><span class="sw" style="background:var(--plan)"></span>规划</span>
+                <span class="lg"><span class="sw" style="background:var(--robot)"></span>机器人</span>
+                <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
+                <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
+                <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
+                <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
+              </div>
+              <div id="mapPoseHud" class="map-pose-hud glass map-overlay-panel" aria-live="polite">
+                <div class="map-pose-title">位姿</div>
+                <div id="mapPoseMeta" class="kv map-pose-meta"></div>
+              </div>
+              <div id="mapStatus" class="pill missing map-status-chip">缺失</div>
+              <div id="mapEmpty" class="empty">等待地图数据。</div>
+            </div>
+          </section>
+          <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
+            <div class="ph">
+              <div class="t"><div class="eyebrow">Perception</div><h2>摄像头画面</h2></div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <button id="mediaSwapBtnVideo" class="media-swap" type="button" title="地图 / 视频 互换位置与大小">⇄ 放大</button>
+                <span id="videoStatus" class="pill missing">缺失</span>
+              </div>
+            </div>
+            <div class="video">
+              <img id="videoFrame" class="video-frame" alt="机器人摄像头画面" hidden>
+              <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
+              <div class="ov">
+                <span id="visionModelStatus" class="ovchip glass">本地模型：--</span>
+                <span id="videoFpsStatus" class="ovchip glass">帧率：--</span>
+                <label class="ovchip glass" style="display:flex;gap:5px;align-items:center"><input id="showDetections" type="checkbox">检测框</label>
+              </div>
+            </div>
+            <div id="videoEmpty" class="empty panel-meta">等待摄像头数据。</div>
+          </section>
+          <section class="card panel rise merged-rail" style="animation-delay:.1s;overflow:auto">
+            <div class="ph">
+              <div class="t"><div class="eyebrow">Map</div><h2>地图摘要</h2></div>
+              <span id="mapSummaryMode" class="mchip">2D 栅格</span>
+            </div>
+            <div id="mapMeta" class="kv"></div>
+          </section>
+          <section class="dock card rise" style="animation-delay:.2s">
+            <div class="dcol">
+              <div class="dh"><div class="t"><h3>最近日志</h3></div><button class="btn" type="button" data-open-view="logs-view">查看全部</button><span id="logsStatus" class="pill missing">等待</span></div>
+              <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
+            </div>
+            <div class="dcol">
+              <div class="dh"><div class="t"><div class="eyebrow">Processes</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
+              <div id="serviceMatrixScope" class="muted small"></div>
+              <div class="dscroll"><div id="serviceMatrix" class="rows"></div></div>
+            </div>
+            <div class="dcol">
+              <div class="dh"><div class="t"><div class="eyebrow">Tasks</div><h3>任务状态</h3></div><span id="taskStatus" class="pill missing">缺失</span></div>
+              <div class="dscroll">
+                <div id="taskSummary" class="rows"></div>
+              </div>
+            </div>
+            <div class="dcol">
+              <div class="dh"><div class="t"><div class="eyebrow">Services</div><h3>服务状态</h3></div><span id="governanceStatus" class="pill missing">缺失</span></div>
+              <div class="dscroll"><div id="governanceMeta" class="service-health-list"></div></div>
+            </div>
+          </section>
+        </div>
+      </div></div>
+      <div class="overview-hidden"><section id="overviewGrid" aria-hidden="true"></section></div>
+    </div>
+    <div id="logs-view" class="view-pane">
+      <section class="card log-workspace" aria-label="结构化运行日志">
+        <header class="log-heading">
+          <div><div class="eyebrow">系统运行记录</div><h2>运行日志</h2><p>按组件、请求或任务追踪运行过程，展开记录查看完整字段与异常。</p></div>
+          <div class="log-summary-stats"><span id="logCount">0 条记录</span><span id="logErrorCount">0 条错误</span><span id="logPending" aria-live="polite"></span></div>
+        </header>
+        <div class="log-filter-grid">
+          <label>等级<select id="logLevelFilter" class="field"><option value="">全部等级</option><option value="debug">调试</option><option value="info">信息</option><option value="warning">警告</option><option value="error">错误</option><option value="critical">严重</option></select></label>
+          <label>来源<select id="logSourceFilter" class="field"><option value="">全部来源</option><option value="python">平台服务</option><option value="rust">Rust 运行进程</option><option value="native">原生组件</option></select></label>
+          <label>组件<input id="logComponentFilter" class="field" type="search" placeholder="组件名称"></label>
+          <label class="log-query-label">全文搜索<input id="logSearch" class="field" type="search" placeholder="消息、事件、异常或详细字段"></label>
+          <label>请求标识<input id="logRequestFilter" class="field mono" type="search" placeholder="request_id"></label>
+          <label>任务标识<input id="logTaskFilter" class="field mono" type="search" placeholder="task_id"></label>
+        </div>
+        <div class="log-actions">
+          <button id="logPause" class="btn" type="button" aria-pressed="false">暂停更新</button>
+          <button id="logRefresh" class="btn" type="button">刷新记录</button>
+          <span class="log-actions-spacer"></span>
+          <button id="logCopyAll" class="btn" type="button">复制当前视图</button>
+          <button id="logExportText" class="btn" type="button">下载文本</button>
+          <button id="logExportJson" class="btn" type="button">下载结构化日志</button>
+        </div>
+        <div id="logMessage" class="log-message-status" role="status" aria-live="polite">正在加载运行记录…</div>
+        <div class="log-column-head" aria-hidden="true"><span>时间</span><span>等级</span><span>组件</span><span>消息与关联信息</span></div>
+        <div id="consoleLogRows" class="console-log-rows" aria-label="日志记录"></div>
+        <footer class="log-footer"><button id="logLoadMore" class="btn" type="button">加载更早记录</button><span>支持直接选择文字，暂停后可连续阅读和复制。</span></footer>
+      </section>
+    </div>
+    <div id="config-view" class="view-pane">
+      <section id="config-section" class="card cfg rise">
+        <nav class="cfg-nav" id="configNav"><div class="hd eyebrow">设置分类</div></nav>
+        <div class="cfg-main">
+          <div class="card-head" style="padding:14px 16px 0;margin:0">
+            <div class="t"><div class="eyebrow">Configuration</div><h2>平台设置</h2></div>
+            <span id="configStatus" class="pill missing">缺失</span>
+          </div>
+          <div class="config-toolbar">
+            <input id="configSearch" class="field" type="search" placeholder="搜索中文名称、键名或说明" aria-label="搜索配置">
+            <label class="small muted" style="display:flex;gap:5px;align-items:center"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
+            <button id="configReload" class="btn" type="button">刷新设置</button>
+            <button id="configSave" class="btn primary" type="button">保存改动</button>
+          </div>
+          <div id="configEffectNote" class="muted small" style="padding:0 16px">仅保存已修改项；保存后需重启网关生效。</div>
+          <div id="configStoragePath" class="muted small config-storage-path"></div>
+          <div id="configDirty" class="muted small" style="padding:0 16px"></div>
+          <div id="configSections" class="config-sections"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+  <script src="/static/js/console-logs.js"></script>
+  <script src="/static/js/console-settings.js"></script>
+  <script src="/static/js/console.js"></script>
+  <script>
+    window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
+    (() => {
+      const config = window.__NUWAX_POINTCLOUD3D_CONFIG__;
+      if (!config || typeof config !== "object") return;
+      const heightColors = Array.isArray(config.height_colors) ? config.height_colors : [];
+      const swatches = {
+        "--pointcloud3d-height-color": heightColors[2],
+        "--pointcloud3d-ground-color": config.ground_color,
+        "--pointcloud3d-structure-color": config.structure_color,
+        "--pointcloud3d-color": config.color,
+      };
+      for (const [name, value] of Object.entries(swatches)) {
+        if (typeof value === "string" && value) document.documentElement.style.setProperty(name, value);
+      }
+    })();
+  </script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260721-pointcloud-display-config"></script>
+  <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
+  <div id="navigation-container" data-role="v2-navigation" hidden>
+    <span data-role="nav-status">未选点</span>
+    <button data-role="nav-submit">导航到选点</button>
+    <button data-role="nav-cancel">取消导航</button>
+    <pre data-role="nav-detail"></pre>
+  </div>
+  <script src="/static/js/navigation.js"></script>
+  <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>
+  <script>
+    // 地图导航工具入口开关：
+    // map-toolbar 上的"导航"按钮 → 显示 navigation-container
+    // map-toolbar 上的"禁行区"按钮 → 显示地图 HUD 内的 boundary-draw-container
+    // 同时只允许一个容器可见（互斥模式）。
+    (function () {
+      'use strict';
+      var navContainer = document.getElementById('navigation-container');
+      var boundaryContainer = document.getElementById('boundary-draw-container');
+      var navBtn = document.getElementById('mapNavToggle');
+      var boundaryBtn = document.getElementById('mapBoundaryToggle');
+      function setActive(target) {
+        if (navContainer) navContainer.hidden = (target !== 'nav');
+        if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');
+        if (navBtn) navBtn.classList.toggle('active', target === 'nav');
+        if (boundaryBtn) boundaryBtn.classList.toggle('active', target === 'boundary');
+      }
+      if (navBtn) {
+        navBtn.addEventListener('click', function () {
+          setActive(navContainer && navContainer.hidden ? 'nav' : null);
+        });
+      }
+      if (boundaryBtn) {
+        boundaryBtn.addEventListener('click', function () {
+          setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

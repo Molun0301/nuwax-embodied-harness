@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, field
 import logging
 import threading
@@ -13,7 +14,7 @@ from contracts.base import MetadataDict, utc_now
 from contracts.naming import build_event_id, build_task_id
 from contracts.tasks import TaskEvent, TaskSpec, TaskState, TaskStatus
 from core.event_bus import EventBus
-from core.logging_utils import LogRateLimiter
+from core.logging_utils import LogRateLimiter, correlation_context
 from core.resource_lock import ResourceLockManager
 
 TaskRunner = Callable[["TaskExecutionContext"], Any]
@@ -350,7 +351,16 @@ class TaskManager:
             with self._lock:
                 self._records[task_id] = record
 
-            future = self._executor.submit(gated_runner)
+            def correlated_runner():
+                request_context = metadata_payload.get("request_context") or {}
+                with correlation_context(
+                    request_id=str(request_context.get("request_id") or ""),
+                    task_id=task_id,
+                    capability_name=capability_name,
+                ):
+                    return gated_runner()
+
+            future = self._executor.submit(copy_context().run, correlated_runner)
             with self._lock:
                 record.future = future
 

@@ -27,7 +27,7 @@ from drivers.registry import ROBOT_DRIVER_REGISTRY
 ROOT_ENV_TEMPLATE = PROJECT_ROOT / ".env.example"
 ROOT_ENV_TARGET = PROJECT_ROOT / ".env"
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_gateway.sh"
-DEFAULT_SYSTEMD_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "nuwax-host-gateway.service.example"
+DEFAULT_SYSTEMD_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "nuwax-host-gateway.service"
 DEFAULT_SYSTEMD_OUTPUT = PROJECT_ROOT / "runtime_data" / "systemd" / "nuwax-host-gateway.service"
 DEFAULT_SYSTEMD_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or "unitree"
 DEFAULT_EXTERNAL_MCP_TEMPLATE = PROJECT_ROOT / "deploy" / "nuwaclaw" / "external_mcp_servers.host_gateway.example.json"

@@ -10,9 +10,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${NUWAX_BOOTSTRAP_ENV_FILE:-${REPO_ROOT}/.env}"
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-python3}"
-RESTART_POLICY="${NUWAX_GATEWAY_RESTART:-on-failure}"
-RESTART_SEC="${NUWAX_GATEWAY_RESTART_SEC:-3}"
-RESTART_MAX_ATTEMPTS="${NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS:-0}"
 ACTION="${1:-start}"
 PID_FILE=""
 LOCK_FILE=""
@@ -42,42 +39,9 @@ trim_whitespace() {
   printf '%s' "${value}"
 }
 
-load_env_file() {
-  local target="$1"
-  local allowed_prefix="${2:-}"
-  local override_existing="${3:-false}"
-  local raw_line=""
-  local line=""
-  local key=""
-  local value=""
-  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
-    line="$(trim_whitespace "${raw_line}")"
-    if [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]]; then
-      continue
-    fi
-    key="$(trim_whitespace "${line%%=*}")"
-    value="$(trim_whitespace "${line#*=}")"
-    if [[ "${value}" == *[[:space:]]\#* ]]; then
-      value="$(trim_whitespace "${value%%#*}")"
-    fi
-    if [[ -z "${key}" ]]; then
-      continue
-    fi
-    if [[ -n "${allowed_prefix}" && "${key}" != "${allowed_prefix}"* ]]; then
-      continue
-    fi
-    if [[ ${#value} -ge 2 ]]; then
-      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
-        value="${value:1:${#value}-2}"
-      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
-        value="${value:1:${#value}-2}"
-      fi
-    fi
-    if [[ "${override_existing}" == "true" || -z "${!key+x}" ]]; then
-      export "${key}=${value}"
-    fi
-  done < "${target}"
-}
+# 与 Python 设置、Rust 启动入口共用解析口径。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/config_env.sh"
+
 
 default_gateway_web_config_env_file() {
   if [[ -n "${STATE_DIRECTORY:-}" ]]; then
@@ -613,10 +577,10 @@ start_geometry_runtime() {
     export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
     export NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL:-${NUWAX_LCM_CHANNEL_POINTCLOUD:-/go2/lidar/points#sensor_msgs.PointCloud2}}"
     export NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL:-${NUWAX_LCM_CHANNEL_CLOUD_MAP:-/cloud_map#sensor_msgs.PointCloud2}}"
-    export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="/nav/goal#nuwax_msgs.GoalEnvelope"
-    export NUWAX_LCM_CHANNEL_GOAL_POSE="/nav/goal#nuwax_msgs.GoalEnvelope"
-    export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="/nav/path#nuwax_msgs.PathEnvelope"
-    export NUWAX_LCM_CHANNEL_NAV_PATH="/nav/path#nuwax_msgs.PathEnvelope"
+    export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL:-${NUWAX_LCM_CHANNEL_GOAL_POSE:-/nav/goal#nuwax_msgs.GoalEnvelope}}"
+    export NUWAX_LCM_CHANNEL_GOAL_POSE="${NUWAX_LCM_CHANNEL_GOAL_POSE:-${NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL}}"
+    export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL:-${NUWAX_LCM_CHANNEL_NAV_PATH:-/nav/path#nuwax_msgs.PathEnvelope}}"
+    export NUWAX_LCM_CHANNEL_NAV_PATH="${NUWAX_LCM_CHANNEL_NAV_PATH:-${NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL}}"
     export NUWAX_GEOMETRY_RUNTIME_BINARY="${binary}"
     run_with_title "nuwax-geometry-runtime-launcher" bash "${launcher}"
   ) &
@@ -1007,23 +971,31 @@ stop_gateway() {
 }
 
 
-if [[ -f "${ENV_FILE}" ]]; then
-  load_env_file "${ENV_FILE}"
-fi
 GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
-if [[ -f "${GO2_DATA_PLANE_ENV_FILE}" ]]; then
-  load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
-fi
+load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
+load_env_file "${REPO_ROOT}/.config"
+load_env_file "${ENV_FILE}"
 GATEWAY_WEB_CONFIG_ENV_FILE="${NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE:-$(default_gateway_web_config_env_file)}"
 export NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE="${GATEWAY_WEB_CONFIG_ENV_FILE}"
 if [[ -f "${GATEWAY_WEB_CONFIG_ENV_FILE}" ]]; then
   # Web 覆盖文件只能影响无安全敏感性的点云显示项。
-  load_env_file "${GATEWAY_WEB_CONFIG_ENV_FILE}" "NUWAX_GATEWAY_POINTCLOUD3D_" true
+  load_env_file "${GATEWAY_WEB_CONFIG_ENV_FILE}" "NUWAX_GATEWAY_POINTCLOUD3D_"
 fi
 
+if [[ -n "${NUWAX_USER_CONFIG_ENV_FILE:-}" ]]; then
+  load_env_file "${NUWAX_USER_CONFIG_ENV_FILE}"
+fi
+RESTART_POLICY="${NUWAX_GATEWAY_RESTART:-on-failure}"
+RESTART_SEC="${NUWAX_GATEWAY_RESTART_SEC:-3}"
+RESTART_MAX_ATTEMPTS="${NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS:-0}"
+PERSON_FOLLOW_TARGET_CHANNEL="${NUWAX_PERSON_FOLLOW_TARGET_CHANNEL:-${PERSON_FOLLOW_TARGET_CHANNEL}}"
+PERSON_FOLLOW_POINTCLOUD_CHANNEL="${NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL:-${PERSON_FOLLOW_POINTCLOUD_CHANNEL}}"
+PERSON_FOLLOW_TF_CHANNEL="${NUWAX_PERSON_FOLLOW_TF_CHANNEL:-${PERSON_FOLLOW_TF_CHANNEL}}"
+PERSON_FOLLOW_COMMAND_CHANNEL="${NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL:-${PERSON_FOLLOW_COMMAND_CHANNEL}}"
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PID_FILE="${NUWAX_GATEWAY_PID_FILE:-${REPO_ROOT}/runtime_data/gateway/gateway.pid}"
 LOCK_FILE="${NUWAX_GATEWAY_LOCK_FILE:-$(default_gateway_lock_file)}"
+normalize_config_aliases
 HOST="${NUWAX_GATEWAY_HOST:-0.0.0.0}"
 PORT="${NUWAX_GATEWAY_PORT:-8766}"
 acquire_script_lock "${LOCK_FILE}"
@@ -1067,16 +1039,13 @@ export NUWAX_PERSON_FOLLOW_TARGET_CHANNEL="${PERSON_FOLLOW_TARGET_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL="${PERSON_FOLLOW_POINTCLOUD_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_TF_CHANNEL="${PERSON_FOLLOW_TF_CHANNEL}"
 export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
-export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="/nav/goal#nuwax_msgs.GoalEnvelope"
-export NUWAX_LCM_CHANNEL_GOAL_POSE="/nav/goal#nuwax_msgs.GoalEnvelope"
-export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="/nav/path#nuwax_msgs.PathEnvelope"
-export NUWAX_LCM_CHANNEL_NAV_PATH="/nav/path#nuwax_msgs.PathEnvelope"
-export GO2_VIDEO_STREAM_GATEWAY_URL="${GO2_VIDEO_STREAM_GATEWAY_URL:-ws://127.0.0.1:${PORT}/streams/video.ingest}"
+export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL:-${NUWAX_LCM_CHANNEL_GOAL_POSE:-/nav/goal#nuwax_msgs.GoalEnvelope}}"
+export NUWAX_LCM_CHANNEL_GOAL_POSE="${NUWAX_LCM_CHANNEL_GOAL_POSE:-${NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL}}"
+export NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL:-${NUWAX_LCM_CHANNEL_NAV_PATH:-/nav/path#nuwax_msgs.PathEnvelope}}"
+export NUWAX_LCM_CHANNEL_NAV_PATH="${NUWAX_LCM_CHANNEL_NAV_PATH:-${NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL}}"
 export NUWAX_RUNTIME_ACTIVATION_REQUEST="${NUWAX_RUNTIME_ACTIVATION_REQUEST:-${REPO_ROOT}/runtime_data/gateway/geometry.request}"
 export NUWAX_RUNTIME_ACTIVATION_RESULT="${NUWAX_RUNTIME_ACTIVATION_RESULT:-${REPO_ROOT}/runtime_data/gateway/geometry.result.json}"
 mkdir -p "$(dirname "${NUWAX_RUNTIME_ACTIVATION_REQUEST}")"
-# 个人机器狗：网关不鉴权，视频推流令牌默认留空（如需可单独设置 GO2_VIDEO_STREAM_ACCESS_TOKEN）。
-export GO2_VIDEO_STREAM_ACCESS_TOKEN="${GO2_VIDEO_STREAM_ACCESS_TOKEN:-}"
 
 cd "${REPO_ROOT}"
 write_pid_file

@@ -5,6 +5,8 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ import grpc
 
 from contracts.frame_semantics import infer_frame_role
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
@@ -2227,6 +2230,8 @@ def _resolve_map_bundle_asset(
     bundle_root: Path,
     relative_path: object,
     field_name: str,
+    *,
+    allow_missing: bool = False,
 ) -> Path:
     requested_root = Path(bundle_root).expanduser()
     if not requested_root.is_absolute():
@@ -2247,12 +2252,12 @@ def _resolve_map_bundle_asset(
     candidate = resolved_root / relative
     if candidate.is_symlink():
         raise ValueError("%s must not be a symlink" % field_name)
-    resolved = candidate.resolve(strict=True)
+    resolved = candidate.resolve(strict=not allow_missing)
     try:
         resolved.relative_to(resolved_root)
     except ValueError as exc:
         raise ValueError("%s escapes bundle_root" % field_name) from exc
-    if not resolved.is_file():
+    if not resolved.is_file() and not (allow_missing and not resolved.exists()):
         raise ValueError("%s is not a regular file" % field_name)
     return resolved
 
@@ -2438,7 +2443,7 @@ def _read_deadline_sec() -> float:
     经 NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC 可配；默认 2.0s，下限 0.1s 避免误配为 0。
     """
     try:
-        return max(0.1, float(os.environ.get("NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC", "2.0")))
+        return max(0.1, float(runtime_value("NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC", "2.0")))
     except (TypeError, ValueError):
         return 2.0
 
@@ -2454,7 +2459,7 @@ def _pose_deadline_sec() -> float:
     默认值需按实机 p95 复核。
     """
     try:
-        return max(0.1, float(os.environ.get("NUWAX_GEOMETRY_GRPC_POSE_DEADLINE_SEC", "5.0")))
+        return max(0.1, float(runtime_value("NUWAX_GEOMETRY_GRPC_POSE_DEADLINE_SEC", "5.0")))
     except (TypeError, ValueError):
         return 5.0
 
@@ -2466,7 +2471,7 @@ def _heavy_deadline_sec() -> float:
     经 NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC 可配；默认 10.0s，下限 0.5s。
     """
     try:
-        return max(0.5, float(os.environ.get("NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC", "10.0")))
+        return max(0.5, float(runtime_value("NUWAX_GEOMETRY_GRPC_HEAVY_DEADLINE_SEC", "10.0")))
     except (TypeError, ValueError):
         return 10.0
 
@@ -2476,7 +2481,7 @@ def _grpc_message_limit_bytes() -> int:
 
     try:
         configured = int(
-            os.environ.get(
+            runtime_value(
                 "NUWAX_GEOMETRY_GRPC_MAX_MESSAGE_BYTES",
                 str(_DEFAULT_GRPC_MESSAGE_LIMIT_BYTES),
             )
@@ -2490,7 +2495,7 @@ def _grpc_stream_retry_sec() -> float:
     try:
         return max(
             0.01,
-            float(os.environ.get("NUWAX_GEOMETRY_GRPC_STREAM_RETRY_SEC", "1.0")),
+            float(runtime_value("NUWAX_GEOMETRY_GRPC_STREAM_RETRY_SEC", "1.0")),
         )
     except (TypeError, ValueError):
         return 1.0
@@ -2501,7 +2506,7 @@ def _grpc_stream_retry_max_sec() -> float:
         return max(
             _grpc_stream_retry_sec(),
             float(
-                os.environ.get(
+                runtime_value(
                     "NUWAX_GEOMETRY_GRPC_STREAM_RETRY_MAX_SEC",
                     "8.0",
                 )
@@ -2515,7 +2520,7 @@ def _exploration_poll_sec() -> float:
     try:
         return max(
             0.01,
-            float(os.environ.get("NUWAX_GEOMETRY_EXPLORATION_POLL_SEC", "0.5")),
+            float(runtime_value("NUWAX_GEOMETRY_EXPLORATION_POLL_SEC", "0.5")),
         )
     except (TypeError, ValueError):
         return 0.5
@@ -3121,7 +3126,7 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
     # 当前帧真实存在的 base 节点串（按语义角色匹配，取第一个角色为 base 的 frame）。
     live_base_frame = next((f for f in present_frames if infer_frame_role(f) == "base"), None)
     if live_base_frame is None:
-        configured_base = _normalize_frame(os.environ.get("NUWAX_BASE_FRAME", ""))
+        configured_base = _normalize_frame(runtime_value("NUWAX_BASE_FRAME", ""))
         if not configured_base:
             configured_base = _normalize_frame(
                 os.environ.get("NUWAX_GEOMETRY_BASE_FRAME", "")
@@ -3325,6 +3330,7 @@ class GeometryRuntimeProvider:
         self._next_map_delivery_ticket_id = 1
         self._last_occupancy_grid: Optional[OccupancyGrid] = None
         self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
+        self._last_occupancy_grid_revision = 0
         self._mapping_identity: Optional[_MappingIdentity] = None
         self._mapping_checkpoint_provenance: Optional[
             _MappingCheckpointProvenance
@@ -4531,6 +4537,7 @@ class GeometryRuntimeProvider:
             bundle_root,
             mapping_database_path,
             "mapping_database_path",
+            allow_missing=not str(pcd_path or "").strip(),
         )
         _resolve_map_bundle_asset(
             bundle_root,
@@ -4678,7 +4685,8 @@ class GeometryRuntimeProvider:
                 )
             else:
                 voxel_size = 0.05
-                source_revision = 0
+                # 普通资产没有后端历史修订，以首次导入修订标识其真实内容。
+                source_revision = 1
                 cloud_frame_id = frame_id
                 payload_schema_version = 1
             if cloud_frame_id != frame_id:
@@ -4731,7 +4739,7 @@ class GeometryRuntimeProvider:
                     origin_x=float(origin.x),
                     origin_y=float(origin.y),
                     frame_id=frame_id,
-                    revision=0,
+                    revision=1,
                     timestamp_ns=max(0, timestamp_ns),
                 ),
                 data=encoded,
@@ -4990,11 +4998,23 @@ class GeometryRuntimeProvider:
                 or payload["activation_request_id"] != session_id
                 or len(payload["activation_request_identity_sha256"]) != 64
                 or len(payload["activation_identity_sha256"]) != 64
-                or len(payload["target_receipt_sha256"]) != 64
+                or (
+                    cloud_checkpoint is not None
+                    and (
+                        len(payload["target_receipt_sha256"]) != 64
+                        or not payload["relocalization_target_available"]
+                    )
+                )
+                or (
+                    cloud_checkpoint is None
+                    and (
+                        bool(payload["target_receipt_sha256"])
+                        or payload["relocalization_target_available"]
+                    )
+                )
                 or payload["asset_manifest_sha256"] != asset_manifest_sha256
                 or payload["asset_bundle_sha256"]
                 != bytes(request.asset_bundle_sha256).hex()
-                or not payload["relocalization_target_available"]
                 or payload["source_policy_version"] <= 0
                 or len(payload["source_policy_sha256"]) != 64
                 or payload["deadline_policy_version"] <= 0
@@ -5732,14 +5752,12 @@ class GeometryRuntimeProvider:
         origin_x: float,
         origin_y: float,
         frame_id: str,
-        revision: int,
         timestamp_ns: int,
         data: bytes,
     ) -> OccupancyGrid:
         width = int(width)
         height = int(height)
         resolution = float(resolution)
-        revision = int(revision)
         timestamp_ns = int(timestamp_ns)
         if width <= 0 or height <= 0:
             raise ValueError("occupancy width/height must be positive")
@@ -5812,7 +5830,6 @@ class GeometryRuntimeProvider:
                 origin_x=float(payload["origin_x"]),
                 origin_y=float(payload["origin_y"]),
                 frame_id=str(payload["frame_id"]),
-                revision=int(payload["revision"]),
                 timestamp_ns=int(payload.get("timestamp_ns") or 0),
                 data=bytes(payload["data"]),
             )
@@ -5833,13 +5850,23 @@ class GeometryRuntimeProvider:
             if request_identity is not None:
                 self._last_occupancy_grid = grid.model_copy(deep=True)
                 self._last_occupancy_grid_identity = request_identity
+                self._last_occupancy_grid_revision = int(payload["revision"])
         return grid
 
     def get_occupancy_grid_identity(
         self,
         occupancy_grid: Optional[OccupancyGrid] = None,
     ) -> Optional[_MappingIdentity]:
-        """Return the session identity that still owns a validated grid."""
+        """读取仍拥有此栅格的会话，与修订描述共用同一来源。"""
+
+        descriptor = self.get_occupancy_grid_descriptor(occupancy_grid)
+        return descriptor["mapping_identity"] if descriptor is not None else None
+
+    def get_occupancy_grid_descriptor(
+        self,
+        occupancy_grid: Optional[OccupancyGrid] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """在现有缓存锁内一并读取栅格的真实修订和所属会话。"""
 
         with self._map_state_lock:
             identity = self._mapping_identity
@@ -5853,7 +5880,10 @@ class GeometryRuntimeProvider:
                 or (occupancy_grid is not None and occupancy_grid != cached)
             ):
                 return None
-            return identity
+            return {
+                "mapping_identity": identity,
+                "revision": int(self._last_occupancy_grid_revision),
+            }
 
     def get_raw_occupancy_grid(self) -> Optional[OccupancyGrid]:
         """返回物理栅格，供地图资产持久化避免烘焙虚拟禁行区。"""
@@ -5877,7 +5907,6 @@ class GeometryRuntimeProvider:
                 origin_x=float(payload["origin_x"]),
                 origin_y=float(payload["origin_y"]),
                 frame_id=str(payload["frame_id"]),
-                revision=int(payload["revision"]),
                 timestamp_ns=int(payload.get("timestamp_ns") or 0),
                 data=bytes(payload["data"]),
             )
@@ -5938,7 +5967,6 @@ class GeometryRuntimeProvider:
             origin_x=meta.origin_x,
             origin_y=meta.origin_y,
             frame_id=meta.frame_id,
-            revision=meta.revision,
             timestamp_ns=meta.timestamp_ns,
             data=data,
         )
@@ -5973,7 +6001,6 @@ class GeometryRuntimeProvider:
                     origin_x=meta.origin_x,
                     origin_y=meta.origin_y,
                     frame_id=meta.frame_id,
-                    revision=meta.revision,
                     timestamp_ns=meta.timestamp_ns,
                     data=raw_data,
                 )
@@ -6060,6 +6087,7 @@ class GeometryRuntimeProvider:
                 )
             self._last_occupancy_grid = grid.model_copy(deep=True)
             self._last_occupancy_grid_identity = identity
+            self._last_occupancy_grid_revision = revision
             delivery_token = self._map_delivery_token_locked()
         return _MapUpdatePayload(
             {
@@ -7807,7 +7835,7 @@ class GeometryRuntimeProvider:
             for start_pose, end_pose in boundary_line_segments or ():
                 for pose in (start_pose, end_pose):
                     frame_id = str(pose.frame_id or "").strip().lstrip("/")
-                    if frame_id != "map":
+                    if frame_id != DEFAULT_MAP_FRAME:
                         raise ValueError(
                             "exploration boundary frame must be map, received %s"
                             % (frame_id or "<empty>")
@@ -7826,7 +7854,7 @@ class GeometryRuntimeProvider:
                 arbitration=arbitration,
                 request_id=request_id,
                 boundary_line_segments=proto_segments,
-                boundary_frame_id="map" if proto_segments else "",
+                boundary_frame_id=DEFAULT_MAP_FRAME if proto_segments else "",
                 max_navigation_retries=max(0, int(max_navigation_retries)),
                 blacklist_radius_m=max(0.0, float(blacklist_radius_m)),
                 motion_guard_generation=motion_guard_generation,

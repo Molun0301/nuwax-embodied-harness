@@ -453,9 +453,8 @@ pub(crate) struct NativeDeferredReplayControl {
     poison_diagnostics: Mutex<Vec<String>>,
 }
 
-/// Initially closed production ingress. Before activation it forwards only to
-/// an unbound validation probe, so Native LIO can prove its first source pair
-/// without reaching Mapping or canonical state.
+/// 初始关闭的生产输入路由；正式功能所有者建立前，不允许写入规范建图状态。
+/// 启动确认只表示订阅可接收，算法数据由正式入口在 gRPC 开放后处理。
 pub(crate) struct LioIngressRoutingGate {
     probe: Arc<dyn LioIngressSink>,
     state: Mutex<LioRoutingState>,
@@ -2873,7 +2872,13 @@ impl LioIngressSink for CommonLioIngress {
         )
         .await?;
         if !committed {
-            return Err("LIO odometry handoff committed no observation".to_string());
+            tracing::debug!(
+                event = "lio.odometry.waiting_for_mapping",
+                reason = "mapping_session_inactive",
+                source_sequence = accepted.envelope.source_sequence,
+                source_timestamp_ns = accepted.envelope.source_timestamp_ns,
+                "实时里程计等待活跃建图会话"
+            );
         }
         Ok(())
     }
@@ -3243,13 +3248,15 @@ impl LioIngressSink for LioIngressRoutingGate {
         &self,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<(), String> {
-        if matches!(
+        if *shutdown_rx.borrow() || matches!(
             *self.state.lock(),
             LioRoutingState::Poisoned | LioRoutingState::Closed
         ) {
             return Err("LIO routing gate closed before startup readiness".to_owned());
         }
-        self.probe.wait_startup_ready(shutdown_rx).await
+        // 生产输入来自稍后启动的 gRPC 服务；此处只确认订阅可收数据。
+        // 算法首帧就绪由正式 ingress 和各功能的 readiness 反映。
+        Ok(())
     }
 
     async fn accept_public_odometry(
@@ -3336,7 +3343,13 @@ async fn accept_public_odometry_with_correction(
     )
     .await?;
     if !committed {
-        return Err("LIO odometry handoff committed no observation".to_owned());
+        tracing::debug!(
+            event = "lio.odometry.waiting_for_mapping",
+            reason = "mapping_session_inactive",
+            source_sequence = accepted.envelope.source_sequence,
+            source_timestamp_ns = accepted.envelope.source_timestamp_ns,
+            "实时里程计等待活跃建图会话"
+        );
     }
     Ok(())
 }
@@ -5269,7 +5282,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             probe.ready_calls.load(std::sync::atomic::Ordering::Acquire),
-            1
+            0
         );
         assert_eq!(
             probe
@@ -6984,7 +6997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_bound_inactive_odometry_sink_reports_zero_commit_without_side_effects() {
+    async fn runtime_bound_inactive_odometry_sink_waits_without_side_effects() {
         let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("test runtime handle");
@@ -7005,10 +7018,9 @@ mod tests {
         let ingress = runtime_bound_ingress(spec(), handle.clone());
 
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let error = LioIngressSink::accept_public_odometry(&ingress, frame, &mut shutdown_rx)
+        LioIngressSink::accept_public_odometry(&ingress, frame, &mut shutdown_rx)
             .await
-            .expect_err("inactive adapter must reject the sink handoff");
-        assert!(error.contains("committed no observation"));
+            .expect("inactive mapping is an expected wait without canonical publication");
         let adapter_state = {
             let adapter = mapping.lock();
             (

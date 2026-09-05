@@ -25,8 +25,6 @@ pub(crate) const PRIVATE_PREFIX_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PRIVATE_P
 pub(crate) const FIRST_PAIR_TIMEOUT_MS_ENV: &str =
     "NUWAX_GEOMETRY_NATIVE_LIO_FIRST_PAIR_TIMEOUT_MS";
 pub(crate) const PAIR_MAX_SKEW_MS_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS";
-pub(crate) const HOST_IP_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_HOST_IP";
-pub(crate) const LIDAR_IP_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_LIDAR_IP";
 
 const LCM_URL_ENV: &str = "NUWAX_LCM_URL";
 const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
@@ -156,8 +154,6 @@ pub(crate) struct NativeLioPreflight {
     executable: PathBuf,
     lcm_url: String,
     private_prefix: String,
-    host_ip: String,
-    lidar_ip: String,
     body_from_sensor: BodyFromSensorTransform,
     first_pair_timeout: Duration,
     pair_max_skew: Duration,
@@ -165,17 +161,23 @@ pub(crate) struct NativeLioPreflight {
 
 impl NativeLioPreflight {
     pub(crate) fn from_env(backend: NativeBackend) -> Result<Self, String> {
-        let executable = canonical_executable(&required_env(NATIVE_EXECUTABLE_ENV)?)?;
+        let executable_path = if env::var_os(NATIVE_EXECUTABLE_ENV).is_some() {
+            required_env(NATIVE_EXECUTABLE_ENV)?
+        } else {
+            // 源码构建沿用本地 result/bin；显式配置仍优先，部署搬迁可指定固定路径。
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../nuwax-workspace/crates/nuwax-lio-backends")
+                .join(backend.source_relpath())
+                .join(backend.executable_relpath())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let executable = canonical_executable(&executable_path)?;
         let body_from_sensor = BodyFromSensorTransform::from_env()?;
         let lcm_url = strict_env_or_default(LCM_URL_ENV, DEFAULT_LCM_URL)?;
         validate_lcm_url(&lcm_url)?;
         let private_prefix = strict_env_or_default(PRIVATE_PREFIX_ENV, DEFAULT_PRIVATE_PREFIX)?;
         validate_private_prefix(&private_prefix)?;
-
-        let defaults = NativeLioConfig::for_backend(backend);
-        let host_ip = strict_env_or_default(HOST_IP_ENV, &defaults.host_ip)?;
-        let lidar_ip = strict_env_or_default(LIDAR_IP_ENV, &defaults.lidar_ip)?;
-        validate_ip_pair(&host_ip, &lidar_ip)?;
 
         let first_pair_timeout_ms = strict_millis_env(
             FIRST_PAIR_TIMEOUT_MS_ENV,
@@ -198,8 +200,6 @@ impl NativeLioPreflight {
             executable,
             lcm_url,
             private_prefix,
-            host_ip,
-            lidar_ip,
             body_from_sensor,
             first_pair_timeout: Duration::from_millis(first_pair_timeout_ms),
             pair_max_skew: Duration::from_millis(pair_max_skew_ms),
@@ -258,8 +258,6 @@ impl NativeLioPreflight {
         config.frame_id = odom_frame.into();
         config.extrinsic_translation_m = self.body_from_sensor.translation_m();
         config.extrinsic_rotation_row_major = self.body_from_sensor.rotation_row_major();
-        config.host_ip.clone_from(&self.host_ip);
-        config.lidar_ip.clone_from(&self.lidar_ip);
         let args = config
             .render_args()
             .map_err(|error| format!("NATIVE_LIO_BIND_FAILED invalid native config: {error}"))?;
@@ -452,21 +450,6 @@ fn validate_private_prefix(value: &str) -> Result<(), String> {
     {
         return Err(format!(
             "NATIVE_LIO_PREFLIGHT_FAILED env={PRIVATE_PREFIX_ENV} invalid_private_prefix"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_ip_pair(host_ip: &str, lidar_ip: &str) -> Result<(), String> {
-    let host = host_ip.parse::<std::net::Ipv4Addr>().map_err(|error| {
-        format!("NATIVE_LIO_PREFLIGHT_FAILED env={HOST_IP_ENV} invalid_ipv4: {error}")
-    })?;
-    let lidar = lidar_ip.parse::<std::net::Ipv4Addr>().map_err(|error| {
-        format!("NATIVE_LIO_PREFLIGHT_FAILED env={LIDAR_IP_ENV} invalid_ipv4: {error}")
-    })?;
-    if host == lidar {
-        return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={HOST_IP_ENV},{LIDAR_IP_ENV} addresses_must_be_distinct"
         ));
     }
     Ok(())
@@ -997,8 +980,6 @@ mod tests {
             (PRIVATE_PREFIX_ENV, Some("/g13")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1234")),
             (PAIR_MAX_SKEW_MS_ENV, Some("25")),
-            (HOST_IP_ENV, None),
-            (LIDAR_IP_ENV, None),
         ]);
         NativeLioPreflight::from_env(backend).expect("native preflight")
     }

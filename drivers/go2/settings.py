@@ -6,32 +6,20 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from core.config_values import config_value, raw_value, read_env_values, user_config_values
 from contracts.geometry_runtime import PlatformGeometryConfig
 from drivers.go2.defaults import GO2_DEFAULT_FRAME_IDS
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
 
 
-def _strip_quotes(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
 def _load_file_values() -> Dict[str, str]:
-    values: Dict[str, str] = {}
-    for file_path in (_GO2_ENV_FILE,):
-        if not file_path.exists():
-            continue
-        for raw_line in file_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if key:
-                values[key] = _strip_quotes(value)
+    configured = os.environ.get("GO2_DATA_PLANE_ENV_FILE", "").strip()
+    path = Path(configured).expanduser() if configured else _GO2_ENV_FILE
+    values = read_env_values(path)
+    core_path = os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", str(_PROJECT_ROOT / ".env"))
+    values.update(read_env_values(Path(core_path).expanduser()))
+    values.update(user_config_values())
     return values
 
 
@@ -39,35 +27,23 @@ _FILE_VALUES = _load_file_values()
 
 
 def _raw_value(name: str, default: str = "") -> str:
-    if name in os.environ:
-        return os.environ[name]
-    return _FILE_VALUES.get(name, default)
+    return raw_value(name, default, _FILE_VALUES)
 
 
 def _cfg_str(name: str, default: str = "") -> str:
-    value = _raw_value(name, default).strip()
-    return value if value else default
+    return config_value(name, default, "str", _FILE_VALUES)
 
 
 def _cfg_bool(name: str, default: bool) -> bool:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
+    return config_value(name, default, "bool", _FILE_VALUES)
 
 
 def _cfg_int(name: str, default: int) -> int:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return int(value.strip())
+    return config_value(name, default, "int", _FILE_VALUES)
 
 
 def _cfg_float(name: str, default: float) -> float:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return float(value.strip())
+    return config_value(name, default, "float", _FILE_VALUES)
 
 
 def _require_nonnegative_finite(name: str, value: float) -> float:
@@ -77,15 +53,7 @@ def _require_nonnegative_finite(name: str, value: float) -> float:
 
 
 def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    result = []
-    for raw_item in value.split(","):
-        item = raw_item.strip()
-        if item:
-            result.append(item)
-    return tuple(result)
+    return config_value(name, default, "csv", _FILE_VALUES)
 
 
 def _prefer_platform_str(platform_value: str, legacy_name: str, default: str) -> str:
@@ -143,6 +111,7 @@ class Go2DataPlaneConfig:
     dds_iface: str = ""
     expected_odom_frame: str = ""
     expected_imu_frame: str = ""
+    lio_backend: str = "device"
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: Go2OfficialControlConfig = field(default_factory=Go2OfficialControlConfig)
     video_stream: Go2VideoStreamConfig = field(default_factory=Go2VideoStreamConfig)
@@ -165,6 +134,10 @@ def load_go2_data_plane_config(
             platform_geometry.frames.odom_frame if platform_geometry is not None else ""
         ).strip(),
         expected_imu_frame=GO2_DEFAULT_FRAME_IDS["imu"],
+        lio_backend=str(
+            getattr(platform_geometry, "lio_backend", "device") if platform_geometry is not None
+            else os.environ.get("NUWAX_GEOMETRY_LIO_BACKEND", "device")
+        ).strip(),
         direct_dds=Go2DirectDdsConfig(
             enabled=_cfg_bool("GO2_DIRECT_DDS_ENABLED", True),
             pose_topic=_cfg_str("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),

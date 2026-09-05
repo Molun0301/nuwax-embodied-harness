@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 from dataclasses import dataclass
 import hashlib
 import importlib
@@ -231,19 +233,19 @@ class Go2Actuator:
 
     @classmethod
     def from_environment(cls) -> "Go2Actuator":
-        backend = os.environ.get("NUWAX_MOTION_GUARD_BACKEND", "").strip()
+        backend = runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip()
         if backend != "unitree_sdk2py":
             raise ActuatorError(
                 "BACKEND_NOT_PRODUCTION",
                 "NUWAX_MOTION_GUARD_BACKEND must be unitree_sdk2py",
             )
         sdk_path = (
-            os.environ.get("GO2_SDK_PATH", "").strip()
-            or os.environ.get("NUWAX_GO2_SDK_PATH", "").strip()
+            runtime_value("GO2_SDK_PATH", "").strip()
+            or runtime_value("NUWAX_GO2_SDK_PATH", "").strip()
         )
         if not sdk_path:
             raise ActuatorError("SDK_PATH_INVALID", "GO2_SDK_PATH is required")
-        manifest_value = os.environ.get("NUWAX_ACTUATOR_SYMBOLS_FILE", "").strip()
+        manifest_value = runtime_value("NUWAX_ACTUATOR_SYMBOLS_FILE", "").strip()
         if not manifest_value:
             raise ActuatorError(
                 "ACTUATOR_MANIFEST_UNAVAILABLE",
@@ -251,13 +253,13 @@ class Go2Actuator:
             )
         manifest_path = Path(manifest_value).expanduser().resolve()
         try:
-            timeout = float(os.environ.get("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
+            timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
             max_linear = float(
-                os.environ.get("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35")
+                runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "0.35")
             )
-            max_yaw = float(os.environ.get("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+            max_yaw = float(runtime_value("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
             yaw_deadband = float(
-                os.environ.get(
+                runtime_value(
                     "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",
                     "0.003490658503988659",
                 )
@@ -293,8 +295,8 @@ class Go2Actuator:
                 "and less than GO2_OFFICIAL_MAX_YAW_RATE_RPS",
             )
         iface = (
-            os.environ.get("GO2_DATA_PLANE_DDS_IFACE", "").strip()
-            or os.environ.get("GO2_DDS_IFACE", "").strip()
+            runtime_value("GO2_DATA_PLANE_DDS_IFACE", "").strip()
+            or runtime_value("GO2_DDS_IFACE", "").strip()
             or None
         )
         return cls(

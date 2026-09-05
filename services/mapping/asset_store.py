@@ -524,32 +524,49 @@ class MapAssetBundleRepository:
     ) -> None:
         if geometry_asset is None:
             raise MapAssetBundleValidationError("地图资产包缺少 geometry_asset。")
-        referenced = [geometry_asset.mapping_database_path]
-        if not geometry_asset.pcd_path:
-            raise MapAssetBundleValidationError("地图资产包缺少 PCD 点云资产。")
-        referenced.append(geometry_asset.pcd_path)
-        referenced.extend(asset.path for asset in geometry_asset.assets)
-        for relative in referenced:
+        # 二维导航资产可以没有点云或原生后端历史状态；只验证实际声明的文件。
+        database_quality = geometry_asset.quality_metrics.get("database") or {}
+        if not isinstance(database_quality, dict):
+            raise MapAssetBundleValidationError("建图数据库质量描述非法。")
+        database_required = database_quality.get("required", True) is not False
+        database_declared = (
+            database_required
+            or database_quality.get("present") is True
+            or geometry_asset.mapping_database_path in manifested_paths
+            or any(
+                asset.asset_type == MapGeometryAssetType.MAPPING_DATABASE
+                for asset in geometry_asset.assets
+            )
+        )
+        referenced = [asset.path for asset in geometry_asset.assets]
+        if database_declared:
+            referenced.append(geometry_asset.mapping_database_path)
+        pcd_paths = {
+            asset.path for asset in geometry_asset.assets
+            if asset.asset_type == MapGeometryAssetType.PCD
+        }
+        if geometry_asset.pcd_path:
+            pcd_paths.add(geometry_asset.pcd_path)
+        referenced.extend(sorted(pcd_paths))
+        for relative in dict.fromkeys(referenced):
             normalized = _validate_relative_path(relative, "几何资产路径")
             if normalized not in manifested_paths:
                 raise MapAssetBundleValidationError("几何资产未被顶层清单绑定：%s" % normalized)
             tree.require_file(normalized, "几何资产").size()
 
-        database_file = tree.require_file(
-            geometry_asset.mapping_database_path,
-            "建图数据库",
-        )
-        if database_file.size() <= 4096:
-            raise MapAssetBundleValidationError("建图数据库缺失或过小。")
-        self._validate_pcd(tree.require_file(geometry_asset.pcd_path, "PCD 地图"))
+        if database_declared:
+            database_file = tree.require_file(geometry_asset.mapping_database_path, "建图数据库")
+            if database_file.size() == 0:
+                raise MapAssetBundleValidationError("建图数据库不能为空。")
+        for pcd_path in sorted(pcd_paths):
+            self._validate_pcd(tree.require_file(pcd_path, "PCD 地图"))
         navigation_assets = [
             asset for asset in geometry_asset.assets if asset.asset_type == MapGeometryAssetType.NAVIGATION_MAP
         ]
         if not navigation_assets:
-            raise MapAssetBundleValidationError("地图资产包缺少 Nav2 地图资产。")
-        for asset in geometry_asset.assets:
-            if asset.asset_type == MapGeometryAssetType.NAVIGATION_MAP:
-                self._validate_nav2_yaml(tree, asset.path, manifested_paths)
+            raise MapAssetBundleValidationError("地图资产包缺少导航地图资产。")
+        for asset in navigation_assets:
+            self._validate_nav2_yaml(tree, asset.path, manifested_paths)
         self._validate_backend_checkpoint(
             tree,
             geometry_asset,
@@ -563,8 +580,14 @@ class MapAssetBundleRepository:
         manifested_paths: set[str],
     ) -> None:
         raw_checkpoint = geometry_asset.metadata.get("mapping_backend_checkpoint")
-        if not isinstance(raw_checkpoint, dict) or raw_checkpoint.get("present") is not True:
-            raise MapAssetBundleValidationError("地图资产包缺少 backend checkpoint。")
+        if raw_checkpoint is None:
+            return
+        if not isinstance(raw_checkpoint, dict):
+            raise MapAssetBundleValidationError("backend checkpoint 描述非法。")
+        if raw_checkpoint.get("present") is False:
+            return
+        if raw_checkpoint.get("present") is not True:
+            raise MapAssetBundleValidationError("backend checkpoint 缺少明确的存在状态。")
         backend_kind = str(raw_checkpoint.get("backend_kind") or "").strip()
         schema_version = raw_checkpoint.get("schema_version")
         if not backend_kind or isinstance(schema_version, bool) or not isinstance(schema_version, int):
@@ -649,9 +672,20 @@ class MapAssetBundleRepository:
 
     @staticmethod
     def _validate_pcd(managed_file: _ManagedRegularFile) -> None:
-        header = managed_file.prefix(_FILE_PREFIX_BYTES)
-        if b"FIELDS x y z" not in header or b"DATA " not in header:
-            raise MapAssetBundleValidationError("PCD 地图头部非法。")
+        # 复用激活/显示链的PCD解析器，从已持有的文件描述符读取，避免另建解析规则。
+        import numpy as np
+        from services.geometry.pointcloud_map import read_pcd_xyz
+
+        managed_file.verify_named_entry()
+        try:
+            header, points = read_pcd_xyz(Path("/proc/self/fd/%d" % managed_file.descriptor))
+        except Exception as exc:
+            raise MapAssetBundleValidationError("PCD 地图不可读取：%s" % managed_file.relative_path) from exc
+        managed_file.verify_named_entry()
+        if not len(points) or not np.isfinite(points).all():
+            raise MapAssetBundleValidationError("PCD 地图没有有效有限点。")
+        if header.points > 0 and len(points) != header.points:
+            raise MapAssetBundleValidationError("PCD 地图点数与头部声明不一致。")
 
     @staticmethod
     def _validate_nav2_yaml(

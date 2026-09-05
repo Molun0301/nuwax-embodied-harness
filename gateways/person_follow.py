@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 from dataclasses import dataclass, replace
 import math
 import os
@@ -658,12 +660,12 @@ class GatewayPersonFollowBridge:
         barrier_timeout_sec: float = 1.0,
         poll_timeout_ms: int = 20,
     ) -> None:
-        self.lcm_url = str(lcm_url or os.getenv("NUWAX_LCM_URL") or DEFAULT_LCM_URL)
+        self.lcm_url = str(lcm_url or runtime_value("NUWAX_LCM_URL") or DEFAULT_LCM_URL)
         self.target_channel = str(
-            target_channel or os.getenv("NUWAX_PERSON_FOLLOW_TARGET_CHANNEL") or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
+            target_channel or runtime_value("NUWAX_PERSON_FOLLOW_TARGET_CHANNEL") or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
         )
         self.command_channel = str(
-            command_channel or os.getenv("NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL") or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
+            command_channel or runtime_value("NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL") or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
         )
         if self.command_channel in _FORBIDDEN_COMMAND_CHANNELS:
             raise PersonFollowBridgeError(

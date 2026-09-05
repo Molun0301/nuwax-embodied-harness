@@ -941,6 +941,7 @@ class LivePointCloudMapSource(PointCloudMapSource):
             return None
         self.open()
         if not self._reader.is_available():
+            self._last_revision = None
             raise PointCloudMapSourceError(
                 "live_unavailable",
                 "实时 cloud-map mmap 不可用。",
@@ -950,6 +951,7 @@ class LivePointCloudMapSource(PointCloudMapSource):
         try:
             snapshot = self._reader.read_stable_snapshot(max_points=self._max_points)
         except Exception as exc:
+            self._last_revision = None
             raise PointCloudMapSourceError(
                 "live_read_failed",
                 str(exc),
@@ -960,6 +962,7 @@ class LivePointCloudMapSource(PointCloudMapSource):
             try:
                 header = self._reader.read_header()
             except Exception as exc:
+                self._last_revision = None
                 raise PointCloudMapSourceError(
                     "live_header_failed",
                     str(exc),
@@ -967,6 +970,7 @@ class LivePointCloudMapSource(PointCloudMapSource):
                     retryable=True,
                 ) from exc
             if header is None:
+                self._last_revision = None
                 raise PointCloudMapSourceError(
                     "live_invalid_header",
                     "实时 cloud-map mmap 头无效。",
@@ -1218,14 +1222,18 @@ class PointCloudMapSourceSwitch:
                 return None
             return self._accept(saved_snapshot)
 
-    @staticmethod
     def _try_read(
+        self,
         source: PointCloudMapSource,
         cancel_event: Optional[threading.Event],
     ) -> Tuple[Optional[PointCloudMapSnapshot], bool]:
         try:
             return source.read(cancel_event), True
         except PointCloudMapSourceError as exc:
+            # 读取失败与“没有新修订”不同；恢复后即使修订相同也必须重新交付。
+            if self._active_source == source.source:
+                self._active_source = None
+                self._active_epoch = None
             if not exc.retryable:
                 raise
             return None, False

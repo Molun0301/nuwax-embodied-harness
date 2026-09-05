@@ -208,6 +208,7 @@ def adapt_go2_l2_lidar(
     *,
     timestamp_ns: int,
     source_sequence: int,
+    registration_state: RegistrationState = RegistrationState.BODY,
 ) -> CanonicalLidarFrame:
     """把已验证的 L2 原始帧映射到设备无关 canonical LiDAR 合同。"""
 
@@ -220,7 +221,18 @@ def adapt_go2_l2_lidar(
             "Go2 L2 LiDAR source frame 不在权威标定 profile：%s"
             % decoded.source_frame
         )
-    transformed_xyz = GO2_CALIBRATION_PROFILE.transform_lidar_xyz(decoded.xyz_array)
+    registration_state = RegistrationState(registration_state)
+    if registration_state not in (RegistrationState.BODY, RegistrationState.SENSOR):
+        raise Go2L2DecodeError("Go2 L2 适配仅支持 sensor 或 body 注册。")
+    sensor_registration = registration_state == RegistrationState.SENSOR
+    transformed_xyz = (
+        decoded.xyz_array if sensor_registration
+        else GO2_CALIBRATION_PROFILE.transform_lidar_xyz(decoded.xyz_array)
+    )
+    output_frame = (
+        GO2_CALIBRATION_PROFILE.lidar_source_frame if sensor_registration
+        else GO2_CALIBRATION_PROFILE.registration_frame
+    )
     intensity_bytes = (
         np.ascontiguousarray(decoded.intensity_array, dtype="<f4").tobytes()
         if decoded.intensity_array is not None
@@ -238,9 +250,9 @@ def adapt_go2_l2_lidar(
         source_sequence=source_sequence,
         timestamp_ns=timestamp_ns,
         clock_domain=SensorClockDomain.UNIX_NS,
-        frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
-        registration_state=RegistrationState.BODY,
-        registration_frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        frame_id=output_frame,
+        registration_state=registration_state,
+        registration_frame_id=output_frame,
         calibration_ref=GO2_CALIBRATION_PROFILE.calibration_ref,
         payload_ownership=PayloadOwnership.INLINE,
         point_count=int(transformed_xyz.shape[0]),
@@ -249,7 +261,9 @@ def adapt_go2_l2_lidar(
         time_offset_ns_le=offset_bytes,
         scan_duration_ns=scan_duration_ns,
         is_dense=decoded.is_dense,
-        transform_provenance="calibration_applied:%s" % GO2_CALIBRATION_PROFILE.calibration_ref,
+        transform_provenance=(
+            "raw_sensor:%s" if sensor_registration else "calibration_applied:%s"
+        ) % GO2_CALIBRATION_PROFILE.calibration_ref,
     )
 
 
@@ -260,9 +274,13 @@ def adapt_go2_l2_imu(
     accel_mps2: tuple,
     gyro_rps: tuple,
     source_sequence: int,
+    registration_state: RegistrationState = RegistrationState.BODY,
 ) -> CanonicalImuSample:
     """把已验证的 Go2 IMU SI 单位样本变换并映射到 canonical IMU 合同。"""
 
+    registration_state = RegistrationState(registration_state)
+    if registration_state not in (RegistrationState.BODY, RegistrationState.SENSOR):
+        raise Go2L2DecodeError("Go2 IMU 适配仅支持 sensor 或 body 注册。")
     try:
         transformed_accel = GO2_CALIBRATION_PROFILE.transform_imu_vector(
             accel_mps2, frame_id
@@ -272,14 +290,23 @@ def adapt_go2_l2_imu(
         )
     except ValueError as exc:
         raise Go2L2DecodeError("Go2 IMU 标定变换失败：%s" % exc) from exc
+    output_frame = GO2_CALIBRATION_PROFILE.registration_frame
+    if registration_state == RegistrationState.SENSOR:
+        # IMU 和 LiDAR 的物理轴向不同，必须做真实旋转，不能只改坐标系名称。
+        lidar_from_body = GO2_CALIBRATION_PROFILE._rotation_from_rpy(
+            GO2_CALIBRATION_PROFILE.lidar_rpy_rad
+        ).T
+        transformed_accel = tuple(lidar_from_body @ np.asarray(transformed_accel))
+        transformed_gyro = tuple(lidar_from_body @ np.asarray(transformed_gyro))
+        output_frame = GO2_CALIBRATION_PROFILE.lidar_source_frame
     return CanonicalImuSample(
         sensor_id="go2_imu",
         source_sequence=source_sequence,
         timestamp_ns=timestamp_ns,
         clock_domain=SensorClockDomain.UNIX_NS,
-        frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
-        registration_state=RegistrationState.BODY,
-        registration_frame_id=GO2_CALIBRATION_PROFILE.registration_frame,
+        frame_id=output_frame,
+        registration_state=registration_state,
+        registration_frame_id=output_frame,
         calibration_ref=GO2_CALIBRATION_PROFILE.calibration_ref,
         payload_ownership=PayloadOwnership.INLINE,
         accel_mps2=transformed_accel,

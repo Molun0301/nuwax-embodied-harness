@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Geometry 24 组合可部署性矩阵 runner。
+"""Geometry 后端组合部署检查。
 
-默认仅 dry-run，不执行 systemd、MCP（模型上下文协议）或实机命令。Python 3.8 兼容。
+默认只查看当前程序与标定前置，不执行服务管理、MCP（模型上下文协议）或实机命令。
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
@@ -16,16 +15,17 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.config_io import (  # noqa: E402
-    _geometry_acceptance_ledger_path,
-    _geometry_owner_env_path,
+    _save_target,
+    _target_path,
     geometry_backend_statuses,
+    save_values,
 )
 
 OWNER_KEYS = {
@@ -33,7 +33,7 @@ OWNER_KEYS = {
     "NUWAX_GEOMETRY_MAPPING_BACKEND": "mapping",
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": "correction",
 }
-DEFAULT_SERVICES = ("nuwax-robot-bridge.service", "nuwax-geometry-runtime.service")
+DEFAULT_SERVICES = ("nuwax-host-gateway.service", "nuwax-geometry-runtime.service")
 
 
 def _utc_now() -> str:
@@ -70,41 +70,6 @@ def _run(command: Sequence[str], timeout_sec: float, *, check: bool = True) -> D
     if check and int(result["returncode"]) != 0:
         raise RuntimeError(json.dumps(result, ensure_ascii=False))
     return result
-
-
-def _read_env(path: Path) -> Dict[str, str]:
-    values: Dict[str, str] = {}
-    if not path.exists():
-        return values
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
-
-
-def _atomic_write_env(path: Path, values: Mapping[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.stat() if path.exists() else None
-    mode = existing.st_mode & 0o777 if existing else 0o600
-    uid = existing.st_uid if existing else os.getuid()
-    gid = existing.st_gid if existing else os.getgid()
-    fd, temporary = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
-    try:
-        os.fchmod(fd, mode)
-        os.fchown(fd, uid, gid)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            for key in sorted(values):
-                handle.write("%s=%s\n" % (key, values[key]))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, str(path))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
@@ -165,12 +130,12 @@ def _restore_file(
 
 
 def _save_combination(status: object) -> Dict[str, str]:
-    path = _geometry_owner_env_path()
-    values = _read_env(path)
-    for key, attribute in OWNER_KEYS.items():
-        values[key] = str(getattr(status, attribute))
-    _atomic_write_env(path, values)
-    return {"path": str(path), "values": {key: values[key] for key in OWNER_KEYS}}
+    values = {key: str(getattr(status, attribute)) for key, attribute in OWNER_KEYS.items()}
+    result = save_values(values)
+    if result.rejected:
+        raise RuntimeError("组合配置无法保存：%s" % result.rejected)
+    path = _target_path(_save_target("NUWAX_GEOMETRY_LIO_BACKEND", "core_env"))
+    return {"path": str(path), "values": values}
 
 
 def _render_command(template: str, status: object) -> List[str]:
@@ -207,44 +172,6 @@ def _journal_snapshot(services: Sequence[str], timeout_sec: float) -> List[Dict[
         _run(["journalctl", "--unit", service, "--lines", "200", "--no-pager"], timeout_sec, check=False)
         for service in services
     ]
-
-
-def _release_generation() -> str:
-    try:
-        from services.geometry.release_manifest import verify_release_manifest
-        proof = verify_release_manifest()
-    except Exception:
-        return ""
-    try:
-        return proof.generation
-    finally:
-        proof.close()
-
-
-def _record_acceptance(status: object, archive: Path) -> None:
-    path = _geometry_acceptance_ledger_path()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        payload = {"schema_version": 1, "records": []}
-    records = payload.get("records")
-    if not isinstance(records, list):
-        records = []
-    key = (getattr(status, "lio"), getattr(status, "mapping"), getattr(status, "correction"))
-    records = [
-        item for item in records
-        if not isinstance(item, dict)
-        or (item.get("lio"), item.get("mapping"), item.get("correction")) != key
-    ]
-    archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
-    records.append({
-        "lio": key[0], "mapping": key[1], "correction": key[2],
-        "passed": True, "completed_at": _utc_now(),
-        "release_generation": _release_generation(), "archive": str(archive),
-        "archive_sha256": archive_sha256,
-    })
-    payload = {"schema_version": 1, "records": records}
-    _atomic_write_json(path, payload)
 
 
 def _execute_real(status: object, args: argparse.Namespace, archive: Path) -> Dict[str, object]:
@@ -311,7 +238,7 @@ def _execute_real(status: object, args: argparse.Namespace, archive: Path) -> Di
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Geometry 24 组合可部署性矩阵 runner")
+    parser = argparse.ArgumentParser(description="Geometry 后端组合部署检查")
     parser.add_argument("--mode", choices=("dry-run", "static", "real"), default="dry-run")
     parser.add_argument("--archive-dir", type=Path, default=REPO_ROOT / "runtime_data" / "geometry_matrix_runs")
     parser.add_argument("--services", nargs="+", default=list(DEFAULT_SERVICES))
@@ -342,7 +269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     run_root = args.archive_dir / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_root.mkdir(parents=True, exist_ok=False)
-    owner_path = _geometry_owner_env_path()
+    owner_path = _target_path(_save_target("NUWAX_GEOMETRY_LIO_BACKEND", "core_env"))
     owner_existed = owner_path.exists()
     owner_stat = owner_path.stat() if owner_existed else None
     owner_content = owner_path.read_bytes() if owner_existed else b""
@@ -356,7 +283,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             archive = run_root / (name + ".json")
             record: Dict[str, object] = {
                 "started_at": _utc_now(),
-                "release_generation": _release_generation(),
                 "combination": status.as_dict(),
             }
             try:
@@ -370,8 +296,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 record["owner_profile_logs"] = _journal_snapshot(args.services, args.command_timeout_sec)
             record["completed_at"] = _utc_now()
             _atomic_write_json(archive, record)
-            if record["passed"]:
-                _record_acceptance(status, archive)
     finally:
         _restore_file(
             owner_path,

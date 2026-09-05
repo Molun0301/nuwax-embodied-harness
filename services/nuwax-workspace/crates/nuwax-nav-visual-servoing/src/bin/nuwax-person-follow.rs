@@ -67,8 +67,9 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() {
+    nuwax_core::logging::init_component_logging("nuwax-person-follow", "info");
     if let Err(error) = run().await {
-        eprintln!("nuwax-person-follow: {error}");
+        tracing::error!(event = "process.failed", error = %error, "跟随进程退出");
         std::process::exit(1);
     }
 }

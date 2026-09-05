@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config_values import runtime_value
+
 from collections import deque
 import hashlib
 import json
@@ -639,7 +641,7 @@ class MemoryService:
         """轻量快路径开关；HIL 验证前默认开启，回退开关 NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS=0。"""
 
         import os
-        flag = os.environ.get("NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS", "1").strip().lower()
+        flag = runtime_value("NX_MEMORY_LIGHTWEIGHT_LIBRARY_STATS", "1").strip().lower()
         return flag not in ("0", "false", "no", "off")
 
     def _list_memory_libraries_lightweight(self) -> Tuple[Dict[str, object], ...]:

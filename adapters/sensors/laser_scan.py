@@ -93,28 +93,31 @@ def _validate_scan(message: object) -> dict:
     )
     range_min = _finite(_member(message, "range_min", None), "range_min")
     range_max = _finite(_member(message, "range_max", None), "range_max")
-    if angle_increment <= 0.0 or angle_max <= angle_min:
+    if angle_increment <= 0.0 or angle_max < angle_min:
         raise LaserScanDecodeError("LaserScan 角度范围或步进非法")
     if range_min < 0.0 or range_max <= range_min:
         raise LaserScanDecodeError("LaserScan 量程范围非法")
 
     try:
-        ranges = [float(value) for value in list(_member(message, "ranges", ()) or ())]
+        raw_ranges = _member(message, "ranges", ())
+        ranges = [float(value) for value in (() if raw_ranges is None else raw_ranges)]
     except (TypeError, ValueError) as exc:
         raise LaserScanDecodeError("LaserScan ranges 不是数字序列") from exc
     if not ranges:
         raise LaserScanDecodeError("LaserScan ranges 不能为空")
     expected_angle_max = angle_min + (len(ranges) - 1) * angle_increment
-    angle_tolerance = max(1e-6, abs(angle_increment) * 1e-5)
+    # 部分驱动将 angle_max 声明为扫描上界，最后一束可落在它之前一个步长内。
+    angle_tolerance = max(1e-6, abs(angle_increment))
     if abs(expected_angle_max - angle_max) > angle_tolerance:
         raise LaserScanDecodeError("LaserScan angle_max 与 ranges 长度不一致")
+    invalid_range_count = 0
     for index, value in enumerate(ranges):
-        if math.isnan(value) or value == float("-inf"):
-            raise LaserScanDecodeError("LaserScan ranges[%d] 不是合法距离" % index)
-        if math.isinf(value):
-            continue
-        if value < range_min or value > range_max:
-            raise LaserScanDecodeError("LaserScan ranges[%d] 超出量程" % index)
+        # 无返回的正无穷保留；无效测量用 NaN 占位，不能删光束造成角度错位。
+        if value != float("inf") and (
+            not math.isfinite(value) or value < range_min or value > range_max
+        ):
+            ranges[index] = float("nan")
+            invalid_range_count += 1
 
     raw_intensities = _member(message, "intensities", None)
     intensities: List[float] = []
@@ -144,6 +147,7 @@ def _validate_scan(message: object) -> dict:
         metadata["source_sequence"] = sequence_value
     metadata["supports_lio"] = False
     metadata["dimensionality"] = "2d"
+    metadata["invalid_range_count"] = invalid_range_count
     return {
         "frame_id": frame_id,
         "angle_min_rad": angle_min,

@@ -10,6 +10,7 @@ import time
 import grpc
 
 from contracts.events import RuntimeEventCategory
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonesEnvelope
 from contracts.map_workspace import MapAssetStatus
 from contracts.runtime_views import LocalizationSessionStatus
@@ -258,7 +259,7 @@ class NavigationService:
                 "navigation.forbidden_zones",
                 source="navigation_service",
                 payload=envelope,
-                frame_id="map",
+                frame_id=DEFAULT_MAP_FRAME,
                 sequence=entry.generation,
                 revision=str(entry.generation),
                 status="available",
@@ -295,7 +296,7 @@ class NavigationService:
                 "navigation.forbidden_zones",
                 source="navigation_service",
                 payload=tombstones,
-                frame_id="map",
+                frame_id=DEFAULT_MAP_FRAME,
                 sequence=entry.generation,
                 revision=str(entry.generation),
                 status="cleared",
@@ -349,7 +350,7 @@ class NavigationService:
                     "navigation.forbidden_zones",
                     source="navigation_service",
                     payload=envelope,
-                    frame_id="map",
+                    frame_id=DEFAULT_MAP_FRAME,
                     sequence=entry.generation,
                     revision=str(entry.generation),
                     status="available",

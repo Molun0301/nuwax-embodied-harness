@@ -30,6 +30,7 @@ features = ["derive", "env"]
 optional = true
 
 [dependencies]
+nuwax-core = { path = "../nuwax-core" }
 nuwax-mapping = { path = "../nuwax-mapping" }
 nuwax-mapping-cloud = { path = "../nuwax-mapping-cloud" }
 # nuwax-mapping-raytracing 依赖已移除（ray_tracing 暂出 workspace，待 shim 实装）

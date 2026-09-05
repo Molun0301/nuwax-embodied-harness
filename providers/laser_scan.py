@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from threading import RLock
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Protocol
 
 from contracts.pointcloud import LaserScanFrame
 from contracts.sensors import SensorDescriptor
-from adapters.sensors.laser_scan import LaserScanAdapter
+
+
+class LaserScanConverter(Protocol):
+    """可注入的扫描转换器；提供器不依赖具体适配器实现。"""
+
+    def adapt(self, message: object) -> LaserScanFrame:
+        """将源消息转换为标准扫描。"""
 
 
 class StreamingLaserScanProvider:
@@ -24,7 +30,7 @@ class StreamingLaserScanProvider:
         self,
         descriptor: SensorDescriptor,
         *,
-        adapter: Optional[LaserScanAdapter] = None,
+        adapter: Optional[LaserScanConverter] = None,
     ) -> None:
         self._descriptor = descriptor
         self._adapter = adapter
@@ -85,7 +91,7 @@ class StreamingLaserScanProvider:
         for callback in callbacks:
             try:
                 callback(scan)
-            except Exception as exc:  # callback isolation is part of provider boundary
+            except Exception as exc:  # 单个订阅者失败不阻断其他订阅者。
                 with self._lock:
                     self._callback_error_count += 1
                     self._last_error = str(exc)

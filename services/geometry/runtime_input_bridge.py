@@ -1,6 +1,4 @@
-"""Phase 5: Go2 sensor producer → GeometryRuntime 输入桥.
-
-2026-07-07 Phase 5 新增，禁止 silent fallback；provider 不可用时不要假装 ok。
+"""机器人标准传感器与设备定位流到 GeometryRuntime 的输入桥。
 
 设计目标
 ========
@@ -8,6 +6,8 @@
 - 把 ``StreamingLocalizationProvider`` / ``StreamingPointCloudProvider`` 的回调
   真正转译成 ``GeometryRuntimeProvider.publish_odom`` / ``publish_point_cloud``，
   让 mapping / nav / explore 真实 readiness 有数据来源。
+- 原生算法优先消费 ``StreamingSensorSampleProvider`` 的规范 LiDAR/IMU 数据，
+  不要求机器人自行实现定位，也不重复订阅显示数据流。
 - 维护运行时 counters（``published_odom_count`` / ``observed_frame_tree_count`` /
   ``published_pointcloud_count`` / ``last_error`` / ``last_publish_latency_ms``），
   便于 Phase 7 mapping_ready_poll 收敛时核对。
@@ -23,7 +23,7 @@ Lifecycle
 
 1. ``ensure_runtime_connected()`` — 等待 ``GeometryRuntimeProvider.is_connected()``。
 2. ``start()`` — 注册 provider callback（仅一次）。
-3. ``stop()`` — 注销 callback，flush 一帧标记（不发送假数据）。
+3. ``stop()`` — 停止接收、注销 callback 并排空已接收回调。
 4. 重复 ``start()`` / ``stop()`` 幂等。
 
 背压策略
@@ -65,9 +65,11 @@ from contracts.sensors import (
     CanonicalImuSample,
     CanonicalLidarFrame,
     CanonicalLioMeasurement,
+    RegistrationState,
 )
 from providers.localization import StreamingLocalizationProvider
 from providers.pointcloud import StreamingPointCloudProvider
+from providers.sensors import StreamingSensorSampleProvider
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime_input_bridge")
 
@@ -81,7 +83,7 @@ _DEFAULT_ODOM_FRAME = "odom"
 _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
 _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
-_DEFAULT_LIO_SENSOR_FRAME = "go2_base_link"
+_DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
 _MAX_LIO_PUBLISH_QUEUE_SIZE = 4
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 
@@ -188,7 +190,7 @@ class BridgeCounters:
 
 @dataclass
 class RuntimeInputBridge:
-    """Go2 sensor producer → GeometryRuntime 输入桥。
+    """机器人标准传感器与定位流到 GeometryRuntime 的输入桥。
 
     参数
     ----
@@ -199,6 +201,8 @@ class RuntimeInputBridge:
         必须实现 ``subscribe_localization`` / ``unsubscribe_localization``。
     point_cloud_provider
         必须实现 ``subscribe_point_cloud`` / ``unsubscribe_point_cloud``。
+    sensor_sample_provider
+        原生模式的标准 LiDAR/IMU 输入；提供时不要求设备定位能力。
     max_points_before_downsample
         点数超过该阈值时触发降采样（默认 ``MAX_POINTS_BEFORE_DOWNSAMPLE``）。
     max_points_after_downsample
@@ -208,6 +212,7 @@ class RuntimeInputBridge:
     runtime_provider: Any
     localization_provider: Optional[StreamingLocalizationProvider] = None
     point_cloud_provider: Optional[StreamingPointCloudProvider] = None
+    sensor_sample_provider: Optional[StreamingSensorSampleProvider] = None
     max_points_before_downsample: int = MAX_POINTS_BEFORE_DOWNSAMPLE
     max_points_after_downsample: int = MAX_POINTS_AFTER_DOWNSAMPLE
 
@@ -269,6 +274,7 @@ class RuntimeInputBridge:
     _started: bool = False
     _localization_subscription_id: Optional[int] = None
     _point_cloud_subscription_id: Optional[int] = None
+    _sensor_sample_subscription_id: Optional[int] = None
     # Phase 5: 显式记录 provider 不可用 vs runtime 未连，不允许混用同一句 "no provider"。
     _missing_localization_provider: bool = False
     _missing_point_cloud_provider: bool = False
@@ -318,8 +324,7 @@ class RuntimeInputBridge:
         Returns
         -------
         bool
-            ``True`` 表示至少 ``LocalizationProvider`` 订阅成功。pointcloud 不可用
-            时不会阻止 ``start()``，但 ``is_ready()`` 在订阅两者都失败时返回 ``False``。
+            ``True`` 表示至少一条输入订阅成功；算法能力就绪由 Rust 中的实际数据决定。
         """
         current_thread_id = threading.get_ident()
         while True:
@@ -389,13 +394,29 @@ class RuntimeInputBridge:
             self._lio_publish_queue.clear()
             self._lio_measurement_assembler.reset()
 
-        localization_ok = self._subscribe_localization(lio_generation)
-        if localization_ok:
-            point_cloud_ok = self._subscribe_point_cloud(lio_generation)
+        if self.sensor_sample_provider is None:
+            for candidate in (self.point_cloud_provider, self.localization_provider):
+                if isinstance(candidate, StreamingSensorSampleProvider):
+                    self.sensor_sample_provider = candidate
+                    break
+        native_samples = (
+            selected_lio_backend != _DEVICE_LIO_BACKEND
+            and self.sensor_sample_provider is not None
+        )
+        if native_samples:
+            # 标准 LiDAR/IMU 流是原生算法的唯一源，不要求机器人自产位姿。
+            sensor_ok = self._subscribe_sensor_samples(lio_generation)
+            localization_ok = False
+            point_cloud_ok = sensor_ok
         else:
-            # localization 订阅可能在 provider 内同步 delivery 时重入 stop；
-            # 此时 generation 已失效，禁止继续创建第二个订阅。
-            point_cloud_ok = False
+            sensor_ok = False
+            localization_ok = self._subscribe_localization(lio_generation)
+            with self._lio_condition:
+                generation_current = self._lio_callback_is_current(lio_generation)
+            # 只在重入 stop 后跳过后续订阅，定位能力缺失不应禁用点云。
+            point_cloud_ok = (
+                self._subscribe_point_cloud(lio_generation) if generation_current else False
+            )
         with self._lock:
             started_after_subscribe = self._started
         with self._lio_condition:
@@ -417,7 +438,7 @@ class RuntimeInputBridge:
             LOGGER.warning("RuntimeInputBridge.start: 两个 provider 都不可用。")
             # 不回滚 _started：让调用方通过 is_ready() 看到 False，并显式 stop() 释放。
             return False
-        if not localization_ok:
+        if not localization_ok and not sensor_ok:
             self._record_error("LocalizationProvider 不可用，odom 不会推送")
         if not point_cloud_ok:
             self._record_error("PointCloudProvider 不可用，pointcloud 不会推送")
@@ -455,11 +476,14 @@ class RuntimeInputBridge:
                     self._started = False
                     loc_id = self._localization_subscription_id
                     pc_id = self._point_cloud_subscription_id
+                    sensor_id = self._sensor_sample_subscription_id
                     self._localization_subscription_id = None
                     self._point_cloud_subscription_id = None
+                    self._sensor_sample_subscription_id = None
                 else:
                     loc_id = None
                     pc_id = None
+                    sensor_id = None
 
             if transitioned:
                 with self._lio_condition:
@@ -470,6 +494,11 @@ class RuntimeInputBridge:
                     )
                     self._lio_publish_queue.clear()
 
+                if sensor_id is not None and self.sensor_sample_provider is not None:
+                    try:
+                        self.sensor_sample_provider.unsubscribe_sensor_sample(sensor_id)
+                    except Exception as exc:
+                        LOGGER.debug("注销标准传感器订阅失败：%s", exc)
                 if (
                     loc_id is not None
                     and self.localization_provider is not None
@@ -537,19 +566,67 @@ class RuntimeInputBridge:
             return self._started
 
     def is_ready(self) -> bool:
-        """综合就绪状态：runtime 已连 + 至少 LocalizationProvider 订阅成功。"""
+        """输入桥就绪：运行时已连接且至少有一条有效输入订阅。"""
         with self._lock:
             if not self._started:
                 return False
             if self._runtime_unavailable:
                 return False
-            if self._missing_localization_provider:
-                return False
-            return True
+            return any(subscription is not None for subscription in (
+                self._localization_subscription_id,
+                self._point_cloud_subscription_id,
+                self._sensor_sample_subscription_id,
+            ))
 
     # ------------------------------------------------------------------
     # subscription helpers
     # ------------------------------------------------------------------
+
+    def _subscribe_sensor_samples(self, generation: int) -> bool:
+        provider = self.sensor_sample_provider
+        if provider is None:
+            return False
+        try:
+            subscription_id = provider.subscribe_sensor_sample(
+                lambda sample: self._on_sensor_sample(sample, generation)
+            )
+        except Exception as exc:
+            self._record_error("标准传感器订阅失败：%s" % exc)
+            return False
+        if subscription_id is None:
+            return False
+        with self._lio_condition:
+            current = self._lio_callback_is_current(generation)
+        if not current:
+            provider.unsubscribe_sensor_sample(subscription_id)
+            return False
+        with self._lock:
+            self._sensor_sample_subscription_id = subscription_id
+        return True
+
+    def _on_sensor_sample(self, sample: Any, generation: int) -> None:
+        if not isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame)):
+            return
+        if not self._admit_bridge_callback(generation):
+            return
+        try:
+            with self._lio_condition:
+                if not self._lio_callback_is_current(generation):
+                    return
+                try:
+                    measurement = (
+                        self._lio_measurement_assembler.add_imu(sample)
+                        if isinstance(sample, CanonicalImuSample)
+                        else self._lio_measurement_assembler.add_lidar(sample)
+                    )
+                except LioMeasurementAssemblerError as exc:
+                    self._record_lio_assembler_error(exc)
+                    return
+                drain = self._enqueue_ready_lio_measurements(measurement, generation)
+            if drain:
+                self._drain_native_lio_measurements()
+        finally:
+            self._release_bridge_callback()
 
     def _subscribe_localization(self, lio_generation: int) -> bool:
         if self.localization_provider is None:
@@ -1038,14 +1115,6 @@ class RuntimeInputBridge:
     ) -> Optional[CanonicalLioMeasurement]:
         """验证 raw RPC 的 frame/provenance，并执行 canonical 有界采样。"""
 
-        if measurement.lidar.intensity_f32_le is None:
-            self._increment_counter("dropped_pointcloud_count")
-            self._increment_counter("lio_not_ready_count")
-            self._record_error(
-                "lio_not_ready: native 固定 XYZI+offset wire layout 缺少真实 intensity"
-            )
-            return None
-
         calibration_ref = measurement.lidar.calibration_ref
         expected_provenance = (
             _APPLIED_TRANSFORM_PROVENANCE_PREFIX + calibration_ref
@@ -1053,7 +1122,7 @@ class RuntimeInputBridge:
             and calibration_ref == calibration_ref.strip()
             else None
         )
-        if (
+        if measurement.lidar.registration_state != RegistrationState.SENSOR and (
             expected_provenance is None
             or measurement.lidar.transform_provenance
             != expected_provenance
@@ -1269,14 +1338,18 @@ class RuntimeInputBridge:
         metadata = {
             "frame_id": registration_frame,
             "timestamp_ns": measurement.scan_begin_timestamp_ns,
-            "fields": _GO2_L2_FIELDS,
+            "fields": (
+                _GO2_L2_FIELDS if measurement.lidar.intensity_f32_le is not None
+                else _CANONICAL_XYZ_OFFSET_FIELDS
+            ),
             "point_count": measurement.lidar.point_count,
             "is_dense": measurement.lidar.is_dense,
             "imu_samples": imu_samples,
         }
         start = time.monotonic()
+        point_step = 20 if measurement.lidar.intensity_f32_le is not None else 16
         try:
-            result = publisher(bytes_payload, 20, **metadata)
+            result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:
             self._increment_counter("dropped_pointcloud_count")
             self._record_error("publish canonical LIO measurement 抛异常：%s" % exc)
@@ -1290,7 +1363,7 @@ class RuntimeInputBridge:
         self._update_counters(
             last_publish_latency_ms=(time.monotonic() - start) * 1000.0,
             last_published_point_count=measurement.lidar.point_count,
-            last_published_point_step=20,
+            last_published_point_step=point_step,
             last_publish_at_monotonic=time.monotonic(),
         )
 
@@ -1302,19 +1375,21 @@ class RuntimeInputBridge:
 
         if (
             lidar.xyz_f32_le is None
-            or lidar.intensity_f32_le is None
             or lidar.time_offset_ns_le is None
         ):
             return None
         try:
             xyz = np.frombuffer(lidar.xyz_f32_le, dtype="<f4").reshape((-1, 3))
-            intensity = np.frombuffer(lidar.intensity_f32_le, dtype="<f4")
             offsets_u64 = np.frombuffer(lidar.time_offset_ns_le, dtype="<u8")
             if np.any(offsets_u64 > np.iinfo(np.uint32).max):
                 return None
-            packed = np.empty(lidar.point_count, dtype=_GO2_L2_DTYPE)
+            packed = np.empty(
+                lidar.point_count,
+                dtype=_GO2_L2_DTYPE if lidar.intensity_f32_le is not None else _XYZ_OFFSET_DTYPE,
+            )
             packed["x"], packed["y"], packed["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-            packed["intensity"] = intensity
+            if lidar.intensity_f32_le is not None:
+                packed["intensity"] = np.frombuffer(lidar.intensity_f32_le, dtype="<f4")
             packed["offset_ns"] = offsets_u64
             return packed.tobytes()
         except (TypeError, ValueError):
@@ -1419,7 +1494,10 @@ class RuntimeInputBridge:
         metadata = dict(getattr(point_cloud, "metadata", {}) or {})
         canonical_lidar = metadata.get("canonical_lidar_frame")
         if isinstance(canonical_lidar, CanonicalLidarFrame):
-            return 20, _GO2_L2_FIELDS
+            return (
+                (20, _GO2_L2_FIELDS) if canonical_lidar.intensity_f32_le is not None
+                else (16, _CANONICAL_XYZ_OFFSET_FIELDS)
+            )
         has_intensity = metadata.get("intensity_array") is not None
         has_offsets = metadata.get("offset_ns_array") is not None
         if has_intensity and has_offsets:
@@ -1533,13 +1611,18 @@ class RuntimeInputBridge:
             ready = (
                 self._started
                 and not self._runtime_unavailable
-                and not self._missing_localization_provider
+                and any(subscription is not None for subscription in (
+                    self._localization_subscription_id,
+                    self._point_cloud_subscription_id,
+                    self._sensor_sample_subscription_id,
+                ))
             )
             runtime_unavailable = self._runtime_unavailable
             missing_localization_provider = self._missing_localization_provider
             missing_point_cloud_provider = self._missing_point_cloud_provider
             localization_subscription_id = self._localization_subscription_id
             point_cloud_subscription_id = self._point_cloud_subscription_id
+            sensor_sample_subscription_id = self._sensor_sample_subscription_id
         with self._counter_lock:
             counters = self.counters.as_dict()
         return {
@@ -1550,6 +1633,7 @@ class RuntimeInputBridge:
             "missing_point_cloud_provider": missing_point_cloud_provider,
             "localization_subscription_id": localization_subscription_id,
             "point_cloud_subscription_id": point_cloud_subscription_id,
+            "sensor_sample_subscription_id": sensor_sample_subscription_id,
             "counters": counters,
         }
 
@@ -1566,12 +1650,14 @@ def build_default_runtime_input_bridge(
     runtime_provider: Any,
     localization_provider: Optional[StreamingLocalizationProvider] = None,
     point_cloud_provider: Optional[StreamingPointCloudProvider] = None,
+    sensor_sample_provider: Optional[StreamingSensorSampleProvider] = None,
 ) -> RuntimeInputBridge:
     """工厂方法，集中默认值，便于测试与生产链路复用。"""
     return RuntimeInputBridge(
         runtime_provider=runtime_provider,
         localization_provider=localization_provider,
         point_cloud_provider=point_cloud_provider,
+        sensor_sample_provider=sensor_sample_provider,
     )
 
 

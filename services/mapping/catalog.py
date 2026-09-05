@@ -469,15 +469,19 @@ class MapCatalogRepository:
             not in {"sealed", "sealed_replay"}
         ):
             raise ValueError("地图激活成功凭据 sealed 身份非法。")
+        target_available = payload.get("relocalization_target_available")
+        if not isinstance(target_available, bool):
+            raise ValueError("地图激活成功凭据重定位资格必须是布尔值。")
         positive_fields = (
             "runtime_generation",
             "session_generation",
             "backend_generation",
-            "cloud_source_revision",
             "source_policy_version",
             "deadline_policy_version",
             "algorithm_options_version",
         )
+        if target_available:
+            positive_fields += ("cloud_source_revision",)
         for field_name in positive_fields:
             value = MapCatalogRepository._require_positive_int(
                 payload.get(field_name),
@@ -505,21 +509,28 @@ class MapCatalogRepository:
         digest_fields = (
             "activation_request_identity_sha256",
             "activation_identity_sha256",
-            "target_receipt_sha256",
             "asset_bundle_sha256",
-            "cloud_source_sha256",
             "source_policy_sha256",
             "deadline_policy_sha256",
             "algorithm_options_sha256",
         )
+        if target_available:
+            digest_fields += ("target_receipt_sha256", "cloud_source_sha256")
         for field_name in digest_fields:
             receipt[field_name] = MapCatalogRepository._require_sha256(
                 payload.get(field_name),
                 "地图激活成功凭据 %s" % field_name,
             )
-        if payload.get("relocalization_target_available") is not True:
-            raise ValueError("地图激活成功凭据缺少 sealed 重定位目标。")
-        receipt["relocalization_target_available"] = True
+        if not target_available:
+            for field_name, empty_value in (
+                ("target_receipt_sha256", ""),
+                ("cloud_source_sha256", ""),
+                ("cloud_source_revision", 0),
+            ):
+                if payload.get(field_name) != empty_value:
+                    raise ValueError("二维地图激活凭据不能携带不完整的三维目标身份。")
+                receipt[field_name] = empty_value
+        receipt["relocalization_target_available"] = target_available
         receipt["trusted_identity"] = True
         return receipt
 
@@ -831,6 +842,8 @@ class MapCatalogRepository:
             activation = self._require_trusted_activation_receipt(
                 activation_receipt
             )
+            if activation.get("relocalization_target_available") is not True:
+                raise ValueError("当前二维地图没有可供重定位使用的三维点云目标。")
             resolved_request_id = self._require_relocalization_request_id(
                 request_id
             )

@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# 先解析共同配置并统一旧通道别名，再物化启动参数。
+source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
 IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
 BINARY="${NUWAX_NAV_STACK_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-nav-stack}"
 PROFILE="${NUWAX_NAV_PROFILE:-simple-2d}"

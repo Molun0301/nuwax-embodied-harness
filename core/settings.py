@@ -5,7 +5,7 @@
 nuwax_robot_bridge 统一配置解析层。
 
 说明：
-1. 用户直接编辑同目录下的 `.env` 文件。
+1. 用户编辑项目根目录的 `.env` 文件，或显式指定配置文件。
 2. 为兼容旧部署，也会回退读取 `.config`。
 3. 同名环境变量优先级高于文件配置。
 4. 这里仅负责把配置解析成结构化对象，业务逻辑不要直接散落读取环境变量。
@@ -13,20 +13,14 @@ nuwax_robot_bridge 统一配置解析层。
 
 from __future__ import annotations
 
-from collections import deque
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-import threading
-from typing import Deque, Dict, Iterator, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows 环境不提供 fcntl
-    fcntl = None
-
+from core.config_values import config_value, raw_value, read_env_values, record_value, user_config_values
 from core.logging_utils import (
     CorrelationContextFilter,
     DeduplicatingLogFilter,
@@ -57,7 +51,7 @@ from contracts.geometry_runtime import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 LEGACY_CONFIG_FILE = BASE_DIR / ".config"
 
@@ -76,29 +70,12 @@ DEFAULT_GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 
 
 
-def _strip_quotes(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
 def _load_file_values() -> Dict[str, str]:
-    values = {}
-    for file_path in (LEGACY_CONFIG_FILE, ENV_FILE):
-        if not file_path.exists():
-            continue
-        for raw_line in file_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not key:
-                continue
-            values[key] = _strip_quotes(value)
+    configured = os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", "").strip()
+    env_file = Path(configured).expanduser() if configured else ENV_FILE
+    values = read_env_values(LEGACY_CONFIG_FILE)
+    values.update(read_env_values(env_file))
+    values.update(user_config_values())
     return values
 
 
@@ -106,48 +83,27 @@ _FILE_VALUES = _load_file_values()
 
 
 def _raw_value(name: str, default: str = "") -> str:
-    if name in os.environ:
-        return os.environ[name]
-    return _FILE_VALUES.get(name, default)
+    return raw_value(name, default, _FILE_VALUES)
 
 
 def _cfg_str(name: str, default: str = "") -> str:
-    value = _raw_value(name, default)
-    value = value.strip()
-    return value if value else default
+    return config_value(name, default, "str", _FILE_VALUES)
 
 
 def _cfg_int(name: str, default: int) -> int:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return int(value.strip())
+    return config_value(name, default, "int", _FILE_VALUES)
 
 
 def _cfg_float(name: str, default: float) -> float:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return float(value.strip())
+    return config_value(name, default, "float", _FILE_VALUES)
 
 
 def _cfg_bool(name: str, default: bool) -> bool:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
+    return config_value(name, default, "bool", _FILE_VALUES)
 
 
 def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
-    value = _raw_value(name, "")
-    if not value.strip():
-        return default
-    items = []
-    for raw_item in value.split(","):
-        item = raw_item.strip()
-        if item:
-            items.append(item)
-    return tuple(items)
+    return config_value(name, default, "csv", _FILE_VALUES)
 
 
 _DEFAULT_POINTCLOUD3D_HEIGHT_COLORS: Tuple[str, ...] = (
@@ -286,10 +242,8 @@ def _resolve_alias_env_value(preferred_name: str, legacy_name: str) -> Optional[
 
 def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> str:
     raw = _resolve_alias_env_value(preferred_name, legacy_name)
-    if raw is None:
-        return default
-    value = raw.strip()
-    return value if value else default
+    value = raw.strip() if raw is not None else ""
+    return record_value(preferred_name, value if value else default)
 
 
 
@@ -301,8 +255,9 @@ class LoggingConfig:
     log_dir: str
     log_file: str
     level: str = "INFO"
-    max_lines: int = 100000
-    trim_check_interval: int = 200
+    format: str = "text"
+    max_bytes: int = 20 * 1024 * 1024
+    backup_count: int = 5
 
 
 @dataclass
@@ -322,62 +277,6 @@ class LowLevelControlConfig:
     max_velocity: float = 2.0
     max_torque: float = 10.0
     control_interval_sec: float = 0.002
-
-
-# ============================================================
-# R-N2:nuwax-workspace runtime 配置 dataclass(Round 5 §4.2 / §12.4 落地)
-# ============================================================
-# 这些 dataclass 是 .env.example 12 键(LCM typed) + 12 键(runtime alias) +
-# 1 键(LCM backend 复合) 的 Python 端结构化入口。
-# `LcmChannelConfig` 仍保留历史消息字段的固定默认值，但 platform 不再暴露
-# 无 runtime consumer 的 tf_static / initial_pose / occ_topic 环境入口。
-@dataclass(frozen=True)
-class LcmBackendConfig:
-    """LCM 后端 + 共享内存路径配置(对齐 lcm_runtime.rs + server.rs)。
-
-    `backend` 仅允许 `real-lcm`；`real_required` 让运维显式声明
-    上游依赖不可用时的 fail-fast 行为。
-    """
-
-    backend: str = _cfg_str("NUWAX_LCM_BACKEND", "real-lcm")
-    url: str = _cfg_str("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=1")
-    real_required: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
-    cloudmap_shm_path: str = _cfg_str("NUWAX_CLOUDMAP_SHM_PATH", "/tmp/nuwax_cloudmap.mmap")
-    occupancy_shm_path: str = _cfg_str("NUWAX_OCCUPANCY_SHM_PATH", "/tmp/nuwax_occupancy.mmap")
-
-
-@dataclass(frozen=True)
-class RuntimeChannelAliasConfig:
-    """Runtime 进程内 channel alias(对齐 `channel_registry.rs` 12 个 `*_CHANNEL` 表项)。
-
-    这些字段是 platform 视角下的"内层 alias"——Rust runtime 启动时优先
-    探测该 env,缺省时 fallback 到对应 `NUWAX_LCM_CHANNEL_*` 平台键。
-    """
-
-    odom: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL", "/odom")
-    tf: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL", "/tf")
-    pointcloud: str = _cfg_str(
-        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
-        "/go2/lidar/points#sensor_msgs.PointCloud2",
-    )
-    cloudmap: str = _cfg_str(
-        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
-        "/cloud_map#sensor_msgs.PointCloud2",
-    )
-    occupancy: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL", "/map/occupancy")
-    cmd_vel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL", "/cmd_vel")
-    nav_goal: str = _cfg_str(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
-        "/nav/goal#nuwax_msgs.GoalEnvelope",
-    )
-    nav_path: str = _cfg_str(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL",
-        "/nav/path#nuwax_msgs.PathEnvelope",
-    )
-    nav_state: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL", "/nav/state")
-    frontiers: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL", "/explore/frontiers")
-    pose: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_POSE_CHANNEL", "/pose_stamped")
-    nav_cancel: str = _cfg_str("NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL", "/nav/cancel")
 
 
 @dataclass
@@ -720,7 +619,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
     _real_lcm_required = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
     _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "").strip().lower()
 
-    log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR)))
+    log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR / "runtime_data" / "logs")))
     log_file = _cfg_str(
         "NUWAX_LOG_FILE",
         _cfg_str("GO2_PROXY_LOG_FILE", str(Path(log_dir) / "nuwax_robot_bridge.log")),
@@ -1182,14 +1081,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             log_dir=log_dir,
             log_file=log_file,
             level=_cfg_str("NUWAX_LOG_LEVEL", _cfg_str("GO2_PROXY_LOG_LEVEL", "INFO")),
-            max_lines=max(0, _cfg_int("NUWAX_LOG_MAX_LINES", _cfg_int("GO2_PROXY_LOG_MAX_LINES", 100000))),
-            trim_check_interval=max(
-                1,
-                _cfg_int(
-                    "NUWAX_LOG_TRIM_CHECK_INTERVAL",
-                    _cfg_int("GO2_PROXY_LOG_TRIM_CHECK_INTERVAL", 200),
-                ),
-            ),
+            format=_cfg_str("NUWAX_LOG_FORMAT", "text"),
+            max_bytes=max(0, _cfg_int("NUWAX_LOG_MAX_BYTES", 20 * 1024 * 1024)),
+            backup_count=max(0, _cfg_int("NUWAX_LOG_BACKUP_COUNT", 5)),
         ),
         gateway=gateway,
         relay=relay,
@@ -1201,119 +1095,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
         volume=volume,
         perception=perception,
     )
-
-
-class _LineLimitedFileHandler(logging.FileHandler):
-    """按最大行数保留日志文件，超出后自动裁剪前面的旧内容。"""
-
-    def __init__(
-        self,
-        filename: str,
-        *,
-        max_lines: int,
-        trim_check_interval: int,
-        **kwargs,
-    ) -> None:
-        super().__init__(filename, **kwargs)
-        self.max_lines = max(0, int(max_lines))
-        self.trim_check_interval = max(1, int(trim_check_interval))
-        self._emit_count = 0
-        self._trim_lock = threading.Lock()
-        self._lock_file_path = Path(f"{self.baseFilename}.lock")
-        self._lock_file_stream = self._open_lock_file_stream()
-        self._repair_file_if_needed()
-
-    def close(self) -> None:
-        try:
-            if self._lock_file_stream is not None:
-                self._lock_file_stream.close()
-        finally:
-            super().close()
-
-    def _open_lock_file_stream(self):
-        if fcntl is None:
-            return None
-
-        self._lock_file_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._lock_file_path.open("a+b")
-
-    @contextmanager
-    def _interprocess_lock(self) -> Iterator[None]:
-        if self._lock_file_stream is None or fcntl is None:
-            yield
-            return
-
-        fcntl.flock(self._lock_file_stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(self._lock_file_stream.fileno(), fcntl.LOCK_UN)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        if self.max_lines <= 0:
-            return
-
-        self._emit_count += 1
-        if self._emit_count % self.trim_check_interval != 0:
-            return
-
-        # 后台线程执行 trim，避免阻塞日志写入
-        threading.Thread(target=self._trim_file_if_needed, daemon=True).start()
-
-    def _repair_file_if_needed(self) -> None:
-        with self._interprocess_lock():
-            self._rewrite_file_if_needed()
-
-    def _trim_file_if_needed(self) -> None:
-        if not self._trim_lock.acquire(blocking=False):
-            return
-
-        try:
-            with self._interprocess_lock():
-                self._rewrite_file_if_needed()
-        finally:
-            self._trim_lock.release()
-
-    def _rewrite_file_if_needed(self) -> bool:
-        self.flush()
-        path = Path(self.baseFilename)
-        if not path.exists():
-            return False
-
-        encoding = self.encoding or "utf-8"
-        tail_lines: Deque[str] = deque(maxlen=self.max_lines) if self.max_lines > 0 else deque()
-        cleaned_lines = [] if self.max_lines <= 0 else None
-        total_lines = 0
-        has_nul_bytes = False
-        with path.open("r+", encoding=encoding, errors="ignore") as stream:
-            for raw_line in stream:
-                total_lines += 1
-                if "\x00" in raw_line:
-                    has_nul_bytes = True
-                    raw_line = raw_line.replace("\x00", "")
-                if self.max_lines > 0:
-                    tail_lines.append(raw_line)
-                else:
-                    cleaned_lines.append(raw_line)
-
-            should_trim = self.max_lines > 0 and total_lines > self.max_lines
-            if not should_trim and not has_nul_bytes:
-                return False
-
-            if self.max_lines > 0:
-                stream.seek(0)
-                stream.writelines(tail_lines)
-            else:
-                stream.seek(0)
-                stream.writelines(cleaned_lines)
-            stream.truncate()
-            stream.flush()
-            os.fsync(stream.fileno())
-
-        if self.stream is not None:
-            self.stream.seek(0, os.SEEK_END)
-        return True
 
 
 def _configure_third_party_logger_levels() -> None:
@@ -1358,7 +1139,7 @@ _SUBSYSTEM_LOGGERS = {
 def _configure_subsystem_levels() -> None:
     for subsystem, logger_name in _SUBSYSTEM_LOGGERS.items():
         env_key = f"NUWAX_LOG_LEVEL_{subsystem.upper()}"
-        level_str = os.environ.get(env_key, "").strip().upper()
+        level_str = _cfg_str(env_key, "").strip().upper()
         if level_str and hasattr(logging, level_str):
             logging.getLogger(logger_name).setLevel(getattr(logging, level_str))
 
@@ -1366,25 +1147,41 @@ def _configure_subsystem_levels() -> None:
 def configure_logging(config: LoggingConfig) -> None:
     """统一初始化日志。"""
 
-    Path(config.log_dir).mkdir(parents=True, exist_ok=True)
     level_name = (config.level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     noisy_filter = DropPatternLogFilter()
 
-    log_format = os.environ.get("NUWAX_LOG_FORMAT", "").strip().lower()
+    log_format = config.format.strip().lower()
     if log_format == "json":
         formatter = JsonLineFormatter()
     else:
         formatter = build_default_formatter()
 
-    file_handler = _LineLimitedFileHandler(
-        config.log_file,
-        max_lines=config.max_lines,
-        trim_check_interval=config.trim_check_interval,
-        encoding="utf-8",
-    )
-    file_handler.addFilter(noisy_filter)
-    file_handler.setFormatter(formatter)
+    requested_file = Path(config.log_file).expanduser()
+    paths = [requested_file]
+    system_log_dir = os.environ.get("LOGS_DIRECTORY", "").split(":")[0]
+    if system_log_dir:
+        paths.append(Path(system_log_dir) / requested_file.name)
+    paths.append(BASE_DIR / "runtime_data" / "logs" / requested_file.name)
+    file_handler = None
+    failures = []
+    for path in dict.fromkeys(paths):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(path, maxBytes=config.max_bytes, backupCount=config.backup_count, encoding="utf-8")
+            break
+        except OSError as error:
+            failures.append(f"{path}: {error}")
+    if file_handler is not None:
+        file_handler.addFilter(noisy_filter)
+        file_handler.setFormatter(JsonLineFormatter())
+        config.log_file = file_handler.baseFilename
+        if Path(config.log_file) != requested_file.resolve():
+            config.log_dir = str(Path(config.log_file).parent)
+        from core.config_values import record_value
+        record_value("NUWAX_LOG_DIR", config.log_dir)
+        record_value("NUWAX_LOG_FILE", config.log_file)
+        file_handler._nuwax_logging_config = config
 
     console_handler = logging.StreamHandler()
     console_handler.addFilter(noisy_filter)
@@ -1393,17 +1190,49 @@ def configure_logging(config: LoggingConfig) -> None:
     correlation_filter = CorrelationContextFilter()
     dedup_filter = DeduplicatingLogFilter(window_sec=15.0)
 
-    file_handler.addFilter(correlation_filter)
+    if file_handler is not None:
+        file_handler.addFilter(correlation_filter)
     console_handler.addFilter(correlation_filter)
     console_handler.addFilter(dedup_filter)
 
     logging.basicConfig(
         level=level,
-        handlers=[file_handler, console_handler],
+        handlers=[handler for handler in (file_handler, console_handler) if handler is not None],
         force=True,
     )
     _configure_third_party_logger_levels()
     _configure_subsystem_levels()
+    if failures:
+        logging.getLogger("nuwax_robot_bridge.logging").warning(
+            "配置日志文件不可写，已采用可用日志输出",
+            extra={"event": "logging.path_fallback", "requested_file": str(requested_file),
+                   "effective_file": config.log_file if file_handler else None, "errors": failures},
+        )
+
+
+def component_logging_environment() -> Dict[str, str]:
+    """把已生效的日志设置传给独立子进程，不改写父进程环境或业务参数。"""
+    from core.config_values import runtime_value
+
+    config = next((getattr(handler, "_nuwax_logging_config", None) for handler in logging.getLogger().handlers
+                   if getattr(handler, "_nuwax_logging_config", None) is not None), None)
+    if config is None:
+        config = load_config().logging
+    environment = dict(os.environ)
+    environment.update(NUWAX_LOG_DIR=config.log_dir, NUWAX_LOG_LEVEL=config.level,
+                       NUWAX_LOG_MAX_BYTES=str(config.max_bytes), NUWAX_LOG_BACKUP_COUNT=str(config.backup_count))
+    rust_filter = runtime_value("RUST_LOG", "")
+    if rust_filter:
+        environment["RUST_LOG"] = str(rust_filter)
+    return environment
+
+
+def configure_component_logging(component: str) -> None:
+    """独立Python进程复用平台日志设置，并写入自己的组件文件。"""
+    from dataclasses import replace
+
+    config = load_config().logging
+    configure_logging(replace(config, log_file=str(Path(config.log_dir) / f"{component}.log")))
 
 
 APP_CONFIG = load_config()

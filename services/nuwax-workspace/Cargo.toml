@@ -1,101 +1,46 @@
 [workspace]
 resolver = "2"
-# 注意：所有 crate 必须满足 edition=2021 + MSRV=1.88 + aarch64-unknown-linux-gnu 兼容
-# 选型依据：docs/开发文档/Ralplan/2026-07-01_彻底去ROS2化-执行方案/00b_开源库选型对比矩阵.md §0.2（C1-C12）
-# MSRV 实际值见下方 [workspace.package].rust-version（C2 修订：依赖生态 az/image/wasip2 等已迁
-# edition2024，实测需要 rustc 1.88+）。Jetson 实机升级路径：`rustup install 1.88`。
+# 工作区最低 Rust 版本由 workspace.package 统一声明。
+# 算法与原生依赖是否启用由各组件的特性配置决定；成员存在不代表部署已启用。
 members = [
-    # 共享基础设施（9 个，已实装）
+    # 共享消息、编码、传输与运行基础
     "crates/nuwax-types",
     "crates/nuwax-numeric",
     "crates/nuwax-codec",
     "crates/nuwax-protocol",
     "crates/nuwax-transport",
-    # Phase 3 (2026-07-07): real-lcm FFI binding + safe wrapper。
-    # - nuwax-lcm-sys: 纯 extern "C" 绑定 + pkg-config 探测系统 liblcm
-    # - nuwax-lcm:    RAII + 单 owner 事件线程,把 liblcm 的 publish/subscribe
-    #                 暴露为 `LcmContext` / `LcmHandle`
-    # real-lcm 是唯一 LCM 链路；
-    # nuwax-lcm-sys 版本锁 `>= 1.3, < 1.6`(build.rs fail-fast)。
     "crates/nuwax-lcm-sys",
     "crates/nuwax-lcm",
     "crates/nuwax-core",
     "crates/nuwax-rpc",
     "crates/nuwax-stream",
     "crates/nuwax-tf",
-    # 建图板块（4 个，已实装或骨架）
+    # 建图、点云与激光惯性里程计
     "crates/nuwax-mapping",
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",
     "crates/nuwax-lio-backends",
-    # nuwax-mapping-raytracing: 源码已从原 dimos-voxel-ray-tracing 1:1 迁移
-    # （2066 行 4 文件）。v4 评审后将 main.rs / python.rs 移至 migration/ 作为
-    # 阶段 0 资产（dimos-module / lcm-msgs / pyo3 / numpy 上游 crate 适配 shim 完成后回拷启用），
-    # src/ 下仅保留 lib.rs + voxel_ray_tracer.rs（1318 行核心 RayCasting 算法）。
-    # 当前 standalone 状态：
-    #   - 已在 stable 下 cargo check / clippy / build / test --lib 全通过（19 passed / 0 failed）
-    #   - 已在 rustc 1.88 下 cargo check --locked 通过（fixed 已降级到 1.30.0）
-    #   - 路径依赖问题（CLI Cargo.toml 曾 path 依赖它）已通过从 CLI Cargo.toml 移除 path 依赖解决
-    # 待子任务 STAGE-01-01（dimos-module 兼容 shim）实装后，恢复 member 声明并启用 lcm-bridge / python features。
-    # 注意：导航/探索/视觉/Fast-LIO2 等板块尚未实装，members 中不引入
-    # 待对应 change（rust-rewrite-navigation-module / rust-rewrite-exploration-module / ...）
-    # 实装完成后再加入 members。
-    # ---- 导航 stack 编排（Phase 6,Stack + Platform lane）----
-    # nuwax-nav-stack: 编排 crate,严格遵循方案 §6.8,只组合上游不持有算法
-    # - 默认 features 为空,所有 planner/bridge/visual/explore 走可选 feature
-    # - 不引入 rcl / rmw / cyclonedds / DDS / CUDA 默认依赖
-    # - 不在 build.rs 下载模型 / 二进制 / 访问网络
+    # 导航编排与探索
     "crates/nuwax-nav-stack",
-    # ---- 探索板块（TARE / Terrain / Wavefront / Exploration）----
     "crates/nuwax-exploration",
     "crates/nuwax-explore-wavefront",
     "crates/nuwax-explore-tare-bridge",
     "crates/nuwax-explore-terrain-bridge",
     "crates/nuwax-explore-terrain-map-bridge",
-    # ---- Phase 0 Foundation（导航板块协议面与共享测试夹具,2026-07-02）----
-    # Foundation lane 产物:让所有后续 crate 共享类型/错误/trait/原生 runner 与测试夹具
-    # - nuwax-nav-types-messages:nav 领域强类型消息(geometry/grid/path/goal/visual)
-    # - nuwax-nav-base:核心 trait + 错误分层 + native 状态 + 诊断 + mock
-    # - nuwax-nav-native-runner:原生 C++ 进程生命周期(start/stop/poll/build/rendered_args)
-    # - nuwax-nav-test-fixtures:JSON fixture + mock-native 测试 binary
+    # 导航协议、原生进程运行器与测试夹具
     "crates/nuwax-nav-types-messages",
     "crates/nuwax-nav-base",
     "crates/nuwax-nav-native-runner",
     "crates/nuwax-nav-test-fixtures",
-    # ---- Phase 1 A* Core（lane-astar-core）----
-    # 纯 Rust replanning A* 核心（min-cost 8 邻接 A*、safe goal、replan limiter、
-    # path distancer/clearance、controllers、local/global planner、position tracker）。
-    # 对应方案 §5.1,参考源 dimos/navigation/replanning_a_star/。
-    # 与 Foundation 同时进行,先用 nuwax-numeric 与本 crate 内嵌 local_types;
-    # Foundation 完成后切换为 nuwax-nav-types-messages / nuwax-nav-base 的类型 re-export。
+    # 路径规划与原生算法桥接
     "crates/nuwax-nav-astar",
-    # ---- Phase 2 Native Bridge (lane-native-bridge) ----
-    # C++ native 进程包装 crate,严格遵循方案 §4.2-§4.5
-    # - nuwax-nav-far-planner-bridge:result/bin/far_planner_native 包装
-    # - nuwax-nav-local-planner-bridge:result/bin/local_planner 包装(typed goal_reached)
-    # - nuwax-nav-path-follower-bridge:result/bin/path_follower 包装
-    # - nuwax-nav-pgo-bridge:result/bin/pgo 包装 + map->odom TF helper
-    # 进程生命周期由 Foundation lane 的 nuwax-nav-native-runner 统一管理
     "crates/nuwax-nav-far-planner-bridge",
     "crates/nuwax-nav-local-planner-bridge",
     "crates/nuwax-nav-path-follower-bridge",
     "crates/nuwax-nav-pgo-bridge",
-    # ---- Phase 3 Simple Planner + Terrain Map Ext (lane-simple-terrain)----
-    # 纯 Rust 算法 crate，迁移自 nuwax Python simple_planner.py 与 terrain_map_ext.py
-    # 不依赖 Open3D / SciPy / NumPy；点云用 &[Point3] 切片
-    # Foundation 完成 types-messages 后，本 crate 自带的 Point2/Point3/Pose3/Timestamp/PointCloud
-    # 将迁移至统一类型并由 nuwax-nav-types-messages 提供
     "crates/nuwax-nav-simple-planner",
     "crates/nuwax-nav-terrain-map-ext",
-    # ---- Phase 4 行为层（lane-behavior, 2026-07-02）----
-    # 8 个 crate，对应方案 §6.1-§6.7
-    # - 基本路径跟随器（纯 Rust fallback）
-    # - 运动管理：click 转发 + teleop/nav mux + 接管取消
-    # - click → start/goal 路由（纯 Rust，非 native bridge）
-    # - 巡逻路由：random / coverage / frontier（wavefront 算法归 explore-wavefront）
-    # - 视觉伺服：2D bbox + 3D detection navigation（TF trait）
-    # - 视觉查询：VLM JSON bbox trait + parser
-    # - bbox 中心 → 相机 frame goal
+    # 路径跟随、任务行为与视觉导航
     "crates/nuwax-nav-basic-path-follower",
     "crates/nuwax-nav-movement-manager",
     "crates/nuwax-nav-click-goal-bridge",
@@ -103,101 +48,66 @@ members = [
     "crates/nuwax-nav-visual-servoing",
     "crates/nuwax-nav-visual-query",
     "crates/nuwax-nav-bbox-tracker",
-    # ---- Phase 9 MLS Planner(lane-stack-mls)----
-    # 纯 Rust 多层表面 3D 路径规划器,迁移自 dimos/navigation/nav_3d/mls_planner/rust/。
-    # 脱钩 dimos-module / lcm-msgs / pyo3 / numpy,不再做 Python binding。
+    # 多层表面规划与运动运行时
     "crates/nuwax-nav-mls-planner",
-    # ---- W41 (RALPLAN §P0B #14 + L-N0.1): motion-safety-guard 守门进程 ----
-    # R-N14 落地:独占官方 Go2 motion client + lease lifecycle + ZeroAck fencing
-    # 状态机 + dedup cache + priority reserve;走 trait 契约路径接 W3 N0。
     "crates/nuwax-motion-safety-guard",
-    # ---- W41 (RALPLAN §Phase N0 + GateT + N1): nav-runtime 调度器 ----
-    # 20Hz fixed-rate controller + cancel epoch + guard client + p95 35-65ms 测量面。
     "crates/nuwax-nav-runtime",
 ]
 
 [workspace.package]
-edition = "2021"             # C1
-# MSRV：因 clap/az 等 crate 已迁移到 edition2024（Cargo 1.85+），
-# 实际构建最低需要 Rust 1.88。Jetson 实机升级路径：`rustup install 1.88`。
-# Rust 生态依赖（az / idna_adapter / image / wasip2 等）已迁 edition2024
-# 实测：cargo 1.75 编译失败；1.85 仍 v4 lock；1.88 是最低可行版本
-# 验证：cargo +1.88.0 check --locked --workspace --all-targets 已通过；
-# 涉及 fixed 1.30.0（root 与 raytracing standalone 两份 lockfile 均已降级）。
+edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Nuwax Team <build@nuwax.dev>"]
 repository = "https://github.com/nuwax-org/nuwax"
-publish = false              # 内部 workspace，不发布 crates.io
+publish = false
 
 [workspace.dependencies]
-# 运行时（C1+C2+C11）
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-# 注:`nuwax-lcm-sys` build.rs 用 `std::process::Command::new("pkg-config")` 直跑探测,
-# 避免引入 `pkg-config` crate(offline mirror 不一定有)。
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-# clap 4.1+ 拉 clap_lex 0.7+；clap 4.5+ 拉 clap_lex 1.1（需 edition2024）
-# 实测：clap 4.0.32 (2023-04) + clap_lex 0.3 (2023-02) 完全兼容 MSRV 1.75
 
-# 数学/数值
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 ndarray = { version = "0.15", features = ["rayon", "serde"] }
 ndarray-linalg = "0.16"
 glam = "0.29"
-kiddo = "=4.2.0"        # 5.x 拉 fixed 1.29 → az 1.3 (edition2024，需 Cargo 1.85+)
-                          # 4.2 是 MSRV 1.75 兼容的最大版本
+kiddo = "=4.2.0"
 
-# 序列化（prost/tonic 版本统一）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 prost = "0.13"
 tonic = "0.12"
-tonic-build = "0.12"   # build dep
+tonic-build = "0.12"
 prost-types = "0.13"
 
-# 压缩/编码
 lz4_flex = "0.11"
 turbojpeg = "0.4"
 
-# HTTP（C6：默认走 rustls-tls，不依赖 OpenSSL 默认 features）
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# 点云/网格/OSM
 osmpbf = "0.1"
 image = { version = "0.25", default-features = false }
 imageproc = { version = "0.25", default-features = false }
 
-# ML 推理（C9+C10：ort 2.x CUDA feature 默认关）
 ort = { version = "2", default-features = false }
 candle-core = "0.8"
 candle-nn = "0.8"
 candle-transformers = "0.8"
 
-# OpenCV（C8：opencv crate ≥ 0.92，aarch64-linux-gnu 支持；默认 features 需评估）
-# 注意：使用前必须在 aarch64 cross compile 实测；矩阵 §0.6 第 5 条硬否决
-# 临时保留为依赖项但未在任何 crate 中使用；待视觉板块实装时启用并标注 aarch64 实测结果
-# opencv = { version = "0.92", default-features = false }  # disabled: unused
-
-# AprilTag / Fiducial
 apriltag-rs = { version = "0.3", default-features = false }
 printpdf = "0.7"
 
-# SHM（C12：优先 memmap2，禁 iceoryx v1）
 memmap2 = "0.9"
 parking_lot = "0.12"
 
-# 通用
 anyhow = "1"
 thiserror = "1"
 bytes = "1"
-# libc 仅供 mock-native binary 使用（测试夹具：C 标准 signal 调用以忽略 SIGTERM）
 libc = { version = "0.2", default-features = false }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -205,11 +115,8 @@ indexmap = { version = "2", features = ["serde"] }
 once_cell = "1"
 rayon = "1"
 bitflags = { version = "2", features = ["serde"] }
-# 校验(mls-planner 依赖;workaround:其 manifest 中 validator 字段被 cargo 强制解析为 workspace 继承)
-# validator 0.18 不导出 `#[validate(...)]` 属性宏(仅 0.20+ 通过 `pub use validator_derive::Validate` 暴露)
 validator = { version = "0.20", features = ["derive"] }
 
-# 测试
 proptest = "1"
 pretty_assertions = "1"
 approx = "0.5"
@@ -217,22 +124,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 mockall = "0.13"
 ahash = "0.8"
 
-# 交叉编译配置（aarch64）
-# ~/.cargo/config.toml 需配置：
-# [target.aarch64-unknown-linux-gnu]
-# linker = "aarch64-linux-gnu-gcc"
-# ar = "aarch64-linux-gnu-ar"
-
-# 禁用清单（矩阵 §0.6 硬否决项）：
-# - gtsam-rs：aarch64 无 prebuilt → nuwax-mapping 自研 PGO
-# - tch / libtorch：CUDA 绑定 + aarch64 编译失败 → 改用 ort (CPU EP)
-# - open3d-rs：依赖 Open3D C++，编译慢 → 改用 nalgebra + 自研
-# - pinocchio：C++ 大依赖 → visual servoing 自研 IK
-# - iceoryx v1（deprecated）→ 用 memmap2
-# - 其它中间件绑定（C7 硬约束）
 [profile.release]
-# Workspace-level release profile. Package-local profiles are ignored by Cargo in a workspace.
-# aarch64 + Ubuntu 20.04 + glibc 2.31 compatibility target.
 lto = "thin"
 codegen-units = 1
 strip = "symbols"

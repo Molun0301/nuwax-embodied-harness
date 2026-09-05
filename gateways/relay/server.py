@@ -30,6 +30,9 @@ _LOW_VALUE_RELAY_PATHS = frozenset(
         "/api/tasks",
         "/api/memory/instances",
         "/mcp",
+        "/console",
+        "/console/",
+        "/api/logs",
         "/events/stream",
         "/streams/sse",
         "/streams/video.mjpeg",
@@ -37,7 +40,7 @@ _LOW_VALUE_RELAY_PATHS = frozenset(
         "/debug/",
     )
 )
-_LOW_VALUE_RELAY_PREFIXES = ("/api/debug/", "/static/")
+_LOW_VALUE_RELAY_PREFIXES = ("/static/",)
 _RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 _RELAY_SLOW_REQUEST_THRESHOLD_MS = 1000.0
 _STREAM_WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024 * 1024

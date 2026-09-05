@@ -19,9 +19,9 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from contracts.debug_views import (
+from contracts.telemetry import (
     CpuMetric,
-    DebugDataStatus,
+    TelemetryStatus,
     MemoryMetric,
     ProcessMetric,
     SystemMetricsSnapshot,
@@ -246,7 +246,7 @@ class SystemMetricsCollector:
         """psutil 不可用时的降级快照。"""
 
         return SystemMetricsSnapshot(
-            status=DebugDataStatus.UNSUPPORTED,
+            status=TelemetryStatus.UNSUPPORTED,
             psutil_available=False,
             sample_interval_sec=self._sample_interval_sec,
             monitor_scope=self.monitor_scope,
@@ -264,7 +264,7 @@ class SystemMetricsCollector:
         cpu = self._sample_cpu()
         memory = self._sample_memory()
         processes = self._sample_processes()
-        status = DebugDataStatus.AVAILABLE if processes else DebugDataStatus.MISSING
+        status = TelemetryStatus.AVAILABLE if processes else TelemetryStatus.MISSING
         return SystemMetricsSnapshot(
             status=status,
             psutil_available=True,

@@ -73,7 +73,7 @@
 
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config pkgs.patch ];
           buildInputs = [
             livox-sdk2
             lcm

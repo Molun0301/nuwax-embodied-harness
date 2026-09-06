@@ -68,7 +68,16 @@ cleanup() {
 
 forward_shutdown() {
   local status=0
-  stop_geometry_child || status=$?
+  # 重复信号不得中断 wait，或让退出清理再次抢先关闭同一子进程。
+  trap '' INT TERM
+  stop_ready_monitor
+  rm -f "${READY_FILE}" "${READY_FILE}.tmp" 2>/dev/null || true
+  if [[ -n "${CHILD_PID}" ]]; then
+    # 根拥有方负责依序回收；服务管理器沿用外层 20 秒最终关闭期限。
+    kill -TERM "${CHILD_PID}" >/dev/null 2>&1 || true
+    wait "${CHILD_PID}" || status=$?
+    CHILD_PID=""
+  fi
   exit "${status}"
 }
 

@@ -56,6 +56,7 @@ from typing import Any, Deque, Dict, Optional, Tuple
 import numpy as np
 
 from adapters.sensors.lio_measurement import (
+    DEFAULT_MAX_IMU_SAMPLES,
     LioMeasurementAssembler,
     LioMeasurementAssemblerError,
 )
@@ -158,6 +159,7 @@ class BridgeCounters:
     lio_not_ready_count: int = 0
     dropped_odom_count: int = 0
     dropped_pointcloud_count: int = 0
+    dropped_lio_imu_count: int = 0
     downsampled_pointcloud_count: int = 0
     last_publish_latency_ms: float = 0.0
     last_publish_at_monotonic: Optional[float] = None
@@ -178,6 +180,7 @@ class BridgeCounters:
             "lio_not_ready_count": self.lio_not_ready_count,
             "dropped_odom_count": self.dropped_odom_count,
             "dropped_pointcloud_count": self.dropped_pointcloud_count,
+            "dropped_lio_imu_count": self.dropped_lio_imu_count,
             "downsampled_pointcloud_count": self.downsampled_pointcloud_count,
             "last_publish_latency_ms": self.last_publish_latency_ms,
             "last_publish_at_monotonic": self.last_publish_at_monotonic,
@@ -1253,19 +1256,79 @@ class RuntimeInputBridge:
         while measurement is not None:
             prepared = self._prepare_native_lio_measurement(measurement)
             if prepared is not None:
-                if len(self._lio_publish_queue) >= _MAX_LIO_PUBLISH_QUEUE_SIZE:
-                    self._lio_publish_queue.popleft()
+                self._lio_publish_queue.append((generation, prepared))
+                if len(self._lio_publish_queue) > _MAX_LIO_PUBLISH_QUEUE_SIZE:
+                    dropped_generation, dropped = self._lio_publish_queue.popleft()
                     self._increment_counter("dropped_pointcloud_count")
                     self._record_error(
-                        "native LIO publish FIFO 已满，丢弃最旧 ready measurement"
+                        "native LIO publish FIFO 已满，丢弃最旧点云并承接其 IMU"
                     )
-                self._lio_publish_queue.append((generation, prepared))
+                    self._carry_dropped_lio_imu(dropped.imu_samples, dropped_generation)
             measurement = self._lio_measurement_assembler.pop_ready()
         if not self._lio_publish_queue or self._lio_publish_owner_active:
             return False
         self._lio_publish_owner_active = True
         self._lio_publish_owner_thread_id = threading.get_ident()
         return True
+
+    def _carry_dropped_lio_imu(
+        self, samples: Tuple[CanonicalImuSample, ...], generation: int
+    ) -> None:
+        """在既有发布锁内把被丢点云的惯性历史交给下一保留帧。"""
+
+        while self._lio_publish_queue:
+            next_generation, measurement = self._lio_publish_queue[0]
+            if next_generation != generation:
+                self._increment_counter("dropped_lio_imu_count", len(samples))
+                self._increment_counter("lio_not_ready_count")
+                self._record_error("拒绝跨代际承接 %d 条 LIO IMU" % len(samples))
+                return
+            by_timestamp = {sample.timestamp_ns: sample for sample in samples}
+            conflicting_samples = 0
+            for sample in measurement.imu_samples:
+                previous = by_timestamp.setdefault(sample.timestamp_ns, sample)
+                if previous != sample:
+                    conflicting_samples += 1
+            if conflicting_samples:
+                # 同时刻不同内容说明源身份已失真，不能任意挑选一个值继续积分。
+                self._lio_publish_queue.popleft()
+                self._increment_counter("dropped_pointcloud_count")
+                dropped_samples = len(by_timestamp) + conflicting_samples
+                self._increment_counter("dropped_lio_imu_count", dropped_samples)
+                self._increment_counter("lio_not_ready_count")
+                self._record_error(
+                    "LIO IMU 同时间戳内容冲突，拒绝承接并丢弃 %d 条样本"
+                    % dropped_samples
+                )
+                return
+            samples = tuple(by_timestamp[stamp] for stamp in sorted(by_timestamp))
+            excess = len(samples) - DEFAULT_MAX_IMU_SAMPLES
+            if excess > 0:
+                samples = samples[excess:]
+                self._increment_counter("dropped_lio_imu_count", excess)
+                self._increment_counter("lio_not_ready_count")
+                self._record_error(
+                    "LIO IMU 承接超过 %d 条上限，丢弃最旧 %d 条待发样本，连续区间无法保证"
+                    % (DEFAULT_MAX_IMU_SAMPLES, excess)
+                )
+            if samples[0].timestamp_ns > measurement.scan_begin_timestamp_ns:
+                self._lio_publish_queue.popleft()
+                self._increment_counter("dropped_pointcloud_count")
+                self._increment_counter("lio_not_ready_count")
+                self._record_error("LIO IMU 承接溢出后不覆盖扫描开始，拒绝该点云")
+                continue
+            self._lio_publish_queue[0] = (
+                generation,
+                CanonicalLioMeasurement(
+                    lidar=measurement.lidar,
+                    imu_samples=samples,
+                    scan_begin_timestamp_ns=measurement.scan_begin_timestamp_ns,
+                    scan_end_timestamp_ns=measurement.scan_end_timestamp_ns,
+                ),
+            )
+            return
+        self._increment_counter("dropped_lio_imu_count", len(samples))
+        self._record_error("LIO IMU 承接后没有可覆盖点云，丢弃 %d 条样本" % len(samples))
 
     def _drain_native_lio_measurements(self) -> None:
         """由单一 owner 在 condition 外顺序执行 native publish RPC。"""

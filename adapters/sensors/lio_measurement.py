@@ -15,6 +15,8 @@ from contracts.sensors import (
     SensorErrorCode,
 )
 
+DEFAULT_MAX_IMU_SAMPLES = 4096
+
 
 class LioMeasurementAssemblerError(ValueError):
     """带稳定错误码的 LIO 测量组装失败。"""
@@ -27,7 +29,9 @@ class LioMeasurementAssemblerError(ValueError):
 class LioMeasurementAssembler:
     """以有界队列组装扫描开始和结束均被 IMU 覆盖的测量组。"""
 
-    def __init__(self, max_lidar_frames: int = 4, max_imu_samples: int = 4096) -> None:
+    def __init__(
+        self, max_lidar_frames: int = 4, max_imu_samples: int = DEFAULT_MAX_IMU_SAMPLES
+    ) -> None:
         if max_lidar_frames <= 0 or max_imu_samples <= 0:
             raise ValueError("LiDAR 与 IMU 队列上限必须为正数")
         self._lock = RLock()
@@ -40,6 +44,7 @@ class LioMeasurementAssembler:
         self._calibration_ref: Optional[str] = None
         self._last_lidar_identity: Optional[Tuple[int, int]] = None
         self._last_imu_identity: Optional[Tuple[int, int]] = None
+        self._last_emitted_scan_end_ns: Optional[int] = None
         self.dropped_lidar_count = 0
         self.dropped_imu_count = 0
         self.emitted_measurement_count = 0
@@ -126,10 +131,14 @@ class LioMeasurementAssembler:
                 self.dropped_lidar_count += 1
                 continue
 
+            # 扫描之间即使没有点云，也必须把惯性积分区间交给下一帧。
+            imu_begin = scan_begin
+            if self._last_emitted_scan_end_ns is not None:
+                imu_begin = min(imu_begin, self._last_emitted_scan_end_ns)
             start_index = 0
             end_index: Optional[int] = None
             for index, sample in enumerate(self._imu_samples):
-                if sample.timestamp_ns <= scan_begin:
+                if sample.timestamp_ns <= imu_begin:
                     start_index = index
                 if sample.timestamp_ns >= scan_end:
                     end_index = index
@@ -147,6 +156,7 @@ class LioMeasurementAssembler:
             self._lidar_frames.popleft()
             for _ in range(start_index):
                 self._imu_samples.popleft()
+            self._last_emitted_scan_end_ns = scan_end
             self.emitted_measurement_count += 1
             return measurement
         return None
@@ -162,6 +172,7 @@ class LioMeasurementAssembler:
             self._calibration_ref = None
             self._last_lidar_identity = None
             self._last_imu_identity = None
+            self._last_emitted_scan_end_ns = None
 
     def status(self) -> Dict[str, int]:
         """返回有界队列与丢弃计数。"""

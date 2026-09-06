@@ -414,8 +414,11 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
         imu_msg->header.frame_id = g_child_frame_id;
         imu_msg->angular_velocity.x = gyro[0];
         imu_msg->angular_velocity.y = gyro[1]; imu_msg->angular_velocity.z = gyro[2];
-        imu_msg->linear_acceleration.x = accel[0];
-        imu_msg->linear_acceleration.y = accel[1]; imu_msg->linear_acceleration.z = accel[2];
+        // 规范输入为米/秒²；PointLIO 内核按重力倍数执行缩放和饱和检查。
+        // 使用内核自身的重力常量逆转换，避免再次乘重力并把静止输入判为饱和。
+        imu_msg->linear_acceleration.x = accel[0] / G_m_s2;
+        imu_msg->linear_acceleration.y = accel[1] / G_m_s2;
+        imu_msg->linear_acceleration.z = accel[2] / G_m_s2;
         g_typed_imu_samples.push_back({timestamp_ns, std::move(imu_msg)});
         g_last_typed_imu_stamp_ns = timestamp_ns;
         g_has_last_typed_imu_stamp = true;

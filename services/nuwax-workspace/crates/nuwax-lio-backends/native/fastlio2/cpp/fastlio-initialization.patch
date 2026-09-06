@@ -1,0 +1,46 @@
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -73,9 +73,10 @@
+   V3D mean_acc;
+   V3D mean_gyr;
+   V3D angvel_last;
+-  V3D acc_s_last;
++  // 首次去畸变前的历史量必须明确初始化，不能读取分配器留下的内存。
++  V3D acc_s_last = Zero3d;
+   double start_timestamp_;
+-  double last_lidar_end_time_;
++  double last_lidar_end_time_ = -1.0;
+   int    init_iter_num = 1;
+   bool   b_first_frame_ = true;
+   bool   imu_need_init_ = true;
+@@ -106,6 +107,8 @@
+   mean_acc      = V3D(0, 0, -1.0);
+   mean_gyr      = V3D(0, 0, 0);
+   angvel_last       = Zero3d;
++  acc_s_last        = Zero3d;
++  last_lidar_end_time_ = -1.0;
+   imu_need_init_    = true;
+   start_timestamp_  = -1;
+   init_iter_num     = 1;
+@@ -236,6 +239,9 @@
+   init_P(21,21) = init_P(22,22) = 0.00001; 
+   kf_state.change_P(init_P);
+   last_imu_ = meas.imu.back();
++  // 初始状态对应这次扫描末端；后续积分从这个已知时刻继续。
++  last_lidar_end_time_ = meas.lidar_end_time;
++  acc_s_last = Zero3d;
+ }
+ 
+ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -282,7 +282,8 @@
+     double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
+     int    time_log_counter = 0, scan_count = 0, publish_count = 0;
+     int    iterCount = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+-    bool   lidar_pushed, flg_first_scan = true, flg_EKF_inited;
++    // 首帧必须建立测量组，不能把未初始化的标志当成已压入扫描。
++    bool   lidar_pushed = false, flg_first_scan = true, flg_EKF_inited;
+     bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+ 
+     vector<vector<int>>  pointSearchInd_surf; 

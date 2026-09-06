@@ -58,6 +58,8 @@ StandardOutput=journal
 StandardError=journal
 Restart=on-failure
 RestartSec=3
+# 先由启动器和 Rust 根拥有方依序关闭；期限耗尽仍回收整个控制组。
+KillMode=mixed
 TimeoutStopSec=20
 ReadWritePaths=/run/nuwax/geometry /tmp /var/lib/nuwax/geometry-runtime /var/lib/nuwax_robot_bridge
 # Phase 8 §13.2 修正:不再把 real-lcm fail-fast code(4) 当 SuccessExitStatus。

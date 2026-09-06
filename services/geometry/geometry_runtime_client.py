@@ -53,6 +53,8 @@ class GeometryRuntimeSubprocess:
         self._lock = threading.RLock()
         self._started = False
         self._attached = False
+        # 保存启动器已确认的进程号，避免相同端口的新进程复用旧挂接。
+        self._attached_ready_pid: Optional[int] = None
         self._last_error: Optional[str] = None
         # attach 状态下 gRPC 健康检查缓存（runtime monitor / is_running 复用）
         self._attached_health_check_at = 0.0
@@ -81,7 +83,7 @@ class GeometryRuntimeSubprocess:
         return self._last_error
 
     def _verify_ready_locked(self) -> bool:
-        """校验 canonical launcher 发布的最小 ready 标记。"""
+        """校验启动器最小就绪标记，并保持本次挂接对应的进程号。"""
         ready_path = Path(
             runtime_value(
                 "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
@@ -115,7 +117,16 @@ class GeometryRuntimeSubprocess:
                 and not port.startswith("0")
             ):
                 return False
-            return int(port) == self._port and Path("/proc", pid).is_dir()
+            if int(port) != self._port or not Path("/proc", pid).is_dir():
+                return False
+            ready_pid = int(pid)
+            if (
+                self._attached_ready_pid is not None
+                and self._attached_ready_pid != ready_pid
+            ):
+                return False
+            self._attached_ready_pid = ready_pid
+            return True
         except (OSError, UnicodeError):
             return False
 
@@ -169,6 +180,11 @@ class GeometryRuntimeSubprocess:
                     "请检查 %s 的 owner 日志" % (self._port, _CANONICAL_LAUNCHER)
                 )
                 LOGGER.error(self._last_error)
+                self._reset_attached_state_locked()
+                return False
+            # 验活可能跨越重启；不能把旧就绪进程与新服务的响应拼成成功挂接。
+            if not self._verify_ready_locked():
+                self._last_error = "Geometry 就绪进程在 GetStatus 验活期间发生变化"
                 self._reset_attached_state_locked()
                 return False
             self._attached = True
@@ -244,11 +260,11 @@ class GeometryRuntimeSubprocess:
             now - self._attached_health_check_at
         ) < _ATTACHED_HEALTH_CHECK_TTL_SEC:
             return True
-        ok = self._verify_attached_runtime_locked()
+        ok = self._verify_attached_runtime_locked() and self._verify_ready_locked()
         self._attached_health_check_at = now
         self._attached_health_check_ok = ok
         if not ok:
-            LOGGER.warning("attach 状态下 gRPC 健康检查失败，清状态等待 canonical owner 恢复")
+            LOGGER.warning("挂接进程身份或 gRPC 健康检查失败，清状态等待进程拥有方恢复")
             self._reset_attached_state_locked()
         return ok
 
@@ -256,5 +272,6 @@ class GeometryRuntimeSubprocess:
         """调用方必须已持有 self._lock。清空 attach 状态与健康检查缓存。"""
         self._started = False
         self._attached = False
+        self._attached_ready_pid = None
         self._attached_health_check_at = 0.0
         self._attached_health_check_ok = False

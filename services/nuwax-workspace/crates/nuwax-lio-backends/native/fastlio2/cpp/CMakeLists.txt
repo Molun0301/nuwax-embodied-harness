@@ -74,6 +74,32 @@ if(NOT FASTLIO_IKD_TREE_SOURCE)
     "FAST-LIO source is missing ikd_Tree.cpp under ${FASTLIO_SOURCE_DIR}")
 endif()
 
+# 修复锁定上游的首帧状态初始化，只在构建目录内生成实际使用的头文件。
+# CMake 与 Nix 共用这一入口，不修改外部源码检出，也不依赖其临时手工补丁。
+find_program(NUWAX_PATCH_EXECUTABLE patch)
+if(NOT NUWAX_PATCH_EXECUTABLE)
+  message(FATAL_ERROR "patch is required to apply the FAST-LIO initialization fix")
+endif()
+set(FASTLIO_PATCHED_DIR "${CMAKE_CURRENT_BINARY_DIR}/fastlio-initialized")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-initialization.patch")
+foreach(HEADER fast_lio.hpp laserMapping.hpp IMU_Processing.hpp)
+  configure_file("${FASTLIO_SOURCE_DIR}/src/${HEADER}"
+    "${FASTLIO_PATCHED_DIR}/src/${HEADER}" COPYONLY)
+endforeach()
+execute_process(
+  COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward -p1
+    -i "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-initialization.patch"
+  WORKING_DIRECTORY "${FASTLIO_PATCHED_DIR}"
+  RESULT_VARIABLE FASTLIO_PATCH_RESULT
+  OUTPUT_VARIABLE FASTLIO_PATCH_OUTPUT
+  ERROR_VARIABLE FASTLIO_PATCH_ERROR
+)
+if(NOT FASTLIO_PATCH_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "FAST-LIO initialization patch failed: ${FASTLIO_PATCH_OUTPUT}${FASTLIO_PATCH_ERROR}")
+endif()
+
 # dimos-lcm C++ message headers
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
@@ -113,6 +139,7 @@ if(NOT LIVOX_COMMON_DIR)
 endif()
 
 target_include_directories(fastlio2_native PRIVATE
+  ${FASTLIO_PATCHED_DIR}/src
   ${FASTLIO_SOURCE_DIR}/include
   ${FASTLIO_SOURCE_DIR}/src
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs

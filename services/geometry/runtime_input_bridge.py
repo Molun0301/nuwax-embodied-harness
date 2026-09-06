@@ -758,11 +758,6 @@ class RuntimeInputBridge:
             finally:
                 self._release_bridge_callback()
             return
-        if pose is None:
-            self._increment_counter("dropped_odom_count")
-            self._record_error("localization callback 收到 None pose")
-            return
-
         callback_metadata = dict(metadata or {})
         native_lio_backend = os.environ.get(
             _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
@@ -787,6 +782,19 @@ class RuntimeInputBridge:
                         )
                 if should_drain:
                     self._drain_native_lio_measurements()
+            else:
+                self._increment_counter("lio_not_ready_count")
+                self._record_error(
+                    "lio_not_ready: 原生定位回调缺少真实 canonical_imu_sample，"
+                    "不能回退到设备里程计"
+                )
+            # 原生后端拥有里程计输出；旧定位订阅仅作为真实惯性输入载体。
+            return
+
+        if pose is None:
+            self._increment_counter("dropped_odom_count")
+            self._record_error("localization callback 收到 None pose")
+            return
 
         if frame_tree is not None and getattr(frame_tree, "transforms", None):
             self._increment_counter("observed_frame_tree_count")

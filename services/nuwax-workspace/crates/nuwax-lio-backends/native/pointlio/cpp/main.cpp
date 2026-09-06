@@ -578,9 +578,10 @@ int main(int argc, char** argv) {
     params.satu_gyro = mod.arg_float("satu_gyro", params.satu_gyro);
     params.acc_norm = mod.arg_float("acc_norm", params.acc_norm);
     params.plane_thr = mod.arg_float("plane_thr", params.plane_thr);
-    params.filter_size_surf = mod.arg_float("filter_size_surf", params.filter_size_surf);
+    // 对齐锁定 Dimos 模块的默认值，避免过稀扫描配上过小地图邻域而丢失激光约束。
+    params.filter_size_surf = mod.arg_float("filter_size_surf", 0.2f);
     params.filter_size_map = mod.arg_float("filter_size_map", params.filter_size_map);
-    params.ivox_grid_resolution = mod.arg_float("ivox_grid_resolution", params.ivox_grid_resolution);
+    params.ivox_grid_resolution = mod.arg_float("ivox_grid_resolution", 2.0f);
     std::string ivox_nearby = mod.arg("ivox_nearby_type", "nearby6");
     params.ivox_nearby_type = ivox_nearby == "center" ? 0 : ivox_nearby == "nearby18" ? 18 :
                               ivox_nearby == "nearby26" ? 26 : 6;

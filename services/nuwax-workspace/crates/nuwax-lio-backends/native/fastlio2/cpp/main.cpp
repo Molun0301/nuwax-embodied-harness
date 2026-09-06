@@ -344,11 +344,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
                 fprintf(stderr, "[fastlio2] reject typed cloud: non-finite or malformed point\\n");
                 return;
             }
-            if (!accepted_points.empty() && offset_ns <= accepted_points.back().offset_time) {
-                fprintf(stderr, "[%s] reject typed cloud: point offsets must increase\n", "fastlio2");
-                return;
-            }
-            max_offset_ns = offset_ns;
+            max_offset_ns = std::max(max_offset_ns, offset_ns);
             custom_messages::CustomPoint point;
             point.x = x; point.y = y; point.z = z;
             point.reflectivity = 0; point.tag = 0; point.line = 0;
@@ -360,6 +356,14 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
         !typed_imu_covers_scan(stamp_ns, stamp_ns + max_offset_ns)) {
         fprintf(stderr, "[%s] reject typed cloud: IMU does not cover scan window\n", "fastlio2");
         return;
+    }
+    // 原载荷保留设备顺序；内核计算副本按真实时间排列，整点移动以保持坐标对应。
+    // 同一时刻的点合法且保持原相对顺序，不改时间、不丢点。
+    const auto earlier_point = [](const auto& left, const auto& right) {
+        return left.offset_time < right.offset_time;
+    };
+    if (!std::is_sorted(accepted_points.begin(), accepted_points.end(), earlier_point)) {
+        std::stable_sort(accepted_points.begin(), accepted_points.end(), earlier_point);
     }
     // A PointCloud2 message is one scan. Replace the pending frame atomically;
     // never append a later scan to the prior scan's timebase.

@@ -49,6 +49,36 @@ _GO2_BODY_FROM_UTLIDAR_TRANSLATION_M = GO2_CALIBRATION_PROFILE.lidar_translation
 _GO2_BODY_FROM_UTLIDAR_PITCH_RAD = GO2_CALIBRATION_PROFILE.lidar_rpy_rad[1]
 _POINT_CLOUD_POSE_HISTORY_SIZE = 256
 _MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
+_NATIVE_IMU_READER_HISTORY_DEPTH = 256
+_NATIVE_CLOUD_READER_HISTORY_DEPTH = 16
+
+
+class _HistoryChannelSubscriber:
+    """仅通过官方公开通道设置单个读取器的有界历史。"""
+
+    def __init__(self, factory, topic, message_type, qos) -> None:
+        self._channel = factory.CreateChannel(topic, message_type)
+        self._qos = qos
+        self._initialized = False
+        self._close_needed = False
+
+    def Init(self) -> None:
+        if self._initialized:
+            return
+        # 部分初始化失败仍由现有启动回滚调用 Close，不遗失关闭途径。
+        self._close_needed = True
+        self._channel.SetReader(self._qos)
+        self._initialized = True
+
+    def Read(self, timeout=None):
+        return self._channel.Read(timeout)
+
+    def Close(self) -> None:
+        if not self._close_needed:
+            return
+        self._channel.CloseReader()
+        self._close_needed = False
+        self._initialized = False
 
 
 @dataclass(frozen=True)
@@ -229,6 +259,12 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
+            if config.lio_backend in {"fastlio2", "pointlio"}:
+                qos_module = importlib.import_module("cyclonedds.qos")
+                modules["ChannelFactory"] = getattr(channel_module, "ChannelFactory")
+                modules["Qos"] = getattr(qos_module, "Qos")
+                modules["HistoryKeepLast"] = getattr(getattr(qos_module, "Policy").History, "KeepLast")
+                modules["ResourceLimits"] = getattr(getattr(qos_module, "Policy"), "ResourceLimits")
             # sensor_msgs/PointCloud2 用于 DirectDDS 点云订阅；缺失则 point_cloud_enabled
             # 启动时记录到 point_cloud_bridge_last_error，避免 silent fallback。
             try:
@@ -673,9 +709,28 @@ class Go2DirectDdsBridge:
         point_cloud_type = None
         try:
             subscriber_class = modules["ChannelSubscriber"]
-            pose_subscriber = subscriber_class(
+            native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
+
+            def make_subscriber(topic, message_type, history_depth):
+                if not native_input:
+                    return subscriber_class(topic, message_type)
+                required = ("ChannelFactory", "Qos", "HistoryKeepLast", "ResourceLimits")
+                if any(not callable(modules.get(name)) for name in required):
+                    raise RuntimeError("Go2原生输入缺少公开读取器有界历史接口")
+                qos = modules["Qos"](
+                    modules["HistoryKeepLast"](history_depth),
+                    modules["ResourceLimits"](
+                        max_samples=history_depth,
+                        max_instances=1,
+                        max_samples_per_instance=history_depth,
+                    ),
+                )
+                return _HistoryChannelSubscriber(modules["ChannelFactory"](), topic, message_type, qos)
+
+            pose_subscriber = make_subscriber(
                 self.config.direct_dds.pose_topic,
                 modules["SportModeState"],
+                _NATIVE_IMU_READER_HISTORY_DEPTH,
             )
             pose_subscriber.Init()
 
@@ -689,9 +744,10 @@ class Go2DirectDdsBridge:
                     LOGGER.warning(message)
                     self._record_point_cloud_bridge_error(message)
                     raise RuntimeError(message)
-                point_cloud_subscriber = subscriber_class(
+                point_cloud_subscriber = make_subscriber(
                     self.config.direct_dds.point_cloud_topic,
                     point_cloud_type,
+                    _NATIVE_CLOUD_READER_HISTORY_DEPTH,
                 )
                 point_cloud_subscriber.Init()
                 LOGGER.info(
@@ -703,6 +759,12 @@ class Go2DirectDdsBridge:
                 LOGGER.info(
                     "Go2 DirectDDS 点云订阅未启用：config.direct_dds.point_cloud_enabled=false，"
                     "需要启用该开关并保证 unitree SDK 提供 sensor_msgs/PointCloud2 IDL。"
+                )
+            if native_input:
+                LOGGER.info(
+                    "Go2原生输入读取器已配置有界历史及单实例资源限额：惯性=%s 点云=%s",
+                    _NATIVE_IMU_READER_HISTORY_DEPTH,
+                    _NATIVE_CLOUD_READER_HISTORY_DEPTH if point_cloud_enabled else 0,
                 )
         except Exception as exc:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)

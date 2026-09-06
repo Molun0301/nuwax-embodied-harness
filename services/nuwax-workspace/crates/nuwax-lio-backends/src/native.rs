@@ -92,6 +92,15 @@ pub struct NativeLioConfig {
     pub pointcloud_frequency_hz: f64,
     pub odometry_frequency_hz: f64,
     pub debug: bool,
+    /// 扫描下采样体素边长；未配置时保留原生程序默认值，单位为米。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_voxel_size_m: Option<f64>,
+    /// 地图插入筛选体素边长，不表示Point的iVox索引格，单位为米。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_voxel_size_m: Option<f64>,
+    /// 初图最少有效扫描数；Point仍同时遵守原有点数门及静止初始化前提。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_map_frames: Option<u32>,
 }
 
 impl NativeLioConfig {
@@ -113,6 +122,9 @@ impl NativeLioConfig {
             pointcloud_frequency_hz: 10.0,
             odometry_frequency_hz: 30.0,
             debug: false,
+            scan_voxel_size_m: None,
+            map_voxel_size_m: None,
+            initial_map_frames: None,
         }
     }
 
@@ -151,6 +163,24 @@ impl NativeLioConfig {
         validate_frequency(self.lidar_frequency_hz, "lidar_frequency_hz")?;
         validate_frequency(self.pointcloud_frequency_hz, "pointcloud_frequency_hz")?;
         validate_frequency(self.odometry_frequency_hz, "odometry_frequency_hz")?;
+        for (name, value) in [
+            ("scan_voxel_size_m", self.scan_voxel_size_m),
+            ("map_voxel_size_m", self.map_voxel_size_m),
+        ] {
+            if let Some(value) = value {
+                let native_value = value as f32;
+                if !value.is_finite() || value <= 0.0
+                    || !native_value.is_normal() || native_value <= 0.0
+                {
+                    return Err(format!(
+                        "{name} must remain a positive normal float32 for native voxel operations"
+                    ));
+                }
+            }
+        }
+        if self.initial_map_frames.is_some_and(|value| value == 0 || value > i32::MAX as u32) {
+            return Err("initial_map_frames must be within [1, 2147483647]".into());
+        }
         Ok(())
     }
 
@@ -180,6 +210,17 @@ impl NativeLioConfig {
             "--debug".into(),
             self.debug.to_string(),
         ];
+        for (option, value) in [
+            ("--filter_size_surf", self.scan_voxel_size_m),
+            ("--filter_size_map", self.map_voxel_size_m),
+        ] {
+            if let Some(value) = value {
+                args.extend([option.to_owned(), render_number(value)]);
+            }
+        }
+        if let Some(value) = self.initial_map_frames {
+            args.extend(["--initial_map_frames".to_owned(), value.to_string()]);
+        }
         if let (Some(input_lidar), Some(input_imu)) =
             (&self.input_lidar_topic, &self.input_imu_topic)
         {
@@ -587,6 +628,73 @@ mod tests {
     }
 
     #[test]
+    fn optional_sampling_defaults_preserve_legacy_serialization_and_arguments() {
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let config = NativeLioConfig::for_backend(backend);
+            let legacy = serde_json::to_value(&config).expect("serialize defaults");
+            for key in ["scan_voxel_size_m", "map_voxel_size_m", "initial_map_frames"] {
+                assert!(legacy.get(key).is_none(), "unset {key} must stay omitted");
+            }
+            let restored: NativeLioConfig = serde_json::from_value(legacy.clone())
+                .expect("old serialized configuration must remain readable");
+            assert_eq!(restored, config);
+            let args = restored.render_args().expect("default arguments");
+            for option in ["--filter_size_surf", "--filter_size_map", "--initial_map_frames"] {
+                assert!(!args.iter().any(|arg| arg == option));
+            }
+            let mut unknown = legacy;
+            unknown["extra_args"] = serde_json::json!(["--unexpected"]);
+            assert!(serde_json::from_value::<NativeLioConfig>(unknown).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_sampling_renders_only_selected_known_arguments() {
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let mut config = NativeLioConfig::for_backend(backend);
+            config.scan_voxel_size_m = Some(0.1);
+            config.initial_map_frames = Some(7);
+            let args = config.render_args().expect("sampling arguments");
+            assert_arg_value(&args, "--filter_size_surf", "0.1");
+            assert_arg_value(&args, "--initial_map_frames", "7");
+            assert!(!args.iter().any(|arg| arg == "--filter_size_map"));
+            config.map_voxel_size_m = Some(0.2);
+            assert_arg_value(&config.render_args().unwrap(), "--filter_size_map", "0.2");
+        }
+    }
+
+    #[test]
+    fn optional_sampling_rejects_unusable_native_number_ranges() {
+        for value in [0.0, -0.1, f64::NAN, f64::INFINITY, 1e-40, 1e-300, 1e40] {
+            for scan in [true, false] {
+                let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
+                if scan {
+                    config.scan_voxel_size_m = Some(value);
+                } else {
+                    config.map_voxel_size_m = Some(value);
+                }
+                assert!(config.render_args().is_err(), "invalid voxel size: {value}");
+            }
+        }
+        for value in [f32::MIN_POSITIVE as f64, 0.1, f32::MAX as f64] {
+            let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+            config.scan_voxel_size_m = Some(value);
+            assert!(config.render_args().is_ok());
+        }
+        for value in [0, i32::MAX as u32 + 1] {
+            let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
+            config.initial_map_frames = Some(value);
+            assert!(config.render_args().is_err());
+        }
+        let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
+        config.initial_map_frames = Some(i32::MAX as u32);
+        assert!(config.render_args().is_ok());
+        let mut serialized = serde_json::to_value(config).unwrap();
+        serialized["initial_map_frames"] = serde_json::json!(1.5);
+        assert!(serde_json::from_value::<NativeLioConfig>(serialized).is_err());
+    }
+
+    #[test]
     fn invalid_extrinsic_fails_closed() {
         let mut config = NativeLioConfig::for_backend(NativeBackend::FastLio2);
         config.extrinsic_translation_m[0] = f64::NAN;
@@ -700,7 +808,7 @@ mod tests {
                 !source.contains("g_accumulated_points.insert(g_accumulated_points.end(), accepted_points.begin(), accepted_points.end())"),
                 "{backend} must not append independent typed scans"
             );
-            assert!(source.contains("point offsets must increase"), "{backend}");
+            // 逐点存储顺序由真实C++回调回归验证，不等同于扫描源时间递增。
             assert!(source.contains("source timestamp must increase"), "{backend}");
             assert!(source.contains("typed_imu_covers_scan"), "{backend}");
 

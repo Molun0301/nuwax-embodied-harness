@@ -34,6 +34,7 @@
 #include "livox_sdk_config.hpp"
 #include "imu_frame_transform.hpp"
 #include "scan_imu_buffer.hpp"
+#include "native_lio_arguments.hpp"
 
 #include "dimos_native_module.hpp"
 
@@ -649,8 +650,6 @@ int main(int argc, char** argv) {
     params.gyr_cov = mod.arg_float("gyr_cov", params.gyr_cov);
     params.b_acc_cov = mod.arg_float("b_acc_cov", params.b_acc_cov);
     params.b_gyr_cov = mod.arg_float("b_gyr_cov", params.b_gyr_cov);
-    params.filter_size_surf = mod.arg_float("filter_size_surf", params.filter_size_surf);
-    params.filter_size_map = mod.arg_float("filter_size_map", params.filter_size_map);
     params.det_range = mod.arg_float("det_range", params.det_range);
     params.cube_side_length = mod.arg_float("cube_side_length", params.cube_side_length);
     params.blind = mod.arg_float("blind", params.blind);
@@ -667,6 +666,17 @@ int main(int argc, char** argv) {
     if (auto et = parse_doubles(mod.arg("extrinsic_t", "")); !et.empty()) { params.extrinsic_T = et; }
     if (auto er = parse_doubles(mod.arg("extrinsic_r", "")); !er.empty()) { params.extrinsic_R = er; }
     try {
+        // 新增配置只接纳完整、有效的原生值；缺省继续保留原 arg_float 的单精度舍入。
+        params.filter_size_surf = mod.has("filter_size_surf")
+            ? nuwax_lio::parse_native_voxel_size(mod.arg("filter_size_surf", ""), "filter_size_surf")
+            : mod.arg_float("filter_size_surf", params.filter_size_surf);
+        params.filter_size_map = mod.has("filter_size_map")
+            ? nuwax_lio::parse_native_voxel_size(mod.arg("filter_size_map", ""), "filter_size_map")
+            : mod.arg_float("filter_size_map", params.filter_size_map);
+        if (mod.has("initial_map_frames")) {
+            params.initial_map_frames = nuwax_lio::parse_initial_map_frames(mod.arg("initial_map_frames", ""));
+        }
+        params.validate_sampling_parameters();
         params.validate_local_map_geometry();
     } catch (const std::invalid_argument& error) {
         fprintf(stderr, "[fastlio2] %s\n", error.what());

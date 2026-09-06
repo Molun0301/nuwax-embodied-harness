@@ -42,7 +42,15 @@
  #include <so3_math.h>
  #include <Eigen/Core>
  #include <pcl/point_cloud.h>
-@@ -65,12 +66,27 @@
+@@ -21,6 +22,7 @@
+ #include "preprocess.h"
+ #include "msgs.h"
+ #include "fast_lio_debug.hpp"
++#include "native_lio_arguments.hpp"
+ 
+ using custom_messages::ImuConstPtr;
+ using custom_messages::ImuPtr;
+@@ -65,12 +67,35 @@
      double b_gyr_cov = 0.0001;
      int fov_degree = 360;
      double det_range = 100.0;
@@ -54,6 +62,14 @@
      bool gravity_align = true;
      double filter_size_surf = 0.5;
      double filter_size_map = 0.5;
++    // 默认保留单帧初图；配置更多有效帧时仍逐帧惯性预测和去畸变。
++    int initial_map_frames = 1;
++
++    void validate_sampling_parameters() const {
++        nuwax_lio::validate_initial_map_frames(initial_map_frames);
++        nuwax_lio::validate_native_voxel_size(filter_size_surf, "filter_size_surf");
++        nuwax_lio::validate_native_voxel_size(filter_size_map, "filter_size_map");
++    }
 +
 +    void validate_local_map_geometry() const {
 +        // 地图框和检测距离使用浮点数，按实际表示检查移动后的安全余量。
@@ -70,7 +86,7 @@
  };
  
  class LaserMapping
-@@ -280,9 +296,16 @@
+@@ -280,9 +305,20 @@
      double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
      double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
      double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -80,6 +96,10 @@
 +    // 局部地图窗口跟随当前实例跨扫描维护，不能在每次调用时重新建立。
 +    BoxPointType LocalMap_Points{};
 +    bool Localmap_Initialized = false;
++    // 初图世界点和计数只属于当前实例，不在后续帧套用先前预测姿态。
++    PointVector initial_map_points_;
++    int initial_map_frame_count_ = 0;
++    int initial_map_frames_ = 1;
      int    time_log_counter = 0, scan_count = 0, publish_count = 0;
      int    iterCount = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 -    bool   lidar_pushed, flg_first_scan = true, flg_EKF_inited;
@@ -88,17 +108,19 @@
      bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
  
      vector<vector<int>>  pointSearchInd_surf; 
-@@ -371,7 +394,8 @@
+@@ -371,7 +407,10 @@
      filter_size_corner_min        = 0.5;
      filter_size_surf_min          = params.filter_size_surf;
      filter_size_map_min           = params.filter_size_map;
 -    cube_len                      = 200;
++    params.validate_sampling_parameters();
++    initial_map_frames_           = params.initial_map_frames;
 +    params.validate_local_map_geometry();
 +    cube_len                      = params.cube_side_length;
      p_pre->point_filter_num       = 2;
      p_pre->feature_enabled        = false;
  
-@@ -504,9 +528,6 @@
+@@ -504,9 +543,6 @@
  
  void LaserMapping::lasermap_fov_segment()
  {
@@ -108,7 +130,7 @@
      cub_needrm.clear();
      kdtree_delete_counter = 0;
      kdtree_delete_time = 0.0;    
-@@ -625,9 +646,6 @@
+@@ -625,9 +661,6 @@
  
  bool LaserMapping::sync_packages(MeasureGroup &meas)
  {
@@ -118,3 +140,27 @@
      // std::cout << "Lidar: " << lidar_buffer.size() << ", IMU: " << imu_buffer.size() << std::endl;
      if (lidar_buffer.empty() || imu_buffer.empty()) {
          // std::cout << "Empttttyyyy..." << std::endl;
+@@ -873,6 +906,8 @@
+         t0 = omp_get_wtime();
+ 
+         // std::cout << "I am here 2" << std::endl;
++        // 两端覆盖不保证本次内核配组有新惯性，早退时不能复用上帧去畸变云。
++        if (Measures.imu.empty()) return;
+         p_imu->Process(Measures, kf, feats_undistort);
+         state_point = kf.get_x();
+         pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+@@ -920,7 +955,13 @@
+                 {
+                     pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                 }
+-                ikdtree.Build(feats_down_world->points);
++                initial_map_points_.insert(initial_map_points_.end(),
++                    feats_down_world->points.begin(), feats_down_world->points.end());
++                ++initial_map_frame_count_;
++                if (initial_map_frame_count_ < initial_map_frames_) return;
++                ikdtree.Build(initial_map_points_);
++                initial_map_points_.clear();
++                initial_map_frame_count_ = 0;
+             }
+             return;
+         }

@@ -25,6 +25,9 @@ pub(crate) const PRIVATE_PREFIX_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PRIVATE_P
 pub(crate) const FIRST_PAIR_TIMEOUT_MS_ENV: &str =
     "NUWAX_GEOMETRY_NATIVE_LIO_FIRST_PAIR_TIMEOUT_MS";
 pub(crate) const PAIR_MAX_SKEW_MS_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS";
+const SCAN_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M";
+const MAP_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M";
+const INITIAL_MAP_FRAMES_ENV: &str = "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES";
 
 const LCM_URL_ENV: &str = "NUWAX_LCM_URL";
 const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
@@ -146,6 +149,7 @@ pub(crate) struct BoundNativeLioRuntime {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeLioPreflight {
     backend: NativeBackend,
+    native_config: NativeLioConfig,
     executable: PathBuf,
     lcm_url: String,
     private_prefix: String,
@@ -190,8 +194,18 @@ impl NativeLioPreflight {
             ));
         }
 
+        // 与其他预检值一起捕获；后续代际绑定不再读取可能变化的环境。
+        let mut native_config = NativeLioConfig::for_backend(backend);
+        native_config.scan_voxel_size_m = optional_number_env(SCAN_VOXEL_SIZE_M_ENV)?;
+        native_config.map_voxel_size_m = optional_number_env(MAP_VOXEL_SIZE_M_ENV)?;
+        native_config.initial_map_frames = optional_number_env(INITIAL_MAP_FRAMES_ENV)?;
+        native_config.validate().map_err(|error| {
+            format!("NATIVE_LIO_PREFLIGHT_FAILED invalid native sampling config: {error}")
+        })?;
+
         Ok(Self {
             backend,
+            native_config,
             executable,
             lcm_url,
             private_prefix,
@@ -241,7 +255,7 @@ impl NativeLioPreflight {
             }
         }
 
-        let mut config = NativeLioConfig::for_backend(self.backend);
+        let mut config = self.native_config.clone();
         config.lidar_topic = cloud_pattern;
         config.odometry_topic = odometry_pattern;
         let input_cloud_pattern = typed_pattern(&channels.input_cloud);
@@ -330,6 +344,22 @@ fn required_env(key: &str) -> Result<String, String> {
         Err(env::VarError::NotPresent) => {
             Err(format!("NATIVE_LIO_PREFLIGHT_FAILED env={key} is_required"))
         }
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
+        )),
+    }
+}
+
+fn optional_number_env<T: std::str::FromStr>(key: &str) -> Result<Option<T>, String> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) if value != value.trim() => Err(format!(
+            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
+        )),
+        Ok(value) => value.parse().map(Some).map_err(|_| {
+            format!("NATIVE_LIO_PREFLIGHT_FAILED env={key} invalid_number")
+        }),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(env::VarError::NotUnicode(_)) => Err(format!(
             "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
         )),
@@ -975,6 +1005,9 @@ mod tests {
             (PRIVATE_PREFIX_ENV, Some("/g13")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1234")),
             (PAIR_MAX_SKEW_MS_ENV, Some("25")),
+            (SCAN_VOXEL_SIZE_M_ENV, None),
+            (MAP_VOXEL_SIZE_M_ENV, None),
+            (INITIAL_MAP_FRAMES_ENV, None),
         ]);
         NativeLioPreflight::from_env(backend).expect("native preflight")
     }
@@ -1087,6 +1120,107 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--extrinsic_r", "0,-1,0,1,0,0,0,0,1"]));
+    }
+
+    #[test]
+    fn optional_sampling_is_captured_before_generation_binding() {
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let (_lock, _env) = EnvRestore::set(&[
+            (NATIVE_EXECUTABLE_ENV, shell.to_str()),
+            (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+            (LCM_URL_ENV, Some("memq://native-sampling-test")),
+            (PRIVATE_PREFIX_ENV, Some("/sample")),
+            (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
+            (PAIR_MAX_SKEW_MS_ENV, Some("100")),
+            (SCAN_VOXEL_SIZE_M_ENV, Some("0.1")),
+            (MAP_VOXEL_SIZE_M_ENV, Some("0.2")),
+            (INITIAL_MAP_FRAMES_ENV, Some("7")),
+        ]);
+        let captured = [NativeBackend::FastLio2, NativeBackend::PointLio]
+            .map(|backend| NativeLioPreflight::from_env(backend).unwrap());
+        env::set_var(SCAN_VOXEL_SIZE_M_ENV, "invalid-after-preflight");
+        env::set_var(MAP_VOXEL_SIZE_M_ENV, "0");
+        env::set_var(INITIAL_MAP_FRAMES_ENV, "9");
+        for (index, preflight) in captured.into_iter().enumerate() {
+            let bound = preflight.bind(index as i64 + 1, "sensor", "body", "odom").unwrap();
+            for pair in [["--filter_size_surf", "0.1"], ["--filter_size_map", "0.2"], ["--initial_map_frames", "7"]] {
+                assert!(bound.runtime.args.windows(2).any(|args| args == pair));
+            }
+        }
+        assert!(NativeLioPreflight::from_env(NativeBackend::PointLio).is_err());
+    }
+
+    #[test]
+    fn optional_sampling_empty_values_preserve_native_defaults() {
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        for value in [None, Some(""), Some("   ")] {
+            let (_lock, _env) = EnvRestore::set(&[
+                (NATIVE_EXECUTABLE_ENV, shell.to_str()),
+                (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (LCM_URL_ENV, Some("memq://native-sampling-test")),
+                (PRIVATE_PREFIX_ENV, Some("/sample")),
+                (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
+                (PAIR_MAX_SKEW_MS_ENV, Some("100")),
+                (SCAN_VOXEL_SIZE_M_ENV, value),
+                (MAP_VOXEL_SIZE_M_ENV, value),
+                (INITIAL_MAP_FRAMES_ENV, value),
+            ]);
+            let bound = NativeLioPreflight::from_env(NativeBackend::PointLio).unwrap()
+                .bind(1, "sensor", "body", "odom").unwrap();
+            for option in ["--filter_size_surf", "--filter_size_map", "--initial_map_frames"] {
+                assert!(!bound.runtime.args.iter().any(|arg| arg == option));
+            }
+        }
+    }
+
+    #[test]
+    fn optional_sampling_rejects_invalid_environment_values() {
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let (_lock, _env) = EnvRestore::set(&[
+            (NATIVE_EXECUTABLE_ENV, shell.to_str()),
+            (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+            (LCM_URL_ENV, Some("memq://native-sampling-test")),
+            (PRIVATE_PREFIX_ENV, Some("/sample")),
+            (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
+            (PAIR_MAX_SKEW_MS_ENV, Some("100")),
+            (SCAN_VOXEL_SIZE_M_ENV, None),
+            (MAP_VOXEL_SIZE_M_ENV, None),
+            (INITIAL_MAP_FRAMES_ENV, None),
+        ]);
+        for key in [SCAN_VOXEL_SIZE_M_ENV, MAP_VOXEL_SIZE_M_ENV] {
+            for value in ["0", "-1", "NaN", "inf", "1e-40", "1e40", "0.1tail", " 0.1 "] {
+                env::set_var(key, value);
+                assert!(NativeLioPreflight::from_env(NativeBackend::PointLio).is_err(), "{key}={value}");
+            }
+            env::remove_var(key);
+        }
+        for value in ["0", "-1", "1.5", "2147483648", "7tail"] {
+            env::set_var(INITIAL_MAP_FRAMES_ENV, value);
+            assert!(NativeLioPreflight::from_env(NativeBackend::FastLio2).is_err(), "initial frames={value}");
+        }
+    }
+
+    #[test]
+    #[ignore = "由临时配置保存和共同环境加载专项驱动，不启动原生进程"]
+    fn saved_sampling_configuration_reaches_actual_bind() {
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let (_lock, _env) = EnvRestore::set(&[
+            (NATIVE_EXECUTABLE_ENV, shell.to_str()),
+            (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+            (LCM_URL_ENV, Some("memq://saved-native-config")),
+            (PRIVATE_PREFIX_ENV, Some("/saved")),
+            (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
+            (PAIR_MAX_SKEW_MS_ENV, Some("100")),
+        ]);
+        // 三个采样值故意不在本测试写入，只接收真实设置保存/环境加载的输出。
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let bound = NativeLioPreflight::from_env(backend).unwrap()
+                .bind(1, "sensor", "body", "odom").unwrap();
+            for pair in [["--filter_size_surf", "0.1"], ["--filter_size_map", "0.2"], ["--initial_map_frames", "7"]] {
+                assert!(bound.runtime.args.windows(2).any(|args| args == pair));
+            }
+            println!("NATIVE_CONFIG_BIND_JSON {}", serde_json::json!({"backend": backend, "args": bound.runtime.args}));
+        }
     }
 
     fn shell_runtime(script: &str) -> NativeRuntimeSpec {

@@ -34,6 +34,7 @@
 #include "livox_sdk_config.hpp"
 #include "imu_frame_transform.hpp"
 #include "scan_imu_buffer.hpp"
+#include "native_lio_arguments.hpp"
 
 #include "dimos_native_module.hpp"
 
@@ -585,8 +586,21 @@ int main(int argc, char** argv) {
     params.acc_norm = mod.arg_float("acc_norm", params.acc_norm);
     params.plane_thr = mod.arg_float("plane_thr", params.plane_thr);
     // 对齐锁定 Dimos 模块的默认值，避免过稀扫描配上过小地图邻域而丢失激光约束。
-    params.filter_size_surf = mod.arg_float("filter_size_surf", 0.2f);
-    params.filter_size_map = mod.arg_float("filter_size_map", params.filter_size_map);
+    int initial_map_frames = 1;
+    try {
+        if (mod.has("initial_map_frames")) {
+            initial_map_frames = nuwax_lio::parse_initial_map_frames(mod.arg("initial_map_frames", ""));
+        }
+        params.filter_size_surf = mod.has("filter_size_surf")
+            ? nuwax_lio::parse_native_voxel_size(mod.arg("filter_size_surf", ""), "filter_size_surf")
+            : mod.arg_float("filter_size_surf", 0.2f);
+        params.filter_size_map = mod.has("filter_size_map")
+            ? nuwax_lio::parse_native_voxel_size(mod.arg("filter_size_map", ""), "filter_size_map")
+            : mod.arg_float("filter_size_map", params.filter_size_map);
+    } catch (const std::invalid_argument& error) {
+        fprintf(stderr, "[pointlio] 配置参数无效：%s\n", error.what());
+        return 2;
+    }
     params.ivox_grid_resolution = mod.arg_float("ivox_grid_resolution", 2.0f);
     std::string ivox_nearby = mod.arg("ivox_nearby_type", "nearby6");
     params.ivox_nearby_type = ivox_nearby == "center" ? 0 : ivox_nearby == "nearby18" ? 18 :
@@ -685,7 +699,7 @@ int main(int argc, char** argv) {
     g_lcm = &lcm;
 
     if (debug) { printf("[pointlio] Initializing Point-LIO...\n"); }
-    PointLio point_lio(params, msr_freq, main_freq);
+    PointLio point_lio(params, msr_freq, main_freq, 10.0, initial_map_frames);
     g_point_lio = &point_lio;
     if (debug) { printf("[pointlio] Point-LIO initialized.\n"); }
 

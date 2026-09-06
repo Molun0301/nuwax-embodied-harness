@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import stat
+import struct
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -489,6 +490,11 @@ _POINTCLOUD3D_COLOR_KEYS = frozenset({
     "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR",
 })
 _POINTCLOUD3D_HEIGHT_COLORS_KEY = "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS"
+_NATIVE_LIO_VOXEL_KEYS = frozenset({
+    "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M",
+    "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
+})
+_NATIVE_LIO_INITIAL_MAP_FRAMES_KEY = "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES"
 
 
 def _normalize_hex_color(value: str) -> Optional[str]:
@@ -508,6 +514,9 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     v = value.strip()
     if any(char in v for char in "\r\n\0"):
         return None
+    if not v and (key in _NATIVE_LIO_VOXEL_KEYS or key == _NATIVE_LIO_INITIAL_MAP_FRAMES_KEY):
+        # 这三项可选覆盖留空时撤销覆盖，由下次原生进程使用自身默认值。
+        return ""
     if key in _POINTCLOUD3D_COLOR_KEYS:
         return _normalize_hex_color(v)
     if key == _POINTCLOUD3D_HEIGHT_COLORS_KEY:
@@ -524,9 +533,12 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
         return None
     if typ == "int":
         try:
-            return str(int(v))
+            number = int(v)
         except ValueError:
             return None
+        if key == _NATIVE_LIO_INITIAL_MAP_FRAMES_KEY and not 1 <= number <= 2_147_483_647:
+            return None
+        return str(number)
     if typ == "float":
         try:
             number = float(v)
@@ -534,6 +546,14 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
             return None
         if not math.isfinite(number):
             return None
+        if key in _NATIVE_LIO_VOXEL_KEYS:
+            # 与Rust预检及C++入口一致；正规数下限保证原生体素倒数不会溢出。
+            try:
+                native_value = struct.unpack("=f", struct.pack("=f", number))[0]
+            except (OverflowError, struct.error):
+                return None
+            if number <= 0.0 or not math.isfinite(native_value) or native_value < 2.0 ** -126:
+                return None
         if key == "NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M" and not 0.01 <= number <= 2.0:
             return None
         if key == "NUWAX_GATEWAY_POINTCLOUD3D_SIZE" and not 0.1 <= number <= 20.0:

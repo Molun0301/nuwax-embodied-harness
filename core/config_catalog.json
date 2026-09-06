@@ -427,6 +427,45 @@
     "apply_scope": "重启几何运行时后生效",
     "description": ""
   },
+  "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M": {
+    "zh_name": "原生定位扫描体素边长（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "原生激光惯性算法的扫描下采样体素边长，以米填写正数；留空保留所选后端默认值。不是平台点云或地图栅格分辨率。"
+  },
+  "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M": {
+    "zh_name": "原生定位地图插入体素边长（米）",
+    "type": "float",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "原生算法的地图点插入筛选尺度，以米填写正数；留空保留后端默认值。PointLIO（逐点激光惯性里程计）中不改变iVox（增量体素地图）的索引格大小，也不是平台地图体素。"
+  },
+  "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES": {
+    "zh_name": "原生定位初图最少有效扫描数（帧）",
+    "type": "int",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/native.rs"
+    ],
+    "apply_scope": "重启几何运行时及其原生定位进程后生效；停止建图不会重载",
+    "description": "初始匹配地图至少累计的有效扫描数，填写正整数；增大会延长首次位姿等待，留空保留后端默认策略。PointLIO（逐点激光惯性里程计）还须满足原有初图点数下限，其多帧积累以静止初始化为前提。"
+  },
   "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR": {
     "zh_name": "激光雷达到机体外参",
     "type": "str",

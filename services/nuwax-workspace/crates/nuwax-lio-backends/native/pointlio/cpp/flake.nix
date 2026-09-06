@@ -66,16 +66,7 @@
 
         livox-common = ../../common;
 
-        # Patch the Point-LIO fork in place: resize (not reserve) the per-point
-        # vectors in run_once, whose reserve+operator[] is out-of-bounds UB that
-        # macOS libc++'s hardened operator[] turns into a SIGTRAP. applyPatches
-        # gives a writable, patched copy of the read-only flake input.
-        fast-lio-patched = pkgs.applyPatches {
-          name = "fast-lio-pointlio-patched";
-          src = fast-lio;
-          patches = [ ./fastlio-resize-darwin.patch ];
-        };
-
+        # 锁定输入保持原样；逐点向量和初始化补丁统一由CMake在构建目录应用。
         pointlio_native = pkgs.stdenv.mkDerivation {
           pname = "pointlio_native";
           version = "0.2.0";
@@ -97,7 +88,7 @@
           cmakeFlags = [
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
             "-DFETCHCONTENT_SOURCE_DIR_DIMOS_LCM=${dimos-lcm}"
-            "-DFASTLIO_DIR=${fast-lio-patched}"
+            "-DFASTLIO_DIR=${fast-lio}"
             "-DLIVOX_COMMON_DIR=${livox-common}"
           ];
         };

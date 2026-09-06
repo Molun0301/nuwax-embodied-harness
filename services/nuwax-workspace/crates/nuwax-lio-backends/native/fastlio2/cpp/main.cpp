@@ -542,14 +542,13 @@ static void run_main_iter(
     bool scan_publish_en,
     bool dense_publish_en
 ) {
-    // At frame rate, drain accumulated raw points into a CustomMsg and feed
-    // FAST-LIO. Hold g_pc_mutex across the rate-limit check + swap so a
-    // callback can't slip a packet in between the decision and the swap.
+    // 外部规范点云已经是完整扫描，下一轮直接消费，避免被裸包聚合节拍覆盖。
+    // SDK裸包仍按帧率聚合；检查与交换共用点云锁，保持帧和时间基准一致。
     std::vector<custom_messages::CustomPoint> points;
     uint64_t frame_start = 0;
     {
         std::lock_guard<std::mutex> lock(g_pc_mutex);
-        if (now - last_emit >= frame_interval) {
+        if (g_external_input || now - last_emit >= frame_interval) {
             if (!g_accumulated_points.empty()) {
                 points.swap(g_accumulated_points);
                 frame_start = g_frame_start_ns;
@@ -649,6 +648,7 @@ int main(int argc, char** argv) {
     params.filter_size_surf = mod.arg_float("filter_size_surf", params.filter_size_surf);
     params.filter_size_map = mod.arg_float("filter_size_map", params.filter_size_map);
     params.det_range = mod.arg_float("det_range", params.det_range);
+    params.cube_side_length = mod.arg_float("cube_side_length", params.cube_side_length);
     params.blind = mod.arg_float("blind", params.blind);
     params.time_offset_lidar_to_imu = mod.arg_float("time_offset_lidar_to_imu", params.time_offset_lidar_to_imu);
     params.fov_degree = mod.arg_int("fov_degree", params.fov_degree);
@@ -662,6 +662,12 @@ int main(int argc, char** argv) {
     params.timestamp_unit = ts_unit == "second" ? 0 : ts_unit == "millisecond" ? 1 : ts_unit == "nanosecond" ? 3 : 2;
     if (auto et = parse_doubles(mod.arg("extrinsic_t", "")); !et.empty()) { params.extrinsic_T = et; }
     if (auto er = parse_doubles(mod.arg("extrinsic_r", "")); !er.empty()) { params.extrinsic_R = er; }
+    try {
+        params.validate_local_map_geometry();
+    } catch (const std::invalid_argument& error) {
+        fprintf(stderr, "[fastlio2] %s\n", error.what());
+        return 2;
+    }
 
     // FAST-LIO internal processing rates
     double msr_freq = mod.arg_float("msr_freq", 50.0f);

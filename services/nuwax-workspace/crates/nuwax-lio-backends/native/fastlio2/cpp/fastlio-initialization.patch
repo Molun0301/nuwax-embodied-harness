@@ -34,8 +34,52 @@
  void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
 --- a/src/laserMapping.hpp
 +++ b/src/laserMapping.hpp
-@@ -282,7 +282,8 @@
+@@ -10,6 +10,7 @@
+ #include <csignal>
+ #include <unistd.h>
+ #include <sstream>
++#include <stdexcept>
+ #include <so3_math.h>
+ #include <Eigen/Core>
+ #include <pcl/point_cloud.h>
+@@ -65,12 +66,27 @@
+     double b_gyr_cov = 0.0001;
+     int fov_degree = 360;
+     double det_range = 100.0;
++    // 原作者 Mid-360 启动配置的有效地图边长，与检测距离 100 米配套。
++    double cube_side_length = 1000.0;
+     bool extrinsic_est_en = false;
+     std::vector<double> extrinsic_T{0.0, 0.0, 0.0};
+     std::vector<double> extrinsic_R{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+     bool gravity_align = true;
+     double filter_size_surf = 0.5;
+     double filter_size_map = 0.5;
++
++    void validate_local_map_geometry() const {
++        // 地图框和检测距离使用浮点数，按实际表示检查移动后的安全余量。
++        const double effective_range = static_cast<float>(det_range);
++        const double effective_cube = static_cast<float>(cube_side_length);
++        if (!std::isfinite(effective_range) || effective_range <= 0.0
++            || !std::isfinite(effective_cube)
++            || effective_cube <= 3.5 * effective_range) {
++            throw std::invalid_argument(
++                "局部地图配置无有效余量：cube_side_length 必须有限且大于 3.5 倍 det_range，"
++                "det_range 必须为正有限值");
++        }
++    }
+ };
+ 
+ class LaserMapping
+@@ -280,9 +296,16 @@
+     double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
+     double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
      double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
++    // 扫描历史属于当前估计器，不能在每次配组时归零或跨实例共享。
++    double lidar_mean_scantime = 0.0;
++    int scan_num = 0;
++    // 局部地图窗口跟随当前实例跨扫描维护，不能在每次调用时重新建立。
++    BoxPointType LocalMap_Points{};
++    bool Localmap_Initialized = false;
      int    time_log_counter = 0, scan_count = 0, publish_count = 0;
      int    iterCount = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 -    bool   lidar_pushed, flg_first_scan = true, flg_EKF_inited;
@@ -44,3 +88,33 @@
      bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
  
      vector<vector<int>>  pointSearchInd_surf; 
+@@ -371,7 +394,8 @@
+     filter_size_corner_min        = 0.5;
+     filter_size_surf_min          = params.filter_size_surf;
+     filter_size_map_min           = params.filter_size_map;
+-    cube_len                      = 200;
++    params.validate_local_map_geometry();
++    cube_len                      = params.cube_side_length;
+     p_pre->point_filter_num       = 2;
+     p_pre->feature_enabled        = false;
+ 
+@@ -504,9 +528,6 @@
+ 
+ void LaserMapping::lasermap_fov_segment()
+ {
+-    BoxPointType LocalMap_Points;
+-    bool Localmap_Initialized = false;
+-
+     cub_needrm.clear();
+     kdtree_delete_counter = 0;
+     kdtree_delete_time = 0.0;    
+@@ -625,9 +646,6 @@
+ 
+ bool LaserMapping::sync_packages(MeasureGroup &meas)
+ {
+-    double lidar_mean_scantime = 0.0;
+-    int    scan_num = 0;
+-
+     // std::cout << "Lidar: " << lidar_buffer.size() << ", IMU: " << imu_buffer.size() << std::endl;
+     if (lidar_buffer.empty() || imu_buffer.empty()) {
+         // std::cout << "Empttttyyyy..." << std::endl;

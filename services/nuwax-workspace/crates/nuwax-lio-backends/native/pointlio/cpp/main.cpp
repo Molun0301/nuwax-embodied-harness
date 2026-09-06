@@ -705,14 +705,13 @@ int main(int argc, char** argv) {
             last_emit = now;
         }
 
-        // At frame rate: drain accumulated points into a CustomMsg and feed
-        // Point-LIO. Hold g_pc_mutex across the rate-limit check AND swap so the
-        // clock + accumulator are observed atomically (no packet slips between).
+        // 外部规范点云已经是完整扫描，下一轮直接消费，避免被裸包聚合节拍覆盖。
+        // SDK裸包仍按帧率聚合；检查与交换共用点云锁，保持帧和时间基准一致。
         std::vector<custom_messages::CustomPoint> points;
         uint64_t frame_start = 0;
         {
             std::lock_guard<std::mutex> lock(g_pc_mutex);
-            if (now - *last_emit >= frame_interval) {
+            if (g_external_input || now - *last_emit >= frame_interval) {
                 if (!g_accumulated_points.empty()) {
                     points.swap(g_accumulated_points);
                     frame_start = g_frame_start_ns;

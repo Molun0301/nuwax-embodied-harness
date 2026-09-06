@@ -66,7 +66,7 @@
 
         livox-common = ../../common;
 
-        # 锁定输入保持原样；逐点向量和初始化补丁统一由CMake在构建目录应用。
+        # 锁定输入保持原样；所有Point修复统一由CMake在构建目录应用。
         pointlio_native = pkgs.stdenv.mkDerivation {
           pname = "pointlio_native";
           version = "0.2.0";

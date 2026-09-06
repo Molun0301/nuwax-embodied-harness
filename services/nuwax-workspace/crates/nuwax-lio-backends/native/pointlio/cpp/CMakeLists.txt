@@ -63,7 +63,7 @@ foreach(REQUIRED_SOURCE preprocess.cpp Estimator.cpp parameters.cpp)
   endif()
 endforeach()
 
-# 在构建目录统一应用逐点向量与初始化修复，普通构建和Nix共用同一入口。
+# 在构建目录统一应用Point修复，普通构建和Nix共用同一入口。
 find_program(NUWAX_PATCH_EXECUTABLE patch)
 if(NOT NUWAX_PATCH_EXECUTABLE)
   message(FATAL_ERROR "patch is required to apply the Point-LIO fixes")
@@ -71,11 +71,12 @@ endif()
 set(POINTLIO_PATCHED_DIR "${CMAKE_CURRENT_BINARY_DIR}/pointlio-initialized")
 set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-resize-darwin.patch"
-  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch")
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-empty-neighbours.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
-foreach(HEADER pointlio.hpp laserMapping.hpp)
-  configure_file("${FASTLIO_SOURCE_DIR}/src/${HEADER}"
-    "${POINTLIO_PATCHED_DIR}/src/${HEADER}" COPYONLY)
+foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp Estimator.cpp)
+  configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
+    "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
 foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
   execute_process(
@@ -165,7 +166,7 @@ set(LIVOX_SDK_INCLUDE_DIR ${LIVOX_SDK_PREFIX}/include)
 add_executable(pointlio_native
   main.cpp
   ${FASTLIO_SOURCE_DIR}/src/preprocess.cpp
-  ${FASTLIO_SOURCE_DIR}/src/Estimator.cpp
+  ${POINTLIO_PATCHED_DIR}/src/Estimator.cpp
   ${FASTLIO_SOURCE_DIR}/src/parameters.cpp
 )
 

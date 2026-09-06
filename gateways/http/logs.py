@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import base64
 from collections import OrderedDict
 import heapq
+from itertools import islice
 from copy import deepcopy
 import json
 import os
@@ -206,20 +207,22 @@ class _LogFilter:
     def before_key(self, key):
         return not ((self.cursor and key >= self.cursor) or (self.timestamp_before and key[0] >= self.timestamp_before))
 
-    def matches(self, entry):
+    def matches(self, entry, redacted_entry=None):
         return not (
             (self.levels and entry["level"] not in self.levels)
             or (self.source and entry["source"] != self.source)
             or (self.component and self.component not in str(entry["component"]).casefold())
             or (self.request_id and entry["request_id"] != self.request_id)
             or (self.task_id and entry["task_id"] != self.task_id)
-            or (self.search and self.search not in json.dumps(_redact_entry(entry), ensure_ascii=False).casefold())
+            or (self.search and self.search not in json.dumps(
+                _redact_entry(entry) if redacted_entry is None else redacted_entry,
+                ensure_ascii=False).casefold())
         )
 
 
-def _page_result(entries, sources, limit, *, cursor_expired=False):
+def _page_result(entries, sources, limit, *, cursor_expired=False, already_redacted=False):
     has_more = len(entries) > limit
-    entries = [_redact_entry(entry) for entry in entries[:limit]]
+    entries = entries[:limit] if already_redacted else [_redact_entry(entry) for entry in entries[:limit]]
     return {"entries": entries, "next_before": _encode_cursor(entries[-1]) if entries else None,
             "has_more": has_more, "sources": sorted(sources), "cursor_expired": cursor_expired}
 
@@ -295,6 +298,11 @@ class _FileLogIndex:
         self.mutable = []
         self.heap = []
         self.sources = set()
+        self.mutable_sources = set()
+        self.ordered = ()
+        self.heap_bytes = 0
+        self.source_bytes = 0
+        self.cache_bytes = 0
         self.dynamic_time = False
         self.anchors = (b"", b"")
 
@@ -317,9 +325,15 @@ class _FileLogIndex:
         anchors = _file_anchors(handle, stat.st_size)
         start = self.tail_start if append else 0
         heap = list(self.heap) if append else []
+        heap_bytes = self.heap_bytes if append else 0
         sources = set(self.sources) if append else set()
+        budget.retain(sys.getsizeof(sources))
+        source_bytes = self.source_bytes if append else 0
         dynamic_time = self.dynamic_time if append else False
         mutable = []
+        mutable_sources = set()
+        mutable_bytes = 0
+        mutable_source_bytes = 0
         fallback_time = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
         continuation = []
         complete_header_seen = False
@@ -334,56 +348,78 @@ class _FileLogIndex:
                 entry["exception"] = "\n".join(reversed(continuation))
                 continuation.clear()
             key = _entry_key(entry)
-            item = (key, offset, entry)
+            before = matcher.before_key(key)
             if not complete_header_seen:
                 # 无换行末行以后可能变成异常续行，连同前一个完整头一起回读。
-                budget.retain(_cache_size(item))
-                mutable.append(item)
+                if before:
+                    source = str(entry["source"])
+                    if source not in mutable_sources:
+                        previous_container_size = sys.getsizeof(mutable_sources)
+                        mutable_sources.add(source)
+                        size = sys.getsizeof(source)
+                        budget.retain(size + sys.getsizeof(mutable_sources) - previous_container_size)
+                        mutable_source_bytes += size
+                    item = _matched_cached_item(entry, key, offset, matcher)
+                    if item is not None:
+                        budget.retain(item[3])
+                        mutable_bytes += item[3]
+                        mutable.append(item)
                 if complete:
                     complete_header_seen = True
                     next_tail_start = offset
                 continue
             dynamic_time = dynamic_time or entry["timestamp"] == fallback_time
-            if matcher.before_key(key):
+            if before:
                 source = str(entry["source"])
                 if source not in sources:
-                    budget.retain(sys.getsizeof(source) + 64)
+                    previous_container_size = sys.getsizeof(sources)
                     sources.add(source)
-                if matcher.matches(entry):
+                    size = sys.getsizeof(source)
+                    budget.retain(size + sys.getsizeof(sources) - previous_container_size)
+                    source_bytes += size
+                if len(heap) < capacity or (key, offset) > heap[0][:2]:
+                    item = _matched_cached_item(entry, key, offset, matcher)
+                    if item is None:
+                        continue
+                    size = item[3]
                     if len(heap) < capacity:
-                        size = _cache_size(item)
                         budget.retain(size)
                         retained_sizes[offset] = size
                         heapq.heappush(heap, item)
-                    elif item[:2] > heap[0][:2]:
+                        heap_bytes += size
+                    else:
                         # 本轮新候选被淘汰即退回预算；旧快照对象仍保守计入。
                         budget.release(retained_sizes.pop(heap[0][1], 0))
-                        size = _cache_size(item)
                         budget.retain(size)
                         retained_sizes[offset] = size
-                        heapq.heapreplace(heap, item)
+                        replaced = heapq.heapreplace(heap, item)
+                        heap_bytes += size - replaced[3]
         finished = os.fstat(handle.fileno())
         if (finished.st_size < stat.st_size
                 or (finished.st_size == stat.st_size and (finished.st_mtime_ns, finished.st_ctime_ns) != (stat.st_mtime_ns, stat.st_ctime_ns))
                 or _file_anchors(handle, stat.st_size) != anchors):
             raise _LogSnapshotChanged()
+        ordered = tuple(sorted(heap + mutable, key=lambda item: item[:2], reverse=True))
+        cache_bytes = (16 * 1024 + heap_bytes + source_bytes + mutable_bytes + mutable_source_bytes
+                       + sys.getsizeof(sources) + sys.getsizeof(mutable_sources))
         self.heap, self.sources, self.mutable = heap, sources, mutable
+        self.mutable_sources = mutable_sources
+        self.ordered = ordered
+        self.heap_bytes, self.source_bytes = heap_bytes, source_bytes
+        self.cache_bytes = cache_bytes
         self.dynamic_time = dynamic_time
         self.tail_start = next_tail_start
         self.anchors = anchors
         self.stat, self.path = stat, path
         return True
 
-    def candidates(self, matcher, sources):
-        sources.update(self.sources)
-        candidates = list(self.heap)
-        for item in self.mutable:
-            if matcher.before_key(item[0]):
-                sources.add(str(item[2]["source"]))
-                if matcher.matches(item[2]):
-                    candidates.append(item)
-        # 同一时间和标识时，保留完整逆序扫描的高字节偏移优先语义。
-        return sorted(candidates, key=lambda item: item[:2], reverse=True)
+    def candidates(self, matcher, sources, budget=None):
+        for contribution in (self.sources, self.mutable_sources):
+            previous_size = sys.getsizeof(sources)
+            sources.update(contribution)
+            if budget is not None:
+                budget.retain(sys.getsizeof(sources) - previous_size)
+        return self.ordered
 
 
 def _cache_size(value):
@@ -405,12 +441,25 @@ def _cache_size(value):
     return size
 
 
+def _matched_cached_item(entry, key, offset, matcher):
+    """新候选只脱敏及估算一次；原排序键独立保留，不对旧条目重复处理。"""
+    redacted = _redact_entry(entry) if matcher.search else None
+    if not matcher.matches(entry, redacted):
+        return None
+    if redacted is None:
+        redacted = _redact_entry(entry)
+    size = _cache_size((key, offset, redacted)) + 64
+    return key, offset, redacted, size
+
+
 class _LogQueryIndex:
     def __init__(self):
         self.lock = threading.Lock()
         self.files = {}
         self.order = ()
         self.response = None
+        self.files_bytes = 0
+        self.response_bytes = 0
         self.cache_bytes = 0
 
     def read(self, log_file, log_dir, limit, matcher):
@@ -421,14 +470,17 @@ class _LogQueryIndex:
                 self.files.clear()
                 self.order = ()
                 self.response = None
+                self.files_bytes = self.response_bytes = 0
                 self.cache_bytes = 0
                 return None
 
     def _read_files(self, log_file, log_dir, limit, matcher):
         cached_response = self.response
+        cached_response_bytes = self.response_bytes
         # 某文件刷新后其它文件可能失败；已持有本索引的等待者也须重建页面。
         self.response = None
-        budget = _LogCacheBudget(self.cache_bytes if cached_response is not None else _cache_size(self.files))
+        self.response_bytes = 0
+        budget = _LogCacheBudget(self.files_bytes + cached_response_bytes)
         seen, order, changed = set(), [], False
         for paths in _log_paths(log_file, log_dir):
             for path in paths:
@@ -443,25 +495,35 @@ class _LogQueryIndex:
                         if len(seen) > _LOG_CACHE_MAX_FILES:
                             self.files.clear()
                             self.response = None
+                            self.files_bytes = self.response_bytes = 0
                             self.cache_bytes = 0
                             return None
                         index = self.files.setdefault(identity, _FileLogIndex())
-                        changed = index.refresh(handle, stat, str(path), matcher, limit + 1, budget) or changed
+                        previous_bytes = index.cache_bytes
+                        try:
+                            changed = index.refresh(handle, stat, str(path), matcher, limit + 1, budget) or changed
+                        finally:
+                            self.files_bytes += index.cache_bytes - previous_bytes
+                            self.cache_bytes = self.files_bytes
                 except FileNotFoundError:
                     continue
         changed = changed or tuple(order) != self.order
+        self.files_bytes -= sum(index.cache_bytes for identity, index in self.files.items() if identity not in seen)
         self.files = {identity: self.files[identity] for identity in order}
         self.order = tuple(order)
         if changed or cached_response is None:
             sources = set()
-            candidates = (item for identity in order for item in self.files[identity].candidates(matcher, sources))
-            selected = heapq.nlargest(limit + 1, candidates, key=lambda item: item[0])
+            # 先汇总全部文件来源，再惰性取一页；未取到的文件不能丢失来源贡献。
+            candidates = [self.files[identity].candidates(matcher, sources, budget) for identity in order]
+            selected = list(islice(heapq.merge(*candidates, key=lambda item: item[0], reverse=True), limit + 1))
             # 在创建缓存页面前预留脱敏结果及返回副本，超额直接使用原扫描。
-            budget.retain(2 * sum(_cache_size(item[2]) for item in selected[:limit]) + _cache_size(sources))
-            self.response = _page_result([item[2] for item in selected], sources, limit)
-            self.cache_bytes = _cache_size((self.files, self.response))
+            self.response_bytes = 16 * 1024 + sum(item[3] for item in selected[:limit]) + sum(sys.getsizeof(source) + 64 for source in sources)
+            budget.retain(2 * self.response_bytes)
+            self.response = _page_result([item[2] for item in selected], sources, limit, already_redacted=True)
         else:
             self.response = cached_response
+            self.response_bytes = cached_response_bytes
+        self.cache_bytes = 16 * 1024 + self.files_bytes + self.response_bytes
         return deepcopy(self.response)
 
 

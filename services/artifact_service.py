@@ -36,11 +36,16 @@ class ArtifactService:
             mime_type=mime_type,
             data=image_frame.data,
             metadata={
+                **dict(image_frame.metadata),
+                **dict(metadata or {}),
                 "camera_id": image_frame.camera_id,
                 "frame_id": image_frame.frame_id,
                 "encoding": image_frame.encoding.value,
-                **dict(image_frame.metadata),
-                **dict(metadata or {}),
+                "width_px": image_frame.width_px,
+                "height_px": image_frame.height_px,
+                # 保留输入帧时间，不能用制品保存时间冒充采集时间。
+                "frame_timestamp": image_frame.timestamp.isoformat(),
+                "frame_timestamp_origin": "image_frame.timestamp",
             },
             extension=extension,
         )

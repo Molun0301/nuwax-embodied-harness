@@ -18,6 +18,8 @@ websockets==10.4
 numpy==1.24.4
 opencv-python==4.10.0.84
 pydantic==2.10.6
+# 智能体接口按真实能力结构校验输入，保持Python 3.8兼容。
+jsonschema==4.19.2
 fastapi==0.115.14
 uvicorn==0.30.6
 httpx==0.27.2

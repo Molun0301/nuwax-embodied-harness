@@ -3994,6 +3994,7 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
         request_context: Optional[Dict[str, Any]] = None,
+        project_result: bool = True,
     ) -> Dict[str, Any]:
         """按技能工具名调用运行时能力。"""
 
@@ -4003,6 +4004,7 @@ class GatewayRuntime:
             arguments,
             requested_by=requested_by,
             request_context=request_context,
+            project_result=project_result,
         )
 
     def invoke_capability(
@@ -4012,6 +4014,7 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
         request_context: Optional[Dict[str, Any]] = None,
+        project_result: bool = True,
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
@@ -4071,16 +4074,16 @@ class GatewayRuntime:
                     message=f"异步能力 {descriptor.name} 任务已接受。",
                 )
                 status = self.task_manager.get_task_status(result.task_id)
-                return self._slim_async_capability_response(
-                    {
-                        "request_id": completed_context.get("request_id"),
-                        "task_id": result.task_id,
-                        "capability_name": descriptor.name,
-                        "mode": descriptor.execution_mode.value,
-                        "task": result,
-                        "status": status,
-                    }
-                )
+                response = {
+                    "request_id": completed_context.get("request_id"),
+                    "task_id": result.task_id,
+                    "capability_name": descriptor.name,
+                    "mode": descriptor.execution_mode.value,
+                    "task": result,
+                    "status": status,
+                }
+                # 智能体调用账本在展示投影前保留真实受理结果。
+                return self._slim_async_capability_response(response) if project_result else response
 
             self._publish_capability_invocation_event(
                 "capability.invocation.completed",
@@ -4090,7 +4093,7 @@ class GatewayRuntime:
                 message=f"同步能力 {descriptor.name} 调用完成。",
             )
             slim_result = result
-            if isinstance(result, dict) and descriptor.name in {
+            if project_result and isinstance(result, dict) and descriptor.name in {
                 # 注意：activate_map 已改 ASYNC_TASK（超时根因 D3），其结果走异步分支不经此 SYNC 瘦身，
                 # 故不再列入；保留仍为 SYNC 的几何/地图能力。
                 "create_map",

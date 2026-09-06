@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import logging
+import threading
 import time
 from typing import Dict, Any
 
@@ -14,6 +15,8 @@ from starlette.requests import Request
 
 from drivers.entry import create_active_robot_assembly
 from gateways.auth import GatewayAccessManager
+from gateways.agent.router import build_agent_router
+from gateways.agent.service import AgentToolService
 from gateways.errors import GatewayError
 from gateways.feedback import build_public_error_payload
 from gateways.request_context import (
@@ -85,24 +88,40 @@ def create_gateway_app(
     """创建宿主机网关应用。"""
 
     access_manager = GatewayAccessManager(config.gateway)
+    agent_tools = None
+    agent_tools_lock = threading.Lock()
     request_log_limiter = LogRateLimiter()
+
+    def get_agent_tools():
+        nonlocal agent_tools
+        with agent_tools_lock:
+            if agent_tools is None:
+                agent_tools = AgentToolService(runtime, access_manager)
+                app.state.agent_tools = agent_tools
+            return agent_tools
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
             if start_runtime_on_lifespan:
+                await run_in_threadpool(get_agent_tools)
                 APP_LOGGER.info("宿主机网关运行时准备启动。")
                 await run_in_threadpool(runtime.start)
             yield
         finally:
-            if start_runtime_on_lifespan:
-                APP_LOGGER.info("宿主机网关运行时准备停止。")
-                await run_in_threadpool(runtime.stop)
+            try:
+                if start_runtime_on_lifespan:
+                    APP_LOGGER.info("宿主机网关运行时准备停止。")
+                    await run_in_threadpool(runtime.stop)
+            finally:
+                if agent_tools is not None:
+                    agent_tools.close()
 
     app = FastAPI(title="nuwax_robot_bridge_gateway", lifespan=lifespan)
     app.state.runtime = runtime
     app.state.config = config
     app.state.access_manager = access_manager
+    app.state.agent_tools = agent_tools
 
     @app.middleware("http")
     async def _request_logging_middleware(request: Request, call_next):
@@ -256,6 +275,7 @@ def create_gateway_app(
         }
 
     app.include_router(build_http_router(runtime, access_manager))
+    app.include_router(build_agent_router(get_agent_tools))
     app.include_router(build_console_router(runtime))
     app.include_router(build_logs_router(runtime, access_manager))
     app.include_router(build_mcp_router(runtime, access_manager))

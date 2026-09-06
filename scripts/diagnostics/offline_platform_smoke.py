@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from tempfile import TemporaryDirectory, mkdtemp
 import threading
@@ -28,6 +29,7 @@ from core.settings import load_config
 from drivers.customrobot import create_customrobot_assembly
 from gateways.app import create_gateway_app
 from gateways.runtime import GatewayRuntime
+from clients.robot_client import RobotClient
 
 
 def run(output_dir: Path) -> dict:
@@ -121,6 +123,36 @@ def run(output_dir: Path) -> dict:
                         if response.content != pixels.tobytes():
                             raise RuntimeError("图像制品下载与发布数据不一致")
                         results.append({"method": "GET", "function": "artifact_download", "passed": True})
+                # 通用工具接口与命令行共用真实网关，不连接对话模型或运动执行器。
+                tools_client = RobotClient(config.gateway.public_base_url, timeout=15)
+                tools_client.info()
+                tools_client.tools("capture_image")
+                capture = tools_client.invoke("capture_image", {"camera_id": "front_camera"},
+                                              request_id="offline_capture_once")
+                if capture.get("error") or capture.get("delivery_state") != "recorded":
+                    raise RuntimeError("工具接口未返回明确拍照回执")
+                full_capture = tools_client.result(request_id="offline_capture_once")
+                repeated = tools_client.invoke("capture_image", {"camera_id": "front_camera"},
+                                               request_id="offline_capture_once")
+                if capture["artifacts"] != repeated["artifacts"]:
+                    raise RuntimeError("同一请求重复调用意外产生新制品")
+                artifact_id = capture["artifacts"][0]["artifact_id"]
+                downloaded = tools_client.download_artifact(artifact_id, output_dir / "客户端观察.png")
+                if Path(downloaded["path"]).read_bytes() != pixels.tobytes():
+                    raise RuntimeError("轻量客户端图像下载与源帧不一致")
+                if not downloaded["source"]["metadata"].get("frame_timestamp"):
+                    raise RuntimeError("图像制品丢失原始帧时间")
+                if not full_capture:
+                    raise RuntimeError("完整调用结果不可读取")
+                completed = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "robot_cli.py"), "--url",
+                     config.gateway.public_base_url, "call", "offline_capture_once"],
+                    check=True, capture_output=True, text=True, timeout=20,
+                )
+                cli_receipt = json.loads(completed.stdout)
+                if cli_receipt["request_id"] != capture["request_id"]:
+                    raise RuntimeError("命令行回执与调用记录不一致")
+                results.append({"method": "HTTP/CLI", "function": "tool_receipt_replay_and_image", "passed": True})
                 if runtime.motion_guard.has_connected:
                     raise RuntimeError("只读验证意外建立了运动连接")
                 report = {"passed": True, "synthetic_input": True, "vision_backend": "metadata_detector", "tool_count": len(catalog["tools"]), "checks": results}

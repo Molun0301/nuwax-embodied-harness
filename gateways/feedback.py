@@ -1036,6 +1036,12 @@ def _tool_failure_data(data: Mapping[str, Any]) -> Mapping[str, Any]:
     }
 
 
+def get_tool_failure_data(structured: Any) -> Dict[str, Any]:
+    """统一识别任务终态、显式错误及业务 ok/success=false，供各结果适配器复用。"""
+
+    return dict(_tool_failure_data(_mapping(structured)))
+
+
 def _collection_labels(items: Sequence[Any], limit: int = 5) -> Sequence[str]:
     labels = []
     for index, item in enumerate(items):

@@ -66,6 +66,10 @@ class ObservationService:
                 "width_px": image_frame.width_px,
                 "height_px": image_frame.height_px,
                 "requested_by": requested_by or "unknown",
+                "frame_timestamp": image_frame.timestamp.isoformat(),
+                "frame_timestamp_origin": "image_frame.timestamp",
+                "source_timestamp_ns": image_frame.metadata.get("source_timestamp_ns"),
+                "clock_domain": image_frame.metadata.get("clock_domain"),
             },
         )
         context = ObservationContext(

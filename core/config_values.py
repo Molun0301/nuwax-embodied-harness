@@ -11,6 +11,10 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+# 模块加载时固定物理目录，避免高频状态查询重复遍历磁盘路径。
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_CORE_PATH = str(_PROJECT_ROOT / ".env")
+_DEFAULT_DEVICE_PATH = str(_PROJECT_ROOT / "drivers/go2/data_plane.env")
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT: ContextVar = ContextVar("nuwax_config_snapshot", default=None)
 # 已由当前进程配置加载器读取的值；控制台预览不会改写该记录。
@@ -134,9 +138,8 @@ def user_config_values() -> Dict[str, str]:
 
 @lru_cache(maxsize=8)
 def _runtime_file_values(core_path: str, device_path: str, user_path: str) -> Dict[str, str]:
-    root = Path(__file__).resolve().parents[1]
     values = read_env_values(Path(device_path).expanduser())
-    values.update(read_env_values(root / ".config"))
+    values.update(read_env_values(_PROJECT_ROOT / ".config"))
     values.update(read_env_values(Path(core_path).expanduser()))
     values.update(user_config_values())
     return values
@@ -144,10 +147,9 @@ def _runtime_file_values(core_path: str, device_path: str, user_path: str) -> Di
 
 def runtime_value(name: str, default=None):
     """供未使用结构化配置的进程边界读取设置；文件在进程首次读取时固定。"""
-    root = Path(__file__).resolve().parents[1]
     files = _runtime_file_values(
-        os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", str(root / ".env")),
-        os.environ.get("GO2_DATA_PLANE_ENV_FILE", str(root / "drivers/go2/data_plane.env")),
+        os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", _DEFAULT_CORE_PATH),
+        os.environ.get("GO2_DATA_PLANE_ENV_FILE", _DEFAULT_DEVICE_PATH),
         os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", ""),
     )
     return record_value(name, raw_value(name, default, files))

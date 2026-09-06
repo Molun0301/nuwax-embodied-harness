@@ -863,6 +863,25 @@ class MapWorkspaceService:
         )
 
     @_serialized_map_activation
+    def get_active_workspace_identity(self) -> Optional[Dict[str, object]]:
+        """读取当前已提交工作区身份，不刷新定位、聚合记忆或写回资产。"""
+
+        pending_activation = self._read_map_activation()
+        if pending_activation is not None and pending_activation.get("phase") != "prepared":
+            return None
+        active_map_name = self.get_active_map_name()
+        if not active_map_name:
+            return None
+        asset = self._repository.get_map_asset(active_map_name)
+        if asset is None:
+            return None
+        snapshot = self._mapping_service.get_latest_snapshot()
+        frame_id = asset.frame_id
+        if snapshot is not None and snapshot.map_name == active_map_name:
+            frame_id = snapshot.frame_id or frame_id
+        return {"active_map_name": active_map_name, "frame_id": frame_id}
+
+    @_serialized_map_activation
     def get_active_workspace(self, *, refresh_localization: bool = True) -> Optional[MapWorkspace]:
         pending_activation = self._read_map_activation()
         if (

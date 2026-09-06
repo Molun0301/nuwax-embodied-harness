@@ -194,8 +194,7 @@ class MappingService:
                 update_sequence_override = int(metadata_update_sequence)
             except (TypeError, ValueError) as exc:
                 raise GatewayError("地图快照 update_sequence 非法。") from exc
-        # 方案A：优先使用 Rust 侧已计算的 content_sha256，避免 Python 侧重复计算
-        # 建图时每帧都会触发 ingest_external_snapshot，完整 SHA256 计算占 1.41% CPU（实测）
+        # 保留来源声明的候选摘要；快照封存时仍会核对它与实际内容是否一致。
         declared_content_sha256 = (
             str(content_sha256 or source_metadata.get("content_sha256") or "")
             .strip()
@@ -203,7 +202,6 @@ class MappingService:
             or None
         )
         if declared_content_sha256:
-            # Rust 侧已提供规范哈希，直接复用
             resolved_content_sha256 = declared_content_sha256
         else:
             # 兜底：离线资产等场景仍需完整计算
@@ -309,6 +307,11 @@ class MappingService:
             else:
                 update_sequence = previous_sequence + 1
             self._update_sequence_by_source_epoch[sequence_key] = update_sequence
+            # 在封存前合并轻量元数据，避免仅补字段就重新复制并验证整张地图。
+            frame_metadata = self._build_map_frame_metadata(
+                snapshot_metadata,
+                update_sequence=update_sequence,
+            )
             snapshot = MapSnapshot(
                 map_name=resolved_map_name,
                 source_name=source_name,
@@ -318,17 +321,7 @@ class MappingService:
                 occupancy_grid=occupancy_grid,
                 cost_map=cost_map,
                 semantic_map=semantic_map,
-                metadata=snapshot_metadata,
-            )
-            frame_metadata = self._build_map_frame_metadata(snapshot)
-            snapshot = snapshot.model_copy(
-                update={
-                    "metadata": {
-                        **dict(snapshot.metadata),
-                        **frame_metadata,
-                    }
-                },
-                deep=True,
+                metadata={**snapshot_metadata, **frame_metadata},
             )
             self._latest_snapshot = snapshot
             self._state_store.write(
@@ -359,22 +352,9 @@ class MappingService:
                 stream_snapshot = snapshot
                 stream_event_payload = dict(event_payload)
                 if stream_occupancy_grid is not None:
-                    effective_occupancy_hash = snapshot.metadata.get(
+                    effective_metadata = snapshot.metadata
+                    effective_occupancy_hash = effective_metadata.get(
                         "occupancy_content_hash"
-                    )
-                    stream_snapshot = snapshot.model_copy(
-                        update={
-                            "occupancy_grid": stream_occupancy_grid,
-                            "content_sha256": map_content_sha256(
-                                map_name=snapshot.map_name,
-                                frame_id=snapshot.frame_id,
-                                occupancy_grid=stream_occupancy_grid,
-                                cost_map=snapshot.cost_map,
-                                semantic_map=snapshot.semantic_map,
-                            ),
-                            "metadata": dict(snapshot.metadata),
-                        },
-                        deep=False,
                     )
                     display_source = str(
                         stream_occupancy_source or "display_override"
@@ -393,27 +373,36 @@ class MappingService:
                         "navigation_occupancy_source": "effective",
                         "navigation_occupancy_content_hash": effective_occupancy_hash,
                     }
-                    stream_snapshot = stream_snapshot.model_copy(
-                        update={
-                            "metadata": {
-                                **dict(stream_snapshot.metadata),
-                                **dict(stream_occupancy_metadata or {}),
-                                **display_annotations,
-                            }
-                        },
-                        deep=True,
-                    )
+                    display_metadata = {
+                        **effective_metadata,
+                        **dict(stream_occupancy_metadata or {}),
+                        **display_annotations,
+                    }
                     stream_frame_metadata = self._build_map_frame_metadata(
-                        stream_snapshot
+                        display_metadata,
+                        update_sequence=snapshot.update_sequence,
                     )
-                    stream_snapshot = stream_snapshot.model_copy(
-                        update={
-                            "metadata": {
-                                **dict(stream_snapshot.metadata),
-                                **stream_frame_metadata,
-                            }
-                        },
-                        deep=True,
+                    # 从已封存有效图各取一份防御副本，显示图仍独立计算和验证内容身份。
+                    display_cost_map = snapshot.cost_map
+                    display_semantic_map = snapshot.semantic_map
+                    stream_snapshot = MapSnapshot(
+                        timestamp=snapshot.timestamp,
+                        map_name=snapshot.map_name,
+                        source_name=snapshot.source_name,
+                        source_epoch=snapshot.source_epoch,
+                        update_sequence=snapshot.update_sequence,
+                        frame_id=snapshot.frame_id,
+                        occupancy_grid=stream_occupancy_grid,
+                        cost_map=display_cost_map,
+                        semantic_map=display_semantic_map,
+                        content_sha256=map_content_sha256(
+                            map_name=snapshot.map_name,
+                            frame_id=snapshot.frame_id,
+                            occupancy_grid=stream_occupancy_grid,
+                            cost_map=display_cost_map,
+                            semantic_map=display_semantic_map,
+                        ),
+                        metadata={**display_metadata, **stream_frame_metadata},
                     )
                     stream_event_payload["content_sha256"] = (
                         stream_snapshot.content_sha256
@@ -591,8 +580,12 @@ class MappingService:
             metadata=dict(heartbeat),
         )
 
-    def _build_map_frame_metadata(self, snapshot: MapSnapshot) -> Dict[str, object]:
-        metadata = dict(snapshot.metadata or {})
+    def _build_map_frame_metadata(
+        self,
+        metadata: Dict[str, object],
+        *,
+        update_sequence: int,
+    ) -> Dict[str, object]:
         occupancy_metrics = metadata.get("occupancy_metrics") if isinstance(metadata.get("occupancy_metrics"), dict) else {}
         cost_map_metrics = metadata.get("cost_map_metrics") if isinstance(metadata.get("cost_map_metrics"), dict) else {}
         occupancy_revision = metadata.get("occupancy_content_revision")
@@ -606,7 +599,7 @@ class MappingService:
                 except (TypeError, ValueError):
                     pass
             content_revision = (
-                sum(revisions) if revisions else snapshot.update_sequence
+                sum(revisions) if revisions else update_sequence
             )
         occupancy_hash = metadata.get("occupancy_content_hash") or occupancy_metrics.get("content_hash")
         cost_map_hash = metadata.get("cost_map_content_hash") or cost_map_metrics.get("content_hash")

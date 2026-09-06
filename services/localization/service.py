@@ -1367,13 +1367,18 @@ class LocalizationService:
             )
         if self._stream_bus is not None:
             if current_pose is not None:
+                # 帧时间由总线记录发布时刻，源采样时间和订阅序号单独保留。
+                pose_metadata = {"source_name": source_name}
+                for key in ("source_timestamp_ns", "sequence"):
+                    if key in snapshot.metadata:
+                        pose_metadata[key] = snapshot.metadata[key]
                 self._stream_bus.publish(
                     "localization.pose",
                     source="localization_service",
                     payload=current_pose,
                     frame_id=getattr(current_pose, "frame_id", None),
                     status="available",
-                    metadata={"source_name": source_name},
+                    metadata=pose_metadata,
                 )
             if frame_tree is not None:
                 self._stream_bus.publish(

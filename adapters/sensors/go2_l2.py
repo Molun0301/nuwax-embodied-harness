@@ -95,7 +95,7 @@ def decode_go2_l2_pointcloud(message: object) -> Go2L2DecodedPointCloud:
     parsed: Dict[str, Dict[str, Any]] = {}
     for raw_field in raw_fields:
         name = str(getattr(raw_field, "name", "") or "").strip().lower()
-        if name not in ("x", "y", "z", "intensity", "offset_ns"):
+        if name not in ("x", "y", "z", "intensity", "offset_ns", "time"):
             continue
         if name in parsed:
             raise Go2L2DecodeError(f"PointCloud2 {name} 字段重复")
@@ -112,6 +112,8 @@ def decode_go2_l2_pointcloud(message: object) -> Go2L2DecodedPointCloud:
             raise Go2L2DecodeError(f"PointCloud2 {name} 字段必须为 FLOAT32，实际 datatype={datatype}")
         if name == "offset_ns" and datatype != 6:
             raise Go2L2DecodeError(f"PointCloud2 offset_ns 字段必须为 UINT32，实际 datatype={datatype}")
+        if name == "time" and datatype != 7:
+            raise Go2L2DecodeError(f"PointCloud2 time 字段必须为 FLOAT32，实际 datatype={datatype}")
         if count != 1:
             raise Go2L2DecodeError(f"PointCloud2 {name} 字段 count 必须为 1，实际为 {count}")
         numpy_dtype, contract_datatype = dtype_spec
@@ -185,6 +187,35 @@ def decode_go2_l2_pointcloud(message: object) -> Go2L2DecodedPointCloud:
                 ),
                 dtype=np.uint32,
             )
+        if "time" in parsed:
+            spec = parsed["time"]
+            times_sec = np.asarray(
+                np.ravel(
+                    np.ndarray(
+                        shape=(height, width),
+                        dtype=spec["numpy_dtype"],
+                        buffer=data,
+                        offset=spec["offset"],
+                        strides=(row_step, point_step),
+                    ),
+                    order="C",
+                ),
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(times_sec)):
+                raise Go2L2DecodeError("Go2 L2 time 必须为有限值")
+            if np.any(times_sec < 0):
+                raise Go2L2DecodeError("Go2 L2 time 必须为非负秒偏移")
+            # 官方 time 相对扫描起点，以秒计；升精度后就近取整，不重排点序。
+            times_ns = np.rint(times_sec * 1_000_000_000)
+            # UINT64 最大值不能由浮点数精确表示，使用可精确表示的排他上界。
+            if np.any(times_ns >= float(1 << 64)):
+                raise Go2L2DecodeError("Go2 L2 time 转换纳秒后超出 UINT64 范围")
+            time_offsets = np.ascontiguousarray(times_ns, dtype=np.uint64)
+            if offsets is not None and not np.array_equal(offsets, time_offsets):
+                raise Go2L2DecodeError("Go2 L2 time 与 offset_ns 的纳秒偏移不一致")
+            if offsets is None:
+                offsets = time_offsets
     except Go2L2DecodeError:
         raise
     except (TypeError, ValueError) as exc:

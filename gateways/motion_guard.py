@@ -206,15 +206,13 @@ class GatewayMotionGuard:
         return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE, proof)
 
     def stop_and_fence(self, session: MotionGuardSession) -> ZeroConfirmation:
-        stop_error: Optional[Exception] = None
         try:
             session.stop()
-        except Exception as exc:
-            stop_error = exc
-        zero = session.close()
-        if stop_error is not None:
-            raise stop_error
-        return zero
+        except Exception:
+            # 在原异常处理上下文中围栏，使归零也失败时仍保留首次停止错误。
+            session.close()
+            raise
+        return session.close()
 
     def execute_sport(
         self,

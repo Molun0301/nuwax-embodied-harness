@@ -13,11 +13,14 @@ import uuid
 from google.protobuf.message import DecodeError, Message
 
 from services.navigation.motion_safety_guard.constants import (
+    ACTOR_POLL_INTERVAL_SECONDS,
     API_VERSION,
     DEFAULT_SOCKET_PATH,
     MAX_COMMAND_DEADLINE_NS,
     MAX_FRAME_BYTES,
+    MAX_PRODUCTION_SDK_TIMEOUT_SECONDS,
     RENEW_INTERVAL_NS,
+    WATCHDOG_FENCE_LEAD_NS,
 )
 from services.navigation.motion_safety_guard.framing import (
     FramingError,
@@ -30,6 +33,9 @@ from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 DEFAULT_TIMEOUT_SECONDS = 1.0
 _BOOT_NONCE_BYTES = 16
+_RENEW_EXECUTION_RESERVE_NS = int(
+    (MAX_PRODUCTION_SDK_TIMEOUT_SECONDS + ACTOR_POLL_INTERVAL_SECONDS) * 1_000_000_000
+)
 
 
 class MotionGuardError(RuntimeError):
@@ -285,10 +291,12 @@ class MotionGuardFenceError(MotionGuardError):
         *,
         cause: Optional[BaseException] = None,
         zero: Optional[ZeroConfirmation] = None,
+        prior_failure: Optional[BaseException] = None,
     ) -> None:
         super().__init__(message)
         self.cause = cause
         self.zero = zero
+        self.prior_failure = prior_failure
 
 
 def normalize_source(source: Union[int, str]) -> int:
@@ -783,6 +791,7 @@ class MotionGuardClient:
             source=source_value,
             lease_tuple=lease_tuple,
             renew_interval_seconds=renew_interval_seconds,
+            owner_deadline_monotonic_ns=outcome.owner_deadline_monotonic_ns,
         )
         try:
             self._register_session(session)
@@ -999,6 +1008,7 @@ class MotionGuardSession:
         source: int,
         lease_tuple: pb.LeaseTuple,
         renew_interval_seconds: float,
+        owner_deadline_monotonic_ns: Optional[int] = None,
     ) -> None:
         if renew_interval_seconds <= 0:
             raise MotionGuardUsageError("renew_interval_seconds must be positive")
@@ -1017,6 +1027,9 @@ class MotionGuardSession:
         self._failure: Optional[BaseException] = None
         self._fence_error: Optional[MotionGuardFenceError] = None
         self._zero: Optional[ZeroConfirmation] = None
+        self._next_renewal_ns = self._client._now()
+        if owner_deadline_monotonic_ns is not None:
+            self._schedule_next_renewal(owner_deadline_monotonic_ns, self._next_renewal_ns)
 
     @property
     def failure(self) -> Optional[BaseException]:
@@ -1055,30 +1068,50 @@ class MotionGuardSession:
             thread.start()
 
     def _renew_loop(self) -> None:
-        while not self._stop_renewal.wait(self.renew_interval_seconds):
+        while not self._stop_renewal.is_set():
+            with self._lock:
+                delay = max(0, self._next_renewal_ns - self._client._now()) / 1_000_000_000
+            if self._stop_renewal.wait(delay):
+                return
             with self._lock:
                 if not self._active or self._fenced:
                     return
                 try:
-                    envelope, _operation = self._next_envelope(
-                        action=pb.GUARD_ACTION_UNSPECIFIED,
-                        label="renew",
-                    )
-                    request = pb.MotionGuardRequest(
-                        api_version=API_VERSION,
-                        request_id=self._client._new_id("request"),
-                        renew_lease=pb.RenewLeaseRequest(envelope=envelope),
-                    )
-                    seal_request(request)
-                    self._client._exchange(
-                        request,
-                        expected_outcome="renew_lease",
-                        expected_acks={pb.ACK_CODE_RECEIVED},
-                    )
+                    self._renew_if_due_locked()
                 except Exception as exc:
                     self._failure = exc
                     self._stop_renewal.set()
                     return
+
+    def _schedule_next_renewal(self, owner_deadline_ns: int, issued_ns: int) -> None:
+        if owner_deadline_ns <= 0:
+            self._client._raise_protocol("lease response contains no owner deadline")
+        # 围栏开始前预留一次既有SDK最坏占用和守卫调度周期；不延长服务端期限。
+        latest_safe_renewal = owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS - _RENEW_EXECUTION_RESERVE_NS
+        requested_renewal = issued_ns + int(self.renew_interval_seconds * 1_000_000_000)
+        self._next_renewal_ns = min(requested_renewal, latest_safe_renewal)
+
+    def _renew_if_due_locked(self) -> None:
+        """命令与续租共用序列锁；到期续租在下一次非零动作之前优先提交。"""
+        if self._stop_renewal.is_set() or self._client._now() < self._next_renewal_ns:
+            return
+        self._assert_operational()
+        envelope, _operation = self._next_envelope(action=pb.GUARD_ACTION_UNSPECIFIED, label="renew")
+        request = pb.MotionGuardRequest(
+            api_version=API_VERSION,
+            request_id=self._client._new_id("request"),
+            renew_lease=pb.RenewLeaseRequest(envelope=envelope),
+        )
+        seal_request(request)
+        try:
+            outcome, _result = self._client._exchange(
+                request, expected_outcome="renew_lease", expected_acks={pb.ACK_CODE_RECEIVED},
+            )
+            self._schedule_next_renewal(outcome.owner_deadline_monotonic_ns, envelope.issued_monotonic_ns)
+        except Exception as exc:
+            self._failure = exc
+            self._stop_renewal.set()
+            raise
 
     def _next_envelope(
         self,
@@ -1119,6 +1152,8 @@ class MotionGuardSession:
     ) -> CommandConfirmation:
         with self._lock:
             self._assert_operational()
+            if action != pb.GUARD_ACTION_STOP:
+                self._renew_if_due_locked()
             envelope, operation = self._next_envelope(
                 action=action,
                 label=field,
@@ -1257,6 +1292,8 @@ class MotionGuardSession:
             raise MotionGuardUsageError("sport action enabled must be a boolean")
         with self._lock:
             self._assert_operational()
+            if action != pb.SPORT_ACTION_STOP_MOVE:
+                self._renew_if_due_locked()
             envelope, operation = self._next_envelope(
                 action=pb.GUARD_ACTION_SPORT_ACTION,
                 label="sport",
@@ -1400,6 +1437,7 @@ class MotionGuardSession:
                 fence_error = MotionGuardFenceError(
                     "RevokeAndZero did not return a verified zero/fence acknowledgement",
                     cause=exc,
+                    prior_failure=prior_failure,
                 )
                 self._fence_error = fence_error
                 self._failure = prior_failure or exc

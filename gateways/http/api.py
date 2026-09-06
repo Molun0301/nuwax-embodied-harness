@@ -746,9 +746,9 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/maps/active")
     async def api_maps_active(request: Request) -> Dict[str, Any]:
-        return {
+        return await run_in_threadpool(lambda: {
             "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-        }
+        })
 
     @router.post("/api/maps/finalize")
     async def api_maps_finalize(request: Request) -> Dict[str, Any]:

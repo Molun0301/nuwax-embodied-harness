@@ -4271,7 +4271,7 @@ class GatewayRuntime:
         navigation_context = self.navigation_service.get_latest_navigation_context()
         exploration_context = self.navigation_service.get_latest_exploration_context()
         perception_runtime = self.perception_video_runtime.get_status()
-        active_workspace = self.map_workspace_service.get_active_workspace()
+        active_workspace = self.map_workspace_service.get_active_workspace_identity()
         artifact_summary = self.artifact_service.get_summary()
         localization_session = self.localization_service.get_active_session()
         geometry_asset = self._runtime_geometry_asset_summary(map_snapshot, localization_session)
@@ -4400,8 +4400,8 @@ class GatewayRuntime:
     def _health_workspace_summary(self, workspace: Any) -> Dict[str, Any]:
         return {
             "available": bool(workspace is not None),
-            "map_name": getattr(workspace, "active_map_name", None),
-            "frame_id": getattr(workspace, "frame_id", None),
+            "map_name": self._payload_get(workspace, "active_map_name"),
+            "frame_id": self._payload_get(workspace, "frame_id"),
         }
 
     def _runtime_mapping_profile_summary(self, map_snapshot: Any) -> MetadataDict:
@@ -4816,7 +4816,7 @@ class GatewayRuntime:
 
         occupancy_grid = getattr(map_snapshot, "occupancy_grid", None) if map_snapshot is not None else None
         map_ts = getattr(occupancy_grid, "timestamp", None) or getattr(map_snapshot, "timestamp", None)
-        map_workspace_name = getattr(active_workspace, "map_name", None)
+        map_workspace_name = self._payload_get(active_workspace, "active_map_name") or self._payload_get(active_workspace, "map_name")
         if occupancy_grid is not None:
             width = getattr(occupancy_grid, "width", None)
             height = getattr(occupancy_grid, "height", None)
@@ -10360,6 +10360,25 @@ class GatewayRuntime:
         capability_name: str,
         error: BaseException,
     ) -> GatewayError:
+        failures = []
+        pending = [error]
+        seen = set()
+        while pending and len(failures) < 8:
+            current = pending.pop(0)
+            if not isinstance(current, BaseException) or id(current) in seen:
+                continue
+            seen.add(id(current))
+            detail = {"type": type(current).__name__, "message": str(current)[:1000]}
+            for field_name in ("code", "operation", "operation_id"):
+                value = getattr(current, field_name, None)
+                if value is not None:
+                    detail[field_name] = str(value)[:256]
+            failures.append(detail)
+            # finally收尾可能成为最外层错误；保留原始续租/命令与归零失败两条链。
+            pending.extend((
+                current.__cause__, current.__context__, getattr(current, "cause", None),
+                getattr(current, "prior_failure", None),
+            ))
         return GatewayError(
             f"motion guard rejected {capability_name}: {error}",
             error_code="motion_guard_unavailable",
@@ -10368,6 +10387,7 @@ class GatewayRuntime:
             details={
                 "capability_name": capability_name,
                 "guard_error_type": type(error).__name__,
+                "guard_failures": failures,
             },
         )
 

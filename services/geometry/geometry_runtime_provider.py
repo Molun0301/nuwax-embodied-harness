@@ -3057,7 +3057,16 @@ def _build_pose(proto_pose: Any) -> Optional[Pose]:
     pos = proto_pose.position
     ori = proto_pose.orientation
     try:
+        source_timestamp_ns = int(getattr(proto_pose, "timestamp_ns", 0) or 0)
+        if source_timestamp_ns < 0:
+            return None
+        # 保留源采样时间；零值仍为未知时间哨兵，不能以处理时刻伪造新鲜度。
+        source_timestamp = datetime.fromtimestamp(
+            source_timestamp_ns // 1_000_000_000,
+            tz=timezone.utc,
+        ).replace(microsecond=(source_timestamp_ns % 1_000_000_000) // 1_000)
         return Pose(
+            timestamp=source_timestamp,
             frame_id=frame_id,
             position=Vector3(x=pos.x, y=pos.y, z=pos.z),
             orientation=Quaternion(x=ori.x, y=ori.y, z=ori.z, w=ori.w),
@@ -8584,16 +8593,14 @@ class GeometryRuntimeProvider:
         """
         if not self._stub:
             return None
-        # frame_tree 由 GetFrameTree 全量重建（_build_frame_tree + 静态边合并），代价较高。
-        # pose 流频率可能远高于 tf 实际变化频率，逐帧重建是冗余。此处按时间节流缓存：
-        # 同一帧位姿到来时复用最近 _FRAME_TREE_TTL_S 内的 frame_tree，超时才重新拉取。
-        # tf 边自带 stamp/TTL，下游容忍亚秒级陈旧，正确性不受影响。
+        # 坐标树查询同步执行，成功或缺失均从查询完成计刷新间隔，避免慢查询逐帧重试。
         _FRAME_TREE_TTL_S = 0.2
 
         def _stream_worker(handle: _CancellableStreamHandle) -> None:
-            cached_tree: Optional[FrameTree] = None
-            cached_at = 0.0
             while self._stub and not handle.stop_event.is_set():
+                # 重连后的位姿不能复用上一次流调用的坐标树。
+                cached_tree: Optional[FrameTree] = None
+                next_tree_refresh_at = 0.0
                 call = None
                 call_failed = False
                 try:
@@ -8610,16 +8617,21 @@ class GeometryRuntimeProvider:
                         if pose is None:
                             continue
                         now = time.monotonic()
-                        if cached_tree is None or (now - cached_at) >= _FRAME_TREE_TTL_S:
+                        if now >= next_tree_refresh_at:
                             cached_tree = self.get_frame_tree()
-                            cached_at = now
+                            next_tree_refresh_at = time.monotonic() + _FRAME_TREE_TTL_S
                         if handle.stop_event.is_set():
                             return
                         try:
                             callback(
                                 pose,
                                 cached_tree,
-                                {"sequence": update.sequence},
+                                {
+                                    "sequence": update.sequence,
+                                    "source_timestamp_ns": int(
+                                        getattr(update.pose, "timestamp_ns", 0) or 0
+                                    ),
+                                },
                             )
                         except Exception:
                             LOGGER.exception(

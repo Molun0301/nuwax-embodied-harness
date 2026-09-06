@@ -63,6 +63,31 @@ foreach(REQUIRED_SOURCE preprocess.cpp Estimator.cpp parameters.cpp)
   endif()
 endforeach()
 
+# 在构建目录应用初始化修复，保留外部锁定源码及其已有向量硬化补丁。
+find_program(NUWAX_PATCH_EXECUTABLE patch)
+if(NOT NUWAX_PATCH_EXECUTABLE)
+  message(FATAL_ERROR "patch is required to apply the Point-LIO initialization fix")
+endif()
+set(POINTLIO_PATCHED_DIR "${CMAKE_CURRENT_BINARY_DIR}/pointlio-initialized")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch")
+foreach(HEADER pointlio.hpp laserMapping.hpp)
+  configure_file("${FASTLIO_SOURCE_DIR}/src/${HEADER}"
+    "${POINTLIO_PATCHED_DIR}/src/${HEADER}" COPYONLY)
+endforeach()
+execute_process(
+  COMMAND "${NUWAX_PATCH_EXECUTABLE}" --batch --forward -p1
+    -i "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch"
+  WORKING_DIRECTORY "${POINTLIO_PATCHED_DIR}"
+  RESULT_VARIABLE POINTLIO_PATCH_RESULT
+  OUTPUT_VARIABLE POINTLIO_PATCH_OUTPUT
+  ERROR_VARIABLE POINTLIO_PATCH_ERROR
+)
+if(NOT POINTLIO_PATCH_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "Point-LIO initialization patch failed: ${POINTLIO_PATCH_OUTPUT}${POINTLIO_PATCH_ERROR}")
+endif()
+
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
   GIT_TAG main
@@ -118,6 +143,7 @@ if(NOT LIVOX_COMMON_DIR)
 endif()
 
 target_include_directories(pointlio_native PRIVATE
+  ${POINTLIO_PATCHED_DIR}/src
   ${FASTLIO_SOURCE_DIR}/include
   ${FASTLIO_SOURCE_DIR}/include/IKFoM/IKFoM_toolkit
   ${FASTLIO_SOURCE_DIR}/src

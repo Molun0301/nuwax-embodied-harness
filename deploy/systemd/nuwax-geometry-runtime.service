@@ -24,6 +24,7 @@ StateDirectoryMode=0700
 UMask=0007
 # 服务默认值；用户配置文件覆盖同名业务设置。
 Environment=PYTHONUNBUFFERED=1
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
 Environment="NUWAX_LCM_CHANNEL_POINTCLOUD=/go2/lidar/points#sensor_msgs.PointCloud2"
 Environment="NUWAX_LCM_CHANNEL_CLOUD_MAP=/cloud_map#sensor_msgs.PointCloud2"
 Environment="NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope"
@@ -39,6 +40,7 @@ Environment=NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30
 Environment=NUWAX_CLOUDMAP_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_cloudmap.mmap
 Environment=NUWAX_OCCUPANCY_SHM_PATH=/var/lib/nuwax_robot_bridge/nuwax_occupancy.mmap
 Environment=NUWAX_FORBIDDEN_ZONES_PATH=/var/lib/nuwax_robot_bridge/forbidden_zones.json
+Environment=NUWAX_GEOMETRY_SEQUENCE_STATE_PATH=/var/lib/nuwax_robot_bridge/geometry/sequence_state.json
 Environment=NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH=/var/lib/nuwax/geometry-runtime/exploration_ownership_journal.json
 Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env

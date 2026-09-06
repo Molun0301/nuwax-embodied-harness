@@ -5,7 +5,7 @@ import base64
 import collections
 from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 # 暂时禁用orjson，先验证async_dispatch优化效果
@@ -29,10 +29,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
+from core.logging_utils import LogRateLimiter
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
 from gateways.runtime import GatewayRuntime
+from gateways.ws.console_projection import console_payload, field_value, selected_fields
 
 try:
     from services.geometry.video_shm_reader import VideoShmReader
@@ -41,6 +43,8 @@ except ImportError:
 
 
 _STREAM_QUEUE_MAXSIZE = 200
+_DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
+_DIAGNOSTIC_LOG_INTERVAL_SEC = 5.0
 _STREAM_REPLAY_MAX_FRAMES = 200
 _STREAM_JSON_MAX_DEPTH = 12
 _STREAM_JSON_MAX_NODES = 2048
@@ -184,11 +188,17 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
     values = {
         str(field_name): getattr(frame, field_name)
         for field_name in model_fields
+        if field_name not in {"payload", "metadata"}
     }
     if frame.cursor is not None:
         values["cursor"] = _pointcloud_identity_integer(frame.cursor, "cursor")
-    if frame.topic == "tasks.state":
-        values["payload"] = build_public_runtime_event(frame.payload)
+    # 先保护信封中的状态与身份，载荷耗尽预算不能把 available 改成截断字符串。
+    values["payload"] = (
+        build_public_runtime_event(frame.payload)
+        if frame.topic == "tasks.state"
+        else console_payload(frame.topic, frame.payload)
+    )
+    values["metadata"] = frame.metadata
     return values
 
 
@@ -571,6 +581,14 @@ def _frame_priority(frame: StreamFrame) -> int:
     return 40
 
 
+class _ClientStreamGap(Exception):
+    """只有丢帧通知而没有数据帧时唤醒发送循环。"""
+
+
+class _ClientStreamClosed(Exception):
+    """客户端队列已关闭，不再接收旧订阅回调。"""
+
+
 class _ClientStreamQueue:
     """单客户端发送队列：按槽位替换最新帧，按优先级分桶丢弃。
 
@@ -592,6 +610,9 @@ class _ClientStreamQueue:
         self._keys_by_priority = {}
         self._sequence = 0
         self._waiter = None
+        self._lock = threading.RLock()
+        self._notification_pending = False
+        self._closed = False
 
     @staticmethod
     def _slot_key(frame: StreamFrame) -> Optional[Tuple[str, str]]:
@@ -620,6 +641,51 @@ class _ClientStreamQueue:
         return next(iter(self._keys_by_priority[priority])), priority
 
     def put(self, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._put_locked(frame, runtime)
+        self._wake_waiter()
+
+    def put_threadsafe(self, loop: asyncio.AbstractEventLoop, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+        """先在有界槽位中合并，再向事件循环合并发送一次唤醒。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._put_locked(frame, runtime)
+        self._schedule_wakeup(loop)
+
+    def note_gap_threadsafe(self, loop: asyncio.AbstractEventLoop, notice: Dict[str, Any]) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            _merge_queue_gap(self, notice)
+        self._schedule_wakeup(loop)
+
+    def _schedule_wakeup(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            if self._closed or self._notification_pending:
+                return
+            self._notification_pending = True
+        try:
+            loop.call_soon_threadsafe(self._wake_waiter)
+        except RuntimeError:
+            # 事件循环已关闭；不保留断开连接的帧或反复向旧循环调度。
+            with self._lock:
+                self._closed = True
+                self._items.clear()
+                self._keys_by_priority.clear()
+                self._waiter = None
+                self._notification_pending = False
+
+    def _wake_waiter(self) -> None:
+        with self._lock:
+            self._notification_pending = False
+            waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    def _put_locked(self, frame: StreamFrame, runtime: GatewayRuntime) -> None:
         priority = _frame_priority(frame)
         key = self._slot_key(frame)
         if key is None:
@@ -643,35 +709,46 @@ class _ClientStreamQueue:
         self._items[key] = (frame, priority)
         self._keys_by_priority.setdefault(priority, collections.OrderedDict())[key] = None
 
-        waiter = self._waiter
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
-
     def empty(self) -> bool:
-        return not self._items
+        with self._lock:
+            return not self._items
 
     def get_nowait(self) -> StreamFrame:
-        if not self._items:
-            raise asyncio.QueueEmpty
-        key, (frame, priority) = self._items.popitem(last=False)
-        self._discard_key(key, priority)
-        return frame
+        with self._lock:
+            if not self._items:
+                raise asyncio.QueueEmpty
+            key, (frame, priority) = self._items.popitem(last=False)
+            self._discard_key(key, priority)
+            return frame
 
     async def get(self) -> StreamFrame:
-        while not self._items:
-            waiter = asyncio.get_running_loop().create_future()
-            self._waiter = waiter
+        while True:
+            with self._lock:
+                if self._items:
+                    return self.get_nowait()
+                if self._closed:
+                    raise _ClientStreamClosed()
+                if getattr(self, "_nuwax_drop_state", None):
+                    raise _ClientStreamGap()
+                waiter = asyncio.get_running_loop().create_future()
+                self._waiter = waiter
             try:
                 await waiter
             finally:
-                if self._waiter is waiter:
-                    self._waiter = None
-        key, (frame, priority) = self._items.popitem(last=False)
-        self._discard_key(key, priority)
-        return frame
+                with self._lock:
+                    if self._waiter is waiter:
+                        self._waiter = None
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._items.clear()
+            self._keys_by_priority.clear()
+            self._nuwax_drop_state = None
+        self._wake_waiter()
 
 
-def _record_queue_drop(queue: asyncio.Queue, frame: StreamFrame) -> None:
+def _merge_queue_gap(queue: _ClientStreamQueue, notice: Dict[str, Any]) -> None:
     state = getattr(queue, "_nuwax_drop_state", None)
     if not isinstance(state, dict):
         state = {
@@ -679,22 +756,34 @@ def _record_queue_drop(queue: asyncio.Queue, frame: StreamFrame) -> None:
             "first_dropped_cursor": None,
             "last_dropped_cursor": None,
             "topics": set(),
+            "reasons": set(),
         }
         setattr(queue, "_nuwax_drop_state", state)
-    state["dropped_count"] += 1
-    cursor = getattr(frame, "cursor", None)
-    if cursor is not None:
-        state["first_dropped_cursor"] = state["first_dropped_cursor"] or cursor
-        state["last_dropped_cursor"] = cursor
-    state["topics"].add(str(getattr(frame, "topic", "unknown")))
+    state["dropped_count"] += int(notice["dropped_count"])
+    for name, pick in (("first_dropped_cursor", min), ("last_dropped_cursor", max)):
+        cursor = notice.get(name)
+        if cursor is not None:
+            state[name] = cursor if state[name] is None else pick(state[name], cursor)
+    state["topics"].update(notice.get("topics") or ())
+    state["reasons"].add(notice.get("reason", "client_queue_overflow"))
 
 
-def _take_queue_gap_notice(queue: asyncio.Queue, runtime: GatewayRuntime) -> Optional[Dict[str, Any]]:
-    state = getattr(queue, "_nuwax_drop_state", None)
+def _record_queue_drop(queue: _ClientStreamQueue, frame: StreamFrame) -> None:
+    _merge_queue_gap(queue, {
+        "reason": "client_queue_overflow", "dropped_count": 1,
+        "first_dropped_cursor": frame.cursor, "last_dropped_cursor": frame.cursor,
+        "topics": (frame.topic,),
+    })
+
+
+def _take_queue_gap_notice(queue: _ClientStreamQueue, runtime: GatewayRuntime) -> Optional[Dict[str, Any]]:
+    with queue._lock:
+        state = getattr(queue, "_nuwax_drop_state", None)
+        setattr(queue, "_nuwax_drop_state", None)
     if not isinstance(state, dict) or not state.get("dropped_count"):
         return None
     notice = {
-        "reason": "client_queue_overflow",
+        "reason": next(iter(state["reasons"])) if len(state["reasons"]) == 1 else "multiple_queue_overflows",
         "dropped_count": int(state["dropped_count"]),
         "first_dropped_cursor": state.get("first_dropped_cursor"),
         "last_dropped_cursor": state.get("last_dropped_cursor"),
@@ -703,8 +792,27 @@ def _take_queue_gap_notice(queue: asyncio.Queue, runtime: GatewayRuntime) -> Opt
         "resync_required": True,
         "next_action": "重新获取任务快照；日志等增量数据从最新游标继续。",
     }
-    setattr(queue, "_nuwax_drop_state", None)
     return notice
+
+
+def _log_frame_delay(frame: StreamFrame, *, stage: str, threshold_ms: float) -> None:
+    """传输延迟按阶段周期汇总，保留文件诊断而不回注同一实时流。"""
+
+    if hasattr(frame, 'timestamp') and frame.timestamp:
+        delay_ms = (datetime.now(timezone.utc) - frame.timestamp).total_seconds() * 1000
+        if delay_ms > threshold_ms:
+            _DIAGNOSTIC_LOG_LIMITER.log(
+                _logger,
+                logging.WARNING,
+                "[PERF] %s延迟过高: %.1fms topic=%s cursor=%s",
+                stage,
+                delay_ms,
+                frame.topic,
+                getattr(frame, 'cursor', None),
+                key=stage,
+                interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
+                extra={"stream_bus_internal": True},
+            )
 
 
 def _safe_enqueue(
@@ -713,25 +821,9 @@ def _safe_enqueue(
     frame: StreamFrame,
     runtime: GatewayRuntime,
 ) -> None:
-    import time
-    from datetime import datetime, timezone
+    _log_frame_delay(frame, stage="入队", threshold_ms=50)
 
-    # 计算从数据产生到入队的延迟
-    enqueue_time = datetime.now(timezone.utc)
-    if hasattr(frame, 'timestamp') and frame.timestamp:
-        delay_ms = (enqueue_time - frame.timestamp).total_seconds() * 1000
-        if delay_ms > 50:  # 超过50ms记录警告
-            _logger.warning(
-                "[PERF] 入队延迟过高: %.1fms topic=%s cursor=%s",
-                delay_ms,
-                frame.topic,
-                getattr(frame, 'cursor', None)
-            )
-
-    def _push() -> None:
-        queue.put(frame, runtime)
-
-    loop.call_soon_threadsafe(_push)
+    queue.put_threadsafe(loop, frame, runtime)
 
 
 def _pointcloud_identity_integer(value: object, field_name: str) -> str:
@@ -850,67 +942,37 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
 
 
 _MAP_BINARY_MAGIC = b"NUWAXMAP"
-_MAP_BINARY_VERSION = 1
+_MAP_BINARY_VERSION = 2
 
 
 def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
-    """编码occupancy grid地图为二进制格式
-
-    格式: 魔术字(8) + 版本(1) + 宽(4) + 高(4) + 分辨率(4) + 数据(width×height×1)
-
-    occupancy_grid.data: List[int], 取值范围 -1(未知), 0-100(占用概率)
-    二进制编码为 int8: -1, 0-100
-    """
+    """版本2：有界身份/绘制帧头与有符号栅格字节；缺少身份的版本1退出使用。"""
     import numpy as np
 
-    payload = frame.payload
-
-    # 从MapSnapshot中提取occupancy_grid
-    occupancy_grid = None
-    if hasattr(payload, "occupancy_grid"):
-        occupancy_grid = payload.occupancy_grid
-    elif isinstance(payload, dict):
-        occupancy_grid = payload.get("occupancy_grid")
-
-    if occupancy_grid is None:
-        raise ValueError("map.frame payload缺少occupancy_grid")
-
-    # 提取字段
-    if hasattr(occupancy_grid, "width"):
-        width = occupancy_grid.width
-        height = occupancy_grid.height
-        resolution = getattr(occupancy_grid, "resolution_m", 0.05)
-        data = occupancy_grid.data
-    elif isinstance(occupancy_grid, dict):
-        width = occupancy_grid["width"]
-        height = occupancy_grid["height"]
-        resolution = occupancy_grid.get("resolution_m", 0.05)
-        data = occupancy_grid["data"]
-    else:
-        raise ValueError("occupancy_grid格式不支持")
-
-    # 验证数据
-    if not isinstance(width, int) or not isinstance(height, int):
-        raise ValueError(f"地图宽高必须是整数: width={width}, height={height}")
-
-    expected_cells = width * height
-    if len(data) != expected_cells:
-        raise ValueError(f"地图数据长度不匹配: 期望{expected_cells}, 实际{len(data)}")
-
-    # 转换为numpy int8数组
-    data_array = np.array(data, dtype=np.int8)
-
-    # 构造header
-    header = struct.pack(
-        "<8sBIIf",  # 魔术字(8), 版本(1), 宽(4), 高(4), 分辨率(4)
-        _MAP_BINARY_MAGIC,
-        _MAP_BINARY_VERSION,
-        width,
-        height,
-        resolution
-    )
-
-    return header + data_array.tobytes()
+    data = _complete_map_occupancy_data(frame)
+    if data is None:
+        raise ValueError("地图栅格尺寸、数量或取值无效")
+    payload = selected_fields(frame.payload, (
+        "map_name", "source_name", "source_epoch", "update_sequence", "content_sha256",
+        "frame_id", "timestamp", "metadata",
+    ))
+    grid = selected_fields(field_value(frame.payload, "occupancy_grid"), (
+        "map_id", "frame_id", "width", "height", "resolution_m", "origin", "timestamp",
+    ))
+    if not payload.get("map_name") or not grid.get("origin") or not grid.get("frame_id"):
+        raise ValueError("二进制地图缺少地图身份、坐标系或原点")
+    if not payload.get("source_name") or not payload.get("source_epoch") or not payload.get("content_sha256"):
+        raise ValueError("二进制地图缺少来源代际或内容身份")
+    payload["update_sequence"] = _pointcloud_identity_integer(payload.get("update_sequence"), "update_sequence")
+    # 栅格先于可变诊断，保持头部字段和显示坐标不被诊断耗尽预算。
+    metadata = payload.pop("metadata", {})
+    payload["occupancy_grid"] = grid
+    payload["metadata"] = metadata
+    header_frame = frame.model_copy(update={"payload": payload})
+    header = _strict_json_dumps({"type": "stream.frame", "frame": header_frame}, compact=True).encode("utf-8")
+    if len(header) > 64 * 1024:
+        raise ValueError("二进制地图头超过64KiB")
+    return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
 
 
 def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
@@ -939,6 +1001,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 after_cursor=resume_after_cursor,
                 topics=topic_filter,
                 async_dispatch=True,
+                latest_only_topics=_LATEST_ONLY_STREAM_TOPICS,
+                on_gap=lambda notice: queue.note_gap_threadsafe(loop, notice),
             )
             try:
                 replay_status, replay_frames = _build_replay_batch(
@@ -960,18 +1024,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     try:
                         frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.sse_keepalive_sec)
 
-                        # 性能监控：计算端到端延迟
-                        from datetime import datetime, timezone
-                        send_time = datetime.now(timezone.utc)
-                        if hasattr(frame, 'timestamp') and frame.timestamp:
-                            e2e_delay_ms = (send_time - frame.timestamp).total_seconds() * 1000
-                            if e2e_delay_ms > 100:  # 超过100ms记录
-                                _logger.warning(
-                                    "[PERF] SSE发送延迟: %.1fms topic=%s cursor=%s",
-                                    e2e_delay_ms,
-                                    frame.topic,
-                                    getattr(frame, 'cursor', None)
-                                )
+                        _log_frame_delay(frame, stage="SSE发送", threshold_ms=100)
 
                         if frame.cursor is not None and frame.cursor <= replay_latest_cursor:
                             continue
@@ -985,9 +1038,16 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         emitted += 1
                         if max_frames is not None and emitted >= max_frames:
                             return
+                    except _ClientStreamGap:
+                        gap_notice = _take_queue_gap_notice(queue, runtime)
+                        if gap_notice is not None:
+                            yield _format_sse("stream.gap", _external_cursor_status(gap_notice))
+                    except _ClientStreamClosed:
+                        return
                     except asyncio.TimeoutError:
                         yield _format_sse_keepalive(runtime.stream_bus.latest_cursor())
             finally:
+                queue.close()
                 runtime.stream_bus.unsubscribe(subscription_id)
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
@@ -1067,6 +1127,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 after_cursor=after_cursor,
                 topics=topic_filter,
                 async_dispatch=True,
+                latest_only_topics=_LATEST_ONLY_STREAM_TOPICS,
+                on_gap=lambda notice: queue.note_gap_threadsafe(loop, notice),
             )
             replay_status, replay_frames = _build_replay_batch(
                 runtime,
@@ -1087,18 +1149,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.ws_ping_interval_sec)
 
-                    # 性能监控：计算端到端延迟
-                    from datetime import datetime, timezone
-                    send_time = datetime.now(timezone.utc)
-                    if hasattr(frame, 'timestamp') and frame.timestamp:
-                        e2e_delay_ms = (send_time - frame.timestamp).total_seconds() * 1000
-                        if e2e_delay_ms > 100:  # 超过100ms记录
-                            _logger.warning(
-                                "[PERF] WS发送延迟: %.1fms topic=%s cursor=%s",
-                                e2e_delay_ms,
-                                frame.topic,
-                                getattr(frame, 'cursor', None)
-                            )
+                    _log_frame_delay(frame, stage="WS发送", threshold_ms=100)
 
                     if frame.cursor is not None and frame.cursor <= replay_latest_cursor:
                         continue
@@ -1140,6 +1191,12 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                                 # 编码失败，降级为JSON
                                 pass
                         await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
+                except _ClientStreamGap:
+                    gap_notice = _take_queue_gap_notice(queue, runtime)
+                    if gap_notice is not None:
+                        await _send_ws_json(websocket, {"type": "stream.gap", **_external_cursor_status(gap_notice)})
+                except _ClientStreamClosed:
+                    return
                 except asyncio.TimeoutError:
                     await _send_ws_json(
                         websocket,
@@ -1154,6 +1211,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         except WebSocketDisconnect:
             return
         finally:
+            queue.close()
             if subscription_id is not None:
                 runtime.stream_bus.unsubscribe(subscription_id)
 

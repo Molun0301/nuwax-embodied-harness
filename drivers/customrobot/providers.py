@@ -90,9 +90,13 @@ class CustomRobotProviderBundle:
         with self._lock:
             state, motion, started = self._robot_state, self._motion_control, self._started
         if not started or motion is None or not motion.is_available():
-            return SafetyState(motors_enabled=False, can_move=False, warning_message="运动执行器未接入或尚未就绪。")
+            return SafetyState(
+                motors_enabled=state.safety.motors_enabled if state is not None else None,
+                can_move=False,
+                warning_message="运动执行器未接入或尚未就绪。",
+            )
         if state is None:
-            return SafetyState(motors_enabled=False, can_move=False, warning_message="尚未收到机器人状态。")
+            return SafetyState(motors_enabled=None, can_move=False, warning_message="尚未收到机器人状态。")
         return state.safety.model_copy(deep=True)
 
     def publish_robot_state(self, state: RobotState) -> bool:
@@ -233,7 +237,7 @@ class CustomRobotProviderBundle:
         return self._sensor_topology.model_copy(deep=True) if self._sensor_topology else None
 
     def send_twist(self, twist: Twist) -> None:
-        if not self.get_safety_state().can_move:
+        if self.get_safety_state().can_move is not True:
             raise RuntimeError("运动执行器不可用。")
         assert self._motion_control is not None
         self._motion_control.send_twist(twist)

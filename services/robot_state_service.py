@@ -291,12 +291,16 @@ class RobotStateService:
                         message=item.message or "适配器健康检查失败。",
                     )
                 )
-        if not safety_state.can_move:
+        if safety_state.can_move is not True:
             diagnostics.append(
                 DiagnosticItem(
                     component="safety",
                     level=DiagnosticLevel.WARNING,
-                    message=safety_state.warning_message or "当前机器人不允许移动。",
+                    message=safety_state.warning_message or (
+                        "当前机器人运动状态尚未确认。"
+                        if safety_state.can_move is None
+                        else "当前机器人运动执行链不可用。"
+                    ),
                 )
             )
         return diagnostics

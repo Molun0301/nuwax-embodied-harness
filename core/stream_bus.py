@@ -8,8 +8,12 @@ import threading
 from typing import Callable, DefaultDict, Deque, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from contracts.streams import StreamFrame, StreamPayloadKind
+from core.logging_utils import LogRateLimiter
 
 _logger = logging.getLogger(__name__)
+_DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
+_DIAGNOSTIC_LOG_INTERVAL_SEC = 5.0
+_ASYNC_DISPATCH_QUEUE_MAXSIZE = 10000
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,8 @@ class StreamSubscription:
     callback: Callable[[StreamFrame], None]
     topics: Optional[FrozenSet[str]] = None
     async_dispatch: bool = False
+    latest_only_topics: FrozenSet[str] = frozenset()
+    on_gap: Optional[Callable[[dict], None]] = None
 
 
 @dataclass(frozen=True)
@@ -58,7 +64,8 @@ class StreamBus:
         self._dispatch_owner_thread_id: Optional[int] = None
 
         # 异步分发队列及消费者线程
-        self._async_queue: collections.deque = collections.deque(maxlen=10000)
+        self._async_queue = collections.OrderedDict()
+        self._async_gaps = collections.OrderedDict()
         self._async_event = threading.Event()
         self._shutdown = False
         self._consumer_thread = threading.Thread(
@@ -121,15 +128,32 @@ class StreamBus:
     def publish_frame(self, frame: StreamFrame) -> StreamFrame:
         publisher_thread_id = threading.get_ident()
         with self._lock:
+            if self._shutdown:
+                raise RuntimeError("实时流总线已关闭，拒绝新的发布。")
             stored_frame = frame.model_copy(update={"cursor": self._next_cursor})
             self._next_cursor += 1
             if stored_frame.payload_kind != StreamPayloadKind.BINARY:
                 self._retain_frame_locked(stored_frame)
                 self._latest_by_topic[stored_frame.topic] = stored_frame
-            subscriptions = tuple(self._subscriptions.values())
+            # 异步消费者在游标分配锁内接收，保持顺序且不等待无关同步回调。
+            # 同步订阅仍沿原有重入/完成等待契约执行。
+            subscriptions = []
+            async_enqueued = False
+            for subscription in self._subscriptions.values():
+                if not self._matches(subscription, stored_frame):
+                    continue
+                if subscription.async_dispatch:
+                    self._enqueue_async_locked(subscription, stored_frame)
+                    async_enqueued = True
+                else:
+                    subscriptions.append(subscription)
+            if async_enqueued:
+                self._async_event.set()
+            if not subscriptions:
+                return stored_frame
             dispatch_item = _StreamDispatchItem(
                 frame=stored_frame,
-                subscriptions=subscriptions,
+                subscriptions=tuple(subscriptions),
                 completion=threading.Event(),
             )
             self._dispatch_queue.append(dispatch_item)
@@ -145,6 +169,28 @@ class StreamBus:
             dispatch_item.completion.wait()
         return stored_frame
 
+    def _enqueue_async_locked(self, subscription: StreamSubscription, frame: StreamFrame) -> None:
+        """在首次跨线程分发前合并订阅明确声明可替代的状态。"""
+        if frame.topic not in {"logs.entry", "tasks.state"} and (
+            frame.topic in subscription.latest_only_topics or frame.payload_kind == StreamPayloadKind.BINARY
+        ):
+            key = (subscription.subscription_id, "latest", frame.topic)
+        else:
+            key = (subscription.subscription_id, "event", frame.cursor)
+        self._async_queue.pop(key, None)
+        if len(self._async_queue) >= _ASYNC_DISPATCH_QUEUE_MAXSIZE:
+            _, (dropped_subscription, dropped_frame) = self._async_queue.popitem(last=False)
+            notice = self._async_gaps.setdefault(dropped_subscription.subscription_id, {
+                "reason": "async_dispatch_overflow", "dropped_count": 0,
+                "first_dropped_cursor": None, "last_dropped_cursor": None, "topics": set(),
+            })
+            notice["dropped_count"] += 1
+            notice["first_dropped_cursor"] = notice["first_dropped_cursor"] or dropped_frame.cursor
+            notice["last_dropped_cursor"] = dropped_frame.cursor
+            notice["topics"].add(dropped_frame.topic)
+            self._dropped_by_topic[dropped_frame.topic] += 1
+        self._async_queue[key] = (subscription, frame)
+
     def _drain_dispatch_queue(self) -> None:
         while True:
             with self._lock:
@@ -157,10 +203,16 @@ class StreamBus:
             try:
                 self._dispatch_frame(dispatch_item.frame, dispatch_item.subscriptions)
             except Exception:
-                _logger.exception(
+                _DIAGNOSTIC_LOG_LIMITER.log(
+                    _logger,
+                    logging.ERROR,
                     "流帧分发边界异常: cursor=%s topic=%s",
                     dispatch_item.frame.cursor,
                     dispatch_item.frame.topic,
+                    key="dispatch_boundary_failed",
+                    interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
+                    extra={"stream_bus_internal": True},
+                    exc_info=True,
                 )
             finally:
                 dispatch_item.completion.set()
@@ -176,11 +228,15 @@ class StreamBus:
 
         failures: List[Tuple[StreamSubscription, Exception]] = []
         for subscription in subscriptions:
+            with self._lock:
+                if self._shutdown or self._subscriptions.get(subscription.subscription_id) is not subscription:
+                    continue
             if not self._matches(subscription, frame):
                 continue
             dispatch_count += 1
             if subscription.async_dispatch:
-                self._async_queue.append((subscription.callback, frame))
+                with self._lock:
+                    self._enqueue_async_locked(subscription, frame)
                 self._async_event.set()
             else:
                 try:
@@ -192,11 +248,16 @@ class StreamBus:
 
         dispatch_elapsed = time.perf_counter() - dispatch_start
         if dispatch_elapsed > 0.005:  # > 5ms
-            _logger.warning(
+            _DIAGNOSTIC_LOG_LIMITER.log(
+                _logger,
+                logging.WARNING,
                 "[PERF] 帧分发耗时: %.2fms topic=%s subs=%d",
                 dispatch_elapsed * 1000,
                 frame.topic,
-                dispatch_count
+                dispatch_count,
+                key="frame_dispatch_slow",
+                interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
+                extra={"stream_bus_internal": True},
             )
 
     def _record_subscription_failures(
@@ -260,14 +321,21 @@ class StreamBus:
         *,
         topics: Optional[Iterable[str]] = None,
         async_dispatch: bool = False,
+        latest_only_topics: Optional[Iterable[str]] = None,
+        on_gap: Optional[Callable[[dict], None]] = None,
     ) -> str:
         """订阅流帧。
 
         Args:
             async_dispatch: 若为 True，回调将由后台消费者线程异步执行，
-                           不阻塞发布者线程。适用于重量级回调（如 WebSocket 序列化推送）。
+                           本订阅不要求发布者等待；同帧匹配的同步订阅仍保留完成等待。
+                           回调应只转交有界队列，避免阻塞共享分发线程。
+            latest_only_topics: 允许在异步队列按主题保留最新帧；任务与日志事件始终不合并。
+            on_gap: 异步队列溢出时接收有界汇总通知，供消费者回读日志或任务状态。
         """
         with self._lock:
+            if self._shutdown:
+                raise RuntimeError("实时流总线已关闭，拒绝新的订阅。")
             subscription_id = f"stream_sub_{self._next_subscription_seq:04d}"
             self._next_subscription_seq += 1
             subscription = StreamSubscription(
@@ -275,6 +343,8 @@ class StreamBus:
                 callback=callback,
                 topics=frozenset(str(topic) for topic in topics) if topics is not None else None,
                 async_dispatch=async_dispatch,
+                latest_only_topics=frozenset(latest_only_topics or ()),
+                on_gap=on_gap,
             )
             self._subscriptions[subscription_id] = subscription
             return subscription_id
@@ -287,6 +357,8 @@ class StreamBus:
         limit: Optional[int] = None,
         topics: Optional[Iterable[str]] = None,
         async_dispatch: bool = False,
+        latest_only_topics: Optional[Iterable[str]] = None,
+        on_gap: Optional[Callable[[dict], None]] = None,
     ) -> Tuple[str, StreamReplaySnapshot]:
         """原子注册订阅并截取对应回放，消除 replay/live 交接窗口。"""
 
@@ -296,6 +368,8 @@ class StreamBus:
                 callback,
                 topics=topic_filter,
                 async_dispatch=async_dispatch,
+                latest_only_topics=latest_only_topics,
+                on_gap=on_gap,
             )
             try:
                 snapshot = self._replay_snapshot_locked(
@@ -383,6 +457,10 @@ class StreamBus:
     def unsubscribe(self, subscription_id: str) -> None:
         with self._lock:
             self._subscriptions.pop(subscription_id, None)
+            self._async_gaps.pop(subscription_id, None)
+            for key in tuple(self._async_queue):
+                if key[0] == subscription_id:
+                    del self._async_queue[key]
 
     def clear_topic(self, topic: str) -> bool:
         """清除指定 topic 的 latest 缓存。
@@ -423,33 +501,73 @@ class StreamBus:
                 "topic_count": len(self._latest_by_topic),
                 "topics": sorted(self._latest_by_topic),
                 "dropped_by_topic": dict(self._dropped_by_topic),
+                "async_pending_count": len(self._async_queue),
+                "async_gap_count": len(self._async_gaps),
+                "closed": self._shutdown,
             }
 
     def _matches(self, subscription: StreamSubscription, frame: StreamFrame) -> bool:
         return subscription.topics is None or frame.topic in subscription.topics
 
     def _async_consumer_loop(self) -> None:
-        """后台消费者线程：从 deque 中取出异步回调并执行。"""
-        while not self._shutdown:
+        """逐项领取有效订阅的回调；关闭和退订撤销尚未领取的工作。"""
+        while True:
             self._async_event.wait(timeout=0.1)
             self._async_event.clear()
-            while self._async_queue:
+            while True:
+                with self._lock:
+                    if self._shutdown:
+                        return
+                    notice = None
+                    frame = None
+                    subscription = None
+                    if self._async_gaps:
+                        subscription_id, notice = self._async_gaps.popitem(last=False)
+                        subscription = self._subscriptions.get(subscription_id)
+                        notice["topics"] = sorted(notice["topics"])
+                    elif self._async_queue:
+                        _, (subscription, frame) = self._async_queue.popitem(last=False)
+                        if self._subscriptions.get(subscription.subscription_id) is not subscription:
+                            continue
+                    else:
+                        break
+                if subscription is None:
+                    continue
                 try:
-                    callback, frame = self._async_queue.popleft()
-                except IndexError:
-                    break
-                try:
-                    callback(frame)
+                    if notice is not None:
+                        if subscription.on_gap is not None:
+                            subscription.on_gap(notice)
+                        else:
+                            # 无恢复回调的通用订阅仍保留明确的计数与文件诊断。
+                            _DIAGNOSTIC_LOG_LIMITER.log(
+                                _logger, logging.ERROR, "异步订阅队列溢出: subscription=%s dropped=%s",
+                                subscription.subscription_id, notice["dropped_count"],
+                                key="async_dispatch_overflow", interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
+                                extra={"stream_bus_internal": True, "stream_gap": notice},
+                            )
+                    else:
+                        subscription.callback(frame)
                 except Exception as exc:
-                    _logger.warning(
+                    _DIAGNOSTIC_LOG_LIMITER.log(
+                        _logger,
+                        logging.WARNING,
                         "异步流回调执行异常: %s — %s",
                         exc.__class__.__name__,
                         exc,
+                        key="async_callback_failed",
+                        interval_sec=_DIAGNOSTIC_LOG_INTERVAL_SEC,
+                        extra={"stream_bus_internal": True},
                     )
 
     def shutdown(self) -> None:
         """停止后台消费者线程并清空队列。"""
-        self._shutdown = True
+        with self._lock:
+            self._shutdown = True
+            self._subscriptions.clear()
+            self._async_queue.clear()
+            self._async_gaps.clear()
+            while self._dispatch_queue:
+                self._dispatch_queue.popleft().completion.set()
         self._async_event.set()
-        self._consumer_thread.join(timeout=2.0)
-        self._async_queue.clear()
+        if self._consumer_thread is not threading.current_thread():
+            self._consumer_thread.join(timeout=2.0)

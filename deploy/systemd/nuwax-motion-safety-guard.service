@@ -21,6 +21,8 @@ Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 StateDirectory=nuwax/motion-guard
 StateDirectoryMode=0700
 UMask=0007
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
+Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env

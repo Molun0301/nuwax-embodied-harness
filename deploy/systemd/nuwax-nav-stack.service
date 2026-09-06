@@ -22,6 +22,7 @@ RuntimeDirectory=nuwax/navigation
 RuntimeDirectoryMode=0750
 UMask=0027
 # 服务默认值；用户配置文件覆盖同名业务设置。
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=NUWAX_LCM_BACKEND=real-lcm
 Environment=NUWAX_REAL_LCM_REQUIRED=true
 Environment=NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1

@@ -5028,20 +5028,71 @@ class GatewayRuntime:
             adapter_count = len(self.robot.get_adapter_health_statuses())
         except Exception:
             adapter_count = None
-        robot_available = bool(robot_status)
+        # 装配可查询不代表状态输入已启动或收到首帧；健康查询只读取现有证据。
+        robot_data_status = {}
+        robot_data_error = None
+        data_status_getter = getattr(getattr(self.robot, "data_plane", None), "get_status", None)
+        if callable(data_status_getter):
+            try:
+                robot_data_status = dict(data_status_getter() or {})
+            except Exception as exc:
+                robot_data_error = str(exc)
+        robot_snapshot = None
+        snapshot_getter = getattr(getattr(self, "robot_state_service", None), "get_latest_snapshot", None)
+        if callable(snapshot_getter):
+            try:
+                robot_snapshot = snapshot_getter()
+            except Exception as exc:
+                robot_data_error = str(exc)
+        robot_state_timestamp = (
+            getattr(getattr(robot_snapshot, "robot_state", None), "timestamp", None)
+            or getattr(robot_snapshot, "timestamp", None)
+        )
+        if robot_data_error is not None or not robot_status:
+            robot_data_health = ServiceHealthStatus.DEGRADED
+            robot_data_summary = "机器人数据面状态无法确认"
+            robot_data_reason = "robot_data_status_unavailable"
+            robot_data_evidence = robot_data_error or "装配状态未上报"
+        elif robot_data_status.get("enabled") is False:
+            robot_data_health = ServiceHealthStatus.DISABLED
+            robot_data_summary = "机器人数据接入已禁用"
+            robot_data_reason = "robot_data_plane_disabled"
+            robot_data_evidence = "数据面 enabled=false"
+        elif robot_data_status.get("started") is False:
+            robot_data_health = ServiceHealthStatus.MISSING
+            robot_data_summary = "机器人数据接入尚未启动"
+            robot_data_reason = "robot_data_plane_not_started"
+            robot_data_evidence = "数据面 started=false"
+        elif robot_snapshot is None:
+            robot_data_health = ServiceHealthStatus.MISSING
+            robot_data_summary = "等待机器人状态首帧"
+            robot_data_reason = "robot_state_unavailable"
+            robot_data_evidence = "尚无机器人状态快照"
+        else:
+            robot_data_health = ServiceHealthStatus.AVAILABLE
+            robot_data_summary = "已收到机器人状态"
+            robot_data_reason = None
+            robot_data_evidence = f"最近状态时间 {robot_state_timestamp or '未提供'}"
         entries.append(
             self._make_service_health_entry(
                 service_id="robot_data_plane",
                 display_name="机器人数据接入",
                 group="机器人数据",
-                status=ServiceHealthStatus.AVAILABLE if robot_available else ServiceHealthStatus.DEGRADED,
-                summary="机器人数据面可访问" if robot_available else "机器人数据面状态未上报",
-                evidence=f"适配器 {adapter_count if adapter_count is not None else '--'} 个",
-                source="robot_assembly",
+                status=robot_data_health,
+                summary=robot_data_summary,
+                evidence=robot_data_evidence,
+                source="robot_state_service",
                 advice="数据面异常时检查机器人连接和驱动日志",
                 order=100,
-                updated_at=utc_now(),
-                metadata={"assembly_status": robot_status},
+                updated_at=robot_state_timestamp,
+                reason=robot_data_reason,
+                related_streams=("robot.state",),
+                metadata={
+                    "assembly_status": robot_status,
+                    "adapter_count": adapter_count,
+                    "data_plane": robot_data_status,
+                    "state_received": robot_snapshot is not None,
+                },
             )
         )
 

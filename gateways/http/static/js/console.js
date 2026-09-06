@@ -22,6 +22,7 @@
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"];
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
+      const TASK_EVENT_QUEUE_LIMIT = 200;
       const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
@@ -88,6 +89,7 @@
         latestStreamFrames: {},
         pendingStreamFrames: {},
         pendingLogFrames: [],
+        pendingTaskFrames: [],
         streamFlushFrame: null,
         videoFrames: 0,
         pendingVideoEnvelope: null,
@@ -120,6 +122,12 @@
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
         taskHistoryById: new Map(),
+        taskEventSequence: 0,
+        taskSnapshotSequence: 0,
+        taskLoadPromise: null,
+        taskReloadPending: false,
+        taskQueueGapPending: false,
+        taskStoreBatching: false,
         bootstrapComplete: { health: false, tasks: false, governance: false },
         bootstrapQueue: { health: [], tasks: [], governance: [] },
         lastRobotStateRevision: null,
@@ -925,7 +933,9 @@
         updateHealthImpl(payload);
       }
       function updateHealthImpl(payload) {
-        const health = payload || {};
+        // 状态流只更新其携带字段，不能清掉首次健康响应中的机器人身份与活动地图。
+        const changes = Object.fromEntries(Object.entries(payload || {}).filter(([, value]) => value !== undefined));
+        const health = { ...(state.latestHealth || {}), ...changes };
         state.latestHealth = health;
         setText(els.robotName, health.robot_name || "nuwax_robot_bridge");
         setText(els.robotModel, `型号：${safeText(health.robot_model)}`);
@@ -940,14 +950,15 @@
           ? `${Math.round(rawBattery <= 1 ? rawBattery * 100 : rawBattery)}%`
           : (battery.level !== undefined ? `${battery.level}%` : "--");
         setText(els.batteryMetric, batteryValue);
-        const canMove = safety.can_move === true;
+        const canMove = safety.can_move;
         setPill(
           els.motionStatus,
-          canMove ? "available" : "stale",
+          canMove === true ? "available" : canMove === false ? "stale" : "missing",
         );
-        setText(els.motionStatus, canMove ? "运动可用" : "运动不可用");
-        if (health.service_health) {
-          mergeServiceHealth(health.service_health, "/api/health", "replace");
+        setText(els.motionStatus, canMove === true ? "运动可用" : canMove === false ? "运动不可用" : "运动状态未确认");
+        els.motionStatus.title = safety.warning_message || (canMove == null ? "设备尚未提供运动状态确认。" : "");
+        if (changes.service_health) {
+          mergeServiceHealth(changes.service_health, "/api/health", "replace");
         } else {
           renderServiceStatus();
         }
@@ -972,6 +983,7 @@
         return typeof limit === "number" ? items.slice(0, limit) : items;
       }
       function refreshTaskStore() {
+        if (state.taskStoreBatching) return;
         // 任务 4.0a Map 内存截断：保留窗口 active=50 / history=200，防止长会话内存增长
         trimMapByUpdatedAt(state.taskActiveById, 50);
         trimMapByUpdatedAt(state.taskHistoryById, 200);
@@ -988,28 +1000,36 @@
         const sorted = Array.from(map.entries()).sort((a, b) => taskUpdatedMs(b[1]) - taskUpdatedMs(a[1]));
         for (const [key] of sorted.slice(keep)) map.delete(key);
       }
-      function replaceTaskStore(payload) {
-        // 任务 3.1：merge 语义而非 clear+set —— 保留流式期间累积的增量
-        for (const task of Array.isArray(payload && payload.active_tasks) ? payload.active_tasks : []) {
+      function replaceTaskStore(payload, snapshotSequence = state.taskEventSequence) {
+        if (snapshotSequence < state.taskSnapshotSequence) return;
+        const hasActiveSnapshot = Array.isArray(payload && payload.active_tasks);
+        const active = hasActiveSnapshot ? payload.active_tasks : [];
+        const activeIds = new Set(active.filter(task => task?.task_id).map(task => String(task.task_id)));
+        // 活动列表为完整权威快照；保留请求开始后才收到的本地事件。
+        for (const [key, task] of state.taskActiveById) {
+          if (hasActiveSnapshot && !activeIds.has(key) && (task.__streamSequence || 0) <= snapshotSequence) state.taskActiveById.delete(key);
+        }
+        for (const task of active) {
           if (!task || !task.task_id) continue;
           const key = String(task.task_id);
+          const terminal = state.taskHistoryById.get(key);
+          if (terminal && isTerminalTaskState(terminal.state || terminal.status)) continue;
           const existing = state.taskActiveById.get(key);
-          if (!existing) {
-            state.taskActiveById.set(key, task);
-          } else {
-            state.taskActiveById.set(key, { ...existing, ...task });
-          }
+          if (existing && (existing.__streamSequence || 0) > snapshotSequence) continue;
+          state.taskActiveById.set(key, { ...existing, ...task });
         }
         for (const task of Array.isArray(payload && payload.history_tasks) ? payload.history_tasks : []) {
           if (!task || !task.task_id) continue;
           const key = String(task.task_id);
           const existing = state.taskHistoryById.get(key);
+          if (isTerminalTaskState(task.state || task.status)) state.taskActiveById.delete(key);
           if (!existing) {
             state.taskHistoryById.set(key, task);
-          } else if (taskUpdatedMs(task) > taskUpdatedMs(existing)) {
+          } else if ((existing.__streamSequence || 0) <= snapshotSequence && taskUpdatedMs(task) >= taskUpdatedMs(existing)) {
             state.taskHistoryById.set(key, { ...existing, ...task });
           }
         }
+        if (hasActiveSnapshot) state.taskSnapshotSequence = snapshotSequence;
         refreshTaskStore();
       }
       function updateTasks(payload) {
@@ -1067,16 +1087,32 @@
         renderServiceStatus();
       }
       async function loadInitialTasks() {
-        try {
-          const response = await fetch("/api/tasks?history_limit=20");
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          replaceTaskStore(await response.json());
-        } catch (err) {
-          showPanelError("tasks", `任务列表初始化失败：${err.message || err}`);
-        } finally {
-          // bootstrap 闸门：完成后才允许 updateTaskFrame 直接写 Map；flush 期间累积的流式事件
-          flushTaskQueue();
-          state.bootstrapComplete.tasks = true;
+        if (state.taskLoadPromise) {
+          state.taskReloadPending = true;
+          return state.taskLoadPromise;
+        }
+        const snapshotSequence = state.taskEventSequence;
+        state.taskLoadPromise = (async () => {
+          try {
+            const response = await fetch("/api/tasks?history_limit=20");
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const snapshot = await response.json();
+            if (!Array.isArray(snapshot.active_tasks) || !Array.isArray(snapshot.history_tasks)) throw new Error("任务快照字段不完整");
+            replaceTaskStore(snapshot, snapshotSequence);
+          } catch (err) {
+            showPanelError("tasks", `任务列表读取失败：${err.message || err}`);
+          } finally {
+            state.bootstrapComplete.tasks = true;
+            flushTaskQueue();
+          }
+        })();
+        try { await state.taskLoadPromise; }
+        finally {
+          state.taskLoadPromise = null;
+          if (state.taskReloadPending) {
+            state.taskReloadPending = false;
+            void loadInitialTasks();
+          }
         }
       }
       async function loadInitialHealth() {
@@ -1537,10 +1573,13 @@
         const explorationRequest = exploration.current_request || exploration.exploration_request || {};
         const navigation = state.latestStreamFrames["navigation.state"]?.payload || {};
         const navigationGoal = navigation.current_goal || {};
+        const mapData = state.lastMapEnvelope?.data || {};
         return firstNonBlank(
+          mapData.map_name,
+          mapData.map_snapshot?.map_name,
           diagnostics.active_map_name,
           diagnostics.map_name,
-          healthWorkspace.map_name,
+          governanceMetadata.map_name,
           pointcloud.map_name,
           localizationSession.map_name,
           liveDiagnostics.active_map_name,
@@ -1550,6 +1589,7 @@
           governance.map_name,
           explorationRequest.map_name,
           navigationGoal.map_name,
+          healthWorkspace.map_name,
         );
       }
       window.__nuwaxActiveMapName = activeMapName;
@@ -3888,9 +3928,20 @@
         setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(state.videoStreamStatus)} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
       }
       function updateVideoDetections(data, envelope) {
-        state.videoDetections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
+        const detections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
+        state.videoDetections = detections.filter((detection) => {
+          const bbox = detection && detection.bbox;
+          return typeof detection?.label === "string" && !detection.label.startsWith("<truncated:")
+            && Number.isFinite(detection.score) && bbox
+            && [bbox.x_px, bbox.y_px, bbox.width_px, bbox.height_px].every(Number.isFinite)
+            && bbox.width_px > 0 && bbox.height_px > 0;
+        });
         if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
-        setPill(els.videoStatus, statusOf(envelope), `${state.videoDetections.length} 个检测`);
+        const count = Number.isSafeInteger(data.detection_count) && data.detection_count >= 0 ? data.detection_count : state.videoDetections.length;
+        const limited = data.detections_truncated === true || count !== state.videoDetections.length;
+        const detectionLabel = limited ? `${count} 个检测 · 显示 ${state.videoDetections.length} 个框` : `${count} 个检测`;
+        const detectionStatus = String(envelope.status || "missing").startsWith("<truncated:") ? "missing" : statusOf(envelope);
+        setPill(els.videoStatus, detectionStatus, detectionLabel);
         setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
         setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(state.videoStreamStatus)}`);
         updatePerceptionNmsCard(data, envelope);
@@ -4204,7 +4255,39 @@
         }
         return true;
       }
+      function decodeMapBinaryFrame(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x4d, 0x41, 0x50];
+        if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value) || bytes[8] !== 2) return null;
+        const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
+        if (headerLength <= 0 || headerLength > 64 * 1024 || 13 + headerLength > bytes.byteLength) return null;
+        try {
+          const message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(13, 13 + headerLength)));
+          const frame = message.frame;
+          const payload = frame?.payload;
+          const grid = payload?.occupancy_grid;
+          if (message.type !== "stream.frame" || frame?.topic !== "map.frame" || !grid || typeof payload.map_name !== "string" || !payload.map_name) return null;
+          const cells = grid.width * grid.height;
+          if (![grid.width, grid.height, cells].every(Number.isSafeInteger) || grid.width < 1 || grid.height < 1 || cells > 2000000) return null;
+          if (!Number.isFinite(grid.resolution_m) || grid.resolution_m <= 0 || !grid.frame_id || !grid.origin) return null;
+          const origin = grid.origin.position;
+          const orientation = grid.origin.orientation;
+          if (!origin || !orientation || ![origin.x, origin.y, origin.z, orientation.x, orientation.y, orientation.z, orientation.w].every(Number.isFinite)) return null;
+          if (bytes.byteLength - 13 - headerLength !== cells) return null;
+          const data = new Int8Array(buffer, 13 + headerLength, cells);
+          if (data.some((value) => value < -1 || value > 100)) return null;
+          grid.data = Array.from(data);
+          return frame;
+        } catch (_) {
+          return null;
+        }
+      }
       function routePointCloudMapBinary(buffer) {
+        const mapFrame = decodeMapBinaryFrame(buffer);
+        if (mapFrame) {
+          handleStreamFrame(mapFrame);
+          return true;
+        }
         const bytes = new Uint8Array(buffer);
         const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x50, 0x43, 0x00];
         if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value)) return false;
@@ -4296,7 +4379,7 @@
             if (message.resync_required || message.replay_gap) {
               resetPointCloudMapBinaryConsumer("replay_gap");
               resetExplorationOverlayConsumer("replay_gap");
-              loadInitialTasks();
+              recoverStreamGap(message);
             }
             return;
           }
@@ -4304,7 +4387,7 @@
             updateLatestStreamCursor(message.latest_cursor);
             resetPointCloudMapBinaryConsumer("queue_gap");
             resetExplorationOverlayConsumer("queue_gap");
-            loadInitialTasks();
+            recoverStreamGap(message);
             return;
           }
           if (message.type !== "stream.frame" || !message.frame) return;
@@ -4321,6 +4404,27 @@
           if (!isCurrentConnection()) return;
           showPanelError("logs", "实时数据流连接异常，正在重连。");
         });
+      }
+      function recoverStreamGap(message) {
+        const topics = Array.isArray(message?.topics) && message.topics.length ? new Set(message.topics) : null;
+        if (!topics || topics.has("tasks.state")) void loadInitialTasks();
+        if (!topics || topics.has("logs.entry")) {
+          const logs = window.nuwaxConsoleLogs;
+          if (typeof logs?.recoverGap === "function") void logs.recoverGap();
+          else {
+            void logs?.reload?.();
+            showPanelError("logs", "实时日志有缺口；仅重读最近200条，更早记录请加载历史或导出。请刷新页面更新日志组件。");
+          }
+        }
+      }
+      function enqueueTaskFrame(queue, frame) {
+        queue.push(frame);
+        if (queue.length <= TASK_EVENT_QUEUE_LIMIT) return;
+        queue.splice(0, queue.length - TASK_EVENT_QUEUE_LIMIT);
+        if (state.taskQueueGapPending) return;
+        state.taskQueueGapPending = true;
+        showPanelError("tasks", "任务事件过多，正在重新读取权威任务状态。");
+        void loadInitialTasks().finally(() => { state.taskQueueGapPending = false; });
       }
       function scheduleStreamReconnect(socket, epoch) {
         const delayMs = Math.min(30000, Math.max(1000, state.streamReconnectDelayMs));
@@ -4348,10 +4452,16 @@
           && state.explorationOverlayRequiresCanonical
         ) return;
         if (frame.topic === "exploration.state" && !acceptCanonicalExplorationFrame(frame)) return;
+        if (frame.topic === "tasks.state") frame = { ...frame, __taskSequence: ++state.taskEventSequence };
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "logs.entry") {
           state.pendingLogFrames.push(frame);
-          if (state.pendingLogFrames.length > 200) state.pendingLogFrames.splice(0, state.pendingLogFrames.length - 200);
+          if (state.pendingLogFrames.length > 200) {
+            state.pendingLogFrames.splice(0, state.pendingLogFrames.length - 200);
+            recoverStreamGap({ topics: ["logs.entry"] });
+          }
+        } else if (frame.topic === "tasks.state") {
+          enqueueTaskFrame(state.pendingTaskFrames, frame);
         } else {
           state.pendingStreamFrames[frame.topic] = frame;
         }
@@ -4366,8 +4476,10 @@
         state.streamFlushFrame = null;
         const pending = state.pendingStreamFrames;
         const logFrames = state.pendingLogFrames;
+        const taskFrames = state.pendingTaskFrames;
         state.pendingStreamFrames = {};
         state.pendingLogFrames = [];
+        state.pendingTaskFrames = [];
         for (const topic of STREAM_FLUSH_ORDER) {
           const frame = pending[topic];
           if (!frame) continue;
@@ -4375,6 +4487,12 @@
           processStreamFrame(frame);
         }
         for (const topic of Object.keys(pending)) processStreamFrame(pending[topic]);
+        if (taskFrames.length) {
+          state.taskStoreBatching = true;
+          try { for (const frame of taskFrames) updateTaskFrame(frame); }
+          finally { state.taskStoreBatching = false; }
+          refreshTaskStore();
+        }
         if (logFrames.length) updateLogFrames(logFrames);
       }
       function processStreamFrame(frame) {
@@ -4461,17 +4579,18 @@
         return metadata.content_hash || metadata.signature || frame.revision || null;
       }
       function updateRobotStateFrame(frame) {
+        const payload = frame.payload;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
         const changeKey = robotStateChangeKey(frame);
         if (changeKey && changeKey === state.lastRobotStateHash) return false;
         state.lastRobotStateHash = changeKey;
         state.lastRobotStateRevision = frame.revision || (frame.metadata && frame.metadata.revision) || state.lastRobotStateRevision;
-        const payload = frame.payload || {};
         updateHealth({
           runtime_started: true,
           robot_name: payload.robot_name,
           robot_model: payload.robot_model,
-          assembly_status: payload.assembly_status || {},
-          latest_robot_snapshot: payload.robot_state || {},
+          assembly_status: payload.assembly_status,
+          latest_robot_snapshot: payload.robot_state,
           active_task_count: state.latestTasks && Array.isArray(state.latestTasks.active_tasks) ? state.latestTasks.active_tasks.length : 0,
           latest_event_cursor: frame.cursor || 0,
         });
@@ -4584,15 +4703,17 @@
       function updateTaskFrame(frame) {
         // 闸门：bootstrap 未完成时入队，避免流式单条事件抢在 /api/tasks 之前写入 Map
         if (!state.bootstrapComplete.tasks) {
-          state.bootstrapQueue.tasks.push(frame);
+          enqueueTaskFrame(state.bootstrapQueue.tasks, frame);
           return;
         }
         updateTaskFrameImpl(frame);
       }
       function updateTaskFrameImpl(frame) {
+        const receiveSequence = frame.__taskSequence || ++state.taskEventSequence;
         const framePayload = frame.payload || {};
         if (Array.isArray(framePayload.active_tasks) || Array.isArray(framePayload.history_tasks)) {
-          replaceTaskStore(framePayload);
+          if (receiveSequence <= state.taskSnapshotSequence) return;
+          replaceTaskStore(framePayload, receiveSequence);
           return;
         }
         const event = framePayload.event || framePayload;
@@ -4608,7 +4729,7 @@
           ...existing,
           task_id: taskId,
           capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
-          state: payload.state || event.state || existing.state || null,
+          state: payload.state || event.state || (isTerminalTaskState(derivedStage) || ["accepted", "running"].includes(derivedStage) ? derivedStage : null) || existing.state || null,
           stage: payload.stage || existing.stage || derivedStage,
           message: payload.message || event.message || existing.message,
           progress: payload.progress !== undefined ? payload.progress : existing.progress,
@@ -4619,7 +4740,13 @@
           next_action: payload.next_action || (payload.error_payload && payload.error_payload.next_action) || existing.next_action,
           updated_at: payload.updated_at || event.timestamp || frame.timestamp || existing.updated_at,
           completed_at: payload.completed_at || existing.completed_at,
+          __streamSequence: receiveSequence,
         };
+        // 历史HTTP只有有限窗口，仍保留已收到的终态；旧活动事件不能复活快照已结束任务。
+        if (receiveSequence <= state.taskSnapshotSequence && !isTerminalTaskState(task.state)) return;
+        if ((existing.__streamSequence || 0) > receiveSequence) return;
+        if (isTerminalTaskState(existing.state || existing.status) && !isTerminalTaskState(task.state)) return;
+        if (taskUpdatedMs(task) && taskUpdatedMs(existing) > taskUpdatedMs(task)) return;
         // 任务 3.2.3：终态时强制 progress=1.0（如果 state 是 SUCCEEDED 且 payload.progress 为 null/undefined）
         if (isTerminalTaskState(task.state) && task.state === "succeeded" && task.progress === undefined) {
           task.progress = 1.0;

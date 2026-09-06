@@ -755,8 +755,13 @@ class StreamBusLogHandler(logging.Handler):
         self._emit_state = threading.local()
         self.addFilter(CorrelationContextFilter())
 
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Handler.handle 在获取日志锁前过滤，避免分发线程诊断与发布线程互相等待。
+        # 仅隔离传输链自身诊断；文件与终端处理器仍正常记录，业务日志继续实时发布。
+        return not getattr(record, "stream_bus_internal", False) and super().filter(record)
+
     def emit(self, record: logging.LogRecord) -> None:
-        if getattr(self._emit_state, "active", False):
+        if getattr(record, "stream_bus_internal", False) or getattr(self._emit_state, "active", False):
             return
         self._emit_state.active = True
         try:

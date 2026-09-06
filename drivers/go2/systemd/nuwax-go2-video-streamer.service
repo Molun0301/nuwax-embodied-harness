@@ -18,6 +18,8 @@ LogsDirectoryMode=0750
 Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 UMask=0007
 Environment=PYTHONUNBUFFERED=1
+Environment=NUWAX_BOOTSTRAP_ENV_FILE=@NUWAX_CONFIG_DIR@/nuwax.env
+Environment=GO2_DATA_PLANE_ENV_FILE=@NUWAX_CONFIG_DIR@/go2-data-plane.env
 Environment=NUWAX_VIDEO_UDS_PATH=/tmp/nuwax_video.sock
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env

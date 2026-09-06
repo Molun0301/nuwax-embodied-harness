@@ -384,6 +384,47 @@ pub struct ShutdownListener {
     graceful_rx: watch::Receiver<bool>,
 }
 
+type SubscriptionStream<T> =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+async fn wait_for_subscription_shutdown(mut graceful_rx: Option<watch::Receiver<bool>>) {
+    match graceful_rx.as_mut() {
+        Some(receiver) => {
+            let _ = receiver.wait_for(|requested| *requested).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn spawn_subscription_stream<T, F>(
+    shutdown: Option<&ShutdownCoordinator>,
+    tx: tokio::sync::mpsc::Sender<Result<T, Status>>,
+    rx: tokio::sync::mpsc::Receiver<Result<T, Status>>,
+    producer: F,
+) -> SubscriptionStream<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // 订阅同一优雅关闭信号，保持先释放生命周期锁、再结束远程流的既有顺序。
+    let graceful_rx = shutdown.map(|coordinator| coordinator.graceful_tx.subscribe());
+    let stream_graceful_rx = graceful_rx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = wait_for_subscription_shutdown(graceful_rx) => {}
+            _ = tx.closed() => {}
+            _ = producer => {}
+        }
+        // 分支结束即丢弃整个生产计算，连同订阅、锁等待和未完成发送一起回收。
+    });
+    // 关闭时放弃尚未交付的状态通知，避免慢客户端继续排空已缓存的大地图。
+    Box::pin(futures::StreamExt::take_until(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+        wait_for_subscription_shutdown(stream_graceful_rx),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn shutdown_channel() -> (ShutdownCoordinator, ShutdownListener) {
     shutdown_channel_inner(None, None, None, None)
@@ -5126,55 +5167,54 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
-    type SubscribePoseStream = tokio_stream::wrappers::ReceiverStream<Result<PoseUpdate, Status>>;
+    type SubscribePoseStream = SubscriptionStream<PoseUpdate>;
     async fn subscribe_pose(
         &self,
         _req: Request<PoseRequest>,
     ) -> Result<Response<Self::SubscribePoseStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let state = self.bridge.state.clone();
-        tokio::spawn(async move {
-            let mut seq = 0u64;
-            // 变化驱动：仅当位姿实际更新（timestamp_ns 变化）时才推送帧；
-            // 避免静止时以 100ms 周期推送大量重复帧。last_stamp 初值 u64::MAX
-            // 确保首个有效帧（含 stamp==0 的早期态）至少推送一次后再去重。
-            let mut last_stamp = u64::MAX;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let update = {
-                    let s = state.read().await;
-                    if s.pose.timestamp_ns == last_stamp {
-                        continue;
-                    }
-                    last_stamp = s.pose.timestamp_ns;
-                    seq += 1;
-                    PoseUpdate {
-                        pose: Some(Pose {
-                            position: Some(Vec3 {
-                                x: s.pose.x,
-                                y: s.pose.y,
-                                z: s.pose.z,
+        let stream =
+            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
+                let mut seq = 0u64;
+                // 变化驱动：仅当位姿实际更新（timestamp_ns 变化）时才推送帧；
+                // 避免静止时以 100ms 周期推送大量重复帧。last_stamp 初值 u64::MAX
+                // 确保首个有效帧（含 stamp==0 的早期态）至少推送一次后再去重。
+                let mut last_stamp = u64::MAX;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let update = {
+                        let s = state.read().await;
+                        if s.pose.timestamp_ns == last_stamp {
+                            continue;
+                        }
+                        last_stamp = s.pose.timestamp_ns;
+                        seq += 1;
+                        PoseUpdate {
+                            pose: Some(Pose {
+                                position: Some(Vec3 {
+                                    x: s.pose.x,
+                                    y: s.pose.y,
+                                    z: s.pose.z,
+                                }),
+                                orientation: Some(Quat {
+                                    x: s.pose.qx,
+                                    y: s.pose.qy,
+                                    z: s.pose.qz,
+                                    w: s.pose.qw,
+                                }),
+                                frame_id: s.pose.frame_id.clone(),
+                                timestamp_ns: s.pose.timestamp_ns,
                             }),
-                            orientation: Some(Quat {
-                                x: s.pose.qx,
-                                y: s.pose.qy,
-                                z: s.pose.qz,
-                                w: s.pose.qw,
-                            }),
-                            frame_id: s.pose.frame_id.clone(),
-                            timestamp_ns: s.pose.timestamp_ns,
-                        }),
-                        sequence: seq,
+                            sequence: seq,
+                        }
+                    };
+                    if tx.send(Ok(update)).await.is_err() {
+                        break;
                     }
-                };
-                if tx.send(Ok(update)).await.is_err() {
-                    break;
                 }
-            }
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+            });
+        Ok(Response::new(stream))
     }
 
     async fn get_frame_tree(&self, _req: Request<Empty>) -> Result<Response<FrameTree>, Status> {
@@ -6085,8 +6125,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         ))
     }
 
-    type SubscribeMapUpdatesStream =
-        tokio_stream::wrappers::ReceiverStream<Result<MapUpdateNotification, Status>>;
+    type SubscribeMapUpdatesStream = SubscriptionStream<MapUpdateNotification>;
     async fn subscribe_map_updates(
         &self,
         _req: Request<Empty>,
@@ -6102,83 +6141,99 @@ impl GeometryRuntime for GeometryRuntimeService {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut map_revision_rx = self.bridge.subscribe_map_revisions();
         let occupancy_shm_current = self.bridge.occupancy_shm_current.clone();
-        tokio::spawn(async move {
-            let mut last_generation = 0u64;
-            let mut last_rev = 0u64;
-            let initial = map_revision_rx.borrow_and_update().clone();
-            if let Some(event) = initial {
-                if !map_revision_claim_is_current(&event, &mapping_adapter, &mapping_lifecycle_lock)
+        let stream =
+            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
+                let mut last_generation = 0u64;
+                let mut last_rev = 0u64;
+                let initial = map_revision_rx.borrow_and_update().clone();
+                if let Some(event) = initial {
+                    if !map_revision_claim_is_current(
+                        &event,
+                        &mapping_adapter,
+                        &mapping_lifecycle_lock,
+                    )
                     .await
-                {
-                    return;
-                }
-                last_generation = event.session_generation;
-                last_rev = event.revision;
-                if !forward_map_revision(&tx, event, &occupancy_shm_current, &expected_map_frame_id)
+                    {
+                        return;
+                    }
+                    last_generation = event.session_generation;
+                    last_rev = event.revision;
+                    if !forward_map_revision(
+                        &tx,
+                        event,
+                        &occupancy_shm_current,
+                        &expected_map_frame_id,
+                    )
                     .await
-                {
-                    return;
+                    {
+                        return;
+                    }
                 }
-            }
 
-            while map_revision_rx.changed().await.is_ok() {
-                let Some(event) = map_revision_rx.borrow_and_update().clone() else {
-                    continue;
-                };
-                if event.session_generation < last_generation
-                    || (event.session_generation == last_generation && event.revision <= last_rev)
-                {
-                    continue;
-                }
-                if !map_revision_claim_is_current(&event, &mapping_adapter, &mapping_lifecycle_lock)
+                while map_revision_rx.changed().await.is_ok() {
+                    let Some(event) = map_revision_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    if event.session_generation < last_generation
+                        || (event.session_generation == last_generation
+                            && event.revision <= last_rev)
+                    {
+                        continue;
+                    }
+                    if !map_revision_claim_is_current(
+                        &event,
+                        &mapping_adapter,
+                        &mapping_lifecycle_lock,
+                    )
                     .await
-                {
-                    continue;
-                }
-                last_generation = event.session_generation;
-                last_rev = event.revision;
-                if !forward_map_revision(&tx, event, &occupancy_shm_current, &expected_map_frame_id)
+                    {
+                        continue;
+                    }
+                    last_generation = event.session_generation;
+                    last_rev = event.revision;
+                    if !forward_map_revision(
+                        &tx,
+                        event,
+                        &occupancy_shm_current,
+                        &expected_map_frame_id,
+                    )
                     .await
-                {
-                    break;
+                    {
+                        break;
+                    }
                 }
-            }
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+            });
+        Ok(Response::new(stream))
     }
 
-    type SubscribeCloudMapUpdatesStream =
-        tokio_stream::wrappers::ReceiverStream<Result<CloudMapShmRef, Status>>;
+    type SubscribeCloudMapUpdatesStream = SubscriptionStream<CloudMapShmRef>;
     async fn subscribe_cloud_map_updates(
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Self::SubscribeCloudMapUpdatesStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut broadcast_rx = self.bridge.cloud_map_tx.subscribe();
-        tokio::spawn(async move {
-            while let Ok(notif) = broadcast_rx.recv().await {
-                let shm_ref = match cloud_map_shm_ref(&notif) {
-                    Ok(reference) => reference,
-                    Err(status) => {
-                        let _ = tx.send(Err(*status)).await;
+        let stream =
+            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
+                while let Ok(notif) = broadcast_rx.recv().await {
+                    let shm_ref = match cloud_map_shm_ref(&notif) {
+                        Ok(reference) => reference,
+                        Err(status) => {
+                            let _ = tx.send(Err(*status)).await;
+                            break;
+                        }
+                    };
+                    let msg = CloudMapShmRef {
+                        shm_ref: Some(shm_ref),
+                        point_count: notif.point_count,
+                        voxel_size: notif.voxel_size,
+                    };
+                    if tx.send(Ok(msg)).await.is_err() {
                         break;
                     }
-                };
-                let msg = CloudMapShmRef {
-                    shm_ref: Some(shm_ref),
-                    point_count: notif.point_count,
-                    voxel_size: notif.voxel_size,
-                };
-                if tx.send(Ok(msg)).await.is_err() {
-                    break;
                 }
-            }
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+            });
+        Ok(Response::new(stream))
     }
 
     // ========================================================================
@@ -6633,25 +6688,23 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(nav_state_to_proto(update)))
     }
 
-    type SubscribeNavigationStateStream =
-        tokio_stream::wrappers::ReceiverStream<Result<NavigationState, Status>>;
+    type SubscribeNavigationStateStream = SubscriptionStream<NavigationState>;
     async fn subscribe_navigation_state(
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Self::SubscribeNavigationStateStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut broadcast_rx = self.bridge.nav_state_tx.subscribe();
-        tokio::spawn(async move {
-            while let Ok(update) = broadcast_rx.recv().await {
-                let state = nav_state_to_proto(update);
-                if tx.send(Ok(state)).await.is_err() {
-                    break;
+        let stream =
+            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
+                while let Ok(update) = broadcast_rx.recv().await {
+                    let state = nav_state_to_proto(update);
+                    if tx.send(Ok(state)).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+            });
+        Ok(Response::new(stream))
     }
 
     async fn get_navigation_readiness(
@@ -6827,8 +6880,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         }))
     }
 
-    type SubscribeFrontiersStream =
-        tokio_stream::wrappers::ReceiverStream<Result<FrontierList, Status>>;
+    type SubscribeFrontiersStream = SubscriptionStream<FrontierList>;
     async fn subscribe_frontiers(
         &self,
         _req: Request<Empty>,
@@ -6836,49 +6888,48 @@ impl GeometryRuntime for GeometryRuntimeService {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut broadcast_rx = self.bridge.frontiers_tx.subscribe();
         let state_handle = self.bridge.state.clone();
-        tokio::spawn(async move {
-            while let Ok(entries) = broadcast_rx.recv().await {
-                let revision = {
-                    let s = state_handle.read().await;
-                    s.frontiers_revision
-                };
-                let frontiers = entries
-                    .iter()
-                    .map(|f| Frontier {
-                        pose: Some(Pose {
-                            position: Some(Vec3 {
-                                x: f.x,
-                                y: f.y,
-                                z: f.z,
+        let stream =
+            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
+                while let Ok(entries) = broadcast_rx.recv().await {
+                    let revision = {
+                        let s = state_handle.read().await;
+                        s.frontiers_revision
+                    };
+                    let frontiers = entries
+                        .iter()
+                        .map(|f| Frontier {
+                            pose: Some(Pose {
+                                position: Some(Vec3 {
+                                    x: f.x,
+                                    y: f.y,
+                                    z: f.z,
+                                }),
+                                orientation: Some(Quat {
+                                    x: f.qx,
+                                    y: f.qy,
+                                    z: f.qz,
+                                    w: f.qw,
+                                }),
+                                frame_id: f.frame_id.clone(),
+                                timestamp_ns: 0,
                             }),
-                            orientation: Some(Quat {
-                                x: f.qx,
-                                y: f.qy,
-                                z: f.qz,
-                                w: f.qw,
-                            }),
-                            frame_id: f.frame_id.clone(),
-                            timestamp_ns: 0,
-                        }),
-                        size_cells: f.size_cells,
-                        heading: f.heading,
-                    })
-                    .collect();
-                if tx
-                    .send(Ok(FrontierList {
-                        frontiers,
-                        revision,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    break;
+                            size_cells: f.size_cells,
+                            heading: f.heading,
+                        })
+                        .collect();
+                    if tx
+                        .send(Ok(FrontierList {
+                            frontiers,
+                            revision,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+            });
+        Ok(Response::new(stream))
     }
 
     // ========================================================================
@@ -8139,6 +8190,202 @@ mod frame_tree_tests {
         assert_eq!(transform.child_frame, "base_link");
         assert_eq!(transform.translation.as_ref().unwrap().x, 3.0);
         assert_eq!(transform.timestamp_ns, 4_000_000_005);
+    }
+}
+
+#[cfg(test)]
+mod subscription_shutdown_tests {
+    use super::*;
+    use crate::lcm_runtime::{MapRevisionEvent, MapState};
+    use tokio_stream::StreamExt;
+
+    fn erase_item<T: Send + 'static>(stream: SubscriptionStream<T>) -> SubscriptionStream<()> {
+        Box::pin(stream.map(|item| item.map(|_| ())))
+    }
+
+    async fn open_all(service: &GeometryRuntimeService) -> Vec<SubscriptionStream<()>> {
+        vec![
+            erase_item(
+                service
+                    .subscribe_pose(Request::new(PoseRequest::default()))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            ),
+            erase_item(
+                service
+                    .subscribe_map_updates(Request::new(Empty {}))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            ),
+            erase_item(
+                service
+                    .subscribe_cloud_map_updates(Request::new(Empty {}))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            ),
+            erase_item(
+                service
+                    .subscribe_navigation_state(Request::new(Empty {}))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            ),
+            erase_item(
+                service
+                    .subscribe_frontiers(Request::new(Empty {}))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            ),
+        ]
+    }
+
+    fn retained_inputs(handle: &GeometryRuntimeHandle) -> [usize; 5] {
+        [
+            Arc::strong_count(&handle.state),
+            handle.map_revision_latest_tx.receiver_count(),
+            handle.cloud_map_tx.receiver_count(),
+            handle.nav_state_tx.receiver_count(),
+            handle.frontiers_tx.receiver_count(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn subscription_streams_release_all_five_producers_without_new_input() {
+        for mode in [
+            "client_without_coordinator",
+            "client_with_coordinator",
+            "graceful",
+            "already_graceful",
+        ] {
+            let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+            let (shutdown, _listener) = shutdown_channel();
+            let service = if mode == "client_without_coordinator" {
+                GeometryRuntimeService::new(handle.clone())
+            } else {
+                GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone())
+            };
+            let baseline = retained_inputs(&handle);
+            if mode == "already_graceful" {
+                shutdown.publish_graceful_shutdown();
+            }
+            let mut streams = open_all(&service).await;
+            if mode == "graceful" {
+                shutdown.request_shutdown();
+                tokio::task::yield_now().await;
+                assert!(retained_inputs(&handle)[1] > baseline[1]);
+                assert!(
+                    !*shutdown.graceful_tx.borrow(),
+                    "接纳关闭不能提前结束响应流"
+                );
+                shutdown.publish_graceful_shutdown();
+            }
+            if mode == "graceful" || mode == "already_graceful" {
+                for stream in &mut streams {
+                    assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+                        .await
+                        .expect("关闭信号必须结束每条流")
+                        .is_none());
+                }
+            }
+            drop(streams);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while retained_inputs(&handle) != baseline {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{mode}: 所有生产者必须释放状态和上游订阅"));
+        }
+    }
+
+    struct ProducerDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for ProducerDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_shutdown_cancels_backpressured_send_and_discards_buffered_payload() {
+        let (shutdown, _listener) = shutdown_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let guard = ProducerDrop(Some(dropped_tx));
+        let mut stream = spawn_subscription_stream(Some(&shutdown), tx.clone(), rx, async move {
+            let _guard = guard;
+            tx.send(Ok(vec![1u8; 1024 * 1024])).await.unwrap();
+            queued_tx.send(()).unwrap();
+            tx.send(Ok(vec![2u8; 1024 * 1024])).await.unwrap();
+            panic!("无接收方时第二帧应保持背压等待");
+        });
+        queued_rx.await.unwrap();
+        shutdown.publish_graceful_shutdown();
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("未轮询响应流也必须取消生产者")
+            .unwrap();
+        assert!(
+            stream.next().await.is_none(),
+            "关闭后不能继续交付队列旧地图"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_shutdown_cancels_mapping_lifecycle_lock_wait() {
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        let session = handle
+            .mapping_adapter
+            .as_ref()
+            .unwrap()
+            .lock()
+            .start_session("stream-session", "warehouse")
+            .unwrap();
+        let event = MapRevisionEvent::from_map(
+            &MapState {
+                width: 1,
+                height: 1,
+                resolution: 0.05,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                frame_id: "map".into(),
+                revision: 1,
+                timestamp_ns: 1,
+                data: vec![0],
+            },
+            &session,
+        );
+        handle.map_revision_latest_tx.send_replace(Some(event));
+        let lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
+        let (shutdown, _listener) = shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
+        let baseline = handle.map_revision_latest_tx.receiver_count();
+        let mut stream = service
+            .subscribe_map_updates(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        tokio::task::yield_now().await;
+        shutdown.publish_graceful_shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.map_revision_latest_tx.receiver_count() != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消不应等待生命周期锁释放");
+        drop(lifecycle_guard);
     }
 }
 

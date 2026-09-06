@@ -194,13 +194,12 @@ class Go2ProviderBundle(
             unsubscriber(subscription_id)
 
     def get_safety_state(self) -> SafetyState:
-        motion_available = bool(self.assembly.high_level_initialized)
+        # 当前数据面未接入电机与设备运动状态，媒体客户端初始化不能确认这些事实。
         return SafetyState(
-            motors_enabled=motion_available,
-            can_move=motion_available,
+            motors_enabled=None,
+            can_move=None,
             warning_message=(
-                None
-                if motion_available
-                else "高层运动执行器尚未初始化。"
+                "设备运动和电机上电状态尚未接入，当前状态未确认；"
+                "视频和语音客户端初始化不能证明运动可用。"
             ),
         )

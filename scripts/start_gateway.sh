@@ -1052,9 +1052,10 @@ write_pid_file
 trap remove_pid_file EXIT
 trap stop_gateway INT TERM
 
+# 先有界排空HTTP长连接，再进入应用生命周期释放运行时资源；外层关闭预算保持不变。
 if ! is_restart_enabled "${RESTART_POLICY}"; then
   set +e
-  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
+  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" --timeout-graceful-shutdown 5) &
   GATEWAY_PID="$!"
   start_go2_video_streamer
   start_runtime_activation_monitor
@@ -1073,7 +1074,7 @@ fi
 attempt=0
 while true; do
   set +e
-  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}") &
+  (run_with_title "nuwax-gateway-web" "${PYTHON_BIN}" -m uvicorn gateways.app:create_gateway_app_from_env --factory --host "${HOST}" --port "${PORT}" --timeout-graceful-shutdown 5) &
   GATEWAY_PID="$!"
   start_go2_video_streamer
   start_runtime_activation_monitor

@@ -8,10 +8,10 @@
   const filterIds = { level: "logLevelFilter", source: "logSourceFilter", component: "logComponentFilter", query: "logSearch", request_id: "logRequestFilter", task_id: "logTaskFilter" };
   const records = new Map();
   const rowNodes = new Map();
-  const state = { displayLimit: PAGE_SIZE, visible: [], paused: false, dirty: false, pending: 0, nextBefore: null, hasMore: false, loading: false, opened: false, request: 0, serial: 0, historicalSerial: 0, renderTimer: null, filterTimer: null };
+  const state = { displayLimit: PAGE_SIZE, visible: [], paused: false, dirty: false, pending: 0, nextBefore: null, hasMore: false, loading: false, opened: false, request: 0, serial: 0, historicalSerial: 0, renderTimer: null, filterTimer: null, gapNotice: "", gapReloadPromise: null };
   const element = (id) => document.getElementById(id);
   const write = (id, value) => { const node = element(id); if (node) node.textContent = String(value); };
-  const message = (text) => write("logMessage", text);
+  const message = (text) => write("logMessage", state.gapNotice ? `${text} ${state.gapNotice}` : text);
 
   function filters() {
     return Object.fromEntries(Object.entries(filterIds).map(([key, id]) => [key, String(element(id)?.value || "").trim()]));
@@ -278,6 +278,13 @@
     return load(false);
   }
 
+  function recoverGap() {
+    state.gapNotice = `实时日志有缺口；重读仅查询最近 ${PAGE_SIZE} 条匹配日志，更早记录请加载历史或导出。`;
+    if (state.gapReloadPromise) return state.gapReloadPromise;
+    state.gapReloadPromise = reload().finally(() => { state.gapReloadPromise = null; });
+    return state.gapReloadPromise;
+  }
+
   async function more() {
     if (state.displayLimit >= CACHE_LIMIT) return message("当前最多显示 5000 条，请缩小筛选范围或导出历史。");
     state.displayLimit = Math.min(CACHE_LIMIT, state.displayLimit + PAGE_SIZE);
@@ -346,6 +353,7 @@
       return Promise.resolve();
     },
     reload,
+    recoverGap,
   };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind, { once: true });
   else bind();

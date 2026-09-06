@@ -33,6 +33,7 @@
 
 #include "livox_sdk_config.hpp"
 #include "imu_frame_transform.hpp"
+#include "scan_imu_buffer.hpp"
 
 #include "dimos_native_module.hpp"
 
@@ -105,6 +106,7 @@ struct TypedImuSample {
     boost::shared_ptr<custom_messages::Imu> message;
 };
 static std::vector<TypedImuSample> g_typed_imu_samples;
+static std::optional<uint64_t> g_last_fed_typed_imu_stamp_ns;
 
 static constexpr uint64_t NANOS_PER_SECOND = 1000000000ULL;
 
@@ -735,14 +737,9 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
             if (g_external_input && !points.empty()) {
                 const uint64_t scan_end_ns = frame_start + static_cast<uint64_t>(points.back().offset_time);
-                for (const auto& sample : g_typed_imu_samples) {
-                    if (sample.timestamp_ns > scan_end_ns) { break; }
-                    point_lio.feed_imu(sample.message);
-                }
-                g_typed_imu_samples.erase(
-                    std::remove_if(g_typed_imu_samples.begin(), g_typed_imu_samples.end(),
-                        [scan_end_ns](const TypedImuSample& sample) { return sample.timestamp_ns <= scan_end_ns; }),
-                    g_typed_imu_samples.end());
+                nuwax_lio::feed_scan_imu_and_retain_boundary(
+                    g_typed_imu_samples, scan_end_ns, g_last_fed_typed_imu_stamp_ns,
+                    [&point_lio](const auto& sample) { point_lio.feed_imu(sample); });
             }
 
             if (!points.empty()) {

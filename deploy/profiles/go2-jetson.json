@@ -124,22 +124,6 @@
         "output": "services/nuwax-workspace/target/release/nuwax-person-follow"
       },
       {
-        "name": "nuwax-fastlio2-backend",
-        "manifest": "services/nuwax-workspace/Cargo.toml",
-        "package": "nuwax-lio-backends",
-        "bin": "nuwax-fastlio2-backend",
-        "features": [],
-        "output": "services/nuwax-workspace/target/release/nuwax-fastlio2-backend"
-      },
-      {
-        "name": "nuwax-pointlio-backend",
-        "manifest": "services/nuwax-workspace/Cargo.toml",
-        "package": "nuwax-lio-backends",
-        "bin": "nuwax-pointlio-backend",
-        "features": [],
-        "output": "services/nuwax-workspace/target/release/nuwax-pointlio-backend"
-      },
-      {
         "name": "nuwax-geometry-runtime",
         "manifest": "services/geometry/nuwax_geometry_runtime/Cargo.toml",
         "package": null,
@@ -208,11 +192,11 @@
       "native_lio_payloads": [
         {
           "role": "fastlio2",
-          "source": "nuwax-fastlio2-backend"
+          "source": "fastlio2_native"
         },
         {
           "role": "pointlio",
-          "source": "nuwax-pointlio-backend"
+          "source": "pointlio_native"
         }
       ]
     }

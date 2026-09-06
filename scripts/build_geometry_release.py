@@ -374,6 +374,11 @@ def _profile_native_lio_contract(profile_path):
                 or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in name)
                 or not isinstance(source, str) or not source):
             raise ValueError("发布 profile native LIO role/source 非法")
+        if name not in ("fastlio2", "pointlio") or source != "%s_native" % name:
+            raise ValueError(
+                "发布 profile 原生 LIO role/source 必须匹配真实 C++ 程序，"
+                "不得使用 Rust 离线程序: role=%s source=%s" % (name, source)
+            )
         if name in names or source in sources:
             raise ValueError("发布 profile native LIO role/source 重复")
         names.add(name)
@@ -392,6 +397,8 @@ def _parse_native_lio(values, profile_contract):
         if not path.is_absolute():
             raise ValueError("--native-lio 必须只提供绝对 artifact path: %s" % raw_path)
         source = path.name
+        if source in {"nuwax-fastlio2-backend", "nuwax-pointlio-backend"}:
+            raise ValueError("--native-lio 不得使用 Rust 离线程序: %s" % source)
         role = by_source.get(source)
         if role is None:
             raise ValueError("--native-lio path basename 不属于发布 profile source 集合: %s" % source)
@@ -405,7 +412,11 @@ def _parse_native_lio(values, profile_contract):
     if seen_sources != expected_sources:
         raise ValueError("--native-lio path 集合必须覆盖发布 profile 全部 source: expected=%s actual=%s"
                          % (",".join(sorted(expected_sources)), ",".join(sorted(seen_sources))))
-    return sorted(resolved, key=lambda item: item[0])
+    # 原生程序由调用者预先构建；在启动大规模 Cargo 构建前检查真实输入文件。
+    return [
+        (role, _validate_source(path, "native_lio_payload:%s" % role, executable=True))
+        for role, path in sorted(resolved, key=lambda item: item[0])
+    ]
 
 
 def _validate_source(path, role, *, executable):
@@ -1233,6 +1244,10 @@ def _build_parser():
         help="部署安装器普通构建用户专用的隔离输出目录",
     )
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--check-native-inputs", action="store_true",
+        help="只检查预先构建的原生 LIO 文件，不构建、不封存、不启动算法",
+    )
     modes.add_argument("--stage-only", type=Path, metavar="PARENT")
     modes.add_argument("--finalize-existing-stage", type=Path, metavar="EXACT_STAGE_DIR")
     return parser
@@ -1313,10 +1328,15 @@ def main(argv=None):
         return _finalize_existing_stage(args, manifests)
 
     # legacy 是 root 私有一体化发布；安装器模式则仅写入普通构建用户隔离目录。
-    if args.stage_only is None and args.installer_output_root is None and os.geteuid() != 0:
+    if (not args.check_native_inputs and args.stage_only is None
+            and args.installer_output_root is None and os.geteuid() != 0):
         raise RuntimeError("legacy 一体化发布必须由 root owner 执行")
     profile_contract = _profile_native_lio_contract(_PROFILE_PATH)
     native_lio = _parse_native_lio(args.native_lio, profile_contract)
+    if args.check_native_inputs:
+        for role, path in native_lio:
+            print("已确认预构建原生 LIO 输入: %s=%s" % (role, path))
+        return 0
     if args.stage_only is not None:
         stage = _build_and_stage(args, native_lio, manifests, args.stage_only)
         print(str(stage))

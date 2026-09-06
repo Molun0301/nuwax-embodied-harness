@@ -520,16 +520,27 @@ def _geometry_release_action(
     if not isinstance(native_payloads, list) or not native_payloads:
         raise ValueError("geometry_release.native_lio_payloads must be a non-empty list")
 
-    builds_by_binary = {build.binary: build for build in profile.rust.builds if build.binary}
     native_paths: List[Path] = []
+    native_roles = set()
     for item in native_payloads:
         if not isinstance(item, dict) or set(item) != {"role", "source"}:
             raise ValueError("geometry_release native LIO entries must contain role and source")
+        role = item.get("role")
         source = item.get("source")
-        build = builds_by_binary.get(source) if isinstance(source, str) else None
-        if build is None:
-            raise ValueError(f"geometry_release source has no Rust build: {source}")
-        native_paths.append(options.rust_target_dir(build.manifest) / "release" / source)
+        if role not in ("fastlio2", "pointlio") or source != f"{role}_native":
+            raise ValueError(
+                "geometry_release 原生 LIO role/source 必须匹配真实 C++ 程序，"
+                f"不得使用 Rust 离线程序：role={role!r} source={source!r}"
+            )
+        if role in native_roles:
+            raise ValueError(f"geometry_release 原生 LIO role 重复：{role}")
+        native_roles.add(role)
+        # 这里只引用按原生构建规范预先生成的程序；计划渲染不构建或创建占位文件。
+        native_paths.append(
+            options.source_root
+            / "services/nuwax-workspace/crates/nuwax-lio-backends/native"
+            / role / "cpp/result/bin" / source
+        )
 
     _cargo_home, rustup_home, _build_user_bin = _build_user_rust_paths()
     cargo = str(options.toolchain_bin / "cargo")
@@ -570,7 +581,8 @@ def _geometry_release_action(
         argv.extend(("--native-lio", str(path)))
     return Action.command(
         "build-geometry-release",
-        "build verified Geometry release manifest and artifact generation",
+        "使用预先构建的 C++ 原生 LIO 程序封存 Geometry 发布制品（不重建原生程序）："
+        + ", ".join(str(path) for path in native_paths),
         argv,
         cwd=options.source_root,
         env=env,
@@ -610,7 +622,17 @@ def build_deployment_plan(
     ) + tuple(_cargo_action(profile, options, build) for build in profile.rust.builds)
     geometry_release_action = _geometry_release_action(profile, options)
     if geometry_release_action is not None:
-        rust_actions += (geometry_release_action,)
+        native_input_check = Action.command(
+            "check-geometry-native-inputs",
+            "先检查预先构建的 C++ 原生 LIO 文件，再开始 Rust 构建（不启动算法）",
+            (*geometry_release_action.argv, "--check-native-inputs"),
+            cwd=geometry_release_action.cwd,
+            env=geometry_release_action.env,
+            as_build_user=geometry_release_action.as_build_user,
+            network_isolated=geometry_release_action.network_isolated,
+            timeout=30,
+        )
+        rust_actions = (native_input_check,) + rust_actions + (geometry_release_action,)
 
     admission_actions: List[Action] = []
     if options.offline_bundle:

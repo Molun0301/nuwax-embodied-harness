@@ -16,10 +16,6 @@
 //! - env 解析入口统一走 `channel_registry`
 
 use nuwax_codec::{lcm::schema, CodecError, CodecResult};
-use nuwax_lio_backends::{
-    BackendKind, Go2ImuSample, Go2L2AdapterConfig, Go2PointCloud2, Go2PointField, LioBackendSlot,
-    LioInputFrame, LioOutputFrame,
-};
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use prost::Message;
 use std::sync::{
@@ -70,7 +66,6 @@ pub struct GeometryRuntimeService {
     /// Native mode publishes raw cloud and IMU to generation-private channels.
     native_raw_input_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
     native_raw_sensor_frame: Option<String>,
-    lio_input_backend: Option<Arc<parking_lot::Mutex<LioBackendSlot>>>,
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
     deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
@@ -282,17 +277,6 @@ fn configured_base_frame() -> String {
         std::env::var("NUWAX_BASE_FRAME").ok().as_deref(),
         std::env::var("NUWAX_GEOMETRY_BASE_FRAME").ok().as_deref(),
     )
-}
-
-fn configured_lio_input_backend() -> Option<Arc<parking_lot::Mutex<LioBackendSlot>>> {
-    let kind = match std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").ok()?.as_str() {
-        "fastlio2" => BackendKind::FastLio2,
-        "pointlio" => BackendKind::PointLio,
-        _ => return None,
-    };
-    let mut slot = LioBackendSlot::new();
-    slot.start(kind).ok()?;
-    Some(Arc::new(parking_lot::Mutex::new(slot)))
 }
 
 fn resolve_base_frame_alias(preferred: Option<&str>, legacy: Option<&str>) -> String {
@@ -710,7 +694,6 @@ impl GeometryRuntimeService {
             point_cloud_binding: Some(point_cloud_binding),
             native_raw_input_binding: None,
             native_raw_sensor_frame: None,
-            lio_input_backend: configured_lio_input_backend(),
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
             deferred_replay: None,
@@ -776,7 +759,6 @@ impl GeometryRuntimeService {
             point_cloud_binding,
             native_raw_input_binding,
             native_raw_sensor_frame,
-            lio_input_backend: configured_lio_input_backend(),
             mapping_transition: shutdown.mapping_transition.clone(),
             deferred_replay: shutdown.deferred_replay.clone(),
             shutdown: Some(shutdown),
@@ -4333,152 +4315,6 @@ fn validate_runtime_point_fields(fields: &[PointCloudField], point_step: u32) ->
     Ok(())
 }
 
-fn adapt_go2_l2_request(
-    request: &PublishPointCloudRequest,
-    body_frame_id: &str,
-) -> Result<LioInputFrame, String> {
-    if request.imu_samples.is_empty() {
-        return Err("Go2 L2 native ingress requires at least one IMU sample".into());
-    }
-    let transform = crate::native_lio_owner::BodyFromSensorTransform::from_env()?;
-    const BODY_FROM_IMU_ENV: &str = "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU";
-    let imu_transform_raw = std::env::var(BODY_FROM_IMU_ENV)
-        .map_err(|_| format!("Go2 L2 native ingress requires env {BODY_FROM_IMU_ENV}"))?;
-    let imu_transform = crate::native_lio_owner::BodyFromSensorTransform::from_json_for_env(
-        &imu_transform_raw,
-        BODY_FROM_IMU_ENV,
-    )?;
-    let fields = request
-        .fields
-        .iter()
-        .map(|field| {
-            Ok(Go2PointField {
-                name: field.name.clone(),
-                offset: field.offset,
-                datatype: u8::try_from(field.datatype)
-                    .map_err(|_| "point field datatype exceeds uint8".to_string())?,
-                count: field.count,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let timestamp_ns = i64::try_from(request.timestamp_ns)
-        .map_err(|_| "point cloud timestamp exceeds int64".to_string())?;
-    let point_count = if request.point_count == 0 {
-        request.points.len() / usize::try_from(request.point_step).unwrap_or(usize::MAX)
-    } else {
-        usize::try_from(request.point_count).map_err(|_| "point count exceeds usize".to_string())?
-    };
-    let row_step = request
-        .point_step
-        .checked_mul(u32::try_from(point_count).map_err(|_| "point count exceeds uint32")?)
-        .ok_or_else(|| "point cloud row_step overflowed".to_string())?;
-    let cloud = Go2PointCloud2 {
-        timestamp_ns,
-        frame_id: request.frame_id.clone(),
-        height: 1,
-        width: u32::try_from(point_count).map_err(|_| "point count exceeds uint32")?,
-        fields,
-        is_bigendian: false,
-        point_step: request.point_step,
-        row_step,
-        data: request.points.clone(),
-    };
-    let imu = request
-        .imu_samples
-        .iter()
-        .map(|sample| {
-            if sample.frame_id.trim().is_empty() {
-                return Err("IMU source frame_id must be non-empty".to_string());
-            }
-            let accel_mps2 = imu_transform.rotate_vector([
-                sample.accel_mps2_x,
-                sample.accel_mps2_y,
-                sample.accel_mps2_z,
-            ]);
-            let gyro_rps = imu_transform.rotate_vector([
-                sample.gyro_rps_x,
-                sample.gyro_rps_y,
-                sample.gyro_rps_z,
-            ]);
-            Ok(Go2ImuSample {
-                timestamp_ns: i64::try_from(sample.timestamp_ns)
-                    .map_err(|_| "IMU timestamp exceeds int64".to_string())?,
-                frame_id: body_frame_id.to_string(),
-                accel_mps2,
-                gyro_rps,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let config = Go2L2AdapterConfig {
-        lidar_frame_id: request.frame_id.clone(),
-        imu_frame_id: body_frame_id.to_string(),
-        body_frame_id: body_frame_id.to_string(),
-        lidar_to_body_translation_m: transform.translation_m(),
-        lidar_to_body_rotation_row_major: transform.rotation_row_major(),
-    };
-    config.adapt(&cloud, &imu)
-}
-
-fn encode_lio_output_payload(output: &LioOutputFrame) -> CodecResult<Vec<u8>> {
-    let mut points = Vec::with_capacity(output.registered_cloud.points.len() * 20);
-    for point in &output.registered_cloud.points {
-        points.extend_from_slice(&(point.x as f32).to_le_bytes());
-        points.extend_from_slice(&(point.y as f32).to_le_bytes());
-        points.extend_from_slice(&(point.z as f32).to_le_bytes());
-        points.extend_from_slice(&(point.intensity as f32).to_le_bytes());
-        points.extend_from_slice(
-            &u32::try_from(point.offset_ns)
-                .map_err(|_| CodecError::LcmEncode("point offset_ns exceeds uint32".into()))?
-                .to_le_bytes(),
-        );
-    }
-    let request = PublishPointCloudRequest {
-        points,
-        point_step: 20,
-        frame_id: output.registered_cloud.frame_id.clone(),
-        timestamp_ns: u64::try_from(output.registered_cloud.timestamp_ns)
-            .map_err(|_| CodecError::LcmEncode("registered cloud timestamp is negative".into()))?,
-        fields: vec![
-            PointCloudField {
-                name: "x".into(),
-                offset: 0,
-                datatype: 7,
-                count: 1,
-            },
-            PointCloudField {
-                name: "y".into(),
-                offset: 4,
-                datatype: 7,
-                count: 1,
-            },
-            PointCloudField {
-                name: "z".into(),
-                offset: 8,
-                datatype: 7,
-                count: 1,
-            },
-            PointCloudField {
-                name: "intensity".into(),
-                offset: 12,
-                datatype: 7,
-                count: 1,
-            },
-            PointCloudField {
-                name: "offset_ns".into(),
-                offset: 16,
-                datatype: 6,
-                count: 1,
-            },
-        ],
-        point_count: u32::try_from(output.registered_cloud.points.len()).map_err(|_| {
-            CodecError::LcmEncode("registered cloud point count exceeds uint32".into())
-        })?,
-        is_dense: true,
-        imu_samples: Vec::new(),
-    };
-    encode_pointcloud_request_payload(&request)
-}
-
 fn validate_native_raw_pointcloud_fields(request: &PublishPointCloudRequest) -> CodecResult<()> {
     if request.fields.is_empty() {
         return Err(CodecError::LcmEncode(
@@ -7481,29 +7317,13 @@ impl GeometryRuntime for GeometryRuntimeService {
             }));
         }
 
-        let payload = if pcr.imu_samples.is_empty() {
-            encode_pointcloud_request_payload(pcr)
-        } else {
-            let adapted = adapt_go2_l2_request(pcr, &self.base_frame_id).and_then(|frame| {
-                let backend = self.lio_input_backend.as_ref().ok_or_else(|| {
-                    "Go2 L2 IMU ingress requires fastlio2 or pointlio backend".to_string()
-                })?;
-                backend.lock().process(&frame)
-            });
-            match adapted {
-                Ok(output) => encode_lio_output_payload(&output),
-                Err(error) => {
-                    tracing::warn!(
-                        "publish_point_cloud: Go2 L2 adapter/backend rejected input: {}",
-                        error
-                    );
-                    return Ok(Response::new(PublishResult {
-                        success: false,
-                        message: format!("Go2 L2 adapter/backend rejected input: {}", error),
-                    }));
-                }
-            }
-        };
+        // 带惯性的原始输入只能交给已绑定的真实原生算法，不能在缺少绑定时改算简化模型。
+        if !pcr.imu_samples.is_empty() {
+            return Err(Status::failed_precondition(
+                "带惯性的点云需要已绑定的原生LIO输入通道",
+            ));
+        }
+        let payload = encode_pointcloud_request_payload(pcr);
         let payload = match payload {
             Ok(payload) => payload,
             Err(error) => {
@@ -7960,57 +7780,43 @@ mod pointcloud_request_tests {
         );
     }
 
-    #[test]
-    fn go2_l2_rpc_request_reaches_canonical_adapter_with_imu_and_extrinsic() {
-        let previous = std::env::var_os(crate::native_lio_owner::BODY_FROM_SENSOR_ENV);
-        let previous_imu = std::env::var_os("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU");
-        std::env::set_var(
-            crate::native_lio_owner::BODY_FROM_SENSOR_ENV,
-            r#"{"translation_m":[1,2,3],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
+    #[tokio::test]
+    async fn imu_pointcloud_without_native_binding_is_rejected_without_publish() {
+        let handle = crate::lcm_runtime::build_handle_for_tests()
+            .await
+            .expect("测试几何运行时");
+        let provider = handle
+            .transport
+            .shared_lcm_context()
+            .expect("测试共享通信上下文")
+            .provider()
+            .to_string();
+        let observer = nuwax_transport::LcmTransport::new_real(&provider)
+            .expect("独立观察者");
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let binding = (
+            LcmTopic::new(&format!("/t/no-lio/{}", &unique[..16])).expect("测试话题"),
+            LcmMessageType::new("sensor_msgs/PointCloud2").expect("点云类型"),
         );
-        std::env::set_var(
-            "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU",
-            r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
-        );
-        let mut request = request();
-        request.imu_samples.push(LioImuSample {
-            timestamp_ns: request.timestamp_ns - 1_000,
-            frame_id: "body".into(),
-            accel_mps2_x: 1.0,
-            accel_mps2_y: -2.0,
+        let mut frames = observer
+            .subscribe(binding.0.clone(), Some(binding.1.clone()))
+            .await;
+        let service = GeometryRuntimeService::new_with_point_cloud_binding(handle, binding);
+        let mut input = request();
+        input.imu_samples.push(LioImuSample {
+            timestamp_ns: input.timestamp_ns - 1_000,
+            frame_id: input.frame_id.clone(),
             accel_mps2_z: 9.81,
-            gyro_rps_x: 0.1,
-            gyro_rps_y: -0.2,
-            gyro_rps_z: 0.3,
             ..LioImuSample::default()
         });
-
-        let frame = adapt_go2_l2_request(&request, "body").expect("adapt Go2 L2 request");
-        assert_eq!(frame.cloud.timestamp_ns, request.timestamp_ns as i64);
-        assert_eq!(frame.cloud.frame_id, "body");
-        assert_eq!(
-            [
-                frame.cloud.points[0].x,
-                frame.cloud.points[0].y,
-                frame.cloud.points[0].z
-            ],
-            [2.0, 4.0, 6.0]
-        );
-        assert_eq!(
-            frame.imu[0].timestamp_ns,
-            request.timestamp_ns as i64 - 1_000
-        );
-        assert_eq!(frame.imu[0].accel_mps2, [1.0, -2.0, 9.81]);
-        assert_eq!(frame.imu[0].gyro_rps, [0.1, -0.2, 0.3]);
-
-        match previous {
-            Some(value) => std::env::set_var(crate::native_lio_owner::BODY_FROM_SENSOR_ENV, value),
-            None => std::env::remove_var(crate::native_lio_owner::BODY_FROM_SENSOR_ENV),
-        }
-        match previous_imu {
-            Some(value) => std::env::set_var("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", value),
-            None => std::env::remove_var("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU"),
-        }
+        let error = GeometryRuntime::publish_point_cloud(&service, Request::new(input))
+            .await
+            .expect_err("未绑定原生通道不能消费惯性生成替代位姿");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("原生LIO输入通道"));
+        assert!(tokio::time::timeout(Duration::from_millis(80), frames.next())
+            .await
+            .is_err(), "拒绝输入后不能发布替代点云");
     }
 
     #[test]

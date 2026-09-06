@@ -115,11 +115,6 @@ impl BodyFromSensorTransform {
         Point3::from(self.data.rotation * sensor_point.coords + self.data.translation_m)
     }
 
-    pub(crate) fn rotate_vector(&self, sensor_vector: [f64; 3]) -> [f64; 3] {
-        let rotated = self.data.rotation * Vector3::from_row_slice(&sensor_vector);
-        [rotated[0], rotated[1], rotated[2]]
-    }
-
     pub(crate) fn translation_m(&self) -> [f64; 3] {
         std::array::from_fn(|index| self.data.translation_m[index])
     }

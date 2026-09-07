@@ -115,6 +115,8 @@ class Go2DataPlaneConfig:
     direct_dds: Go2DirectDdsConfig = field(default_factory=Go2DirectDdsConfig)
     official: Go2OfficialControlConfig = field(default_factory=Go2OfficialControlConfig)
     video_stream: Go2VideoStreamConfig = field(default_factory=Go2VideoStreamConfig)
+    lio_body_from_sensor: str = ""
+    lio_body_from_imu: str = ""
 
 
 def load_go2_data_plane_config(
@@ -138,6 +140,8 @@ def load_go2_data_plane_config(
             getattr(platform_geometry, "lio_backend", "device") if platform_geometry is not None
             else os.environ.get("NUWAX_GEOMETRY_LIO_BACKEND", "device")
         ).strip(),
+        lio_body_from_sensor=_cfg_str("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
+        lio_body_from_imu=_cfg_str("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
         direct_dds=Go2DirectDdsConfig(
             enabled=_cfg_bool("GO2_DIRECT_DDS_ENABLED", True),
             pose_topic=_cfg_str("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),

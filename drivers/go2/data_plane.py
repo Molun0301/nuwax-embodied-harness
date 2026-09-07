@@ -21,7 +21,11 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CH
 
 import numpy as np
 
-from adapters.sensors.go2_calibration import GO2_CALIBRATION_PROFILE
+from adapters.sensors.go2_calibration import (
+    GO2_CALIBRATION_PROFILE,
+    Go2CalibrationProfile,
+    go2_calibration_profile_from_config,
+)
 from adapters.sensors.go2_l2 import (
     Go2L2DecodeError,
     adapt_go2_l2_imu,
@@ -45,8 +49,6 @@ LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
 _STATIONARY_YAW_RATE_FILTER_TAU_SEC = 0.5
 _MAX_STATIONARY_YAW_SAMPLE_GAP_SEC = 1.0
 _GO2_UTLIDAR_FRAME = GO2_CALIBRATION_PROFILE.lidar_source_frame
-_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M = GO2_CALIBRATION_PROFILE.lidar_translation_m
-_GO2_BODY_FROM_UTLIDAR_PITCH_RAD = GO2_CALIBRATION_PROFILE.lidar_rpy_rad[1]
 _POINT_CLOUD_POSE_HISTORY_SIZE = 256
 _MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
 _NATIVE_IMU_READER_HISTORY_DEPTH = 256
@@ -165,30 +167,14 @@ def _quaternion_rotation_matrix(quaternion: Quaternion) -> np.ndarray:
 def _transform_utlidar_xyz_to_odom(
     points_xyz: np.ndarray,
     pose: Pose,
+    calibration_profile: Go2CalibrationProfile = GO2_CALIBRATION_PROFILE,
 ) -> np.ndarray:
-    # Go2 URDF: base_link <- utlidar_lidar.
-    cosine = math.cos(_GO2_BODY_FROM_UTLIDAR_PITCH_RAD)
-    sine = math.sin(_GO2_BODY_FROM_UTLIDAR_PITCH_RAD)
-    body_from_lidar_rotation = np.asarray(
-        [
-            [cosine, 0.0, sine],
-            [0.0, 1.0, 0.0],
-            [-sine, 0.0, cosine],
-        ],
-        dtype=np.float64,
-    )
-    body_from_lidar_translation = np.asarray(
-        _GO2_BODY_FROM_UTLIDAR_TRANSLATION_M,
-        dtype=np.float64,
-    )
     odom_from_body_rotation = _quaternion_rotation_matrix(pose.orientation)
     odom_from_body_translation = np.asarray(
         [pose.position.x, pose.position.y, pose.position.z],
         dtype=np.float64,
     )
-    points_in_body = (
-        np.asarray(points_xyz, dtype=np.float64) @ body_from_lidar_rotation.T
-    ) + body_from_lidar_translation
+    points_in_body = calibration_profile.transform_lidar_xyz(points_xyz)
     points_in_odom = (
         points_in_body @ odom_from_body_rotation.T
     ) + odom_from_body_translation
@@ -283,6 +269,12 @@ class Go2DirectDdsBridge:
 
     def __init__(self, config: "Go2DataPlaneConfig") -> None:
         self.config = config
+        # 原生定位两类样本共用创建时标定；设备自带模式不消费或验证定位覆盖。
+        self._calibration_profile = (
+            go2_calibration_profile_from_config(config.lio_body_from_sensor, config.lio_body_from_imu)
+            if config.lio_backend in {"fastlio2", "pointlio"}
+            else GO2_CALIBRATION_PROFILE
+        )
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_generation = 0
@@ -898,6 +890,7 @@ class Go2DirectDdsBridge:
         if imu_state is not None:
             try:
                 canonical_imu_sample = adapt_go2_l2_imu(
+                    calibration_profile=self._calibration_profile,
                     timestamp_ns=int(imu_source_timestamp_ns),
                     frame_id=imu_state.frame_id,
                     accel_mps2=(
@@ -1183,6 +1176,7 @@ class Go2DirectDdsBridge:
             canonical_lidar_frame = (
                 adapt_go2_l2_lidar(
                     decoded,
+                    calibration_profile=self._calibration_profile,
                     timestamp_ns=source_timestamp_ns,
                     source_sequence=source_timestamp_ns,
                     registration_state=(
@@ -1233,6 +1227,7 @@ class Go2DirectDdsBridge:
                     xyz_array = _transform_utlidar_xyz_to_odom(
                         xyz_array,
                         pose_snapshot.pose,
+                        self._calibration_profile,
                     )
                 except (TypeError, ValueError) as exc:
                     reject(f"utlidar_lidar 到 odom 坐标变换失败：{exc}")
@@ -1352,14 +1347,24 @@ class Go2DirectDdsBridge:
                     "pose_sample_skew_sec": pose_sample_skew_sec,
                     "max_pose_sample_skew_sec": _MAX_POINT_CLOUD_POSE_SKEW_SEC,
                     "body_from_sensor_translation_m": (
-                        list(_GO2_BODY_FROM_UTLIDAR_TRANSLATION_M)
+                        list(self._calibration_profile.lidar_translation_m)
                         if driver_sensor_to_odom_applied
                         else []
                     ),
                     "body_from_sensor_rpy_rad": (
-                        [0.0, _GO2_BODY_FROM_UTLIDAR_PITCH_RAD, 0.0]
+                        list(self._calibration_profile.lidar_rpy_rad)
                         if driver_sensor_to_odom_applied
                         else []
+                    ),
+                    "body_from_sensor_rotation_row_major": (
+                        self._calibration_profile.lidar_rotation.ravel().tolist()
+                        if driver_sensor_to_odom_applied
+                        else []
+                    ),
+                    "calibration_ref": (
+                        canonical_lidar_frame.calibration_ref
+                        if canonical_lidar_frame is not None
+                        else None
                     ),
                     "yaw_stabilization_applied": yaw_stabilization_applied,
                     "yaw_stabilization_offset_rad": yaw_stabilization_offset_rad,

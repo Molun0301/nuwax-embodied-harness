@@ -473,10 +473,12 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "drivers/go2/settings.py",
+      "drivers/go2/data_plane.py"
     ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": "单行 JSON（结构化文本），包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个旋转矩阵元素）；来自机器人实际标定。"
+    "apply_scope": "重启机器人数据面及几何运行时后生效；停止建图或数据断线重连不会重载",
+    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将雷达坐标转换到机体，来自实际标定。Go2数据面创建时与惯性外参共同捕获；数据面留空沿用模型默认，原生定位仍要求明确提供有效外参。"
   },
   "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU": {
     "zh_name": "惯性传感器到机体外参",
@@ -485,10 +487,11 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/server.rs"
+      "drivers/go2/settings.py",
+      "drivers/go2/data_plane.py"
     ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": "单行 JSON（结构化文本），包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个旋转矩阵元素）；来自机器人实际标定。"
+    "apply_scope": "重启机器人数据面及几何运行时后生效；停止建图或数据断线重连不会重载",
+    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将惯性传感器坐标转换到机体，来自实际标定。Go2数据面与雷达外参共同捕获，留空沿用模型默认；加速度和角速度只应用旋转，平移不作用于向量。"
   },
   "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": {
     "zh_name": "原生定位后端程序",

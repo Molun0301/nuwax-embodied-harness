@@ -456,6 +456,12 @@ _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES = (
     | _GUARD_ONLY_CAPABILITY_NAMES
     | _PERSON_FOLLOW_CAPABILITY_NAMES
 )
+# 资产激活/完成不要求实时观测；其余实时功能只补齐装配实际声明的输入源。
+_LIVE_GEOMETRY_INPUT_CAPABILITY_NAMES = (
+    _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES
+    - _GUARD_ONLY_CAPABILITY_NAMES
+    - {"activate_map", "finalize_active_map"}
+)
 _MOTION_ADMISSION_BYPASS_CAPABILITY_NAMES = frozenset(
     {
         "stop_all_motion",
@@ -1164,6 +1170,7 @@ class GatewayRuntime:
 
         # The input bridge starts only after the Rust geometry gRPC endpoint is ready.
         self._input_bridge: Optional[RuntimeInputBridge] = None
+        self._input_bridge_started = False
 
     def _attach_geometry_runtime_on_start(self) -> bool:
         """Attach and probe the systemd-owned geometry sidecar at startup.
@@ -1425,7 +1432,8 @@ class GatewayRuntime:
                         ),
                     },
                 )
-            self._stop_runtime_input_bridge()
+            if self._stop_runtime_input_bridge() is False and stop_error is None:
+                stop_error = RuntimeError("传感器输入桥未完成关闭。")
             cleanup_steps = (
                 ("geometry runtime", self.platform_geometry_runtime.stop),
                 ("audio service", self.audio_service.stop),
@@ -10284,17 +10292,46 @@ class GatewayRuntime:
     # Sensor input bridge lifecycle. Motion actuation is owned by the external guard.
     # ------------------------------------------------------------------
 
-    def _start_runtime_input_bridge(self) -> None:
-        """构造并启动 RuntimeInputBridge；要求 geometry runtime 已连。"""
+    def _requires_runtime_input_bridge(self, capability_name: str) -> bool:
+        """仅实时能力且装配声明流式来源时，输入桥属于本次确保范围。"""
 
-        if self._input_bridge is not None:
-            return
+        if capability_name not in _LIVE_GEOMETRY_INPUT_CAPABILITY_NAMES:
+            return False
+        providers = getattr(getattr(self, "robot", None), "providers", None)
+        return isinstance(providers, (
+            StreamingSensorSampleProvider,
+            StreamingLocalizationProvider,
+            StreamingPointCloudProvider,
+        ))
+
+    def _runtime_input_bridge_ready(self) -> bool:
+        """仅当前提供器对应且完整启动成功的输入桥可供能力复用。"""
+
+        bridge = getattr(self, "_input_bridge", None)
+        if bridge is None or not getattr(self, "_input_bridge_started", False):
+            return False
+        provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
+        return bool(
+            provider is not None
+            and bridge.runtime_provider is provider
+            and bridge.is_ready()
+        )
+
+    def _start_runtime_input_bridge(self) -> bool:
+        """由共享启动事件拥有者补齐当前提供器的桥，旧桥排空后才替换。"""
+
+        if getattr(self, "_closed", False):
+            return False
         remote_provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
         if remote_provider is None:
             RUNTIME_LOGGER.warning(
                 "RuntimeInputBridge: geometry runtime 尚未就绪，跳过本轮启动。",
             )
-            return
+            return False
+        if self._runtime_input_bridge_ready():
+            return True
+        if self._input_bridge is not None and not self._stop_runtime_input_bridge():
+            return False
         providers = getattr(self.robot, "providers", None)
         localization_provider = providers if providers is not None and isinstance(
             providers, StreamingLocalizationProvider
@@ -10309,33 +10346,46 @@ class GatewayRuntime:
             point_cloud_provider=point_cloud_provider,
             sensor_sample_provider=sensor_sample_provider,
         )
-        if not bridge.start():
-            status = bridge.get_status()
-            RUNTIME_LOGGER.warning(
-                "RuntimeInputBridge 启动失败 readiness=false counters=%s",
-                status.get("counters"),
-            )
-            return
+        # 先接管资源引用，完整启动后才提交可复用状态；回滚失败仍保留清理拥有权。
         self._input_bridge = bridge
-        RUNTIME_LOGGER.info(
-            "RuntimeInputBridge 已接入 gateway lifecycle "
-            "(localization=%s, pointcloud=%s)。",
-            localization_provider is not None,
-            point_cloud_provider is not None,
-        )
+        self._input_bridge_started = False
+        try:
+            if not bridge.start() or not bridge.is_ready():
+                status = bridge.get_status()
+                RUNTIME_LOGGER.warning(
+                    "RuntimeInputBridge 启动失败 readiness=false counters=%s",
+                    status.get("counters"),
+                )
+                return False
+            if self.platform_geometry_runtime.get_geometry_runtime_provider() is not remote_provider:
+                RUNTIME_LOGGER.warning("RuntimeInputBridge 启动期间 Geometry 提供器已更换，回收旧绑定。")
+                return False
+            RUNTIME_LOGGER.info(
+                "RuntimeInputBridge 已接入 gateway lifecycle "
+                "(localization=%s, pointcloud=%s)。",
+                localization_provider is not None,
+                point_cloud_provider is not None,
+            )
+            self._input_bridge_started = True
+            return True
+        finally:
+            if not self._input_bridge_started:
+                self._stop_runtime_input_bridge()
 
-    def _stop_runtime_input_bridge(self) -> None:
+    def _stop_runtime_input_bridge(self) -> bool:
         """注销 RuntimeInputBridge 订阅，幂等。"""
 
         bridge = self._input_bridge
+        self._input_bridge_started = False
         if bridge is None:
-            return
+            return True
         try:
             bridge.stop()
         except Exception:
             RUNTIME_LOGGER.exception("RuntimeInputBridge.stop 异常。")
-        finally:
-            self._input_bridge = None
+            return False
+        self._input_bridge = None
+        return True
 
     def _mark_geometry_cmd_vel_sink_unavailable(self) -> None:
         """Keep Rust navigation readiness false: Gateway owns no LCM actuator sink."""
@@ -13139,7 +13189,9 @@ class GatewayRuntime:
         provider_ready = False
         if activation_level in {"geometry", "motion", "person_follow"}:
             provider_ready, _ = self._geometry_runtime_provider_ready()
-        if activation_level == "geometry" and provider_ready:
+        if activation_level == "geometry" and provider_ready and (
+            not self._requires_runtime_input_bridge(capability_name) or self._runtime_input_bridge_ready()
+        ):
             return
         if capability_name in _SYNC_GEOMETRY_CAPABILITY_NAMES:
             self._ensure_geometry_runtime_started(capability_name)
@@ -13416,6 +13468,7 @@ class GatewayRuntime:
             "motion",
             "person_follow",
         }
+        requires_input_bridge = requires_geometry and self._requires_runtime_input_bridge(capability_name)
 
         def ensure_activation_deadline() -> None:
             if (
@@ -13427,6 +13480,13 @@ class GatewayRuntime:
                     grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
                     grpc_details="parent task deadline exhausted during activation",
                 )
+            if getattr(self, "_closed", False):
+                raise GatewayError(
+                    "网关运行时已关闭，不能启动输入桥。",
+                    error_code="gateway_runtime_closed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                )
 
         while True:
             ensure_activation_deadline()
@@ -13435,12 +13495,15 @@ class GatewayRuntime:
                 provider_ready, _ = self._geometry_runtime_provider_ready(
                     deadline_monotonic=deadline_monotonic,
                 )
-            if activation_level == "geometry" and provider_ready:
-                return
+            input_bridge_ready = not requires_input_bridge or (
+                provider_ready and self._runtime_input_bridge_ready()
+            )
             if activation_level == "guard" and self.motion_guard.started:
                 return
             with self._geometry_runtime_lock:
                 event = self._geometry_runtime_start_event
+                if event is None and activation_level == "geometry" and provider_ready and input_bridge_ready:
+                    return
                 should_start = event is None
                 if should_start:
                     event = threading.Event()
@@ -13459,18 +13522,22 @@ class GatewayRuntime:
                 provider_ready, _ = self._geometry_runtime_provider_ready(
                     deadline_monotonic=deadline_monotonic,
                 )
-                if provider_ready and self.motion_guard.started:
+                if provider_ready and self.motion_guard.started and (
+                    not requires_input_bridge or self._runtime_input_bridge_ready()
+                ):
                     if activation_level == "motion":
                         return
                     if self._person_follow_readiness().ready:
                         return
         if should_start:
             try:
-                self._request_geometry_runtime_activation(
-                    capability_name,
-                    activation_level,
-                    deadline_monotonic=deadline_monotonic,
-                )
+                # 健康 Geometry 只缺输入桥时不重复请求外部服务激活。
+                if activation_level != "geometry" or not provider_ready:
+                    self._request_geometry_runtime_activation(
+                        capability_name,
+                        activation_level,
+                        deadline_monotonic=deadline_monotonic,
+                    )
                 ensure_activation_deadline()
                 if requires_geometry:
                     provider_ready, provider_message = (
@@ -13487,7 +13554,13 @@ class GatewayRuntime:
                                 operation="geometry_runtime_restart",
                             )
                             ensure_activation_deadline()
-                            self._stop_runtime_input_bridge()
+                            if self._stop_runtime_input_bridge() is False:
+                                raise GatewayError(
+                                    "旧输入桥尚未完成关闭，不能更换 Geometry 提供器。",
+                                    error_code="geometry_input_bridge_unavailable",
+                                    http_status=503,
+                                    jsonrpc_code=-32010,
+                                )
                             self.platform_geometry_runtime.stop()
                         ensure_activation_deadline()
                         self.platform_geometry_runtime.start()
@@ -13508,7 +13581,31 @@ class GatewayRuntime:
                                 },
                             )
                         self._mark_geometry_cmd_vel_sink_unavailable()
-                        self._start_runtime_input_bridge()
+                    if requires_input_bridge:
+                        ensure_activation_deadline()
+                        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+                        if lifecycle_lock is not None and not lifecycle_lock.acquire(blocking=False):
+                            raise GatewayError(
+                                "网关正在启停，当前不能补齐传感器输入桥。",
+                                error_code="geometry_input_bridge_unavailable",
+                                http_status=503,
+                                jsonrpc_code=-32010,
+                            )
+                        try:
+                            ensure_activation_deadline()
+                            self._start_runtime_input_bridge()
+                        finally:
+                            if lifecycle_lock is not None:
+                                lifecycle_lock.release()
+                        ensure_activation_deadline()
+                        if not self._runtime_input_bridge_ready():
+                            raise GatewayError(
+                                "Geometry 提供器已连接，但当前传感器输入桥未就绪。",
+                                error_code="geometry_input_bridge_unavailable",
+                                http_status=503,
+                                jsonrpc_code=-32010,
+                                details={"capability_name": capability_name, "activation_level": activation_level},
+                            )
                 if activation_level == "person_follow":
                     readiness = self._person_follow_readiness()
                     if not readiness.ready:
@@ -13538,18 +13635,19 @@ class GatewayRuntime:
                     },
                 ) from exc
             finally:
-                event.set()
                 with self._geometry_runtime_lock:
-                    self._geometry_runtime_start_event = None
+                    if self._geometry_runtime_start_event is event:
+                        self._geometry_runtime_start_event = None
+                    event.set()
         if not requires_geometry:
             return
         provider_ready, provider_message = self._geometry_runtime_provider_ready(
             deadline_monotonic=deadline_monotonic,
         )
-        if not provider_ready:
+        if not provider_ready or (requires_input_bridge and not self._runtime_input_bridge_ready()):
             runtime_status = self.platform_geometry_runtime.get_runtime_status()
             raise GatewayError(
-                provider_message
+                (provider_message if not provider_ready else "Geometry 输入桥未绑定当前提供器。")
                 or str(runtime_status.get("message") or "平台几何运行时未就绪。"),
                 error_code="geometry_runtime_unavailable",
                 http_status=503,

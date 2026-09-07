@@ -15,6 +15,8 @@ from contracts.sensors import (
     SensorErrorCode,
 )
 
+# 待配扫描容纳短时惯性迟到；已完成配组的下游发布队列仍独立限额。
+DEFAULT_MAX_LIDAR_FRAMES = 16
 DEFAULT_MAX_IMU_SAMPLES = 4096
 
 
@@ -30,7 +32,7 @@ class LioMeasurementAssembler:
     """以有界队列组装扫描开始和结束均被 IMU 覆盖的测量组。"""
 
     def __init__(
-        self, max_lidar_frames: int = 4, max_imu_samples: int = DEFAULT_MAX_IMU_SAMPLES
+        self, max_lidar_frames: int = DEFAULT_MAX_LIDAR_FRAMES, max_imu_samples: int = DEFAULT_MAX_IMU_SAMPLES
     ) -> None:
         if max_lidar_frames <= 0 or max_imu_samples <= 0:
             raise ValueError("LiDAR 与 IMU 队列上限必须为正数")

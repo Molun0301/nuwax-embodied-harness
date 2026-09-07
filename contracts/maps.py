@@ -19,6 +19,22 @@ class OccupancyGrid(TimestampedContract):
     origin: Pose = Field(description="地图原点位姿。")
     data: List[int] = Field(default_factory=list, description="一维行优先栅格数据，范围为 -1 到 100。")
 
+    def __deepcopy__(self, memo: Optional[dict] = None) -> "OccupancyGrid":
+        """复制整数栅格时免去逐格递归，其它字段仍沿模型完整深复制。"""
+
+        if memo is None:
+            memo = {}
+        if type(self) is OccupancyGrid:
+            data = getattr(self, "data", None)
+            if type(data) is list and id(data) not in memo:
+                # 先捕获独立列表再检查，源列表在检查期间变化也不会带入可变别名。
+                copied_data = data.copy()
+                if all(type(value) is int for value in copied_data):
+                    memo[id(data)] = copied_data
+                    # 与标准深复制一样保活原对象，复用备忘表时不能把复用的对象编号误认成旧列表。
+                    memo.setdefault(id(memo), []).append(data)
+        return super().__deepcopy__(memo=memo)
+
     @field_validator("map_id")
     @classmethod
     def _validate_map_id(cls, value: str) -> str:

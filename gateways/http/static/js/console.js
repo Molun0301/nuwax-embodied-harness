@@ -52,8 +52,10 @@
       const state = {
         mapGrid: null,
         mapViewport: null,
-        mapViewIdentity: "",
-        mapFitSpan: null,
+        mapZoom: 1,
+        map2dCameraMode: "follow",
+        mapFreeView: { center: null, zoom: 1, fitSpan: null },
+        mapFreeViewIdentity: "",
         mapViewMode: "2d",
         pointcloud3dCameraMode: "free",
         pointcloud3dDistance: null,
@@ -186,6 +188,7 @@
         mapZoomIn: document.getElementById("mapZoomIn"),
         mapZoomOut: document.getElementById("mapZoomOut"),
         mapZoomReset: document.getElementById("mapZoomReset"),
+        map2dCameraToggle: document.getElementById("map2dCameraToggle"),
         mapCenterRobot: document.getElementById("mapCenterRobot"),
         mapZoomValue: document.getElementById("mapZoomValue"),
         mapRvizHint: document.getElementById("mapRvizHint"),
@@ -1261,42 +1264,87 @@
       function isMapToolActive() {
         return Boolean(state.goalPickMode || state.publishPointMode || state.initialPosePickMode);
       }
+      function usesRvizMapView() {
+        return Boolean(
+          state.map2dCameraMode === "free"
+          || isMapToolActive()
+          || state.goalPickDrag
+          || state.initialPosePickDrag
+          || state.mapPanDrag,
+        );
+      }
+      function activeMapWorldView() {
+        return state.map2dCameraMode === "free" ? state.mapFreeView : state.mapRvizView;
+      }
       function mapViewZoom() {
-        return state.mapRvizView.zoom || 1;
+        return usesRvizMapView() ? (activeMapWorldView().zoom || 1) : state.mapZoom;
       }
       function defaultMapViewCenter() {
+        const posePoint = pointFromPose(state.pose);
+        if (posePoint) return { x: posePoint.x, y: posePoint.y };
         const corners = mapCorners(state.mapGrid);
         if (!corners.length) return { x: 0, y: 0 };
         return corners.reduce((acc, item) => ({ x: acc.x + item.x / corners.length, y: acc.y + item.y / corners.length }), { x: 0, y: 0 });
       }
       function getMapRvizViewCenter() {
-        const center = state.mapRvizView && state.mapRvizView.center;
+        const center = activeMapWorldView().center;
         if (center && Number.isFinite(Number(center.x)) && Number.isFinite(Number(center.y))) {
           return { x: Number(center.x), y: Number(center.y) };
         }
-        const initialCenter = defaultMapViewCenter();
-        if (state.mapGrid) state.mapRvizView.center = initialCenter;
-        return initialCenter;
+        return defaultMapViewCenter();
       }
       function resetRvizMapView(focusPose) {
+        const posePoint = focusPose || pointFromPose(state.pose);
         state.mapRvizView = {
-          center: focusPose ? { x: focusPose.x, y: focusPose.y } : defaultMapViewCenter(),
+          center: posePoint ? { x: posePoint.x, y: posePoint.y } : defaultMapViewCenter(),
           zoom: 1,
         };
-        state.mapFitSpan = null;
-        if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...state.mapRvizView.center };
+      }
+      function resetFreeMapView() {
+        const corners = mapCorners(state.mapGrid);
+        const center = corners.length
+          ? corners.reduce((sum, point) => ({ x: sum.x + point.x / corners.length, y: sum.y + point.y / corners.length }), { x: 0, y: 0 })
+          : defaultMapViewCenter();
+        state.mapFreeView = { center, zoom: 1, fitSpan: null };
+        if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...center };
         if (state.mapGrid) basePixelsPerMeterRviz();
+      }
+      function syncMap2dCameraControls() {
+        const button = els.map2dCameraToggle;
+        if (!button) return;
+        const free = state.map2dCameraMode === "free";
+        const busy = Boolean(isMapToolActive() || state.mapPanDrag || window.__nuwaxMapToolV2?.active());
+        button.textContent = free ? "自由拖拽" : "机器人跟随";
+        button.classList.toggle("active", free);
+        button.setAttribute("aria-pressed", free ? "true" : "false");
+        button.disabled = busy;
+        button.title = busy
+          ? "结束选点、绘制或拖拽后可切换二维视角"
+          : free
+            ? "当前自由视角：拖拽平移、滚轮缩放；点击切回机器人居中朝上的跟随视角"
+            : "当前跟随机器人：箭头固定居中朝上，地图随机器人移动和转向；点击切换自由拖拽";
+      }
+      function setMap2dCameraMode(mode) {
+        if (isMapToolActive() || state.mapPanDrag || window.__nuwaxMapToolV2?.active()) return;
+        state.map2dCameraMode = mode === "free" ? "free" : "follow";
+        if (state.map2dCameraMode === "free" && !state.mapFreeView.center) resetFreeMapView();
+        syncMapToolUi();
+        requestMapDraw(false);
       }
       function centerRvizMapOnRobot() {
         const posePoint = pointFromPose(state.pose);
         if (!posePoint) return;
-        if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
-        state.mapRvizView.center = { x: posePoint.x, y: posePoint.y };
-        if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...state.mapRvizView.center };
+        activeMapWorldView().center = { x: posePoint.x, y: posePoint.y };
+        if (state.map2dCameraMode === "free" && window.__nuwaxMapFreeze) {
+          window.__nuwaxMapFreezeCenter = { ...activeMapWorldView().center };
+        }
         requestMapDraw(false);
       }
       function cameraAnchor() {
-        // 划线期间沿用工具捕获的世界中心，避免交互中改变选点参考。
+        // V2 boundary draw freeze：划线模式下冻结相机，强制走 mapFixed 路径——
+        // canvas 不再 robotLocked 跟随 pose 旋转/平移，地图视觉静止。
+        // 冻结中心由 boundary_draw.js 在 setDrawing(true) 时写入当前 anchor.point；
+        // 解冻时清掉（false/未设）：原路径不变。
         if (window.__nuwaxMapFreeze && window.__nuwaxMapFreezeCenter) {
           const fc = window.__nuwaxMapFreezeCenter;
           return {
@@ -1306,15 +1354,19 @@
             mapFixed: true,
           };
         }
-        // 二维地图保持世界视角，机器人真实平移与偏航仅更新箭头和轨迹。
-        const center = getMapRvizViewCenter();
-        return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
+        if (usesRvizMapView()) {
+          const center = getMapRvizViewCenter();
+          return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
+        }
+        const posePoint = pointFromPose(state.pose);
+        if (posePoint) return { point: posePoint, yaw: planarYawFromPose(state.pose) || 0, locked: true, mapFixed: false };
+        const fallback = defaultMapViewCenter();
+        return { point: { x: fallback.x, y: fallback.y, z: 0 }, yaw: 0, locked: false, mapFixed: false };
       }
       function basePixelsPerMeterRviz() {
         const canvas = els.mapCanvas;
-        if (state.mapFitSpan) {
-          return Math.max(4, Math.min(canvas.width / state.mapFitSpan.x, canvas.height / state.mapFitSpan.y));
-        }
+        const fitSpan = state.map2dCameraMode === "free" && state.mapFreeView.fitSpan;
+        if (fitSpan) return Math.max(4, Math.min(canvas.width / fitSpan.x, canvas.height / fitSpan.y));
         const corners = mapCorners(state.mapGrid);
         if (!corners.length) return 60;
         let minX = Infinity;
@@ -1329,12 +1381,32 @@
         }
         const spanX = Math.max(maxX - minX, 1);
         const spanY = Math.max(maxY - minY, 1);
-        // 只在初次入图、切图或明确复位后适配；增量栅格边界不能推动镜头缩放。
-        state.mapFitSpan = { x: spanX * 1.12, y: spanY * 1.12 };
-        return Math.max(4, Math.min(canvas.width / state.mapFitSpan.x, canvas.height / state.mapFitSpan.y));
+        // 自由视角只在首次入图、切图或明确复位时适配，地图增量不能推动用户镜头。
+        if (state.map2dCameraMode === "free") state.mapFreeView.fitSpan = { x: spanX * 1.12, y: spanY * 1.12 };
+        return Math.max(4, Math.min(canvas.width / (spanX * 1.12), canvas.height / (spanY * 1.12)));
+      }
+      function basePixelsPerMeter(anchor) {
+        if (anchor && anchor.mapFixed) return basePixelsPerMeterRviz();
+        const canvas = els.mapCanvas;
+        const corners = mapCorners(state.mapGrid);
+        if (!corners.length) return 60;
+        let maxX = 1;
+        let maxY = 1;
+        const yaw = anchor.yaw || 0;
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        for (const corner of corners) {
+          const dx = Number(corner.x) - anchor.point.x;
+          const dy = Number(corner.y) - anchor.point.y;
+          const right = sin * dx - cos * dy;
+          const up = cos * dx + sin * dy;
+          maxX = Math.max(maxX, Math.abs(right));
+          maxY = Math.max(maxY, Math.abs(up));
+        }
+        return Math.max(4, Math.min(canvas.width / (maxX * 2.16), canvas.height / (maxY * 2.16)));
       }
       function cameraScale(anchor) {
-        return basePixelsPerMeterRviz() * mapViewZoom();
+        return basePixelsPerMeter(anchor) * mapViewZoom();
       }
       function applyCameraTransform(ctx, anchor, scale) {
         const centerX = els.mapCanvas.width / 2;
@@ -1425,18 +1497,18 @@
         if (!Number.isFinite(scaleBefore) || scaleBefore <= 0) return;
         const world = canvasToMap(pointer.x, pointer.y, anchor);
         const nextZoom = Math.min(8, Math.max(0.25, mapViewZoom() * factor));
-        if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
-        state.mapRvizView.zoom = nextZoom;
+        activeMapWorldView().zoom = nextZoom;
         const anchorAfter = cameraAnchor();
         const scaleAfter = cameraScale(anchorAfter);
         const centerX = els.mapCanvas.width / 2;
         const centerY = els.mapCanvas.height / 2;
-        state.mapRvizView.center = {
+        activeMapWorldView().center = {
           x: world.x - (pointer.x - centerX) / scaleAfter,
           y: world.y + (pointer.y - centerY) / scaleAfter,
         };
-        // 明确缩放操作同步划线中心，退出工具后继续使用同一镜头。
-        if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...state.mapRvizView.center };
+        if (state.map2dCameraMode === "free" && window.__nuwaxMapFreeze) {
+          window.__nuwaxMapFreezeCenter = { ...activeMapWorldView().center };
+        }
       }
       function formatMapPoint(point) {
         if (!point) return "--";
@@ -1644,6 +1716,8 @@
         const pointActive = Boolean(state.publishPointMode);
         const initialPoseActive = Boolean(state.initialPosePickMode);
         const toolActive = goalActive || pointActive || initialPoseActive;
+        const free = state.map2dCameraMode === "free";
+        syncMap2dCameraControls();
         if (els.mapInitialPoseToggle) els.mapInitialPoseToggle.classList.toggle("active", initialPoseActive);
         if (els.mapGoalToggle) els.mapGoalToggle.classList.toggle("active", goalActive);
         if (els.mapPublishPointToggle) els.mapPublishPointToggle.classList.toggle("active", pointActive);
@@ -1651,18 +1725,20 @@
           els.mapCanvas.classList.toggle("goal-pick", toolActive);
           els.mapCanvas.classList.toggle("publish-point", pointActive && !goalActive && !initialPoseActive);
           els.mapCanvas.classList.toggle("initial-pose", initialPoseActive && !goalActive && !pointActive);
-          els.mapCanvas.classList.toggle("pan-ready", toolActive && !state.mapPanDrag);
+          els.mapCanvas.classList.toggle("pan-ready", (toolActive || free) && !state.mapPanDrag);
           els.mapCanvas.classList.toggle("panning", Boolean(state.mapPanDrag));
         }
-        if (els.mapCenterRobot) els.mapCenterRobot.hidden = false;
+        if (els.mapCenterRobot) els.mapCenterRobot.hidden = !toolActive && !free;
         if (els.mapRvizHint) {
-          els.mapRvizHint.hidden = !toolActive;
+          els.mapRvizHint.hidden = !toolActive && !free;
           if (initialPoseActive) {
             els.mapRvizHint.textContent = "2D Pose：左键拖拽设初始位姿 · 中/右键平移 · 滚轮缩放";
           } else if (goalActive) {
             els.mapRvizHint.textContent = "2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放";
           } else if (pointActive) {
             els.mapRvizHint.textContent = "选点：左键发布 /clicked_point · 中/右键平移 · 滚轮缩放";
+          } else if (free) {
+            els.mapRvizHint.textContent = "自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图";
           }
         }
       }
@@ -2212,9 +2288,8 @@
         state.mapGridContentKey = "";
         state.mapBaseCache = null;
         state.mapViewport = null;
-        state.mapViewIdentity = "";
-        state.mapFitSpan = null;
-        state.mapRvizView = { center: null, zoom: 1 };
+        state.mapFreeViewIdentity = "";
+        state.mapFreeView = { center: null, zoom: 1, fitSpan: null };
         if (!activeSpatialContextReason()) clearMapOverlayState();
         setPill(els.mapStatus, status || "missing");
         els.mapEmpty.hidden = false;
@@ -2259,6 +2334,7 @@
       }
       function drawMap() {
         syncMapCanvasSize();
+        syncMap2dCameraControls();
         const canvas = els.mapCanvas;
         const ctx = canvas.getContext("2d");
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2465,14 +2541,22 @@
       function drawRobot(ctx, anchor) {
         const posePoint = pointFromPose(state.pose);
         if (!posePoint) return;
-        const canvasPoint = mapToCanvas(posePoint, anchor);
-        if (!canvasPoint) return;
+        const locked = anchor && anchor.locked === true;
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.translate(canvasPoint.x, canvasPoint.y);
-        const yaw = planarYawFromPose(state.pose) || 0;
-        // 世界正Y朝屏幕上方，箭头按真实偏航转向。
-        ctx.rotate(Math.PI / 2 - yaw);
+        if (locked) {
+          ctx.translate(els.mapCanvas.width / 2, els.mapCanvas.height / 2);
+        } else {
+          const canvasPoint = mapToCanvas(posePoint);
+          if (!canvasPoint) {
+            ctx.restore();
+            return;
+          }
+          ctx.translate(canvasPoint.x, canvasPoint.y);
+          const yaw = planarYawFromPose(state.pose) || 0;
+          // 北向 map 视图：屏幕 Y 向上对应 world +Y，三角形默认指屏幕上方，需用 π/2 - yaw（不是 yaw + π/2）
+          ctx.rotate(Math.PI / 2 - yaw);
+        }
         ctx.fillStyle = CANVAS_THEME.robot;
         ctx.strokeStyle = CANVAS_THEME.robotStroke;
         ctx.lineWidth = 2;
@@ -3079,14 +3163,14 @@
           state.mapGrid = grid;
           state.mapGridContentKey = nextContentKey;
           const source = data.map_snapshot || data;
-          const viewIdentity = JSON.stringify([
-            source.map_name || diagnostics.map_name || "",
-            source.source_name || "", source.source_epoch || "",
+          const freeViewIdentity = JSON.stringify([
+            source.map_name || diagnostics.map_name || "", source.source_name || "", source.source_epoch || "",
             grid.frame_id || source.frame_id || envelope.frame_id || "",
           ]);
-          if (state.mapViewIdentity !== viewIdentity) {
-            state.mapViewIdentity = viewIdentity;
-            resetRvizMapView();
+          if (state.mapFreeViewIdentity !== freeViewIdentity) {
+            state.mapFreeViewIdentity = freeViewIdentity;
+            state.mapFreeView = { center: null, zoom: 1, fitSpan: null };
+            if (state.map2dCameraMode === "free") resetFreeMapView();
           }
           els.mapEmpty.hidden = status === "available";
           els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
@@ -4829,14 +4913,23 @@
       startVideoStream();
       function setMapZoom(nextZoom) {
         const zoom = Math.min(8, Math.max(0.25, nextZoom));
-        state.mapRvizView.zoom = zoom;
+        if (usesRvizMapView() || isMapToolActive()) {
+          activeMapWorldView().zoom = zoom;
+        } else {
+          state.mapZoom = zoom;
+        }
         requestMapDraw(false);
       }
       els.mapZoomIn.addEventListener("click", () => setMapZoom(mapViewZoom() * 1.25));
       els.mapZoomOut.addEventListener("click", () => setMapZoom(mapViewZoom() / 1.25));
       els.mapZoomReset.addEventListener("click", () => {
-        resetRvizMapView();
+        if (state.map2dCameraMode === "free") resetFreeMapView();
+        else if (isMapToolActive()) resetRvizMapView();
+        else setMapZoom(1);
         requestMapDraw(false);
+      });
+      els.map2dCameraToggle?.addEventListener("click", () => {
+        setMap2dCameraMode(state.map2dCameraMode === "free" ? "follow" : "free");
       });
       if (els.mapCenterRobot) {
         els.mapCenterRobot.addEventListener("click", () => centerRvizMapOnRobot());
@@ -4890,6 +4983,7 @@
           state.initialPosePickMode = next;
           syncMapToolUi();
           if (state.initialPosePickMode) {
+            if (state.map2dCameraMode !== "free") resetRvizMapView();
             reevaluateCachedMapDisplay();
             updateGoalPickStatus(
               state.mapGrid
@@ -4910,6 +5004,7 @@
           state.goalPickMode = next;
           syncMapToolUi();
           if (state.goalPickMode) {
+            if (state.map2dCameraMode !== "free") resetRvizMapView();
             reevaluateCachedMapDisplay();
             updateGoalPickStatus(
               state.mapGrid
@@ -4930,6 +5025,7 @@
           state.publishPointMode = next;
           syncMapToolUi();
           if (state.publishPointMode) {
+            if (state.map2dCameraMode !== "free") resetRvizMapView();
             reevaluateCachedMapDisplay();
             updateGoalPickStatus(
               state.mapGrid
@@ -4961,7 +5057,7 @@
         void dispatchClickedPoint(click.mapPoint);
       }
       els.mapCanvas.addEventListener("contextmenu", (event) => {
-        if (!isMap3dVisible()) event.preventDefault();
+        if (isMapToolActive() || state.map2dCameraMode === "free") event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
         // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
@@ -4976,9 +5072,9 @@
             return;
           }
         }
-        if (isMap3dVisible()) return;
+        if ((!isMapToolActive() && state.map2dCameraMode !== "free") || isMap3dVisible()) return;
         const pointer = canvasPointer(event);
-        if (event.button === 1 || event.button === 2) {
+        if (event.button === 1 || event.button === 2 || (event.button === 0 && state.map2dCameraMode === "free" && !isMapToolActive())) {
           event.preventDefault();
           state.mapPanDrag = {
             pointerStart: pointer,
@@ -4988,7 +5084,6 @@
           if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
           return;
         }
-        if (!isMapToolActive()) return;
         if (event.button !== 0) return;
         event.preventDefault();
         const anchor = cameraAnchor();
@@ -5029,8 +5124,7 @@
           if (!Number.isFinite(scale) || scale <= 0) return;
           const dx = pointer.x - state.mapPanDrag.pointerStart.x;
           const dy = pointer.y - state.mapPanDrag.pointerStart.y;
-          if (!state.mapRvizView) state.mapRvizView = { center: null, zoom: 1 };
-          state.mapRvizView.center = {
+          activeMapWorldView().center = {
             x: state.mapPanDrag.centerStart.x - dx / scale,
             y: state.mapPanDrag.centerStart.y + dy / scale,
           };
@@ -5084,9 +5178,13 @@
       });
       els.mapCanvas.addEventListener("wheel", (event) => {
         event.preventDefault();
-        const pointer = canvasPointer(event);
-        zoomRvizMapAt(pointer, event.deltaY < 0 ? 1.12 : 1 / 1.12);
-        requestMapDraw(false);
+        if (isMapToolActive() || state.map2dCameraMode === "free") {
+          const pointer = canvasPointer(event);
+          zoomRvizMapAt(pointer, event.deltaY < 0 ? 1.12 : 1 / 1.12);
+          requestMapDraw(false);
+          return;
+        }
+        setMapZoom(state.mapZoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12));
       }, { passive: false });
       // V2 navigation-and-exploration-boundary §9.3 全局钩子：
       // boundary_draw.js / navigation.js 拆模块需要从屏幕坐标拿世界坐标，
@@ -5156,7 +5254,7 @@
       window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
       // V2 boundary freeze：boundary_draw.js 在 setDrawing(true) 时调一次取当前 anchor
       // 作冻结中心；setDrawing(false) 时清掉。cameraAnchor() 入口的 __nuwaxMapFreeze
-      // 划线工具捕获的是当前固定世界视角，不改变原始机器人位姿。
+      // 短路优先于 usesRvizMapView() 与 pose-locked 路径。
       window.__nuwaxCameraAnchor = function () {
         return cameraAnchor();
       };
@@ -5301,6 +5399,7 @@
       els.map3dResetView?.addEventListener("click", () => window.pointcloud3d?.resetView());
       els.map3dCenterRobot?.addEventListener("click", () => window.pointcloud3d?.centerOnRobot());
       syncMapViewControls();
+      syncMap2dCameraControls();
       updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.latestPose)) });
       updateMapPoseHud();
     })();

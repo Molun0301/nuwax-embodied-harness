@@ -45,10 +45,11 @@
                     <button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
                   </div>
                   <div id="map2dCameraControls" class="map-tool-group glass" data-map-view="2d" aria-label="2D 地图视角">
+                    <button id="map2dCameraToggle" class="tool" type="button" aria-pressed="false" title="当前跟随机器人：箭头固定居中朝上，地图随机器人移动和转向；点击切换自由拖拽">机器人跟随</button>
                     <button id="mapZoomOut" class="tool" type="button" title="缩小 2D 地图">–</button>
                     <span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span>
                     <button id="mapZoomIn" class="tool" type="button" title="放大 2D 地图">+</button>
-                    <button id="mapZoomReset" class="tool" type="button" title="居中并适配当前完整二维地图；中键或右键平移，滚轮缩放">复位</button>
+                    <button id="mapZoomReset" class="tool" type="button" title="复位 2D 地图视角">复位</button>
                     <button id="mapCenterRobot" class="tool" type="button" title="2D 视图居中到机器人" hidden>机器人</button>
                   </div>
                   <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
@@ -260,7 +261,7 @@
 </div>
   <script src="/static/js/console-logs.js?v=20260906-task-log-recovery"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260907-stable-map-view"></script>
+  <script src="/static/js/console.js?v=20260907-map-camera-modes"></script>
   <script>
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
     (() => {

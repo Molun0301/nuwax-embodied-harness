@@ -22,14 +22,16 @@ Lifecycle
 =========
 
 1. ``ensure_runtime_connected()`` — 等待 ``GeometryRuntimeProvider.is_connected()``。
-2. ``start()`` — 注册 provider callback（仅一次）。
-3. ``stop()`` — 停止接收、注销 callback 并排空已接收回调。
+2. ``start()`` — 原生模式先建立独立发布线程，再注册 provider callback（仅一次）。
+3. ``stop()`` — 停止接收、注销 callback，等待已接收回调及在途发布退出并回收线程。
 4. 重复 ``start()`` / ``stop()`` 幂等。
 
 背压策略
 ========
 
 - odom: 直发，不节流；calling thread 同步走 gRPC。
+- 原生 LiDAR/IMU：回调组装后进入既有四帧队列，由独立单拥有方线程顺序发布；
+  队列满时承接旧帧惯性，停止取消未领取帧，不占用传感器读取线程等待发布。
 - pointcloud:
 
     * 默认阈值 ``MAX_POINTS_BEFORE_DOWNSAMPLE = 100_000``；
@@ -243,6 +245,8 @@ class RuntimeInputBridge:
     )
     _lio_publish_owner_active: bool = field(default=False, init=False)
     _lio_publish_owner_thread_id: Optional[int] = field(default=None, init=False)
+    _lio_publisher_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
+    _native_lio_enabled: bool = field(default=False, init=False)
     _lio_in_flight_count: int = field(default=0, init=False)
     _callback_in_flight_count: int = field(default=0, init=False)
     _callback_in_flight_by_thread: Dict[int, int] = field(
@@ -355,7 +359,17 @@ class RuntimeInputBridge:
                 with self._lio_condition:
                     if self._lio_reset_pending_generation is not None:
                         continue
-                return self._start_new_generation_locked()
+                    previous_generation = self._lio_generation
+                started = self._start_new_generation_locked()
+                rollback = None
+                if not started and self._native_lio_enabled and self._lio_generation != previous_generation:
+                    # 锁内撤销本次启动，锁外等待；发布线程也可能重入 stop 取得此锁。
+                    self.stop(_wait_for_drain=False)
+                    with self._lio_condition:
+                        rollback = (self._lio_generation, self._lio_publisher_thread)
+            if rollback is not None:
+                self._wait_for_stop_drain(*rollback)
+            return started
 
     def _start_new_generation_locked(self) -> bool:
         """在 lifecycle operation lock 内启动一个新的 bridge generation。"""
@@ -376,6 +390,11 @@ class RuntimeInputBridge:
         with self._lock:
             if self._started:
                 return True
+        # 重入停止的最后释放者只标记排空；新代际开始前仍须回收实际线程句柄。
+        with self._lio_condition:
+            previous_publisher = self._lio_publisher_thread
+        self._join_native_lio_publisher(previous_publisher)
+        with self._lock:
             if not self.ensure_runtime_connected(timeout_sec=0.0):
                 LOGGER.warning(
                     "RuntimeInputBridge.start: runtime 未连，不订 provider。"
@@ -390,12 +409,20 @@ class RuntimeInputBridge:
             self._lio_accepting = True
             self._lio_reset_pending_generation = None
             self._lio_publish_owner_thread_id = None
+            self._native_lio_enabled = selected_lio_backend != _DEVICE_LIO_BACKEND
             self._lio_sensor_frame = os.environ.get(
                 _LIO_SENSOR_FRAME_ENV,
                 _DEFAULT_LIO_SENSOR_FRAME,
             ).strip()
             self._lio_publish_queue.clear()
             self._lio_measurement_assembler.reset()
+
+        if self._native_lio_enabled:
+            try:
+                self._start_native_lio_publisher(lio_generation)
+            except Exception as exc:
+                self._record_error("原生输入发布线程启动失败：%s" % exc)
+                return False
 
         if self.sensor_sample_provider is None:
             for candidate in (self.point_cloud_provider, self.localization_provider):
@@ -439,7 +466,8 @@ class RuntimeInputBridge:
                 "LocalizationProvider 与 PointCloudProvider 均不可用"
             )
             LOGGER.warning("RuntimeInputBridge.start: 两个 provider 都不可用。")
-            # 不回滚 _started：让调用方通过 is_ready() 看到 False，并显式 stop() 释放。
+            # 网关不会接管启动失败的桥，原生模式必须自行回收新增的发布线程。
+            # start 在锁外完成原生回滚排空；设备模式仍由显式 stop 释放。
             return False
         if not localization_ok and not sensor_ok:
             self._record_error("LocalizationProvider 不可用，odom 不会推送")
@@ -447,7 +475,7 @@ class RuntimeInputBridge:
             self._record_error("PointCloudProvider 不可用，pointcloud 不会推送")
         return True
 
-    def stop(self) -> None:
+    def stop(self, *, _wait_for_drain: bool = True) -> None:
         """注销 callback；外部调用等待 drain，callback 重入由最后 release 延迟 reset。"""
         stopping_thread_id = threading.get_ident()
         with self._lock:
@@ -496,6 +524,7 @@ class RuntimeInputBridge:
                         self._lio_generation
                     )
                     self._lio_publish_queue.clear()
+                    self._lio_condition.notify_all()
 
                 if sensor_id is not None and self.sensor_sample_provider is not None:
                     try:
@@ -529,6 +558,10 @@ class RuntimeInputBridge:
                             exc,
                         )
 
+            with self._lio_condition:
+                stopped_generation = self._lio_generation
+                stopped_publisher = self._lio_publisher_thread
+
         with self._lio_condition:
             current_callback_count = (
                 self._callback_in_flight_by_thread.get(
@@ -546,23 +579,57 @@ class RuntimeInputBridge:
                 or self._lio_publish_owner_active
                 or self._lio_in_flight_count > 0
                 or self._callback_in_flight_count > 0
+                or self._lio_publisher_thread is not None
             )
-        if current_callback_count > 0 or current_owns_publish:
+        if not _wait_for_drain or current_callback_count > 0 or current_owns_publish:
             return
         if should_drain:
-            self._wait_for_stop_drain()
+            self._wait_for_stop_drain(stopped_generation, stopped_publisher)
 
-    def _wait_for_stop_drain(self) -> None:
-        """等待外部 stop 的全部 callback/native delivery 退出。"""
+    def _wait_for_stop_drain(self, generation: int, publisher: Optional[threading.Thread]) -> None:
+        """只等待本次停止的代际与句柄，不能误等并发重启后的空闲线程。"""
 
         with self._lio_condition:
-            while (
+            while self._lio_generation == generation and (
                 self._lio_publish_owner_active
                 or self._lio_in_flight_count > 0
                 or self._callback_in_flight_count > 0
             ):
                 self._lio_condition.wait()
-            self._reset_lio_assembler_if_quiescent_locked()
+            if self._lio_generation == generation:
+                self._reset_lio_assembler_if_quiescent_locked()
+        self._join_native_lio_publisher(publisher)
+
+    def _start_native_lio_publisher(self, generation: int) -> None:
+        """订阅前建立当前代际唯一发布拥有方，启动失败不留下活跃哨兵。"""
+        worker = threading.Thread(
+            target=self._drain_native_lio_measurements,
+            args=(generation,),
+            name="nuwax-native-lio-publisher-%d" % generation,
+            daemon=True,
+        )
+        with self._lio_condition:
+            self._lio_publisher_thread = worker
+            self._lio_publish_owner_active = True
+        try:
+            worker.start()
+        except Exception:
+            with self._lio_condition:
+                self._lio_publisher_thread = None
+                self._lio_publish_owner_active = False
+                self._lio_publish_owner_thread_id = None
+                self._lio_condition.notify_all()
+            raise
+
+    def _join_native_lio_publisher(self, worker: Optional[threading.Thread]) -> None:
+        """在状态/条件锁外等待旧线程真正退出；重入拥有方不得等待自身。"""
+        if worker is None or worker is threading.current_thread():
+            return
+        worker.join()
+        with self._lio_condition:
+            if self._lio_publisher_thread is worker:
+                self._lio_publisher_thread = None
+            self._lio_condition.notify_all()
 
     def is_started(self) -> bool:
         with self._lock:
@@ -625,9 +692,7 @@ class RuntimeInputBridge:
                 except LioMeasurementAssemblerError as exc:
                     self._record_lio_assembler_error(exc)
                     return
-                drain = self._enqueue_ready_lio_measurements(measurement, generation)
-            if drain:
-                self._drain_native_lio_measurements()
+                self._enqueue_ready_lio_measurements(measurement, generation)
         finally:
             self._release_bridge_callback()
 
@@ -759,13 +824,10 @@ class RuntimeInputBridge:
                 self._release_bridge_callback()
             return
         callback_metadata = dict(metadata or {})
-        native_lio_backend = os.environ.get(
-            _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
-        ) in {"fastlio2", "pointlio"}
+        native_lio_backend = self._native_lio_enabled
         if native_lio_backend:
             canonical_imu = callback_metadata.get("canonical_imu_sample")
             if isinstance(canonical_imu, CanonicalImuSample):
-                should_drain = False
                 with self._lio_condition:
                     if not self._lio_callback_is_current(_lio_generation):
                         return
@@ -776,12 +838,10 @@ class RuntimeInputBridge:
                     except LioMeasurementAssemblerError as exc:
                         self._record_lio_assembler_error(exc)
                     else:
-                        should_drain = self._enqueue_ready_lio_measurements(
+                        self._enqueue_ready_lio_measurements(
                             measurement,
                             self._lio_generation,
                         )
-                if should_drain:
-                    self._drain_native_lio_measurements()
             else:
                 self._increment_counter("lio_not_ready_count")
                 self._record_error(
@@ -890,9 +950,7 @@ class RuntimeInputBridge:
             "direct_pointcloud",
             "go2_direct_dds_pointcloud",
         }
-        native_lio_backend = os.environ.get(
-            _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
-        ) in {"fastlio2", "pointlio"}
+        native_lio_backend = self._native_lio_enabled
         if has_raw_sensor_payload or legacy_registered_metadata:
             source_frame = (
                 canonical_lidar.frame_id
@@ -927,7 +985,6 @@ class RuntimeInputBridge:
                     return
 
         if native_lio_backend:
-            should_drain = False
             with self._lio_condition:
                 if not self._lio_callback_is_current(_lio_generation):
                     return
@@ -953,12 +1010,10 @@ class RuntimeInputBridge:
                         "保留有界等待窗口"
                     )
                     return
-                should_drain = self._enqueue_ready_lio_measurements(
+                self._enqueue_ready_lio_measurements(
                     measurement,
                     self._lio_generation,
                 )
-            if should_drain:
-                self._drain_native_lio_measurements()
             return
 
         imu_samples = []
@@ -1258,8 +1313,8 @@ class RuntimeInputBridge:
         self,
         measurement: Optional[CanonicalLioMeasurement],
         generation: int,
-    ) -> bool:
-        """在 condition 内按 FIFO 排空 assembler，并选出唯一发布 owner。"""
+    ) -> None:
+        """在条件锁内组装到既有有界队列，唤醒独立发布拥有方。"""
 
         while measurement is not None:
             prepared = self._prepare_native_lio_measurement(measurement)
@@ -1273,11 +1328,8 @@ class RuntimeInputBridge:
                     )
                     self._carry_dropped_lio_imu(dropped.imu_samples, dropped_generation)
             measurement = self._lio_measurement_assembler.pop_ready()
-        if not self._lio_publish_queue or self._lio_publish_owner_active:
-            return False
-        self._lio_publish_owner_active = True
-        self._lio_publish_owner_thread_id = threading.get_ident()
-        return True
+        if self._lio_publish_queue:
+            self._lio_condition.notify_all()
 
     def _carry_dropped_lio_imu(
         self, samples: Tuple[CanonicalImuSample, ...], generation: int
@@ -1338,34 +1390,39 @@ class RuntimeInputBridge:
         self._increment_counter("dropped_lio_imu_count", len(samples))
         self._record_error("LIO IMU 承接后没有可覆盖点云，丢弃 %d 条样本" % len(samples))
 
-    def _drain_native_lio_measurements(self) -> None:
-        """由单一 owner 在 condition 外顺序执行 native publish RPC。"""
-
-        while True:
-            with self._lio_condition:
-                while self._lio_publish_queue:
-                    generation, measurement = self._lio_publish_queue.popleft()
-                    if self._lio_callback_is_current(generation):
-                        self._lio_in_flight_count += 1
-                        break
-                else:
-                    self._lio_publish_owner_active = False
-                    self._lio_publish_owner_thread_id = None
-                    self._reset_lio_assembler_if_quiescent_locked()
-                    self._lio_condition.notify_all()
-                    return
-            try:
-                self._publish_native_lio_measurement(measurement)
-            except Exception as exc:
-                self._increment_counter("dropped_pointcloud_count")
-                self._record_error(
-                    "publish canonical LIO measurement 未处理异常：%s" % exc
-                )
-            finally:
+    def _drain_native_lio_measurements(self, generation: int) -> None:
+        """当前代际独立线程在条件锁外顺序发布，空闲等待，停止后退出。"""
+        with self._lio_condition:
+            self._lio_publish_owner_thread_id = threading.get_ident()
+        try:
+            while True:
                 with self._lio_condition:
-                    self._lio_in_flight_count -= 1
-                    self._reset_lio_assembler_if_quiescent_locked()
-                    self._lio_condition.notify_all()
+                    while self._lio_callback_is_current(generation) and not self._lio_publish_queue:
+                        self._lio_condition.wait()
+                    if not self._lio_callback_is_current(generation):
+                        return
+                    queued_generation, measurement = self._lio_publish_queue.popleft()
+                    if queued_generation != generation:
+                        continue
+                    self._lio_in_flight_count += 1
+                try:
+                    self._publish_native_lio_measurement(measurement)
+                except Exception as exc:
+                    self._increment_counter("dropped_pointcloud_count")
+                    self._record_error("publish canonical LIO measurement 未处理异常：%s" % exc)
+                finally:
+                    with self._lio_condition:
+                        self._lio_in_flight_count -= 1
+                        self._lio_condition.notify_all()
+        except Exception as exc:
+            self._record_error("原生输入发布线程异常退出：%s" % exc)
+            self.stop()
+        finally:
+            with self._lio_condition:
+                self._lio_publish_owner_active = False
+                self._lio_publish_owner_thread_id = None
+                self._reset_lio_assembler_if_quiescent_locked()
+                self._lio_condition.notify_all()
 
     def _lio_callback_is_current(self, generation: Optional[int]) -> bool:
         """在 LIO condition 内拒绝 stop/restart 前创建的 callback。"""

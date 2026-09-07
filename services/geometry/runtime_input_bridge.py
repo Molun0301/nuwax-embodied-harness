@@ -70,6 +70,7 @@ from contracts.sensors import (
     CanonicalLioMeasurement,
     RegistrationState,
 )
+from core.logging_utils import LogRateLimiter
 from providers.localization import StreamingLocalizationProvider
 from providers.pointcloud import StreamingPointCloudProvider
 from providers.sensors import StreamingSensorSampleProvider
@@ -89,6 +90,13 @@ _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
 _DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
 _MAX_LIO_PUBLISH_QUEUE_SIZE = 4
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
+_INPUT_ERROR_LOG_INTERVAL_SEC = 5.0
+# 仅汇总已知逐样本重复诊断，固定键集合不会随任意异常正文增长。
+_REPEATED_INPUT_ERROR_KEYS = {
+    "lio_not_ready: IMU 尚未覆盖 LiDAR 扫描开始与末端，保留有界等待窗口": "imu_coverage_pending",
+    "time_regression: IMU source_sequence 和 timestamp_ns 必须严格递增": "imu_time_regression",
+    "time_regression: LiDAR source_sequence 和 timestamp_ns 必须严格递增": "lidar_time_regression",
+}
 
 # 下游发布使用的标准 PointField 布局；可选字段只在真实存在时进入字段表。
 _CANONICAL_XYZ_FIELDS = (
@@ -222,6 +230,7 @@ class RuntimeInputBridge:
     max_points_after_downsample: int = MAX_POINTS_AFTER_DOWNSAMPLE
 
     counters: BridgeCounters = field(default_factory=BridgeCounters)
+    _error_log_limiter: LogRateLimiter = field(default_factory=LogRateLimiter, init=False, repr=False)
     _lio_measurement_assembler: LioMeasurementAssembler = field(
         default_factory=LioMeasurementAssembler,
         init=False,
@@ -1770,7 +1779,20 @@ class RuntimeInputBridge:
             last_error=message,
             last_error_at_monotonic=time.monotonic(),
         )
-        LOGGER.debug("RuntimeInputBridge: %s", message)
+        error_key = _REPEATED_INPUT_ERROR_KEYS.get(message)
+        if error_key is None:
+            LOGGER.debug("RuntimeInputBridge: %s", message)
+        elif LOGGER.isEnabledFor(logging.DEBUG):
+            # 放行前不创建日志记录；最新错误与完整计数始终已在上方更新。
+            self._error_log_limiter.log(
+                LOGGER,
+                logging.DEBUG,
+                "RuntimeInputBridge: %s",
+                message,
+                key=error_key,
+                interval_sec=_INPUT_ERROR_LOG_INTERVAL_SEC,
+                extra={"event": "geometry.input.diagnostic", "diagnostic_kind": error_key},
+            )
 
 
 def build_default_runtime_input_bridge(

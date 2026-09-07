@@ -34,6 +34,7 @@
 #include "livox_sdk_config.hpp"
 #include "imu_frame_transform.hpp"
 #include "scan_imu_buffer.hpp"
+#include "native_input_subscription.hpp"
 #include "native_lio_arguments.hpp"
 
 #include "dimos_native_module.hpp"
@@ -778,8 +779,16 @@ int main(int argc, char** argv) {
 
     bool sdk_started = false;
     if (g_external_input) {
-        lcm.subscribeFunction(g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
-        lcm.subscribeFunction(g_input_imu_topic, on_typed_imu, static_cast<void*>(nullptr));
+        auto* lidar_subscription = lcm.subscribeFunction(
+            g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
+        if (!nuwax_lio::configure_native_input_subscription(
+                lidar_subscription, nuwax_lio::kNativeInputCloudQueueCapacity,
+                "fastlio2", g_input_lidar_topic)) return 1;
+        auto* imu_subscription = lcm.subscribeFunction(
+            g_input_imu_topic, on_typed_imu, static_cast<void*>(nullptr));
+        if (!nuwax_lio::configure_native_input_subscription(
+                imu_subscription, nuwax_lio::kNativeInputImuQueueCapacity,
+                "fastlio2", g_input_imu_topic)) return 1;
         if (debug) { printf("[fastlio2] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
     } else {
         // Direct Livox mode is retained for device deployments.

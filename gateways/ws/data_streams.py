@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
+from contracts.runtime_views import MapSnapshot
 from core.logging_utils import LogRateLimiter
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
@@ -202,17 +203,12 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
     return values
 
 
-def _complete_map_occupancy_data(frame: StreamFrame) -> Optional[object]:
-    """Return a validated map grid that must not be truncated in transport."""
+def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None) -> Optional[object]:
+    """完整校验地图栅格；调用者可复用本次消费已读取的防御副本。"""
 
     if frame.topic != "map.frame":
         return None
-    payload = frame.payload
-    occupancy_grid = (
-        payload.get("occupancy_grid")
-        if isinstance(payload, Mapping)
-        else getattr(payload, "occupancy_grid", None)
-    )
+    occupancy_grid = grid if grid is not None else field_value(frame.payload, "occupancy_grid")
     if occupancy_grid is None:
         return None
     width = (
@@ -306,8 +302,15 @@ def _project_json_value(
     active_ids.add(value_id)
     try:
         if isinstance(value, StreamFrame):
+            frame_values = _stream_frame_values(value)
+            if value.topic == "map.frame":
+                payload = frame_values["payload"]
+                # 仅优化正式快照；子类和通用模型继续保留逐字段异常与预算保护。
+                if type(payload) is MapSnapshot:
+                    # 保留合同的防御读取，每个图层仅取一份，编码和完整性校验共用。
+                    frame_values["payload"] = selected_fields(payload, MapSnapshot.model_fields)
             projected_frame = _project_json_value(
-                _stream_frame_values(value),
+                frame_values,
                 budget,
                 active_ids,
                 depth=depth + 1,
@@ -319,7 +322,10 @@ def _project_json_value(
                     for key in ("message", "exception"):
                         if isinstance(value.payload.get(key), str):
                             projected_payload[key] = value.payload[key]
-            occupancy_data = _complete_map_occupancy_data(value)
+            occupancy_data = _complete_map_occupancy_data(
+                value,
+                grid=field_value(frame_values["payload"], "occupancy_grid") if value.topic == "map.frame" else None,
+            )
             if occupancy_data is not None and isinstance(projected_frame, dict):
                 projected_payload = projected_frame.get("payload")
                 if isinstance(projected_payload, dict):
@@ -949,14 +955,16 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     """版本2：有界身份/绘制帧头与有符号栅格字节；缺少身份的版本1退出使用。"""
     import numpy as np
 
-    data = _complete_map_occupancy_data(frame)
+    # MapSnapshot 每次读图层都会防御性深拷贝；帧头与栅格共享这一次读取。
+    occupancy_grid = field_value(frame.payload, "occupancy_grid")
+    data = _complete_map_occupancy_data(frame, grid=occupancy_grid)
     if data is None:
         raise ValueError("地图栅格尺寸、数量或取值无效")
     payload = selected_fields(frame.payload, (
         "map_name", "source_name", "source_epoch", "update_sequence", "content_sha256",
         "frame_id", "timestamp", "metadata",
     ))
-    grid = selected_fields(field_value(frame.payload, "occupancy_grid"), (
+    grid = selected_fields(occupancy_grid, (
         "map_id", "frame_id", "width", "height", "resolution_m", "origin", "timestamp",
     ))
     if not payload.get("map_name") or not grid.get("origin") or not grid.get("frame_id"):

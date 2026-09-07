@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import math
-import struct
 from typing import Literal, Optional, Tuple
+
+import numpy as np
 
 from contracts.base import ContractModel
 from contracts.compat import StrEnum
@@ -255,16 +256,14 @@ class CanonicalLidarFrame(SensorSample):
             for field_name, value in inline_fields.items():
                 if value is not None and len(value) != expected_lengths[field_name]:
                     raise ValueError("%s 长度与 point_count 不匹配" % field_name)
-            for x, y, z in struct.iter_unpack("<fff", self.xyz_f32_le):
-                if not all(math.isfinite(value) for value in (x, y, z)):
-                    raise ValueError("XYZ 必须全部为有限值")
-            if self.time_offset_ns_le is not None:
-                offsets = (
-                    struct.unpack("<%dQ" % self.point_count, self.time_offset_ns_le)
-                    if self.point_count
-                    else ()
-                )
-                if self.scan_duration_ns is not None and offsets and max(offsets) > self.scan_duration_ns:
+            # 在只读原始字节上批量校验，避免逐点解释执行挤占惯性读取线程。
+            xyz = np.frombuffer(self.xyz_f32_le, dtype="<f4")
+            if not np.isfinite(xyz).all():
+                raise ValueError("XYZ 必须全部为有限值")
+            if self.time_offset_ns_le is not None and self.scan_duration_ns is not None and self.point_count:
+                offsets = np.frombuffer(self.time_offset_ns_le, dtype="<u8")
+                # 转回整数再比较，保留64位纳秒边界，避免浮点数舍入放过越界值。
+                if int(offsets.max()) > self.scan_duration_ns:
                     raise ValueError("逐点时间偏移不能超过 scan_duration_ns")
             return self
 

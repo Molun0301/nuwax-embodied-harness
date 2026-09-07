@@ -212,6 +212,10 @@ class RobotStateService:
             "twist",
             "joints",
             "imu",
+            # 高频惯性载荷与姿态派生数值只更新完整快照，不驱动网页语义修订。
+            "canonical_imu_sample",
+            "orientation_yaw_rate_rps",
+            "yaw_stabilization_offset_rad",
             "timestamp",
             "updated_at",
             "source_timestamp",

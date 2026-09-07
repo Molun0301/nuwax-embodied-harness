@@ -26,6 +26,7 @@ _logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+import numpy as np
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
@@ -899,10 +900,9 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
     point_count = int(point_count_text)
     if len(xyz_bytes) != point_count * 12:
         raise ValueError("点云 XYZ 长度与 point_count 不一致。")
-    if any(
-        not math.isfinite(coordinate)
-        for coordinate, in struct.iter_unpack("<f", xyz_bytes)
-    ):
+    # 只读小端视图批量校验全部坐标，避免逐点解释执行挤占惯性读取线程。
+    xyz = np.frombuffer(xyz_bytes, dtype="<f4")
+    if not np.isfinite(xyz).all():
         raise ValueError("点云 XYZ 坐标必须全部为有限 float32。")
 
     header = {

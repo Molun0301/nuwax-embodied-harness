@@ -73,9 +73,10 @@ set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/fastlio-resize-darwin.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-imu-initialization.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-empty-neighbours.patch"
-  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-initial-map-frames.patch")
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-initial-map-frames.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-static-bias-initialization.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
-foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp Estimator.cpp)
+foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
     "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()

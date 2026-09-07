@@ -56,30 +56,118 @@ _NATIVE_CLOUD_READER_HISTORY_DEPTH = 16
 
 
 class _HistoryChannelSubscriber:
-    """仅通过官方公开通道设置单个读取器的有界历史。"""
+    """通过公开接收接口复用有界读取器和等待资源，关闭时先取消在读操作。"""
 
-    def __init__(self, factory, topic, message_type, qos) -> None:
-        self._channel = factory.CreateChannel(topic, message_type)
+    def __init__(self, modules, topic, message_type, qos) -> None:
+        self._modules = modules
+        self._topic_name = topic
+        self._message_type = message_type
         self._qos = qos
+        self._lock = threading.RLock()
         self._initialized = False
-        self._close_needed = False
+        self._initializing = False
+        self._closed = False
+        self._reading_thread_id: Optional[int] = None
+        self._participant = None
+        self._topic = None
+        self._reader = None
+        self._read_condition = None
+        self._waitset = None
+        self._guard_condition = None
 
     def Init(self) -> None:
-        if self._initialized:
-            return
-        # 部分初始化失败仍由现有启动回滚调用 Close，不遗失关闭途径。
-        self._close_needed = True
-        self._channel.SetReader(self._qos)
-        self._initialized = True
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Go2 DDS 读取器已关闭，重启须创建新代际实例")
+            if self._initialized:
+                return
+            if self._initializing:
+                raise RuntimeError("Go2 DDS 读取器初始化不允许重入")
+            self._initializing = True
+            try:
+                # SDK 已按设备接口初始化域0；新增参与者复用该域，不重设域级配置。
+                self._participant = self._modules["DomainParticipant"](0)
+                self._topic = self._modules["Topic"](
+                    self._participant, self._topic_name, self._message_type,
+                )
+                self._reader = self._modules["DataReader"](
+                    self._participant, self._topic, self._qos,
+                )
+                self._read_condition = self._modules["ReadCondition"](
+                    self._reader, self._modules["ReadConditionMask"],
+                )
+                self._waitset = self._modules["WaitSet"](self._participant)
+                self._guard_condition = self._modules["GuardCondition"](self._participant)
+                self._waitset.attach(self._read_condition)
+                self._waitset.attach(self._guard_condition)
+                if self._closed:
+                    raise RuntimeError("Go2 DDS 读取器初始化期间已关闭")
+                self._initialized = True
+            except Exception:
+                self._closed = True
+                self._release_entities_locked()
+                raise
+            finally:
+                self._initializing = False
 
     def Read(self, timeout=None):
-        return self._channel.Read(timeout)
+        with self._lock:
+            if self._closed or not self._initialized:
+                return None
+            if self._reading_thread_id is not None:
+                raise RuntimeError("Go2 DDS 读取器只允许所属线程逐次读取")
+            self._reading_thread_id = threading.get_ident()
+            reader, condition, waitset = self._reader, self._read_condition, self._waitset
+        try:
+            deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+            while True:
+                with self._lock:
+                    if self._closed:
+                        return None
+                samples = reader.take(1, condition=condition)
+                if samples:
+                    with self._lock:
+                        return None if self._closed else samples[0]
+                if deadline is None:
+                    remaining_ns = (1 << 63) - 1
+                else:
+                    remaining_ns = int(max(0.0, deadline - time.monotonic()) * 1_000_000_000)
+                    if remaining_ns == 0:
+                        return None
+                waitset.wait(remaining_ns)
+        finally:
+            with self._lock:
+                self._reading_thread_id = None
+                if self._closed:
+                    self._release_entities_locked()
 
     def Close(self) -> None:
-        if not self._close_needed:
-            return
-        self._channel.CloseReader()
-        self._close_needed = False
+        with self._lock:
+            self._closed = True
+            if self._guard_condition is not None:
+                self._guard_condition.set(True)
+            # 由外层已有有界线程等待负责排空；不得在这里无期限等待反序列化。
+            # 在读/初始化的最后退出者释放实体，迟到样本仍被关闭事实拒绝。
+            if self._initializing or self._reading_thread_id is not None:
+                return
+            self._release_entities_locked()
+
+    def _release_entities_locked(self) -> None:
+        waitset = self._waitset
+        if waitset is not None:
+            for condition in (self._read_condition, self._guard_condition):
+                if condition is not None:
+                    try:
+                        waitset.detach(condition)
+                    except Exception:
+                        LOGGER.debug("分离 Go2 DDS 读取条件失败。", exc_info=True)
+        # Python 绑定由拥有引用析构实体，不调用SDK私有成员或删除执行中的读取器。
+        self._waitset = None
+        self._read_condition = None
+        self._guard_condition = None
+        self._reader = None
+        self._topic = None
+        self._participant = None
         self._initialized = False
 
 
@@ -247,7 +335,17 @@ def _load_go2_official_sdk_modules(
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
             if config.lio_backend in {"fastlio2", "pointlio"}:
                 qos_module = importlib.import_module("cyclonedds.qos")
-                modules["ChannelFactory"] = getattr(channel_module, "ChannelFactory")
+                core_module = importlib.import_module("cyclonedds.core")
+                modules["DomainParticipant"] = getattr(
+                    importlib.import_module("cyclonedds.domain"), "DomainParticipant",
+                )
+                modules["Topic"] = getattr(importlib.import_module("cyclonedds.topic"), "Topic")
+                modules["DataReader"] = getattr(importlib.import_module("cyclonedds.sub"), "DataReader")
+                for name in ("ReadCondition", "WaitSet", "GuardCondition"):
+                    modules[name] = getattr(core_module, name)
+                modules["ReadConditionMask"] = (
+                    core_module.ViewState.Any | core_module.InstanceState.Alive | core_module.SampleState.NotRead
+                )
                 modules["Qos"] = getattr(qos_module, "Qos")
                 modules["HistoryKeepLast"] = getattr(getattr(qos_module, "Policy").History, "KeepLast")
                 modules["ResourceLimits"] = getattr(getattr(qos_module, "Policy"), "ResourceLimits")
@@ -706,8 +804,14 @@ class Go2DirectDdsBridge:
             def make_subscriber(topic, message_type, history_depth):
                 if not native_input:
                     return subscriber_class(topic, message_type)
-                required = ("ChannelFactory", "Qos", "HistoryKeepLast", "ResourceLimits")
-                if any(not callable(modules.get(name)) for name in required):
+                required = (
+                    "DomainParticipant", "Topic", "DataReader", "ReadCondition", "WaitSet", "GuardCondition",
+                    "Qos", "HistoryKeepLast", "ResourceLimits",
+                )
+                if (
+                    any(not callable(modules.get(name)) for name in required)
+                    or not isinstance(modules.get("ReadConditionMask"), int)
+                ):
                     raise RuntimeError("Go2原生输入缺少公开读取器有界历史接口")
                 qos = modules["Qos"](
                     modules["HistoryKeepLast"](history_depth),
@@ -717,7 +821,7 @@ class Go2DirectDdsBridge:
                         max_samples_per_instance=history_depth,
                     ),
                 )
-                return _HistoryChannelSubscriber(modules["ChannelFactory"](), topic, message_type, qos)
+                return _HistoryChannelSubscriber(modules, topic, message_type, qos)
 
             pose_subscriber = make_subscriber(
                 self.config.direct_dds.pose_topic,
@@ -759,7 +863,7 @@ class Go2DirectDdsBridge:
                     _NATIVE_CLOUD_READER_HISTORY_DEPTH if point_cloud_enabled else 0,
                 )
         except Exception as exc:
-            LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", exc)
+            LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", str(exc))
             self._close_direct_dds_subscriber(point_cloud_subscriber, "点云订阅器")
             self._close_direct_dds_subscriber(pose_subscriber, "位姿订阅器")
             with self._lock:

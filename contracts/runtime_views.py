@@ -247,7 +247,7 @@ def map_content_sha256(
     cost_map=None,
     semantic_map=None,
 ) -> str:
-    """Return the deterministic digest for map content, excluding volatile timestamps."""
+    """计算排除动态时间戳的确定性地图内容摘要。"""
 
     def normalize(value):
         if hasattr(value, "model_dump"):
@@ -258,6 +258,11 @@ def map_content_sha256(
                 for key, inner in sorted(value.items(), key=lambda item: str(item[0]))
                 if key != "timestamp"
             }
+        if type(value) is list:
+            # 先捕获副本；普通整数无需逐格重复模型/容器检查，其它元素继续原递归。
+            copied = value.copy()
+            if all(type(item) is int for item in copied):
+                return copied
         if isinstance(value, (list, tuple)):
             return [normalize(item) for item in value]
         return value

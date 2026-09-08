@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# 函数内失败也必须执行同一回滚与回执处理，不能留下永久 activating 请求。
+set -Eeuo pipefail
 
 REPO_ROOT="${NUWAX_REPO_ROOT:?NUWAX_REPO_ROOT is required}"
 REQUEST_FILE="${NUWAX_RUNTIME_ACTIVATION_REQUEST:-/run/nuwax/gateway/geometry.request}"
@@ -89,7 +90,10 @@ capture_unit_failure() {
   FAILURE_UNIT_EXIT_STATUS="$(systemctl show --property=ExecMainStatus --value "${LAST_UNIT}" 2>/dev/null || true)"
   status_detail="$(systemctl status --no-pager --full --lines=20 "${LAST_UNIT}" 2>&1 || true)"
   journal_detail="$(journalctl --no-pager --quiet --lines=20 --unit "${LAST_UNIT}" 2>/dev/null || true)"
-  FAILURE_DIAGNOSTIC="${status_detail}"
+  if [[ -n "${FAILURE_DIAGNOSTIC}" ]]; then
+    FAILURE_DIAGNOSTIC+=$'\n'
+  fi
+  FAILURE_DIAGNOSTIC+="${status_detail}"
   if [[ -n "${journal_detail}" ]]; then
     FAILURE_DIAGNOSTIC+=$'\n'"${journal_detail}"
   fi
@@ -255,12 +259,22 @@ PY
 
 start_unit_if_needed() {
   local unit="$1"
+  local start_output=""
+  local start_status=0
   check_cancel
   if systemctl is-active --quiet "${unit}"; then
     return 0
   fi
   STARTED_UNITS+=("${unit}")
-  systemctl start "${unit}"
+  if start_output="$(systemctl start "${unit}" 2>&1)"; then
+    :
+  else
+    start_status=$?
+    # 服务未启动时，单元状态不一定记录权限或总线错误，保留本次命令原文。
+    FAILURE_DIAGNOSTIC="${start_output}"
+    printf '%s\n' "${start_output}" >&2
+    return "${start_status}"
+  fi
   check_cancel
 }
 

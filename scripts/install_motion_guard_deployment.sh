@@ -304,8 +304,16 @@ check_systemd_owned_invariants() {
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
               "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
               "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
-    grep -qx 'User=nuwax' "${unit}" \
-      || fail "production service must run as nuwax: ${unit}"
+    if [[ "${unit}" == "${RUNTIME_ACTIVATION_UNIT_SOURCE}" ]]; then
+      # 只有系统服务编排拥有方需要特权，且不能接管普通组件的共享日志目录。
+      grep -qx 'User=root' "${unit}" \
+        || fail "runtime activator must run as root to manage system services: ${unit}"
+      ! grep -q '^LogsDirectory=' "${unit}" \
+        || fail "runtime activator must not change shared log directory ownership: ${unit}"
+    else
+      grep -qx 'User=nuwax' "${unit}" \
+        || fail "production service must run as nuwax: ${unit}"
+    fi
     grep -qx 'Group=nuwax' "${unit}" \
       || fail "production service must run with group nuwax: ${unit}"
     grep -qx 'WorkingDirectory=@NUWAX_REPO_ROOT@' "${unit}" \

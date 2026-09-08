@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=nuwax
+# 激活器负责管理系统服务；实际网关与算法仍由各自服务的普通账号运行。
+User=root
 Group=nuwax
 ProtectHome=read-only
 WorkingDirectory=@NUWAX_REPO_ROOT@
-LogsDirectory=nuwax/gateway
-LogsDirectoryMode=0750
+# 日志目录由普通服务创建，避免特权激活器改变共享目录的拥有者。
 Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env

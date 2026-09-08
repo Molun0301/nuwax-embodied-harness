@@ -186,13 +186,19 @@ class InstanceAssociationService:
         instances = dict(existing_instances)
         outcomes: List[AssociationOutcome] = []
         matched_by_source: Dict[Tuple[str, Optional[str]], set[str]] = {}
+        # 同一次关联的地图域固定，只筛选一次；保留原字典顺序和未绑定地图的候选。
+        candidate_ids = [
+            instance_id for instance_id, candidate in instances.items()
+            if not (map_name and candidate.map_name and candidate.map_name != map_name)
+        ]
 
         for item in projected_observations:
             source_key = (item.source_observation_id, item.camera_id)
             matched_ids = matched_by_source.setdefault(source_key, set())
             best_instance = None
             best_score = 0.0
-            for candidate in instances.values():
+            for instance_id in candidate_ids:
+                candidate = instances[instance_id]
                 if candidate.lifecycle_state == InstanceLifecycleState.REMOVED:
                     continue
                 if candidate.instance_id in matched_ids:
@@ -229,6 +235,8 @@ class InstanceAssociationService:
                 cost_map=cost_map,
                 now=resolved_now,
             )
+            if created.instance_id not in instances:
+                candidate_ids.append(created.instance_id)
             instances[created.instance_id] = created
             matched_ids.add(created.instance_id)
             outcomes.append(AssociationOutcome(instance=created, created=True, matched_score=1.0))

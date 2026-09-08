@@ -449,6 +449,11 @@ impl MapRevisionEvent {
             return event;
         }
 
+        // 未叠加禁区的同内容地图共用已编码字节与摘要，不再分配并散列第二份整图。
+        if raw.data == effective.data {
+            return event;
+        }
+
         let raw_data: Arc<[u8]> = raw
             .data
             .iter()
@@ -6257,10 +6262,22 @@ fn forbidden_zone_watcher_future(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let request = {
+                let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
+                mapping_adapter.lock().begin_forbidden_zone_refresh()
+            };
+            let Some(mut request) = request else {
+                continue;
+            };
+            // 文件读取和解析不占用建图锁；没有新增脱离根拥有方的后台工作。
+            let loaded = request.load();
             let _lifecycle_guard = mapping_lifecycle_lock.lock().await;
-            let result = mapping_adapter
-                .lock()
-                .refresh_forbidden_zones(&state, &map_revision_tx);
+            let result = mapping_adapter.lock().finish_forbidden_zone_refresh(
+                request,
+                loaded,
+                &state,
+                &map_revision_tx,
+            );
             match result {
                 Ok(true) => info!("forbidden-zone update committed as canonical map revision"),
                 Ok(false) => {}

@@ -22,10 +22,9 @@ use nuwax_mapping::cost_mapper::{CostAlgoSelector, CostMapper, OccupancyConfig, 
 use nuwax_mapping::pointclouds::occupancy::PointCloudOccConfig;
 use nuwax_mapping::OccupancyGrid;
 use nuwax_mapping_raytracing::voxel_ray_tracer::{
-    append_voxel_map_checkpoint, conservative_ray_step_bound,
-    decode_voxel_map_checkpoint_for_config, iter_global_points, try_update_map,
-    validate_update_inputs, voxel_map_checkpoint_encoded_len, Config, VoxelMap,
-    MAX_REQUEST_RAY_STEPS, VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
+    append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config, iter_global_points,
+    try_update_map, voxel_map_checkpoint_encoded_len, Config, PreparedRayUpdate, VoxelMap,
+    VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
 };
 
 const WORKER_QUEUE_CAPACITY: usize = 1;
@@ -1138,9 +1137,10 @@ impl MappingBackendSpec {
         let mut validation = RaytracingKernel {
             config: spec.config(),
             map: VoxelMap::default(),
-            prepared_origin: None,
+            prepared_update: None,
             input: Vec::new(),
             stable_points: Vec::new(),
+            stable_points_dirty: false,
             last_occupancy: None,
             last_candidate_point_count: 0,
             last_candidate_received_at_ns: 0,
@@ -1161,9 +1161,10 @@ impl MappingBackendSpec {
             Self::Raytracing(spec) => MappingKernel::Raytracing(RaytracingKernel {
                 config: spec.config(),
                 map: VoxelMap::default(),
-                prepared_origin: None,
+                prepared_update: None,
                 input: Vec::new(),
                 stable_points: Vec::new(),
+                stable_points_dirty: false,
                 last_occupancy: None,
                 last_candidate_point_count: 0,
                 last_candidate_received_at_ns: 0,
@@ -1220,7 +1221,9 @@ impl MappingKernel {
         let Self::Raytracing(kernel) = self else {
             return Ok(());
         };
-        kernel.commit_prepared_map_frame()
+        kernel.commit_prepared_map_frame()?;
+        kernel.refresh_stable_points();
+        Ok(())
     }
 
     pub(crate) fn accumulated_points<'a>(
@@ -1236,7 +1239,8 @@ impl MappingKernel {
     pub(crate) fn reset(&mut self) {
         if let Self::Raytracing(kernel) = self {
             kernel.map = VoxelMap::default();
-            kernel.prepared_origin = None;
+            kernel.prepared_update = None;
+            kernel.stable_points_dirty = false;
             kernel.input.clear();
             kernel.stable_points.clear();
         }
@@ -1269,9 +1273,10 @@ impl VoxelKernel {
 pub(crate) struct RaytracingKernel {
     config: Config,
     map: VoxelMap,
-    prepared_origin: Option<(f32, f32, f32)>,
+    prepared_update: Option<PreparedRayUpdate>,
     input: Vec<(f32, f32, f32)>,
     stable_points: Vec<Point3<f64>>,
+    stable_points_dirty: bool,
     last_occupancy: Option<OccupancyGrid>,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1284,7 +1289,7 @@ impl RaytracingKernel {
         sensor_origin: [f64; 3],
         points: &[Point3<f64>],
     ) -> Result<(), String> {
-        self.prepared_origin = None;
+        self.prepared_update = None;
         let origin = (
             sensor_origin[0] as f32,
             sensor_origin[1] as f32,
@@ -1297,54 +1302,28 @@ impl RaytracingKernel {
                 .iter()
                 .map(|point| (point.x as f32, point.y as f32, point.z as f32)),
         );
-        validate_update_inputs(origin, &self.input, &self.config)
-            .map_err(|error| format!("RAYTRACING_UPDATE_REJECTED: {error}"))?;
-        self.validate_frame_work(origin)?;
-        self.prepared_origin = Some(origin);
-        Ok(())
-    }
-
-    fn validate_frame_work(&self, origin: (f32, f32, f32)) -> Result<(), String> {
-        let mut total_steps = 0_u64;
-        for point in self
-            .input
-            .iter()
-            .step_by(self.config.ray_subsample as usize)
-        {
-            let range = f64::from(point.0 - origin.0)
-                .hypot(f64::from(point.1 - origin.1))
-                .hypot(f64::from(point.2 - origin.2));
-            if self.config.max_range > 0.0 && range > f64::from(self.config.max_range) {
-                continue;
-            }
-            let steps = conservative_ray_step_bound(
-                range,
-                f64::from(self.config.shadow_depth),
-                f64::from(self.config.voxel_size),
-            )
-            .ok_or_else(|| {
-                "RAYTRACING_UPDATE_REJECTED: total ray work estimate is not finite".to_owned()
-            })?;
-            total_steps = total_steps.checked_add(steps).ok_or_else(|| {
-                "RAYTRACING_UPDATE_REJECTED: total ray work estimate overflowed".to_owned()
-            })?;
-            if total_steps > MAX_REQUEST_RAY_STEPS {
-                return Err(format!(
-                    "RAYTRACING_UPDATE_REJECTED: frame requires more than {MAX_REQUEST_RAY_STEPS} ray steps"
-                ));
-            }
-        }
+        let input = std::mem::take(&mut self.input);
+        self.prepared_update = Some(
+            PreparedRayUpdate::new(origin, input, self.config.clone())
+                .map_err(|error| format!("RAYTRACING_UPDATE_REJECTED: {error}"))?,
+        );
         Ok(())
     }
 
     fn commit_prepared_map_frame(&mut self) -> Result<(), String> {
-        let origin = self
-            .prepared_origin
+        let prepared = self
+            .prepared_update
             .take()
             .ok_or_else(|| "RAYTRACING_UPDATE_REJECTED: no prepared frame".to_owned())?;
-        try_update_map(&mut self.map, origin, &self.input, &self.config)
-            .map_err(|error| format!("RAYTRACING_UPDATE_REJECTED: {error}"))?;
+        self.input = prepared.apply(&mut self.map);
+        self.stable_points_dirty = true;
+        Ok(())
+    }
 
+    fn refresh_stable_points(&mut self) {
+        if !self.stable_points_dirty {
+            return;
+        }
         self.stable_points.clear();
         self.stable_points.extend(
             iter_global_points(&self.map, self.config.voxel_size)
@@ -1356,13 +1335,18 @@ impl RaytracingKernel {
                 .then_with(|| left.y.total_cmp(&right.y))
                 .then_with(|| left.z.total_cmp(&right.z))
         });
-        Ok(())
+        self.stable_points_dirty = false;
     }
 
     fn validate_retained_state_bound(&self) -> Result<(), String> {
         let inv = 1.0_f32 / self.config.voxel_size;
         let mut new_voxels = std::collections::HashSet::new();
-        for point in &self.input {
+        let points = self
+            .prepared_update
+            .as_ref()
+            .map(|prepared| prepared.points())
+            .unwrap_or(&[]);
+        for point in points {
             let key = (
                 (point.0 * inv).floor() as i32,
                 (point.1 * inv).floor() as i32,
@@ -1393,7 +1377,18 @@ impl RaytracingKernel {
     }
 
     fn validate_checkpoint_budget(&self) -> Result<(), String> {
-        let encoded_len = mapping_backend_ray_checkpoint_encoded_len(self)?;
+        // 已拥有的栅格由构图或检查点解码验证；预算只需精确长度，不再逐格检查旧内容。
+        let occupancy_len = self
+            .last_occupancy
+            .as_ref()
+            .map(|grid| {
+                MAPPING_BACKEND_OCCUPANCY_FIXED_BYTES + grid.frame_id.len() + grid.data.len()
+            })
+            .unwrap_or(0);
+        let encoded_len = MAPPING_BACKEND_RAY_HEADER_BYTES
+            .checked_add(voxel_map_checkpoint_encoded_len(&self.map)?)
+            .and_then(|length| length.checked_add(occupancy_len))
+            .ok_or_else(|| "RAYTRACING_UPDATE_REJECTED: checkpoint length overflow".to_owned())?;
         if encoded_len > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES {
             return Err(format!(
                 "RAYTRACING_UPDATE_REJECTED: retained ray state requires {encoded_len} checkpoint bytes, limit is {MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}"
@@ -1930,9 +1925,10 @@ fn restore_mapping_kernel_checkpoint(
             let ray = RaytracingKernel {
                 config,
                 map,
-                prepared_origin: None,
+                prepared_update: None,
                 input: Vec::new(),
                 stable_points,
+                stable_points_dirty: false,
                 last_occupancy,
                 last_candidate_point_count,
                 last_candidate_received_at_ns,
@@ -2086,6 +2082,7 @@ fn flush_candidate(
                 ray.validate_checkpoint_budget()?;
                 return Ok(None);
             }
+            ray.refresh_stable_points();
             if ray.stable_points.is_empty() {
                 let Some(previous) = ray.last_occupancy.as_ref() else {
                     ray.dirty_since_candidate = false;
@@ -2191,6 +2188,11 @@ fn compute_candidate_in_place(
             ray.commit_prepared_map_frame()?;
             ray.validate_checkpoint_budget()?;
             ray.dirty_since_candidate = true;
+            // 每帧更新体素，但只有真正构图时才导出并排序完整历史点集。
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
+                return Ok(None);
+            }
+            ray.refresh_stable_points();
             MappingBackendKind::Raytracing
         }
     };
@@ -2456,6 +2458,37 @@ mod tests {
             .expect_err("aggregate ray work must be bounded");
         assert!(error.contains("more than 50000000 ray steps"));
         assert!(!kernel.ready_to_build());
+    }
+
+    #[test]
+    fn ray_history_is_materialized_only_when_candidate_or_flush_needs_it() {
+        let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
+        for sequence in 1..=3 {
+            compute_candidate_in_place(&mut kernel, &input(sequence), compute_config()).unwrap();
+        }
+        let mut skipped = input(4);
+        skipped.received_at_ns = 3_100_000_000;
+        skipped.source_timestamp_ns = skipped.received_at_ns;
+        assert!(
+            compute_candidate_in_place(&mut kernel, &skipped, compute_config())
+                .unwrap()
+                .is_none()
+        );
+        let MappingKernel::Raytracing(ray) = &kernel else {
+            panic!("射线后端");
+        };
+        assert!(ray.stable_points_dirty);
+        let mut flush_token = token(4);
+        flush_token.source_timestamp_ns = skipped.source_timestamp_ns;
+        assert!(
+            flush_candidate(&mut kernel, &skipped, &flush_token, compute_config())
+                .unwrap()
+                .is_some()
+        );
+        let MappingKernel::Raytracing(ray) = &kernel else {
+            panic!("射线后端");
+        };
+        assert!(!ray.stable_points_dirty);
     }
 
     #[test]

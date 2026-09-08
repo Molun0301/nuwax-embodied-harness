@@ -5782,9 +5782,9 @@ class GeometryRuntimeProvider:
                 "occupancy data size mismatch: expected=%d actual=%d"
                 % (expected_size, len(data))
             )
-        # 原生栅格已经是有符号字节，批量解码，值域只在合同构造边界检查一次。
-        import numpy as np
-        decoded = np.frombuffer(data, dtype=np.int8).tolist()
+        # 原生只读字节在进入合同前检查一次；列表仅在公共序列化或显式深复制时展开。
+        from contracts.occupancy_cells import PackedOccupancyCells
+        decoded = PackedOccupancyCells(data)
         frame_id = str(frame_id or "map").strip().lstrip("/") or "map"
         map_name = str(map_name or "").strip()
         if not map_name:

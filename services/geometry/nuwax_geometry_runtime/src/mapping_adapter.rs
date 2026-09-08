@@ -1070,6 +1070,7 @@ pub struct MappingAdapter {
     checkpoint_activation_digest: Option<[u8; 32]>,
     /// Optional production-only shared forbidden-zone document.
     forbidden_zones_path: Option<PathBuf>,
+    forbidden_zone_cache: parking_lot::Mutex<crate::forbidden_zones::ForbiddenZoneCache>,
     /// Last physical occupancy grid before virtual forbidden zones are applied.
     raw_map: Option<MapState>,
     /// Signature of the zone set used to compose the current effective map.
@@ -1085,6 +1086,22 @@ pub struct MappingAdapter {
     last_built_received_at_ns: u64,
     lifecycle: MappingSessionSnapshot,
     next_session_generation: u64,
+}
+
+/// 捕获既有会话和文件路径，读取时不持有生命周期或地图状态锁。
+pub(crate) struct ForbiddenZoneRefresh {
+    session_id: String,
+    generation: u64,
+    map_name: String,
+    path: PathBuf,
+    base_cache: crate::forbidden_zones::ForbiddenZoneCache,
+    cache: crate::forbidden_zones::ForbiddenZoneCache,
+}
+
+impl ForbiddenZoneRefresh {
+    pub(crate) fn load(&mut self) -> crate::forbidden_zones::LoadedForbiddenZones {
+        self.cache.load(&self.path, &self.map_name)
+    }
 }
 
 impl MappingAdapter {
@@ -1244,6 +1261,9 @@ impl MappingAdapter {
             checkpoint_installed: false,
             checkpoint_activation_digest: None,
             forbidden_zones_path: None,
+            forbidden_zone_cache: parking_lot::Mutex::new(
+                crate::forbidden_zones::ForbiddenZoneCache::default(),
+            ),
             raw_map: None,
             forbidden_zone_signature: String::new(),
             forbidden_zone_generation: 0,
@@ -2300,7 +2320,10 @@ impl MappingAdapter {
 
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
         match self.forbidden_zones_path.as_deref() {
-            Some(path) => crate::forbidden_zones::load_for_map(path, &self.lifecycle.map_name),
+            Some(path) => self
+                .forbidden_zone_cache
+                .lock()
+                .load(path, &self.lifecycle.map_name),
             None => crate::forbidden_zones::LoadedForbiddenZones {
                 signature: format!("disabled:{}", self.lifecycle.map_name),
                 generation: 0,
@@ -2363,6 +2386,44 @@ impl MappingAdapter {
     /// file replacement.  A successful update advances the canonical map
     /// revision and therefore reaches SHM, LCM, planners, guard and exploration
     /// through the existing fanout path.
+    pub(crate) fn begin_forbidden_zone_refresh(&self) -> Option<ForbiddenZoneRefresh> {
+        if !self.is_active() {
+            return None;
+        }
+        let cache = self.forbidden_zone_cache.lock().clone();
+        Some(ForbiddenZoneRefresh {
+            session_id: self.lifecycle.session_id.clone(),
+            generation: self.lifecycle.session_generation,
+            map_name: self.lifecycle.map_name.clone(),
+            path: self.forbidden_zones_path.clone()?,
+            base_cache: cache.clone(),
+            cache,
+        })
+    }
+
+    pub(crate) fn finish_forbidden_zone_refresh(
+        &mut self,
+        request: ForbiddenZoneRefresh,
+        loaded: crate::forbidden_zones::LoadedForbiddenZones,
+        state: &Arc<RwLock<SharedState>>,
+        map_revision_tx: &broadcast::Sender<MapRevisionEvent>,
+    ) -> Result<bool, String> {
+        if !self.is_active()
+            || self.lifecycle.session_id != request.session_id
+            || self.lifecycle.session_generation != request.generation
+            || self.lifecycle.map_name != request.map_name
+            || self.forbidden_zones_path.as_ref() != Some(&request.path)
+            || !self
+                .forbidden_zone_cache
+                .lock()
+                .same_source_version(&request.base_cache)
+        {
+            return Ok(false);
+        }
+        *self.forbidden_zone_cache.lock() = request.cache;
+        self.apply_forbidden_zone_refresh(loaded, state, map_revision_tx)
+    }
+
     pub fn refresh_forbidden_zones(
         &mut self,
         state: &Arc<RwLock<SharedState>>,
@@ -2372,6 +2433,15 @@ impl MappingAdapter {
             return Ok(false);
         }
         let loaded = self.load_forbidden_zones();
+        self.apply_forbidden_zone_refresh(loaded, state, map_revision_tx)
+    }
+
+    fn apply_forbidden_zone_refresh(
+        &mut self,
+        loaded: crate::forbidden_zones::LoadedForbiddenZones,
+        state: &Arc<RwLock<SharedState>>,
+        map_revision_tx: &broadcast::Sender<MapRevisionEvent>,
+    ) -> Result<bool, String> {
         if loaded.signature == self.forbidden_zone_signature {
             return Ok(false);
         }
@@ -3879,6 +3949,26 @@ mod tests {
                 assert_eq!(value, 0, "confirmed free observations clear the obstacle");
             }
         }
+    }
+
+    #[test]
+    fn forbidden_zone_refresh_reads_independently_and_rejects_retired_session() {
+        let mut adapter = active_adapter(sample_config());
+        adapter.forbidden_zones_path =
+            Some(std::env::temp_dir().join(format!("nuwax-zone-absent-{}", uuid::Uuid::new_v4())));
+        let mut request = adapter.begin_forbidden_zone_refresh().unwrap();
+        // 即使拥有方缓存锁正被占用，读取阶段也仅访问自己的快照。
+        let held = adapter.forbidden_zone_cache.lock();
+        let loaded = request.load();
+        drop(held);
+        adapter.lifecycle.session_generation += 1;
+        let before = adapter.forbidden_zone_signature.clone();
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let (tx, _) = broadcast::channel(4);
+        assert!(!adapter
+            .finish_forbidden_zone_refresh(request, loaded, &state, &tx)
+            .unwrap());
+        assert_eq!(adapter.forbidden_zone_signature, before);
     }
 
     #[test]

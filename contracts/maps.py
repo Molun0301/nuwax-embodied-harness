@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, WithJsonSchema, field_validator, model_validator
+from typing_extensions import Annotated
 
 from contracts.base import MetadataDict, TimestampedContract
 from contracts.geometry import Pose, Vector3
 from contracts.naming import validate_frame_id
-from typing import List, Optional
+from contracts.occupancy_cells import PackedOccupancyCells
+from typing import List, Optional, Union
 
 
 class OccupancyGrid(TimestampedContract):
@@ -17,7 +19,10 @@ class OccupancyGrid(TimestampedContract):
     height: int = Field(ge=1, description="地图高度，单位格。")
     resolution_m: float = Field(gt=0.0, description="每格分辨率，单位米。")
     origin: Pose = Field(description="地图原点位姿。")
-    data: List[int] = Field(default_factory=list, description="一维行优先栅格数据，范围为 -1 到 100。")
+    data: Annotated[
+        Union[PackedOccupancyCells, List[int]],
+        WithJsonSchema({"type": "array", "items": {"type": "integer"}}),
+    ] = Field(default_factory=list, description="一维行优先栅格数据，范围为 -1 到 100。")
 
     def __deepcopy__(self, memo: Optional[dict] = None) -> "OccupancyGrid":
         """复制整数栅格时免去逐格递归，其它字段仍沿模型完整深复制。"""
@@ -52,7 +57,9 @@ class OccupancyGrid(TimestampedContract):
     def _validate_grid(self) -> "OccupancyGrid":
         if len(self.data) != self.width * self.height:
             raise ValueError("OccupancyGrid 的 data 长度必须等于 width * height。")
-        if min(self.data, default=0) < -1 or max(self.data, default=0) > 100:
+        if type(self.data) is not PackedOccupancyCells and (
+            min(self.data, default=0) < -1 or max(self.data, default=0) > 100
+        ):
             raise ValueError("OccupancyGrid 的栅格取值必须在 -1 到 100 之间。")
         return self
 

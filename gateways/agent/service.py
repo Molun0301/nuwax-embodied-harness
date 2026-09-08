@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import json
 import logging
 import math
@@ -38,8 +39,10 @@ def validate_request_id(value: Any) -> str:
     return value
 
 
-def validate_arguments(arguments: Dict[str, Any], schema: Dict[str, Any]) -> None:
-    """使用能力真实结构验证参数；禁止结构引用触发远端请求。"""
+@lru_cache(maxsize=128)
+def _prepared_argument_validator(schema_json: str):
+    """按完整结构内容复用验证器，注册替换和原地更新自然产生新版本。"""
+    schema = json.loads(schema_json)
     stack = [schema]
     while stack:
         item = stack.pop()
@@ -52,14 +55,22 @@ def validate_arguments(arguments: Dict[str, Any], schema: Dict[str, Any]) -> Non
             stack.extend(item.values())
         elif isinstance(item, list):
             stack.extend(item)
+    validator = validator_for(schema)
+    validator.check_schema(schema)
+    return validator(schema)
+
+
+def validate_arguments(arguments: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """每次只验证实际参数；结构版本改变才检查定义与引用。"""
     try:
-        validator = validator_for(schema)
-        validator.check_schema(schema)
-        validator(schema).validate(arguments)
+        schema_json = json.dumps(schema, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        # 限制缓存保留的单项大小；超大结构仍按原完整校验执行。
+        prepare = _prepared_argument_validator if len(schema_json) <= 64 * 1024 else _prepared_argument_validator.__wrapped__
+        prepare(schema_json).validate(arguments)
     except ValidationError as exc:
         raise GatewayError("参数不符合工具声明的输入结构。", error_code="invalid_params", http_status=422,
                            details={"path": list(exc.absolute_path), "validator": exc.validator}) from exc
-    except SchemaError as exc:
+    except (SchemaError, TypeError, ValueError) as exc:
         raise GatewayError("工具参数结构无效。", error_code="agent_schema_invalid", http_status=500) from exc
 
 

@@ -903,7 +903,42 @@ pub fn update_map(
     try_update_map(map, origin, points, cfg).expect("invalid input passed to update_map")
 }
 
-/// Validate and apply one map update without partially mutating `map` on error.
+/// 拥有已验证的点、原点与配置；外部不能修改数据后复用旧验证结果。
+#[derive(Clone)]
+pub struct PreparedRayUpdate {
+    origin: (f32, f32, f32),
+    points: Vec<(f32, f32, f32)>,
+    config: Config,
+}
+
+impl PreparedRayUpdate {
+    /// 在相同遍历中核对坐标范围、每束射线及整帧预算。
+    pub fn new(
+        origin: (f32, f32, f32),
+        points: Vec<(f32, f32, f32)>,
+        config: Config,
+    ) -> Result<Self, UpdateMapError> {
+        validate_update_inputs_with_budget(origin, &points, &config, Some(MAX_REQUEST_RAY_STEPS))?;
+        Ok(Self {
+            origin,
+            points,
+            config,
+        })
+    }
+
+    /// 只读访问准备后的点，供拥有方检查保留状态大小。
+    pub fn points(&self) -> &[(f32, f32, f32)] {
+        &self.points
+    }
+
+    /// 消费准备结果后归还点缓冲，调用者可在下一帧复用其容量。
+    pub fn apply(self, map: &mut VoxelMap) -> Vec<(f32, f32, f32)> {
+        update_map_prevalidated(map, self.origin, &self.points, &self.config);
+        self.points
+    }
+}
+
+/// 校验并应用一帧更新，校验失败时不修改地图。
 pub fn try_update_map(
     map: &mut VoxelMap,
     origin: (f32, f32, f32),
@@ -1009,6 +1044,15 @@ pub fn validate_update_inputs(
     points: &[(f32, f32, f32)],
     cfg: &Config,
 ) -> Result<(), UpdateMapError> {
+    validate_update_inputs_with_budget(origin, points, cfg, None)
+}
+
+fn validate_update_inputs_with_budget(
+    origin: (f32, f32, f32),
+    points: &[(f32, f32, f32)],
+    cfg: &Config,
+    total_budget: Option<u64>,
+) -> Result<(), UpdateMapError> {
     cfg.validate()
         .map_err(|error| UpdateMapError::InvalidConfig(error.to_string()))?;
     let config_values = [
@@ -1035,6 +1079,7 @@ pub fn validate_update_inputs(
         return Err(UpdateMapError::OriginVoxelRange);
     }
 
+    let mut total_steps = 0_u64;
     for (index, point) in points.iter().copied().enumerate() {
         if ![point.0, point.1, point.2].into_iter().all(f32::is_finite) {
             return Err(UpdateMapError::NonFinitePoint { index });
@@ -1064,6 +1109,14 @@ pub fn validate_update_inputs(
         })?;
         if steps > MAX_STEPS_PER_RAY {
             return Err(UpdateMapError::RayStepBudget { index, steps });
+        }
+        if let Some(limit) = total_budget {
+            total_steps = total_steps.saturating_add(steps);
+            if total_steps > limit {
+                return Err(UpdateMapError::InvalidConfig(format!(
+                    "frame requires more than {limit} ray steps"
+                )));
+            }
         }
     }
     Ok(())

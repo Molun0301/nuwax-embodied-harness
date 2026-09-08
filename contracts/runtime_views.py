@@ -248,6 +248,8 @@ def map_content_sha256(
 ) -> str:
     """计算排除动态时间戳的确定性地图内容摘要。"""
 
+    from contracts.occupancy_cells import PackedOccupancyCells
+
     def normalize(value):
         if type(value) in (OccupancyGrid, CostMap):
             # 栅格已通过合同解析，数据直接复用；只递归处理小型几何和元数据字段。
@@ -277,13 +279,24 @@ def map_content_sha256(
         "cost_map": normalize(cost_map),
         "semantic_map": normalize(semantic_map),
     }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    def encode(value):
+        if type(value) is PackedOccupancyCells:
+            yield value.canonical_json
+        elif isinstance(value, dict):
+            yield b"{"
+            for index, key in enumerate(sorted(value)):
+                if index:
+                    yield b","
+                yield json.dumps(key, ensure_ascii=False).encode("utf-8") + b":"
+                yield from encode(value[key])
+            yield b"}"
+        else:
+            yield json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    digest = hashlib.sha256()
+    for chunk in encode(payload):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 class LocalizationSnapshot(TimestampedContract):

@@ -6,6 +6,8 @@
 //! have been configured for that map yet.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -136,6 +138,85 @@ impl LoadedForbiddenZones {
     }
 }
 
+/// 由建图适配器拥有的单项解析缓存；每次重新打开文件，删除和权限错误不复用旧结果。
+#[derive(Default, Clone)]
+pub(crate) struct ForbiddenZoneCache {
+    entry: Option<std::sync::Arc<(PathBuf, String, FileStamp, LoadedForbiddenZones)>>,
+    latest_result: Option<(String, String)>,
+}
+
+type FileStamp = (u64, u64, u64, i64, i64, i64, i64);
+
+fn file_stamp(meta: &std::fs::Metadata) -> FileStamp {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    )
+}
+
+impl ForbiddenZoneCache {
+    pub(crate) fn load(&mut self, path: &Path, map_name: &str) -> LoadedForbiddenZones {
+        let loaded = self.load_inner(path, map_name.trim());
+        self.latest_result = Some((map_name.trim().to_owned(), loaded.signature.clone()));
+        loaded
+    }
+
+    pub(crate) fn same_source_version(&self, other: &Self) -> bool {
+        self.latest_result == other.latest_result
+            && match (&self.entry, &other.entry) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.0 == right.0 && left.1 == right.1 && left.2 == right.2
+                }
+                _ => false,
+            }
+    }
+
+    fn load_inner(&mut self, path: &Path, map_name: &str) -> LoadedForbiddenZones {
+        let map_name = map_name.trim();
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => {
+                self.entry = None;
+                return load_for_map(path, map_name);
+            }
+        };
+        let before = file.metadata().ok().map(|meta| file_stamp(&meta));
+        if let (Some(stamp), Some((cached_path, cached_map, cached_stamp, loaded))) =
+            (before, self.entry.as_deref())
+        {
+            if path == cached_path && map_name == cached_map && stamp == *cached_stamp {
+                return loaded.clone();
+            }
+        }
+        let mut bytes = Vec::new();
+        if let Err(error) = file.read_to_end(&mut bytes) {
+            self.entry = None;
+            return LoadedForbiddenZones::fail_closed(
+                format!("io-error:{map_name}:{error}"),
+                format!("cannot read {}: {error}", path.display()),
+            );
+        }
+        let loaded = parse_for_map(&bytes, map_name);
+        // 原地写入期间的结果不缓存；下一次必须重新读取并验证。
+        let after = file.metadata().ok().map(|meta| file_stamp(&meta));
+        self.entry = before.filter(|stamp| Some(*stamp) == after).map(|stamp| {
+            std::sync::Arc::new((
+                path.to_path_buf(),
+                map_name.to_owned(),
+                stamp,
+                loaded.clone(),
+            ))
+        });
+        loaded
+    }
+}
+
 pub fn load_for_map(path: &Path, map_name: &str) -> LoadedForbiddenZones {
     let map_name = map_name.trim();
     if map_name.is_empty() {
@@ -157,7 +238,17 @@ pub fn load_for_map(path: &Path, map_name: &str) -> LoadedForbiddenZones {
             );
         }
     };
-    let file_hash = crate::map_checksum::sha256_hex(&bytes);
+    parse_for_map(&bytes, map_name)
+}
+
+fn parse_for_map(bytes: &[u8], map_name: &str) -> LoadedForbiddenZones {
+    if map_name.is_empty() {
+        return LoadedForbiddenZones::fail_closed(
+            "invalid:empty-map-binding".to_owned(),
+            "active map_name is empty",
+        );
+    }
+    let file_hash = crate::map_checksum::sha256_hex(bytes);
     let document: ForbiddenZoneDocument = match serde_json::from_slice(&bytes) {
         Ok(document) => document,
         Err(error) => {
@@ -863,6 +954,47 @@ mod tests {
         let map = compose_effective_map(&free_map(3, 2), &loaded).unwrap();
         assert!(map.data.iter().all(|value| *value == 100));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cached_document_detects_replacement_same_mtime_and_removal() {
+        let path = std::env::temp_dir().join(format!("nuwax-zone-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, br#"{"schema_version":1,"maps":{}}"#).unwrap();
+        let mut cache = ForbiddenZoneCache::default();
+        let first = cache.load(&path, "map-a");
+        let entry = cache.entry.clone().unwrap();
+        assert_eq!(cache.load(&path, "map-a").signature, first.signature);
+        assert!(std::sync::Arc::ptr_eq(
+            &entry,
+            cache.entry.as_ref().unwrap()
+        ));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let next = path.with_extension("next");
+        std::fs::write(&next, br#"{"schema_version":9,"maps":{}}"#).unwrap();
+        std::fs::File::open(&next)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert!(matches!(
+            cache.load(&path, "map-a").status,
+            ZoneLoadStatus::FailClosed(_)
+        ));
+        std::fs::write(&path, br#"{"schema_version":1,"maps":{}}"#).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(matches!(
+            cache.load(&path, "map-a").status,
+            ZoneLoadStatus::Empty
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            cache.load(&path, "map-a").status,
+            ZoneLoadStatus::Empty
+        ));
+        assert!(cache.entry.is_none());
     }
 
     #[test]

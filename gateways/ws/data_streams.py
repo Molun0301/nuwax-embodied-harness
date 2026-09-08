@@ -29,6 +29,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
 from contracts.runtime_views import MapSnapshot
+from contracts.occupancy_cells import PackedOccupancyCells
 from core.logging_utils import LogRateLimiter
 from core.stream_coalescing import stream_replacement_key
 from gateways.auth import GatewayAccessManager
@@ -335,7 +336,7 @@ def _project_json_value(
                 if isinstance(projected_payload, dict):
                     projected_grid = projected_payload.get("occupancy_grid")
                     if isinstance(projected_grid, dict):
-                        projected_grid["data"] = occupancy_data
+                        projected_grid["data"] = occupancy_data.to_list() if type(occupancy_data) is PackedOccupancyCells else occupancy_data
             return projected_frame
 
         if isinstance(value, Mapping):
@@ -967,6 +968,31 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
 
 _MAP_BINARY_MAGIC = b"NUWAXMAP"
 _MAP_BINARY_VERSION = 2
+_MAP_ENCODE_CACHE_BYTES = 32 * 1024 * 1024
+_MAP_ENCODE_CACHE = collections.OrderedDict()
+_MAP_ENCODE_LOCK = threading.Lock()
+_MAP_ENCODE_RETAINED_BYTES = 0
+
+
+def _pack_map_envelope(header: bytes, raw: bytes) -> bytes:
+    """相同只读载荷和完整帧头只拼接一次；强引用避免对象编号复用。"""
+    global _MAP_ENCODE_RETAINED_BYTES
+    key = (header, id(raw))
+    size = len(raw) * 2 + len(header) * 2 + 13
+    if size > _MAP_ENCODE_CACHE_BYTES:
+        return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + raw
+    with _MAP_ENCODE_LOCK:
+        cached = _MAP_ENCODE_CACHE.get(key)
+        if cached is not None:
+            _MAP_ENCODE_CACHE.move_to_end(key)
+            return cached[1]
+        encoded = struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + raw
+        while _MAP_ENCODE_CACHE and (_MAP_ENCODE_RETAINED_BYTES + size > _MAP_ENCODE_CACHE_BYTES or len(_MAP_ENCODE_CACHE) >= 8):
+            _, (_, _, retired_size) = _MAP_ENCODE_CACHE.popitem(last=False)
+            _MAP_ENCODE_RETAINED_BYTES -= retired_size
+        _MAP_ENCODE_CACHE[key] = (raw, encoded, size)
+        _MAP_ENCODE_RETAINED_BYTES += size
+        return encoded
 
 
 def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
@@ -998,6 +1024,8 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     header = _stream_json_dumps({"type": "stream.frame", "frame": header_frame}).encode("utf-8")
     if len(header) > 64 * 1024:
         raise ValueError("二进制地图头超过64KiB")
+    if type(data) is PackedOccupancyCells:
+        return _pack_map_envelope(header, data.raw)
     return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
 
 

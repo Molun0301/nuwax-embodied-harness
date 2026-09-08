@@ -140,6 +140,7 @@ pub(crate) struct MapPoseAdapter {
     map_frame: String,
     odom_frame: String,
     base_frame: String,
+    strict_body_reference: bool,
     map_to_odom: Option<RigidTransform>,
     tf_ttl: Duration,
     alignment_tolerance: Duration,
@@ -196,11 +197,29 @@ impl MapPoseAdapter {
             map_frame,
             odom_frame,
             base_frame,
+            strict_body_reference: false,
             map_to_odom: None,
             tf_ttl,
             alignment_tolerance,
             generation: 0,
         })
+    }
+
+    /// 三维接线不能把足印参考点与机体参考点当作同一高度。
+    pub(crate) fn require_body_reference(mut self) -> Self {
+        self.strict_body_reference = true;
+        self
+    }
+
+    fn matches_base_frame(&self, actual: &str) -> bool {
+        let is_footprint = |frame: &str| {
+            frame
+                .rsplit('/')
+                .next()
+                .is_some_and(|leaf| leaf.ends_with("base_footprint"))
+        };
+        (!self.strict_body_reference || is_footprint(actual) == is_footprint(&self.base_frame))
+            && frame_ids_semantically_equal(actual, &self.base_frame)
     }
 
     /// Observe the latest real map->odom transform. Returns whether one was accepted.
@@ -268,7 +287,7 @@ impl MapPoseAdapter {
             .rev()
             .find(|transform| {
                 frame_ids_semantically_equal(&transform.header.frame_id, &self.odom_frame)
-                    && frame_ids_semantically_equal(&transform.child_frame_id, &self.base_frame)
+                    && self.matches_base_frame(&transform.child_frame_id)
             })
             .map(|odom_to_base| {
                 validate_translation(odom_to_base.transform.translation, "odom_to_base")?;
@@ -338,7 +357,7 @@ impl MapPoseAdapter {
         odometry: &schema::Odometry,
         now: Instant,
     ) -> Result<Option<MapPoseObservation>, MapPoseError> {
-        if !frame_ids_semantically_equal(&odometry.child_frame_id, &self.base_frame) {
+        if !self.matches_base_frame(&odometry.child_frame_id) {
             return Err(MapPoseError::FrameMismatch {
                 field: "odometry.child_frame_id",
                 expected: self.base_frame.clone(),
@@ -591,6 +610,18 @@ mod tests {
             .transform_odometry(&odometry("odom", "camera", 1.0, 2.0))
             .expect_err("foreign frame role must fail closed");
         assert!(matches!(error, MapPoseError::FrameMismatch { .. }));
+    }
+
+    #[test]
+    fn surface_reference_does_not_alias_footprint_height_to_body() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link")
+            .unwrap().require_body_reference();
+        adapter.observe_tf(&map_to_odom(0.0, 0.0)).unwrap();
+        assert!(adapter.transform_odometry(&odometry("odom", "base_footprint", 1.0, 2.0)).is_err());
+        let mut body = odometry("odom", "base_link", 1.0, 2.0);
+        body.pose.position[2] = 0.4;
+        let observed = adapter.transform_odometry(&body).unwrap().unwrap();
+        assert_eq!(observed.pose.pose.position[2], 0.4);
     }
 
     #[test]

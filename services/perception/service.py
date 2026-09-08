@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import threading
+import json
 from collections import deque
+from datetime import timezone
 from urllib.parse import urlencode
 from time import perf_counter
 
@@ -82,6 +84,8 @@ class PerceptionService:
         self._video_frame_source = video_frame_source
         self._live_pose_provider = live_pose_provider
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
+        self._fast_frame_cache = {}
+        self._last_published_video_frames = {}
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._latest_full_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
@@ -230,14 +234,15 @@ class PerceptionService:
         )
 
         stage_started_at = perf_counter()
+        detector_available = stage_status["detector"] in {"completed", "fallback"}
         tracks = self._tracker_backend.update(
             image_frame,
             detections_2d=detection_bundle.detections_2d,
             detections_3d=detection_bundle.detections_3d,
             camera_info=camera_info,
-        )
+        ) if detector_available else ()
         stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
-        stage_status["tracker"] = "completed"
+        stage_status["tracker"] = "completed" if detector_available else "skipped_detector_unavailable"
 
         detections_2d = self._attach_track_ids(detection_bundle.detections_2d, tracks)
 
@@ -530,6 +535,18 @@ class PerceptionService:
         if camera_info is not None and not isinstance(camera_info, CameraInfo):
             raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
 
+        source_frame = image_frame
+        cacheable = not detection_metadata and open_vocabulary_classes is None
+        cache_key = (detector_backend_name or self._detector_pipeline.default_backend_name, source_name, requested_by)
+        input_signature = self._fast_input_signature(image_frame, camera_info)
+        cacheable = cacheable and input_signature is not None
+        cached = self._fast_frame_cache.get(image_frame.camera_id)
+        if (
+            cacheable and cached is not None and cached[0] is source_frame
+            and cached[1] == input_signature and cached[2] == cache_key
+        ):
+            return cached[3]
+
         image_frame = self._apply_detection_metadata(
             image_frame,
             detection_metadata=detection_metadata,
@@ -557,14 +574,15 @@ class PerceptionService:
         )
 
         stage_started_at = perf_counter()
+        detector_available = stage_status["detector"] in {"completed", "fallback"}
         tracks = self._tracker_backend.update(
             image_frame,
             detections_2d=detection_bundle.detections_2d,
             detections_3d=detection_bundle.detections_3d,
             camera_info=camera_info,
-        )
+        ) if detector_available else ()
         stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
-        stage_status["tracker"] = "completed"
+        stage_status["tracker"] = "completed" if detector_available else "skipped_detector_unavailable"
 
         detections_2d = self._attach_track_ids(detection_bundle.detections_2d, tracks)
         stage_duration_ms["total"] = self._elapsed_ms(pipeline_started_at)
@@ -578,6 +596,10 @@ class PerceptionService:
             tracks=tracks,
             stage_duration_ms=stage_duration_ms,
         )
+        if not detector_available:
+            scene_summary = scene_summary.model_copy(update={
+                "headline": "检测模型尚未完成有效推理，当前帧识别结果不可用。",
+            })
         observation = Observation(
             observation_id=build_observation_id(self._normalize_camera_id(image_frame.camera_id)),
             frame_id=image_frame.frame_id,
@@ -657,8 +679,27 @@ class PerceptionService:
             source=source_name or detector_spec.name,
             metadata={"kind": "latest_perception_fast", "pipeline_name": self._pipeline_name},
         )
+        if cacheable and stage_status["detector"] in {"completed", "fallback"}:
+            self._fast_frame_cache[context.camera_id] = (source_frame, input_signature, cache_key, context)
+            if len(self._fast_frame_cache) > 8:
+                self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
         self._publish_detection_overlay_frame(context)
         return context
+
+    @staticmethod
+    def _fast_input_signature(image_frame, camera_info):
+        """缓存保存不可变输入签名，防止复用对象后读到旧图像或旧内参结果。"""
+
+        try:
+            metadata = json.dumps(image_frame.metadata, sort_keys=True, default=lambda item: item.model_dump(mode="json"))
+            calibration = camera_info.model_dump_json() if camera_info is not None else None
+        except Exception:
+            return None
+        if len(metadata) > 8192 or not isinstance(image_frame.data, (bytes, type(None))):
+            return None
+        return (image_frame.timestamp, id(image_frame.data), len(image_frame.data or b""),
+                image_frame.width_px, image_frame.height_px, image_frame.encoding, image_frame.frame_id,
+                image_frame.uri, image_frame.artifact_id, metadata, calibration)
 
     def describe_current_scene(
         self,
@@ -766,6 +807,11 @@ class PerceptionService:
         open_vocabulary_classes: Optional[Iterable[str]] = None,
     ):
         metadata_update = dict(detection_metadata or {})
+        # 请求补充的检测条件不能覆盖图像来源、时间或标定事实。
+        for key in ("source_timestamp_ns", "source_clock_domain", "source_clock_id", "source_sequence",
+                    "ingest_sequence", "frame_timestamp", "frame_timestamp_source", "frame_timestamp_unknown",
+                    "camera_info", "camera_id", "frame_id", "width_px", "height_px", "source_kind"):
+            metadata_update.pop(key, None)
         if open_vocabulary_classes is not None:
             class_names = [str(item).strip() for item in open_vocabulary_classes if str(item or "").strip()]
             if class_names:
@@ -779,11 +825,27 @@ class PerceptionService:
         return image_frame
 
     @staticmethod
-    def _source_timestamp_metadata(image_frame) -> Dict[str, int]:
-        value = dict(image_frame.metadata or {}).get("source_timestamp_ns")
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            return {}
-        return {"source_timestamp_ns": value}
+    def _source_timestamp_metadata(image_frame) -> Dict[str, Any]:
+        """保留输入时间及已声明来源，不能用结果发布时间冒充采集时间。"""
+
+        metadata = dict(image_frame.metadata or {})
+        timestamp = image_frame.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        result = {
+            "frame_timestamp": None if metadata.get("frame_timestamp_unknown") else timestamp.isoformat(),
+            "frame_timestamp_source": str(metadata.get("frame_timestamp_source") or "image_frame.timestamp"),
+        }
+        value = metadata.get("source_timestamp_ns")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            result["source_timestamp_ns"] = value
+        sequence = metadata.get("source_sequence", metadata.get("ingest_sequence"))
+        if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence >= 0:
+            result["source_sequence"] = sequence
+        for key in ("source_clock_domain", "source_clock_id"):
+            if isinstance(metadata.get(key), str):
+                result[key] = metadata[key]
+        return result
 
     def list_latest_contexts(self) -> Tuple[PerceptionContext, ...]:
         """返回各相机当前最新感知结果。"""
@@ -916,38 +978,37 @@ class PerceptionService:
         tracks: Tuple[Track, ...],
     ) -> Tuple[Detection2D, ...]:
         active_states = {TrackState.TENTATIVE, TrackState.TRACKED}
+        indexed = {}
+        for track in tracks:
+            if track.state in active_states and track.bbox is not None:
+                box = track.bbox
+                key = (track.label, box.x_px, box.y_px, box.width_px, box.height_px)
+                indexed.setdefault(key, []).append(track)
         assigned: List[Detection2D] = []
+        used_ids = set()
         for detection in detections_2d:
-            matched_track_id = None
-            for track in tracks:
-                if track.state not in active_states:
-                    continue
-                if track.label != detection.label:
-                    continue
-                if track.bbox is None:
-                    continue
-                if track.bbox == detection.bbox:
-                    matched_track_id = track.track_id
-                    break
-            track_metadata = {}
-            if matched_track_id:
-                for track in tracks:
-                    if track.track_id == matched_track_id:
-                        track_metadata = dict(track.attributes or {})
-                        break
+            box = detection.bbox
+            key = (detection.label, box.x_px, box.y_px, box.width_px, box.height_px)
+            matched = next((track for track in indexed.get(key, ())
+                            if track.track_id not in used_ids
+                            and (not detection.camera_id or not track.attributes.get("camera_id")
+                                 or track.attributes.get("camera_id") == detection.camera_id)), None)
+            resolved_track_id = matched.track_id if matched is not None else detection.track_id
+            if resolved_track_id in used_ids:
+                resolved_track_id = None
+            if resolved_track_id:
+                used_ids.add(resolved_track_id)
             attributes = dict(detection.attributes or {})
-            resolved_track_id = matched_track_id or detection.track_id
+            attributes.pop("track_id", None)
             if resolved_track_id:
                 attributes["track_id"] = resolved_track_id
-            for key in ("last_seen", "velocity_hint", "short_trajectory", "track_age_frames", "track_miss_frames", "tracker"):
-                if key in track_metadata:
-                    attributes[key] = track_metadata[key]
-            assigned.append(
-                detection.model_copy(
-                    update={"track_id": resolved_track_id, "attributes": attributes},
-                    deep=False,
-                )
-            )
+            track_metadata = dict(matched.attributes or {}) if matched is not None else {}
+            for name in ("last_seen", "velocity_hint", "short_trajectory", "track_age_frames", "track_miss_frames", "tracker"):
+                if name in track_metadata:
+                    attributes[name] = track_metadata[name]
+            assigned.append(detection.model_copy(
+                update={"track_id": resolved_track_id, "attributes": attributes}, deep=False,
+            ))
         return tuple(assigned)
 
     def _build_fast_scene_summary(
@@ -1015,7 +1076,8 @@ class PerceptionService:
         if self._stream_bus is None:
             return
         observation = context.observation
-        detections = tuple(self._serialize_detection_overlay(detection) for detection in observation.detections_2d)
+        detection_count = len(observation.detections_2d)
+        detections = tuple(self._serialize_detection_overlay(detection) for detection in observation.detections_2d[:64])
         now = perf_counter()
         previous_publish_at = self._last_detection_overlay_publish_at_by_camera.get(context.camera_id)
         publish_interval_ms = None
@@ -1027,15 +1089,30 @@ class PerceptionService:
         # 写入 payload.nms_stats 与 stage_duration_ms.pipeline_lock_wait_ms。
         detection_metadata = dict(context.metadata.get("detection_metadata") or {})
         nms_stats = dict(detection_metadata.get("postprocess") or {})
+        stage_status = dict(context.metadata.get("stage_status") or {})
+        available = stage_status.get("detector", "completed") in {"completed", "fallback"}
         payload = {
-            "available": True,
+            "available": available,
+            "observation_id": observation.observation_id,
+            "frame_timestamp": context.metadata.get("frame_timestamp"),
+            "frame_timestamp_source": context.metadata.get("frame_timestamp_source"),
+            "source_clock_domain": context.metadata.get("source_clock_domain"),
+            "source_clock_id": context.metadata.get("source_clock_id"),
+            "source_sequence": context.metadata.get("source_sequence"),
+            "provider_fallback_used": bool(context.metadata.get("provider_fallback_used") or stage_status.get("detector") == "fallback" or detection_metadata.get("worker_fallback_used")),
+            "provider_fallback_reason": context.metadata.get("provider_fallback_reason") or self._provider_fallback_reason(detection_metadata),
+            "worker_fallback_used": bool(detection_metadata.get("worker_fallback_used")),
+            "worker_fallback_reason": detection_metadata.get("worker_fallback_reason"),
+            "inference_execution": detection_metadata.get("inference_execution"),
             "camera_id": context.camera_id,
             "frame_id": observation.frame_id,
             "width_px": observation.metadata.get("width_px"),
             "height_px": observation.metadata.get("height_px"),
             "detector_backend": context.detector_backend,
             "tracker_backend": context.tracker_backend,
-            "detection_count": len(detections),
+            "detection_count": detection_count,
+            "displayed_detection_count": len(detections),
+            "detections_truncated": detection_count > len(detections),
             "detections_2d": detections,
             "stage_status": dict(context.metadata.get("stage_status") or {}),
             "stage_duration_ms": dict(context.metadata.get("stage_duration_ms") or {}),
@@ -1050,7 +1127,7 @@ class PerceptionService:
             source="perception_service",
             payload=payload,
             frame_id=observation.frame_id,
-            status="available",
+            status="available" if available else "unavailable",
             metadata={
                 "camera_id": context.camera_id,
                 "detector_backend": context.detector_backend,
@@ -1073,12 +1150,19 @@ class PerceptionService:
                 "width_px": bbox.width_px,
                 "height_px": bbox.height_px,
             },
-            "attributes": dict(detection.attributes or {}),
+            "attributes": {key: detection.attributes[key] for key in ("display_name_zh",) if key in detection.attributes},
         }
 
     def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
         if self._stream_bus is None:
             return
+        input_signature = self._fast_input_signature(image_frame, None)
+        previous = self._last_published_video_frames.get(image_frame.camera_id)
+        if input_signature is not None and previous is not None and previous[0] is image_frame and previous[1] == input_signature:
+            return
+        self._last_published_video_frames[image_frame.camera_id] = (image_frame, input_signature)
+        if len(self._last_published_video_frames) > 8:
+            self._last_published_video_frames.pop(next(iter(self._last_published_video_frames)))
         metadata = dict(image_frame.metadata or {})
         payload_bytes = len(image_frame.data or b"")
         latest_frame = None
@@ -1102,6 +1186,7 @@ class PerceptionService:
             )
         )
         payload = {
+            **self._source_timestamp_metadata(image_frame),
             "available": bool(mjpeg_available or image_frame.uri or image_frame.artifact_id),
             "camera_id": image_frame.camera_id,
             "frame_id": image_frame.frame_id,
@@ -1334,7 +1419,7 @@ class PerceptionService:
             geometry_metadata = {
                 **dict(geometry_metadata),
                 "geometry_projection_status": "pointcloud_unavailable",
-                "geometry_degraded_reason": "pointcloud_unavailable",
+                "geometry_degraded_reason": geometry_metadata.get("geometry_projection_degradation_reason") or "pointcloud_unavailable",
             }
         if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
             return detection_bundle.__class__(
@@ -1346,7 +1431,7 @@ class PerceptionService:
                 },
             )
         support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
-        degraded_reason = str(geometry_metadata.get("geometry_degraded_reason") or "")
+        degraded_reason = str(geometry_metadata.get("geometry_projection_degradation_reason") or geometry_metadata.get("geometry_degraded_reason") or "")
         if support_count <= 0 and _has_usable_point_cloud(point_cloud_frame):
             degraded_reason = degraded_reason or "pointcloud_projection_failed"
         return detection_bundle.__class__(

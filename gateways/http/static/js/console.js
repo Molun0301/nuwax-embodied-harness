@@ -28,6 +28,9 @@
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
       const MJPEG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+      const VIDEO_DISPLAY_FRESH_MS = 3000;
+      const VIDEO_DETECTION_FRESH_MS = 3000;
+      const VIDEO_DETECTION_ALIGNMENT_MS = 1000;
       const MAP_DISPLAY_FRESH_MS = 20000;
       const MAP_DISPLAY_IDLE_MESSAGE = "未启动建图/导航/探索，隐藏缓存地图。";
       const LOCALIZATION_DISPLAY_IDLE_MESSAGE = "无活跃地图/建图/导航/探索，隐藏定位。";
@@ -89,6 +92,21 @@
         streamReconnectDelayMs: 1000,
         streamReconnectAttempt: 0,
         latestStreamCursor: "0",
+        poseStream: {
+          topics: ["localization.pose", "map.frame"],
+          mapPayload: "identity",
+          streamSocket: null,
+          streamConnectionEpoch: 0,
+          streamReconnectTimer: null,
+          streamReconnectDelayMs: 1000,
+          streamReconnectAttempt: 0,
+          latestStreamCursor: "0",
+        },
+        poseMapIdentity: null,
+        mapStreamReady: false,
+        receivedMapIdentity: null,
+        appliedMapIdentity: null,
+        pendingMapPose: null,
         latestStreamFrames: {},
         pendingStreamFrames: {},
         pendingLogFrames: [],
@@ -110,10 +128,18 @@
         videoLastError: "",
         videoLastFrameAt: null,
         videoCurrentObjectUrl: null,
-        showDetections: false,
+        showDetections: true,
         videoDetections: [],
         videoSourceSize: null,
         videoDetectionDrawFrame: null,
+        videoFrameMetadata: null,
+        videoDisplayedIdentity: null,
+        videoDetectionFrame: null,
+        videoDetectionRevision: 0,
+        videoDetectionDrawKey: "",
+        videoDetectionLayoutRevision: 0,
+        visionPanelKey: "",
+        visionLabelsKey: "",
         latestOverview: null,
         overviewRenderTimer: null,
         overviewLastRenderAt: 0,
@@ -145,6 +171,16 @@
         latestExplorationOverlayIdentity: null,
         explorationOverlayRequiresCanonical: false,
         semanticInstances: [],
+        semanticLoadPromise: null,
+        semanticSnapshotKey: "",
+        semanticPublishedKey: "",
+        semanticMapCache: null,
+        semanticLastMapName: "",
+        semanticFetchedAt: 0,
+        semanticError: "",
+        semanticMeta: {},
+        semanticSelectedId: null,
+        semanticOverlayReturnFocus: null,
         showSemanticInstances: true,
         highlightTarget: null,
         clusterAnim: null,
@@ -194,6 +230,7 @@
         mapRvizHint: document.getElementById("mapRvizHint"),
         mapInitialPoseToggle: document.getElementById("mapInitialPoseToggle"),
         mapGoalToggle: document.getElementById("mapGoalToggle"),
+        mapGoalHeight: document.getElementById("mapGoalHeight"),
         mapPublishPointToggle: document.getElementById("mapPublishPointToggle"),
         mapGoalStatus: document.getElementById("mapGoalStatus"),
         mapStreamStatus: document.getElementById("mapStreamStatus"),
@@ -213,8 +250,23 @@
         videoFrame: document.getElementById("videoFrame"),
         videoDetections: document.getElementById("videoDetections"),
         showDetections: document.getElementById("showDetections"),
+        visionDetectionStatus: document.getElementById("visionDetectionStatus"),
+        visionMessage: document.getElementById("visionMessage"),
+        visionLabels: document.getElementById("visionLabels"),
+        visionCameraStatus: document.getElementById("visionCameraStatus"),
+        visionObservedAt: document.getElementById("visionObservedAt"),
+        visionTimingStatus: document.getElementById("visionTimingStatus"),
         showSemanticInstances: document.getElementById("showSemanticInstances"),
         semanticInstancesRefresh: document.getElementById("semanticInstancesRefresh"),
+        semanticMemoryToggle: document.getElementById("semanticMemoryToggle"),
+        semanticMemoryCount: document.getElementById("semanticMemoryCount"),
+        semanticMemoryPanel: document.getElementById("semanticMemoryPanel"),
+        semanticMemoryClose: document.getElementById("semanticMemoryClose"),
+        semanticMemoryStatus: document.getElementById("semanticMemoryStatus"),
+        semanticMemorySearch: document.getElementById("semanticMemorySearch"),
+        semanticMemoryFilter: document.getElementById("semanticMemoryFilter"),
+        semanticMemorySummary: document.getElementById("semanticMemorySummary"),
+        semanticMemoryList: document.getElementById("semanticMemoryList"),
         videoEmpty: document.getElementById("videoEmpty"),
         videoMeta: document.getElementById("videoMeta"),
         visionModelStatus: document.getElementById("visionModelStatus"),
@@ -1512,7 +1564,8 @@
       }
       function formatMapPoint(point) {
         if (!point) return "--";
-        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`;
+        const height = typeof point.z === "number" && Number.isFinite(point.z) ? `, ${point.z.toFixed(2)}` : "";
+        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)}${height})`;
       }
       function planarDistanceMeters(a, b) {
         if (!a || !b) return null;
@@ -1526,7 +1579,13 @@
         const point = pointFromPose(targetPose);
         if (!point) return false;
         const dist = planarDistanceMeters(point, pending);
-        return dist !== null && dist < 0.35;
+        const z = targetPose.position && targetPose.position.z;
+        const frame = String(targetPose.frame_id || "").trim().replace(/^\/+/, "");
+        const pendingFrame = String(pending.frame_id || "").trim().replace(/^\/+/, "");
+        return typeof z === "number" && Number.isFinite(z)
+          && typeof pending.z === "number" && Number.isFinite(pending.z)
+          && frame !== "" && frame === pendingFrame
+          && dist !== null && Math.hypot(dist, z - pending.z) < 0.35;
       }
       function syncDebugNavGoalFromStream(navPayload) {
         const pending = state.pendingNavGoal;
@@ -1553,7 +1612,7 @@
           return;
         }
         if (status === "failed" || status === "cancelled") {
-          if (!matches && pending.status !== "pending" && pending.status !== "accepted") return;
+          if (!matches) return;
           const message = navState.message || (status === "cancelled" ? "导航已取消" : "导航失败");
           const failureReason = String(metadata.failure_reason || "");
           if (
@@ -1698,6 +1757,37 @@
         const gridFrame = state.mapGrid && state.mapGrid.frame_id;
         return normalizeFrameId(poseFrame || gridFrame, "map");
       }
+      function currentNavigationBodyPose(frameId) {
+        const envelope = state.lastLocalizationEnvelope;
+        const pose = state.latestPose;
+        const position = pose && pose.position;
+        if (!envelope || statusOf(envelope) !== "available" || envelope.stale === true || !position) return null;
+        if (![position.x, position.y, position.z].every(value => typeof value === "number" && Number.isFinite(value))) return null;
+        const poseFrame = String(pose.frame_id || envelope.frame_id || "").trim().replace(/^\/+/, "");
+        const targetFrame = String(frameId || "").trim().replace(/^\/+/, "");
+        if (!poseFrame || poseFrame !== targetFrame) return null;
+        // 只读当前真实定位帧；显示缓存重绘不能刷新定位的采样时间和接收时间。
+        const source = pose.timestamp;
+        const sourceMs = typeof source === "number" ? source * (source < 1e12 ? 1000 : 1) : Date.parse(source);
+        const receivedMs = Date.parse(envelope.__receivedAt);
+        const now = Date.now();
+        if (![sourceMs, receivedMs].every(value => Number.isFinite(value) && now - value >= -1000 && now - value <= 2000)) return null;
+        return { x: position.x, y: position.y, z: position.z, frame_id: poseFrame };
+      }
+      function resolveNavigationHeight(input, frameId) {
+        if (input && input.validity && input.validity.badInput) {
+          throw new Error("目标机体高度无效，请填写有限数值（米）。");
+        }
+        const value = input ? String(input.value || "").trim() : "";
+        if (value) {
+          const height = Number(value);
+          if (!Number.isFinite(height)) throw new Error("目标机体高度无效，请填写有限数值（米）。");
+          return height;
+        }
+        const current = currentNavigationBodyPose(frameId);
+        if (!current) throw new Error("当前机体高度不可用或已过期，请填写目标在地图中的机体高度（米）。");
+        return current.z;
+      }
       function updateGoalPickStatus(text, tone) {
         if (!els.mapGoalStatus) return;
         const value = String(text || "").trim();
@@ -1803,24 +1893,32 @@
         const mapName = activeMapName();
         const robotPoint = pointFromPose(state.pose);
         const distanceM = planarDistanceMeters(mapPoint, robotPoint);
+        let targetHeight;
+        try {
+          targetHeight = resolveNavigationHeight(els.mapGoalHeight, frameId);
+        } catch (error) {
+          updateGoalPickStatus(error.message, "error");
+          return;
+        }
         const body = {
           frame_id: frameId,
           x: Number(mapPoint.x),
           y: Number(mapPoint.y),
-          z: 0,
+          z: targetHeight,
           yaw_rad: Number(yawRad),
         };
         if (mapName) body.map_name = mapName;
         state.pendingNavGoal = {
           x: body.x,
           y: body.y,
+          z: body.z,
           yaw_rad: body.yaw_rad,
           frame_id: frameId,
           status: "sending",
         };
         const robotLabel = robotPoint ? formatMapPoint(robotPoint) : "--";
         const distanceLabel = distanceM === null ? "" : ` · 距离 ${distanceM.toFixed(2)}m`;
-        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(mapPoint)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
+        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(body)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
         requestMapDraw(false);
         const controller = new AbortController();
         const requestTimeout = window.setTimeout(() => controller.abort(), 5000);
@@ -1845,13 +1943,14 @@
           state.pendingNavGoal = {
             x: body.x,
             y: body.y,
+            z: body.z,
             yaw_rad: body.yaw_rad,
             frame_id: frameId,
             status: "published",
             topic: payload.topic || "/goal_pose",
           };
           const topicLabel = payload.topic ? ` · ${payload.topic}` : "";
-          const goalLabel = `${formatMapPoint(mapPoint)}${distanceSuffix} · ${frameId}`;
+          const goalLabel = `${formatMapPoint(body)}${distanceSuffix} · ${frameId}`;
           updateGoalPickStatus(`已发布 RViz 目标 ${goalLabel}${topicLabel}`, "ok");
         } catch (error) {
           const message = error && error.name === "AbortError"
@@ -1860,6 +1959,7 @@
           state.pendingNavGoal = {
             x: body.x,
             y: body.y,
+            z: body.z,
             yaw_rad: body.yaw_rad,
             frame_id: frameId,
             status: "error",
@@ -2006,10 +2106,11 @@
       }
       function requestMapDraw(baseDirty) {
         if (baseDirty) state.mapBaseCache = null;
+        if (state.mapViewMode === "3d") return;
         if (state.mapDrawFrame) return;
         state.mapDrawFrame = window.requestAnimationFrame(() => {
           state.mapDrawFrame = null;
-          drawMap();
+          if (state.mapViewMode !== "3d") drawMap();
         });
       }
       function mapGridDataSignature(grid) {
@@ -2285,6 +2386,7 @@
           return;
         }
         state.mapGrid = null;
+        state.appliedMapIdentity = null;
         state.mapGridContentKey = "";
         state.mapBaseCache = null;
         state.mapViewport = null;
@@ -2570,45 +2672,173 @@
         ctx.stroke();
         ctx.restore();
       }
-      // ── 语义实例 marker 层 ──────────────────────────────────────────────
+      // 空间记忆只读刷新：合并并发请求，避免相同数据反复重建三维标记。
       function loadSemanticInstances() {
+        if (state.semanticLoadPromise) return state.semanticLoadPromise;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 8000);
+        const requestedMap = activeMapName();
         if (els.semanticInstancesRefresh) {
           els.semanticInstancesRefresh.disabled = true;
           els.semanticInstancesRefresh.setAttribute("aria-busy", "true");
+          els.semanticInstancesRefresh.textContent = "刷新中…";
         }
-        return fetch("/api/memory/instances")
-          .then((r) => r.ok ? r.json() : Promise.reject(r.status))
-          .then((body) => {
-            // 兼容两种结构：契约 {instances:[...]} 或 capability 信封 {result:{instances:[...]}}
-            const src = (body && Array.isArray(body.instances)) ? body
-              : (body && body.result && Array.isArray(body.result.instances)) ? body.result
-              : null;
-            const list = src ? src.instances : [];
-            state.semanticInstances = list;
-            window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
-              detail: { instances: list },
-            }));
-            if (els.semanticInstancesRefresh) {
-              els.semanticInstancesRefresh.textContent = "刷新物品";
-              els.semanticInstancesRefresh.title = list.length
-                ? `已加载 ${list.length} 个当前记忆库物品`
-                : "当前记忆库暂无物品";
+        state.semanticLoadPromise = fetch("/api/memory/instances?limit=500", { signal: controller.signal })
+          .then(async (response) => {
+            if (!response.ok) throw new Error(`服务返回 ${response.status}`);
+            const body = await response.json();
+            const src = Array.isArray(body?.instances) ? body : body?.result;
+            if (!Array.isArray(src?.instances)) throw new Error("记忆接口返回格式异常");
+            if (requestedMap && requestedMap !== activeMapName()) throw new Error("地图已切换，正在刷新当前记忆库");
+            const seen = new Set();
+            const list = src.instances.filter((inst) => {
+              if (!inst || typeof inst !== "object" || !inst.instance_id || seen.has(inst.instance_id)) return false;
+              seen.add(inst.instance_id);
+              return true;
+            });
+            const snapshotKey = JSON.stringify([src.library_name, src.map_name, list]);
+            const wasError = Boolean(state.semanticError);
+            state.semanticError = "";
+            state.semanticFetchedAt = Date.now();
+            const previousLibrary = state.semanticMeta.library_name;
+            state.semanticMeta = src;
+            if (snapshotKey !== state.semanticSnapshotKey || wasError) {
+              state.semanticSnapshotKey = snapshotKey;
+              state.semanticInstances = list;
+              if (!list.some((inst) => inst.instance_id === state.semanticSelectedId)) state.semanticSelectedId = null;
+              reconcileSemanticOverlay(previousLibrary);
+              publishSemanticMapInstances();
+              requestMapDraw(false);
+              renderSemanticMemoryList();
             }
+          })
+          .catch((error) => {
+            state.semanticError = error.name === "AbortError" ? "读取超时" : String(error.message || error);
+            reconcileSemanticOverlay(state.semanticMeta.library_name);
+            // 失败时保留可查阅记录，但撤下地图标记，避免缓存被当作当前位置。
+            publishSemanticMapInstances();
             requestMapDraw(false);
           })
-          .catch((err) => {
-            console.warn("[semantic] 实例拉取失败", err);
-            if (els.semanticInstancesRefresh) {
-              els.semanticInstancesRefresh.textContent = "刷新失败";
-              els.semanticInstancesRefresh.title = `物品刷新失败：${String(err)}`;
-            }
-          })
           .finally(() => {
+            window.clearTimeout(timeout);
+            state.semanticLoadPromise = null;
             if (els.semanticInstancesRefresh) {
               els.semanticInstancesRefresh.disabled = false;
               els.semanticInstancesRefresh.removeAttribute("aria-busy");
+              els.semanticInstancesRefresh.textContent = state.semanticError ? "重试刷新" : "刷新物品";
             }
+            renderSemanticMemoryStatus();
+            if (requestedMap && requestedMap !== activeMapName() && !document.hidden) window.setTimeout(loadSemanticInstances, 0);
           });
+        renderSemanticMemoryStatus();
+        return state.semanticLoadPromise;
+      }
+      function semanticObservationOnly(inst) {
+        return inst.observation_only === true || inst.projection_method === "current_pose_fallback";
+      }
+      function semanticQuality(inst) {
+        if (semanticObservationOnly(inst)) return { key: "observation", label: "仅观察" };
+        if (inst.lifecycle_state === "stale") return { key: "uncertain", label: "已过时" };
+        if (inst.lifecycle_state === "removed") return { key: "uncertain", label: "已移除" };
+        if (inst.lifecycle_state === "uncertain") return { key: "uncertain", label: "待确认" };
+        if (isFallbackInstance(inst) || isUnknownFrame(inst) || !semanticFinitePose(inst.pose)) return { key: "uncertain", label: "待确认" };
+        return { key: "located", label: "有位置" };
+      }
+      function semanticFinitePose(pose) {
+        return Boolean(pose && [pose.x, pose.y, pose.z].every((v) => typeof v === "number" && Number.isFinite(v)));
+      }
+      function semanticScopeMatches(inst) {
+        const currentMap = activeMapName();
+        const mapName = inst.map_name;
+        return Boolean(currentMap && mapName && currentMap === mapName);
+      }
+      function semanticMapInstances() {
+        if (state.semanticError) return [];
+        const mapName = activeMapName();
+        const cache = state.semanticMapCache;
+        if (cache?.snapshot === state.semanticSnapshotKey && cache.mapName === mapName) return cache.instances;
+        const instances = state.semanticInstances.filter((inst) => semanticScopeMatches(inst) && semanticQuality(inst).key === "located");
+        state.semanticMapCache = { snapshot: state.semanticSnapshotKey, mapName, instances };
+        return instances;
+      }
+      function publishSemanticMapInstances() {
+        const mapName = activeMapName();
+        const previous = state.semanticPublishedKey;
+        if (previous?.snapshot === state.semanticSnapshotKey && previous.mapName === mapName && previous.error === state.semanticError) return;
+        state.semanticPublishedKey = { snapshot: state.semanticSnapshotKey, mapName, error: state.semanticError };
+        window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
+          detail: { instances: semanticMapInstances() },
+        }));
+      }
+      function renderSemanticMemoryStatus() {
+        const meta = state.semanticMeta;
+        const count = state.semanticInstances.length;
+        const library = meta.library_name || meta.active_library_name;
+        const suffix = state.semanticFetchedAt ? ` · 更新于 ${new Date(state.semanticFetchedAt).toLocaleTimeString()}` : "";
+        const mismatch = count > 0 && !state.semanticInstances.some(semanticScopeMatches);
+        const status = state.semanticError
+          ? `刷新失败：${state.semanticError}。${count ? "正在查看上次缓存，地图标记已隐藏。" : "请重试。"}`
+          : state.semanticLoadPromise ? "正在读取当前记忆库…"
+          : !library && !count ? "未启用记忆库，请先激活地图。"
+          : `${library ? `记忆库：${library}` : "当前记忆库"}${suffix}${mismatch ? " · 与当前地图不匹配，标记已隐藏" : ""}`;
+        if (els.semanticMemoryStatus) {
+          els.semanticMemoryStatus.textContent = status;
+          els.semanticMemoryStatus.dataset.state = state.semanticError ? "error" : mismatch ? "stale" : "ready";
+        }
+        setText(els.semanticMemoryCount, state.semanticFetchedAt ? String(count) : "—");
+        const located = state.semanticInstances.filter((inst) => semanticQuality(inst).key === "located").length;
+        const observations = state.semanticInstances.filter(semanticObservationOnly).length;
+        setText(els.semanticMemorySummary, `${count} 条记录 · ${located} 个有位置 · ${observations} 条仅观察${meta.truncated ? ` · 已载入 ${count}/${meta.total} 条` : ""}`);
+        if (els.semanticInstancesRefresh) els.semanticInstancesRefresh.title = status;
+      }
+      function semanticListRow(inst) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "semantic-memory-row";
+        row.dataset.instanceId = inst.instance_id;
+        row.setAttribute("aria-pressed", String(state.semanticSelectedId === inst.instance_id));
+        const name = document.createElement("strong");
+        name.textContent = semanticInstanceName(inst);
+        const badge = document.createElement("span");
+        badge.className = "semantic-memory-badge";
+        const quality = semanticQuality(inst);
+        badge.dataset.quality = quality.key;
+        badge.textContent = quality.label;
+        const evidence = document.createElement("small");
+        const observations = Number.isFinite(inst.observation_count) ? `${inst.observation_count} 次观察 · ` : "";
+        evidence.textContent = `${inst.label || "未分类"} · ${observations}最后见于 ${formatLastSeen(inst.last_seen_ts)}`;
+        row.append(name, badge, evidence);
+        row.addEventListener("click", () => showSemanticInstanceDetail(inst));
+        return row;
+      }
+      function renderSemanticMemoryList() {
+        if (!els.semanticMemoryList) return;
+        const query = String(els.semanticMemorySearch?.value || "").trim().toLocaleLowerCase();
+        const filter = els.semanticMemoryFilter?.value || "all";
+        const list = state.semanticInstances.filter((inst) => {
+          const text = `${semanticInstanceName(inst)} ${inst.label || ""} ${inst.instance_id}`.toLocaleLowerCase();
+          return (!query || text.includes(query)) && (filter === "all" || semanticQuality(inst).key === filter);
+        });
+        const fragment = document.createDocumentFragment();
+        if (!list.length) {
+          const empty = document.createElement("p");
+          empty.className = "semantic-memory-empty";
+          empty.textContent = state.semanticInstances.length ? "没有匹配的记忆，试试其它名称或证据类型。" : "当前记忆库暂无物品。完成场景观察并写入记忆后，可在这里查看。";
+          fragment.append(empty);
+        }
+        for (const inst of list) fragment.append(semanticListRow(inst));
+        els.semanticMemoryList.replaceChildren(fragment);
+      }
+      function toggleSemanticMemoryPanel(open) {
+        if (!els.semanticMemoryPanel) return;
+        els.semanticMemoryPanel.hidden = !open;
+        els.semanticMemoryToggle?.setAttribute("aria-expanded", String(open));
+        if (open) {
+          renderSemanticMemoryList();
+          renderSemanticMemoryStatus();
+          if (!state.semanticFetchedAt || Date.now() - state.semanticFetchedAt >= 30000) loadSemanticInstances();
+          els.semanticMemorySearch?.focus();
+        }
       }
       function syncPointcloud3dState() {
         const navigationFrame = state.latestStreamFrames["navigation.state"];
@@ -2647,7 +2877,7 @@
           },
         }));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
-          detail: { instances: state.semanticInstances || [] },
+          detail: { instances: semanticMapInstances() },
         }));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-visibility", {
           detail: { visible: state.showSemanticInstances },
@@ -2660,19 +2890,12 @@
         }
       }
       function isFallbackInstance(inst) {
-        if (inst.is_fallback) return true;
-        if (typeof inst.confidence === "number" && inst.confidence < 0.3) return true;
-        const posePoint = pointFromPose(state.pose);
-        if (posePoint && inst.pose) {
-          const dx = Number(inst.pose.x || 0) - Number(posePoint.x);
-          const dy = Number(inst.pose.y || 0) - Number(posePoint.y);
-          if (Math.sqrt(dx * dx + dy * dy) < 0.15) return true;
-        }
-        return false;
+        return inst.is_fallback === true || semanticObservationOnly(inst)
+          || (!inst.projection_method && inst.navigable !== true);
       }
       function isUnknownFrame(inst) {
-        const fid = String(inst.frame_id || "").toLowerCase();
-        return fid !== "" && fid !== "map";
+        const fid = String(inst.frame_id || "").trim();
+        return fid !== "map";
       }
       const CLUSTER_PX_THRESHOLD = 28;
       const SEMANTIC_MARKER_HEIGHT = 24;
@@ -2745,26 +2968,29 @@
           for (let dx = -1; dx <= 1 && !merged; dx++) {
             for (let dy = -1; dy <= 1 && !merged; dy++) {
               const key = `${gx + dx},${gy + dy}`;
-              const cell = grid.get(key);
-              if (!cell) continue;
-              const lx = cell.sumX / cell.members.length;
-              const ly = cell.sumY / cell.members.length;
-              const dist = Math.sqrt((item.cx - lx) ** 2 + (item.cy - ly) ** 2);
-              if (dist < CLUSTER_PX_THRESHOLD) {
-                cell.members.push(item.inst);
-                cell.sumX += item.cx;
-                cell.sumY += item.cy;
-                merged = true;
+              const cells = grid.get(key) || [];
+              for (const cell of cells) {
+                const lx = cell.sumX / cell.members.length;
+                const ly = cell.sumY / cell.members.length;
+                const dist = Math.sqrt((item.cx - lx) ** 2 + (item.cy - ly) ** 2);
+                if (dist < CLUSTER_PX_THRESHOLD) {
+                  cell.members.push(item.inst);
+                  cell.sumX += item.cx;
+                  cell.sumY += item.cy;
+                  merged = true;
+                  break;
+                }
               }
             }
           }
           if (!merged) {
             const key = `${gx},${gy}`;
-            grid.set(key, { members: [item.inst], sumX: item.cx, sumY: item.cy });
+            if (!grid.has(key)) grid.set(key, []);
+            grid.get(key).push({ members: [item.inst], sumX: item.cx, sumY: item.cy });
           }
         }
         const clusters = [];
-        for (const cell of grid.values()) {
+        for (const cells of grid.values()) for (const cell of cells) {
           const cx = cell.sumX / cell.members.length;
           const cy = cell.sumY / cell.members.length;
           const ids = cell.members.map((m) => m.instance_id).sort().join("|");
@@ -2801,7 +3027,7 @@
       }
       function drawSemanticInstances(ctx, anchor, scale) {
         if (!state.showSemanticInstances) return;
-        const instances = state.semanticInstances;
+        const instances = semanticMapInstances();
         if (!instances || !instances.length) {
           // 若有 target_pose 但无实例，画临时高亮环
           if (state.highlightTarget && state.highlightTarget.target_pose) {
@@ -2914,7 +3140,7 @@
         } else if (fallback) {
           ctx.font = "9px sans-serif";
           ctx.fillStyle = "#6b7280";
-          ctx.fillText("粗略", x, top + marker.height + 11);
+          ctx.fillText("待确认", x, top + marker.height + 11);
         }
       }
       function drawClusterMarker(ctx, x, y, cl, allFallback, fallbackCount, highlighted) {
@@ -2969,7 +3195,7 @@
         if (allFallback) {
           ctx.font = "9px sans-serif";
           ctx.fillStyle = "#6b7280";
-          ctx.fillText("粗略", x, top + marker.height + 11);
+          ctx.fillText("待确认", x, top + marker.height + 11);
         }
       }
       function detectAndStartClusterAnim(newClusters, now) {
@@ -3006,7 +3232,7 @@
         if (!state.showSemanticInstances || !state.semanticInstances.length) return null;
         const anchor = cameraAnchor();
         const scale = cameraScale(anchor);
-        const clusters = clusterInstances(state.semanticInstances, anchor, scale);
+        const clusters = clusterInstances(semanticMapInstances(), anchor, scale);
         const highlightedKey = resolveHighlightCluster(clusters);
         const ctx = els.mapCanvas.getContext("2d");
         let bestDist = Number.POSITIVE_INFINITY;
@@ -3032,114 +3258,208 @@
       }
       function closeSemanticOverlay() {
         const el = document.getElementById("semanticOverlay");
-        if (el) el.remove();
+        if (el) {
+          el.close();
+          el.remove();
+          if (state.semanticOverlayReturnFocus?.isConnected) state.semanticOverlayReturnFocus.focus();
+          else els.semanticMemorySearch?.focus();
+        }
       }
-      async function navigateToInstance(inst) {
-        closeSemanticOverlay();
-        if (!inst || !inst.pose) {
-          updateGoalPickStatus("物品无有效位置，无法导航", "error");
+      async function navigateToInstance(inst, button, status) {
+        if (state.semanticError || !semanticScopeMatches(inst) || inst.navigable !== true || semanticQuality(inst).key !== "located") {
+          status.textContent = "当前记录缺少有效导航证据，请刷新或重新观察。";
           return;
         }
-        const x = Number(inst.pose.x);
-        const y = Number(inst.pose.y);
-        if (!Number.isFinite(x) || !Number.isFinite(y)) {
-          updateGoalPickStatus("物品坐标无效，无法导航", "error");
-          return;
+        const requestedMap = activeMapName();
+        const requestedLibrary = state.semanticMeta.library_name;
+        button.disabled = true;
+        status.textContent = "正在查找此物品的可用导航候选…";
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 10000);
+        try {
+          const response = await fetch("/api/capabilities/resolve_navigation_candidates/invoke", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ arguments: { query: inst.label || semanticInstanceName(inst), map_name: requestedMap, limit: 20 } }),
+            signal: controller.signal,
+          });
+          const body = await response.json();
+          if (!response.ok || body.ok === false) throw new Error(body.error?.message || body.detail || "导航候选查询失败");
+          const candidates = (body.result || body).navigation_candidates;
+          const candidate = Array.isArray(candidates) && candidates.find((item) =>
+            item.record_id === inst.instance_id && item.map_name === requestedMap
+            && item.metadata?.allowed_for_navigation === true && item.metadata?.resolution_decision === "navigate");
+          if (!candidate) throw new Error("此物品当前没有可用导航候选，请补充观察或在地图中选择可达位置。");
+          const pose = candidate.target_pose;
+          const point = pose?.position;
+          if (!semanticFinitePose(point) || pose.frame_id !== navigationFrameId()) throw new Error("候选位置或坐标系无效。");
+          if (requestedMap !== activeMapName() || requestedLibrary !== state.semanticMeta.library_name || state.semanticError) throw new Error("地图或记忆库已变化，请刷新后重试。");
+          const robotPoint = pointFromPose(state.pose);
+          const yaw = planarYawFromPose(pose) ?? (robotPoint ? Math.atan2(point.y - robotPoint.y, point.x - robotPoint.x) : 0);
+          state.highlightTarget = { record_id: inst.instance_id, target_pose: point, target_name: semanticInstanceName(inst) };
+          closeSemanticOverlay();
+          // 候选决定平面观察位置；机体高度仍由统一导航入口核对，不能使用物品中心高度。
+          await dispatchNavGoal(point, yaw);
+        } catch (error) {
+          status.textContent = error.name === "AbortError" ? "导航候选查询超时，请重试。" : String(error.message || error);
+        } finally {
+          window.clearTimeout(timeout);
+          button.disabled = false;
         }
-        const mapPoint = { x, y, z: Number(inst.pose.z) || 0 };
-        const robotPoint = pointFromPose(state.pose);
-        let yawRad = 0;
-        if (robotPoint) {
-          yawRad = Math.atan2(mapPoint.y - robotPoint.y, mapPoint.x - robotPoint.x);
-        }
-        const label = inst.display_name || inst.label || inst.instance_id || "物品";
-        state.highlightTarget = {
-          record_id: inst.instance_id || null,
-          record_kind: inst.instance_type || "object",
-          target_pose: { x: mapPoint.x, y: mapPoint.y, z: mapPoint.z },
-          target_name: label,
-        };
-        requestMapDraw(false);
-        updateGoalPickStatus(`导航到 ${label} ${formatMapPoint(mapPoint)} · 发布 /goal_pose`, "pending");
-        await dispatchNavGoal(mapPoint, yawRad);
       }
       function formatLastSeen(ts) {
-        if (!ts) return "--";
+        if (ts === null || ts === undefined || ts === "") return "未记录";
         const d = new Date(typeof ts === "number" && ts < 1e12 ? ts * 1000 : ts);
-        return isNaN(d.getTime()) ? String(ts) : d.toLocaleTimeString();
+        return Number.isFinite(d.getTime()) ? d.toLocaleString(undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "时间无效";
+      }
+      function semanticDetailShell(title) {
+        const dialog = document.createElement("dialog");
+        dialog.id = "semanticOverlay";
+        dialog.className = "semantic-overlay";
+        dialog.setAttribute("aria-labelledby", "semanticOverlayTitle");
+        const head = document.createElement("div");
+        head.className = "semantic-memory-head";
+        const heading = document.createElement("strong");
+        heading.id = "semanticOverlayTitle";
+        heading.textContent = title;
+        const close = document.createElement("button");
+        close.className = "tool";
+        close.type = "button";
+        close.dataset.semanticAction = "close";
+        close.textContent = "×";
+        close.setAttribute("aria-label", "关闭物品详情");
+        close.addEventListener("click", closeSemanticOverlay);
+        head.append(heading, close);
+        dialog.append(head);
+        dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeSemanticOverlay(); });
+        dialog.addEventListener("click", (event) => {
+          if (event.target !== dialog) return;
+          const rect = dialog.getBoundingClientRect();
+          if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeSemanticOverlay();
+        });
+        return dialog;
+      }
+      function locateSemanticInstance(inst) {
+        if (!semanticScopeMatches(inst) || semanticQuality(inst).key !== "located" || state.semanticError) return;
+        if (isMapToolActive() || window.__nuwaxMapToolV2?.active()) {
+          updateGoalPickStatus("请先结束地图选点或区域绘制，再定位查看物品。", "error");
+          return;
+        }
+        closeSemanticOverlay();
+        setMapViewMode("2d");
+        setMap2dCameraMode("free");
+        state.mapFreeView.center = { x: inst.pose.x, y: inst.pose.y };
+        state.highlightTarget = { record_id: inst.instance_id, target_name: semanticInstanceName(inst) };
+        requestMapDraw(false);
       }
       function buildDetailCard(inst) {
-        const fallback = isFallbackInstance(inst);
-        const unknownFrame = isUnknownFrame(inst);
-        const div = document.createElement("div");
-        div.id = "semanticOverlay";
-        div.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;min-width:260px;max-width:360px;background:var(--glass,rgba(15,23,42,0.92));border:1px solid var(--line,rgba(255,255,255,0.12));border-radius:12px;padding:18px 20px;color:var(--fg,#e2e8f0);backdrop-filter:blur(12px);box-shadow:0 8px 32px rgba(0,0,0,0.5)";
+        const quality = semanticQuality(inst);
+        const dialog = semanticDetailShell(semanticInstanceName(inst));
+        dialog.dataset.instanceId = inst.instance_id;
+        dialog.dataset.snapshot = JSON.stringify([inst, state.semanticError, activeMapName()]);
+        const note = document.createElement("p");
+        note.className = "semantic-detail-note";
+        note.textContent = semanticObservationOnly(inst)
+          ? "仅有观察证据：机器人曾在观察位置见过该物品，尚不能确定物品坐标。"
+          : quality.key === "located" ? "已保存物体位置估计。历史位置不保证物品仍在原处，导航前会重新解析可用候选。"
+          : "空间证据不足或坐标系不匹配，暂不作为地图物品位置显示。";
+        const methodNames = { support_points_map: "地图支持点", support_points_camera: "相机支持点", explicit_map_pose: "显式地图位置", track_pose: "跟踪位置", detection3d_pose: "三维检测位置", map_point_samples: "地图支持点采样", camera_point_samples: "相机支持点采样", depth_camera_projection: "相机深度投影", depth_pose_fallback: "深度与观察位姿估计", delayed_pointcloud_projection: "延后点云投影", current_pose_fallback: "观察者位置回退", explicit_position: "显式空间位置", pointcloud_projection: "点云投影", pointcloud_depth: "点云深度", depth_projection: "深度投影", ray_triangulation: "多视角三角化", deferred_pointcloud_refine: "延后点云修正", tracked_position: "跟踪空间位置" };
+        const pose = semanticFinitePose(inst.pose) ? inst.pose : null;
+        const confidence = Number.isFinite(inst.projection_confidence) ? `${Math.round(inst.projection_confidence * 100)}%` : "未记录";
         const rows = [
-          ["名称", inst.display_name || inst.label || "--"],
-          ["标签", inst.label || "--"],
-          ["实例 ID", inst.instance_id || "--"],
-          ["位置", inst.pose ? `x=${(inst.pose.x||0).toFixed(2)}, y=${(inst.pose.y||0).toFixed(2)}` : "--"],
-          ["坐标系", inst.frame_id || "--"],
-          ["置信度", typeof inst.confidence === "number" ? inst.confidence.toFixed(2) : "--"],
+          ["标签", inst.label || "未分类"],
+          ["空间证据", quality.label],
+          ["地图 / 记忆库", `${inst.map_name || "未绑定地图"} / ${inst.library_name || state.semanticMeta.library_name || "未记录"}`],
+          [semanticObservationOnly(inst) ? "观察位置" : "物体位置", pose ? `x ${pose.x.toFixed(2)} · y ${pose.y.toFixed(2)} · z ${pose.z.toFixed(2)} 米` : "未确定"],
+          ["坐标系", inst.frame_id || "未记录"],
+          ["位置依据", methodNames[inst.projection_method] || inst.projection_method || "未记录"],
+          ["空间置信度", confidence],
+          ["支持点数", Number.isFinite(inst.support_point_count) ? String(inst.support_point_count) : "未记录"],
+          ["观察次数", Number.isFinite(inst.observation_count) ? String(inst.observation_count) : "未记录"],
+          ["记忆状态", ({ active: "有效", uncertain: "待确认", stale: "已过时", removed: "已移除" })[inst.lifecycle_state] || "未记录"],
+          ["移动状态", ({ static: "静止", dynamic: "移动中", quasi_static: "短时静止", unknown: "未确定" })[inst.dynamic_state] || "未记录"],
           ["最后见到", formatLastSeen(inst.last_seen_ts)],
-          ["类型", inst.instance_type || "--"],
+          ["实例标识", inst.instance_id || "未记录"],
         ];
-        let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><strong style="font-size:14px">物品详情</strong><button onclick="document.getElementById('semanticOverlay').remove()" style="background:none;border:none;color:inherit;cursor:pointer;font-size:16px;padding:0">×</button></div>`;
-        if (fallback) html += `<div style="color:#f87171;font-size:11px;margin-bottom:8px;padding:4px 8px;background:rgba(248,113,113,0.1);border-radius:6px">位置粗略（依赖投影修复）</div>`;
-        if (unknownFrame) html += `<div style="color:#fb923c;font-size:11px;margin-bottom:8px;padding:4px 8px;background:rgba(251,146,60,0.1);border-radius:6px">坐标系未知（frame_id: ${inst.frame_id}）</div>`;
-        html += `<table style="width:100%;border-collapse:collapse;font-size:12px">`;
-        for (const [k, v] of rows) html += `<tr><td style="color:#94a3b8;padding:3px 0;width:80px">${k}</td><td style="padding:3px 0;word-break:break-all">${v}</td></tr>`;
-        html += `</table>`;
-        div.innerHTML = html;
-        const btn = document.createElement("button");
-        btn.textContent = "导航到此";
-        btn.style.cssText = "margin-top:12px;width:100%;padding:7px;background:#f59e0b;border:none;border-radius:8px;color:#000;font-weight:600;cursor:pointer;font-size:13px";
-        btn.onclick = () => navigateToInstance(inst);
-        div.appendChild(btn);
-        div.addEventListener("click", (e) => e.stopPropagation());
-        return div;
+        const fields = document.createElement("dl");
+        fields.className = "semantic-detail-fields";
+        for (const [key, value] of rows) {
+          const term = document.createElement("dt");
+          const description = document.createElement("dd");
+          term.textContent = key;
+          description.textContent = value;
+          fields.append(term, description);
+        }
+        const actions = document.createElement("div");
+        actions.className = "semantic-detail-actions";
+        const locate = document.createElement("button");
+        locate.type = "button";
+        locate.dataset.semanticAction = "locate";
+        locate.className = "btn";
+        locate.textContent = "在地图中查看";
+        locate.disabled = quality.key !== "located" || !semanticScopeMatches(inst) || Boolean(state.semanticError) || !state.mapGrid;
+        locate.addEventListener("click", () => locateSemanticInstance(inst));
+        const navigate = document.createElement("button");
+        navigate.type = "button";
+        navigate.dataset.semanticAction = "navigate";
+        navigate.className = "btn primary";
+        navigate.textContent = "导航到可用观察点";
+        navigate.disabled = locate.disabled || inst.navigable !== true;
+        const status = document.createElement("p");
+        status.className = "semantic-memory-status";
+        status.setAttribute("role", "status");
+        status.textContent = state.semanticError ? "当前为上次缓存，请刷新后再操作。"
+          : !semanticScopeMatches(inst) ? "此记录与当前地图不匹配。"
+          : inst.navigable !== true ? "此记录尚不满足导航条件，需要补充空间观察。" : "导航受理与到点后的物品复核分别确认。";
+        navigate.addEventListener("click", () => navigateToInstance(inst, navigate, status));
+        actions.append(locate, navigate);
+        dialog.append(note, fields, actions, status);
+        return dialog;
+      }
+      function reconcileSemanticOverlay(previousLibrary) {
+        const dialog = document.getElementById("semanticOverlay");
+        if (!dialog) return;
+        const instance = state.semanticInstances.find((item) => item.instance_id === dialog.dataset.instanceId);
+        if (!instance || previousLibrary !== state.semanticMeta.library_name) {
+          closeSemanticOverlay();
+          return;
+        }
+        const snapshot = JSON.stringify([instance, state.semanticError, activeMapName()]);
+        if (dialog.dataset.snapshot === snapshot) return;
+        const focusedAction = document.activeElement?.dataset?.semanticAction;
+        const scrollTop = dialog.scrollTop;
+        const updated = buildDetailCard(instance);
+        dialog.replaceChildren(...updated.childNodes);
+        dialog.dataset.snapshot = snapshot;
+        dialog.scrollTop = scrollTop;
+        if (focusedAction) dialog.querySelector(`[data-semantic-action="${focusedAction}"]`)?.focus();
+      }
+      function openSemanticDialog(dialog) {
+        state.semanticOverlayReturnFocus = document.activeElement;
+        document.body.appendChild(dialog);
+        dialog.showModal();
       }
       function showSemanticInstanceDetail(inst) {
         closeSemanticOverlay();
-        document.body.appendChild(buildDetailCard(inst));
-        const closeOnOut = (e) => {
-          if (!document.getElementById("semanticOverlay")) { document.removeEventListener("pointerdown", closeOnOut); return; }
-          if (!document.getElementById("semanticOverlay").contains(e.target)) { closeSemanticOverlay(); document.removeEventListener("pointerdown", closeOnOut); }
-        };
-        setTimeout(() => document.addEventListener("pointerdown", closeOnOut), 0);
+        state.semanticSelectedId = inst.instance_id;
+        state.highlightTarget = { record_id: inst.instance_id, target_name: semanticInstanceName(inst) };
+        for (const row of els.semanticMemoryList?.querySelectorAll?.(".semantic-memory-row") || []) {
+          row.setAttribute("aria-pressed", String(row.dataset.instanceId === inst.instance_id));
+        }
+        requestMapDraw(false);
+        openSemanticDialog(buildDetailCard(inst));
       }
       function showSemanticClusterList(cluster) {
         closeSemanticOverlay();
-        const div = document.createElement("div");
-        div.id = "semanticOverlay";
-        div.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;min-width:240px;max-width:340px;background:var(--glass,rgba(15,23,42,0.92));border:1px solid var(--line,rgba(255,255,255,0.12));border-radius:12px;padding:18px 20px;color:var(--fg,#e2e8f0);backdrop-filter:blur(12px);box-shadow:0 8px 32px rgba(0,0,0,0.5)";
-        let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><strong style="font-size:14px">物品簇（${cluster.members.length} 个）</strong><button onclick="document.getElementById('semanticOverlay').remove()" style="background:none;border:none;color:inherit;cursor:pointer;font-size:16px;padding:0">×</button></div>`;
-        html += `<div style="max-height:260px;overflow-y:auto">`;
-        for (const inst of cluster.members) {
-          const fb = isFallbackInstance(inst);
-          const uf = isUnknownFrame(inst);
-          html += `<div data-iid="${inst.instance_id}" style="padding:7px 10px;border-radius:8px;cursor:pointer;margin-bottom:4px;background:rgba(255,255,255,0.05);font-size:13px;display:flex;justify-content:space-between;align-items:center">`;
-          html += `<span>${inst.display_name || inst.label || inst.instance_id}</span>`;
-          if (fb) html += `<span style="color:#6b7280;font-size:10px">粗略</span>`;
-          else if (uf) html += `<span style="color:#fb923c;font-size:10px">未知系</span>`;
-          else html += `<span style="color:#f59e0b;font-size:10px">精确</span>`;
-          html += `</div>`;
-        }
-        html += `</div>`;
-        div.innerHTML = html;
-        for (const inst of cluster.members) {
-          const row = div.querySelector(`[data-iid="${inst.instance_id}"]`);
-          if (row) row.addEventListener("click", () => showSemanticInstanceDetail(inst));
-        }
-        div.addEventListener("click", (e) => e.stopPropagation());
-        document.body.appendChild(div);
-        const closeOnOut = (e) => {
-          if (!document.getElementById("semanticOverlay")) { document.removeEventListener("pointerdown", closeOnOut); return; }
-          if (!document.getElementById("semanticOverlay").contains(e.target)) { closeSemanticOverlay(); document.removeEventListener("pointerdown", closeOnOut); }
-        };
-        setTimeout(() => document.addEventListener("pointerdown", closeOnOut), 0);
+        const dialog = semanticDetailShell(`此处有 ${cluster.members.length} 个物品`);
+        const list = document.createElement("div");
+        list.className = "semantic-memory-list";
+        for (const inst of cluster.members) list.append(semanticListRow(inst));
+        dialog.append(list);
+        openSemanticDialog(dialog);
       }
       function updateMap(envelope) {
+        if (!acceptAppliedMapIdentity(envelope)) return;
         state.lastMapEnvelope = envelope;
         const status = statusOf(envelope);
         const data = envelope.data || {};
@@ -3148,9 +3468,16 @@
         const streamBridge = diagnostics.stream_bridge || {};
         const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
-        const displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+        let displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
+        if (!displayDecision.display && !cleared && status === "available"
+            && grid && Array.isArray(grid.data) && grid.width && grid.height
+            && state.pendingMapPose?.frame.status === "available"
+            && pendingMapPoseMatches(state.receivedMapIdentity)) {
+          displayDecision = { display: true, reason: "localization_pose_stream" };
+        }
         if (!displayDecision.display) {
           clearMapDisplay(displayDecision.message, displayDecision.status || (cleared ? "cleared" : status), diagnostics, streamBridge, envelope, grid);
+          releasePendingMapPose();
           return;
         }
         setPill(els.mapStatus, status);
@@ -3161,6 +3488,7 @@
           const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
           const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
+          state.appliedMapIdentity = state.receivedMapIdentity;
           state.mapGridContentKey = nextContentKey;
           const source = data.map_snapshot || data;
           const freeViewIdentity = JSON.stringify([
@@ -3182,6 +3510,7 @@
         }
         renderMapSummary({ grid, diagnostics, envelope });
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
+        releasePendingMapPose();
       }
       function isMapClearedEnvelope(envelope, diagnostics, status) {
         const cleared = status === "cleared"
@@ -3273,6 +3602,7 @@
       }
       function applyLocalizationDisplay(envelope, options) {
         const reevaluateMap = !options || options.reevaluateMap !== false;
+        const wasPoseStreamAvailable = localizationPoseStreamReason() !== null;
         state.lastLocalizationEnvelope = envelope;
         const data = envelope.data || {};
         const incomingPose = data.pose || (pointFromPose(data) ? data : null);
@@ -3300,8 +3630,10 @@
           ["已过期", displayBool(envelope.stale === true)],
           ["前端接收", shortTime(envelope.__receivedAt)],
         ]);
-        if (reevaluateMap) reevaluateCachedMapDisplay();
-        else requestMapDraw(false);
+        // 持续位姿只移动覆盖层；定位可用性改变时才重新评估缓存地图。
+        if (reevaluateMap && wasPoseStreamAvailable !== (localizationPoseStreamReason() !== null)) {
+          reevaluateCachedMapDisplay();
+        } else requestMapDraw(false);
       }
       function updateLocalization(envelope) {
         applyLocalizationDisplay(envelope, { reevaluateMap: true });
@@ -3615,14 +3947,117 @@
       }
       function setVideoStreamStatus(status, message) {
         state.videoStreamStatus = status;
-        if (message) {
-          els.videoEmpty.hidden = state.videoFrames > 0;
-          if (!els.videoEmpty.hidden) els.videoEmpty.textContent = message;
+        state.videoStreamMessage = message || "";
+        renderVideoStreamSummary();
+        scheduleVideoDetectionDraw();
+      }
+      function setVisionText(element, text) {
+        if (element && element.textContent !== text) element.textContent = text;
+      }
+      function videoSourceTime(value) {
+        if (typeof value !== "string" || !value.trim()) return null;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+      function videoFrameIdentity(data) {
+        return {
+          cameraId: typeof data?.camera_id === "string" ? data.camera_id : "",
+          frameId: typeof data?.frame_id === "string" ? data.frame_id : "",
+          sourceTime: videoSourceTime(data?.frame_timestamp),
+          timestampSource: data?.frame_timestamp_source || "",
+          sequence: data?.frame_sequence ?? data?.sequence ?? null,
+        };
+      }
+      function videoHasFreshImage(now = Date.now()) {
+        const sourceTime = state.videoDisplayedIdentity?.sourceTime;
+        return Boolean(!els.videoFrame.hidden && state.videoLastFrameAt && now - state.videoLastFrameAt <= VIDEO_DISPLAY_FRESH_MS
+          && (sourceTime === null || sourceTime === undefined || (now - sourceTime <= VIDEO_DISPLAY_FRESH_MS && sourceTime - now <= VIDEO_DETECTION_ALIGNMENT_MS)));
+      }
+      function renderVideoStreamSummary() {
+        const fresh = videoHasFreshImage();
+        const hasFrame = Boolean(state.videoLastFrameAt && !els.videoFrame.hidden);
+        const waiting = ["idle", "pending", "connecting", "streaming"].includes(state.videoStreamStatus);
+        const failed = state.videoStreamStatus === "error";
+        const status = fresh ? "available" : failed ? "error" : hasFrame ? "stale" : waiting ? "pending" : "missing";
+        const label = fresh ? "视频可用" : failed ? "视频不可用" : hasFrame ? "画面已过时" : "等待视频";
+        const key = `${status}|${label}|${state.videoStreamMessage || ""}`;
+        if (key !== state.videoSummaryKey) {
+          state.videoSummaryKey = key;
+          setPill(els.videoStatus, status, label);
+          els.videoEmpty.hidden = fresh;
+          if (!fresh) setVisionText(els.videoEmpty, hasFrame ? "视频已中断，当前保留上次画面。" : state.videoStreamMessage || "等待摄像头视频帧。");
         }
-        setText(
-          els.videoFpsStatus,
-          `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(status)}`
-        );
+        const size = state.videoSourceSize;
+        setVisionText(els.videoFpsStatus, hasFrame ? `已显示 ${state.videoFrames} 帧${size ? ` · ${size.width} × ${size.height}` : ""}` : "等待视频帧");
+      }
+      function visionDisplayState(now = Date.now()) {
+        const frame = state.videoDetectionFrame;
+        if (!videoHasFreshImage(now)) return { key: "no_video", status: "pending", label: "等待画面", message: "尚无当前可用画面，检测框已隐藏。", drawable: false };
+        if (!frame) return { key: "waiting", status: "pending", label: "等待识别", message: "视频已到达，尚未收到识别结果。", drawable: false };
+        if (frame.failed) return { key: "error", status: "error", label: "识别失败", message: frame.message || "识别阶段未成功，当前没有有效检测结果。", drawable: false };
+        if (frame.stale) return { key: "stale", status: "stale", label: "识别已过时", message: "识别来源已报告结果过期，等待新的观察。", drawable: false };
+        const shown = state.videoDisplayedIdentity;
+        if (!shown?.cameraId || !frame.identity.cameraId) return { key: "source_unknown", status: "degraded", label: "来源待确认", message: "画面或识别缺少相机身份，暂不叠加检测框。", drawable: false };
+        if (frame.identity.cameraId !== shown.cameraId) return { key: "camera_mismatch", status: "degraded", label: "相机不匹配", message: "识别结果来自其它相机，已隐藏检测框。", drawable: false };
+        if (frame.identity.frameId && shown.frameId && frame.identity.frameId !== shown.frameId) return { key: "frame_mismatch", status: "degraded", label: "来源不匹配", message: "图像坐标来源不一致，已隐藏检测框。", drawable: false };
+        const size = state.videoSourceSize;
+        if (!size || size.width !== frame.width || size.height !== frame.height) return { key: "size_mismatch", status: "degraded", label: "尺寸不匹配", message: "识别尺寸与当前画面不一致，等待匹配结果。", drawable: false };
+        const sourceTime = frame.identity.sourceTime;
+        if (sourceTime === null || shown.sourceTime === null || shown.sourceTime === undefined) return { key: "time_unknown", status: "degraded", label: "时间待确认", message: "缺少输入帧时间，不能确认识别与当前画面的对应关系。", drawable: false };
+        if (now - sourceTime > VIDEO_DETECTION_FRESH_MS || sourceTime - now > VIDEO_DETECTION_ALIGNMENT_MS || now - frame.receivedAt > VIDEO_DETECTION_FRESH_MS) return { key: "stale", status: "stale", label: "识别已过时", message: "识别结果已超过显示时限，等待新的观察。", drawable: false };
+        if (Math.abs(sourceTime - shown.sourceTime) > VIDEO_DETECTION_ALIGNMENT_MS) return { key: "time_mismatch", status: "stale", label: "等待对齐", message: "识别与当前画面的来源时间相差较大，检测框已隐藏。", drawable: false };
+        const count = frame.total;
+        if (count > 0 && !state.videoDetections.length) return { key: "invalid_boxes", status: "degraded", label: "检测框无效", message: `来源报告 ${count} 个检测，但没有可绘制的有效边框。`, drawable: false };
+        const limited = count !== state.videoDetections.length || frame.truncated;
+        const label = count === 0 ? "未发现目标" : limited ? `${count} 个检测 · 显示 ${state.videoDetections.length} 个框` : `${count} 个目标`;
+        const message = frame.workerFallback ? `识别已回退到当前进程执行：${frame.workerFallbackReason || "独立工作进程不可用"}${frame.providerFallback ? `；同时使用备用模型：${frame.fallbackReason || "原模型未提供可用结果"}` : ""}`
+          : frame.fallback ? `使用回退识别：${frame.fallbackReason || "原模型未提供可用结果"}`
+          : count === 0 ? "本次识别成功，未发现目标；不表示场景中一定没有物品。"
+          : "显示同相机的近期识别；二维框不代表已知物体空间位置。";
+        return { key: count === 0 ? "empty" : "ready", status: frame.fallback ? "degraded" : "available", label, message, drawable: count > 0 };
+      }
+      function renderVisionPanel() {
+        const display = visionDisplayState();
+        if (!videoPanelVisible()) return display;
+        const frame = state.videoDetectionFrame;
+        const key = JSON.stringify([display, frame?.identity, frame?.backend, frame?.inferenceExecution, frame?.detectorMs, frame?.waitMs]);
+        if (state.visionPanelKey !== key) {
+          state.visionPanelKey = key;
+          const statusKey = `${display.status}|${display.label}`;
+          if (state.visionStatusKey !== statusKey) {
+            state.visionStatusKey = statusKey;
+            setPill(els.visionDetectionStatus, display.status, display.label);
+          }
+          setVisionText(els.visionMessage, display.message);
+          if (els.visionMessage) els.visionMessage.dataset.level = display.status;
+          const execution = ({ worker_process: "独立工作进程", in_process: "当前进程" })[frame?.inferenceExecution];
+          setVisionText(els.visionModelStatus, `${frame?.backend || "未上报"}${execution ? ` · ${execution}` : ""}`);
+          setVisionText(els.visionCameraStatus, frame?.identity.cameraId || state.videoDisplayedIdentity?.cameraId || "未上报");
+          const timeSource = frame?.identity.timestampSource === "video_relay.write_time" ? "中转写入时间" : "输入帧时间";
+          setVisionText(els.visionObservedAt, frame?.identity.sourceTime ? `${new Date(frame.identity.sourceTime).toLocaleString()} · ${timeSource}` : "未上报输入帧时间");
+          setVisionText(els.visionTimingStatus, `${Number.isFinite(frame?.detectorMs) ? `${frame.detectorMs.toFixed(1)} 毫秒` : "未上报"} / ${Number.isFinite(frame?.waitMs) ? `${frame.waitMs.toFixed(1)} 毫秒` : "未上报"}`);
+        }
+        const labelsKey = `${display.key}|${state.videoDetectionRevision}`;
+        if (els.visionLabels && state.visionLabelsKey !== labelsKey) {
+          state.visionLabelsKey = labelsKey;
+          const fragment = document.createDocumentFragment();
+          if (display.drawable) {
+            const grouped = new Map();
+            for (const detection of state.videoDetections) grouped.set(detection.label, (grouped.get(detection.label) || 0) + 1);
+            for (const [label, count] of Array.from(grouped).slice(0, 8)) {
+              const tag = document.createElement("span");
+              tag.textContent = `${label}${count > 1 ? ` × ${count}` : ""}`;
+              fragment.append(tag);
+            }
+            if (grouped.size > 8) {
+              const more = document.createElement("span");
+              more.textContent = `另有 ${grouped.size - 8} 类`;
+              fragment.append(more);
+            }
+          }
+          els.visionLabels.replaceChildren(fragment);
+        }
+        return display;
       }
       function scheduleVideoStreamReconnect(reason) {
         if (!state.videoStreamSrc) return;
@@ -3658,7 +4093,12 @@
         els.videoFrame.removeAttribute("src");
         els.videoFrame.hidden = true;
         state.videoStreamSrc = null;
+        state.videoPendingSingleFrame = null;
         state.lastVideoFrameKey = null;
+        state.videoDisplayedIdentity = null;
+        state.videoLastFrameAt = null;
+        scheduleVideoDetectionDraw();
+        renderVisionPanel();
       }
       function startVideoStream(options) {
         const opts = options || {};
@@ -3666,6 +4106,7 @@
           ? new URL(opts.streamUrl, window.location.origin).toString()
           : buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
         if (!videoSrc) return;
+        if (state.videoRejectedSource === videoSrc && Date.now() < state.videoRejectedSourceUntil) return;
         if (!opts.force && state.videoStreamSrc === videoSrc && state.videoStreamController) return;
         const reconnectDelay = opts.reason === "reconnect" ? state.videoStreamReconnectDelayMs : VIDEO_STREAM_INITIAL_RECONNECT_MS;
         if (state.videoStreamController) {
@@ -3699,11 +4140,21 @@
             setVideoStreamStatus("pending", "等待摄像头视频帧，接收到数据后会自动显示。");
             return;
           }
+          if (err && err.code === "video_camera_unavailable") {
+            state.videoStreamController = null;
+            state.videoRejectedSource = videoSrc;
+            state.videoRejectedSourceUntil = Date.now() + 30000;
+            state.videoDisplayedIdentity = null;
+            state.videoLastFrameAt = null;
+            els.videoFrame.hidden = true;
+            setVideoStreamStatus("error", err.message);
+            return;
+          }
           const message = err && err.message ? err.message : String(err || "未知错误");
           state.videoLastError = message;
-          state.videoDecodeErrors += 1;
+          state.videoStreamErrors = (state.videoStreamErrors || 0) + 1;
           state.videoStreamController = null;
-          scheduleVideoStreamReconnect(`MJPEG 解码流失败：${message}`);
+          scheduleVideoStreamReconnect(`视频流连接失败：${message}`);
         });
       }
       function resetVideoStreamFromMetadata(videoSrc) {
@@ -3723,16 +4174,16 @@
       async function consumeMjpegStream(videoSrc, signal, generation) {
         const response = await fetch(videoSrc, { method: "GET", cache: "no-store", signal });
         if (!response.ok) {
-          if (response.status === 503) {
-            let detail = null;
-            try { detail = await response.json(); } catch (_) {}
-            if (detail && detail.reason === "rust_bridge_no_frames") {
-              const waiting = new Error(detail.message || "等待摄像头视频帧");
-              waiting.code = "video_not_ready";
-              throw waiting;
-            }
+          let detail = null;
+          try { detail = await response.json(); } catch (_) { /* 非结构化错误保留响应状态。 */ }
+          if (response.status === 503 && detail?.reason === "rust_bridge_no_frames") {
+            const waiting = new Error(detail.message || "等待摄像头视频帧");
+            waiting.code = "video_not_ready";
+            throw waiting;
           }
-          throw new Error(`HTTP ${response.status}`);
+          const error = new Error(detail?.message || `视频服务返回 ${response.status}`);
+          error.code = detail?.error || "video_stream_error";
+          throw error;
         }
         if (!response.body || !response.body.getReader) {
           throw new Error("当前浏览器不支持 ReadableStream MJPEG 解码。");
@@ -3755,6 +4206,7 @@
             }
             let parsedAny = false;
             let latestFrameBytes = null;
+            let latestFrameIdentity = null;
             while (true) {
               const parsed = extractNextJpeg(buffer);
               if (!parsed) break;
@@ -3764,12 +4216,14 @@
               }
               parsedAny = true;
               latestFrameBytes = parsed.frame;
+              latestFrameIdentity = parsed.identity;
               buffer = parsed.remaining;
             }
             if (latestFrameBytes) {
               try {
-                await renderDecodedVideoFrame(latestFrameBytes, generation);
+                await renderDecodedVideoFrame(latestFrameBytes, generation, latestFrameIdentity || {});
               } catch (err) {
+                if (generation !== state.videoStreamGeneration || signal.aborted) return;
                 const message = err && err.message ? err.message : String(err || "未知错误");
                 state.videoLastError = message;
                 state.videoDecodeErrors += 1;
@@ -3783,6 +4237,8 @@
             }
           }
         } finally {
+          // 解码失败或换源提前退出时也取消字节读取，避免失去旧连接的拥有方。
+          try { await reader.cancel(); } catch (_) { /* 已中止或已结束的读取器无需再次处理。 */ }
           try {
             reader.releaseLock();
           } catch (err) {
@@ -3813,63 +4269,37 @@
         if (soi < 0) {
           return {
             frame: null,
-            remaining: buffer.byteLength > 2 ? buffer.slice(buffer.byteLength - 2) : buffer,
+            remaining: buffer.byteLength > 16384 ? buffer.slice(buffer.byteLength - 16384) : buffer,
           };
         }
-        const eoi = findMarker(buffer, 0xff, 0xd9, soi + 2);
-        if (eoi < 0) {
+        const prefix = new TextDecoder().decode(buffer.subarray(Math.max(0, soi - 16384), soi));
+        const boundary = prefix.lastIndexOf("--frame\r\n");
+        const header = boundary >= 0 ? prefix.slice(boundary) : prefix;
+        const lengthHeader = header.match(/^Content-Length:\s*([0-9]+)\s*$/mi)?.[1];
+        const length = lengthHeader ? Number(lengthHeader) : null;
+        if (length !== null && (!Number.isSafeInteger(length) || length < 4 || length > MJPEG_MAX_BUFFER_BYTES)) throw new Error("视频帧长度超出有效范围。");
+        // 有长度头时以传输边界为准，图像元数据中的内嵌缩略图结束标记不能截断主图。
+        const eoi = length !== null ? soi + length - 2 : findMarker(buffer, 0xff, 0xd9, soi + 2);
+        if (eoi < 0 || eoi + 2 > buffer.byteLength) {
           return {
             frame: null,
-            remaining: soi > 0 ? buffer.slice(soi) : buffer,
+            remaining: soi > 16384 ? buffer.slice(soi - 16384) : buffer,
           };
         }
         const frame = buffer.slice(soi, eoi + 2);
         const remaining = buffer.slice(eoi + 2);
         if (!frame.byteLength) return null;
-        return { frame, remaining };
+        const cameraValue = header.match(/^X-Camera-Id:\s*([^\r\n]*)/mi)?.[1] || "";
+        let cameraId = "";
+        try { cameraId = decodeURIComponent(cameraValue.trim()); } catch (_) { /* 无效头不作为来源依据。 */ }
+        const timestamp = header.match(/^X-Frame-Timestamp:\s*([^\r\n]*)/mi)?.[1]?.trim();
+        const sequence = header.match(/^X-Frame-Sequence:\s*([0-9]+)/mi)?.[1] || null;
+        const timestampSource = header.match(/^X-Frame-Timestamp-Source:\s*([^\r\n]*)/mi)?.[1]?.trim() || "";
+        return { frame, remaining, identity: { cameraId, sourceTime: videoSourceTime(timestamp), timestampSource, sequence } };
       }
-      async function decodeJpegBlob(blob) {
-        let probeUrl = null;
-        if (typeof createImageBitmap === "function") {
-          const timeout = new Promise((_, reject) => {
-            window.setTimeout(() => reject(new Error("JPEG 解码超时")), VIDEO_JPEG_DECODE_TIMEOUT_MS);
-          });
-          const bitmap = await Promise.race([createImageBitmap(blob), timeout]);
-          if (bitmap && typeof bitmap.close === "function") bitmap.close();
-        } else {
-          try {
-            await new Promise((resolve, reject) => {
-              const probe = new Image();
-              let settled = false;
-              const timer = window.setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                reject(new Error("JPEG 解码超时"));
-              }, VIDEO_JPEG_DECODE_TIMEOUT_MS);
-              probe.onload = () => {
-                if (settled) return;
-                settled = true;
-                window.clearTimeout(timer);
-                resolve();
-              };
-              probe.onerror = () => {
-                if (settled) return;
-                settled = true;
-                window.clearTimeout(timer);
-                reject(new Error("JPEG 解码失败"));
-              };
-              probeUrl = URL.createObjectURL(blob);
-              probe.src = probeUrl;
-            });
-          } finally {
-            if (probeUrl) URL.revokeObjectURL(probeUrl);
-          }
-        }
-      }
-      async function renderDecodedVideoFrame(frameBytes, generation) {
+      async function renderDecodedVideoFrame(frameBytes, generation, identity = {}) {
         if (!frameBytes || !frameBytes.byteLength) return;
         const blob = new Blob([frameBytes], { type: "image/jpeg" });
-        await decodeJpegBlob(blob);
         if (generation !== state.videoStreamGeneration) return;
         const nextUrl = await displayVideoBlob(blob, generation);
         if (generation !== state.videoStreamGeneration) {
@@ -3884,10 +4314,11 @@
         state.videoDecodedBytes += frameBytes.byteLength;
         state.videoFrames += 1;
         state.videoLastFrameAt = Date.now();
+        state.videoDisplayedIdentity = { ...identity, receivedAt: state.videoLastFrameAt };
+        state.videoSourceSize = { width: els.videoFrame.naturalWidth, height: els.videoFrame.naturalHeight };
         state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
         els.videoEmpty.hidden = true;
-        void els.videoFrame.offsetHeight;
         scheduleVideoDetectionDraw();
       }
       async function displayVideoBlob(blob, generation) {
@@ -3939,76 +4370,96 @@
         }
         if (generation !== state.videoStreamGeneration) return nextUrl;
         if (previousUrl) {
-          window.setTimeout(() => {
-            try {
-              URL.revokeObjectURL(previousUrl);
-            } catch (err) {
-              // 旧帧 URL 释放失败不影响后续实时帧。
-            }
-          }, 250);
+          // 新图已完成加载，旧对象地址可立即释放，无需为每帧另起延时器。
+          try { URL.revokeObjectURL(previousUrl); } catch (_) { /* 释放失败不阻塞新图。 */ }
         }
         return nextUrl;
       }
       function updateVideo(envelope) {
-        const status = statusOf(envelope);
         const data = envelope.data || {};
-        const detections = Array.isArray(data.detections_2d) ? data.detections_2d : null;
-        if (detections) {
+        if (Array.isArray(data.detections_2d)) {
           updateVideoDetections(data, envelope);
           return;
         }
-        setPill(els.videoStatus, status);
+        const metadata = videoFrameIdentity(data);
+        const previousCamera = state.videoFrameMetadata?.cameraId;
+        state.videoFrameMetadata = metadata;
+        if (previousCamera && metadata.cameraId && previousCamera !== metadata.cameraId) {
+          state.videoDisplayedIdentity = null;
+          state.videoLastFrameAt = null;
+          els.videoFrame.hidden = true;
+          scheduleVideoDetectionDraw();
+        }
         const videoSrc = buildVideoFrameSrc(data);
-        if (videoSrc) {
+        if (videoSrc && data.available !== false && !["missing", "failed", "error", "stale"].includes(statusOf(envelope))) {
           if (data.stream_url) {
             if (state.videoStreamSrc !== videoSrc || (!state.videoStreamController && !state.videoStreamReconnectTimer)) {
               startVideoStream({ streamUrl: videoSrc, force: state.videoStreamSrc !== videoSrc, reason: "metadata" });
-            } else {
-              resetVideoStreamFromMetadata(videoSrc);
-            }
+            } else resetVideoStreamFromMetadata(videoSrc);
           } else if (state.lastVideoFrameKey !== videoSrc) {
-            stopVideoStream("切换到单帧图像显示。");
+            stopVideoStream("正在加载图像。");
             revokeVideoObjectUrl();
-            els.videoFrame.setAttribute("src", videoSrc);
+            state.videoPendingSingleFrame = { src: videoSrc, identity: metadata, generation: state.videoStreamGeneration };
             state.videoStreamSrc = videoSrc;
             state.lastVideoFrameKey = videoSrc;
-            state.videoFrames += 1;
-            state.videoLastFrameAt = Date.now();
+            els.videoFrame.setAttribute("src", videoSrc);
           }
-          if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
-          if (state.videoFrames > 0 || !data.stream_url) {
-            els.videoFrame.hidden = false;
-            els.videoEmpty.hidden = state.videoFrames > 0;
-          } else {
-            els.videoFrame.hidden = true;
-            els.videoEmpty.hidden = false;
-          }
-          scheduleVideoDetectionDraw();
-        } else if (!state.lastVideoFrameKey) {
+        } else if (data.available === false || !videoSrc) {
           clearVideoDisplay(errorReason(envelope, "尚未收到摄像头发布的视频帧。"));
-          els.videoEmpty.textContent = errorReason(envelope, "尚未收到摄像头发布的视频帧。");
         }
-        setText(els.visionModelStatus, `本地模型：${status}`);
-        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(state.videoStreamStatus)} · 延迟 ${fmt(envelope.latency_ms, " ms")}`);
+        renderVideoStreamSummary();
+        renderVisionPanel();
+        scheduleVideoDetectionDraw();
       }
       function updateVideoDetections(data, envelope) {
+        data = data || {};
+        envelope = envelope || {};
+        const identity = videoFrameIdentity(data);
+        const previous = state.videoDetectionFrame;
+        // 同相机的乱序结果不能覆盖更新的观察；其它相机的结果保留明确不匹配状态。
+        if (previous?.identity.cameraId === identity.cameraId && identity.sourceTime !== null
+          && previous.identity.sourceTime !== null && identity.sourceTime < previous.identity.sourceTime) return;
         const detections = Array.isArray(data.detections_2d) ? data.detections_2d : [];
-        state.videoDetections = detections.filter((detection) => {
+        const valid = detections.filter((detection) => {
           const bbox = detection && detection.bbox;
           return typeof detection?.label === "string" && !detection.label.startsWith("<truncated:")
-            && Number.isFinite(detection.score) && bbox
+            && Number.isFinite(detection.score) && detection.score >= 0 && detection.score <= 1 && bbox
             && [bbox.x_px, bbox.y_px, bbox.width_px, bbox.height_px].every(Number.isFinite)
             && bbox.width_px > 0 && bbox.height_px > 0;
-        });
-        if (data.width_px && data.height_px) state.videoSourceSize = { width: Number(data.width_px), height: Number(data.height_px) };
-        const count = Number.isSafeInteger(data.detection_count) && data.detection_count >= 0 ? data.detection_count : state.videoDetections.length;
-        const limited = data.detections_truncated === true || count !== state.videoDetections.length;
-        const detectionLabel = limited ? `${count} 个检测 · 显示 ${state.videoDetections.length} 个框` : `${count} 个检测`;
-        const detectionStatus = String(envelope.status || "missing").startsWith("<truncated:") ? "missing" : statusOf(envelope);
-        setPill(els.videoStatus, detectionStatus, detectionLabel);
-        setText(els.visionModelStatus, `本地模型：${data.detector_backend || envelope.source || "perception"}`);
-        setText(els.videoFpsStatus, `解码帧 ${state.videoFrames} · 检测 ${state.videoDetections.length} · 流 ${displayStatus(state.videoStreamStatus)}`);
-        updatePerceptionNmsCard(data, envelope);
+        }).slice(0, 64);
+        const total = Number.isSafeInteger(data.detection_count) && data.detection_count >= 0 ? data.detection_count : valid.length;
+        const status = String(envelope.status || "missing").startsWith("<truncated:") ? "missing" : statusOf(envelope);
+        const detectorStage = data.stage_status?.detector;
+        const failed = data.available === false || ["missing", "failed", "error", "unavailable"].includes(status)
+          || ["failed", "error", "unavailable"].includes(detectorStage);
+        const next = {
+          identity, width: data.width_px, height: data.height_px, total,
+          truncated: data.detections_truncated === true || total !== valid.length,
+          failed, stale: status === "stale" || envelope.stale === true, message: data.message || data.error_message || "",
+          backend: data.detector_backend || "未上报",
+          inferenceExecution: data.inference_execution || "",
+          detectorMs: data.stage_duration_ms?.detector,
+          waitMs: data.pipeline_lock_wait_ms,
+          fallback: data.provider_fallback_used === true || data.worker_fallback_used === true,
+          providerFallback: data.provider_fallback_used === true,
+          workerFallback: data.worker_fallback_used === true,
+          workerFallbackReason: data.worker_fallback_reason || "",
+          fallbackReason: data.provider_fallback_reason || "",
+          receivedAt: Date.now(),
+        };
+        const signature = JSON.stringify([valid, { ...next, receivedAt: undefined }]);
+        if (signature !== state.videoDetectionSignature) {
+          state.videoDetectionSignature = signature;
+          updatePerceptionNmsCard(data, envelope);
+        }
+        const geometrySignature = JSON.stringify([valid, identity.cameraId, next.width, next.height]);
+        if (geometrySignature !== state.videoDetectionGeometrySignature) {
+          state.videoDetectionGeometrySignature = geometrySignature;
+          state.videoDetectionRevision = (state.videoDetectionRevision || 0) + 1;
+          state.videoDetections = valid;
+        }
+        state.videoDetectionFrame = next;
+        renderVisionPanel();
         scheduleVideoDetectionDraw();
       }
       // vis-three-fixes 任务 1.7 / AC3.4：用 video.detections 流里的 nms_stats 填充感知 NMS 卡片。
@@ -4031,67 +4482,72 @@
         ]);
         section.querySelector(".small").textContent = `前端接收 ${shortTime(envelope.__receivedAt)}`;
       }
+      function videoPanelVisible() {
+        return !document.hidden && document.getElementById("monitor-view")?.classList.contains("active") !== false;
+      }
       function scheduleVideoDetectionDraw() {
-        if (state.videoDetectionDrawFrame) return;
+        if (!videoPanelVisible() || state.videoDetectionDrawFrame) return;
         state.videoDetectionDrawFrame = window.requestAnimationFrame(() => {
           state.videoDetectionDrawFrame = null;
           drawVideoDetections();
         });
       }
+      function videoOverlayGeometry(width, height, sourceWidth, sourceHeight) {
+        const scale = Math.min(width / sourceWidth, height / sourceHeight);
+        return { scale, x: (width - sourceWidth * scale) / 2, y: (height - sourceHeight * scale) / 2 };
+      }
       function drawVideoDetections() {
+        if (!videoPanelVisible()) return;
         const canvas = els.videoDetections;
         const image = els.videoFrame;
-        if (!canvas || !image || !state.showDetections || image.hidden || !state.videoDetections.length) {
+        const display = renderVisionPanel();
+        const source = state.videoSourceSize;
+        const ratio = Math.min(2, window.devicePixelRatio || 1);
+        const drawKey = `${state.videoDetectionRevision}|${state.videoDetectionLayoutRevision}|${state.showDetections}|${display.drawable}|${source?.width}|${source?.height}|${ratio}`;
+        if (state.videoDetectionDrawKey === drawKey) return;
+        state.videoDetectionDrawKey = drawKey;
+        if (!canvas || !image || !state.showDetections || image.hidden || !display.drawable || !state.videoDetections.length) {
           if (canvas) {
             canvas.hidden = true;
             const context = canvas.getContext("2d");
-            if (context) context.clearRect(0, 0, canvas.width, canvas.height);
+            context?.clearRect(0, 0, canvas.width, canvas.height);
           }
           return;
         }
         const stageRect = canvas.parentElement.getBoundingClientRect();
-        const imageRect = image.getBoundingClientRect();
-        const width = Math.max(1, Math.round(stageRect.width));
-        const height = Math.max(1, Math.round(stageRect.height));
-        if (canvas.width !== width || canvas.height !== height) {
-          canvas.width = width;
-          canvas.height = height;
+        const width = Math.round(stageRect.width);
+        const height = Math.round(stageRect.height);
+        if (!(width > 0 && height > 0)) { canvas.hidden = true; state.videoDetectionDrawKey = ""; return; }
+        const pixelWidth = Math.round(width * ratio), pixelHeight = Math.round(height * ratio);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+          canvas.width = pixelWidth;
+          canvas.height = pixelHeight;
         }
-        const sourceWidth = Number((state.videoSourceSize && state.videoSourceSize.width) || image.naturalWidth || 0);
-        const sourceHeight = Number((state.videoSourceSize && state.videoSourceSize.height) || image.naturalHeight || 0);
-        if (!(sourceWidth > 0 && sourceHeight > 0)) {
-          canvas.hidden = true;
-          return;
-        }
-        const fitScale = Math.min(imageRect.width / sourceWidth, imageRect.height / sourceHeight);
-        const drawnWidth = sourceWidth * fitScale;
-        const drawnHeight = sourceHeight * fitScale;
-        const scaleX = fitScale;
-        const scaleY = fitScale;
-        const offsetX = imageRect.left - stageRect.left + (imageRect.width - drawnWidth) / 2;
-        const offsetY = imageRect.top - stageRect.top + (imageRect.height - drawnHeight) / 2;
+        const geometry = videoOverlayGeometry(width, height, source.width, source.height);
         const context = canvas.getContext("2d");
-        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.setTransform(ratio, 0, 0, ratio, 0, 0);
+        context.clearRect(0, 0, width, height);
         context.lineWidth = 2;
-        context.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+        context.font = "12px sans-serif";
         for (const detection of state.videoDetections) {
-          const bbox = detection && detection.bbox;
-          if (!bbox) continue;
-          const x = offsetX + Number(bbox.x_px || 0) * scaleX;
-          const y = offsetY + Number(bbox.y_px || 0) * scaleY;
-          const boxWidth = Number(bbox.width_px || 0) * scaleX;
-          const boxHeight = Number(bbox.height_px || 0) * scaleY;
-          if (!(boxWidth > 0 && boxHeight > 0)) continue;
-          const label = `${detection.label || "object"} ${detection.score !== undefined ? Math.round(Number(detection.score) * 100) + "%" : ""}`.trim();
+          const bbox = detection.bbox;
+          const left = Math.max(0, bbox.x_px), top = Math.max(0, bbox.y_px);
+          const right = Math.min(source.width, bbox.x_px + bbox.width_px);
+          const bottom = Math.min(source.height, bbox.y_px + bbox.height_px);
+          if (!(right > left && bottom > top)) continue;
+          const x = geometry.x + left * geometry.scale, y = geometry.y + top * geometry.scale;
+          const boxWidth = (right - left) * geometry.scale, boxHeight = (bottom - top) * geometry.scale;
+          const label = `${detection.label} ${Math.round(detection.score * 100)}%`;
+          const labelMaxWidth = Math.max(20, Math.min(240, width - x - 10));
+          const fitted = fitSemanticMarkerLabel(context, label, labelMaxWidth);
+          const labelWidth = Math.min(width - x, context.measureText(fitted).width + 10);
+          const labelTop = Math.max(geometry.y, y - 20);
           context.strokeStyle = "#22d3ee";
-          context.fillStyle = "rgba(34, 211, 238, 0.16)";
           context.strokeRect(x, y, boxWidth, boxHeight);
-          context.fillRect(x, y, boxWidth, boxHeight);
-          const labelWidth = Math.min(context.measureText(label).width + 10, Math.max(50, boxWidth));
-          context.fillStyle = "rgba(2, 6, 23, 0.82)";
-          context.fillRect(x, Math.max(0, y - 20), labelWidth, 18);
+          context.fillStyle = "rgba(2, 6, 23, 0.88)";
+          context.fillRect(x, labelTop, labelWidth, 20);
           context.fillStyle = "#e0f2fe";
-          context.fillText(label, x + 5, Math.max(12, y - 7));
+          context.fillText(fitted, x + 5, labelTop + 14);
         }
         canvas.hidden = false;
       }
@@ -4207,6 +4663,7 @@
           source_timestamp: frame.timestamp || (frame.payload && frame.payload.timestamp),
           gateway_timestamp: frame.timestamp,
           sequence: frame.sequence ?? frame.cursor,
+          cursor: frame.cursor,
           revision: frame.revision,
           status: frame.status || "available",
           stale: frame.status === "stale",
@@ -4216,11 +4673,14 @@
           __frontendLatencyMs: 0,
         };
       }
-      function buildStreamUrl() {
+      function buildStreamUrl(stream = state) {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const url = new URL(`${protocol}//${window.location.host}/streams/ws`);
-        url.searchParams.set("topics", STREAM_TOPICS.join(","));
-        if (state.latestStreamCursor) url.searchParams.set("after_cursor", String(state.latestStreamCursor));
+        // 位姿独立传输，避免大地图的发送队列阻塞小帧；续传游标也按连接隔离。
+        const topics = stream.topics || STREAM_TOPICS.filter((topic) => topic !== "localization.pose");
+        url.searchParams.set("topics", topics.join(","));
+        if (stream.mapPayload) url.searchParams.set("map_payload", stream.mapPayload);
+        if (stream.latestStreamCursor) url.searchParams.set("after_cursor", String(stream.latestStreamCursor));
         return url.toString();
       }
       const STREAM_CURSOR_MAX_U64 = "18446744073709551615";
@@ -4241,12 +4701,12 @@
         ) return null;
         return normalized;
       }
-      function updateLatestStreamCursor(value, allowReset = false) {
+      function updateLatestStreamCursor(value, allowReset = false, stream = state) {
         const next = normalizedStreamCursor(value);
         if (next === null) return false;
-        const current = normalizedStreamCursor(state.latestStreamCursor) || "0";
+        const current = normalizedStreamCursor(stream.latestStreamCursor) || "0";
         if (allowReset || next.length > current.length || (next.length === current.length && next > current)) {
-          state.latestStreamCursor = next;
+          stream.latestStreamCursor = next;
           return true;
         }
         return next === current;
@@ -4255,6 +4715,79 @@
         if (left.length !== right.length) return left.length < right.length ? -1 : 1;
         if (left === right) return 0;
         return left < right ? -1 : 1;
+      }
+      function mapIdentityKey(identity) {
+        const fields = [identity?.map_name, identity?.source_name, identity?.source_epoch, identity?.frame_id];
+        return fields.every((field) => typeof field === "string" && field.length > 0)
+          ? JSON.stringify(fields) : null;
+      }
+      function hideMapPose() {
+        state.lastLocalizationEnvelope = null;
+        state.latestPose = null;
+        clearLocalizationDisplay("等待当前地图与定位同步。", "missing");
+        requestMapDraw(false);
+        window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: null }));
+      }
+      function acceptPoseMapIdentity(message) {
+        const cursor = normalizedStreamCursor(message.cursor);
+        const cleared = message.cleared === true;
+        const key = cleared ? null : mapIdentityKey(message);
+        if (cursor === null || (!cleared && key === null)) return;
+        const current = state.poseMapIdentity;
+        if (current && compareCanonicalInteger(cursor, current.cursor) <= 0) return;
+        const changed = !current || current.key !== key || current.cleared !== cleared;
+        state.poseMapIdentity = { key, cursor, cleared, startCursor: changed ? cursor : current.startCursor };
+        if (cleared) state.appliedMapIdentity = null;
+        if (changed) {
+          state.pendingMapPose = null;
+          hideMapPose();
+        }
+        // 主连接重启后的低游标地图可能先被旧屏障挡住，新屏障到达后重试该候选。
+        if (!cleared && (!state.appliedMapIdentity || state.appliedMapIdentity.key !== key)) {
+          const mapFrame = state.latestStreamFrames["map.frame"];
+          const source = mapFrame?.payload?.map_snapshot || mapFrame?.payload;
+          const mapCursor = normalizedStreamCursor(mapFrame?.cursor);
+          if (mapCursor !== null && compareCanonicalInteger(mapCursor, state.poseMapIdentity.startCursor) >= 0
+              && mapIdentityKey({ ...source, frame_id: source?.frame_id || mapFrame?.frame_id }) === key) {
+            state.pendingStreamFrames["map.frame"] = mapFrame;
+            scheduleStreamFlush();
+          }
+        }
+        releasePendingMapPose();
+      }
+      function acceptAppliedMapIdentity(envelope) {
+        const cursor = normalizedStreamCursor(envelope.cursor);
+        if (cursor === null) return false;
+        const source = envelope.data?.map_snapshot || envelope.data;
+        const cleared = envelope.status === "cleared" || source === null;
+        const key = cleared ? null : mapIdentityKey({ ...source, frame_id: source?.frame_id || envelope.frame_id });
+        if (!cleared && key === null) return false;
+        const received = state.receivedMapIdentity;
+        const barrier = state.poseMapIdentity;
+        if (received && compareCanonicalInteger(cursor, received.cursor) < 0) return false;
+        if (barrier && key !== barrier.key && compareCanonicalInteger(cursor, barrier.startCursor) <= 0) return false;
+        if (!state.appliedMapIdentity && barrier && !cleared && compareCanonicalInteger(cursor, barrier.startCursor) < 0) return false;
+        if (!received || received.key !== key || received.cleared !== cleared) hideMapPose();
+        state.receivedMapIdentity = { key, cursor, cleared };
+        return true;
+      }
+      function pendingMapPoseMatches(applied = state.appliedMapIdentity) {
+        const pending = state.pendingMapPose;
+        const barrier = state.poseMapIdentity;
+        if (!pending || !barrier || barrier.cleared || !applied || applied.cleared || state.mapStreamReady === false) return false;
+        if (pending.mapKey !== barrier.key || applied.key !== barrier.key) return false;
+        const cursor = normalizedStreamCursor(pending.frame.cursor);
+        return cursor !== null && compareCanonicalInteger(cursor, barrier.startCursor) > 0;
+      }
+      function releasePendingMapPose(reevaluateMap = false) {
+        if (!pendingMapPoseMatches()) {
+          if (reevaluateMap && !state.appliedMapIdentity && state.lastMapEnvelope?.status === "available"
+              && pendingMapPoseMatches(state.receivedMapIdentity)) updateMap(state.lastMapEnvelope);
+          return;
+        }
+        const pending = state.pendingMapPose;
+        state.pendingMapPose = null;
+        processStreamFrame(pending.frame);
       }
       function isCanonicalExplorationFrame(frame) {
         const exploration = frame && frame.payload && frame.payload.exploration_state;
@@ -4395,78 +4928,117 @@
       window.addEventListener("stream:pointcloud_map.cursor-accepted", (event) => {
         updateLatestStreamCursor(event.detail?.cursor);
       });
-      function connectStreams() {
+      function connectStreams(stream = state) {
         if (
-          state.streamSocket
-          && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.streamSocket.readyState)
+          stream.streamSocket
+          && [WebSocket.CONNECTING, WebSocket.OPEN].includes(stream.streamSocket.readyState)
         ) return;
-        if (state.streamReconnectTimer) {
-          window.clearTimeout(state.streamReconnectTimer);
-          state.streamReconnectTimer = null;
+        if (stream.streamReconnectTimer) {
+          window.clearTimeout(stream.streamReconnectTimer);
+          stream.streamReconnectTimer = null;
         }
-        const socket = new WebSocket(buildStreamUrl());
-        const epoch = state.streamConnectionEpoch + 1;
-        state.streamConnectionEpoch = epoch;
+        const socket = new WebSocket(buildStreamUrl(stream));
+        const epoch = stream.streamConnectionEpoch + 1;
+        stream.streamConnectionEpoch = epoch;
         socket.binaryType = "arraybuffer";
-        state.streamSocket = socket;
+        stream.streamSocket = socket;
+        let acceptsMessages = true;
         const isCurrentConnection = () => (
-          socket === state.streamSocket
-          && epoch === state.streamConnectionEpoch
+          socket === stream.streamSocket
+          && epoch === stream.streamConnectionEpoch
         );
         socket.addEventListener("open", () => {
           if (!isCurrentConnection()) return;
-          const wasReconnect = state.streamReconnectAttempt > 0;
-          state.streamReconnectAttempt = 0;
-          state.streamReconnectDelayMs = 1000;
-          if (state.streamReconnectTimer) {
-            window.clearTimeout(state.streamReconnectTimer);
-            state.streamReconnectTimer = null;
+          const wasReconnect = stream.streamReconnectAttempt > 0;
+          stream.streamReconnectAttempt = 0;
+          stream.streamReconnectDelayMs = 1000;
+          if (stream.streamReconnectTimer) {
+            window.clearTimeout(stream.streamReconnectTimer);
+            stream.streamReconnectTimer = null;
           }
-          if (wasReconnect) loadInitialTasks();
+          if (wasReconnect && stream === state) loadInitialTasks();
         });
         socket.addEventListener("message", (event) => {
-          if (!isCurrentConnection()) return;
+          if (!isCurrentConnection() || !acceptsMessages) return;
           if (event.data instanceof ArrayBuffer) {
             routePointCloudMapBinary(event.data);
             return;
           }
           const message = JSON.parse(event.data);
+          if (message.type === "stream.map_identity" && stream === state.poseStream) {
+            updateLatestStreamCursor(message.cursor, false, stream);
+            acceptPoseMapIdentity(message);
+            return;
+          }
           if (message.type === "keepalive") {
-            updateLatestStreamCursor(message.cursor);
+            updateLatestStreamCursor(message.cursor, false, stream);
             return;
           }
           if (message.type === "stream.replay") {
             updateLatestStreamCursor(
               message.latest_cursor,
               message.resync_required && message.gap_reason === "cursor_ahead_of_stream",
+              stream,
             );
-            if (message.resync_required || message.replay_gap) {
+            if (stream === state && (message.resync_required || message.replay_gap)) {
               resetPointCloudMapBinaryConsumer("replay_gap");
               resetExplorationOverlayConsumer("replay_gap");
               recoverStreamGap(message);
             }
+            if (stream === state) {
+              state.mapStreamReady = true;
+              if (message.gap_reason === "cursor_ahead_of_stream") {
+                state.receivedMapIdentity = null;
+                state.appliedMapIdentity = null;
+                const mapFrame = state.latestStreamFrames["map.frame"];
+                const mapCursor = normalizedStreamCursor(mapFrame?.cursor);
+                const latestCursor = normalizedStreamCursor(message.latest_cursor);
+                if (mapCursor !== null && latestCursor !== null && compareCanonicalInteger(mapCursor, latestCursor) <= 0) {
+                  state.pendingStreamFrames["map.frame"] = mapFrame;
+                  scheduleStreamFlush();
+                }
+              }
+              releasePendingMapPose(true);
+            }
             return;
           }
           if (message.type === "stream.gap") {
-            updateLatestStreamCursor(message.latest_cursor);
+            updateLatestStreamCursor(message.latest_cursor, false, stream);
+            if (stream !== state) {
+              acceptsMessages = false;
+              state.poseMapIdentity = null;
+              state.pendingMapPose = null;
+              hideMapPose();
+              socket.close();
+              return;
+            }
             resetPointCloudMapBinaryConsumer("queue_gap");
             resetExplorationOverlayConsumer("queue_gap");
             recoverStreamGap(message);
             return;
           }
           if (message.type !== "stream.frame" || !message.frame) return;
-          handleStreamFrame(message.frame);
+          handleStreamFrame(message.frame, stream);
         });
         socket.addEventListener("close", () => {
           if (!isCurrentConnection()) return;
-          resetPointCloudMapBinaryConsumer("disconnect");
-          resetExplorationOverlayConsumer("disconnect");
-          state.streamReconnectAttempt += 1;
-          scheduleStreamReconnect(socket, epoch);
+          acceptsMessages = false;
+          if (stream === state) {
+            resetPointCloudMapBinaryConsumer("disconnect");
+            resetExplorationOverlayConsumer("disconnect");
+            state.mapStreamReady = false;
+            delete state.pendingStreamFrames["map.frame"];
+          } else {
+            state.poseMapIdentity = null;
+          }
+          state.pendingMapPose = null;
+          hideMapPose();
+          stream.streamReconnectAttempt += 1;
+          scheduleStreamReconnect(socket, epoch, stream);
         });
         socket.addEventListener("error", () => {
           if (!isCurrentConnection()) return;
-          showPanelError("logs", "实时数据流连接异常，正在重连。");
+          showPanelError(stream === state ? "logs" : "localization", "实时数据流连接异常，正在重连。");
         });
       }
       function recoverStreamGap(message) {
@@ -4490,15 +5062,15 @@
         showPanelError("tasks", "任务事件过多，正在重新读取权威任务状态。");
         void loadInitialTasks().finally(() => { state.taskQueueGapPending = false; });
       }
-      function scheduleStreamReconnect(socket, epoch) {
-        const delayMs = Math.min(30000, Math.max(1000, state.streamReconnectDelayMs));
-        if (state.streamReconnectTimer) return;
-        state.streamReconnectTimer = window.setTimeout(() => {
-          if (socket !== state.streamSocket || epoch !== state.streamConnectionEpoch) return;
-          state.streamReconnectTimer = null;
-          connectStreams();
+      function scheduleStreamReconnect(socket, epoch, stream = state) {
+        const delayMs = Math.min(30000, Math.max(1000, stream.streamReconnectDelayMs));
+        if (stream.streamReconnectTimer) return;
+        stream.streamReconnectTimer = window.setTimeout(() => {
+          if (socket !== stream.streamSocket || epoch !== stream.streamConnectionEpoch) return;
+          stream.streamReconnectTimer = null;
+          connectStreams(stream);
         }, delayMs);
-        state.streamReconnectDelayMs = Math.min(30000, delayMs * 2);
+        stream.streamReconnectDelayMs = Math.min(30000, delayMs * 2);
       }
       function updateReceiveLatency(frame) {
         const sentAtMs = Date.parse(frame && frame.timestamp ? frame.timestamp : "");
@@ -4509,8 +5081,8 @@
         const latencyMs = Math.max(0, Date.now() - sentAtMs);
         setText(els.lastReceive, `${Math.round(latencyMs)} ms`);
       }
-      function handleStreamFrame(frame) {
-        updateLatestStreamCursor(frame.cursor);
+      function handleStreamFrame(frame, stream = state) {
+        updateLatestStreamCursor(frame.cursor, false, stream);
         if (
           frame.topic === "exploration.frontier"
           && state.explorationOverlayRequiresCanonical
@@ -4518,6 +5090,18 @@
         if (frame.topic === "exploration.state" && !acceptCanonicalExplorationFrame(frame)) return;
         if (frame.topic === "tasks.state") frame = { ...frame, __taskSequence: ++state.taskEventSequence };
         state.latestStreamFrames[frame.topic] = frame;
+        if (frame.topic === "localization.pose") {
+          // 状态立即应用，二维与三维各自合并到下一动画帧，不先等待通用面板刷新。
+          updateReceiveLatency(frame);
+          if (!frame.payload || frame.status === "missing") {
+            state.pendingMapPose = null;
+            processStreamFrame(frame);
+          } else {
+            state.pendingMapPose = { frame, mapKey: state.poseMapIdentity?.key || null };
+            releasePendingMapPose(true);
+          }
+          return;
+        }
         if (frame.topic === "logs.entry") {
           state.pendingLogFrames.push(frame);
           if (state.pendingLogFrames.length > 200) {
@@ -4571,7 +5155,12 @@
           updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
         } else if (frame.topic === "localization.trajectory") {
           const trajectory = frame.payload && Array.isArray(frame.payload.trajectory) ? frame.payload.trajectory : [];
-          updateLocalization(envelopeFromFrame(frame, { pose: state.pose, trajectory }));
+          state.trajectory = trajectory;
+          const localization = state.lastLocalizationEnvelope;
+          // 轨迹连接可能晚于位姿到达，不能用旧轨迹的状态和时间覆盖新定位。
+          if (localization) {
+            applyLocalizationDisplay({ ...localization, data: { ...localization.data, trajectory } }, { reevaluateMap: false });
+          } else requestMapDraw(false);
         } else if (frame.topic === "navigation.state") {
           updateNavigation(envelopeFromFrame(frame, {
             navigation_context: frame.payload,
@@ -4898,18 +5487,44 @@
         scheduleVideoDetectionDraw();
       });
       els.videoFrame.addEventListener("load", () => {
+        const pending = state.videoPendingSingleFrame;
+        if (!pending || pending.generation !== state.videoStreamGeneration || els.videoFrame.getAttribute("src") !== pending.src) return;
+        state.videoPendingSingleFrame = null;
+        state.videoFrames += 1;
+        state.videoLastFrameAt = Date.now();
+        state.videoDisplayedIdentity = { ...pending.identity, receivedAt: state.videoLastFrameAt };
+        state.videoSourceSize = { width: els.videoFrame.naturalWidth, height: els.videoFrame.naturalHeight };
+        state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
-        els.videoEmpty.hidden = true;
+        renderVideoStreamSummary();
         scheduleVideoDetectionDraw();
       });
       els.videoFrame.addEventListener("error", () => {
-        els.videoFrame.hidden = true;
-        els.videoEmpty.hidden = false;
-        state.videoLastError = "浏览器无法显示已解码 JPEG 帧。";
+        if (!state.videoPendingSingleFrame) return;
+        state.videoPendingSingleFrame = null;
         state.videoDecodeErrors += 1;
-        els.videoEmpty.textContent = "已收到 MJPEG 字节流，但浏览器显示解码后的 JPEG 帧失败。";
+        state.videoLastError = "浏览器无法显示图像。";
+        state.videoDisplayedIdentity = null;
+        state.videoLastFrameAt = null;
+        els.videoFrame.hidden = true;
+        setVideoStreamStatus("error", "浏览器无法显示收到的图像，请检查图像编码与来源。");
       });
-      window.addEventListener("resize", scheduleVideoDetectionDraw);
+      const resizeVideoOverlay = () => {
+        state.videoDetectionLayoutRevision += 1;
+        scheduleVideoDetectionDraw();
+      };
+      if (window.ResizeObserver) new ResizeObserver(resizeVideoOverlay).observe(els.videoFrame.parentElement);
+      else window.addEventListener("resize", resizeVideoOverlay);
+      window.setInterval(() => {
+        if (!videoPanelVisible()) return;
+        renderVideoStreamSummary();
+        scheduleVideoDetectionDraw();
+      }, 500);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) { renderVideoStreamSummary(); scheduleVideoDetectionDraw(); }
+      });
+      document.getElementById("viewSwitchMonitor")?.addEventListener("click", resizeVideoOverlay);
+
       startVideoStream();
       function setMapZoom(nextZoom) {
         const zoom = Math.min(8, Math.max(0.25, nextZoom));
@@ -5190,14 +5805,16 @@
       // boundary_draw.js / navigation.js 拆模块需要从屏幕坐标拿世界坐标，
       // canvasToMap / canvasPointer / cameraAnchor 是 IIFE 闭包私有的，必须挂 window。
       window.__nuwaxMapUnproject = function (screenX, screenY) {
-        if (!els.mapCanvas) return null;
+        if (!els.mapCanvas || !state.mapGrid || isMap3dVisible()) return null;
         const fakeEv = { clientX: Number(screenX), clientY: Number(screenY) };
         const pointer = canvasPointer(fakeEv);
         const anchor = cameraAnchor();
         const world = canvasToMap(pointer.x, pointer.y, anchor);
         if (!world) return null;
-        return { x: world.x, y: world.y, frame_id: 'map' };
+        return { x: world.x, y: world.y, frame_id: navigationFrameId() };
       };
+      window.__nuwaxResolveNavigationHeight = resolveNavigationHeight;
+      window.__nuwaxDisableMapTools = disableMapTools;
       // 选点回调：navigation.js 会在启动时 monkey-patch 此函数缓存点击坐标。
       // 这里默认 no-op；publish-point 走的是 isMapToolActive() 的现有 publishPoint 流程。
       window.__nuwaxMapClick = window.__nuwaxMapClick || null;
@@ -5311,6 +5928,7 @@
         state.mapViewMode = nextMode;
         if (nextMode === "3d") disableMapTools(true);
         syncMapViewControls();
+        window.pointcloud3d?.setVisible(nextMode === "3d");
         if (nextMode === "3d") {
           if (!window.pointcloud3d || !els.map3dContainer) {
             setText(els.mapStreamStatus, "3D 模块加载中");
@@ -5374,9 +5992,32 @@
       if (els.semanticInstancesRefresh) {
         els.semanticInstancesRefresh.addEventListener("click", () => loadSemanticInstances());
       }
-      state._semanticPollTimer = window.setInterval(() => loadSemanticInstances(), 30000);
+      els.semanticMemoryToggle?.addEventListener("click", () => toggleSemanticMemoryPanel(els.semanticMemoryPanel?.hidden));
+      els.semanticMemoryClose?.addEventListener("click", () => toggleSemanticMemoryPanel(false));
+      document.querySelectorAll('[data-view-target]:not([data-view-target="monitor-view"])').forEach((button) => {
+        button.addEventListener("click", () => toggleSemanticMemoryPanel(false));
+      });
+      els.semanticMemorySearch?.addEventListener("input", renderSemanticMemoryList);
+      els.semanticMemoryFilter?.addEventListener("change", renderSemanticMemoryList);
+      state._semanticPollTimer = window.setInterval(() => {
+        if (!document.hidden && (state.showSemanticInstances || els.semanticMemoryPanel?.hidden === false)) loadSemanticInstances();
+      }, 30000);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && Date.now() - state.semanticFetchedAt >= 30000) loadSemanticInstances();
+      });
+      window.addEventListener("stream:map.frame", () => {
+        const mapName = activeMapName();
+        if (state.semanticLastMapName !== mapName) {
+          state.semanticLastMapName = mapName;
+          reconcileSemanticOverlay(state.semanticMeta.library_name);
+          if (!document.hidden) loadSemanticInstances();
+        }
+        publishSemanticMapInstances();
+        renderSemanticMemoryStatus();
+      });
       loadSemanticInstances();
       connectStreams();
+      connectStreams(state.poseStream);
       els.mapModeToggle?.addEventListener("click", () => {
         setMapViewMode(state.mapViewMode === "3d" ? "2d" : "3d");
       });

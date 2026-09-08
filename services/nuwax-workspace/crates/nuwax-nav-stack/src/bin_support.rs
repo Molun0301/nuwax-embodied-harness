@@ -490,7 +490,6 @@ mod tests {
         for profile in [
             NavStackProfile::CmuNative,
             NavStackProfile::ExplorationNative,
-            NavStackProfile::Mls3D,
         ] {
             let opts = CliOptions {
                 profile,
@@ -516,7 +515,9 @@ mod tests {
                 admitted,
                 matches!(
                     profile,
-                    NavStackProfile::Simple2D | NavStackProfile::ReplanningAStar
+                    NavStackProfile::Simple2D
+                        | NavStackProfile::ReplanningAStar
+                        | NavStackProfile::Mls3D
                 ),
                 "{profile}"
             );

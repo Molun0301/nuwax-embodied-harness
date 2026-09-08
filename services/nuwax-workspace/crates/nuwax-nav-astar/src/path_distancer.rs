@@ -6,9 +6,8 @@
 //! - 累积距离数组（按 segment 累加的 world-frame 距离）
 //! - `find_lookahead_point`：从 `start_idx` 沿路径前进 `lookahead_dist` 米
 //! - `distance_to_goal`：当前点到路径终点距离
-//! - `get_distance_to_path`：当前点到路径最近点的距离(最近顶点距离,非线段投影;
-//!   与 Python `dimos/navigation/replanning_a_star/path_distancer.py:68-75` 一致,
-//!   避免线段投影 vs 点投影的语义差异;fixes 审计 H-17)
+//! - `get_distance_to_path`：当前点到路径最近线段投影的距离
+//! - `find_lookahead_from_position`：从当前投影位置向前推进，支持稀疏路径
 //! - `find_closest_point_index`：路径最近点 index
 
 use crate::helpers::{Path2D, Point2};
@@ -72,7 +71,33 @@ impl PathDistancer {
         } else {
             self.cumulative_dists[start_idx - 1]
         };
-        let target_dist = base_dist + self.lookahead_dist;
+        self.point_at_distance(base_dist + self.lookahead_dist)
+    }
+
+    /// 从当前位置的最近线段投影沿路径前进，而非固定在最近顶点的前瞻点。
+    #[must_use]
+    pub fn find_lookahead_from_position(&self, pos: Point2) -> Point2 {
+        let (segment, projected) = self.closest_projection(pos);
+        let base = if segment == 0 {
+            0.0
+        } else {
+            self.cumulative_dists[segment - 1]
+        };
+        let along_segment = self
+            .path_points
+            .get(segment)
+            .map_or(0.0, |start| distance(start, &projected));
+        self.point_at_distance(base + along_segment + self.lookahead_dist)
+    }
+
+    fn point_at_distance(&self, target_dist: f64) -> Point2 {
+        let n = self.path_points.len();
+        if n == 0 {
+            return Point2::new(0.0, 0.0);
+        }
+        if n == 1 {
+            return self.path_points[0];
+        }
         let idx = searchsorted(&self.cumulative_dists, target_dist);
         if idx >= self.cumulative_dists.len() {
             return self.path_points[n - 1];
@@ -101,21 +126,42 @@ impl PathDistancer {
         distance(&self.path_points[self.path_points.len() - 1], &current_pos)
     }
 
-    /// 当前点到路径最近点的距离
-    ///
-    /// 与 Python `path_distancer.py:68-70` 一致:返回 `pos` 到 `path_points[i]` 欧氏距离的
-    /// 最小值,其中 `i = find_closest_point_index(pos)`(即最近顶点距离,非线段投影)。
-    ///
-    /// 为什么不用段投影:段投影会给出"投影到线段最近处"的距离;在路径拐弯处会高估
-    /// 局部最小值,导致障碍物避让半径计算偏小。Python 原始实现采用顶点距离,语义
-    /// 简洁且与 `find_closest_point_index` 调用约定一致。
+    /// 当前点到路径最近线段的距离；路径采样稀疏不应被误判为偏离路径。
     #[must_use]
     pub fn get_distance_to_path(&self, pos: Point2) -> f64 {
         if self.path_points.is_empty() {
             return 0.0;
         }
-        let idx = self.find_closest_point_index(pos);
-        distance(&self.path_points[idx], &pos)
+        let (_, projected) = self.closest_projection(pos);
+        distance(&projected, &pos)
+    }
+
+    /// 返回最近线段的起点索引与该线段上的投影，重复点作为零长度线段处理。
+    #[must_use]
+    pub fn closest_projection(&self, pos: Point2) -> (usize, Point2) {
+        let Some(first) = self.path_points.first().copied() else {
+            return (0, Point2::new(0.0, 0.0));
+        };
+        let mut best = (0, first);
+        let mut best_distance = distance(&first, &pos);
+        for (index, segment) in self.path_points.windows(2).enumerate() {
+            let dx = segment[1].x - segment[0].x;
+            let dy = segment[1].y - segment[0].y;
+            let length_squared = dx * dx + dy * dy;
+            let fraction = if length_squared > 0.0 {
+                (((pos.x - segment[0].x) * dx + (pos.y - segment[0].y) * dy) / length_squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let projected = lerp_point(segment[0], segment[1], fraction);
+            let candidate_distance = distance(&projected, &pos);
+            if candidate_distance < best_distance {
+                best = (index, projected);
+                best_distance = candidate_distance;
+            }
+        }
+        best
     }
 
     /// 当前点到路径最近点的 index
@@ -239,65 +285,34 @@ mod tests {
         assert!(d.abs() < 1e-9);
     }
 
-    /// H-17 修复验证:Python `path_distancer.get_distance_to_path` 用最近顶点距离,
-    /// 而非段投影。对 L 形路径,顶点距离与段投影在拐角处给出不同结果。
     #[test]
-    fn distance_to_path_uses_vertex_not_segment_projection() {
-        // L 形路径:(0,0) → (1,0) → (1,1);靠近拐角 (1,0) 但不在路径上的查询点 (1.1, 0.1)
+    fn sparse_path_distance_and_lookahead_use_segment_projection() {
+        let path = make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)]);
+        let pd = PathDistancer::new(&path, 0.5);
+        for x in [0.5, 1.0, 2.0, 3.0] {
+            assert!((pd.get_distance_to_path(Point2::new(x, 0.3)) - 0.3).abs() < 1e-9);
+            let ahead = pd.find_lookahead_from_position(Point2::new(x, 0.0));
+            assert!((ahead.x - x - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn projected_lookahead_follows_bends_and_ignores_repeated_points() {
         let path = make_path2d(vec![
             Point2::new(0.0, 0.0),
+            Point2::new(1.0, 0.0),
             Point2::new(1.0, 0.0),
             Point2::new(1.0, 1.0),
         ]);
         let pd = PathDistancer::new(&path, 0.5);
-        let query = Point2::new(1.1, 0.1);
-        // 最近顶点是 (1,0),distance = sqrt(0.1^2 + 0.1^2) ≈ 0.1414
-        let expected = (0.1_f64 * 0.1 + 0.1_f64 * 0.1).sqrt();
-        let d = pd.get_distance_to_path(query);
-        assert!(
-            (d - expected).abs() < 1e-9,
-            "expected vertex distance {expected}, got {d}"
-        );
-        // 段投影会给出 (1.0, 0.1) 处的距离 0.1(更小),与 Python 不一致。
-        // 因此该测试同时为修复行为的契约断言。
-        let segment_projection_distance =
-            // segment (1,0)→(1,1) 投影:clamp 到 t=0...1,本例 t=-0.01→clamp 0,得 (1,0)
-            0.1_f64;
-        assert!(
-            d > segment_projection_distance + 1e-6,
-            "vertex distance should exceed segment-projection distance for L-shape near corner"
-        );
-    }
-
-    /// H-17 单测:S 形路径,查询点偏离路径中段,验证顶点距离语义稳定。
-    #[test]
-    fn distance_to_path_s_curve_vertex_distance() {
-        // S 形:(0,0) → (1,1) → (2,0) → (3,1)
-        let path = make_path2d(vec![
-            Point2::new(0.0, 0.0),
+        assert!((pd.get_distance_to_path(Point2::new(1.1, 0.1)) - 0.1).abs() < 1e-9);
+        let ahead = pd.find_lookahead_from_position(Point2::new(0.8, 0.0));
+        assert!((ahead.x - 1.0).abs() < 1e-9);
+        assert!((ahead.y - 0.3).abs() < 1e-9);
+        assert_eq!(
+            pd.find_lookahead_from_position(Point2::new(1.0, 0.9)),
             Point2::new(1.0, 1.0),
-            Point2::new(2.0, 0.0),
-            Point2::new(3.0, 1.0),
-        ]);
-        let pd = PathDistancer::new(&path, 0.5);
-        // 中点 (1.5, 0.5) 距 (1,1)=sqrt(0.5)≈0.7071,距 (2,0)=sqrt(0.5)≈0.7071,距 (1.5 midy?)
-        // 取绝对最近:argmin(|(1,1)-(1.5,0.5)|, |(2,0)-(1.5,0.5)|) — 两者相等 (≈0.7071),argmin 取 index 1
-        let d = pd.get_distance_to_path(Point2::new(1.5, 0.5));
-        let expected = ((1.0_f64 - 1.5).powi(2) + (1.0_f64 - 0.5).powi(2)).sqrt();
-        assert!((d - expected).abs() < 1e-9, "expected {expected}, got {d}");
-        // 另一个测试点:明显靠近 (2,0)
-        let d2 = pd.get_distance_to_path(Point2::new(2.1, 0.1));
-        let expected2 = ((2.0_f64 - 2.1).powi(2) + (0.0_f64 - 0.1).powi(2)).sqrt();
-        assert!((d2 - expected2).abs() < 1e-9);
-    }
-
-    /// H-17 单测:直线路径,偏离路径中点。验证段投影与顶点距离相等时(中点附近)结果一致。
-    #[test]
-    fn distance_to_path_straight_aligned_with_vertex() {
-        let pd = PathDistancer::new(&straight_path(), 0.5);
-        // 偏离 (1,0) 0.3 米向右 (1,0.3):最近顶点仍为 (1,0),距离 0.3
-        let d = pd.get_distance_to_path(Point2::new(1.0, 0.3));
-        assert!((d - 0.3).abs() < 1e-9);
+        );
     }
 
     #[test]

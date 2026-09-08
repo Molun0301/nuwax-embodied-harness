@@ -38,23 +38,6 @@ fn far_ready_contract(
     ))
 }
 
-#[cfg(all(feature = "native-runner", feature = "mls"))]
-fn mls_ready_contract(
-    node: &crate::graph::ModuleNode,
-) -> Option<crate::lcm_dataflow::NativePlannerReadyContract> {
-    Some(crate::lcm_dataflow::NativePlannerReadyContract::Mls(
-        nuwax_nav_mls_planner::lcm_worker::ReadyContract {
-            global_map: native_topic(node, "global_map")?,
-            local_map: native_topic(node, "local_map")?,
-            region_bounds: native_topic(node, "region_bounds")?,
-            start_pose: native_topic(node, "start_pose")?,
-            goal: native_topic(node, "goal")?,
-            cancel: native_topic(node, "cancel")?,
-            events: native_topic(node, "events")?,
-        },
-    ))
-}
-
 /// Register every concrete in-process owner available in this build.
 pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
     #[cfg(all(
@@ -72,23 +55,6 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
                         crate::lcm_dataflow::native_planner_readiness(expected.clone(), generation)
                     },
                 );
-            }
-        }
-        #[cfg(feature = "mls")]
-        if _runner.graph().find("far_planner").is_none() {
-            if let Some(planner) = _runner.graph().find("mls_planner").cloned() {
-                if let Some(expected) = mls_ready_contract(&planner) {
-                    _runner.register_native_readiness(
-                        "mls_planner",
-                        crate::runner::NativeLifecycleOptions::default(),
-                        move |generation, _identity| {
-                            crate::lcm_dataflow::native_planner_readiness(
-                                expected.clone(),
-                                generation,
-                            )
-                        },
-                    );
-                }
             }
         }
     }
@@ -136,6 +102,8 @@ pub(crate) fn register_compiled_owners(_runner: &mut StackRunner) {
 
     #[cfg(feature = "patrolling")]
     _runner.register_in_process_factory("patrolling", crate::lcm_dataflow::patrolling_owner);
+    #[cfg(feature = "mls")]
+    crate::lcm_dataflow::register_surface_owners(_runner);
 }
 
 #[cfg(all(
@@ -284,49 +252,27 @@ mod tests {
 
     #[cfg(feature = "mls")]
     #[test]
-    fn mls_expected_contract_is_derived_from_graph_native_spec() {
-        let graph = crate::profiles::build_graph(
-            NavStackProfile::Mls3D,
-            &crate::topics::NavTopicConfig::empty(),
-            NavStackPreset::Mls.to_flags(),
-        );
-        let planner = graph.find("mls_planner").expect("MLS planner graph node");
-        let ready_contract =
-            super::mls_ready_contract(planner).expect("derived MLS READY contract");
-        #[cfg(any(feature = "cmu-native", feature = "explore"))]
-        let contract = match ready_contract {
-            crate::lcm_dataflow::NativePlannerReadyContract::Mls(contract) => contract,
-            crate::lcm_dataflow::NativePlannerReadyContract::Far(_) => {
-                panic!("MLS node derived FAR contract")
-            }
-        };
-        #[cfg(not(any(feature = "cmu-native", feature = "explore")))]
-        let crate::lcm_dataflow::NativePlannerReadyContract::Mls(contract) = ready_contract;
-        let topics = &planner
-            .native_spec
-            .as_ref()
-            .expect("MLS native spec")
-            .spec
-            .topics;
-        assert_eq!(contract.global_map, topics["global_map"]);
-        assert_eq!(contract.local_map, topics["local_map"]);
-        assert_eq!(contract.region_bounds, topics["region_bounds"]);
-        assert_eq!(contract.start_pose, topics["start_pose"]);
-        assert_eq!(contract.goal, topics["goal"]);
-        assert_eq!(contract.cancel, topics["cancel"]);
-        assert_eq!(contract.events, topics["events"]);
-    }
-
-    #[cfg(feature = "mls")]
-    #[test]
-    fn mls_profile_has_native_worker_and_concrete_rust_owners() {
+    fn mls_profile_has_only_shared_surface_in_process_owners() {
         let runner = NavStackBuilder::new(NavStackProfile::Mls3D)
             .build_runner()
             .unwrap();
-        assert_eq!(runner.native_bridge_ids(), vec!["mls_planner"]);
+        assert!(runner.native_bridge_ids().is_empty());
+        assert!(runner.unowned_nodes().is_empty());
+        let graph = runner.graph();
+        let planner = graph.find("mls_planner").unwrap();
+        let scheduler = graph.find("surface_nav_scheduler").unwrap();
+        assert_eq!(planner.inputs.len(), 5);
+        assert_eq!(planner.inputs[4], scheduler.outputs[1]);
+        assert_eq!(planner.outputs[0], scheduler.inputs[2]);
         assert_eq!(
-            runner.unowned_nodes(),
-            vec!["movement_manager (Coordinator)"]
+            graph
+                .find("map_pose_adapter")
+                .unwrap()
+                .feature_gate
+                .as_deref(),
+            Some("mls")
         );
+        assert!(graph.find("basic_path_follower").is_none());
+        assert!(graph.find("native_planner_path_adapter").is_none());
     }
 }

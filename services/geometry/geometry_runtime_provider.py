@@ -8593,7 +8593,7 @@ class GeometryRuntimeProvider:
         """
         if not self._stub:
             return None
-        # 坐标树查询同步执行，成功或缺失均从查询完成计刷新间隔，避免慢查询逐帧重试。
+        # 坐标树独立刷新，位姿只领取已完成结果，不等待远程查询。
         _FRAME_TREE_TTL_S = 0.2
 
         def _stream_worker(handle: _CancellableStreamHandle) -> None:
@@ -8601,6 +8601,7 @@ class GeometryRuntimeProvider:
                 # 重连后的位姿不能复用上一次流调用的坐标树。
                 cached_tree: Optional[FrameTree] = None
                 next_tree_refresh_at = 0.0
+                tree_call = None
                 call = None
                 call_failed = False
                 try:
@@ -8617,9 +8618,26 @@ class GeometryRuntimeProvider:
                         if pose is None:
                             continue
                         now = time.monotonic()
-                        if now >= next_tree_refresh_at:
-                            cached_tree = self.get_frame_tree()
+                        try:
+                            if tree_call is None and now >= next_tree_refresh_at:
+                                # 动态变换已过刷新期限，不能把旧树配给持续到达的新位姿。
+                                cached_tree = None
+                                tree_call = stub.GetFrameTree.future(
+                                    pb2.Empty(), timeout=_pose_deadline_sec()
+                                )
+                            if tree_call is not None and tree_call.done():
+                                response = tree_call.result()
+                                cached_tree = _merge_static_edges(
+                                    _build_frame_tree(response.transforms),
+                                    self._static_extrinsic_edges,
+                                )
+                                tree_call = None
+                                next_tree_refresh_at = time.monotonic() + _FRAME_TREE_TTL_S
+                        except grpc.RpcError as exc:
+                            cached_tree = None
+                            tree_call = None
                             next_tree_refresh_at = time.monotonic() + _FRAME_TREE_TTL_S
+                            _log_rpc_error("GetFrameTree(pose stream)", exc)
                         if handle.stop_event.is_set():
                             return
                         try:
@@ -8651,6 +8669,8 @@ class GeometryRuntimeProvider:
                             "SubscribePose 非 gRPC 异常，准备重连。"
                         )
                 finally:
+                    if tree_call is not None:
+                        _cancel_stream_call(tree_call, context="位姿订阅坐标树")
                     if call is not None:
                         handle.clear_call(call, cancel=call_failed)
                 if not self._stub or handle.stop_event.is_set():

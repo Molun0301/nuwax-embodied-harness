@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 from uuid import UUID
+from urllib.parse import quote
 
 _logger = logging.getLogger(__name__)
 
@@ -609,8 +610,9 @@ class _ClientStreamQueue:
       优先级取值只有 7 种，因此选择丢弃对象是 O(1)。
     """
 
-    def __init__(self, maxsize: int) -> None:
+    def __init__(self, maxsize: int, *, preserve_topics: Iterable[str] = ()) -> None:
         self._maxsize = int(maxsize)
+        self._preserve_topics = frozenset(preserve_topics)
         # 槽位键 -> (帧, 优先级)，插入序即交付序。
         self._items = collections.OrderedDict()
         # 优先级 -> 该优先级下的槽位键（插入有序），用于 O(1) 选丢弃对象。
@@ -621,14 +623,15 @@ class _ClientStreamQueue:
         self._notification_pending = False
         self._closed = False
 
-    @staticmethod
-    def _slot_key(frame: StreamFrame) -> Optional[Tuple[str, str]]:
+    def _slot_key(self, frame: StreamFrame) -> Optional[Tuple[str, str]]:
         """返回可被后续同类帧覆盖的槽位键；None 表示该帧独占一个位置。
 
         与原过滤条件等价：latest-only 主题按主题整体收敛；其余主题只有 BINARY
         帧之间互相收敛，同主题的非 BINARY 帧不受影响。
         """
 
+        if frame.topic in self._preserve_topics:
+            return None
         if frame.topic in _LATEST_ONLY_STREAM_TOPICS:
             return ("topic", frame.topic)
         if frame.payload_kind == StreamPayloadKind.BINARY:
@@ -983,6 +986,62 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
 
 
+def _encode_ws_frame(frame: StreamFrame) -> str | bytes:
+    """回放与实时发送使用同一编码；大载荷的降级也留在编码线程内。"""
+    if frame.payload_kind == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
+        if frame.topic not in _POINTCLOUD_BINARY_TOPICS:
+            return bytes(frame.payload)
+        try:
+            return _encode_pointcloud_binary_frame(frame)
+        except (TypeError, ValueError) as exc:
+            return _strict_json_dumps({
+                "type": "stream.binary_rejected", "topic": frame.topic,
+                "cursor": _pointcloud_identity_integer(frame.cursor, "cursor"),
+                "reason": str(exc),
+            }, compact=True)
+    if frame.topic == "map.frame" and frame.payload is not None:
+        try:
+            return _encode_map_binary_frame(frame)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return _strict_json_dumps({"type": "stream.frame", "frame": frame}, compact=True)
+
+
+async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame) -> None:
+    # 地图复制、完整栅格校验和点云编码不能占用所有连接共享的事件循环。
+    # 轻量位姿直接编码，避免在工作线程繁忙时跟随地图排队。
+    if frame.topic == "map.frame" or frame.payload_kind == StreamPayloadKind.BINARY:
+        payload = await _run_blocking(_encode_ws_frame, frame)
+    else:
+        payload = _encode_ws_frame(frame)
+    if isinstance(payload, bytes):
+        await websocket.send_bytes(payload)
+    else:
+        await websocket.send_text(payload)
+
+
+async def _format_sse_frame(frame: StreamFrame) -> str:
+    if frame.topic == "map.frame":
+        return await _run_blocking(_format_sse_payload, frame)
+    return _format_sse_payload(frame)
+
+
+def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0) -> Dict[str, object]:
+    """只投影既有地图身份，不读取栅格或为传输创建另一套来源代际。"""
+    cleared = frame is None or frame.status == "cleared" or frame.payload is None
+    identity = selected_fields(frame.payload, (
+        "map_name", "source_name", "source_epoch", "frame_id",
+    )) if frame is not None and not cleared else {}
+    if frame is not None and not cleared and not identity.get("frame_id"):
+        identity["frame_id"] = frame.frame_id
+    return {
+        "type": "stream.map_identity",
+        "cursor": _pointcloud_identity_integer(frame.cursor if frame is not None else empty_cursor, "cursor"),
+        **{name: identity.get(name) for name in ("map_name", "source_name", "source_epoch", "frame_id")},
+        "cleared": cleared,
+    }
+
+
 def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
     """构造实时数据流路由。"""
 
@@ -1021,7 +1080,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 )
                 replay_latest_cursor = replay_status["latest_cursor"]
                 for frame in replay_frames:
-                    yield _format_sse_payload(frame)
+                    yield await _format_sse_frame(frame)
                     emitted += 1
                     if max_frames is not None and emitted >= max_frames:
                         return
@@ -1042,7 +1101,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                                 "stream.gap",
                                 _external_cursor_status(gap_notice),
                             )
-                        yield _format_sse_payload(frame)
+                        yield await _format_sse_frame(frame)
                         emitted += 1
                         if max_frames is not None and emitted >= max_frames:
                             return
@@ -1066,6 +1125,15 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         camera_id: Optional[str] = None,
         fps: float = 15.0,
     ):
+        source_status = runtime.perception_service.video_frame_source_status()
+        source_camera_id = str(source_status.get("camera_id") or "front_camera")
+        if camera_id is not None and camera_id != source_camera_id:
+            return JSONResponse(status_code=404, content={
+                "error": "video_camera_unavailable",
+                "message": "当前视频源未绑定请求的相机。",
+                "camera_id": camera_id,
+                "available_camera_id": source_camera_id,
+            })
         video_available = False
         if VideoShmReader is not None:
             _shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
@@ -1089,7 +1157,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         async def frame_generator():
             shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
-            attached = _SHARED_MJPEG_SOURCE.acquire(shm_path)
+            attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
             last_sent_sequence = -1
             try:
                 while not await request.is_disconnected():
@@ -1119,6 +1187,9 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         try:
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
+            map_identity_only = websocket.query_params.get("map_payload") == "identity"
+            if map_identity_only and set(topic_filter or ()) != {"localization.pose", "map.frame"}:
+                raise ValueError("地图身份模式须仅订阅 localization.pose 与 map.frame。")
         except Exception as exc:
             error = exc if isinstance(exc, GatewayError) else GatewayError(f"数据流订阅初始化失败: {exc}")
             await websocket.close(code=4403, reason=error.message)
@@ -1126,16 +1197,23 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
 
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue = _ClientStreamQueue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        queue = _ClientStreamQueue(
+            maxsize=_STREAM_QUEUE_MAXSIZE,
+            preserve_topics=("map.frame",) if map_identity_only else (),
+        )
         subscription_id: Optional[str] = None
 
         try:
             subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
-                after_cursor=after_cursor,
+                # 身份通道只有可替代状态，每次连接从同一原子边界重建地图与位姿。
+                after_cursor=0 if map_identity_only else after_cursor,
                 topics=topic_filter,
                 async_dispatch=True,
-                latest_only_topics=_LATEST_ONLY_STREAM_TOPICS,
+                latest_only_topics=(
+                    _LATEST_ONLY_STREAM_TOPICS - {"map.frame"}
+                    if map_identity_only else _LATEST_ONLY_STREAM_TOPICS
+                ),
                 on_gap=lambda notice: queue.note_gap_threadsafe(loop, notice),
             )
             replay_status, replay_frames = _build_replay_batch(
@@ -1145,10 +1223,20 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 snapshot=replay_snapshot,
             )
             replay_latest_cursor = replay_status["latest_cursor"]
+            if map_identity_only:
+                map_frame = next((frame for frame in replay_frames if frame.topic == "map.frame"), None)
+                barrier_cursor = int(map_frame.cursor or 0) if map_frame is not None else replay_latest_cursor
+                # 新地图之后不能重放可能属于旧图的缓存位姿，也不再重放旧地图屏障。
+                replay_frames = tuple(
+                    frame for frame in replay_frames
+                    if frame.topic == "localization.pose" and int(frame.cursor or 0) > barrier_cursor
+                )
+                replay_status["frame_count"] = len(replay_frames)
+                await _send_ws_json(websocket, _map_identity_message(map_frame, empty_cursor=barrier_cursor))
             for frame in replay_frames:
                 if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
                     continue  # binary 帧不回放
-                await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
+                await _send_ws_frame(websocket, frame)
             await _send_ws_json(
                 websocket,
                 {"type": "stream.replay", **_external_cursor_status(replay_status)},
@@ -1167,38 +1255,10 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                             websocket,
                             {"type": "stream.gap", **_external_cursor_status(gap_notice)},
                         )
-                    if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
-                        if frame.topic in _POINTCLOUD_BINARY_TOPICS:
-                            try:
-                                binary_payload = _encode_pointcloud_binary_frame(frame)
-                            except (TypeError, ValueError) as exc:
-                                await _send_ws_json(
-                                    websocket,
-                                    {
-                                        "type": "stream.binary_rejected",
-                                        "topic": frame.topic,
-                                        "cursor": _pointcloud_identity_integer(
-                                            frame.cursor,
-                                            "cursor",
-                                        ),
-                                        "reason": str(exc),
-                                    },
-                                )
-                                continue
-                            await websocket.send_bytes(binary_payload)
-                        else:
-                            await websocket.send_bytes(frame.payload)
+                    if map_identity_only and frame.topic == "map.frame":
+                        await _send_ws_json(websocket, _map_identity_message(frame))
                     else:
-                        # 对于非BINARY的map.frame，尝试转换为二进制
-                        if frame.topic == "map.frame" and frame.payload is not None:
-                            try:
-                                binary_payload = _encode_map_binary_frame(frame)
-                                await websocket.send_bytes(binary_payload)
-                                continue
-                            except (TypeError, ValueError, AttributeError):
-                                # 编码失败，降级为JSON
-                                pass
-                        await _send_ws_json(websocket, {"type": "stream.frame", "frame": frame})
+                        await _send_ws_frame(websocket, frame)
                 except _ClientStreamGap:
                     gap_notice = _take_queue_gap_notice(queue, runtime)
                     if gap_notice is not None:
@@ -1250,16 +1310,20 @@ class _SharedMjpegFrameSource:
         self._consumers = 0
         self._cached_multipart = None
         self._cached_sequence = -1
+        self._camera_id = ""
 
-    def acquire(self, shm_path: str) -> bool:
+    def acquire(self, shm_path: str, *, camera_id: str = "front_camera") -> bool:
         if VideoShmReader is None:
             return False
         with self._lock:
-            if self._reader is not None and self._shm_path != shm_path and self._consumers == 0:
+            if self._reader is not None and (self._shm_path != shm_path or self._camera_id != camera_id):
+                if self._consumers:
+                    return False
                 self._reset_locked()
             if self._reader is None:
                 self._reader = VideoShmReader(shm_path)
                 self._shm_path = shm_path
+                self._camera_id = camera_id
             self._consumers += 1
             return True
 
@@ -1285,21 +1349,35 @@ class _SharedMjpegFrameSource:
                 return None, -1
             result = self._reader.read_latest()
             if result is not None:
-                frame_data, sequence, _ = result
-                self._cached_multipart = _format_mjpeg_frame(frame_data)
-                self._cached_sequence = sequence
+                frame_data, sequence, timestamp_ns = result
+                self._cached_multipart = _format_mjpeg_frame(
+                    frame_data, camera_id=self._camera_id, sequence=sequence, timestamp_ns=timestamp_ns,
+                )
+                # 本地修订号保证写者重启并复用源序号时，新帧仍可下发。
+                self._cached_sequence += 1
             return self._cached_multipart, self._cached_sequence
 
 
 _SHARED_MJPEG_SOURCE = _SharedMjpegFrameSource()
 
 
-def _format_mjpeg_frame(data: bytes) -> bytes:
+def _format_mjpeg_frame(data: bytes, *, camera_id: str = "", sequence=None, timestamp_ns: int = 0) -> bytes:
+    identity_headers = b""
+    if camera_id:
+        identity_headers += f"X-Camera-Id: {quote(camera_id, safe='')}\r\n".encode("ascii")
+    if sequence is not None:
+        identity_headers += f"X-Frame-Sequence: {int(sequence)}\r\n".encode("ascii")
+    if timestamp_ns > 0:
+        timestamp = datetime.fromtimestamp(timestamp_ns // 1_000_000_000, tz=timezone.utc).replace(
+            microsecond=(timestamp_ns % 1_000_000_000) // 1000,
+        )
+        identity_headers += f"X-Frame-Timestamp: {timestamp.isoformat()}\r\n".encode("ascii")
+        identity_headers += b"X-Frame-Timestamp-Source: video_relay.write_time\r\n"
     headers = (
         b"--frame\r\n"
         b"Content-Type: image/jpeg\r\n"
         + f"Content-Length: {len(data)}".encode("ascii")
-        + b"\r\n\r\n"
+        + b"\r\n" + identity_headers + b"\r\n"
     )
     return headers + data + b"\r\n"
 

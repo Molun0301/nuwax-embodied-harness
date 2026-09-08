@@ -456,9 +456,12 @@ def handle_list_semantic_instances(
     *,
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """列出语义实例，返回精简 DTO 列表。"""
+    """列出语义实例，保留未指定库与显式空库的区别。"""
     del requested_by
-    library_name = params.optional_str(payload, "library_name")
+    raw_library_name = payload.get("library_name")
+    library_name = (
+        str(raw_library_name).strip() if raw_library_name is not None else None
+    )
     label = params.optional_str(payload, "label")
     instances = ctx.memory_service.list_semantic_instances(
         library_name=library_name,

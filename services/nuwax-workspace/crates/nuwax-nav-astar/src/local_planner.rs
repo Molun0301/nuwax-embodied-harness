@@ -5,7 +5,7 @@
 //! 状态机：
 //! - `Idle` → `InitialRotation` → `PathFollowing` → `FinalRotation` → `Arrived`
 //! - 或 `Idle` → `PathFollowing`（如果 yaw error 在 tolerance 内且位置未到）
-//! - 或 `Idle` → `FinalRotation`（如果已经在 pose_index 0 位置）
+//! - 或 `Idle` → `FinalRotation`（如果已经进入路径终点的位置容差）
 //!
 //! Phase 1：本模块以**确定性 tick**形式暴露状态机（不内置 thread / reactive stream）。
 //! 由 [`crate::global_planner`] 在每次 tick 中显式调用 `step()` 并消费输出 twist 与 stop message。
@@ -324,6 +324,26 @@ impl LocalPlanner {
     /// - 若返回 `Some(StopMessage)`，全局规划器应据此触发 arrived / replan / cancel。
     /// - 若返回 `None`，表示继续按当前 twist 运动。
     pub fn step(&mut self, robot_width: f64) -> (Twist2, Option<StopMessage>) {
+        // 非法姿态或路径不能进入控制器，避免非数朝向传播成非数运动指令。
+        let invalid_pose = self.current_odom.as_ref().is_some_and(|odom| {
+            let position = odom.pose.position;
+            !position.x.is_finite()
+                || !position.y.is_finite()
+                || !position.z.is_finite()
+                || !odom.pose.orientation.yaw().is_finite()
+        });
+        let invalid_path = self.path.as_ref().is_some_and(|path| {
+            path.points
+                .iter()
+                .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        }) || self
+            .path_yaws
+            .as_ref()
+            .is_some_and(|yaws| yaws.iter().any(|yaw| !yaw.is_finite()));
+        if invalid_pose || invalid_path {
+            self.stop_planning();
+            return (make_twist2_zero(), Some(StopMessage::Error));
+        }
         // 初始化：若 path 已设置且状态仍 Idle，进入 InitialRotation（或 PathFollowing / FinalRotation）
         if self.state == LocalPlannerState::Idle
             && self.path.is_some()
@@ -338,24 +358,15 @@ impl LocalPlanner {
             let initial_yaw_error = angle_diff(first_yaw, oyaw);
             self.controller.reset_yaw_error(initial_yaw_error);
             let angle_in_tol = initial_yaw_error.abs() < self.config.orientation_tolerance;
-            let new_state = if angle_in_tol {
-                // 检查位置
-                let position_in_tol = if let Some(path) = self.path.as_ref() {
-                    if let Some(p0) = path.points.first() {
-                        let dx = p0.x - ox;
-                        let dy = p0.y - oy;
-                        (dx * dx + dy * dy).sqrt() < 0.01
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
-                if position_in_tol {
-                    LocalPlannerState::FinalRotation
-                } else {
-                    LocalPlannerState::PathFollowing
-                }
+            let Some(goal) = self.path.as_ref().and_then(|path| path.points.last()) else {
+                // 空路径没有可到达的终点，不能将其解释为已完成。
+                return (make_twist2_zero(), Some(StopMessage::Error));
+            };
+            let position_in_tol = (goal.x - ox).hypot(goal.y - oy) < self.config.goal_tolerance;
+            let new_state = if position_in_tol {
+                LocalPlannerState::FinalRotation
+            } else if angle_in_tol {
+                LocalPlannerState::PathFollowing
             } else {
                 LocalPlannerState::InitialRotation
             };
@@ -363,18 +374,27 @@ impl LocalPlanner {
         }
 
         // 检查 costmap 与 obstacle
+        let path_progress = self
+            .path_distancer
+            .as_ref()
+            .zip(self.current_odom.as_ref())
+            .map(|(path, odom)| path.closest_projection(pose_to_point2(odom)));
         let mut obstacle_ahead = false;
         if let Some(pc) = self.path_clearance.as_mut() {
             if let Some(cm) = self.costmap.as_ref() {
                 pc.update_costmap(cm.clone());
-                pc.update_pose_index(self.pose_index);
+            }
+            if let Some((index, projected)) = path_progress {
+                pc.update_path_progress(index, projected);
             }
             obstacle_ahead = pc.is_obstacle_ahead();
         } else if let (Some(cm), Some(path)) = (self.costmap.as_ref(), self.path.as_ref()) {
             // 第一次：构造 path_clearance
             let mut pc = PathClearance::new(path.clone(), robot_width, 3.0);
             pc.update_costmap(cm.clone());
-            pc.update_pose_index(self.pose_index);
+            if let Some((index, projected)) = path_progress {
+                pc.update_path_progress(index, projected);
+            }
             obstacle_ahead = pc.is_obstacle_ahead();
             self.path_clearance = Some(pc);
         }
@@ -437,9 +457,8 @@ impl LocalPlanner {
             self.change_state(LocalPlannerState::FinalRotation);
             return self.compute_final_rotation();
         }
-        let closest = pd.find_closest_point_index(pos);
-        self.pose_index = closest;
-        let lookahead = pd.find_lookahead_point(closest);
+        self.pose_index = pd.closest_projection(pos).0;
+        let lookahead = pd.find_lookahead_from_position(pos);
         let t = self
             .controller
             .advance((lookahead.x, lookahead.y), odom.clone());
@@ -451,6 +470,14 @@ impl LocalPlanner {
             Some(o) => o,
             _ => return (make_twist2_zero(), None),
         };
+        // 旋转期间定位可能变化或机器人发生位移，终态须同时满足位置与朝向。
+        let Some(pd) = self.path_distancer.as_ref() else {
+            return (make_twist2_zero(), Some(StopMessage::Error));
+        };
+        if pd.distance_to_goal(pose_to_point2(odom)) >= self.config.goal_tolerance {
+            self.change_state(LocalPlannerState::PathFollowing);
+            return self.compute_path_following();
+        }
         let (_, _, oyaw) = pose_xy_yaw(odom);
         // H-13:stored pose orientation(若提供)优先;否则末段方向。
         let goal_yaw_opt = self.last_segment_yaw_or_last_yaw();
@@ -524,6 +551,29 @@ mod tests {
     }
 
     #[test]
+    fn invalid_pose_or_path_stops_before_emitting_motion() {
+        use nuwax_nav_types_messages::Quaternion;
+
+        for invalid in 0..4 {
+            let mut planner = LocalPlanner::new(0.5, 10.0, 0.2);
+            let mut pose = make_pose_stamped("map", 0.5, 0.5, 0.0);
+            let mut points = vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)];
+            let mut yaws = vec![0.0, 0.0];
+            match invalid {
+                0 => pose.pose.orientation = Quaternion::default(),
+                1 => pose.pose.position.x = f64::NAN,
+                2 => points[1].y = f64::INFINITY,
+                _ => yaws[1] = f64::NAN,
+            }
+            planner.handle_odom(pose);
+            planner.start_planning_with_orientations(make_path2d(points), Some(yaws));
+            assert_eq!(planner.step(0.3), (Twist2::ZERO, Some(StopMessage::Error)));
+            assert_eq!(planner.state(), LocalPlannerState::Idle);
+            assert_eq!(planner.goal_reached(), GoalReached::NotReached);
+        }
+    }
+
+    #[test]
     fn start_then_idle_step_returns_zero_when_no_odom() {
         let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
         lp.start_planning(make_path2d(vec![
@@ -549,6 +599,74 @@ mod tests {
         let _ = lp.step(0.3);
         // 朝向与第一段 (1,0) 一致，应该直接进入 PathFollowing
         assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
+    }
+
+    #[test]
+    fn follows_from_exact_start_and_reaches_endpoint_with_requested_orientation() {
+        let mut lp = LocalPlanner::new(0.5, 20.0, 0.2);
+        let goal_yaw = std::f64::consts::FRAC_PI_2;
+        lp.start_planning_with_orientations(
+            make_path2d(vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)]),
+            Some(vec![0.0, goal_yaw]),
+        );
+        lp.update_costmap(CostMap2D::new_all_free("map", 60, 30, 0.1));
+        let (mut x, mut y, mut yaw) = (0.5, 0.5, 0.0_f64);
+        let mut arrived = false;
+        for tick in 0..800 {
+            lp.handle_odom(make_pose_stamped("map", x, y, yaw));
+            let (twist, stop) = lp.step(0.3);
+            if tick == 0 {
+                assert!(stop.is_none());
+                assert!(twist.linear.x > 0.0);
+                assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
+            }
+            if stop == Some(StopMessage::Arrived) {
+                assert!((x - 2.5).hypot(y - 0.5) < 0.2);
+                assert!(angle_diff(goal_yaw, yaw).abs() < 0.35);
+                assert_eq!(lp.goal_reached(), GoalReached::FinalReached);
+                arrived = true;
+                break;
+            }
+            assert!(stop.is_none(), "非预期的路径终态: {stop:?}");
+            // 用控制指令积分合成位姿，验证整段运动而非只检查状态字段。
+            x += twist.linear.x * yaw.cos() * 0.05;
+            y += twist.linear.x * yaw.sin() * 0.05;
+            yaw += twist.angular_z * 0.05;
+        }
+        assert!(arrived, "合成机器人应走到路径终点并完成朝向调整");
+    }
+
+    #[test]
+    fn final_rotation_resumes_following_if_pose_leaves_goal_tolerance() {
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let goal_yaw = std::f64::consts::FRAC_PI_2;
+        lp.start_planning_with_orientations(
+            make_path2d(vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)]),
+            Some(vec![0.0, goal_yaw]),
+        );
+        lp.update_costmap(CostMap2D::new_all_free("map", 60, 30, 0.1));
+        lp.handle_odom(make_pose_stamped("map", 2.45, 0.5, 0.0));
+        assert!(lp.step(0.3).1.is_none());
+        assert_eq!(lp.state(), LocalPlannerState::FinalRotation);
+
+        // 朝向已经达到要求，但更新后的位姿再次离开终点，不能误报到达。
+        lp.handle_odom(make_pose_stamped("map", 1.5, 0.5, goal_yaw));
+        let (_, stop) = lp.step(0.3);
+        assert!(stop.is_none());
+        assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
+        assert_eq!(lp.goal_reached(), GoalReached::NotReached);
+    }
+
+    #[test]
+    fn empty_path_reports_error_without_claiming_arrival() {
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        lp.start_planning(make_path2d(Vec::new()));
+        lp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
+        lp.update_costmap(CostMap2D::new_all_free("map", 20, 20, 0.1));
+        let (twist, stop) = lp.step(0.3);
+        assert_eq!(twist, make_twist2_zero());
+        assert_eq!(stop, Some(StopMessage::Error));
+        assert_eq!(lp.goal_reached(), GoalReached::NotReached);
     }
 
     #[test]
@@ -607,9 +725,8 @@ mod tests {
         let d = lp.get_distance_to_path();
         assert!(d.is_some());
         let d = d.unwrap();
-        // H-17:顶点距离(不是段投影)。query (0.5, 0.5) 距 (1.0,0.0) = sqrt(0.5)≈0.7071
-        // 旧实现段投影到 (0.5, 0.0) 距离 0.5,新实现改用顶点,数值改变。
-        let expected = (0.5_f64 * 0.5 + 0.5_f64 * 0.5).sqrt();
+        // 到水平路径线段的垂直距离为0.5米，与路径点间距无关。
+        let expected = 0.5;
         assert!((d - expected).abs() < 1e-9, "expected {expected}, got {d}");
     }
 

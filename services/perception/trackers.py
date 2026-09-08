@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timezone
 import itertools
+import math
 
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, Track, TrackState
 from services.perception.base import TrackerBackend, TrackerBackendSpec
+from services.perception.postprocess import _valid_detection
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -39,7 +42,7 @@ class _TrackRecord:
             state=self.state,
             score=self.score,
             bbox=self.bbox,
-            attributes=dict(self.attributes or {}),
+            attributes={**dict(self.attributes or {}), "camera_id": self.camera_id},
         )
 
 
@@ -66,8 +69,27 @@ def _bbox_iou(left: Optional[BoundingBox2D], right: Optional[BoundingBox2D]) -> 
         return 0.0
     left_area = left.width_px * left.height_px
     right_area = right.width_px * right.height_px
-    union = max(1.0, left_area + right_area - intersection)
-    return intersection / union
+    union = left_area + right_area - intersection
+    return intersection / union if math.isfinite(union) and union > 0.0 else 0.0
+
+
+def _accept_source_frame(last_frames: Dict[str, tuple], image_frame: ImageFrame, records: Dict[str, _TrackRecord]) -> bool:
+    """同相机只推进新的采集帧；图像几何改变后不能沿用旧像素轨迹。"""
+
+    timestamp = image_frame.timestamp
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    frame_key = (timestamp, image_frame.frame_id, image_frame.width_px, image_frame.height_px)
+    previous = last_frames.get(image_frame.camera_id)
+    if previous is not None:
+        if timestamp < previous[0]:
+            return False
+        if frame_key[1:] != previous[1:]:
+            records.clear()
+        elif timestamp == previous[0]:
+            return False
+    last_frames[image_frame.camera_id] = frame_key
+    return True
 
 
 class Basic2DTrackerBackend(TrackerBackend):
@@ -86,6 +108,7 @@ class Basic2DTrackerBackend(TrackerBackend):
         )
         self._policy = lifecycle_policy or TrackLifecyclePolicy()
         self._records_by_camera: Dict[str, Dict[str, _TrackRecord]] = {}
+        self._last_frames_by_camera: Dict[str, tuple] = {}
         self._track_counter = itertools.count(1)
 
     def update(
@@ -99,10 +122,14 @@ class Basic2DTrackerBackend(TrackerBackend):
         del detections_3d, camera_info
         camera_id = image_frame.camera_id
         records = self._records_by_camera.setdefault(camera_id, {})
+        if not _accept_source_frame(self._last_frames_by_camera, image_frame, records):
+            return tuple(record.to_contract() for record in records.values())
         matched_track_ids: Set[str] = set()
         emitted: List[Track] = []
 
         for detection in sorted(detections_2d, key=lambda item: item.score, reverse=True):
+            if not _valid_detection(detection) or detection.camera_id not in (None, camera_id):
+                continue
             matched = self._match_record(records, detection, matched_track_ids)
             if matched is None:
                 matched = self._create_record(camera_id, detection)
@@ -146,8 +173,10 @@ class Basic2DTrackerBackend(TrackerBackend):
     def reset(self, camera_id: Optional[str] = None) -> None:
         if camera_id is None:
             self._records_by_camera.clear()
+            self._last_frames_by_camera.clear()
             return
         self._records_by_camera.pop(camera_id, None)
+        self._last_frames_by_camera.pop(camera_id, None)
 
     def _match_record(
         self,
@@ -228,6 +257,7 @@ class ByteTrackTrackerBackend(TrackerBackend):
         self._lost_ttl_frames = int(self.spec.metadata["lost_ttl_frames"])
         self._trajectory_limit = int(self.spec.metadata["trajectory_limit"])
         self._records_by_camera: Dict[str, Dict[str, _TrackRecord]] = {}
+        self._last_frames_by_camera: Dict[str, tuple] = {}
         self._track_counter = itertools.count(1)
 
     def update(
@@ -241,9 +271,15 @@ class ByteTrackTrackerBackend(TrackerBackend):
         del detections_3d, camera_info
         camera_id = image_frame.camera_id
         records = self._records_by_camera.setdefault(camera_id, {})
+        if not _accept_source_frame(self._last_frames_by_camera, image_frame, records):
+            return tuple(record.to_contract() for record in records.values())
         matched_track_ids: Set[str] = set()
         emitted: List[Track] = []
-        candidate_detections = [item for item in detections_2d if float(item.score) >= self._low_threshold]
+        candidate_detections = [
+            item for item in detections_2d
+            if _valid_detection(item) and item.camera_id in (None, camera_id)
+            and float(item.score) >= self._low_threshold
+        ]
         high_detections = [item for item in candidate_detections if float(item.score) >= self._high_threshold]
         low_detections = [item for item in candidate_detections if float(item.score) < self._high_threshold]
 
@@ -287,8 +323,10 @@ class ByteTrackTrackerBackend(TrackerBackend):
     def reset(self, camera_id: Optional[str] = None) -> None:
         if camera_id is None:
             self._records_by_camera.clear()
+            self._last_frames_by_camera.clear()
             return
         self._records_by_camera.pop(camera_id, None)
+        self._last_frames_by_camera.pop(camera_id, None)
 
     def _match_record(
         self,

@@ -11,9 +11,9 @@
 //!
 //! ## 核心职责
 //!
-//! 1. 读 `NUWAX_NAV_PROFILE` env,默认 `simple-2d`,可选 `replanning-astar` /
-//!    `cmu-native` / `exploration-native` / `mls3d`(本阶段只实装 `simple-2d`
-//!    + `replanning-astar` 的纯 Rust 路径,其它 profile 标记为 P1 native)。
+//! 1. 读取 `NUWAX_NAV_PROFILE`，默认 `simple-2d`；`replanning-astar` 与
+//!    `mls-3d` 同样使用统一运动守卫。`cmu-native` 和 `exploration-native`
+//!    保留仅检查准入，具体状态由导航配置清单决定。
 //! 2. 用 `nuwax_nav_stack::NavStackBuilder` 构造 `ModuleGraph`,把节点列表
 //!    写入 diagnostics / nav state message 的 `message` 字段(便于 health
 //!    check / 日志 / CI 守门观测)。
@@ -66,7 +66,7 @@ pub const PROFILE_REPLANNING_ASTAR: &str = "replanning-astar";
 pub const PROFILE_CMU_NATIVE: &str = "cmu-native";
 /// `exploration-native` profile 字符串(P1:依赖 native bridge 进程,本期未实装)。
 pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
-/// `mls-3d` profile 字符串(P1:`nuwax-nav-mls-planner` feature 未开)。
+/// 已接入统一运动守卫的多层表面导航配置名。
 /// 注意:与 `NavStackProfile::Mls3D.as_str()` 一致,使用 kebab-case "mls-3d"
 /// 而非 "mls3d",否则 `build_nav_stack_handle_renders_for_all_profiles`
 /// 测试中 `text.contains(p)` 会失败。
@@ -325,6 +325,8 @@ impl NavRuntimeSlot {
 /// 解耦;server.rs 通过 `Arc<NavRuntimeState>` 访问。
 #[derive(Clone)]
 pub struct NavRuntimeState {
+    /// 启动时捕获的配置，在地图生命周期锁内读取也不获取导航状态锁。
+    configured_profile: &'static str,
     inner: Arc<RwLock<NavRuntimeSlot>>,
     stack_observation: Arc<StdMutex<StackObservation>>,
     runtime_observations: Arc<StdMutex<RuntimeObservations>>,
@@ -644,6 +646,7 @@ impl NavRuntimeState {
         let mut slot = NavRuntimeSlot::new_default(profile);
         slot.module_nodes = module_nodes;
         Self {
+            configured_profile: profile,
             inner: Arc::new(RwLock::new(slot)),
             stack_observation: Arc::new(StdMutex::new(StackObservation::default())),
             runtime_observations: Arc::new(StdMutex::new(RuntimeObservations::default())),
@@ -687,6 +690,11 @@ impl NavRuntimeState {
     /// Stable producer generation for the lifetime of this runtime instance.
     pub fn producer_runtime_generation(&self) -> u64 {
         self.producer_runtime_generation
+    }
+
+    /// 不持状态锁读取已捕获配置，用于规范地图发布等已有生命周期围栏内的接线。
+    pub fn configured_profile(&self) -> &'static str {
+        self.configured_profile
     }
 
     fn reserve_publish_attempt(&self) -> Result<u64, ()> {
@@ -810,6 +818,29 @@ impl NavRuntimeState {
             .goal
             .as_ref()
             .map(|goal| goal.lease.clone())
+    }
+
+    /// 查询同一目标身份的完整空间目标；真正状态提交仍须通过原租约校验。
+    pub(crate) async fn spatial_feedback_target(
+        &self,
+        session_id: &str,
+        owner_kind: i32,
+        parent_request_id: &str,
+        goal_generation: u64,
+        goal_payload_sha256: [u8; 32],
+    ) -> Option<PoseState> {
+        if self.configured_profile != PROFILE_MLS3D {
+            return None;
+        }
+        let slot = self.inner.read().await;
+        let goal = slot.goal.as_ref()?;
+        let lease = &goal.lease;
+        (lease.session_id == session_id
+            && lease.owner_kind == owner_kind
+            && lease.parent_request_id == parent_request_id
+            && lease.goal_generation == goal_generation
+            && lease.goal_payload_sha256 == goal_payload_sha256)
+            .then(|| goal.target.clone())
     }
 
     /// Validate and retain planner output without replacing a path already
@@ -1346,7 +1377,7 @@ impl NavRuntimeState {
         let profile_supported = self
             .inner
             .try_read()
-            .is_ok_and(|slot| matches!(slot.profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR));
+            .is_ok_and(|slot| profile_has_guarded_execution(slot.profile));
         profile_supported
             && self.stack_is_live()
             && snapshot.tf_fresh
@@ -1916,11 +1947,20 @@ pub struct NavigationReadinessDetail {
     pub motion_sink_fresh: bool,
 }
 
-const P1_NATIVE_PROFILES: &[&str] = &[
-    PROFILE_CMU_NATIVE,
-    PROFILE_EXPLORATION_NATIVE,
-    PROFILE_MLS3D,
-];
+fn profile_has_guarded_execution(profile: &str) -> bool {
+    nuwax_nav_stack::NavStackProfile::from_cli_str(profile)
+        .ok()
+        .is_some_and(|profile| {
+            nuwax_nav_stack::ProfileManifest::for_profile(
+                profile,
+                &nuwax_nav_stack::NavTopicConfig::empty(),
+            )
+            .activation
+            .is_production_guarded()
+        })
+}
+
+const P1_NATIVE_PROFILES: &[&str] = &[PROFILE_CMU_NATIVE, PROFILE_EXPLORATION_NATIVE];
 
 /// Compute readiness exclusively from observations written by real consumers.
 pub async fn compute_readiness(
@@ -1928,7 +1968,7 @@ pub async fn compute_readiness(
     state: &NavRuntimeState,
 ) -> NavigationReadinessDetail {
     let profile = state.profile().await;
-    let profile_supported = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
+    let profile_supported = profile_has_guarded_execution(profile);
     let stack_health = state.stack_health_snapshot();
     let observations = state.runtime_observation_snapshot();
     let lcm_backend = handle.lcm_backend_available;
@@ -2038,7 +2078,7 @@ fn compute_admission_readiness<'a>(
 ) -> impl std::future::Future<Output = NavigationReadinessDetail> + 'a {
     async move {
         let profile = state.profile().await;
-        let profile_supported = matches!(profile, PROFILE_SIMPLE_2D | PROFILE_REPLANNING_ASTAR);
+        let profile_supported = profile_has_guarded_execution(profile);
         let stack_health = state.stack_health_snapshot();
         let observations = state.runtime_observation_snapshot();
         let lcm_backend = io.lcm_backend_available;
@@ -2842,8 +2882,12 @@ async fn admit_goal_input(
                     detail.reason,
                 ),
                 goal_id: input.goal_id.clone(),
-                distance_remaining: distance_to_target_from_state(&io.shared_state, &input.target)
-                    .await,
+                distance_remaining: distance_to_target_from_state(
+                    &io.shared_state,
+                    &input.target,
+                    state.configured_profile() == PROFILE_MLS3D,
+                )
+                .await,
                 timestamp_ns: now_ns(),
             },
             lease: None,
@@ -2871,7 +2915,12 @@ async fn admit_goal_input(
             reject_reason: None,
         };
     }
-    let distance_remaining = distance_to_target_from_state(&io.shared_state, &input.target).await;
+    let distance_remaining = distance_to_target_from_state(
+        &io.shared_state,
+        &input.target,
+        state.configured_profile() == PROFILE_MLS3D,
+    )
+    .await;
     let transaction_guard = state.transaction_gate.lock().await;
     let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
     if !admission.map_name_unchanged() {
@@ -3520,16 +3569,27 @@ fn cancel_outcome_from_slot(
 async fn distance_to_target_from_state(
     shared_state: &Arc<RwLock<SharedState>>,
     target: &PoseState,
+    spatial: bool,
 ) -> f32 {
     let state = shared_state.read().await;
     let dx = state.pose.x - target.x;
     let dy = state.pose.y - target.y;
-    ((dx * dx + dy * dy) as f32).sqrt()
+    let dz = if spatial {
+        state.pose.z - target.z
+    } else {
+        0.0
+    };
+    dx.hypot(dy).hypot(dz) as f32
 }
 
-/// 计算当前位置到 target 的欧氏距离(2D 平面),给 `distance_remaining` 用。
+/// 按当前后端计算目标距离；多层表面保留高度，二维后端只计平面距离。
 pub async fn distance_to_target(handle: &GeometryRuntimeHandle, target: &PoseState) -> f32 {
-    distance_to_target_from_state(&handle.state, target).await
+    distance_to_target_from_state(
+        &handle.state,
+        target,
+        handle.nav.configured_profile() == PROFILE_MLS3D,
+    )
+    .await
 }
 
 /// 生成或保留 goal_id。空字符串时生成 UUID v4。
@@ -3707,6 +3767,23 @@ async fn seqno_for(_handle: &GeometryRuntimeHandle) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn surface_distance_keeps_vertical_separation_at_same_xy() {
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let target = PoseState {
+            z: 3.0,
+            ..PoseState::default()
+        };
+        assert_eq!(
+            distance_to_target_from_state(&state, &target, true).await,
+            3.0
+        );
+        assert_eq!(
+            distance_to_target_from_state(&state, &target, false).await,
+            0.0
+        );
+    }
     use crate::lcm_runtime::{MapState, SharedState};
     use async_trait::async_trait;
     use nuwax_transport::{
@@ -4432,14 +4509,14 @@ mod tests {
         assert!(!d.tf);
         assert!(!d.costmap);
         assert_eq!(d.profile, PROFILE_SIMPLE_2D);
-        // p1 profile 列表必须包含 cmu-native / exploration-native / mls3d
+        // 仅检查列表保留尚未接通运动守卫的原生配置。
         assert!(d
             .p1_native_profiles
             .contains(&PROFILE_CMU_NATIVE.to_string()));
         assert!(d
             .p1_native_profiles
             .contains(&PROFILE_EXPLORATION_NATIVE.to_string()));
-        assert!(d.p1_native_profiles.contains(&PROFILE_MLS3D.to_string()));
+        assert!(!d.p1_native_profiles.contains(&PROFILE_MLS3D.to_string()));
     }
 
     #[test]

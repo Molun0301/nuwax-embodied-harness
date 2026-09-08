@@ -26,6 +26,8 @@ generated/python/geometry_msgs/*
 generated/python/nav_msgs/*
 !generated/python/nav_msgs/__init__.py
 !generated/python/nav_msgs/Odometry.py
+!generated/python/nav_msgs/OccupancyGrid.py
+!generated/python/nav_msgs/MapMetaData.py
 !generated/python/sensor_msgs/
 generated/python/sensor_msgs/*
 !generated/python/sensor_msgs/__init__.py
@@ -38,3 +40,4 @@ generated/python/nuwax_msgs/*
 !generated/python/nuwax_msgs/LioOdometryEnvelope.py
 !generated/python/nuwax_msgs/LioCloudEnvelope.py
 !generated/python/nuwax_msgs/LioStatus.py
+!generated/python/nuwax_msgs/NavigationMap3D.py

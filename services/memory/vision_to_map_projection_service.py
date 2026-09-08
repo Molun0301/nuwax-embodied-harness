@@ -48,30 +48,46 @@ class InstanceCacheRayHistoryProvider:
     def __init__(self, instances: Iterable[object]) -> None:
         self._rays_by_track: Dict[str, List[RaySample]] = {}
         self._rays_by_instance: Dict[str, List[RaySample]] = {}
+        track_owner: Dict[str, str] = {}
+        ambiguous_tracks: set[str] = set()
         for instance in instances:
             instance_id = str(getattr(instance, "instance_id", "") or "")
             cache = getattr(instance, "deferred_projection_cache", None) or []
             collected: List[RaySample] = []
-            track_ids: set = set()
+            samples_by_track: Dict[str, List[RaySample]] = {}
             for entry in cache:
                 origin = getattr(entry, "ray_origin_map", None)
                 direction = getattr(entry, "ray_dir_map", None)
                 if not origin or not direction or len(origin) < 3 or len(direction) < 3:
                     continue
-                sample = RaySample(
-                    origin=(float(origin[0]), float(origin[1]), float(origin[2])),
-                    direction=(float(direction[0]), float(direction[1]), float(direction[2])),
-                )
+                try:
+                    sample = RaySample(
+                        origin=(float(origin[0]), float(origin[1]), float(origin[2])),
+                        direction=(float(direction[0]), float(direction[1]), float(direction[2])),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) for value in (*sample.origin, *sample.direction)):
+                    continue
+                if sum(value * value for value in sample.direction) <= 0.0:
+                    continue
                 collected.append(sample)
                 window_track = self._extract_track_id(entry)
                 if window_track:
-                    track_ids.add(window_track)
+                    samples_by_track.setdefault(window_track, []).append(sample)
             if not collected:
                 continue
             if instance_id:
                 self._rays_by_instance[instance_id] = collected
-            for track_id in track_ids:
-                self._rays_by_track.setdefault(track_id, []).extend(collected)
+            for track_id, samples in samples_by_track.items():
+                if track_id in track_owner and track_owner[track_id] != instance_id:
+                    ambiguous_tracks.add(track_id)
+                    continue
+                track_owner[track_id] = instance_id
+                self._rays_by_track.setdefault(track_id, []).extend(samples)
+        # 跟踪号可被相机或重启后的跟踪器复用，归属不唯一时禁止混合射线三角化。
+        for track_id in ambiguous_tracks:
+            self._rays_by_track.pop(track_id, None)
 
     @staticmethod
     def _extract_track_id(entry: object) -> Optional[str]:

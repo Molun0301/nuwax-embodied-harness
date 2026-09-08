@@ -724,111 +724,35 @@ fn build_exploration_native(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 // ---------- Mls3D ----------
 
 fn build_mls3d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
-    #[cfg(feature = "native-runner")]
-    let planner_node = {
-        use nuwax_nav_native_runner::prelude::RestartPolicy;
-        use nuwax_nav_native_runner::{NativeBuildPolicy, NativeBuildSpec, NativeProgramSpec};
-
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("nuwax-nav-stack must live under <workspace>/crates/<crate>")
-            .to_path_buf();
-        let target_dir = workspace_root.join("target");
-        let executable = target_dir.join("release").join("mls_planner_native");
-
-        let spec = NativeProgramSpec {
-            name: "mls_planner".into(),
-            executable,
-            topics: topic_map_for_node("mls_planner", topics)
-                .into_iter()
-                .map(|(port, topic)| (port, absolute_lcm_topic(topic)))
-                .collect(),
-            args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            cwd: Some(workspace_root.clone()),
-            restart: RestartPolicy::Never,
-        };
-        let build = NativeBuildSpec {
-            build_command: Some(
-                "cargo build --release -p nuwax-nav-mls-planner --bin mls_planner_native".into(),
-            ),
-            policy: NativeBuildPolicy::IfMissing,
-            cwd: Some(workspace_root),
-            env: std::collections::BTreeMap::from([(
-                "CARGO_TARGET_DIR".into(),
-                target_dir.to_string_lossy().into_owned(),
-            )]),
-        };
-        ModuleNode::from_native_specs(
-            "mls_planner",
-            "MLS Planner",
-            ModuleKind::NativeBridge,
-            spec,
-            Some(build),
-        )
-    };
-    #[cfg(not(feature = "native-runner"))]
-    let planner_node = ModuleNode::new("mls_planner", "MLS Planner", ModuleKind::NativeBridge)
-        .with_binary("services/nuwax-workspace/target/release/mls_planner_native");
-
+    g.push_node(map_pose_adapter(topics).with_feature("mls"));
     g.push_node(
-        planner_node
+        ModuleNode::new("mls_planner", "多层表面持续规划", ModuleKind::RustAlgorithm)
             .with_feature("mls")
-            .add_input(topics.get_or("global_map", "global_map"))
-            .add_input(topics.get_or("local_map", "local_map"))
-            .add_input(topics.get_or("region_bounds", "region_bounds"))
-            .add_input(topics.get_or("start_pose", "start_pose"))
+            .add_input(topics.get_or("navigation_map3d", "/nav/map3d"))
+            .add_input(topics.get_or("map_pose", "/nav/map_pose"))
             .add_input(topics.get_or("goal_pose", "goal_pose"))
             .add_input(topics.get_or("nav_cancel", "/nav/cancel"))
-            .add_output(topics.get_or("mls_worker_event", "/nav/mls/worker_event"))
-            .add_output(topics.get_or("surface_map", "mls_surface"))
-            .add_output(topics.get_or("nodes", "mls_nodes"))
-            .add_output(topics.get_or("node_edges", "mls_node_edges")),
+            .add_input(topics.get_or("nav_state", "/nav/state"))
+            .add_output(topics.get_or("goal_path", "goal_path"))
+            .depends_on_node("map_pose_adapter"),
     );
-
-    g.push_node(native_planner_path_adapter(
-        topics,
-        "mls_planner",
-        topics.get_or("goal_pose", "goal_pose"),
-        topics.get_or("mls_worker_event", "/nav/mls/worker_event"),
-        None,
-    ));
+    let mut scheduler = guarded_nav_scheduler(topics, "mls_planner");
+    scheduler.id = "surface_nav_scheduler".into();
+    scheduler.display_name = "三维受控路径执行".into();
+    scheduler.inputs[3] = topics.get_or("navigation_map3d", "/nav/map3d").into();
+    g.push_node(scheduler);
     g.push_edge(GraphEdge {
         from: "mls_planner".into(),
-        to: "native_planner_path_adapter".into(),
-        topic: topics
-            .get_or("mls_worker_event", "/nav/mls/worker_event")
-            .into(),
+        to: "surface_nav_scheduler".into(),
+        topic: topics.get_or("goal_path", "goal_path").into(),
     });
-
-    g.push_node(
-        ModuleNode::new(
-            "basic_path_follower",
-            "Basic Path Follower",
-            ModuleKind::RustAlgorithm,
-        )
-        .with_feature("basic-path-follower")
-        .add_input(topics.get_or("goal_path", "goal_path"))
-        .add_input(topics.get_or("odometry", "odometry"))
-        .add_input(topics.get_or("stop_movement", "stop_movement"))
-        .add_output(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
-        .depends_on_node("mls_planner"),
-    );
-
-    g.push_node(
-        ModuleNode::new(
-            "movement_manager",
-            "Movement Manager",
-            ModuleKind::Coordinator,
-        )
-        .with_feature("movement-manager")
-        .add_input(topics.get_or("nav_cmd_vel", "/nav/cmd_vel"))
-        .add_input(topics.get_or("joy_cmd", "joy_cmd"))
-        .add_output(topics.get_or("cmd_vel", "cmd_vel"))
-        .add_output(topics.get_or("stop_movement", "stop_movement"))
-        .depends_on_node("basic_path_follower"),
-    );
+    for destination in ["mls_planner", "surface_nav_scheduler"] {
+        g.push_edge(GraphEdge {
+            from: "map_pose_adapter".into(),
+            to: destination.into(),
+            topic: topics.get_or("map_pose", "/nav/map_pose").into(),
+        });
+    }
 }
 
 #[cfg(feature = "native-runner")]
@@ -920,43 +844,37 @@ mod tests {
     }
 
     #[test]
-    fn mls_profile_includes_planner_and_follower() {
-        let g = build_graph(
+    fn mls_profile_connects_shared_surface_planner_to_the_only_guarded_executor() {
+        let graph = build_graph(
             NavStackProfile::Mls3D,
             &empty_topics(),
             NavStackPreset::Mls.to_flags(),
         );
-        g.validate().expect("validate");
-        assert!(g.find("mls_planner").is_some());
-        assert!(g.find("basic_path_follower").is_some());
+        graph.validate().unwrap();
+        let planner = graph.find("mls_planner").unwrap();
+        let scheduler = graph.find("surface_nav_scheduler").unwrap();
+        assert_eq!(planner.kind, ModuleKind::RustAlgorithm);
+        assert!(planner.binary.is_none());
+        assert!(graph.find("basic_path_follower").is_none());
+        assert!(graph.find("movement_manager").is_none());
+        assert!(graph.find("native_planner_path_adapter").is_none());
+        assert_eq!(planner.outputs, vec!["goal_path"]);
+        assert_eq!(planner.inputs[4], scheduler.outputs[1]);
         assert_eq!(
-            g.find("mls_planner").unwrap().kind,
-            ModuleKind::NativeBridge
-        );
-        #[cfg(feature = "native-runner")]
-        assert_eq!(
-            g.find("mls_planner")
-                .unwrap()
-                .native_spec
-                .as_ref()
-                .unwrap()
-                .spec
-                .topics
-                .len(),
-            10
-        );
-        let planner = g.find("mls_planner").expect("MLS planner");
-        let adapter = g
-            .find("native_planner_path_adapter")
-            .expect("canonical adapter");
-        assert!(!planner.outputs.iter().any(|topic| topic == "goal_path"));
-        assert_eq!(adapter.outputs, vec!["goal_path"]);
-        assert_eq!(
-            g.nodes()
+            graph
+                .nodes()
                 .iter()
                 .filter(|node| node.outputs.iter().any(|topic| topic == "goal_path"))
                 .count(),
             1
+        );
+        assert_eq!(
+            graph
+                .find("map_pose_adapter")
+                .unwrap()
+                .feature_gate
+                .as_deref(),
+            Some("mls")
         );
     }
 

@@ -17,17 +17,21 @@
 //! 纯 Rust 多层表面 (Multi-Level Surface, MLS) 3D 路径规划器。
 //!
 //! 本 crate 是 nuwax 旧 `dimos-mls-planner` 的 Nuwax 移植版本。
-//! 原算法逻辑保持不变,只剥离了以下旧依赖:
+//! 基础表面图算法沿用原实现，并剥离了以下旧依赖:
 //! - `dimos-module`(提供 `native_config` 派生宏与 LCM transport)
 //! - `lcm-msgs`(LCM 消息类型)
 //! - `pyo3` / `numpy`(Python 绑定)
 //!
-//! 算法层面与原版等价:
+//! 基础算法入口:
 //! - `voxel::voxelize` / `surface_point_xyz`:体素坐标与表面采样
 //! - `adjacency`:基于 morphological closing 的可通行表面提取
 //! - `nodes` + `edges`:节点放置与图构建
 //! - `dijkstra`:最短路径搜索
 //! - `planner`:组合上述步骤产出路径
+//!
+//! 端点安全规则已收紧：输入为支撑面坐标，必须在自身水平单元存在满足
+//! 净空的表面，仅允许一个体素的高度量化差；不会借邻近表面跳过断带或
+//! 把地图外目标拼入路径。缓存续行同样检查当前支撑面，并按三维位置恢复。
 //!
 //! 公开 API:`Config` / `Planner` / `RegionBounds` / `edges_to_segments` /
 //! `voxel::VoxelKey` / `voxel::voxelize` / `voxel::surface_point_xyz`。
@@ -49,6 +53,11 @@ pub mod nodes;
 pub mod planner;
 pub mod scenarios;
 pub mod stamp_pair;
+pub mod surface;
 pub mod surfaces;
 pub mod transformer;
 pub mod voxel;
+
+pub use surface::{
+    SurfaceError, SurfaceFrontier, SurfaceLocation, SurfaceSnapshot, SurfaceTransition,
+};

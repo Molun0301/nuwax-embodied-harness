@@ -254,6 +254,7 @@ class YoloInferenceWorker:
 
     def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:
         """等待模型加载；并发调用时只有一个 owner 消费就绪队列。"""
+        deadline = time.monotonic() + max(0.0, timeout_sec)
         with self._readiness_condition:
             if self._readiness_state == "ready":
                 return True
@@ -261,15 +262,17 @@ class YoloInferenceWorker:
                 return False
             if self._readiness_owner:
                 while self._readiness_state == "starting":
-                    self._readiness_condition.wait()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    self._readiness_condition.wait(timeout=remaining)
                 return self._readiness_state == "ready"
             self._readiness_owner = True
-
-        deadline = time.monotonic() + max(0.0, timeout_sec)
-        failure_reason = ""
-        while time.monotonic() < deadline:
             process = self._process
             response_queue = self._response_queue
+
+        failure_reason = ""
+        while time.monotonic() < deadline:
             if process is None or response_queue is None:
                 failure_reason = "worker_resources_missing"
                 break
@@ -289,15 +292,21 @@ class YoloInferenceWorker:
                 failure_reason = "ready_queue_error:%s" % exc
                 break
 
-            if msg[0] == "ready":
+            if isinstance(msg, (list, tuple)) and msg and msg[0] == "ready":
                 with self._readiness_condition:
+                    if (
+                        self._readiness_state != "starting"
+                        or self._process is not process
+                        or self._response_queue is not response_queue
+                    ):
+                        return False
                     self._ready = True
                     self._readiness_state = "ready"
                     self._readiness_owner = False
                     self._readiness_condition.notify_all()
                 logger.info("YOLO 推理 worker 进程已就绪 pid=%d", process.pid)
                 return True
-            if msg[0] == "startup_error" and len(msg) >= 4:
+            if isinstance(msg, (list, tuple)) and len(msg) >= 4 and msg[0] == "startup_error":
                 failure_reason = "%s:%s:%s" % (msg[1], msg[2], msg[3])
                 logger.error(
                     "YOLO 推理 worker 启动失败 stage=%s error=%s: %s",
@@ -315,77 +324,110 @@ class YoloInferenceWorker:
             logger.error("等待 YOLO worker 就绪超时: %.1fs", timeout_sec)
         elif failure_reason.startswith("worker_exited:"):
             logger.error("YOLO worker 在就绪前退出 %s", failure_reason)
-        with self._readiness_condition:
-            if self._readiness_state == "starting":
+        # 回收期间持有启动锁，避免旧等待器在另一代进程启动后误停新进程。
+        with self._start_lock:
+            with self._readiness_condition:
+                if (
+                    self._readiness_state != "starting"
+                    or self._process is not process
+                    or self._response_queue is not response_queue
+                ):
+                    return False
                 self._ready = False
                 self._readiness_state = "failed"
                 self._readiness_failure = failure_reason
-            self._readiness_owner = False
-            self._readiness_condition.notify_all()
-        self.stop()
+                self._readiness_owner = False
+                self._readiness_condition.notify_all()
+            self.stop()
         return False
 
     def predict(
         self,
         image_bgr: np.ndarray,
+        *,
+        timeout_sec: float = 10.0,
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Any, Any]]:
-        """发送图像到 worker 进程进行推理，阻塞等待结果（但释放 GIL）。
-
-        Returns:
-            (xyxy, conf, cls, names, masks_data) 或 None（推理失败时）
-        """
+        """提交单帧并等待同请求结果；失败后回收进程，禁止复用仍在读取的共享图像。"""
+        failure_reason = ""
         with self._predict_lock:
+            self._last_inference_ms = None
             if not self._ready or self._process is None or not self._process.is_alive():
                 return None
-
-            # 确保共享内存足够大
-            needed = image_bgr.nbytes
-            if self._shm is None or self._shm_size < needed:
-                if self._shm is not None:
-                    try:
+            process = self._process
+            request_queue = self._request_queue
+            response_queue = self._response_queue
+            inference_started_at = time.perf_counter()
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            try:
+                if request_queue is None or response_queue is None:
+                    raise RuntimeError("worker_resources_missing")
+                if image_bgr.ndim != 3 or image_bgr.shape[2] != 3 or image_bgr.dtype != np.uint8 or image_bgr.size == 0:
+                    raise ValueError("工作进程输入必须是非空三通道八位图像。")
+                needed = image_bgr.nbytes
+                if self._shm is None or self._shm_size < needed:
+                    if self._shm is not None:
                         self._shm.close()
                         self._shm.unlink()
-                    except Exception:
-                        pass
-                self._shm = shared_memory.SharedMemory(create=True, size=needed)
-                self._shm_size = needed
+                    self._shm = shared_memory.SharedMemory(create=True, size=needed)
+                    self._shm_size = needed
 
-            # 拷贝图像到共享内存
-            shm_array = np.ndarray(image_bgr.shape, dtype=image_bgr.dtype, buffer=self._shm.buf)
-            np.copyto(shm_array, image_bgr)
-
-            self._req_counter += 1
-            req_id = self._req_counter
-            inference_started_at = time.perf_counter()
-            self._request_queue.put(
-                (self._shm.name, image_bgr.shape, str(image_bgr.dtype), req_id)
-            )
-
-            # 等待结果（Queue.get 阻塞时释放 GIL）
-            try:
-                msg = self._response_queue.get(timeout=10.0)
-                if msg[0] == "result" and msg[1] == req_id:
-                    # 任务 3.8：记录 worker 推理往返耗时（毫秒）。
-                    self._last_inference_ms = round((time.perf_counter() - inference_started_at) * 1000.0, 3)
+                shm_array = np.ndarray(image_bgr.shape, dtype=image_bgr.dtype, buffer=self._shm.buf)
+                np.copyto(shm_array, image_bgr)
+                self._req_counter += 1
+                req_id = self._req_counter
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError("worker_request_timeout")
+                request_queue.put(
+                    (self._shm.name, image_bgr.shape, str(image_bgr.dtype), req_id),
+                    timeout=remaining,
+                )
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise TimeoutError("worker_response_timeout")
+                    try:
+                        msg = response_queue.get(timeout=min(0.25, remaining))
+                    except queue.Empty:
+                        if process.is_alive():
+                            continue
+                        raise RuntimeError("worker_exited_during_prediction")
+                    if not isinstance(msg, (list, tuple)) or len(msg) < 3 or msg[0] not in ("result", "error"):
+                        raise RuntimeError("worker_response_invalid")
+                    if msg[1] != req_id:
+                        # 迟到结果不能归属当前帧；仍在同一个截止时间内等待匹配结果。
+                        continue
+                    if msg[0] == "error":
+                        raise RuntimeError("worker_prediction_error:%s" % msg[2])
                     raw = msg[2]
-                    if raw and len(raw) >= 3:
-                        return (
-                            raw[0],
-                            raw[1],
-                            raw[2],
-                            raw[3] if len(raw) > 3 else None,
-                            raw[4] if len(raw) > 4 else None,
-                        )
-                    return None
-                if msg[0] == "error":
-                    logger.warning(
-                        "YOLO worker 推理错误: %s",
-                        msg[2] if len(msg) > 2 else msg,
+                    if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+                        raise RuntimeError("worker_result_invalid")
+                    self._last_inference_ms = round((time.perf_counter() - inference_started_at) * 1000.0, 3)
+                    return (
+                        raw[0], raw[1], raw[2],
+                        raw[3] if len(raw) > 3 else None,
+                        raw[4] if len(raw) > 4 else None,
                     )
-                    return None
             except Exception as exc:
-                logger.warning("等待 YOLO worker 响应超时: %s", exc)
-            return None
+                failure_reason = "%s:%s" % (type(exc).__name__, exc)
+                with self._readiness_condition:
+                    self._ready = False
+                    self._readiness_state = "failed"
+                    self._readiness_failure = failure_reason
+                    self._readiness_condition.notify_all()
+        logger.warning("YOLO worker 推理失败，停止旧工作进程: %s", failure_reason)
+        # stop 的顺序为启动锁→停止锁→推理锁，必须先释放本次推理锁。
+        self.stop_if_current((process, request_queue, response_queue))
+        return None
+
+    def stop_if_current(self, expected_identity: Tuple[object, object, object]) -> bool:
+        """仅回收指定工作进程的资源；迟到收尾不能停止已替换的新进程。"""
+        with self._start_lock:
+            current_identity = (self._process, self._request_queue, self._response_queue)
+            if any(current is not expected for current, expected in zip(current_identity, expected_identity)):
+                return False
+            self.stop()
+            return True
 
     def stop(self) -> None:
         """停止 worker 进程并释放共享内存。并发调用只执行一次清理。"""
@@ -513,6 +555,26 @@ class YoloInferenceWorker:
             ready = self._readiness_state == "ready" and self._ready
             process = self._process
         return ready and process is not None and process.is_alive()
+
+    @property
+    def failure_reason(self) -> Optional[str]:
+        """最近一次启动或推理失败原因。"""
+        with self._readiness_condition:
+            return self._readiness_failure
+
+    @property
+    def resource_identity(self) -> Tuple[object, object, object]:
+        """工作进程及请求/响应队列的一致身份快照，只供拥有方协调收尾。"""
+        with self._start_lock:
+            return self._process, self._request_queue, self._response_queue
+
+    @property
+    def has_pending_resources(self) -> bool:
+        """仍持有未回收的进程或通信资源时，调用方不得同时启动回退模型。"""
+        with self._start_lock:
+            return any(resource is not None for resource in (
+                self._process, self._request_queue, self._response_queue, self._shm,
+            ))
 
     @property
     def last_inference_ms(self) -> Optional[float]:

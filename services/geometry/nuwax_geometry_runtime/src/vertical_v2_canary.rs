@@ -2468,10 +2468,16 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         adapter
             .feed_pose_in_frame(0.0, 0.0, 0.0, 0.0, "odom")
             .expect("production mapping pose API");
+        // 周向观测让自动栅格覆盖完整机器人轮廓；只有前方三个点时，
+        // 自动边界的最小横坐标为0，机器人后侧在图外，不能开始导航。
         let points = [
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(1.5, 0.5, 0.0),
             Point3::new(1.5, -0.5, 0.0),
+            Point3::new(-1.5, 0.5, 0.0),
+            Point3::new(-1.5, -0.5, 0.0),
+            Point3::new(0.0, 1.5, 0.0),
+            Point3::new(0.0, -1.5, 0.0),
         ];
         let outcome = ingest_mapping_points(
             &mut adapter,
@@ -2509,6 +2515,53 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         .expect("decode fanout occupancy");
     assert_eq!(occupancy.header.seq, event.revision as i32);
     assert_eq!(occupancy.header.frame_id, "map");
+    let grid_resolution = f64::from(occupancy.info.resolution);
+    let robot_col = (-occupancy.info.origin.position[0] / grid_resolution).floor() as i32;
+    let robot_row = (-occupancy.info.origin.position[1] / grid_resolution).floor() as i32;
+    let footprint_radius = (nuwax_explore_wavefront::WavefrontConfig::default()
+        .obstacle_inflation_radius_m
+        / grid_resolution)
+        .ceil() as i32;
+    // 核对实际生产发布的栅格，不能由配置里的固定原点/宽高推断地图范围。
+    for dy in -footprint_radius..=footprint_radius {
+        for dx in -footprint_radius..=footprint_radius {
+            if dx * dx + dy * dy > footprint_radius * footprint_radius {
+                continue;
+            }
+            let col = robot_col + dx;
+            let row = robot_row + dy;
+            assert!(
+                col >= 0 && row >= 0 && col < occupancy.info.width && row < occupancy.info.height,
+                "机器人轮廓必须位于已发布地图内"
+            );
+            assert_eq!(
+                occupancy.data[(row * occupancy.info.width + col) as usize],
+                0,
+                "机器人轮廓必须被发布为已知自由区域"
+            );
+        }
+    }
+    assert!(occupancy.data.iter().any(|value| *value < 0), "夹具必须保留未观测区域");
+    let published_costmap = exploration_costmap_from_revision_in_frame(&fanned_out, "map")
+        .expect("由实际发布修订构造探索栅格");
+    let mut selector = nuwax_explore_wavefront::selector::WavefrontGoalSelector::new(
+        nuwax_explore_wavefront::WavefrontConfig::default(),
+    );
+    let mut selector_session = nuwax_explore_wavefront::session::ExplorationSession::new();
+    let mut selector_ids = nuwax_exploration::wavefront_adapter::CountingIdSource::default();
+    let selection = selector
+        .select_goal_at(
+            Point2 { x: 0.0, y: 0.0 },
+            &published_costmap.grid,
+            &mut selector_session,
+            nuwax_nav_types_messages::geometry::Timestamp::default(),
+            &mut selector_ids,
+        )
+        .expect("发布地图上的前沿检测");
+    assert!(
+        matches!(selection, nuwax_explore_wavefront::GoalSelection::Goal(_)),
+        "已发布地图必须同时提供完整起点轮廓和可达安全前沿：{selection:?}"
+    );
 
     let pose = schema::PoseStamped {
         header: schema::Header {

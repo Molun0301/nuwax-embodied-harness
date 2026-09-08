@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import logging
+import math
 import queue
 import re
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -41,7 +43,7 @@ from contracts.memory import (
 from contracts.navigation import NavigationGoal
 from contracts.naming import build_location_id, build_memory_id, build_observation_event_id, build_scene_space_id
 from contracts.perception import Detection2D
-from contracts.runtime_views import LocalizationSnapshot, NavigationSemanticContext, TopologyNodeSummary
+from contracts.runtime_views import LocalizationSnapshot, MapSnapshot, NavigationSemanticContext, TopologyNodeSummary, PerceptionContext
 from contracts.spatial_memory import (
     GroundingQueryPlan,
     InstanceDynamicState,
@@ -300,6 +302,8 @@ class MemoryService:
         self._deferred_refine_worker: Optional[threading.Thread] = None
         self._deferred_refine_stop_event = threading.Event()
         self._instances_lock = threading.RLock()
+        # 只限定当前关键帧结构提交；向量任务在释放结构锁后再执行。
+        self._observation_write_state = threading.local()
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -380,9 +384,10 @@ class MemoryService:
         if reset_library:
             self._delete_memory_library_records(resolved_name)
         self._ensure_embedders_initialized()
-        self._clear_active_memory_state()
-        self._memory_enabled = True
-        self._active_library_name = resolved_name
+        with self._instances_lock:
+            self._clear_active_memory_state()
+            self._memory_enabled = True
+            self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
         self._start_vectorization_worker()
@@ -452,9 +457,10 @@ class MemoryService:
         previous_name = self._active_library_name
         self._stop_deferred_refine_worker()
         self._stop_vectorization_worker()
-        self._clear_active_memory_state()
-        self._memory_enabled = False
-        self._active_library_name = None
+        with self._instances_lock:
+            self._clear_active_memory_state()
+            self._memory_enabled = False
+            self._active_library_name = None
         summary = self.get_summary()
         if previous_name:
             self._publish_memory_event(
@@ -822,7 +828,9 @@ class MemoryService:
             )
             self._text_embedder_ready = True
         if self._text_embedder is not None:
-            self._instance_association_service.set_text_embedder(self._text_embedder)
+            # 库切换的准备阶段也不能并发清空正在关联的模型缓存。
+            with self._instances_lock:
+                self._instance_association_service.set_text_embedder(self._text_embedder)
         if not self._image_embedder_ready:
             self._image_embedder = self._build_image_embedder_with_fallback(
                 self._configured_image_model,
@@ -871,9 +879,40 @@ class MemoryService:
 
     def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
         merged = dict(metadata or {})
-        if self._active_library_name:
-            merged[MEMORY_LIBRARY_METADATA_KEY] = self._active_library_name
+        scope = self._observation_write_scope()
+        library_name = scope["library_name"] if scope is not None else self._active_library_name
+        if library_name:
+            merged[MEMORY_LIBRARY_METADATA_KEY] = library_name
         return merged
+
+    def _observation_write_scope(self):
+        return getattr(getattr(self, "_observation_write_state", None), "scope", None)
+
+    def _assert_observation_library(self, expected_library_name: str) -> None:
+        """调用方持有实例锁，在结构或向量提交前复核捕获的库身份。"""
+        if not self.is_enabled() or self._active_library_name != expected_library_name:
+            raise GatewayError(
+                "观察处理期间记忆库已切换，拒绝将旧观察写入当前库。",
+                error_code="memory_library_changed", http_status=409,
+                details={"expected_library_name": expected_library_name, "active_library_name": self._active_library_name},
+            )
+
+    def _observation_localization_session(self):
+        """显式关键帧只使用捕获快照中的会话身份，不借用当前定位会话。"""
+        scope = self._observation_write_scope()
+        if scope is None or not scope["use_spatial_snapshot"]:
+            return self._localization_service.get_active_session()
+        snapshot = scope["localization_snapshot"]
+        metadata = dict(snapshot.metadata or {}) if snapshot is not None else {}
+        session_id = metadata.get("session_id") or metadata.get("localization_session_id")
+        if not session_id:
+            return None
+        map_snapshot = scope["map_snapshot"]
+        return SimpleNamespace(
+            session_id=session_id,
+            map_name=metadata.get("map_name") or (map_snapshot.map_name if map_snapshot is not None else scope["library_name"]),
+            status=SimpleNamespace(value=metadata.get("session_status") or metadata.get("localization_session_status")),
+        )
 
     def _record_library_name(self, record: object) -> str:
         metadata = getattr(record, "metadata", {}) or {}
@@ -1368,18 +1407,30 @@ class MemoryService:
         tags: Union[List[str], Tuple[str, ...], None] = None,
         linked_location_id: Optional[str] = None,
         metadata: Optional[Dict[str, object]] = None,
+        perception_context: Optional[PerceptionContext] = None,
+        observation_pose: Optional[Pose] = None,
+        map_snapshot: Optional[MapSnapshot] = None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+        expected_library_name: Optional[str] = None,
     ) -> SemanticMemoryEntry:
         """把当前观察或感知结果写入语义记忆。"""
 
-        self._require_memory_enabled()
+        active_library = self._require_memory_enabled()
+        expected_library = active_library if expected_library_name is None else str(expected_library_name).strip()
+        with self._instances_lock:
+            self._assert_observation_library(expected_library)
         linked_location = None
         if linked_location_id:
             linked_location = self._tagged_locations_by_id.get(linked_location_id)
             if linked_location is None:
                 raise GatewayError("未找到地点记忆：%s" % linked_location_id)
 
-        perception_context = self._perception_service.get_latest_perception(camera_id)
-        observation_context = self._observation_service.get_latest_observation(camera_id)
+        explicit_context = perception_context is not None
+        if explicit_context and camera_id is not None and perception_context.camera_id != camera_id:
+            raise GatewayError("关键帧观察与请求相机不一致。", error_code="perception_camera_mismatch", http_status=409)
+        if perception_context is None:
+            perception_context = self._perception_service.get_latest_perception(camera_id)
+        observation_context = None if explicit_context else self._observation_service.get_latest_observation(camera_id)
         if perception_context is None and observation_context is None:
             raise GatewayError("当前没有可写入记忆的观察或感知结果。")
 
@@ -1414,6 +1465,14 @@ class MemoryService:
             linked_location=linked_location,
             camera_id=camera_id,
             metadata=merged_metadata,
+            perception_context=perception_context,
+            observation_context=observation_context,
+            use_observation_snapshot=True,
+            observation_pose=observation_pose,
+            use_spatial_snapshot=explicit_context,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            expected_library_name=expected_library,
         )
 
     def query_location(
@@ -2623,7 +2682,7 @@ class MemoryService:
         localization_snapshot=None,
         map_name: Optional[str] = None,
     ) -> Dict[str, object]:
-        active_session = self._localization_service.get_active_session()
+        active_session = self._observation_localization_session()
         resolved_map_name = self._resolve_stable_map_name(
             map_name=map_name,
             map_snapshot=map_snapshot,
@@ -2652,7 +2711,7 @@ class MemoryService:
         map_snapshot=None,
         localization_snapshot: Optional[LocalizationSnapshot] = None,
     ) -> Optional[str]:
-        active_session = self._localization_service.get_active_session()
+        active_session = self._observation_localization_session()
         map_metadata = dict(getattr(map_snapshot, "metadata", {}) or {})
         localization_metadata = dict(
             getattr(localization_snapshot, "metadata", {}) or {}
@@ -2761,60 +2820,111 @@ class MemoryService:
         library_name: Optional[str] = None,
         label: Optional[str] = None,
     ) -> List[Dict[str, object]]:
-        """列出语义实例，返回精简 DTO 列表（供 Web 面板和 capability 消费）。
+        """列出指定库的实例及真实空间证据；无激活库时返回空列表。
 
-        参数:
-            library_name: 若指定则仅返回该记忆库的实例；未指定时按当前激活库
-                ``_active_library_name`` 自动过滤；激活库未启用时返回空列表。
-                显式传 ``library_name=""`` 视为"未启用"语义，返回空列表。
-            label: 若指定则按 label 过滤（大小写不敏感）。
-
-        返回字段：instance_id / label / display_name / pose{x,y,z} /
-        frame_id / confidence / instance_type / last_seen_ts / is_fallback。
-        is_fallback 判定规则：confidence < 0.3 视为 fallback（真实精确坐标
-        缺失时后端注入 confidence=0.2）；frame_id 非 map 系也归入 fallback。
+        观察者位置与物体位置通过 observation_only 区分；is_fallback 表示
+        尚无可展示的地图物体位置，不再用识别置信度猜测几何是否成立。
+        navigable 仅保留明确通过质量判断且当前仍有效的结果。
         """
-        all_instances = self._repository.load_semantic_instances()
         target_library = (
             str(library_name).strip() if library_name is not None else self._active_library_name
         )
         if not target_library:
             return []
+        resolved_now = utc_now()
+        instances = sorted(
+            self._repository.load_semantic_instances(library_name=target_library),
+            key=lambda item: (
+                item.last_seen_ts if item.last_seen_ts.tzinfo is not None
+                else item.last_seen_ts.replace(tzinfo=resolved_now.tzinfo),
+                item.instance_id,
+            ),
+            reverse=True,
+        )
         label_lower = str(label).lower().strip() if label else None
+        lifecycle_order = {
+            InstanceLifecycleState.ACTIVE: 0,
+            InstanceLifecycleState.UNCERTAIN: 1,
+            InstanceLifecycleState.STALE: 2,
+            InstanceLifecycleState.REMOVED: 3,
+        }
         result: List[Dict[str, object]] = []
-        for inst in all_instances:
-            if self._record_library_name(inst) != target_library:
+        for inst in instances:
+            if label_lower is not None and str(inst.label).lower().strip() != label_lower:
                 continue
-            if label_lower is not None:
-                if str(inst.label).lower().strip() != label_lower:
-                    continue
-            if label_lower is not None:
-                if str(inst.label).lower().strip() != label_lower:
-                    continue
             pose = inst.pose
             frame_id = pose.frame_id if pose else ""
             pos = pose.position if pose else None
-            is_fallback = (inst.confidence < 0.3) or (frame_id != "map")
-            last_seen: object = (
-                inst.last_seen_ts.isoformat()
-                if hasattr(inst.last_seen_ts, "isoformat")
-                else inst.last_seen_ts
+            valid_position = pos is not None and all(math.isfinite(value) for value in (pos.x, pos.y, pos.z))
+            map_matches_library = str(inst.map_name or "").strip() == target_library
+            metadata = dict(inst.metadata or {})
+            projection_method = str(metadata.get("projection_method") or "").strip()
+            observation_only = (
+                self._coerce_optional_bool(metadata.get("observation_only")) is True
+                or projection_method == "current_pose_fallback"
             )
+            is_fallback = (
+                observation_only or not valid_position or frame_id != DEFAULT_MAP_FRAME
+                or projection_method.lower() in {"", "unknown", "none"} or not map_matches_library
+            )
+            projection_confidence = self._coerce_optional_float(metadata.get("projection_confidence"))
+            if projection_confidence is not None and not math.isfinite(projection_confidence):
+                projection_confidence = None
+            dynamic_state = self._instance_dynamic_state(inst)
+            lifecycle_source = inst
+            if inst.last_seen_ts.tzinfo is None:
+                lifecycle_source = inst.model_copy(
+                    update={"last_seen_ts": inst.last_seen_ts.replace(tzinfo=resolved_now.tzinfo)},
+                )
+            aged_instance = self._instance_association_service._mark_stale(lifecycle_source, now=resolved_now)
+            # 展示时复用关联老化规则，只读派生；不能重新激活已明确失效的记录。
+            lifecycle_state = max(
+                (inst.lifecycle_state, aged_instance.lifecycle_state), key=lifecycle_order.__getitem__,
+            ).value
+            navigable = (
+                self._coerce_optional_bool(metadata.get("navigable")) is True
+                and not is_fallback
+                and lifecycle_state == InstanceLifecycleState.ACTIVE.value
+                and self._is_long_term_static_instance(inst)
+            )
+            non_navigable_reason = str(metadata.get("non_navigable_reason") or "")
+            if not navigable and not non_navigable_reason:
+                if not valid_position:
+                    non_navigable_reason = "invalid_object_position"
+                elif not map_matches_library:
+                    non_navigable_reason = "map_binding_mismatch"
+                elif observation_only:
+                    non_navigable_reason = "observation_only"
+                elif is_fallback:
+                    non_navigable_reason = "object_position_unverified"
+                elif lifecycle_state != InstanceLifecycleState.ACTIVE.value:
+                    non_navigable_reason = "instance_not_active"
+                elif not self._is_long_term_static_instance(inst):
+                    non_navigable_reason = "not_long_term_static_target"
+                else:
+                    non_navigable_reason = "navigation_unverified"
             result.append(
                 {
                     "instance_id": inst.instance_id,
                     "label": inst.label,
                     "display_name": inst.display_name or inst.label,
-                    "pose": {
-                        "x": pos.x if pos else 0.0,
-                        "y": pos.y if pos else 0.0,
-                        "z": pos.z if pos else 0.0,
-                    },
+                    "pose": {"x": pos.x, "y": pos.y, "z": pos.z} if valid_position else None,
                     "frame_id": frame_id,
-                    "confidence": inst.confidence,
+                    "confidence": inst.confidence if math.isfinite(inst.confidence) else None,
                     "instance_type": inst.instance_type,
-                    "last_seen_ts": last_seen,
+                    "last_seen_ts": lifecycle_source.last_seen_ts.isoformat(),
                     "is_fallback": is_fallback,
+                    "map_name": inst.map_name,
+                    "library_name": target_library,
+                    "observation_only": observation_only,
+                    "navigable": navigable,
+                    "non_navigable_reason": non_navigable_reason if not navigable else "",
+                    "projection_method": projection_method,
+                    "projection_confidence": projection_confidence,
+                    "support_point_count": self._coerce_optional_int(metadata.get("support_point_count")) or 0,
+                    "observation_count": inst.observation_count,
+                    "lifecycle_state": lifecycle_state,
+                    "dynamic_state": dynamic_state.value,
                 }
             )
         return result
@@ -2834,6 +2944,7 @@ class MemoryService:
         active_library = self._require_memory_enabled()
         if payload_filter is None:
             spaces = self._repository.list_scene_spaces(
+                library_name=active_library,
                 scene_space_ids=scene_space_ids,
                 map_name=map_name,
                 localization_session_id=localization_session_id,
@@ -2854,11 +2965,11 @@ class MemoryService:
                     for item in review_statuses
                 ]
             resolved_filter.record_kinds = [MemoryRecordKind.SCENE_SPACE]
-            spaces = self._repository.query_scene_spaces(resolved_filter, limit=limit)
-        visible_spaces = [space for space in spaces if self._record_library_name(space) == active_library]
-        for space in visible_spaces:
-            self._cache_scene_space(space)
-        return tuple(visible_spaces)
+            spaces = self._repository.query_scene_spaces(
+                resolved_filter, library_name=active_library, limit=limit,
+            )
+        # 查询只返回已按库筛选的快照；缓存由激活与写入维护，避免迟到读取污染新库。
+        return tuple(spaces)
 
     def query_scene_spaces(
         self,
@@ -2875,7 +2986,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询场景空间。"""
 
-        self._require_memory_enabled()
+        active_library = self._require_memory_enabled()
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[MemoryRecordKind.SCENE_SPACE],
@@ -2894,11 +3005,9 @@ class MemoryService:
                 include_non_direct_navigation_candidates=include_non_direct_navigation_candidates,
                 default_query_scope="scene_space",
             )
-        spaces = [
-            space
-            for space in self._repository.query_scene_spaces(resolved_filter, limit=limit)
-            if self._record_library_name(space) == self._active_library_name
-        ]
+        spaces = self._repository.query_scene_spaces(
+            resolved_filter, library_name=active_library, limit=limit,
+        )
         current_pose = self._get_current_pose()
         matches = [
             self._build_scene_space_filter_match(space, current_pose=current_pose)
@@ -3011,11 +3120,72 @@ class MemoryService:
         linked_location: Optional[TaggedLocation],
         camera_id: Optional[str],
         metadata: Optional[Dict[str, object]],
+        perception_context: Optional[PerceptionContext] = None,
+        observation_context=None,
+        use_observation_snapshot: bool = False,
+        observation_pose: Optional[Pose] = None,
+        use_spatial_snapshot: bool = False,
+        map_snapshot: Optional[MapSnapshot] = None,
+        localization_snapshot: Optional[LocalizationSnapshot] = None,
+        expected_library_name: Optional[str] = None,
     ) -> SemanticMemoryEntry:
-        localization_snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
-        map_snapshot = self._get_map_snapshot()
-        observation_context = self._observation_service.get_latest_observation(camera_id)
-        perception_context = self._perception_service.get_latest_perception(camera_id)
+        expected_library = (
+            self._require_memory_enabled() if expected_library_name is None else expected_library_name
+        )
+        if not use_spatial_snapshot:
+            localization_snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
+            map_snapshot = self._get_map_snapshot()
+        if not use_observation_snapshot:
+            observation_context = self._observation_service.get_latest_observation(camera_id)
+            perception_context = self._perception_service.get_latest_perception(camera_id)
+        vector_tasks = []
+        with self._instances_lock:
+            self._assert_observation_library(expected_library)
+            previous_scope = self._observation_write_scope()
+            self._observation_write_state.scope = {
+                "library_name": expected_library,
+                "use_spatial_snapshot": use_spatial_snapshot,
+                "map_snapshot": map_snapshot,
+                "localization_snapshot": localization_snapshot,
+                "vector_tasks": vector_tasks,
+            }
+            try:
+                entry = self._commit_scene_memory_entry(
+                    title=title, summary=summary, tags=tags, linked_location=linked_location,
+                    camera_id=camera_id, metadata=metadata, perception_context=perception_context,
+                    observation_context=observation_context, observation_pose=observation_pose,
+                    map_snapshot=map_snapshot, localization_snapshot=localization_snapshot,
+                )
+            finally:
+                self._observation_write_state.scope = previous_scope
+        # 远端图文向量计算和队列投递不持有结构提交锁。
+        for task in vector_tasks:
+            self._dispatch_vectorization_task(task)
+        with self._instances_lock:
+            self._assert_observation_library(expected_library)
+        self._publish_memory_event(
+            "memory.entry_created",
+            "语义记忆 %s 已写入。" % entry.title,
+            payload={"memory_id": entry.memory_id, "title": entry.title},
+        )
+        return entry
+
+    def _commit_scene_memory_entry(
+        self,
+        *,
+        title: str,
+        summary: Optional[str],
+        tags: Union[List[str], Tuple[str, ...], None],
+        linked_location: Optional[TaggedLocation],
+        camera_id: Optional[str],
+        metadata: Optional[Dict[str, object]],
+        perception_context: Optional[PerceptionContext],
+        observation_context,
+        observation_pose: Optional[Pose],
+        map_snapshot: Optional[MapSnapshot],
+        localization_snapshot: Optional[LocalizationSnapshot],
+    ) -> SemanticMemoryEntry:
+        """在固定库的结构临界区内提交观察及其派生结构，向量暂存到当前任务。"""
         artifact_ids: List[str] = []
         if observation_context is not None and observation_context.image_artifact is not None:
             artifact_ids.append(observation_context.image_artifact.artifact_id)
@@ -3026,6 +3196,8 @@ class MemoryService:
         pose = None
         if linked_location is not None:
             pose = linked_location.pose
+        elif observation_pose is not None:
+            pose = observation_pose
         elif localization_snapshot is not None:
             pose = localization_snapshot.current_pose
         semantic_region_id = None
@@ -3080,7 +3252,8 @@ class MemoryService:
             semantic_region_id=semantic_region_id,
             semantic_labels=semantic_labels,
             observation_id=(
-                observation_context.observation.observation_id if observation_context is not None else None
+                observation_context.observation.observation_id if observation_context is not None
+                else perception_context.observation.observation_id if perception_context is not None else None
             ),
             perception_headline=(
                 perception_context.scene_summary.headline if perception_context is not None else None
@@ -3101,11 +3274,6 @@ class MemoryService:
             localization_snapshot=localization_snapshot,
             current_pose=pose,
             camera_id=camera_id,
-        )
-        self._publish_memory_event(
-            "memory.entry_created",
-            "语义记忆 %s 已写入。" % entry.title,
-            payload={"memory_id": entry.memory_id, "title": entry.title},
         )
         return entry
 
@@ -3145,10 +3313,18 @@ class MemoryService:
                 query_image_vector = query_text_vector
             else:
                 query_image_vector = self._image_embedder.embed_text(query)
+        # 先约束当前激活缓存中的可见记录，再做向量召回限额，避免其他库挤掉结果。
+        lexical_scores = {
+            candidate_id: lexical_score
+            for record_kind in allowed_record_kinds
+            for candidate_id, lexical_score in self._iter_lexical_candidate_ids(normalized_query, record_kind)
+        }
         recall_limit = max(limit * 12, 20)
         vector_hits = self._vector_store.query(
             vector_name=TEXT_VECTOR_NAME,
             query_vector=query_text_vector,
+            model_name=self._text_embedder.model_name,
+            candidate_ids=lexical_scores.keys(),
             limit=recall_limit,
             payload_filter=payload_filter,
             collection_names=self._collections_for_record_kinds(allowed_record_kinds),
@@ -3160,6 +3336,8 @@ class MemoryService:
                 image_hits = self._vector_store.query(
                     vector_name=IMAGE_VECTOR_NAME,
                     query_vector=query_image_vector,
+                    model_name=self._image_embedder.model_name,
+                    candidate_ids=lexical_scores.keys(),
                     limit=recall_limit,
                     payload_filter=payload_filter,
                     collection_names=self._collections_for_record_kinds(allowed_record_kinds),
@@ -3171,14 +3349,15 @@ class MemoryService:
             except Exception:
                 pass  # image 检索失败不影响主链路
         candidate_ids = set(recall_by_id.keys())
-        for record_kind in allowed_record_kinds:
-            for candidate_id, lexical_score in self._iter_lexical_candidate_ids(normalized_query, record_kind):
-                if lexical_score >= max(0.18, similarity_threshold * 0.5):
-                    candidate_ids.add(candidate_id)
+        for candidate_id, lexical_score in lexical_scores.items():
+            if lexical_score >= max(0.18, similarity_threshold * 0.5):
+                candidate_ids.add(candidate_id)
 
+        # 召回点只携带单路向量；批量补齐全部向量，保留图像重排并避免逐条读库。
+        points_by_id = self._vector_store.get_points_batch(candidate_ids)
         scored_candidates: List[_ScoredCandidate] = []
         for candidate_id in sorted(candidate_ids):
-            point = self._vector_store.get_point(candidate_id)
+            point = points_by_id.get(candidate_id)
             if point is None:
                 continue
             if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
@@ -3299,6 +3478,8 @@ class MemoryService:
             query_image_vector is not None
             and IMAGE_VECTOR_NAME in point.vectors
             and self._image_embedder is not None
+            and point.vectors[IMAGE_VECTOR_NAME].model_name == self._image_embedder.model_name
+            and point.vectors[IMAGE_VECTOR_NAME].dimension == self._image_embedder.dimension
         ):
             image_score = max(
                 0.0,
@@ -3782,13 +3963,14 @@ class MemoryService:
                 segmentation_score,
                 segmentation_quality_score,
                 stability_score,
-                coverage,
-                map_projection_coverage,
-                depth_coverage,
-                reprojection_error,
-                segmentation_support_point_count,
             )
-        ) or bool(occlusion_flags or truncation_flags)
+        ) or bool(
+            occlusion_flags or truncation_flags
+            or metadata.get("segmentation_bbox_xyxy") or metadata.get("mask_polygon_px")
+            or metadata.get("segmentation_polygon_px") or metadata.get("mask_center_px")
+            or metadata.get("segmentation_source")
+            or (segmentation_support_point_count is not None and segmentation_support_point_count > 0)
+        )
         risk_factors: List[str] = []
         if segmentation_support_point_count is not None and segmentation_support_point_count <= 0:
             risk_factors.append("segmentation_support_points_missing")
@@ -3815,6 +3997,8 @@ class MemoryService:
         for item in risk_factors:
             if item not in unique_risks:
                 unique_risks.append(item)
+        if not has_structured_segmentation:
+            unique_risks = []
         quality_signals = [
             value
             for value in (
@@ -3827,7 +4011,9 @@ class MemoryService:
             )
             if value is not None
         ]
-        if unique_risks:
+        if not has_structured_segmentation:
+            segmentation_quality = "unknown"
+        elif unique_risks:
             segmentation_quality = "low"
         elif quality_signals and min(quality_signals) >= 0.65:
             segmentation_quality = "high"
@@ -4371,30 +4557,14 @@ class MemoryService:
         if not target_library:
             return
 
-        persisted_locations = [
-            item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == target_library
-        ]
-        persisted_memories = [
-            item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == target_library
-        ]
-        persisted_instances = [
-            item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == target_library
-        ]
-        persisted_events = [
-            item for item in self._repository.load_observation_events() if self._record_library_name(item) == target_library
-        ]
-        persisted_scene_spaces = [
-            item for item in self._repository.load_scene_spaces() if self._record_library_name(item) == target_library
-        ]
-        persisted_trajectory_events = [
-            item for item in self._repository.load_navigation_trajectory_events() if self._record_library_name(item) == target_library
-        ]
-        persisted_graph_relations = [
-            item for item in self._repository.load_semantic_graph_relations() if self._record_library_name(item) == target_library
-        ]
-        persisted_summary_nodes = [
-            item for item in self._repository.load_semantic_summary_nodes() if self._record_library_name(item) == target_library
-        ]
+        persisted_locations = self._repository.load_tagged_locations(library_name=target_library)
+        persisted_memories = self._repository.load_semantic_memories(library_name=target_library)
+        persisted_instances = self._repository.load_semantic_instances(library_name=target_library)
+        persisted_events = self._repository.load_observation_events(library_name=target_library)
+        persisted_scene_spaces = self._repository.load_scene_spaces(library_name=target_library)
+        persisted_trajectory_events = self._repository.load_navigation_trajectory_events(library_name=target_library)
+        persisted_graph_relations = self._repository.load_semantic_graph_relations(library_name=target_library)
+        persisted_summary_nodes = self._repository.load_semantic_summary_nodes(library_name=target_library)
 
         for location in persisted_locations:
             self._tagged_locations_by_id[location.location_id] = location
@@ -4861,14 +5031,7 @@ class MemoryService:
                     retrieval_text=str(task["retrieval_text"]),
                     image_bytes=image_bytes,
                 )
-                self._vector_store.upsert_point(
-                    point_id=str(task["point_id"]),
-                    collection_name=str(task["collection_name"]),
-                    record_kind=str(task["record_kind"]),
-                    payload=task["payload"],  # type: ignore[arg-type]
-                    vectors=vectors,
-                    updated_at=str(task["updated_at"]),
-                )
+                self._commit_vectorization_result(task, vectors)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("后台向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
             finally:
@@ -4911,16 +5074,32 @@ class MemoryService:
             "artifact_ids": artifact_ids,
             "updated_at": updated_at,
             "payload": payload,
+            "expected_library_name": self._active_library_name,
         }
+        scope = self._observation_write_scope()
+        if scope is not None:
+            task["expected_library_name"] = scope["library_name"]
+            scope["vector_tasks"].append(task)
+            return
+        self._dispatch_vectorization_task(task)
+
+    def _dispatch_vectorization_task(self, task: Dict[str, object]) -> None:
+        """仅调度仍属于当前库的任务，执行向量计算时不持有实例锁。"""
+        expected_library = task.get("expected_library_name")
+        with self._instances_lock:
+            if expected_library is not None and (
+                not self.is_enabled() or self._active_library_name != expected_library
+            ):
+                return
         if self._vectorization_worker is None or not self._vectorization_worker.is_alive():
             self._run_vectorization_task_sync(task)
             return
         try:
             self._vectorization_queue.put_nowait(task)
         except queue.Full:
-            LOGGER.warning("向量化队列已满，标记待处理 point_id=%s", point_id)
+            LOGGER.warning("向量化队列已满，标记待处理 point_id=%s", task["point_id"])
             # 标记为 pending，后续 worker 空闲时补充
-            self._mark_pending_vectorization(point_id, task)
+            self._mark_pending_vectorization(str(task["point_id"]), task)
             return  # 不阻塞调用方
 
     def _mark_pending_vectorization(self, point_id: str, task: Dict[str, object]) -> None:
@@ -4936,19 +5115,39 @@ class MemoryService:
                 retrieval_text=str(task["retrieval_text"]),
                 image_bytes=image_bytes,
             )
-            self._vector_store.upsert_point(
-                point_id=str(task["point_id"]),
-                collection_name=str(task["collection_name"]),
-                record_kind=str(task["record_kind"]),
-                payload=task["payload"],  # type: ignore[arg-type]
-                vectors=vectors,
-                updated_at=str(task["updated_at"]),
-            )
+            self._commit_vectorization_result(task, vectors)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("同步向量化任务失败，已跳过 point_id=%s: %s", task.get("point_id"), exc)
 
+    def _commit_vectorization_result(self, task: Dict[str, object], vectors: Dict[str, NamedVector]) -> None:
+        """生成完成后再验证库身份，旧任务不能在切库清理后回灌当前向量缓存。"""
+        expected_library = task.get("expected_library_name")
+        with self._instances_lock:
+            if expected_library is not None and (
+                not self.is_enabled() or self._active_library_name != expected_library
+            ):
+                return
+            self._vector_store.upsert_point(
+                point_id=str(task["point_id"]), collection_name=str(task["collection_name"]),
+                record_kind=str(task["record_kind"]), payload=task["payload"],
+                vectors=vectors, updated_at=str(task["updated_at"]),
+            )
+
     def _upsert_vector_point_for_scene_space(self, scene_space: SceneSpace) -> None:
         payload = self._build_scene_space_payload(scene_space)
+        if self._observation_write_scope() is not None:
+            self._vector_store.upsert_point(
+                point_id=scene_space.scene_space_id, collection_name=SCENE_SPACES_COLLECTION,
+                record_kind=MemoryRecordKind.SCENE_SPACE.value, payload=payload, vectors={},
+                updated_at=(scene_space.semantic_updated_at or scene_space.timestamp).isoformat(),
+            )
+            self._enqueue_vectorization(
+                point_id=scene_space.scene_space_id, collection_name=SCENE_SPACES_COLLECTION,
+                record_kind=MemoryRecordKind.SCENE_SPACE.value, payload=payload,
+                retrieval_text=str(payload["retrieval_text"]), artifact_ids=self._scene_space_artifact_ids(scene_space),
+                updated_at=(scene_space.semantic_updated_at or scene_space.timestamp).isoformat(),
+            )
+            return
         image_bytes = self._load_primary_image_bytes(self._scene_space_artifact_ids(scene_space))
         vectors = self._build_named_vectors(
             retrieval_text=str(payload["retrieval_text"]),
@@ -5821,7 +6020,7 @@ class MemoryService:
         *,
         map_name: Optional[str] = None,
     ) -> SemanticMapBuildResult:
-        active_session = self._localization_service.get_active_session()
+        active_session = self._observation_localization_session()
         active_session_id = active_session.session_id if active_session is not None else None
         resolved_map_name = self._resolve_stable_map_name(
             map_name=map_name,
@@ -6173,20 +6372,10 @@ class MemoryService:
             )
             self._semantic_instances_by_id = dict(updated_instances)
         linked_instance_ids: List[str] = []
-        for projected_item, outcome in zip(projected, outcomes):
+        for _projected_item, outcome in zip(projected, outcomes):
             projection_metadata = dict(outcome.instance.metadata)
-            projection_metadata.update(
-                {
-                    "projection_method": str(projected_item.attributes.get("projection_method") or ""),
-                    "projection_confidence": self._coerce_optional_float(
-                        projected_item.attributes.get("projection_confidence")
-                    ),
-                    "support_point_count": self._coerce_optional_int(
-                        projected_item.attributes.get("support_point_count")
-                    )
-                    or 0,
-                }
-            )
+            # 关联可能保留历史可靠坐标，其质量证据必须与最终坐标保持一致。
+            # 当前帧退化信息由观察事件单独保存，不能覆盖实例已选中的投影证据。
             platform_metadata = self._build_platform_semantic_metadata(
                 map_snapshot=map_snapshot,
                 localization_snapshot=localization_snapshot,

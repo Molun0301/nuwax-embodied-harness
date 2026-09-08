@@ -21,6 +21,17 @@ def decode_image_frame_to_bgr(image_frame: ImageFrame) -> np.ndarray:
         decoded = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
         if decoded is None:
             raise GatewayError("图像解码失败，无法生成 BGR 帧。")
+        if decoded.shape[:2] != (image_frame.height_px, image_frame.width_px):
+            raise GatewayError(
+                "压缩图像实际尺寸与图像帧声明不一致，无法保证检测坐标正确。",
+                error_code="image_dimensions_mismatch",
+                details={
+                    "declared_width_px": image_frame.width_px,
+                    "declared_height_px": image_frame.height_px,
+                    "decoded_width_px": int(decoded.shape[1]),
+                    "decoded_height_px": int(decoded.shape[0]),
+                },
+            )
         return decoded
 
     if image_frame.encoding == ImageEncoding.BGR8:

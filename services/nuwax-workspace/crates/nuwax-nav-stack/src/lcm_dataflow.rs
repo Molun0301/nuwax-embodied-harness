@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(feature = "guard-runtime")]
 use std::time::Instant;
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use nuwax_codec::lcm::schema;
 #[cfg(feature = "patrolling")]
 use nuwax_nav_types_messages::GridSnapshot;
@@ -37,7 +37,12 @@ use nuwax_nav_types_messages::Path2D;
     feature = "explore"
 ))]
 use nuwax_nav_types_messages::Point2;
-#[cfg(any(feature = "simple-2d", feature = "cmu-native", feature = "explore"))]
+#[cfg(any(
+    feature = "simple-2d",
+    feature = "cmu-native",
+    feature = "explore",
+    feature = "mls"
+))]
 use nuwax_nav_types_messages::PointCloud;
 #[cfg(feature = "simple-2d")]
 use nuwax_nav_types_messages::PointStamped;
@@ -67,6 +72,12 @@ use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder};
 use nuwax_transport::{LcmFrameStream, LcmTransport, TransportResult};
 use tokio::sync::oneshot;
+
+#[cfg(feature = "mls")]
+#[path = "surface_dataflow.rs"]
+mod surface_dataflow;
+#[cfg(feature = "mls")]
+pub(crate) use surface_dataflow::register_surface_owners;
 
 use crate::error::{NavStackError, NavStackResult};
 use crate::graph::ModuleNode;
@@ -348,22 +359,24 @@ pub(crate) fn native_planner_readiness(
     })
 }
 
+fn build_body_frame(channel: &str, type_name: &str, body: Vec<u8>) -> NavStackResult<RawLcmFrame> {
+    let topic =
+        protocol_topic(channel).map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
+    let message_type = LcmMessageType::new(type_name)
+        .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
+    Ok(RawLcmFrameBuilder::new(topic, message_type)
+        .payload(body)
+        .build())
+}
+
 async fn publish_body(
     transport: &LcmTransport,
     channel: &str,
     type_name: &str,
     body: Vec<u8>,
 ) -> NavStackResult<()> {
-    let topic =
-        protocol_topic(channel).map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
-    let message_type = LcmMessageType::new(type_name)
-        .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
     transport
-        .publish(
-            RawLcmFrameBuilder::new(topic, message_type)
-                .payload(body)
-                .build(),
-        )
+        .publish(build_body_frame(channel, type_name, body)?)
         .await
         .map_err(|error| NavStackError::Internal(format!("publish {channel}: {error}")))
 }
@@ -648,6 +661,26 @@ fn discard_pending_odometry_through(
 }
 
 #[cfg(feature = "guard-runtime")]
+const MAX_REPLACEABLE_POSE_BATCH: usize = 64;
+
+#[cfg(feature = "guard-runtime")]
+fn retain_newest_map_pose(
+    newest: &mut Option<crate::map_pose::MapPoseObservation>,
+    candidate: crate::map_pose::MapPoseObservation,
+) -> NavStackResult<()> {
+    let stamp = lcm_header_timestamp_ns(&candidate.pose.header, "map_pose_adapter.output")?;
+    let current = newest
+        .as_ref()
+        .map(|value| lcm_header_timestamp_ns(&value.pose.header, "map_pose_adapter.output"))
+        .transpose()?
+        .unwrap_or(0);
+    if stamp > current {
+        *newest = Some(candidate);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "guard-runtime")]
 async fn run_map_pose_adapter(
     node: ModuleNode,
     mut shutdown: oneshot::Receiver<()>,
@@ -662,6 +695,9 @@ async fn run_map_pose_adapter(
         configured_frame_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link")?,
     )
     .map_err(|error| module_error("map_pose_adapter", error))?;
+    if node.feature_gate.as_deref() == Some("mls") {
+        adapter = adapter.require_body_reference();
+    }
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut pending_odometry: Option<Box<schema::Odometry>> = None;
     let mut last_published_timestamp_ns = None;
@@ -671,66 +707,77 @@ async fn run_map_pose_adapter(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             message = transforms.next() => {
-                let frame = required_frame(message, "map_pose_adapter.tf")?;
-                match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
-                    OwnerInput::Accepted(Some(observed)) => {
-                        discard_pending_odometry_through(&mut pending_odometry, &observed)?;
-                        publish_map_pose_observation(
-                            &transport,
-                            &node.outputs[0],
-                            &mut last_published_timestamp_ns,
-                            &mut diagnostics,
-                            observed,
-                        ).await?;
-                    }
-                    OwnerInput::Accepted(None) => {
-                        if let Some(odometry) = pending_odometry.take() {
-                            match transform_map_pose_odometry(&adapter, *odometry)? {
-                                MapPoseOdometryIngress::Accepted(observed) => {
-                                    publish_map_pose_observation(
-                                        &transport,
-                                        &node.outputs[0],
-                                        &mut last_published_timestamp_ns,
-                                        &mut diagnostics,
-                                        observed,
-                                    ).await?;
-                                }
-                                MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
-                                    pending_odometry = Some(odometry);
-                                    diagnostics.reject("map_pose_adapter.odometry", &reason);
-                                }
-                                MapPoseOdometryIngress::Rejected(reason) => {
-                                    diagnostics.reject("map_pose_adapter.odometry", &reason);
+                let mut next = message;
+                let mut newest = None;
+                for index in 0..MAX_REPLACEABLE_POSE_BATCH {
+                    let frame = required_frame(next, "map_pose_adapter.tf")?;
+                    match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
+                        OwnerInput::Accepted(Some(observed)) => {
+                            discard_pending_odometry_through(&mut pending_odometry, &observed)?;
+                            retain_newest_map_pose(&mut newest, observed)?;
+                        }
+                        OwnerInput::Accepted(None) => {
+                            if let Some(odometry) = pending_odometry.take() {
+                                match transform_map_pose_odometry(&adapter, *odometry)? {
+                                    MapPoseOdometryIngress::Accepted(observed) => {
+                                        retain_newest_map_pose(&mut newest, observed)?;
+                                    }
+                                    MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
+                                        pending_odometry = Some(odometry);
+                                        diagnostics.reject("map_pose_adapter.odometry", &reason);
+                                    }
+                                    MapPoseOdometryIngress::Rejected(reason) => {
+                                        diagnostics.reject("map_pose_adapter.odometry", &reason);
+                                    }
                                 }
                             }
                         }
+                        OwnerInput::Rejected(reason) => diagnostics.reject("map_pose_adapter.tf", &reason),
                     }
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("map_pose_adapter.tf", &reason);
+                    if index + 1 == MAX_REPLACEABLE_POSE_BATCH { break; }
+                    match transforms.next().now_or_never() {
+                        Some(message) => next = message,
+                        None => break,
                     }
+                }
+                if let Some(observed) = newest {
+                    publish_map_pose_observation(&transport, &node.outputs[0],
+                        &mut last_published_timestamp_ns, &mut diagnostics, observed).await?;
                 }
             }
             message = odometry.next() => {
-                let frame = required_frame(message, "map_pose_adapter.odometry")?;
-                match ingest_map_pose_odometry(&adapter, &frame.payload)? {
-                    MapPoseOdometryIngress::Accepted(observed) => {
-                        pending_odometry = None;
-                        publish_map_pose_observation(
-                            &transport,
-                            &node.outputs[0],
-                            &mut last_published_timestamp_ns,
-                            &mut diagnostics,
-                            observed,
-                        ).await?;
+                let mut next = message;
+                let mut newest = None;
+                for index in 0..MAX_REPLACEABLE_POSE_BATCH {
+                    let frame = required_frame(next, "map_pose_adapter.odometry")?;
+                    match ingest_map_pose_odometry(&adapter, &frame.payload)? {
+                        MapPoseOdometryIngress::Accepted(observed) => {
+                            discard_pending_odometry_through(&mut pending_odometry, &observed)?;
+                            retain_newest_map_pose(&mut newest, observed)?;
+                        }
+                        MapPoseOdometryIngress::AwaitingTransform(candidate, reason) => {
+                            let candidate_stamp = lcm_header_timestamp_ns(&candidate.header, "map_pose_adapter.odometry")?;
+                            let pending_stamp = pending_odometry.as_ref()
+                                .map(|pending| lcm_header_timestamp_ns(&pending.header, "map_pose_adapter.pending"))
+                                .transpose()?.unwrap_or(0);
+                            if candidate_stamp > pending_stamp {
+                                pending_odometry = Some(candidate);
+                            }
+                            diagnostics.reject("map_pose_adapter.odometry", &reason);
+                        }
+                        MapPoseOdometryIngress::Rejected(reason) => {
+                            diagnostics.reject("map_pose_adapter.odometry", &reason);
+                        }
                     }
-                    MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
-                        pending_odometry = Some(odometry);
-                        diagnostics.reject("map_pose_adapter.odometry", &reason);
+                    if index + 1 == MAX_REPLACEABLE_POSE_BATCH { break; }
+                    match odometry.next().now_or_never() {
+                        Some(message) => next = message,
+                        None => break,
                     }
-                    MapPoseOdometryIngress::Rejected(reason) => {
-                        pending_odometry = None;
-                        diagnostics.reject("map_pose_adapter.odometry", &reason);
-                    }
+                }
+                if let Some(observed) = newest {
+                    publish_map_pose_observation(&transport, &node.outputs[0],
+                        &mut last_published_timestamp_ns, &mut diagnostics, observed).await?;
                 }
             }
         }
@@ -804,6 +851,10 @@ struct GuardedNavTelemetry {
     pose_frame: String,
     goal: [f64; 3],
     current: [f64; 3],
+    // 旧线格式的第三项仍为yaw；三维高度在内部独立保留用于真实进度。
+    current_z: f64,
+    goal_z: f64,
+    surface_navigation: bool,
     initial_distance: f64,
     progress: f64,
     path_revision: i64,
@@ -919,6 +970,97 @@ struct GuardedPoseInput {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn drain_guarded_pose_input(
+    first: Option<TransportResult<RawLcmFrame>>,
+    poses: &mut LcmFrameStream,
+    diagnostics: &mut InputDiagnosticLimiter,
+    source_max_age: Option<Duration>,
+) -> NavStackResult<Option<GuardedPoseInput>> {
+    let wall_now = std::time::SystemTime::now();
+    let mono_now = tokio::time::Instant::now();
+    let mut next = first;
+    let mut newest: Option<GuardedPoseInput> = None;
+    for index in 0..MAX_REPLACEABLE_POSE_BATCH {
+        let frame = required_frame(next, "guarded_nav_scheduler.map_pose")?;
+        match decode_guarded_pose_input(&frame.payload)? {
+            OwnerInput::Accepted(candidate) => {
+                let valid = source_max_age
+                    .map(|maximum| {
+                        guarded_pose_source_deadline(
+                            candidate.pose.stamp.nanos,
+                            maximum,
+                            wall_now,
+                            mono_now,
+                        )
+                    })
+                    .transpose();
+                if let Err(reason) = valid {
+                    diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
+                } else if newest
+                    .as_ref()
+                    .is_none_or(|value| candidate.pose.stamp.nanos > value.pose.stamp.nanos)
+                {
+                    newest = Some(candidate);
+                }
+            }
+            OwnerInput::Rejected(reason) => {
+                diagnostics.reject("guarded_nav_scheduler.map_pose", &reason)
+            }
+        }
+        if index + 1 == MAX_REPLACEABLE_POSE_BATCH {
+            break;
+        }
+        match poses.next().now_or_never() {
+            Some(message) => next = message,
+            None => break,
+        }
+    }
+    Ok(newest)
+}
+
+#[cfg(feature = "guard-runtime")]
+fn configured_pose_source_max_age() -> NavStackResult<Duration> {
+    let raw = std::env::var("NUWAX_GEOMETRY_ODOM_MAX_AGE_SEC").unwrap_or_else(|_| "0.5".into());
+    let seconds: f64 = raw.parse().map_err(|_| {
+        NavStackError::InvalidConfig("NUWAX_GEOMETRY_ODOM_MAX_AGE_SEC必须为正有限秒数".into())
+    })?;
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| {
+            NavStackError::InvalidConfig("NUWAX_GEOMETRY_ODOM_MAX_AGE_SEC必须为正有限秒数".into())
+        })
+}
+
+#[cfg(feature = "guard-runtime")]
+fn guarded_pose_source_deadline(
+    source_timestamp_ns: i64,
+    max_age: Duration,
+    wall_now: std::time::SystemTime,
+    mono_now: tokio::time::Instant,
+) -> Result<tokio::time::Instant, String> {
+    let unix_now = wall_now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "当前墙钟早于Unix纪元".to_string())?;
+    let source = u64::try_from(source_timestamp_ns)
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Duration::from_nanos)
+        .ok_or_else(|| "位姿源时间必须为正".to_string())?;
+    if source > unix_now + Duration::from_millis(50) {
+        return Err("位姿源时间超前当前墙钟超过50毫秒".into());
+    }
+    let age = unix_now.saturating_sub(source);
+    let remaining = max_age
+        .checked_sub(age)
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| format!("位姿原始采样已过期：{}毫秒", age.as_millis()))?;
+    mono_now
+        .checked_add(remaining)
+        .ok_or_else(|| "位姿有效期限溢出".into())
+}
+
+#[cfg(feature = "guard-runtime")]
 fn decode_guarded_pose_input(payload: &[u8]) -> OwnerInputResult<GuardedPoseInput> {
     let pose_message =
         match schema::decode_pose_stamped(&prefixed(schema::POSE_STAMPED_FINGERPRINT, payload)) {
@@ -970,6 +1112,7 @@ fn commit_guarded_pose_telemetry(telemetry: &mut GuardedNavTelemetry, input: &Gu
     telemetry.map_frame = input.frame_id.clone();
     telemetry.pose_frame = input.frame_id.clone();
     telemetry.current = input.current;
+    telemetry.current_z = input.pose.pose.position.z;
     update_progress(telemetry);
 }
 
@@ -1015,24 +1158,14 @@ fn decode_guarded_costmap_input(payload: &[u8]) -> OwnerInputResult<GuardedCostm
             Ok(timestamp) => timestamp,
             Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
         };
-    let mut costmap = match decode_astar_costmap(payload) {
+    let costmap = match decode_astar_costmap(payload) {
         Ok(costmap) => costmap,
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
-    // The simple global planner can route to frontier goals through unknown
-    // space. Keep the guarded local controller on the same occupancy policy so
-    // UNKNOWN cells do not turn a valid exploration path into an immediate hold.
-    use nuwax_nav_astar::navigation_map::{FREE, UNKNOWN};
-    for y in 0..costmap.height() {
-        for x in 0..costmap.width() {
-            if costmap.get(x, y) == UNKNOWN {
-                costmap.set(x, y, FREE);
-            }
-        }
-    }
+    // 探索目标位于已知自由区，局部执行保留未知格的不可通行语义。
     Ok(OwnerInput::Accepted(GuardedCostmapInput {
         observation: nuwax_nav_runtime::CostmapObservation {
-            costmap,
+            costmap: nuwax_nav_runtime::ExecutionMap::Planar(costmap),
             source_timestamp_ns,
         },
         map_frame: grid.header.frame_id,
@@ -1104,6 +1237,7 @@ async fn run_guarded_nav_scheduler(
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
+    let source_max_age = configured_pose_source_max_age()?;
     let transport = lcm_transport()?;
     let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
     let poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
@@ -1122,7 +1256,17 @@ async fn run_guarded_nav_scheduler(
     signal_ready(ready)?;
 
     let loop_future = run_guarded_nav_loop(
-        &node, &transport, &scheduler, shutdown, goals, poses, paths, costmaps, cancels, status,
+        &node,
+        &transport,
+        &scheduler,
+        shutdown,
+        goals,
+        poses,
+        paths,
+        costmaps,
+        cancels,
+        status,
+        Some(source_max_age),
     );
     let task_future = async move {
         task.await
@@ -1173,9 +1317,55 @@ impl GuardedNavSource {
 }
 
 #[cfg(feature = "guard-runtime")]
+enum GuardedMapFrame {
+    Planar(RawLcmFrame),
+    #[cfg(feature = "mls")]
+    Surface(surface_dataflow::PreparedSurfaceMap),
+}
+
+#[cfg(feature = "guard-runtime")]
+impl From<RawLcmFrame> for GuardedMapFrame {
+    fn from(frame: RawLcmFrame) -> Self {
+        Self::Planar(frame)
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuardedMapAuthority {
+    committed_map: schema::CommittedMapIdentity,
+    producer_runtime_generation: i64,
+    map_frame_generation: i64,
+    cloud_revision: i64,
+    commit_boot_nonce: [u8; 16],
+}
+
+#[cfg(feature = "guard-runtime")]
+impl GuardedMapAuthority {
+    fn same_domain(&self, other: &Self) -> bool {
+        self.producer_runtime_generation == other.producer_runtime_generation
+            && self.committed_map.session_id == other.committed_map.session_id
+            && self.committed_map.session_generation == other.committed_map.session_generation
+            && self.committed_map.frame_id == other.committed_map.frame_id
+            && self.map_frame_generation == other.map_frame_generation
+            && self.commit_boot_nonce == other.commit_boot_nonce
+    }
+
+    fn permits_goal(&self, goal: &schema::GoalEnvelope) -> bool {
+        self.producer_runtime_generation == goal.producer_runtime_generation
+            && self.committed_map.session_id == goal.committed_map_session_id
+            && self.committed_map.session_generation == goal.committed_map_session_generation
+            && self.committed_map.frame_id == goal.committed_map_frame_id
+            && self.committed_map.revision >= goal.committed_map_revision
+            && (self.committed_map.revision != goal.committed_map_revision
+                || self.committed_map.payload_sha256 == goal.committed_map_payload_sha256)
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 enum GuardedNavEvent {
     Pose(Option<TransportResult<RawLcmFrame>>),
-    Costmap(Option<TransportResult<RawLcmFrame>>),
+    Costmap(Option<TransportResult<GuardedMapFrame>>),
     Status(Result<(), tokio::sync::watch::error::RecvError>),
     Goal(Option<TransportResult<RawLcmFrame>>),
     Path(Option<TransportResult<RawLcmFrame>>),
@@ -1233,21 +1423,25 @@ impl GuardedNavArbiter {
 }
 
 #[cfg(feature = "guard-runtime")]
-fn scan_guarded_nav_event(
+fn scan_guarded_nav_event<M, T>(
     arbiter: &GuardedNavArbiter,
     goals: &mut LcmFrameStream,
     poses: &mut LcmFrameStream,
     paths: &mut LcmFrameStream,
-    costmaps: &mut LcmFrameStream,
+    costmaps: &mut M,
     cancels: &mut LcmFrameStream,
     status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
-) -> Option<GuardedNavEvent> {
+) -> Option<GuardedNavEvent>
+where
+    M: Stream<Item = TransportResult<T>> + Unpin,
+    T: Into<GuardedMapFrame>,
+{
     for offset in 0..GuardedNavSource::ORDER.len() {
         let event = match arbiter.source_at(offset) {
             GuardedNavSource::Pose => poses.next().now_or_never().map(GuardedNavEvent::Pose),
-            GuardedNavSource::Costmap => {
-                costmaps.next().now_or_never().map(GuardedNavEvent::Costmap)
-            }
+            GuardedNavSource::Costmap => costmaps.next().now_or_never().map(|message| {
+                GuardedNavEvent::Costmap(message.map(|frame| frame.map(Into::into)))
+            }),
             GuardedNavSource::Status => {
                 status.changed().now_or_never().map(GuardedNavEvent::Status)
             }
@@ -1263,17 +1457,21 @@ fn scan_guarded_nav_event(
 }
 
 #[cfg(feature = "guard-runtime")]
-async fn wait_guarded_nav_event(
+async fn wait_guarded_nav_event<M, T>(
     goals: &mut LcmFrameStream,
     poses: &mut LcmFrameStream,
     paths: &mut LcmFrameStream,
-    costmaps: &mut LcmFrameStream,
+    costmaps: &mut M,
     cancels: &mut LcmFrameStream,
     status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
-) -> GuardedNavEvent {
+) -> GuardedNavEvent
+where
+    M: Stream<Item = TransportResult<T>> + Unpin,
+    T: Into<GuardedMapFrame>,
+{
     tokio::select! {
         message = poses.next() => GuardedNavEvent::Pose(message),
-        message = costmaps.next() => GuardedNavEvent::Costmap(message),
+        message = costmaps.next() => GuardedNavEvent::Costmap(message.map(|frame| frame.map(Into::into))),
         changed = status.changed() => GuardedNavEvent::Status(changed),
         message = goals.next() => GuardedNavEvent::Goal(message),
         message = paths.next() => GuardedNavEvent::Path(message),
@@ -1291,7 +1489,7 @@ fn guarded_nav_shutdown_requested(shutdown: &mut oneshot::Receiver<()>) -> bool 
 
 #[cfg(feature = "guard-runtime")]
 #[allow(clippy::too_many_arguments)]
-async fn run_guarded_nav_loop(
+async fn run_guarded_nav_loop<M, T>(
     node: &ModuleNode,
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
@@ -1299,21 +1497,27 @@ async fn run_guarded_nav_loop(
     mut goals: LcmFrameStream,
     mut poses: LcmFrameStream,
     mut paths: LcmFrameStream,
-    mut costmaps: LcmFrameStream,
+    mut costmaps: M,
     mut cancels: LcmFrameStream,
     mut status: tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
-) -> NavStackResult<()> {
+    source_max_age: Option<Duration>,
+) -> NavStackResult<()>
+where
+    M: Stream<Item = TransportResult<T>> + Unpin + Send,
+    T: Into<GuardedMapFrame> + Send,
+{
     let process_runtime_generation = runtime_generation();
     let authoritative_planner_generation = saturating_i64(process_runtime_generation);
     let mut telemetry = GuardedNavTelemetry {
         runtime_generation: process_runtime_generation,
+        surface_navigation: node.id == "surface_nav_scheduler",
         ..GuardedNavTelemetry::default()
     };
     let mut active_session: Option<schema::GoalEnvelope> = None;
     let mut accepted_planner_generation: Option<([u8; 32], i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
-    let mut applied_commands = 0_u64;
-    let mut last_zero_ack_id: Option<String> = None;
+    let mut surface_authority: Option<GuardedMapAuthority> = None;
+    let mut publications = GuardedStatusPublications::default();
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut last_cancel_terminal: Option<GuardedCancelTerminal> = None;
     // This watermark rejects generation rollback but never grants replay or
@@ -1321,12 +1525,13 @@ async fn run_guarded_nav_loop(
     // and terminal goal records.
     let mut cancel_generation_watermark: Option<GuardedCancelGenerationWatermark> = None;
     let initial_status = status.borrow().clone();
-    publish_guarded_nav_state(
+    publish_guarded_nav_observation(
         transport,
-        &node.outputs[1],
+        node,
         initial_status,
         &telemetry,
         None,
+        &mut publications,
     )
     .await?;
 
@@ -1367,27 +1572,13 @@ async fn run_guarded_nav_loop(
                     NavStackError::Internal("guard scheduler status stream closed".into())
                 })?;
                 let snapshot = status.borrow().clone();
-                if snapshot.applied_commands > applied_commands {
-                    if let Some(twist) = snapshot.last_applied_twist {
-                        publish_twist2(transport, &node.outputs[0], twist).await?;
-                    }
-                    applied_commands = snapshot.applied_commands;
-                }
-                if snapshot.last_zero_ack_id != last_zero_ack_id {
-                    if snapshot.last_zero_ack_id.is_some() {
-                        publish_twist2(transport, &node.outputs[0], Twist2::ZERO).await?;
-                    }
-                    last_zero_ack_id = snapshot.last_zero_ack_id.clone();
-                }
-                if snapshot.last_terminal == Some(nuwax_nav_runtime::TerminalOutcome::Succeeded) {
-                    publish_bool(transport, &node.outputs[2], true).await?;
-                }
-                publish_guarded_nav_state(
+                publish_guarded_nav_observation(
                     transport,
-                    &node.outputs[1],
+                    node,
                     snapshot.clone(),
                     &telemetry,
                     None,
+                    &mut publications,
                 )
                 .await?;
                 clear_terminal_session_after_publication(
@@ -1397,17 +1588,42 @@ async fn run_guarded_nav_loop(
                 );
             }
             GuardedNavEvent::Pose(message) => {
-                let frame = required_frame(message, "guarded_nav_scheduler.map_pose")?;
-                let input = match decode_guarded_pose_input(&frame.payload)? {
-                    OwnerInput::Accepted(input) => input,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
-                        continue;
+                let Some(input) = drain_guarded_pose_input(
+                    message,
+                    &mut poses,
+                    &mut diagnostics,
+                    source_max_age,
+                )?
+                else {
+                    continue;
+                };
+                let source_deadline = if let Some(max_age) = source_max_age {
+                    match guarded_pose_source_deadline(
+                        input.pose.stamp.nanos,
+                        max_age,
+                        std::time::SystemTime::now(),
+                        tokio::time::Instant::now(),
+                    ) {
+                        Ok(deadline) => Some(deadline),
+                        Err(reason) => {
+                            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
+                            continue;
+                        }
                     }
+                } else {
+                    None
                 };
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
-                if let Err(error) = scheduler.update_odometry(input.pose).await {
+                let result = match source_deadline {
+                    Some(deadline) => {
+                        scheduler
+                            .update_odometry_with_deadline(input.pose, deadline)
+                            .await
+                    }
+                    None => scheduler.update_odometry(input.pose).await,
+                };
+                if let Err(error) = result {
                     match runtime_input_error::<()>("guarded_nav_scheduler.map_pose", error)? {
                         OwnerInput::Rejected(reason) => {
                             diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
@@ -1428,16 +1644,18 @@ async fn run_guarded_nav_loop(
                         &mut active_session,
                         &mut goal_buffer,
                         *goal,
+                        surface_authority.as_ref(),
                     )
                     .await?;
                 }
                 let snapshot = scheduler.status();
-                publish_guarded_nav_state(
+                publish_guarded_nav_observation(
                     transport,
-                    &node.outputs[1],
+                    node,
                     snapshot.clone(),
                     &telemetry,
                     Some(snapshot.planner_inputs_fresh),
+                    &mut publications,
                 )
                 .await?;
                 clear_terminal_session_after_publication(
@@ -1447,8 +1665,78 @@ async fn run_guarded_nav_loop(
                 );
             }
             GuardedNavEvent::Costmap(message) => {
-                let frame = required_frame(message, "guarded_nav_scheduler.costmap")?;
-                let input = match decode_guarded_costmap_input(&frame.payload)? {
+                let frame = message
+                    .ok_or_else(|| NavStackError::Internal("guarded map stream closed".into()))?
+                    .map_err(|error| module_error("guarded map input", error))?;
+                let (decoded, received_at) = match frame {
+                    GuardedMapFrame::Planar(frame) => {
+                        (decode_guarded_costmap_input(&frame.payload)?, None)
+                    }
+                    #[cfg(feature = "mls")]
+                    GuardedMapFrame::Surface(update) => {
+                        let changed_domain = surface_authority
+                            .as_ref()
+                            .is_some_and(|previous| !previous.same_domain(&update.authority));
+                        if changed_domain || update.snapshot.is_err() {
+                            scheduler
+                                .invalidate_map_received(
+                                    update
+                                        .snapshot
+                                        .as_ref()
+                                        .err()
+                                        .cloned()
+                                        .unwrap_or_else(|| "surface map domain changed".into()),
+                                    tokio::time::Instant::from_std(update.received_at),
+                                )
+                                .await
+                                .map_err(|error| module_error("surface map invalidation", error))?;
+                            goal_buffer.costmap_observed = false;
+                            goal_buffer.active_goal_sha256 = None;
+                            if update.snapshot.is_err()
+                                || !goal_buffer
+                                    .pending_goal
+                                    .as_ref()
+                                    .is_some_and(|pending| update.authority.permits_goal(pending))
+                            {
+                                goal_buffer.pending_goal = None;
+                            }
+                            let snapshot = scheduler.status();
+                            publish_guarded_nav_observation(
+                                transport,
+                                node,
+                                snapshot.clone(),
+                                &telemetry,
+                                Some(false),
+                                &mut publications,
+                            )
+                            .await?;
+                            clear_terminal_session_after_publication(
+                                &mut active_session,
+                                &mut telemetry,
+                                &snapshot,
+                            );
+                        }
+                        surface_authority = Some(update.authority.clone());
+                        let surface = match update.snapshot {
+                            Ok(surface) => surface,
+                            Err(reason) => {
+                                diagnostics.reject("surface map", &reason);
+                                continue;
+                            }
+                        };
+                        (
+                            OwnerInput::Accepted(GuardedCostmapInput {
+                                map_frame: update.authority.committed_map.frame_id.clone(),
+                                observation: nuwax_nav_runtime::CostmapObservation {
+                                    costmap: nuwax_nav_runtime::ExecutionMap::Surface(surface),
+                                    source_timestamp_ns: update.source_timestamp_ns,
+                                },
+                            }),
+                            Some(update.received_at),
+                        )
+                    }
+                };
+                let input = match decoded {
                     OwnerInput::Accepted(input) => input,
                     OwnerInput::Rejected(reason) => {
                         diagnostics.reject("guarded_nav_scheduler.costmap", &reason);
@@ -1458,7 +1746,13 @@ async fn run_guarded_nav_loop(
                 // 保留活动会话；只有显式替换目标才能抢占。
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
-                if let Err(error) = scheduler.update_costmap(input.observation).await {
+                if let Err(error) = scheduler
+                    .update_costmap_received(
+                        input.observation,
+                        tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now)),
+                    )
+                    .await
+                {
                     match runtime_input_error::<()>("guarded_nav_scheduler.costmap", error)? {
                         OwnerInput::Rejected(reason) => {
                             diagnostics.reject("guarded_nav_scheduler.costmap", &reason);
@@ -1480,16 +1774,18 @@ async fn run_guarded_nav_loop(
                         &mut active_session,
                         &mut goal_buffer,
                         *goal,
+                        surface_authority.as_ref(),
                     )
                     .await?;
                 }
                 let snapshot = scheduler.status();
-                publish_guarded_nav_state(
+                publish_guarded_nav_observation(
                     transport,
-                    &node.outputs[1],
+                    node,
                     snapshot.clone(),
                     &telemetry,
                     Some(snapshot.planner_inputs_fresh),
+                    &mut publications,
                 )
                 .await?;
                 clear_terminal_session_after_publication(
@@ -1545,12 +1841,13 @@ async fn run_guarded_nav_loop(
                         )
                         .await?
                         {
-                            publish_guarded_nav_state(
+                            publish_guarded_nav_observation(
                                 transport,
-                                &node.outputs[1],
+                                node,
                                 scheduler.status(),
                                 &telemetry,
                                 None,
+                                &mut publications,
                             )
                             .await?;
                         }
@@ -1577,6 +1874,7 @@ async fn run_guarded_nav_loop(
                     &mut active_session,
                     &mut goal_buffer,
                     goal_envelope,
+                    surface_authority.as_ref(),
                 )
                 .await?;
             }
@@ -1664,7 +1962,10 @@ async fn run_guarded_nav_loop(
                     .await?;
                     continue;
                 }
-                let path = match path_from_schema(&path_envelope.path) {
+                let path = match execution_path_from_schema(
+                    &path_envelope.path,
+                    node.id == "surface_nav_scheduler",
+                ) {
                     Ok(path) => path,
                     Err(error) => {
                         publish_guarded_rejection(
@@ -1679,21 +1980,6 @@ async fn run_guarded_nav_loop(
                         continue;
                     }
                 };
-                if path.frame_id != NavFrameId::Map {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "path",
-                        &format!(
-                            "scheduler path frame must be map, got {}",
-                            path.frame_id.as_str()
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
                 let result = scheduler
                     .submit_path(nuwax_nav_runtime::VersionedPath {
                         session_id: path_envelope.session_id.clone(),
@@ -1701,6 +1987,21 @@ async fn run_guarded_nav_loop(
                         path_revision: u64::try_from(path_envelope.path_revision)
                             .expect("validated positive path revision"),
                         payload_hash: path_envelope.path_payload_sha256,
+                        path_yaws: if node.id == "surface_nav_scheduler" {
+                            None
+                        } else {
+                            Some(
+                                path_envelope
+                                    .path
+                                    .poses
+                                    .iter()
+                                    .map(|pose| {
+                                        let [x, y, z, w] = pose.pose.orientation_xyzw;
+                                        Quaternion { x, y, z, w }.yaw()
+                                    })
+                                    .collect(),
+                            )
+                        },
                         path,
                     })
                     .await;
@@ -1834,12 +2135,13 @@ async fn run_guarded_nav_loop(
                     telemetry = candidate_telemetry;
                     publish_bool(transport, &node.outputs[3], true).await?;
                     let snapshot = scheduler.status();
-                    publish_guarded_nav_state(
+                    publish_guarded_nav_observation(
                         transport,
-                        &node.outputs[1],
+                        node,
                         snapshot.clone(),
                         &telemetry,
                         None,
+                        &mut publications,
                     )
                     .await?;
                     goal_buffer.clear_pending_goal_for(&active_goal);
@@ -1962,6 +2264,7 @@ async fn run_guarded_nav_loop(
                         );
                         let session_id = buffered_goal.session_id.clone();
                         let session = nuwax_nav_runtime::NavSession {
+                            goal_pose: pose_from_schema(&buffered_goal.goal)?,
                             session_id: session_id.clone(),
                             execution_identity: guarded_goal_execution_identity(&buffered_goal),
                             local_owner_runtime_generation: process_runtime_generation,
@@ -2037,12 +2340,13 @@ async fn run_guarded_nav_loop(
                         }
                         publish_bool(transport, &node.outputs[3], true).await?;
                         let snapshot = scheduler.status();
-                        publish_guarded_nav_state(
+                        publish_guarded_nav_observation(
                             transport,
-                            &node.outputs[1],
+                            node,
                             snapshot.clone(),
                             &telemetry,
                             None,
+                            &mut publications,
                         )
                         .await?;
                         last_cancel_terminal = Some(GuardedCancelTerminal {
@@ -2131,7 +2435,16 @@ async fn activate_or_defer_guarded_goal(
     active_session: &mut Option<schema::GoalEnvelope>,
     goal_buffer: &mut PlannerGoalBuffer,
     goal_envelope: schema::GoalEnvelope,
+    surface_authority: Option<&GuardedMapAuthority>,
 ) -> NavStackResult<()> {
+    if node.id == "surface_nav_scheduler"
+        && !surface_authority.is_some_and(|map| map.permits_goal(&goal_envelope))
+    {
+        goal_buffer.costmap_observed = false;
+        goal_buffer.defer_ready_goal(goal_envelope);
+        return Ok(());
+    }
+
     if !guarded_goal_inputs_ready(telemetry, scheduler, &goal_envelope) {
         if !goal_buffer.defer_ready_goal(goal_envelope) {
             return Err(NavStackError::Internal(
@@ -2231,6 +2544,7 @@ async fn activate_guarded_goal(
         goal.pose.position.y,
         goal.pose.orientation.yaw(),
     ];
+    candidate_telemetry.goal_z = goal.pose.position.z;
     candidate_telemetry.public_session_id = goal_envelope.session_id.clone();
     candidate_telemetry.owner_kind = goal_envelope.owner_kind;
     candidate_telemetry.parent_request_id = goal_envelope.parent_request_id.clone();
@@ -2238,11 +2552,11 @@ async fn activate_guarded_goal(
     candidate_telemetry.goal_payload_sha256 = goal_envelope.payload_sha256;
     candidate_telemetry.path_revision = 0;
     candidate_telemetry.path_payload_sha256 = [0; 32];
-    candidate_telemetry.initial_distance =
-        distance_2d(candidate_telemetry.goal, candidate_telemetry.current);
+    candidate_telemetry.initial_distance = telemetry_distance(&candidate_telemetry);
     candidate_telemetry.progress = 0.0;
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
+            goal_pose: pose_from_schema(&goal_envelope.goal)?,
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
             local_owner_runtime_generation: runtime_generation(),
@@ -2310,6 +2624,7 @@ fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
     telemetry.goal_generation = 0;
     telemetry.cancel_generation = 0;
     telemetry.goal = [0.0; 3];
+    telemetry.goal_z = 0.0;
     telemetry.goal_payload_sha256 = [0; 32];
     telemetry.path_revision = 0;
     telemetry.path_payload_sha256 = [0; 32];
@@ -2433,7 +2748,8 @@ fn guarded_buffered_cancel_telemetry(
     candidate.goal_payload_sha256 = goal.payload_sha256;
     candidate.path_revision = 0;
     candidate.path_payload_sha256 = [0; 32];
-    candidate.initial_distance = distance_2d(candidate.goal, candidate.current);
+    candidate.goal_z = goal_pose.pose.position.z;
+    candidate.initial_distance = telemetry_distance(&candidate);
     candidate.progress = 0.0;
     candidate
 }
@@ -2455,11 +2771,102 @@ fn lcm_header_timestamp_ns(header: &schema::Header, component: &str) -> NavStack
 }
 
 #[cfg(feature = "guard-runtime")]
+fn telemetry_distance(telemetry: &GuardedNavTelemetry) -> f64 {
+    let xy = distance_2d(telemetry.goal, telemetry.current);
+    if telemetry.surface_navigation {
+        xy.hypot(telemetry.goal_z - telemetry.current_z)
+    } else {
+        xy
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
 fn update_progress(telemetry: &mut GuardedNavTelemetry) {
     if telemetry.initial_distance > f64::EPSILON {
-        let remaining = distance_2d(telemetry.goal, telemetry.current);
+        let remaining = telemetry_distance(telemetry);
         telemetry.progress = (1.0 - remaining / telemetry.initial_distance).clamp(0.0, 1.0);
     }
+}
+
+#[cfg(feature = "guard-runtime")]
+#[derive(Default)]
+struct GuardedStatusPublications {
+    goal: Option<(String, i32, String, i64, [u8; 32])>,
+    applied_commands: u64,
+    last_zero_ack_id: Option<String>,
+    reached_published: bool,
+}
+
+#[cfg(feature = "guard-runtime")]
+impl GuardedStatusPublications {
+    fn frames(
+        &mut self,
+        node: &ModuleNode,
+        status: &nuwax_nav_runtime::SchedulerStatus,
+        telemetry: &GuardedNavTelemetry,
+        planner_observation: Option<bool>,
+    ) -> NavStackResult<Vec<RawLcmFrame>> {
+        let mut frames = Vec::with_capacity(4);
+        if !telemetry.public_session_id.is_empty() {
+            let goal = (
+                telemetry.public_session_id.clone(),
+                telemetry.owner_kind,
+                telemetry.parent_request_id.clone(),
+                telemetry.goal_generation,
+                telemetry.goal_payload_sha256,
+            );
+            if self.goal.as_ref() != Some(&goal) {
+                self.goal = Some(goal);
+                self.applied_commands = 0;
+                self.last_zero_ack_id = None;
+                self.reached_published = false;
+            }
+            if status.applied_commands > self.applied_commands {
+                if let Some(twist) = status.last_applied_twist {
+                    frames.push(build_twist2_frame(&node.outputs[0], twist)?);
+                }
+                self.applied_commands = status.applied_commands;
+            }
+            if status.last_zero_ack_id != self.last_zero_ack_id {
+                if status.last_zero_ack_id.is_some() {
+                    frames.push(build_twist2_frame(&node.outputs[0], Twist2::ZERO)?);
+                }
+                self.last_zero_ack_id = status.last_zero_ack_id.clone();
+            }
+            if status.last_terminal == Some(nuwax_nav_runtime::TerminalOutcome::Succeeded)
+                && !self.reached_published
+            {
+                frames.push(build_body_frame(
+                    &node.outputs[2],
+                    "std_msgs.Bool",
+                    schema::encode_bool_body(&schema::Bool { data: true }),
+                )?);
+                self.reached_published = true;
+            }
+        }
+        frames.push(build_guarded_nav_state_frame(
+            &node.outputs[1],
+            status,
+            telemetry,
+            planner_observation,
+        )?);
+        Ok(frames)
+    }
+}
+
+#[cfg(feature = "guard-runtime")]
+async fn publish_guarded_nav_observation(
+    transport: &LcmTransport,
+    node: &ModuleNode,
+    status: nuwax_nav_runtime::SchedulerStatus,
+    telemetry: &GuardedNavTelemetry,
+    planner_observation: Option<bool>,
+    publications: &mut GuardedStatusPublications,
+) -> NavStackResult<()> {
+    transport
+        .publish_batch(publications.frames(node, &status, telemetry, planner_observation)?)
+        .await
+        .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -2470,6 +2877,24 @@ async fn publish_guarded_nav_state(
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
 ) -> NavStackResult<()> {
+    transport
+        .publish(build_guarded_nav_state_frame(
+            channel,
+            &status,
+            telemetry,
+            planner_observation,
+        )?)
+        .await
+        .map_err(|error| NavStackError::Internal(format!("publish {channel}: {error}")))
+}
+
+#[cfg(feature = "guard-runtime")]
+fn build_guarded_nav_state_frame(
+    channel: &str,
+    status: &nuwax_nav_runtime::SchedulerStatus,
+    telemetry: &GuardedNavTelemetry,
+    planner_observation: Option<bool>,
+) -> NavStackResult<RawLcmFrame> {
     let message = build_guarded_navigation_state(
         &status,
         telemetry,
@@ -2480,7 +2905,7 @@ async fn publish_guarded_nav_state(
     );
     let body = schema::encode_navigation_state_body(&message)
         .map_err(|error| NavStackError::Internal(format!("NavigationState encode: {error}")))?;
-    publish_body(transport, channel, "nuwax_msgs.NavigationState", body).await
+    build_body_frame(channel, "nuwax_msgs.NavigationState", body)
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -3755,7 +4180,8 @@ fn apply_simple_planner_goal(
             Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
         },
     };
-    Module::on_terrain_map_ext(module, occupancy)
+    module
+        .on_occupancy_grid(occupancy)
         .map_err(|error| module_error("simple_planner.goal_boundary", error))?;
     if let Err(error) = Module::on_goal(
         module,
@@ -4282,7 +4708,7 @@ async fn run_simple_planner(
                         }
                         OwnerInput::Rejected(reason) => {
                             diagnostics.reject("simple_planner.goal_pose", &reason);
-                            Module::on_terrain_map_ext(&mut module, raw_occupancy)
+                            module.on_occupancy_grid(raw_occupancy)
                                 .map_err(|error| module_error("simple_planner.occupancy", error))?;
                         }
                     }
@@ -4305,7 +4731,7 @@ async fn run_simple_planner(
                         },
                         None => raw_occupancy,
                     };
-                    Module::on_terrain_map_ext(&mut module, occupancy)
+                    module.on_occupancy_grid(occupancy)
                         .map_err(|error| module_error("simple_planner.occupancy", error))?;
                 }
                 active_map_resolution = f64::from(grid.info.resolution);
@@ -5301,6 +5727,41 @@ fn decode_path_body(body: &[u8]) -> NavStackResult<Path2D> {
     path_from_schema(&path)
 }
 
+#[cfg(feature = "guard-runtime")]
+fn execution_path_from_schema(
+    path: &schema::Path,
+    surface: bool,
+) -> NavStackResult<nuwax_nav_runtime::ExecutionPath> {
+    if path.header.frame_id != "map" {
+        return Err(NavStackError::InvalidConfig(format!(
+            "scheduler path frame must be map, got {}",
+            path.header.frame_id
+        )));
+    }
+    if surface {
+        if path
+            .poses
+            .iter()
+            .any(|pose| pose.header.frame_id != path.header.frame_id)
+        {
+            return Err(NavStackError::InvalidConfig(
+                "Path pose frame does not match path frame".into(),
+            ));
+        }
+        Ok(nuwax_nav_runtime::ExecutionPath::Surface(
+            nuwax_nav_types_messages::Path3D {
+                poses: path
+                    .poses
+                    .iter()
+                    .map(pose_from_schema)
+                    .collect::<NavStackResult<Vec<_>>>()?,
+            },
+        ))
+    } else {
+        path_from_schema(path).map(nuwax_nav_runtime::ExecutionPath::Planar)
+    }
+}
+
 #[cfg(any(
     feature = "basic-path-follower",
     feature = "simple-2d",
@@ -5328,14 +5789,14 @@ fn path_from_schema(path: &schema::Path) -> NavStackResult<Path2D> {
     ))
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
+#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 fn decode_cloud_body(body: &[u8]) -> NavStackResult<PointCloud> {
     let cloud = schema::decode_point_cloud2(&prefixed(schema::POINT_CLOUD2_FINGERPRINT, body))
         .map_err(|error| NavStackError::Internal(format!("PointCloud2 decode: {error}")))?;
     point_cloud_from_schema(cloud)
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
+#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 fn point_cloud_from_schema(cloud: schema::PointCloud2) -> NavStackResult<PointCloud> {
     let width = usize::try_from(cloud.width)
         .map_err(|_| NavStackError::InvalidConfig("PointCloud2 width is negative".into()))?;
@@ -5383,7 +5844,7 @@ fn point_cloud_from_schema(cloud: schema::PointCloud2) -> NavStackResult<PointCl
     })
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
+#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 fn cloud_field<'a>(
     fields: &'a [schema::PointField],
     name: &str,
@@ -5394,7 +5855,7 @@ fn cloud_field<'a>(
         .ok_or_else(|| NavStackError::InvalidConfig(format!("PointCloud2 missing {name} field")))
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
+#[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 fn read_cloud_scalar(
     data: &[u8],
     base: usize,
@@ -5439,7 +5900,9 @@ fn read_cloud_scalar(
 }
 
 #[cfg(feature = "simple-2d")]
-fn decode_simple_occupancy(body: &[u8]) -> NavStackResult<PointCloud> {
+fn decode_simple_occupancy(
+    body: &[u8],
+) -> NavStackResult<nuwax_nav_types_messages::OccupancyGrid2D> {
     decode_simple_occupancy_with_boundary(body, None)
 }
 
@@ -5447,7 +5910,7 @@ fn decode_simple_occupancy(body: &[u8]) -> NavStackResult<PointCloud> {
 fn decode_simple_occupancy_with_boundary(
     body: &[u8],
     boundary: Option<&NavigationBoundary>,
-) -> NavStackResult<PointCloud> {
+) -> NavStackResult<nuwax_nav_types_messages::OccupancyGrid2D> {
     let grid = schema::decode_occupancy_grid_body(body)
         .map_err(|error| NavStackError::Internal(format!("OccupancyGrid decode: {error}")))?;
     if grid.header.frame_id != "map" {
@@ -5495,7 +5958,9 @@ fn decode_simple_occupancy_with_boundary(
             "simple planner cannot consume a rotated/non-planar occupancy origin".into(),
         ));
     }
-    let mut points = Vec::new();
+    use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
+
+    let mut cells = Vec::with_capacity(grid.data.len());
     for y in 0..height {
         for x in 0..width {
             let value = grid.data[y * width + x];
@@ -5503,17 +5968,25 @@ fn decode_simple_occupancy_with_boundary(
                 grid.info.origin.position[0] + (x as f64 + 0.5) * resolution,
                 grid.info.origin.position[1] + (y as f64 + 0.5) * resolution,
             );
-            if value >= 50 || boundary.is_some_and(|boundary| !boundary.contains(center)) {
-                points.push(Point3::new(center.x, center.y, 0.0));
-            }
+            cells.push(
+                if boundary.is_some_and(|boundary| !boundary.contains(center)) || value >= 50 {
+                    OccupancyCell::Occupied
+                } else if value < 0 {
+                    OccupancyCell::Unknown
+                } else {
+                    OccupancyCell::Free
+                },
+            );
         }
     }
-    Ok(PointCloud {
-        stamp: timestamp(&grid.header)?,
-        frame_id: NavFrameId::Map,
-        points,
-        intensities: Vec::new(),
-    })
+    timestamp(&grid.header)?;
+    Ok(OccupancyGrid2D::new(
+        Point2::new(grid.info.origin.position[0], grid.info.origin.position[1]),
+        resolution,
+        width as u32,
+        height as u32,
+        cells,
+    ))
 }
 
 #[cfg(any(feature = "replanning-astar", feature = "guard-runtime"))]
@@ -5581,7 +6054,7 @@ fn decode_astar_costmap(body: &[u8]) -> NavStackResult<nuwax_nav_astar::navigati
                 y,
                 if value < 0 {
                     UNKNOWN
-                } else if value >= 100 {
+                } else if value >= 50 {
                     OCCUPIED
                 } else {
                     value as u8
@@ -5685,49 +6158,85 @@ fn build_versioned_path_envelope(
         (source_timestamp_ns % 1_000_000_000) as u32,
     );
     let header = schema_header(stamp, publication.goal.committed_map_frame_id.as_str())?;
-    let mut envelope = schema::PathEnvelope {
-        schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-        session_id: publication.goal.session_id.clone(),
-        owner_kind: publication.goal.owner_kind,
-        parent_request_id: publication.goal.parent_request_id.clone(),
-        goal_generation: publication.goal.goal_generation,
-        producer: publication.goal.producer.clone(),
-        producer_epoch: publication.goal.producer_epoch,
-        producer_runtime_generation: publication.goal.producer_runtime_generation,
-        committed_map_session_id: publication.goal.committed_map_session_id.clone(),
-        committed_map_session_generation: publication.goal.committed_map_session_generation,
-        committed_map_revision: publication.goal.committed_map_revision,
-        committed_map_payload_sha256: publication.goal.committed_map_payload_sha256,
-        committed_map_frame_id: publication.goal.committed_map_frame_id.clone(),
-        boundary_id: publication.goal.boundary_id.clone(),
-        boundary_sha256: publication.goal.boundary_sha256,
-        motion_guard_generation: publication.goal.motion_guard_generation,
-        motion_guard_boot_nonce: publication.goal.motion_guard_boot_nonce,
-        motion_stop_generation: publication.goal.motion_stop_generation,
-        planner_runtime_generation: publication.planner_runtime_generation,
-        path_revision: publication.path_revision,
-        source_timestamp_ns,
-        goal_payload_sha256: publication.goal.payload_sha256,
-        path_payload_sha256: [0; 32],
-        path: schema::Path {
-            header: header.clone(),
-            poses: publication
-                .path
-                .points
-                .iter()
-                .map(|point| schema::PoseStamped {
+    let path = schema::Path {
+        header: header.clone(),
+        poses: publication
+            .path
+            .points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                // 中途沿下一段方向前进；最后一点恢复用户要求的目标朝向。
+                let orientation_xyzw = publication.path.points.get(index + 1).map_or(
+                    publication.goal.goal.pose.orientation_xyzw,
+                    |next| {
+                        let half_yaw = (next.y - point.y).atan2(next.x - point.x) * 0.5;
+                        [0.0, 0.0, half_yaw.sin(), half_yaw.cos()]
+                    },
+                );
+                schema::PoseStamped {
                     header: header.clone(),
                     pose: schema::Pose {
-                        position: [point.x, point.y, 0.0],
-                        orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                        position: [point.x, point.y, publication.goal.goal.pose.position[2]],
+                        orientation_xyzw,
                     },
-                })
-                .collect(),
-        },
+                }
+            })
+            .collect(),
+    };
+    build_versioned_path_from_schema(
+        publication.goal,
+        publication.planner_runtime_generation,
+        publication.path_revision,
+        source_timestamp_ns,
+        path,
+    )
+    .map(Some)
+}
+
+#[cfg(any(
+    feature = "simple-2d",
+    feature = "replanning-astar",
+    feature = "cmu-native",
+    feature = "explore",
+    feature = "mls"
+))]
+fn build_versioned_path_from_schema(
+    goal: &schema::GoalEnvelope,
+    planner_runtime_generation: i64,
+    path_revision: i64,
+    source_timestamp_ns: i64,
+    path: schema::Path,
+) -> NavStackResult<schema::PathEnvelope> {
+    let mut envelope = schema::PathEnvelope {
+        schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+        session_id: goal.session_id.clone(),
+        owner_kind: goal.owner_kind,
+        parent_request_id: goal.parent_request_id.clone(),
+        goal_generation: goal.goal_generation,
+        producer: goal.producer.clone(),
+        producer_epoch: goal.producer_epoch,
+        producer_runtime_generation: goal.producer_runtime_generation,
+        committed_map_session_id: goal.committed_map_session_id.clone(),
+        committed_map_session_generation: goal.committed_map_session_generation,
+        committed_map_revision: goal.committed_map_revision,
+        committed_map_payload_sha256: goal.committed_map_payload_sha256,
+        committed_map_frame_id: goal.committed_map_frame_id.clone(),
+        boundary_id: goal.boundary_id.clone(),
+        boundary_sha256: goal.boundary_sha256,
+        motion_guard_generation: goal.motion_guard_generation,
+        motion_guard_boot_nonce: goal.motion_guard_boot_nonce,
+        motion_stop_generation: goal.motion_stop_generation,
+        planner_runtime_generation: planner_runtime_generation,
+        path_revision: path_revision,
+        source_timestamp_ns,
+        goal_payload_sha256: goal.payload_sha256,
+        path_payload_sha256: [0; 32],
+        path,
     };
     schema::seal_path_envelope(&mut envelope)
         .map_err(|error| NavStackError::InvalidConfig(format!("PathEnvelope seal: {error}")))?;
-    Ok(Some(envelope))
+    Ok(envelope)
 }
 
 #[cfg(any(
@@ -5784,6 +6293,18 @@ async fn publish_bool(transport: &LcmTransport, channel: &str, value: bool) -> N
         schema::encode_bool_body(&schema::Bool { data: value }),
     )
     .await
+}
+
+#[cfg(feature = "guard-runtime")]
+fn build_twist2_frame(channel: &str, twist: Twist2) -> NavStackResult<RawLcmFrame> {
+    build_body_frame(
+        channel,
+        "geometry_msgs.Twist",
+        schema::encode_twist_body(&schema::Twist {
+            linear: [twist.linear.x, twist.linear.y, 0.0],
+            angular: [0.0, 0.0, twist.angular_z],
+        }),
+    )
 }
 
 #[cfg(any(
@@ -6150,6 +6671,45 @@ mod simple_tests {
     use super::*;
 
     #[test]
+    fn published_path_preserves_goal_heading_and_uses_segment_headings() {
+        let mut goal = planner_test_goal("heading", 1);
+        goal.goal.pose.position[2] = 3.0;
+        let half_yaw = std::f64::consts::FRAC_PI_4;
+        goal.goal.pose.orientation_xyzw = [0.0, 0.0, half_yaw.sin(), half_yaw.cos()];
+        schema::seal_goal_envelope(&mut goal).unwrap();
+        let path = Path2D::stamped(
+            NavFrameId::Map,
+            Timestamp::from_unix(12, 0),
+            vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)],
+        );
+        let envelope = build_versioned_path_envelope(
+            VersionedPathPublication {
+                goal: &goal,
+                planner_runtime_generation: 1,
+                path_revision: 1,
+                path: &path,
+                boundary_safe: true,
+            },
+            12_000_000_000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            envelope.path.poses[0].pose.orientation_xyzw,
+            [0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            envelope.path.poses[1].pose.orientation_xyzw,
+            goal.goal.pose.orientation_xyzw
+        );
+        assert!(envelope
+            .path
+            .poses
+            .iter()
+            .all(|pose| pose.pose.position[2] == 3.0));
+    }
+
+    #[test]
     fn simple_occupancy_uses_persistent_map_cells_not_cloud_history() {
         let body = schema::encode_occupancy_grid_body(&schema::OccupancyGrid {
             header: schema::Header {
@@ -6171,9 +6731,19 @@ mod simple_tests {
         })
         .expect("encode occupancy fixture");
 
-        let cloud = decode_simple_occupancy(&body).expect("decode persistent occupancy");
-        assert_eq!(cloud.frame_id, NavFrameId::Map);
-        assert_eq!(cloud.points, vec![Point3::new(-0.75, -1.25, 0.0)]);
+        use nuwax_nav_types_messages::OccupancyCell;
+        let grid = decode_simple_occupancy(&body).expect("decode persistent occupancy");
+        assert_eq!(grid.origin, Point2::new(-1.0, -2.0));
+        assert_eq!(grid.resolution, 0.5);
+        assert_eq!(
+            grid.cells,
+            vec![
+                OccupancyCell::Free,
+                OccupancyCell::Unknown,
+                OccupancyCell::Occupied,
+                OccupancyCell::Free
+            ]
+        );
     }
 
     #[test]
@@ -6187,9 +6757,10 @@ mod simple_tests {
     }
 
     #[test]
-    fn simple_planner_can_leave_a_free_island_through_unknown_cells() {
+    fn simple_planner_rejects_routes_through_unknown_cells() {
         let mut data = vec![-1; 25];
         data[12] = 0;
+        data[14] = 0; // 起终点均为空闲，但中间未知带没有可通行证据。
         let body = schema::encode_occupancy_grid_body(&schema::OccupancyGrid {
             header: schema::Header {
                 frame_id: "map".into(),
@@ -6208,8 +6779,7 @@ mod simple_tests {
             data,
         })
         .expect("encode frontier-style occupancy fixture");
-        let cloud = decode_simple_occupancy(&body).expect("decode unknown cells as traversable");
-        assert!(cloud.points.is_empty());
+        let grid = decode_simple_occupancy(&body).expect("decode unknown cells");
 
         let mut planner =
             SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
@@ -6219,7 +6789,7 @@ mod simple_tests {
             })
             .expect("frontier planner config");
         Module::start(&mut planner).expect("start simple planner");
-        Module::on_terrain_map_ext(&mut planner, cloud).expect("frontier occupancy");
+        planner.on_occupancy_grid(grid).expect("frontier occupancy");
         Module::on_odometry(
             &mut planner,
             PoseStamped::from_pose(
@@ -6237,11 +6807,13 @@ mod simple_tests {
         )
         .expect("frontier goal");
 
-        let ModuleOutput::Plan { path, .. } = Module::tick(&mut planner).expect("planner tick")
-        else {
-            panic!("unknown cells must not isolate a reachable frontier goal");
-        };
-        assert!(path.points.len() >= 3);
+        assert!(matches!(
+            Module::tick(&mut planner).expect("planner tick"),
+            ModuleOutput::SafetyHold {
+                reason: nuwax_nav_simple_planner::module::HoldReason::PlanningFailed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6435,11 +7007,11 @@ mod simple_tests {
 
         let mut buffer = PlannerGoalBuffer::default();
         assert!(buffer.observe_costmap().is_none());
-        Module::on_terrain_map_ext(
-            &mut planner,
-            decode_simple_occupancy(&planner_test_grid_body(12)).expect("map 12"),
-        )
-        .expect("apply map 12");
+        planner
+            .on_occupancy_grid(
+                decode_simple_occupancy(&planner_test_grid_body(12)).expect("map 12"),
+            )
+            .expect("apply map 12");
         let goal_12 = planner_test_goal("simple-12", 1);
         let ready_12 = match buffer.observe_goal(goal_12.clone()) {
             PlannerGoalIngress::Ready(goal) => *goal,
@@ -6581,13 +7153,23 @@ mod simple_tests {
             OwnerInput::Accepted(_)
         ));
         let occupancy = decode_simple_occupancy(&grid_body).expect("decode valid simple grid");
-        Module::on_terrain_map_ext(&mut planner, occupancy)
+        planner
+            .on_occupancy_grid(occupancy)
             .expect("simple planner accepts valid grid");
     }
 }
 
 #[cfg(all(test, feature = "guard-runtime"))]
 mod guarded_tests {
+    fn planar_test_costmap(
+        observation: &nuwax_nav_runtime::CostmapObservation,
+    ) -> &nuwax_nav_astar::navigation_map::CostMap2D {
+        match &observation.costmap {
+            nuwax_nav_runtime::ExecutionMap::Planar(map) => map,
+            _ => panic!("expected planar map"),
+        }
+    }
+
     use super::*;
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
@@ -6664,7 +7246,7 @@ mod guarded_tests {
         })
         .await
         .expect("post-baseline applied command");
-        let twist_ready_dispatch = feeder.dequeued();
+        let twist_ready_dispatch = feeder.dequeued_by_source();
         let applied = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
@@ -6687,10 +7269,7 @@ mod guarded_tests {
         .await
         .expect("bounded status Twist publication");
         feeder.assert_ready_evidence("Twist");
-        assert!(
-            feeder.dequeued().saturating_sub(twist_ready_dispatch) <= 2,
-            "Status Twist exceeded the Pose/Costmap dispatch bound"
-        );
+        feeder.assert_status_dispatch_bound(twist_ready_dispatch);
         assert_eq!(applied.linear[0], expected_twist.linear.x);
         assert_eq!(applied.linear[1], expected_twist.linear.y);
         assert_eq!(applied.angular[2], expected_twist.angular_z);
@@ -6706,7 +7285,7 @@ mod guarded_tests {
         })
         .await
         .expect("Succeeded terminal status");
-        let terminal_ready_dispatch = feeder.dequeued();
+        let terminal_ready_dispatch = feeder.dequeued_by_source();
 
         let zero = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -6727,7 +7306,7 @@ mod guarded_tests {
         .await
         .expect("bounded status ZERO publication");
         feeder.assert_ready_evidence("ZERO");
-        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
         assert_eq!(zero.linear, [0.0; 3]);
         assert_eq!(zero.angular, [0.0; 3]);
 
@@ -6748,7 +7327,7 @@ mod guarded_tests {
         .await
         .expect("bounded Succeeded bool publication");
         feeder.assert_ready_evidence("Succeeded Bool");
-        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
         assert!(reached.data);
 
         let terminal = tokio::time::timeout(Duration::from_secs(1), async {
@@ -6772,7 +7351,7 @@ mod guarded_tests {
         .await
         .expect("bounded terminal NavigationState publication");
         feeder.assert_ready_evidence("terminal NavigationState");
-        assert!(feeder.dequeued().saturating_sub(terminal_ready_dispatch) <= 2);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
         assert_eq!(
             harness.scheduler.status().last_terminal,
             Some(TerminalOutcome::Succeeded)
@@ -6921,10 +7500,12 @@ mod guarded_tests {
             assert_eq!(event.source(), source);
             match event {
                 GuardedNavEvent::Pose(Some(Ok(frame)))
-                | GuardedNavEvent::Costmap(Some(Ok(frame)))
                 | GuardedNavEvent::Goal(Some(Ok(frame)))
                 | GuardedNavEvent::Path(Some(Ok(frame)))
                 | GuardedNavEvent::Cancel(Some(Ok(frame))) => assert_eq!(frame.payload, payload),
+                GuardedNavEvent::Costmap(Some(Ok(GuardedMapFrame::Planar(frame)))) => {
+                    assert_eq!(frame.payload, payload)
+                }
                 GuardedNavEvent::Status(Ok(())) => {
                     assert_eq!(status.borrow().message, "status-payload")
                 }
@@ -7238,7 +7819,7 @@ mod guarded_tests {
     }
 
     #[derive(Clone)]
-    struct RecordingMotion(Arc<Mutex<Vec<String>>>);
+    pub(super) struct RecordingMotion(pub(super) Arc<Mutex<Vec<String>>>);
 
     impl nuwax_nav_runtime::NavMotionPort for RecordingMotion {
         fn acquire<'life0, 'life1, 'life2, 'async_trait>(
@@ -7516,14 +8097,28 @@ mod guarded_tests {
             );
         }
 
-        fn dequeued(&self) -> usize {
-            self.pose_ledger
-                .dequeued
-                .load(std::sync::atomic::Ordering::SeqCst)
-                + self
-                    .costmap_ledger
+        fn dequeued_by_source(&self) -> (usize, usize) {
+            (
+                self.pose_ledger
                     .dequeued
-                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                self.costmap_ledger
+                    .dequeued
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        fn assert_status_dispatch_bound(&self, before: (usize, usize)) {
+            let after = self.dequeued_by_source();
+            // 状态就绪后最多分派一次位姿批次和一次地图；合并读取不等于多次分派。
+            assert!(
+                after.0.saturating_sub(before.0) <= MAX_REPLACEABLE_POSE_BATCH,
+                "状态发送前消费超过一个位姿批次"
+            );
+            assert!(
+                after.1.saturating_sub(before.1) <= 1,
+                "状态发送前分派超过一次地图输入"
+            );
         }
 
         async fn stop(self) -> Result<(), String> {
@@ -7750,6 +8345,7 @@ mod guarded_tests {
                     costmap_stream,
                     cancel_stream,
                     status,
+                    None,
                 )
                 .await
             });
@@ -8246,6 +8842,7 @@ mod guarded_tests {
         harness
             .scheduler
             .start_session(nuwax_nav_runtime::NavSession {
+                goal_pose: pose_from_schema(&blocker.goal).expect("valid goal pose"),
                 session_id: blocker.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&blocker),
                 local_owner_runtime_generation: runtime_generation(),
@@ -8832,6 +9429,9 @@ mod guarded_tests {
             pose_frame: "map".into(),
             goal: [1.0, 2.0, 0.0],
             current: [0.5, 0.25, 0.0],
+            current_z: 0.0,
+            goal_z: 0.0,
+            surface_navigation: false,
             initial_distance: 3.0,
             progress: 0.5,
             path_revision: 3,
@@ -9177,7 +9777,9 @@ mod guarded_tests {
         handle.update_odometry(pose).await.expect("map pose");
         handle
             .update_costmap(nuwax_nav_runtime::CostmapObservation {
-                costmap: nuwax_nav_astar::navigation_map::CostMap2D::new_all_free("map", 4, 4, 0.1),
+                costmap: nuwax_nav_runtime::ExecutionMap::Planar(
+                    nuwax_nav_astar::navigation_map::CostMap2D::new_all_free("map", 4, 4, 0.1),
+                ),
                 source_timestamp_ns: 1_000_000_000,
             })
             .await
@@ -9189,6 +9791,7 @@ mod guarded_tests {
         path_identity.path_payload_sha256 = [0x11; 32];
         handle
             .start_session(nuwax_nav_runtime::NavSession {
+                goal_pose: pose_from_schema(&goal_a.goal).expect("valid goal pose"),
                 session_id: goal_a.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&goal_a),
                 local_owner_runtime_generation: runtime_generation(),
@@ -9204,15 +9807,16 @@ mod guarded_tests {
             .expect("map-a session");
         handle
             .submit_path(nuwax_nav_runtime::VersionedPath {
+                path_yaws: None,
                 session_id: goal_a.session_id.clone(),
                 execution_identity: path_identity,
                 path_revision: 1,
                 payload_hash: [0x11; 32],
-                path: Path2D::stamped(
+                path: nuwax_nav_runtime::ExecutionPath::Planar(Path2D::stamped(
                     NavFrameId::Map,
                     Timestamp::from_unix(1, 0),
                     vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)],
-                ),
+                )),
             })
             .await
             .expect("map-a path");
@@ -9352,6 +9956,162 @@ mod guarded_tests {
         };
         assert_eq!(observed.pose.header.frame_id, "map");
         assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn queued_pose_keeps_latest_valid_sample_and_preserves_stream_failure() {
+        let (sender, mut poses) = guarded_test_stream();
+        let make = |stamp| {
+            build_body_frame(
+                "/test/pose",
+                "geometry_msgs.PoseStamped",
+                guarded_pose_body(stamp),
+            )
+            .unwrap()
+        };
+        sender.unbounded_send((Ok(make(3)), None, None)).unwrap();
+        sender.unbounded_send((Ok(make(2)), None, None)).unwrap();
+        sender
+            .unbounded_send((
+                Ok(build_body_frame("/test/pose", "geometry_msgs.PoseStamped", vec![255]).unwrap()),
+                None,
+                None,
+            ))
+            .unwrap();
+        let mut diagnostics = InputDiagnosticLimiter::default();
+        let input = drain_guarded_pose_input(Some(Ok(make(1))), &mut poses, &mut diagnostics, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(input.pose.stamp.nanos, 3_000_000_000);
+        drop(sender);
+        assert!(
+            drain_guarded_pose_input(Some(Ok(make(4))), &mut poses, &mut diagnostics, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn queued_future_pose_cannot_discard_a_valid_sample() {
+        let (sender, mut poses) = guarded_test_stream();
+        let current = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut pose = schema::PoseStamped {
+            header: schema::Header {
+                stamp_sec: current.as_secs() as i32,
+                stamp_nsec: current.subsec_nanos() as i32,
+                frame_id: "map".into(),
+                ..Default::default()
+            },
+            pose: schema::Pose {
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            },
+        };
+        let body = |pose: &schema::PoseStamped| {
+            build_body_frame(
+                "/test/pose",
+                "geometry_msgs.PoseStamped",
+                schema::encode_pose_stamped_body(pose).unwrap(),
+            )
+            .unwrap()
+        };
+        let valid = body(&pose);
+        pose.header.stamp_sec += 3600;
+        sender
+            .unbounded_send((Ok(body(&pose)), None, None))
+            .unwrap();
+        let input = drain_guarded_pose_input(
+            Some(Ok(valid)),
+            &mut poses,
+            &mut InputDiagnosticLimiter::default(),
+            Some(Duration::from_millis(500)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(input.pose.stamp.nanos, current.as_nanos() as i64);
+    }
+
+    #[test]
+    fn status_publications_reset_per_goal_and_publish_success_once() {
+        let mut node = ModuleNode::new(
+            "guard-test",
+            "守卫状态",
+            crate::graph::ModuleKind::Coordinator,
+        );
+        node.outputs = vec![
+            "/test/cmd".into(),
+            "/test/state".into(),
+            "/test/reached".into(),
+        ];
+        let mut publications = GuardedStatusPublications::default();
+        let mut telemetry = GuardedNavTelemetry {
+            public_session_id: "goal-a".into(),
+            goal_generation: 1,
+            ..Default::default()
+        };
+        let mut status = nuwax_nav_runtime::SchedulerStatus {
+            applied_commands: 12,
+            last_applied_twist: Some(Twist2 {
+                linear: Point2::new(0.2, 0.0),
+                angular_z: 0.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            publications
+                .frames(&node, &status, &telemetry, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        status.last_terminal = Some(TerminalOutcome::Succeeded);
+        status.last_zero_ack_id = Some("zero-a".into());
+        let terminal = publications
+            .frames(&node, &status, &telemetry, Some(true))
+            .unwrap();
+        assert_eq!(terminal.len(), 3);
+        assert_eq!(terminal[1].msg_type.fqn(), "std_msgs.Bool");
+        assert_eq!(
+            publications
+                .frames(&node, &status, &telemetry, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        clear_guarded_session_telemetry(&mut telemetry);
+        assert_eq!(
+            publications
+                .frames(&node, &status, &telemetry, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        telemetry.public_session_id = "goal-b".into();
+        telemetry.goal_generation = 2;
+        status.last_terminal = None;
+        status.last_zero_ack_id = None;
+        status.applied_commands = 1;
+        let next = publications
+            .frames(&node, &status, &telemetry, None)
+            .unwrap();
+        assert_eq!(
+            next.len(),
+            2,
+            "第二个目标首个执行回执不能被上一目标累计计数吞掉"
+        );
+        assert_eq!(next[0].msg_type.fqn(), "geometry_msgs.Twist");
+    }
+
+    #[test]
+    fn pose_source_deadline_uses_original_sampling_time() {
+        let wall = std::time::UNIX_EPOCH + Duration::from_secs(10);
+        let mono = tokio::time::Instant::now();
+        let maximum = Duration::from_millis(500);
+        let deadline = guarded_pose_source_deadline(9_600_000_000, maximum, wall, mono).unwrap();
+        assert_eq!(deadline.duration_since(mono), Duration::from_millis(100));
+        assert!(guarded_pose_source_deadline(9_500_000_000, maximum, wall, mono).is_err());
+        assert!(guarded_pose_source_deadline(10_051_000_000, maximum, wall, mono).is_err());
     }
 
     #[test]
@@ -9744,9 +10504,9 @@ mod guarded_tests {
     }
 
     #[test]
-    fn guarded_controller_moves_along_a_path_through_unknown_cells() {
+    fn guarded_controller_holds_a_path_through_unknown_cells() {
         use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig};
-        use nuwax_nav_astar::navigation_map::{FREE, OCCUPIED};
+        use nuwax_nav_astar::navigation_map::{OCCUPIED, UNKNOWN};
 
         let width = 60_usize;
         let height = 20_usize;
@@ -9775,17 +10535,21 @@ mod guarded_tests {
             OwnerInput::Accepted(input) => input,
             OwnerInput::Rejected(reason) => panic!("unknown costmap rejected: {reason}"),
         };
-        assert_eq!(input.observation.costmap.get(10, 5), FREE);
+        assert_eq!(planar_test_costmap(&input.observation).get(10, 5), UNKNOWN);
         assert_eq!(
-            input.observation.costmap.get(width - 1, height - 1),
+            planar_test_costmap(&input.observation).get(width - 1, height - 1),
             OCCUPIED
         );
 
         let mut planner = LocalPlanner::with_config(LocalPlannerConfig::default_config());
-        planner.update_costmap(input.observation.costmap);
+        planner.update_costmap(match input.observation.costmap {
+            nuwax_nav_runtime::ExecutionMap::Planar(map) => map,
+            _ => panic!("expected planar map"),
+        });
         planner.handle_odom(PoseStamped::from_pose(
             Pose3 {
                 position: Point3::new(0.5, 0.5, 0.0),
+                orientation: Quaternion::IDENTITY,
                 ..Pose3::default()
             },
             NavFrameId::Map,
@@ -9797,8 +10561,11 @@ mod guarded_tests {
         ));
 
         let (twist, stop) = planner.step(0.3);
-        assert_eq!(stop, None);
-        assert_ne!(twist, Twist2::ZERO);
+        assert_eq!(
+            stop,
+            Some(nuwax_nav_astar::local_planner::StopMessage::ObstacleFound)
+        );
+        assert_eq!(twist, Twist2::ZERO);
     }
 
     #[test]
@@ -10448,12 +11215,12 @@ mod boundary_tests {
         assert_eq!(map.get(3, 5), OCCUPIED, "concave notch must be masked");
         assert_eq!(map.get(1, 5), 0, "left arm remains navigable");
 
-        let cloud = decode_simple_occupancy_with_boundary(&free_grid_body(), Some(&boundary))
+        let grid = decode_simple_occupancy_with_boundary(&free_grid_body(), Some(&boundary))
             .expect("masked simple occupancy");
-        assert!(cloud
-            .points
-            .iter()
-            .any(|point| point.to_2d().distance(Point2::new(3.5, 5.5)) < 1e-9));
+        assert_eq!(
+            grid.get(3, 5),
+            Some(nuwax_nav_types_messages::OccupancyCell::Occupied)
+        );
     }
 
     #[test]

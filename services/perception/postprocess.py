@@ -1,24 +1,14 @@
-"""检测结果后处理：类无关 NMS（class-agnostic NMS）。
+"""同相机检测结果的高重叠去重，保留替代标签以供核对。
 
-杠杆二（见方案文档第 6.2 节）：开放词汇模型会对同一图像区域同时输出多个语义
-相近的标签框（如玻璃门同时被框为「门 / 玻璃 / 窗户」），它们框定几乎同一块像素，
-仅标签不同。模型内置 NMS 通常只抑制同类别重叠，跨类别的重叠保留下来，于是同一
-物体进入平台后变成多个框 / 多个语义实例。
-
-本模块在 detector 之后、tracker 之前做一次**类无关 NMS**：忽略标签，凡 bbox IoU
-高于阈值（偏高，默认 0.8）的重叠框只保留置信度最高的一个，被抑制框的标签存入代表
-框的 ``attributes["alternative_labels"]`` 以备追溯。纯单帧、无状态，下游 tracker /
-实例关联 / 记忆摄入无需改动。
-
-设计依据：一帧图像里两个真正不同的物体不可能占据几乎相同的像素区域，因此「框高度
-重叠」本身就是「同一物体」的充分证据，与标签内容无关——无需人工维护别名表。高阈值
-保证只合并几乎完全重合的框，空间分离的同类物体（两扇窗、并排两把椅子）IoU 远不到
-阈值，不会被误并。
+跨标签抑制是可配置的单帧启发式；高度重叠不能证明真实物体身份相同。
 """
 
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
+import math
+
+import numpy as np
 
 from contracts.perception import BoundingBox2D, Detection2D
 
@@ -46,8 +36,23 @@ def _bbox_iou(left: BoundingBox2D, right: BoundingBox2D) -> float:
         return 0.0
     left_area = left.width_px * left.height_px
     right_area = right.width_px * right.height_px
-    union = max(1.0, left_area + right_area - intersection)
-    return intersection / union
+    union = left_area + right_area - intersection
+    return intersection / union if math.isfinite(union) and union > 0.0 else 0.0
+
+
+def _valid_detection(detection: Detection2D) -> bool:
+    """拒绝非有限或空框，防止非法模型结果进入去重和轨迹状态。"""
+
+    bbox = detection.bbox
+    values = (detection.score, bbox.x_px, bbox.y_px, bbox.width_px, bbox.height_px)
+    return (
+        all(math.isfinite(float(value)) for value in values)
+        and 0.0 <= detection.score <= 1.0
+        and bbox.x_px >= 0.0 and bbox.y_px >= 0.0
+        and bbox.width_px > 0.0 and bbox.height_px > 0.0
+        and math.isfinite(bbox.width_px * bbox.height_px)
+        and math.isfinite(bbox.x_px + bbox.width_px) and math.isfinite(bbox.y_px + bbox.height_px)
+    )
 
 
 class ClassAgnosticNmsPostProcessor:
@@ -81,49 +86,78 @@ class ClassAgnosticNmsPostProcessor:
         """
 
         raw_count = len(detections)
-        if not self._enabled or raw_count <= 1:
+        detections = tuple(item for item in detections if _valid_detection(item))
+        invalid_count = raw_count - len(detections)
+        if not self._enabled or len(detections) <= 1:
             return detections, {
                 "raw_count": raw_count,
-                "kept_count": raw_count,
+                "kept_count": len(detections),
                 "suppressed_count": 0,
+                "invalid_count": invalid_count,
             }
 
         # 按置信度从高到低排序；忽略标签。保留原始索引仅用于稳定性（同分时保序）。
         order = sorted(
-            range(raw_count),
+            range(len(detections)),
             key=lambda idx: (detections[idx].score, -idx),
             reverse=True,
         )
 
-        suppressed: List[bool] = [False] * raw_count
+        # 常见少量检测直接比较，避免数组准备与逐代表框调度的固定开销。
+        boxes = None
+        if len(detections) > 32:
+            boxes = np.asarray([
+                [item.bbox.x_px, item.bbox.y_px, item.bbox.x_px + item.bbox.width_px,
+                 item.bbox.y_px + item.bbox.height_px]
+                for item in detections
+            ], dtype=np.float64)
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            cameras = np.asarray([item.camera_id or "" for item in detections], dtype=object)
+        suppressed = np.zeros(len(detections), dtype=bool)
         kept: List[Detection2D] = []
         for i_pos, idx in enumerate(order):
             if suppressed[idx]:
                 continue
             representative = detections[idx]
-            rep_bbox = representative.bbox
             alternative_labels: List[str] = []
-            # 与后续更低分框逐一比较，IoU 超阈值者抑制并收集其标签。
-            for jdx in order[i_pos + 1 :]:
-                if suppressed[jdx]:
-                    continue
+            if boxes is None:
+                duplicate_ids = []
+                for jdx in order[i_pos + 1 :]:
+                    other = detections[jdx]
+                    if suppressed[jdx] or (other.camera_id or "") != (representative.camera_id or ""):
+                        continue
+                    overlap = _bbox_iou(representative.bbox, other.bbox)
+                    if overlap > 0.0 and overlap >= self._iou_threshold:
+                        duplicate_ids.append(jdx)
+            else:
+                remaining = np.asarray(order[i_pos + 1 :], dtype=np.intp)
+                remaining = remaining[~suppressed[remaining] & (cameras[remaining] == cameras[idx])]
+                intersections = np.maximum(0.0, np.minimum(boxes[idx, 2:], boxes[remaining, 2:])
+                                           - np.maximum(boxes[idx, :2], boxes[remaining, :2])).prod(axis=1)
+                unions = areas[idx] + areas[remaining] - intersections
+                overlaps = np.divide(intersections, unions, out=np.zeros_like(intersections), where=unions > 0.0)
+                duplicate_ids = remaining[(intersections > 0.0) & (overlaps >= self._iou_threshold)]
+            # 数值比较批量完成，只有被抑制框需要读取标签。
+            for jdx in duplicate_ids:
                 other = detections[jdx]
-                if _bbox_iou(rep_bbox, other.bbox) < self._iou_threshold:
-                    continue
                 suppressed[jdx] = True
                 if other.label and other.label != representative.label:
                     alternative_labels.append(other.label)
+                alternatives = other.attributes.get("alternative_labels")
+                if isinstance(alternatives, (list, tuple)):
+                    alternative_labels.extend(str(item) for item in alternatives if str(item) != representative.label)
 
             if alternative_labels:
                 kept.append(self._attach_alternative_labels(representative, alternative_labels))
             else:
                 kept.append(representative)
 
-        suppressed_count = sum(1 for flag in suppressed if flag)
+        suppressed_count = int(np.count_nonzero(suppressed))
         stats = {
             "raw_count": raw_count,
             "kept_count": len(kept),
             "suppressed_count": suppressed_count,
+            "invalid_count": invalid_count,
         }
         return tuple(kept), stats
 

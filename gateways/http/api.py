@@ -5,7 +5,7 @@ import json
 import math
 from typing import Dict, Optional, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -976,11 +976,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return _navigation_state_payload(context, fallback_goal_id=body.goal_id)
 
     @router.get("/api/memory/summary")
-    async def api_memory_summary(request: Request) -> Dict[str, Any]:
+    def api_memory_summary(request: Request) -> Dict[str, Any]:
         return {"memory_summary": to_jsonable(runtime.memory_service.get_summary())}
 
     @router.get("/api/memory/libraries")
-    async def api_memory_libraries(request: Request) -> Dict[str, Any]:
+    def api_memory_libraries(request: Request) -> Dict[str, Any]:
         return {
             "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
             "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
@@ -1015,7 +1015,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         }
 
     @router.get("/api/memory/locations")
-    async def api_memory_locations(request: Request, limit: int = 20) -> Dict[str, Any]:
+    def api_memory_locations(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:
         # 未启用 active 库时返回空列表（避免跨库串数据），service 已默认按 active 库过滤。
         return {
             "locations": to_jsonable(
@@ -1028,7 +1028,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         }
 
     @router.get("/api/memory/semantic")
-    async def api_memory_semantic(request: Request, limit: int = 20) -> Dict[str, Any]:
+    def api_memory_semantic(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:
         return {
             "entries": to_jsonable(
                 runtime.memory_service.list_semantic_memories(
@@ -1040,34 +1040,42 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         }
 
     @router.get("/api/memory/instances")
-    async def api_memory_instances(
+    def api_memory_instances(
         request: Request,
         library_name: Optional[str] = None,
         label: Optional[str] = None,
+        limit: int = Query(500, ge=1, le=1000),
     ) -> Dict[str, Any]:
-        # list_semantic_instances 已默认按 active 库过滤；前端显式传 library_name 时透传。
-        result = await run_in_threadpool(
-            lambda: runtime.invoke_capability(
-                "list_semantic_instances",
-                {
-                    "library_name": library_name
-                    or runtime.memory_service.get_active_library_name(),
-                    "label": label,
-                },
-                requested_by="http_api",
-            )
+        # 同步路由由网关线程池执行，读取和序列化均不占用异步事件循环。
+        active_library = runtime.memory_service.get_active_library_name()
+        target_library = library_name.strip() if library_name is not None else active_library
+        result = runtime.invoke_capability(
+            "list_semantic_instances",
+            {"library_name": target_library or "", "label": label},
+            requested_by="http_api",
         )
         payload = to_jsonable(result)
-        # invoke_capability 返回 capability 信封 {request_id, capability_name, result:{instances:[...]}}
-        # 端点契约为 {instances:[...]}，解包取内层 result 载荷
         if isinstance(payload, dict) and "instances" not in payload and isinstance(payload.get("result"), dict):
-            return payload["result"]
+            payload = payload["result"]
+        if runtime.memory_service.get_active_library_name() != active_library:
+            raise GatewayError("查询期间记忆库已切换，请刷新。", error_code="memory_library_changed", http_status=409)
+        if isinstance(payload, dict) and isinstance(payload.get("instances"), list):
+            instances = payload["instances"]
+            payload = {
+                **payload,
+                "instances": instances[:limit],
+                "library_name": target_library or None,
+                "active_library_name": active_library,
+                "total": len(instances),
+                "limit": limit,
+                "truncated": len(instances) > limit,
+            }
         return payload
 
     @router.get("/api/memory/scene_spaces")
-    async def api_memory_scene_spaces(
+    def api_memory_scene_spaces(
         request: Request,
-        limit: int = 20,
+        limit: int = Query(20, ge=1, le=1000),
         scene_space_id: Optional[str] = None,
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
@@ -1085,10 +1093,10 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return to_jsonable(memory_skills.handle_list_scene_spaces(runtime._skill_ctx, arguments, requested_by="http_api"))
 
     @router.get("/api/memory/scene_spaces/query")
-    async def api_memory_scene_spaces_query(
+    def api_memory_scene_spaces_query(
         request: Request,
         query: str,
-        limit: int = 5,
+        limit: int = Query(5, ge=1, le=1000),
         similarity_threshold: float = 0.25,
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
@@ -1111,7 +1119,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return to_jsonable(memory_skills.handle_query_scene_spaces(runtime._skill_ctx, arguments, requested_by="http_api"))
 
     @router.get("/api/memory/scene_spaces/{scene_space_id}")
-    async def api_memory_scene_space(scene_space_id: str, request: Request) -> Dict[str, Any]:
+    def api_memory_scene_space(scene_space_id: str, request: Request) -> Dict[str, Any]:
         return to_jsonable(
             memory_skills.handle_get_scene_space(
                 runtime._skill_ctx,

@@ -7,7 +7,7 @@
 use crate::{
     NavError, Point3, PointCloud, PointStamped, SimplePlanner, SimplePlannerConfig, Timestamp,
 };
-use nuwax_nav_types_messages::{NavFrameId, Path2D, PoseStamped};
+use nuwax_nav_types_messages::{NavFrameId, OccupancyGrid2D, Path2D, PoseStamped};
 
 /// Recommended lifecycle period (10 Hz).
 pub const TICK_PERIOD_MS: u64 = 100;
@@ -124,6 +124,14 @@ impl SimplePlannerModule {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// 用已经分类的有界占据图更新规划输入，保留未知区与地图几何。
+    pub fn on_occupancy_grid(&mut self, grid: OccupancyGrid2D) -> Result<(), NavError> {
+        self.ensure_running()?;
+        let costmap = crate::Costmap::from_occupancy(grid, self.config.inflation_radius)?;
+        self.planner.replace_costmap(costmap);
+        Ok(())
     }
 
     /// Dispatch a typed input through the validated runtime handlers.
@@ -274,6 +282,14 @@ impl Module for SimplePlannerModule {
             if pose.pose.position.to_2d().distance(goal.point.to_2d())
                 <= self.config.goal_reached_threshold
             {
+                let map = self.planner.costmap();
+                if !map.permits_endpoints(
+                    map.world_to_cell(pose.pose.position.x, pose.pose.position.y),
+                    map.world_to_cell(goal.point.x, goal.point.y),
+                    map.inflation_radius(),
+                ) {
+                    return self.safety_hold(HoldReason::PlanningFailed);
+                }
                 self.planner.cancel_navigation();
                 self.active_goal = None;
                 return self.safety_hold(HoldReason::GoalReached);
@@ -357,6 +373,151 @@ fn validate_point(point: Point3, field: &'static str) -> Result<(), NavError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuwax_nav_types_messages::{OccupancyCell, Point2, Pose3};
+
+    #[test]
+    fn occupancy_input_restores_configured_footprint_after_terrain_shrink() {
+        let mut module = SimplePlannerModule::new();
+        module.start().unwrap();
+        module
+            .on_odometry(PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(0.55, 1.05, 0.0),
+                    ..Pose3::default()
+                },
+                NavFrameId::Map,
+            ))
+            .unwrap();
+        module
+            .on_goal(PointStamped::from_xyz(NavFrameId::Map, 3.05, 1.05, 0.0))
+            .unwrap();
+        module.planner.replan_once(0.0);
+        assert!(module.planner.replan_once(6.0).2);
+        assert!(module.planner.effective_inflation() < 0.2);
+        let grid = OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 40, 30, OccupancyCell::Free);
+        for _ in 0..2 {
+            module.on_occupancy_grid(grid.clone()).unwrap();
+            assert_eq!(module.planner.effective_inflation(), 0.2);
+            assert_eq!(module.planner.costmap().inflation_radius(), 0.2);
+        }
+    }
+
+    #[test]
+    fn occupancy_rejects_near_invalid_goals_and_preserves_exact_endpoints() {
+        for cell in [OccupancyCell::Unknown, OccupancyCell::Occupied] {
+            let mut module = SimplePlannerModule::with_config(SimplePlannerConfig {
+                inflation_radius: 0.0,
+                ..SimplePlannerConfig::default()
+            })
+            .unwrap();
+            module.start().unwrap();
+            let mut grid =
+                OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 10, 10, OccupancyCell::Free);
+            grid.set(3, 5, cell);
+            module.on_occupancy_grid(grid).unwrap();
+            module
+                .on_odometry(PoseStamped::from_pose(
+                    Pose3 {
+                        position: Point3::new(0.25, 0.55, 0.0),
+                        ..Pose3::default()
+                    },
+                    NavFrameId::Map,
+                ))
+                .unwrap();
+            for goal in [(0.35, 0.55), (-0.05, 0.55)] {
+                module
+                    .on_goal(PointStamped::from_xyz(NavFrameId::Map, goal.0, goal.1, 0.0))
+                    .unwrap();
+                assert!(
+                    matches!(
+                        module.tick().unwrap(),
+                        ModuleOutput::SafetyHold {
+                            reason: HoldReason::PlanningFailed,
+                            ..
+                        }
+                    ),
+                    "近距离的未知、占据或图外目标不能被报告到达"
+                );
+            }
+        }
+        let grid = OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 1.0, 5, 4, OccupancyCell::Free);
+        let map = crate::Costmap::from_occupancy(grid, 0.0).unwrap();
+        let start = Point2::new(0.1, 1.1);
+        let goal = Point2::new(3.99, 1.99);
+        let path = crate::plan_on_costmap(&map, start, goal, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&goal));
+    }
+
+    #[test]
+    fn occupancy_keeps_geometry_height_independent_obstacles_and_replans_updates() {
+        let mut module = SimplePlannerModule::with_config(SimplePlannerConfig {
+            inflation_radius: 0.0,
+            ..SimplePlannerConfig::default()
+        })
+        .unwrap();
+        module.start().unwrap();
+        let origin = Point2::new(-1.13, 2.17);
+        let mut grid = OccupancyGrid2D::filled(origin, 0.2, 20, 10, OccupancyCell::Free);
+        let start = grid.cell_center(2, 5).unwrap();
+        let goal = grid.cell_center(17, 5).unwrap();
+        // 首帧没有位姿也能消费障碍分类，后续高度不会把占据格当作地面过滤。
+        module.on_occupancy_grid(grid.clone()).unwrap();
+        module
+            .on_odometry(PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(start.x, start.y, 3.0),
+                    ..Pose3::default()
+                },
+                NavFrameId::Map,
+            ))
+            .unwrap();
+        module
+            .on_goal(PointStamped::from_xyz(NavFrameId::Map, goal.x, goal.y, 3.0))
+            .unwrap();
+        let ModuleOutput::Plan { path, .. } = module.tick().unwrap() else {
+            panic!("已知自由通道应当可规划");
+        };
+        assert_eq!(path.points.first(), Some(&start));
+        assert_eq!(path.points.last(), Some(&goal));
+
+        for y in 0..grid.height {
+            grid.set(10, y, OccupancyCell::Occupied);
+        }
+        module.on_occupancy_grid(grid.clone()).unwrap();
+        assert!(
+            matches!(
+                module.tick().unwrap(),
+                ModuleOutput::SafetyHold {
+                    reason: HoldReason::PlanningFailed,
+                    ..
+                }
+            ),
+            "地图更新须立即废弃缓存路线，不能绕到图外穿墙"
+        );
+
+        for y in 0..grid.height {
+            grid.set(10, y, OccupancyCell::Unknown);
+        }
+        module.on_occupancy_grid(grid.clone()).unwrap();
+        assert!(
+            matches!(
+                module.tick().unwrap(),
+                ModuleOutput::SafetyHold {
+                    reason: HoldReason::PlanningFailed,
+                    ..
+                }
+            ),
+            "未知带不等于自由通道"
+        );
+        for y in 0..grid.height {
+            grid.set(10, y, OccupancyCell::Free);
+        }
+        module.on_occupancy_grid(grid).unwrap();
+        assert!(matches!(module.tick().unwrap(), ModuleOutput::Plan { .. }));
+    }
 
     fn cloud(points: Vec<Point3>) -> PointCloud {
         PointCloud {

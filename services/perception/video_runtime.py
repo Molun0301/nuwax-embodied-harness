@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Dict, Iterable, Optional, Tuple
 from datetime import datetime
+from contextlib import nullcontext
 
 from contracts.base import utc_now
 from contracts.geometry import Pose
@@ -84,6 +85,8 @@ class PerceptionVideoRuntime:
         self._stop_event = threading.Event()
         self._thread = None
         self._processed_frames = 0
+        self._last_processed_observation_id = None
+        self._memory_write_thread = None
         self._failure_count = 0
         self._last_keyframe_reason = None
         self._last_success_message = None
@@ -209,6 +212,11 @@ class PerceptionVideoRuntime:
                 metadata={
                     **dict(self._last_status_metadata),
                     "prewarm_status": dict(self._prewarm_status),
+                    "stopping": self._stop_event.is_set() and self.is_running(),
+                    "memory_write_in_flight": self._memory_write_in_flight,
+                    "memory_write_completed_count": self._memory_write_completed_count,
+                    "memory_write_failed_count": self._memory_write_failed_count,
+                    "last_memory_write_error": self._last_memory_write_error,
                 },
             )
         return status
@@ -239,19 +247,27 @@ class PerceptionVideoRuntime:
         return status
 
     def stop(self) -> PerceptionRuntimeStatus:
-        """停止后台持续感知线程。"""
+        """有界等待工作退出；超时仍保留线程引用，防止启动第二条感知循环。"""
 
-        thread = None
+        deadline = time.monotonic() + max(1.0, self._interval_sec + self._failure_backoff_sec + 0.5)
         with self._lock:
             thread = self._thread
             self._stop_event.set()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(1.0, self._interval_sec + self._failure_backoff_sec + 0.5))
+        with self._memory_write_lock:
+            self._memory_write_pending = None
+            memory_thread = self._memory_write_thread
+        for worker in (thread, memory_thread):
+            if worker is not None and worker is not threading.current_thread() and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
-            self._thread = None
+            if thread is not None and not thread.is_alive() and self._thread is thread:
+                self._thread = None
             status = self.get_status()
-        self._write_status(running=False)
-        PERCEPTION_RUNTIME_LOGGER.info("持续视频感知运行时已停止 camera=%s", status.camera_id)
+        self._write_status(running=status.running)
+        PERCEPTION_RUNTIME_LOGGER.info(
+            "持续感知停止等待结束 camera=%s running=%s memory_in_flight=%s",
+            status.camera_id, status.running, self._memory_write_in_flight,
+        )
         return status
 
     def run_once(
@@ -295,6 +311,8 @@ class PerceptionVideoRuntime:
             return None
 
         now = utc_now()
+        library_getter = getattr(self._memory_service, "get_active_library_name", None)
+        observation_library = library_getter() if callable(library_getter) else None
         current_pose, map_snapshot, localization_snapshot = self._resolve_runtime_context()
         decision = self._keyframe_selector.decide(
             now=now,
@@ -327,13 +345,31 @@ class PerceptionVideoRuntime:
         fast_started_at = time.monotonic()
         # 高频检测观测链路：每 tick 只执行 detector + 2D tracker + video.detections。
         # segmentation/geometry/scene_description/keyframe memory 属于慢链路，不能反压下一次 YOLO tick。
-        context = self._perception_service.detect_current_frame_fast(
-            camera_id=self._camera_id,
-            requested_by="perception_video_runtime",
-            detector_backend_name=self._detector_backend_name or None,
-            detection_metadata=detection_metadata,
-            open_vocabulary_classes=open_vocabulary_classes,
-        )
+        try:
+            context = self._perception_service.detect_current_frame_fast(
+                camera_id=self._camera_id,
+                requested_by="perception_video_runtime",
+                detector_backend_name=self._detector_backend_name or None,
+                detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
+        except GatewayError as exc:
+            if exc.error_code != "video_ingest_not_ready":
+                raise
+            # 共享帧读取器可能尚无新帧；等待输入不属于模型失败，也不触发失败退避。
+            self._last_status_metadata = {**self._last_status_metadata, "waiting_for_frame": True}
+            self._last_error = None
+            self._write_status(running=self.is_running())
+            return None
+        detector_status = str(dict(context.metadata.get("stage_status") or {}).get("detector") or "completed")
+        if detector_status not in {"completed", "fallback"}:
+            self._last_error = "检测模型尚未完成有效推理：%s" % detector_status
+            self._write_status(running=self.is_running())
+            return None
+        observation_id = context.observation.observation_id
+        if observation_id == self._last_processed_observation_id:
+            return None
+        self._last_processed_observation_id = observation_id
         fast_loop_duration_ms = round((time.monotonic() - fast_started_at) * 1000.0, 3)
         stage_duration_ms = dict(context.metadata.get("stage_duration_ms") or {})
         last_full_stage_duration_ms_total = self._latest_full_stage_duration_ms_total()
@@ -352,32 +388,33 @@ class PerceptionVideoRuntime:
         effective_reason = decision.reason if (decision.should_process and not force_keyframe) else reason
         memory_written = False
         continuous_ingested = False
+        memory_scope_valid = not callable(library_getter) or (
+            observation_library is not None and library_getter() == observation_library
+        )
+        allow_memory_write = allow_memory_write and memory_scope_valid
         if write_memory:
-            # 关键帧路径：完整记忆写入（remember_current_scene 内部走 persist=True 全摄入）。
-            # mark_processed 只在此处调用——它更新 _last_keyframe_at/_last_keyframe_pose 基准，
-            # 若每 tick 都调，位移基准会被刷成上一 tick（几厘米），永远达不到阈值、关键帧永不触发。
-            self._keyframe_selector.mark_processed(
-                timestamp=now,
-                current_pose=current_pose,
-            )
             memory_written = self._schedule_memory_write(
                 context=context,
                 current_pose=current_pose,
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+                expected_library_name=observation_library,
                 reason=effective_reason,
                 now=now,
                 force=force_keyframe,
                 allow_memory_write=allow_memory_write,
             )
-        else:
-            # 非关键帧路径：仅连续感知摄入（关联 + 射线累积，不落盘不向量化）
-            self._ingest_continuous_observation(
+            if memory_written:
+                self._keyframe_selector.mark_processed(timestamp=now, current_pose=current_pose)
+        if not memory_written and allow_memory_write and not self._stop_event.is_set():
+            continuous_ingested = self._ingest_continuous_observation(
                 context=context,
                 map_snapshot=map_snapshot,
                 localization_snapshot=localization_snapshot,
                 current_pose=current_pose,
                 now=now,
+                expected_library_name=observation_library,
             )
-            continuous_ingested = True
 
         capture_mode = "burst" if force_keyframe else ("keyframe" if decision.should_process else "continuous")
         with self._lock:
@@ -405,7 +442,7 @@ class PerceptionVideoRuntime:
                 "store_artifact": self._store_artifact,
                 "capture_mode": capture_mode,
                 "keyframe_reason": effective_reason,
-                "memory_written": memory_written,
+                "memory_written": False,
                 "memory_write_scheduled": memory_written,
                 "remember_keyframes": self._remember_keyframes,
                 "detection_metadata": dict(detection_metadata or {}),
@@ -440,7 +477,8 @@ class PerceptionVideoRuntime:
         localization_snapshot,
         current_pose: Optional[Pose],
         now: datetime,
-    ) -> None:
+        expected_library_name: Optional[str] = None,
+    ) -> bool:
         """非关键帧 tick 的连续感知摄入：关联 + 射线累积，不落盘不向量化。
 
         方案 B：让 track_id 帧间连续、射线累积进同一实例的 deferred_projection_cache，
@@ -448,26 +486,33 @@ class PerceptionVideoRuntime:
         """
         memory_service = self._memory_service
         if memory_service is None or current_pose is None:
-            return
+            return False
         if hasattr(memory_service, "is_enabled") and not memory_service.is_enabled():
-            return
+            return False
         ingest = getattr(memory_service, "ingest_perception_observation", None)
         if not callable(ingest):
-            return
+            return False
         try:
-            ingest(
-                perception_context=context,
-                map_snapshot=map_snapshot,
-                localization_snapshot=localization_snapshot,
-                current_pose=current_pose,
-                camera_id=self._camera_id,
-                now=now,
-                persist=False,
-            )
+            # 与记忆库切换共享已有结构锁，避免识别过程中切库后回灌旧图观察。
+            with getattr(memory_service, "_instances_lock", nullcontext()):
+                library_getter = getattr(memory_service, "get_active_library_name", None)
+                if expected_library_name is not None and callable(library_getter) and library_getter() != expected_library_name:
+                    return False
+                ingest(
+                    perception_context=context,
+                    map_snapshot=map_snapshot,
+                    localization_snapshot=localization_snapshot,
+                    current_pose=current_pose,
+                    camera_id=self._camera_id,
+                    now=now,
+                    persist=False,
+                )
+            return True
         except Exception:
             PERCEPTION_RUNTIME_LOGGER.debug(
                 "连续感知摄入失败 camera=%s。", self._camera_id, exc_info=True
             )
+            return False
 
     def _schedule_memory_write(
         self,
@@ -478,10 +523,13 @@ class PerceptionVideoRuntime:
         now: datetime,
         force: bool,
         allow_memory_write: bool,
+        map_snapshot=None,
+        localization_snapshot=None,
+        expected_library_name: Optional[str] = None,
     ) -> bool:
         """latest-only 调度关键帧记忆写入，避免阻塞高频检测 tick。"""
 
-        if not allow_memory_write:
+        if not allow_memory_write or self._stop_event.is_set():
             return False
         memory_service = self._memory_service
         if memory_service is None:
@@ -494,15 +542,24 @@ class PerceptionVideoRuntime:
                     return False
             except Exception:
                 return False
+        library_getter = getattr(memory_service, "get_active_library_name", None)
+        current_library = library_getter() if callable(library_getter) else None
+        if expected_library_name is not None and current_library != expected_library_name:
+            return False
         job = {
+            "library_name": expected_library_name if expected_library_name is not None else current_library,
             "context": context,
             "current_pose": current_pose,
+            "map_snapshot": map_snapshot,
+            "localization_snapshot": localization_snapshot,
             "reason": reason,
             "now": now,
             "force": force,
             "allow_memory_write": allow_memory_write,
         }
         with self._memory_write_lock:
+            if self._stop_event.is_set():
+                return False
             self._memory_write_scheduled_count += 1
             if self._memory_write_in_flight:
                 self._memory_write_pending = job
@@ -514,7 +571,15 @@ class PerceptionVideoRuntime:
             name="nuwax_perception_memory_write",
             daemon=True,
         )
-        thread.start()
+        with self._memory_write_lock:
+            self._memory_write_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._memory_write_lock:
+                self._memory_write_in_flight = False
+                self._memory_write_thread = None
+            raise
         return True
 
     def _memory_write_worker(self, initial_job) -> None:
@@ -523,7 +588,16 @@ class PerceptionVideoRuntime:
             ok = False
             error = None
             try:
-                ok = self._remember_from_keyframe(**job)
+                parameters = dict(job)
+                expected_library = parameters.pop("library_name", None)
+                parameters["expected_library_name"] = expected_library
+                library_getter = getattr(self._memory_service, "get_active_library_name", None)
+                if self._stop_event.is_set():
+                    error = "memory_write_cancelled"
+                elif expected_library is not None and callable(library_getter) and library_getter() != expected_library:
+                    error = "memory_library_changed"
+                else:
+                    ok = self._remember_from_keyframe(**parameters)
             except Exception as exc:  # 防御性兜底；_remember_from_keyframe 自身通常吞异常。
                 ok = False
                 error = str(exc)
@@ -542,10 +616,11 @@ class PerceptionVideoRuntime:
                     self._memory_write_failed_count += 1
                     self._last_memory_write_error = error or "memory_write_skipped_or_failed"
             with self._memory_write_lock:
-                job = self._memory_write_pending
+                job = None if self._stop_event.is_set() else self._memory_write_pending
                 self._memory_write_pending = None
                 if job is None:
                     self._memory_write_in_flight = False
+                    self._memory_write_thread = None
                     return
 
     @staticmethod
@@ -643,6 +718,7 @@ class PerceptionVideoRuntime:
             remaining = self._interval_sec - (time.monotonic() - frame_start)
             if remaining > 0 and self._stop_event.wait(remaining):
                 break
+        self._write_status(running=False)
 
     def _log_skip(self, *, reason: str, level: int, detail: str) -> None:
         """限流记录跳帧诊断：原因变化或超过间隔才输出，避免 0.5s 循环刷屏。"""
@@ -762,8 +838,10 @@ class PerceptionVideoRuntime:
         now: datetime,
         force: bool,
         allow_memory_write: bool,
+        map_snapshot=None,
+        localization_snapshot=None,
+        expected_library_name=None,
     ) -> bool:
-        del current_pose
         if not allow_memory_write:
             return False
         if self._memory_service is None:
@@ -774,6 +852,11 @@ class PerceptionVideoRuntime:
             return False
         try:
             self._memory_service.remember_current_scene(
+                perception_context=context,
+                observation_pose=current_pose,
+                map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot,
+                expected_library_name=expected_library_name,
                 title="自动场景记忆：%s" % context.scene_summary.headline[:48],
                 camera_id=context.camera_id,
                 summary_override=context.scene_summary.headline,

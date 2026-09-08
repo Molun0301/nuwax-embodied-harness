@@ -34,12 +34,13 @@ nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link
 
 # Phase 2:建图 / 导航 / 探索功能 crate 接入。
 # feature 名以 dimos 实际 Cargo.toml 为准(见 Phase 2 执行方案 / feedback_phase2.md)。
-# - nuwax-nav-stack:foundation + simple-2d + replanning-astar(P1 再开 native-*/explore)
-# - nuwax-exploration:wavefront + runtime(P1 再开 tare,terrain-map-ext,spec-summary)
+# - 导航接入二维简易、持续重规划和多层表面的统一守卫链。
+# - 探索运行时使用波前会话，按配置选择栅格或三维表面目标源。
 nuwax-mapping = { path = "../../nuwax-workspace/crates/nuwax-mapping" }
 nuwax-mapping-cloud = { path = "../../nuwax-workspace/crates/nuwax-mapping-cloud", features = ["cloud-enabled"] }
 nuwax-mapping-raytracing = { path = "../../nuwax-workspace/crates/nuwax-mapping-raytracing" }
-nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["foundation", "simple-2d", "replanning-astar"] }
+nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["foundation", "simple-2d", "replanning-astar", "mls"] }
+nuwax-nav-mls-planner = { path = "../../nuwax-workspace/crates/nuwax-nav-mls-planner" }
 nuwax-nav-types-messages = { path = "../../nuwax-workspace/crates/nuwax-nav-types-messages" }
 nuwax-nav-simple-planner = { path = "../../nuwax-workspace/crates/nuwax-nav-simple-planner" }
 nuwax-nav-astar = { path = "../../nuwax-workspace/crates/nuwax-nav-astar" }
@@ -48,7 +49,7 @@ nuwax-nav-pgo-bridge = { path = "../../nuwax-workspace/crates/nuwax-nav-pgo-brid
 nuwax-motion-safety-guard = { path = "../../nuwax-workspace/crates/nuwax-motion-safety-guard" }
 # Phase 4 nav_runtime:serde 用于 NavigationReadinessDetail JSON 序列化
 uuid = { version = "1", features = ["v4"] }
-nuwax-exploration = { path = "../../nuwax-workspace/crates/nuwax-exploration", default-features = false, features = ["wavefront", "runtime"] }
+nuwax-exploration = { path = "../../nuwax-workspace/crates/nuwax-exploration", default-features = false, features = ["wavefront", "runtime", "surface"] }
 nuwax-explore-wavefront = { path = "../../nuwax-workspace/crates/nuwax-explore-wavefront" }
 
 # 原生 runtime 必备依赖（gRPC/HTTP/SHM/日志/系统调用）

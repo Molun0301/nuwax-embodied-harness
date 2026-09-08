@@ -167,11 +167,11 @@ impl Point3 {
     }
 }
 
-/// 四元数(w, x, y, z),归一化。
+/// 四元数(w, x, y, z)，字段与反序列化本身不执行归一化。
 ///
 /// 仅承载数学结构;不直接与 `nuwax-tf` 类型互转(由调用方按需映射)。
 ///
-/// 默认值为全零 `(w=0, x=0, y=0, z=0)`(非单位四元数,需要主动 `Quaternion::IDENTITY` 归一化)。
+/// 默认值为全零 `(w=0, x=0, y=0, z=0)`，没有定义朝向；无旋转请使用 `Quaternion::IDENTITY`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Quaternion {
     /// w 分量
@@ -205,12 +205,30 @@ impl Quaternion {
         }
     }
 
-    /// 提取 yaw(z 轴旋转)
+    /// 提取三维姿态的偏航角（绕 z 轴，弧度）。
+    /// 有限非零输入先归一化；全零或非有限输入返回非数，调用方须拒绝无效朝向。
     #[must_use]
     pub fn yaw(self) -> f64 {
-        let sinp = 2.0 * (self.w * self.z);
-        let cosp = 1.0 - 2.0 * (self.z * self.z);
-        sinp.atan2(cosp)
+        let components = [self.w, self.x, self.y, self.z];
+        if components.iter().any(|value| !value.is_finite()) {
+            return f64::NAN;
+        }
+        let scale = components.into_iter().map(f64::abs).fold(0.0, f64::max);
+        if scale == 0.0 {
+            return f64::NAN;
+        }
+        // 先缩放到最大分量为一，避免非单位输入在求范数时上溢或下溢。
+        let (w, x, y, z) = (
+            self.w / scale,
+            self.x / scale,
+            self.y / scale,
+            self.z / scale,
+        );
+        let norm = (w * w + x * x + y * y + z * z).sqrt();
+        let (w, x, y, z) = (w / norm, x / norm, y / norm, z / norm);
+        let sin_yaw = 2.0 * (w * z + x * y);
+        let cos_yaw = 1.0 - 2.0 * (y * y + z * z);
+        sin_yaw.atan2(cos_yaw)
     }
 }
 
@@ -245,7 +263,7 @@ impl Default for Pose2 {
 
 /// 3D 位姿
 ///
-/// 默认值为原点 + 单位朝向。
+/// 默认值为原点与未定义的全零四元数；有效位姿须显式提供朝向。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pose3 {
     /// 位置
@@ -430,6 +448,51 @@ mod tests {
         assert!((q.yaw() - yaw).abs() < 1e-9);
         // identity yaw
         assert!(Quaternion::IDENTITY.yaw().abs() < 1e-9);
+    }
+
+    #[test]
+    fn quaternion_yaw_preserves_tilted_attitude_under_nonzero_scaling() {
+        for (roll, pitch, yaw) in [(0.4, -0.5, 1.2), (-1.0, 0.7, -2.4)] {
+            // 用已有旋转库生成三轴姿态，期望值直接取原始偏航角。
+            let rotation = nalgebra::UnitQuaternion::from_euler_angles(roll, pitch, yaw);
+            let unit = rotation.quaternion();
+            for scale in [1.0, 3.5, -2.0, 1e300, -1e-300] {
+                let quaternion = Quaternion {
+                    w: unit.w * scale,
+                    x: unit.i * scale,
+                    y: unit.j * scale,
+                    z: unit.k * scale,
+                };
+                let actual = quaternion.yaw();
+                assert!(
+                    (actual - yaw).abs() < 1e-12,
+                    "混合姿态或非单位倍率改变偏航：roll={roll}, pitch={pitch}, yaw={yaw}, scale={scale}, actual={actual}"
+                );
+                let projected = Pose3 {
+                    position: Point3::new(1.0, 2.0, 3.0),
+                    orientation: quaternion,
+                }
+                .to_pose2();
+                assert!((projected.yaw - yaw).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn quaternion_yaw_marks_undefined_orientation_as_nonfinite() {
+        for quaternion in [
+            Quaternion::default(),
+            Quaternion {
+                x: f64::NAN,
+                ..Quaternion::IDENTITY
+            },
+            Quaternion {
+                w: f64::INFINITY,
+                ..Quaternion::IDENTITY
+            },
+        ] {
+            assert!(quaternion.yaw().is_nan(), "非法姿态不能伪装为零偏航");
+        }
     }
 
     #[test]

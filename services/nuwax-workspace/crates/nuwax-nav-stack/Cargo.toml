@@ -109,10 +109,9 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
-    "native-runner",
+    "guard-runtime",
     "dep:nuwax-nav-mls-planner",
-    "basic-path-follower",
-    "movement-manager",
+    "click-goal",
 ]
 explore = [
     "native-far",
@@ -207,6 +206,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bitflags = { workspace = true }
+sha2 = "0.10"
 futures = { workspace = true, optional = true }
 # P0-07 StackRunner 使用 process / time / rt,CLI 通过 signal 等待 Ctrl-C。
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }

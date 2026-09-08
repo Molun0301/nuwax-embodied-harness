@@ -128,6 +128,12 @@ class FinalizedAssetAuthorityResolver:
             self._fail("repository_identity_mismatch", "finalized 资产 map/frame 与 sealed 权威不一致。")
         if bundle.manifest_sha256 != sealed.asset_manifest_sha256:
             self._fail("manifest_mismatch", "finalized 资产清单摘要与 sealed 权威不一致。")
+        if bundle.georeference is None:
+            self._fail(
+                "map_georeference_required",
+                "当前地图没有地理锚点，无法将经纬度转换为地图目标；本地地图坐标仍可使用。",
+            )
+        assert bundle.georeference is not None
         georeference = bundle.georeference.contract
         georeference_sha256 = hashlib.sha256(snapshot.georeference_bytes).hexdigest()
         if (

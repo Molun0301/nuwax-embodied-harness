@@ -20,11 +20,42 @@ use nuwax_motion_safety_guard::{
 };
 use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig, StopMessage};
 use nuwax_nav_astar::navigation_map::CostMap2D;
-use nuwax_nav_types_messages::{Path2D, PoseStamped, Twist2};
+use nuwax_nav_types_messages::{Path2D, Path3D, PoseStamped, Twist2};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
+
+pub mod surface_follower;
+pub use nuwax_nav_mls_planner::SurfaceSnapshot;
+pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
+
+/// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionPath {
+    /// 现有二维路径，配套朝向沿原可选字段传递。
+    Planar(Path2D),
+    /// 完整机体参考位置与姿态路径。
+    Surface(Path3D),
+}
+
+/// 当前局部执行使用的不可变地图输入。
+#[derive(Clone)]
+pub enum ExecutionMap {
+    /// 现有二维占据图。
+    Planar(CostMap2D),
+    /// 由同一MLS拥有方生成的不可变表面快照。
+    Surface(Arc<SurfaceSnapshot>),
+}
+
+impl std::fmt::Debug for ExecutionMap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Planar(map) => formatter.debug_tuple("Planar").field(map).finish(),
+            Self::Surface(_) => formatter.write_str("Surface(..)"),
+        }
+    }
+}
 
 /// Production controller cadence: 20 Hz.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
@@ -36,7 +67,7 @@ pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DEFAULT_POSE_TTL: Duration = Duration::from_millis(200);
 /// Default maximum receipt age for the planner-consumed occupancy costmap.
 pub const DEFAULT_COSTMAP_TTL: Duration = Duration::from_millis(500);
-/// Maximum time a leased session may wait for its first correlated path.
+/// 租约会话等待首次路径或失效后替换路径的最大时间。
 pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard upper bound from cancel admission to a terminal fence attempt.
 pub const MAX_CANCEL_FENCE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -148,7 +179,7 @@ impl PathExecutionIdentity {
 }
 
 /// One navigation session and its request-level motion admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NavSession {
     /// Stable goal/session identifier.
     pub session_id: String,
@@ -158,6 +189,8 @@ pub struct NavSession {
     pub local_owner_runtime_generation: u64,
     /// Request-level motion admission proof transported with the goal.
     pub motion_admission: NavMotionAdmission,
+    /// 已封存的用户原目标；三维目标使用机体参考位置。
+    pub goal_pose: PoseStamped,
 }
 
 /// A planner path with the correlation fields required for safe cutover.
@@ -172,7 +205,9 @@ pub struct VersionedPath {
     /// Canonical payload digest supplied by the versioned codec.
     pub payload_hash: [u8; 32],
     /// Planner output consumed by the local controller.
-    pub path: Path2D,
+    pub path: ExecutionPath,
+    /// 可选路径朝向；生产入口由已核对身份的目标与路径生成，末项为请求的到达朝向。
+    pub path_yaws: Option<Vec<f64>>,
 }
 
 /// Scheduler lifecycle. Terminal meaning is carried separately in status.
@@ -182,7 +217,7 @@ pub enum SchedulerPhase {
     Idle,
     /// Waiting for the motion guard to grant a NAV lease.
     Acquiring,
-    /// Lease acquired; waiting for the first correlated path.
+    /// 租约已取得，等待首次有效路径或已确认零速后的更新路径。
     AwaitingPath,
     /// Running the 20 Hz controller and waiting for every APPLIED proof.
     Controlling,
@@ -396,8 +431,8 @@ pub struct LeaseProof {
 /// One planner-consumed occupancy snapshot with immutable source metadata.
 #[derive(Debug, Clone)]
 pub struct CostmapObservation {
-    /// Decoded controller costmap.
-    pub costmap: CostMap2D,
+    /// 保留原维度的局部执行地图；三维表面只共享不可变快照。
+    pub costmap: ExecutionMap,
     /// Positive source timestamp carried by the occupancy frame.
     pub source_timestamp_ns: i64,
 }
@@ -655,6 +690,8 @@ pub enum PlannerStep {
     Succeeded,
     /// Planner cannot safely continue.
     Failed(String),
+    /// 当前路径已失效，先确认零速再有界等待更新的规划修订。
+    ReplanRequired(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -670,16 +707,56 @@ enum LocalExecutionPayload {
     Command(Twist2),
     Succeeded,
     Failed(String),
+    ReplanRequired(String),
 }
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
     /// Replace the active plan after version validation.
     fn replace_path(&mut self, path: Path2D);
+    /// 替换路径与可选朝向；不使用朝向的兼容后端仍沿原接口运行。
+    fn replace_path_with_orientations(&mut self, path: Path2D, _yaws: Option<Vec<f64>>) {
+        self.replace_path(path);
+    }
+    /// 接收经调度器核对的完整路径与原用户目标，默认后端不支持三维降级。
+    fn replace_execution_path(
+        &mut self,
+        path: ExecutionPath,
+        yaws: Option<Vec<f64>>,
+        _goal: PoseStamped,
+    ) -> Result<(), RuntimeError> {
+        match path {
+            ExecutionPath::Planar(path) => {
+                self.replace_path_with_orientations(path, yaws);
+                Ok(())
+            }
+            ExecutionPath::Surface(_) => Err(RuntimeError::InvalidInput {
+                field: "execution_path",
+                reason: "当前局部后端不支持三维路径".into(),
+            }),
+        }
+    }
     /// Update the latest odometry sample.
     fn update_odometry(&mut self, odometry: PoseStamped);
     /// Update the latest planner-consumed occupancy costmap.
     fn update_costmap(&mut self, costmap: CostMap2D);
+    /// 接收与路径维度匹配的地图，默认后端不能把表面快照当作二维占据图。
+    fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
+        match map {
+            ExecutionMap::Planar(map) => {
+                self.update_costmap(map);
+                Ok(())
+            }
+            ExecutionMap::Surface(_) => Err(RuntimeError::InvalidInput {
+                field: "execution_map",
+                reason: "当前局部后端不支持三维表面地图".into(),
+            }),
+        }
+    }
+    /// 来源被明确清空或更换时撤销局部缓存，不能用旧地图重新恢复运动。
+    fn invalidate_execution_map(&mut self) {
+        self.stop();
+    }
     /// Produce one controller step.
     fn step(&mut self, robot_width_m: f64) -> PlannerStep;
     /// Clear planner state after a terminal fence.
@@ -691,6 +768,8 @@ pub trait NavPlanner: Send + 'static {
 pub enum LocalExecutionBackendKind {
     /// Run the deterministic basic local planner inside the scheduler task.
     BasicInProcess,
+    /// 显式配置机体到支撑面的标定后，在同一调度任务内跟随三维路径。
+    SurfaceInProcess,
 }
 
 struct BasicInProcessLocalBackend(LocalPlanner);
@@ -711,6 +790,10 @@ impl BasicInProcessLocalBackend {
 impl NavPlanner for BasicInProcessLocalBackend {
     fn replace_path(&mut self, path: Path2D) {
         self.0.start_planning(path);
+    }
+
+    fn replace_path_with_orientations(&mut self, path: Path2D, yaws: Option<Vec<f64>>) {
+        self.0.start_planning_with_orientations(path, yaws);
     }
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
@@ -736,9 +819,15 @@ impl NavPlanner for BasicInProcessLocalBackend {
     }
 }
 
-fn production_local_backend(kind: LocalExecutionBackendKind) -> BasicInProcessLocalBackend {
+fn production_local_backend(
+    kind: LocalExecutionBackendKind,
+) -> Result<BasicInProcessLocalBackend, RuntimeError> {
     match kind {
-        LocalExecutionBackendKind::BasicInProcess => BasicInProcessLocalBackend::production(),
+        LocalExecutionBackendKind::BasicInProcess => Ok(BasicInProcessLocalBackend::production()),
+        LocalExecutionBackendKind::SurfaceInProcess => Err(RuntimeError::InvalidInput {
+            field: "body_to_support_z_m",
+            reason: "三维后端必须通过显式配置构造，缺少机体到支撑面的标定".into(),
+        }),
     }
 }
 
@@ -778,12 +867,14 @@ pub struct NavScheduler<M, P> {
     lease_active: bool,
     current_path_revision: u64,
     current_payload_hash: Option<[u8; 32]>,
-    current_path: Option<Path2D>,
+    current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     local_intent_sequence: u64,
     path_wait_started_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
+    pose_valid_until: Option<Instant>,
     costmap_receipt: Option<PlannerInputReceipt>,
+    map_invalidated_at: Option<Instant>,
     operation_sequence: u64,
     status: SchedulerStatus,
 }
@@ -820,7 +911,9 @@ where
             local_intent_sequence: 0,
             path_wait_started_at: None,
             pose_receipt: None,
+            pose_valid_until: None,
             costmap_receipt: None,
+            map_invalidated_at: None,
             operation_sequence: 0,
             status,
         })
@@ -940,6 +1033,38 @@ where
                 let _ = reply.send(result);
                 None
             }
+            UrgentCommand::InvalidateMap {
+                reason,
+                invalidated_at,
+                reply,
+            } => {
+                self.map_invalidated_at = Some(
+                    self.map_invalidated_at
+                        .map_or(invalidated_at, |previous| previous.max(invalidated_at)),
+                );
+                self.costmap_receipt = None;
+                self.planner.invalidate_execution_map();
+                self.refresh_input_status(Instant::now());
+                let result = if self.lease_active || self.session.is_some() {
+                    let error = self
+                        .fail_closed(
+                            status_tx,
+                            RuntimeError::StaleInput(format!("地图来源失效: {reason}")),
+                        )
+                        .await;
+                    if self.lease_active {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    self.status.message = format!("地图来源失效，等待新输入: {reason}");
+                    self.publish_status(status_tx);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+                None
+            }
             UrgentCommand::Shutdown { reply } => {
                 let result = self
                     .finish_terminal(status_tx, TerminalOutcome::Shutdown, SchedulerPhase::Idle)
@@ -958,8 +1083,12 @@ where
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
-            InputKind::UpdateOdometry(odometry) => self.observe_odometry(status_tx, odometry),
-            InputKind::UpdateCostmap(observation) => self.observe_costmap(status_tx, observation),
+            InputKind::UpdateOdometry(odometry, valid_until) => {
+                self.observe_odometry(status_tx, odometry, valid_until)
+            }
+            InputKind::UpdateCostmap(observation, received_at) => {
+                self.observe_costmap(status_tx, observation, received_at)
+            }
         };
         let _ = command.reply.send(result);
     }
@@ -968,12 +1097,18 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
         odometry: PoseStamped,
+        valid_until: Option<Instant>,
     ) -> Result<(), RuntimeError> {
         if odometry.frame_id != nuwax_nav_types_messages::NavFrameId::Map {
             return Err(RuntimeError::InvalidInput {
                 field: "odometry.frame_id",
                 reason: format!("expected map, got {}", odometry.frame_id.as_str()),
             });
+        }
+        if valid_until.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(RuntimeError::StaleInput(
+                "pose source deadline already elapsed before admission".into(),
+            ));
         }
         let source_timestamp_ns = odometry.stamp.nanos;
         validate_source_timestamp(
@@ -986,6 +1121,7 @@ where
             source_timestamp_ns,
             received_at: Instant::now(),
         });
+        self.pose_valid_until = valid_until;
         self.refresh_input_status(Instant::now());
         if self.status.last_terminal.is_none() {
             self.status.message = "fresh map pose consumed".into();
@@ -998,16 +1134,31 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
         observation: CostmapObservation,
+        received_at: Instant,
     ) -> Result<(), RuntimeError> {
+        if received_at > Instant::now() {
+            return Err(RuntimeError::InvalidInput {
+                field: "costmap.received_at",
+                reason: "地图接收时刻不能位于未来".into(),
+            });
+        }
+        if self
+            .map_invalidated_at
+            .is_some_and(|invalidated_at| received_at < invalidated_at)
+        {
+            return Err(RuntimeError::StaleInput(
+                "地图在来源失效前已经接收，不能迟到恢复旧地图".into(),
+            ));
+        }
         validate_source_timestamp(
             "costmap.source_timestamp_ns",
             observation.source_timestamp_ns,
             self.costmap_receipt,
         )?;
-        self.planner.update_costmap(observation.costmap);
+        self.planner.update_execution_map(observation.costmap)?;
         self.costmap_receipt = Some(PlannerInputReceipt {
             source_timestamp_ns: observation.source_timestamp_ns,
-            received_at: Instant::now(),
+            received_at,
         });
         self.refresh_input_status(Instant::now());
         if self.status.last_terminal.is_none() {
@@ -1029,6 +1180,7 @@ where
         self.status.planner_inputs_fresh = self
             .pose_receipt
             .is_some_and(|receipt| now.duration_since(receipt.received_at) <= self.config.pose_ttl)
+            && self.pose_valid_until.is_none_or(|deadline| now < deadline)
             && self.costmap_receipt.is_some_and(|receipt| {
                 now.duration_since(receipt.received_at) <= self.config.costmap_ttl
             });
@@ -1037,7 +1189,18 @@ where
     fn stale_input_reason(&mut self, now: Instant) -> Option<String> {
         self.refresh_input_status(now);
         let pose_reason =
-            stale_receipt_reason("pose", self.pose_receipt, now, self.config.pose_ttl);
+            stale_receipt_reason("pose", self.pose_receipt, now, self.config.pose_ttl).or_else(
+                || {
+                    self.pose_valid_until
+                        .filter(|deadline| now >= *deadline)
+                        .map(|_| {
+                            format!(
+                                "pose source deadline elapsed (source_timestamp_ns={})",
+                                self.status.pose_source_timestamp_ns
+                            )
+                        })
+                },
+            );
         let costmap_reason = stale_receipt_reason(
             "costmap",
             self.costmap_receipt,
@@ -1170,12 +1333,19 @@ where
         }
         if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
             let immutable = self.current_payload_hash == Some(path.payload_hash)
-                && self.current_path.as_ref() == Some(&path.path)
+                && self.current_path.as_ref().is_some_and(|(current, yaws)| {
+                    current == &path.path && yaws == &path.path_yaws
+                })
                 && self
                     .current_execution_identity
                     .as_ref()
                     .is_some_and(|identity| identity.as_ref() == &path.execution_identity);
             if immutable {
+                if self.status.phase == SchedulerPhase::AwaitingPath {
+                    return Err(path_rejected(
+                        "失效路径需要更高规划修订，不能用同修订重放恢复",
+                    ));
+                }
                 return Ok(());
             }
             let error = RuntimeError::PathMutation {
@@ -1198,17 +1368,22 @@ where
 
         let VersionedPath {
             path: planner_path,
+            path_yaws,
             execution_identity,
             path_revision,
             payload_hash,
             ..
         } = path;
-        self.planner.replace_path(planner_path.clone());
+        self.planner.replace_execution_path(
+            planner_path.clone(),
+            path_yaws.clone(),
+            session.goal_pose.clone(),
+        )?;
         self.current_path_revision = path_revision;
         self.current_payload_hash = Some(payload_hash);
-        self.current_path = Some(planner_path);
+        self.current_path = Some((planner_path, path_yaws));
         self.current_execution_identity = Some(Arc::new(execution_identity));
-        self.path_wait_started_at = None;
+        // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
         self.status.message = "versioned path accepted".into();
@@ -1265,28 +1440,16 @@ where
         }
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
-                if let Err(error) = validate_twist(twist) {
-                    return Err(self.fail_closed(status_tx, error).await);
-                }
-                let operation_id = self.next_operation_id("twist")?;
-                let proof = match self.motion.submit_twist(&operation_id, twist).await {
-                    Ok(proof) => proof,
-                    Err(error) => {
-                        let error = RuntimeError::Motion(error.message);
-                        return Err(self.fail_closed(status_tx, error).await);
-                    }
-                };
-                if proof.operation_id != operation_id || proof.applied_monotonic_ns == 0 {
-                    let reason = format!(
-                        "expected operation_id={operation_id}, got {} at {}",
-                        proof.operation_id, proof.applied_monotonic_ns
-                    );
-                    let error = RuntimeError::InvalidApplied(reason);
-                    return Err(self.fail_closed(status_tx, error).await);
-                }
-                self.status.applied_commands = self.status.applied_commands.saturating_add(1);
-                self.status.last_applied_twist = Some(twist);
-                self.status.message = "twist APPLIED".into();
+                self.apply_controller_twist(status_tx, twist).await?;
+                self.path_wait_started_at = None;
+                Ok(())
+            }
+            LocalExecutionPayload::ReplanRequired(reason) => {
+                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                self.planner.stop();
+                self.path_wait_started_at.get_or_insert_with(Instant::now);
+                self.status.phase = SchedulerPhase::AwaitingPath;
+                self.status.message = format!("路径失效，零速已执行，等待更新路径: {reason}");
                 self.publish_status(status_tx);
                 Ok(())
             }
@@ -1309,6 +1472,38 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// 运动和等待重规划的零速共用同一提交与回执校验路径。
+    async fn apply_controller_twist(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+        twist: Twist2,
+    ) -> Result<(), RuntimeError> {
+        if let Err(error) = validate_twist(twist) {
+            return Err(self.fail_closed(status_tx, error).await);
+        }
+        let operation_id = self.next_operation_id("twist")?;
+        let proof = match self.motion.submit_twist(&operation_id, twist).await {
+            Ok(proof) => proof,
+            Err(error) => {
+                let error = RuntimeError::Motion(error.message);
+                return Err(self.fail_closed(status_tx, error).await);
+            }
+        };
+        if proof.operation_id != operation_id || proof.applied_monotonic_ns == 0 {
+            let reason = format!(
+                "expected operation_id={operation_id}, got {} at {}",
+                proof.operation_id, proof.applied_monotonic_ns
+            );
+            let error = RuntimeError::InvalidApplied(reason);
+            return Err(self.fail_closed(status_tx, error).await);
+        }
+        self.status.applied_commands = self.status.applied_commands.saturating_add(1);
+        self.status.last_applied_twist = Some(twist);
+        self.status.message = "twist APPLIED".into();
+        self.publish_status(status_tx);
+        Ok(())
     }
 
     fn wrap_local_intent(
@@ -1335,6 +1530,7 @@ where
             PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
             PlannerStep::Succeeded => LocalExecutionPayload::Succeeded,
             PlannerStep::Failed(reason) => LocalExecutionPayload::Failed(reason),
+            PlannerStep::ReplanRequired(reason) => LocalExecutionPayload::ReplanRequired(reason),
         };
         Ok(LocalExecutionCommandIntent {
             identity,
@@ -1370,6 +1566,19 @@ where
         }
         if self.status.phase != SchedulerPhase::AwaitingPath {
             return Ok(());
+        }
+        if self.current_path_revision > 0 {
+            if let Some(reason) = self.stale_input_reason(Instant::now()) {
+                self.finish_terminal(
+                    status_tx,
+                    TerminalOutcome::SafetyFailed,
+                    SchedulerPhase::Failed,
+                )
+                .await?;
+                self.status.message = format!("SafetyFailed cause=StaleInput: {reason}");
+                self.publish_status(status_tx);
+                return Ok(());
+            }
         }
         let Some(started_at) = self.path_wait_started_at else {
             let error = RuntimeError::Planner("awaiting path without a deadline".into());
@@ -1560,7 +1769,18 @@ impl NavSchedulerHandle {
 
     /// Update planner odometry through the scheduler task.
     pub async fn update_odometry(&self, odometry: PoseStamped) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry)).await
+        self.send_input(InputKind::UpdateOdometry(odometry, None))
+            .await
+    }
+
+    /// 保留真实来源有效期限；队列消费不能把旧观测重新变成新鲜位姿。
+    pub async fn update_odometry_with_deadline(
+        &self,
+        odometry: PoseStamped,
+        valid_until: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until)))
+            .await
     }
 
     /// Update the planner costmap with its real revision and source timestamp.
@@ -1568,7 +1788,18 @@ impl NavSchedulerHandle {
         &self,
         observation: CostmapObservation,
     ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateCostmap(observation)).await
+        self.update_costmap_received(observation, Instant::now())
+            .await
+    }
+
+    /// 保留实际地图接收时刻，表面构建完成或队列等待不能延长输入有效期。
+    pub async fn update_costmap_received(
+        &self,
+        observation: CostmapObservation,
+        received_at: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.send_input(InputKind::UpdateCostmap(observation, received_at))
+            .await
     }
 
     /// Cancel the active session and wait for a verified fence.
@@ -1577,6 +1808,35 @@ impl NavSchedulerHandle {
         self.urgent_tx
             .send(UrgentCommand::Cancel {
                 session_id: session_id.trim().to_string(),
+                reply,
+            })
+            .await
+            .map_err(|_| RuntimeError::SchedulerStopped)?;
+        result.await.map_err(|_| RuntimeError::SchedulerStopped)?
+    }
+
+    /// 明确撤销地图来源；活跃会话等待失败停车围栏，空闲状态不申请运动租约。
+    pub async fn invalidate_map(&self, reason: impl Into<String>) -> Result<(), RuntimeError> {
+        self.invalidate_map_received(reason, Instant::now()).await
+    }
+
+    /// 使用来源失效事件的原接收时刻，不把排队处理时刻当作来源水位。
+    pub async fn invalidate_map_received(
+        &self,
+        reason: impl Into<String>,
+        received_at: Instant,
+    ) -> Result<(), RuntimeError> {
+        if received_at > Instant::now() {
+            return Err(RuntimeError::InvalidInput {
+                field: "map.invalidated_at",
+                reason: "地图失效事件的接收时刻不能位于未来".into(),
+            });
+        }
+        let (reply, result) = oneshot::channel();
+        self.urgent_tx
+            .send(UrgentCommand::InvalidateMap {
+                reason: reason.into(),
+                invalidated_at: received_at,
                 reply,
             })
             .await
@@ -1659,12 +1919,27 @@ pub async fn spawn_production_scheduler_with_backend(
     config: SchedulerConfig,
     backend_kind: LocalExecutionBackendKind,
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
+    validate_config(config)?;
+    let backend = production_local_backend(backend_kind)?;
     let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.message))?;
-    let backend = production_local_backend(backend_kind);
     let scheduler = NavScheduler::new(motion, backend, config)?;
     Ok(spawn_scheduler(scheduler))
+}
+
+/// 显式构造三维局部后端，标定非法时先拒绝，不能为失败配置连接运动端。
+pub async fn spawn_production_surface_scheduler(
+    socket_path: impl Into<PathBuf>,
+    config: SchedulerConfig,
+    surface_config: SurfaceFollowerConfig,
+) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
+    validate_config(config)?;
+    let backend = SurfaceFollower::new(surface_config)?;
+    let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
+        .await
+        .map_err(|error| RuntimeError::Motion(error.message))?;
+    Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
 }
 
 struct InputCommand {
@@ -1675,13 +1950,18 @@ struct InputCommand {
 enum InputKind {
     StartSession(NavSession),
     SubmitPath(VersionedPath),
-    UpdateOdometry(PoseStamped),
-    UpdateCostmap(CostmapObservation),
+    UpdateOdometry(PoseStamped, Option<Instant>),
+    UpdateCostmap(CostmapObservation, Instant),
 }
 
 enum UrgentCommand {
     Cancel {
         session_id: String,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    InvalidateMap {
+        reason: String,
+        invalidated_at: Instant,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Shutdown {
@@ -1772,6 +2052,7 @@ fn stale_receipt_reason(
 }
 
 fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
+    validate_map_pose(&session.goal_pose, "goal_pose")?;
     if session.session_id.trim().is_empty() {
         return Err(RuntimeError::InvalidInput {
             field: "session_id",
@@ -1823,6 +2104,41 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
 }
 
 fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
+    match &path.path {
+        ExecutionPath::Planar(planar) => {
+            if planar.frame_id != nuwax_nav_types_messages::NavFrameId::Map
+                || planar.points.is_empty()
+                || planar
+                    .points
+                    .iter()
+                    .any(|point| !point.x.is_finite() || !point.y.is_finite())
+            {
+                return Err(RuntimeError::InvalidInput {
+                    field: "path.payload",
+                    reason: "二维路径必须在map坐标系包含有限坐标".into(),
+                });
+            }
+            if path.path_yaws.as_ref().is_some_and(|yaws| {
+                yaws.len() != planar.points.len() || yaws.iter().any(|yaw| !yaw.is_finite())
+            }) {
+                return Err(RuntimeError::InvalidInput {
+                    field: "path.path_yaws",
+                    reason: "路径朝向数量必须等于路径点数，且所有朝向必须是有限值".into(),
+                });
+            }
+        }
+        ExecutionPath::Surface(surface) => {
+            if surface.poses.is_empty() || path.path_yaws.is_some() {
+                return Err(RuntimeError::InvalidInput {
+                    field: "path.payload",
+                    reason: "三维路径必须包含完整姿态，不能叠加二维朝向来源".into(),
+                });
+            }
+            for pose in &surface.poses {
+                validate_map_pose(pose, "path.payload")?;
+            }
+        }
+    }
     if path.session_id.trim().is_empty() {
         return Err(RuntimeError::InvalidInput {
             field: "path.session_id",
@@ -1855,21 +2171,23 @@ fn validate_path_shape(path: &VersionedPath) -> Result<(), RuntimeError> {
             reason: "must be positive".into(),
         });
     }
-    if path.path.is_empty() {
-        return Err(RuntimeError::InvalidInput {
-            field: "path.payload",
-            reason: "must contain at least one point".into(),
-        });
-    }
-    if path
-        .path
-        .points
-        .iter()
-        .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    Ok(())
+}
+
+fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), RuntimeError> {
+    if pose.frame_id != nuwax_nav_types_messages::NavFrameId::Map
+        || ![
+            pose.pose.position.x,
+            pose.pose.position.y,
+            pose.pose.position.z,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+        || !pose.pose.orientation.yaw().is_finite()
     {
         return Err(RuntimeError::InvalidInput {
-            field: "path.payload",
-            reason: "all path coordinates must be finite".into(),
+            field,
+            reason: "位姿必须在map坐标系具有有限位置和有效完整四元数".into(),
         });
     }
     Ok(())
@@ -2404,6 +2722,7 @@ mod tests {
                 guard_boot_nonce: [7; 16],
                 motion_stop_generation: 1,
             },
+            goal_pose: nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0),
         }
     }
 
@@ -2417,11 +2736,12 @@ mod tests {
             execution_identity: execution_identity_for(session_id, path_revision),
             path_revision,
             payload_hash: [u8::try_from(path_revision).unwrap_or(u8::MAX); 32],
-            path: Path2D::stamped(
+            path_yaws: None,
+            path: ExecutionPath::Planar(Path2D::stamped(
                 NavFrameId::Map,
                 Timestamp::default(),
                 vec![Point2::new(1.0, 0.0), Point2::new(2.0, 0.0)],
-            ),
+            )),
         }
     }
 
@@ -2431,6 +2751,8 @@ mod tests {
 
     fn map_pose_at(seconds: i64) -> PoseStamped {
         let mut pose = PoseStamped::from_pose(Pose3::default(), NavFrameId::Map);
+        // 测试输入表示真实有效姿态，不能用全零四元数冒充单位旋转。
+        pose.pose.orientation = nuwax_nav_types_messages::Quaternion::IDENTITY;
         pose.stamp = Timestamp::from_unix(seconds, 0);
         pose
     }
@@ -2441,7 +2763,7 @@ mod tests {
 
     fn costmap_at(source_timestamp_ns: i64) -> CostmapObservation {
         CostmapObservation {
-            costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
+            costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 40, 40, 0.1)),
             source_timestamp_ns,
         }
     }
@@ -2518,7 +2840,7 @@ mod tests {
         handle.start_session(session()).await.expect("session");
         handle
             .update_costmap(CostmapObservation {
-                costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
+                costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 4, 4, 0.1)),
                 source_timestamp_ns: 1_000_000_000,
             })
             .await
@@ -2560,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn basic_in_process_backend_is_scheduler_owned_and_intent_gated() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let backend = production_local_backend(LocalExecutionBackendKind::BasicInProcess);
+        let backend = production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap();
         assert_eq!(backend.kind(), LocalExecutionBackendKind::BasicInProcess);
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::clone(&motion_state)),
@@ -2653,6 +2975,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_backend_waits_for_goal_yaw_and_fences_orientation_mutation() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::clone(&motion_state)),
+            production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap(),
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(5),
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+                ..SchedulerConfig::default()
+            },
+        )
+        .expect("生产局部后端");
+        let (handle, task) = spawn_scheduler(scheduler);
+        wait_for_sink(&handle).await;
+        let goal_yaw = std::f64::consts::FRAC_PI_2;
+        let mut endpoint = nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0);
+        endpoint.stamp = Timestamp::from_unix(1, 0);
+        handle.update_odometry(endpoint).await.expect("终点位姿");
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .expect("覆盖路径的地图");
+        handle.start_session(session()).await.expect("会话");
+
+        let mut oriented_path = path();
+        for invalid_yaws in [vec![0.0], vec![0.0, f64::NAN]] {
+            oriented_path.path_yaws = Some(invalid_yaws);
+            assert!(matches!(
+                handle.submit_path(oriented_path.clone()).await,
+                Err(RuntimeError::InvalidInput {
+                    field: "path.path_yaws",
+                    ..
+                })
+            ));
+        }
+        oriented_path.path_yaws = Some(vec![0.0, goal_yaw]);
+        handle.submit_path(oriented_path).await.expect("带朝向路径");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut status = handle.subscribe_status();
+            while status.borrow().applied_commands == 0 {
+                status.changed().await.expect("控制状态");
+            }
+        })
+        .await
+        .expect("实际旋转指令");
+        let rotating = handle.status();
+        assert_eq!(rotating.last_terminal, None);
+        let twist = rotating.last_applied_twist.expect("旋转已执行");
+        assert_eq!(twist.linear.x, 0.0);
+        assert!(twist.angular_z > 0.0);
+
+        let mut aligned = nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, goal_yaw);
+        aligned.stamp = Timestamp::from_unix(2, 0);
+        handle.update_odometry(aligned).await.expect("朝向已到");
+        let terminal = wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert!(terminal.last_zero_ack_id.is_some());
+
+        handle
+            .start_session(session_for("goal-2"))
+            .await
+            .expect("第二次会话");
+        let mut second_path = path_for("goal-2", 1);
+        second_path.path_yaws = Some(vec![0.0, 0.0]);
+        handle
+            .submit_path(second_path.clone())
+            .await
+            .expect("第二次旋转路径");
+        second_path.path_yaws = Some(vec![0.0, goal_yaw]);
+        assert!(matches!(
+            handle.submit_path(second_path).await,
+            Err(RuntimeError::PathMutation { .. })
+        ));
+        assert_eq!(
+            handle.status().last_terminal,
+            Some(TerminalOutcome::SafetyFailed)
+        );
+        handle.shutdown().await.expect("关闭");
+        task.await.expect("等待调度器").expect("调度器已退出");
+    }
+
+    #[tokio::test]
     async fn same_revision_replay_is_idempotent_but_mutation_fences_motion() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
@@ -2695,11 +3100,11 @@ mod tests {
         assert_eq!(handle.status().path_revision, 2);
 
         let mut mutation = replacement;
-        mutation.path = Path2D::stamped(
+        mutation.path = ExecutionPath::Planar(Path2D::stamped(
             NavFrameId::Map,
             Timestamp::default(),
             vec![Point2::new(3.0, 0.0), Point2::new(4.0, 0.0)],
-        );
+        ));
         let error = handle
             .submit_path(mutation)
             .await
@@ -2779,11 +3184,11 @@ mod tests {
             .await
             .expect("initial path");
         let mut mutation = accepted;
-        mutation.path = Path2D::stamped(
+        mutation.path = ExecutionPath::Planar(Path2D::stamped(
             NavFrameId::Map,
             Timestamp::default(),
             vec![Point2::new(3.0, 0.0), Point2::new(4.0, 0.0)],
-        );
+        ));
         let error = handle
             .submit_path(mutation)
             .await
@@ -2932,6 +3337,396 @@ mod tests {
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
+    }
+
+    #[tokio::test]
+    async fn replan_confirms_zero_requires_new_revision_and_remains_cancellable() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let planner = FakePlanner::commanding();
+        let planner_state = Arc::clone(&planner.state);
+        planner_state.lock().unwrap().step = PlannerStep::ReplanRequired("连接阻断".into());
+        let (handle, task) = test_scheduler(FakeMotion(Arc::clone(&motion_state)), planner);
+        handle.update_odometry(map_pose()).await.unwrap();
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        let held = handle.status();
+        assert_eq!(held.last_applied_twist, Some(Twist2::ZERO));
+        assert!(held.applied_commands > 0);
+        assert_eq!(held.last_terminal, None);
+        assert!(matches!(
+            handle.submit_path(path()).await,
+            Err(RuntimeError::PathRejected { .. })
+        ));
+
+        planner_state.lock().unwrap().step = PlannerStep::Command(Twist2 {
+            linear: Point2::new(0.2, 0.0),
+            angular_z: 0.0,
+        });
+        handle.submit_path(path_for("goal-1", 2)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status().last_applied_twist == Some(Twist2::ZERO) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("更高路径修订恢复执行");
+        planner_state.lock().unwrap().step = PlannerStep::ReplanRequired("再次阻断".into());
+        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        handle.cancel("goal-1").await.unwrap();
+        assert_eq!(
+            handle.status().last_terminal,
+            Some(TerminalOutcome::Cancelled)
+        );
+        assert!(handle.status().last_zero_ack_id.is_some());
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    async fn wait_for_phase(handle: &NavSchedulerHandle, expected: SchedulerPhase) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut status = handle.subscribe_status();
+            while status.borrow().phase != expected {
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("调度阶段等待超时");
+    }
+
+    #[tokio::test]
+    async fn unusable_replan_revisions_cannot_extend_the_original_wait_budget() {
+        let planner = FakePlanner::commanding();
+        planner.state.lock().unwrap().step = PlannerStep::ReplanRequired("无有效连接".into());
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            planner,
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(2),
+                renew_interval: Duration::from_millis(20),
+                path_wait_timeout: Duration::from_millis(60),
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let (handle, task) = spawn_scheduler(scheduler);
+        handle.update_odometry(map_pose()).await.unwrap();
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            let mut revision = 1;
+            while handle.status().last_terminal.is_none() {
+                if handle.status().phase == SchedulerPhase::AwaitingPath {
+                    revision += 1;
+                    let _ = handle.submit_path(path_for("goal-1", revision)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("无效修订不能不断续期等待时间");
+        assert_eq!(
+            handle.status().last_terminal,
+            Some(TerminalOutcome::PlannerFailed)
+        );
+        assert!(handle.status().last_zero_ack_id.is_some());
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_pose_deadline_fences_while_receipt_is_still_fresh() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) = test_scheduler(
+            FakeMotion(Arc::clone(&motion_state)),
+            FakePlanner::commanding(),
+        );
+        handle
+            .update_costmap(costmap_at(1_000_000_000))
+            .await
+            .unwrap();
+        handle
+            .update_odometry_with_deadline(map_pose(), Instant::now() + Duration::from_millis(120))
+            .await
+            .unwrap();
+        assert!(matches!(
+            handle
+                .update_odometry_with_deadline(
+                    map_pose_at(2),
+                    Instant::now() - Duration::from_millis(1)
+                )
+                .await,
+            Err(RuntimeError::StaleInput(_))
+        ));
+        assert_eq!(
+            handle.status().pose_source_timestamp_ns,
+            1_000_000_000,
+            "过期输入不能覆盖已接纳位姿"
+        );
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        let terminal = wait_for_terminal(&handle, TerminalOutcome::SafetyFailed).await;
+        assert!(
+            terminal.applied_commands > 0,
+            "验证运动开始后按来源期限实际停车"
+        );
+        assert!(
+            terminal.pose_receipt_age_ms < 1_000,
+            "接收期限仍有效，来源期限已先到"
+        );
+        assert!(terminal.message.contains("pose source deadline"));
+        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
+        assert!(terminal.last_zero_ack_id.is_some());
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn supplied_map_receipt_age_survives_construction_and_rejects_the_future() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) = test_scheduler(
+            FakeMotion(Arc::clone(&motion_state)),
+            FakePlanner::commanding(),
+        );
+        handle.update_odometry(map_pose()).await.unwrap();
+        assert!(matches!(
+            handle
+                .update_costmap_received(
+                    costmap_at(1_000_000_000),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .await,
+            Err(RuntimeError::InvalidInput {
+                field: "costmap.received_at",
+                ..
+            })
+        ));
+        handle
+            .update_costmap_received(
+                costmap_at(1_000_000_000),
+                Instant::now() - Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(!handle.status().planner_inputs_fresh);
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        wait_for_terminal(&handle, TerminalOutcome::SafetyFailed).await;
+        assert!(motion_state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("twist:")));
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_surface_backend_stops_for_changed_map_and_resumes_only_new_path() {
+        let mut local_config = SurfaceFollowerConfig::new(0.4);
+        local_config.controller.speed = 0.2;
+        local_config.controller.goal_tolerance = 0.12;
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            SurfaceFollower::new(local_config).unwrap(),
+            SchedulerConfig {
+                tick_interval: Duration::from_millis(5),
+                pose_ttl: Duration::from_secs(1),
+                costmap_ttl: Duration::from_secs(1),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let (handle, task) = spawn_scheduler(scheduler);
+        let mut start = nuwax_nav_astar::helpers::make_pose_stamped("map", 0.55, 1.55, 0.0);
+        start.pose.position.z = 0.5;
+        start.stamp = Timestamp::from_unix(1, 0);
+        let mut goal = start.clone();
+        goal.pose.position.x = 4.55;
+        let surface_path = Path3D {
+            poses: vec![start.clone(), goal.clone()],
+        };
+        handle.update_odometry(start.clone()).await.unwrap();
+        handle
+            .update_costmap(CostmapObservation {
+                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, false)),
+                source_timestamp_ns: 1_000_000_000,
+            })
+            .await
+            .unwrap();
+        let mut surface_session = session();
+        surface_session.goal_pose = goal;
+        handle.start_session(surface_session).await.unwrap();
+        let mut first_path = path();
+        first_path.path = ExecutionPath::Surface(surface_path.clone());
+        handle.submit_path(first_path).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status().applied_commands == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle.status().last_applied_twist.unwrap().linear.x > 0.0);
+        handle
+            .update_costmap(CostmapObservation {
+                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, true)),
+                source_timestamp_ns: 2_000_000_000,
+            })
+            .await
+            .unwrap();
+        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        let stopped_count = handle.status().applied_commands;
+        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
+        assert_eq!(handle.status().last_terminal, None);
+        handle
+            .update_costmap(CostmapObservation {
+                costmap: ExecutionMap::Surface(surface_follower::test_snapshot(0.0, false)),
+                source_timestamp_ns: 3_000_000_000,
+            })
+            .await
+            .unwrap();
+        let mut replacement = path_for("goal-1", 2);
+        replacement.path = ExecutionPath::Surface(surface_path);
+        handle.submit_path(replacement).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status().applied_commands <= stopped_count {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle.status().last_applied_twist.unwrap().linear.x > 0.0);
+        handle.cancel("goal-1").await.unwrap();
+
+        // 原目标仍在上层，收到仅包含下层当前位置的路径不能报告已到达。
+        let mut upper_goal_session = session_for("upper-goal");
+        upper_goal_session.goal_pose = start.clone();
+        upper_goal_session.goal_pose.pose.position.z += 3.0;
+        handle.start_session(upper_goal_session).await.unwrap();
+        let mut partial = path_for("upper-goal", 1);
+        partial.path = ExecutionPath::Surface(Path3D { poses: vec![start] });
+        handle.submit_path(partial).await.unwrap();
+        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        assert_eq!(handle.status().last_terminal, None);
+        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
+        handle.cancel("upper-goal").await.unwrap();
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_map_invalidation_preserves_owner_and_fences_only_active_motion() {
+        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) = test_scheduler(
+            FakeMotion(Arc::clone(&motion_state)),
+            FakePlanner::commanding(),
+        );
+        handle.update_odometry(map_pose()).await.unwrap();
+        let old_receipt = Instant::now();
+        assert!(matches!(
+            handle
+                .invalidate_map_received("未来失效事件", old_receipt + Duration::from_secs(1))
+                .await,
+            Err(RuntimeError::InvalidInput {
+                field: "map.invalidated_at",
+                ..
+            })
+        ));
+        handle
+            .update_costmap_received(costmap_at(1_000_000_000), old_receipt)
+            .await
+            .unwrap();
+        let invalidation_receipt = Instant::now();
+        handle
+            .invalidate_map_received("空闲时切换地图", invalidation_receipt)
+            .await
+            .unwrap();
+        assert_eq!(handle.status().phase, SchedulerPhase::Idle);
+        assert!(!handle.status().planner_inputs_fresh);
+        assert!(
+            motion_state.lock().unwrap().calls.is_empty(),
+            "空闲失效不能申请或围栏租约"
+        );
+        assert!(matches!(
+            handle
+                .update_costmap_received(costmap_at(2_000_000_000), old_receipt)
+                .await,
+            Err(RuntimeError::StaleInput(_))
+        ));
+
+        // 同一来源事件可同时表示新地图域；相同原接收时刻的有效新图可立即接入。
+        handle
+            .update_costmap_received(costmap_at(2_000_000_000), invalidation_receipt)
+            .await
+            .unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        handle.invalidate_map("活动地图被清空").await.unwrap();
+        let stopped = handle.status();
+        assert_eq!(stopped.last_terminal, Some(TerminalOutcome::SafetyFailed));
+        assert_ne!(stopped.last_terminal, Some(TerminalOutcome::Cancelled));
+        assert_eq!(stopped.last_applied_twist, Some(Twist2::ZERO));
+        assert!(stopped.last_zero_ack_id.is_some());
+        assert!(!stopped.planner_inputs_fresh);
+        assert!(!task.is_finished());
+
+        handle.update_odometry(map_pose_at(3)).await.unwrap();
+        handle
+            .update_costmap(costmap_at(3_000_000_000))
+            .await
+            .unwrap();
+        handle
+            .start_session(session_for("new-map-goal"))
+            .await
+            .unwrap();
+        handle
+            .submit_path(path_for("new-map-goal", 1))
+            .await
+            .unwrap();
+        handle.cancel("new-map-goal").await.unwrap();
+        assert_eq!(
+            handle.status().last_terminal,
+            Some(TerminalOutcome::Cancelled)
+        );
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn surface_backend_without_calibration_is_rejected_before_connecting_motion() {
+        let result = spawn_production_scheduler_with_backend(
+            "/not-a-motion-socket",
+            SchedulerConfig::default(),
+            LocalExecutionBackendKind::SurfaceInProcess,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::InvalidInput {
+                field: "body_to_support_z_m",
+                ..
+            })
+        ));
+        let mut basic =
+            production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap();
+        let surface_path = Path3D {
+            poses: vec![map_pose()],
+        };
+        assert!(basic
+            .replace_execution_path(ExecutionPath::Surface(surface_path), None, map_pose())
+            .is_err());
     }
 
     #[tokio::test]
@@ -3143,7 +3938,7 @@ mod tests {
         handle.start_session(session()).await.expect("session");
         handle
             .update_costmap(CostmapObservation {
-                costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
+                costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 4, 4, 0.1)),
                 source_timestamp_ns: 1_000_000_000,
             })
             .await

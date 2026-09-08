@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
+from collections import OrderedDict
 import math
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from contracts.base import utc_now
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.naming import build_anchor_id, build_instance_id
@@ -80,6 +81,24 @@ class InstanceAssociationService:
     _QUASI_STATIC_SPEED_MPS = 0.05
     _STATIC_CONSISTENCY_M = 0.18
     _ID_KIND_MAX_LENGTH = 24
+    _TRACK_CONTINUITY_SEC = 30.0
+    _SIMILARITY_CACHE_LIMIT = 512
+    _SEMANTIC_ATTRIBUTE_KEYS = (
+        "color", "colour", "material", "shape", "category", "object_type",
+        "brand", "model", "pattern", "text", "ocr_text", "description", "display_name_zh",
+    )
+    _POSE_EVIDENCE_KEYS = (
+        "projection_method", "projection_confidence", "support_point_count",
+        "projection_degradation_reason", "pose_quality_level", "observation_only",
+        "coverage", "depth_coverage", "map_projection_coverage", "reprojection_error",
+        "geometry_projection_method", "geometry_projection_status", "segmentation_projection_status",
+        "support_points_2d", "support_points_3d", "support_points_map", "centroid_map",
+        "bbox_3d_map", "object_3d_bbox", "navigable", "non_navigable_reason",
+        "has_structured_segmentation", "segmentation_score", "predicted_iou", "stability_score",
+        "segmentation_quality_score", "segmentation_support_point_count", "segmentation_bbox_xyxy",
+        "centroid_uv", "mask_center_px", "segmentation_area_ratio", "segmentation_occlusion_flags",
+        "segmentation_truncation_flags",
+    )
 
     def __init__(
         self,
@@ -89,6 +108,8 @@ class InstanceAssociationService:
     ) -> None:
         self._text_embedder = text_embedder
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
+        self._label_similarity_cache: OrderedDict[frozenset[str], float] = OrderedDict()
+        self._embedding_cache: OrderedDict[str, object] = OrderedDict()
 
     def set_text_embedder(self, text_embedder: TextEmbedder) -> None:
         """在运行期注入文本向量器。"""
@@ -96,9 +117,7 @@ class InstanceAssociationService:
         self._text_embedder = text_embedder
         # 切换 embedder 后清空缓存，避免使用旧模型的结果
         self._label_similarity_cache.clear()
-
-    # 实例级标签相似度缓存，key 为 frozenset{label_a, label_b}，顺序无关
-    _label_similarity_cache: Dict[frozenset, float] = {}
+        self._embedding_cache.clear()
 
     def _label_similarity(self, label_a: str, label_b: str) -> float:
         """计算两个标签的语义相似度，返回 [0.0, 1.0]。
@@ -108,39 +127,49 @@ class InstanceAssociationService:
         """
         a = label_a.strip().lower()
         b = label_b.strip().lower()
+        if not a or not b:
+            return 0.0
         if a == b:
             return 1.0
 
         cache_key: frozenset = frozenset({a, b})
         if cache_key in self._label_similarity_cache:
+            self._label_similarity_cache.move_to_end(cache_key)
             return self._label_similarity_cache[cache_key]
 
         if self._text_embedder is not None:
             try:
-                emb_a = self._text_embedder.embed(a)
-                emb_b = self._text_embedder.embed(b)
-                # 计算余弦相似度
-                dot = sum(x * y for x, y in zip(emb_a, emb_b))
-                norm_a = math.sqrt(sum(x * x for x in emb_a))
-                norm_b = math.sqrt(sum(x * x for x in emb_b))
-                if norm_a > 0.0 and norm_b > 0.0:
-                    similarity = dot / (norm_a * norm_b)
-                else:
-                    similarity = 0.0
+                similarity = self._text_embedder.cosine_similarity(
+                    self._embed_text_cached(a), self._embed_text_cached(b)
+                )
                 # 相似度低于阈值直接归零，避免弱相关噪声干扰评分
-                result = similarity if similarity >= 0.75 else 0.0
+                result = min(1.0, similarity) if math.isfinite(similarity) and similarity >= 0.75 else 0.0
             except Exception:
                 # embedder 异常时降级为精确匹配
-                result = 1.0 if a == b else 0.0
+                return 0.0
         else:
             # fallback：精确匹配已在函数入口处理；这里额外考虑标签包含关系
-            if a in b or b in a:
+            if set(a.split()).issubset(b.split()) or set(b.split()).issubset(a.split()):
                 result = 1.0
             else:
                 result = 0.0
 
         self._label_similarity_cache[cache_key] = result
+        if len(self._label_similarity_cache) > self._SIMILARITY_CACHE_LIMIT:
+            self._label_similarity_cache.popitem(last=False)
         return result
+
+    def _embed_text_cached(self, text: str):
+        """仅缓存当前模型的有限语义文本，避免每个候选重复推理。"""
+
+        if text in self._embedding_cache:
+            self._embedding_cache.move_to_end(text)
+            return self._embedding_cache[text]
+        vector = self._text_embedder.embed_text(text)
+        self._embedding_cache[text] = vector
+        if len(self._embedding_cache) > self._SIMILARITY_CACHE_LIMIT:
+            self._embedding_cache.popitem(last=False)
+        return vector
 
     def associate(
         self,
@@ -156,14 +185,23 @@ class InstanceAssociationService:
         resolved_now = now or utc_now()
         instances = dict(existing_instances)
         outcomes: List[AssociationOutcome] = []
+        matched_by_source: Dict[Tuple[str, Optional[str]], set[str]] = {}
 
         for item in projected_observations:
+            source_key = (item.source_observation_id, item.camera_id)
+            matched_ids = matched_by_source.setdefault(source_key, set())
             best_instance = None
             best_score = 0.0
             for candidate in instances.values():
                 if candidate.lifecycle_state == InstanceLifecycleState.REMOVED:
                     continue
-                score = self._association_score(item, candidate, resolved_now)
+                if candidate.instance_id in matched_ids:
+                    continue
+                if map_name and candidate.map_name and candidate.map_name != map_name:
+                    continue
+                score = self._association_score(
+                    item, candidate, resolved_now, localization_session_id=localization_session_id
+                )
                 if score > best_score:
                     best_score = score
                     best_instance = candidate
@@ -179,6 +217,7 @@ class InstanceAssociationService:
                     now=resolved_now,
                 )
                 instances[merged.instance_id] = merged
+                matched_ids.add(merged.instance_id)
                 outcomes.append(AssociationOutcome(instance=merged, created=False, matched_score=best_score))
                 continue
 
@@ -191,6 +230,7 @@ class InstanceAssociationService:
                 now=resolved_now,
             )
             instances[created.instance_id] = created
+            matched_ids.add(created.instance_id)
             outcomes.append(AssociationOutcome(instance=created, created=True, matched_score=1.0))
 
         stale_updated: Dict[str, SemanticInstance] = {}
@@ -203,19 +243,38 @@ class InstanceAssociationService:
         observation: ProjectedObservation,
         candidate: SemanticInstance,
         now: datetime,
+        *,
+        localization_session_id: Optional[str] = None,
     ) -> float:
-        label_score = self._label_similarity(observation.label, candidate.label)
-        if label_score == 0.0:
+        if not frame_ids_semantically_equal(observation.pose.frame_id, candidate.pose.frame_id):
             return 0.0
         distance_m = self._distance(observation.pose, candidate.pose)
+        if not math.isfinite(distance_m):
+            return 0.0
         max_distance_m = self._MERGE_DISTANCE_M.get(candidate.movability, 1.0)
-        same_track = bool(observation.track_id and observation.track_id == str(candidate.metadata.get("last_track_id") or ""))
-        # 方案 B：同 track_id 即绕过距离硬门。track_id 是 ByteTrack 的 2D 框连续性证据，
-        # 比 fallback 的 3D 坐标距离可靠。连续检测下，同一物体多帧观测虽因机器人位移
-        # 坐标被拉开，但 track 一致即应合并，射线才能累积进同一实例的 deferred_projection_cache。
-        # 安全边界：不同物体 track_id 不同，不会被误并（避免"三门塌一"过度合并）。
-        # fallback 观测的 3D 坐标无空间意义，不能反过来用距离把同 track 观测拆开。
-        if distance_m > max_distance_m and not same_track:
+        age_sec = max(0.0, (now - candidate.last_seen_ts).total_seconds())
+        max_time_gap_sec = self._MAX_TIME_GAP_SEC.get(candidate.movability, 3600.0)
+        if age_sec > max_time_gap_sec:
+            return 0.0
+        same_track = bool(
+            observation.track_id
+            and observation.track_id == str(candidate.metadata.get("last_track_id") or "")
+            and observation.camera_id
+            and observation.camera_id == candidate.metadata.get("last_camera_id")
+            and age_sec <= self._TRACK_CONTINUITY_SEC
+            and (not localization_session_id or localization_session_id == candidate.localization_session_id)
+        )
+        has_fallback_pose = self._is_fallback_observation(observation) or bool(
+            candidate.metadata.get("pending_localization")
+            or candidate.metadata.get("projection_method") == "current_pose_fallback"
+        )
+        # 无几何坐标只表达观察者位置，必须依靠短时、同相机跟踪连续性关联。
+        if has_fallback_pose and not same_track:
+            return 0.0
+        if distance_m > max_distance_m and not (same_track and has_fallback_pose):
+            return 0.0
+        label_score = self._label_similarity(observation.label, candidate.label)
+        if label_score == 0.0:
             return 0.0
         observation_segmentation = self._summarize_segmentation_metadata(observation.attributes)
         candidate_segmentation = self._summarize_segmentation_metadata(candidate.metadata)
@@ -226,12 +285,8 @@ class InstanceAssociationService:
             candidate_segmentation=candidate_segmentation,
         ):
             return 0.0
-        distance_score = 1.0 / (1.0 + distance_m)
+        distance_score = 1.0 if has_fallback_pose else 1.0 / (1.0 + distance_m)
         attribute_score = self._attribute_similarity(observation, candidate)
-        age_sec = max(0.0, (now - candidate.last_seen_ts).total_seconds())
-        max_time_gap_sec = self._MAX_TIME_GAP_SEC.get(candidate.movability, 3600.0)
-        if age_sec > max_time_gap_sec:
-            return 0.0
         temporal_score = max(0.1, 1.0 - (age_sec / max_time_gap_sec))
         similarity_gate = self._ATTRIBUTE_SIMILARITY_GATE.get(candidate.movability, 0.0)
         if attribute_score < similarity_gate:
@@ -359,13 +414,14 @@ class InstanceAssociationService:
                 segmentation_score,
                 segmentation_quality_score,
                 stability_score,
-                coverage,
-                depth_coverage,
-                map_projection_coverage,
-                reprojection_error,
-                segmentation_support_point_count,
             )
-        ) or bool(occlusion_flags or truncation_flags)
+        ) or bool(
+            occlusion_flags or truncation_flags
+            or metadata.get("segmentation_bbox_xyxy") or metadata.get("mask_polygon_px")
+            or metadata.get("segmentation_polygon_px") or metadata.get("mask_center_px")
+            or metadata.get("segmentation_source")
+            or (segmentation_support_point_count is not None and segmentation_support_point_count > 0)
+        )
         risk_factors: List[str] = []
         if segmentation_support_point_count is not None and segmentation_support_point_count <= 0:
             risk_factors.append("segmentation_support_points_missing")
@@ -392,6 +448,8 @@ class InstanceAssociationService:
         for item in risk_factors:
             if item not in unique_risks:
                 unique_risks.append(item)
+        if not has_structured_segmentation:
+            unique_risks = []
         quality_values = [
             value
             for value in (
@@ -403,7 +461,9 @@ class InstanceAssociationService:
             )
             if value is not None
         ]
-        if unique_risks:
+        if not has_structured_segmentation:
+            segmentation_quality = "unknown"
+        elif unique_risks:
             segmentation_quality = "low"
         elif quality_values and min(quality_values) >= 0.65:
             segmentation_quality = "high"
@@ -496,10 +556,13 @@ class InstanceAssociationService:
         now: datetime,
     ) -> SemanticInstance:
         updated_count = current.observation_count + 1
+        reliable_pose_count = int(current.metadata.get("position_observation_count") or 0)
+        if self._instance_pose_is_reliable(current) and reliable_pose_count <= 0:
+            reliable_pose_count = current.observation_count
         # 阶段0 quality-gated blend：
         # - fallback 观测(坐标=机器人位姿)不参与位置加权；既有可信则保留，否则用本次。
         # - 可信观测遇到 pending/不可信的既有坐标(哨兵无意义) → 完全覆盖，不做加权。
-        # - 其余(双方可信) → 正常按观测次数加权融合。
+        # - 其余(双方可信) → 只按有几何依据的观测次数加权融合。
         if self._is_fallback_observation(observation):
             blended_pose = current.pose if self._instance_pose_is_reliable(current) else observation.pose
         elif not self._instance_pose_is_reliable(current):
@@ -508,7 +571,7 @@ class InstanceAssociationService:
             blended_pose = self._blend_pose(
                 current.pose,
                 observation.pose,
-                weight=float(current.observation_count) / float(updated_count),
+                weight=float(reliable_pose_count) / float(reliable_pose_count + 1),
             )
         visual_labels = self._merge_strings(current.visual_labels, observation.visual_labels)
         semantic_labels = self._merge_strings(current.semantic_labels, observation.semantic_labels)
@@ -544,6 +607,18 @@ class InstanceAssociationService:
             movability=current.movability,
             current_metadata=current.metadata,
         )
+        metadata["position_observation_count"] = (
+            reliable_pose_count + (0 if self._is_fallback_observation(observation) else 1)
+        )
+        if self._is_fallback_observation(observation) and self._instance_pose_is_reliable(current):
+            # 坐标保留时同步保留其证据，最新观测退化另存 last_observation 字段。
+            for key in self._POSE_EVIDENCE_KEYS:
+                if key in current.metadata:
+                    metadata[key] = current.metadata[key]
+                else:
+                    metadata.pop(key, None)
+            metadata["observation_only"] = False
+            metadata.update(self._summarize_segmentation_metadata(metadata))
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
         # 阶段0：待定位实例收到首个可信投影时，清除 pending_localization 标记并转回 ACTIVE。
@@ -611,6 +686,7 @@ class InstanceAssociationService:
             observation,
             movability=movability,
         )
+        metadata["position_observation_count"] = 0 if self._is_fallback_observation(observation) else 1
         metadata.update(dynamic_metadata)
         metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
         # 阶段0：首观测即 fallback 时，不把机器人位姿当作物体坐标暴露给导航。
@@ -750,7 +826,12 @@ class InstanceAssociationService:
                 value = previous_metadata.get(key)
             return str(value or "")
 
-        projection_degradation_reason = string_metadata_value("projection_degradation_reason")
+        # 空字符串表示本次投影已经恢复，不能继承上次的退化原因。
+        projection_degradation_reason = str(
+            observation.attributes.get("projection_degradation_reason")
+            if "projection_degradation_reason" in observation.attributes
+            else previous_metadata.get("projection_degradation_reason") or ""
+        )
         geometry_projection_method = string_metadata_value("geometry_projection_method")
         geometry_projection_status = string_metadata_value("geometry_projection_status")
         segmentation_projection_status = string_metadata_value("segmentation_projection_status")
@@ -803,12 +884,17 @@ class InstanceAssociationService:
             **previous_metadata,
             "last_track_id": observation.track_id or previous_metadata.get("last_track_id", ""),
             "last_camera_id": observation.camera_id or previous_metadata.get("last_camera_id", ""),
+            "last_source_observation_id": observation.source_observation_id,
+            "last_observation_projection_method": str(observation.attributes.get("projection_method") or ""),
+            "last_observation_projection_confidence": observation.attributes.get("projection_confidence"),
             "association_policy": movability.value,
             "uncertain_after_sec": self._UNCERTAIN_AFTER_SEC[movability],
             "stale_after_sec": self._STALE_AFTER_SEC[movability],
             "removed_after_sec": self._REMOVED_AFTER_SEC[movability],
             "projection_method": projection_method,
             "projection_confidence": projection_confidence,
+            "pose_quality_level": observation.attributes.get("pose_quality_level", observation.pose_quality_level),
+            "observation_only": self._is_fallback_observation(observation),
             "support_point_count": support_point_count,
             "coverage": coverage,
             "depth_coverage": depth_coverage,
@@ -1166,27 +1252,33 @@ class InstanceAssociationService:
         return InstanceMovability.MOVABLE
 
     def _attribute_similarity(self, observation: ProjectedObservation, candidate: SemanticInstance) -> float:
-        if self._text_embedder is None:
-            return 0.0
-        left_text = " ".join(
-            [
-                observation.label,
-                " ".join(observation.semantic_labels),
-                " ".join("%s:%s" % (key, value) for key, value in sorted(observation.attributes.items())),
-            ]
-        ).strip()
-        right_text = " ".join(
-            [
-                candidate.label,
-                " ".join(candidate.semantic_labels),
-                " ".join("%s:%s" % (key, value) for key, value in sorted(candidate.attributes.items())),
-            ]
-        ).strip()
+        left_text = self._semantic_attribute_text(observation.label, observation.semantic_labels, observation.attributes)
+        right_text = self._semantic_attribute_text(candidate.label, candidate.semantic_labels, candidate.attributes)
         if not left_text or not right_text:
             return 0.0
-        left_vector = self._text_embedder.embed_text(left_text)
-        right_vector = self._text_embedder.embed_text(right_text)
-        return max(0.0, self._text_embedder.cosine_similarity(left_vector, right_vector))
+        if left_text == right_text:
+            return 1.0
+        if self._text_embedder is not None:
+            try:
+                similarity = self._text_embedder.cosine_similarity(
+                    self._embed_text_cached(left_text), self._embed_text_cached(right_text)
+                )
+                return max(0.0, min(1.0, similarity)) if math.isfinite(similarity) else 0.0
+            except Exception:
+                # 属性推理不可用时保留可复现的文本证据，不中断整帧记忆。
+                pass
+        left_tokens, right_tokens = set(left_text.split()), set(right_text.split())
+        return len(left_tokens & right_tokens) / float(len(left_tokens | right_tokens))
+
+    def _semantic_attribute_text(self, label: str, semantic_labels: Iterable[str], attributes: Dict[str, object]) -> str:
+        """点云、坐标和处理状态不属于物体语义，避免数值噪声及大载荷进入向量推理。"""
+
+        parts = [label.strip().lower(), *sorted({str(item).strip().lower() for item in semantic_labels})]
+        for key in self._SEMANTIC_ATTRIBUTE_KEYS:
+            value = attributes.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                parts.append(f"{key}:{str(value).strip().lower()[:160]}")
+        return " ".join(parts).strip()
 
     @staticmethod
     def _is_fallback_observation(observation: ProjectedObservation) -> bool:

@@ -13,7 +13,7 @@ use nuwax_nav_types_messages::{NavFrameId, Quaternion};
 
 /// 在 costmap 上做 A*，输出世界坐标路径。
 ///
-/// - `start` 与 `goal` 即使被 inflation 阻挡也允许通行（caller 已经在 start/goal cell 上 "解堵"）。
+/// - 有界占据图的端点及路径均须具备完整轮廓余量，旧地形输入保留端点解堵行为。
 /// - `max_expansions = None` 用 200_000 默认值。
 /// - `inflation_override = Some(r)` 用 `r` 替代 `costmap.inflation_radius()` 构造阻塞集合。
 /// - 找不到路径返回 `Ok(None)`；costmap 错误（如 cell_size <= 0 已构造时拦住）返回 `Err`。
@@ -30,15 +30,32 @@ pub fn plan_on_costmap(
             reason: "non-finite coordinate".into(),
         });
     }
-    let blocked: HashSet<(i64, i64)> = match inflation_override {
-        Some(r) if (r - costmap.inflation_radius()).abs() > f64::EPSILON => costmap.blocked_at(r),
-        _ => costmap.blocked_cells(),
+    let requested_radius = inflation_override.unwrap_or_else(|| costmap.inflation_radius());
+    if !requested_radius.is_finite() || requested_radius < 0.0 {
+        return Err(NavError::InvalidInput {
+            field: "inflation_radius",
+            reason: "轮廓半径必须是有限非负数".into(),
+        });
+    }
+    let effective_radius = costmap.effective_radius(requested_radius);
+    let blocked: HashSet<(i64, i64)> = if costmap.has_occupancy() {
+        // 有界输入直接检查候选圆盘，不对整片未知区构造稀疏障碍展开。
+        HashSet::new()
+    } else {
+        costmap.blocked_at(effective_radius)
     };
 
     let start_cell = costmap.world_to_cell(start.x, start.y);
     let goal_cell = costmap.world_to_cell(goal.x, goal.y);
 
+    if !costmap.permits_endpoints(start_cell, goal_cell, effective_radius) {
+        return Ok(None);
+    }
+
     let is_blocked = |ix: i64, iy: i64| -> bool {
+        if costmap.has_occupancy() {
+            return !costmap.has_footprint_clearance(ix, iy, effective_radius);
+        }
         if (ix, iy) == start_cell || (ix, iy) == goal_cell {
             return false;
         }
@@ -48,13 +65,23 @@ pub fn plan_on_costmap(
     let max_exp = max_expansions.unwrap_or(200_000);
     let path = astar(start_cell, goal_cell, is_blocked, max_exp);
     Ok(path.map(|cells| {
-        cells
+        let mut points: Vec<Point2> = cells
             .into_iter()
             .map(|(ix, iy)| {
                 let (wx, wy) = costmap.cell_to_world(ix, iy);
                 Point2 { x: wx, y: wy }
             })
-            .collect()
+            .collect();
+        // 原点/分辨率来自实际占据图，格中心不能替代用户要求的精确目标。
+        if costmap.has_occupancy() {
+            if points.len() == 1 {
+                points = vec![start, goal];
+            } else {
+                points[0] = start;
+                *points.last_mut().expect("A*路径包含终点") = goal;
+            }
+        }
+        points
     }))
 }
 
@@ -120,8 +147,20 @@ impl SimplePlanner {
     }
 
     /// 直接覆盖 costmap（接收 terrain_map_ext 输入后调用）。
-    pub fn replace_costmap(&mut self, costmap: Costmap) {
+    pub fn replace_costmap(&mut self, mut costmap: Costmap) {
+        if costmap.has_occupancy() {
+            costmap.preserve_inflation_floor(
+                self.config
+                    .inflation_radius
+                    .max(self.costmap.minimum_inflation_radius()),
+            );
+            self.effective_inflation = costmap.inflation_radius();
+            self.stuck.effective_inflation = self.effective_inflation;
+        }
         self.costmap = costmap;
+        // 地图更新可能阻断旧路径，必须在下一次调度重新规划，不能继续冷却缓存。
+        self.cached_path = None;
+        self.current_wp = None;
     }
 
     /// 访问当前 costmap。
@@ -188,13 +227,13 @@ impl SimplePlanner {
         self.goal_x = Some(goal.x);
         self.goal_y = Some(goal.y);
         self.goal_z = goal.z;
-        self.effective_inflation = self.config.inflation_radius;
         self.costmap
             .set_inflation_radius(self.config.inflation_radius);
+        self.effective_inflation = self.costmap.inflation_radius();
         self.stuck = StuckState {
             ref_goal_dist: f64::INFINITY,
             last_progress_time: now,
-            effective_inflation: self.config.inflation_radius,
+            effective_inflation: self.effective_inflation,
         };
         self.cached_path = None;
         self.last_plan_time = 0.0;
@@ -252,6 +291,15 @@ impl SimplePlanner {
         let gy = self.goal_y.expect("checked above");
         let goal_dist = ((gx - rx).powi(2) + (gy - ry).powi(2)).sqrt();
         if goal_dist <= self.config.goal_reached_threshold {
+            if !self.costmap.permits_endpoints(
+                self.costmap.world_to_cell(rx, ry),
+                self.costmap.world_to_cell(gx, gy),
+                self.effective_inflation,
+            ) {
+                self.cached_path = None;
+                self.current_wp = None;
+                return (Some(None), true, false);
+            }
             self.cancel_navigation();
             return (None, false, false);
         }
@@ -272,7 +320,9 @@ impl SimplePlanner {
             self.config.progress_epsilon,
             self.config.stuck_seconds,
             self.config.stuck_shrink_factor,
-            self.config.stuck_min_inflation,
+            self.config
+                .stuck_min_inflation
+                .max(self.costmap.minimum_inflation_radius()),
         );
         self.stuck = new_stuck;
         if escalated {
@@ -366,6 +416,108 @@ impl SimplePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_planner_keeps_footprint_clear_of_unknown_corners() {
+        use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
+        for resolution in [0.1, 0.2] {
+            let mut grid = OccupancyGrid2D::filled(
+                Point2::new(0.0, 0.0),
+                resolution,
+                20,
+                20,
+                OccupancyCell::Free,
+            );
+            for y in 10..20 {
+                for x in 10..20 {
+                    grid.set(x, y, OccupancyCell::Unknown);
+                }
+            }
+            let start = grid.cell_center(5, 14).unwrap();
+            let goal = grid.cell_center(14, 5).unwrap();
+            let map = Costmap::from_occupancy(grid.clone(), 0.2).unwrap();
+            let path = plan_on_costmap(&map, start, goal, None, None)
+                .unwrap()
+                .unwrap();
+            let radius = (0.2 / resolution).ceil() as i64;
+            for point in path {
+                let (x, y) = map.world_to_cell(point.x, point.y);
+                for dx in -radius..=radius {
+                    for dy in -radius..=radius {
+                        if dx * dx + dy * dy <= radius * radius {
+                            assert!(
+                                map.is_known_free(x + dx, y + dy),
+                                "resolution={resolution} 路径点{point:?}的轮廓触及未知凹角"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_endpoints_require_ceil_disk_even_with_smaller_override() {
+        use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
+        for blocked in [OccupancyCell::Unknown, OccupancyCell::Occupied] {
+            let mut grid =
+                OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 20, 20, OccupancyCell::Free);
+            grid.set(10, 10, blocked);
+            let start = grid.cell_center(5, 5).unwrap();
+            let goal = grid.cell_center(8, 10).unwrap();
+            let mut map = Costmap::from_occupancy(grid, 0.15).unwrap();
+            map.set_inflation_radius(0.01);
+            assert_eq!(map.inflation_radius(), 0.15);
+            assert!(
+                plan_on_costmap(&map, start, goal, None, Some(0.0))
+                    .unwrap()
+                    .is_none(),
+                "0.15米在0.1米图上按2格圆盘检查，不能通过显式覆盖缩小"
+            );
+            let edge = Point2::new(0.15, 0.55);
+            assert!(
+                plan_on_costmap(&map, edge, edge, None, None)
+                    .unwrap()
+                    .is_none(),
+                "同格终点也不能绕过图外轮廓检查"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_stuck_and_map_updates_preserve_footprint_floor() {
+        use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D};
+        let mut grid =
+            OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 40, 30, OccupancyCell::Free);
+        for y in 0..grid.height {
+            grid.set(20, y, OccupancyCell::Occupied);
+        }
+        let mut planner = SimplePlanner::new(SimplePlannerConfig::default()).unwrap();
+        planner.update_odometry(Pose3 {
+            position: Point3::new(0.55, 1.05, 0.0),
+            ..Pose3::default()
+        });
+        planner.replace_costmap(Costmap::from_occupancy(grid.clone(), 0.25).unwrap());
+        planner.set_goal(Point3::new(3.05, 1.05, 0.0), 0.0);
+        for now in [0.0, 6.0, 12.0] {
+            let (path, _, escalated) = planner.replan_once(now);
+            assert!(matches!(path, Some(None)));
+            assert!(!escalated);
+            assert_eq!(planner.effective_inflation(), 0.25);
+        }
+        planner.replace_costmap(Costmap::from_occupancy(grid, 0.05).unwrap());
+        planner.set_goal(Point3::new(3.05, 1.05, 0.0), 13.0);
+        assert_eq!(planner.effective_inflation(), 0.25);
+        assert_eq!(planner.costmap().inflation_radius(), 0.25);
+
+        // 没有有界占据图的旧地形输入仍保留原有额外膨胀降级行为。
+        let mut terrain = SimplePlanner::new(SimplePlannerConfig::default()).unwrap();
+        terrain.update_odometry(Pose3::default());
+        terrain.set_goal(Point3::new(3.0, 0.0, 0.0), 0.0);
+        terrain.replan_once(0.0);
+        assert!(terrain.replan_once(6.0).2);
+        assert!(terrain.effective_inflation() < 0.2);
+    }
 
     #[test]
     fn failed_replan_stops_old_waypoints_and_recovers_after_obstacle_removal() {

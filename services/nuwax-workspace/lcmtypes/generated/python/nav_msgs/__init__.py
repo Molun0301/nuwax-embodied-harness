@@ -5,3 +5,5 @@ lcm-gen 1.5.2
 """
 
 from .Odometry import Odometry as Odometry
+from .OccupancyGrid import OccupancyGrid as OccupancyGrid
+from .MapMetaData import MapMetaData as MapMetaData

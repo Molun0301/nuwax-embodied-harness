@@ -194,23 +194,12 @@ impl ProfileManifest {
                 ],
             ),
             NavStackProfile::Mls3D => (
-                ProfileActivation::InspectionOnly {
-                    blocker: "MLS planner and follower nodes do not have guard-backed production runtime owners",
-                },
+                ProfileActivation::ProductionGuarded,
                 vec![
-                    slot(
-                        "goal-path",
-                        "native_planner_path_adapter",
-                        "goal_path",
-                        "goal_path",
-                    ),
-                    slot(
-                        "navigation-command",
-                        "basic_path_follower",
-                        "nav_cmd_vel",
-                        "/nav/cmd_vel",
-                    ),
-                    slot("command", "movement_manager", "cmd_vel", "cmd_vel"),
+                    slot("map-pose", "map_pose_adapter", "map_pose", "/nav/map_pose"),
+                    slot("goal-path", "mls_planner", "goal_path", "goal_path"),
+                    slot("guarded-command", "surface_nav_scheduler", "cmd_vel", "cmd_vel"),
+                    slot("navigation-state", "surface_nav_scheduler", "nav_state", "/nav/state"),
                 ],
             ),
         };
@@ -295,8 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn activation_is_guarded_only_for_simple_and_astar() {
-        for profile in [NavStackProfile::Simple2D, NavStackProfile::ReplanningAStar] {
+    fn activation_is_guarded_for_simple_astar_and_surface() {
+        for profile in [
+            NavStackProfile::Simple2D,
+            NavStackProfile::ReplanningAStar,
+            NavStackProfile::Mls3D,
+        ] {
             let activation =
                 ProfileManifest::for_profile(profile, &NavTopicConfig::empty()).activation;
             assert!(activation.is_production_guarded(), "{profile}");
@@ -306,7 +299,6 @@ mod tests {
         for profile in [
             NavStackProfile::CmuNative,
             NavStackProfile::ExplorationNative,
-            NavStackProfile::Mls3D,
         ] {
             let activation =
                 ProfileManifest::for_profile(profile, &NavTopicConfig::empty()).activation;

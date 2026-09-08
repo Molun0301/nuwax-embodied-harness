@@ -7,3 +7,4 @@ lcm-gen 1.5.2
 from .LioOdometryEnvelope import LioOdometryEnvelope as LioOdometryEnvelope
 from .LioCloudEnvelope import LioCloudEnvelope as LioCloudEnvelope
 from .LioStatus import LioStatus as LioStatus
+from .NavigationMap3D import NavigationMap3D as NavigationMap3D

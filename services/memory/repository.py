@@ -71,93 +71,58 @@ class MemoryRepository:
         with self._lock:
             self._conn.close()
 
-    def load_tagged_locations(self) -> List[TaggedLocation]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM tagged_locations
-                ORDER BY created_at ASC, location_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(TaggedLocation, row) for row in rows]
+    def _load_library_records(self, table_name, model_type, order_by, library_name):
+        """先按库索引筛选，再解析记录；表名和排序仅由内部固定调用提供。"""
 
-    def load_semantic_memories(self) -> List[SemanticMemoryEntry]:
+        query = f"SELECT payload_json, map_name, library_name FROM {table_name}"
+        params = ()
+        if library_name is not None:
+            query += " WHERE library_name = ?"
+            params = (str(library_name).strip(),)
+        query += f" ORDER BY {order_by}"
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM semantic_memories
-                ORDER BY created_at ASC, memory_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(SemanticMemoryEntry, row) for row in rows]
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._load_record(model_type, row) for row in rows]
 
-    def load_semantic_instances(self) -> List[SemanticInstance]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM semantic_instances
-                ORDER BY updated_at ASC, instance_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(SemanticInstance, row) for row in rows]
+    def load_tagged_locations(self, *, library_name: Optional[str] = None) -> List[TaggedLocation]:
+        return self._load_library_records(
+            "tagged_locations", TaggedLocation, "created_at ASC, location_id ASC", library_name
+        )
 
-    def load_observation_events(self) -> List[ObservationEvent]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM observation_events
-                ORDER BY created_at ASC, event_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(ObservationEvent, row) for row in rows]
+    def load_semantic_memories(self, *, library_name: Optional[str] = None) -> List[SemanticMemoryEntry]:
+        return self._load_library_records(
+            "semantic_memories", SemanticMemoryEntry, "created_at ASC, memory_id ASC", library_name
+        )
 
-    def load_scene_spaces(self) -> List[SceneSpace]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM scene_spaces
-                ORDER BY updated_at ASC, scene_space_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(SceneSpace, row) for row in rows]
+    def load_semantic_instances(self, *, library_name: Optional[str] = None) -> List[SemanticInstance]:
+        return self._load_library_records(
+            "semantic_instances", SemanticInstance, "updated_at ASC, instance_id ASC", library_name
+        )
 
-    def load_navigation_trajectory_events(self) -> List[NavigationTrajectoryEvent]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM navigation_trajectory_events
-                ORDER BY created_at ASC, trajectory_event_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(NavigationTrajectoryEvent, row) for row in rows]
+    def load_observation_events(self, *, library_name: Optional[str] = None) -> List[ObservationEvent]:
+        return self._load_library_records(
+            "observation_events", ObservationEvent, "created_at ASC, event_id ASC", library_name
+        )
 
-    def load_semantic_graph_relations(self) -> List[SemanticGraphRelation]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM semantic_graph_relations
-                ORDER BY updated_at ASC, relation_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(SemanticGraphRelation, row) for row in rows]
+    def load_scene_spaces(self, *, library_name: Optional[str] = None) -> List[SceneSpace]:
+        return self._load_library_records(
+            "scene_spaces", SceneSpace, "updated_at ASC, scene_space_id ASC", library_name
+        )
 
-    def load_semantic_summary_nodes(self) -> List[SemanticSummaryNode]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT payload_json, map_name, library_name
-                FROM semantic_summary_nodes
-                ORDER BY updated_at ASC, summary_id ASC
-                """
-            ).fetchall()
-        return [self._load_record(SemanticSummaryNode, row) for row in rows]
+    def load_navigation_trajectory_events(self, *, library_name: Optional[str] = None) -> List[NavigationTrajectoryEvent]:
+        return self._load_library_records(
+            "navigation_trajectory_events", NavigationTrajectoryEvent, "created_at ASC, trajectory_event_id ASC", library_name
+        )
+
+    def load_semantic_graph_relations(self, *, library_name: Optional[str] = None) -> List[SemanticGraphRelation]:
+        return self._load_library_records(
+            "semantic_graph_relations", SemanticGraphRelation, "updated_at ASC, relation_id ASC", library_name
+        )
+
+    def load_semantic_summary_nodes(self, *, library_name: Optional[str] = None) -> List[SemanticSummaryNode]:
+        return self._load_library_records(
+            "semantic_summary_nodes", SemanticSummaryNode, "updated_at ASC, summary_id ASC", library_name
+        )
 
     def load_scene_space(self, scene_space_id: str) -> Optional[SceneSpace]:
         resolved_id = str(scene_space_id or "").strip()
@@ -180,6 +145,7 @@ class MemoryRepository:
         self,
         *,
         scene_space_ids: Optional[Sequence[str]] = None,
+        library_name: Optional[str] = None,
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[Sequence[object]] = None,
@@ -187,6 +153,9 @@ class MemoryRepository:
     ) -> List[SceneSpace]:
         where_clauses: List[str] = []
         params: List[object] = []
+        if library_name is not None:
+            where_clauses.append("library_name = ?")
+            params.append(str(library_name).strip())
         resolved_ids = [str(item).strip() for item in scene_space_ids or [] if str(item).strip()]
         if resolved_ids:
             placeholders = ", ".join("?" for _ in resolved_ids)
@@ -218,15 +187,17 @@ class MemoryRepository:
         self,
         payload_filter: Optional[MemoryPayloadFilter] = None,
         *,
+        library_name: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[SceneSpace]:
         if payload_filter is None:
-            return self.list_scene_spaces(limit=limit)
+            return self.list_scene_spaces(library_name=library_name, limit=limit)
         if payload_filter.record_kinds:
             record_kinds = self._enum_values(payload_filter.record_kinds)
             if SCENE_SPACE_VECTOR_NAMESPACE not in record_kinds:
                 return []
         spaces = self.list_scene_spaces(
+            library_name=library_name,
             scene_space_ids=payload_filter.scene_space_ids,
             map_name=payload_filter.map_name,
             localization_session_id=payload_filter.localization_session_id,

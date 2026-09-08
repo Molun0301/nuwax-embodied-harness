@@ -109,11 +109,9 @@ class SQLiteNamedVectorStore:
             self._read_conn.row_factory = sqlite3.Row
             self._read_conn.execute("PRAGMA journal_mode=WAL")
             self._read_conn.execute("PRAGMA query_only=ON")
-        # ANN（近似最近邻）批量计算缓存 —— 按 vector_name 分组增量维护
-        self._cache_dirty: bool = False
-        self._cache_matrices: Dict[str, np.ndarray] = {}  # {vector_name: (N, dim)}
-        self._cache_point_ids: Dict[str, List[str]] = {}  # {vector_name: [point_id...]}
-        self._cache_threshold: int = 50  # 超过此数量启用批量矩阵计算
+        # 按点缓存向量，写入只替换当前点，避免每次追加都复制整个历史矩阵。
+        self._cached_vectors: Dict[str, Dict[str, np.ndarray]] = {}
+        self._cache_threshold: int = 50  # 超过此数量启用精确批量余弦计算
         self._init_schema()
 
     @property
@@ -250,32 +248,17 @@ class SQLiteNamedVectorStore:
                     ),
                 )
             self._conn.commit()
-            # 增量更新缓存矩阵：追加或替换向量，避免全量重建
+            # 只替换当前点的缓存，保持数据库与后续查询使用的向量一致
             self._incremental_cache_update(point_id, vectors)
 
     def _incremental_cache_update(
         self, point_id: str, vectors: Dict[str, "NamedVector"]
     ) -> None:
-        """增量更新缓存矩阵：新 point 追加，已有 point 原地替换向量。"""
-        for vector_name, named_vec in vectors.items():
-            vec = named_vec.vector.astype(np.float32)
-            ids_list = self._cache_point_ids.setdefault(vector_name, [])
-            matrix = self._cache_matrices.get(vector_name)
-            if point_id in ids_list:
-                # 已有 point，原地替换
-                idx = ids_list.index(point_id)
-                if matrix is not None and idx < matrix.shape[0]:
-                    matrix[idx] = vec
-            else:
-                # 新 point，追加
-                ids_list.append(point_id)
-                row = vec.reshape(1, -1)
-                if matrix is None or matrix.shape[0] == 0:
-                    self._cache_matrices[vector_name] = row
-                else:
-                    self._cache_matrices[vector_name] = np.vstack(
-                        [matrix, row]
-                    )
+        """替换当前点的缓存，允许不同点使用不同维度，并清除已删除的向量名。"""
+        self._cached_vectors[point_id] = {
+            name: np.array(named.vector, dtype=np.float32, copy=True).reshape(-1)
+            for name, named in vectors.items()
+        }
 
     def get_point(self, point_id: str) -> Optional[VectorPoint]:
         with self._read_lock:
@@ -362,64 +345,74 @@ class SQLiteNamedVectorStore:
         payload_filter: Optional[MemoryPayloadFilter] = None,
         candidate_ids: Optional[Iterable[str]] = None,
         collection_names: Optional[Iterable[str]] = None,
+        model_name: Optional[str] = None,
     ) -> Tuple[VectorSearchHit, ...]:
-        selected_rows = self._select_candidate_rows(
-            payload_filter=payload_filter,
-            candidate_ids=candidate_ids,
-            collection_names=collection_names,
-        )
-        if not selected_rows:
+        query_vector = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+        if not query_vector.size or not np.all(np.isfinite(query_vector)):
             return ()
-        point_ids = [str(row["point_id"]) for row in selected_rows]
-        vector_rows = self._select_vector_rows(vector_name, point_ids)
-        vector_map = {str(row["point_id"]): row for row in vector_rows}
+        # 数据库行与缓存引用一次取快照；大矩阵计算在锁外进行。
+        with self._lock:
+            selected_rows = self._select_candidate_rows(
+                payload_filter=payload_filter,
+                candidate_ids=candidate_ids,
+                collection_names=collection_names,
+            )
+            if not selected_rows:
+                return ()
+            point_ids = [str(row["point_id"]) for row in selected_rows]
+            vector_rows = self._select_vector_rows(vector_name, point_ids)
+            vector_map = {
+                str(row["point_id"]): row
+                for row in vector_rows
+                if int(row["dimension"]) == query_vector.size
+                and (model_name is None or str(row["model_name"]) == model_name)
+            }
+            cached_vectors = {
+                point_id: self._cached_vectors.get(point_id, {}).get(vector_name)
+                for point_id in vector_map
+            }
 
-        hits: List[VectorSearchHit] = []
-        # 候选数量超过阈值时，使用矩阵批量余弦相似度计算（约快 10-50x）
-        use_batch = len(vector_map) > self._cache_threshold
-        if use_batch:
-            try:
-                ordered_ids = [pid for pid in point_ids if pid in vector_map]
-                # 优先使用增量缓存矩阵（避免每次从 DB 解码重建）
-                cached_matrix = self._cache_matrices.get(vector_name)
-                cached_ids = self._cache_point_ids.get(vector_name, [])
-                if (
-                    not self._cache_dirty
-                    and cached_matrix is not None
-                    and cached_ids
-                    and set(ordered_ids).issubset(set(cached_ids))
-                ):
-                    # 从缓存矩阵中按候选 id 提取子矩阵
-                    id_to_idx = {pid: i for i, pid in enumerate(cached_ids)}
-                    indices = [id_to_idx[pid] for pid in ordered_ids]
-                    matrix = cached_matrix[indices]
-                else:
-                    # fallback：从 DB 行解码构建矩阵
-                    matrix = np.stack(
-                        [_decode_vector(vector_map[pid]["vector_payload"]) for pid in ordered_ids]
-                    )
-                scores_arr = self._batch_cosine_similarity(query_vector, matrix)
-                score_by_id = {pid: float(scores_arr[i]) for i, pid in enumerate(ordered_ids)}
-            except Exception:
-                # 批量计算失败，退回到逐条计算
-                use_batch = False
-
+        rows_by_id = {}
+        vectors_by_id = {}
         for point_row in selected_rows:
             point_id = str(point_row["point_id"])
             vector_row = vector_map.get(point_id)
             if vector_row is None:
                 continue
-            point = self._build_point(point_row, [vector_row])
-            if not self._payload_matches(point.payload, payload_filter):
+            if payload_filter is not None:
+                payload = json.loads(str(point_row["payload_json"]))
+                if not self._payload_matches(payload, payload_filter):
+                    continue
+            vector = cached_vectors.get(point_id)
+            if vector is None:
+                vector = _decode_vector(vector_row["vector_payload"])
+            if vector.size != query_vector.size or not np.all(np.isfinite(vector)):
                 continue
-            if use_batch:
-                score = max(0.0, score_by_id.get(point_id, 0.0))
-            else:
-                stored_vector = point.vectors[vector_name].vector
-                score = max(0.0, _cosine_similarity(query_vector, stored_vector))
-            hits.append(VectorSearchHit(point=point, vector_name=vector_name, score=score))
-        hits.sort(key=lambda item: item.score, reverse=True)
-        return tuple(hits[: max(1, limit)])
+            rows_by_id[point_id] = point_row
+            vectors_by_id[point_id] = vector
+        if not vectors_by_id:
+            return ()
+
+        ordered_ids = list(vectors_by_id)
+        if len(ordered_ids) > self._cache_threshold:
+            matrix = np.stack(list(vectors_by_id.values()))
+            scores = self._batch_cosine_similarity(query_vector, matrix)
+        else:
+            scores = [_cosine_similarity(query_vector, vector) for vector in vectors_by_id.values()]
+        ranked = sorted(
+            ((point_id, max(0.0, float(score))) for point_id, score in zip(ordered_ids, scores)),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        # 只为最终命中构造对象，避免全部候选重复解码向量和载荷。
+        return tuple(
+            VectorSearchHit(
+                point=self._build_point(rows_by_id[point_id], [vector_map[point_id]]),
+                vector_name=vector_name,
+                score=score,
+            )
+            for point_id, score in ranked[: max(1, limit)]
+        )
 
     def count_points(self) -> int:
         with self._read_lock:
@@ -464,10 +457,8 @@ class SQLiteNamedVectorStore:
                 [(point_id,) for point_id in normalized_ids],
             )
             self._conn.commit()
-            # delete 较少发生，标记 dirty 全量重建
-            self._cache_dirty = True
-            self._cache_matrices.clear()
-            self._cache_point_ids.clear()
+            for point_id in normalized_ids:
+                self._cached_vectors.pop(point_id, None)
         return len(normalized_ids)
 
     def clear_all(self) -> None:
@@ -475,6 +466,7 @@ class SQLiteNamedVectorStore:
             self._conn.execute("DELETE FROM memory_named_vectors")
             self._conn.execute("DELETE FROM memory_vector_points")
             self._conn.commit()
+            self._cached_vectors.clear()
 
     def _batch_cosine_similarity(self, query_vector: np.ndarray, matrix: np.ndarray) -> np.ndarray:
         """批量计算 query_vector 与矩阵每行的余弦相似度，利用 numpy BLAS 加速。"""
@@ -502,7 +494,9 @@ class SQLiteNamedVectorStore:
             query.append("AND collection_name IN (%s)" % ",".join("?" for _ in normalized_collections))
             params.extend(normalized_collections)
 
-        normalized_candidate_ids = _normalize_string_list(tuple(candidate_ids or ()))
+        normalized_candidate_ids = _normalize_string_list(tuple(candidate_ids) if candidate_ids is not None else ())
+        if candidate_ids is not None and not normalized_candidate_ids:
+            return []
         if normalized_candidate_ids:
             query.append("AND point_id IN (%s)" % ",".join("?" for _ in normalized_candidate_ids))
             params.extend(normalized_candidate_ids)

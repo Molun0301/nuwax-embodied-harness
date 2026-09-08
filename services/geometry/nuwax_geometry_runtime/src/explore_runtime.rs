@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use nuwax_codec::lcm::schema;
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
+use nuwax_exploration::surface_adapter::{SurfaceGoalSourceAdapter, SurfaceInputReceiver};
 use nuwax_exploration::wavefront_adapter::WavefrontGoalSourceAdapter;
 use nuwax_exploration::{
     ExplorationArbitrationPolicy, ExplorationBoundary, ExplorationController,
@@ -29,6 +30,8 @@ use nuwax_exploration::{
     ExplorationStopReason, ExplorationTerminalKind,
 };
 use nuwax_explore_wavefront::WavefrontConfig;
+use nuwax_nav_mls_planner::SurfaceSnapshot;
+use nuwax_nav_stack::surface_config::SurfaceNavigationConfig;
 use nuwax_nav_types_messages::frames::NavFrameId;
 use nuwax_nav_types_messages::geometry::{
     ClockKind, Point3, Pose3, PoseStamped, Quaternion, Timestamp,
@@ -61,6 +64,8 @@ const POLICY_HIGHEST_SCORE: &str = "highest_score";
 const POLICY_FIRST_AVAILABLE: &str = "first_available";
 const DEFAULT_SCHEDULER_PERIOD: Duration = Duration::from_millis(200);
 const DEFAULT_POSE_RECEIPT_TTL: Duration = Duration::from_secs(1);
+const DEFAULT_COSTMAP_RECEIPT_TTL: Duration = Duration::from_secs(2);
+const DEFAULT_NO_FRONTIER_STABILITY: Duration = Duration::from_secs(5);
 const DEFAULT_POSE_UNAVAILABLE_GRACE: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const SCHEDULER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -117,6 +122,7 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
         ExplorationStopReason::NoFrontierTimeout => "no_frontier_timeout",
         ExplorationStopReason::DurationExceeded => "duration_exceeded",
         ExplorationStopReason::MaxGoalsReached => "max_goals_reached",
+        ExplorationStopReason::MapRevisionChanged => "map_revision_changed",
         _ => "unsupported_stop_reason",
     }
 }
@@ -194,9 +200,13 @@ impl Default for ExploreStartConfig {
 }
 
 impl ExploreStartConfig {
-    fn validate(&self) -> Result<ExplorationArbitrationPolicy, String> {
+    fn validate(&self, surface_mode: bool) -> Result<ExplorationArbitrationPolicy, String> {
         match self.strategy.trim().to_ascii_lowercase().as_str() {
             "" | "wavefront" | "frontier" => {}
+            "surface" if surface_mode => {}
+            "surface" => {
+                return Err("surface exploration requires the mls-3d navigation profile".into())
+            }
             "tare" | "native" | "exploration-native" => {
                 return Err(format!(
                     "exploration source `{}` is unsupported/source unavailable in the qualified production profile",
@@ -204,6 +214,11 @@ impl ExploreStartConfig {
                 ));
             }
             other => return Err(format!("unknown exploration strategy: {other}")),
+        }
+        if surface_mode && self.stop_conditions.max_coverage_pct.is_some() {
+            return Err(
+                "3D exploration max_coverage_pct requires a known volume and is unsupported".into(),
+            );
         }
         let policy = try_parse_arbitration_policy(&self.arbitration)?;
         if policy == ExplorationArbitrationPolicy::PreferTare {
@@ -239,6 +254,8 @@ pub struct ExploreCostmapSnapshot {
 pub struct ExploreRobotPose {
     pub x: f64,
     pub y: f64,
+    pub z: f64,
+    pub orientation: Quaternion,
     pub frame_id: String,
     pub source_timestamp_ns: u64,
     pub received_monotonic_ns: u64,
@@ -279,7 +296,9 @@ pub(crate) fn build_wavefront_goal_intent(
     if cancel_generation > i64::MAX as u64 {
         return Err("wavefront cancel generation is outside the shared intent domain".to_string());
     }
-    if !matches!(&goal.target.frame_id, NavFrameId::Map) {
+    if !matches!(&goal.target.frame_id, NavFrameId::Map)
+        && goal.target.frame_id.as_str() != committed_map.frame_id
+    {
         return Err("wavefront goal is not in map-frame semantics".to_string());
     }
     motion_admission
@@ -1349,6 +1368,40 @@ fn durable_snapshot_from_runtime(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SurfaceMapTicket {
+    pub(crate) committed_map: schema::CommittedMapIdentity,
+    producer_runtime_generation: i64,
+    map_frame_generation: i64,
+    cloud_revision: i64,
+    commit_boot_nonce: [u8; 16],
+    received_monotonic_ns: u64,
+}
+
+impl SurfaceMapTicket {
+    fn same_domain(&self, other: &Self) -> bool {
+        self.producer_runtime_generation == other.producer_runtime_generation
+            && self.commit_boot_nonce == other.commit_boot_nonce
+            && self.committed_map.session_id == other.committed_map.session_id
+            && self.committed_map.session_generation == other.committed_map.session_generation
+            && self.committed_map.frame_id == other.committed_map.frame_id
+            && self.map_frame_generation == other.map_frame_generation
+    }
+}
+
+struct SurfaceExplorationMode {
+    config: Result<SurfaceNavigationConfig, String>,
+    receiver: SurfaceInputReceiver,
+    producer_runtime_generation: i64,
+    commit_boot_nonce: [u8; 16],
+    latest: Option<SurfaceMapTicket>,
+    installed_cloud_revision: Option<i64>,
+    minimum_eligible_cloud_revision: i64,
+    input_ready: bool,
+    input_error: Option<String>,
+    accepting: bool,
+}
+
 pub struct ExploreRuntimeInner {
     controller: ExplorationController,
     arbitration: ExplorationArbitrationPolicy,
@@ -1359,6 +1412,9 @@ pub struct ExploreRuntimeInner {
     last_frontier_goal: Option<FrontierGoal>,
     last_poll: Option<ExplorationPoll>,
     costmap_input: Option<ExploreCostmapSnapshot>,
+    surface_mode: Option<SurfaceExplorationMode>,
+    /// 最近一次有效地图输入的本地接收时刻，不参与地图身份。
+    costmap_received_monotonic_ns: u64,
     committed_map: Option<schema::CommittedMapIdentity>,
     active_config: Option<ExploreStartConfig>,
     active_child: Option<ActiveChildNavigation>,
@@ -1370,7 +1426,7 @@ pub struct ExploreRuntimeInner {
     child_sequence: u64,
     reached_goals: u32,
     started_at_ns: u64,
-    no_frontier_since_ns: Option<u64>,
+    no_frontier_since: Option<Instant>,
     frontiers: Vec<FrontierGoal>,
     frontier_revision: u64,
 }
@@ -1390,6 +1446,8 @@ impl ExploreRuntimeInner {
             last_frontier_goal: None,
             last_poll: None,
             costmap_input: None,
+            surface_mode: None,
+            costmap_received_monotonic_ns: 0,
             committed_map: None,
             active_config: None,
             active_child: None,
@@ -1401,7 +1459,7 @@ impl ExploreRuntimeInner {
             child_sequence: 0,
             reached_goals: 0,
             started_at_ns: 0,
-            no_frontier_since_ns: None,
+            no_frontier_since: None,
             frontiers: Vec::new(),
             frontier_revision: 0,
         }
@@ -1513,6 +1571,36 @@ fn build_controller(
     );
     controller.add_source(adapter);
     controller
+}
+
+fn build_profile_controller(
+    policy: ExplorationArbitrationPolicy,
+    config: &ExploreStartConfig,
+    surface: Option<&SurfaceExplorationMode>,
+) -> Result<ExplorationController, String> {
+    let Some(surface) = surface else {
+        return Ok(build_controller(policy, config));
+    };
+    if !surface.accepting {
+        return Err("surface exploration input owner is stopped".into());
+    }
+    let surface_config = surface.config.as_ref().map_err(Clone::clone)?;
+    let mut adapter = SurfaceGoalSourceAdapter::new(
+        "surface",
+        surface_config.follower.body_to_support_z_m,
+        surface.receiver.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    adapter
+        .configure_constraints(
+            config.boundary.clone(),
+            config.max_navigation_retries,
+            config.blacklist_radius_m,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut controller = ExplorationController::new(policy);
+    controller.add_source(adapter);
+    Ok(controller)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1698,6 +1786,243 @@ pub struct ExploreRuntimeHandle {
 }
 
 impl ExploreRuntimeHandle {
+    /// 初始化时捕获三维配置；配置错误只撤销探索能力，不关闭几何服务。
+    pub(crate) async fn configure_surface_source(
+        &self,
+        mut config: Result<SurfaceNavigationConfig, String>,
+        producer_runtime_generation: u64,
+        commit_boot_nonce: [u8; 16],
+    ) -> Result<(), String> {
+        if producer_runtime_generation == 0
+            || producer_runtime_generation > i64::MAX as u64
+            || commit_boot_nonce == [0; 16]
+        {
+            config = Err("surface exploration producer identity is unavailable".into());
+        }
+        if config
+            .as_ref()
+            .is_ok_and(|config| config.geometry.world_frame != self.expected_map_frame.as_ref())
+        {
+            config = Err(
+                "surface navigation configuration frame differs from Geometry map frame".into(),
+            );
+        }
+        let mut guard = self.inner.lock().await;
+        if guard.session_in_progress() {
+            return Err("cannot reconfigure an active exploration source".into());
+        }
+        let mode = SurfaceExplorationMode {
+            config,
+            receiver: SurfaceInputReceiver::new(),
+            producer_runtime_generation: producer_runtime_generation as i64,
+            commit_boot_nonce,
+            latest: None,
+            installed_cloud_revision: None,
+            minimum_eligible_cloud_revision: 0,
+            input_ready: false,
+            input_error: Some("surface map input is unavailable".into()),
+            accepting: true,
+        };
+        guard.controller = build_profile_controller(
+            guard.arbitration,
+            &ExploreStartConfig::default(),
+            Some(&mode),
+        )
+        .unwrap_or_else(|_| ExplorationController::new(guard.arbitration));
+        guard.surface_mode = Some(mode);
+        guard.committed_map = None;
+        guard.costmap_received_monotonic_ns = 0;
+        drop(guard);
+        let backend = self.readiness_cache.lock().backend_available;
+        self.refresh_readiness_cache_with_backend(backend);
+        Ok(())
+    }
+
+    /// 接收新消息身份并立即处理清空/域变化；表面计算由外部受管工作执行。
+    pub(crate) async fn begin_surface_map_update(
+        &self,
+        message: &schema::NavigationMap3D,
+        received_monotonic_ns: u64,
+    ) -> Result<Option<SurfaceMapTicket>, String> {
+        schema::validate_navigation_map_3d(message)?;
+        if received_monotonic_ns == 0
+            || message.committed_map.frame_id != self.expected_map_frame.as_ref()
+        {
+            return Err("surface map receipt time or frame is invalid".into());
+        }
+        let ticket = SurfaceMapTicket {
+            committed_map: message.committed_map.clone(),
+            producer_runtime_generation: message.producer_runtime_generation,
+            map_frame_generation: message.map_frame_generation,
+            cloud_revision: message.cloud_revision,
+            commit_boot_nonce: message.commit_boot_nonce,
+            received_monotonic_ns,
+        };
+        let mut guard = self.inner.lock().await;
+        let invalidates = {
+            let mode = guard
+                .surface_mode
+                .as_mut()
+                .ok_or_else(|| "surface exploration is disabled".to_string())?;
+            if !mode.accepting {
+                return Err("surface exploration input owner is stopped".into());
+            }
+            mode.config.as_ref().map_err(Clone::clone)?;
+            if ticket.producer_runtime_generation != mode.producer_runtime_generation
+                || ticket.commit_boot_nonce != mode.commit_boot_nonce
+            {
+                return Err("surface map producer does not belong to this Geometry runtime".into());
+            }
+            if mode
+                .latest
+                .as_ref()
+                .is_some_and(|previous| ticket.cloud_revision <= previous.cloud_revision)
+            {
+                return Err("surface cloud revision is duplicate or stale".into());
+            }
+            let invalidates = message.cleared
+                || mode
+                    .latest
+                    .as_ref()
+                    .is_some_and(|previous| !ticket.same_domain(previous));
+            mode.latest = Some(ticket.clone());
+            if invalidates {
+                mode.installed_cloud_revision = None;
+                mode.minimum_eligible_cloud_revision =
+                    message.cloud_revision + i64::from(message.cleared);
+                mode.receiver.clear().map_err(|error| error.to_string())?;
+                mode.input_ready = false;
+                mode.input_error = Some(
+                    if message.cleared {
+                        "surface map cleared"
+                    } else {
+                        "surface map domain changed"
+                    }
+                    .into(),
+                );
+            }
+            invalidates
+        };
+        let finish_request = if invalidates {
+            guard.committed_map = None;
+            guard.costmap_received_monotonic_ns = 0;
+            guard.no_frontier_since = None;
+            guard
+                .controller
+                .is_active()
+                .then(|| guard.last_request_id.clone())
+        } else {
+            None
+        };
+        drop(guard);
+        if let Some(request_id) = finish_request {
+            self.finish_session(
+                Some(&request_id),
+                ExplorationStopReason::MapRevisionChanged,
+                if message.cleared {
+                    "surface map cleared by mapping owner"
+                } else {
+                    "surface map domain changed"
+                }
+                .into(),
+            )
+            .await;
+        }
+        let backend = self.readiness_cache.lock().backend_available;
+        self.refresh_readiness_cache_with_backend(backend);
+        Ok((!message.cleared).then_some(ticket))
+    }
+
+    /// 同域允许最新完成图先安装；票据保留自身身份和接收时刻，清空/换域仍撤销旧结果。
+    pub(crate) async fn finish_surface_map_update(
+        &self,
+        ticket: SurfaceMapTicket,
+        result: Result<Arc<SurfaceSnapshot>, String>,
+    ) -> bool {
+        let mut guard = self.inner.lock().await;
+        let error = {
+            let Some(mode) = guard.surface_mode.as_mut() else {
+                return false;
+            };
+            if !mode.accepting
+                || mode.latest.as_ref().is_none_or(|latest| {
+                    !ticket.same_domain(latest) || ticket.cloud_revision > latest.cloud_revision
+                })
+                || ticket.cloud_revision < mode.minimum_eligible_cloud_revision
+                || mode
+                    .installed_cloud_revision
+                    .is_some_and(|revision| ticket.cloud_revision <= revision)
+            {
+                return false;
+            }
+            match result {
+                Ok(snapshot) => match mode.receiver.replace(Some(snapshot)) {
+                    Ok(()) => {
+                        mode.installed_cloud_revision = Some(ticket.cloud_revision);
+                        mode.input_ready = true;
+                        mode.input_error = None;
+                        None
+                    }
+                    Err(error) => Some(error.to_string()),
+                },
+                Err(error) => Some(error),
+            }
+        };
+        let finish_request = if let Some(error) = error.as_ref() {
+            let mode = guard
+                .surface_mode
+                .as_mut()
+                .expect("surface mode was checked");
+            let _ = mode.receiver.clear();
+            mode.input_ready = false;
+            mode.input_error = Some(error.clone());
+            guard.committed_map = None;
+            guard.costmap_received_monotonic_ns = 0;
+            guard.no_frontier_since = None;
+            guard
+                .controller
+                .is_active()
+                .then(|| guard.last_request_id.clone())
+        } else {
+            guard.committed_map = Some(ticket.committed_map);
+            guard.costmap_received_monotonic_ns = ticket.received_monotonic_ns;
+            None
+        };
+        drop(guard);
+        if let Some(request_id) = finish_request {
+            self.finish_session(
+                Some(&request_id),
+                ExplorationStopReason::ConsecutiveFailuresExceeded,
+                format!(
+                    "surface map computation failed: {}",
+                    error.unwrap_or_default()
+                ),
+            )
+            .await;
+        }
+        let backend = self.readiness_cache.lock().backend_available;
+        self.refresh_readiness_cache_with_backend(backend);
+        true
+    }
+
+    pub(crate) async fn stop_surface_input_owner(&self) {
+        let mut guard = self.inner.lock().await;
+        if let Some(mode) = guard.surface_mode.as_mut() {
+            mode.accepting = false;
+            mode.latest = None;
+            mode.installed_cloud_revision = None;
+            mode.input_ready = false;
+            mode.input_error = Some("surface input owner stopped".into());
+            let _ = mode.receiver.clear();
+            guard.committed_map = None;
+            guard.costmap_received_monotonic_ns = 0;
+            guard.no_frontier_since = None;
+        }
+        drop(guard);
+        let backend = self.readiness_cache.lock().backend_available;
+        self.refresh_readiness_cache_with_backend(backend);
+    }
+
     pub fn default_with_wavefront() -> Self {
         Self::new_with_validated_map_frame(Arc::from("map"))
     }
@@ -1914,7 +2239,7 @@ impl ExploreRuntimeHandle {
         request_id: &str,
         config: ExploreStartConfig,
     ) -> ExploreRuntimeSnapshot {
-        {
+        let surface_mode = {
             let guard = self.inner.lock().await;
             if guard.session_in_progress() {
                 return ExploreRuntimeSnapshot {
@@ -1937,8 +2262,9 @@ impl ExploreRuntimeHandle {
                     ownership_reconciliation_receipt: None,
                 };
             }
-        }
-        let policy = match config.validate() {
+            guard.surface_mode.is_some()
+        };
+        let policy = match config.validate(surface_mode) {
             Ok(policy) => policy,
             Err(error) => {
                 let mut snapshot = self.snapshot();
@@ -1981,7 +2307,19 @@ impl ExploreRuntimeHandle {
             return snapshot;
         }
 
-        let mut controller = build_controller(policy, &config);
+        let mut controller =
+            match build_profile_controller(policy, &config, guard.surface_mode.as_ref()) {
+                Ok(controller) => controller,
+                Err(error) => {
+                    let mut snapshot = guard.snapshot(STATUS_REJECTED, error);
+                    snapshot.request_id = request_id.to_string();
+                    if surface_mode {
+                        snapshot.selected_source = "surface".into();
+                    }
+                    drop(guard);
+                    return self.store_snapshot(snapshot);
+                }
+            };
         if let Err(error) = controller.begin_exploration() {
             let snapshot = ExploreRuntimeSnapshot {
                 status: STATUS_REJECTED,
@@ -1998,6 +2336,9 @@ impl ExploreRuntimeHandle {
         guard.arbitration = policy;
         guard.last_request_id = request_id.to_string();
         guard.last_selected_source.clear();
+        if surface_mode {
+            guard.last_selected_source = "surface".into();
+        }
         guard.last_stop_reason.clear();
         guard.last_stop = None;
         guard.last_frontier_goal = None;
@@ -2012,12 +2353,13 @@ impl ExploreRuntimeHandle {
         guard.child_sequence = 0;
         guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
-        guard.no_frontier_since_ns = None;
+        guard.no_frontier_since = None;
         let frontier_update = guard.update_frontiers(Vec::new());
         let snapshot = guard.snapshot(
             STATUS_ACCEPTED,
             format!(
-                "exploration accepted (source=wavefront, arbitration={})",
+                "exploration accepted (source={}, arbitration={})",
+                if surface_mode { "surface" } else { "wavefront" },
                 arbitration_policy_str(policy)
             ),
         );
@@ -2154,7 +2496,7 @@ impl ExploreRuntimeHandle {
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
         guard.active_child = None;
-        guard.no_frontier_since_ns = None;
+        guard.no_frontier_since = None;
         guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
         guard.last_stop_reason = "runtime_rollover_aborted_safe".to_string();
         let frontier_update = guard.update_frontiers(Vec::new());
@@ -2418,7 +2760,7 @@ impl ExploreRuntimeHandle {
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
         guard.active_child = None;
-        guard.no_frontier_since_ns = None;
+        guard.no_frontier_since = None;
         guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
         guard.last_stop_reason = "global_stop_reconciled_safe".to_string();
         let frontier_update = guard.update_frontiers(Vec::new());
@@ -2758,6 +3100,8 @@ impl ExploreRuntimeHandle {
         self.tick_with_pose(ExploreRobotPose {
             x: robot_xy.0,
             y: robot_xy.1,
+            z: 0.0,
+            orientation: Quaternion::IDENTITY,
             frame_id: self.expected_map_frame.to_string(),
             source_timestamp_ns: now_unix_nanos(),
             received_monotonic_ns: now_monotonic_ns,
@@ -2775,6 +3119,20 @@ impl ExploreRuntimeHandle {
         generation: u64,
         pose: ExploreRobotPose,
     ) -> ExploreRuntimeSnapshot {
+        if ![pose.x, pose.y, pose.z]
+            .iter()
+            .all(|value| value.is_finite())
+            || !pose.orientation.yaw().is_finite()
+            || pose.source_timestamp_ns > i64::MAX as u64
+        {
+            return self
+                .finish_session(
+                    None,
+                    ExplorationStopReason::ConsecutiveFailuresExceeded,
+                    "exploration pose is not a finite full body pose".into(),
+                )
+                .await;
+        }
         if normalize_frame(&pose.frame_id) != self.expected_map_frame.as_ref() {
             return self
                 .finish_session(
@@ -2851,12 +3209,36 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
-        let Some(costmap) = guard.costmap_input.clone() else {
+        let surface_mode = guard.surface_mode.is_some();
+        let costmap = if surface_mode {
+            if !guard
+                .surface_mode
+                .as_ref()
+                .is_some_and(|mode| mode.input_ready && mode.accepting)
+            {
+                guard.no_frontier_since = None;
+                let reason = guard
+                    .surface_mode
+                    .as_ref()
+                    .and_then(|mode| mode.input_error.clone())
+                    .unwrap_or_else(|| "surface map input unavailable".into());
+                let snapshot = guard.snapshot(STATUS_PENDING, reason);
+                drop(guard);
+                return self.store_snapshot(snapshot);
+            }
+            None
+        } else {
+            guard.costmap_input.clone()
+        };
+        if !surface_mode && costmap.is_none() {
+            guard.no_frontier_since = None;
             let snapshot = guard.snapshot(STATUS_PENDING, "source unavailable: missing costmap");
             drop(guard);
             return self.store_snapshot(snapshot);
-        };
-        if normalize_frame(&costmap.frame_id) != self.expected_map_frame.as_ref() {
+        }
+        if costmap.as_ref().is_some_and(|costmap| {
+            normalize_frame(&costmap.frame_id) != self.expected_map_frame.as_ref()
+        }) {
             drop(guard);
             return self
                 .finish_session(
@@ -2864,10 +3246,27 @@ impl ExploreRuntimeHandle {
                     ExplorationStopReason::ConsecutiveFailuresExceeded,
                     format!(
                         "global exploration requires costmap frame={}; received frame={}",
-                        self.expected_map_frame, costmap.frame_id
+                        self.expected_map_frame,
+                        costmap.as_ref().expect("checked costmap").frame_id
                     ),
                 )
                 .await;
+        }
+        if guard.costmap_received_monotonic_ns == 0
+            || now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
+                > DEFAULT_COSTMAP_RECEIPT_TTL.as_nanos() as u64
+        {
+            guard.no_frontier_since = None;
+            let snapshot = guard.snapshot(
+                STATUS_PENDING,
+                if surface_mode {
+                    "source unavailable: surface map input stale"
+                } else {
+                    "source unavailable: costmap input stale"
+                },
+            );
+            drop(guard);
+            return self.store_snapshot(snapshot);
         }
         if let Some(request) = guard.pending_child_dispatch.take() {
             let snapshot = guard.snapshot(
@@ -2881,17 +3280,69 @@ impl ExploreRuntimeHandle {
             return self.dispatch_child(generation, request, guard).await;
         }
 
-        let mut state = ExplorationStateSnapshot::from_xy(
-            (pose.x, pose.y),
+        // 先确认提交所需的同步上下文，再允许选择器领取目标。
+        // 等待期间既没有导航副作用，也不能计为目标失败或无前沿。
+        let navigation_context = (|| {
+            let committed_map = guard
+                .committed_map
+                .clone()
+                .ok_or_else(|| "committed map identity unavailable".to_string())?;
+            let sink = self
+                .navigation_sink
+                .read()
+                .clone()
+                .ok_or_else(|| "navigation sink unavailable".to_string())?;
+            Ok::<_, String>((
+                committed_map,
+                sink.current_cancel_generation()?,
+                sink.current_map_name()?,
+            ))
+        })();
+        let (committed_map, cancel_generation, expected_map_name) = match navigation_context {
+            Ok(context) => context,
+            Err(error) => {
+                guard.no_frontier_since = None;
+                let snapshot =
+                    guard.snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
+                drop(guard);
+                return self.store_snapshot(snapshot);
+            }
+        };
+        let mut state = ExplorationStateSnapshot::new(
+            PoseStamped {
+                frame_id: if surface_mode {
+                    NavFrameId::from_static(self.expected_map_frame.as_ref())
+                } else {
+                    NavFrameId::Map
+                },
+                stamp: Timestamp {
+                    nanos: pose.source_timestamp_ns as i64,
+                    clock: ClockKind::Unix,
+                },
+                pose: Pose3 {
+                    position: Point3 {
+                        x: pose.x,
+                        y: pose.y,
+                        z: pose.z,
+                    },
+                    orientation: pose.orientation,
+                },
+            },
             Timestamp {
                 nanos: now_ns as i64,
                 clock: ClockKind::Unix,
             },
         );
-        state.global_costmap = Some(&costmap.grid);
+        state.global_costmap = costmap.as_ref().map(|costmap| &costmap.grid);
         let poll_result = guard.controller.poll_next_goal(&state);
         let diagnostics = guard.controller.diagnostics();
-        guard.last_selected_source = diagnostics.selected_source.unwrap_or_default();
+        guard.last_selected_source = diagnostics.selected_source.unwrap_or_else(|| {
+            if surface_mode {
+                "surface".into()
+            } else {
+                String::new()
+            }
+        });
         let source_frontiers = guard.controller.frontier_snapshot();
         let frontier_update = guard.update_frontiers(source_frontiers);
 
@@ -2899,51 +3350,13 @@ impl ExploreRuntimeHandle {
             Ok(ExplorationPoll::Goal(goal)) => {
                 guard.last_frontier_goal = Some(goal.clone());
                 guard.last_poll = Some(ExplorationPoll::Goal(goal.clone()));
-                guard.no_frontier_since_ns = None;
+                guard.no_frontier_since = None;
                 guard.child_sequence = guard.child_sequence.saturating_add(1);
                 let child_request_id =
                     format!("{}.nav.{}", guard.last_request_id, guard.child_sequence);
                 let mut navigation_goal = frontier_goal_to_navigation_goal(&goal);
                 navigation_goal.id = child_request_id.clone();
                 let config = guard.active_config.clone().unwrap_or_default();
-                let Some(committed_map) = guard.committed_map.clone() else {
-                    let snapshot = guard.snapshot(
-                        STATUS_PENDING,
-                        "wavefront goal withheld: committed map identity unavailable",
-                    );
-                    self.publish_frontiers(frontier_update);
-                    return self.store_snapshot(snapshot);
-                };
-                let cancel_generation = match self
-                    .navigation_sink
-                    .read()
-                    .as_ref()
-                    .ok_or_else(|| "navigation sink unavailable".to_string())
-                    .and_then(|sink| sink.current_cancel_generation())
-                {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        let snapshot = guard
-                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
-                        self.publish_frontiers(frontier_update);
-                        return self.store_snapshot(snapshot);
-                    }
-                };
-                let expected_map_name = match self
-                    .navigation_sink
-                    .read()
-                    .as_ref()
-                    .ok_or_else(|| "navigation sink unavailable".to_string())
-                    .and_then(|sink| sink.current_map_name())
-                {
-                    Ok(map_name) => map_name,
-                    Err(error) => {
-                        let snapshot = guard
-                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
-                        self.publish_frontiers(frontier_update);
-                        return self.store_snapshot(snapshot);
-                    }
-                };
                 let intent = match build_wavefront_goal_intent(
                     guard.session_generation,
                     cancel_generation,
@@ -2956,10 +3369,15 @@ impl ExploreRuntimeHandle {
                 ) {
                     Ok(intent) => intent,
                     Err(error) => {
-                        let snapshot = guard
-                            .snapshot(STATUS_PENDING, format!("wavefront goal withheld: {error}"));
+                        drop(guard);
                         self.publish_frontiers(frontier_update);
-                        return self.store_snapshot(snapshot);
+                        return self
+                            .finish_session(
+                                None,
+                                ExplorationStopReason::ConsecutiveFailuresExceeded,
+                                format!("wavefront goal intent invalid: {error}"),
+                            )
+                            .await;
                     }
                 };
                 let request = ChildNavigationRequest {
@@ -2980,18 +3398,15 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(dispatching);
                 self.dispatch_child(generation, request, guard).await
             }
-            Ok(ExplorationPoll::Pending) => {
-                let first_no_frontier = *guard.no_frontier_since_ns.get_or_insert(now_ns);
-                guard.last_poll = Some(ExplorationPoll::Pending);
-                if guard
+            Ok(ExplorationPoll::NoFrontier) => {
+                let first_no_frontier = *guard.no_frontier_since.get_or_insert_with(Instant::now);
+                guard.last_poll = Some(ExplorationPoll::NoFrontier);
+                let limit_ms = guard
                     .active_config
                     .as_ref()
                     .and_then(|config| config.stop_conditions.no_frontier_timeout_ms)
-                    .is_some_and(|limit_ms| {
-                        now_ns.saturating_sub(first_no_frontier)
-                            >= limit_ms.saturating_mul(1_000_000)
-                    })
-                {
+                    .unwrap_or(DEFAULT_NO_FRONTIER_STABILITY.as_millis() as u64);
+                if first_no_frontier.elapsed() >= Duration::from_millis(limit_ms) {
                     drop(guard);
                     self.publish_frontiers(frontier_update);
                     return self
@@ -3007,7 +3422,19 @@ impl ExploreRuntimeHandle {
                 self.publish_frontiers(frontier_update);
                 self.store_snapshot(snapshot)
             }
+            Ok(ExplorationPoll::Pending) => {
+                guard.no_frontier_since = None;
+                guard.last_poll = Some(ExplorationPoll::Pending);
+                let snapshot = guard.snapshot(
+                    STATUS_PENDING,
+                    "exploration source is awaiting work completion",
+                );
+                drop(guard);
+                self.publish_frontiers(frontier_update);
+                self.store_snapshot(snapshot)
+            }
             Ok(ExplorationPoll::SourceUnavailable(reason)) => {
+                guard.no_frontier_since = None;
                 guard.last_poll = Some(ExplorationPoll::SourceUnavailable(reason.clone()));
                 let snapshot =
                     guard.snapshot(STATUS_PENDING, format!("source unavailable: {reason}"));
@@ -3414,7 +3841,7 @@ impl ExploreRuntimeHandle {
                 .active_child
                 .take()
                 .expect("active child checked above");
-            guard.no_frontier_since_ns = None;
+            guard.no_frontier_since = None;
             let (status, message, frontier_update) = if let Some(error) = pending.failure {
                 let _ = guard
                     .controller
@@ -3465,7 +3892,7 @@ impl ExploreRuntimeHandle {
             guard.reached_goals = guard.reached_goals.saturating_add(1);
         }
         guard.active_child = None;
-        guard.no_frontier_since_ns = None;
+        guard.no_frontier_since = None;
         let frontiers = guard.controller.frontier_snapshot();
         let frontier_update = guard.update_frontiers(frontiers);
         let message = match result {
@@ -3529,9 +3956,17 @@ impl ExploreRuntimeHandle {
             }
         }
         let mut guard = self.inner.lock().await;
+        if guard.surface_mode.is_some() {
+            // 二维栅格仅保留展示，不覆盖三维输入的权威身份与原始接收时刻。
+            let changed = guard.costmap_input.as_ref() != Some(&snapshot);
+            guard.costmap_input = Some(snapshot);
+            return Ok(changed);
+        }
         if guard.costmap_input.as_ref() == Some(&snapshot)
             && guard.committed_map.as_ref() == committed_map.as_ref()
         {
+            // 新的输入接收事件可以续期，状态查询或缓存读取不会进入这里。
+            guard.costmap_received_monotonic_ns = now_monotonic_nanos();
             return Ok(false);
         }
         if let Some(identity) = committed_map.as_ref() {
@@ -3547,6 +3982,7 @@ impl ExploreRuntimeHandle {
         }
         // 缺少提交身份的输入必须清除旧身份，避免把未提交栅格冒充为已提交快照。
         guard.committed_map = committed_map;
+        guard.costmap_received_monotonic_ns = now_monotonic_nanos();
 
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(snapshot);
@@ -3633,21 +4069,44 @@ impl ExploreRuntimeHandle {
         let controller_active = guard.controller.is_active();
         let source_count = guard.controller.source_count();
         let frontier_source_ready = controller_active && source_count > 0;
-        let costmap_input_ready = guard.costmap_input.as_ref().is_some_and(|snapshot| {
-            validate_costmap_snapshot(snapshot, expected_map_frame).is_ok()
-        });
+        let costmap_input_ready = guard.surface_mode.as_ref().map_or_else(
+            || {
+                guard.costmap_input.as_ref().is_some_and(|snapshot| {
+                    validate_costmap_snapshot(snapshot, expected_map_frame).is_ok()
+                })
+            },
+            |mode| {
+                mode.config.is_ok()
+                    && mode.accepting
+                    && mode.input_ready
+                    && mode
+                        .receiver
+                        .snapshot()
+                        .is_ok_and(|snapshot| snapshot.is_some())
+            },
+        );
         let ready = backend_available
             && frontier_source_ready
             && costmap_input_ready
             && navigation_sink_ready;
         let reason = if !backend_available {
             "LCM backend unavailable"
+        } else if let Some(error) = guard
+            .surface_mode
+            .as_ref()
+            .and_then(|mode| mode.config.as_ref().err())
+        {
+            error.as_str()
         } else if !controller_active {
             "exploration controller not active"
         } else if source_count == 0 {
             "no exploration source registered"
         } else if !costmap_input_ready {
-            "valid map-frame costmap not available"
+            guard
+                .surface_mode
+                .as_ref()
+                .and_then(|mode| mode.input_error.as_deref())
+                .unwrap_or("valid map-frame costmap not available")
         } else if !navigation_sink_ready {
             "navigation sink unavailable"
         } else {
@@ -3666,7 +4125,14 @@ impl ExploreRuntimeHandle {
                 .controller
                 .diagnostics()
                 .selected_source
-                .unwrap_or_else(|| "wavefront".to_string()),
+                .unwrap_or_else(|| {
+                    if guard.surface_mode.is_some() {
+                        "surface"
+                    } else {
+                        "wavefront"
+                    }
+                    .to_string()
+                }),
             arbitration: arbitration_policy_str(guard.arbitration).to_string(),
         }
     }
@@ -3767,23 +4233,34 @@ fn evaluate_stop_conditions(
     if let (Some(max_coverage), Some(costmap)) =
         (conditions.max_coverage_pct, guard.costmap_input.as_ref())
     {
-        if coverage_pct(&costmap.grid) >= max_coverage {
+        if guard.committed_map.is_some()
+            && guard.costmap_received_monotonic_ns != 0
+            && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
+                <= DEFAULT_COSTMAP_RECEIPT_TTL.as_nanos() as u64
+            && coverage_pct(&costmap.grid, config.boundary.as_ref())
+                .is_some_and(|coverage| coverage >= max_coverage)
+        {
             return Some(ExplorationStopReason::CoverageReached);
         }
     }
     None
 }
 
-fn coverage_pct(grid: &OccupancyGrid2D) -> f64 {
-    if grid.cells.is_empty() {
-        return 0.0;
+fn coverage_pct(grid: &OccupancyGrid2D, boundary: Option<&ExplorationBoundary>) -> Option<f64> {
+    let mut total = 0usize;
+    let mut known = 0usize;
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            let point = grid.cell_center(x, y)?;
+            if boundary.is_some_and(|boundary| !boundary.contains(point)) {
+                continue;
+            }
+            let cell = grid.get(x, y)?;
+            total += 1;
+            known += usize::from(cell != OccupancyCell::Unknown);
+        }
     }
-    let known = grid
-        .cells
-        .iter()
-        .filter(|cell| !matches!(cell, OccupancyCell::Unknown))
-        .count();
-    known as f64 * 100.0 / grid.cells.len() as f64
+    (total > 0).then(|| known as f64 * 100.0 / total as f64)
 }
 
 #[derive(Clone)]
@@ -4238,6 +4715,7 @@ pub struct ControllerDiagnosticsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuwax_nav_types_messages::geometry::Point2;
     use std::borrow::Cow;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -4258,6 +4736,8 @@ mod tests {
     struct RecordingNavSink {
         submitted: StdMutex<Vec<ChildNavigationRequest>>,
         submit_errors: StdMutex<VecDeque<ChildNavigationSubmitError>>,
+        cancel_snapshot: StdMutex<Option<Result<u64, String>>>,
+        map_name_error: StdMutex<Option<String>>,
         cancelled: StdMutex<Vec<String>>,
         cancel_error: StdMutex<Option<String>>,
         cancel_recovery: StdMutex<Option<ChildNavigationCancelRecovery>>,
@@ -4272,7 +4752,18 @@ mod tests {
 
     #[async_trait]
     impl ExploreNavigationSink for RecordingNavSink {
+        fn current_cancel_generation(&self) -> Result<u64, String> {
+            self.cancel_snapshot
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(Ok(0))
+        }
+
         fn current_map_name(&self) -> Result<String, String> {
+            if let Some(error) = self.map_name_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok("map".to_string())
         }
 
@@ -4347,6 +4838,8 @@ mod tests {
             Ok(ExploreRobotPose {
                 x: 2.0,
                 y: 2.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "map".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),
@@ -4462,6 +4955,510 @@ mod tests {
         let sink = Arc::new(RecordingNavSink::default());
         handle.set_navigation_sink(sink.clone());
         (handle, sink)
+    }
+
+    fn surface_config(frame: &str) -> SurfaceNavigationConfig {
+        SurfaceNavigationConfig::new(frame.into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2).unwrap()
+    }
+
+    fn surface_message(frame: &str, revision: i32) -> schema::NavigationMap3D {
+        let mut data = Vec::new();
+        for z in [0.0_f32, 3.0] {
+            for x in 0..50 {
+                for y in 0..30 {
+                    for value in [(x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z] {
+                        data.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let timestamp = now_unix_nanos() as i64;
+        schema::NavigationMap3D {
+            producer_runtime_generation: 37,
+            committed_map: schema::CommittedMapIdentity {
+                session_id: "surface-session".into(),
+                session_generation: 1,
+                revision: i64::from(revision),
+                payload_sha256: [4; 32],
+                frame_id: frame.into(),
+            },
+            map_frame_generation: 1,
+            cloud_revision: i64::from(revision),
+            source_timestamp_ns: timestamp,
+            source_voxel_size: 0.1,
+            commit_boot_nonce: [7; 16],
+            commit_sequence: i64::from(revision),
+            cloud: schema::PointCloud2 {
+                header: schema::Header {
+                    seq: revision,
+                    stamp_sec: (timestamp / 1_000_000_000) as i32,
+                    stamp_nsec: (timestamp % 1_000_000_000) as i32,
+                    frame_id: frame.into(),
+                },
+                width: (data.len() / 12) as i32,
+                height: 1,
+                point_step: 12,
+                row_step: data.len() as i32,
+                fields: ["x", "y", "z"]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| schema::PointField {
+                        name: (*name).into(),
+                        offset: index as i32 * 4,
+                        datatype: 7,
+                        count: 1,
+                    })
+                    .collect(),
+                data,
+                is_dense: true,
+                ..schema::PointCloud2::default()
+            },
+            ..schema::NavigationMap3D::default()
+        }
+    }
+
+    fn surface_pose(
+        snapshot: &SurfaceSnapshot,
+        height: f64,
+        orientation: Quaternion,
+    ) -> ExploreRobotPose {
+        let support = snapshot.locate_support([1.5, 1.5, height]).unwrap();
+        let body = snapshot
+            .body_position_from_support(
+                support.support_xyz,
+                [orientation.x, orientation.y, orientation.z, orientation.w],
+                0.5,
+            )
+            .unwrap();
+        ExploreRobotPose {
+            x: body[0],
+            y: body[1],
+            z: body[2],
+            orientation,
+            frame_id: snapshot.config().world_frame.clone(),
+            source_timestamp_ns: now_unix_nanos(),
+            received_monotonic_ns: now_monotonic_nanos(),
+        }
+    }
+
+    async fn install_surface_fixture(
+        handle: &ExploreRuntimeHandle,
+        frame: &str,
+    ) -> (
+        schema::NavigationMap3D,
+        SurfaceMapTicket,
+        Arc<SurfaceSnapshot>,
+    ) {
+        handle
+            .configure_surface_source(Ok(surface_config(frame)), 37, [7; 16])
+            .await
+            .unwrap();
+        let message = surface_message(frame, 1);
+        let ticket = handle
+            .begin_surface_map_update(&message, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = Arc::new(
+            SurfaceSnapshot::from_points(
+                &schema::navigation_map_3d_points(&message).unwrap(),
+                surface_config(frame).geometry,
+                message.source_voxel_size,
+            )
+            .unwrap(),
+        );
+        assert!(
+            handle
+                .finish_surface_map_update(ticket.clone(), Ok(snapshot.clone()))
+                .await
+        );
+        (message, ticket, snapshot)
+    }
+
+    #[tokio::test]
+    async fn surface_goals_preserve_real_floor_height_full_orientation_and_source() {
+        for (strategy, floor) in [("frontier", 0.0), ("wavefront", 3.0), ("surface", 3.0)] {
+            let handle = ExploreRuntimeHandle::with_wavefront_map_frame("map").unwrap();
+            let sink = Arc::new(RecordingNavSink::default());
+            handle.set_navigation_sink(sink.clone());
+            let (_, _, snapshot) = install_surface_fixture(&handle, "map").await;
+            let orientation = Quaternion {
+                x: 0.05_f64.sin(),
+                y: 0.0,
+                z: 0.0,
+                w: 0.05_f64.cos(),
+            };
+            let started = handle
+                .start_with_config(
+                    "surface-height",
+                    ExploreStartConfig {
+                        strategy: strategy.into(),
+                        motion_admission: crate::nav_runtime::test_motion_admission(),
+                        ..ExploreStartConfig::default()
+                    },
+                )
+                .await;
+            assert_eq!(started.status, STATUS_ACCEPTED, "{}", started.message);
+            assert_eq!(started.selected_source, "surface");
+            let active = handle
+                .tick_with_pose(surface_pose(&snapshot, floor, orientation))
+                .await;
+            assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+            assert_eq!(active.selected_source, "surface");
+            let requests = sink.submitted.lock().unwrap();
+            let goal = &requests[0].goal.target;
+            assert!(goal.pose.position.z > floor + 0.4 && goal.pose.position.z < floor + 0.7);
+            assert_eq!(goal.pose.orientation, orientation);
+            assert_eq!(
+                requests[0].intent.goal.pose.position[2],
+                goal.pose.position.z
+            );
+            assert_eq!(requests[0].intent.goal.header.frame_id, "map");
+        }
+    }
+
+    #[tokio::test]
+    async fn surface_clear_stops_exact_child_and_discards_old_inputs_and_computation() {
+        let (handle, sink) = configured_handle();
+        let (message, ticket, snapshot) = install_surface_fixture(&handle, "map").await;
+        handle.start("surface-clear", "prefer_wavefront").await;
+        let active = handle
+            .tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY))
+            .await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        let lease = active_child_lease(&handle).await;
+        let mut clear = message.clone();
+        clear.cleared = true;
+        clear.cloud_revision = 2;
+        clear.source_timestamp_ns = 0;
+        clear.commit_sequence = 0;
+        clear.committed_map.revision = 0;
+        clear.committed_map.payload_sha256 = [0; 32];
+        clear.cloud = schema::PointCloud2 {
+            header: schema::Header {
+                seq: 2,
+                frame_id: "map".into(),
+                ..schema::Header::default()
+            },
+            ..schema::PointCloud2::default()
+        };
+        assert!(handle
+            .begin_surface_map_update(&clear, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(
+            sink.cancelled.lock().unwrap().as_slice(),
+            &[active.child_task_id.clone()]
+        );
+        assert!(!handle.finish_surface_map_update(ticket, Ok(snapshot)).await);
+        assert!(handle
+            .begin_surface_map_update(&message, now_monotonic_nanos())
+            .await
+            .is_err());
+        let mut wrong_producer = surface_message("map", 3);
+        wrong_producer.producer_runtime_generation = 36;
+        assert!(handle
+            .begin_surface_map_update(&wrong_producer, now_monotonic_nanos())
+            .await
+            .is_err());
+        let stopped = handle
+            .report_navigation_result(
+                &active.child_task_id,
+                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_FAILED);
+        assert_eq!(stopped.last_stop_reason, "map_revision_changed");
+        assert!(stopped.child_task_id.is_empty());
+        assert!(handle
+            .inner
+            .lock()
+            .await
+            .surface_mode
+            .as_ref()
+            .unwrap()
+            .receiver
+            .snapshot()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn surface_domain_change_and_two_dimensional_display_preserve_input_authority() {
+        let (handle, _) = configured_handle();
+        let (message, old_ticket, snapshot) = install_surface_fixture(&handle, "map").await;
+        let received = handle.inner.lock().await.costmap_received_monotonic_ns;
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 90)
+            .await
+            .unwrap();
+        {
+            let guard = handle.inner.lock().await;
+            assert_eq!(guard.committed_map.as_ref(), Some(&message.committed_map));
+            assert_eq!(guard.costmap_received_monotonic_ns, received);
+        }
+        let wrong_frame = surface_message("odom", 2);
+        assert!(handle
+            .begin_surface_map_update(&wrong_frame, now_monotonic_nanos())
+            .await
+            .is_err());
+        let mut new_map = surface_message("map", 2);
+        new_map.committed_map.session_id = "other-map-session".into();
+        new_map.committed_map.session_generation = 2;
+        handle
+            .begin_surface_map_update(&new_map, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !handle
+                .finish_surface_map_update(old_ticket, Ok(snapshot))
+                .await
+        );
+        let guard = handle.inner.lock().await;
+        assert!(guard.committed_map.is_none());
+        assert_eq!(guard.costmap_received_monotonic_ns, 0);
+        assert!(guard
+            .surface_mode
+            .as_ref()
+            .unwrap()
+            .receiver
+            .snapshot()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn surface_configuration_and_coverage_errors_reject_exploration_only() {
+        let (handle, _) = configured_handle();
+        let surface_request = ExploreStartConfig {
+            strategy: "surface".into(),
+            motion_admission: crate::nav_runtime::test_motion_admission(),
+            ..ExploreStartConfig::default()
+        };
+        let rejected = handle
+            .start_with_config("surface-two-dimensional", surface_request.clone())
+            .await;
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        handle
+            .configure_surface_source(Err("missing body/support calibration".into()), 37, [7; 16])
+            .await
+            .unwrap();
+        let rejected = handle
+            .start_with_config("surface-bad-config", surface_request.clone())
+            .await;
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert!(rejected.message.contains("calibration"));
+        assert_eq!(rejected.request_id, "surface-bad-config");
+        handle
+            .configure_surface_source(Ok(surface_config("map")), 37, [7; 16])
+            .await
+            .unwrap();
+        let mut coverage = surface_request;
+        coverage.stop_conditions.max_coverage_pct = Some(80.0);
+        let rejected = handle.start_with_config("surface-coverage", coverage).await;
+        assert_eq!(rejected.status, STATUS_REJECTED);
+        assert!(rejected.message.contains("known volume"));
+    }
+
+    #[tokio::test]
+    async fn surface_no_frontier_uses_stable_completion_without_two_dimensional_coverage() {
+        let (handle, sink) = configured_handle();
+        let (_, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 1.0, y: 1.0 },
+            Point2 { x: 2.0, y: 1.0 },
+            Point2 { x: 2.0, y: 2.0 },
+            Point2 { x: 1.0, y: 2.0 },
+        ])
+        .unwrap();
+        handle
+            .start_with_config(
+                "surface-no-frontier",
+                ExploreStartConfig {
+                    boundary: Some(boundary),
+                    motion_admission: crate::nav_runtime::test_motion_admission(),
+                    ..ExploreStartConfig::default()
+                },
+            )
+            .await;
+        let waiting = handle
+            .tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY))
+            .await;
+        assert_eq!(waiting.status, STATUS_PENDING, "{}", waiting.message);
+        assert_eq!(waiting.selected_source, "surface");
+        handle.inner.lock().await.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
+        let done = handle
+            .tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY))
+            .await;
+        assert_eq!(done.status, STATUS_SUCCEEDED, "{}", done.message);
+        assert_eq!(done.last_stop_reason, "no_frontier_timeout");
+        assert!(sink.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn surface_computation_completion_never_refreshes_expired_receive_time() {
+        let (handle, _) = configured_handle();
+        handle
+            .configure_surface_source(Ok(surface_config("map")), 37, [7; 16])
+            .await
+            .unwrap();
+        let message = surface_message("map", 1);
+        let received = now_monotonic_nanos();
+        let ticket = handle
+            .begin_surface_map_update(&message, received)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = Arc::new(
+            SurfaceSnapshot::from_points(
+                &schema::navigation_map_3d_points(&message).unwrap(),
+                surface_config("map").geometry,
+                message.source_voxel_size,
+            )
+            .unwrap(),
+        );
+        tokio::time::sleep(DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_millis(20)).await;
+        assert!(
+            handle
+                .finish_surface_map_update(ticket, Ok(snapshot.clone()))
+                .await
+        );
+        assert_eq!(
+            handle.inner.lock().await.costmap_received_monotonic_ns,
+            received
+        );
+        handle.start("surface-stale", "prefer_wavefront").await;
+        let waiting = handle
+            .tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY))
+            .await;
+        assert_eq!(waiting.status, STATUS_PENDING);
+        assert!(waiting.message.contains("surface map input stale"));
+    }
+
+    #[tokio::test]
+    async fn surface_continuous_same_domain_updates_install_progress_without_crossing_clear() {
+        let (handle, _) = configured_handle();
+        handle
+            .configure_surface_source(Ok(surface_config("map")), 37, [7; 16])
+            .await
+            .unwrap();
+        let first = surface_message("map", 1);
+        let received = now_monotonic_nanos();
+        let first_ticket = handle
+            .begin_surface_map_update(&first, received)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = surface_message("map", 2);
+        let second_ticket = handle
+            .begin_surface_map_update(&second, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = Arc::new(
+            SurfaceSnapshot::from_points(
+                &schema::navigation_map_3d_points(&first).unwrap(),
+                surface_config("map").geometry,
+                first.source_voxel_size,
+            )
+            .unwrap(),
+        );
+        assert!(
+            handle
+                .finish_surface_map_update(first_ticket.clone(), Ok(snapshot.clone()))
+                .await,
+            "同域新输入排队不能饿死正在完成的有效图"
+        );
+        {
+            let guard = handle.inner.lock().await;
+            assert_eq!(guard.committed_map.as_ref(), Some(&first.committed_map));
+            assert_eq!(guard.costmap_received_monotonic_ns, received);
+            assert!(Arc::ptr_eq(
+                &guard
+                    .surface_mode
+                    .as_ref()
+                    .unwrap()
+                    .receiver
+                    .snapshot()
+                    .unwrap()
+                    .unwrap(),
+                &snapshot,
+            ));
+        }
+        let replacement = Arc::new(
+            SurfaceSnapshot::from_points(
+                &schema::navigation_map_3d_points(&second).unwrap(),
+                surface_config("map").geometry,
+                second.source_voxel_size,
+            )
+            .unwrap(),
+        );
+        let second_received = second_ticket.received_monotonic_ns;
+        assert!(
+            handle
+                .finish_surface_map_update(second_ticket, Ok(replacement.clone()))
+                .await
+        );
+        {
+            let guard = handle.inner.lock().await;
+            assert_eq!(guard.committed_map.as_ref(), Some(&second.committed_map));
+            assert_eq!(guard.costmap_received_monotonic_ns, second_received);
+            assert!(Arc::ptr_eq(
+                &guard
+                    .surface_mode
+                    .as_ref()
+                    .unwrap()
+                    .receiver
+                    .snapshot()
+                    .unwrap()
+                    .unwrap(),
+                &replacement,
+            ));
+        }
+        assert!(
+            !handle
+                .finish_surface_map_update(first_ticket, Ok(snapshot.clone()))
+                .await
+        );
+        let third = surface_message("map", 3);
+        let third_ticket = handle
+            .begin_surface_map_update(&third, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut clear = surface_message("map", 4);
+        clear.cleared = true;
+        clear.cloud.width = 0;
+        clear.cloud.row_step = 0;
+        clear.cloud.data.clear();
+        handle
+            .begin_surface_map_update(&clear, now_monotonic_nanos())
+            .await
+            .unwrap();
+        let fifth = surface_message("map", 5);
+        let fifth_ticket = handle
+            .begin_surface_map_update(&fifth, now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !handle
+                .finish_surface_map_update(third_ticket, Ok(snapshot.clone()))
+                .await,
+            "即使清空后同域新图已排队，清空前的旧图也不能恢复"
+        );
+        assert!(
+            handle
+                .finish_surface_map_update(fifth_ticket, Ok(snapshot))
+                .await
+        );
+        assert_eq!(
+            handle.inner.lock().await.committed_map.as_ref(),
+            Some(&fifth.committed_map)
+        );
     }
 
     async fn active_child_lease(handle: &ExploreRuntimeHandle) -> ChildNavigationLease {
@@ -4773,6 +5770,8 @@ mod tests {
             .tick_with_pose(ExploreRobotPose {
                 x: 2.0,
                 y: 2.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "map".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),
@@ -4812,6 +5811,224 @@ mod tests {
         assert!(after_feedback.child_task_id.is_empty());
         assert_eq!(after_feedback.frontier_count, 0);
         assert!(after_feedback.revision > active.revision);
+    }
+
+    #[tokio::test]
+    async fn preflight_readiness_recovers_without_stranding_selected_goal() {
+        for missing in ["committed_map", "cancel_generation", "map_name"] {
+            let (handle, sink) = configured_handle();
+            if missing == "committed_map" {
+                handle
+                    .ingest_costmap_snapshot(frontier_costmap(1))
+                    .await
+                    .unwrap();
+            } else {
+                ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+                    .await
+                    .unwrap();
+            }
+            if missing == "cancel_generation" {
+                *sink.cancel_snapshot.lock().unwrap() = Some(Err("取消代次暂不可读".to_string()));
+            }
+            if missing == "map_name" {
+                *sink.map_name_error.lock().unwrap() = Some("地图名称暂不可读".to_string());
+            }
+            handle.start("req-preflight", "prefer_wavefront").await;
+            let waiting = handle.tick((2.0, 2.0)).await;
+            assert_eq!(waiting.status, STATUS_PENDING, "{missing}");
+            assert!(sink.submitted.lock().unwrap().is_empty());
+
+            ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+                .await
+                .unwrap();
+            *sink.cancel_snapshot.lock().unwrap() = None;
+            *sink.map_name_error.lock().unwrap() = None;
+            let recovered = handle.tick((2.0, 2.0)).await;
+            assert_eq!(
+                recovered.status, STATUS_ACTIVE,
+                "{missing}: {}",
+                recovered.message
+            );
+            let submitted = sink.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0].request_id, "req-preflight.nav.1");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_goal_intent_finishes_without_stranded_child() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+            .await
+            .unwrap();
+        *sink.cancel_snapshot.lock().unwrap() = Some(Ok(u64::MAX));
+        handle.start("req-invalid-intent", "prefer_wavefront").await;
+        let failed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(failed.status, STATUS_FAILED, "{}", failed.message);
+        assert!(failed.message.contains("cancel generation"));
+        assert!(failed.child_task_id.is_empty());
+        assert!(!handle.is_active().await);
+        assert!(sink.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_no_frontier_stability_window_finishes_with_fresh_map_input() {
+        let (handle, sink) = configured_handle();
+        let mut costmap = frontier_costmap(1);
+        costmap.grid.cells.fill(OccupancyCell::Free);
+        ingest_committed_costmap_fixture(&handle, costmap.clone(), 1)
+            .await
+            .unwrap();
+        handle.start("req-no-frontier", "prefer_wavefront").await;
+        assert_eq!(handle.tick((2.0, 2.0)).await.status, STATUS_PENDING);
+        handle.inner.lock().await.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
+        ingest_committed_costmap_fixture(&handle, costmap, 2)
+            .await
+            .unwrap();
+        let completed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(completed.status, STATUS_SUCCEEDED);
+        assert_eq!(completed.last_stop_reason, "no_frontier_timeout");
+        assert!(sink.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_stale_costmap_never_completes_no_frontier_window() {
+        let (handle, sink) = configured_handle();
+        handle.start("req-no-input", "prefer_wavefront").await;
+        assert_eq!(handle.tick((2.0, 2.0)).await.status, STATUS_PENDING);
+        assert!(handle.inner.lock().await.no_frontier_since.is_none());
+
+        let mut costmap = frontier_costmap(1);
+        costmap.grid.cells.fill(OccupancyCell::Free);
+        handle
+            .ingest_costmap_snapshot(costmap.clone())
+            .await
+            .unwrap();
+        let uncommitted = handle.tick((2.0, 2.0)).await;
+        assert!(uncommitted
+            .message
+            .contains("committed map identity unavailable"));
+        assert!(handle.inner.lock().await.no_frontier_since.is_none());
+
+        ingest_committed_costmap_fixture(&handle, costmap.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(handle.tick((2.0, 2.0)).await.status, STATUS_PENDING);
+        {
+            let mut guard = handle.inner.lock().await;
+            guard.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
+            // 模拟地图输入过期，随后仅查询状态与调度，不接收新地图。
+            guard.costmap_received_monotonic_ns = 0;
+        }
+        let stale = handle.tick((2.0, 2.0)).await;
+        assert_eq!(stale.status, STATUS_PENDING);
+        assert!(stale.message.contains("costmap input stale"));
+        assert!(stale.last_stop_reason.is_empty());
+        assert!(handle.inner.lock().await.no_frontier_since.is_none());
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        // 同一有效快照的实际续收恢复输入，但仍必须重新积累稳定窗口。
+        ingest_committed_costmap_fixture(&handle, costmap, 1)
+            .await
+            .unwrap();
+        let resumed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(resumed.status, STATUS_PENDING);
+        assert!(resumed.last_stop_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_navigation_readiness_does_not_count_as_no_frontier() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors.lock().unwrap().extend(
+            (0..2).map(|_| {
+                ChildNavigationSubmitError::RetryableReadiness("等待运动执行端".to_string())
+            }),
+        );
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
+            .await
+            .unwrap();
+        handle.start("req-pending-goal", "prefer_wavefront").await;
+        assert_eq!(handle.tick((2.0, 2.0)).await.status, STATUS_PENDING);
+        let pending = handle.tick((2.0, 2.0)).await;
+        assert!(pending
+            .message
+            .contains("waiting for child navigation readiness"));
+        assert!(pending.last_stop_reason.is_empty());
+        assert!(handle.inner.lock().await.no_frontier_since.is_none());
+        assert_eq!(handle.tick((2.0, 2.0)).await.status, STATUS_ACTIVE);
+    }
+
+    #[test]
+    fn coverage_has_no_value_when_boundary_does_not_overlap_map() {
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2 { x: 20.0, y: 20.0 },
+            Point2 { x: 21.0, y: 20.0 },
+            Point2 { x: 21.0, y: 21.0 },
+            Point2 { x: 20.0, y: 21.0 },
+        ])
+        .unwrap();
+        assert_eq!(
+            coverage_pct(&frontier_costmap(1).grid, Some(&boundary)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_stop_counts_only_cells_inside_requested_boundary() {
+        for inside_known in [false, true] {
+            let (handle, _) = configured_handle();
+            let mut costmap = frontier_costmap(1);
+            costmap.grid.cells.fill(if inside_known {
+                OccupancyCell::Unknown
+            } else {
+                OccupancyCell::Free
+            });
+            for y in 0..4 {
+                for x in 0..4 {
+                    costmap.grid.set(
+                        x,
+                        y,
+                        if inside_known {
+                            OccupancyCell::Free
+                        } else {
+                            OccupancyCell::Unknown
+                        },
+                    );
+                }
+            }
+            let boundary = ExplorationBoundary::from_vertices(vec![
+                Point2 { x: 0.0, y: 0.0 },
+                Point2 { x: 2.0, y: 0.0 },
+                Point2 { x: 2.0, y: 2.0 },
+                Point2 { x: 0.0, y: 2.0 },
+            ])
+            .unwrap();
+            ingest_committed_costmap_fixture(&handle, costmap, 1)
+                .await
+                .unwrap();
+            handle
+                .start_with_config(
+                    "req-coverage",
+                    ExploreStartConfig {
+                        boundary: Some(boundary),
+                        stop_conditions: ExploreStopConditions {
+                            max_coverage_pct: Some(50.0),
+                            ..ExploreStopConditions::default()
+                        },
+                        motion_admission: crate::nav_runtime::test_motion_admission(),
+                        ..ExploreStartConfig::default()
+                    },
+                )
+                .await;
+            let result = handle
+                .tick(if inside_known { (1.0, 1.0) } else { (3.0, 3.0) })
+                .await;
+            assert_eq!(
+                result.last_stop_reason == "coverage_reached",
+                inside_known,
+                "{}",
+                result.message
+            );
+        }
     }
 
     #[tokio::test]
@@ -6218,17 +7435,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn natural_no_reachable_completion_is_succeeded_not_cancelled() {
+    async fn no_reachable_robot_origin_is_failed_not_completed() {
         let (handle, _) = configured_handle();
-        handle
-            .ingest_costmap_snapshot(occupied_costmap(1))
+        ingest_committed_costmap_fixture(&handle, occupied_costmap(1), 1)
             .await
             .unwrap();
         handle.start("req-natural", "prefer_wavefront").await;
 
         let completed = handle.tick((1.0, 1.0)).await;
 
-        assert_eq!(completed.status, STATUS_SUCCEEDED);
+        assert_eq!(completed.status, STATUS_FAILED);
         assert_eq!(completed.last_stop_reason, "no_reachable_free_space");
     }
 

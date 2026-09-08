@@ -68,7 +68,7 @@ class MapAssetMigrationError(MapAssetBundleError):
 
 @dataclass(frozen=True)
 class ValidatedMapAssetBundleSnapshot:
-    """一次稳定目录读取中验证完成的 finalized 资产与地理参考原文。"""
+    """一次稳定目录读取中验证完成的资产；无地理锚点时参考原文为空字节。"""
 
     bundle: MapAssetBundle
     georeference_bytes: bytes
@@ -136,12 +136,14 @@ class MapAssetBundleRepository:
                 tree,
                 expected_manifest_sha256=expected_manifest_sha256,
             )
-            georeference_bytes, _size, georeference_sha256 = tree.require_file(
-                bundle.georeference.relative_path,
-                "地理参考文件",
-            ).read_and_hash(_MAX_GEOREFERENCE_JSON_BYTES)
-            if georeference_sha256 != bundle.georeference.raw_sha256:
-                raise MapAssetBundleValidationError("地理参考原文摘要在稳定读取期间发生变化。")
+            georeference_bytes = b""
+            if bundle.georeference is not None:
+                georeference_bytes, _size, georeference_sha256 = tree.require_file(
+                    bundle.georeference.relative_path,
+                    "地理参考文件",
+                ).read_and_hash(_MAX_GEOREFERENCE_JSON_BYTES)
+                if georeference_sha256 != bundle.georeference.raw_sha256:
+                    raise MapAssetBundleValidationError("地理参考原文摘要在稳定读取期间发生变化。")
             tree.verify_all()
             if tree.root is None:
                 raise MapAssetBundleValidationError("地图资产目录描述符已关闭。")
@@ -248,25 +250,26 @@ class MapAssetBundleRepository:
         staging_dir: Path,
     ) -> MapAssetBundle:
         georeference = bundle.georeference
-        georeference_path = _contained_path(staging_dir, georeference.relative_path)
-        if not georeference_path.exists() and not georeference_path.is_symlink():
-            _atomic_write_relative(
-                staging_dir,
-                georeference.relative_path,
-                _model_json_bytes(georeference.contract),
-                create_parents=True,
+        if georeference is not None:
+            georeference_path = _contained_path(staging_dir, georeference.relative_path)
+            if not georeference_path.exists() and not georeference_path.is_symlink():
+                _atomic_write_relative(
+                    staging_dir,
+                    georeference.relative_path,
+                    _model_json_bytes(georeference.contract),
+                    create_parents=True,
+                )
+            georeference_payload = _read_regular_file(
+                georeference_path,
+                "地理参考文件",
+                maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
             )
-        georeference_payload = _read_regular_file(
-            georeference_path,
-            "地理参考文件",
-            maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
-        )
-        georeference = self._validate_georeference_asset(
-            georeference,
-            payload=georeference_payload,
-            raw_sha256=_sha256_bytes(georeference_payload),
-            require_bound_digest=False,
-        )
+            georeference = self._validate_georeference_asset(
+                georeference,
+                payload=georeference_payload,
+                raw_sha256=_sha256_bytes(georeference_payload),
+                require_bound_digest=False,
+            )
 
         geometry_asset = bundle.geometry_asset
         if geometry_asset is not None:
@@ -438,12 +441,10 @@ class MapAssetBundleRepository:
         if bundle_document.get("manifest_sha256") is not None and bundle_document.get("manifest_sha256") != "":
             raise MapAssetBundleValidationError("bundle.json 不得自引用 manifest_sha256。")
         georeference_document = bundle_document.get("georeference")
-        if not isinstance(georeference_document, dict) or set(georeference_document) != {
-            "schema_version",
-            "relative_path",
-            "raw_sha256",
-            "contract",
-        }:
+        if georeference_document is not None and (
+            not isinstance(georeference_document, dict)
+            or set(georeference_document) != {"schema_version", "relative_path", "raw_sha256", "contract"}
+        ):
             raise MapAssetBundleValidationError("地图资产包地理参考绑定字段不完整或包含未知字段。")
         try:
             bundle = MapAssetBundle.model_validate(bundle_document)
@@ -451,29 +452,34 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("地图资产包契约非法。") from exc
         if bundle.map_name != map_name:
             raise MapAssetBundleValidationError("地图资产包 map_name 不匹配。")
-        georeference_file = tree.require_file(
-            bundle.georeference.relative_path,
-            "地理参考文件",
-        )
-        georeference_payload, georeference_size, georeference_sha256 = georeference_file.read_and_hash(
-            _MAX_GEOREFERENCE_JSON_BYTES
-        )
-        _validate_manifested_file_observation(
-            bundle.georeference.relative_path,
-            expected_files.get(bundle.georeference.relative_path),
-            georeference_size,
-            georeference_sha256,
-        )
-        georeference = self._validate_georeference_asset(
-            bundle.georeference,
-            payload=georeference_payload,
-            raw_sha256=georeference_sha256,
-            manifested_paths=set(expected_files),
-            require_bound_digest=True,
-        )
-        bundle = bundle.model_copy(update={"georeference": georeference}, deep=True)
+        validated_paths = {_BUNDLE_FILE_NAME}
+        if bundle.georeference is not None:
+            georeference_file = tree.require_file(
+                bundle.georeference.relative_path,
+                "地理参考文件",
+            )
+            georeference_payload, georeference_size, georeference_sha256 = georeference_file.read_and_hash(
+                _MAX_GEOREFERENCE_JSON_BYTES
+            )
+            _validate_manifested_file_observation(
+                bundle.georeference.relative_path,
+                expected_files.get(bundle.georeference.relative_path),
+                georeference_size,
+                georeference_sha256,
+            )
+            georeference = self._validate_georeference_asset(
+                bundle.georeference,
+                payload=georeference_payload,
+                raw_sha256=georeference_sha256,
+                manifested_paths=set(expected_files),
+                require_bound_digest=True,
+            )
+            bundle = bundle.model_copy(update={"georeference": georeference}, deep=True)
+            validated_paths.add(georeference.relative_path)
+        elif any(path == "georeference" or path.startswith("georeference/") for path in expected_files):
+            raise MapAssetBundleValidationError("无地理锚点的资产不得包含未绑定的地理参考文件。")
         for relative, metadata in expected_files.items():
-            if relative in {_BUNDLE_FILE_NAME, bundle.georeference.relative_path}:
+            if relative in validated_paths:
                 continue
             size, sha256 = actual_files[relative].hash()
             _validate_manifested_file_observation(relative, metadata, size, sha256)
@@ -853,32 +859,28 @@ class MapAssetBundleRepository:
         document: Mapping[str, object],
     ) -> MapAssetBundle:
         georeference_payload = document.get("georeference")
-        if not isinstance(georeference_payload, dict) or set(georeference_payload) != {
-            "schema_version",
-            "relative_path",
-            "raw_sha256",
-            "contract",
-        }:
-            raise MapAssetMigrationError("旧地图没有完整地理参考绑定，拒绝推测锚点或坐标变换。")
-        try:
-            georeference = MapGeoreferenceBindingV1.model_validate(georeference_payload)
-            georeference_path = _contained_path(
-                source_dir,
-                georeference.relative_path,
-            )
-            georeference_bytes = _read_regular_file(
-                georeference_path,
-                "旧地图地理参考文件",
-                maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
-            )
-            georeference = self._validate_georeference_asset(
-                georeference,
-                payload=georeference_bytes,
-                raw_sha256=_sha256_bytes(georeference_bytes),
-                require_bound_digest=True,
-            )
-        except Exception as exc:
-            raise MapAssetMigrationError("旧地图地理参考无法精确验证，拒绝迁移。") from exc
+        georeference = None
+        if georeference_payload is not None:
+            if not isinstance(georeference_payload, dict) or set(georeference_payload) != {
+                "schema_version", "relative_path", "raw_sha256", "contract",
+            }:
+                raise MapAssetMigrationError("旧地图地理参考绑定不完整，拒绝推测锚点或坐标变换。")
+            try:
+                georeference = MapGeoreferenceBindingV1.model_validate(georeference_payload)
+                georeference_path = _contained_path(source_dir, georeference.relative_path)
+                georeference_bytes = _read_regular_file(
+                    georeference_path,
+                    "旧地图地理参考文件",
+                    maximum_bytes=_MAX_GEOREFERENCE_JSON_BYTES,
+                )
+                georeference = self._validate_georeference_asset(
+                    georeference,
+                    payload=georeference_bytes,
+                    raw_sha256=_sha256_bytes(georeference_bytes),
+                    require_bound_digest=True,
+                )
+            except Exception as exc:
+                raise MapAssetMigrationError("旧地图地理参考无法精确验证，拒绝迁移。") from exc
 
         geometry_payload = document.get("geometry_asset")
         geometry_asset = None

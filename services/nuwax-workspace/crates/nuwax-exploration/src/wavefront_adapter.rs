@@ -230,7 +230,7 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             Ok(GoalSelection::NoFrontier) => {
                 self.last_frontiers.clear();
                 self.last_error = None;
-                Ok(ExplorationPoll::Pending)
+                Ok(ExplorationPoll::NoFrontier)
             }
             Ok(GoalSelection::Stop(stop)) => {
                 let facade_stop = match stop {
@@ -327,8 +327,8 @@ mod tests {
             stamp: now,
             pose: Pose3 {
                 position: Point3 {
-                    x: 0.0,
-                    y: 0.0,
+                    x: 1.0,
+                    y: 1.0,
                     z: 0.0,
                 },
                 orientation: Quaternion::IDENTITY,
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn free_grid_returns_pending() {
+    fn free_grid_reports_no_frontier() {
         let mut ad =
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         ad.begin().unwrap();
@@ -383,11 +383,11 @@ mod tests {
         };
         let s = sample_state(Some(&grid), Timestamp::default());
         let poll = ad.poll_goal(&s).unwrap();
-        assert!(matches!(poll, ExplorationPoll::Pending));
+        assert!(matches!(poll, ExplorationPoll::NoFrontier));
     }
 
     #[test]
-    fn ingest_costmap_then_pending() {
+    fn ingested_free_costmap_reports_no_frontier() {
         let mut ad =
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         ad.begin().unwrap();
@@ -401,7 +401,7 @@ mod tests {
         ad.ingest_costmap(grid).unwrap();
         let s = sample_state(None, Timestamp::default());
         let poll = ad.poll_goal(&s).unwrap();
-        assert!(matches!(poll, ExplorationPoll::Pending));
+        assert!(matches!(poll, ExplorationPoll::NoFrontier));
     }
 
     #[test]
@@ -444,7 +444,10 @@ mod tests {
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         ad.begin().unwrap();
         let grid = frontier_grid();
-        let s = sample_state(Some(&grid), Timestamp::default());
+        let mut s = sample_state(Some(&grid), Timestamp::default());
+        // 机器人必须在已知自由区域内，不能依赖跨未知区域寻找替代起点。
+        s.robot_pose.pose.position.x = 2.25;
+        s.robot_pose.pose.position.y = 2.25;
 
         let first = ad.poll_goal(&s).unwrap();
         let goal = match first {
@@ -482,7 +485,9 @@ mod tests {
         );
         ad.begin().unwrap();
         let grid = frontier_grid();
-        let s = sample_state(Some(&grid), Timestamp::default());
+        let mut s = sample_state(Some(&grid), Timestamp::default());
+        s.robot_pose.pose.position.x = 2.25;
+        s.robot_pose.pose.position.y = 2.25;
 
         assert!(matches!(
             ad.poll_goal(&s).unwrap(),

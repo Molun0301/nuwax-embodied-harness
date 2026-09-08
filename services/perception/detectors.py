@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
@@ -47,7 +48,7 @@ class _WorkerResult:
 
     def __init__(self, xyxy, conf, cls, names, masks_data) -> None:
         self.boxes = _WorkerBoxes(xyxy, conf, cls) if xyxy is not None else None
-        self.names = names if isinstance(names, dict) else {}
+        self.names = names if isinstance(names, (dict, list, tuple)) else {}
         self.masks = _WorkerMasks(masks_data) if masks_data else None
 
 
@@ -147,7 +148,7 @@ def _clamp_score(value: object) -> float:
         score = float(value)
     except (TypeError, ValueError):
         score = 0.0
-    return max(0.0, min(1.0, score))
+    return max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
 
 
 def _normalize_label(value: object) -> str:
@@ -165,11 +166,18 @@ def _clamp_bbox(
 ) -> BoundingBox2D:
     frame_width = max(1.0, float(image_frame.width_px))
     frame_height = max(1.0, float(image_frame.height_px))
-    x = max(0.0, min(float(x_px), frame_width - 1.0))
-    y = max(0.0, min(float(y_px), frame_height - 1.0))
-    width = max(1.0, min(float(width_px), frame_width - x))
-    height = max(1.0, min(float(height_px), frame_height - y))
-    return BoundingBox2D(x_px=x, y_px=y, width_px=width, height_px=height)
+    try:
+        x, y, width, height = (float(value) for value in (x_px, y_px, width_px, height_px))
+    except (TypeError, ValueError) as exc:
+        raise GatewayError("检测框坐标必须为有限数值。", error_code="invalid_detection_bbox") from exc
+    if not all(math.isfinite(value) for value in (x, y, width, height)) or width <= 0.0 or height <= 0.0:
+        raise GatewayError("检测框必须具有有限坐标和正面积。", error_code="invalid_detection_bbox")
+    # 裁剪原始两个端点，保留真实交集，不把图外目标压成图像边缘的伪检测。
+    x1, y1 = max(0.0, x), max(0.0, y)
+    x2, y2 = min(frame_width, x + width), min(frame_height, y + height)
+    if x2 <= x1 or y2 <= y1:
+        raise GatewayError("检测框与图像没有有效交集。", error_code="invalid_detection_bbox")
+    return BoundingBox2D(x_px=x1, y_px=y1, width_px=x2 - x1, height_px=y2 - y1)
 
 
 def normalize_detection_2d(raw_detection: object, image_frame: ImageFrame) -> Detection2D:
@@ -364,10 +372,14 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._resolved_backend_kind = "yolo_world_tensorrt" if self._use_tensorrt else "yolo_world_pytorch"
         self._inference_worker = None
         self._inference_worker_lock = threading.Lock()
+        # 预热直接调用后端，需与正式感知共用模型、词表和本次遥测的互斥范围。
+        self._detection_lock = threading.RLock()
         # vis-three-fixes 任务 3.4：worker 进程开关，默认 True；由配置/构造参数显式覆盖。
         self._use_worker_process = bool(use_worker_process)
         # 任务 3.9：最近一次 worker 推理耗时（毫秒），detect() 元数据透传。
         self._last_worker_inference_ms = None
+        self._last_inference_execution = "not_run"
+        self._worker_fallback_reason = ""
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
             backend_kind="yolo_world",
@@ -392,38 +404,48 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         image_frame: ImageFrame,
         camera_info: Optional[CameraInfo] = None,
     ) -> DetectionBundle:
-        del camera_info
-        image_bgr = decode_image_frame_to_bgr(image_frame)
-        results = self._predict(image_bgr)
-        first_result = results[0] if results else None
-        detections_2d = self._normalize_yolo_result(first_result, image_frame)
-        return DetectionBundle(
-            detections_2d=detections_2d,
-            detections_3d=(),
-            metadata={
-                "backend_name": self.spec.name,
-                "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
-                "detector_provider": dict(self.spec.metadata.get("provider") or {}),
-                "raw_detection_count": len(detections_2d),
-                "weights": self._weights,
-                "model_source": self._resolved_model_source,
-                "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
-                "device": self._device or "auto",
-            },
-        )
+        with self._detection_lock:
+            del camera_info
+            image_bgr = decode_image_frame_to_bgr(image_frame)
+            results = self._predict(image_bgr)
+            first_result = results[0] if results else None
+            detections_2d = self._normalize_yolo_result(first_result, image_frame)
+            return DetectionBundle(
+                detections_2d=detections_2d,
+                detections_3d=(),
+                metadata={
+                    "backend_name": self.spec.name,
+                    "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+                    "detector_provider": dict(self.spec.metadata.get("provider") or {}),
+                    "raw_detection_count": len(detections_2d),
+                    "weights": self._weights,
+                    "model_source": self._resolved_model_source,
+                    "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
+                    "device": self._device or "auto",
+                },
+            )
 
     def _predict(self, image_bgr) -> List[Any]:
         # 优先使用独立进程推理（释放主线程 GIL）
         self._last_worker_inference_ms = None
         if self._use_worker_process:
             worker = self._get_inference_worker()
-            if worker is not None and worker.is_ready:
-                result = worker.predict(image_bgr)
+            if worker is not None:
+                worker_identity = worker.resource_identity
+                result = worker.predict(image_bgr) if worker.is_ready else None
                 if result is not None:
+                    if any(current is not expected for current, expected in zip(worker.resource_identity, worker_identity)):
+                        raise RuntimeError("推理期间工作进程已替换，本次结果失效。")
                     # vis-three-fixes 任务 3.9：记录 worker 推理耗时供 detect() 元数据透传。
                     self._last_worker_inference_ms = getattr(worker, "last_inference_ms", None)
+                    self._last_inference_execution = "worker_process"
+                    self._resolved_model_source = self._weights
                     return [_WorkerResult(*result)]
-                # worker 返回 None 时回退到主线程推理
+                # 必须先回收旧工作进程，避免回退时同时保留两份模型或复用旧图像。
+                self._retire_inference_worker(
+                    worker, worker.failure_reason or "worker_inference_failed",
+                    expected_identity=worker_identity,
+                )
 
         # 回退：主线程直接推理
         model = self._get_model()
@@ -436,10 +458,19 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         }
         if self._device:
             kwargs["device"] = self._device
-        return list(model.predict(image_bgr, **kwargs))
+        first_result = next(iter(model.predict(image_bgr, **kwargs)), None)
+        self._last_inference_execution = "in_process"
+        return [first_result] if first_result is not None else []
+
+    @property
+    def supports_worker_process(self) -> bool:
+        """当前配置的推理路径是否实际使用独立工作进程。"""
+        return self._use_worker_process
 
     def start_inference_worker_nonblocking(self) -> bool:
         """在当前线程创建 YOLO worker 进程，但不等待模型加载。"""
+        if not self.supports_worker_process:
+            return False
         with self._inference_worker_lock:
             if self._inference_worker is not None:
                 return True
@@ -456,23 +487,52 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 max_detections=self._max_detections,
                 device=self._device,
             )
-            if not worker.start_nonblocking():
-                return False
             self._inference_worker = worker
+            if not worker.start_nonblocking():
+                self._worker_fallback_reason = worker.failure_reason or "worker_start_failed"
+                if not worker.has_pending_resources:
+                    self._inference_worker = None
+                return False
             return True
 
     def _get_inference_worker(self):
         """获取 YOLO 推理 worker，并在调用线程等待其完成加载。"""
         if not self.start_inference_worker_nonblocking():
+            if self._inference_worker is not None:
+                self._retire_inference_worker(self._inference_worker, "worker_start_failed")
             self._use_worker_process = False
+            self._worker_fallback_reason = self._worker_fallback_reason or "worker_start_failed"
             return None
         worker = self._inference_worker
-        if worker is not None and worker.wait_until_ready():
-            return worker
-        self._inference_worker = None
+        if worker is not None:
+            worker_identity = worker.resource_identity
+            if worker.wait_until_ready():
+                if any(current is not expected for current, expected in zip(worker.resource_identity, worker_identity)):
+                    raise RuntimeError("等待就绪期间工作进程已替换，本次请求失效。")
+                return worker
+            self._retire_inference_worker(
+                worker, worker.failure_reason or "worker_start_failed",
+                expected_identity=worker_identity,
+            )
         DETECTOR_LOGGER.warning("YOLO 推理 worker 启动失败，永久回退到主线程推理")
         self._use_worker_process = False
         return None
+
+    def _retire_inference_worker(
+        self, worker, reason: str, *, expected_identity: Optional[Tuple[object, object, object]] = None,
+    ) -> None:
+        """退出工作进程并保留失败原因，未完成回收时禁止再加载回退模型。"""
+        with self._inference_worker_lock:
+            matched = worker.stop_if_current(expected_identity if expected_identity is not None else worker.resource_identity)
+            if worker.has_pending_resources:
+                if not matched:
+                    raise RuntimeError("推理工作进程已替换，本次旧请求不能停止新进程或启动回退模型。")
+                self._worker_fallback_reason = reason
+                raise RuntimeError("推理工作进程尚未退出，暂不能启动进程内回退模型。")
+            self._worker_fallback_reason = reason
+            if self._inference_worker is worker:
+                self._inference_worker = None
+            self._use_worker_process = False
 
     def _get_model(self):
         if self._model is not None:
@@ -505,8 +565,9 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         if boxes is None:
             return ()
         names = getattr(result, "names", None)
-        if not isinstance(names, dict):
-            names = getattr(self._get_model(), "names", {})
+        if not isinstance(names, (dict, list, tuple)):
+            # 归一化只消费已返回或已加载的类别表，不为补标签再次加载模型。
+            names = getattr(self._model, "names", {})
 
         xyxy_items = self._to_nested_list(getattr(boxes, "xyxy", ()))
         conf_items = self._to_list(getattr(boxes, "conf", ()))
@@ -516,13 +577,27 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
 
         detections = []
         for index, xyxy in enumerate(xyxy_items):
-            if len(xyxy) < 4:
+            if not isinstance(xyxy, (list, tuple)) or len(xyxy) < 4 or index >= len(conf_items) or index >= len(class_items):
                 continue
-            x1, y1, x2, y2 = [float(value) for value in xyxy[:4]]
-            width = max(1.0, x2 - x1)
-            height = max(1.0, y2 - y1)
-            class_id = int(class_items[index]) if index < len(class_items) else -1
-            score = float(conf_items[index]) if index < len(conf_items) else 0.0
+            try:
+                x1, y1, x2, y2 = [float(value) for value in xyxy[:4]]
+                score = float(conf_items[index])
+                raw_class_id = float(class_items[index])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(score) or not math.isfinite(raw_class_id) or raw_class_id < 0.0 or not raw_class_id.is_integer():
+                continue
+            try:
+                bbox = _clamp_bbox(
+                    x_px=x1, y_px=y1, width_px=x2 - x1, height_px=y2 - y1,
+                    image_frame=image_frame,
+                )
+            except GatewayError:
+                continue
+            class_id = int(raw_class_id)
+            width, height = bbox.width_px, bbox.height_px
+            x1, y1 = bbox.x_px, bbox.y_px
+            x2, y2 = x1 + width, y1 + height
             label = self._resolve_label(names, class_id)
             attributes = {
                 "backend_name": self.spec.name,
@@ -586,7 +661,9 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 if not isinstance(point, (list, tuple)) or len(point) < 2:
                     continue
                 try:
-                    points.append([float(point[0]), float(point[1])])
+                    x, y = float(point[0]), float(point[1])
+                    if math.isfinite(x) and math.isfinite(y):
+                        points.append([x, y])
                 except (TypeError, ValueError):
                     continue
             polygons.append(points)
@@ -595,19 +672,19 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
     def _extract_mask_quality(self, masks: Any) -> List[dict]:
         if masks is None:
             return []
-        quality_count = max(len(self._to_list_or_empty(getattr(masks, key, ()))) for key in ("predicted_iou", "stability_score", "scores"))
+        # 每个质量张量整批转换一次，避免每个实例重复从设备读取全部结果。
+        values = {
+            key: self._to_list_or_empty(getattr(masks, key, ()))
+            for key in ("predicted_iou", "stability_score", "scores")
+        }
+        quality_count = max(len(items) for items in values.values())
         quality_items = []
         for index in range(quality_count):
             metadata = {}
-            predicted_iou = self._item_at(getattr(masks, "predicted_iou", ()), index)
-            stability_score = self._item_at(getattr(masks, "stability_score", ()), index)
-            segmentation_score = self._item_at(getattr(masks, "scores", ()), index)
-            if predicted_iou is not None:
-                metadata["predicted_iou"] = _clamp_score(predicted_iou)
-            if stability_score is not None:
-                metadata["stability_score"] = _clamp_score(stability_score)
-            if segmentation_score is not None:
-                metadata["segmentation_score"] = _clamp_score(segmentation_score)
+            for source, target in (("predicted_iou", "predicted_iou"), ("stability_score", "stability_score"), ("scores", "segmentation_score")):
+                items = values[source]
+                if index < len(items) and items[index] is not None:
+                    metadata[target] = _clamp_score(items[index])
             quality_items.append(metadata)
         return quality_items
 
@@ -735,31 +812,31 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         return items[index]
 
     def _resolve_label(self, names: Any, class_id: int) -> str:
-        if isinstance(names, dict) and class_id in names:
+        if isinstance(names, dict):
+            value = names.get(class_id, names.get(str(class_id)))
+            if value is not None:
+                return str(value)
+        if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
             return str(names[class_id])
         return "class_%s" % class_id
 
-    def _to_list(self, payload: Any) -> List[float]:
+    def _to_list(self, payload: Any) -> List[Any]:
         if payload is None:
             return []
         if hasattr(payload, "tolist"):
             payload = payload.tolist()
-        if isinstance(payload, tuple):
-            return [float(item) for item in payload]
-        if isinstance(payload, list):
-            return [float(item) for item in payload]
-        return [float(payload)]
+        return list(payload) if isinstance(payload, (list, tuple)) else [payload]
 
-    def _to_nested_list(self, payload: Any) -> List[List[float]]:
+    def _to_nested_list(self, payload: Any) -> List[Any]:
         if payload is None:
             return []
         if hasattr(payload, "tolist"):
             payload = payload.tolist()
-        if not isinstance(payload, list):
+        if not isinstance(payload, (list, tuple)):
             return []
-        if payload and not isinstance(payload[0], list):
-            return [[float(item) for item in payload]]
-        return [[float(item) for item in row] for row in payload]
+        if payload and not isinstance(payload[0], (list, tuple)):
+            return [list(payload)]
+        return list(payload)
 
 
 class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
@@ -827,7 +904,8 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                 "device": self._device or "auto",
                 "supports_runtime_switch": True,
                 "input_contract": "ImageFrame/CameraInfo",
-                "open_vocabulary": True,
+                "open_vocabulary": not self._use_tensorrt,
+                "supports_dynamic_vocabulary": not self._use_tensorrt,
                 "configured_class_count": len(self._configured_class_names),
                 "dynamic_class_metadata_keys": list(self._dynamic_class_metadata_keys),
             },
@@ -838,77 +916,106 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         image_frame: ImageFrame,
         camera_info: Optional[CameraInfo] = None,
     ) -> DetectionBundle:
-        class_names, class_source = self._resolve_class_names(image_frame)
-        provider_metadata = dict(self.spec.metadata.get("provider") or {})
-        base_metadata = {
-            "backend_name": self.spec.name,
-            "backend_kind": self.spec.backend_kind,
-            "detector_provider": provider_metadata,
-            "provider": provider_metadata,
-            "open_vocabulary": True,
-            "open_vocabulary_classes": list(class_names),
-            "open_vocabulary_class_count": len(class_names),
-            "open_vocabulary_class_source": class_source,
-            "weights": self._weights,
-            "model_source": self._resolved_model_source,
-            "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
-            "device": self._device or "auto",
-        }
-        image_bgr = decode_image_frame_to_bgr(image_frame)
-        if not class_names:
-            try:
-                results = self._predict(image_bgr)
-            except Exception as exc:
-                return DetectionBundle(
-                    metadata={
-                        **base_metadata,
-                        "raw_detection_count": 0,
-                        "stage_status": "not_ready",
-                        "availability": "unavailable",
-                        "reason": "open_vocabulary_classes_empty",
-                        "fallback_reason": "open_vocabulary_classes_empty",
-                        "error": str(exc),
-                        "model_loaded": self._model is not None,
-                    }
-                )
-        else:
-            try:
-                results = self._predict_with_classes(image_bgr, class_names)
-            except Exception as exc:
-                return DetectionBundle(
-                    metadata={
-                        **base_metadata,
-                        "raw_detection_count": 0,
-                        "stage_status": "not_ready",
-                        "availability": "unavailable",
-                        "reason": "model_not_loaded_or_prediction_failed",
-                        "fallback_reason": "model_not_loaded_or_prediction_failed",
-                        "error": str(exc),
-                        "model_loaded": self._model is not None,
-                    }
-                )
-        first_result = results[0] if results else None
-        detections_2d = self._enrich_open_vocabulary_detections(
-            self._normalize_yolo_result(first_result, image_frame),
-            image_frame=image_frame,
-            camera_info=camera_info,
-            class_names=class_names,
-        )
-        return DetectionBundle(
-            detections_2d=detections_2d,
-            detections_3d=(),
-            metadata={
-                **base_metadata,
-                "raw_detection_count": len(detections_2d),
-                "stage_status": "completed",
-                "availability": "available",
-                "model_loaded": self._model is not None,
-                "model_source": self._resolved_model_source or self._weights,
-                "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
-                "worker_inference_ms": self._last_worker_inference_ms,
-                "use_worker_process": self._use_worker_process,
-            },
-        )
+        with self._detection_lock:
+            self._last_inference_execution = "not_run"
+            class_names, class_source = self._resolve_class_names(image_frame)
+            provider_metadata = dict(self.spec.metadata.get("provider") or {})
+            base_metadata = {
+                "backend_name": self.spec.name,
+                "backend_kind": self.spec.backend_kind,
+                "detector_provider": provider_metadata,
+                "provider": provider_metadata,
+                "open_vocabulary": not self._use_tensorrt,
+                "requested_classes": list(class_names),
+                "requested_class_source": class_source,
+                "open_vocabulary_classes": [] if self._use_tensorrt else list(class_names),
+                "open_vocabulary_class_count": 0 if self._use_tensorrt else len(class_names),
+                "open_vocabulary_class_source": "engine_class_table" if self._use_tensorrt else class_source,
+                "supports_dynamic_vocabulary": not self._use_tensorrt,
+                "class_prompt_applied": False,
+                "class_prompt_limitation": "fixed_engine_vocabulary" if self._use_tensorrt else "",
+                "weights": self._weights,
+                "model_source": self._resolved_model_source,
+                "runtime": "tensorrt" if self._use_tensorrt else "pytorch",
+                "device": self._device or "auto",
+            }
+            image_bgr = decode_image_frame_to_bgr(image_frame)
+            if not class_names:
+                try:
+                    results = self._predict(image_bgr)
+                except Exception as exc:
+                    return DetectionBundle(
+                        metadata={
+                            **base_metadata,
+                            "raw_detection_count": 0,
+                            "stage_status": "not_ready",
+                            "availability": "unavailable",
+                            "reason": "open_vocabulary_classes_empty",
+                            "fallback_reason": "open_vocabulary_classes_empty",
+                            "error": str(exc),
+                            "model_loaded": self._model is not None,
+                            "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
+                            "worker_fallback_reason": self._worker_fallback_reason,
+                        }
+                    )
+            else:
+                try:
+                    results = self._predict_with_classes(image_bgr, class_names)
+                except Exception as exc:
+                    return DetectionBundle(
+                        metadata={
+                            **base_metadata,
+                            "raw_detection_count": 0,
+                            "stage_status": "not_ready",
+                            "availability": "unavailable",
+                            "reason": "model_not_loaded_or_prediction_failed",
+                            "fallback_reason": "model_not_loaded_or_prediction_failed",
+                            "error": str(exc),
+                            "model_loaded": self._model is not None,
+                            "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
+                            "worker_fallback_reason": self._worker_fallback_reason,
+                        }
+                    )
+            first_result = results[0] if results else None
+            if self._use_tensorrt:
+                # 固定引擎无法应用动态请求词表，只报告模型实际返回的类别表。
+                names = getattr(first_result, "names", None)
+                if not isinstance(names, (dict, list, tuple)):
+                    names = getattr(self._model, "names", ())
+                class_names = self._normalize_class_names(tuple(names.values()) if isinstance(names, dict) else names)
+                base_metadata["open_vocabulary_classes"] = list(class_names)
+                base_metadata["open_vocabulary_class_count"] = len(class_names)
+            else:
+                base_metadata["class_prompt_applied"] = bool(class_names)
+            detections_2d = self._enrich_open_vocabulary_detections(
+                self._normalize_yolo_result(first_result, image_frame),
+                image_frame=image_frame,
+                camera_info=camera_info,
+                class_names=class_names,
+            )
+            return DetectionBundle(
+                detections_2d=detections_2d,
+                detections_3d=(),
+                metadata={
+                    **base_metadata,
+                    "raw_detection_count": len(detections_2d),
+                    "stage_status": "completed",
+                    "availability": "available",
+                    "model_loaded": self._model is not None or self._last_inference_execution == "worker_process",
+                    "model_source": self._resolved_model_source or self._weights,
+                    "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+                    "worker_inference_ms": self._last_worker_inference_ms,
+                    "use_worker_process": self._use_worker_process,
+                    "inference_execution": self._last_inference_execution,
+                    "worker_fallback_used": bool(self._worker_fallback_reason) and self._last_inference_execution == "in_process",
+                    "worker_fallback_reason": self._worker_fallback_reason,
+                },
+            )
+
+    @property
+    def supports_worker_process(self) -> bool:
+        """动态词表在当前进程设置；仅固定引擎使用既有工作进程协议。"""
+        return self._use_worker_process and self._use_tensorrt
 
     def _get_model(self):
         if self._model is not None:
@@ -938,17 +1045,13 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         # vis-three-fixes 任务 3.9：TensorRT engine 的类别已固化进引擎，set_classes 不可用，
         # 此路径可走 worker 子进程（释放 GIL）。.pt 需主线程 set_classes，故仍走主线程。
         self._last_worker_inference_ms = None
-        if self._use_tensorrt and self._use_worker_process:
-            worker = self._get_inference_worker()
-            if worker is not None and worker.is_ready:
-                result = worker.predict(image_bgr)
-                if result is not None:
-                    self._last_worker_inference_ms = getattr(worker, "last_inference_ms", None)
-                    return [_WorkerResult(*result)]
-                # worker 返回 None 时回退主线程推理
+        if self._use_tensorrt:
+            return self._predict(image_bgr)
 
         model = self._get_model()
-        if class_names != self._last_class_names and hasattr(model, "set_classes"):
+        if class_names != self._last_class_names:
+            if not callable(getattr(model, "set_classes", None)):
+                raise RuntimeError("当前检测模型不支持设置动态类别词表。")
             model.set_classes(list(class_names))
             self._last_class_names = class_names
         kwargs = {
@@ -960,7 +1063,9 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
         }
         if self._device:
             kwargs["device"] = self._device
-        return list(model.predict(image_bgr, **kwargs))
+        first_result = next(iter(model.predict(image_bgr, **kwargs)), None)
+        self._last_inference_execution = "in_process"
+        return [first_result] if first_result is not None else []
 
     def _ensure_local_model_source_available(self) -> None:
         # 校验本地模型文件存在（仅校验带目录的绝对/相对路径，纯文件名交给 ultralytics 自动下载）。

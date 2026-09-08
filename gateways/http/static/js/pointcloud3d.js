@@ -425,9 +425,8 @@ class PointCloud3DViewer {
     this._lod = 'preview';
     this._pointStyle = DEFAULT_POINT_STYLE;
     this._displayConfig = POINTCLOUD3D_CONFIG;
-    this._needsRender = false;
     this._rafId = null;
-    this._lastFrameTime = 0;
+    this._visible = true;
     this._allPositions = new Float32Array(0);
     this._pointCloudMapWatermark = null;
     this._explorationOverlayWatermark = null;
@@ -577,10 +576,9 @@ class PointCloud3DViewer {
   }
 
   _requestRender() {
-    this._needsRender = true;
-    if (!this._renderer || !this._scene || !this._camera) return;
+    if (!this._visible || !this._renderer || !this._scene || !this._camera) return;
     if (!this._rafId) {
-      this._rafId = requestAnimationFrame((t) => this._renderLoop(t));
+      this._rafId = requestAnimationFrame(() => this._renderLoop());
     }
   }
 
@@ -601,17 +599,9 @@ class PointCloud3DViewer {
     return helpers.length;
   }
 
-  _renderLoop(timestamp) {
+  _renderLoop() {
     this._rafId = null;
-    const elapsed = timestamp - this._lastFrameTime;
-    if (elapsed < 1000 / 30) {
-      if (this._needsRender) {
-        this._rafId = requestAnimationFrame((t) => this._renderLoop(t));
-      }
-      return;
-    }
-    this._lastFrameTime = timestamp;
-    this._needsRender = false;
+    if (!this._visible) return;
     const controlsChanged = Boolean(this._controls?.update());
     this._removeLegacySceneHelpers();
     this._syncSemanticGroupVisibility();
@@ -626,6 +616,17 @@ class PointCloud3DViewer {
     return this._camera && target
       ? this._camera.position.distanceTo(target)
       : null;
+  }
+
+  setVisible(visible) {
+    this._visible = Boolean(visible);
+    if (!this._visible) {
+      if (this._rafId) cancelAnimationFrame(this._rafId);
+      this._rafId = null;
+      return;
+    }
+    this.resize();
+    this._requestRender();
   }
 
   _setCameraReferenceDistance(distance = this._cameraDistance()) {
@@ -1031,8 +1032,15 @@ class PointCloud3DViewer {
   _renderPointCloudPositions(positions, sourceMeasurement = null, floorContext = null) {
     if (!this._scene) return;
     const previousBounds = this._pointCloudBounds;
-    this._disposePointsMesh();
     if (!positions.length) {
+      if (this._pointsMesh) {
+        // 空图立即释放旧点载荷，但保留材质程序供后续点云恢复复用。
+        if (this._pointsMesh.geometry.getAttribute('position')) {
+          this._pointsMesh.geometry.dispose();
+          this._pointsMesh.geometry = new THREE.BufferGeometry();
+        }
+        this._pointsMesh.visible = false;
+      }
       this._displayedPointCount = 0;
       this._pointCloudBounds = null;
       this._emitPointCount();
@@ -1051,13 +1059,26 @@ class PointCloud3DViewer {
     ));
     geo.boundingSphere = measurement.bounds.clone();
     this._pointCloudBounds = measurement.bounds.clone();
-    const mat = new THREE.PointsMaterial({
-      size: preset.size,
-      vertexColors: true,
-      sizeAttenuation: preset.sizeAttenuation,
-    });
-    this._pointsMesh = new THREE.Points(geo, mat);
-    this._scene.add(this._pointsMesh);
+    if (this._pointsMesh) {
+      this._pointsMesh.geometry.dispose();
+      this._pointsMesh.geometry = geo;
+      const material = this._pointsMesh.material;
+      material.size = preset.size;
+      if (material.sizeAttenuation !== preset.sizeAttenuation) {
+        material.sizeAttenuation = preset.sizeAttenuation;
+        material.needsUpdate = true;
+      }
+      this._pointsMesh.visible = true;
+    } else {
+      // 顶点与颜色属于每帧几何，材质跨帧保留以免不断删除和重编译点云程序。
+      const material = new THREE.PointsMaterial({
+        size: preset.size,
+        vertexColors: true,
+        sizeAttenuation: preset.sizeAttenuation,
+      });
+      this._pointsMesh = new THREE.Points(geo, material);
+      this._scene.add(this._pointsMesh);
+    }
     this._displayedPointCount = Math.floor(positions.length / 3);
     this._emitPointCount();
     if (!this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') {
@@ -1532,22 +1553,45 @@ class PointCloud3DViewer {
 
   updateTrajectory(trajectory) {
     this._trajectory = Array.isArray(trajectory) ? trajectory.slice() : [];
-    if (this._trajectoryLine) {
-      this._scene.remove(this._trajectoryLine);
-      this._trajectoryLine.geometry.dispose();
-      this._trajectoryLine.material.dispose();
-      this._trajectoryLine = null;
+    if (!this._scene) return;
+    const pointCount = this._trajectory.length;
+    if (pointCount < 2) {
+      if (this._trajectoryLine) {
+        this._trajectoryLine.visible = false;
+        this._trajectoryLine.geometry.setDrawRange(0, 0);
+        this._requestRender();
+      }
+      return;
     }
-    if (!this._scene || this._trajectory.length < 2) return;
-    const pts = this._trajectory.map(p => new THREE.Vector3(
-      Number(p.x || 0),
-      Number(p.y || 0),
-      Number(p.z || 0.05),
-    ));
-    const geo = new THREE.BufferGeometry().setFromPoints(pts);
-    const mat = new THREE.LineBasicMaterial({ color: COLORS.trajectory });
-    this._trajectoryLine = new THREE.Line(geo, mat);
-    this._scene.add(this._trajectoryLine);
+    let position = this._trajectoryLine?.geometry.getAttribute('position');
+    if (!position || position.count < pointCount) {
+      // 只在容量不足时扩容并释放旧几何，材质始终复用，避免逐帧销毁着色程序。
+      const capacity = Math.max(32, pointCount, (position?.count || 0) * 2);
+      position = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3);
+      position.setUsage(THREE.DynamicDrawUsage);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', position);
+      if (this._trajectoryLine) {
+        this._trajectoryLine.geometry.dispose();
+        this._trajectoryLine.geometry = geometry;
+      } else {
+        this._trajectoryLine = new THREE.Line(
+          geometry,
+          new THREE.LineBasicMaterial({ color: COLORS.trajectory }),
+        );
+        this._scene.add(this._trajectoryLine);
+      }
+    }
+    for (let index = 0; index < pointCount; index += 1) {
+      const point = this._trajectory[index];
+      position.setXYZ(index, Number(point.x || 0), Number(point.y || 0), Number(point.z || 0.05));
+    }
+    position.clearUpdateRanges();
+    position.addUpdateRange(0, pointCount * 3);
+    position.needsUpdate = true;
+    this._trajectoryLine.geometry.setDrawRange(0, pointCount);
+    this._trajectoryLine.geometry.computeBoundingSphere();
+    this._trajectoryLine.visible = true;
     this._requestRender();
   }
 

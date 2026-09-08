@@ -51,6 +51,8 @@ pub(crate) struct FrontierCluster {
 pub(crate) struct FrontierCandidate {
     /// cluster 几何
     pub cluster: FrontierCluster,
+    /// 位于前沿内侧、具有机器人轮廓余量且真实可达的接近目标。
+    pub goal_position: Point2,
     /// 原始(尚未打分)id 槽位
     pub debug_index: usize,
 }
@@ -150,8 +152,8 @@ impl WavefrontDetector {
     /// 流程(方案 §4.8 + v18 HIGH-2 修正):
     /// 1. robot -> cell;越界返回 `RobotPoseOutOfBounds`
     /// 2. 清空 classification
-    /// 3. BFS 找最近 free cell;若不存在返回 `DetectionOutcome::NoReachableFreeSpace`
-    /// 4. 主 BFS 把可达 free/unknown 标记为 MAP_OPEN/MAP_CLOSED
+    /// 3. 起点必须是自由格，不能穿越未知区域或障碍寻找替代起点。
+    /// 4. 主 BFS 只遍历可达自由格，并禁止穿过对角墙角。
     /// 5. 收集 frontier cluster:仅从 MAP_CLOSED 区域相邻的 frontier seed 出发
     ///    (满足 v18 "reachable frontier 语义闭环")
     /// 6. 返回 `DetectionOutcome::Candidates`
@@ -171,22 +173,23 @@ impl WavefrontDetector {
                     robot_pose.y,
                 ))?;
 
-        // 3. BFS 找最近 free cell
+        self.diagnostics.last_candidates.clear();
+        // 非自由起点没有已证实的通行路径，不能任意投影到墙另一侧。
         let start_cell = GridPoint::new(start_x, start_y);
-        let nearest_free = find_nearest_free_space(start_cell, costmap);
-        let nearest_free = match nearest_free {
-            Some(c) => c,
-            None => return Ok(DetectionOutcome::NoReachableFreeSpace),
-        };
+        if cell_at(costmap, start_x, start_y) != OccupancyCell::Free {
+            return Ok(DetectionOutcome::NoReachableFreeSpace);
+        }
+        let footprint_map = footprint_safe_map(costmap, self.config.obstacle_inflation_radius_m);
+        if cell_at(&footprint_map, start_x, start_y) != OccupancyCell::Free {
+            return Ok(DetectionOutcome::NoReachableFreeSpace);
+        }
+        let safe_reachable = reachable_free_region(start_cell, &footprint_map);
 
-        // 4. 主 BFS:可达 free/unknown -> MAP_OPEN,处理完 -> MAP_CLOSED
+        // 主搜索只把真实连通的自由格标记为可达。
         let mut queue = std::collections::VecDeque::new();
-        queue.push_back(nearest_free);
-        self.classification.set(
-            nearest_free.x,
-            nearest_free.y,
-            PointClassification::MAP_OPEN,
-        );
+        queue.push_back(start_cell);
+        self.classification
+            .set(start_cell.x, start_cell.y, PointClassification::MAP_OPEN);
         while let Some(p) = queue.pop_front() {
             self.classification
                 .insert_flags(p.x, p.y, PointClassification::MAP_CLOSED);
@@ -198,8 +201,7 @@ impl WavefrontDetector {
                 {
                     continue;
                 }
-                let cell = cell_at(costmap, n.x, n.y);
-                if is_free_or_unknown(cell) {
+                if is_traversable_step(p, n, costmap) {
                     self.classification
                         .set(n.x, n.y, PointClassification::MAP_OPEN);
                     queue.push_back(n);
@@ -258,8 +260,20 @@ impl WavefrontDetector {
                     continue;
                 }
                 let cluster = build_cluster(&cluster_cells, costmap);
+                let Some(goal_position) = choose_approach_position(
+                    &cluster_cells,
+                    cluster.centroid,
+                    robot_pose,
+                    start_cell,
+                    costmap,
+                    &safe_reachable,
+                    self.config.obstacle_inflation_radius_m,
+                ) else {
+                    continue;
+                };
                 candidates.push(FrontierCandidate {
                     cluster,
+                    goal_position,
                     debug_index: candidates.len(),
                 });
             }
@@ -312,8 +326,15 @@ fn cell_at(grid: &OccupancyGrid2D, x: u32, y: u32) -> OccupancyCell {
     grid.cells[idx]
 }
 
-fn is_free_or_unknown(cell: OccupancyCell) -> bool {
-    matches!(cell, OccupancyCell::Free | OccupancyCell::Unknown)
+fn is_traversable_step(from: GridPoint, to: GridPoint, grid: &OccupancyGrid2D) -> bool {
+    if cell_at(grid, to.x, to.y) != OccupancyCell::Free {
+        return false;
+    }
+    // 八邻域的对角步必须有两个自由正交邻格，不能从两面墙之间穿角。
+    from.x == to.x
+        || from.y == to.y
+        || (cell_at(grid, from.x, to.y) == OccupancyCell::Free
+            && cell_at(grid, to.x, from.y) == OccupancyCell::Free)
 }
 
 /// frontier 判定:unknown + 至少一个 free 邻居 + strict `>` 占用阈值排除。
@@ -346,9 +367,10 @@ fn has_reachable_neighbor(
     classification: &ClassificationGrid,
 ) -> bool {
     for n in neighbors8(p, grid).iter() {
-        if classification
-            .get(n.x, n.y)
-            .contains(PointClassification::MAP_CLOSED)
+        if cell_at(grid, n.x, n.y) == OccupancyCell::Free
+            && classification
+                .get(n.x, n.y)
+                .contains(PointClassification::MAP_CLOSED)
         {
             return true;
         }
@@ -356,29 +378,123 @@ fn has_reachable_neighbor(
     false
 }
 
-/// BFS 找最近 free cell,无 free 返回 None。
-pub(crate) fn find_nearest_free_space(
-    start: GridPoint,
-    grid: &OccupancyGrid2D,
-) -> Option<GridPoint> {
-    use std::collections::VecDeque;
-    let mut visited = ClassificationGrid::new(grid.width, grid.height);
-    let mut queue = VecDeque::new();
-    queue.push_back(start);
-    visited.insert_flags(start.x, start.y, PointClassification::MAP_OPEN);
-    while let Some(p) = queue.pop_front() {
-        if matches!(cell_at(grid, p.x, p.y), OccupancyCell::Free) {
-            return Some(p);
-        }
-        for n in neighbors8(p, grid).iter() {
-            if visited.contains_flags(n.x, n.y, PointClassification::MAP_OPEN) {
-                continue;
+/// 将机器人圆形轮廓投影到原始占据图，未知、图外和障碍均不提供通行余量。
+fn footprint_safe_map(grid: &OccupancyGrid2D, radius_m: f64) -> OccupancyGrid2D {
+    let mut safe = grid.clone();
+    let radius = (radius_m.max(0.0) / grid.resolution).ceil() as i64;
+    if !radius_m.is_finite()
+        || !grid.resolution.is_finite()
+        || grid.resolution <= 0.0
+        || radius >= i64::from(grid.width)
+        || radius >= i64::from(grid.height)
+    {
+        safe.cells.fill(OccupancyCell::Inflated);
+        return safe;
+    }
+    let disk: Vec<(i64, i64)> = (-radius..=radius)
+        .flat_map(|dy| (-radius..=radius).map(move |dx| (dx, dy)))
+        .filter(|(dx, dy)| dx * dx + dy * dy <= radius * radius)
+        .collect();
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            let free = disk.iter().all(|(dx, dy)| {
+                let nx = i64::from(x) + dx;
+                let ny = i64::from(y) + dy;
+                nx >= 0
+                    && ny >= 0
+                    && nx < i64::from(grid.width)
+                    && ny < i64::from(grid.height)
+                    && cell_at(grid, nx as u32, ny as u32) == OccupancyCell::Free
+            });
+            if !free {
+                safe.set(x, y, OccupancyCell::Inflated);
             }
-            visited.insert_flags(n.x, n.y, PointClassification::MAP_OPEN);
-            queue.push_back(n);
         }
     }
-    None
+    safe
+}
+
+fn reachable_free_region(start: GridPoint, grid: &OccupancyGrid2D) -> ClassificationGrid {
+    let mut reachable = ClassificationGrid::new(grid.width, grid.height);
+    let mut queue = std::collections::VecDeque::from([start]);
+    reachable.set(start.x, start.y, PointClassification::MAP_CLOSED);
+    while let Some(point) = queue.pop_front() {
+        for next in neighbors8(point, grid).iter() {
+            if !reachable.contains_flags(next.x, next.y, PointClassification::MAP_CLOSED)
+                && is_traversable_step(point, next, grid)
+            {
+                reachable.set(next.x, next.y, PointClassification::MAP_CLOSED);
+                queue.push_back(next);
+            }
+        }
+    }
+    reachable
+}
+
+/// 从前沿向已知侧退让一个轮廓半径，目标及其接近区域必须真实可通行。
+#[allow(clippy::too_many_arguments)]
+fn choose_approach_position(
+    frontier_cells: &[GridPoint],
+    centroid: Point2,
+    robot_pose: Point2,
+    robot_cell: GridPoint,
+    grid: &OccupancyGrid2D,
+    classification: &ClassificationGrid,
+    clearance_m: f64,
+) -> Option<Point2> {
+    let inset_cells = (clearance_m.max(0.0) / grid.resolution).ceil() as i64 + 1;
+    frontier_cells
+        .iter()
+        .flat_map(|frontier| {
+            (-inset_cells..=inset_cells).flat_map(move |dy| {
+                (-inset_cells..=inset_cells).filter_map(move |dx| {
+                    let x = i64::from(frontier.x) + dx;
+                    let y = i64::from(frontier.y) + dy;
+                    (x >= 0 && y >= 0 && x < i64::from(grid.width) && y < i64::from(grid.height))
+                        .then_some((GridPoint::new(x as u32, y as u32), *frontier))
+                })
+            })
+        })
+        .filter(|(cell, frontier)| {
+            *cell != robot_cell
+                && cell_at(grid, cell.x, cell.y) == OccupancyCell::Free
+                && classification.contains_flags(cell.x, cell.y, PointClassification::MAP_CLOSED)
+                && frontier_visible_from(*cell, *frontier, grid)
+        })
+        .filter_map(|(cell, _)| grid.cell_center(cell.x, cell.y))
+        .min_by(|a, b| {
+            a.distance(centroid)
+                .total_cmp(&b.distance(centroid))
+                .then_with(|| b.distance(robot_pose).total_cmp(&a.distance(robot_pose)))
+                .then_with(|| a.y.total_cmp(&b.y))
+                .then_with(|| a.x.total_cmp(&b.x))
+        })
+}
+
+/// 接近点至前沿的视线在首次触及未知前必须始终位于已知自由区。
+fn frontier_visible_from(start: GridPoint, target: GridPoint, grid: &OccupancyGrid2D) -> bool {
+    let (mut x, mut y) = (i64::from(start.x), i64::from(start.y));
+    let (tx, ty) = (i64::from(target.x), i64::from(target.y));
+    let dx = (tx - x).abs();
+    let dy = -(ty - y).abs();
+    let sx = (tx - x).signum();
+    let sy = (ty - y).signum();
+    let mut error = dx + dy;
+    while (x, y) != (tx, ty) {
+        if cell_at(grid, x as u32, y as u32) != OccupancyCell::Free {
+            return false;
+        }
+        let twice = 2 * error;
+        if twice >= dy {
+            error += dy;
+            x += sx;
+        }
+        if twice <= dx {
+            error += dx;
+            y += sy;
+        }
+    }
+    true
 }
 
 fn build_cluster(cells: &[GridPoint], grid: &OccupancyGrid2D) -> FrontierCluster {
@@ -386,10 +502,9 @@ fn build_cluster(cells: &[GridPoint], grid: &OccupancyGrid2D) -> FrontierCluster
     let mut sx = 0.0_f64;
     let mut sy = 0.0_f64;
     for p in cells {
-        // Python OccupancyGrid.grid_to_world uses the grid index itself, not
-        // the cell center: origin + index * resolution.
-        sx += grid.origin.x + f64::from(p.x) * grid.resolution;
-        sy += grid.origin.y + f64::from(p.y) * grid.resolution;
+        // 地图合同的原点是格子左下角，几何点统一使用格子中心。
+        sx += grid.origin.x + (f64::from(p.x) + 0.5) * grid.resolution;
+        sy += grid.origin.y + (f64::from(p.y) + 0.5) * grid.resolution;
     }
     let n = cell_count.max(1) as f64;
     let centroid = Point2 {
@@ -447,6 +562,80 @@ mod tests {
             .detect_candidates(Point2 { x: 999.0, y: 999.0 }, &grid, &session)
             .unwrap_err();
         assert_eq!(err, WavefrontError::RobotPoseOutOfBounds(999.0, 999.0));
+    }
+
+    #[test]
+    fn unknown_cells_do_not_connect_separate_free_islands() {
+        let mut grid = OccupancyGrid2D::filled(
+            Point2 { x: 0.0, y: 0.0 },
+            1.0,
+            25,
+            15,
+            OccupancyCell::Unknown,
+        );
+        for y in 4..=8 {
+            for x in 1..=5 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        for y in 4..=9 {
+            for x in 15..=20 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        let mut detector = WavefrontDetector::new(WavefrontConfig::default());
+        let result = detector
+            .detect_candidates(Point2 { x: 3.5, y: 6.5 }, &grid, &ExplorationSession::new())
+            .unwrap();
+        let DetectionOutcome::Candidates(candidates) = result else {
+            panic!("机器人所在自由岛应有可达前沿");
+        };
+        assert_eq!(candidates.len(), 1, "未知区域另一侧的自由岛不可达");
+        assert!(candidates[0].cluster.centroid.x < 6.0);
+    }
+
+    #[test]
+    fn blocked_robot_cell_does_not_search_through_walls() {
+        let mut grid = grid_free();
+        grid.set(0, 0, OccupancyCell::Occupied);
+        let mut detector = WavefrontDetector::new(WavefrontConfig::default());
+        let result = detector
+            .detect_candidates(
+                Point2 { x: 0.25, y: 0.25 },
+                &grid,
+                &ExplorationSession::new(),
+            )
+            .unwrap();
+        assert!(matches!(result, DetectionOutcome::NoReachableFreeSpace));
+    }
+
+    #[test]
+    fn diagonal_corner_does_not_connect_free_regions() {
+        let mut grid = OccupancyGrid2D::filled(
+            Point2 { x: 0.0, y: 0.0 },
+            1.0,
+            12,
+            12,
+            OccupancyCell::Unknown,
+        );
+        grid.set(1, 1, OccupancyCell::Free);
+        // 起点只有对角自由邻格，两个正交出口均被墙封住。
+        for (x, y) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 0), (1, 2), (2, 1)] {
+            grid.set(x, y, OccupancyCell::Occupied);
+        }
+        for y in 2..=7 {
+            for x in 2..=7 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        let mut detector = WavefrontDetector::new(WavefrontConfig::default());
+        let result = detector
+            .detect_candidates(Point2 { x: 1.5, y: 1.5 }, &grid, &ExplorationSession::new())
+            .unwrap();
+        assert!(
+            matches!(result, DetectionOutcome::NoReachableFreeSpace),
+            "起点轮廓已触墙，不能穿过墙角抵达另一自由区域"
+        );
     }
 
     #[test]

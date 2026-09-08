@@ -51,6 +51,9 @@ def start_yolo_world_worker(detector_pipeline, config) -> Dict[str, Any]:
     backend = getter(getattr(yolo_cfg, "backend_name", None)) if callable(getter) else None
     if backend is None:
         return {"status": "deferred", "reason": "yolo_world_backend_not_registered"}
+    if not getattr(backend, "supports_worker_process", True):
+        # 网关仍需调度预热线程，仅跳过不会被当前检测路径消费的子进程。
+        return {"status": "starting", "reason": "in_process_inference", "inference_execution": "in_process"}
     starter = getattr(backend, "start_inference_worker_nonblocking", None)
     if not callable(starter):
         return {"status": "deferred", "reason": "worker_process_not_supported"}
@@ -94,8 +97,19 @@ def prewarm_yolo_world(detector_pipeline, config, *, camera_id: str = "front_cam
         image_frame = _build_dummy_image_frame(imgsz, camera_id)
         started_at = perf_counter()
         # detect() 内部触发 _get_model + （.pt 时 set_classes）+ 推理，与生产链路一致。
-        backend.detect(image_frame)
+        bundle = backend.detect(image_frame)
         first_inference_ms = round((perf_counter() - started_at) * 1000.0, 3)
+        metadata = dict(getattr(bundle, "metadata", {}) or {})
+        if metadata.get("stage_status") != "completed" or metadata.get("availability") != "available":
+            reason = str(metadata.get("reason") or metadata.get("fallback_reason") or "detector_not_ready")
+            PERCEPTION_PREWARM_LOGGER.warning("prewarm_yolo_world 检测尚未就绪 reason=%s", reason)
+            return {
+                "status": "deferred",
+                "reason": reason,
+                "error": str(metadata.get("error") or ""),
+                "first_inference_ms": first_inference_ms,
+                "backend": getattr(yolo_cfg, "backend_name", "yolo_world"),
+            }
     except Exception as exc:  # noqa: BLE001 — 预热失败必须静默降级，绝不 raise。
         PERCEPTION_PREWARM_LOGGER.warning(
             "prewarm_yolo_world 预热失败，降级为懒加载 backend=%s reason=%s",

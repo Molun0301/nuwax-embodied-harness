@@ -34,6 +34,10 @@ def console_payload(topic, payload):
         "available", "camera_id", "frame_id", "width_px", "height_px",
         "detector_backend", "tracker_backend", "detection_count",
         "overlay_phase", "publish_interval_ms", "source_timestamp_ns",
+        "observation_id", "frame_timestamp", "frame_timestamp_source",
+        "source_sequence", "source_clock_domain", "source_clock_id", "displayed_detection_count",
+        "provider_fallback_used", "provider_fallback_reason",
+        "worker_fallback_used", "worker_fallback_reason", "inference_execution",
     ))
     detections = field_value(payload, "detections_2d", ())
     if not isinstance(detections, (list, tuple)):
@@ -58,6 +62,6 @@ def console_payload(topic, payload):
         })
     result["detections_2d"] = overlays
     result["overlay_count"] = len(overlays)
-    result["detections_truncated"] = len(overlays) != len(detections)
+    result["detections_truncated"] = bool(field_value(payload, "detections_truncated", False)) or len(overlays) != len(detections)
     result.update(selected_fields(payload, ("stage_status", "stage_duration_ms", "nms_stats", "pipeline_lock_wait_ms")))
     return result

@@ -5008,23 +5008,32 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         _req: Request<PoseRequest>,
     ) -> Result<Response<Self::SubscribePoseStream>, Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
         let state = self.bridge.state.clone();
-        let stream =
-            spawn_subscription_stream(self.shutdown.as_ref(), tx.clone(), rx, async move {
-                let mut seq = 0u64;
-                // 变化驱动：仅当位姿实际更新（timestamp_ns 变化）时才推送帧；
-                // 避免静止时以 100ms 周期推送大量重复帧。last_stamp 初值 u64::MAX
-                // 确保首个有效帧（含 stamp==0 的早期态）至少推送一次后再去重。
-                let mut last_stamp = u64::MAX;
+        let graceful_rx = self
+            .shutdown
+            .as_ref()
+            .map(|coordinator| coordinator.graceful_tx.subscribe());
+        // 直接按消费需求读取最新规范状态，不增加轮询等待或历史帧发送队列。
+        // 通知与首次快照之间的更新由接收器保留，关闭信号沿用其它订阅的来源。
+        let updates = futures::stream::unfold(
+            (None::<watch::Receiver<()>>, state, None, 0u64),
+            |(mut changes, state, mut last_stamp, mut seq)| async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Some(receiver) = changes.as_mut() {
+                        if receiver.changed().await.is_err() {
+                            return None;
+                        }
+                    }
                     let update = {
                         let s = state.read().await;
-                        if s.pose.timestamp_ns == last_stamp {
+                        // 首次订阅和快照共用状态锁；锁等待本身也由外层关闭信号取消。
+                        if changes.is_none() {
+                            changes = Some(s.pose_changed.subscribe());
+                        }
+                        if Some(s.pose.timestamp_ns) == last_stamp {
                             continue;
                         }
-                        last_stamp = s.pose.timestamp_ns;
+                        last_stamp = Some(s.pose.timestamp_ns);
                         seq += 1;
                         PoseUpdate {
                             pose: Some(Pose {
@@ -5045,11 +5054,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                             sequence: seq,
                         }
                     };
-                    if tx.send(Ok(update)).await.is_err() {
-                        break;
-                    }
+                    return Some((Ok(update), (changes, state, last_stamp, seq)));
                 }
-            });
+            },
+        );
+        let stream: Self::SubscribePoseStream = Box::pin(futures::StreamExt::take_until(
+            updates,
+            wait_for_subscription_shutdown(graceful_rx),
+        ));
         Ok(Response::new(stream))
     }
 
@@ -8059,6 +8071,80 @@ mod subscription_shutdown_tests {
         ]
     }
 
+    async fn commit_pose(handle: &GeometryRuntimeHandle, stamp: u64) {
+        let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
+        let pose = PoseState {
+            x: stamp as f64,
+            qw: 1.0,
+            frame_id: "odom".into(),
+            timestamp_ns: stamp,
+            ..PoseState::default()
+        };
+        let binding = (
+            LcmTopic::new("/test/geometry/pose-stream-tf").unwrap(),
+            LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
+        );
+        assert!(crate::lcm_runtime::handoff_lio_odometry(handle, &pose, "base_link", &binding)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pose_subscription_is_immediate_coalesces_slow_consumers_and_preserves_source_time() {
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        handle.mapping_adapter.as_ref().unwrap().lock()
+            .start_session("pose-stream-session", "warehouse").unwrap();
+        let service = GeometryRuntimeService::new(handle.clone());
+        let mut stream = service.subscribe_pose(Request::new(PoseRequest::default()))
+            .await.unwrap().into_inner();
+        let first = tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await.expect("首个快照不能等待原来的100毫秒轮询")
+            .unwrap().unwrap();
+        assert_eq!(first.pose.unwrap().timestamp_ns, 0);
+        assert_eq!(first.sequence, 1);
+
+        // 更新先于下一次轮询流到达，必须保留唤醒并直接返回源时间。
+        commit_pose(&handle, 10).await;
+        let changed = tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await.expect("规范位姿提交应立即唤醒订阅")
+            .unwrap().unwrap();
+        assert_eq!(changed.pose.unwrap().timestamp_ns, 10);
+        assert_eq!(changed.sequence, 2);
+
+        // 客户端暂停消费时不积累历史帧；恢复后交付最新规范状态。
+        for stamp in 11..=50 {
+            commit_pose(&handle, stamp).await;
+        }
+        let latest = tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(latest.pose.unwrap().timestamp_ns, 50);
+        assert_eq!(latest.sequence, 3);
+        commit_pose(&handle, 50).await;
+        assert!(tokio::time::timeout(Duration::from_millis(20), stream.next()).await.is_err(),
+            "相同源时间的规范通知不能生成重复位姿帧");
+        commit_pose(&handle, 51).await;
+        let changed = tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(changed.pose.unwrap().timestamp_ns, 51);
+        assert_eq!(changed.sequence, 4);
+    }
+
+    #[tokio::test]
+    async fn pose_subscription_shutdown_cancels_latest_state_lock_wait() {
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        let (shutdown, _listener) = shutdown_channel();
+        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
+        let _state_guard = handle.state.write().await;
+        let mut stream = tokio::time::timeout(
+            Duration::from_millis(50),
+            service.subscribe_pose(Request::new(PoseRequest::default())),
+        ).await.expect("建立订阅不能等待共享状态锁").unwrap().into_inner();
+        assert!(tokio::time::timeout(Duration::from_millis(10), stream.next()).await.is_err());
+        shutdown.publish_graceful_shutdown();
+        assert!(tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await.expect("关闭必须取消位姿快照锁等待").is_none());
+    }
+
     #[tokio::test]
     async fn subscription_streams_release_all_five_producers_without_new_input() {
         for mode in [
@@ -9945,6 +10031,8 @@ mod lifecycle_tests {
             Ok(ExploreRobotPose {
                 x: 2.0,
                 y: 2.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "map".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),
@@ -11790,6 +11878,8 @@ mod lifecycle_tests {
             .tick_with_pose(ExploreRobotPose {
                 x: 0.0,
                 y: 0.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "odom".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),

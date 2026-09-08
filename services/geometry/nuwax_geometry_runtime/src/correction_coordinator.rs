@@ -15935,7 +15935,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         fn frame(sequence: u64, timestamp_ns: u64, x: f64) -> CorrectionFrameInput {
-            let body_points = asymmetric_cloud();
+            // 合成回环有0.4米漂移，点间距应足够区分真实对应与相邻重复结构。
+            let body_points: Vec<_> = asymmetric_cloud()
+                .iter()
+                .map(|point| Point3::from(point.coords * 3.0))
+                .collect();
             let odom_from_body = Isometry3::translation(x, 0.0, 0.0);
             let mut occupancy = vec![0_u8; 101 * 79];
             occupancy[..4].copy_from_slice(&[0, 20, 80, 255]);
@@ -17664,6 +17668,80 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 Err(CorrectionOwnerError::Stopped)
             );
             library.shutdown();
+        }
+
+        #[test]
+        fn library_owner_accurate_turn_does_not_emit_pose_only_correction() {
+            let mut library = CorrectionOwnerHandle::start(
+                CorrectionOwnerSpec::LibraryPgo {
+                    map_frame_id: "robot_map".into(),
+                    odom_frame_id: "robot_odom".into(),
+                    body_frame_id: "robot_body".into(),
+                    pipeline: LoopClosurePipelineConfig::default(),
+                },
+                owner_identity(),
+            )
+            .unwrap();
+            let world = asymmetric_cloud();
+            let anchor = Isometry3::from_parts(
+                Translation3::new(3.0, -2.0, 0.5),
+                UnitQuaternion::from_euler_angles(0.1, -0.2, 0.3),
+            );
+            let mut effective = anchor;
+            for (sequence, seconds, pose) in [
+                (1, 0, Isometry3::identity()),
+                (2, 10, Isometry3::translation(2.0, 0.0, 0.0)),
+                (
+                    3,
+                    60,
+                    Isometry3::from_parts(
+                        Translation3::new(0.6, 0.0, 0.0),
+                        UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI),
+                    ),
+                ),
+                (
+                    4,
+                    61,
+                    Isometry3::from_parts(
+                        Translation3::new(-0.1, 0.0, 0.0),
+                        UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI),
+                    ),
+                ),
+                (
+                    5,
+                    62,
+                    Isometry3::from_parts(
+                        Translation3::new(-0.8, 0.0, 0.0),
+                        UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::PI),
+                    ),
+                ),
+            ] {
+                let mut input = frame(sequence, seconds * 1_000_000_000, 0.0);
+                input.body_points = world.iter().map(|point| pose.inverse() * point).collect();
+                input.registered_cloud.body_points_sha256 =
+                    body_points_sha256(&input.body_points).unwrap();
+                input.correlated_odom.odom_from_body = pose;
+                input.correlated_odom.proof.pose_sha256 = odom_pose_sha256(&pose).unwrap();
+                input.base_anchor_map_from_odom = anchor;
+                // 对照原建图锚点与拥有方候选的公共位姿解释，保留上一校正以覆盖持续偏移。
+                if let Some(candidate) = library.submit_frame(input).unwrap() {
+                    let q = candidate.transform.rotation_xyzw;
+                    effective = anchor
+                        * Isometry3::from_parts(
+                            Translation3::from(nalgebra::Vector3::from(candidate.transform.translation_m)),
+                            UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                                q[3], q[0], q[1], q[2],
+                            )),
+                        );
+                }
+                assert_isometry_close(&(effective * pose), &(anchor * pose));
+                for point in &world {
+                    assert!(
+                        (effective * pose * (pose.inverse() * point) - anchor * point).norm()
+                            < 1e-8
+                    );
+                }
+            }
         }
 
         #[test]

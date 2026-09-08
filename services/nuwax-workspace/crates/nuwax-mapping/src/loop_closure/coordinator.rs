@@ -291,7 +291,12 @@ impl LoopClosureCoordinator {
             .keyframes
             .last_key_value()
             .map(|(id, frame)| (*id, frame.local_pose));
-        let node_id = self.graph.add_node(timestamp.floor() as i64, local_pose);
+        // 图中的节点属于优化坐标；新节点沿上一优化位姿传播原始里程计增量。
+        // 直接写回原始位姿会丢失已有校正，并给下一次优化制造虚假残差。
+        let initial_pose = previous.map_or(local_pose, |(previous_id, previous_pose)| {
+            self.graph.nodes[&previous_id].pose * (previous_pose.inverse() * local_pose)
+        });
+        let node_id = self.graph.add_node(timestamp.floor() as i64, initial_pose);
         if let Some((previous_id, previous_pose)) = previous {
             self.graph.add_edge(PoseEdge::new(
                 previous_id,
@@ -387,8 +392,16 @@ impl LoopClosureCoordinator {
         candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
 
         for (_, historic_id, historic) in candidates {
+            // 两帧点分别属于各自机体坐标，先用里程计相对位姿对齐。
+            // 从单位变换直接匹配会在转向或重复结构中收敛到错误回环。
+            let historic_from_current = historic.local_pose.inverse() * current.local_pose;
+            let seeded_points: Vec<_> = current
+                .points
+                .iter()
+                .map(|point| historic_from_current * point)
+                .collect();
             let registration =
-                IcpSolver::new(self.config.icp).align(&current.points, &historic.points);
+                IcpSolver::new(self.config.icp).align(&seeded_points, &historic.points);
             if registration.converged
                 && registration.mse.is_finite()
                 && registration.mse <= self.config.max_loop_mse
@@ -397,7 +410,8 @@ impl LoopClosureCoordinator {
                 return Some(LoopClosureRecord {
                     from: historic_id,
                     to: current_id,
-                    measurement: registration.transformation,
+                    // 求解器返回历史坐标中的残差，约束须还原为完整机体间变换。
+                    measurement: registration.transformation * historic_from_current,
                     mse: registration.mse,
                 });
             }

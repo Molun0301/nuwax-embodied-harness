@@ -135,13 +135,20 @@ cancel_activation() {
 }
 
 read_request() {
-  IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID MOTION_STOP_GENERATION < <(
+  local request_fields=""
+  local read_status=0
+  if request_fields="$(
     /usr/bin/python3 - "${REQUEST_FILE}" <<'PY'
 import json
 import pathlib
 import sys
 
-payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+try:
+    raw = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+except FileNotFoundError:
+    # 文件删除也会唤醒路径单元；没有待处理请求时保留上一次真实回执。
+    raise SystemExit(3)
+payload = json.loads(raw)
 level = str(payload.get("activation_level") or "motion").strip().lower()
 if level not in {"guard", "geometry", "motion", "person_follow"}:
     raise SystemExit("invalid activation_level: %s" % level)
@@ -163,7 +170,13 @@ if motion_stop_generation < 0:
     raise SystemExit("invalid motion_stop_generation")
 print("%s\t%s\t%s\t%s" % (level, capability, request_id, motion_stop_generation))
 PY
-  )
+  )"; then
+    IFS=$'\t' read -r ACTIVATION_LEVEL CAPABILITY_NAME REQUEST_ID MOTION_STOP_GENERATION <<< "${request_fields}"
+  else
+    read_status=$?
+    [[ "${read_status}" -ne 3 ]] || exit 0
+    return "${read_status}"
+  fi
 }
 
 marker_matches_request() {
@@ -280,9 +293,9 @@ start_unit_if_needed() {
 
 trap fail_activation ERR
 trap 'cancel_activation "runtime activation interrupted"' INT TERM HUP
-mkdir -p "$(dirname "${RESULT_FILE}")"
 LAST_STAGE="request"
 read_request
+mkdir -p "$(dirname "${RESULT_FILE}")"
 check_cancel
 
 if [[ "${ACTIVATION_LEVEL}" == "guard" \

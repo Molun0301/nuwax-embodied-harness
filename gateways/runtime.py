@@ -4,10 +4,12 @@ from core.config_values import runtime_value
 
 import base64
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import IntEnum
 from functools import partial
+import fcntl
 import hashlib
 import json
 import logging
@@ -17,7 +19,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import uuid
 
 import grpc
@@ -346,6 +348,15 @@ _EXPLORATION_STOP_TRANSACTION_CAPACITY = 32
 _EXPLORATION_STOP_TRANSACTION_INIT_LOCK = threading.Lock()
 
 
+class _RuntimeActivationEvent(threading.Event):
+    """只在一次在途启动内共享结果，后续独立请求仍可重新尝试。"""
+
+    def __init__(self, activation_level: str) -> None:
+        super().__init__()
+        self.activation_level = activation_level
+        self.error: Optional[Exception] = None
+
+
 class _ExplorationStopPhase(IntEnum):
     ZEROED = 0
     DISCOVERING = 1
@@ -528,6 +539,29 @@ def _runtime_activation_timeout_sec() -> float:
 
 def _has_observability_value(value: Any) -> bool:
     return value is not None and value != ""
+
+
+@contextmanager
+def _runtime_activation_protocol_lock(request_path: Path) -> Iterator[None]:
+    """串行化同一请求路径的跨进程文件变更，不覆盖服务启动或就绪等待。"""
+
+    lock_path = str(request_path) + ".lock"
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        descriptor = os.open(lock_path, os.O_RDONLY)
+    else:
+        # 激活器和网关可由不同账户创建；只读描述符也能持有当前系统的独占文件锁。
+        try:
+            os.fchmod(descriptor, 0o644)
+        except BaseException:
+            os.close(descriptor)
+            raise
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
@@ -1044,12 +1078,13 @@ class GatewayRuntime:
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
-        # YOLO-World 模型由独立 worker 进程加载；这里只异步编排预热，
-        # 不允许模型启动阻塞 Gateway HTTP 主线程。
+        # 构造只登记检测器，首次感知再加载模型，基础接口不占用推理资源。
         self._prewarm_done = False
         self._prewarm_thread: Optional[threading.Thread] = None
         self._prewarm_lock = threading.Lock()
-        self._start_yolo_prewarm()
+        self.perception_video_runtime.set_prewarm_status(
+            {"status": "deferred", "reason": "on_demand"}
+        )
         self.navigation_service = NavigationService(
             provider_owner=self.platform_geometry_runtime,
             localization_service=self.localization_service,
@@ -1245,13 +1280,6 @@ class GatewayRuntime:
             )
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
-            try:
-                self.person_follow_bridge.start()
-            except Exception:
-                RUNTIME_LOGGER.exception(
-                    "PersonFollow Gateway LCM bridge failed to start; "
-                    "the optional follow capability will remain unavailable."
-                )
             self._started = True
             try:
                 if self.perception_video_runtime.should_auto_start():
@@ -5839,7 +5867,7 @@ class GatewayRuntime:
         }
 
     def _start_yolo_prewarm(self) -> None:
-        """主线程创建 YOLO worker，再异步等待预热完成。"""
+        """显式启动感知时创建推理进程，再异步等待预热完成。"""
         with self._prewarm_lock:
             thread = getattr(self, "_prewarm_thread", None)
             if thread is not None and thread.is_alive():
@@ -10500,18 +10528,19 @@ class GatewayRuntime:
             ack_path = Path(context["ack_path"])
             cancel_path = Path(context["cancel_path"])
             try:
-                ack_path.unlink(missing_ok=True)
-                _write_json_file_atomically(
-                    cancel_path,
-                    {
-                        "request_id": context["request_id"],
-                        "state": "cancel_requested",
-                        "error_code": error_code,
-                        "reason": reason,
-                        "motion_stop_generation": current_generation,
-                        "cancelled_at": utc_now().isoformat(),
-                    },
-                )
+                with _runtime_activation_protocol_lock(Path(context["request_path"])):
+                    ack_path.unlink(missing_ok=True)
+                    _write_json_file_atomically(
+                        cancel_path,
+                        {
+                            "request_id": context["request_id"],
+                            "state": "cancel_requested",
+                            "error_code": error_code,
+                            "reason": reason,
+                            "motion_stop_generation": current_generation,
+                            "cancelled_at": utc_now().isoformat(),
+                        },
+                    )
             except OSError:
                 RUNTIME_LOGGER.exception(
                     "写入按需组件激活取消标记失败 request_id=%s path=%s",
@@ -10543,15 +10572,16 @@ class GatewayRuntime:
                     error_code="activation_cancelled",
                 )
                 raise self._runtime_activation_cancelled_error(context)
-            _write_json_file_atomically(
-                Path(context["ack_path"]),
-                {
-                    "request_id": context["request_id"],
-                    "state": "acknowledged",
-                    "motion_stop_generation": expected_generation,
-                    "acknowledged_at": utc_now().isoformat(),
-                },
-            )
+            with _runtime_activation_protocol_lock(Path(context["request_path"])):
+                _write_json_file_atomically(
+                    Path(context["ack_path"]),
+                    {
+                        "request_id": context["request_id"],
+                        "state": "acknowledged",
+                        "motion_stop_generation": expected_generation,
+                        "acknowledged_at": utc_now().isoformat(),
+                    },
+                )
 
     def _commit_runtime_activation_request(
         self,
@@ -10577,9 +10607,10 @@ class GatewayRuntime:
                     error_code="activation_cancelled",
                 )
                 raise self._runtime_activation_cancelled_error(context)
-            Path(context["request_path"]).unlink(missing_ok=True)
-            Path(context["ack_path"]).unlink(missing_ok=True)
-            Path(context["cancel_path"]).unlink(missing_ok=True)
+            with _runtime_activation_protocol_lock(Path(context["request_path"])):
+                Path(context["request_path"]).unlink(missing_ok=True)
+                Path(context["ack_path"]).unlink(missing_ok=True)
+                Path(context["cancel_path"]).unlink(missing_ok=True)
             self._runtime_activation_context = None
 
     def _cancel_active_motion_tasks(self, reason: str) -> Tuple[str, ...]:
@@ -13234,6 +13265,62 @@ class GatewayRuntime:
             return False, "GeometryRuntimeProvider live GetStatus 失败：%s" % exc
         return bool(ok), str(message or "ready")
 
+    def _wait_for_previous_runtime_activation(
+        self,
+        request_path: Path,
+        result_path: Path,
+        *,
+        deadline: float,
+        context: Dict[str, Any],
+    ) -> None:
+        """等前序拥有方消费提交或取消，不能覆盖仍在收尾的协议文件。"""
+
+        def read_payload(path: Path) -> Dict[str, Any]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return payload if isinstance(payload, dict) else {}
+            except (FileNotFoundError, ValueError):
+                return {}
+
+        while True:
+            expected_generation = context.get("motion_stop_generation")
+            if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
+                raise self._runtime_activation_cancelled_error(context)
+            if getattr(self, "_closed", False):
+                raise GatewayError(
+                    "网关运行时已关闭，不能提交组件激活请求。",
+                    error_code="gateway_runtime_closed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                )
+            with _runtime_activation_protocol_lock(request_path):
+                request_exists = request_path.exists()
+                previous = read_payload(request_path)
+                result = read_payload(result_path)
+                previous_id = str(previous.get("request_id") or "")
+                state = str(result.get("state") or "")
+                settled = state in {"committed", "failed", "cancelled"} and (
+                    not request_exists or not previous_id or result.get("request_id") == previous_id
+                )
+                pending = request_exists or state in {"activating", "prepared", "ready"}
+                if settled or not pending:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayError(
+                    "等待前一次组件激活完成收尾超时，保留原请求供拥有方处理。",
+                    error_code="runtime_activation_timeout",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                    details={
+                        "capability_name": context["capability_name"],
+                        "stage": "previous_activation",
+                        "previous_request_id": previous_id or result.get("request_id"),
+                        "previous_state": state,
+                    },
+                )
+            time.sleep(min(0.05, remaining))
+
     def _request_geometry_runtime_activation(
         self,
         capability_name: str,
@@ -13293,17 +13380,40 @@ class GatewayRuntime:
         request_written = False
         committed = False
         terminal_received = False
+        # 前序收尾期间发生停车也必须使本次旧运动请求失效；暂不接管前序请求上下文。
+        with state_lock:
+            context["motion_stop_generation"] = (
+                self.safety_guard.motion_stop_generation if motion_sensitive else None
+            )
 
         try:
-            with state_lock:
+            self._wait_for_previous_runtime_activation(
+                request_path,
+                result_path,
+                deadline=deadline,
+                context=context,
+            )
+            with state_lock, _runtime_activation_protocol_lock(request_path):
+                expected_generation = context["motion_stop_generation"]
+                if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
+                    raise self._runtime_activation_cancelled_error(context)
+                if getattr(self, "_closed", False):
+                    raise GatewayError(
+                        "网关运行时已关闭，不能提交组件激活请求。",
+                        error_code="gateway_runtime_closed",
+                        http_status=503,
+                        jsonrpc_code=-32010,
+                    )
+                if time.monotonic() >= deadline:
+                    raise GatewayError(
+                        "组件激活期限已耗尽，未提交新请求。",
+                        error_code="runtime_activation_timeout",
+                        http_status=503,
+                        jsonrpc_code=-32010,
+                    )
                 result_path.unlink(missing_ok=True)
                 cancel_path.unlink(missing_ok=True)
                 ack_path.unlink(missing_ok=True)
-                context["motion_stop_generation"] = (
-                    self.safety_guard.motion_stop_generation
-                    if motion_sensitive
-                    else None
-                )
                 self._runtime_activation_context = context
                 _write_json_file_atomically(
                     request_path,
@@ -13454,6 +13564,29 @@ class GatewayRuntime:
         except GatewayMotionGuardError as exc:
             raise self._motion_guard_gateway_error(capability_name, exc) from exc
 
+    def _ensure_person_follow_bridge_started(self) -> None:
+        """首次跟随才创建通信线程，与网关关闭共用既有生命周期边界。"""
+
+        lifecycle_lock = self._lifecycle_lock
+        if not lifecycle_lock.acquire(blocking=False):
+            raise GatewayError(
+                "网关正在启停，当前不能启动跟随通信桥。",
+                error_code="person_follow_unavailable",
+                http_status=503,
+                jsonrpc_code=-32010,
+            )
+        try:
+            if self._closed:
+                raise GatewayError(
+                    "网关运行时已关闭，不能启动跟随通信桥。",
+                    error_code="gateway_runtime_closed",
+                    http_status=503,
+                    jsonrpc_code=-32010,
+                )
+            self.person_follow_bridge.start()
+        finally:
+            lifecycle_lock.release()
+
     def _ensure_geometry_runtime_started(
         self,
         capability_name: str,
@@ -13498,6 +13631,7 @@ class GatewayRuntime:
             input_bridge_ready = not requires_input_bridge or (
                 provider_ready and self._runtime_input_bridge_ready()
             )
+            ensure_activation_deadline()
             if activation_level == "guard" and self.motion_guard.started:
                 return
             with self._geometry_runtime_lock:
@@ -13506,7 +13640,7 @@ class GatewayRuntime:
                     return
                 should_start = event is None
                 if should_start:
-                    event = threading.Event()
+                    event = _RuntimeActivationEvent(activation_level)
                     self._geometry_runtime_start_event = event
             if should_start:
                 break
@@ -13516,18 +13650,24 @@ class GatewayRuntime:
                 if wait_timeout <= 0.0:
                     ensure_activation_deadline()
             event.wait(timeout=wait_timeout)
-            if not event.is_set():
-                ensure_activation_deadline()
-            if activation_level in {"motion", "person_follow"}:
+            ensure_activation_deadline()
+            # 共享同一级别在途请求的结果；较低级别的完成不能代替导航/跟随依赖。
+            if isinstance(event, _RuntimeActivationEvent) and event.activation_level == activation_level:
+                if event.error is not None:
+                    raise event.error
+                if activation_level == "guard":
+                    return
                 provider_ready, _ = self._geometry_runtime_provider_ready(
                     deadline_monotonic=deadline_monotonic,
                 )
-                if provider_ready and self.motion_guard.started and (
+                if provider_ready and (
                     not requires_input_bridge or self._runtime_input_bridge_ready()
                 ):
-                    if activation_level == "motion":
+                    if activation_level != "person_follow":
+                        ensure_activation_deadline()
                         return
-                    if self._person_follow_readiness().ready:
+                    if self._person_follow_readiness().ready and self.person_follow_bridge.started:
+                        ensure_activation_deadline()
                         return
         if should_start:
             try:
@@ -13546,41 +13686,52 @@ class GatewayRuntime:
                         )
                     )
                     if not provider_ready:
-                        ensure_activation_deadline()
-                        runtime_status = self.platform_geometry_runtime.get_runtime_status()
-                        if runtime_status.get("started"):
-                            ensure_activation_deadline()
-                            self._settle_relocalization_owner_before_geometry_stop(
-                                operation="geometry_runtime_restart",
-                            )
-                            ensure_activation_deadline()
-                            if self._stop_runtime_input_bridge() is False:
-                                raise GatewayError(
-                                    "旧输入桥尚未完成关闭，不能更换 Geometry 提供器。",
-                                    error_code="geometry_input_bridge_unavailable",
-                                    http_status=503,
-                                    jsonrpc_code=-32010,
-                                )
-                            self.platform_geometry_runtime.stop()
-                        ensure_activation_deadline()
-                        self.platform_geometry_runtime.start()
-                        provider_ready, provider_message = (
-                            self._geometry_runtime_provider_ready(
-                                deadline_monotonic=deadline_monotonic,
-                            )
-                        )
-                        if not provider_ready:
+                        lifecycle_lock = self._lifecycle_lock
+                        if not lifecycle_lock.acquire(blocking=False):
                             raise GatewayError(
-                                provider_message,
+                                "网关正在启停，当前不能挂接几何提供器。",
                                 error_code="geometry_runtime_unavailable",
                                 http_status=503,
                                 jsonrpc_code=-32010,
-                                details={
-                                    "capability_name": capability_name,
-                                    "activation_level": activation_level,
-                                },
                             )
-                        self._mark_geometry_cmd_vel_sink_unavailable()
+                        try:
+                            ensure_activation_deadline()
+                            runtime_status = self.platform_geometry_runtime.get_runtime_status()
+                            if runtime_status.get("started"):
+                                ensure_activation_deadline()
+                                self._settle_relocalization_owner_before_geometry_stop(
+                                    operation="geometry_runtime_restart",
+                                )
+                                ensure_activation_deadline()
+                                if self._stop_runtime_input_bridge() is False:
+                                    raise GatewayError(
+                                        "旧输入桥尚未完成关闭，不能更换 Geometry 提供器。",
+                                        error_code="geometry_input_bridge_unavailable",
+                                        http_status=503,
+                                        jsonrpc_code=-32010,
+                                    )
+                                self.platform_geometry_runtime.stop()
+                            ensure_activation_deadline()
+                            self.platform_geometry_runtime.start()
+                            provider_ready, provider_message = (
+                                self._geometry_runtime_provider_ready(
+                                    deadline_monotonic=deadline_monotonic,
+                                )
+                            )
+                            if not provider_ready:
+                                raise GatewayError(
+                                    provider_message,
+                                    error_code="geometry_runtime_unavailable",
+                                    http_status=503,
+                                    jsonrpc_code=-32010,
+                                    details={
+                                        "capability_name": capability_name,
+                                        "activation_level": activation_level,
+                                    },
+                                )
+                            self._mark_geometry_cmd_vel_sink_unavailable()
+                        finally:
+                            lifecycle_lock.release()
                     if requires_input_bridge:
                         ensure_activation_deadline()
                         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
@@ -13621,10 +13772,32 @@ class GatewayRuntime:
                                 "person_follow_ready_file": readiness.ready_file,
                             },
                         )
+                    self._ensure_person_follow_bridge_started()
+                ensure_activation_deadline()
+                if requires_geometry:
+                    provider_ready, provider_message = self._geometry_runtime_provider_ready(
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    if not provider_ready or (requires_input_bridge and not self._runtime_input_bridge_ready()):
+                        runtime_status = self.platform_geometry_runtime.get_runtime_status()
+                        raise GatewayError(
+                            (provider_message if not provider_ready else "Geometry 输入桥未绑定当前提供器。")
+                            or str(runtime_status.get("message") or "平台几何运行时未就绪。"),
+                            error_code="geometry_runtime_unavailable",
+                            http_status=503,
+                            jsonrpc_code=-32010,
+                            details={
+                                "capability_name": capability_name,
+                                "activation_level": activation_level,
+                                "runtime_status": runtime_status,
+                            },
+                        )
+                ensure_activation_deadline()
             except Exception as exc:
                 if isinstance(exc, (GatewayError, GeometryRuntimeRpcError)):
+                    event.error = exc
                     raise
-                raise GatewayError(
+                error = GatewayError(
                     "按需启动运行组件失败：%s" % exc,
                     error_code="runtime_component_start_failed",
                     http_status=503,
@@ -13633,31 +13806,14 @@ class GatewayRuntime:
                         "capability_name": capability_name,
                         "activation_level": activation_level,
                     },
-                ) from exc
+                )
+                event.error = error
+                raise error from exc
             finally:
                 with self._geometry_runtime_lock:
                     if self._geometry_runtime_start_event is event:
                         self._geometry_runtime_start_event = None
                     event.set()
-        if not requires_geometry:
-            return
-        provider_ready, provider_message = self._geometry_runtime_provider_ready(
-            deadline_monotonic=deadline_monotonic,
-        )
-        if not provider_ready or (requires_input_bridge and not self._runtime_input_bridge_ready()):
-            runtime_status = self.platform_geometry_runtime.get_runtime_status()
-            raise GatewayError(
-                (provider_message if not provider_ready else "Geometry 输入桥未绑定当前提供器。")
-                or str(runtime_status.get("message") or "平台几何运行时未就绪。"),
-                error_code="geometry_runtime_unavailable",
-                http_status=503,
-                jsonrpc_code=-32010,
-                details={
-                    "capability_name": capability_name,
-                    "activation_level": activation_level,
-                    "runtime_status": runtime_status,
-                },
-            )
 
     def _ensure_geometry_runtime_for_capability(
         self,

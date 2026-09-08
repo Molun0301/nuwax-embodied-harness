@@ -53,7 +53,31 @@ rollback_started_units() {
 }
 
 cleanup_protocol_files() {
-  rm -f "${REQUEST_FILE}" "${ACK_FILE}" "${CANCEL_FILE}"
+  # 与网关写入共用短文件锁，旧激活不得删除已替换进来的下一请求或标记。
+  /usr/bin/python3 - "${REQUEST_FILE}" "${REQUEST_ID}" "${ACK_FILE}" "${CANCEL_FILE}" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+
+request, request_id, ack, cancel = sys.argv[1:]
+try:
+    descriptor = os.open(request + ".lock", os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
+except FileExistsError:
+    descriptor = os.open(request + ".lock", os.O_RDONLY)
+else:
+    os.fchmod(descriptor, 0o644)
+protocol_lock = os.fdopen(descriptor, "r")
+fcntl.flock(protocol_lock, fcntl.LOCK_EX)
+for value in (request, ack, cancel):
+    path = Path(value)
+    try:
+        if str(json.loads(path.read_text(encoding="utf-8")).get("request_id") or "") == request_id:
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
+PY
 }
 
 capture_unit_failure() {
@@ -318,4 +342,6 @@ if ! wait_for_gateway_commit; then
 fi
 
 trap - ERR INT TERM HUP
-rm -f "${ACK_FILE}" "${CANCEL_FILE}"
+cleanup_protocol_files
+LAST_STAGE="committed"
+write_result committed "Gateway commit confirmed; runtime activation transaction completed"

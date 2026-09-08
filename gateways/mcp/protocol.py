@@ -283,26 +283,43 @@ def _tool_catalog_item(runtime: GatewayRuntime, descriptor: SkillDescriptor, lay
     }
 
 
-def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def _build_collection_catalogs(
+    runtime: GatewayRuntime,
+    *,
+    tool_names: Optional[Tuple[str, ...]] = None,
+    refresh_availability: bool = True,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     catalogs: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in _MCP_COLLECTIONS}
-    refresh_availability = getattr(runtime, "_refresh_dynamic_capability_matrix", None)
-    if callable(refresh_availability):
-        refresh_availability()
+    refresh = getattr(runtime, "_refresh_dynamic_capability_matrix", None)
+    if refresh_availability and callable(refresh):
+        refresh()
     descriptors = runtime.skill_registry.list_descriptors()
+    get_availability = getattr(runtime.capability_registry, "get_availability", None)
+    robot_model = getattr(
+        getattr(getattr(runtime, "robot", None), "manifest", None),
+        "robot_model",
+        None,
+    )
     for descriptor in descriptors:
+        # 调用只读取候选能力，避免为无关工具重复查询支持矩阵和组装参数模式。
+        if tool_names is not None and descriptor.name not in tool_names:
+            continue
+        if not descriptor.exposed_to_agent:
+            continue
+        layer = _tool_layer(descriptor)
+        collection_name = next(
+            (name for name, config in _MCP_COLLECTIONS.items() if layer in config["layers"]),
+            None,
+        )
+        if collection_name is None:
+            continue
         try:
             registration = runtime.capability_registry.get_registration(descriptor.capability_name)
         except Exception:
             continue
         if not registration.runnable:
             continue
-        get_availability = getattr(runtime.capability_registry, "get_availability", None)
         if callable(get_availability):
-            robot_model = getattr(
-                getattr(getattr(runtime, "robot", None), "manifest", None),
-                "robot_model",
-                None,
-            )
             try:
                 availability = get_availability(
                     descriptor.capability_name,
@@ -312,13 +329,7 @@ def _build_collection_catalogs(runtime: GatewayRuntime) -> Dict[str, Dict[str, D
                 continue
             if not availability.supported:
                 continue
-        if not descriptor.exposed_to_agent:
-            continue
-        layer = _tool_layer(descriptor)
-        for collection_name, config in _MCP_COLLECTIONS.items():
-            if layer in config["layers"]:
-                catalogs[collection_name][descriptor.name] = _tool_catalog_item(runtime, descriptor, layer)
-                break
+        catalogs[collection_name][descriptor.name] = _tool_catalog_item(runtime, descriptor, layer)
     return catalogs
 
 
@@ -414,8 +425,9 @@ def _resolve_tool_invocation(
     if tool_name in _MCP_COLLECTIONS:
         return _resolve_collection_call(runtime, tool_name, arguments)
 
-    catalogs = _build_collection_catalogs(runtime)
     target_name = _MCP_STANDALONE_TOOL_TARGETS.get(tool_name)
+    candidates = (tool_name,) if target_name is None else (tool_name, target_name)
+    catalogs = _build_collection_catalogs(runtime, tool_names=candidates)
     if target_name is not None and target_name in catalogs["platform"]:
         item = catalogs["platform"][target_name]
         schema = (
@@ -553,10 +565,9 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             http_status=422,
             jsonrpc_code=-32602,
         )
-    catalog = _build_collection_catalogs(runtime)[collection_name]
     _validate_closed_schema(
         arguments,
-        _build_collection_input_schema(catalog),
+        _build_collection_input_schema({}),
         path="arguments",
     )
     function_name = str(arguments.get("function", "")).strip()
@@ -577,7 +588,10 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             http_status=422,
             jsonrpc_code=-32602,
         )
+    catalog = _build_collection_catalogs(runtime, tool_names=(function_name,))[collection_name]
     if function_name not in catalog:
+        # 错误诊断需要完整功能清单，复用本次已经刷新的支持矩阵。
+        available_catalog = _build_collection_catalogs(runtime, refresh_availability=False)[collection_name]
         raise GatewayError(
             f"功能 {function_name} 不属于 {collection_name} 集合。",
             error_code="invalid_params",
@@ -586,7 +600,7 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
             details={
                 "collection": collection_name,
                 "function": function_name,
-                "available_functions": sorted(catalog),
+                "available_functions": sorted(available_catalog),
             },
         )
     _validate_closed_schema(
@@ -722,7 +736,13 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         jsonrpc_code=-32602,
                         details={"tool_name": name},
                     )
-                function_name, function_arguments = _resolve_tool_invocation(runtime, name, arguments)
+                # 动态支持检查可能探测后端状态，不能阻塞其他连接的事件循环。
+                function_name, function_arguments = await run_in_threadpool(
+                    _resolve_tool_invocation,
+                    runtime,
+                    name,
+                    arguments,
+                )
                 request_context = _build_mcp_request_context(
                     request,
                     rpc_request_id=request_id,

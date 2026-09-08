@@ -97,6 +97,10 @@ def run(output_dir: Path) -> dict:
                     payload = response.json()
                     if "error" in payload or payload.get("result", {}).get("isError"):
                         raise RuntimeError(json.dumps(payload, ensure_ascii=False))
+                    if method == "tools/call":
+                        result = payload["result"]
+                        if json.loads(result["content"][0]["text"]) != result["structuredContent"]:
+                            raise RuntimeError("MCP文本与结构化结果不完整或不一致")
                     results.append({"method": method, "function": params.get("arguments", {}).get("function"), "passed": True})
                     return payload["result"]
 
@@ -108,6 +112,7 @@ def run(output_dir: Path) -> dict:
                     for function in tool.get("inputSchema", {}).get("properties", {}).get("function", {}).get("enum", [])
                 }
                 for name, arguments in (
+                    ("list_capabilities", {}),
                     ("get_robot_status", {}),
                     ("capture_image", {"camera_id": "front_camera"}),
                     ("perceive_current_scene", {"camera_id": "front_camera", "detector_backend": "metadata_detector"}),
@@ -116,6 +121,14 @@ def run(output_dir: Path) -> dict:
                     ("enable_memory_library", {"library_name": "离线验证地图"}),
                 ):
                     result = rpc("tools/call", {"name": collections[name], "arguments": {"function": name, "parameters": arguments}})
+                    if name == "list_capabilities":
+                        expected = runtime.invoke_tool(name, {}, project_result=False)["result"]
+                        actual = result["structuredContent"]["result"]
+                        for field in ("skills", "capabilities"):
+                            if actual[field] != expected[field]:
+                                raise RuntimeError("MCP能力目录未完整返回：" + field)
+                        results[-1]["capabilities_count"] = len(actual["capabilities"])
+                        results[-1]["skills_count"] = len(actual["skills"])
                     if name == "capture_image":
                         artifact = result["structuredContent"]["result"]["artifact"]
                         response = client.get(artifact["uri"])

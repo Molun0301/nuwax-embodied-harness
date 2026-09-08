@@ -5312,7 +5312,6 @@ class GatewayRuntime:
             snapshot["map_asset_finalize"] = dict(receipt)
             if isinstance(snapshot["result"], dict):
                 snapshot["result"] = {**snapshot["result"], "finalize_pending": False}
-        snapshot = self._slim_task_snapshot(snapshot)
         return self._attach_async_task_polling_advisory(task_id, snapshot)
 
     @staticmethod
@@ -5404,10 +5403,6 @@ class GatewayRuntime:
             advisory["polled_too_soon"] = True
         snapshot["polling_advisory"] = advisory
         snapshot["next_step_hint"] = next_step_hint
-        events = snapshot.get("events")
-        if isinstance(events, list) and len(events) > 3:
-            snapshot["events_truncated"] = True
-            snapshot["events"] = events[-2:]
         return snapshot
 
     @staticmethod
@@ -5745,54 +5740,6 @@ class GatewayRuntime:
             slim["map_asset_bundle"] = self._slim_map_asset_bundle(slim.get("map_asset_bundle"))
         if capability_name == "finalize_active_map" and not slim.get("next_step_hint"):
             slim["next_step_hint"] = "地图 current 资产包已完成。请调用 stop_mapping 停止几何建图栈。"
-        return slim
-
-    @staticmethod
-    def _slim_task_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        events = snapshot.get("events")
-        if isinstance(events, (list, tuple)):
-            snapshot["events"] = [
-                GatewayRuntime._slim_task_event(event)
-                for event in events
-            ]
-        result = snapshot.get("result")
-        if isinstance(result, dict):
-            snapshot["result"] = GatewayRuntime._slim_task_payload(result)
-        return snapshot
-
-    @staticmethod
-    def _slim_task_event(event: Any) -> Any:
-        if not hasattr(event, "model_copy"):
-            return event
-        payload = getattr(event, "payload", None)
-        if not isinstance(payload, dict):
-            return event
-        return event.model_copy(
-            update={"payload": GatewayRuntime._slim_task_payload(payload)},
-            deep=True,
-        )
-
-    @staticmethod
-    def _slim_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-        slim = dict(payload)
-        diagnostics = slim.get("mapping_chain_diagnostics")
-        if isinstance(diagnostics, dict):
-            slim["mapping_chain_diagnostics"] = GatewayRuntime._summarize_mapping_chain_diagnostics(diagnostics)
-        exploration_context = slim.get("exploration_context")
-        if exploration_context is not None:
-            slim["exploration_context"] = GatewayRuntime._slim_exploration_context(exploration_context)
-        if "map_asset_bundle" in slim:
-            slim["map_asset_bundle"] = GatewayRuntime._slim_map_asset_bundle(
-                slim.get("map_asset_bundle")
-            )
-        if "finalized_map_asset" in slim:
-            slim["finalized_map_asset"] = GatewayRuntime._slim_map_asset_bundle(
-                slim.get("finalized_map_asset")
-            )
-        if "active_workspace" in slim:
-            slim["active_workspace"] = GatewayRuntime._slim_workspace(slim.get("active_workspace"))
-        if slim.get("next_step_hint"):
-            slim["next_step_hint"] = str(slim.get("next_step_hint"))
         return slim
 
     @staticmethod

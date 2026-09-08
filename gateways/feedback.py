@@ -12,17 +12,13 @@ from gateways.request_context import categorize_gateway_error
 
 
 MCP_TEXT_MAX_CHARS = 1800
-MCP_STRUCTURED_MAX_BYTES = 24 * 1024
-MCP_RESULT_MAX_BYTES = 32 * 1024
+MCP_RESULT_MAX_BYTES = 16 * 1024 * 1024
 PUBLIC_MESSAGE_MAX_CHARS = 360
 PUBLIC_DETAIL_STRING_MAX_CHARS = 320
 PUBLIC_DETAIL_MAX_ITEMS = 12
 PUBLIC_DETAIL_MAX_DEPTH = 3
 PUBLIC_DETAIL_MAX_BYTES = 6 * 1024
 PUBLIC_DETAIL_MAX_NODES = 160
-MCP_STRUCTURED_MAX_DEPTH = 6
-MCP_STRUCTURED_MAX_ITEMS = 16
-MCP_STRUCTURED_MAX_NODES = 512
 PUBLIC_EVENT_MAX_BYTES = 16 * 1024
 PUBLIC_EVENT_MAX_DEPTH = 5
 PUBLIC_EVENT_MAX_ITEMS = 24
@@ -85,6 +81,8 @@ _NON_RETRYABLE_ERROR_CODES = frozenset(
         "not_found",
         "artifact_not_found",
         "unsupported_mcp_protocol_version",
+        "mcp_result_unavailable",
+        "mcp_response_too_large",
     }
 )
 _INTERNAL_ERROR_CODES = frozenset(
@@ -523,6 +521,8 @@ def _is_internal_error(error_code: str, error_category: str) -> bool:
 
 
 def _public_error_message(error_code: str, error_category: str, message: Any) -> str:
+    if error_code in {"mcp_result_unavailable", "mcp_response_too_large"}:
+        return "无法完整返回MCP数据；工具可能已经执行，请勿自动重复执行操作。"
     if _is_internal_error(error_code, error_category):
         return "工具执行失败，未完成请求。"
     return _public_text(message, PUBLIC_MESSAGE_MAX_CHARS)
@@ -530,6 +530,8 @@ def _public_error_message(error_code: str, error_category: str, message: Any) ->
 
 def _next_action_for_error(error_code: str, *, retryable: bool) -> str:
     code = str(error_code or "").strip().lower()
+    if code in {"mcp_result_unavailable", "mcp_response_too_large"}:
+        return "先核对任务/操作状态；只读查询可缩小范围，已有完整结果或制品地址可单独读取。不要自动重复执行操作。"
     if code in {"authentication_required", "invalid_token"}:
         return "补充有效认证信息后重试。"
     if code in {"access_denied", "forbidden", "capability_not_allowed"}:
@@ -1180,70 +1182,113 @@ def summarize_tool_result(structured: Any) -> str:
     return _public_text("\n".join(lines), MCP_TEXT_MAX_CHARS)
 
 
+def _complete_tool_data(value: Any, *, max_bytes: int) -> Any:
+    """完整转换工具数据并脱敏；无法完整表达时失败，绝不返回裁剪的成功结果。"""
+
+    from gateways.serialization import to_jsonable
+
+    ancestors: set[int] = set()
+    nodes = 0
+    remaining = max_bytes
+
+    def invalid(reason: str) -> GatewayError:
+        return GatewayError(
+            "工具已执行，但返回数据无法完整编码；请勿据此推断操作未执行或自动重试。",
+            error_code="mcp_result_unavailable",
+            http_status=500,
+            jsonrpc_code=-32603,
+            details={"reason": reason},
+        )
+
+    def visit(item: Any, depth: int = 0) -> Any:
+        nonlocal nodes, remaining
+        nodes += 1
+        if depth > 64 or nodes > 300_000:
+            raise invalid("structure_limit")
+        if isinstance(item, Enum):
+            item = item.value
+        if isinstance(item, str):
+            result = _redact_text(item)
+        elif item is None or isinstance(item, (bool, int)):
+            result = item
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise invalid("non_finite_number")
+            result = item
+        elif isinstance(item, (bytes, bytearray, memoryview)):
+            # 二进制应由能力提供制品引用，不能静默替换为长度说明。
+            raise invalid("binary_requires_artifact")
+        else:
+            identity = id(item)
+            if identity in ancestors:
+                raise invalid("cycle")
+            ancestors.add(identity)
+            try:
+                mapping = _shallow_mapping(item)
+                if mapping is not None:
+                    result = {}
+                    for key, child in mapping.items():
+                        public_key = str(key)
+                        if public_key in result:
+                            raise invalid("duplicate_json_key")
+                        remaining -= _json_bytes(public_key) + 1
+                        if remaining < 0:
+                            raise invalid("size_limit")
+                        result[public_key] = visit(
+                            _REDACTED if _SENSITIVE_KEY_RE.search(public_key) else child,
+                            depth + 1,
+                        )
+                    remaining -= 2 + len(result)
+                    return result
+                if isinstance(item, (Sequence, set, frozenset)):
+                    result = [visit(child, depth + 1) for child in item]
+                    remaining -= 2 + len(result)
+                    return result
+                return visit(to_jsonable(item), depth + 1)
+            finally:
+                ancestors.remove(identity)
+        remaining -= _json_bytes(result)
+        if remaining < 0:
+            raise invalid("size_limit")
+        return result
+
+    try:
+        return visit(value)
+    except GatewayError:
+        raise
+    except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+        raise invalid("serialization_failed") from exc
+
+
 def build_mcp_tool_result(
     structured: Any,
     *,
     max_total_bytes: int = MCP_RESULT_MAX_BYTES,
 ) -> Dict[str, Any]:
-    """构造兼容 MCP 的有界结果，保留关键机器字段并明确标记省略内容。"""
+    """文本和结构化通道返回同一完整结果，兼容只读取文本的客户端。"""
 
     total_limit = max(256, min(MCP_RESULT_MAX_BYTES, int(max_total_bytes)))
-    text = summarize_tool_result(structured)
-    is_error = bool(_tool_failure_data(_mapping(structured)))
-    envelope_without_structured: Dict[str, Any] = {
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": None,
-        "isError": is_error,
-    }
-    envelope_bytes = _json_bytes(envelope_without_structured) - _json_bytes(None)
-    structured_budget = min(
-        MCP_STRUCTURED_MAX_BYTES,
-        max(2, total_limit - envelope_bytes),
-    )
-    public_data = compact_public_data(
-        structured,
-        max_depth=MCP_STRUCTURED_MAX_DEPTH,
-        max_items=MCP_STRUCTURED_MAX_ITEMS,
-        max_string_chars=640,
-        max_total_bytes=max(256, structured_budget),
-        max_nodes=MCP_STRUCTURED_MAX_NODES,
-    )
+    public_data = _complete_tool_data(structured, max_bytes=total_limit)
     result: Dict[str, Any] = {
-        "content": [{"type": "text", "text": text}],
+        "content": [{"type": "text", "text": json.dumps(
+            public_data, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+        )}],
         "structuredContent": public_data,
-        "isError": is_error,
+        "isError": bool(_tool_failure_data(_mapping(structured))),
     }
-    if _json_bytes(public_data) > structured_budget:
-        result["structuredContent"] = _projection_fallback(
-            public_data,
-            structured_budget,
-        )
     if _json_bytes(result) > total_limit:
-        result["structuredContent"] = _projection_fallback(
-            result["structuredContent"],
-            max(2, structured_budget // 2),
+        raise GatewayError(
+            "工具已执行，但完整返回超过传输上限；请缩小查询范围或使用完整结果/制品读取接口，不要自动重复执行操作。",
+            error_code="mcp_response_too_large",
+            http_status=500,
+            jsonrpc_code=-32603,
+            details={"max_bytes": total_limit},
         )
-    if _json_bytes(result) > total_limit:
-        original_text = result["content"][0]["text"]
-        low = 0
-        high = len(original_text)
-        best = ""
-        while low <= high:
-            middle = (low + high) // 2
-            candidate = _truncate(original_text, middle)
-            result["content"][0]["text"] = candidate
-            if _json_bytes(result) <= total_limit:
-                best = candidate
-                low = middle + 1
-            else:
-                high = middle - 1
-        result["content"][0]["text"] = best
     return result
 
 
 __all__ = [
     "MCP_RESULT_MAX_BYTES",
-    "MCP_STRUCTURED_MAX_BYTES",
     "MCP_TEXT_MAX_CHARS",
     "PUBLIC_DETAIL_MAX_BYTES",
     "PUBLIC_EVENT_MAX_BYTES",

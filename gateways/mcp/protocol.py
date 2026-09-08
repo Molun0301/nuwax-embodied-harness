@@ -767,6 +767,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                             function_arguments,
                             requested_by="local",
                             request_context=request_context,
+                            project_result=False,
                         )
                     )
                     structured = result
@@ -808,9 +809,8 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 )
                 response_payload = _jsonrpc_result(
                     request_id,
-                    build_mcp_tool_result(
-                        structured,
-                        max_total_bytes=result_budget,
+                    await run_in_threadpool(
+                        lambda: build_mcp_tool_result(structured, max_total_bytes=result_budget)
                     ),
                 )
                 if _json_bytes(response_payload) > MCP_RESULT_MAX_BYTES:

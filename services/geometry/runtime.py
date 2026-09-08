@@ -6313,13 +6313,6 @@ class PlatformGeometryRuntime:
             source_name=str(live_status.get("provider_name") or "geometry_runtime"),
             source_epoch=source_epoch,
             update_sequence=update_sequence,
-            content_sha256=map_content_sha256(
-                map_name=map_name,
-                frame_id=frame_id,
-                occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
-                semantic_map=semantic_map,
-            ),
             frame_id=frame_id,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,

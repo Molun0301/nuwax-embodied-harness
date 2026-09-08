@@ -168,9 +168,26 @@ async def _consume_video_track(
     first_frame: asyncio.Event,
     cancel_requested: threading.Event,
 ) -> None:
+    frames = asyncio.Queue(maxsize=1)
+
+    async def receive_latest() -> None:
+        try:
+            while True:
+                frame = await track.recv()
+                # 接收不等编码；负载上升时只替换尚未编码的旧帧。
+                if frames.full():
+                    frames.get_nowait()
+                frames.put_nowait(frame)
+        except Exception as exc:
+            # 最后一个完整帧仍可消费，随后把真实轨道错误交给已有重连拥有方。
+            await frames.put(exc)
+
+    receiver = asyncio.create_task(receive_latest(), name="go2-video-track-reader")
     try:
         while True:
-            frame = await track.recv()
+            frame = await frames.get()
+            if isinstance(frame, Exception):
+                raise frame
             # 取消时线程池任务无法中断，由 _encode_and_send_frame 在编码结束、
             # 发送开始之前检查 cancel_requested，跳过这一帧即可。
             sent = await _run_blocking(
@@ -188,6 +205,9 @@ async def _consume_video_track(
         raise
     except Exception as exc:
         raise RuntimeError(f"Go2 WebRTC 视频轨道中断: {exc}") from exc
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
 
 
 async def _cancel_and_wait_consumer(

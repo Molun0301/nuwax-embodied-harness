@@ -5,7 +5,7 @@ import uuid
 from typing import Any
 
 from contracts.events import RuntimeEventCategory
-from contracts.runtime_views import MapSnapshot, map_content_sha256
+from contracts.runtime_views import MapSnapshot
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
 from providers import MapProvider
@@ -201,21 +201,6 @@ class MappingService:
             .lower()
             or None
         )
-        if declared_content_sha256:
-            resolved_content_sha256 = declared_content_sha256
-        else:
-            # 兜底：离线资产等场景仍需完整计算
-            resolved_content_sha256 = map_content_sha256(
-                map_name=resolved_map_name,
-                frame_id=self._resolve_snapshot_frame_id(
-                    occupancy_grid,
-                    cost_map,
-                    semantic_map,
-                ),
-                occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
-                semantic_map=semantic_map,
-            )
         for legacy_key in (
             "version_id",
             "revision",
@@ -283,7 +268,49 @@ class MappingService:
                     # 快速去重成功：内容未变，直接返回旧快照
                     return latest
 
-        # 完整去重已被 P2 的轻量级快速去重替代，此处不再需要昂贵的 _normalize_snapshot_value 递归比较
+        # 整图构造、摘要和显示图准备在读取锁外完成；状态读者始终可读取上一份完整图。
+        prepared = MapSnapshot(
+            map_name=resolved_map_name,
+            source_name=source_name,
+            source_epoch=resolved_source_epoch,
+            update_sequence=int(update_sequence_override) if update_sequence_override is not None else 1,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+            metadata=snapshot_metadata,
+            **({"content_sha256": declared_content_sha256} if declared_content_sha256 else {}),
+        )
+        resolved_content_sha256 = prepared.content_sha256
+        prepared_display = None
+        display_annotations = {}
+        if self._stream_bus is not None and stream_occupancy_grid is not None:
+            display_source = str(stream_occupancy_source or "display_override").strip()
+            display_fallback_reason = str(stream_occupancy_fallback_reason or "").strip() or None
+            display_annotations = {
+                "occupancy_view": display_source,
+                "display_occupancy_source": display_source,
+                "display_occupancy_fallback": bool(display_fallback_reason or display_source == "effective_fallback"),
+                "display_occupancy_fallback_reason": display_fallback_reason,
+                "navigation_occupancy_source": "effective",
+                "navigation_occupancy_content_hash": snapshot_metadata.get("occupancy_content_hash"),
+            }
+            display_metadata = {**snapshot_metadata, **dict(stream_occupancy_metadata or {}), **display_annotations}
+            if stream_occupancy_grid is occupancy_grid:
+                prepared_display = prepared.model_copy(update={"metadata": display_metadata})
+            else:
+                prepared_display = MapSnapshot(
+                    timestamp=prepared.timestamp,
+                    map_name=resolved_map_name,
+                    source_name=source_name,
+                    source_epoch=resolved_source_epoch,
+                    update_sequence=1,
+                    frame_id=prepared.frame_id,
+                    occupancy_grid=stream_occupancy_grid,
+                    cost_map=cost_map,
+                    semantic_map=semantic_map,
+                    metadata=display_metadata,
+                )
+
         with self._lock:
             self._require_current_snapshot_source(resolved_map_name, snapshot_metadata)
             sequence_key = (source_name, resolved_source_epoch)
@@ -313,17 +340,10 @@ class MappingService:
                 snapshot_metadata,
                 update_sequence=update_sequence,
             )
-            snapshot = MapSnapshot(
-                map_name=resolved_map_name,
-                source_name=source_name,
-                source_epoch=resolved_source_epoch,
-                update_sequence=update_sequence,
-                content_sha256=resolved_content_sha256,
-                occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
-                semantic_map=semantic_map,
-                metadata={**snapshot_metadata, **frame_metadata},
-            )
+            snapshot = prepared.model_copy(update={
+                "update_sequence": update_sequence,
+                "metadata": {**snapshot_metadata, **frame_metadata},
+            })
             self._latest_snapshot = snapshot
             self._state_store.write(
                 StateNamespace.MAP,
@@ -352,59 +372,16 @@ class MappingService:
             if self._stream_bus is not None:
                 stream_snapshot = snapshot
                 stream_event_payload = dict(event_payload)
-                if stream_occupancy_grid is not None:
-                    effective_metadata = snapshot.metadata
-                    effective_occupancy_hash = effective_metadata.get(
-                        "occupancy_content_hash"
-                    )
-                    display_source = str(
-                        stream_occupancy_source or "display_override"
-                    ).strip()
-                    display_fallback_reason = str(
-                        stream_occupancy_fallback_reason or ""
-                    ).strip() or None
-                    display_annotations = {
-                        "occupancy_view": display_source,
-                        "display_occupancy_source": display_source,
-                        "display_occupancy_fallback": bool(
-                            display_fallback_reason
-                            or display_source == "effective_fallback"
-                        ),
-                        "display_occupancy_fallback_reason": display_fallback_reason,
-                        "navigation_occupancy_source": "effective",
-                        "navigation_occupancy_content_hash": effective_occupancy_hash,
-                    }
-                    display_metadata = {
-                        **effective_metadata,
-                        **dict(stream_occupancy_metadata or {}),
-                        **display_annotations,
-                    }
+                if prepared_display is not None:
+                    display_metadata = {**prepared_display.metadata, **frame_metadata}
                     stream_frame_metadata = self._build_map_frame_metadata(
                         display_metadata,
                         update_sequence=snapshot.update_sequence,
                     )
-                    # 从已封存有效图各取一份防御副本，显示图仍独立计算和验证内容身份。
-                    display_cost_map = snapshot.cost_map
-                    display_semantic_map = snapshot.semantic_map
-                    stream_snapshot = MapSnapshot(
-                        timestamp=snapshot.timestamp,
-                        map_name=snapshot.map_name,
-                        source_name=snapshot.source_name,
-                        source_epoch=snapshot.source_epoch,
-                        update_sequence=snapshot.update_sequence,
-                        frame_id=snapshot.frame_id,
-                        occupancy_grid=stream_occupancy_grid,
-                        cost_map=display_cost_map,
-                        semantic_map=display_semantic_map,
-                        content_sha256=map_content_sha256(
-                            map_name=snapshot.map_name,
-                            frame_id=snapshot.frame_id,
-                            occupancy_grid=stream_occupancy_grid,
-                            cost_map=display_cost_map,
-                            semantic_map=display_semantic_map,
-                        ),
-                        metadata={**display_metadata, **stream_frame_metadata},
-                    )
+                    stream_snapshot = prepared_display.model_copy(update={
+                        "update_sequence": snapshot.update_sequence,
+                        "metadata": {**display_metadata, **stream_frame_metadata},
+                    })
                     stream_event_payload["content_sha256"] = (
                         stream_snapshot.content_sha256
                     )

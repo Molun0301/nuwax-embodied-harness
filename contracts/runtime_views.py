@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from copy import deepcopy
 
 from contracts.compat import StrEnum
 from datetime import datetime
@@ -22,7 +21,7 @@ from contracts.spatial_memory import (
     SemanticRegion as SpatialSemanticRegion,
     SpatialAnchor,
 )
-from typing import List, Mapping, Optional
+from typing import List, Optional
 
 
 class DiagnosticLevel(StrEnum):
@@ -250,12 +249,16 @@ def map_content_sha256(
     """计算排除动态时间戳的确定性地图内容摘要。"""
 
     def normalize(value):
+        if type(value) in (OccupancyGrid, CostMap):
+            # 栅格已通过合同解析，数据直接复用；只递归处理小型几何和元数据字段。
+            fields = value.model_dump(mode="json", exclude={"data", "timestamp"})
+            return {**{key: normalize(inner) for key, inner in fields.items()}, "data": value.data}
         if hasattr(value, "model_dump"):
             value = value.model_dump(mode="json")
         if isinstance(value, dict):
             return {
                 str(key): normalize(inner)
-                for key, inner in sorted(value.items(), key=lambda item: str(item[0]))
+                for key, inner in value.items()
                 if key != "timestamp"
             }
         if type(value) is list:
@@ -293,7 +296,7 @@ class LocalizationSnapshot(TimestampedContract):
 
 
 class MapSnapshot(TimestampedContract):
-    """地图服务快照。"""
+    """地图服务快照；发布后共享只读图层，修改内容须构造下一份快照。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -301,7 +304,7 @@ class MapSnapshot(TimestampedContract):
     source_name: str = Field(description="地图来源名称。")
     source_epoch: str = Field(description="来源生命周期内稳定、跨生命周期变化的作用域标识。")
     update_sequence: int = Field(ge=1, description="source_epoch 作用域内递增的更新序号。")
-    content_sha256: str = Field(description="快照规范内容 SHA-256。")
+    content_sha256: str = Field(default="", description="快照规范内容摘要；构造时未提供则计算一次。")
     frame_id: Optional[str] = Field(default=None, description="地图快照统一消费坐标系。")
     occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")
     cost_map: Optional[CostMap] = Field(default=None, description="代价地图。")
@@ -326,19 +329,13 @@ class MapSnapshot(TimestampedContract):
 
     @model_validator(mode="after")
     def _validate_snapshot_identity(self) -> "MapSnapshot":
-        """先封存输入，再推导统一 frame 并验证内容身份。"""
+        """仅在构造边界核对图层；普通读取和元数据复制不遍历整张地图。"""
 
-        occupancy_grid = deepcopy(object.__getattribute__(self, "occupancy_grid"))
-        cost_map = deepcopy(object.__getattribute__(self, "cost_map"))
-        semantic_map = deepcopy(object.__getattribute__(self, "semantic_map"))
-        metadata = deepcopy(object.__getattribute__(self, "metadata"))
-        object.__setattr__(self, "occupancy_grid", occupancy_grid)
-        object.__setattr__(self, "cost_map", cost_map)
-        object.__setattr__(self, "semantic_map", semantic_map)
-        object.__setattr__(self, "metadata", metadata)
-
-        map_name = object.__getattribute__(self, "map_name")
-        frame_id = object.__getattribute__(self, "frame_id")
+        occupancy_grid = self.occupancy_grid
+        cost_map = self.cost_map
+        semantic_map = self.semantic_map
+        map_name = self.map_name
+        frame_id = self.frame_id
         layers = tuple(
             layer
             for layer in (occupancy_grid, cost_map, semantic_map)
@@ -363,28 +360,11 @@ class MapSnapshot(TimestampedContract):
             cost_map=cost_map,
             semantic_map=semantic_map,
         )
-        if object.__getattribute__(self, "content_sha256") != expected_content_sha256:
+        if not self.content_sha256:
+            object.__setattr__(self, "content_sha256", expected_content_sha256)
+        elif self.content_sha256 != expected_content_sha256:
             raise ValueError("地图快照 content_sha256 与规范内容不一致。")
         return self
-
-    def __getattribute__(self, name: str):
-        value = super().__getattribute__(name)
-        if name in {"occupancy_grid", "cost_map", "semantic_map", "metadata"}:
-            return deepcopy(value)
-        return value
-
-    def model_copy(
-        self,
-        *,
-        update: Optional[Mapping[str, object]] = None,
-        deep: bool = False,
-    ) -> "MapSnapshot":
-        payload = self.model_dump(mode="python")
-        if deep:
-            payload = deepcopy(payload)
-        changes = dict(update or {})
-        payload.update(deepcopy(changes) if deep else changes)
-        return type(self).model_validate(payload)
 
 
 class NavigationContext(TimestampedContract):

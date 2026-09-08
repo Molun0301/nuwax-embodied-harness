@@ -52,7 +52,7 @@ class OccupancyGrid(TimestampedContract):
     def _validate_grid(self) -> "OccupancyGrid":
         if len(self.data) != self.width * self.height:
             raise ValueError("OccupancyGrid 的 data 长度必须等于 width * height。")
-        if any(value < -1 or value > 100 for value in self.data):
+        if min(self.data, default=0) < -1 or max(self.data, default=0) > 100:
             raise ValueError("OccupancyGrid 的栅格取值必须在 -1 到 100 之间。")
         return self
 

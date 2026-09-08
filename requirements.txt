@@ -22,6 +22,7 @@ pydantic==2.10.6
 jsonschema==4.19.2
 fastapi==0.115.14
 uvicorn==0.30.6
+uvloop==0.21.0; sys_platform != "win32"
 httpx==0.27.2
 openai==1.60.2
 # Rust 桥（geometry 主链）gRPC 客户端依赖：

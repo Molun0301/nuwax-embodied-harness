@@ -22,6 +22,7 @@ import mmap
 import os
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -47,9 +48,11 @@ class VideoShmReader:
         self._backing_identity: Optional[Tuple[int, int, int]] = None
         self._last_identity: Optional[Tuple[bytes, int]] = None
         self._last_seq: int = 0
+        self._next_mapping_check_at = 0.0
 
     def open(self) -> bool:
         with self._lock:
+            self._next_mapping_check_at = 0.0
             return self._ensure_mapping()
 
     def close(self) -> None:
@@ -81,6 +84,7 @@ class VideoShmReader:
         self._mm = None
         self._fd = None
         self._backing_identity = None
+        self._next_mapping_check_at = 0.0
         if reset_identity:
             self._last_identity = None
             self._last_seq = 0
@@ -88,8 +92,11 @@ class VideoShmReader:
 
     def _ensure_mapping(self) -> bool:
         """把路径原子切换到当前 inode，并保留其 fd 与映射。"""
-        # 稳定帧路径只需检查路径身份；仅在 inode 或大小变化时重新打开 fd。
+        now = time.monotonic()
+        # 发布头逐帧读取，文件替换每250毫秒检查一次；正常取帧不反复进入文件系统。
         if self._fd is not None and self._backing_identity is not None:
+            if now < self._next_mapping_check_at:
+                return True
             try:
                 stat_result = os.stat(self._path)
                 current_identity = (
@@ -101,6 +108,7 @@ class VideoShmReader:
                 self._drop_mapping(reset_identity=True)
                 return False
             if current_identity == self._backing_identity:
+                self._next_mapping_check_at = now + 0.25
                 return True
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -141,38 +149,11 @@ class VideoShmReader:
         self._mm = candidate_mm
         self._fd = candidate_fd
         self._backing_identity = candidate_identity
+        self._next_mapping_check_at = now + 0.25
         self._last_identity = None
         self._last_seq = 0
         self._close_resources(old_mm, old_fd)
         return True
-
-    def _pread_exact(self, size: int, offset: int) -> Optional[bytes]:
-        """通过稳定 fd 读取，避免并发截断 mmap 时触发不可捕获的 SIGBUS。"""
-        fd = self._fd
-        if fd is None or size < 0 or offset < 0:
-            return None
-        if size == 0:
-            return b""
-        try:
-            # 正常 regular-file 读取通常一次完成，直接返回 os.pread 结果，
-            # 避免每个视频帧都创建 chunks 列表并 join 一次。
-            first = os.pread(fd, size, offset)
-            if len(first) == size:
-                return first
-            if not first:
-                return None
-            snapshot = bytearray(size)
-            snapshot[: len(first)] = first
-            filled = len(first)
-            while filled < size:
-                chunk = os.pread(fd, size - filled, offset + filled)
-                if not chunk:
-                    return None
-                snapshot[filled : filled + len(chunk)] = chunk
-                filled += len(chunk)
-            return bytes(snapshot)
-        except OSError:
-            return None
 
     @staticmethod
     def _parse_header(header: bytes) -> Optional[Tuple[bytes, int, int, int, int]]:
@@ -209,11 +190,11 @@ class VideoShmReader:
         with self._lock:
             if not self._ensure_mapping():
                 return None
-
+            # 写者先创建定长文件再原子发布；重启替换 inode，不原地截断已发布文件。
+            # 直接复制映射，避免三次 pread 释放解释器锁后被整图处理拖过一个视频周期。
+            mm = self._mm
             for _ in range(3):
-                backing_before = self._backing_identity
-                header_before = self._pread_exact(HEADER_SIZE, 0)
-                parsed = self._parse_header(header_before or b"")
+                parsed = self._parse_header(mm[:HEADER_SIZE])
                 if parsed is None:
                     return None
                 generation, seq, frame_size, timestamp_ns, active_buf = parsed
@@ -224,23 +205,12 @@ class VideoShmReader:
                     return None
 
                 buf_offset = HEADER_SIZE + active_buf * MAX_FRAME_SIZE
-                data = self._pread_exact(frame_size, buf_offset)
-                if data is None:
-                    self._drop_mapping(reset_identity=True)
-                    return None
-
-                header_after = self._pread_exact(HEADER_SIZE, 0)
-                parsed_after = self._parse_header(header_after or b"")
+                data = mm[buf_offset : buf_offset + frame_size]
+                parsed_after = self._parse_header(mm[:HEADER_SIZE])
                 if parsed_after is None:
                     continue
                 generation_after, seq_after, _, _, _ = parsed_after
                 if generation_after != generation or seq_after != seq:
-                    continue
-
-                # 替换路径后不能把旧 inode 上的一致帧交给新一代消费者。
-                if not self._ensure_mapping():
-                    return None
-                if self._backing_identity != backing_before:
                     continue
 
                 self._last_identity = frame_identity
@@ -253,19 +223,12 @@ class VideoShmReader:
         with self._lock:
             if not self._ensure_mapping():
                 return False
-            backing_before = self._backing_identity
-            header_before = self._pread_exact(HEADER_SIZE, 0)
-            parsed = self._parse_header(header_before or b"")
+            # 就绪探测只读发布头；不因探测期间到达下一帧而误报视频不可用。
+            parsed = self._parse_header(self._mm[:HEADER_SIZE])
             if parsed is None:
                 return False
             generation, seq, frame_size, _, active_buf = parsed
             if not self._bounds_are_valid(frame_size, active_buf):
-                return False
-            header_after = self._pread_exact(HEADER_SIZE, 0)
-            parsed_after = self._parse_header(header_after or b"")
-            if parsed_after is None or parsed_after[:2] != (generation, seq):
-                return False
-            if not self._ensure_mapping() or self._backing_identity != backing_before:
                 return False
             return (generation, seq) != self._last_identity
 

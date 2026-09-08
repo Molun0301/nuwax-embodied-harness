@@ -1056,6 +1056,7 @@ install_sources() {
   ensure_gateway_device_groups
   secure_runtime_config_permissions
   apply_systemd_tmpfiles /usr/lib/tmpfiles.d/nuwax-motion.conf
+  bash "${REPO_ROOT}/scripts/configure_realtime_network.sh"
   secure_runtime_data_permissions
   bash "${LCM_PREFLIGHT}"
   check_service_access

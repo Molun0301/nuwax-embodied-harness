@@ -5782,9 +5782,9 @@ class GeometryRuntimeProvider:
                 "occupancy data size mismatch: expected=%d actual=%d"
                 % (expected_size, len(data))
             )
-        decoded = [value if value <= 100 else value - 256 for value in data]
-        if any(value < -1 or value > 100 for value in decoded):
-            raise ValueError("occupancy data contains values outside [-1, 100]")
+        # 原生栅格已经是有符号字节，批量解码，值域只在合同构造边界检查一次。
+        import numpy as np
+        decoded = np.frombuffer(data, dtype=np.int8).tolist()
         frame_id = str(frame_id or "map").strip().lstrip("/") or "map"
         map_name = str(map_name or "").strip()
         if not map_name:
@@ -5946,7 +5946,7 @@ class GeometryRuntimeProvider:
 
     def _map_update_to_payload(self, update) -> Dict[str, Any]:
         """校验 MapUpdateNotification 并构造 MappingService 可消费 payload。"""
-
+        import numpy as np
         meta = update.meta
         data = bytes(update.data)
         declared_size = int(update.size)
@@ -5982,8 +5982,9 @@ class GeometryRuntimeProvider:
             data=data,
         )
         revision = int(meta.revision)
-        known_cell_count = sum(1 for value in grid.data if value >= 0)
-        occupied_cell_count = sum(1 for value in grid.data if value >= 50)
+        cells = np.frombuffer(data, dtype=np.int8)
+        known_cell_count = int(np.count_nonzero(cells >= 0))
+        occupied_cell_count = int(np.count_nonzero(cells >= 50))
         display_grid = grid
         display_revision = revision
         display_occupancy_source = "effective_fallback"
@@ -6029,12 +6030,9 @@ class GeometryRuntimeProvider:
             display_known_cell_count = known_cell_count
             display_occupied_cell_count = occupied_cell_count
         else:
-            display_known_cell_count = sum(
-                1 for value in display_grid.data if value >= 0
-            )
-            display_occupied_cell_count = sum(
-                1 for value in display_grid.data if value >= 50
-            )
+            display_cells = np.frombuffer(raw_data, dtype=np.int8)
+            display_known_cell_count = int(np.count_nonzero(display_cells >= 0))
+            display_occupied_cell_count = int(np.count_nonzero(display_cells >= 50))
         display_occupancy_metadata = {
             "checksum": display_checksum,
             "occupancy_content_hash": display_checksum,
@@ -6101,7 +6099,8 @@ class GeometryRuntimeProvider:
                     "map update mapping identity mismatch: expected=%r actual=%r"
                     % (self._mapping_identity, identity)
                 )
-            self._last_occupancy_grid = grid.model_copy(deep=True)
+            # 与地图服务共享本次已发布的只读图层，不在状态锁内复制整图。
+            self._last_occupancy_grid = grid
             self._last_occupancy_grid_identity = identity
             self._last_occupancy_grid_revision = revision
             delivery_token = self._map_delivery_token_locked()

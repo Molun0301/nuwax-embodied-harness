@@ -53,6 +53,7 @@ _POINT_CLOUD_POSE_HISTORY_SIZE = 256
 _MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
 _NATIVE_IMU_READER_HISTORY_DEPTH = 256
 _NATIVE_CLOUD_READER_HISTORY_DEPTH = 16
+_NATIVE_STATE_SAMPLE_INTERVAL_SEC = 0.05
 
 
 class _HistoryChannelSubscriber:
@@ -738,6 +739,8 @@ class Go2DirectDdsBridge:
         self._latest_imu_source_topic = ""
         self._direct_pose_ready = False
         self._direct_imu_ready = False
+        self._native_state_sample_at = None
+        self._native_state_sample_key = None
         self._reset_stationary_yaw_filter_locked()
         self._invalidate_point_cloud_locked(message)
 
@@ -1112,13 +1115,53 @@ class Go2DirectDdsBridge:
             generation = self._active_generation_snapshot()
         if generation is None:
             return
-        pose = self._build_pose_from_sport_mode_state(message)
-        imu_state = self._build_imu_from_sport_mode_state(message, source_pose=pose)
+        native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
+        canonical_imu_sample = None
+        if native_input:
+            # 原生估计器只需要每条原始惯性；完整设备状态不参与算法输入。
+            stamp = message.stamp
+            source_timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+            raw_imu = message.imu_state
+            try:
+                canonical_imu_sample = adapt_go2_l2_imu(
+                    calibration_profile=self._calibration_profile,
+                    timestamp_ns=source_timestamp_ns,
+                    frame_id=self.config.expected_imu_frame,
+                    accel_mps2=raw_imu.accelerometer,
+                    gyro_rps=raw_imu.gyroscope,
+                    source_sequence=source_timestamp_ns,
+                    registration_state=RegistrationState.SENSOR,
+                )
+            except ValueError:
+                LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
+            if canonical_imu_sample is not None:
+                self._publish_sensor_sample(canonical_imu_sample, generation)
+            now = time.monotonic()
+            state_key = (generation, getattr(message, "mode", None), getattr(message, "gait_type", None))
+            with self._lock:
+                if not self._is_generation_active_locked(generation):
+                    return
+                previous_at = getattr(self, "_native_state_sample_at", None)
+                if (
+                    previous_at is not None
+                    and now - previous_at < _NATIVE_STATE_SAMPLE_INTERVAL_SEC
+                    and state_key == getattr(self, "_native_state_sample_key", None)
+                ):
+                    return
+                self._native_state_sample_at = now
+                self._native_state_sample_key = state_key
+        try:
+            pose = self._build_pose_from_sport_mode_state(message)
+            imu_state = self._build_imu_from_sport_mode_state(message, source_pose=pose)
+        except ValueError:
+            if not native_input:
+                raise
+            LOGGER.debug("设备展示位姿不可用，原生惯性输入继续。", exc_info=True)
+            return
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
         )
-        canonical_imu_sample = None
-        if imu_state is not None:
+        if not native_input and imu_state is not None:
             try:
                 canonical_imu_sample = adapt_go2_l2_imu(
                     calibration_profile=self._calibration_profile,
@@ -1209,7 +1252,7 @@ class Go2DirectDdsBridge:
                 self._latest_imu_source_topic = f"{source_topic}#imu_state" if source_topic else ""
                 callbacks = tuple(self._localization_callbacks.values())
                 delivery_token = self._direct_dds_stop_event
-        if canonical_imu_sample is not None:
+        if canonical_imu_sample is not None and not native_input:
             self._publish_sensor_sample(canonical_imu_sample, generation)
         for callback in callbacks:
             with self._lock:

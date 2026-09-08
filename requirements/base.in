@@ -9,6 +9,8 @@ fastapi==0.115.14
 # 代码直接导入 starlette；0.44.0 仍支持 Python 3.8，并满足 FastAPI 的范围。
 starlette==0.44.0
 uvicorn==0.30.6
+# 原生事件循环减少实时连接的解释器调度开销，仍兼容设备 Python 3.8。
+uvloop==0.21.0; sys_platform != "win32"
 httpx==0.27.2
 openai==1.60.2
 grpcio==1.70.0

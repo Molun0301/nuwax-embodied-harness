@@ -8,9 +8,6 @@ from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
-# 暂时禁用orjson，先验证async_dispatch优化效果
-_HAS_ORJSON = False
-_orjson = None
 import json
 import logging
 import math
@@ -208,13 +205,16 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
 
 
 def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None) -> Optional[object]:
-    """完整校验地图栅格；调用者可复用本次消费已读取的防御副本。"""
+    """共享已验证的规范栅格；原始字典输入仍在编码边界验证。"""
 
     if frame.topic != "map.frame":
         return None
     occupancy_grid = grid if grid is not None else field_value(frame.payload, "occupancy_grid")
     if occupancy_grid is None:
         return None
+    from contracts.maps import OccupancyGrid
+    if isinstance(occupancy_grid, OccupancyGrid):
+        return occupancy_grid.data
     width = (
         occupancy_grid.get("width")
         if isinstance(occupancy_grid, Mapping)
@@ -433,19 +433,40 @@ def _strict_json_dumps(value: object, *, compact: bool = False) -> str:
         depth=0,
     )
 
-    if _HAS_ORJSON:
-        return _orjson.dumps(projected).decode("utf-8")
-    else:
-        return json.dumps(
-            projected,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":") if compact else None,
-        )
+    return json.dumps(
+        projected,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":") if compact else None,
+    )
+
+
+def _stream_json_default(value):
+    """规范实时载荷直接使用模型序列化，不逐字段重复做预算、反射与字符串编码。"""
+    if isinstance(value, StreamFrame):
+        return _stream_frame_values(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (Path, UUID, Decimal)):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+
+def _stream_json_dumps(value) -> str:
+    try:
+        return json.dumps(value, default=_stream_json_default, ensure_ascii=False,
+                          allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        # 非规范诊断对象仍可展示；正常消息不经过整棵对象树的防御投影。
+        return _strict_json_dumps(value, compact=True)
 
 
 async def _send_ws_json(websocket: WebSocket, payload: object) -> None:
-    await websocket.send_text(_strict_json_dumps(payload, compact=True))
+    await websocket.send_text(_stream_json_dumps(payload))
 
 
 def _parse_topics(values: Optional[str]) -> Optional[Tuple[str, ...]]:
@@ -952,7 +973,7 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     """版本2：有界身份/绘制帧头与有符号栅格字节；缺少身份的版本1退出使用。"""
     import numpy as np
 
-    # MapSnapshot 每次读图层都会防御性深拷贝；帧头与栅格共享这一次读取。
+    # 已发布快照按只读共享；帧头与栅格共享同一份输入。
     occupancy_grid = field_value(frame.payload, "occupancy_grid")
     data = _complete_map_occupancy_data(frame, grid=occupancy_grid)
     if data is None:
@@ -974,7 +995,7 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
     payload["occupancy_grid"] = grid
     payload["metadata"] = metadata
     header_frame = frame.model_copy(update={"payload": payload})
-    header = _strict_json_dumps({"type": "stream.frame", "frame": header_frame}, compact=True).encode("utf-8")
+    header = _stream_json_dumps({"type": "stream.frame", "frame": header_frame}).encode("utf-8")
     if len(header) > 64 * 1024:
         raise ValueError("二进制地图头超过64KiB")
     return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
@@ -998,7 +1019,7 @@ def _encode_ws_frame(frame: StreamFrame) -> str | bytes:
             return _encode_map_binary_frame(frame)
         except (TypeError, ValueError, AttributeError):
             pass
-    return _strict_json_dumps({"type": "stream.frame", "frame": frame}, compact=True)
+    return _stream_json_dumps({"type": "stream.frame", "frame": frame})
 
 
 async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame) -> None:
@@ -1153,18 +1174,21 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
             attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
             last_sent_sequence = -1
+            next_frame_at = time.monotonic()
             try:
                 while not await request.is_disconnected():
-                    started_at = time.monotonic()
                     if attached:
                         multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
                         # 与原来每连接一个 reader 等价：同一帧只发一次。
                         if multipart is not None and sequence != last_sent_sequence:
                             last_sent_sequence = sequence
                             yield multipart
-                    elapsed = time.monotonic() - started_at
-                    if elapsed < frame_interval_sec:
-                        await asyncio.sleep(frame_interval_sec - elapsed)
+                    # 按绝对节奏安排下一次读取，晚唤醒不累积到后续每一帧。
+                    next_frame_at += frame_interval_sec
+                    now = time.monotonic()
+                    if now - next_frame_at > frame_interval_sec:
+                        next_frame_at = now
+                    await asyncio.sleep(max(0.0, next_frame_at - now))
             finally:
                 if attached:
                     # 原实现从不关闭 reader，每个连接泄漏一个 fd 和一份 mmap。

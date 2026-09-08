@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import logging
+import sys
 import threading
 import time
 from typing import Dict, Any
@@ -79,6 +80,127 @@ def _should_rate_limit_http_request(path: str, status_code: int, duration_ms: fl
     return path in _LOW_VALUE_HTTP_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_HTTP_PREFIXES)
 
 
+class RequestLoggingMiddleware:
+    """直接包装异步网关接口，流式响应体不经过额外任务和内存队列。"""
+
+    def __init__(self, app, *, request_log_limiter):
+        self.app = app
+        self._request_log_limiter = request_log_limiter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        request_id_context = normalize_request_id(request.headers.get(REQUEST_ID_HEADER))
+        request.state.request_id = request_id_context.request_id
+        request.state.request_id_generated = request_id_context.request_id_generated
+        request.state.request_id_replaced = request_id_context.request_id_replaced
+        request.state.request_id_invalid_reason = request_id_context.request_id_invalid_reason
+
+        with correlation_context(request_id=request_id_context.request_id):
+            start_at = time.perf_counter()
+            method = request.method
+            path = request.url.path
+            client_host = _resolve_client_host(request)
+            base_extra = {
+                "method": method,
+                "path": path,
+                "client_ip": client_host,
+                "request_id": request_id_context.request_id,
+                "request_id_generated": request_id_context.request_id_generated,
+                "request_id_replaced": request_id_context.request_id_replaced,
+            }
+            if request_id_context.request_id_invalid_reason:
+                base_extra["request_id_invalid_reason"] = request_id_context.request_id_invalid_reason
+
+            response_started = False
+
+            async def send_response(message):
+                nonlocal response_started
+                if message["type"] == "http.response.start":
+                    response_started = True
+                    status_code = message["status"]
+                    request_header = REQUEST_ID_HEADER.lower().encode("ascii")
+                    message["headers"] = [
+                        (key, value) for key, value in message.get("headers", [])
+                        if key.lower() != request_header
+                    ] + [(request_header, request_id_context.request_id.encode("ascii"))]
+                    duration_ms = (time.perf_counter() - start_at) * 1000.0
+                    waiting_for_video = (
+                        path == "/streams/video.mjpeg"
+                        and status_code == 503
+                        and getattr(request.state, "error_category", None) == "not_ready"
+                    )
+                    level = logging.INFO
+                    if waiting_for_video:
+                        level = logging.DEBUG
+                    elif status_code >= 500:
+                        level = logging.ERROR
+                    elif status_code >= 400:
+                        level = logging.WARNING
+                    extra = {
+                        **base_extra,
+                        "event": "http.request.completed",
+                        "status_code": status_code,
+                        "duration_ms": duration_ms,
+                        "error_category": getattr(request.state, "error_category", None)
+                        or error_category_from_status(status_code),
+                    }
+                    if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
+                        if level < logging.WARNING:
+                            level = logging.WARNING
+                        extra["slow_request"] = True
+                        extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
+                    if (
+                        waiting_for_video and duration_ms < _HTTP_SLOW_REQUEST_THRESHOLD_MS
+                    ) or _should_rate_limit_http_request(path, status_code, duration_ms):
+                        extra["low_value_request"] = True
+                        extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
+                        self._request_log_limiter.log(
+                            HTTP_LOGGER,
+                            logging.DEBUG,
+                            "HTTP 请求完成",
+                            key=("http_request", method, path, status_code),
+                            interval_sec=_REQUEST_LOG_RATE_LIMIT_SEC,
+                            extra=extra,
+                        )
+                    else:
+                        HTTP_LOGGER.log(level, "HTTP 请求完成", extra=extra)
+                await send(message)
+
+            try:
+                await self.app(scope, receive, send_response)
+            except Exception:
+                if response_started:
+                    raise
+                duration_ms = (time.perf_counter() - start_at) * 1000.0
+                error_category = getattr(request.state, "error_category", None) or "internal"
+                failed_extra = {
+                    **base_extra,
+                    "event": "http.request.failed",
+                    "status_code": 500,
+                    "duration_ms": duration_ms,
+                    "error_category": error_category,
+                }
+                HTTP_LOGGER.exception("HTTP 请求异常", extra=failed_extra)
+                response = JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": {
+                            "code": "internal_error",
+                            "message": "网关内部错误。",
+                            "request_id": request_id_context.request_id,
+                            "error_category": error_category,
+                            "retryable": False,
+                            "next_action": "使用 request_id 在详细日志中定位根因，修正条件后再调用。",
+                        }
+                    },
+                    headers={REQUEST_ID_HEADER: request_id_context.request_id},
+                )
+                await response(scope, receive, send)
+
+
 def create_gateway_app(
     runtime: GatewayRuntime,
     config: NuwaxRobotBridgeConfig,
@@ -123,101 +245,7 @@ def create_gateway_app(
     app.state.access_manager = access_manager
     app.state.agent_tools = agent_tools
 
-    @app.middleware("http")
-    async def _request_logging_middleware(request: Request, call_next):
-        request_id_context = normalize_request_id(request.headers.get(REQUEST_ID_HEADER))
-        request.state.request_id = request_id_context.request_id
-        request.state.request_id_generated = request_id_context.request_id_generated
-        request.state.request_id_replaced = request_id_context.request_id_replaced
-        request.state.request_id_invalid_reason = request_id_context.request_id_invalid_reason
-
-        with correlation_context(request_id=request_id_context.request_id):
-            start_at = time.perf_counter()
-            method = request.method
-            path = request.url.path
-            client_host = _resolve_client_host(request)
-            base_extra = {
-                "method": method,
-                "path": path,
-                "client_ip": client_host,
-                "request_id": request_id_context.request_id,
-                "request_id_generated": request_id_context.request_id_generated,
-                "request_id_replaced": request_id_context.request_id_replaced,
-            }
-            if request_id_context.request_id_invalid_reason:
-                base_extra["request_id_invalid_reason"] = request_id_context.request_id_invalid_reason
-
-            try:
-                response = await call_next(request)
-            except Exception:
-                duration_ms = (time.perf_counter() - start_at) * 1000.0
-                error_category = getattr(request.state, "error_category", None) or "internal"
-                failed_extra = {
-                    **base_extra,
-                    "event": "http.request.failed",
-                    "status_code": 500,
-                    "duration_ms": duration_ms,
-                    "error_category": error_category,
-                }
-                HTTP_LOGGER.exception("HTTP 请求异常", extra=failed_extra)
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": {
-                            "code": "internal_error",
-                            "message": "网关内部错误。",
-                            "request_id": request_id_context.request_id,
-                            "error_category": error_category,
-                            "retryable": False,
-                            "next_action": "使用 request_id 在详细日志中定位根因，修正条件后再调用。",
-                        }
-                    },
-                    headers={REQUEST_ID_HEADER: request_id_context.request_id},
-                )
-
-            response.headers[REQUEST_ID_HEADER] = request_id_context.request_id
-            duration_ms = (time.perf_counter() - start_at) * 1000.0
-            waiting_for_video = (
-                path == "/streams/video.mjpeg"
-                and response.status_code == 503
-                and getattr(request.state, "error_category", None) == "not_ready"
-            )
-            level = logging.INFO
-            if waiting_for_video:
-                level = logging.DEBUG
-            elif response.status_code >= 500:
-                level = logging.ERROR
-            elif response.status_code >= 400:
-                level = logging.WARNING
-            extra = {
-                **base_extra,
-                "event": "http.request.completed",
-                "status_code": response.status_code,
-                "duration_ms": duration_ms,
-                "error_category": getattr(request.state, "error_category", None)
-                or error_category_from_status(response.status_code),
-            }
-            if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
-                if level < logging.WARNING:
-                    level = logging.WARNING
-                extra["slow_request"] = True
-                extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
-            if (
-                waiting_for_video and duration_ms < _HTTP_SLOW_REQUEST_THRESHOLD_MS
-            ) or _should_rate_limit_http_request(path, response.status_code, duration_ms):
-                extra["low_value_request"] = True
-                extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
-                request_log_limiter.log(
-                    HTTP_LOGGER,
-                    logging.DEBUG,
-                    "HTTP 请求完成",
-                    key=("http_request", method, path, response.status_code),
-                    interval_sec=_REQUEST_LOG_RATE_LIMIT_SEC,
-                    extra=extra,
-                )
-            else:
-                HTTP_LOGGER.log(level, "HTTP 请求完成", extra=extra)
-            return response
+    app.add_middleware(RequestLoggingMiddleware, request_log_limiter=request_log_limiter)
 
     @app.exception_handler(GatewayError)
     async def _gateway_error_handler(request: Request, exc: GatewayError) -> JSONResponse:
@@ -290,6 +318,8 @@ def create_gateway_app(
 def create_gateway_app_from_env() -> FastAPI:
     """按环境配置创建宿主机网关应用。"""
 
+    # 网关同时承担高频采集和网络交付；短时间片避免计算线程反复抢占刚唤醒的网页线程。
+    sys.setswitchinterval(0.001)
     set_process_title("nuwax-gateway")
     config = load_config()
     configure_logging(config.logging)

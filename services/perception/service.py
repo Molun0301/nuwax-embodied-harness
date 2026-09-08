@@ -90,10 +90,10 @@ class PerceptionService:
         self._latest_full_by_camera: Dict[str, PerceptionContext] = {}
         self._pipeline_name = pipeline_name
         self._last_detection_overlay_publish_at_by_camera: Dict[str, float] = {}
-        # P1-2：感知全管线无并发保护——process_image 可被后台运行时线程、
-        # FastAPI threadpool 能力调用、memory 到点复核并发触发，模型/跟踪器状态
-        # 在无锁下会竞态损坏。粗粒度串行整条管线（推理本身是吞吐瓶颈）。
+        # 检测/跟踪共享短管线锁，完整分析另行串行；慢分割和几何不占快速检测锁。
         self._pipeline_lock = threading.Lock()
+        self._full_pipeline_lock = threading.Lock()
+        self._latest_frame_timestamp_by_camera = {}
 
     def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
         self._video_frame_sink = video_frame_sink
@@ -133,14 +133,13 @@ class PerceptionService:
     ) -> PerceptionContext:
         """消费标准图像并产出检测、跟踪和场景摘要。
 
-        P1-2：整条管线（检测/分割/几何/跟踪/场景摘要）在一把锁内串行执行，
-        避免后台运行时线程、HTTP threadpool 能力、memory 到点复核并发触发时
-        模型与跟踪器内部状态竞态损坏。
+        检测和跟踪先取得同帧结果，随后独立执行分割、几何与摘要。
+        慢阶段运行时允许后续快速检测继续更新。
         """
 
         # vis-three-fixes AC2.4a：在加锁前后各打点，计算 pipeline_lock_wait_ms。
         requested_at = perf_counter()
-        with self._pipeline_lock:
+        with self._full_pipeline_lock:
             acquired_at = perf_counter()
             return self._process_image_locked(
                 image_frame,
@@ -167,7 +166,7 @@ class PerceptionService:
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
     ) -> PerceptionContext:
-        """process_image 的实际实现，调用方须已持有 _pipeline_lock。"""
+        """完整分析的实现；调用方持有完整分析锁，检测/跟踪独立加锁。"""
 
         from contracts.artifacts import ArtifactRef
         from contracts.image import CameraInfo, ImageFrame
@@ -190,17 +189,31 @@ class PerceptionService:
         stage_duration_ms: Dict[str, float] = {}
         stage_status: Dict[str, str] = {}
 
-        stage_started_at = perf_counter()
-        detection_bundle, detector_spec = self._detector_pipeline.detect(
-            image_frame,
-            camera_info,
-            backend_name=detector_backend_name,
-        )
-        stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
-        stage_status["detector"] = self._provider_stage_status(
-            detector_spec.backend_kind,
-            detection_bundle.metadata,
-        )
+        detector_lock_requested_at = perf_counter()
+        with self._pipeline_lock:
+            lock_wait_ms = (lock_wait_ms or 0.0) + self._elapsed_ms(detector_lock_requested_at)
+            stage_started_at = perf_counter()
+            detection_bundle, detector_spec = self._detector_pipeline.detect(
+                image_frame,
+                camera_info,
+                backend_name=detector_backend_name,
+            )
+            stage_duration_ms["detector"] = self._elapsed_ms(stage_started_at)
+            stage_status["detector"] = self._provider_stage_status(
+                detector_spec.backend_kind,
+                detection_bundle.metadata,
+            )
+
+            stage_started_at = perf_counter()
+            detector_available = stage_status["detector"] in {"completed", "fallback"}
+            tracks = self._tracker_backend.update(
+                image_frame,
+                detections_2d=detection_bundle.detections_2d,
+                detections_3d=detection_bundle.detections_3d,
+                camera_info=camera_info,
+            ) if detector_available else ()
+            stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
+            stage_status["tracker"] = "completed" if detector_available else "skipped_detector_unavailable"
 
         stage_started_at = perf_counter()
         segmentation_bundle = self._segmentation_backend.segment(
@@ -232,17 +245,6 @@ class PerceptionService:
             or detection_bundle.metadata.get("geometry_status")
             or "completed"
         )
-
-        stage_started_at = perf_counter()
-        detector_available = stage_status["detector"] in {"completed", "fallback"}
-        tracks = self._tracker_backend.update(
-            image_frame,
-            detections_2d=detection_bundle.detections_2d,
-            detections_3d=detection_bundle.detections_3d,
-            camera_info=camera_info,
-        ) if detector_available else ()
-        stage_duration_ms["tracker"] = self._elapsed_ms(stage_started_at)
-        stage_status["tracker"] = "completed" if detector_available else "skipped_detector_unavailable"
 
         detections_2d = self._attach_track_ids(detection_bundle.detections_2d, tracks)
 
@@ -342,16 +344,20 @@ class PerceptionService:
                 **source_timestamp_metadata,
             },
         )
-        self._latest_by_camera[context.camera_id] = context
-        self._latest_full_by_camera[context.camera_id] = context
-        self._history.append(context)
-        self._state_store.write(
-            StateNamespace.PERCEPTION,
-            context.camera_id,
-            context,
-            source=source_name or detector_spec.name,
-            metadata={"kind": "latest_perception", "pipeline_name": self._pipeline_name},
-        )
+        with self._pipeline_lock:
+            self._latest_full_by_camera[context.camera_id] = context
+            self._history.append(context)
+            latest_frame_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
+            if latest_frame_time is None or image_frame.timestamp >= latest_frame_time:
+                self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
+                self._latest_by_camera[context.camera_id] = context
+                self._state_store.write(
+                    StateNamespace.PERCEPTION,
+                    context.camera_id,
+                    context,
+                    source=source_name or detector_spec.name,
+                    metadata={"kind": "latest_perception", "pipeline_name": self._pipeline_name},
+                )
         if self._event_bus is not None:
             self._event_bus.publish(
                 self._event_bus.build_event(
@@ -385,7 +391,9 @@ class PerceptionService:
                     },
                 )
             )
-        self._publish_detection_overlay_frame(context)
+        with self._pipeline_lock:
+            if self._latest_by_camera.get(context.camera_id) is context:
+                self._publish_detection_overlay_frame(context)
         return context
 
     def perceive_current_scene(
@@ -670,6 +678,7 @@ class PerceptionService:
                 **source_timestamp_metadata,
             },
         )
+        self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
         self._latest_by_camera[context.camera_id] = context
         self._history.append(context)
         self._state_store.write(

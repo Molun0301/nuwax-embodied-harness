@@ -4,10 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260908-vision-display">
+  <link rel="stylesheet" href="/static/console.css?v=20260908-layout-unification">
 </head>
 <body>
-<button class="tt glass" id="themeToggle" title="切换主题">🌙</button>
 <div class="app" id="app">
   <header class="vitals card">
     <div class="brand">
@@ -29,6 +28,7 @@
       <button class="view-switch-btn" id="viewSwitchLogs" type="button" data-view-target="logs-view">日志</button>
       <button class="view-switch-btn" id="viewSwitchConfig" type="button" data-view-target="config-view">设置</button>
     </div>
+    <button id="themeToggle" type="button" title="切换主题" aria-label="切换亮色或暗色主题">🌙</button>
   </header>
   <div id="view-host">
     <div id="monitor-view" class="view-pane active">
@@ -178,7 +178,7 @@
           <section id="video-perception" class="card panel rise" style="animation-delay:.05s">
             <div class="ph">
               <div class="t"><div class="eyebrow">视觉感知</div><h2>摄像头与识别</h2></div>
-              <div style="display:flex;align-items:center;gap:8px">
+              <div class="panel-actions">
                 <button id="mediaSwapBtnVideo" class="media-swap" type="button" title="地图 / 视频 互换位置与大小">⇄ 放大</button>
                 <span id="videoStatus" class="pill missing">缺失</span>
               </div>
@@ -213,9 +213,9 @@
               </div>
             </div>
           </section>
-          <section class="card panel rise merged-rail" style="animation-delay:.1s;overflow:auto">
+          <section class="card panel rise merged-rail" style="animation-delay:.1s">
             <div class="ph">
-              <div class="t"><div class="eyebrow">Map</div><h2>地图摘要</h2></div>
+              <div class="t"><div class="eyebrow">地图信息</div><h2>地图摘要</h2></div>
               <span id="mapSummaryMode" class="mchip">2D 栅格</span>
             </div>
             <div id="mapMeta" class="kv"></div>
@@ -226,18 +226,18 @@
               <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
             </div>
             <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">Processes</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
+              <div class="dh"><div class="t"><div class="eyebrow">运行进程</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
               <div id="serviceMatrixScope" class="muted small"></div>
               <div class="dscroll"><div id="serviceMatrix" class="rows"></div></div>
             </div>
             <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">Tasks</div><h3>任务状态</h3></div><span id="taskStatus" class="pill missing">缺失</span></div>
+              <div class="dh"><div class="t"><div class="eyebrow">任务执行</div><h3>任务状态</h3></div><span id="taskStatus" class="pill missing">缺失</span></div>
               <div class="dscroll">
                 <div id="taskSummary" class="rows"></div>
               </div>
             </div>
             <div class="dcol">
-              <div class="dh"><div class="t"><div class="eyebrow">Services</div><h3>服务状态</h3></div><span id="governanceStatus" class="pill missing">缺失</span></div>
+              <div class="dh"><div class="t"><div class="eyebrow">平台服务</div><h3>服务状态</h3></div><span id="governanceStatus" class="pill missing">缺失</span></div>
               <div class="dscroll"><div id="governanceMeta" class="service-health-list"></div></div>
             </div>
           </section>
@@ -277,19 +277,19 @@
       <section id="config-section" class="card cfg rise">
         <nav class="cfg-nav" id="configNav"><div class="hd eyebrow">设置分类</div></nav>
         <div class="cfg-main">
-          <div class="card-head" style="padding:14px 16px 0;margin:0">
-            <div class="t"><div class="eyebrow">Configuration</div><h2>平台设置</h2></div>
+          <div class="card-head config-heading">
+            <div class="t"><div class="eyebrow">配置管理</div><h2>平台设置</h2></div>
             <span id="configStatus" class="pill missing">缺失</span>
           </div>
           <div class="config-toolbar">
             <input id="configSearch" class="field" type="search" placeholder="搜索中文名称、键名或说明" aria-label="搜索配置">
-            <label class="small muted" style="display:flex;gap:5px;align-items:center"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
+            <label class="small muted config-option"><input id="configShowAdvanced" type="checkbox">展开高级项</label>
             <button id="configReload" class="btn" type="button">刷新设置</button>
             <button id="configSave" class="btn primary" type="button">保存改动</button>
           </div>
-          <div id="configEffectNote" class="muted small" style="padding:0 16px">仅保存已修改项；保存后需重启网关生效。</div>
+          <div id="configEffectNote" class="muted small config-note">仅保存已修改项；保存后需重启网关生效。</div>
           <div id="configStoragePath" class="muted small config-storage-path"></div>
-          <div id="configDirty" class="muted small" style="padding:0 16px"></div>
+          <div id="configDirty" class="muted small config-note"></div>
           <div id="configSections" class="config-sections"></div>
         </div>
       </section>

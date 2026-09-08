@@ -19,7 +19,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 import uuid
 
 import grpc
@@ -364,6 +364,15 @@ _EXPLORATION_STOP_TRANSACTION_CAPACITY = 32
 _EXPLORATION_STOP_TRANSACTION_INIT_LOCK = threading.Lock()
 
 
+@dataclass(frozen=True)
+class _PendingExplorationAdmission:
+    """仅供后台探索启动使用的请求身份；不包含运动执行许可。"""
+
+    capability_name: str
+    request_id: str
+    motion_stop_generation: int
+
+
 class _RuntimeActivationEvent(threading.Event):
     """只在一次在途启动内共享结果，后续独立请求仍可重新尝试。"""
 
@@ -431,9 +440,10 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
         "initial_wait_sec": 30.0,
         "poll_interval_sec": 15.0,
         "hint": (
-            "explore_area 提交后等待约 30 秒再 get_task_status，之后每 15 秒轮询直至 state=succeeded。"
-            "进度看 frontier_count 与 message，不要查 TF 或触发 relocalize_active_map。"
-            "探索进行中 localization_ready=false 属正常，勿误判卡住。"
+            "explore_area 受理后在后台启动服务、准备地图并等待定位与导航输入，"
+            "约 30 秒后再 get_task_status，之后每 15 秒轮询至任务终态。"
+            "准备阶段看 waiting_for 与 message；accepted 不代表已经开始移动。"
+            "探索进度看 frontier_count，失败时保留具体原因。"
             "用户要求结束探索时请调用独立工具 stop_exploration；建图会话会继续运行。"
         ),
     },
@@ -4113,7 +4123,16 @@ class GatewayRuntime:
             message=f"能力 {descriptor.name} 调用开始。",
         )
         try:
-            if self._requires_motion_admission(descriptor):
+            if descriptor.name in {"explore_area", "explore_area_v2"}:
+                self._ensure_geometry_runtime_for_invoke(capability_name)
+                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
+                    _PendingExplorationAdmission(
+                        capability_name=descriptor.name,
+                        request_id=str(context.get("request_id") or ""),
+                        motion_stop_generation=self.safety_guard.begin_motion_admission(),
+                    )
+                )
+            elif self._requires_motion_admission(descriptor):
                 payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
                     self._admit_motion_request(
                         descriptor.name,
@@ -6074,6 +6093,26 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={"required_parameter": "request_id"},
             )
+        # 准备中的请求尚可能没有后端会话；先取消原任务，由其拥有方完成收尾。
+        # 读取阶段后若恰好进入后端提交，任务仍沿既有定向停车屏障退出。
+        preparing_task_ids = []
+        for status in self.task_manager.list_active_tasks():
+            preparing = status.stage in {
+                "prepare_exploration_runtime", "waiting_exploration_inputs",
+            } or (status.stage == "accepted" and status.state.value == "accepted")
+            if preparing and self._task_matches_exploration_request(status.task_id, request_id):
+                if self.task_manager.cancel_task(status.task_id, reason):
+                    preparing_task_ids.append(status.task_id)
+        if preparing_task_ids:
+            return {
+                "stopped": False,
+                "stop_pending": True,
+                "reason": reason,
+                "request_id": request_id,
+                "cancelled_parent_task_ids": preparing_task_ids,
+                "mapping_stopped": False,
+                "next_step_hint": "已请求取消探索启动；请查询原任务，等待其取消或停止收尾完成。",
+            }
         try:
             context = self._stop_exploration_with_safety_barrier(
                 None,
@@ -7085,16 +7124,22 @@ class GatewayRuntime:
                 jsonrpc_code=-32602,
                 details={"unsupported_parameters": removed_fields},
             )
-        motion_admission = self._require_motion_admission(
-            arguments,
-            capability_name,
-        )
-        map_name, _ = self._resolve_map_workspace_for_request(
-            arguments,
-            capability_name=capability_name,
-            requested_by=requested_by,
-            create_if_missing=True,
-        )
+        motion_admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
+        if not isinstance(motion_admission, _PendingExplorationAdmission):
+            motion_admission = self._require_motion_admission(arguments, capability_name)
+        elif motion_admission.capability_name != capability_name:
+            raise RuntimeError("探索启动请求的能力身份不匹配。")
+        # 受理阶段只固定地图名称；创建、激活及后端等待都由任务拥有。
+        map_name = str(arguments.get("map_name", "")).strip()
+        if not map_name:
+            map_name = self.map_workspace_service.get_active_map_name()
+        if not map_name:
+            raise GatewayError(
+                "请提供 map_name 或先激活地图。",
+                error_code="map_not_activated",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
         if "x" in arguments or "y" in arguments:
@@ -11352,8 +11397,12 @@ class GatewayRuntime:
         capability_name: str,
         *,
         request_id: str,
+        deadline_monotonic: Optional[float] = None,
     ) -> MotionAdmission:
-        self._ensure_geometry_runtime_started(capability_name)
+        self._ensure_geometry_runtime_started(
+            capability_name,
+            **({"deadline_monotonic": deadline_monotonic} if deadline_monotonic is not None else {}),
+        )
         try:
             self._ensure_motion_guard_connected(capability_name)
             stop_generation = self.safety_guard.begin_motion_admission()
@@ -11410,10 +11459,10 @@ class GatewayRuntime:
 
     def _run_with_motion_admission(
         self,
-        admission: MotionAdmission,
+        admission: Union[MotionAdmission, _PendingExplorationAdmission],
         operation: Callable[[], Any],
     ) -> Any:
-        """Run one final motion submission atomically against stop-all."""
+        """按原停车代次原子提交；待准入身份只用于任务受理与空操作复核。"""
 
         try:
             with self.safety_guard.motion_submission(
@@ -12716,11 +12765,57 @@ class GatewayRuntime:
             details=details,
         )
 
+    def _prepare_exploration_mapping(
+        self,
+        context,
+        *,
+        request: ExploreAreaRequest,
+        motion_admission: MotionAdmission,
+        poll_interval_sec: float,
+    ) -> None:
+        """先启动同名建图，等待真实导航输入，再允许提交探索。"""
+
+        deadline = context.timeout_deadline_monotonic()
+        context.ensure_active()
+        self._run_with_motion_admission(motion_admission, lambda: None)
+        self.platform_geometry_runtime.start_mapping(
+            map_name=request.map_name,
+            deadline_monotonic=deadline,
+        )
+        while True:
+            context.ensure_active()
+            self._run_with_motion_admission(motion_admission, lambda: None)
+            provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
+            if provider is None:
+                raise GatewayError(
+                    "探索准备期间几何提供器已断开。",
+                    error_code="geometry_runtime_unavailable",
+                    http_status=503,
+                )
+            readiness = provider.get_navigation_readiness(deadline_monotonic=deadline)
+            context.ensure_active()
+            if readiness.get("ready") is True:
+                return
+            context.update(
+                stage="waiting_exploration_inputs",
+                message=str(readiness.get("message") or "等待建图、定位与导航输入就绪。"),
+                payload={
+                    "request_id": request.request_id,
+                    "waiting_for": readiness.get("reason_code") or "navigation_ready",
+                    "navigation_readiness": readiness,
+                },
+            )
+            remaining = context.timeout_remaining_sec()
+            sleep_sec = min(poll_interval_sec, 0.2)
+            if remaining is not None:
+                sleep_sec = min(sleep_sec, max(0.0, remaining))
+            time.sleep(sleep_sec)
+
     def _submit_exploration_task(
         self,
         *,
         request: ExploreAreaRequest,
-        motion_admission: MotionAdmission,
+        motion_admission: Union[MotionAdmission, _PendingExplorationAdmission],
         poll_interval_sec: float,
         timeout_sec: float,
         requested_by: Optional[str],
@@ -12729,15 +12824,12 @@ class GatewayRuntime:
         capability_name: str = "explore_area",
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
-        request = self._exploration_with_motion_admission(
-            request,
-            motion_admission,
-        )
         poll_interval_sec = max(0.05, poll_interval_sec)
 
-        def runner(context) -> Dict[str, Any]:
+        def runner(context, request=request, motion_admission=motion_admission) -> Dict[str, Any]:
             parent_deadline = context.timeout_deadline_monotonic()
             backend_started = False
+            exploration_start_attempted = False
             perception_attached = False
             finalized = False
             try:
@@ -12746,6 +12838,33 @@ class GatewayRuntime:
                     stage="prepare_exploration_runtime",
                     message="检查并复用探索建图运行时。",
                 )
+                context.ensure_active()
+                if isinstance(motion_admission, _PendingExplorationAdmission):
+                    pending = motion_admission
+                    self._run_with_motion_admission(pending, lambda: None)
+                    motion_admission = self._admit_motion_request(
+                        capability_name,
+                        request_id=pending.request_id,
+                        deadline_monotonic=parent_deadline,
+                    )
+                    # 启动期间的全局停车不能被新取得的许可掩盖。
+                    self._run_with_motion_admission(pending, lambda: None)
+                else:
+                    self._ensure_motion_runtime_for_backend_call(
+                        capability_name,
+                        motion_admission,
+                        deadline_monotonic=parent_deadline,
+                    )
+                context.ensure_active()
+                request = self._exploration_with_motion_admission(request, motion_admission)
+                if request.map_name:
+                    self.map_workspace_service.ensure_workspace(
+                        map_name=request.map_name,
+                        create_if_missing=True,
+                        load_memory_history=True,
+                        reset_memory_library=False,
+                        metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+                    )
                 context.ensure_active()
                 self._refresh_workspace_snapshots()
                 workspace = self.map_workspace_service.get_active_workspace()
@@ -12758,10 +12877,11 @@ class GatewayRuntime:
                     )
                 self._ensure_workspace_memory_library_ready(map_name=request.map_name)
                 context.ensure_active()
-                self._ensure_motion_runtime_for_backend_call(
-                    capability_name,
-                    motion_admission,
-                    deadline_monotonic=parent_deadline,
+                self._prepare_exploration_mapping(
+                    context,
+                    request=request,
+                    motion_admission=motion_admission,
+                    poll_interval_sec=poll_interval_sec,
                 )
                 context.ensure_active()
 
@@ -12777,6 +12897,7 @@ class GatewayRuntime:
                     )
                     return last_context, generation_snapshot
 
+                exploration_start_attempted = True
                 last_context, generation_snapshot = (
                     self._run_with_motion_admission(
                         motion_admission,
@@ -12928,6 +13049,18 @@ class GatewayRuntime:
                         sleep_sec = min(sleep_sec, remaining_sec)
                     time.sleep(sleep_sec)
             except GeometryRuntimeRpcError as exc:
+                if not exploration_start_attempted:
+                    if context.is_cancel_requested() or context.is_timed_out():
+                        context.acknowledge_interrupt_barrier(
+                            {"request_id": request.request_id, "backend_not_started": True}
+                        )
+                        context.ensure_active()
+                    raise GatewayError(
+                        "探索启动准备失败：%s" % exc,
+                        error_code="exploration_preparation_failed",
+                        http_status=503,
+                        details=self._geometry_runtime_rpc_details(exc),
+                    ) from exc
                 self._raise_exploration_rpc_failure_after_barrier(
                     context,
                     error=exc,
@@ -12954,6 +13087,10 @@ class GatewayRuntime:
                 raise
             finally:
                 interrupted = context.is_cancel_requested() or context.is_timed_out()
+                if interrupted and not exploration_start_attempted:
+                    context.acknowledge_interrupt_barrier(
+                        {"request_id": request.request_id, "backend_not_started": True}
+                    )
                 if backend_started and not finalized and not interrupted:
                     try:
                         self._finalize_workspace_assets_after_task(

@@ -2992,7 +2992,8 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
             "producer_runtime_generation": int(
                 lease.producer_runtime_generation
             ),
-            "goal_payload_sha256": bytes(lease.goal_payload_sha256),
+            # 元数据采用可完整编码的字节数组，原恢复入口仍以bytes(...)无损还原。
+            "goal_payload_sha256": list(lease.goal_payload_sha256),
         }
     global_stop_reconciliation = None
     if resp.HasField("global_stop_reconciliation"):
@@ -3006,7 +3007,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
             "admission_guard_generation": int(
                 reconciliation.admission_guard_generation
             ),
-            "admission_guard_boot_nonce": bytes(
+            "admission_guard_boot_nonce": list(
                 reconciliation.admission_guard_boot_nonce
             ),
             "admission_motion_stop_generation": int(

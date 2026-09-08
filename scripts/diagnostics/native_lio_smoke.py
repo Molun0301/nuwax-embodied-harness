@@ -216,7 +216,7 @@ class GatewayMappingSession:
         assert self.runtime._log_stream_handler not in logging.getLogger().handlers
 
 
-def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False):
+def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False, correction_backend="none"):
     root = ROOT
     evidence = output_dir
     # 仅在资源确已退出后删除；清理失败时保留路径供继续处理。
@@ -253,7 +253,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         "NUWAX_GEOMETRY_MAP_FRAME": "map",
         "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
         "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
-        "NUWAX_GEOMETRY_CORRECTION_BACKEND": "none",
+        "NUWAX_GEOMETRY_CORRECTION_BACKEND": correction_backend,
         "NUWAX_LOG_DIR": str(evidence.resolve() / (backend + "组件日志")),
         "NUWAX_LOG_FILE": str(evidence.resolve() / (backend + "组件日志") / "nuwax_robot_bridge.log"),
         "NUWAX_LOG_LEVEL": "INFO",
@@ -347,14 +347,15 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         input_elapsed_s = time.monotonic() - input_started
         deadline = time.monotonic() + 5
         minimum_final_stamp = first_stamp + max(1, frame_count - 5) * 100_000_000
-        # 就绪可能早于最后一批计算，有限等待源时间追上输入，不靠偶然调度通过。
+        # 就绪可能早于最后一批发布/计算，沿原期限等待发布线程排空和源时间推进。
         while True:
             readiness = stub.GetMappingReadiness(pb2.Empty(), timeout=2)
             pose = stub.GetCurrentPose(pb2.PoseRequest(), timeout=2)
             if pose.timestamp_ns >= first_stamp:
                 pose_samples.append([pose.position.x, pose.position.y, pose.position.z])
                 pose_timestamps.append(pose.timestamp_ns)
-            if (readiness.ready and pose.timestamp_ns >= minimum_final_stamp) or time.monotonic() >= deadline:
+            if (readiness.ready and pose.timestamp_ns >= minimum_final_stamp
+                    and bridge.counters.emitted_lio_measurement_count == frame_count) or time.monotonic() >= deadline:
                 break
             time.sleep(.05)
         assert readiness.ready, readiness.message
@@ -397,10 +398,11 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             assert stopped.get("stopped") is True and stopped.get("mapping_active") is False, stopped
             assert stopped.get("sidecar_kept_alive") is True, stopped
             (evidence / (backend + "MCP建图结果.json")).write_text(json.dumps({
-                "synthetic": True, "backend": backend, "map_snapshot": snapshot,
+                "synthetic": True, "backend": backend, "correction_backend": correction_backend, "map_snapshot": snapshot,
                 "active_map": active, "stop_mapping": stopped, "checks": gateway.calls,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps({"synthetic": True, "backend": backend, "control_plane": "http_mcp" if gateway_mode else "grpc",
+        print(json.dumps({"synthetic": True, "backend": backend, "correction_backend": correction_backend,
+            "control_plane": "http_mcp" if gateway_mode else "grpc",
             "sent_frames": bridge.counters.emitted_lio_measurement_count,
             "input_elapsed_s": input_elapsed_s,
             "publish_mean_ms": float(np.mean(publish_latencies)),
@@ -460,6 +462,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, help="保留原生日志；未设置时使用自动清理的临时目录")
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument("--gateway", action="store_true", help="通过真实HTTP/MCP创建、激活与控制建图")
+    parser.add_argument("--correction-backend", choices=("none", "library_pgo", "native_pgo"), default="none", help="选择实际校正后端，核对原生定位与位姿图优化组合")
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error("--frames 必须大于零")
@@ -474,7 +477,7 @@ def main():
             executable = args.executable or ROOT / ("services/nuwax-workspace/crates/nuwax-lio-backends/native/%s/cpp/result/bin/%s_native" % (backend, backend))
             if not executable.is_file():
                 parser.error("原生程序尚未构建：%s" % executable)
-            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway)
+            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway, args.correction_backend)
 
 
 if __name__ == "__main__":

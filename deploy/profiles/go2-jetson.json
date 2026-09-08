@@ -109,7 +109,8 @@
         "bin": "nuwax-nav-stack",
         "features": [
           "simple-2d",
-          "replanning-astar"
+          "replanning-astar",
+          "mls"
         ],
         "output": "services/nuwax-workspace/target/release/nuwax-nav-stack"
       },

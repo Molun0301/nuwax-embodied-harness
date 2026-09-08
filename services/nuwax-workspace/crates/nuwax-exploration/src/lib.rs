@@ -31,6 +31,9 @@ use thiserror::Error;
 
 pub mod conversions;
 
+#[cfg(feature = "surface")]
+pub mod surface_adapter;
+
 #[cfg(all(feature = "runtime", feature = "tare"))]
 pub mod tare_adapter;
 #[cfg(all(feature = "runtime", feature = "wavefront"))]
@@ -91,7 +94,7 @@ impl From<ExploreError> for NavResult<()> {
 pub enum ExplorationStopReason {
     /// 连续无信息增益
     NoInformationGain,
-    /// BFS 找不到可达 free cell
+    /// 机器人起点没有可通行的自由区域，属于输入或通行条件失败。
     NoReachableFreeSpace,
     /// 连续失败次数超限
     ConsecutiveFailuresExceeded,
@@ -126,15 +129,14 @@ impl ExplorationStopReason {
     pub fn terminal_kind(self) -> ExplorationTerminalKind {
         match self {
             Self::NoInformationGain
-            | Self::NoReachableFreeSpace
             | Self::CoverageReached
             | Self::NoFrontierTimeout
             | Self::DurationExceeded
             | Self::MaxGoalsReached => ExplorationTerminalKind::Succeeded,
             Self::UserCancelled => ExplorationTerminalKind::Cancelled,
-            Self::ConsecutiveFailuresExceeded | Self::MapRevisionChanged => {
-                ExplorationTerminalKind::Failed
-            }
+            Self::NoReachableFreeSpace
+            | Self::ConsecutiveFailuresExceeded
+            | Self::MapRevisionChanged => ExplorationTerminalKind::Failed,
         }
     }
 }
@@ -322,8 +324,7 @@ fn segments_intersect(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
 
 /// controller 单次 `poll_next_goal` 输出
 ///
-/// 按方案 §8.2:`Goal / Pending / Stop / SourceUnavailable`。
-/// 不再以 `Option<FrontierGoal>` 隐式表达 pending / no-gain / stop。
+/// 明确区分已选择目标、工作等待、有效输入上的无前沿、停止和输入不可用。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExplorationPoll {
     /// 当前 source 已经选择出 frontier goal
@@ -331,6 +332,8 @@ pub enum ExplorationPoll {
     /// 当前 source 暂时没有可用 goal(`HighestScore` 与 `FirstAvailable` 之下
     /// 会继续 fallback 或继续扫描其它 source)
     Pending,
+    /// 已检查有效输入，当前没有可达且未排除的前沿目标。
+    NoFrontier,
     /// 当前 source / controller 发出停止信号;controller 立即结束本轮 exploration,
     /// 释放 active,不 fallback 到其它 source
     Stop(ExplorationStopReason),
@@ -629,6 +632,7 @@ impl ExplorationController {
         let order = self.arbitration_order();
         let mut best_goal: Option<(f32, usize, FrontierGoal)> = None;
         let mut any_pending = false;
+        let mut any_no_frontier = false;
         let mut any_unavailable = false;
         let mut last_unavailable: Option<String> = None;
 
@@ -683,6 +687,11 @@ impl ExplorationController {
                     self.last_source_diag
                         .push(diag_for(&*self.sources[idx], None, None));
                 }
+                ExplorationPoll::NoFrontier => {
+                    any_no_frontier = true;
+                    self.last_source_diag
+                        .push(diag_for(&*self.sources[idx], None, None));
+                }
                 ExplorationPoll::SourceUnavailable(reason) => {
                     any_unavailable = true;
                     last_unavailable = Some(reason);
@@ -721,6 +730,8 @@ impl ExplorationController {
             }
         } else if any_pending {
             Ok(ExplorationPoll::Pending)
+        } else if any_no_frontier {
+            Ok(ExplorationPoll::NoFrontier)
         } else {
             // 没有任何 source 被询问(空 sources 情况下 begin 已被 NoSources 截断;此处兜底)
             Ok(ExplorationPoll::Pending)
@@ -852,6 +863,7 @@ mod tests {
         name: Cow<'static, str>,
         active: bool,
         diag: ExplorationSourceDiagnostics,
+        poll: ExplorationPoll,
     }
 
     impl DummySource {
@@ -859,6 +871,7 @@ mod tests {
             Self {
                 name: Cow::Borrowed(name),
                 active: false,
+                poll: ExplorationPoll::Pending,
                 diag: ExplorationSourceDiagnostics {
                     source_name: name.to_string(),
                     is_active: false,
@@ -887,7 +900,7 @@ mod tests {
             &mut self,
             _state: &ExplorationStateSnapshot<'_>,
         ) -> ExploreResult<ExplorationPoll> {
-            Ok(ExplorationPoll::Pending)
+            Ok(self.poll.clone())
         }
         fn diagnostics(&self) -> ExplorationSourceDiagnostics {
             self.diag.clone()
@@ -901,6 +914,30 @@ mod tests {
         ctrl.add_source(DummySource::new("wavefront"));
         let order = ctrl.arbitration_order();
         assert_eq!(order.first().copied(), Some(1));
+    }
+
+    #[test]
+    fn controller_reports_no_frontier_only_when_no_source_is_waiting_or_unavailable() {
+        for (other_poll, expected) in [
+            (ExplorationPoll::NoFrontier, ExplorationPoll::NoFrontier),
+            (ExplorationPoll::Pending, ExplorationPoll::Pending),
+            (
+                ExplorationPoll::SourceUnavailable("缺少地图".to_string()),
+                ExplorationPoll::SourceUnavailable("缺少地图".to_string()),
+            ),
+        ] {
+            let mut controller =
+                ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+            let mut first = DummySource::new("first");
+            first.poll = ExplorationPoll::NoFrontier;
+            let mut second = DummySource::new("second");
+            second.poll = other_poll;
+            controller.add_source(first);
+            controller.add_source(second);
+            controller.begin_exploration().unwrap();
+            let state = ExplorationStateSnapshot::from_xy((0.0, 0.0), Timestamp::default());
+            assert_eq!(controller.poll_next_goal(&state).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -956,6 +993,10 @@ mod tests {
         );
         assert_eq!(
             ExplorationStopReason::ConsecutiveFailuresExceeded.terminal_kind(),
+            ExplorationTerminalKind::Failed
+        );
+        assert_eq!(
+            ExplorationStopReason::NoReachableFreeSpace.terminal_kind(),
             ExplorationTerminalKind::Failed
         );
     }

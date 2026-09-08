@@ -1554,23 +1554,16 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
 
-        if georeference is None:
-            raise GatewayError(
-                "新地图发布必须提供经过测量或配置冻结的地理参考。",
-                error_code="map_georeference_required",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        if not isinstance(georeference, MapGeoreferenceV1):
+        if georeference is not None and not isinstance(georeference, MapGeoreferenceV1):
             raise GatewayError(
                 "地图地理参考必须使用 MapGeoreferenceV1 强类型合同。",
                 error_code="invalid_params",
                 http_status=422,
                 jsonrpc_code=-32602,
             )
-        if georeference.map_name != resolved_name or (
-            asset.frame_id is not None
-            and georeference.map_frame_id != asset.frame_id
+        if georeference is not None and (
+            georeference.map_name != resolved_name
+            or (asset.frame_id is not None and georeference.map_frame_id != asset.frame_id)
         ):
             raise GatewayError(
                 "地图地理参考与待发布地图身份不一致。",
@@ -1589,7 +1582,14 @@ class MapWorkspaceService:
             )
         snapshot = coherent_binding[1]
         map_frame_id = self._resolve_map_frame_id(snapshot)
-        if not map_frame_id or georeference.map_frame_id != map_frame_id:
+        if not map_frame_id:
+            raise GatewayError(
+                "当前可发布地图快照缺少地图坐标系。",
+                error_code="map_snapshot_frame_unavailable",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        if georeference is not None and georeference.map_frame_id != map_frame_id:
             raise GatewayError(
                 "地图地理参考坐标系与当前可发布地图快照不一致。",
                 error_code="map_georeference_identity_mismatch",
@@ -1669,7 +1669,11 @@ class MapWorkspaceService:
             source_name=snapshot.source_name,
             frame_id=map_frame_id,
             snapshot=snapshot.model_copy(deep=True),
-            georeference=MapGeoreferenceBindingV1(contract=georeference),
+            georeference=(
+                MapGeoreferenceBindingV1(contract=georeference)
+                if georeference is not None
+                else None
+            ),
             metadata={
                 "reason": str(reason or "").strip(),
                 "mapping_session_id": snapshot_metadata.get("mapping_session_id")

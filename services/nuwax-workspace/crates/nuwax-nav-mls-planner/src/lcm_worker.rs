@@ -108,6 +108,8 @@ impl Default for WorkerOptions {
                 wall_buffer_m: 0.75,
                 wall_buffer_weight: 100.0,
                 step_threshold_m: 0.25,
+                max_slope_deg: 30.0,
+                min_step_tread_depth_m: 0.3,
                 step_penalty_weight: 4.0,
                 goal_tolerance: 0.3,
                 viz_publish_hz: 2.0,
@@ -1205,7 +1207,11 @@ fn pose_position(pose: &Pose) -> Xyz {
 }
 
 fn is_at_goal(start: Xyz, goal: Xyz, tolerance: f32) -> bool {
-    (start.0 - goal.0).hypot(start.1 - goal.1) < tolerance
+    // 多层表面上的目标必须同时接近其高度，不能仅按平面投影停止规划。
+    (start.0 - goal.0)
+        .hypot(start.1 - goal.1)
+        .hypot(start.2 - goal.2)
+        < tolerance
 }
 
 fn same_stamp(a: &Header, b: &Header) -> bool {
@@ -1772,6 +1778,18 @@ fn message_type(value: &str) -> Result<LcmMessageType, WorkerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_tolerance_requires_same_floor_and_spatial_proximity() {
+        let start = (1.0, 2.0, 0.1);
+        // 上下楼层的平面投影重合，不能当作已经到达。
+        assert!(!is_at_goal(start, (1.0, 2.0, 3.1), 0.3));
+        // 平面与高度分别接近，也仍须满足三维距离容差。
+        assert!(!is_at_goal((0.0, 0.0, 0.0), (0.2, 0.2, 0.2), 0.3));
+        assert!(is_at_goal(start, (1.1, 2.1, 0.15), 0.3));
+        assert!(is_at_goal(start, start, 0.3));
+        assert!(!is_at_goal((0.0, 0.0, 0.0), (0.0, 0.0, 0.3), 0.3));
+    }
 
     fn header(sec: i32, nsec: i32) -> Header {
         Header {

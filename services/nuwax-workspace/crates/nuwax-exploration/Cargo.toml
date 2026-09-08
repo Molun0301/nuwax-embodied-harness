@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [features]
 default = []
 wavefront = ["dep:nuwax-explore-wavefront"]
+surface = ["dep:nuwax-nav-mls-planner"]
 tare = ["dep:nuwax-explore-tare-bridge"]
 terrain-map-ext = ["dep:nuwax-explore-terrain-map-bridge"]
 runtime = ["dep:tokio"]
@@ -28,6 +29,7 @@ spec-summary = [
 
 [dependencies]
 nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true }
+nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }
 nuwax-explore-terrain-map-bridge = { path = "../nuwax-explore-terrain-map-bridge", optional = true }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }

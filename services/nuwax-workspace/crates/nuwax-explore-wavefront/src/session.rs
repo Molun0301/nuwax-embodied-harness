@@ -55,6 +55,8 @@ pub struct ExplorationSession {
     pub(crate) exploration_direction: Option<Direction2>,
     /// 上一次 information count(用于 no-gain 判定)
     pub(crate) last_information_count: Option<u64>,
+    /// 上次信息评估对应的已完成目标数，防止重复调度被计为探索尝试。
+    last_information_completed_goals: usize,
     /// 连续 no-gain 计数
     pub(crate) no_gain_counter: u32,
     /// 已发布 goal 数
@@ -228,8 +230,7 @@ impl ExplorationSession {
     /// 顺序固定(方案 §4.10):
     /// 1. 计算 `current_info`
     /// 2. 若 `last_information_count` 为 `None`,只 seed 为 `Some(current_info)` 并返回 None
-    /// 3. 否则当 `explored_goals.len() > cfg.min_goals_before_no_gain_check` 且上次信息量大于 0 时
-    ///    启用 no-gain 判定;
+    /// 3. 只有新增已完成目标、历史目标数超过阈值且上次信息量大于0时，才累计低增益次数。
     ///    增长比例低于 `cfg.info_gain_threshold_ratio` 时递增 counter;
     ///    `no_gain_counter >= cfg.num_no_gain_attempts` 返回 `Some(StopReason::NoInformationGain)` 并清零
     /// 4. 函数结束前更新 `last_information_count = Some(current_info)`
@@ -241,29 +242,34 @@ impl ExplorationSession {
     ) -> Option<crate::frontier_goal::StopReason> {
         let current_info = self.information_count(grid, cfg);
         let last = self.last_information_count;
+        let completed_goals = self.explored_goals.len();
+        let has_new_completed_goal = completed_goals > self.last_information_completed_goals;
+        self.last_information_completed_goals = completed_goals;
         if last.is_none() {
             self.last_information_count = Some(current_info);
             return None;
         }
         let last = last.expect("checked is_some above");
-        let stop_reason =
-            if self.explored_goals.len() as u32 > cfg.min_goals_before_no_gain_check && last > 0 {
-                let gain_ratio = (current_info as f64 - last as f64) / (last as f64);
-                if gain_ratio < cfg.info_gain_threshold_ratio {
-                    self.no_gain_counter = self.no_gain_counter.saturating_add(1);
-                    if self.no_gain_counter >= cfg.num_no_gain_attempts {
-                        self.no_gain_counter = 0;
-                        Some(crate::frontier_goal::StopReason::NoInformationGain)
-                    } else {
-                        None
-                    }
-                } else {
+        let stop_reason = if has_new_completed_goal
+            && completed_goals as u32 > cfg.min_goals_before_no_gain_check
+            && last > 0
+        {
+            let gain_ratio = (current_info as f64 - last as f64) / (last as f64);
+            if gain_ratio < cfg.info_gain_threshold_ratio {
+                self.no_gain_counter = self.no_gain_counter.saturating_add(1);
+                if self.no_gain_counter >= cfg.num_no_gain_attempts {
                     self.no_gain_counter = 0;
+                    Some(crate::frontier_goal::StopReason::NoInformationGain)
+                } else {
                     None
                 }
             } else {
+                self.no_gain_counter = 0;
                 None
-            };
+            }
+        } else {
+            None
+        };
         self.last_information_count = Some(current_info);
         stop_reason
     }
@@ -273,6 +279,7 @@ impl ExplorationSession {
         self.explored_goals.clear();
         self.exploration_direction = None;
         self.last_information_count = None;
+        self.last_information_completed_goals = 0;
         self.no_gain_counter = 0;
     }
 
@@ -281,6 +288,7 @@ impl ExplorationSession {
         self.explored_goals.clear();
         self.exploration_direction = None;
         self.last_information_count = None;
+        self.last_information_completed_goals = 0;
         self.no_gain_counter = 0;
         self.goals_published = 0;
         self.consecutive_failures = 0;
@@ -419,9 +427,10 @@ mod tests {
         for _ in 0..=cfg.min_goals_before_no_gain_check {
             s.mark_explored_goal(Point2 { x: 0.0, y: 0.0 });
         }
-        // 连续 num_no_gain_attempts 次相同 map -> 触发 NoInformationGain
+        // 不同已完成目标连续没有带来新地图信息，才触发低增益停止。
         let mut triggered = false;
         for _ in 0..cfg.num_no_gain_attempts + 1 {
+            s.record_goal_reached(Point2 { x: 1.0, y: 1.0 });
             if s.check_information_gain(&g, &cfg)
                 .is_some_and(|r| matches!(r, crate::frontier_goal::StopReason::NoInformationGain))
             {
@@ -435,6 +444,41 @@ mod tests {
     }
 
     #[test]
+    fn repeated_polls_without_a_new_reached_goal_do_not_count_as_no_gain_attempts() {
+        let mut session = ExplorationSession::new();
+        let cfg = WavefrontConfig::default();
+        let mut grid = empty_grid(4, 5);
+        grid.cells[..16].fill(OccupancyCell::Free);
+        let _ = session.check_information_gain(&grid, &cfg);
+        for index in 0..=cfg.min_goals_before_no_gain_check {
+            session.record_goal_reached(Point2 {
+                x: f64::from(index),
+                y: 0.0,
+            });
+        }
+        assert!(session.check_information_gain(&grid, &cfg).is_none());
+        for _ in 0..10 {
+            assert!(
+                session.check_information_gain(&grid, &cfg).is_none(),
+                "重复调度不是新完成的探索尝试"
+            );
+        }
+        assert_eq!(session.no_gain_counter, 1);
+        grid.cells.fill(OccupancyCell::Free);
+        assert!(session.check_information_gain(&grid, &cfg).is_none());
+        assert_eq!(session.last_information_count, Some(20));
+        assert_eq!(
+            session.no_gain_counter, 1,
+            "新地图更新基准，但不是新的完成目标"
+        );
+        session.record_goal_reached(Point2 { x: 9.0, y: 0.0 });
+        assert_eq!(
+            session.check_information_gain(&grid, &cfg),
+            Some(crate::frontier_goal::StopReason::NoInformationGain)
+        );
+    }
+
+    #[test]
     fn reset_clears_all_state() {
         let mut s = ExplorationSession::new();
         s.mark_explored_goal(Point2 { x: 1.0, y: 1.0 });
@@ -444,6 +488,7 @@ mod tests {
         assert!(s.explored_goals.is_empty());
         assert!(s.exploration_direction.is_none());
         assert!(s.last_information_count.is_none());
+        assert_eq!(s.last_information_completed_goals, 0);
         assert_eq!(s.no_gain_counter, 0);
         assert_eq!(s.goals_published, 0);
         assert_eq!(s.consecutive_failures, 0);

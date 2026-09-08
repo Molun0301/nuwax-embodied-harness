@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css">
+  <link rel="stylesheet" href="/static/console.css?v=20260908-nav-height">
 </head>
 <body>
 <button class="tt glass" id="themeToggle" title="切换主题">🌙</button>
@@ -86,11 +86,28 @@
                     <button id="mapGoalToggle" class="tool" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
                     <button id="mapPublishPointToggle" class="tool" type="button" title="Publish Point：发布 /clicked_point">选点</button>
                   </div>
+                  <label class="map-tool-group glass navigation-height-field" title="目标在地图中的机体高度；留空使用当前定位高度，跨层时填写目标楼层的机体高度。">
+                    目标机体高度（米）
+                    <input id="mapGoalHeight" type="number" step="any" inputmode="decimal" placeholder="当前高度" aria-label="地图目标机体高度（米）">
+                  </label>
                   <div class="map-tool-group glass">
                     <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
                     <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
                   </div>
                 </div>
+              </div>
+              <div id="navigation-container" class="navigation-panel glass" data-role="v2-navigation" hidden>
+                <strong>导航到地图选点</strong>
+                <p class="navigation-hint">在二维地图上单击选点；跨层时填写目标在地图中的机体高度。</p>
+                <label class="navigation-height-field">目标机体高度（米）
+                  <input data-role="nav-height" type="number" step="any" inputmode="decimal" placeholder="留空使用当前定位高度">
+                </label>
+                <div class="navigation-actions">
+                  <button data-role="nav-submit" type="button">导航到选点</button>
+                  <button data-role="nav-cancel" type="button">取消导航</button>
+                </div>
+                <p data-role="nav-status" aria-live="polite">未选点</p>
+                <pre data-role="nav-detail"></pre>
               </div>
               <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
                 <div class="forbidden-zone-head">
@@ -261,7 +278,7 @@
 </div>
   <script src="/static/js/console-logs.js?v=20260906-task-log-recovery"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260907-map-camera-modes"></script>
+  <script src="/static/js/console.js?v=20260908-nav-height"></script>
   <script>
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
     (() => {
@@ -280,14 +297,8 @@
     })();
   </script>
   <script type="module" src="/static/js/pointcloud3d.js?v=20260721-pointcloud-display-config"></script>
-  <!-- 地图导航工具模块：导航面板在页面尾部，禁行区面板常驻地图 HUD。 -->
-  <div id="navigation-container" data-role="v2-navigation" hidden>
-    <span data-role="nav-status">未选点</span>
-    <button data-role="nav-submit">导航到选点</button>
-    <button data-role="nav-cancel">取消导航</button>
-    <pre data-role="nav-detail"></pre>
-  </div>
-  <script src="/static/js/navigation.js"></script>
+  <!-- 地图导航与禁行区面板均在地图内展示。 -->
+  <script src="/static/js/navigation.js?v=20260908-nav-height"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>
   <script>
     // 地图导航工具入口开关：
@@ -301,6 +312,9 @@
       var navBtn = document.getElementById('mapNavToggle');
       var boundaryBtn = document.getElementById('mapBoundaryToggle');
       function setActive(target) {
+        window.__nuwaxNavigationActive = target === 'nav';
+        if ((target === 'nav' || target === 'boundary') && typeof window.__nuwaxDisableMapTools === 'function') window.__nuwaxDisableMapTools(true);
+        if (target !== 'boundary' && window.__nuwaxBoundaryDrawModule) window.__nuwaxBoundaryDrawModule.setDrawing(false);
         if (navContainer) navContainer.hidden = (target !== 'nav');
         if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');
         if (navBtn) navBtn.classList.toggle('active', target === 'nav');
@@ -316,6 +330,10 @@
           setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);
         });
       }
+      ['mapGoalToggle', 'mapInitialPoseToggle', 'mapPublishPointToggle', 'mapModeToggle'].forEach(function (id) {
+        var button = document.getElementById(id);
+        if (button) button.addEventListener('click', function () { setActive(null); });
+      });
     })();
   </script>
 </body>

@@ -13,16 +13,10 @@ use crate::dijkstra::walk_preds;
 use crate::edges::{NodeEdgeIdx, NodeId, PlannerGraph, NO_NODE};
 use crate::mls_planner::Config;
 use crate::nodes::penalty_of;
-use crate::voxel::{surface_point_xyz, VoxelKey};
+use crate::voxel::{surface_point_xyz, voxelize, VoxelKey};
 
 /// Robot-rooted candidate search radius, in multiples of node spacing.
 const CANDIDATE_RADIUS_FACTOR: f32 = 3.0;
-
-/// Horizontal search radius when snapping a pose to the surface.
-const SNAP_SEARCH_RADIUS_M: f32 = 1.5;
-
-/// Max snap candidates tried when connecting the start.
-const MAX_SNAP_ATTEMPTS: usize = 64;
 
 /// On a blocked path, stop this far short of the last traversable point.
 const BEST_EFFORT_DISTANCE_M: f32 = 1.0;
@@ -31,34 +25,29 @@ const BEST_EFFORT_DISTANCE_M: f32 = 1.0;
 /// them. The cell path is cached for later safe truncation.
 type PlannedPath = (Vec<(f32, f32, f32)>, Vec<VoxelKey>);
 
-/// Surface cells near the pose, nearest first in xy.
+/// 返回端点自身水平单元内高度最近的表面；没有支撑时不搜索其它列。
+/// 保留列表返回形式，结果最多包含一个表面，不能借吸附改变连通分量。
 pub fn snap_candidates(
     surface_lookup: &SurfaceLookup,
     pose: (f32, f32, f32),
     voxel_size: f32,
     tolerance_m: f32,
 ) -> Vec<VoxelKey> {
-    let ix = (pose.0 / voxel_size).floor() as i32;
-    let iy = (pose.1 / voxel_size).floor() as i32;
-    let target_iz = (pose.2 / voxel_size).floor() as i32 - 1;
-    let tol_cells = (tolerance_m / voxel_size).ceil() as i32;
-    let search_radius = (SNAP_SEARCH_RADIUS_M / voxel_size).ceil() as i32;
-
-    let mut found: Vec<(i32, VoxelKey)> = Vec::new();
-    for dix in -search_radius..=search_radius {
-        for diy in -search_radius..=search_radius {
-            if let Some(cell) =
-                best_iz_in_column(surface_lookup, ix + dix, iy + diy, target_iz, tol_cells)
-            {
-                found.push((dix * dix + diy * diy, cell));
-            }
-        }
+    if ![pose.0, pose.1, pose.2, voxel_size, tolerance_m]
+        .into_iter()
+        .all(f32::is_finite)
+        || voxel_size <= 0.0
+        || tolerance_m < 0.0
+    {
+        return Vec::new();
     }
-    found.sort_by_key(|&(d2, _)| d2);
-    found.into_iter().map(|(_, c)| c).collect()
+    let (ix, iy, _) = voxelize(pose, voxel_size);
+    best_iz_in_column(surface_lookup, ix, iy, pose.2, voxel_size, tolerance_m)
+        .into_iter()
+        .collect()
 }
 
-/// Snap a pose to the nearest surface cell.
+/// 将端点关联到自身水平单元的最近高度表面，不代替净空校验。
 pub fn snap_pose_to_cell(
     surface_lookup: &SurfaceLookup,
     pose: (f32, f32, f32),
@@ -74,27 +63,55 @@ fn best_iz_in_column(
     surface_lookup: &SurfaceLookup,
     ix: i32,
     iy: i32,
-    target_iz: i32,
-    tol_cells: i32,
+    target_z: f32,
+    voxel_size: f32,
+    tolerance_m: f32,
 ) -> Option<VoxelKey> {
     let zs = surface_lookup.get(&(ix, iy))?;
-    let mut best: Option<(i32, i32)> = None;
+    let mut best: Option<(f32, i32)> = None;
     for &iz in zs {
-        let d = (iz - target_iz).abs();
+        let d = (surface_point_xyz(ix, iy, iz, voxel_size).2 - target_z).abs();
         if best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, iz));
         }
     }
     let (bd, iz) = best?;
-    if bd > tol_cells {
+    if bd > tolerance_m + voxel_size * 1e-5 {
         return None;
     }
     Some((ix, iy, iz))
 }
 
+/// 地面端点只允许一个体素的高度量化误差，并须满足表面的硬净空。
+/// 原始端点与表面中心处于同一水平单元，连接不会经过未知列。
+fn endpoint_cell(plg: &PlannerGraph, pose: (f32, f32, f32), config: &Config) -> Option<CellId> {
+    let coord = snap_pose_to_cell(
+        &plg.surface_lookup,
+        pose,
+        config.voxel_size,
+        config.voxel_size,
+    )?;
+    let cell = plg.cells.id(coord)?;
+    let wall_dist = plg
+        .wall_state
+        .dist
+        .get(cell as usize)
+        .copied()
+        .unwrap_or(f32::INFINITY);
+    penalty_of(
+        wall_dist,
+        config.wall_clearance_m,
+        config.wall_buffer_m,
+        config.wall_buffer_weight,
+    )
+    .is_finite()
+    .then_some(cell)
+}
+
 /// Plan path from start pose to goal pose using the node graph.
 /// Returns the waypoints and the string-pulled cell path, or none if either
 /// pose can't be snapped to surface or there is no valid path.
+/// 起终点必须是地面/支撑面坐标；传感器或机体坐标应先按真实外参转换。
 pub fn plan(
     plg: &PlannerGraph,
     start_pose: (f32, f32, f32),
@@ -102,34 +119,25 @@ pub fn plan(
     config: &Config,
 ) -> Option<PlannedPath> {
     let voxel_size = config.voxel_size;
-    let z_tolerance_m = config.robot_height;
-    let start_candidates =
-        snap_candidates(&plg.surface_lookup, start_pose, voxel_size, z_tolerance_m);
-    if start_candidates.is_empty() {
+    let Some(start_cell) = endpoint_cell(plg, start_pose, config) else {
         tracing::warn!(
             ?start_pose,
-            "plan failed: start does not snap to any surface cell"
+            "plan failed: start has no traversable surface in its own column"
         );
         return None;
-    }
-    let Some(goal_coord) =
-        snap_pose_to_cell(&plg.surface_lookup, goal_pose, voxel_size, z_tolerance_m)
-    else {
+    };
+    let Some(goal_cell) = endpoint_cell(plg, goal_pose, config) else {
         tracing::warn!(
             ?goal_pose,
-            "plan failed: goal does not snap to any surface cell"
+            "plan failed: goal has no traversable surface in its own column"
         );
         return None;
     };
-    let Some(goal_cell) = plg.cells.id(goal_coord) else {
-        tracing::warn!(?goal_coord, "plan failed: goal cell is not in the graph");
-        return None;
-    };
+    let goal_coord = plg.cells.coord(goal_cell);
 
     let node_cells: AHashSet<NodeId> = plg.nodes.iter().map(|n| n.cell_id).collect();
 
-    // The penalized Voronoi cannot own sub-clearance goals, so fall back to the
-    // nearest node by hops. A real failure then reports as disconnected below.
+    // 端点未被节点区域覆盖时，回退仍只能沿可通行边连接节点。
     let mut goal_segment = walk_preds(&plg.cell_state, goal_cell);
     let mut goal_node = *goal_segment
         .last()
@@ -150,27 +158,18 @@ pub fn plan(
     let (cost_to_go, pred_to_goal) = node_dijkstra(plg, goal_node);
 
     let radius = (config.node_spacing_m * CANDIDATE_RADIUS_FACTOR).max(voxel_size);
-    let mut entry: Option<(Vec<CellId>, Vec<NodeId>)> = None;
-    for &candidate in start_candidates.iter().take(MAX_SNAP_ATTEMPTS) {
-        let Some(start_cell) = plg.cells.id(candidate) else {
-            continue;
-        };
-        entry = select_entry(
-            plg,
-            start_cell,
-            goal_node,
-            &cost_to_go,
-            &pred_to_goal,
-            &node_cells,
-            radius,
-        );
-        if entry.is_some() {
-            break;
-        }
-    }
-    let Some((lead_in, node_seq)) = entry else {
+    let Some((lead_in, node_seq)) = select_entry(
+        plg,
+        start_cell,
+        goal_node,
+        &cost_to_go,
+        &pred_to_goal,
+        &node_cells,
+        radius,
+    ) else {
         tracing::warn!(
-            candidates = start_candidates.len().min(MAX_SNAP_ATTEMPTS),
+            ?start_pose,
+            ?goal_pose,
             reachable_nodes = cost_to_go.len(),
             total_nodes = plg.nodes.len(),
             "plan failed: start and goal lie on separate connected surface components",
@@ -206,6 +205,10 @@ pub fn truncate_to_safe(
     if cached.len() < 2 {
         return Vec::new();
     }
+    let Some(start_cell) = endpoint_cell(plg, start_pose, config) else {
+        return Vec::new();
+    };
+    let start_coord = plg.cells.coord(start_cell);
     let voxel_size = config.voxel_size;
     let step_cells = (config.step_threshold_m / voxel_size).floor() as i32;
     let wall_cost = WallCost {
@@ -224,14 +227,10 @@ pub fn truncate_to_safe(
     let mut waypoints = vec![start_pose];
     let mut blocked = false;
     for j in resume..cached.len() - 1 {
-        let (last_safe, cut) = last_safe_on_chord(
-            plg,
-            cached[j],
-            cached[j + 1],
-            step_cells,
-            &wall_cost,
-            voxel_size,
-        );
+        // 首段必须从机器人当前支撑面验证，不能直接拼接旧路径首点。
+        let from = if j == resume { start_coord } else { cached[j] };
+        let (last_safe, cut) =
+            last_safe_on_chord(plg, from, cached[j + 1], step_cells, &wall_cost, voxel_size);
         if cut {
             if let Some(p) = last_safe {
                 if waypoints.last() != Some(&p) {
@@ -242,7 +241,10 @@ pub fn truncate_to_safe(
             break;
         }
         let (ix, iy, iz) = cached[j + 1];
-        waypoints.push(surface_point_xyz(ix, iy, iz, voxel_size));
+        let point = surface_point_xyz(ix, iy, iz, voxel_size);
+        if waypoints.last() != Some(&point) {
+            waypoints.push(point);
+        }
     }
 
     if waypoints.len() < 2 {
@@ -362,10 +364,8 @@ fn last_safe_on_chord(
     (last_safe, false)
 }
 
-/// Index of the cached segment the robot is on, by nearest-point projection in
-/// the ground plane. The route ahead resumes at the following cell.
+/// 根据三维最近投影恢复缓存段，避免重叠楼层被当作同一条路径。
 fn resume_segment(cached: &[VoxelKey], start: (f32, f32, f32), voxel_size: f32) -> usize {
-    let p = (start.0, start.1);
     let mut best = 0usize;
     let mut best_d2 = f32::INFINITY;
     for i in 0..cached.len() - 1 {
@@ -376,7 +376,7 @@ fn resume_segment(cached: &[VoxelKey], start: (f32, f32, f32), voxel_size: f32) 
             cached[i + 1].2,
             voxel_size,
         );
-        let d2 = point_segment_dist2((a.0, a.1), (b.0, b.1), p);
+        let d2 = point_segment_dist2(a, b, start);
         if d2 < best_d2 {
             best_d2 = d2;
             best = i;
@@ -385,18 +385,18 @@ fn resume_segment(cached: &[VoxelKey], start: (f32, f32, f32), voxel_size: f32) 
     best
 }
 
-/// Squared distance from point p to segment a-b in the plane.
-fn point_segment_dist2(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
-    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
-    let denom = abx * abx + aby * aby;
+/// 三维点到线段的平方距离。
+fn point_segment_dist2(a: (f32, f32, f32), b: (f32, f32, f32), p: (f32, f32, f32)) -> f32 {
+    let (abx, aby, abz) = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+    let denom = abx * abx + aby * aby + abz * abz;
     let t = if denom == 0.0 {
         0.0
     } else {
-        (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / denom).clamp(0.0, 1.0)
+        (((p.0 - a.0) * abx + (p.1 - a.1) * aby + (p.2 - a.2) * abz) / denom).clamp(0.0, 1.0)
     };
-    let (cx, cy) = (a.0 + t * abx, a.1 + t * aby);
-    let (dx, dy) = (p.0 - cx, p.1 - cy);
-    dx * dx + dy * dy
+    let (cx, cy, cz) = (a.0 + t * abx, a.1 + t * aby, a.2 + t * abz);
+    let (dx, dy, dz) = (p.0 - cx, p.1 - cy, p.2 - cz);
+    dx * dx + dy * dy + dz * dz
 }
 
 /// Pick the entry node by connect cost plus cost-to-go, with its on-surface
@@ -490,9 +490,7 @@ fn robot_search(
     (dist, pred)
 }
 
-/// Nearest node to `from` by hops, ignoring edge cost so it reaches a node
-/// across cells the wall penalty makes impassable. Returns the node and the
-/// path from `from`.
+/// 按步数寻找可连接节点；硬净空产生的不可通行边不能被回退搜索绕过。
 fn nearest_node(
     cells: &SurfaceCells,
     from: CellId,
@@ -509,6 +507,9 @@ fn nearest_node(
 
     while let Some(u) = queue.pop_front() {
         for edge in cells.neighbors(u) {
+            if !edge.cost.is_finite() {
+                continue;
+            }
             let v = edge.dest;
             if !seen.insert(v) {
                 continue;
@@ -875,6 +876,8 @@ mod tests {
             wall_buffer_m: 0.5,
             wall_buffer_weight: 4.0,
             step_threshold_m: 0.25,
+            max_slope_deg: 30.0,
+            min_step_tread_depth_m: 0.2,
             step_penalty_weight: 4.0,
             goal_tolerance: 0.3,
             viz_publish_hz: 2.0,
@@ -900,6 +903,8 @@ mod tests {
             wall_buffer_m: 0.5,
             wall_buffer_weight: 4.0,
             step_threshold_m: 0.25,
+            max_slope_deg: 30.0,
+            min_step_tread_depth_m: 0.2,
             step_penalty_weight: 4.0,
             goal_tolerance: 0.3,
             viz_publish_hz: 2.0,
@@ -998,6 +1003,31 @@ mod tests {
     }
 
     #[test]
+    fn truncate_resumes_on_the_current_floor_of_an_overlapping_route() {
+        let cfg = truncate_config();
+        let mut surface: Vec<_> = (0..40).map(|x| (x, 0, 0)).collect();
+        surface.extend((1..31).map(|y| (39, y, y)));
+        surface.extend((0..40).map(|x| (x, 30, 30)));
+        surface.extend((0..31).map(|y| (0, y, 30)));
+        surface.extend((0..40).map(|x| (x, 0, 30)));
+        // 先走下层，经远端坡道绕到上层，再走过同一段平面投影。
+        let cached = vec![
+            (0, 0, 0),
+            (39, 0, 0),
+            (39, 30, 30),
+            (0, 30, 30),
+            (0, 0, 30),
+            (39, 0, 30),
+        ];
+        let robot = surface_point_xyz(20, 0, 30, VOXEL);
+        let path = truncate_to_safe(&surface_graph(&surface), &cached, robot, &cfg);
+        assert_eq!(path.first(), Some(&robot));
+        assert_eq!(path.last(), Some(&surface_point_xyz(39, 0, 30, VOXEL)));
+        assert!(path.iter().all(|point| (point.2 - robot.2).abs() < 1e-5));
+        assert!(path.iter().all(|point| point.0 >= robot.0));
+    }
+
+    #[test]
     fn back_off_tail_trims_from_the_goal_end() {
         let path = vec![
             (0.0, 0.0, 0.0),
@@ -1024,13 +1054,12 @@ mod tests {
     }
 
     #[test]
-    fn snap_falls_back_to_nearby_column() {
+    fn snap_rejects_a_missing_column_instead_of_relocating_the_endpoint() {
         let mut cells = strip(20);
         cells.retain(|c| c.0 != 2);
         let mut lookup = SurfaceLookup::new();
         build_surface_lookup(&cells, &mut lookup);
-        let cell = snap_pose_to_cell(&lookup, (0.25, 0.0, 0.1), VOXEL, Z_TOL).unwrap();
-        assert!(cell == (1, 0, 0) || cell == (3, 0, 0));
+        assert!(snap_pose_to_cell(&lookup, (0.25, 0.0, 0.1), VOXEL, Z_TOL).is_none());
     }
 
     #[test]
@@ -1049,8 +1078,7 @@ mod tests {
 
     #[test]
     fn plan_returns_none_if_disconnected() {
-        // The gap must exceed SNAP_SEARCH_RADIUS_M so no start candidate
-        // can relocate onto the goal island.
+        // 相距较远的两个支撑面分量不可达；窄断带另由点云级反例覆盖。
         let mut cells: Vec<VoxelKey> = (0..5).map(|x| (x, 0, 0)).collect();
         cells.extend((30..35).map(|x| (x, 0, 0)));
         let plg = graph_with_nodes(&cells, &[(2, 0, 0), (32, 0, 0)]);

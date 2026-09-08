@@ -13,6 +13,7 @@ nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 
 # A* + LocalPlanner(compute_control_for_plan 复用)
 nuwax-nav-astar = { path = "../nuwax-nav-astar" }
+nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner" }
 nuwax-motion-safety-guard = { path = "../nuwax-motion-safety-guard" }
 
 # 运行时

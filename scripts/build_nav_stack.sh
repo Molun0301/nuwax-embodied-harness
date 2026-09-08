@@ -8,7 +8,7 @@ cargo +1.88.0 build \
   --manifest-path "${REPO_ROOT}/services/nuwax-workspace/Cargo.toml" \
   --release \
   -p nuwax-nav-stack \
-  --features simple-2d,replanning-astar
+  --features simple-2d,replanning-astar,mls
 
 BINARY="${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-nav-stack"
 EXPECTED_CONTRACT="nuwax-nav-stack-internal-ready-v1"

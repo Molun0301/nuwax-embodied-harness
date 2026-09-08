@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nuwax_nav_astar::navigation_map::CostMap2D;
 use nuwax_nav_runtime::{
-    spawn_scheduler, AppliedProof, CostmapObservation, FenceLeaseState, FenceProof, LeaseProof,
-    MotionPortError, NavMotionAdmission, NavMotionPort, NavPlanner, NavScheduler, NavSession,
-    PathExecutionIdentity, PlannerStep, RuntimeError, SchedulerConfig, SchedulerStatus,
-    VersionedPath,
+    spawn_scheduler, AppliedProof, CostmapObservation, ExecutionMap, ExecutionPath,
+    FenceLeaseState, FenceProof, LeaseProof, MotionPortError, NavMotionAdmission, NavMotionPort,
+    NavPlanner, NavScheduler, NavSession, PathExecutionIdentity, PlannerStep, RuntimeError,
+    SchedulerConfig, SchedulerStatus, VersionedPath,
 };
 use nuwax_nav_types_messages::{NavFrameId, Path2D, Point2, Pose3, PoseStamped, Timestamp, Twist2};
 
@@ -140,6 +140,7 @@ fn identity(session_id: &str, path_revision: i64) -> PathExecutionIdentity {
 
 fn session() -> NavSession {
     NavSession {
+        goal_pose: nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0),
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 0),
         local_owner_runtime_generation: 1,
@@ -153,27 +154,29 @@ fn session() -> NavSession {
 
 fn path() -> VersionedPath {
     VersionedPath {
+        path_yaws: None,
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 1),
         path_revision: 1,
         payload_hash: [5; 32],
-        path: Path2D::stamped(
+        path: ExecutionPath::Planar(Path2D::stamped(
             NavFrameId::Map,
             Timestamp::from_unix(1, 0),
             vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)],
-        ),
+        )),
     }
 }
 
 fn pose() -> PoseStamped {
     let mut value = PoseStamped::from_pose(Pose3::default(), NavFrameId::Map);
+    value.pose.orientation = nuwax_nav_types_messages::Quaternion::IDENTITY;
     value.stamp = Timestamp::from_unix(1, 0);
     value
 }
 
 fn costmap(source_timestamp_ns: i64) -> CostmapObservation {
     CostmapObservation {
-        costmap: CostMap2D::new_all_free("map", 4, 4, 0.1),
+        costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 4, 4, 0.1)),
         source_timestamp_ns,
     }
 }

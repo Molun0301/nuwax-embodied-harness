@@ -3043,6 +3043,18 @@ impl GeometryRuntimeHandle {
         self.map_revision_latest_tx.subscribe()
     }
 
+    /// 复用导航运行时已捕获的模式与生产者代际，不重新读取环境配置。
+    pub(crate) fn navigation_map_3d_publish_context(
+        &self,
+    ) -> Option<NavigationMap3DPublishContext> {
+        Some(NavigationMap3DPublishContext {
+            enabled: self.nav.configured_profile() == crate::nav_runtime::PROFILE_MLS3D,
+            producer_runtime_generation: self.nav.producer_runtime_generation(),
+            mapping: self.mapping_adapter.as_ref()?.clone(),
+            committed_map_authority: self.committed_map_authority.clone(),
+        })
+    }
+
     /// Reserve cloud-map clear before any worker can touch SHM or lifecycle
     /// state. Rejected reservations own and immediately drop their unstarted
     /// future, so Phase A closure cannot fall through to detached work.
@@ -3057,6 +3069,8 @@ impl GeometryRuntimeHandle {
         let cloud_map_tx = self.cloud_map_tx.clone();
         let mapping_adapter = self.mapping_adapter.clone();
         let lifecycle_lock = self.mapping_lifecycle_lock.clone();
+        let navigation_runtime = self.nav.clone();
+        let committed_map_authority = self.committed_map_authority.clone();
         let (activation_tx, activation_rx) = tokio::sync::oneshot::channel();
         let (update_tx, update_rx) = tokio::sync::oneshot::channel();
         let task = async move {
@@ -3106,17 +3120,30 @@ impl GeometryRuntimeHandle {
 
             // Direct checkpoint callers already hold this fence. The deferred
             // clear path acquires the same fence before canonical publication.
+            let navigation_enabled =
+                navigation_runtime.configured_profile() == crate::nav_runtime::PROFILE_MLS3D;
+            let navigation_context =
+                mapping_adapter
+                    .as_ref()
+                    .map(|mapping| NavigationMap3DPublishContext {
+                        enabled: navigation_enabled,
+                        producer_runtime_generation: navigation_runtime
+                            .producer_runtime_generation(),
+                        mapping: mapping.clone(),
+                        committed_map_authority,
+                    });
             let _lifecycle_guard = lifecycle_lock.lock().await;
             let frame_id = mapping_adapter
                 .as_ref()
                 .map(|adapter| adapter.lock().configured_map_frame_id().to_owned())
                 .unwrap_or_else(|| "map".to_owned());
-            publish_latest_canonical_cloud_map(
+            publish_latest_canonical_cloud_map_with_navigation(
                 &transport,
                 &writer,
                 &state,
                 &cloud_map_tx,
                 &frame_id,
+                navigation_context.as_ref(),
             )
             .await
             .map(|_| ())
@@ -4632,6 +4659,8 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
         Ok(crate::explore_runtime::ExploreRobotPose {
             x: pose.x,
             y: pose.y,
+            z: pose.z,
+            orientation: nuwax_nav_types_messages::geometry::Quaternion { x: pose.qx, y: pose.qy, z: pose.qz, w: pose.qw },
             frame_id: self.expected_map_frame.to_string(),
             source_timestamp_ns: pose.timestamp_ns,
             received_monotonic_ns,
@@ -6843,11 +6872,23 @@ async fn run_owned_nav_state_consumer(
                     Ok(frame) => frame,
                     Err(error) => break Err(format!("navigation-state receive failed: {error}")),
                 };
-                let Some(update) = crate::typed_codec::decode_nav_state_payload(&frame.payload)
+                let Some(mut update) = crate::typed_codec::decode_nav_state_payload(&frame.payload)
                 else {
                     warn!("nav_state generated payload 解析失败 ({} 字节)", frame.payload.len());
                     continue;
                 };
+                if let Some(target) = nav_runtime.spatial_feedback_target(
+                    &update.state.goal_id, update.feedback.owner_kind,
+                    &update.feedback.parent_request_id, update.feedback.goal_generation,
+                    update.feedback.goal_payload_sha256,
+                ).await {
+                    let current = state.read().await.pose.clone();
+                    let distance = (current.x - target.x).hypot(current.y - target.y)
+                        .hypot(current.z - target.z);
+                    if distance.is_finite() {
+                        update.state.distance_remaining = distance as f32;
+                    }
+                }
                 let Some(update) = apply_typed_navigation_feedback(&nav_runtime, update).await else {
                     continue;
                 };
@@ -6857,6 +6898,104 @@ async fn run_owned_nav_state_consumer(
     };
     unsubscribe_owned_geometry_subscription("navigation-state-consumer", subscription, terminal)
         .await
+}
+
+type SurfaceMapComputation = (
+    crate::explore_runtime::SurfaceMapTicket,
+    Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String>,
+);
+
+fn build_exploration_surface_map(
+    message: &schema::NavigationMap3D,
+    geometry: nuwax_nav_mls_planner::mls_planner::Config,
+) -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String> {
+    let points = schema::navigation_map_3d_points(message).map_err(|error| error.to_string())?;
+    let mut snapshot = nuwax_nav_mls_planner::SurfaceSnapshot::from_points(
+        &points, geometry, message.source_voxel_size,
+    ).map_err(|error| error.to_string())?;
+    if let Some(mask) = message.virtual_obstacles.as_ref() {
+        let blocked = mask.data.iter().map(|value| *value == 100).collect::<Vec<_>>();
+        snapshot = snapshot.with_virtual_obstacles(
+            [mask.info.origin.position[0], mask.info.origin.position[1]],
+            f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32, &blocked,
+        ).map_err(|error| error.to_string())?;
+    }
+    Ok(Arc::new(snapshot))
+}
+
+fn register_surface_map_build(
+    control: &GeometryRuntimeTaskControl,
+    ticket: crate::explore_runtime::SurfaceMapTicket,
+    completed: tokio::sync::mpsc::Sender<SurfaceMapComputation>,
+    compute: impl FnOnce() -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String> + Send + 'static,
+) -> Result<(), String> {
+    control.register_retained("surface-map-build", async move {
+        // 注册接纳后才启动实际计算；保留任务始终等待阻塞工作句柄结束。
+        let result = tokio::task::spawn_blocking(compute).await
+            .map_err(|error| format!("surface map worker join failed: {error}"))
+            .and_then(|result| result);
+        let _ = completed.send((ticket, result)).await;
+        Ok(())
+    })
+}
+
+/// 订阅拥有方保持接收清空消息；至多一个保留任务构建表面，排队只保留最新输入。
+async fn run_owned_surface_map_consumer(
+    mut subscription: nuwax_transport::OwnedLcmSubscription,
+    explore: crate::explore_runtime::ExploreRuntimeHandle,
+    config: nuwax_nav_stack::surface_config::SurfaceNavigationConfig,
+    control: GeometryRuntimeTaskControl,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let (computed_tx, mut computed_rx) = tokio::sync::mpsc::channel::<SurfaceMapComputation>(1);
+    let mut computing = false;
+    let mut latest_pending: Option<(schema::NavigationMap3D, crate::explore_runtime::SurfaceMapTicket)> = None;
+    let terminal = loop {
+        if !computing {
+            if let Some((message, ticket)) = latest_pending.take() {
+                let geometry = config.geometry.clone();
+                let completed = computed_tx.clone();
+                let rejected_ticket = ticket.clone();
+                let compute = move || build_exploration_surface_map(&message, geometry);
+                match register_surface_map_build(&control, ticket, completed, compute) {
+                    Ok(()) => computing = true,
+                    Err(error) => {
+                        explore.finish_surface_map_update(rejected_ticket, Err(error)).await;
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = wait_for_geometry_task_stop(&mut shutdown_rx) => break Ok(()),
+            completed = computed_rx.recv(), if computing => {
+                let Some((ticket, result)) = completed else {
+                    break Err("surface map completion channel closed".into());
+                };
+                computing = false;
+                explore.finish_surface_map_update(ticket, result).await;
+            }
+            frame = subscription.recv() => {
+                // 接收时刻先于解码和MLS构建，计算耗时不能使旧图重新变新鲜。
+                let received = crate::explore_runtime::now_monotonic_nanos();
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(format!("surface map receive failed: {error}")),
+                };
+                let message = match schema::decode_navigation_map_3d_body(&frame.payload) {
+                    Ok(message) => message,
+                    Err(error) => { warn!(%error, "invalid NavigationMap3D rejected by exploration"); continue; }
+                };
+                match explore.begin_surface_map_update(&message, received).await {
+                    Ok(Some(ticket)) => latest_pending = Some((message, ticket)),
+                    Ok(None) => latest_pending = None,
+                    Err(error) => warn!(%error, "stale or foreign surface map rejected by exploration"),
+                }
+            }
+        }
+    };
+    explore.stop_surface_input_owner().await;
+    unsubscribe_owned_geometry_subscription("surface-map-consumer", subscription, terminal).await
 }
 
 async fn rollback_owned_geometry_subscriptions(
@@ -7126,6 +7265,13 @@ pub async fn spawn_geometry_runtime(
     };
 
     let mut owned_subscriptions = Vec::with_capacity(3);
+    let surface_config = if nav_runtime.configured_profile() == crate::nav_runtime::PROFILE_MLS3D {
+        Some(nuwax_nav_stack::surface_config::SurfaceNavigationConfig::from_env()
+            .map_err(|error| error.to_string()).and_then(|config| {
+                if config.geometry.world_frame == map_frame { Ok(config) }
+                else { Err("surface navigation config does not match Geometry map frame".into()) }
+            }))
+    } else { None };
     let tf_subscription = match transport
         .subscribe_owned(tf_topic.clone(), Some(tf_msg_type.clone()))
         .await
@@ -7173,6 +7319,22 @@ pub async fn spawn_geometry_runtime(
         }
     };
     owned_subscriptions.push(("navigation-state-consumer", nav_subscription));
+
+    if surface_config.as_ref().is_some_and(Result::is_ok) {
+        let surface_subscription = transport.subscribe_owned(
+            LcmTopic::new("/nav/map3d").expect("固定三维地图通道"),
+            Some(LcmMessageType::new("nuwax_msgs.NavigationMap3D").expect("三维地图消息类型")),
+        ).await;
+        match surface_subscription {
+            Ok(subscription) => owned_subscriptions.insert(0, ("surface-map-consumer", subscription)),
+            Err(error) => {
+                let rollback = rollback_owned_geometry_subscriptions(owned_subscriptions).await;
+                return Err(RealLcmBackendUnavailable::transport(format!(
+                    "surface-map subscribe acknowledgement failed: {error}; rollback={rollback:?}"
+                )).into());
+            }
+        }
+    }
 
     if legacy_cm_binding.is_some() {
         info!("legacy /cloud_map input is ignored; MappingSession owns cloud-map SHM revisions");
@@ -7258,6 +7420,14 @@ pub async fn spawn_geometry_runtime(
         task_control: Some(task_control.clone()),
     };
 
+    if let Some(config) = surface_config.as_ref() {
+        if let Err(error) = config { warn!(%error, "surface exploration configuration unavailable; mapping remains enabled"); }
+        let boot_nonce = mapping_adapter.as_ref().map(|mapping| mapping.lock().mapping_commit_boot_nonce().to_be_bytes())
+            .unwrap_or([0; 16]);
+        explore_runtime.configure_surface_source(config.clone(), nav_runtime.producer_runtime_generation(), boot_nonce)
+            .await.expect("新建探索拥有方尚未接收用户会话");
+    }
+
     let mut task_owner = Some(GeometryRuntimeTaskOwner::start(
         task_control.clone(),
         task_registration_rx,
@@ -7322,6 +7492,17 @@ pub async fn spawn_geometry_runtime(
         ),
     )
     .await?;
+
+    if let Some(Ok(config)) = surface_config {
+        let (name, subscription) = owned_subscriptions.pop().expect("三维地图订阅已经确认");
+        debug_assert_eq!(name, "surface-map-consumer");
+        register_geometry_startup_persistent(
+            &task_control, &mut task_owner, &handle, &mut owned_subscriptions, &mut pending_children,
+            "surface-map-consumer",
+            run_owned_surface_map_consumer(subscription, explore_runtime.clone(), config, task_control.clone(),
+                task_control.shutdown_request_receiver()),
+        ).await?;
+    }
 
     let cancel_shutdown_rx = task_control.shutdown_receiver();
     register_geometry_startup_persistent(
@@ -8175,6 +8356,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
     committed: &CommittedMappingCloudMap,
     frame_id: &str,
 ) -> Result<(), String> {
+    let navigation_context = handle.navigation_map_3d_publish_context();
     // The server callers retain mapping_lifecycle_lock. Reconstructing this
     // identity from current receipts makes their checkpoint path share the
     // canonical SHM/typed-publication sequencer instead of publishing bytes
@@ -8219,6 +8401,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
         &handle.state,
         &handle.cloud_map_tx,
         &expected,
+        navigation_context.as_ref(),
     )
     .await?;
     Ok(())
@@ -8300,6 +8483,213 @@ struct CanonicalCloudPublication {
     /// `None` is reserved for the zero-point session-clear publication. Every
     /// non-empty canonical snapshot carries the complete commit receipt.
     receipt: Option<crate::mapping_commit::CloudCommitReceipt>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NavigationMap3DPublishContext {
+    enabled: bool,
+    producer_runtime_generation: u64,
+    mapping: Arc<parking_lot::Mutex<MappingAdapter>>,
+    committed_map_authority: Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NavigationMap3DPublicationMetadata {
+    committed_map: schema::CommittedMapIdentity,
+    producer_runtime_generation: i64,
+    map_frame_generation: i64,
+    commit_boot_nonce: [u8; 16],
+    commit_sequence: i64,
+    virtual_obstacles: Option<schema::OccupancyGrid>,
+}
+
+async fn navigation_map_3d_publication_metadata(
+    context: &NavigationMap3DPublishContext,
+    publication: &CanonicalCloudPublication,
+    state: &Arc<RwLock<SharedState>>,
+    frame_id: &str,
+) -> Result<NavigationMap3DPublicationMetadata, String> {
+    let (session, map_frame_generation, occupancy_receipt, boot_nonce, configured_frame, virtual_obstacles) = {
+        let mapping = context.mapping.lock();
+        (
+            mapping.snapshot(),
+            mapping.global_frame_generation(),
+            mapping.latest_occupancy_commit_receipt(),
+            mapping.mapping_commit_boot_nonce(),
+            mapping.configured_map_frame_id().to_owned(),
+            if publication.receipt.is_some() { mapping.virtual_obstacles_snapshot()? } else { None },
+        )
+    };
+    if session.session_generation != publication.notification.session_generation
+        || configured_frame != frame_id
+        || boot_nonce == 0
+    {
+        return Err("NavigationMap3D publication crossed mapping session/frame identity".into());
+    }
+    let mut metadata = NavigationMap3DPublicationMetadata {
+        committed_map: schema::CommittedMapIdentity {
+            session_id: session.session_id.clone(),
+            session_generation: i64::try_from(session.session_generation)
+                .map_err(|_| "NavigationMap3D mapping generation exceeds i64".to_string())?,
+            frame_id: frame_id.to_owned(),
+            ..schema::CommittedMapIdentity::default()
+        },
+        producer_runtime_generation: i64::try_from(context.producer_runtime_generation)
+            .map_err(|_| "NavigationMap3D producer generation exceeds i64".to_string())?,
+        map_frame_generation: i64::try_from(map_frame_generation)
+            .map_err(|_| "NavigationMap3D frame generation exceeds i64".to_string())?,
+        commit_boot_nonce: boot_nonce.to_be_bytes(),
+        commit_sequence: 0,
+        virtual_obstacles: None,
+    };
+    let Some(cloud_receipt) = publication.receipt.as_ref() else {
+        if publication.notification.point_count != 0 || !publication.xyz_f32_le.is_empty() {
+            return Err("NavigationMap3D clear must have an empty canonical cloud".into());
+        }
+        if metadata.committed_map.session_id.is_empty() {
+            metadata.committed_map.session_generation = 0;
+        }
+        return Ok(metadata);
+    };
+    let occupancy_receipt = occupancy_receipt
+        .ok_or_else(|| "NavigationMap3D requires a real occupancy receipt".to_string())?;
+    if !session.active
+        || session.session_id != occupancy_receipt.session_id
+        || session.revision != occupancy_receipt.occupancy_revision
+        || session.session_generation != occupancy_receipt.session_generation
+        || cloud_receipt.commit_id != occupancy_receipt.commit_id
+        || cloud_receipt.commit_id.boot_nonce != boot_nonce
+        || cloud_receipt.session_generation != occupancy_receipt.session_generation
+        || cloud_receipt.occupancy_revision != occupancy_receipt.occupancy_revision
+        || cloud_receipt.source_timestamp_ns != occupancy_receipt.source_timestamp_ns
+        || cloud_receipt.source_timestamp_ns != publication.source_timestamp_ns
+        || cloud_receipt.cloud_revision != publication.notification.revision
+        || cloud_receipt.point_count != publication.notification.point_count
+    {
+        return Err("NavigationMap3D map/cloud commit receipts do not match".into());
+    }
+    let shared = state.read().await;
+    if shared.map.revision != occupancy_receipt.occupancy_revision
+        || shared.map.timestamp_ns != occupancy_receipt.source_timestamp_ns
+        || shared.map.frame_id != frame_id
+    {
+        return Err("NavigationMap3D canonical occupancy state does not match receipt".into());
+    }
+    // 摘要沿用规范占据载荷算法，不为三维地图创建另一套内容身份。
+    let canonical_data = shared
+        .map
+        .data
+        .iter()
+        .map(|value| *value as u8)
+        .collect::<Vec<_>>();
+    metadata.committed_map.revision = i64::try_from(occupancy_receipt.occupancy_revision)
+        .map_err(|_| "NavigationMap3D occupancy revision exceeds i64".to_string())?;
+    metadata.committed_map.payload_sha256 = crate::map_checksum::sha256_bytes(&canonical_data);
+    metadata.commit_sequence = i64::try_from(cloud_receipt.commit_id.sequence)
+        .map_err(|_| "NavigationMap3D commit sequence exceeds i64".to_string())?;
+    if let Some(mask) = virtual_obstacles {
+        if mask.revision != occupancy_receipt.occupancy_revision
+            || mask.timestamp_ns != occupancy_receipt.source_timestamp_ns
+            || mask.frame_id != frame_id
+            || mask.width != shared.map.width || mask.height != shared.map.height
+            || mask.resolution != shared.map.resolution
+            || mask.origin_x != shared.map.origin_x || mask.origin_y != shared.map.origin_y
+        {
+            return Err("NavigationMap3D virtual obstacles do not match the committed occupancy geometry".into());
+        }
+        let stamp_sec = i32::try_from(mask.timestamp_ns / 1_000_000_000)
+            .map_err(|_| "virtual obstacle timestamp exceeds i32".to_string())?;
+        let stamp_nsec = (mask.timestamp_ns % 1_000_000_000) as i32;
+        metadata.virtual_obstacles = Some(schema::OccupancyGrid {
+            header: schema::Header {
+                seq: i32::try_from(mask.revision).map_err(|_| "virtual obstacle revision exceeds i32".to_string())?,
+                stamp_sec, stamp_nsec, frame_id: mask.frame_id,
+            },
+            info: schema::MapMetaData {
+                map_load_time_sec: stamp_sec, map_load_time_nsec: stamp_nsec,
+                resolution: mask.resolution,
+                width: i32::try_from(mask.width).map_err(|_| "virtual obstacle width exceeds i32".to_string())?,
+                height: i32::try_from(mask.height).map_err(|_| "virtual obstacle height exceeds i32".to_string())?,
+                origin: schema::Pose { position: [mask.origin_x, mask.origin_y, 0.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+            },
+            data: mask.data,
+        });
+    }
+    let authority = context
+        .committed_map_authority
+        .lock()
+        .map_err(|_| "NavigationMap3D committed-map authority is unavailable".to_string())?;
+    if let Some(authority) = authority.as_ref() {
+        if authority.session_id == metadata.committed_map.session_id
+            && authority.session_generation == metadata.committed_map.session_generation
+            && authority.revision == metadata.committed_map.revision
+            && authority != &metadata.committed_map
+        {
+            return Err("NavigationMap3D canonical occupancy hash conflicts with authority".into());
+        }
+    }
+    Ok(metadata)
+}
+
+fn build_navigation_map_3d_publication_frame(
+    publication: &CanonicalCloudPublication,
+    metadata: &NavigationMap3DPublicationMetadata,
+) -> Result<RawLcmFrame, String> {
+    let source_timestamp_ns = i64::try_from(publication.source_timestamp_ns)
+        .map_err(|_| "NavigationMap3D source time exceeds i64".to_string())?;
+    let revision = i64::try_from(publication.notification.revision)
+        .map_err(|_| "NavigationMap3D cloud revision exceeds i64".to_string())?;
+    let cloud = schema::PointCloud2 {
+        header: schema::Header {
+            seq: i32::try_from(revision)
+                .map_err(|_| "NavigationMap3D cloud revision exceeds header".to_string())?,
+            stamp_sec: i32::try_from(source_timestamp_ns / 1_000_000_000)
+                .map_err(|_| "NavigationMap3D source time exceeds header".to_string())?,
+            stamp_nsec: (source_timestamp_ns % 1_000_000_000) as i32,
+            frame_id: metadata.committed_map.frame_id.clone(),
+        },
+        height: 1,
+        width: i32::try_from(publication.notification.point_count)
+            .map_err(|_| "NavigationMap3D point count exceeds i32".to_string())?,
+        fields: ["x", "y", "z"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| schema::PointField {
+                name: (*name).to_string(),
+                offset: index as i32 * 4,
+                datatype: 7,
+                count: 1,
+            })
+            .collect(),
+        point_step: 12,
+        row_step: i32::try_from(publication.xyz_f32_le.len())
+            .map_err(|_| "NavigationMap3D point payload exceeds i32".to_string())?,
+        data: publication.xyz_f32_le.clone(),
+        is_dense: true,
+        ..schema::PointCloud2::default()
+    };
+    let message = schema::NavigationMap3D {
+        schema_version: 1,
+        producer_runtime_generation: metadata.producer_runtime_generation,
+        committed_map: metadata.committed_map.clone(),
+        map_frame_generation: metadata.map_frame_generation,
+        cloud_revision: revision,
+        source_timestamp_ns,
+        source_voxel_size: publication.notification.voxel_size,
+        commit_boot_nonce: metadata.commit_boot_nonce,
+        commit_sequence: metadata.commit_sequence,
+        cleared: publication.receipt.is_none(),
+        virtual_obstacles: metadata.virtual_obstacles.clone(),
+        cloud,
+    };
+    let payload =
+        schema::encode_navigation_map_3d_body(&message).map_err(|error| error.to_string())?;
+    Ok(crate::typed_codec::build_typed_frame(
+        LcmTopic::new("/nav/map3d").map_err(|error| error.to_string())?,
+        LcmMessageType::new("nuwax_msgs.NavigationMap3D").map_err(|error| error.to_string())?,
+        payload,
+        publication.notification.revision,
+    ))
 }
 
 fn canonical_cloud_payload_matches(notification: &CloudMapNotification, xyz_f32_le: &[u8]) -> bool {
@@ -8491,6 +8881,25 @@ async fn publish_latest_canonical_cloud_map(
     cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
     frame_id: &str,
 ) -> Result<Option<CloudMapNotification>, String> {
+    publish_latest_canonical_cloud_map_with_navigation(
+        transport,
+        writer,
+        state,
+        cloud_map_tx,
+        frame_id,
+        None,
+    )
+    .await
+}
+
+async fn publish_latest_canonical_cloud_map_with_navigation(
+    transport: &LcmTransport,
+    writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    state: &Arc<RwLock<SharedState>>,
+    cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
+    frame_id: &str,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
+) -> Result<Option<CloudMapNotification>, String> {
     'acquire_sequencer: loop {
         let Some((publish_state, _, _)) = latest_canonical_cloud_publication(writer)? else {
             return Ok(None);
@@ -8543,6 +8952,21 @@ async fn publish_latest_canonical_cloud_map(
                 continue;
             }
 
+            let navigation_metadata = if let Some(context) =
+                navigation_context.filter(|context| context.enabled)
+            {
+                Some(
+                    navigation_map_3d_publication_metadata(context, &publication, state, frame_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let navigation_frame = navigation_metadata
+                .as_ref()
+                .map(|metadata| build_navigation_map_3d_publication_frame(&publication, metadata))
+                .transpose()?;
+
             let mut canonical_identity_rx = invalidation.subscribe();
             if *canonical_identity_rx.borrow_and_update() != canonical_identity {
                 continue;
@@ -8551,6 +8975,8 @@ async fn publish_latest_canonical_cloud_map(
             if *session_generation_rx.borrow_and_update() != canonical_identity.0 {
                 continue;
             }
+            // 两路规范输出共享原有发送预算，不把生命周期等待上限翻倍。
+            let publish_deadline = tokio::time::Instant::now() + MAP_FANOUT_SINK_TIMEOUT;
             let publish_result = tokio::select! {
                 biased;
                 changed = session_generation_rx.changed() => {
@@ -8565,18 +8991,51 @@ async fn publish_latest_canonical_cloud_map(
                         Err(_) => return Ok(None),
                     }
                 }
-                result = publish_global_map_snapshot_in_frame(
-                    transport,
-                    &publication.xyz_f32_le,
-                    publication.notification.revision,
-                    publication.source_timestamp_ns,
-                    frame_id,
-                ) => Some(result),
+                result = async {
+                    publish_global_map_snapshot_in_frame(
+                        transport, &publication.xyz_f32_le, publication.notification.revision,
+                        publication.source_timestamp_ns, frame_id,
+                    ).await?;
+                    if let Some(frame) = navigation_frame {
+                        let Some((_, _, current)) = latest_canonical_cloud_publication(writer)? else {
+                            return Ok::<bool, String>(false);
+                        };
+                        if (current.notification.session_generation, current.notification.revision) != canonical_identity
+                            || (publication.receipt.is_some()
+                                && !same_canonical_cloud_publication_identity(&current, &publication))
+                        {
+                            return Ok(false);
+                        }
+                        if let (Some(context), Some(expected)) = (navigation_context, navigation_metadata.as_ref()) {
+                            let current = navigation_map_3d_publication_metadata(context, &publication, state, frame_id).await?;
+                            if current != *expected {
+                                return Ok(false);
+                            }
+                        }
+                        tokio::time::timeout_at(publish_deadline, publish_raw_lcm_frame(transport, frame))
+                            .await
+                            .map_err(|_| "NavigationMap3D publish exceeded canonical cloud deadline".to_string())??;
+                    }
+                    Ok::<bool, String>(true)
+                } => Some(result),
             };
             let Some(publish_result) = publish_result else {
                 continue;
             };
-            publish_result?;
+            if !publish_result? {
+                continue;
+            }
+
+            if let (Some(context), Some(expected)) =
+                (navigation_context, navigation_metadata.as_ref())
+            {
+                let current =
+                    navigation_map_3d_publication_metadata(context, &publication, state, frame_id)
+                        .await?;
+                if current != *expected {
+                    return Err("NavigationMap3D publication identity changed during send".into());
+                }
+            }
 
             let mut shared = state.write().await;
             let current_snapshot_matches = {
@@ -8792,14 +9251,16 @@ async fn publish_canonical_mapping_cloud_while_lifecycle_fenced(
     state: &Arc<RwLock<SharedState>>,
     cloud_map_tx: &broadcast::Sender<CloudMapNotification>,
     expected: &CanonicalMappingCloudIdentity<'_>,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
 ) -> Result<CloudMapNotification, String> {
     ensure_canonical_mapping_cloud_identity(mapping, writer, state, expected, false).await?;
-    let published = publish_latest_canonical_cloud_map(
+    let published = publish_latest_canonical_cloud_map_with_navigation(
         transport,
         writer,
         state,
         cloud_map_tx,
         &expected.map_frame_id,
+        navigation_context,
     )
     .await?
     .ok_or_else(|| "canonical cloud-map snapshot became unavailable".to_owned())?;
@@ -8822,6 +9283,7 @@ async fn publish_mapping_ingest_commit_while_lifecycle_fenced(
     commit: &MappingIngestCommit,
     binding: Option<&crate::lio_ingress::RegistrationBinding>,
     expected_mode: Option<ExpectedRelocalizationMode>,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
 ) -> Result<(), String> {
     if let Some(event) = commit.outcome.occupancy_event.as_ref() {
         let _ = map_revision_tx.send(event.clone());
@@ -8843,6 +9305,7 @@ async fn publish_mapping_ingest_commit_while_lifecycle_fenced(
         state,
         cloud_map_tx,
         &expected,
+        navigation_context,
     )
     .await?;
     Ok(())
@@ -8861,6 +9324,7 @@ async fn publish_mapping_ingest_commit_with_lifecycle_fence(
     commit: &MappingIngestCommit,
     binding: Option<&crate::lio_ingress::RegistrationBinding>,
     expected_mode: Option<ExpectedRelocalizationMode>,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
 ) -> Result<(), String> {
     let _lifecycle_guard = lifecycle_lock.lock().await;
     publish_mapping_ingest_commit_while_lifecycle_fenced(
@@ -8874,6 +9338,7 @@ async fn publish_mapping_ingest_commit_with_lifecycle_fence(
         commit,
         binding,
         expected_mode,
+        navigation_context,
     )
     .await
 }
@@ -8884,17 +9349,19 @@ async fn publish_read_only_mapping_cloud_while_lifecycle_fenced(
     binding: &crate::lio_ingress::RegistrationBinding,
     expected_cloud: &CommittedMappingCloudMap,
     expected_mode: ExpectedRelocalizationMode,
+    navigation_context: Option<&NavigationMap3DPublishContext>,
 ) -> Result<CloudMapNotification, String> {
     if !expected_mode.matches() {
         return Err("relocalization mode changed before read-only publication".to_owned());
     }
     ensure_read_only_mapping_identity(handle, binding, expected_cloud).await?;
-    let published = publish_latest_canonical_cloud_map(
+    let published = publish_latest_canonical_cloud_map_with_navigation(
         &handle.transport,
         &handle.cloud_map_writer,
         &handle.state,
         &handle.cloud_map_tx,
         map_frame,
+        navigation_context,
     )
     .await?
     .ok_or_else(|| "relocalization canonical cloud publication disappeared".to_owned())?;
@@ -9064,6 +9531,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     binding: &crate::lio_ingress::RegistrationBinding,
     correction: &crate::correction_coordinator::CorrectionFrameIngress,
 ) -> Result<bool, String> {
+    let navigation_context = handle.navigation_map_3d_publish_context();
     let initial_mode = correction.relocalization_mode_snapshot();
     let Some(frame_capture_epoch) = binding.frame_capture_relocalization_epoch else {
         return Ok(false);
@@ -9112,6 +9580,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
                     epoch: active_mode.epoch,
                     active: active_mode.active,
                 },
+                navigation_context.as_ref(),
             )
             .await?;
             return Ok(true);
@@ -9181,6 +9650,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
             epoch: initial_mode.epoch,
             active: initial_mode.active,
         }),
+        navigation_context.as_ref(),
     )
     .await?;
     let event = commit
@@ -9299,6 +9769,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
     binding: &crate::lio_ingress::RegistrationBinding,
     correction: &crate::correction_coordinator::CorrectionFrameIngress,
 ) -> Result<bool, String> {
+    let navigation_context = handle.navigation_map_3d_publish_context();
     let initial_mode = correction.relocalization_mode_snapshot();
     let Some(frame_capture_epoch) = binding.frame_capture_relocalization_epoch else {
         return Ok(false);
@@ -9341,6 +9812,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
                     epoch: active_mode.epoch,
                     active: active_mode.active,
                 },
+                navigation_context.as_ref(),
             )
             .await?;
             return Ok(true);
@@ -9393,6 +9865,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
             epoch: initial_mode.epoch,
             active: initial_mode.active,
         }),
+        navigation_context.as_ref(),
     )
     .await?;
     let input = registered_lio_correction_input(
@@ -9855,6 +10328,7 @@ async fn publish_registered_lio_commit(
     map_frame: &str,
     commit: &MappingIngestCommit,
 ) -> Result<(), String> {
+    let navigation_context = handle.navigation_map_3d_publish_context();
     let mapping = handle
         .mapping_adapter
         .as_ref()
@@ -9871,6 +10345,7 @@ async fn publish_registered_lio_commit(
         commit,
         None,
         None,
+        navigation_context.as_ref(),
     )
     .await
 }
@@ -10081,6 +10556,7 @@ fn spawn_mapping_feed_tasks(
                         &map_revision_lidar,
                         &mapping_lidar_frame,
                         &commit,
+                        None,
                         None,
                         None,
                     )
@@ -11011,6 +11487,438 @@ mod mapping_feed_tests {
 
     fn shared_active_mapping_adapter() -> Arc<parking_lot::Mutex<MappingAdapter>> {
         Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
+    }
+
+    struct NavigationMap3DFixture {
+        context: NavigationMap3DPublishContext,
+        state: Arc<RwLock<SharedState>>,
+        writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+        cloud_tx: broadcast::Sender<CloudMapNotification>,
+        map_tx: broadcast::Sender<MapRevisionEvent>,
+        path: std::path::PathBuf,
+    }
+
+    impl NavigationMap3DFixture {
+        fn new() -> Self {
+            Self::with_mapping(shared_active_mapping_adapter())
+        }
+
+        fn with_mapping(mapping: Arc<parking_lot::Mutex<MappingAdapter>>) -> Self {
+            let generation = mapping.lock().snapshot().session_generation;
+            let path = std::env::temp_dir().join(format!(
+                "nuwax-navigation-map-3d-{}-{}.mmap",
+                std::process::id(),
+                uuid::Uuid::new_v4(),
+            ));
+            let mut writer = CloudMapShmWriter::new(&path).expect("三维发布测试共享内存");
+            writer.begin_session(generation).expect("会话清空");
+            Self {
+                context: NavigationMap3DPublishContext {
+                    enabled: true,
+                    producer_runtime_generation: 37,
+                    mapping,
+                    committed_map_authority: Arc::new(std::sync::Mutex::new(None)),
+                },
+                state: Arc::new(RwLock::new(SharedState::default())),
+                writer: Arc::new(parking_lot::Mutex::new(Some(writer))),
+                cloud_tx: broadcast::channel(4).0,
+                map_tx: broadcast::channel(4).0,
+                path,
+            }
+        }
+
+        fn commit(&self, timestamp_ns: u64) -> CommittedMappingCloudMap {
+            self.commit_points(timestamp_ns, &[Point3::new(0.5, 0.0, 0.0), Point3::new(1.0, 1.0, 0.5)])
+        }
+
+        fn commit_points(&self, timestamp_ns: u64, points: &[Point3<f64>]) -> CommittedMappingCloudMap {
+            let mut mapping = self.context.mapping.lock();
+            let outcome = ingest_mapping_points(
+                &mut mapping,
+                points,
+                12,
+                timestamp_ns,
+                "map",
+                timestamp_ns,
+                &self.state,
+                &self.map_tx,
+            )
+            .expect("真实规范建图提交");
+            let event = outcome.occupancy_event.as_ref().expect("真实占据修订");
+            *self.context.committed_map_authority.lock().unwrap() =
+                Some(committed_map_identity_from_revision(event).expect("规范占据身份"));
+            update_mapping_cloud_map_if_current(&outcome, &mapping.snapshot(), &self.writer)
+                .expect("真实关联点云提交")
+        }
+    }
+
+    impl Drop for NavigationMap3DFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors() {
+        let root = std::env::temp_dir().join(format!("nuwax-nav3d-virtual-mask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let zone_path = root.join("禁区.json");
+        std::fs::write(&zone_path, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":1,"zones":[{"id":"line","shape":"line","mode":"inside","frame_id":"map","vertices":[{"x":0.0,"y":-5.0},{"x":0.0,"y":5.0}],"stroke_width_m":0.1}]}}}"#).unwrap();
+        let store = Arc::new(crate::sequence_state::SequenceStateStore::open(&root.join("sequence.json")).unwrap());
+        let mut mapping = MappingAdapter::new_with_frames_sequence_store_and_forbidden_zones(
+            mapping_config(), crate::mapping_backend::MappingBackendSpec::Voxel, "map", "odom", store, zone_path.clone(),
+        );
+        mapping.start_session("test-session", "test-map").unwrap();
+        let fixture = NavigationMap3DFixture::with_mapping(Arc::new(parking_lot::Mutex::new(mapping)));
+        let mut points = Vec::new();
+        for z in [0.0, 3.0] {
+            for x in -30..30 {
+                for y in -30..30 {
+                    points.push(Point3::new((f64::from(x) + 0.5) * 0.1, (f64::from(y) + 0.5) * 0.1, z));
+                }
+            }
+        }
+        fixture.commit_points(1_700_000_000_000_000_000, &points);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
+        let mask = message.virtual_obstacles.as_ref().unwrap();
+        assert_eq!(i64::from(mask.header.seq), message.committed_map.revision);
+        assert_eq!((mask.header.stamp_sec, mask.header.stamp_nsec), (message.cloud.header.stamp_sec, message.cloud.header.stamp_nsec));
+        assert!(mask.data.contains(&0) && mask.data.contains(&100));
+        assert!(mask.data.iter().all(|value| matches!(value, 0 | 100)));
+        let geometry = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
+            "map".into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2,
+        ).unwrap().geometry;
+        let mut unmasked = message.clone();
+        unmasked.virtual_obstacles = None;
+        let free = build_exploration_surface_map(&unmasked, geometry.clone()).unwrap();
+        let protected = build_exploration_surface_map(&message, geometry.clone()).unwrap();
+        for z in [0.0, 3.0] {
+            let start = free.locate_support([-2.0, 0.0, z]).unwrap().support_xyz;
+            let goal = free.locate_support([2.0, 0.0, z]).unwrap().support_xyz;
+            assert!(free.plan(start, goal).is_ok(), "物理三维图原本连通");
+            assert!(protected.plan(start, goal).is_err(), "纯虚拟细线必须阻断两层路径");
+        }
+        std::fs::write(&zone_path, b"{broken-json").unwrap();
+        let unchanged = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        assert_eq!(unchanged, metadata, "未应用文件不得泄漏进已提交三维消息");
+        {
+            let mut mapping = fixture.context.mapping.lock();
+            assert!(mapping.refresh_forbidden_zones(&fixture.state, &fixture.map_tx).unwrap());
+        }
+        assert!(navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.is_err(),
+            "只更新二维禁区后不得伪造一条新传感器点云提交");
+        fixture.commit_points(1_700_000_001_000_000_000, &points);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let blocked = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
+        assert!(blocked.virtual_obstacles.as_ref().unwrap().data.iter().all(|value| *value == 100));
+        let closed = build_exploration_surface_map(&blocked, geometry).unwrap();
+        assert!(closed.locate_support([-2.0, 0.0, 0.0]).is_err());
+        assert!(closed.locate_support([-2.0, 0.0, 3.0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn navigation_map_3d_publication_preserves_real_receipts_and_clear_order() {
+        let fixture = NavigationMap3DFixture::new();
+        let committed = fixture.commit(1_700_000_000_000_000_000);
+        let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/nav3d").unwrap());
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport,
+            &fixture.writer,
+            &fixture.state,
+            &fixture.cloud_tx,
+            "map",
+            Some(&fixture.context),
+        )
+        .await
+        .expect("三维关联发布");
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport,
+            &fixture.writer,
+            &fixture.state,
+            &fixture.cloud_tx,
+            "map",
+            Some(&fixture.context),
+        )
+        .await
+        .expect("重复发布不重复发送");
+        let frames = backend.published.lock().unwrap().clone();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.topic.channel())
+                .collect::<Vec<_>>(),
+            vec![
+                GLOBAL_MAP_CHANNEL,
+                "/nav/map3d",
+                GLOBAL_MAP_CHANNEL,
+                "/nav/map3d"
+            ]
+        );
+        let clear = schema::decode_navigation_map_3d_body(&frames[1].payload).unwrap();
+        let live = schema::decode_navigation_map_3d_body(&frames[3].payload).unwrap();
+        assert!(clear.cleared);
+        assert!(!live.cleared);
+        assert!(clear.cloud_revision < live.cloud_revision);
+        assert_eq!(clear.commit_sequence, 0);
+        assert_eq!(
+            clear.commit_boot_nonce,
+            committed.receipt.commit_id.boot_nonce.to_be_bytes()
+        );
+        assert_eq!(live.commit_boot_nonce, clear.commit_boot_nonce);
+        assert_eq!(
+            live.commit_sequence,
+            committed.receipt.commit_id.sequence as i64
+        );
+        assert_eq!(live.cloud_revision, committed.receipt.cloud_revision as i64);
+        assert_eq!(
+            live.source_timestamp_ns,
+            committed.receipt.source_timestamp_ns as i64
+        );
+        assert_eq!(live.source_voxel_size, committed.notification.voxel_size);
+        assert_eq!(
+            live.map_frame_generation,
+            fixture.context.mapping.lock().global_frame_generation() as i64
+        );
+        assert_eq!(live.producer_runtime_generation, 37);
+        assert_eq!(
+            clear.producer_runtime_generation,
+            live.producer_runtime_generation
+        );
+        assert_eq!(
+            Some(live.committed_map),
+            *fixture.context.committed_map_authority.lock().unwrap()
+        );
+        assert_eq!(live.cloud.data, committed.xyz_f32_le);
+        assert_eq!(
+            frames[3].msg_type.fingerprint(),
+            schema::NAVIGATION_MAP_3D_FINGERPRINT
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_map_3d_rejects_wrong_authority_and_preserves_two_dimensional_output() {
+        for enabled in [true, false] {
+            let mut fixture = NavigationMap3DFixture::new();
+            fixture.context.enabled = enabled;
+            let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/nav3d").unwrap());
+            let transport = LcmTransport::new(Arc::new(backend.clone()));
+            publish_latest_canonical_cloud_map_with_navigation(
+                &transport,
+                &fixture.writer,
+                &fixture.state,
+                &fixture.cloud_tx,
+                "map",
+                Some(&fixture.context),
+            )
+            .await
+            .expect("首先发布会话清空");
+            fixture.commit(1_700_000_000_000_000_000);
+            fixture
+                .context
+                .committed_map_authority
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .payload_sha256[0] ^= 1;
+            backend.published.lock().unwrap().clear();
+            let result = publish_latest_canonical_cloud_map_with_navigation(
+                &transport,
+                &fixture.writer,
+                &fixture.state,
+                &fixture.cloud_tx,
+                "map",
+                Some(&fixture.context),
+            )
+            .await;
+            let frames = backend.published.lock().unwrap().clone();
+            if enabled {
+                assert!(result.unwrap_err().contains("hash conflicts"));
+                assert!(frames.is_empty(), "错误权威身份不得发布生效三维图");
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].topic.channel(), GLOBAL_MAP_CHANNEL);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn navigation_map_3d_delayed_old_session_cannot_replace_new_clear_and_live() {
+        let fixture = NavigationMap3DFixture::new();
+        let initial_backend =
+            MappingFeedRecordingBackend::new(LcmTopic::new("/unused/nav3d").unwrap());
+        let initial_transport = LcmTransport::new(Arc::new(initial_backend));
+        publish_latest_canonical_cloud_map_with_navigation(
+            &initial_transport,
+            &fixture.writer,
+            &fixture.state,
+            &fixture.cloud_tx,
+            "map",
+            Some(&fixture.context),
+        )
+        .await
+        .unwrap();
+        let old = fixture.commit(1_700_000_000_000_000_000);
+        let backend = FirstGlobalMapPublishGateBackend::default();
+        let transport = LcmTransport::new(Arc::new(backend.clone()));
+        let delayed = {
+            let transport = transport.clone();
+            let writer = fixture.writer.clone();
+            let state = fixture.state.clone();
+            let cloud_tx = fixture.cloud_tx.clone();
+            let context = fixture.context.clone();
+            tokio::spawn(async move {
+                publish_latest_canonical_cloud_map_with_navigation(
+                    &transport,
+                    &writer,
+                    &state,
+                    &cloud_tx,
+                    "map",
+                    Some(&context),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.first_publish_started.notified(),
+        )
+        .await
+        .unwrap();
+        let new_generation = {
+            let mut mapping = fixture.context.mapping.lock();
+            mapping.stop_session("test-session").unwrap();
+            mapping.start_session("new-session", "new-map").unwrap();
+            mapping.snapshot().session_generation
+        };
+        fixture
+            .writer
+            .lock()
+            .as_mut()
+            .unwrap()
+            .begin_session(new_generation)
+            .unwrap();
+        let new = fixture.commit(1_700_000_003_000_000_000);
+        publish_latest_canonical_cloud_map_with_navigation(
+            &transport,
+            &fixture.writer,
+            &fixture.state,
+            &fixture.cloud_tx,
+            "map",
+            Some(&fixture.context),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delayed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let messages = backend
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.topic.channel() == "/nav/map3d")
+            .map(|frame| schema::decode_navigation_map_3d_body(&frame.payload).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].cleared);
+        assert!(!messages[1].cleared);
+        assert!(messages
+            .iter()
+            .all(|message| message.committed_map.session_id == "new-session"));
+        assert!(messages
+            .iter()
+            .all(|message| message.cloud_revision > old.receipt.cloud_revision as i64));
+        assert_eq!(
+            messages[1].cloud_revision,
+            new.receipt.cloud_revision as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_pose_provider_preserves_real_height_and_complete_orientation() {
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        state.write().await.pose = PoseState {
+            x: 1.0, y: 2.0, z: 3.5, qx: 0.1, qy: -0.2, qz: 0.3, qw: 0.86_f64.sqrt(),
+            frame_id: "map".into(), timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            ..PoseState::default()
+        };
+        let provider = SharedStatePoseProvider {
+            state, expected_map_frame: Arc::from("map"),
+            freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
+            max_receipt_age: Duration::from_secs(1),
+        };
+        let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider).await.unwrap();
+        assert_eq!((pose.x, pose.y, pose.z), (1.0, 2.0, 3.5));
+        assert_eq!(pose.orientation, nuwax_nav_types_messages::geometry::Quaternion {
+            x: 0.1, y: -0.2, z: 0.3, w: 0.86_f64.sqrt(),
+        });
+        assert!(pose.source_timestamp_ns > 0 && pose.received_monotonic_ns > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn surface_build_is_retained_until_actual_blocking_work_finishes() {
+        let fixture = NavigationMap3DFixture::new();
+        fixture.commit(1_700_000_000_000_000_000);
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
+        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
+        let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
+        let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
+        let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
+            "map".into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2,
+        ).unwrap();
+        explore.configure_surface_source(Ok(config), 37, message.commit_boot_nonce).await.unwrap();
+        let ticket = explore.begin_surface_map_update(&message, crate::explore_runtime::now_monotonic_nanos())
+            .await.unwrap().unwrap();
+        let (control, registrations) = GeometryRuntimeTaskControl::channel();
+        let mut owner = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(1);
+        struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Gate {
+            fn drop(&mut self) { *self.0.0.lock().unwrap() = true; self.0.1.notify_all(); }
+        }
+        let gate = Gate(Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())));
+        let worker_gate = gate.0.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let worker_entered = entered.clone();
+        register_surface_map_build(&control, ticket.clone(), completed_tx.clone(), move || {
+            worker_entered.notify_one();
+            let mut released = worker_gate.0.lock().unwrap();
+            while !*released { released = worker_gate.1.wait(released).unwrap(); }
+            Err("受控计算已真实结束".into())
+        }).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified()).await.unwrap();
+        control.request_stop();
+        let mut stopping = Box::pin(owner.shutdown());
+        assert!(tokio::time::timeout(Duration::from_millis(25), stopping.as_mut()).await.is_err(),
+            "阻塞计算尚未结束时不能报告拥有方关闭完成");
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_attempted = attempted.clone();
+        assert!(register_surface_map_build(&control, ticket, completed_tx, move || {
+            worker_attempted.store(true, std::sync::atomic::Ordering::Release);
+            Err("不应启动".into())
+        }).is_err());
+        assert!(!attempted.load(std::sync::atomic::Ordering::Acquire));
+        drop(gate);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), stopping).await.unwrap();
+        assert!(outcome.producers_settled());
+        assert!(outcome.result.is_ok());
+        assert!(completed_rx.recv().await.unwrap().1.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -62,6 +62,7 @@ impl WavefrontGoalSelector {
         id_source: &mut dyn FrontierGoalIdSource,
     ) -> Result<GoalSelection, WavefrontError> {
         let cfg = self.detector.config().clone();
+        let physical_costmap = costmap;
         let inflated_costmap = inflate_obstacles(costmap, cfg.obstacle_inflation_radius_m);
         let costmap = &inflated_costmap;
 
@@ -73,7 +74,7 @@ impl WavefrontGoalSelector {
         // 2. detect
         let outcome = self
             .detector
-            .detect_candidates(robot_pose, costmap, session)?;
+            .detect_candidates(robot_pose, physical_costmap, session)?;
 
         // 3. map NoReachableFreeSpace
         let candidates = match outcome {
@@ -89,11 +90,11 @@ impl WavefrontGoalSelector {
             &crate::detector::FrontierCandidate,
         )> = Vec::with_capacity(candidates.len());
         for cand in &candidates {
-            if session.is_blacklisted(cand.cluster.centroid) {
+            if session.is_blacklisted(cand.goal_position) {
                 continue;
             }
             let geom = CandidateGeometry {
-                centroid: cand.cluster.centroid,
+                centroid: cand.goal_position,
                 cell_count: cand.cluster.cell_count,
                 perimeter_m: cand.cluster.perimeter_m,
                 area_m2: cand.cluster.area_m2,
@@ -136,7 +137,7 @@ impl WavefrontGoalSelector {
 
         // 6. 生成 id
         let seed = FrontierGoalIdSeed {
-            centroid: cand.cluster.centroid,
+            centroid: cand.goal_position,
             score: breakdown.total,
             frontier_area_m2: Some(cand.cluster.area_m2 as f32),
             stamp: now,
@@ -209,8 +210,8 @@ pub(crate) fn frontier_candidate_to_goal(
         stamp,
         pose: Pose3 {
             position: Point3 {
-                x: candidate.cluster.centroid.x,
-                y: candidate.cluster.centroid.y,
+                x: candidate.goal_position.x,
+                y: candidate.goal_position.y,
                 z: 0.0,
             },
             orientation: Quaternion::IDENTITY,
@@ -307,6 +308,58 @@ mod tests {
             r,
             GoalSelection::Stop(StopReason::NoReachableFreeSpace)
         ));
+    }
+
+    #[test]
+    fn enclosed_frontier_selects_free_approach_cell_instead_of_centroid() {
+        for center_occupied in [false, true] {
+            let mut grid = OccupancyGrid2D::filled(
+                Point2 { x: 0.0, y: 0.0 },
+                1.0,
+                15,
+                15,
+                OccupancyCell::Unknown,
+            );
+            for y in 4..=10 {
+                for x in 4..=10 {
+                    grid.set(x, y, OccupancyCell::Free);
+                }
+            }
+            let robot = if center_occupied {
+                grid.set(7, 7, OccupancyCell::Occupied);
+                Point2 { x: 5.5, y: 5.5 }
+            } else {
+                Point2 { x: 7.5, y: 7.5 }
+            };
+            let mut selector = WavefrontGoalSelector::new(WavefrontConfig::default());
+            let mut session = ExplorationSession::new();
+            let mut ids = SeqIdSrc(Cell::new(0));
+            let result = selector
+                .select_goal_at(robot, &grid, &mut session, Timestamp::default(), &mut ids)
+                .unwrap();
+            let GoalSelection::Goal(goal) = result else {
+                panic!("已知区域边缘应提供可达目标");
+            };
+            let point = goal.pose.pose.position.to_2d();
+            let (x, y) = grid.world_to_cell(point).unwrap();
+            assert_eq!(grid.get(x, y), Some(OccupancyCell::Free));
+            assert_eq!(point, grid.cell_center(x, y).unwrap(), "目标须在栅格中心");
+            assert!(point.distance(robot) > 0.5, "目标须产生实际移动");
+            for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                assert_eq!(
+                    grid.get((x as i32 + dx) as u32, (y as i32 + dy) as u32),
+                    Some(OccupancyCell::Free),
+                    "目标的整个轮廓必须保持已知自由"
+                );
+            }
+            assert!(
+                (-2..=2).any(|dx| (-2..=2).any(|dy| {
+                    grid.get((x as i32 + dx) as u32, (y as i32 + dy) as u32)
+                        == Some(OccupancyCell::Unknown)
+                })),
+                "目标须从前沿内退一个轮廓余量，不能回到已知区域中心"
+            );
+        }
     }
 
     #[test]

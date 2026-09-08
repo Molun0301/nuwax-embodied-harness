@@ -8,7 +8,6 @@ use crate::Point3;
 /// 返回 costmap 是否被修改（dirty）。
 #[must_use]
 pub fn classify_points(points: &[Point3], costmap: &mut Costmap, ground_z: f64) -> bool {
-    let cell_size = costmap.cell_size();
     let mut best_per_cell: std::collections::HashMap<(i64, i64), f64> =
         std::collections::HashMap::new();
     for p in points {
@@ -31,11 +30,8 @@ pub fn classify_points(points: &[Point3], costmap: &mut Costmap, ground_z: f64) 
             .unwrap_or(f64::NEG_INFINITY);
         if h > prev {
             dirty = true;
-            costmap.update(
-                (k.0 as f64 + 0.5) * cell_size,
-                (k.1 as f64 + 0.5) * cell_size,
-                h,
-            );
+            let (x, y) = costmap.cell_to_world(k.0, k.1);
+            costmap.update(x, y, h);
         }
     }
     dirty

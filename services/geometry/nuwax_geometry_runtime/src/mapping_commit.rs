@@ -54,6 +54,11 @@ impl MappingCommitClock {
             sequence,
         })
     }
+
+    /// 读取同一提交时钟的进程标识，清空消息不额外分配提交序号。
+    pub(crate) fn boot_nonce(&self) -> u128 {
+        self.boot_nonce
+    }
 }
 
 #[cfg(test)]

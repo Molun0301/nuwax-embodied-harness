@@ -435,7 +435,10 @@ class MapAssetBundle(TimestampedContract):
         default=None,
         description="资产包绑定的几何资产信息。",
     )
-    georeference: MapGeoreferenceBindingV1 = Field(description="资产包绑定的不可变地理参考。")
+    georeference: Optional[MapGeoreferenceBindingV1] = Field(
+        default=None,
+        description="资产包绑定的不可变地理参考；缺失表示只有本地地图坐标。",
+    )
     manifest_sha256: Optional[str] = Field(default=None, description="资产包清单 SHA-256；加载时计算。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
@@ -475,12 +478,13 @@ class MapAssetBundle(TimestampedContract):
             raise ValueError("地图资产包 map_name 与运行态快照不一致。")
         if self.geometry_asset is not None and self.geometry_asset.map_name != self.map_name:
             raise ValueError("地图资产包与 geometry_asset 的 map_name 不一致。")
-        if self.georeference.contract.map_name != self.map_name:
-            raise ValueError("地图资产包与 georeference 的 map_name 不一致。")
         if not self.frame_id:
-            raise ValueError("绑定地理参考的地图资产包必须声明 frame_id。")
-        if self.georeference.contract.map_frame_id != self.frame_id:
-            raise ValueError("地图资产包与 georeference 的 frame_id 不一致。")
+            raise ValueError("地图资产包必须声明 frame_id。")
+        if self.georeference is not None:
+            if self.georeference.contract.map_name != self.map_name:
+                raise ValueError("地图资产包与 georeference 的 map_name 不一致。")
+            if self.georeference.contract.map_frame_id != self.frame_id:
+                raise ValueError("地图资产包与 georeference 的 frame_id 不一致。")
         if (
             self.geometry_asset is not None
             and self.frame_id

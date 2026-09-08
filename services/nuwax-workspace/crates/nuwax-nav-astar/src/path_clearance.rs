@@ -21,11 +21,9 @@ pub struct PathClearance {
     path: Path2D,
     robot_width: f64,
     path_lookup_distance: f64,
-    max_distance_cache: f64,
     costmap: Option<CostMap2D>,
     pose_index: usize,
-    last_costmap_shape: Option<(usize, usize)>,
-    last_pose_index: usize,
+    path_start: Option<Point2>,
     last_mask: Option<Vec<bool>>,
 }
 
@@ -42,29 +40,62 @@ impl PathClearance {
             path,
             robot_width,
             path_lookup_distance,
-            max_distance_cache: 1.0,
             costmap: None,
             pose_index: 0,
-            last_costmap_shape: None,
-            last_pose_index: 0,
+            path_start: None,
             last_mask: None,
         }
     }
 
     /// 更新 costmap
     pub fn update_costmap(&mut self, costmap: CostMap2D) {
+        if self.costmap.as_ref().is_some_and(|previous| {
+            previous.width() != costmap.width()
+                || previous.height() != costmap.height()
+                || previous.resolution() != costmap.resolution()
+                || previous.frame_id() != costmap.frame_id()
+                || previous.cell_center_world(0, 0) != costmap.cell_center_world(0, 0)
+        }) {
+            // 掩膜是栅格索引，原点或分辨率变化后即使尺寸相同也必须重算。
+            self.last_mask = None;
+        }
         self.costmap = Some(costmap);
     }
 
     /// 更新 pose_index（当前路径上的进度）
     pub fn update_pose_index(&mut self, index: usize) {
+        if self.pose_index != index || self.path_start.is_some() {
+            self.last_mask = None;
+        }
         self.pose_index = index;
+        self.path_start = None;
+    }
+
+    /// 从机器人在线段上的实际投影更新前瞻起点，支持稀疏路径。
+    pub fn update_path_progress(&mut self, index: usize, projected_position: Point2) {
+        if self.pose_index != index || self.path_start != Some(projected_position) {
+            self.last_mask = None;
+        }
+        self.pose_index = index;
+        self.path_start = Some(projected_position);
     }
 
     /// 是否前方有 obstacle
     #[must_use]
     pub fn is_obstacle_ahead(&mut self) -> bool {
-        if self.costmap.is_none() {
+        let Some(costmap) = self.costmap.as_ref() else {
+            return true;
+        };
+        let Some(segments) = self.lookahead_segments() else {
+            return true;
+        };
+        if segments.iter().any(|(start, end)| {
+            [start, end].into_iter().any(|point| {
+                let (x, y) = costmap.world_to_cell(*point);
+                !costmap.in_bounds(x, y)
+            })
+        }) {
+            // 图外不能因为栅格绘制被裁剪而变成“没有障碍”。
             return true;
         }
         let mask = self.compute_mask();
@@ -94,14 +125,8 @@ impl PathClearance {
         let Some(costmap) = self.costmap.as_ref() else {
             return Vec::new();
         };
-        let shape = (costmap.width(), costmap.height());
-        if let Some(prev_shape) = self.last_costmap_shape {
-            if prev_shape == shape {
-                let pose_dist = self.pose_distance(self.last_pose_index, self.pose_index);
-                if pose_dist < self.max_distance_cache && self.last_mask.is_some() {
-                    return self.last_mask.clone().unwrap();
-                }
-            }
+        if let Some(mask) = self.last_mask.as_ref() {
+            return mask.clone();
         }
 
         let width = costmap.width();
@@ -122,56 +147,12 @@ impl PathClearance {
         };
         let r2 = i128::from(radius_cells) * i128::from(radius_cells);
 
-        let points = &self.path.points;
-        if points.is_empty() {
-            return mask;
-        }
-        let n = points.len();
-        let start_idx = self.pose_index.min(n.saturating_sub(1));
-        let mut remaining = self.path_lookup_distance;
-
-        // 累加距离推进；最后一段裁剪到前瞻边界后再连续栅格化。
-        let mut idx = start_idx;
-        while idx + 1 < n && remaining > 0.0 {
-            let p = &points[idx];
-            let next = &points[idx + 1];
-            let seg_len = (next.x - p.x).hypot(next.y - p.y);
-
-            if !seg_len.is_finite() {
-                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
-                break;
+        if let Some(segments) = self.lookahead_segments() {
+            for (start, end) in segments {
+                self.stamp_line(&mut mask, costmap, &start, &end, radius_cells, r2);
             }
-
-            if seg_len <= f64::EPSILON {
-                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
-                idx += 1;
-                continue;
-            }
-
-            let drawn_len = seg_len.min(remaining);
-            let ratio = drawn_len / seg_len;
-            let clipped_end =
-                Point2::new(p.x + (next.x - p.x) * ratio, p.y + (next.y - p.y) * ratio);
-            if !clipped_end.x.is_finite() || !clipped_end.y.is_finite() {
-                self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
-                break;
-            }
-            self.stamp_line(&mut mask, costmap, p, &clipped_end, radius_cells, r2);
-
-            if seg_len >= remaining {
-                break;
-            }
-            remaining -= seg_len;
-            idx += 1;
         }
 
-        if start_idx + 1 >= n || self.path_lookup_distance <= 0.0 {
-            let p = &points[start_idx];
-            self.stamp_line(&mut mask, costmap, p, p, radius_cells, r2);
-        }
-
-        self.last_costmap_shape = Some(shape);
-        self.last_pose_index = self.pose_index;
         self.last_mask = Some(mask.clone());
         mask
     }
@@ -342,16 +323,43 @@ impl PathClearance {
         }
     }
 
-    fn pose_distance(&self, idx1: usize, idx2: usize) -> f64 {
+    /// 返回裁剪到前瞻长度的连续线段；非法坐标不能参与安全判断。
+    fn lookahead_segments(&self) -> Option<Vec<(Point2, Point2)>> {
         let points = &self.path.points;
-        if idx1 >= points.len() || idx2 >= points.len() {
-            return f64::INFINITY;
+        if points.is_empty() || !self.path_lookup_distance.is_finite() {
+            return None;
         }
-        let a = &points[idx1];
-        let b = &points[idx2];
-        let dx = a.x - b.x;
-        let dy = a.y - b.y;
-        (dx * dx + dy * dy).sqrt()
+        let start_index = self.pose_index.min(points.len() - 1);
+        let mut start = self.path_start.unwrap_or(points[start_index]);
+        if !start.x.is_finite() || !start.y.is_finite() {
+            return None;
+        }
+        let mut remaining = self.path_lookup_distance.max(0.0);
+        let mut segments = vec![(start, start)];
+        for end in &points[start_index + 1..] {
+            if remaining <= 0.0 {
+                break;
+            }
+            let length = (end.x - start.x).hypot(end.y - start.y);
+            if !length.is_finite() {
+                return None;
+            }
+            if length > f64::EPSILON {
+                let drawn = remaining.min(length);
+                let ratio = drawn / length;
+                let clipped = Point2::new(
+                    start.x + (end.x - start.x) * ratio,
+                    start.y + (end.y - start.y) * ratio,
+                );
+                if !clipped.x.is_finite() || !clipped.y.is_finite() {
+                    return None;
+                }
+                segments.push((start, clipped));
+                remaining -= drawn;
+            }
+            start = *end;
+        }
+        Some(segments)
     }
 
     /// 当前 path 引用（只读）
@@ -399,6 +407,49 @@ mod tests {
         let path = path_through_straight_line();
         let mut pc = PathClearance::new(path, 0.3, 2.0);
         assert!(pc.is_obstacle_ahead());
+    }
+
+    #[test]
+    fn changed_origin_or_resolution_rebuilds_the_mask_for_new_obstacles() {
+        for (resolution, origin_x) in [(1.0, -10.0), (0.5, 0.0)] {
+            let path = make_path2d(vec![Point2::new(1.5, 1.5), Point2::new(4.5, 1.5)]);
+            let mut pc = PathClearance::new(path, 0.0, 3.0);
+            pc.update_costmap(CostMap2D::new_all_free("map", 30, 10, 1.0));
+            assert!(!pc.is_obstacle_ahead());
+
+            let mut changed = CostMap2D::new_all_free("map", 30, 10, resolution);
+            changed.set_origin(Point2::new(origin_x, 0.0));
+            let (x, y) = changed.world_to_cell(Point2::new(2.5, 1.5));
+            changed.set(x as usize, y as usize, OCCUPIED);
+            pc.update_costmap(changed);
+            assert!(pc.is_obstacle_ahead(), "变化后的世界坐标障碍必须落入新掩膜");
+        }
+    }
+
+    #[test]
+    fn sparse_path_obstacle_lookahead_advances_with_projected_position() {
+        let path = make_path2d(vec![Point2::new(0.5, 0.5), Point2::new(6.5, 0.5)]);
+        let mut pc = PathClearance::new(path, 0.0, 3.0);
+        let mut map = CostMap2D::new_all_free("map", 10, 3, 1.0);
+        map.set(4, 0, OCCUPIED);
+        pc.update_costmap(map);
+        pc.update_path_progress(0, Point2::new(0.5, 0.5));
+        assert!(!pc.is_obstacle_ahead());
+        pc.update_path_progress(0, Point2::new(1.5, 0.5));
+        assert!(pc.is_obstacle_ahead());
+    }
+
+    #[test]
+    fn outside_map_lookahead_is_blocked_but_distant_outside_endpoint_is_not() {
+        for (start, end, blocked) in [
+            (Point2::new(-2.0, 0.5), Point2::new(-1.0, 0.5), true),
+            (Point2::new(3.5, 0.5), Point2::new(8.5, 0.5), true),
+            (Point2::new(0.5, 0.5), Point2::new(8.5, 0.5), false),
+        ] {
+            let mut pc = PathClearance::new(make_path2d(vec![start, end]), 0.0, 3.0);
+            pc.update_costmap(CostMap2D::new_all_free("map", 5, 3, 1.0));
+            assert_eq!(pc.is_obstacle_ahead(), blocked);
+        }
     }
 
     #[test]

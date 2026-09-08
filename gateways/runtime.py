@@ -2330,7 +2330,21 @@ class GatewayRuntime:
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object({"task_id": {"type": "string"}}, required=("task_id",)),
-                output_schema=_schema_object({"task": {"type": "object"}}),
+                output_schema=_schema_object(
+                    {
+                        "task_id": {"type": "string"},
+                        "status": {"type": "object"},
+                        "events": {"type": "array", "items": {"type": "object"}},
+                        "result": {},
+                        "error": {"type": ["string", "null"]},
+                        "error_payload": {"type": ["object", "null"]},
+                        "map_asset_finalize": {"type": "object"},
+                        "polling_advisory": {"type": "object"},
+                        "next_step_hint": {"type": "string"},
+                        "events_truncated": {"type": "boolean"},
+                    },
+                    required=("task_id", "status", "events", "result", "error", "error_payload"),
+                ),
             ),
             _descriptor(
                 "cancel_task",
@@ -2641,7 +2655,7 @@ class GatewayRuntime:
             _descriptor(
                 "finalize_active_map",
                 "完成当前地图",
-                "将当前建图结果原子发布为该地图唯一的 current 资产包。已完成地图不可被不同内容覆盖。",
+                "将当前建图结果原子发布为该地图唯一的 current 资产包。本地地图可省略地理参考；已完成地图不可被不同内容覆盖。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -3017,7 +3031,7 @@ class GatewayRuntime:
             _descriptor(
                 "navigate_to_pose",
                 "导航到位姿",
-                "以统一导航接口把机器人导航到二维目标位姿。",
+                "按所选导航方案把机器人导航到目标位姿；三维方案保留地图坐标中的机体高度。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -3026,7 +3040,7 @@ class GatewayRuntime:
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
                         "y": {"type": "number"},
-                        "z": {"type": "number", "default": 0.0},
+                        "z": {"type": "number", "default": 0.0, "description": "地图坐标中的目标机体高度（米）；三维导航须填写实际高度。"},
                         "yaw_rad": {"type": "number", "default": 0.0},
                         "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.3},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
@@ -5249,6 +5263,11 @@ class GatewayRuntime:
             "error": self.task_manager.get_task_error(task_id),
             "error_payload": self.task_manager.get_task_error_payload(task_id),
         }
+        receipt = self.task_manager.get_task_spec(task_id).metadata.get("map_asset_finalize")
+        if isinstance(receipt, dict):
+            snapshot["map_asset_finalize"] = dict(receipt)
+            if isinstance(snapshot["result"], dict):
+                snapshot["result"] = {**snapshot["result"], "finalize_pending": False}
         snapshot = self._slim_task_snapshot(snapshot)
         return self._attach_async_task_polling_advisory(task_id, snapshot)
 
@@ -12895,6 +12914,8 @@ class GatewayRuntime:
                         self._schedule_exploration_workspace_finalize(
                             map_name=request.map_name,
                             trigger="explore_area_completed",
+                            exploration_request_id=request.request_id,
+                            task_id=context.task_id,
                         )
                         return result
                     if complete_terminal and status.value == "failed":
@@ -13687,7 +13708,11 @@ class GatewayRuntime:
             deadline_monotonic=deadline_monotonic,
         )
 
-    def _schedule_exploration_workspace_finalize(self, *, map_name: str, trigger: str) -> None:
+    def _schedule_exploration_workspace_finalize(
+        self, *, map_name: str, trigger: str,
+        exploration_request_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> None:
         """探索任务先标记 succeeded，地图资产发布放到后台，避免阻塞 get_task_status。"""
 
         def _run_finalize() -> None:
@@ -13702,7 +13727,10 @@ class GatewayRuntime:
                     delay_sec = 8.0
                 if delay_sec > 0.0:
                     time.sleep(delay_sec)
-                self._finalize_workspace_assets_after_task(map_name=map_name, trigger=trigger)
+                self._finalize_workspace_assets_after_task(
+                    map_name=map_name, trigger=trigger,
+                    exploration_request_id=exploration_request_id, task_id=task_id,
+                )
             except Exception:
                 RUNTIME_LOGGER.exception(
                     "探索任务后台发布地图资产失败 map_name=%s trigger=%s",
@@ -13752,27 +13780,70 @@ class GatewayRuntime:
         *,
         map_name: Optional[str],
         trigger: str,
+        exploration_request_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not map_name:
             return {}
         self._refresh_workspace_snapshots()
         finalized_map_asset = None
+        finalize_error = None
         if trigger.startswith("explore"):
-            finalized_map_asset = self._maybe_finalize_map_after_exploration(
-                map_name=map_name,
-                trigger=trigger,
-            )
+            try:
+                finalized_map_asset = self._maybe_finalize_map_after_exploration(
+                    map_name=map_name,
+                    trigger=trigger,
+                    exploration_request_id=exploration_request_id,
+                    task_id=task_id,
+                )
+            except Exception as exc:
+                finalize_error = {
+                    "error_code": self._extract_error_code(exc),
+                    "message": str(exc),
+                    "map_name": map_name,
+                    "exploration_request_id": exploration_request_id,
+                }
+                RUNTIME_LOGGER.exception("探索结束后地图资产发布失败 map_name=%s trigger=%s", map_name, trigger)
+                self.event_bus.publish(self.event_bus.build_event(
+                    "map.asset_finalize_failed",
+                    category=RuntimeEventCategory.SYSTEM,
+                    source="gateway_runtime",
+                    subject_id=map_name,
+                    task_id=task_id,
+                    severity=RuntimeEventSeverity.ERROR,
+                    message="探索已结束，但地图资产保存失败：%s" % str(exc),
+                    payload={**finalize_error, "trigger": trigger},
+                ))
         active_workspace = self.map_workspace_service.get_active_workspace()
-        return {
+        result = {
             "active_workspace": active_workspace,
             "finalized_map_asset": finalized_map_asset,
         }
+        if finalize_error is not None:
+            result["map_asset_finalize_error"] = finalize_error
+        if task_id:
+            asset_metadata = dict(getattr(finalized_map_asset, "metadata", {}) or {})
+            receipt = {
+                "status": "failed" if finalize_error else "succeeded" if finalized_map_asset is not None else "skipped",
+                "map_name": map_name,
+                "exploration_request_id": exploration_request_id,
+                "task_id": task_id,
+                "manifest_sha256": getattr(finalized_map_asset, "manifest_sha256", None),
+                "mapping_session_id": asset_metadata.get("mapping_session_id"),
+                "session_generation": asset_metadata.get("session_generation"),
+                "error": finalize_error,
+            }
+            self.task_manager.update_task_metadata(task_id, {"map_asset_finalize": receipt})
+            result["map_asset_finalize"] = receipt
+        return result
 
     def _maybe_finalize_map_after_exploration(
         self,
         *,
         map_name: str,
         trigger: str,
+        exploration_request_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ):
         active_workspace = self.map_workspace_service.get_active_workspace()
         if active_workspace is None or active_workspace.active_map_name != map_name:
@@ -13789,15 +13860,16 @@ class GatewayRuntime:
                 trigger,
             )
             return None
-        try:
-            return self.map_workspace_service.finalize_active_map(
-                map_name=map_name,
-                reason=trigger,
-                metadata={"source": "task_finalize"},
-            )
-        except Exception:
-            RUNTIME_LOGGER.exception("探索任务结束后自动完成地图失败 map_name=%s trigger=%s", map_name, trigger)
-            return None
+        metadata = {"source": "task_finalize"}
+        if exploration_request_id:
+            metadata["exploration_request_id"] = exploration_request_id
+        if task_id:
+            metadata["task_id"] = task_id
+        return self.map_workspace_service.finalize_active_map(
+            map_name=map_name,
+            reason=trigger,
+            metadata=metadata,
+        )
 
     def _exploration_snapshot_matches_active_map(self, active_workspace) -> bool:
         snapshot = getattr(active_workspace, "latest_map_snapshot", None)

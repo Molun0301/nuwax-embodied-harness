@@ -103,10 +103,10 @@ internal_scheduler_ready() {
 }
 
 case "${PROFILE}" in
-  simple-2d|replanning-astar)
+  simple-2d|replanning-astar|mls-3d)
     ;;
   *)
-    fail "unsupported production profile '${PROFILE}'; expected simple-2d or replanning-astar"
+    fail "unsupported production profile '${PROFILE}'; expected simple-2d, replanning-astar or mls-3d"
     ;;
 esac
 

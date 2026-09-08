@@ -251,7 +251,7 @@ _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_GEOMETRY_LIO_BACKEND": ("device", "fastlio2", "pointlio"),
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("voxel", "raytracing"),
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("none", "library_pgo", "native_pgo", "relocalization"),
-    "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar"),
+    "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar", "mls-3d"),
     "NUWAX_EXPLORE_ARBITRATION": ("prefer_wavefront",),
 }
 
@@ -261,7 +261,7 @@ _CHOICE_LABELS: Dict[str, Tuple[str, ...]] = {
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("体素窗口", "射线追踪"),
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("不启用校正", "库内位姿图优化", "原生位姿图优化", "重定位校正"),
     "NUWAX_LOG_LEVEL": ("调试", "信息", "警告", "错误", "严重错误"),
-    "NUWAX_NAV_PROFILE": ("二维路径跟踪", "动态路径重规划"),
+    "NUWAX_NAV_PROFILE": ("二维路径跟踪", "动态路径重规划", "楼梯与斜坡三维导航"),
     "NUWAX_EXPLORE_ARBITRATION": ("优先波前探索",),
 }
 

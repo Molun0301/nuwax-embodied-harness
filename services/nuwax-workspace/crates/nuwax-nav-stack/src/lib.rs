@@ -80,6 +80,8 @@ pub mod profiles;
 pub mod runner;
 mod runtime_owners;
 pub mod topics;
+#[cfg(feature = "mls")]
+pub mod surface_config;
 
 pub use builder::{NavStackBuilder, NavStackHandle};
 pub use error::{NavStackError, NavStackResult};

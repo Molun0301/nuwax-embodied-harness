@@ -358,6 +358,22 @@ button{font-family:inherit;cursor:pointer}
 .map-tool-group .tool.active,.map-tool-group .tool[aria-pressed="true"]{background:var(--ink);color:var(--surface)}
 .map-tool-group .tool:disabled{cursor:not-allowed;opacity:.42;background:transparent;color:var(--faint)}
 .map-tool-separator{width:1px;height:20px;background:var(--line);margin:0 2px}
+.navigation-height-field{display:flex;align-items:center;gap:7px;color:var(--strong);font-size:11px;padding:4px 8px}
+.navigation-height-field input{min-width:0;width:108px;height:27px;padding:3px 6px;border:1px solid var(--line);
+  border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit}
+.navigation-panel{position:absolute;left:14px;top:140px;z-index:7;width:min(350px,calc(100% - 28px));
+  max-height:calc(100% - 210px);overflow:auto;padding:12px;border:1px solid var(--line);border-radius:var(--r);font-size:12px}
+.navigation-panel[hidden]{display:none!important}
+.navigation-panel .navigation-height-field{display:grid;padding:0}
+.navigation-panel input{width:100%}
+.navigation-hint{color:var(--muted);line-height:1.5;margin:8px 0}
+.navigation-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.navigation-actions button{min-height:29px;padding:5px 9px;border:1px solid var(--line);border-radius:var(--r-sm);
+  background:var(--inset);color:var(--strong);font:inherit;cursor:pointer}
+.navigation-actions [data-role="nav-submit"]{background:var(--ink);color:var(--surface);border-color:transparent}
+.navigation-panel [data-role="nav-status"]{overflow-wrap:anywhere;line-height:1.5;margin:8px 0 0}
+.navigation-panel [data-role="nav-status"][data-level="warn"],.navigation-panel [data-role="nav-status"][data-level="error"]{color:var(--bad)}
+.navigation-panel pre{white-space:pre-wrap;margin:6px 0 0;font-size:11px}
 .map-layer-toggle{min-height:29px;padding:5px 8px;border-radius:var(--r-sm);display:inline-flex;gap:6px;align-items:center;
   color:var(--strong);font-size:11.5px;font-weight:620;cursor:pointer}
 .map-layer-toggle:hover{background:var(--inset)}

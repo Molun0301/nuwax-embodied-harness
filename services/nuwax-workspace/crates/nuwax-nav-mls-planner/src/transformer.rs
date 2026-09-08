@@ -213,6 +213,8 @@ fn validate_config(config: &Config) -> Result<(), TransformError> {
         config.wall_buffer_m,
         config.wall_buffer_weight,
         config.step_threshold_m,
+        config.max_slope_deg,
+        config.min_step_tread_depth_m,
         config.step_penalty_weight,
         config.goal_tolerance,
         config.viz_publish_hz,

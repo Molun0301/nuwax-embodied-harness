@@ -48,10 +48,16 @@ pub struct Config {
     /// 最大可跨越的垂直高度(米),超过则不可通行。
     #[validate(range(min = 0.0))]
     pub step_threshold_m: f32,
+    /// 共享表面允许的连续坡道最大坡度（度）；台阶另需具备真实踏面。
+    #[validate(range(min = 0.0, exclusive_max = 90.0))]
+    pub max_slope_deg: f32,
+    /// 台阶两侧沿行进方向必须存在的最小踏面深度（米）。
+    #[validate(range(exclusive_min = 0.0))]
+    pub min_step_tread_depth_m: f32,
     /// 每米爬升增加的软代价权重。
     #[validate(range(min = 0.0))]
     pub step_penalty_weight: f32,
-    /// 距目标平面距离(米),低于此值停止 replan。
+    /// 距目标的三维欧氏距离(米),低于此值停止重新规划。
     #[validate(range(exclusive_min = 0.0))]
     pub goal_tolerance: f32,
     /// 可视化产物发布频率上限(Hz),`0` 关闭。路径本身不限流。
@@ -124,6 +130,25 @@ pub struct Planner {
 }
 
 impl Planner {
+    /// 从原规划器的真实体素导出共享快照；配置体素须与建立规划器时一致。
+    pub fn surface_snapshot(
+        &self,
+        config: &Config,
+    ) -> Result<crate::surface::SurfaceSnapshot, crate::surface::SurfaceError> {
+        let points: Vec<_> = self
+            .voxel_keys()
+            .map(|(x, y, z)| {
+                let size = config.voxel_size;
+                (
+                    (x as f32 + 0.5) * size,
+                    (y as f32 + 0.5) * size,
+                    (z as f32 + 0.5) * size,
+                )
+            })
+            .collect();
+        crate::surface::SurfaceSnapshot::from_points(&points, config.clone(), config.voxel_size)
+    }
+
     /// 使用新点云更新全局体素地图,并重建相关图结构。
     pub fn update_global_map(&mut self, points: &[(f32, f32, f32)], config: &Config) {
         let voxel_size = config.voxel_size;
@@ -408,6 +433,7 @@ impl Planner {
     }
 
     /// 规划从起点到目标点的路径(找不到完整路径时返回 `None`)。
+    /// 起终点为支撑面坐标，须在自身水平单元内满足净空和高度量化约束。
     pub fn plan(
         &self,
         start: (f32, f32, f32),
@@ -422,6 +448,7 @@ impl Planner {
 
     /// Plan to the goal, or follow the cached path as far as it is still safe.
     /// Returns the waypoints, empty when nothing ahead is traversable (stop).
+    /// 当前起点也必须属于可通行支撑面，缓存不会放宽端点连接条件。
     pub fn plan_or_truncate(
         &mut self,
         start: (f32, f32, f32),
@@ -536,6 +563,8 @@ mod region_tests {
             wall_buffer_m: 0.3,
             wall_buffer_weight: 1.0,
             step_threshold_m: 0.25,
+            max_slope_deg: 30.0,
+            min_step_tread_depth_m: 0.2,
             step_penalty_weight: 0.0,
             goal_tolerance: 0.3,
             viz_publish_hz: 2.0,
@@ -1056,7 +1085,130 @@ mod region_tests {
     }
 
     #[test]
-    fn goal_on_subclearance_spur_still_plans() {
+    fn endpoint_connections_never_cross_missing_surface() {
+        let mut cfg = test_config();
+        cfg.surface_closing_radius = 0.0;
+        cfg.wall_buffer_weight = 0.0;
+        cfg.node_spacing_m = 0.3;
+        let mut points = Vec::new();
+        for ix in -10..31 {
+            if ix == 11 {
+                continue;
+            }
+            for iy in -10..11 {
+                points.push(((ix as f32 + 0.5) * 0.1, (iy as f32 + 0.5) * 0.1, 0.0));
+            }
+        }
+        let mut planner = Planner::default();
+        planner.update_global_map(&points, &cfg);
+
+        let goal = (2.55, 0.05, 0.1);
+        // 两端都有支撑，但中间只有一列断带，仍不能吸附到另一侧。
+        assert!(planner.plan((0.95, 0.05, 0.1), goal, &cfg).is_none());
+        // 端点本身处于断带或地图外时，不能由邻近有效单元替代。
+        assert!(planner.plan((1.15, 0.05, 0.1), goal, &cfg).is_none());
+        assert!(planner.plan(goal, (3.65, 0.05, 0.1), &cfg).is_none());
+        assert!(planner.plan((3.65, 0.05, 0.1), goal, &cfg).is_none());
+        // 同一支撑面的正常局部目标保留其原始坐标。
+        let valid_goal = (2.83, 0.07, 0.08);
+        let path = planner.plan(goal, valid_goal, &cfg).unwrap();
+        assert_eq!(path.last(), Some(&valid_goal));
+    }
+
+    fn stacked_floor_points(with_ramp: bool) -> Vec<(f32, f32, f32)> {
+        let mut points = Vec::new();
+        let mut add = |ix, iy, iz| {
+            points.push((
+                (ix as f32 + 0.5) * 0.1,
+                (iy as f32 + 0.5) * 0.1,
+                (iz as f32 + 0.5) * 0.1,
+            ));
+        };
+        for ix in 0..20 {
+            for iy in 0..20 {
+                add(ix, iy, 0);
+                add(ix, iy, 30);
+            }
+        }
+        if with_ramp {
+            // 坡道放在两层投影之外，每前进两个体素上升一个体素。
+            for ix in 10..20 {
+                for iy in 20..81 {
+                    add(ix, iy, (iy - 20) / 2);
+                }
+            }
+            // 上层返回走廊位于坡道侧面，只有接近坡顶才可跨接。
+            for ix in 20..30 {
+                for iy in 0..81 {
+                    add(ix, iy, 30);
+                }
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn overlapping_floors_require_the_real_ramp_connection() {
+        let mut cfg = test_config();
+        cfg.surface_closing_radius = 0.0;
+        cfg.node_spacing_m = 0.5;
+        let lower = (1.05, 1.05, 0.1);
+        let upper = (1.05, 1.05, 3.1);
+        for with_ramp in [false, true] {
+            let mut planner = Planner::default();
+            planner.update_global_map(&stacked_floor_points(with_ramp), &cfg);
+            for (start, goal) in [(lower, upper), (upper, lower)] {
+                let path = planner.plan(start, goal, &cfg);
+                if !with_ramp {
+                    assert!(path.is_none(), "没有连接的重叠楼层必须不可达");
+                    continue;
+                }
+                let path = path.expect("有连续支撑面的坡道必须能连接两层");
+                assert_eq!(path.first(), Some(&start));
+                assert_eq!(path.last(), Some(&goal));
+                assert!(
+                    path.iter().any(|point| point.1 > 7.0),
+                    "必须实际绕行坡道，不能从重叠平面位置直接换层：{path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_path_cannot_restore_an_unsupported_start() {
+        let mut cfg = test_config();
+        cfg.surface_closing_radius = 0.0;
+        cfg.wall_buffer_weight = 0.0;
+        cfg.node_spacing_m = 0.3;
+        let points: Vec<_> = (0..40)
+            .flat_map(|ix| {
+                (0..10).map(move |iy| ((ix as f32 + 0.5) * 0.1, (iy as f32 + 0.5) * 0.1, 0.0))
+            })
+            .collect();
+        let mut planner = Planner::default();
+        planner.update_global_map(&points, &cfg);
+        let goal = (3.55, 0.55, 0.1);
+        assert!(!planner
+            .plan_or_truncate((0.55, 0.55, 0.1), goal, &cfg)
+            .is_empty());
+        let missing_start: Vec<_> = points
+            .into_iter()
+            .filter(|point| !(point.0 > 1.0 && point.0 < 1.1))
+            .collect();
+        planner.update_global_map(&missing_start, &cfg);
+        assert!(planner
+            .plan_or_truncate((1.05, 0.55, 0.1), goal, &cfg)
+            .is_empty());
+        assert!(planner
+            .plan_or_truncate((-0.05, 0.55, 0.1), goal, &cfg)
+            .is_empty());
+        assert!(planner
+            .plan_or_truncate((0.55, 0.55, 1.1), goal, &cfg)
+            .is_empty());
+    }
+
+    #[test]
+    fn endpoint_on_subclearance_spur_is_rejected() {
         let mut cfg = test_config();
         cfg.surface_closing_radius = 0.0;
         cfg.wall_clearance_m = 0.3;
@@ -1083,10 +1235,8 @@ mod region_tests {
 
         let start = (0.45, 0.45, 0.0);
         let goal = (15.0 * vs + half, 5.0 * vs + half, 0.0);
-        let wp = p
-            .plan(start, goal, &cfg)
-            .expect("goal on a sub-clearance spur still reaches its component node");
-        let last = *wp.last().expect("path has waypoints");
-        assert!((last.0 - goal.0).abs() < 1e-3 && (last.1 - goal.1).abs() < 1e-3);
+        // 连通分量内存在节点，也不能把硬净空不足的单元当作合法端点。
+        assert!(p.plan(start, goal, &cfg).is_none());
+        assert!(p.plan(goal, start, &cfg).is_none());
     }
 }

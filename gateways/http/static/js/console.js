@@ -194,6 +194,7 @@
         mapRvizHint: document.getElementById("mapRvizHint"),
         mapInitialPoseToggle: document.getElementById("mapInitialPoseToggle"),
         mapGoalToggle: document.getElementById("mapGoalToggle"),
+        mapGoalHeight: document.getElementById("mapGoalHeight"),
         mapPublishPointToggle: document.getElementById("mapPublishPointToggle"),
         mapGoalStatus: document.getElementById("mapGoalStatus"),
         mapStreamStatus: document.getElementById("mapStreamStatus"),
@@ -1512,7 +1513,8 @@
       }
       function formatMapPoint(point) {
         if (!point) return "--";
-        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`;
+        const height = typeof point.z === "number" && Number.isFinite(point.z) ? `, ${point.z.toFixed(2)}` : "";
+        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)}${height})`;
       }
       function planarDistanceMeters(a, b) {
         if (!a || !b) return null;
@@ -1526,7 +1528,13 @@
         const point = pointFromPose(targetPose);
         if (!point) return false;
         const dist = planarDistanceMeters(point, pending);
-        return dist !== null && dist < 0.35;
+        const z = targetPose.position && targetPose.position.z;
+        const frame = String(targetPose.frame_id || "").trim().replace(/^\/+/, "");
+        const pendingFrame = String(pending.frame_id || "").trim().replace(/^\/+/, "");
+        return typeof z === "number" && Number.isFinite(z)
+          && typeof pending.z === "number" && Number.isFinite(pending.z)
+          && frame !== "" && frame === pendingFrame
+          && dist !== null && Math.hypot(dist, z - pending.z) < 0.35;
       }
       function syncDebugNavGoalFromStream(navPayload) {
         const pending = state.pendingNavGoal;
@@ -1553,7 +1561,7 @@
           return;
         }
         if (status === "failed" || status === "cancelled") {
-          if (!matches && pending.status !== "pending" && pending.status !== "accepted") return;
+          if (!matches) return;
           const message = navState.message || (status === "cancelled" ? "导航已取消" : "导航失败");
           const failureReason = String(metadata.failure_reason || "");
           if (
@@ -1698,6 +1706,37 @@
         const gridFrame = state.mapGrid && state.mapGrid.frame_id;
         return normalizeFrameId(poseFrame || gridFrame, "map");
       }
+      function currentNavigationBodyPose(frameId) {
+        const envelope = state.lastLocalizationEnvelope;
+        const pose = state.latestPose;
+        const position = pose && pose.position;
+        if (!envelope || statusOf(envelope) !== "available" || envelope.stale === true || !position) return null;
+        if (![position.x, position.y, position.z].every(value => typeof value === "number" && Number.isFinite(value))) return null;
+        const poseFrame = String(pose.frame_id || envelope.frame_id || "").trim().replace(/^\/+/, "");
+        const targetFrame = String(frameId || "").trim().replace(/^\/+/, "");
+        if (!poseFrame || poseFrame !== targetFrame) return null;
+        // 只读当前真实定位帧；显示缓存重绘不能刷新定位的采样时间和接收时间。
+        const source = pose.timestamp;
+        const sourceMs = typeof source === "number" ? source * (source < 1e12 ? 1000 : 1) : Date.parse(source);
+        const receivedMs = Date.parse(envelope.__receivedAt);
+        const now = Date.now();
+        if (![sourceMs, receivedMs].every(value => Number.isFinite(value) && now - value >= -1000 && now - value <= 2000)) return null;
+        return { x: position.x, y: position.y, z: position.z, frame_id: poseFrame };
+      }
+      function resolveNavigationHeight(input, frameId) {
+        if (input && input.validity && input.validity.badInput) {
+          throw new Error("目标机体高度无效，请填写有限数值（米）。");
+        }
+        const value = input ? String(input.value || "").trim() : "";
+        if (value) {
+          const height = Number(value);
+          if (!Number.isFinite(height)) throw new Error("目标机体高度无效，请填写有限数值（米）。");
+          return height;
+        }
+        const current = currentNavigationBodyPose(frameId);
+        if (!current) throw new Error("当前机体高度不可用或已过期，请填写目标在地图中的机体高度（米）。");
+        return current.z;
+      }
       function updateGoalPickStatus(text, tone) {
         if (!els.mapGoalStatus) return;
         const value = String(text || "").trim();
@@ -1803,24 +1842,32 @@
         const mapName = activeMapName();
         const robotPoint = pointFromPose(state.pose);
         const distanceM = planarDistanceMeters(mapPoint, robotPoint);
+        let targetHeight;
+        try {
+          targetHeight = resolveNavigationHeight(els.mapGoalHeight, frameId);
+        } catch (error) {
+          updateGoalPickStatus(error.message, "error");
+          return;
+        }
         const body = {
           frame_id: frameId,
           x: Number(mapPoint.x),
           y: Number(mapPoint.y),
-          z: 0,
+          z: targetHeight,
           yaw_rad: Number(yawRad),
         };
         if (mapName) body.map_name = mapName;
         state.pendingNavGoal = {
           x: body.x,
           y: body.y,
+          z: body.z,
           yaw_rad: body.yaw_rad,
           frame_id: frameId,
           status: "sending",
         };
         const robotLabel = robotPoint ? formatMapPoint(robotPoint) : "--";
         const distanceLabel = distanceM === null ? "" : ` · 距离 ${distanceM.toFixed(2)}m`;
-        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(mapPoint)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
+        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(body)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
         requestMapDraw(false);
         const controller = new AbortController();
         const requestTimeout = window.setTimeout(() => controller.abort(), 5000);
@@ -1845,13 +1892,14 @@
           state.pendingNavGoal = {
             x: body.x,
             y: body.y,
+            z: body.z,
             yaw_rad: body.yaw_rad,
             frame_id: frameId,
             status: "published",
             topic: payload.topic || "/goal_pose",
           };
           const topicLabel = payload.topic ? ` · ${payload.topic}` : "";
-          const goalLabel = `${formatMapPoint(mapPoint)}${distanceSuffix} · ${frameId}`;
+          const goalLabel = `${formatMapPoint(body)}${distanceSuffix} · ${frameId}`;
           updateGoalPickStatus(`已发布 RViz 目标 ${goalLabel}${topicLabel}`, "ok");
         } catch (error) {
           const message = error && error.name === "AbortError"
@@ -1860,6 +1908,7 @@
           state.pendingNavGoal = {
             x: body.x,
             y: body.y,
+            z: body.z,
             yaw_rad: body.yaw_rad,
             frame_id: frameId,
             status: "error",
@@ -5190,14 +5239,16 @@
       // boundary_draw.js / navigation.js 拆模块需要从屏幕坐标拿世界坐标，
       // canvasToMap / canvasPointer / cameraAnchor 是 IIFE 闭包私有的，必须挂 window。
       window.__nuwaxMapUnproject = function (screenX, screenY) {
-        if (!els.mapCanvas) return null;
+        if (!els.mapCanvas || !state.mapGrid || isMap3dVisible()) return null;
         const fakeEv = { clientX: Number(screenX), clientY: Number(screenY) };
         const pointer = canvasPointer(fakeEv);
         const anchor = cameraAnchor();
         const world = canvasToMap(pointer.x, pointer.y, anchor);
         if (!world) return null;
-        return { x: world.x, y: world.y, frame_id: 'map' };
+        return { x: world.x, y: world.y, frame_id: navigationFrameId() };
       };
+      window.__nuwaxResolveNavigationHeight = resolveNavigationHeight;
+      window.__nuwaxDisableMapTools = disableMapTools;
       // 选点回调：navigation.js 会在启动时 monkey-patch 此函数缓存点击坐标。
       // 这里默认 no-op；publish-point 走的是 isMapToolActive() 的现有 publishPoint 流程。
       window.__nuwaxMapClick = window.__nuwaxMapClick || null;

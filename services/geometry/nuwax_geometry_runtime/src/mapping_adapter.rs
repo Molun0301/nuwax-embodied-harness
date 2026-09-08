@@ -1081,6 +1081,8 @@ pub struct MappingAdapter {
     forbidden_zone_generation: u64,
     /// First canonical occupancy revision composed with the current signature.
     forbidden_zone_applied_revision: u64,
+    /// 与当前有效占据图同次应用的禁区快照；发布时不得重读未来文件。
+    applied_forbidden_zones: Option<crate::forbidden_zones::LoadedForbiddenZones>,
     last_built_generation: u64,
     last_built_point_count: usize,
     last_built_received_at_ns: u64,
@@ -1249,6 +1251,7 @@ impl MappingAdapter {
             forbidden_zone_signature: String::new(),
             forbidden_zone_generation: 0,
             forbidden_zone_applied_revision: 0,
+            applied_forbidden_zones: None,
             last_built_generation: 0,
             last_built_point_count: 0,
             last_built_received_at_ns: 0,
@@ -2193,6 +2196,11 @@ impl MappingAdapter {
         self.last_occupancy_commit_receipt.clone()
     }
 
+    /// 读取当前规范地图提交时钟标识，供同拥有方的清空发布使用。
+    pub(crate) fn mapping_commit_boot_nonce(&self) -> u128 {
+        self.commit_clock.boot_nonce()
+    }
+
     pub(crate) fn set_legacy_checkpoint_reconstructed(&mut self, reconstructed: bool) {
         self.lifecycle.legacy_checkpoint_reconstructed = reconstructed;
     }
@@ -2273,6 +2281,26 @@ impl MappingAdapter {
         self.raw_map.clone()
     }
 
+    /// 只生成已应用禁区的虚拟遮罩，物理占据和未知单元均不进入该层。
+    pub(crate) fn virtual_obstacles_snapshot(&self) -> Result<Option<MapState>, String> {
+        let Some(loaded) = self.applied_forbidden_zones.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(
+            loaded.status,
+            crate::forbidden_zones::ZoneLoadStatus::FailClosed(_)
+        ) && !loaded.zones.iter().any(|zone| zone.enabled)
+        {
+            return Ok(None);
+        }
+        let mut free = self
+            .raw_map
+            .clone()
+            .ok_or_else(|| "applied forbidden zones have no physical map geometry".to_string())?;
+        free.data.fill(0);
+        crate::forbidden_zones::compose_effective_map(&free, loaded).map(Some)
+    }
+
     fn load_forbidden_zones(&self) -> crate::forbidden_zones::LoadedForbiddenZones {
         match self.forbidden_zones_path.as_deref() {
             Some(path) => crate::forbidden_zones::load_for_map(path, &self.lifecycle.map_name),
@@ -2293,6 +2321,7 @@ impl MappingAdapter {
         let signature_changed = loaded.signature != self.forbidden_zone_signature;
         self.forbidden_zone_signature = loaded.signature.clone();
         self.forbidden_zone_generation = loaded.generation;
+        self.applied_forbidden_zones = Some(loaded.clone());
         if signature_changed || self.forbidden_zone_applied_revision == 0 {
             self.forbidden_zone_applied_revision = applied_revision;
         }
@@ -2305,6 +2334,7 @@ impl MappingAdapter {
         self.forbidden_zone_signature = loaded.signature.clone();
         self.forbidden_zone_generation = loaded.generation;
         self.forbidden_zone_applied_revision = 0;
+        self.applied_forbidden_zones = None;
     }
 
     pub(crate) fn forbidden_zone_ack(&self) -> ForbiddenZoneAck {
@@ -3161,6 +3191,7 @@ impl MappingAdapter {
         self.forbidden_zone_signature.clear();
         self.forbidden_zone_generation = 0;
         self.forbidden_zone_applied_revision = 0;
+        self.applied_forbidden_zones = None;
         self.last_built_generation = 0;
         self.last_built_point_count = 0;
         self.last_built_received_at_ns = 0;
@@ -3876,6 +3907,66 @@ mod tests {
         assert!(s.map.revision >= 1);
         assert_eq!(s.map.width, 20);
         assert_eq!(s.map.height, 20);
+    }
+
+    #[test]
+    fn virtual_obstacles_use_applied_snapshot_without_physical_projection_or_future_file() {
+        let zone_path = std::env::temp_dir().join(format!(
+            "nuwax-applied-virtual-zones-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(zone_path.clone());
+        std::fs::write(&zone_path, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":1,"zones":[{"id":"circle","shape":"circle","mode":"inside","frame_id":"map","center":{"x":2.5,"y":2.5},"radius_m":0.3}]}}}"#).unwrap();
+        let mut adapter = active_adapter(sample_config());
+        adapter.forbidden_zones_path = Some(zone_path.clone());
+        let mut checkpoint = OccupancyGrid::with_frame(6, 6, 1.0, "map");
+        checkpoint.origin = [0.0, 0.0, 0.0];
+        checkpoint.data.fill(-1);
+        checkpoint.data[0] = 100;
+        let (effective, _) = adapter
+            .install_checkpoint(checkpoint, 10_000_000_000, 0)
+            .unwrap();
+        let mask = adapter.virtual_obstacles_snapshot().unwrap().unwrap();
+        assert_eq!(
+            (mask.revision, mask.timestamp_ns, mask.frame_id.as_str()),
+            (effective.revision, 10_000_000_000, "map")
+        );
+        assert_eq!(mask.data[0], 0, "物理障碍不能投影为跨层虚拟禁区");
+        assert_eq!(mask.data[2 + 2 * 6], 100);
+        assert!(mask.data.iter().all(|value| matches!(value, 0 | 100)));
+        std::fs::write(&zone_path, b"{broken-json").unwrap();
+        assert_eq!(
+            adapter.virtual_obstacles_snapshot().unwrap().unwrap().data,
+            mask.data,
+            "未应用的未来文件不能改变当前提交的遮罩"
+        );
+        let state = Arc::new(RwLock::new(SharedState {
+            map: effective,
+            ..SharedState::default()
+        }));
+        let (map_tx, _) = broadcast::channel(4);
+        assert!(adapter.refresh_forbidden_zones(&state, &map_tx).unwrap());
+        let blocked = adapter.virtual_obstacles_snapshot().unwrap().unwrap();
+        assert!(blocked.revision > mask.revision);
+        assert!(blocked.data.iter().all(|value| *value == 100));
+        assert_eq!(blocked.revision, state.try_read().unwrap().map.revision);
+        std::fs::write(&zone_path, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":2,"zones":[]}}}"#).unwrap();
+        assert!(adapter
+            .virtual_obstacles_snapshot()
+            .unwrap()
+            .unwrap()
+            .data
+            .iter()
+            .all(|value| *value == 100));
+        assert!(adapter.refresh_forbidden_zones(&state, &map_tx).unwrap());
+        assert!(adapter.virtual_obstacles_snapshot().unwrap().is_none());
+        assert_eq!(adapter.raw_map_snapshot().unwrap().data[0], 100);
     }
 
     #[test]

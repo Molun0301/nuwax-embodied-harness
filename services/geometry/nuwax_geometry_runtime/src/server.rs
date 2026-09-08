@@ -9945,6 +9945,8 @@ mod lifecycle_tests {
             Ok(ExploreRobotPose {
                 x: 2.0,
                 y: 2.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "map".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),
@@ -11790,6 +11792,8 @@ mod lifecycle_tests {
             .tick_with_pose(ExploreRobotPose {
                 x: 0.0,
                 y: 0.0,
+                z: 0.0,
+                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
                 frame_id: "odom".to_string(),
                 source_timestamp_ns: now_unix_nanos(),
                 received_monotonic_ns: now_monotonic_nanos(),

@@ -12,7 +12,6 @@
 
   const NAV_API = '/api/capabilities/navigate_to_pose/invoke';
   const CANCEL_API = '/api/capabilities/cancel_navigation/invoke';
-  const STATE_API = '/api/capabilities/get_navigation_state/invoke';
   const POLL_INTERVAL_MS = 500; // 2Hz
   const WS_STREAM_NAME = 'navigation.state';
 
@@ -22,8 +21,11 @@
     detailEl: null,
     btnNav: null,
     btnCancel: null,
+    heightInput: null,
     pendingPose: null,
     inflightRequestId: null,
+    submittedPose: null,
+    submitting: false,
     pollTimer: null,
     wsToken: null,
     mapClickHandler: null,
@@ -47,8 +49,9 @@
       lines.push('剩余距离: ' + payload.remaining_distance_m.toFixed(2) + ' m');
     }
     if (payload.current_pose) {
-      const cp = payload.current_pose;
-      lines.push('当前位姿: x=' + (cp.x || 0).toFixed(2) + ' y=' + (cp.y || 0).toFixed(2));
+      const cp = payload.current_pose.position || payload.current_pose;
+      const coordinates = ['x', 'y', 'z'].filter(function (axis) { return typeof cp[axis] === 'number' && Number.isFinite(cp[axis]); });
+      if (coordinates.length) lines.push('当前位姿: ' + coordinates.map(function (axis) { return axis + '=' + cp[axis].toFixed(2); }).join(' '));
     }
     if (payload.message) lines.push('说明: ' + payload.message);
     if (payload.failure && payload.failure.code) {
@@ -58,86 +61,156 @@
   }
 
   function invokeCapability(url, args) {
-    return fetch(url, {
+    return requestJson(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ arguments: args || {} }),
-    }).then(function (r) { return r.json(); });
+    });
+  }
+
+  function requestJson(url, options) {
+    return fetch(url, options).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!response.ok || payload.ok === false) {
+          const error = payload.error || payload;
+          throw new Error(error.message || payload.detail || '请求失败：HTTP ' + response.status);
+        }
+        return payload;
+      });
+    });
+  }
+
+  function selectedPoseLabel(pose) {
+    const height = typeof pose.z === 'number' && Number.isFinite(pose.z) ? pose.z.toFixed(2) + ' 米' : '待填写';
+    return 'x=' + pose.x.toFixed(2) + ' y=' + pose.y.toFixed(2) + ' · 机体高度 ' + height;
+  }
+
+  function targetHeight(frameId) {
+    if (typeof window.__nuwaxResolveNavigationHeight !== 'function') {
+      throw new Error('定位高度入口不可用，请刷新控制台。');
+    }
+    return window.__nuwaxResolveNavigationHeight(state.heightInput, frameId);
+  }
+
+  function selectMapPoint(x, y, frameId) {
+    if (![x, y].every(function (value) { return typeof value === 'number' && Number.isFinite(value); })) return;
+    const pose = { x: x, y: y, z: null, yaw: 0.0, frame_id: frameId || 'map' };
+    try { pose.z = targetHeight(pose.frame_id); } catch (_) { /* 没有真实高度时保留待填，不猜楼层。 */ }
+    state.pendingPose = pose;
+    setStatus('已选点：' + selectedPoseLabel(pose), 'pending');
   }
 
   function captureClickFromMap() {
-    // 监听地图 canvas / 已知地图 div 的 mouseup，把最后点击的世界坐标缓存到 state.pendingPose。
-    // 主 html 暴露的钩子：window.__nuwaxMapClick 提供 (x, y, frame_id) 回调。
+    // 兼容已有世界坐标钩子，同时监听控制台实际使用的地图画布。
     if (typeof window.__nuwaxMapClick === 'function') {
       const original = window.__nuwaxMapClick;
       window.__nuwaxMapClick = function (x, y, frameId) {
-        state.pendingPose = { x: x, y: y, yaw: 0.0, frame_id: frameId || 'map' };
-        setStatus('已选点：x=' + x.toFixed(2) + ' y=' + y.toFixed(2), 'pending');
+        selectMapPoint(x, y, frameId);
         return original.apply(this, arguments);
       };
-      return;
     }
-    // 兜底：监听 #map 容器 click 事件（不影响主流程；主 html 仍可由 SVG/canvas 接管）。
-    const mapEl = document.getElementById('map') || document.getElementById('map-canvas');
+    const mapEl = document.getElementById('mapCanvas') || document.getElementById('map') || document.getElementById('map-canvas');
     if (!mapEl) return;
     mapEl.addEventListener('nuwax:map-click', function (ev) {
       const d = ev && ev.detail;
       if (!d) return;
-      state.pendingPose = { x: d.x, y: d.y, yaw: 0.0, frame_id: d.frame_id || 'map' };
-      setStatus('已选点：x=' + d.x.toFixed(2) + ' y=' + d.y.toFixed(2), 'pending');
+      selectMapPoint(d.x, d.y, d.frame_id);
+    });
+    let pointerStart = null;
+    mapEl.addEventListener('pointerdown', function (ev) {
+      if (!state.container || state.container.hidden || ev.button !== 0 || ev.isPrimary === false) return;
+      pointerStart = { x: ev.clientX, y: ev.clientY, id: ev.pointerId };
+    });
+    mapEl.addEventListener('pointercancel', function () { pointerStart = null; });
+    mapEl.addEventListener('pointerup', function (ev) {
+      const start = pointerStart;
+      pointerStart = null;
+      if (!start || state.container.hidden || ev.button !== 0 || start.id !== ev.pointerId) return;
+      if (Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > 6) return;
+      const point = typeof window.__nuwaxMapUnproject === 'function' ? window.__nuwaxMapUnproject(ev.clientX, ev.clientY) : null;
+      if (!point) { setStatus('等待可用的二维地图后选点', 'warn'); return; }
+      selectMapPoint(point.x, point.y, point.frame_id);
     });
   }
 
   function submitNavigation() {
+    if (state.submitting || state.inflightRequestId) {
+      setStatus('上一条导航尚未结束，请先取消或等待完成', 'warn');
+      return;
+    }
     if (!state.pendingPose) {
       setStatus('请先在地图上选点', 'warn');
       return;
     }
-    setStatus('提交导航中…', 'pending');
+    let pose;
+    try {
+      pose = Object.assign({}, state.pendingPose, { z: targetHeight(state.pendingPose.frame_id) });
+    } catch (err) {
+      setStatus(err.message, 'warn');
+      return;
+    }
+    state.pendingPose = pose;
+    state.submitting = true;
+    setStatus('提交导航中：' + selectedPoseLabel(pose), 'pending');
     invokeCapability(NAV_API, {
-      target_pose: state.pendingPose,
+      frame_id: pose.frame_id,
+      x: pose.x,
+      y: pose.y,
+      z: pose.z,
+      yaw_rad: pose.yaw,
       timeout_sec: 60,
     }).then(function (resp) {
-      if (resp && resp.ok === false) {
-        setStatus('导航失败：' + (resp.error && resp.error.message || JSON.stringify(resp)), 'error');
-        renderDetail({ status: 'failed', failure: resp.error });
-        return;
-      }
-      const taskId = resp && (resp.task_id || resp.id);
-      state.inflightRequestId = taskId || null;
-      setStatus('已提交：' + (taskId || 'n/a'), 'active');
+      const taskId = resp && resp.task_id;
+      if (!taskId) throw new Error('网关响应缺少导航任务标识，无法确认受理。');
+      state.inflightRequestId = taskId;
+      state.submittedPose = pose;
+      setStatus('已提交：' + taskId + ' · ' + selectedPoseLabel(pose), 'active');
       startPolling();
     }).catch(function (err) {
-      setStatus('网络错误：' + err, 'error');
+      setStatus('导航提交失败：' + err.message, 'error');
+    }).finally(function () {
+      state.submitting = false;
     });
   }
 
   function cancelNavigation() {
-    invokeCapability(CANCEL_API, { request_id: state.inflightRequestId || '' })
+    if (state.submitting) { setStatus('正在确认导航受理，请稍候再取消', 'warn'); return; }
+    const taskId = state.inflightRequestId;
+    // 本面板持有的是平台任务标识，不能把它当作后端导航目标标识。
+    const cancellation = taskId
+      ? requestJson('/api/tasks/' + encodeURIComponent(taskId) + '/cancel', { method: 'POST' })
+      : invokeCapability(CANCEL_API, {});
+    cancellation
       .then(function (resp) {
-        if (resp && resp.ok) {
-          setStatus('已发送取消', 'idle');
-        } else {
-          setStatus('取消失败：' + JSON.stringify(resp), 'warn');
-        }
+        const result = taskId ? resp : resp.result;
+        if (!result) throw new Error('网关响应缺少取消结果');
+        if (taskId && result.cancelled !== true) setStatus('该任务未接受取消请求，正在读取当前状态', 'warn');
+        else setStatus(result.completed === true ? '导航已结束' : '取消请求已发送，等待导航结束', 'pending');
+        if (taskId) startPolling();
       })
-      .catch(function (err) { setStatus('网络错误：' + err, 'error'); });
+      .catch(function (err) { setStatus('取消失败：' + err.message, 'error'); });
   }
 
   function pollOnce() {
-    invokeCapability(STATE_API, {}).then(function (resp) {
-      if (!resp) return;
-      const ns = resp.navigation_state || resp;
-      renderDetail(ns);
-      if (ns && (ns.status === 'succeeded' || ns.status === 'failed' || ns.status === 'canceled')) {
+    const taskId = state.inflightRequestId;
+    if (!taskId) return;
+    requestJson('/api/tasks/' + encodeURIComponent(taskId)).then(function (snapshot) {
+      if (state.inflightRequestId !== taskId) return;
+      const status = snapshot.status || {};
+      const result = snapshot.result || {};
+      const nav = result.navigation_context && result.navigation_context.navigation_state;
+      renderDetail(nav || { status: status.state, message: status.message || snapshot.error });
+      const selected = state.submittedPose ? ' · ' + selectedPoseLabel(state.submittedPose) : '';
+      if (['succeeded', 'failed', 'cancelled', 'timeout'].includes(status.state)) {
         stopPolling();
-        if (ns.status === 'succeeded') setStatus('已到达', 'success');
-        else if (ns.status === 'failed') setStatus('导航失败', 'error');
-        else setStatus('已取消', 'idle');
-      } else if (ns && ns.status) {
-        setStatus('导航中：' + ns.status, 'active');
+        state.inflightRequestId = null;
+        if (status.state === 'succeeded') setStatus('已到达' + selected, 'success');
+        else if (status.state === 'cancelled') setStatus('已取消' + selected, 'idle');
+        else setStatus((status.state === 'timeout' ? '导航超时' : '导航失败') + selected, 'error');
+      } else {
+        setStatus((status.message || '导航执行中') + selected, 'active');
       }
-    }).catch(function () { /* 静默轮询错误 */ });
+    }).catch(function (err) { setStatus('导航状态读取失败：' + err.message, 'warn'); });
   }
 
   function startPolling() {
@@ -170,6 +243,11 @@
     state.detailEl = state.container.querySelector('[data-role="nav-detail"]');
     state.btnNav = state.container.querySelector('[data-role="nav-submit"]');
     state.btnCancel = state.container.querySelector('[data-role="nav-cancel"]');
+    state.heightInput = state.container.querySelector('[data-role="nav-height"]');
+    if (state.heightInput) state.heightInput.addEventListener('input', function () {
+      const pose = state.pendingPose;
+      if (pose) selectMapPoint(pose.x, pose.y, pose.frame_id);
+    });
     if (state.btnNav) state.btnNav.addEventListener('click', submitNavigation);
     if (state.btnCancel) state.btnCancel.addEventListener('click', cancelNavigation);
     captureClickFromMap();

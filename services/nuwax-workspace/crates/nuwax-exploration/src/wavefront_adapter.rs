@@ -183,7 +183,7 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             .global_costmap
             .cloned()
             .or_else(|| self.cached_costmap.borrow().clone());
-        let Some(costmap) = costmap_opt else {
+        let Some(mut costmap) = costmap_opt else {
             self.last_error = Some("missing costmap".to_string());
             return Ok(ExplorationPoll::SourceUnavailable(
                 "missing costmap".to_string(),
@@ -191,6 +191,30 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         };
 
         let robot_pose = state.robot_position();
+        if let Some(boundary) = &self.boundary {
+            if !boundary.contains(Point2::new(robot_pose.x, robot_pose.y)) {
+                self.last_error = Some("robot pose outside exploration boundary".to_owned());
+                return Ok(ExplorationPoll::Stop(
+                    crate::ExplorationStopReason::NoReachableFreeSpace,
+                ));
+            }
+            // 在候选搜索前应用边界，目标及其机体轮廓与导航使用同一区域。
+            // 只修改私有候选栅格，范围外未知不作为新的待探索前沿。
+            for y in 0..costmap.height {
+                for x in 0..costmap.width {
+                    if costmap
+                        .cell_center(x, y)
+                        .is_some_and(|point| !boundary.contains(point))
+                    {
+                        costmap.set(
+                            x,
+                            y,
+                            nuwax_nav_types_messages::grid::OccupancyCell::Occupied,
+                        );
+                    }
+                }
+            }
+        }
         let now = state.now;
         match self.selector.select_goal_at(
             Point2 {
@@ -491,12 +515,52 @@ mod tests {
 
         assert!(matches!(
             ad.poll_goal(&s).unwrap(),
-            ExplorationPoll::Pending
+            ExplorationPoll::Stop(crate::ExplorationStopReason::NoReachableFreeSpace)
         ));
         assert!(ad.frontier_snapshot().is_empty());
         assert!(ad
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("outside exploration boundary")));
+    }
+
+    #[test]
+    fn known_bounded_region_does_not_create_frontiers_outside_boundary() {
+        let mut grid =
+            OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 40, 40, OccupancyCell::Unknown);
+        for y in 10..30 {
+            for x in 10..30 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        let mut ad =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        ad.configure_constraints(
+            Some(
+                ExplorationBoundary::from_vertices(vec![
+                    Point2::new(1.0, 1.0),
+                    Point2::new(3.0, 1.0),
+                    Point2::new(3.0, 3.0),
+                    Point2::new(1.0, 3.0),
+                ])
+                .unwrap(),
+            ),
+            1,
+            0.75,
+        );
+        ad.begin().unwrap();
+        let mut state = sample_state(Some(&grid), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.0;
+        state.robot_pose.pose.position.y = 2.0;
+        assert!(matches!(
+            ad.poll_goal(&state).unwrap(),
+            ExplorationPoll::NoFrontier
+        ));
+        assert!(ad.frontier_snapshot().is_empty());
+        assert_eq!(
+            grid.get(0, 0),
+            Some(OccupancyCell::Unknown),
+            "原始观测不得被边界掩码修改"
+        );
     }
 }

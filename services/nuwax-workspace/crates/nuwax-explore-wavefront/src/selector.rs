@@ -48,7 +48,7 @@ impl WavefrontGoalSelector {
     /// 选择 frontier goal(公共 API)。
     ///
     /// 顺序(方案 §4.10):
-    /// 1. `session.check_information_gain(grid, cfg)` 先跑(可能返回 `StopReason::NoInformationGain`)
+    /// 1. 记录信息增益；低增益只有在没有未访问的可达替代前沿时才结束探索。
     /// 2. `detector.detect_candidates(...)`
     /// 3. `DetectionOutcome::NoReachableFreeSpace` -> `GoalSelection::Stop(StopReason::NoReachableFreeSpace)`
     /// 4. `DetectionOutcome::Candidates` -> 打分 + 排序 + 选择 top 1 + 调 `id_source` 生成 id
@@ -66,10 +66,8 @@ impl WavefrontGoalSelector {
         let inflated_costmap = inflate_obstacles(costmap, cfg.obstacle_inflation_radius_m);
         let costmap = &inflated_costmap;
 
-        // 1. no-gain 检查
-        if let Some(reason) = session.check_information_gain(costmap, &cfg) {
-            return Ok(GoalSelection::Stop(reason));
-        }
+        // 低增益是局部目标的反馈，不能在检查其它可达前沿之前结束全图探索。
+        let no_gain_reason = session.check_information_gain(costmap, &cfg);
 
         // 2. detect
         let outcome = self
@@ -91,6 +89,14 @@ impl WavefrontGoalSelector {
         )> = Vec::with_capacity(candidates.len());
         for cand in &candidates {
             if session.is_blacklisted(cand.goal_position) {
+                continue;
+            }
+            if no_gain_reason.is_some()
+                && session.explored_goals.iter().any(|visited| {
+                    visited.distance(cand.goal_position)
+                        <= cfg.obstacle_inflation_radius_m + costmap.resolution
+                })
+            {
                 continue;
             }
             let geom = CandidateGeometry {
@@ -132,7 +138,10 @@ impl WavefrontGoalSelector {
 
         // 5. 选 top 1
         let Some((breakdown, cand)) = scored.first() else {
-            return Ok(GoalSelection::NoFrontier);
+            return Ok(match no_gain_reason {
+                Some(reason) => GoalSelection::Stop(reason),
+                None => GoalSelection::NoFrontier,
+            });
         };
 
         // 6. 生成 id
@@ -248,6 +257,7 @@ mod tests {
     use std::cell::Cell;
 
     struct SeqIdSrc(Cell<u32>);
+
     impl crate::frontier_goal::FrontierGoalIdSource for SeqIdSrc {
         fn next_frontier_goal_id(&mut self, _seed: &FrontierGoalIdSeed) -> String {
             let v = self.0.get();
@@ -278,6 +288,44 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(r, GoalSelection::NoFrontier));
+    }
+
+    #[test]
+    fn low_gain_continues_to_unvisited_frontier_but_stops_when_candidates_are_exhausted() {
+        let mut grid =
+            OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 50, 50, OccupancyCell::Unknown);
+        for y in 0..50 {
+            for x in 0..40 {
+                grid.set(x, y, OccupancyCell::Free);
+            }
+        }
+        let mut selector = WavefrontGoalSelector::new(WavefrontConfig {
+            min_goals_before_no_gain_check: 0,
+            num_no_gain_attempts: 1,
+            ..WavefrontConfig::default()
+        });
+        let mut session = ExplorationSession::new();
+        let mut ids = SeqIdSrc(Cell::new(0));
+        let robot = Point2::new(1.0, 2.5);
+        let seed = selector
+            .select_goal_at(robot, &grid, &mut session, Timestamp::default(), &mut ids)
+            .unwrap();
+        assert!(matches!(seed, GoalSelection::Goal(_)));
+        session.record_goal_reached(Point2::new(1.0, 1.0));
+        let next = selector
+            .select_goal_at(robot, &grid, &mut session, Timestamp::default(), &mut ids)
+            .unwrap();
+        let GoalSelection::Goal(goal) = next else {
+            panic!("局部无增益不能掩盖其它尚未访问的可达前沿");
+        };
+        session.record_goal_reached(goal.pose.pose.position.to_2d());
+        let exhausted = selector
+            .select_goal_at(robot, &grid, &mut session, Timestamp::default(), &mut ids)
+            .unwrap();
+        assert!(matches!(
+            exhausted,
+            GoalSelection::Stop(StopReason::NoInformationGain)
+        ));
     }
 
     #[test]

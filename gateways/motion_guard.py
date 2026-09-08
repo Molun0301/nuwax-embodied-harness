@@ -9,6 +9,7 @@ import uuid
 from typing import Callable, Dict, Optional, Union
 
 from core.errors import MotionGuardFacadeError
+from core.config_values import runtime_value
 from services.navigation.motion_guard_client import (
     CommandConfirmation,
     GuardState,
@@ -98,10 +99,15 @@ class GatewayMotionGuard:
     def __init__(
         self,
         *,
-        socket_path: Union[str, os.PathLike[str]] = DEFAULT_SOCKET_PATH,
+        socket_path: Optional[Union[str, os.PathLike[str]]] = None,
         client_factory: Callable[..., MotionGuardClient] = MotionGuardClient,
     ) -> None:
-        self.socket_path = os.fspath(socket_path)
+        # 与守卫和导航进程共用配置；显式注入仍优先，地址随本实例固定。
+        self.socket_path = os.fspath(
+            socket_path if socket_path is not None else runtime_value(
+                "NUWAX_MOTION_GUARD_SOCKET", DEFAULT_SOCKET_PATH,
+            )
+        )
         self._client_factory = client_factory
         self._lock = threading.RLock()
         self._client: Optional[MotionGuardClient] = None

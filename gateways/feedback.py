@@ -1224,6 +1224,11 @@ def _complete_tool_data(value: Any, *, max_bytes: int) -> Any:
                 raise invalid("cycle")
             ancestors.add(identity)
             try:
+                # 序列优先遵守数组合同，例如压缩栅格虽由数据类实现，也不能展开内部字节。
+                if isinstance(item, (Sequence, set, frozenset)):
+                    result = [visit(child, depth + 1) for child in item]
+                    remaining -= 2 + len(result)
+                    return result
                 mapping = _shallow_mapping(item)
                 if mapping is not None:
                     result = {}
@@ -1238,10 +1243,6 @@ def _complete_tool_data(value: Any, *, max_bytes: int) -> Any:
                             _REDACTED if _SENSITIVE_KEY_RE.search(public_key) else child,
                             depth + 1,
                         )
-                    remaining -= 2 + len(result)
-                    return result
-                if isinstance(item, (Sequence, set, frozenset)):
-                    result = [visit(child, depth + 1) for child in item]
                     remaining -= 2 + len(result)
                     return result
                 return visit(to_jsonable(item), depth + 1)

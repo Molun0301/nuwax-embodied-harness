@@ -3442,6 +3442,7 @@ class PlatformGeometryRuntime:
         }
         # live map readiness 读取 Rust mapping diagnostics；observer 不再承载地图真值。
         if provider_key == "live_map_provider":
+            stub.update({"occupancy_grid_ready": False, "occupancy_message_count": 0})
             mapping_diagnostics = None
             if self._remote_provider is not None:
                 try:
@@ -3449,21 +3450,15 @@ class PlatformGeometryRuntime:
                 except Exception:
                     mapping_diagnostics = None
             if isinstance(mapping_diagnostics, dict):
-                revision = int(
-                    mapping_diagnostics.get("last_occupancy_revision")
-                    or mapping_diagnostics.get("occupancy_revision")
-                    or 0
-                )
-                message_count = int(mapping_diagnostics.get("pointcloud_count") or 0)
-                stub.update({
-                    "occupancy_grid_ready": revision > 0,
-                    "occupancy_has_publisher": revision > 0,
-                    "occupancy_revision": revision,
-                    "occupancy_sequence": revision,
-                    "occupancy_message_count": message_count,
-                    "streaming": bool(mapping_diagnostics.get("ready")),
-                    "mapping_diagnostics": dict(mapping_diagnostics),
-                })
+                stub["mapping_diagnostics"] = dict(mapping_diagnostics)
+                stream_reader = getattr(self._remote_provider, "get_mapping_stream_status", None)
+                stream_status = stream_reader() if callable(stream_reader) else {}
+                if stream_status and all(
+                    stream_status.get(key) == mapping_diagnostics.get(key)
+                    for key in ("mapping_session_id", "map_name", "session_generation")
+                ):
+                    # 后端点云数不等于地图接收；流就绪只使用同一来源的真实观测。
+                    stub.update(stream_status)
         if provider_key == "tf_localization_provider":
             stub = self._resolve_external_tf_localization_status(base_stub=stub)
         return stub

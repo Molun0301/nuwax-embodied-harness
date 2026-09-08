@@ -11572,20 +11572,28 @@ class GatewayRuntime:
     def _navigation_runtime_generation(navigation_context: Any) -> Optional[int]:
         state = getattr(navigation_context, "navigation_state", None)
         metadata = dict(getattr(state, "metadata", {}) or {})
-        value = metadata.get("runtime_generation")
+        # 运动状态帧可省略规划器观测（代次为零），不能据此判断进程更换。
+        # 正常读取附带的就绪查询持有真实规划器观测，优先用其代次建立围栏。
+        readiness = metadata.get("readiness")
+        value = (
+            readiness["planner_generation"]
+            if isinstance(readiness, dict) and "planner_generation" in readiness
+            else metadata.get("runtime_generation")
+        )
         if value is None or isinstance(value, bool):
             return None
         try:
             generation = int(value)
         except (TypeError, ValueError):
             return None
-        return generation if generation >= 0 else None
+        return generation if generation > 0 else None
 
     def _capture_task_generation_snapshot(
         self,
         *,
         navigation_context: Any = None,
         motion_admission: Optional[MotionAdmission] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> MetadataDict:
         if navigation_context is None:
             refresh_navigation = getattr(
@@ -11594,10 +11602,16 @@ class GatewayRuntime:
                 None,
             )
             if callable(refresh_navigation):
-                try:
-                    navigation_context = refresh_navigation()
-                except Exception:
-                    navigation_context = None
+                if deadline_monotonic is not None:
+                    # 任务读取当前后端，不复用展示层保留的上一子目标终态。
+                    navigation_context = refresh_navigation(
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                else:
+                    try:
+                        navigation_context = refresh_navigation()
+                    except Exception:
+                        navigation_context = None
         return {
             "motion_guard_generation": (
                 motion_admission.generation
@@ -12837,6 +12851,7 @@ class GatewayRuntime:
             exploration_start_attempted = False
             perception_attached = False
             finalized = False
+            backend_cancel_proof = None
             try:
                 context.update(
                     progress=0.02,
@@ -12898,6 +12913,7 @@ class GatewayRuntime:
                     generation_snapshot = (
                         self._capture_task_generation_snapshot(
                             motion_admission=motion_admission,
+                            deadline_monotonic=parent_deadline,
                         )
                     )
                     return last_context, generation_snapshot
@@ -12939,6 +12955,7 @@ class GatewayRuntime:
                     )
                     current_generations = self._capture_task_generation_snapshot(
                         motion_admission=motion_admission,
+                        deadline_monotonic=parent_deadline,
                     )
                     rollovers = self._task_generation_rollovers(
                         generation_snapshot,
@@ -12961,6 +12978,7 @@ class GatewayRuntime:
                         )
                         current_generations = self._capture_task_generation_snapshot(
                             motion_admission=motion_admission,
+                            deadline_monotonic=parent_deadline,
                         )
                         rollovers = self._task_generation_rollovers(
                             generation_snapshot,
@@ -13043,6 +13061,20 @@ class GatewayRuntime:
                             last_context.exploration_state.message or "探索执行失败。"
                         )
                     if complete_terminal and status.value == "cancelled":
+                        backend_cancel_proof = {
+                            "request_id": request.request_id,
+                            "terminal_status": "cancelled",
+                            "exploration_terminal": True,
+                            "child_task_id": None,
+                            "last_stop_reason": exploration_metadata.get("last_stop_reason"),
+                        }
+                        # 后端停车可能先于停止工具的父任务取消标记到达。
+                        # 先声明取消，再确认已有证明，避免退出时被误判为停车未确认。
+                        self.task_manager.cancel_task(
+                            context.task_id,
+                            last_context.exploration_state.message or "探索后端已取消。",
+                        )
+                        context.ensure_active()
                         raise TaskCancelledError(
                             last_context.exploration_state.message or "探索已取消。"
                         )
@@ -13074,7 +13106,9 @@ class GatewayRuntime:
                 )
             except (TaskCancelledError, TaskTimeoutError):
                 if context.is_cancel_requested() or context.is_timed_out():
-                    if backend_started:
+                    if backend_cancel_proof is not None:
+                        context.acknowledge_interrupt_barrier(backend_cancel_proof)
+                    elif backend_started:
                         self._stop_exploration_with_safety_barrier(
                             context,
                             request_id=request.request_id,

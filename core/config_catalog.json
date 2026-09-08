@@ -927,6 +927,7 @@
     "section_id": "robot",
     "target_file": "core_env",
     "consumers": [
+      "gateways/motion_guard.py",
       "scripts/bootstrap.py",
       "scripts/diagnostics/check_nuwax_runtime.sh",
       "scripts/install_motion_guard_deployment.sh",
@@ -939,8 +940,8 @@
       "services/navigation/motion_safety_guard/__main__.py",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs"
     ],
-    "apply_scope": "重启几何运行时、导航后端、运动控制进程后生效",
-    "description": ""
+    "apply_scope": "重启网关、几何运行时、导航后端、运动控制进程后生效",
+    "description": "网关、几何、导航和运动守卫共用的通信地址；修改后需同步重启这些进程。"
   },
   "NUWAX_MOTION_GUARD_START_TIMEOUT_SEC": {
     "zh_name": "运动控制启动等待时间（秒）",

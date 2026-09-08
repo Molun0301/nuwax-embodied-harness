@@ -3341,6 +3341,7 @@ class GeometryRuntimeProvider:
         self._last_occupancy_grid: Optional[OccupancyGrid] = None
         self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
         self._last_occupancy_grid_revision = 0
+        self._last_map_stream_observation = None
         self._mapping_identity: Optional[_MappingIdentity] = None
         self._mapping_checkpoint_provenance: Optional[
             _MappingCheckpointProvenance
@@ -5896,6 +5897,23 @@ class GeometryRuntimeProvider:
                 "revision": int(self._last_occupancy_grid_revision),
             }
 
+    def get_mapping_stream_status(self) -> Dict[str, Any]:
+        """只读返回当前来源实际收到的地图观测，不把查询时间变成输入时间。"""
+
+        with self._map_state_lock:
+            observation = self._last_map_stream_observation
+            if (
+                not self._connected
+                or self._stopping
+                or self._mapping_transition_inflight
+                or observation is None
+                or observation[0] != self._map_delivery_token_locked()
+            ):
+                return {}
+            status = dict(observation[1])
+            status["occupancy_metrics"] = dict(status["occupancy_metrics"])
+            return status
+
     def get_raw_occupancy_grid(self) -> Optional[OccupancyGrid]:
         """返回物理栅格，供地图资产持久化避免烘焙虚拟禁行区。"""
 
@@ -6104,6 +6122,21 @@ class GeometryRuntimeProvider:
             self._last_occupancy_grid_identity = identity
             self._last_occupancy_grid_revision = revision
             delivery_token = self._map_delivery_token_locked()
+            self._last_map_stream_observation = (delivery_token, {
+                "mapping_session_id": session_id,
+                "map_name": map_name,
+                "session_generation": session_generation,
+                "occupancy_grid_ready": revision > 0,
+                "occupancy_has_publisher": True,
+                "occupancy_revision": revision,
+                "occupancy_sequence": revision,
+                "occupancy_message_count": revision,
+                "latest_occupancy_timestamp": (
+                    grid.timestamp.isoformat() if int(meta.timestamp_ns) > 0 else None
+                ),
+                "latest_occupancy_received_at": datetime.now(timezone.utc).isoformat(),
+                "occupancy_metrics": dict(metadata["occupancy_metrics"]),
+            })
         return _MapUpdatePayload(
             {
                 "source_name": "geometry_runtime",

@@ -2709,6 +2709,7 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
                 None,
                 None,
                 Some(&task_control),
+                None,
             )
             .await
         });
@@ -7725,6 +7726,7 @@ pub async fn spawn_geometry_runtime(
 
 #[derive(Debug)]
 struct MappingIngestOutcome {
+    sensor_origin_map: Option<[f64; 3]>,
     accepted_map_points: Vec<nalgebra::Point3<f64>>,
     occupancy_event: Option<MapRevisionEvent>,
     occupancy_receipt: Option<crate::mapping_commit::OccupancyCommitReceipt>,
@@ -7761,6 +7763,7 @@ fn ingest_mapping_points(
     )?;
     if stats.accepted == 0 {
         return Ok(MappingIngestOutcome {
+            sensor_origin_map: None,
             accepted_map_points: Vec::new(),
             occupancy_event: None,
             occupancy_receipt: None,
@@ -7780,6 +7783,7 @@ fn ingest_mapping_points(
         .as_ref()
         .and_then(|_| adapter.latest_occupancy_commit_receipt());
     Ok(MappingIngestOutcome {
+        sensor_origin_map: None,
         accepted_map_points,
         occupancy_committed: occupancy_event.is_some(),
         occupancy_event,
@@ -7814,6 +7818,7 @@ async fn ingest_mapping_points_with_backend(
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     task_control: Option<&GeometryRuntimeTaskControl>,
+    sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let owned_mapping = mapping.clone();
     let owned_lifecycle_lock = lifecycle_lock.clone();
@@ -7845,6 +7850,7 @@ async fn ingest_mapping_points_with_backend(
             expected_generations,
             expected_relocalization_epoch,
             owned_relocalization_mode,
+            sensor_origin_map,
         )
         .await;
         let terminal = result
@@ -7893,6 +7899,7 @@ async fn ingest_mapping_points_with_backend_owned(
     expected_generations: Option<(u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
+    sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let prepared = {
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -7900,6 +7907,7 @@ async fn ingest_mapping_points_with_backend_owned(
         if !adapter.is_active() {
             return Ok(MappingIngestCommit {
                 outcome: MappingIngestOutcome {
+                    sensor_origin_map: None,
                     accepted_map_points: Vec::new(),
                     occupancy_event: None,
                     occupancy_receipt: None,
@@ -7938,6 +7946,7 @@ async fn ingest_mapping_points_with_backend_owned(
         let adapter = mapping.lock();
         return Ok(MappingIngestCommit {
             outcome: MappingIngestOutcome {
+                sensor_origin_map: None,
                 accepted_map_points: Vec::new(),
                 occupancy_event: None,
                 occupancy_receipt: None,
@@ -8046,6 +8055,7 @@ async fn ingest_mapping_points_with_backend_owned(
                     let session_generation = adapter.snapshot().session_generation;
                     Some(Ok(MappingIngestCommit {
                         outcome: MappingIngestOutcome {
+                            sensor_origin_map: None,
                             accepted_map_points: Vec::new(),
                             occupancy_event: None,
                             occupancy_receipt: None,
@@ -8084,6 +8094,7 @@ async fn ingest_mapping_points_with_backend_owned(
                         ..
                     } = committed;
                     let outcome = MappingIngestOutcome {
+                        sensor_origin_map,
                         accepted_map_points,
                         #[cfg(test)]
                         occupancy_committed: event.is_some(),
@@ -8128,6 +8139,7 @@ async fn ingest_mapping_points_with_backend_owned(
                     let session_generation = adapter.snapshot().session_generation;
                     Ok(MappingIngestCommit {
                         outcome: MappingIngestOutcome {
+                            sensor_origin_map: None,
                             accepted_map_points: Vec::new(),
                             occupancy_event: None,
                             occupancy_receipt: None,
@@ -8249,6 +8261,7 @@ pub(crate) fn accept_mapping_cloud_map_for_backend_candidate(
     writer: &Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
 ) -> (bool, Option<CommittedMappingCloudMap>) {
     let outcome = MappingIngestOutcome {
+        sensor_origin_map: None,
         accepted_map_points: accepted_map_points.to_vec(),
         occupancy_event: event.clone(),
         occupancy_receipt: occupancy_receipt.clone(),
@@ -8290,9 +8303,11 @@ fn update_mapping_cloud_map_with_acceptance(
     ) {
         (None, None) => {
             let accepted = outcome.accepted_map_points.is_empty()
-                || writer.accumulate_mapping_frame(
+                || writer.accumulate_mapping_scan(
                     outcome.session_generation,
                     outcome.accepted_map_points.as_slice(),
+                    outcome.sensor_origin_map,
+                    outcome.source_timestamp_ns,
                 );
             return MappingCloudMapAcceptance {
                 cloud_commit: None,
@@ -8322,9 +8337,11 @@ fn update_mapping_cloud_map_with_acceptance(
         };
     }
     if !outcome.accepted_map_points.is_empty()
-        && !writer.accumulate_mapping_frame(
+        && !writer.accumulate_mapping_scan(
             outcome.session_generation,
             outcome.accepted_map_points.as_slice(),
+            outcome.sensor_origin_map,
+            outcome.source_timestamp_ns,
         )
     {
         return MappingCloudMapAcceptance {
@@ -8375,6 +8392,7 @@ pub(crate) async fn publish_committed_global_map_in_frame(
         .ok_or_else(|| "canonical cloud publication occupancy receipt is unavailable".to_owned())?;
     let direct_commit = MappingIngestCommit {
         outcome: MappingIngestOutcome {
+            sensor_origin_map: None,
             accepted_map_points: Vec::new(),
             occupancy_event: None,
             occupancy_receipt: Some(occupancy_receipt),
@@ -9500,6 +9518,7 @@ pub(crate) async fn handoff_registered_lio_cloud(
         source_timestamp_ns,
         map_frame,
         None,
+        None,
     )
     .await
 }
@@ -9513,6 +9532,7 @@ pub(crate) async fn handoff_registered_lio_cloud_fenced(
     map_frame: &str,
     expected_session_generation: u64,
     expected_frame_generation: u64,
+    sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<bool, String> {
     handoff_registered_lio_cloud_inner(
         handle,
@@ -9522,6 +9542,7 @@ pub(crate) async fn handoff_registered_lio_cloud_fenced(
         source_timestamp_ns,
         map_frame,
         Some((expected_session_generation, expected_frame_generation)),
+        sensor_origin_map,
     )
     .await
 }
@@ -9607,6 +9628,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         )),
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
+        binding.sensor_origin_map,
     )
     .await?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
@@ -9839,6 +9861,7 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         )),
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
+        binding.sensor_origin_map,
     )
     .await?;
     if commit.outcome.occupancy_event.is_none() {
@@ -10261,6 +10284,7 @@ async fn handoff_registered_lio_cloud_inner(
     source_timestamp_ns: u64,
     map_frame: &str,
     expected_generations: Option<(u64, u64)>,
+    sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<bool, String> {
     let commit = commit_registered_lio_cloud_inner(
         handle,
@@ -10272,6 +10296,7 @@ async fn handoff_registered_lio_cloud_inner(
         expected_generations,
         None,
         None,
+        sensor_origin_map,
     )
     .await?;
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
@@ -10301,6 +10326,7 @@ async fn commit_registered_lio_cloud_inner(
     expected_generations: Option<(u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
+    sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<MappingIngestCommit, String> {
     let mapping = handle
         .mapping_adapter
@@ -10324,6 +10350,7 @@ async fn commit_registered_lio_cloud_inner(
         expected_relocalization_epoch,
         relocalization_mode,
         handle.task_control.as_ref(),
+        sensor_origin_map,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -10539,6 +10566,7 @@ fn spawn_mapping_feed_tasks(
                 parsed.timestamp_ns,
                 &state_lidar,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -11963,6 +11991,7 @@ mod mapping_feed_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -12037,6 +12066,7 @@ mod mapping_feed_tests {
                     None,
                     Some(expected_epoch),
                     Some(mode),
+                    None,
                     None,
                 )
                 .await
@@ -12333,6 +12363,7 @@ mod mapping_feed_tests {
             },
         ] {
             let invalid_outcome = MappingIngestOutcome {
+                sensor_origin_map: None,
                 accepted_map_points: outcome.accepted_map_points.clone(),
                 occupancy_event: Some(event.clone()),
                 occupancy_receipt: Some(invalid_receipt),
@@ -13651,6 +13682,7 @@ mod mapping_feed_tests {
         );
         let source_timestamp_ns = 8_765_432_100;
         let mut binding = crate::lio_ingress::RegistrationBinding {
+            sensor_origin_map: None,
             runtime_generation: 41,
             cloud_source_sequence: 7,
             correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
@@ -13860,6 +13892,7 @@ mod mapping_feed_tests {
         let captured = correction.relocalization_mode_snapshot();
         assert!(!captured.active);
         let binding = crate::lio_ingress::RegistrationBinding {
+            sensor_origin_map: None,
             runtime_generation: 77,
             cloud_source_sequence: 9,
             correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
@@ -15054,6 +15087,7 @@ mod mapping_feed_tests {
                 100,
                 &state,
                 false,
+                None,
                 None,
                 None,
                 None,

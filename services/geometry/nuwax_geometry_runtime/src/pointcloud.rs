@@ -11,6 +11,10 @@ use tracing::{error, info, warn};
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
 
+#[path = "dynamic_cloud.rs"]
+mod dynamic_cloud;
+use dynamic_cloud::DynamicCloudFilter;
+
 pub const VOXEL_SIZE: f32 = 0.05;
 
 /// 单次输入点云允许的 raw point 上限(防御性 sanity cap)。
@@ -143,6 +147,7 @@ pub struct CloudMapShmWriter {
     voxel_size: f32,
     session_generation: u64,
     voxels: HashSet<VoxelKey>,
+    dynamic_filter: DynamicCloudFilter,
     max_points: usize,
     last_occupancy_receipt: Option<OccupancyCommitReceipt>,
     last_cloud_receipt: Option<CloudCommitReceipt>,
@@ -379,6 +384,7 @@ impl CloudMapShmWriter {
             voxel_size: VOXEL_SIZE,
             session_generation: 0,
             voxels: HashSet::new(),
+            dynamic_filter: DynamicCloudFilter::default(),
             max_points: CM_MAX_POINTS,
             last_occupancy_receipt: None,
             last_cloud_receipt: None,
@@ -425,6 +431,42 @@ impl CloudMapShmWriter {
             return false;
         }
         self.coarsen_to_fit()
+    }
+
+    /// 原生两种里程计共用：先撤销实测空闲中的历史点，再加入当前全部障碍。
+    pub(crate) fn accumulate_mapping_scan(
+        &mut self,
+        session_generation: u64,
+        points: &[Point3<f64>],
+        sensor_origin_map: Option<[f64; 3]>,
+        source_timestamp_ns: u64,
+    ) -> bool {
+        if points.is_empty()
+            || points.len() > POINTCLOUD_MAX_FRAME_POINTS
+            || session_generation == 0
+            || points
+                .iter()
+                .any(|point| voxel_key([point.x, point.y, point.z], self.voxel_size).is_none())
+            || sensor_origin_map.is_some_and(|origin| voxel_key(origin, self.voxel_size).is_none())
+        {
+            return false;
+        }
+        if self.session_generation != session_generation {
+            self.reset_accumulator(session_generation);
+        }
+        if let Some(origin) = sensor_origin_map {
+            let removed = self.dynamic_filter.clear_observed_free_space(
+                &mut self.voxels,
+                self.voxel_size,
+                origin,
+                source_timestamp_ns,
+                points,
+            );
+            if removed > 0 {
+                tracing::debug!(removed, source_timestamp_ns, "三维地图已清除动态残留体素");
+            }
+        }
+        self.accumulate_mapping_frame(session_generation, points)
     }
 
     /// Serialize the current voxel centroids into the double-buffered SHM.
@@ -585,6 +627,7 @@ impl CloudMapShmWriter {
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels;
+        self.dynamic_filter = DynamicCloudFilter::default();
         self.commit_accumulated_snapshot(occupancy_receipt)?
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
     }
@@ -664,6 +707,7 @@ impl CloudMapShmWriter {
 
     fn reset_accumulator(&mut self, session_generation: u64) {
         self.voxels.clear();
+        self.dynamic_filter = DynamicCloudFilter::default();
         self.voxel_size = VOXEL_SIZE;
         self.session_generation = session_generation;
         self.last_occupancy_receipt = None;
@@ -735,6 +779,8 @@ impl CloudMapShmWriter {
             }
             self.voxels = coarsened;
             self.voxel_size = next_voxel_size;
+            // 体素身份改变后，不把细网格的反证套到新的粗网格。
+            self.dynamic_filter = DynamicCloudFilter::default();
         }
         !self.voxels.is_empty()
     }
@@ -836,6 +882,70 @@ fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_cloud_checkpoint_and_session_reset_keep_only_committed_geometry() {
+        let path = test_path("dynamic-checkpoint");
+        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        let origin = Some([0.025; 3]);
+        let person = [Point3::new(2.025, 0.025, 0.025)];
+        let background = [Point3::new(4.025, 0.025, 0.025)];
+        assert!(writer.accumulate_mapping_scan(1, &person, origin, 1));
+        for stamp in 2..=3 {
+            assert!(writer.accumulate_mapping_scan(1, &background, origin, stamp));
+        }
+        let before = writer.voxels.clone();
+        assert!(!writer.accumulate_mapping_scan(1, &background, Some([f64::NAN; 3]), 4));
+        assert!(!writer.accumulate_mapping_scan(1, &[Point3::new(f64::NAN, 0.0, 0.0)], origin, 4));
+        assert!(writer.accumulate_mapping_scan(1, &background, None, 4));
+        assert_eq!(writer.voxels, before);
+        writer.commit_accumulated().unwrap();
+        let checkpoint = writer.committed_snapshot().unwrap();
+        let receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 1,
+                sequence: 1,
+            },
+            session_id: "dynamic-restored".to_owned(),
+            session_generation: 2,
+            occupancy_revision: 1,
+            source_timestamp_ns: 5,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        writer
+            .install_checkpoint(
+                &receipt,
+                checkpoint.voxel_size,
+                checkpoint.point_count,
+                &checkpoint.xyz_f32_le,
+            )
+            .unwrap();
+        // 检查点不携带未完成的删除投票，恢复后重新获得三次反证。
+        for stamp in 6..=8 {
+            assert!(writer.accumulate_mapping_scan(2, &background, origin, stamp));
+            assert_eq!(writer.voxels.contains(&(40, 0, 0)), stamp < 8);
+        }
+        writer.commit_accumulated().unwrap();
+        let cleaned = writer.committed_snapshot().unwrap();
+        assert_eq!(cleaned.point_count, 1);
+        assert_eq!(
+            decode_checkpoint_voxels(
+                cleaned.voxel_size,
+                cleaned.point_count,
+                &cleaned.xyz_f32_le,
+                CM_MAX_POINTS
+            )
+            .unwrap(),
+            writer.voxels
+        );
+        writer.begin_session(3).unwrap();
+        assert!(writer.accumulate_mapping_scan(3, &person, origin, 1));
+        assert!(writer.accumulate_mapping_scan(3, &background, origin, 2));
+        assert!(writer.voxels.contains(&(40, 0, 0)));
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn test_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

@@ -163,6 +163,8 @@ pub(crate) struct RegistrationBinding {
     pub(crate) envelope_sha256: [u8; 32],
     pub(crate) frozen_odom_from_body: Isometry3<f64>,
     pub(crate) base_anchor_map_from_odom: Isometry3<f64>,
+    /// 同一配对扫描的雷达原点；缺少原生标定的旧输入不进行动态清理。
+    pub(crate) sensor_origin_map: Option<[f64; 3]>,
     /// Epoch observed when this registered cloud becomes an admitted
     /// correction source. `None` means it has not crossed that boundary.
     pub(crate) frame_capture_relocalization_epoch: Option<u64>,
@@ -234,6 +236,7 @@ pub(crate) struct CommonLioIngressSnapshot {
 
 pub(crate) struct CommonLioIngress {
     spec: DeviceLioIngressSpec,
+    sensor_origin_body: Option<Point3<f64>>,
     state: Mutex<CommonLioIngressState>,
     runtime: Option<CommonLioRuntime>,
     odometry_admission: Notify,
@@ -731,6 +734,7 @@ impl CommonLioIngress {
         Self {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
+            sensor_origin_body: None,
             runtime: None,
             odometry_admission: Notify::new(),
             relocalization_mode_fence: OnceLock::new(),
@@ -747,6 +751,7 @@ impl CommonLioIngress {
         Self {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
+            sensor_origin_body: None,
             runtime: Some(CommonLioRuntime {
                 handle,
                 public_odometry,
@@ -1236,6 +1241,11 @@ impl CommonLioIngress {
             envelope_sha256,
             frozen_odom_from_body,
             base_anchor_map_from_odom,
+            sensor_origin_map: self.sensor_origin_body.map(|origin| {
+                let point =
+                    (base_anchor_map_from_odom * frozen_odom_from_body).transform_point(&origin);
+                [point.x, point.y, point.z]
+            }),
             frame_capture_relocalization_epoch: registration_mode_token
                 .frame_capture_relocalization_epoch,
         };
@@ -1488,8 +1498,10 @@ impl NativeLioIngress {
             probe_phase: NativeProbePhase::Probing,
             ..NativePairState::default()
         };
+        let mut common = CommonLioIngress::new(spec);
+        common.sensor_origin_body = Some(body_from_sensor.transform_point(&Point3::origin()));
         Ok(Self {
-            common: CommonLioIngress::new(spec),
+            common,
             body_from_sensor,
             pair_max_skew_ns,
             pair_state: Mutex::new(pair_state),
@@ -1517,8 +1529,11 @@ impl NativeLioIngress {
             return Err(LioIngressError::PairSkewOverflow);
         }
         let (source_pair_ready_tx, source_pair_ready_rx) = watch::channel(false);
+        let mut common =
+            CommonLioIngress::with_runtime(spec, handle, public_odometry, public_cloud, tf);
+        common.sensor_origin_body = Some(body_from_sensor.transform_point(&Point3::origin()));
         Ok(Self {
-            common: CommonLioIngress::with_runtime(spec, handle, public_odometry, public_cloud, tf),
+            common,
             body_from_sensor,
             pair_max_skew_ns,
             pair_state: Mutex::new(NativePairState::default()),
@@ -2925,6 +2940,7 @@ impl LioIngressSink for CommonLioIngress {
             &accepted.envelope.map_frame_id,
             accepted.binding.mapping_session_generation,
             accepted.binding.map_frame_generation,
+            accepted.binding.sensor_origin_map,
         )
         .await?;
         if !committed {
@@ -5875,6 +5891,7 @@ mod tests {
     #[test]
     fn pending_registration_revoke_is_hash_and_generation_bound_and_one_shot() {
         let binding = RegistrationBinding {
+            sensor_origin_map: None,
             runtime_generation: 7,
             cloud_source_sequence: 3,
             correlated_odometry: CorrelatedOdometry {
@@ -7215,6 +7232,198 @@ mod tests {
             .expect("odometry pairs with prior cloud");
         assert_eq!(pair.odometry.identity.source_timestamp_ns, 2_000);
         assert_eq!(pair.cloud.identity.source_timestamp_ns, 2_000);
+    }
+
+    #[tokio::test]
+    async fn dynamic_cloud_both_native_backends_clear_and_publish_registered_scans() {
+        for (backend_id, with_correction) in [LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO]
+            .into_iter()
+            .flat_map(|id| [(id, false), (id, true)])
+        {
+            let mut handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+            handle.transport = LcmTransport::new(Arc::new(RecordingBackend::default()));
+            let mapping = Arc::new(Mutex::new(active_adapter("map")));
+            handle.mapping_adapter = Some(mapping.clone());
+            let path =
+                std::env::temp_dir().join(format!("nuwax-dynamic-{}.mmap", uuid::Uuid::new_v4()));
+            *handle.cloud_map_writer.lock() =
+                Some(crate::pointcloud::CloudMapShmWriter::new(&path).unwrap());
+            let native_spec = DeviceLioIngressSpec::new_for_backend(
+                backend_id,
+                7,
+                "lidar",
+                "base_link",
+                "odom",
+                "map",
+            )
+            .unwrap();
+            let public_cloud = binding("/test/dynamic/cloud", "nuwax_msgs.LioCloudEnvelope");
+            let rotated = backend_id == LIO_BACKEND_POINTLIO;
+            let extrinsic = BodyFromSensorTransform::from_json(if rotated {
+                r#"{"translation_m":[0.025,-0.025,0.025],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#
+            } else {
+                r#"{"translation_m":[0.025,0.025,0.025],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#
+            })
+            .unwrap();
+            let ingress = NativeLioIngress::with_runtime(
+                native_spec,
+                handle.clone(),
+                binding("/test/dynamic/odom", "nuwax_msgs.LioOdometryEnvelope"),
+                public_cloud.clone(),
+                binding("/test/dynamic/tf", "tf2_msgs.TFMessage"),
+                extrinsic.clone(),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            let ingress = Arc::new(ingress);
+            let (correction_owner, correction_wrapper) = if with_correction {
+                let identity = crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
+                    runtime_generation: 7,
+                    backend_generation: 7,
+                    correction_lease: crate::correction_coordinator::CorrectionLeaseId {
+                        boot_nonce: 42,
+                        generation: 7,
+                    },
+                };
+                let applier = Arc::new(
+                    GeometryCanonicalCorrectionApplier::new(
+                        identity.clone(),
+                        "map",
+                        "odom",
+                        "base_link",
+                        handle.state.clone(),
+                        handle.transport.clone(),
+                        binding("/test/dynamic/tf", "tf2_msgs.TFMessage"),
+                    )
+                    .unwrap(),
+                );
+                let owner = crate::correction_coordinator::CorrectionTransportOwner::start(
+                    crate::correction_coordinator::CorrectionOwnerSpec::None,
+                    identity,
+                    "unused-by-none",
+                    Arc::new(ReplayCorrectionSink::default()),
+                )
+                .await
+                .unwrap();
+                let wrapper =
+                    CorrectionAwareLioIngress::native(ingress.clone(), owner.ingress(), applier);
+                (Some(owner), Some(wrapper))
+            } else {
+                (None, None)
+            };
+            let sink: &dyn LioIngressSink = match &correction_wrapper {
+                Some(wrapper) => wrapper,
+                None => &ingress.common,
+            };
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            for sequence in 1..=4 {
+                if sequence > 1 {
+                    // 公共入口使用真实接收时钟，等待原250毫秒发布周期。
+                    tokio::time::sleep(Duration::from_millis(270)).await;
+                }
+                let identity = SourceIdentity {
+                    backend: backend_id,
+                    runtime_generation: 7,
+                    source_sequence: sequence,
+                    source_timestamp_ns: sequence * 300_000_000,
+                };
+                let mut odom = valid_odometry();
+                odom.pose.position = [1.0, 2.0, 0.0];
+                if rotated {
+                    let angle = std::f64::consts::FRAC_PI_4;
+                    odom.pose.orientation_xyzw = [0.0, 0.0, angle.sin(), angle.cos()];
+                }
+                ingress
+                    .common
+                    .accept_odometry_for_test(identity, identity.source_timestamp_ns, odom.clone())
+                    .unwrap();
+                let sensor_points = vec![
+                    Point3::new(if sequence == 1 { 2.0 } else { 4.0 }, 0.0, 0.0),
+                    Point3::new(4.0, 1.0, 0.0),
+                    Point3::new(4.0, -1.0, 0.0),
+                ];
+                let pair = NativeSourcePair {
+                    odometry: NativeOdometrySample {
+                        identity,
+                        odometry: odom,
+                    },
+                    cloud: NativeCloudSample {
+                        identity,
+                        source_point_count: sensor_points.len(),
+                        sensor_points,
+                        registration_mode_token: ingress.common.capture_registration_mode_token(),
+                    },
+                };
+                let points = transform_native_pair(&pair, &extrinsic).unwrap();
+                let prepared = ingress
+                    .common
+                    .register_odom_points_with_mode_token(
+                        identity,
+                        CorrelatedOdometry {
+                            source_sequence: sequence,
+                            source_timestamp_ns: identity.source_timestamp_ns,
+                        },
+                        identity.source_timestamp_ns,
+                        points.len(),
+                        points,
+                        &mapping.lock(),
+                        ingress.common.capture_registration_mode_token(),
+                        Some(odometry_pose_isometry(&pair.odometry.odometry).unwrap()),
+                    )
+                    .unwrap();
+                let origin = ingress.common.state.lock().pending_registrations[&(7, sequence)]
+                    .binding
+                    .sensor_origin_map
+                    .unwrap();
+                for value in origin {
+                    assert!((value - 0.025).abs() < 1e-9);
+                }
+                // 模拟配对后新里程计到达，清理仍须使用许可捕获的旧扫描原点。
+                mapping
+                    .lock()
+                    .feed_pose_in_frame(101.0, 102.0, 0.0, 0.0, "odom")
+                    .unwrap();
+                let encoded = encode_lio_cloud_envelope(&prepared.envelope).unwrap();
+                LioIngressSink::accept_public_cloud(
+                    sink,
+                    public_frame(&public_cloud, sequence, &encoded),
+                    &mut shutdown_rx,
+                )
+                .await
+                .unwrap();
+                let snapshot = handle
+                    .cloud_map_writer
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .committed_snapshot()
+                    .unwrap();
+                let contains_person = snapshot.xyz_f32_le.chunks_exact(12).any(|p| {
+                    let offset = if rotated { 4 } else { 0 };
+                    let x = f32::from_le_bytes(p[offset..offset + 4].try_into().unwrap());
+                    (x - 2.025).abs() < 0.01
+                });
+                assert_eq!(
+                    contains_person,
+                    sequence < 4,
+                    "后端={backend_id} 扫描={sequence}"
+                );
+                assert_eq!(
+                    snapshot.point_count,
+                    if sequence == 2 || sequence == 3 { 4 } else { 3 }
+                );
+                assert_eq!(
+                    snapshot.revision,
+                    handle.state.read().await.cloud_map_revision
+                );
+            }
+            if let Some(owner) = correction_owner {
+                owner.shutdown().await.unwrap();
+            }
+            mapping.lock().stop_session("lio-test-session").unwrap();
+            *handle.cloud_map_writer.lock() = None;
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

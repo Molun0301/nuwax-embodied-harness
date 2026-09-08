@@ -16,6 +16,7 @@ import struct
 import subprocess
 import tempfile
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,6 +46,7 @@ _GEOMETRY_OWNER_KEYS = frozenset({
 
 _SENSITIVE_MASK = "********"
 _SAVED_SINCE_START = set()
+_SCHEMA_FILES: ContextVar = ContextVar("nuwax_schema_files", default=None)
 
 # 三个独立后端维度与运行时一致；当前程序和标定缺项只提示，不阻止保存。
 _GEOMETRY_LIO_BACKENDS = ("device", "fastlio2", "pointlio")
@@ -297,7 +299,23 @@ def _save_target(key: str, registry_target: str) -> str:
 
 
 def _read_env_values(path: Path) -> Dict[str, str]:
-    return read_env_values(path)
+    files = _SCHEMA_FILES.get()
+    if files is None:
+        return read_env_values(path)
+    if path not in files:
+        files[path] = read_env_values(path)
+    return files[path]
+
+
+@contextmanager
+def _schema_file_snapshot():
+    """只在一次设置查询内复用文件，刷新及保存仍读取最新内容。"""
+
+    token = _SCHEMA_FILES.set({})
+    try:
+        yield
+    finally:
+        _SCHEMA_FILES.reset(token)
 
 
 def _current_value(key: str) -> str:
@@ -363,6 +381,7 @@ def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str
     return values
 
 
+@_schema_file_snapshot()
 def build_schema() -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 

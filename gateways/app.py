@@ -12,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 
 from drivers.entry import create_active_robot_assembly
@@ -311,7 +312,12 @@ def create_gateway_app(
     app.include_router(build_data_stream_router(runtime, access_manager))
     static_dir = Path(__file__).resolve().parent / "http" / "static"
     if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        # 压缩仅作用于页面静态资源，避免缓冲视频和实时数据流。
+        app.mount(
+            "/static",
+            GZipMiddleware(StaticFiles(directory=str(static_dir)), minimum_size=1024, compresslevel=1),
+            name="static",
+        )
     return app
 
 

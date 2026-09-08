@@ -4373,8 +4373,12 @@ class GatewayRuntime:
             geometry_runtime_status=self.platform_geometry_runtime.get_runtime_status(),
         )
         robot_state = getattr(robot_snapshot, "robot_state", robot_snapshot)
+        input_bridge = getattr(self, "_input_bridge", None)
         return {
             "runtime_started": self._started,
+            "runtime_input_bridge": input_bridge.get_status() if input_bridge is not None else {
+                "started": False, "ready": False,
+            },
             "robot_name": self.robot.manifest.robot_name,
             "robot_model": self.robot.manifest.robot_model,
             "assembly_status": self._serialize(self.robot.get_status()),
@@ -5224,11 +5228,12 @@ class GatewayRuntime:
             geometry_runtime_source = "system.metrics"
             geometry_runtime_reason = "grpc_provider_unattached"
         else:
-            geometry_process_status = ServiceHealthStatus.MISSING
-            geometry_runtime_summary = "未发现 Native geometry runtime 进程"
-            geometry_runtime_evidence = "进程矩阵未匹配 role=geometry_runtime"
+            # 遥测可以关闭或只筛选部分进程；没有证据不能确认独立服务不存在。
+            geometry_process_status = ServiceHealthStatus.DEGRADED
+            geometry_runtime_summary = "几何运行进程状态尚未确认"
+            geometry_runtime_evidence = "提供器未连接且暂无匹配进程证据，请核对遥测启用状态与进程筛选范围"
             geometry_runtime_source = "system.metrics"
-            geometry_runtime_reason = "expected_process_absent"
+            geometry_runtime_reason = "process_evidence_unavailable"
         entries.append(
             self._make_service_health_entry(
                 service_id="geometry_runtime",

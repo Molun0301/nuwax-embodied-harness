@@ -62,7 +62,7 @@ use crate::mapping_backend::{
     MappingBackendCandidate, MappingBackendClient, MappingBackendCommitHandle,
     MappingBackendCompletion, MappingBackendComputeConfig, MappingBackendInput,
     MappingBackendJoinHandle, MappingBackendKind, MappingBackendSpec, MappingBackendWorker,
-    MappingComputeToken,
+    MappingComputeToken, MAPPING_CANDIDATE_INTERVAL_NS,
 };
 use crate::mapping_commit::{MappingCommitClock, OccupancyCommitReceipt};
 #[cfg(test)]
@@ -70,9 +70,6 @@ use crate::persistent_occupancy::{snap_grid_index, OCCUPANCY_CHANGE_CONFIRMATION
 use crate::persistent_occupancy::{validate_checkpoint_grid, PersistentOccupancyGrid};
 use crate::sequence_state::SequenceStateStore;
 
-const MIN_REBUILD_INTERVAL_NS: u64 = 250_000_000;
-const MAX_REBUILD_INTERVAL_NS: u64 = 1_000_000_000;
-const REBUILD_GROWTH_DIVISOR: usize = 20;
 #[cfg(not(test))]
 const MAPPING_FINAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
@@ -2976,20 +2973,8 @@ impl MappingAdapter {
         let elapsed_ns = self
             .latest_pointcloud_received_at_ns
             .saturating_sub(self.last_built_received_at_ns);
-        if elapsed_ns >= MAX_REBUILD_INTERVAL_NS {
-            return true;
-        }
-        if elapsed_ns < MIN_REBUILD_INTERVAL_NS {
-            return false;
-        }
-
-        let current_count = self.session.current_size();
-        if current_count < self.last_built_point_count {
-            return true;
-        }
-        let new_points = current_count - self.last_built_point_count;
-        let growth_threshold = (self.last_built_point_count / REBUILD_GROWTH_DIVISOR).max(1);
-        new_points >= growth_threshold
+        // 与实际后端候选节奏一致；没有新的点云接纳代次仍由上方检查拒绝。
+        elapsed_ns >= MAPPING_CANDIDATE_INTERVAL_NS
     }
 
     /// 把当前 accumulated 点云 + sensor_origin 走完整链路:
@@ -4635,6 +4620,42 @@ mod tests {
             "100ms high-rate updates should be coalesced into the next bounded rebuild"
         );
         assert_eq!(adapter.current_revision(), 1);
+    }
+
+    #[test]
+    fn steady_legacy_mapping_rebuilds_from_new_input_within_navigation_receipt_budget() {
+        let mut adapter = active_adapter(sample_config());
+        adapter.session = MappingSession::with_capacity(1);
+        let state = Arc::new(RwLock::new(SharedState::default()));
+        let mut last_received = 0;
+        for index in 0_u64..=15 {
+            let received = 1_000_000_000 + index * 100_000_000;
+            let source = 77_000_000_000 + index * 100_000_000;
+            adapter
+                .feed_pointcloud_session(
+                    &[Point3::new(0.0, 0.0, 0.5)],
+                    (0.0, 0.0),
+                    12,
+                    received,
+                    "map",
+                    source,
+                )
+                .expect("新的真实静态场景输入");
+            if adapter.build_and_publish(&state, None) {
+                last_received = received;
+                assert_eq!(state.try_read().unwrap().map.timestamp_ns, source);
+            }
+            assert!(
+                received - last_received <= 500_000_000,
+                "旧适配路径也必须满足导航地图接收期限"
+            );
+        }
+        let revision = adapter.current_revision();
+        assert!(
+            !adapter.build_and_publish(&state, None),
+            "没有新接纳输入不能续发缓存地图"
+        );
+        assert_eq!(adapter.current_revision(), revision);
     }
 
     #[test]

@@ -8,6 +8,8 @@
   const filterIds = { level: "logLevelFilter", source: "logSourceFilter", component: "logComponentFilter", query: "logSearch", request_id: "logRequestFilter", task_id: "logTaskFilter" };
   const records = new Map();
   const rowNodes = new Map();
+  const recentRowNodes = new Map();
+  const recentState = { entries: [], count: 0, frame: null, pointerActive: false, dirty: false };
   const state = { displayLimit: PAGE_SIZE, visible: [], paused: false, dirty: false, pending: 0, nextBefore: null, hasMore: false, loading: false, opened: false, request: 0, serial: 0, historicalSerial: 0, renderTimer: null, filterTimer: null, gapNotice: "", gapReloadPromise: null };
   const element = (id) => document.getElementById(id);
   const write = (id, value) => { const node = element(id); if (node) node.textContent = String(value); };
@@ -195,6 +197,83 @@
     return outer;
   }
 
+  function recentRow(entry) {
+    const outer = make("details", "console-log-entry recent-log-entry");
+    outer.dataset.logId = entry.id;
+    const summary = make("summary", "recent-log-summary");
+    const level = LEVEL_NAMES[entry.level] ? entry.level : "info";
+    const time = make("time", "console-log-time", entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "时间未知");
+    time.title = entry.timestamp;
+    if (entry.timestamp) time.dateTime = entry.timestamp;
+    summary.append(time, make("span", `console-log-level level-${level}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", entry.component), make("span", "console-log-message", entry.message));
+    summary.title = "点击展开完整日志";
+    const body = make("div", "console-log-details");
+    body.append(make("pre", "console-log-message", asText(entry)), copyButton("复制文本", entry, false));
+    outer.append(summary, body);
+    outer.addEventListener("toggle", () => {
+      if (recentState.dirty && !outer.open) scheduleRender();
+      scheduleRecentLayout();
+    });
+    return outer;
+  }
+
+  function renderRecentPrefix(count) {
+    const recent = element("recentLogs");
+    if (!recent) return;
+    recentState.count = Math.min(count, recentState.entries.length);
+    const wanted = recentState.entries.slice(0, recentState.count).map((entry) => {
+      if (!recentRowNodes.has(entry.id)) recentRowNodes.set(entry.id, recentRow(entry));
+      return recentRowNodes.get(entry.id);
+    });
+    if (!wanted.length) wanted.push(make("p", "console-log-empty", "暂无日志"));
+    const keep = new Set(wanted);
+    for (const node of [...recent.children]) if (!keep.has(node)) node.remove();
+    wanted.forEach((node, index) => { if (recent.children[index] !== node) recent.insertBefore(node, recent.children[index] || null); });
+    for (const id of recentRowNodes.keys()) if (!records.has(id)) recentRowNodes.delete(id);
+  }
+
+  function fitRecentLogs() {
+    recentState.frame = null;
+    const recent = element("recentLogs");
+    const host = recent?.parentElement;
+    if (!host?.clientHeight || state.paused || selectedText() || recentState.pointerActive) return;
+    // 每个动画帧集中测量一次实际排版，预留少量滚动内容；不以固定条数猜测行高。
+    const bottom = host.getBoundingClientRect().top + host.clientHeight * 1.25;
+    const nodes = [...recent.children];
+    const bounds = nodes.map((node) => node.getBoundingClientRect());
+    const enoughAt = bounds.findIndex((rect) => rect.bottom >= bottom);
+    if (enoughAt >= 0) {
+      const keepReading = nodes.reduce((last, node, index) => node.open || node.contains(document.activeElement) ? index + 1 : last, 0);
+      const count = Math.max(enoughAt + 1, keepReading);
+      if (host.scrollTop <= 4 && count < recentState.count) renderRecentPrefix(count);
+      return;
+    }
+    if (recentState.count >= recentState.entries.length) return;
+    const lastBottom = bounds.length ? bounds[bounds.length - 1].bottom : host.getBoundingClientRect().top;
+    const average = bounds.length ? Math.max(1, (lastBottom - bounds[0].top) / bounds.length) : 60;
+    const batch = Math.max(1, Math.min(40, Math.ceil((bottom - lastBottom) / average)));
+    renderRecentPrefix(recentState.count + batch);
+    scheduleRecentLayout();
+  }
+
+  function scheduleRecentLayout() {
+    if (recentState.frame === null) recentState.frame = window.requestAnimationFrame(fitRecentLogs);
+  }
+
+  function updateRecentLogs(sorted) {
+    const recent = element("recentLogs");
+    if (!recent) return;
+    if (recentState.pointerActive || recent.contains(document.activeElement)
+        || recent.querySelector(".recent-log-entry[open]") || (recent.parentElement.scrollTop > 4 && recentState.count)) {
+      recentState.dirty = true;
+      return;
+    }
+    recentState.entries = sorted;
+    recentState.dirty = false;
+    renderRecentPrefix(recentState.count || 1);
+    scheduleRecentLayout();
+  }
+
   function render() {
     state.renderTimer = null;
     if (state.paused || selectedText()) {
@@ -223,16 +302,7 @@
     write("logPending", "");
     const more = element("logLoadMore");
     if (more) more.disabled = state.loading || state.displayLimit >= CACHE_LIMIT || (!state.hasMore && filtered.length <= state.visible.length);
-    const recent = element("recentLogs");
-    if (recent) {
-      const preview = sorted.slice(0, 5).map((entry) => {
-        const node = make("div", "console-log-entry");
-        node.append(make("span", `console-log-level level-${LEVEL_NAMES[entry.level] ? entry.level : "info"}`, LEVEL_NAMES[entry.level] || entry.level), make("span", "console-log-component", entry.component), make("span", "console-log-message", entry.message.slice(0, 180)));
-        node.title = entry.message;
-        return node;
-      });
-      recent.replaceChildren(...(preview.length ? preview : [make("p", "console-log-empty", "暂无日志")]));
-    }
+    updateRecentLogs(sorted);
   }
 
   function scheduleRender() {
@@ -337,7 +407,33 @@
     element("logCopyAll")?.addEventListener("click", copyVisible);
     element("logExportText")?.addEventListener("click", () => exportLogs("text"));
     element("logExportJson")?.addEventListener("click", () => exportLogs("jsonl"));
-    document.addEventListener("selectionchange", () => { if (state.dirty && !selectedText()) scheduleRender(); });
+    document.addEventListener("selectionchange", () => {
+      if (!selectedText()) {
+        if (state.dirty) scheduleRender();
+        scheduleRecentLayout();
+      }
+    });
+    const recent = element("recentLogs");
+    if (recent) {
+      recent.addEventListener("pointerdown", () => { recentState.pointerActive = true; });
+      recent.addEventListener("focusout", () => { if (recentState.dirty) scheduleRender(); });
+      const releasePointer = () => {
+        if (!recentState.pointerActive) return;
+        recentState.pointerActive = false;
+        if (recentState.dirty) scheduleRender();
+        scheduleRecentLayout();
+      };
+      window.addEventListener("pointerup", releasePointer);
+      window.addEventListener("pointercancel", releasePointer);
+      window.addEventListener("blur", releasePointer);
+      recent.parentElement.addEventListener("scroll", () => {
+        if (recent.parentElement.scrollTop <= 4 && recentState.dirty) scheduleRender();
+        scheduleRecentLayout();
+      }, { passive: true });
+      if (window.ResizeObserver) new ResizeObserver(scheduleRecentLayout).observe(recent.parentElement);
+      else window.addEventListener("resize", scheduleRecentLayout);
+      document.addEventListener("visibilitychange", scheduleRecentLayout);
+    }
     // 网关流只推送本进程事件；独立Rust/Python服务从共享文件补取，不另开连接。
     window.setInterval?.(() => {
       const pane = element("logs-view");

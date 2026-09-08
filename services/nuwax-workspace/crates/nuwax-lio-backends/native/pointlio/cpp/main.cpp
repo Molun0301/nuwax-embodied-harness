@@ -56,6 +56,7 @@ using livox_common::DATA_TYPE_CARTESIAN_HIGH;
 using livox_common::DATA_TYPE_CARTESIAN_LOW;
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_typed_input_failed{false};
 static lcm::LCM* g_lcm = nullptr;
 static PointLio* g_point_lio = nullptr;
 
@@ -409,6 +410,16 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
             fprintf(stderr, "[%s] reject typed IMU: source timestamp must increase\n", "pointlio");
             return;
         }
+        if (g_has_last_typed_imu_stamp && nuwax_lio::imu_source_gap_exceeded(
+                g_last_typed_imu_stamp_ns, timestamp_ns)) {
+            // 缺测已破坏本代估计器连续性；锁定失败并交由原拥有方退出，不能推进水位后续算。
+            g_typed_input_failed.store(true);
+            g_running.store(false);
+            fprintf(stderr, "[pointlio] native_input_discontinuity: IMU source gap=%llu ns exceeds %llu ns; restart owner required\n",
+                static_cast<unsigned long long>(timestamp_ns - g_last_typed_imu_stamp_ns),
+                static_cast<unsigned long long>(nuwax_lio::kMaxImuSourceGapNs));
+            return;
+        }
         auto imu_msg = boost::make_shared<custom_messages::Imu>();
         imu_msg->header.seq = msg->header.seq;
         imu_msg->header.stamp.sec = msg->header.stamp.sec;
@@ -547,6 +558,11 @@ static void signal_handler(int /*sig*/) {
 }
 
 int main(int argc, char** argv) {
+    // 身份查询在通信和算法构造前结束；允许部署路径或文件名独立于后端名称。
+    if (argc == 2 && std::strcmp(argv[1], "--nuwax-lio-contract") == 0) {
+        std::puts("nuwax-native-lio-v1:pointlio");
+        return 0;
+    }
     dimos::NativeModule mod(argc, argv);
 
     g_lidar_topic = mod.has("lidar") ? mod.topic("lidar") : "";
@@ -868,5 +884,5 @@ int main(int argc, char** argv) {
     g_lcm = nullptr;
 
     if (debug) { printf("[pointlio] Done.\n"); }
-    return 0;
+    return g_typed_input_failed.load() ? 2 : 0;
 }

@@ -249,6 +249,7 @@ class MappingService:
         # 方案B：轻量级去重检查前置，避免进入锁和完整去重流程
         # 建图时大部分帧是增量更新，metadata 中的 occupancy_content_hash 和 cost_map_content_hash 足够判断
         with self._lock:
+            self._require_current_snapshot_source(resolved_map_name, snapshot_metadata)
             latest = self._latest_snapshot
             if (
                 latest is not None
@@ -284,7 +285,7 @@ class MappingService:
 
         # 完整去重已被 P2 的轻量级快速去重替代，此处不再需要昂贵的 _normalize_snapshot_value 递归比较
         with self._lock:
-
+            self._require_current_snapshot_source(resolved_map_name, snapshot_metadata)
             sequence_key = (source_name, resolved_source_epoch)
             previous_sequence = self._update_sequence_by_source_epoch.get(
                 sequence_key,
@@ -443,6 +444,16 @@ class MappingService:
                 metadata=stream_event_payload,
             )
         return snapshot
+
+    def _require_current_snapshot_source(self, map_name: str, metadata) -> None:
+        validator = getattr(self._provider_owner, "is_map_snapshot_source_current", None)
+        if callable(validator) and not validator(map_name=map_name, metadata=metadata):
+            raise GatewayError(
+                "地图快照已不属于当前工作区或建图会话，拒绝覆盖当前地图。",
+                error_code="map_snapshot_source_mismatch",
+                http_status=409,
+                details={"map_name": map_name},
+            )
 
     def get_latest_snapshot(self) -> Optional[MapSnapshot]:
         """返回最新地图快照。"""

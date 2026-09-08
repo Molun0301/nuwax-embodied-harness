@@ -23,7 +23,9 @@
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "pointcloud.frame", "video.frame", "video.detections", "tasks.state", "system.metrics"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "tasks.state", "system.metrics"];
+      const POSE_STREAM_TOPICS = ["localization.pose", "map.frame"];
+      const LOG_STREAM_TOPICS = ["logs.entry"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
@@ -92,7 +94,7 @@
         streamReconnectAttempt: 0,
         latestStreamCursor: "0",
         poseStream: {
-          topics: ["localization.pose", "map.frame"],
+          topics: POSE_STREAM_TOPICS,
           mapPayload: "identity",
           streamSocket: null,
           streamConnectionEpoch: 0,
@@ -102,6 +104,15 @@
           latestStreamCursor: "0",
         },
         poseMapIdentity: null,
+        logStream: {
+          topics: LOG_STREAM_TOPICS,
+          streamSocket: null,
+          streamConnectionEpoch: 0,
+          streamReconnectTimer: null,
+          streamReconnectDelayMs: 1000,
+          streamReconnectAttempt: 0,
+          latestStreamCursor: "0",
+        },
         mapStreamReady: false,
         receivedMapIdentity: null,
         appliedMapIdentity: null,
@@ -266,7 +277,6 @@
         videoFpsStatus: document.getElementById("videoFpsStatus"),
         servicesStatus: document.getElementById("servicesStatus"),
         serviceMatrix: document.getElementById("serviceMatrix"),
-        serviceMatrixScope: document.getElementById("serviceMatrixScope"),
         logsStatus: document.getElementById("logsStatus"),
         logsMeta: document.getElementById("logsMeta"),
         themeToggle: document.getElementById("themeToggle"),
@@ -315,6 +325,7 @@
         if (targetId === "config-view") window.nuwaxConsoleSettings?.open();
         if (targetId === "logs-view") window.nuwaxConsoleLogs?.open();
         if (targetId === "monitor-view") redrawMapAfterResize();
+        updateMapStreamChip();
       }
       function initViewSwitch() {
         for (const button of document.querySelectorAll(".view-switch-btn, [data-open-view]")) {
@@ -753,7 +764,7 @@
           }).join(" / ");
         }
         const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
-        return roles.length ? "期望进程未匹配" : "";
+        return roles.length ? "暂无匹配进程证据" : "";
       }
       function serviceHealthChip(label, value, title) {
         const chip = document.createElement("span");
@@ -805,7 +816,7 @@
         const expectedRoles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
         const evidenceList = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
         if (expectedRoles.length && !evidenceList.length) {
-          foot.appendChild(serviceHealthChip("期望角色", expectedRoles.join(", "), "未匹配任何进程"));
+          foot.appendChild(serviceHealthChip("期望角色", expectedRoles.join(", "), "当前遥测暂无这些角色的进程证据；不能据此断言进程不存在"));
         }
         if (entry.advice) foot.appendChild(serviceHealthChip("建议", entry.advice));
         if (options && options.compatibleFallback) foot.appendChild(serviceHealthChip("模式", "兼容推断"));
@@ -821,7 +832,41 @@
         details.className = "service-health-details";
         details.append(summary, evidence, foot);
         card.append(top, details);
-        ((options && options.target) || els.governanceMeta).appendChild(card);
+        state.serviceCardNodes ||= new Map();
+        const current = state.serviceCardNodes.get(entry.service_id);
+        const result = current || card;
+        if (current) patchServiceNode(current, card);
+        else state.serviceCardNodes.set(entry.service_id, card);
+        if (!options?.deferAppend) ((options && options.target) || els.governanceMeta).appendChild(result);
+        return result;
+      }
+      function patchServiceNode(current, next) {
+        // 保留实际点击目标、焦点和文本节点；原生展开状态只由用户操作改变。
+        if (current.nodeType === 3) {
+          if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+          return;
+        }
+        for (const attribute of [...current.attributes]) {
+          if (attribute.name !== "open" && !next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+        }
+        for (const attribute of [...next.attributes]) {
+          if (attribute.name !== "open" && current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+        }
+        const nextChildren = [...next.childNodes];
+        nextChildren.forEach((child, index) => {
+          const existing = current.childNodes[index];
+          if (existing && existing.nodeType === child.nodeType && existing.nodeName === child.nodeName) patchServiceNode(existing, child);
+          else if (existing) current.replaceChild(child, existing);
+          else current.appendChild(child);
+        });
+        while (current.childNodes.length > nextChildren.length) current.lastChild.remove();
+      }
+      function reconcileServiceNodes(parent, wanted) {
+        const keep = new Set(wanted);
+        for (const child of [...parent.children]) if (!keep.has(child)) child.remove();
+        wanted.forEach((node, index) => {
+          if (parent.children[index] !== node) parent.insertBefore(node, parent.children[index] || null);
+        });
       }
       function displayReasonLabel(reason) {
         // 任务 6.1.1：reason 字段为机器可读 token 时映射为中文短标签
@@ -915,12 +960,10 @@
       }
       function renderServiceStatus() {
         if (!els.governanceMeta) return;
-        // 高频状态刷新保留用户已展开的服务及其余列表。
-        const openServices = new Set(Array.from(els.governanceMeta.querySelectorAll(".service-health-card[open]"), (card) => card.dataset.serviceId));
-        const moreOpen = Boolean(els.governanceMeta.querySelector(".service-health-more[open]"));
+        state.serviceCardNodes ||= new Map();
         const scrollHost = els.governanceMeta.parentElement;
         const scrollTop = scrollHost.scrollTop;
-        els.governanceMeta.replaceChildren();
+        const focused = document.activeElement;
         const summary = state.latestServiceHealth || buildLegacyServiceHealthFallback();
         const entries = Array.isArray(summary.entries) ? summary.entries : [];
         const status = summary.status || worstStatus(entries);
@@ -939,21 +982,30 @@
           generated_at: summary.generated_at,
           timestamp: summary.timestamp,
           compatibleFallback: summary.authoritative === false,
-          openServices,
+          deferAppend: true,
         };
-        for (const entry of primary) appendServiceHealthCard(entry, options);
-        if (secondary.length) {
+        const primaryNodes = primary.map((entry) => appendServiceHealthCard(entry, options));
+        if (!state.serviceMoreNode) {
           const more = document.createElement("details");
           more.className = "service-health-more";
-          more.open = moreOpen;
           const label = document.createElement("summary");
-          label.textContent = `其余服务（${secondary.length}）`;
           const list = document.createElement("div");
           list.className = "service-health-list";
-          for (const entry of secondary) appendServiceHealthCard(entry, { ...options, target: list });
           more.append(label, list);
-          els.governanceMeta.appendChild(more);
+          state.serviceMoreNode = more;
         }
+        const more = state.serviceMoreNode;
+        const moreLabel = `其余服务（${secondary.length}）`;
+        if (more.firstElementChild.firstChild) {
+          if (more.firstElementChild.firstChild.nodeValue !== moreLabel) more.firstElementChild.firstChild.nodeValue = moreLabel;
+        } else setText(more.firstElementChild, moreLabel);
+        more.hidden = !secondary.length;
+        const secondaryNodes = secondary.map((entry) => appendServiceHealthCard(entry, options));
+        reconcileServiceNodes(more.lastElementChild, secondaryNodes);
+        reconcileServiceNodes(els.governanceMeta, [...primaryNodes, more]);
+        const ids = new Set(entries.map((entry) => entry.service_id));
+        for (const id of state.serviceCardNodes.keys()) if (!ids.has(id)) state.serviceCardNodes.delete(id);
+        if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
         scrollHost.scrollTop = scrollTop;
       }
       function formatGB(bytes) {
@@ -983,17 +1035,13 @@
       function renderProcessMatrix(snap) {
         const status = snap && snap.status ? snap.status : "missing";
         setPill(els.servicesStatus, status);
-        if (els.serviceMatrixScope) {
-          els.serviceMatrixScope.textContent = snap && snap.monitor_scope
-            ? `监控范围：${snap.monitor_scope}` : "";
-        }
         els.serviceMatrix.replaceChildren();
         const processes = snap && Array.isArray(snap.processes) ? snap.processes : [];
         if (!processes.length) {
           const empty = document.createElement("div");
           empty.className = "empty panel-meta";
           empty.textContent = snap && snap.psutil_available === false
-            ? "psutil 不可用，性能监控降级。" : "未匹配到本项目进程。";
+            ? "性能采集不可用，已降级。" : "暂无项目进程采集结果。";
           els.serviceMatrix.appendChild(empty);
           return;
         }
@@ -1002,12 +1050,11 @@
           row.className = "service-row";
           const left = document.createElement("div");
           const title = document.createElement("div");
-          title.textContent = `${safeText(proc.display_name || proc.name)} · PID ${safeText(proc.pid)}`;
+          title.textContent = `${processPurposeName(proc)} · 进程号 ${safeText(proc.pid)}`;
           title.className = "mono";
-          title.title = proc.cmdline_preview || proc.name || "";
           const meta = document.createElement("div");
           meta.className = "meta";
-          meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · CPU ${fmt(proc.cpu_percent, "%")} · 角色 ${safeText(proc.role || proc.matched_keyword)}`;
+          meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · 处理器 ${fmt(proc.cpu_percent, "%")}`;
           left.append(title, meta);
           const pill = document.createElement("span");
           pill.className = "pill mono";
@@ -1015,6 +1062,24 @@
           row.append(left, pill);
           els.serviceMatrix.appendChild(row);
         }
+      }
+      function processPurposeName(proc) {
+        if (String(proc.cmdline_preview || "").split(/\s+/).includes("--nuwax-video-relay-helper-v1")) return "视频帧中转";
+        const names = {
+          gateway_web: "网页与能力接口", gateway_supervisor: "网关启动与进程守护",
+          geometry_runtime: "定位建图与几何计算", geometry_external: "几何服务接口",
+          nav_stack: "路径规划与导航执行", static_tf: "固定坐标变换",
+          go2_video_streamer: "摄像头采集与视频推流", go2_data_plane: "机器人状态与传感器接入",
+          motion_safety_guard: "运动安全守卫", nuwax_motion_safety_guard: "运动安全守卫",
+          pointlio_native: "逐点激光惯性定位", fastlio2_native: "快速激光惯性定位",
+          nuwax_lcm_runtime: "机器人数据通信", lcm_runtime: "机器人数据通信",
+        };
+        const known = names[proc.role] || names[String(proc.name || "").replaceAll("-", "_")];
+        if (known) return known;
+        const provided = String(proc.display_name || "").trim();
+        if (/[\u3400-\u9fff]/.test(provided) && !/[A-Za-z_]/.test(provided)
+            && !["项目相关进程", "项目子进程", "未知进程"].includes(provided)) return provided;
+        return "用途未识别的项目进程";
       }
       function updateHealth(payload) {
         // 闸门：bootstrap 未完成时入队，避免流式帧抢在 /api/health 之前写入 state
@@ -2373,6 +2438,7 @@
       }
       function clearLocalizationDisplay(message, status) {
         state.pose = null;
+        state.displayedPoseMetrics = {};
         state.trajectory = [];
         updateMapPoseHud();
         setPill(els.localizationStatus, status || "missing");
@@ -2384,6 +2450,7 @@
           ["偏航角", "--"],
           ["轨迹点数", 0],
         ]);
+        updateMapStreamChip();
       }
       function clearMapOverlayState() {
         state.frontiers = [];
@@ -2707,6 +2774,7 @@
         ctx.fill();
         ctx.stroke();
         ctx.restore();
+        recordDisplayedMapPose("map2d", state.pose);
       }
       // 空间记忆只读刷新：合并并发请求，避免相同数据反复重建三维标记。
       function loadSemanticInstances() {
@@ -3528,8 +3596,8 @@
           state.mapGridContentKey = nextContentKey;
           const source = data.map_snapshot || data;
           recordMediaFrame("map2d", mapSnapshotIsOffline(diagnostics) ? null : videoSourceTime(envelope.source_timestamp),
-            JSON.stringify([envelope.sequence, envelope.revision, envelope.source_timestamp, nextContentKey]),
-            JSON.stringify([source.map_name, source.source_epoch, grid.frame_id]));
+            nextContentKey,
+            JSON.stringify([source.map_name, source.source_name, source.source_epoch, grid.frame_id]));
           const freeViewIdentity = JSON.stringify([
             source.map_name || diagnostics.map_name || "", source.source_name || "", source.source_epoch || "",
             grid.frame_id || source.frame_id || envelope.frame_id || "",
@@ -3584,13 +3652,45 @@
         metric.frameKey = frameKey;
         metric.sourceTime = Number.isFinite(sourceTime) && sourceTime > 0 ? sourceTime : null;
       }
+      function displayedMapPoseAllowed(kind, pose) {
+        if (!pose || pose !== state.pose || state.mapStreamReady !== true || state.lastLocalizationEnvelope?.status !== "available") return false;
+        if (kind !== (state.mapViewMode === "3d" ? "map3d" : "map2d")) return false;
+        const barrier = state.poseMapIdentity, applied = state.appliedMapIdentity;
+        if (!barrier?.key || barrier.cleared || !applied || applied.cleared || barrier.key !== applied.key) return false;
+        if (state.lastLocalizationEnvelope?.stale === true) return false;
+        if (typeof document !== "undefined") {
+          if (document.hidden) return false;
+          const monitor = document.getElementById?.("monitor-view");
+          if (monitor && !monitor.classList.contains("active")) return false;
+        }
+        return true;
+      }
+      function recordDisplayedMapPose(kind, pose, displayedAt = Date.now()) {
+        if (!displayedMapPoseAllowed(kind, pose)) return;
+        state.displayedPoseMetrics ||= {};
+        const mapKey = state.appliedMapIdentity.key;
+        const previous = state.displayedPoseMetrics[kind];
+        if (previous?.pose === pose && previous.mapKey === mapKey) return;
+        // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
+        const sourceTime = typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN;
+        const age = displayedAt - sourceTime;
+        state.displayedPoseMetrics[kind] = { pose, mapKey, ageMs: Number.isFinite(sourceTime) && Number.isFinite(age) && age >= 0 ? age : null };
+        updateMapStreamChip();
+      }
+      function mapPoseLatencyText(kind) {
+        const metric = state.displayedPoseMetrics?.[kind];
+        if (!metric || !displayedMapPoseAllowed(kind, metric.pose) || metric.mapKey !== state.appliedMapIdentity?.key || metric.ageMs === null) return "--";
+        return `${Math.round(metric.ageMs)} ms`;
+      }
       function mediaMetricText(kind, now = Date.now(), monotonicNow = performance.now()) {
         const metric = state.mediaMetrics?.[kind];
-        if (!metric) return "-- FPS · 延迟 --";
+        const mapMetric = kind === "map2d" || kind === "map3d";
+        if (!metric) return mapMetric ? `-- FPS · 位姿延迟 ${mapPoseLatencyText(kind)}` : "-- FPS · 延迟 --";
         metric.samples = metric.samples.filter((time) => monotonicNow - time <= 5000);
         const samples = metric.samples;
         const span = samples.length > 1 ? samples[samples.length - 1] - samples[0] : 0;
         const fps = span > 0 && monotonicNow - samples[samples.length - 1] <= 2000 ? (samples.length - 1) * 1000 / span : 0;
+        if (mapMetric) return `${fps.toFixed(1)} FPS · 位姿延迟 ${mapPoseLatencyText(kind)}`;
         const age = metric.sourceTime === null ? null : now - metric.sourceTime;
         const delay = age !== null && Number.isFinite(age) && age >= 0 ? `${Math.round(age)} ms` : "--";
         return `${fps.toFixed(1)} FPS · 延迟 ${delay}`;
@@ -3602,11 +3702,18 @@
       function updateMapStreamChip() {
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
-        const visible = kind === "map3d" || Boolean(state.mapGrid);
-        setVisionText(els.mapStreamStatus, visible ? mediaMetricText(kind) : "-- FPS · 延迟 --");
-        els.mapStreamStatus.title = "地图更新帧率；延迟为最新地图帧时间至当前时刻，不包含未知的传感器采集耗时。";
+        setVisionText(els.mapStreamStatus, mediaMetricText(kind));
+        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知，包含两端时钟偏差，不等于纯网络时延。";
       }
       function updateMapHeartbeat(envelope) {
+        const cursor = normalizedStreamCursor(envelope.cursor);
+        const mapCursor = normalizedStreamCursor(state.receivedMapIdentity?.cursor);
+        const previousCursor = state.lastMapHeartbeatEpoch === state.streamConnectionEpoch
+          ? normalizedStreamCursor(state.lastMapHeartbeatEnvelope?.cursor) : null;
+        // 主题分别合并后，旧清空心跳可能排在新地图之后执行，必须按原总线游标核对。
+        if (cursor === null || (mapCursor !== null && compareCanonicalInteger(cursor, mapCursor) < 0)
+            || (previousCursor !== null && compareCanonicalInteger(cursor, previousCursor) <= 0)) return false;
+        state.lastMapHeartbeatEpoch = state.streamConnectionEpoch;
         state.lastMapHeartbeatEnvelope = envelope;
         const status = statusOf(envelope);
         const heartbeat = envelope.data || {};
@@ -4594,7 +4701,6 @@
         "robot.state",
         "map.frame",
         "map.heartbeat",
-        "localization.pose",
         "localization.frame_tree",
         "localization.trajectory",
         "navigation.state",
@@ -4604,10 +4710,8 @@
         "runtime.governance",
         "pointcloud_map.meta",
         "pointcloud_map.snapshot",
-        "pointcloud.frame",
         "video.frame",
         "video.detections",
-        "logs.entry",
         "tasks.state",
         "system.metrics"
       ];
@@ -4709,8 +4813,8 @@
       function buildStreamUrl(stream = state) {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const url = new URL(`${protocol}//${window.location.host}/streams/ws`);
-        // 位姿独立传输，避免大地图的发送队列阻塞小帧；续传游标也按连接隔离。
-        const topics = stream.topics || STREAM_TOPICS.filter((topic) => topic !== "localization.pose");
+        // 状态/地图、位姿及日志独立排队与续传，日志洪峰不能挤掉地图帧。
+        const topics = stream.topics || STREAM_TOPICS;
         url.searchParams.set("topics", topics.join(","));
         if (stream.mapPayload) url.searchParams.set("map_payload", stream.mapPayload);
         if (stream.latestStreamCursor) url.searchParams.set("after_cursor", String(stream.latestStreamCursor));
@@ -4913,6 +5017,9 @@
         }
       }
       function routePointCloudMapBinary(buffer) {
+        state.binaryReceivedCount = (state.binaryReceivedCount || 0) + 1;
+        state.binaryReceivedBytes = (state.binaryReceivedBytes || 0) + buffer.byteLength;
+        recordPointcloudDiagnostic({ binaryReceivedCount: state.binaryReceivedCount, binaryReceivedBytes: state.binaryReceivedBytes });
         const mapFrame = decodeMapBinaryFrame(buffer);
         if (mapFrame) {
           handleStreamFrame(mapFrame);
@@ -4931,10 +5038,22 @@
           return false;
         }
         if (!header || !["pointcloud_map.snapshot", "pointcloud_map.live_chunk"].includes(header.topic)) return false;
+        state.pointcloudRoutedCount = (state.pointcloudRoutedCount || 0) + 1;
+        state.pointcloudRoutedBytes = (state.pointcloudRoutedBytes || 0) + buffer.byteLength;
+        recordPointcloudDiagnostic({ pointcloudRoutedCount: state.pointcloudRoutedCount, pointcloudRoutedBytes: state.pointcloudRoutedBytes });
         window.dispatchEvent(new CustomEvent("stream:pointcloud_map.binary", {
           detail: { buffer, routingHeader: header },
         }));
         return true;
+      }
+      function recordPointcloudDiagnostic(values) {
+        const node = els.map3dContainer;
+        if (!node) return;
+        // 诊断仅保留在不可见数据属性，按接收、验收和内容绘制边界更新。
+        for (const [key, value] of Object.entries(values)) {
+          const text = String(value ?? "");
+          if (node.dataset[key] !== text) node.dataset[key] = text;
+        }
       }
       function resetPointCloudMapBinaryConsumer(reason) {
         window.dispatchEvent(new CustomEvent("stream:pointcloud_map.reset", {
@@ -4990,14 +5109,26 @@
             stream.streamReconnectTimer = null;
           }
           if (wasReconnect && stream === state) loadInitialTasks();
+          if (stream === state) {
+            state.connectionProbe = null;
+            state.connectionProbeDue = 0;
+            updateConnectionLatency();
+          }
         });
         socket.addEventListener("message", (event) => {
           if (!isCurrentConnection() || !acceptsMessages) return;
           if (event.data instanceof ArrayBuffer) {
-            routePointCloudMapBinary(event.data);
+            if (stream === state) routePointCloudMapBinary(event.data);
             return;
           }
+          if (typeof event.data !== "string") {
+            recordPointcloudDiagnostic({ pointcloudUnexpectedMessageType: Object.prototype.toString.call(event.data), pointcloudSocketBinaryType: socket.binaryType });
+          }
           const message = JSON.parse(event.data);
+          if (message.type === "stream.pong" && stream === state) {
+            acceptConnectionPong(message);
+            return;
+          }
           if (message.type === "stream.map_identity" && stream === state.poseStream) {
             updateLatestStreamCursor(message.cursor, false, stream);
             acceptPoseMapIdentity(message);
@@ -5018,6 +5149,9 @@
               resetExplorationOverlayConsumer("replay_gap");
               recoverStreamGap(message);
             }
+            if (stream === state.logStream && (message.resync_required || message.replay_gap)) {
+              recoverStreamGap({ ...message, topics: ["logs.entry"] });
+            }
             if (stream === state) {
               state.mapStreamReady = true;
               if (message.gap_reason === "cursor_ahead_of_stream") {
@@ -5037,7 +5171,11 @@
           }
           if (message.type === "stream.gap") {
             updateLatestStreamCursor(message.latest_cursor, false, stream);
-            if (stream !== state) {
+            if (stream === state.logStream) {
+              recoverStreamGap({ ...message, topics: ["logs.entry"] });
+              return;
+            }
+            if (stream === state.poseStream) {
               acceptsMessages = false;
               state.poseMapIdentity = null;
               state.pendingMapPose = null;
@@ -5051,27 +5189,32 @@
             return;
           }
           if (message.type !== "stream.frame" || !message.frame) return;
+          if (stream.topics && !stream.topics.includes(message.frame.topic)) return;
           handleStreamFrame(message.frame, stream);
         });
         socket.addEventListener("close", () => {
           if (!isCurrentConnection()) return;
           acceptsMessages = false;
           if (stream === state) {
+            state.connectionProbe = null;
+            setText(els.lastReceive, "--");
             resetPointCloudMapBinaryConsumer("disconnect");
             resetExplorationOverlayConsumer("disconnect");
             state.mapStreamReady = false;
             delete state.pendingStreamFrames["map.frame"];
-          } else {
+          } else if (stream === state.poseStream) {
             state.poseMapIdentity = null;
           }
-          state.pendingMapPose = null;
-          hideMapPose();
+          if (stream !== state.logStream) {
+            state.pendingMapPose = null;
+            hideMapPose();
+          }
           stream.streamReconnectAttempt += 1;
           scheduleStreamReconnect(socket, epoch, stream);
         });
         socket.addEventListener("error", () => {
           if (!isCurrentConnection()) return;
-          showPanelError(stream === state ? "logs" : "localization", "实时数据流连接异常，正在重连。");
+          showPanelError(stream === state.poseStream ? "localization" : "logs", stream === state.logStream ? "日志实时连接异常，正在重连。" : "实时数据流连接异常，正在重连。");
         });
       }
       function recoverStreamGap(message) {
@@ -5105,14 +5248,27 @@
         }, delayMs);
         stream.streamReconnectDelayMs = Math.min(30000, delayMs * 2);
       }
-      function updateReceiveLatency(frame) {
-        const sentAtMs = Date.parse(frame && frame.timestamp ? frame.timestamp : "");
-        if (!Number.isFinite(sentAtMs)) {
-          setText(els.lastReceive, "--");
+      function updateConnectionLatency() {
+        const socket = state.streamSocket;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        const now = performance.now();
+        if (state.connectionProbe) {
+          const elapsed = now - state.connectionProbe.sentAt;
+          if (elapsed >= 1000) setText(els.lastReceive, `${Math.round(elapsed)} ms · 等待`);
           return;
         }
-        const latencyMs = Math.max(0, Date.now() - sentAtMs);
-        setText(els.lastReceive, `${Math.round(latencyMs)} ms`);
+        if (now < (state.connectionProbeDue || 0)) return;
+        const requestId = `${state.streamConnectionEpoch}:${state.connectionProbeSequence = (state.connectionProbeSequence || 0) + 1}`;
+        state.connectionProbe = { requestId, sentAt: now };
+        socket.send(JSON.stringify({ type: "stream.ping", request_id: requestId }));
+      }
+      function acceptConnectionPong(message) {
+        const probe = state.connectionProbe;
+        if (!probe || message.request_id !== probe.requestId) return;
+        const now = performance.now();
+        setText(els.lastReceive, `${Math.round(now - probe.sentAt)} ms`);
+        state.connectionProbe = null;
+        state.connectionProbeDue = now + 5000;
       }
       function handleStreamFrame(frame, stream = state) {
         updateLatestStreamCursor(frame.cursor, false, stream);
@@ -5125,7 +5281,6 @@
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "localization.pose") {
           // 状态立即应用，二维与三维各自合并到下一动画帧，不先等待通用面板刷新。
-          updateReceiveLatency(frame);
           if (!frame.payload || frame.status === "missing") {
             state.pendingMapPose = null;
             processStreamFrame(frame);
@@ -5146,7 +5301,6 @@
         } else {
           state.pendingStreamFrames[frame.topic] = frame;
         }
-        updateReceiveLatency(frame);
         scheduleStreamFlush();
       }
       function scheduleStreamFlush() {
@@ -5183,7 +5337,7 @@
         } else if (frame.topic === "map.frame") {
           updateMap(envelopeFromFrame(frame));
         } else if (frame.topic === "map.heartbeat") {
-          updateMapHeartbeat(envelopeFromFrame(frame));
+          if (updateMapHeartbeat(envelopeFromFrame(frame)) === false) return;
         } else if (frame.topic === "localization.pose") {
           updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
         } else if (frame.topic === "localization.trajectory") {
@@ -5237,8 +5391,6 @@
           updateGovernance(envelopeFromFrame(frame));
         } else if (frame.topic === "pointcloud_map.meta") {
           updatePointcloudMapFrame(frame);
-        } else if (frame.topic === "pointcloud.frame") {
-          updatePointcloudFrame(frame);
         } else if (frame.topic === "video.frame") {
           scheduleVideoUpdate(envelopeFromFrame(frame));
         } else if (frame.topic === "video.detections") {
@@ -5354,12 +5506,6 @@
         updateSensorSummary({ ...(state.latestOverview || {}), ...data });
         renderMapSummary();
       }
-      function updatePointcloudFrame(frame) {
-        const payload = frame.payload || {};
-        const envelope = envelopeFromFrame(frame, payload);
-        const data = { pointcloud: { status: envelope.status, frame_id: envelope.frame_id, revision: envelope.revision, latency_ms: envelope.latency_ms, source_timestamp: envelope.source_timestamp, metadata: { source: envelope.source, point_count: payload.point_count || (frame.metadata && frame.metadata.point_count) } } };
-        updateSensorSummary({ ...(state.latestOverview || {}), ...data });
-      }
       function logEntryFromFrame(frame) {
         const payload = frame.payload || {};
         const details = payload.details || payload.details_compact || {};
@@ -5460,7 +5606,6 @@
           "exploration.state": "exploration",
           "runtime.governance": "runtime_governance",
           "pointcloud_map.meta": "pointcloud_map",
-          "pointcloud.frame": "pointcloud",
           "video.frame": "video",
           "logs.entry": "logs",
         };
@@ -5470,7 +5615,6 @@
         const pointcloudMeta = { source: frame.source, point_count: payload.point_count ?? (frame.metadata && frame.metadata.point_count) };
         const metadata = frame.topic === "pointcloud_map.meta"
           ? { ...pointcloudMeta, source_kind: payload.source_kind || (frame.metadata && frame.metadata.source_kind), pcd_path: payload.pcd_path || (frame.metadata && frame.metadata.pcd_path) }
-          : frame.topic === "pointcloud.frame" ? pointcloudMeta
           : frame.topic === "map.heartbeat" ? { source: frame.source, event_type: payload.event_type || (frame.metadata && frame.metadata.event_type), message_count: payload.message_count, update_sequence: payload.update_sequence }
           : { source: frame.source };
         const overview = { ...(state.latestOverview || {}) };
@@ -5515,6 +5659,7 @@
         window.addEventListener("resize", redrawMapAfterResize);
       }
       window.setInterval(updateClock, 1000);
+      window.setInterval(updateConnectionLatency, 1000);
       els.showDetections.addEventListener("change", () => {
         state.showDetections = Boolean(els.showDetections.checked);
         scheduleVideoDetectionDraw();
@@ -5557,6 +5702,7 @@
       }, 500);
       document.addEventListener("visibilitychange", () => {
         if (!document.hidden) { renderVideoStreamSummary(); scheduleVideoDetectionDraw(); }
+        updateMapStreamChip();
       });
       document.getElementById("viewSwitchMonitor")?.addEventListener("click", resizeVideoOverlay);
 
@@ -5985,8 +6131,21 @@
         recordMediaFrame("map3d", frame.source === "saved" ? null : frame.sourceTime, frame.frameKey, frame.sourceKey);
         updateMapStreamChip();
       });
+      window.addEventListener("pointcloud3d:pose-drawn", (event) => {
+        recordDisplayedMapPose("map3d", event.detail?.pose, event.detail?.displayedAt);
+      });
+      window.addEventListener("pointcloud3d:consumer-ready", () => {
+        recordPointcloudDiagnostic({ pointcloudConsumerReady: true });
+      });
+      window.addEventListener("pointcloud3d:diagnostic", (event) => {
+        recordPointcloudDiagnostic(event.detail || {});
+      });
+      window.addEventListener("pointcloud3d:content-drawn", (event) => {
+        recordPointcloudDiagnostic({ pointcloudDrawnPoints: event.detail?.points, pointcloudDrawnRevision: event.detail?.revision });
+      });
       window.addEventListener("pointcloud3d:ready", () => {
         state.pointcloud3dReady = true;
+        recordPointcloudDiagnostic({ pointcloudInitialized: true });
         window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);
         window.pointcloud3d?.setPointStyle(els.map3dPointStyle?.value || "height");
         syncPointcloud3dState();
@@ -6020,6 +6179,7 @@
           ? Math.max(0, Math.floor(sourcePoints))
           : state.pointcloud3dDisplayedPoints;
         state.pointcloud3dPointCountKnown = hasDisplayedPoints || hasSourcePoints;
+        recordPointcloudDiagnostic({ pointcloudDisplayedPoints: state.pointcloud3dDisplayedPoints, pointcloudSourcePoints: state.pointcloud3dSourcePoints });
         renderMapSummary();
       });
       if (els.showSemanticInstances) {
@@ -6060,6 +6220,7 @@
       loadSemanticInstances();
       connectStreams();
       connectStreams(state.poseStream);
+      connectStreams(state.logStream);
       els.mapModeToggle?.addEventListener("click", () => {
         setMapViewMode(state.mapViewMode === "3d" ? "2d" : "3d");
       });

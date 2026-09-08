@@ -5,8 +5,8 @@
 //! 本 crate 是 `nuwax-lcm-sys` (liblcm FFI) 之上的 safe 包装,负责:
 //!
 //! - **RAII 持有 `lcm_t*`**:`LcmContext` 析构时自动 `lcm_destroy`
-//! - **单 owner 事件线程**:spawn 一个 `std::thread` 反复调用
-//!   `lcm_handle_timeout(lcm, 50)` 驱动 publish / subscribe 协议栈,
+//! - **单 owner 事件线程**: 同时等待通信描述符与命令唤醒管道，
+//!   收到实际数据后以非阻塞 `lcm_handle_timeout(lcm, 0)` 驱动接收，
 //!   handler 回调把消息 push 进 `broadcast::Sender`
 //! - **owner-thread serialized 调用**:`publish` / `subscribe` 必须经
 //!   mpsc `Command` 队列送进 owner thread,**禁止**跨线程直接调
@@ -30,7 +30,10 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_void};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -52,7 +55,60 @@ pub const LCM_SUBSCRIPTION_QUEUE_CAPACITY: usize = 10_000;
 
 const MAX_COMMANDS_PER_TICK: usize = 64;
 const MAX_RECEIVES_PER_TICK: usize = 64;
-const IDLE_HANDLE_TIMEOUT_MS: i32 = 50;
+
+/// 仅通知命令已经入队；命令内容和顺序仍由原有队列拥有。
+#[derive(Debug)]
+struct CommandWakeup {
+    reader: UnixStream,
+    writer: UnixStream,
+}
+
+impl CommandWakeup {
+    fn new() -> io::Result<Self> {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Ok(Self { reader, writer })
+    }
+
+    fn notify(&self) -> io::Result<()> {
+        let mut writer = &self.writer;
+        loop {
+            match writer.write(&[1]) {
+                Ok(_) => return Ok(()),
+                // 管道已满意味着通知仍可读，不需要为每条命令保存独立通知。
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn consume(&self) -> io::Result<()> {
+        let mut reader = &self.reader;
+        let mut notifications = [0_u8; 256];
+        loop {
+            match reader.read(&mut notifications) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "命令唤醒管道已关闭",
+                    ))
+                }
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wake_owner(&self) -> Result<(), LcmError> {
+        self.notify().map_err(|error| LcmError::OwnerThreadDown {
+            detail: format!("命令已提交但无法唤醒通信拥有线程：{error}"),
+        })
+    }
+}
 
 // =============================================================================
 // 错误类型
@@ -132,6 +188,7 @@ pub struct LcmSubscription {
     /// broadcast receiver
     pub receiver: broadcast::Receiver<LcmReceivedMessage>,
     control_tx: std::sync::mpsc::Sender<Command>,
+    wakeup: Arc<CommandWakeup>,
 }
 
 /// Message delivered by liblcm, including the actual callback channel.
@@ -166,6 +223,7 @@ impl LcmSubscription {
             .map_err(|error| LcmError::OwnerThreadDown {
                 detail: error.to_string(),
             })?;
+        self.wakeup.wake_owner()?;
         reply_rx.await.map_err(|error| LcmError::OwnerThreadDown {
             detail: error.to_string(),
         })?
@@ -179,6 +237,7 @@ impl Drop for LcmSubscription {
                 subscription_id,
                 reply: None,
             });
+            let _ = self.wakeup.notify();
         }
     }
 }
@@ -250,6 +309,7 @@ struct OwnerThread {
     cmd_rx: mpsc::Receiver<Command>,
     /// Non-droppable lifecycle/control commands, independent of publish backpressure.
     control_rx: std::sync::mpsc::Receiver<Command>,
+    wakeup: Arc<CommandWakeup>,
     /// 已注册的 subscription:`channel CString → SubscriptionHandle`
     ///
     /// 2026-07-09 B2 修复后,`lcm_subscribe` 返回 `*mut lcm_subscription_t`
@@ -489,7 +549,55 @@ impl OwnerThread {
         }
     }
 
-    /// event loop 主循环:处理 commands + lcm_handle_timeout。
+    /// 空闲时只等待实际数据或命令通知，不以固定收包超时拖延发布。
+    fn wait_for_activity(&self) -> io::Result<()> {
+        // 描述符由当前拥有线程读取并使用，其他线程只写私有唤醒管道。
+        let lcm_fd = unsafe { lcm_get_fileno(self.lcm) };
+        if lcm_fd < 0 {
+            return Err(io::Error::other("LCM 未提供可等待的接收描述符"));
+        }
+        let mut descriptors = [
+            libc::pollfd {
+                fd: lcm_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.wakeup.reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // 描述符在本次等待期间均由 self 保活；仅系统调用读取此定长数组。
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    -1,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptors
+                .iter()
+                .any(|fd| fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+            {
+                return Err(io::Error::other("通信或命令唤醒描述符失效"));
+            }
+            if descriptors[1].revents & libc::POLLIN != 0 {
+                self.wakeup.consume()?;
+            }
+            return Ok(());
+        }
+    }
+
+    /// 保持原有控制、命令和接收配额，在同一线程完成所有通信操作。
     fn run(mut self) {
         info!("nuwax-lcm owner thread 启动");
         let _fd = unsafe { lcm_get_fileno(self.lcm) };
@@ -549,14 +657,17 @@ impl OwnerThread {
 
             // Both sides are bounded. A command storm cannot starve receive,
             // and an inbound storm cannot starve publish/subscribe commands.
-            for receive_index in 0..MAX_RECEIVES_PER_TICK {
-                let timeout_ms = if command_count == 0 && control_count == 0 && receive_index == 0 {
-                    IDLE_HANDLE_TIMEOUT_MS
-                } else {
-                    0
-                };
-                let handled = unsafe { lcm_handle_timeout(self.lcm, timeout_ms) };
+            let mut receive_count = 0;
+            for _ in 0..MAX_RECEIVES_PER_TICK {
+                let handled = unsafe { lcm_handle_timeout(self.lcm, 0) };
                 if handled <= 0 {
+                    break;
+                }
+                receive_count += 1;
+            }
+            if command_count == 0 && control_count == 0 && receive_count == 0 {
+                if let Err(error) = self.wait_for_activity() {
+                    error!(%error, "LCM 拥有线程事件等待失败，退出并释放资源");
                     break;
                 }
             }
@@ -642,6 +753,7 @@ pub struct LcmContext {
     cmd_tx: mpsc::Sender<Command>,
     /// Unbounded lifecycle channel so unsubscribe/shutdown cannot be dropped by data backpressure.
     control_tx: std::sync::mpsc::Sender<Command>,
+    wakeup: Arc<CommandWakeup>,
     /// provider URL —— Debug 用
     provider: Arc<String>,
     owner_thread: Mutex<Option<JoinHandle<()>>>,
@@ -666,6 +778,9 @@ impl LcmContext {
     /// - 返回 `Err(LcmError::Create)` 当 `lcm_create` 返回 NULL(provider
     ///   格式错误 / system liblcm 内部初始化失败)
     pub fn new(provider: &str) -> Result<Self, LcmError> {
+        let wakeup = Arc::new(CommandWakeup::new().map_err(|error| {
+            LcmError::BackendUnavailable(format!("创建通信命令唤醒管道失败：{error}"))
+        })?);
         let provider_c =
             to_cstring(provider).map_err(|_| LcmError::NulByte(provider.to_owned()))?;
         let lcm = unsafe { lcm_create(provider_c.as_ptr()) };
@@ -682,6 +797,7 @@ impl LcmContext {
             lcm,
             cmd_rx,
             control_rx,
+            wakeup: Arc::clone(&wakeup),
             subscriptions: std::collections::HashMap::new(),
             next_subscription_id: 1,
             retired_entries: Vec::new(),
@@ -696,11 +812,16 @@ impl LcmContext {
                 owner.run();
                 thread_alive.store(false, Ordering::Release);
             })
-            .map_err(|e| LcmError::BackendUnavailable(format!("spawn owner thread 失败: {e}")))?;
+            .map_err(|e| {
+                // 创建线程失败时闭包未运行，原生上下文仍由构造方负责释放。
+                unsafe { lcm_destroy(lcm) };
+                LcmError::BackendUnavailable(format!("spawn owner thread 失败: {e}"))
+            })?;
 
         Ok(Self {
             cmd_tx,
             control_tx,
+            wakeup,
             provider: provider_owned,
             owner_thread: Mutex::new(Some(owner_thread)),
             owner_alive,
@@ -729,6 +850,7 @@ impl LcmContext {
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
+        self.wakeup.wake_owner()?;
         reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
             detail: e.to_string(),
         })?
@@ -759,6 +881,7 @@ impl LcmContext {
             .map_err(|error| LcmError::OwnerThreadDown {
                 detail: error.to_string(),
             })?;
+        self.wakeup.wake_owner()?;
         reply_rx.await.map_err(|error| LcmError::OwnerThreadDown {
             detail: error.to_string(),
         })?
@@ -784,6 +907,7 @@ impl LcmContext {
                 detail: e.to_string(),
             })?;
 
+        self.wakeup.wake_owner()?;
         let resp = reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
             detail: format!("subscribe reply 失败: {e}"),
         })?;
@@ -794,6 +918,7 @@ impl LcmContext {
             channel: Arc::new(chan_c),
             receiver: rx,
             control_tx: self.control_tx.clone(),
+            wakeup: Arc::clone(&self.wakeup),
         })
     }
 
@@ -809,6 +934,7 @@ impl LcmContext {
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
+        self.wakeup.wake_owner()?;
         reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
             detail: e.to_string(),
         })?
@@ -817,14 +943,14 @@ impl LcmContext {
     /// 主动关闭 owner thread。一般用不到(Drop 会自动关)。
     pub async fn shutdown(&self) -> Result<(), LcmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.cmd_tx
+        self.control_tx
             .send(Command::Shutdown {
                 reply: Some(reply_tx),
             })
-            .await
             .map_err(|e| LcmError::OwnerThreadDown {
                 detail: e.to_string(),
             })?;
+        self.wakeup.wake_owner()?;
         reply_rx.await.map_err(|e| LcmError::OwnerThreadDown {
             detail: e.to_string(),
         })?;
@@ -851,6 +977,7 @@ impl LcmContext {
 impl Drop for LcmContext {
     fn drop(&mut self) {
         let _ = self.control_tx.send(Command::Shutdown { reply: None });
+        let _ = self.wakeup.notify();
         if let Ok(owner) = self.owner_thread.get_mut() {
             if let Some(owner) = owner.take() {
                 let _ = owner.join();
@@ -931,6 +1058,97 @@ mod tests {
         context.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn idle_owner_publish_wakes_without_waiting_for_receive_timeout() {
+        let context = LcmContext::new("memq://").expect("真实 liblcm 内存传输");
+        let mut elapsed_samples = Vec::new();
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let started = std::time::Instant::now();
+            context
+                .publish("/test/idle-wakeup", Bytes::from_static(b"probe"))
+                .await
+                .unwrap();
+            elapsed_samples.push(started.elapsed());
+        }
+        elapsed_samples.sort();
+        let median = elapsed_samples[elapsed_samples.len() / 2];
+        eprintln!("空闲拥有线程发布中位延迟：{median:?}；样本：{elapsed_samples:?}");
+        context.shutdown().await.unwrap();
+        assert!(
+            median < std::time::Duration::from_millis(20),
+            "发布命令不应等待收包轮询超时：{median:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wakeup_preserves_batch_order_subscription_cleanup_and_idle_shutdown() {
+        let context = LcmContext::new("memq://").expect("真实 liblcm 内存传输");
+        let wakeup = Arc::downgrade(&context.wakeup);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut subscription = context.subscribe("/test/wakeup-order").await.unwrap();
+        let retired = context.subscribe("/test/wakeup-retired").await.unwrap();
+        drop(retired);
+        context
+            .publish_batch(
+                (0_u64..8)
+                    .map(|index| {
+                        (
+                            "/test/wakeup-order".to_owned(),
+                            Bytes::copy_from_slice(&index.to_le_bytes()),
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        for index in 0_u64..8 {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                subscription.receiver.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(message.payload.as_ref(), &index.to_le_bytes());
+        }
+        subscription.unsubscribe().await.unwrap();
+        context
+            .publish(
+                "/test/wakeup-order",
+                Bytes::from_static(b"after-unsubscribe"),
+            )
+            .await
+            .unwrap();
+        assert!(subscription.receiver.is_closed());
+        context.unsubscribe("/test/wakeup-retired").await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        context.shutdown().await.unwrap();
+        drop(subscription);
+        drop(context);
+        assert!(
+            wakeup.upgrade().is_none(),
+            "拥有方和订阅释放后唤醒描述符一并回收"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_owner_even_when_publish_queue_capacity_is_reserved() {
+        let context = LcmContext::new("memq://").expect("真实 liblcm 内存传输");
+        let permits = context
+            .cmd_tx
+            .reserve_many(LCM_COMMAND_QUEUE_CAPACITY)
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        tokio::time::timeout(std::time::Duration::from_secs(1), context.shutdown())
+            .await
+            .expect("关闭不等待发布队列容量")
+            .unwrap();
+        assert!(!context.owner_alive.load(Ordering::Acquire));
+        drop(permits);
+    }
+
     #[cfg(feature = "link-liblcm")]
     #[test]
     fn successful_unsubscribe_reclaims_callback_entry_immediately() {
@@ -944,6 +1162,7 @@ mod tests {
             lcm,
             cmd_rx,
             control_rx,
+            wakeup: Arc::new(CommandWakeup::new().expect("命令唤醒管道")),
             subscriptions: HashMap::new(),
             next_subscription_id: 1,
             retired_entries: Vec::new(),
@@ -981,6 +1200,7 @@ mod tests {
             lcm,
             cmd_rx,
             control_rx,
+            wakeup: Arc::new(CommandWakeup::new().expect("命令唤醒管道")),
             subscriptions: HashMap::new(),
             next_subscription_id: 1,
             retired_entries: Vec::new(),
@@ -1013,6 +1233,7 @@ mod tests {
             lcm,
             cmd_rx,
             control_rx,
+            wakeup: Arc::new(CommandWakeup::new().expect("命令唤醒管道")),
             subscriptions: HashMap::new(),
             next_subscription_id: 1,
             retired_entries: Vec::new(),

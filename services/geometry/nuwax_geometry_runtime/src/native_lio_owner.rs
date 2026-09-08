@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nalgebra::{Matrix3, Point3, Vector3};
 use nuwax_codec::lcm::lio::{LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO};
@@ -202,6 +204,7 @@ impl NativeLioPreflight {
         native_config.validate().map_err(|error| {
             format!("NATIVE_LIO_PREFLIGHT_FAILED invalid native sampling config: {error}")
         })?;
+        validate_native_backend_identity(&executable, backend, Duration::from_secs(2))?;
 
         Ok(Self {
             backend,
@@ -304,6 +307,90 @@ impl NativeLioPreflight {
             pair_max_skew: self.pair_max_skew,
         })
     }
+}
+
+fn validate_native_backend_identity(
+    executable: &Path,
+    backend: NativeBackend,
+    timeout: Duration,
+) -> Result<(), String> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let expected = match backend {
+        NativeBackend::FastLio2 => "nuwax-native-lio-v1:fastlio2",
+        NativeBackend::PointLio => "nuwax-native-lio-v1:pointlio",
+    };
+    let failure = |reason: String| format!(
+        "NATIVE_LIO_PREFLIGHT_FAILED backend_identity path={} expected={expected} {reason}; rebuild the selected native backend or correct {NATIVE_EXECUTABLE_ENV}",
+        executable.display(),
+    );
+    let mut child = std::process::Command::new(executable)
+        .arg("--nuwax-lio-contract")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| failure(format!("spawn_failed={error}")))?;
+    let result = (|| {
+        let mut stdout = child.stdout.take().ok_or_else(|| failure("stdout_missing".into()))?;
+        // 未知旧程序可能持续写入或派生子进程；读取容量和等待时间均有界。
+        fcntl(stdout.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .map_err(|error| failure(format!("nonblocking_failed={error}")))?;
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        loop {
+            let mut buffer = [0u8; 256];
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if output.len() + count > 256 {
+                            return Err(failure("response_too_large".into()));
+                        }
+                        output.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(failure(format!("read_failed={error}"))),
+                }
+            }
+            if let Some(status) = observe_exit_without_reap(child.id()).map_err(|error| failure(format!("wait_failed={error}")))? {
+                // 子进程可能刚在读管道之后退出，再读取一次已提交的短响应。
+                let mut tail = [0u8; 256];
+                if let Ok(count) = stdout.read(&mut tail) {
+                    if output.len() + count > 256 {
+                        return Err(failure("response_too_large".into()));
+                    }
+                    output.extend_from_slice(&tail[..count]);
+                }
+                let actual = String::from_utf8_lossy(&output);
+                return if status.success() && actual.trim_end() == expected {
+                    Ok(())
+                } else {
+                    Err(failure(format!("status={status} actual={actual:?}")))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(failure("probe_timeout".into()));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    // 保留组长身份直到整个探针组收到关闭，再回收组长，避免误用已复用的进程号。
+    let group_shutdown = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+    // 显式路径可能是改变进程组的包装器，组关闭失败时仍须终止直接子进程。
+    let direct_shutdown = child.kill();
+    let reaped = child.wait().map_err(|error| failure(format!("reap_failed={error}")));
+    reaped?;
+    if let Err(error) = group_shutdown {
+        if error != nix::errno::Errno::ESRCH {
+            return Err(failure(format!("group_shutdown_failed={error} direct_shutdown={direct_shutdown:?}")));
+        }
+    }
+    result
 }
 
 fn backend_tag(backend: NativeBackend) -> &'static str {
@@ -993,11 +1080,42 @@ mod tests {
         r#"{"translation_m":[1.0,2.0,3.0],"rotation_row_major":[0.0,-1.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]}"#
     }
 
+    struct ProbeExecutable(PathBuf);
+
+    impl ProbeExecutable {
+        fn new(script: &str) -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = env::temp_dir().join(format!(
+                "nuwax-native-probe-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("renamed-program");
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+
+        fn for_backend(backend: NativeBackend) -> Self {
+            let tag = match backend {
+                NativeBackend::FastLio2 => "fastlio2",
+                NativeBackend::PointLio => "pointlio",
+            };
+            Self::new(&format!("[ \"$1\" = --nuwax-lio-contract ] || exit 9\nprintf 'nuwax-native-lio-v1:{tag}\\n'"))
+        }
+    }
+
+    impl Drop for ProbeExecutable {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir(self.0.parent().unwrap());
+        }
+    }
+
     fn preflight(backend: NativeBackend) -> NativeLioPreflight {
-        let shell = Path::new("/bin/sh")
-            .canonicalize()
-            .expect("canonical shell");
-        let shell = shell.to_str().expect("UTF-8 shell path");
+        let probe = ProbeExecutable::for_backend(backend);
+        let shell = probe.0.to_str().unwrap();
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, Some(shell)),
             (BODY_FROM_SENSOR_ENV, Some(rotated_json())),
@@ -1137,7 +1255,11 @@ mod tests {
             (INITIAL_MAP_FRAMES_ENV, Some("7")),
         ]);
         let captured = [NativeBackend::FastLio2, NativeBackend::PointLio]
-            .map(|backend| NativeLioPreflight::from_env(backend).unwrap());
+            .map(|backend| {
+                let probe = ProbeExecutable::for_backend(backend);
+                env::set_var(NATIVE_EXECUTABLE_ENV, &probe.0);
+                NativeLioPreflight::from_env(backend).unwrap()
+            });
         env::set_var(SCAN_VOXEL_SIZE_M_ENV, "invalid-after-preflight");
         env::set_var(MAP_VOXEL_SIZE_M_ENV, "0");
         env::set_var(INITIAL_MAP_FRAMES_ENV, "9");
@@ -1152,7 +1274,8 @@ mod tests {
 
     #[test]
     fn optional_sampling_empty_values_preserve_native_defaults() {
-        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let probe = ProbeExecutable::for_backend(NativeBackend::PointLio);
+        let shell = &probe.0;
         for value in [None, Some(""), Some("   ")] {
             let (_lock, _env) = EnvRestore::set(&[
                 (NATIVE_EXECUTABLE_ENV, shell.to_str()),
@@ -1214,6 +1337,8 @@ mod tests {
         ]);
         // 三个采样值故意不在本测试写入，只接收真实设置保存/环境加载的输出。
         for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let probe = ProbeExecutable::for_backend(backend);
+            env::set_var(NATIVE_EXECUTABLE_ENV, &probe.0);
             let bound = NativeLioPreflight::from_env(backend).unwrap()
                 .bind(1, "sensor", "body", "odom").unwrap();
             for pair in [["--filter_size_surf", "0.1"], ["--filter_size_map", "0.2"], ["--initial_map_frames", "7"]] {
@@ -1221,6 +1346,34 @@ mod tests {
             }
             println!("NATIVE_CONFIG_BIND_JSON {}", serde_json::json!({"backend": backend, "args": bound.runtime.args}));
         }
+    }
+
+    #[test]
+    fn native_backend_identity_accepts_renaming_and_rejects_mismatch_or_old_binary() {
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let probe = ProbeExecutable::for_backend(backend);
+            validate_native_backend_identity(&probe.0, backend, Duration::from_secs(1)).unwrap();
+            let other = match backend {
+                NativeBackend::FastLio2 => NativeBackend::PointLio,
+                NativeBackend::PointLio => NativeBackend::FastLio2,
+            };
+            let error = validate_native_backend_identity(&probe.0, other, Duration::from_secs(1)).unwrap_err();
+            assert!(error.contains("backend_identity") && error.contains("actual="), "{error}");
+        }
+        let old = ProbeExecutable::new("exit 0");
+        assert!(validate_native_backend_identity(&old.0, NativeBackend::PointLio, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn native_backend_identity_probe_has_bounded_output_and_wait() {
+        let noisy = ProbeExecutable::new("while :; do printf 'unexpected-output'; done");
+        let error = validate_native_backend_identity(&noisy.0, NativeBackend::PointLio, Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("response_too_large"), "{error}");
+        let hanging = ProbeExecutable::new("sleep 30");
+        let started = Instant::now();
+        let error = validate_native_backend_identity(&hanging.0, NativeBackend::PointLio, Duration::from_millis(30)).unwrap_err();
+        assert!(error.contains("probe_timeout"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn shell_runtime(script: &str) -> NativeRuntimeSpec {

@@ -558,6 +558,8 @@ class MapWorkspaceService:
                 )
         backend_outcome = "not_attempted"
         try:
+            if bundle is None:
+                self._geometry_runtime.prepare_unfinalized_map_workspace(map_name=resolved_name)
             if bundle is not None:
                 assert activation_identity is not None
                 self._activate_map_asset_bundle(
@@ -588,7 +590,16 @@ class MapWorkspaceService:
                 reset_library=reset_memory_library,
                 expected_library_name=resolved_name,
             )
-            if bundle is None and previous_active_map_name != resolved_name:
+            latest_snapshot = self._mapping_service.get_latest_snapshot() if bundle is None else None
+            if bundle is None and (
+                previous_active_map_name != resolved_name
+                or (latest_snapshot is not None and (
+                    latest_snapshot.map_name != resolved_name
+                    or not self._geometry_runtime.is_map_snapshot_source_current(
+                        map_name=latest_snapshot.map_name, metadata=latest_snapshot.metadata,
+                    )
+                ))
+            ):
                 self._geometry_runtime.clear_active_map_asset(reason="switch_active_map")
                 self._mapping_service.clear_latest_snapshot(
                     cleared_map_name=previous_active_map_name,
@@ -656,6 +667,10 @@ class MapWorkspaceService:
                 )
         except Exception as exc:
             if bundle is None:
+                self._geometry_runtime.restore_unfinalized_map_workspace_selection(
+                    expected_map_name=resolved_name,
+                    map_name=self._repository.get_active_map_name(),
+                )
                 raise
             if self._is_stale_backend_activation_request(exc):
                 assert activation_identity is not None
@@ -851,9 +866,12 @@ class MapWorkspaceService:
                 reset_memory_library=reset_memory_library,
                 metadata=metadata,
             )
-        current = self.get_active_workspace()
-        if current is not None and current.active_map_name == self._require_map_name(map_name):
-            return current
+        resolved_name = self._require_map_name(map_name)
+        # 先读取目录身份，避免旧图不一致令修复切换本身无法进入。
+        current_name = self.get_active_map_name()
+        current_asset = self._repository.get_map_asset(current_name) if current_name else None
+        if current_name == resolved_name and current_asset is not None and current_asset.finalized:
+            return self.get_active_workspace()
         return self.activate_map(
             map_name=map_name,
             create_if_missing=create_if_missing,

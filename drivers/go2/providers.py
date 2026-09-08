@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 from contracts.calibration import SensorTopology
@@ -8,15 +9,20 @@ from contracts.geometry import FrameTree, Pose
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
+from contracts.sensors import SensorSample
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO, GO2_DEFAULT_SENSOR_TOPOLOGY
 from providers.calibration import CalibrationProvider
 from providers.image import ImageProvider
 from providers.localization import StreamingLocalizationProvider
 from providers.pointcloud import PointCloudProvider, StreamingPointCloudProvider
 from providers.state import StateProvider, StreamingStateProvider
+from providers.sensors import StreamingSensorSampleProvider
 
 if TYPE_CHECKING:
     from drivers.go2.assembly import Go2RobotAssembly
+
+
+_ROBOT_STATE_SAMPLE_INTERVAL_SEC = 0.05
 
 
 def _to_control_mode(mode: str) -> RobotControlMode:
@@ -35,6 +41,7 @@ class Go2ProviderBundle(
     StreamingPointCloudProvider,
     StreamingLocalizationProvider,
     StreamingStateProvider,
+    StreamingSensorSampleProvider,
     CalibrationProvider,
 ):
     """Go2 默认提供器集合。"""
@@ -122,7 +129,42 @@ class Go2ProviderBundle(
         return GO2_DEFAULT_SENSOR_TOPOLOGY.model_copy(deep=True)
 
     def subscribe_robot_state(self, callback: Callable[[RobotState], None]) -> Optional[int]:
-        return self.subscribe_localization(lambda pose, frame_tree, metadata: callback(self._build_robot_state_from_stream(pose, metadata)))
+        # 高频惯性由独立标准订阅逐条消费；完整状态只采样最新值。
+        # 模式、就绪及安全变化立即交付，不能在采样间隔中吞掉故障或停车事实。
+        last_sample_at = None
+        last_critical_state = None
+
+        def publish_latest(pose, frame_tree, metadata):
+            nonlocal last_sample_at, last_critical_state
+            now = time.monotonic()
+            safety = self.get_safety_state()
+            critical_state = (
+                self.assembly.current_mode,
+                self.assembly.high_level_initialized,
+                safety.motors_enabled, safety.can_move, safety.warning_message,
+                metadata.get("dds_pose_ready"), metadata.get("dds_imu_ready"),
+                metadata.get("source_generation"),
+                metadata.get("device_mode"), metadata.get("device_gait_type"),
+            )
+            if (
+                last_sample_at is not None
+                and 0.0 <= now - last_sample_at < _ROBOT_STATE_SAMPLE_INTERVAL_SEC
+                and critical_state == last_critical_state
+            ):
+                return
+            callback(self._build_robot_state_from_stream(pose, metadata))
+            last_sample_at, last_critical_state = now, critical_state
+
+        return self.subscribe_localization(publish_latest)
+
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
+        subscriber = getattr(self.assembly.data_plane, "subscribe_sensor_sample", None)
+        return subscriber(callback) if callable(subscriber) else None
+
+    def unsubscribe_sensor_sample(self, subscription_id: Optional[int]) -> None:
+        unsubscriber = getattr(self.assembly.data_plane, "unsubscribe_sensor_sample", None)
+        if subscription_id is not None and callable(unsubscriber):
+            unsubscriber(subscription_id)
 
     def unsubscribe_robot_state(self, subscription_id: Optional[int]) -> None:
         self.unsubscribe_localization(subscription_id)

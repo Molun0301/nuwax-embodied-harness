@@ -7,6 +7,14 @@
 
 namespace nuwax_lio {
 
+// 与规范导航默认0.5秒来源准入一致的保守缺测上限；不是消息到达间隔。
+// 批量迟到但源采样连续仍合法，缺失整段惯性不能按旧边界继续积分。
+inline constexpr uint64_t kMaxImuSourceGapNs = 500'000'000ULL;
+
+inline bool imu_source_gap_exceeded(uint64_t previous_ns, uint64_t incoming_ns) {
+    return incoming_ns > previous_ns && incoming_ns - previous_ns > kMaxImuSourceGapNs;
+}
+
 // 扫描需要左右两侧的真实惯性样本。保留左界供下一扫描验证，右界喂给内核完成配组；
 // 接收去重和内核喂入去重分别记时，避免保留的边界样本被再次送入估计器。
 template <typename Sample, typename Feed>

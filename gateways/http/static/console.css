@@ -420,7 +420,7 @@ button{font-family:inherit;cursor:pointer}
 .map-point-style[data-point-style="mono"] .sw{background:var(--pointcloud3d-color,#e2e8f0)}
 .map-overlay-panel{border-radius:var(--r)}
 .forbidden-zone-panel{border-radius:var(--r)}
-.map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:min(46%,280px);white-space:pre-line;overflow-wrap:anywhere}
 .map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
 .legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:52%}
 #mapZoomValue{min-width:48px;justify-content:center;font-family:var(--mono);font-size:11px}
@@ -659,7 +659,12 @@ button{font-family:inherit;cursor:pointer}
 }
 
 /* 日志摘要将级别、组件和正文分行对齐，避免文字直接粘连。 */
-.recent-logs .console-log-entry{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 8px;padding:10px 0}
+.recent-logs .console-log-entry{padding:8px 0}
+.recent-log-summary{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:4px 8px;cursor:pointer}
+.recent-log-summary .console-log-message{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;overflow:hidden}
+.recent-log-entry[open] .recent-log-summary .console-log-message{display:none}
+.recent-log-entry .console-log-details{padding:8px 0}
+.recent-log-entry .console-log-time{font-size:10px}
 .recent-logs .console-log-message{grid-column:1/-1;font-size:12px}
 
 /* 服务概览只常显核心组件与异常，证据按需展开。 */

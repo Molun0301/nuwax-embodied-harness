@@ -1647,6 +1647,7 @@ name = "nuwax-lcm"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "nuwax-lcm-sys",
  "thiserror 1.0.69",
  "tokio",

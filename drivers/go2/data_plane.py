@@ -35,7 +35,7 @@ from adapters.sensors.go2_l2 import (
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField
 from contracts.robot_state import IMUState
-from contracts.sensors import RegistrationState
+from contracts.sensors import RegistrationState, SensorSample
 from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
 
 if TYPE_CHECKING:
@@ -58,11 +58,19 @@ _NATIVE_CLOUD_READER_HISTORY_DEPTH = 16
 class _HistoryChannelSubscriber:
     """通过公开接收接口复用有界读取器和等待资源，关闭时先取消在读操作。"""
 
-    def __init__(self, modules, topic, message_type, qos) -> None:
+    def __init__(
+        self, modules, topic, message_type, qos, *,
+        read_batch_size: int = 1, latest_sample_key: Optional[Callable[[object], int]] = None,
+    ) -> None:
         self._modules = modules
         self._topic_name = topic
         self._message_type = message_type
         self._qos = qos
+        self._read_batch_size = int(read_batch_size) if latest_sample_key is not None else 1
+        if self._read_batch_size <= 0:
+            raise ValueError("Go2 DDS 读取批次大小必须为正")
+        self._latest_sample_key = latest_sample_key
+        self._dropped_sample_count = 0
         self._lock = threading.RLock()
         self._initialized = False
         self._initializing = False
@@ -124,10 +132,19 @@ class _HistoryChannelSubscriber:
                 with self._lock:
                     if self._closed:
                         return None
-                samples = reader.take(1, condition=condition)
+                samples = reader.take(self._read_batch_size, condition=condition)
                 if samples:
+                    # 点云是可替代扫描：在昂贵解析/分发之前丢弃当前批次的旧云。
+                    # 惯性读取器仍每次只取一条，源时间及完整惯性历史不变。
+                    selected = (
+                        max(samples, key=self._latest_sample_key)
+                        if self._latest_sample_key is not None else samples[0]
+                    )
                     with self._lock:
-                        return None if self._closed else samples[0]
+                        if self._closed:
+                            return None
+                        self._dropped_sample_count += len(samples) - 1
+                        return selected
                 if deadline is None:
                     remaining_ns = (1 << 63) - 1
                 else:
@@ -140,6 +157,11 @@ class _HistoryChannelSubscriber:
                 self._reading_thread_id = None
                 if self._closed:
                     self._release_entities_locked()
+
+    @property
+    def dropped_sample_count(self) -> int:
+        with self._lock:
+            return self._dropped_sample_count
 
     def Close(self) -> None:
         with self._lock:
@@ -301,6 +323,16 @@ def _unitree_stamp_to_datetime_ns(stamp: object, label: str) -> Tuple[datetime, 
     return timestamp, (sec * 1_000_000_000) + nanosec
 
 
+def _point_cloud_source_time_key(message: object) -> int:
+    """只比较合法源时间头；选中帧仍须通过原完整载荷/坐标/水位校验。"""
+    stamp = getattr(getattr(message, "header", None), "stamp", None)
+    try:
+        sec, nanosec = int(stamp.sec), int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return -1
+    return sec * 1_000_000_000 + nanosec if sec >= 0 and 0 <= nanosec < 1_000_000_000 else -1
+
+
 def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
     sdk_path = str(getattr(config, "sdk_path", "") or "").strip()
     if sdk_path:
@@ -397,6 +429,8 @@ class Go2DirectDdsBridge:
         self._latest_point_cloud_source_topic = ""
         self._localization_callbacks: Dict[int, Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]] = {}
         self._point_cloud_callbacks: Dict[int, Callable[[PointCloudFrame], None]] = {}
+        self._sensor_sample_callbacks: Dict[int, Callable[[SensorSample], None]] = {}
+        self._dds_input_timing: Dict[str, Deque[Dict[str, Any]]] = {}
         self._next_callback_id = 1
         self._direct_pose_ready = False
         self._direct_imu_ready = False
@@ -517,6 +551,30 @@ class Go2DirectDdsBridge:
             self._localization_callbacks[callback_id] = callback
             return callback_id
 
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> int:
+        with self._lock:
+            callback_id = self._next_subscription_id()
+            self._sensor_sample_callbacks[callback_id] = callback
+            return callback_id
+
+    def unsubscribe_sensor_sample(self, callback_id: int) -> None:
+        with self._lock:
+            self._sensor_sample_callbacks.pop(int(callback_id), None)
+
+    def _publish_sensor_sample(self, sample: SensorSample, generation: int) -> None:
+        """标准输入先于显示回调；沿原同步回调代际与外层交付围栏收尾。"""
+        with self._lock:
+            callbacks = tuple(self._sensor_sample_callbacks.values())
+            delivery_token = self._direct_dds_stop_event
+        for callback in callbacks:
+            with self._lock:
+                if not self._is_generation_active_locked(generation, delivery_token):
+                    return
+            try:
+                callback(sample)
+            except Exception:
+                LOGGER.debug("分发 Go2 规范传感器样本失败。", exc_info=True)
+
     def unsubscribe_localization(self, callback_id: int) -> None:
         with self._lock:
             self._localization_callbacks.pop(int(callback_id), None)
@@ -530,6 +588,57 @@ class Go2DirectDdsBridge:
     def unsubscribe_local_point_cloud(self, callback_id: int) -> None:
         with self._lock:
             self._point_cloud_callbacks.pop(int(callback_id), None)
+
+    def _record_dds_input_timing(
+        self, kind: str, stamp: object, generation: int,
+        read_started: float, read_returned: float, received_wall_ns: int,
+    ) -> None:
+        """每个源只留十个秒桶，区分返回时已旧与回调处理变慢，不保存载荷。"""
+        completed = time.monotonic()
+        try:
+            sec, nanosec = int(stamp.sec), int(stamp.nanosec)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if sec < 0 or not 0 <= nanosec < 1_000_000_000:
+            return
+        source_ns = sec * 1_000_000_000 + nanosec
+        values = {
+            "source_age_ms": (received_wall_ns - source_ns) / 1_000_000,
+            "read_ms": (read_returned - read_started) * 1000.0,
+            "callback_ms": (completed - read_returned) * 1000.0,
+        }
+        with self._lock:
+            if not self._is_generation_active_locked(generation):
+                return
+            buckets = self._dds_input_timing.setdefault(kind, deque(maxlen=10))
+            second = int(completed)
+            if not buckets or buckets[-1]["second"] != second:
+                buckets.append({"second": second, "count": 0})
+            bucket = buckets[-1]
+            bucket["count"] += 1
+            bucket["source_ns"] = source_ns
+            for name, value in values.items():
+                total, maximum, _last = bucket.get(name, (0.0, value, value))
+                bucket[name] = (total + value, max(maximum, value), value)
+
+    def _input_timing_snapshot_locked(self) -> Dict[str, Any]:
+        """诊断读取只汇总近期常量规模计数；无新输入不延长窗口。"""
+        if not self._dds_input_timing:
+            return {}
+        oldest_second = int(time.monotonic()) - 9
+        result = {}
+        for kind, history in self._dds_input_timing.items():
+            buckets = [bucket for bucket in history if bucket["second"] >= oldest_second]
+            count = sum(bucket["count"] for bucket in buckets)
+            item = {"window_sec": 10, "sample_count": count}
+            if count:
+                item["last_source_timestamp_ns"] = buckets[-1]["source_ns"]
+                for name in ("source_age_ms", "read_ms", "callback_ms"):
+                    item[name + "_latest"] = buckets[-1][name][2]
+                    item[name + "_mean"] = sum(bucket[name][0] for bucket in buckets) / count
+                    item[name + "_max"] = max(bucket[name][1] for bucket in buckets)
+            result[kind] = item
+        return result
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
@@ -561,6 +670,7 @@ class Go2DirectDdsBridge:
                 "direct_dds_started": self._direct_dds_started and active_generation is not None,
                 "lifecycle_generation": self._lifecycle_generation,
                 "active_generation": active_generation,
+                "input_timing": self._input_timing_snapshot_locked(),
                 "dds_pose_ready": pose_active,
                 "dds_imu_ready": imu_active,
                 "dds_cloud_ready": point_cloud_active,
@@ -568,6 +678,9 @@ class Go2DirectDdsBridge:
                 "imu_source_topic": self._latest_imu_source_topic if imu_active else "",
                 "point_cloud_source_topic": (self._latest_point_cloud_source_topic if point_cloud_active else ""),
                 "latest_point_cloud_points": (self._latest_local_point_cloud.point_count if point_cloud_active else 0),
+                "dds_point_cloud_reader_drop_count": getattr(
+                    self._direct_point_cloud_subscriber, "dropped_sample_count", 0
+                ),
                 "last_accepted_point_cloud_source_timestamp_ns": (self._last_accepted_point_cloud_source_timestamp_ns),
                 # Phase 5：§13.4 要求 status 暴露这些字段。
                 "point_cloud_bridge_topic": self._point_cloud_bridge_topic,
@@ -615,6 +728,7 @@ class Go2DirectDdsBridge:
         self._point_cloud_bridge_last_error_at = time.monotonic()
 
     def _invalidate_observations_locked(self, message: str) -> None:
+        self._dds_input_timing.clear()
         self._latest_pose_from_dds = None
         self._latest_imu_state_from_dds = None
         self._latest_pose_generation = None
@@ -801,7 +915,7 @@ class Go2DirectDdsBridge:
             subscriber_class = modules["ChannelSubscriber"]
             native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
 
-            def make_subscriber(topic, message_type, history_depth):
+            def make_subscriber(topic, message_type, history_depth, *, latest_cloud=False):
                 if not native_input:
                     return subscriber_class(topic, message_type)
                 required = (
@@ -821,7 +935,11 @@ class Go2DirectDdsBridge:
                         max_samples_per_instance=history_depth,
                     ),
                 )
-                return _HistoryChannelSubscriber(modules, topic, message_type, qos)
+                return _HistoryChannelSubscriber(
+                    modules, topic, message_type, qos,
+                    read_batch_size=history_depth,
+                    latest_sample_key=_point_cloud_source_time_key if latest_cloud else None,
+                )
 
             pose_subscriber = make_subscriber(
                 self.config.direct_dds.pose_topic,
@@ -844,6 +962,7 @@ class Go2DirectDdsBridge:
                     self.config.direct_dds.point_cloud_topic,
                     point_cloud_type,
                     _NATIVE_CLOUD_READER_HISTORY_DEPTH,
+                    latest_cloud=True,
                 )
                 point_cloud_subscriber.Init()
                 LOGGER.info(
@@ -958,6 +1077,7 @@ class Go2DirectDdsBridge:
         if stop_event is None or subscriber is None:
             return
         while not stop_event.is_set():
+            read_started = time.monotonic()
             try:
                 sample = subscriber.Read(timeout_sec)
             except Exception:
@@ -969,10 +1089,17 @@ class Go2DirectDdsBridge:
                 continue
             if sample is None:
                 continue
+            read_returned, received_wall_ns = time.monotonic(), time.time_ns()
             with self._lock:
                 if not self._is_generation_active_locked(generation, stop_event):
                     return
-            self._on_sport_mode_state(sample, source_topic=source_topic, generation=generation)
+            try:
+                self._on_sport_mode_state(sample, source_topic=source_topic, generation=generation)
+            finally:
+                self._record_dds_input_timing(
+                    "imu", getattr(sample, "stamp", None), generation,
+                    read_started, read_returned, received_wall_ns,
+                )
 
     def _on_sport_mode_state(
         self,
@@ -986,7 +1113,7 @@ class Go2DirectDdsBridge:
         if generation is None:
             return
         pose = self._build_pose_from_sport_mode_state(message)
-        imu_state = self._build_imu_from_sport_mode_state(message)
+        imu_state = self._build_imu_from_sport_mode_state(message, source_pose=pose)
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
         )
@@ -1023,6 +1150,9 @@ class Go2DirectDdsBridge:
         frame_tree = FrameTree(root_frame_id=pose.frame_id)
         metadata = {
             "source_topic": str(source_topic or ""),
+            "source_generation": generation,
+            "device_mode": getattr(message, "mode", None),
+            "device_gait_type": getattr(message, "gait_type", None),
             "imu_source_topic": f"{source_topic}#imu_state" if source_topic else "",
             "dds_pose_ready": True,
             "dds_imu_ready": imu_state is not None,
@@ -1079,6 +1209,8 @@ class Go2DirectDdsBridge:
                 self._latest_imu_source_topic = f"{source_topic}#imu_state" if source_topic else ""
                 callbacks = tuple(self._localization_callbacks.values())
                 delivery_token = self._direct_dds_stop_event
+        if canonical_imu_sample is not None:
+            self._publish_sensor_sample(canonical_imu_sample, generation)
         for callback in callbacks:
             with self._lock:
                 if not self._is_generation_active_locked(generation, delivery_token):
@@ -1104,17 +1236,26 @@ class Go2DirectDdsBridge:
                 "禁止使用硬编码兜底字符串。"
             )
         return Pose(
+            timestamp=_unitree_stamp_to_datetime_ns(
+                getattr(message, "stamp", None), "Go2 SportModeState"
+            )[0],
             frame_id=expected_odom_frame,
             position=Vector3(x=float(position[0]), y=float(position[1]), z=float(position[2])),
             orientation=quaternion,
         )
 
-    def _build_imu_from_sport_mode_state(self, message: object) -> IMUState:
+    def _build_imu_from_sport_mode_state(
+        self, message: object, *, source_pose: Optional[Pose] = None,
+    ) -> IMUState:
         imu_state = getattr(message, "imu_state", None)
         quaternion_values = getattr(imu_state, "quaternion", None)
         if imu_state is None or quaternion_values is None:
             raise ValueError("Go2 输入缺少实测 quaternion")
-        quaternion = _unitree_wxyz_quaternion_to_contract(quaternion_values)
+        # 同一实际消息的位姿已经校验四元数和采样时间，惯性快照可直接复用。
+        quaternion = (
+            source_pose.orientation if source_pose is not None
+            else _unitree_wxyz_quaternion_to_contract(quaternion_values)
+        )
         gyroscope_values = getattr(imu_state, "gyroscope", None)
         accelerometer_values = getattr(imu_state, "accelerometer", None)
         if gyroscope_values is None or accelerometer_values is None:
@@ -1135,8 +1276,11 @@ class Go2DirectDdsBridge:
                 "Go2DataPlaneConfig.expected_imu_frame 必须由 assembly.defaults.frame_ids['imu'] 注入；"
                 "禁止使用硬编码兜底字符串。"
             )
-        timestamp, _timestamp_ns = _unitree_stamp_to_datetime_ns(
-            getattr(message, "stamp", None), "Go2 SportModeState"
+        timestamp = (
+            source_pose.timestamp if source_pose is not None
+            else _unitree_stamp_to_datetime_ns(
+                getattr(message, "stamp", None), "Go2 SportModeState"
+            )[0]
         )
         return IMUState(
             timestamp=timestamp,
@@ -1179,6 +1323,7 @@ class Go2DirectDdsBridge:
         if stop_event is None or subscriber is None:
             return
         while not stop_event.is_set():
+            read_started = time.monotonic()
             try:
                 sample = subscriber.Read(timeout_sec)
             except Exception as exc:
@@ -1194,6 +1339,7 @@ class Go2DirectDdsBridge:
                 continue
             if sample is None:
                 continue
+            read_returned, received_wall_ns = time.monotonic(), time.time_ns()
             with self._lock:
                 if not self._is_generation_active_locked(generation, stop_event):
                     return
@@ -1208,6 +1354,11 @@ class Go2DirectDdsBridge:
                 self._record_point_cloud_bridge_error(
                     f"PointCloud2 callback 异常：{exc}",
                     generation=generation,
+                )
+            finally:
+                self._record_dds_input_timing(
+                    "pointcloud", getattr(getattr(sample, "header", None), "stamp", None), generation,
+                    read_started, read_returned, received_wall_ns,
                 )
 
     def _on_point_cloud_message(
@@ -1306,7 +1457,7 @@ class Go2DirectDdsBridge:
         yaw_stabilization_offset_rad = 0.0
         yaw_stabilization_origin_xy = [0.0, 0.0]
         stationary_yaw_locked = False
-        if source_frame == _GO2_UTLIDAR_FRAME:
+        if source_frame == _GO2_UTLIDAR_FRAME and self.config.lio_backend == "device":
             with self._lock:
                 if not self._is_generation_active_locked(generation):
                     return
@@ -1351,7 +1502,7 @@ class Go2DirectDdsBridge:
                     float(pose_snapshot.pose.position.x),
                     float(pose_snapshot.pose.position.y),
                 ]
-        elif upstream_registered_to_odom:
+        elif source_frame != _GO2_UTLIDAR_FRAME and upstream_registered_to_odom:
             registered_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
             if not registered_frame:
                 reject("点云声明已注册到 odom，但 expected_odom_frame 为空")
@@ -1452,17 +1603,17 @@ class Go2DirectDdsBridge:
                     "max_pose_sample_skew_sec": _MAX_POINT_CLOUD_POSE_SKEW_SEC,
                     "body_from_sensor_translation_m": (
                         list(self._calibration_profile.lidar_translation_m)
-                        if driver_sensor_to_odom_applied
+                        if source_frame == _GO2_UTLIDAR_FRAME
                         else []
                     ),
                     "body_from_sensor_rpy_rad": (
                         list(self._calibration_profile.lidar_rpy_rad)
-                        if driver_sensor_to_odom_applied
+                        if source_frame == _GO2_UTLIDAR_FRAME
                         else []
                     ),
                     "body_from_sensor_rotation_row_major": (
                         self._calibration_profile.lidar_rotation.ravel().tolist()
-                        if driver_sensor_to_odom_applied
+                        if source_frame == _GO2_UTLIDAR_FRAME
                         else []
                     ),
                     "calibration_ref": (
@@ -1510,6 +1661,8 @@ class Go2DirectDdsBridge:
             LOGGER.debug("Go2 DirectDDS 点云帧拒绝：%s", rejection_error)
             return
 
+        if canonical_lidar_frame is not None:
+            self._publish_sensor_sample(canonical_lidar_frame, generation)
         for callback in callbacks:
             with self._lock:
                 if not self._is_generation_active_locked(generation, delivery_token):
@@ -1753,6 +1906,17 @@ class Go2DataPlaneRuntime:
         finally:
             delivery_gate.leave()
 
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
+        if self.bridge is None:
+            return None
+        return self.bridge.subscribe_sensor_sample(
+            lambda sample: self._deliver_if_committed(callback, sample)
+        )
+
+    def unsubscribe_sensor_sample(self, callback_id: Optional[int]) -> None:
+        if self.bridge is not None and callback_id is not None:
+            self.bridge.unsubscribe_sensor_sample(callback_id)
+
     def subscribe_localization(
         self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]
     ) -> Optional[int]:
@@ -1955,6 +2119,12 @@ class Go2DeviceDataPlane:
         self, callback: Callable[[Pose, Optional[FrameTree], Dict[str, object]], None]
     ) -> Optional[int]:
         return self.runtime.subscribe_localization(callback)
+
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
+        return self.runtime.subscribe_sensor_sample(callback)
+
+    def unsubscribe_sensor_sample(self, callback_id: Optional[int]) -> None:
+        self.runtime.unsubscribe_sensor_sample(callback_id)
 
     def unsubscribe_localization(self, callback_id: Optional[int]) -> None:
         self.runtime.unsubscribe_localization(callback_id)

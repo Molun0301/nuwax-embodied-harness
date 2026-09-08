@@ -30,7 +30,7 @@ Lifecycle
 ========
 
 - odom: 直发，不节流；calling thread 同步走 gRPC。
-- 原生 LiDAR/IMU：回调组装后进入既有四帧队列，由独立单拥有方线程顺序发布；
+- 原生 LiDAR/IMU：回调组装后只保留最新待发扫描，由独立单拥有方线程顺序发布；
   队列满时承接旧帧惯性，停止取消未领取帧，不占用传感器读取线程等待发布。
 - pointcloud:
 
@@ -69,6 +69,7 @@ from contracts.sensors import (
     CanonicalLidarFrame,
     CanonicalLioMeasurement,
     RegistrationState,
+    SensorClockDomain,
 )
 from core.logging_utils import LogRateLimiter
 from providers.localization import StreamingLocalizationProvider
@@ -88,7 +89,8 @@ _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
 _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
 _DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
-_MAX_LIO_PUBLISH_QUEUE_SIZE = 4
+# 一组在途之外只保留最新待发扫描，旧扫描的必要惯性由原承接逻辑保留。
+_MAX_LIO_PUBLISH_QUEUE_SIZE = 1
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 _INPUT_ERROR_LOG_INTERVAL_SEC = 5.0
 # 仅汇总已知逐样本重复诊断，固定键集合不会随任意异常正文增长。
@@ -165,6 +167,8 @@ class BridgeCounters:
     # 兼容旧诊断键。Python bridge 不拥有 TF publisher，因此该值恒为 0。
     published_tf_count: int = 0
     published_pointcloud_count: int = 0
+    received_lio_imu_count: int = 0
+    received_lio_pointcloud_count: int = 0
     emitted_lio_measurement_count: int = 0
     lio_not_ready_count: int = 0
     dropped_odom_count: int = 0
@@ -186,6 +190,8 @@ class BridgeCounters:
             "tf_owner": "rust_canonical",
             "tf_observation_semantics": "observed_not_published",
             "published_pointcloud_count": self.published_pointcloud_count,
+            "received_lio_imu_count": self.received_lio_imu_count,
+            "received_lio_pointcloud_count": self.received_lio_pointcloud_count,
             "emitted_lio_measurement_count": self.emitted_lio_measurement_count,
             "lio_not_ready_count": self.lio_not_ready_count,
             "dropped_odom_count": self.dropped_odom_count,
@@ -692,6 +698,10 @@ class RuntimeInputBridge:
             with self._lio_condition:
                 if not self._lio_callback_is_current(generation):
                     return
+                self._increment_counter(
+                    "received_lio_imu_count" if isinstance(sample, CanonicalImuSample)
+                    else "received_lio_pointcloud_count"
+                )
                 try:
                     measurement = (
                         self._lio_measurement_assembler.add_imu(sample)
@@ -840,6 +850,7 @@ class RuntimeInputBridge:
                 with self._lio_condition:
                     if not self._lio_callback_is_current(_lio_generation):
                         return
+                    self._increment_counter("received_lio_imu_count")
                     try:
                         measurement = self._lio_measurement_assembler.add_imu(
                             canonical_imu
@@ -1004,6 +1015,7 @@ class RuntimeInputBridge:
                         "lio_not_ready: native LIO 点云缺少 canonical LiDAR 帧"
                     )
                     return
+                self._increment_counter("received_lio_pointcloud_count")
                 try:
                     measurement = self._lio_measurement_assembler.add_lidar(
                         canonical_lidar
@@ -1333,7 +1345,7 @@ class RuntimeInputBridge:
                     dropped_generation, dropped = self._lio_publish_queue.popleft()
                     self._increment_counter("dropped_pointcloud_count")
                     self._record_error(
-                        "native LIO publish FIFO 已满，丢弃最旧点云并承接其 IMU"
+                        "native LIO 待发槽已替换，丢弃旧点云并承接其 IMU"
                     )
                     self._carry_dropped_lio_imu(dropped.imu_samples, dropped_generation)
             measurement = self._lio_measurement_assembler.pop_ready()
@@ -1762,6 +1774,21 @@ class RuntimeInputBridge:
             sensor_sample_subscription_id = self._sensor_sample_subscription_id
         with self._counter_lock:
             counters = self.counters.as_dict()
+        with self._lio_condition:
+            oldest = self._lio_publish_queue[0][1] if self._lio_publish_queue else None
+            native_input = {
+                "generation": self._lio_generation,
+                "pending_measurement_count": len(self._lio_publish_queue),
+                "max_pending_measurement_count": _MAX_LIO_PUBLISH_QUEUE_SIZE,
+                "in_flight_measurement_count": self._lio_in_flight_count,
+                "oldest_pending_source_timestamp_ns": oldest.scan_begin_timestamp_ns if oldest else 0,
+                "oldest_pending_clock_domain": oldest.lidar.clock_domain.value if oldest else None,
+                "oldest_pending_source_age_ms": (
+                    (time.time_ns() - oldest.scan_begin_timestamp_ns) / 1_000_000
+                    if oldest and oldest.lidar.clock_domain == SensorClockDomain.UNIX_NS else None
+                ),
+                "assembler": self._lio_measurement_assembler.status(),
+            }
         return {
             "started": started,
             "ready": ready,
@@ -1772,6 +1799,7 @@ class RuntimeInputBridge:
             "point_cloud_subscription_id": point_cloud_subscription_id,
             "sensor_sample_subscription_id": sensor_sample_subscription_id,
             "counters": counters,
+            "native_input": native_input,
         }
 
     def _record_error(self, message: str) -> None:

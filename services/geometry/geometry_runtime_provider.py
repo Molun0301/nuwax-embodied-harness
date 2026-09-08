@@ -3811,7 +3811,8 @@ class GeometryRuntimeProvider:
                         self._last_nav_parent_request_id = ""
                         self._last_nav_goal_generation = 0
                         self._last_nav_producer_runtime_generation = 0
-                        self._last_nav_goal_command_generation = 0
+                        # 新连接的空状态属于本次命令代次，允许其合法空闲心跳。
+                        self._last_nav_goal_command_generation = self._nav_command_generation
                         self._last_nav_status = ""
                         self._last_nav_message = message
                         self._last_nav_distance_remaining = None
@@ -6023,12 +6024,17 @@ class GeometryRuntimeProvider:
                 display_checksum = raw_checksum_actual
                 display_occupancy_source = "raw_physical"
                 display_occupancy_fallback_reason = None
-        display_known_cell_count = sum(
-            1 for value in display_grid.data if value >= 0
-        )
-        display_occupied_cell_count = sum(
-            1 for value in display_grid.data if value >= 50
-        )
+        if display_grid is grid:
+            # 同一次更新的同一个栅格复用已计算标量，不再次遍历整张地图。
+            display_known_cell_count = known_cell_count
+            display_occupied_cell_count = occupied_cell_count
+        else:
+            display_known_cell_count = sum(
+                1 for value in display_grid.data if value >= 0
+            )
+            display_occupied_cell_count = sum(
+                1 for value in display_grid.data if value >= 50
+            )
         display_occupancy_metadata = {
             "checksum": display_checksum,
             "occupancy_content_hash": display_checksum,
@@ -6705,7 +6711,11 @@ class GeometryRuntimeProvider:
                     incoming_lease == current_lease
                     and (
                         _is_canonical_public_navigation_lease(current_lease)
-                        or current_lease == ("", 0, "", 0, 0)
+                        or (
+                            current_lease == ("", 0, "", 0, 0)
+                            and normalized_status == "idle"
+                            and self._nav_inflight_command_token is None
+                        )
                     )
                 )
                 current_status = self._nav_status_to_enum(

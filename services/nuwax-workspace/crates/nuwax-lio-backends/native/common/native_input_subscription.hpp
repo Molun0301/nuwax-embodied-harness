@@ -5,9 +5,9 @@
 
 namespace nuwax_lio {
 
-// 输入桥最多有四组待发和一组锁外发布中，每组最多携带 4096 条惯性。
-// 该预算吸收桥的有限批次突发，不代表任意长时间积压都能无损接收。
-inline constexpr int kNativeInputBurstGroups = 4 + 1;
+// 保留既有五组历史的接收突发预算，每组最多携带 4096 条惯性。
+// 网关现为一组待发加一组在途；底层预算不等于网关当前队列长度，也不保证无限积压无损。
+inline constexpr int kNativeInputBurstGroups = 5;
 inline constexpr int kNativeInputMaxImuSamplesPerGroup = 4096;
 inline constexpr int kNativeInputImuQueueCapacity =
     kNativeInputBurstGroups * kNativeInputMaxImuSamplesPerGroup;

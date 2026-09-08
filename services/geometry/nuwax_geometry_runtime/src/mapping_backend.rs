@@ -36,9 +36,8 @@ const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 const PREINSTALL_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const MIN_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
-const MAX_CANDIDATE_INTERVAL_NS: u64 = 1_000_000_000;
-const CANDIDATE_GROWTH_DIVISOR: usize = 20;
+// 持续真实输入的候选最迟间隔；为导航500毫秒接收期限保留构图与传输余量。
+pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAPPING_BACKEND_CHECKPOINT_MAGIC: [u8; 8] = *b"NWMBCKP\0";
@@ -2046,28 +2045,9 @@ fn cleared_previous_occupancy(
     cleared
 }
 
-fn candidate_due(
-    last_received_at_ns: u64,
-    last_point_count: usize,
-    received_at_ns: u64,
-    point_count: usize,
-) -> bool {
-    if last_received_at_ns == 0 {
-        return true;
-    }
-    let elapsed_ns = received_at_ns.saturating_sub(last_received_at_ns);
-    if elapsed_ns >= MAX_CANDIDATE_INTERVAL_NS {
-        return true;
-    }
-    if elapsed_ns < MIN_CANDIDATE_INTERVAL_NS {
-        return false;
-    }
-    if point_count < last_point_count {
-        return true;
-    }
-    let new_points = point_count - last_point_count;
-    let growth_threshold = (last_point_count / CANDIDATE_GROWTH_DIVISOR).max(1);
-    new_points >= growth_threshold
+fn candidate_due(last_received_at_ns: u64, received_at_ns: u64) -> bool {
+    last_received_at_ns == 0
+        || received_at_ns.saturating_sub(last_received_at_ns) >= MAPPING_CANDIDATE_INTERVAL_NS
 }
 
 fn flush_candidate(
@@ -2220,9 +2200,7 @@ fn compute_candidate_in_place(
             let point_count = voxel.current_window.len();
             if !candidate_due(
                 voxel.last_candidate_received_at_ns,
-                voxel.last_candidate_point_count,
                 input.received_at_ns,
-                point_count,
             ) {
                 return Ok(None);
             }
@@ -2242,9 +2220,7 @@ fn compute_candidate_in_place(
             };
             if !candidate_due(
                 ray.last_candidate_received_at_ns,
-                ray.last_candidate_point_count,
                 input.received_at_ns,
-                0,
             ) {
                 return Ok(None);
             }
@@ -2260,9 +2236,7 @@ fn compute_candidate_in_place(
             let point_count = ray.stable_points.len();
             if !candidate_due(
                 ray.last_candidate_received_at_ns,
-                ray.last_candidate_point_count,
                 input.received_at_ns,
-                point_count,
             ) {
                 return Ok(None);
             }
@@ -2612,6 +2586,74 @@ mod tests {
 
             original.stop_and_join().expect("join original worker");
             restored.stop_and_join().expect("join restored worker");
+        }
+    }
+
+    #[test]
+    fn steady_small_maps_publish_real_candidates_before_navigation_receipt_expires() {
+        for spec in [
+            MappingBackendSpec::Voxel,
+            MappingBackendSpec::raytracing_defaults(),
+        ] {
+            let mut config = compute_config();
+            config.window_capacity = 1;
+            let worker = MappingBackendWorker::start(spec, 1, config).expect("真实后端线程");
+            let client = worker.client();
+            let mut last_candidate_received = None;
+            let mut candidate_count = 0;
+            for sequence in 1_u64..=16 {
+                let mut observation = input(sequence);
+                observation.received_at_ns = 1_000_000_000 + (sequence - 1) * 100_000_000;
+                observation.source_timestamp_ns = 77_000_000_000 + (sequence - 1) * 100_000_000;
+                let received_at_ns = observation.received_at_ns;
+                let source_timestamp_ns = observation.source_timestamp_ns;
+                let mut request = token(sequence);
+                request.prepared_at_ns = received_at_ns;
+                request.source_timestamp_ns = source_timestamp_ns;
+                let completion = client
+                    .submit(request, observation)
+                    .expect("持续真实点输入")
+                    .blocking_recv()
+                    .expect("后端回执");
+                if let Some(candidate) = commit_completion(completion).expect("提交真实候选")
+                {
+                    assert_eq!(candidate.source_timestamp_ns, source_timestamp_ns);
+                    assert_eq!(candidate.received_at_ns, received_at_ns);
+                    last_candidate_received = Some(received_at_ns);
+                    candidate_count += 1;
+                }
+                if let Some(last) = last_candidate_received {
+                    assert!(
+                        received_at_ns - last <= 500_000_000,
+                        "低增长真实输入不应跨过导航500毫秒地图接收期限：{}",
+                        spec.stable_name()
+                    );
+                }
+            }
+            assert!(candidate_count >= 5, "恒定小图也需持续交付真实候选");
+            let mut empty = input(17);
+            empty.registered_points_map.clear();
+            empty.source_timestamp_ns = 79_000_000_000;
+            empty.received_at_ns = 3_000_000_000;
+            let mut request = token(17);
+            request.source_timestamp_ns = empty.source_timestamp_ns;
+            assert!(
+                commit_completion(
+                    client
+                        .submit(request, empty)
+                        .unwrap()
+                        .blocking_recv()
+                        .unwrap()
+                )
+                .unwrap()
+                .is_none(),
+                "空输入不得从缓存生成保活候选"
+            );
+            worker.stop_and_join().expect("停止并等待真实后端线程");
+            assert!(
+                client.submit(token(18), input(18)).is_err(),
+                "已停止后端不能续发地图"
+            );
         }
     }
 

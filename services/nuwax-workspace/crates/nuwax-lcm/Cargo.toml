@@ -10,6 +10,7 @@ description = "nuwax real-LCM 安全包装 + 单 owner 事件线程，本 crate 
 [dependencies]
 nuwax-lcm-sys = { path = "../nuwax-lcm-sys" }
 bytes = { workspace = true }
+libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }

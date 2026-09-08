@@ -6,7 +6,6 @@ import base64
 from collections import OrderedDict
 import heapq
 from itertools import islice
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -254,6 +253,7 @@ def _scan_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
 _LOG_CACHE_MAX_QUERIES = 4
 _LOG_CACHE_MAX_FILES = 64
 _LOG_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_LOG_CACHE_PAGE_SIZE = 200
 _LOG_CACHE_ANCHOR_BYTES = 256
 _LOG_QUERY_CACHE = OrderedDict()
 _LOG_QUERY_CACHE_LOCK = threading.Lock()
@@ -395,10 +395,12 @@ class _FileLogIndex:
                         replaced = heapq.heapreplace(heap, item)
                         heap_bytes += size - replaced[3]
         finished = os.fstat(handle.fileno())
-        if (finished.st_size < stat.st_size
-                or (finished.st_size == stat.st_size and (finished.st_mtime_ns, finished.st_ctime_ns) != (stat.st_mtime_ns, stat.st_ctime_ns))
-                or _file_anchors(handle, stat.st_size) != anchors):
-            raise _LogSnapshotChanged()
+        if finished.st_size < stat.st_size:
+            raise _LogSnapshotChanged("文件在索引期间被截断")
+        if finished.st_size == stat.st_size and (finished.st_mtime_ns, finished.st_ctime_ns) != (stat.st_mtime_ns, stat.st_ctime_ns):
+            raise _LogSnapshotChanged("固定大小文件的修改/元数据时间在索引期间变化")
+        if _file_anchors(handle, stat.st_size) != anchors:
+            raise _LogSnapshotChanged("文件头或读取边界在索引期间被覆盖")
         ordered = tuple(sorted(heap + mutable, key=lambda item: item[:2], reverse=True))
         cache_bytes = (16 * 1024 + heap_bytes + source_bytes + mutable_bytes + mutable_source_bytes
                        + sys.getsizeof(sources) + sys.getsizeof(mutable_sources))
@@ -442,14 +444,26 @@ def _cache_size(value):
 
 
 def _matched_cached_item(entry, key, offset, matcher):
-    """新候选只脱敏及估算一次；原排序键独立保留，不对旧条目重复处理。"""
+    """只缓存脱敏后的紧凑字节，避免各查询重复保留大量字典与字符串对象。"""
     redacted = _redact_entry(entry) if matcher.search else None
     if not matcher.matches(entry, redacted):
         return None
     if redacted is None:
         redacted = _redact_entry(entry)
-    size = _cache_size((key, offset, redacted)) + 64
-    return key, offset, redacted, size
+    encoded = json.dumps(redacted, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    size = _cache_size((key, offset, encoded)) + 64
+    return key, offset, encoded, size
+
+
+def _encode_cached_page(items, sources):
+    """拼接已脱敏候选，不重新解析、脱敏或深拷贝历史记录。"""
+    chunks = [b'{"entries":[']
+    for index, item in enumerate(items):
+        if index:
+            chunks.append(b",")
+        chunks.append(item[2])
+    chunks.extend((b'],"sources":', json.dumps(sorted(sources), ensure_ascii=False).encode("utf-8"), b"}"))
+    return b"".join(chunks)
 
 
 class _LogQueryIndex:
@@ -500,43 +514,50 @@ class _LogQueryIndex:
                             return None
                         index = self.files.setdefault(identity, _FileLogIndex())
                         previous_bytes = index.cache_bytes
+                        previous_budget = budget.used
                         try:
-                            changed = index.refresh(handle, stat, str(path), matcher, limit + 1, budget) or changed
+                            changed = index.refresh(handle, stat, str(path), matcher, _LOG_CACHE_PAGE_SIZE + 1, budget) or changed
                         finally:
                             self.files_bytes += index.cache_bytes - previous_bytes
                             self.cache_bytes = self.files_bytes
+                            # refresh返回后旧局部堆已释放；缓存页独立持有字节，不引用旧候选。
+                            # 只在单文件构建时保留新旧峰值，不能把已释放快照累计到后续文件。
+                            budget.used = previous_budget - previous_bytes + index.cache_bytes
                 except FileNotFoundError:
                     continue
         changed = changed or tuple(order) != self.order
-        self.files_bytes -= sum(index.cache_bytes for identity, index in self.files.items() if identity not in seen)
+        removed_bytes = sum(index.cache_bytes for identity, index in self.files.items() if identity not in seen)
+        self.files_bytes -= removed_bytes
         self.files = {identity: self.files[identity] for identity in order}
+        budget.release(removed_bytes)
         self.order = tuple(order)
         if changed or cached_response is None:
             sources = set()
             # 先汇总全部文件来源，再惰性取一页；未取到的文件不能丢失来源贡献。
             candidates = [self.files[identity].candidates(matcher, sources, budget) for identity in order]
-            selected = list(islice(heapq.merge(*candidates, key=lambda item: item[0], reverse=True), limit + 1))
-            # 在创建缓存页面前预留脱敏结果及返回副本，超额直接使用原扫描。
-            self.response_bytes = 16 * 1024 + sum(item[3] for item in selected[:limit]) + sum(sys.getsizeof(source) + 64 for source in sources)
+            selected = list(islice(heapq.merge(*candidates, key=lambda item: item[0], reverse=True), _LOG_CACHE_PAGE_SIZE + 1))
+            # 缓存最大普通页的紧凑字节；数量变化共用文件索引，返回时才解码独立对象。
+            self.response_bytes = 16 * 1024 + sum(len(item[2]) + 1 for item in selected) + sum(sys.getsizeof(source) + 64 for source in sources)
             budget.retain(2 * self.response_bytes)
-            self.response = _page_result([item[2] for item in selected], sources, limit, already_redacted=True)
+            self.response = _encode_cached_page(selected, sources)
         else:
             self.response = cached_response
             self.response_bytes = cached_response_bytes
         self.cache_bytes = 16 * 1024 + self.files_bytes + self.response_bytes
-        return deepcopy(self.response)
+        decoded = json.loads(self.response)
+        return _page_result(decoded["entries"], decoded["sources"], limit, already_redacted=True)
 
 
 def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: str = "", level: str = "", source: str = "",
                component: str = "", query: str = "", request_id: str = "", task_id: str = "") -> dict:
     """最近四种普通页查询按文件增量更新；追加不再使全部历史失去缓存。"""
-    if limit > 200 or limit < 1:
+    if limit > _LOG_CACHE_PAGE_SIZE or limit < 1:
         return _scan_logs(log_file, log_dir=log_dir, limit=limit, before=before, level=level, source=source,
                           component=component, query=query, request_id=request_id, task_id=task_id)
     matcher = _LogFilter(before, level, source, component, query, request_id, task_id)
     if not matcher.valid:
         return _page_result([], set(), limit, cursor_expired=True)
-    signature = (log_file, log_dir, limit, before, level, source, component, query, request_id, task_id)
+    signature = (log_file, log_dir, before, level, source, component, query, request_id, task_id)
     with _LOG_QUERY_CACHE_LOCK:
         index = _LOG_QUERY_CACHE.setdefault(signature, _LogQueryIndex())
         _LOG_QUERY_CACHE.move_to_end(signature)

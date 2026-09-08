@@ -33,6 +33,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from contracts.streams import StreamFrame, StreamPayloadKind
 from contracts.runtime_views import MapSnapshot
 from core.logging_utils import LogRateLimiter
+from core.stream_coalescing import stream_replacement_key
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
@@ -90,6 +91,7 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
         "localization.frame_tree",  # 坐标树只需要最新帧
         "localization.trajectory",  # 轨迹只需要最新帧
         "map.heartbeat",  # 地图心跳只需要最新帧
+        "navigation.state",  # 仅共享判定认可的无目标守卫心跳，业务状态不合并。
     }
 )
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
@@ -547,16 +549,12 @@ def _coalesce_latest_topic_frames(
     frames: Iterable[StreamFrame],
 ) -> Tuple[StreamFrame, ...]:
     frame_list = tuple(frames)
-    latest_index_by_topic = {
-        frame.topic: index
-        for index, frame in enumerate(frame_list)
-        if frame.topic in _LATEST_ONLY_STREAM_TOPICS
-    }
+    keys = tuple(stream_replacement_key(frame, _LATEST_ONLY_STREAM_TOPICS) if frame.topic in _LATEST_ONLY_STREAM_TOPICS else None for frame in frame_list)
+    latest_index_by_topic = {key: index for index, key in enumerate(keys) if key is not None}
     return tuple(
         frame
         for index, frame in enumerate(frame_list)
-        if frame.topic not in _LATEST_ONLY_STREAM_TOPICS
-        or latest_index_by_topic.get(frame.topic) == index
+        if keys[index] is None or latest_index_by_topic.get(keys[index]) == index
     )
 
 
@@ -632,11 +630,7 @@ class _ClientStreamQueue:
 
         if frame.topic in self._preserve_topics:
             return None
-        if frame.topic in _LATEST_ONLY_STREAM_TOPICS:
-            return ("topic", frame.topic)
-        if frame.payload_kind == StreamPayloadKind.BINARY:
-            return ("binary", frame.topic)
-        return None
+        return stream_replacement_key(frame, _LATEST_ONLY_STREAM_TOPICS)
 
     def _discard_key(self, key: object, priority: int) -> None:
         self._items.pop(key, None)
@@ -1202,6 +1196,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             preserve_topics=("map.frame",) if map_identity_only else (),
         )
         subscription_id: Optional[str] = None
+        receive_task = None
+        frame_task = None
 
         try:
             subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
@@ -1241,9 +1237,38 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 websocket,
                 {"type": "stream.replay", **_external_cursor_status(replay_status)},
             )
+            receive_task = asyncio.create_task(websocket.receive())
             while True:
                 try:
-                    frame = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.ws_ping_interval_sec)
+                    if frame_task is None:
+                        frame_task = asyncio.create_task(queue.get())
+                    done, _ = await asyncio.wait(
+                        (frame_task, receive_task),
+                        timeout=runtime.config.gateway.ws_ping_interval_sec,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        raise asyncio.TimeoutError
+                    if receive_task in done:
+                        message = receive_task.result()
+                        if message.get("type") == "websocket.disconnect":
+                            return
+                        # 往返探针只沿当前发送拥有方应答，不并发写套接字或挤入业务游标。
+                        raw = message.get("text")
+                        if isinstance(raw, str) and len(raw) <= 256:
+                            try:
+                                probe = json.loads(raw)
+                            except (ValueError, TypeError):
+                                probe = None
+                            if isinstance(probe, dict) and probe.get("type") == "stream.ping":
+                                request_id = probe.get("request_id")
+                                if isinstance(request_id, str) and 0 < len(request_id) <= 64:
+                                    await _send_ws_json(websocket, {"type": "stream.pong", "request_id": request_id})
+                        receive_task = asyncio.create_task(websocket.receive())
+                    if frame_task not in done:
+                        continue
+                    current_frame_task, frame_task = frame_task, None
+                    frame = current_frame_task.result()
 
                     _log_frame_delay(frame, stage="WS发送", threshold_ms=100)
 
@@ -1282,6 +1307,11 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             queue.close()
             if subscription_id is not None:
                 runtime.stream_bus.unsubscribe(subscription_id)
+            pending_tasks = [task for task in (receive_task, frame_task) if task is not None]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     return router
 

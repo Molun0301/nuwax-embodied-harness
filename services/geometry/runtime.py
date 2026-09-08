@@ -24,6 +24,7 @@ import grpc
 
 from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
+from core.errors import GatewayError
 from core.logging_utils import JsonLineFormatter
 from contracts.map_workspace import (
     MapAssetBundle,
@@ -1616,6 +1617,132 @@ class PlatformGeometryRuntime:
                     "GetMappingState 未返回权威 mapping session 字典，请重试。"
                 )
             return self._clone_metadata(state)
+
+    def prepare_unfinalized_map_workspace(self, *, map_name: str) -> None:
+        """切换未完成工作区前，收敛真实建图会话并停止旧来源。"""
+
+        resolved_name = str(map_name or "").strip()
+        if not resolved_name:
+            raise ValueError("地图工作区名称不能为空。")
+        self._ensure_mapping_lifecycle_fields()
+        with self._mapping_lifecycle_lock:
+            provider = getattr(self, "_remote_provider", None)
+            context = self._mapping_session_context
+            if provider is not None and _remote_is_connected(provider):
+                context = self.get_authoritative_mapping_session_state()
+                attach_epoch = int(getattr(self, "_provider_attach_epoch", 0))
+                phase = str(context.get("phase") or "").upper()
+                if (
+                    context.get("success") is not True
+                    or phase not in {"IDLE", "ACTIVE", "STOPPED"}
+                    or (phase == "ACTIVE") != bool(context.get("active"))
+                ):
+                    raise RuntimeError("建图拥有方尚未收敛，不能切换地图工作区。")
+                if context.get("map_name") != resolved_name:
+                    # 已停止建图仍可能承载已完成地图上的导航，不能当作运动空闲。
+                    navigation = provider.get_navigation_state()
+                    navigation_status_value = getattr(navigation, "status", "")
+                    navigation_status = str(
+                        getattr(navigation_status_value, "value", navigation_status_value) or ""
+                    ).lower()
+                    exploration = provider.get_exploration_state()
+                    exploration_status_value = exploration.get("status")
+                    exploration_status = str(
+                        getattr(exploration_status_value, "value", exploration_status_value) or ""
+                    ).upper()
+                    if (
+                        navigation_status not in {"idle", "succeeded", "failed", "cancelled"}
+                        or exploration_status not in {"IDLE", "STOPPED", "SUCCEEDED", "FAILED", "CANCELLED"}
+                    ):
+                        raise GatewayError(
+                            "导航或探索尚未确认空闲，停止原任务后才能切换地图工作区。",
+                            error_code="map_workspace_motion_conflict",
+                            http_status=409,
+                            details={
+                                "target_map_name": resolved_name,
+                                "current_map_name": context.get("map_name"),
+                                "mapping_session_id": context.get("session_id"),
+                                "session_generation": context.get("session_generation"),
+                                "navigation_status": navigation_status,
+                                "navigation_goal_id": getattr(navigation, "current_goal_id", None),
+                                "exploration_status": exploration_status,
+                                "exploration_request_id": exploration.get("request_id"),
+                                "exploration_child_task_id": exploration.get("child_task_id"),
+                            },
+                        )
+                if context.get("active"):
+                    identity = _mapping_context_snapshot_token(context)
+                    if phase != "ACTIVE" or not all(identity[:2]) or identity[2] <= 0:
+                        raise RuntimeError("建图拥有方未返回完整的活动会话身份。")
+                    if context.get("map_name") != resolved_name:
+                        # 直接请求原会话停止；不使用会自动停车探索的手动停止入口。
+                        stopped = provider.stop_mapping(
+                            session_id=str(context["session_id"]),
+                            reason="switch_active_map",
+                        )
+                        if (
+                            not isinstance(stopped, dict)
+                            or stopped.get("success") is not True
+                            or stopped.get("active")
+                            or str(stopped.get("phase") or "") != "STOPPED"
+                            or _mapping_context_snapshot_token(stopped)[:3] != identity[:3]
+                        ):
+                            raise RuntimeError("切换工作区未确认原建图会话的停止终态。")
+                        context = stopped
+                if (
+                    provider is not getattr(self, "_remote_provider", None)
+                    or attach_epoch != int(getattr(self, "_provider_attach_epoch", 0))
+                    or not _remote_is_connected(provider)
+                ):
+                    raise RuntimeError("切换地图期间提供器已更换，不能提交旧拥有方的状态。")
+                self._mapping_session_context = dict(context)
+                self._mapping_session_provider_attach_epoch = attach_epoch
+            elif isinstance(context, dict) and context.get("active"):
+                raise RuntimeError("建图提供器已断开，无法确认旧会话停止，拒绝切换工作区。")
+            with self._runtime_state_lock:
+                self._workspace_map_name = resolved_name
+                tickets = self._map_asset_activation_delivery_tickets_snapshot()
+        # 等待已经进入消费者的旧回调；新到旧图会由工作区来源检查拒绝。
+        self._wait_for_subscription_deliveries(tickets)
+
+    def restore_unfinalized_map_workspace_selection(
+        self, *, expected_map_name: str, map_name: Optional[str],
+    ) -> None:
+        """失败后恢复实际目录选择；已停止的建图会话保持真实终态。"""
+
+        with self._runtime_state_lock:
+            if getattr(self, "_workspace_map_name", None) == expected_map_name:
+                self._workspace_map_name = str(map_name or "").strip() or None
+
+    def is_map_snapshot_source_current(self, *, map_name: str, metadata) -> bool:
+        """沿已有工作区、会话和代次验证来源，不重写外部快照身份。"""
+
+        selected_name = getattr(self, "_workspace_map_name", None)
+        if not selected_name:
+            return True
+        # 只捕获标量身份，逐帧检查不能深复制整份资产包。
+        with self._runtime_state_lock:
+            bundle = self._map_activation_snapshot_locked().bundle
+            expected_name = bundle.map_name if bundle is not None else selected_name
+            current_identity = _mapping_context_snapshot_token(
+                getattr(self, "_mapping_session_context", None)
+            )[:3]
+        if str(map_name or "").strip() != expected_name:
+            return False
+        source = metadata if isinstance(metadata, dict) else {}
+        if source.get("map_snapshot_kind") == "offline_checkpoint" or source.get("source_kind") == "map_asset_bundle":
+            return True
+        if not all(current_identity):
+            return True
+        try:
+            source_generation = int(source.get("session_generation") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            str(source.get("mapping_session_id") or ""),
+            str(map_name or "").strip(),
+            source_generation,
+        ) == current_identity
 
     def clear_exploration_mapping_context(self) -> None:
         with self._exploration_loop_lock:
@@ -4009,15 +4136,14 @@ class PlatformGeometryRuntime:
         if exploration_backend is not None:
             checker = getattr(exploration_backend, "is_exploration_available", None)
             exploration_available = bool(checker()) if callable(checker) else bool(exploration_backend.is_available())
-        return self.get_map_snapshot() is not None or any(
-            available
-            for available in (
-                self._resolve_localization_backend() is not None,
-                self._resolve_mapping_backend() is not None,
-                navigation_available,
-                exploration_available,
-            )
-        )
+        # 已有可消费后端时无需拉取、复制并重新封存整张地图。
+        backend_available = any((
+            self._resolve_localization_backend() is not None,
+            self._resolve_mapping_backend() is not None,
+            navigation_available,
+            exploration_available,
+        ))
+        return backend_available or self.get_map_snapshot() is not None
 
     def describe_backend(self) -> dict:
         """返回当前几何后端来源说明。"""
@@ -5613,6 +5739,17 @@ class PlatformGeometryRuntime:
             return finalize(payload)
         activation_snapshot = self._map_activation_snapshot_read()
         bundle = activation_snapshot.bundle
+        source_metadata = payload.get("metadata") or {}
+        if not self.is_map_snapshot_source_current(
+            map_name=str(payload.get("map_name") or source_metadata.get("map_name") or ""),
+            metadata=source_metadata,
+        ):
+            return {"metadata": {
+                **source_metadata,
+                "event_type": "heartbeat",
+                "suppressed_live_map_update": True,
+                "suppressed_live_map_reason": "workspace_map_source_mismatch",
+            }}
         if bundle is None:
             return finalize(payload)
         metadata = self._clone_metadata(payload.get("metadata") or {})
@@ -5901,7 +6038,9 @@ class PlatformGeometryRuntime:
                     else:
                         with cache_lock:
                             self._last_validated_live_map_cache = validated_cache
-                if self._map_asset_activation_snapshot_read_blocked():
+                if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
+                    map_name=snapshot.map_name, metadata=snapshot.metadata,
+                ):
                     return None
                 return snapshot
             break
@@ -5941,7 +6080,9 @@ class PlatformGeometryRuntime:
                 seed_bundle=validated_cache.seed_bundle,
                 activation_result=activation_result,
             )
-            if self._map_asset_activation_snapshot_read_blocked():
+            if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
+                map_name=cached_snapshot.map_name, metadata=cached_snapshot.metadata,
+            ):
                 return None
             return cached_snapshot
         if bundle is None:
@@ -9047,6 +9188,12 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
                 )
+            with self._runtime_state_lock:
+                selected_name = getattr(self, "_workspace_map_name", None)
+                active_bundle = self._map_activation_snapshot_locked().bundle
+                expected_name = active_bundle.map_name if active_bundle is not None else selected_name
+            if expected_name and resolved_map_name != expected_name:
+                raise RuntimeError("建图目标与已选择工作区不一致，请先激活目标工作区。")
             current = self._mapping_session_context
             new_session_started = not (
                 isinstance(current, dict) and bool(current.get("active"))

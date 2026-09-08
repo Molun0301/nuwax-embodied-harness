@@ -606,6 +606,18 @@ class PointCloud3DViewer {
     this._removeLegacySceneHelpers();
     this._syncSemanticGroupVisibility();
     this._renderer.render(this._scene, this._camera);
+    if (this._robotMesh?.visible && this._robotPoseSource && this._lastPoseDrawnSource !== this._robotPoseSource) {
+      this._lastPoseDrawnSource = this._robotPoseSource;
+      window.dispatchEvent(new CustomEvent('pointcloud3d:pose-drawn', {
+        detail: { pose: this._robotPoseSource, displayedAt: Date.now() },
+      }));
+    }
+    if (this._pointCloudDrawDiagnosticPending) {
+      this._pointCloudDrawDiagnosticPending = false;
+      window.dispatchEvent(new CustomEvent('pointcloud3d:content-drawn', {
+        detail: { points: this._renderer.info?.render?.points ?? null, revision: this._lastCloudMapRevision ?? null },
+      }));
+    }
     if (this._interactionActive || controlsChanged) {
       this._requestRender();
     }
@@ -621,6 +633,7 @@ class PointCloud3DViewer {
   setVisible(visible) {
     this._visible = Boolean(visible);
     if (!this._visible) {
+      this._lastPoseDrawnSource = null;
       if (this._rafId) cancelAnimationFrame(this._rafId);
       this._rafId = null;
       return;
@@ -1015,6 +1028,7 @@ class PointCloud3DViewer {
   }
 
   _emitPointCount() {
+    this._pointCloudDrawDiagnosticPending = true;
     const bufferedPoints = Math.floor(this._allPositions.length / 3);
     const sourcePoints = Number.isFinite(this._pointCloudSourcePoints)
       ? Math.max(bufferedPoints, Math.floor(this._pointCloudSourcePoints))
@@ -1327,6 +1341,8 @@ class PointCloud3DViewer {
 
   clearRobotPose() {
     this._robotPose = null;
+    this._robotPoseSource = null;
+    this._lastPoseDrawnSource = null;
     this._lastFollowTarget = null;
     if (this._robotMesh) this._robotMesh.visible = false;
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
@@ -2060,6 +2076,7 @@ window.addEventListener('stream:localization.pose', (e) => {
     window.pointcloud3d.clearRobotPose();
     return;
   }
+  window.pointcloud3d._robotPoseSource = d;
   window.pointcloud3d.setRobotPose(
     Number(pos.x),
     Number(pos.y),
@@ -2178,6 +2195,9 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
   try {
     envelope = parsePointCloudMapBinaryEnvelope(buffer);
   } catch (error) {
+    window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
+      detail: { pointcloudParseError: error.message, pointcloudDecision: 'parse_error' },
+    }));
     window.dispatchEvent(new CustomEvent('pointcloud3d:status', {
       detail: { state: 'error', message: error.message },
     }));
@@ -2187,15 +2207,34 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
   window.dispatchEvent(new CustomEvent('stream:pointcloud_map.cursor-accepted', {
     detail: { cursor: envelope.header.cursor },
   }));
-  if (!shouldAcceptPointCloudMapEnvelope(window.pointcloud3d._pointCloudMapWatermark, envelope)) return;
+  const current = window.pointcloud3d._pointCloudMapWatermark;
+  window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
+    detail: { pointcloudParseError: '', pointcloudCandidateRevision: envelope.header.revision, pointcloudCandidateGeneration: String(envelope.streamGeneration), pointcloudCandidateSourceEpoch: envelope.header.source_epoch },
+  }));
+  const sourceKey = JSON.stringify([envelope.header.source, envelope.header.source_epoch, envelope.header.frame_id, String(envelope.streamGeneration)]);
+  if (!shouldAcceptPointCloudMapEnvelope(current, envelope)) {
+    if (current && current.streamGeneration === envelope.streamGeneration
+        && current.header.source === envelope.header.source && current.header.source_epoch === envelope.header.source_epoch
+        && current.header.frame_id === envelope.header.frame_id && current.header.revision === envelope.header.revision
+        && current.revisionOrdinal === envelope.revisionOrdinal) {
+      // 完整解析后的同内容重发不重计地图帧率；也不更新机器人位姿指标。
+      window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', { detail: { pointcloudDecision: 'unchanged' } }));
+    } else window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', { detail: { pointcloudDecision: 'rejected_identity' } }));
+    return;
+  }
   window.pointcloud3d._replaceCloudMapBuffer(envelope.xyz, envelope);
+  window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
+    detail: { pointcloudDecision: 'accepted', pointcloudAcceptedPoints: envelope.header.point_count,
+      pointcloudAcceptedRevision: envelope.header.revision, pointcloudAcceptedGeneration: String(envelope.streamGeneration),
+      pointcloudAcceptedSourceEpoch: envelope.header.source_epoch },
+  }));
   // 已验收的地图帧供控制台统计更新频率，不把传输心跳或相机重绘计作新帧。
   window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {
     detail: {
       source: envelope.header.source,
       sourceTime: Number(envelope.sourceTimestampNs / 1000000n),
       frameKey: `${envelope.streamGeneration}:${envelope.revisionOrdinal}:${envelope.header.revision}`,
-      sourceKey: `${envelope.header.source}:${envelope.header.source_epoch}:${envelope.header.frame_id}`,
+      sourceKey,
     },
   }));
 });
@@ -2204,3 +2243,6 @@ window.addEventListener('stream:pointcloud_map.reset', () => {
   if (!window.pointcloud3d) return;
   window.pointcloud3d._pointCloudMapWatermark = null;
 });
+
+// 二进制消费者已注册与三维画布已初始化是两个不同阶段。
+window.dispatchEvent(new CustomEvent('pointcloud3d:consumer-ready'));

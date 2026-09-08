@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260908-media-metrics">
+  <link rel="stylesheet" href="/static/console.css?v=20260908-pose-log-stream">
 </head>
 <body>
 <div class="app" id="app">
@@ -20,7 +20,7 @@
       <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
       <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">运存</div></div>
       <div class="vstat"><div class="v mono" id="clockNow">--:--:--</div><div class="l">时间</div></div>
-      <div class="vstat"><div class="v mono" id="lastReceive">--</div><div class="l">接收延迟</div></div>
+      <div class="vstat" title="主实时连接一次探测的往返耗时，包含浏览器与服务端调度、发送排队及网络；使用浏览器单调时钟，不使用历史日志或传感器时间。等待回执时显示已等待时长。"><div class="v mono" id="lastReceive">--</div><div class="l">连接往返</div></div>
     </div>
     <span class="pill idle" id="motionStatus">运动状态</span>
     <div class="seg">
@@ -37,7 +37,7 @@
           <section id="live-map" class="map-panel hero card rise">
             <div class="canvas-wrap">
               <canvas id="mapCanvas" width="1400" height="900"></canvas>
-              <div id="map3dContainer" style="display:none;"></div>
+              <div id="map3dContainer" data-pointcloud-consumer-ready="false" data-binary-received-count="0" data-pointcloud-routed-count="0" data-pointcloud-parse-error="" data-pointcloud-accepted-points="0" data-pointcloud-displayed-points="0" data-pointcloud-drawn-points="0" style="display:none;"></div>
               <div class="hud map-toolbar" aria-label="地图视图与交互控制">
                 <div class="map-tool-row">
                   <div id="mapViewControls" class="map-tool-group glass" aria-label="地图视图">
@@ -155,7 +155,7 @@
                 <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
-              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip" title="地图更新帧率与最新帧延迟">-- FPS · 延迟 --</span>
+              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip" title="地图内容更新帧率与当前显示位姿的源时间至绘制时间">-- FPS · 位姿延迟 --</span>
               <details class="glass legend" id="mapLegend" open>
                 <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
                 <div class="lgnd legend-items">
@@ -220,7 +220,6 @@
             </div>
             <div class="dcol">
               <div class="dh"><div class="t"><div class="eyebrow">运行进程</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
-              <div id="serviceMatrixScope" class="muted small"></div>
               <div class="dscroll"><div id="serviceMatrix" class="rows"></div></div>
             </div>
             <div class="dcol">
@@ -300,9 +299,9 @@
                 <div id="semanticMemoryList" class="semantic-memory-list" aria-label="记忆物品列表"></div>
                 <p class="semantic-memory-footnote">地图只显示有空间依据的物体位置。观察记录表示曾在此处见过物品。</p>
               </aside>
-  <script src="/static/js/console-logs.js?v=20260906-task-log-recovery"></script>
+  <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260908-media-metrics"></script>
+  <script src="/static/js/console.js?v=20260908-pose-log-stream"></script>
   <script>
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
     (() => {
@@ -320,7 +319,7 @@
       }
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260908-media-metrics"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260908-pose-log-stream"></script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
   <script src="/static/js/navigation.js?v=20260908-nav-height"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>

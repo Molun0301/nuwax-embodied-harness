@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
@@ -299,6 +300,25 @@ def adapt_go2_l2_lidar(
     )
 
 
+@lru_cache(maxsize=32)
+def _imu_registration_rotation(
+    calibration_profile: Go2CalibrationProfile, registration_state: RegistrationState,
+) -> tuple:
+    """不可变标定只求一次固定旋转；缓存不可变数值，不缓存传感器样本。"""
+    rotation = calibration_profile.imu_rotation
+    if registration_state == RegistrationState.SENSOR:
+        rotation = calibration_profile.lidar_rotation.T @ rotation
+    return tuple(tuple(float(value) for value in row) for row in rotation)
+
+
+def _rotate_imu_vector(values: tuple, rotation: tuple) -> tuple:
+    vector = tuple(float(value) for value in values)
+    if len(vector) != 3:
+        raise ValueError("Go2 IMU 向量必须有 3 个轴")
+    x, y, z = vector
+    return tuple(row[0] * x + row[1] * y + row[2] * z for row in rotation)
+
+
 def adapt_go2_l2_imu(
     *,
     timestamp_ns: int,
@@ -315,20 +335,16 @@ def adapt_go2_l2_imu(
     if registration_state not in (RegistrationState.BODY, RegistrationState.SENSOR):
         raise Go2L2DecodeError("Go2 IMU 适配仅支持 sensor 或 body 注册。")
     try:
-        transformed_accel = calibration_profile.transform_imu_vector(
-            accel_mps2, frame_id
-        )
-        transformed_gyro = calibration_profile.transform_imu_vector(
-            gyro_rps, frame_id
-        )
+        if frame_id not in calibration_profile.imu_source_frames:
+            raise ValueError("Go2 IMU source frame 不在标定 profile：%s" % frame_id)
+        rotation = _imu_registration_rotation(calibration_profile, registration_state)
+        transformed_accel = _rotate_imu_vector(accel_mps2, rotation)
+        transformed_gyro = _rotate_imu_vector(gyro_rps, rotation)
     except ValueError as exc:
         raise Go2L2DecodeError("Go2 IMU 标定变换失败：%s" % exc) from exc
     output_frame = calibration_profile.registration_frame
     if registration_state == RegistrationState.SENSOR:
-        # IMU 和 LiDAR 的物理轴向不同，必须做真实旋转，不能只改坐标系名称。
-        lidar_from_body = calibration_profile.lidar_rotation.T
-        transformed_accel = tuple(lidar_from_body @ np.asarray(transformed_accel))
-        transformed_gyro = tuple(lidar_from_body @ np.asarray(transformed_gyro))
+        # 固定旋转已经包含真实IMU到雷达的轴向关系，不能只改坐标系名称。
         output_frame = calibration_profile.lidar_source_frame
     return CanonicalImuSample(
         sensor_id="go2_imu",

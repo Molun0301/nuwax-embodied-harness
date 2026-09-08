@@ -59,6 +59,7 @@ using livox_common::DATA_TYPE_CARTESIAN_LOW;
 // Global state
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_typed_input_failed{false};
 static lcm::LCM* g_lcm = nullptr;
 static FastLio* g_fastlio = nullptr;
 
@@ -410,6 +411,16 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
             fprintf(stderr, "[%s] reject typed IMU: source timestamp must increase\n", "fastlio2");
             return;
         }
+        if (g_has_last_typed_imu_stamp && nuwax_lio::imu_source_gap_exceeded(
+                g_last_typed_imu_stamp_ns, timestamp_ns)) {
+            // 缺测已破坏本代估计器连续性；锁定失败并交由原拥有方退出，不能推进水位后续算。
+            g_typed_input_failed.store(true);
+            g_running.store(false);
+            fprintf(stderr, "[fastlio2] native_input_discontinuity: IMU source gap=%llu ns exceeds %llu ns; restart owner required\n",
+                static_cast<unsigned long long>(timestamp_ns - g_last_typed_imu_stamp_ns),
+                static_cast<unsigned long long>(nuwax_lio::kMaxImuSourceGapNs));
+            return;
+        }
         auto imu_msg = boost::make_shared<custom_messages::Imu>();
         imu_msg->header.seq = msg->header.seq;
         imu_msg->header.stamp.sec = msg->header.stamp.sec;
@@ -634,6 +645,11 @@ static void run_main_iter(
 }
 
 int main(int argc, char** argv) {
+    // 身份查询在通信和算法构造前结束；允许部署路径或文件名独立于后端名称。
+    if (argc == 2 && std::strcmp(argv[1], "--nuwax-lio-contract") == 0) {
+        std::puts("nuwax-native-lio-v1:fastlio2");
+        return 0;
+    }
     dimos::NativeModule mod(argc, argv);
 
     // Required: LCM topics for output ports
@@ -843,5 +859,5 @@ int main(int argc, char** argv) {
     g_lcm = nullptr;
 
     if (debug) { printf("[fastlio2] Done.\n"); }
-    return 0;
+    return g_typed_input_failed.load() ? 2 : 0;
 }

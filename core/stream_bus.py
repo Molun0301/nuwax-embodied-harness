@@ -9,6 +9,7 @@ from typing import Callable, DefaultDict, Deque, Dict, FrozenSet, Iterable, List
 
 from contracts.streams import StreamFrame, StreamPayloadKind
 from core.logging_utils import LogRateLimiter
+from core.stream_coalescing import stream_replacement_key
 
 _logger = logging.getLogger(__name__)
 _DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
@@ -171,12 +172,8 @@ class StreamBus:
 
     def _enqueue_async_locked(self, subscription: StreamSubscription, frame: StreamFrame) -> None:
         """在首次跨线程分发前合并订阅明确声明可替代的状态。"""
-        if frame.topic not in {"logs.entry", "tasks.state"} and (
-            frame.topic in subscription.latest_only_topics or frame.payload_kind == StreamPayloadKind.BINARY
-        ):
-            key = (subscription.subscription_id, "latest", frame.topic)
-        else:
-            key = (subscription.subscription_id, "event", frame.cursor)
+        replacement = stream_replacement_key(frame, subscription.latest_only_topics)
+        key = (subscription.subscription_id, "latest", replacement) if replacement is not None else (subscription.subscription_id, "event", frame.cursor)
         self._async_queue.pop(key, None)
         if len(self._async_queue) >= _ASYNC_DISPATCH_QUEUE_MAXSIZE:
             _, (dropped_subscription, dropped_frame) = self._async_queue.popitem(last=False)

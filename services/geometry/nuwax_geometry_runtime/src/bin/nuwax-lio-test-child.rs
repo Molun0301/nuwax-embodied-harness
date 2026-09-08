@@ -708,6 +708,20 @@ async fn run_raw_input_test_child(
 }
 
 fn main() -> ExitCode {
+    // 夹具也走生产身份预检；查询先于运行时、通信及进程标记创建。
+    let arguments = env::args().collect::<Vec<_>>();
+    if arguments.len() == 2 && arguments[1] == "--nuwax-lio-contract" {
+        let backend = match required_env(BACKEND_ENV).as_deref() {
+            Ok("fastlio2") => NativeBackend::FastLio2,
+            Ok("pointlio") => NativeBackend::PointLio,
+            value => {
+                eprintln!("原生输入测试子进程的身份查询后端无效: {value:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("nuwax-native-lio-v1:{}", backend_name(backend));
+        return ExitCode::SUCCESS;
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {

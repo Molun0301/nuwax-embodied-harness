@@ -3833,6 +3833,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_map_receipt_budget_accepts_real_cadence_and_expires_after_input_stops() {
+        let scheduler = NavScheduler::new(
+            FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            FakePlanner::commanding(),
+            SchedulerConfig::default(),
+        )
+        .expect("默认生产调度器配置");
+        let (handle, task) = spawn_scheduler(scheduler);
+        wait_for_sink(&handle).await;
+        let mut latest_map_source = 0;
+        for tick in 0_i64..=20 {
+            handle.update_odometry(map_pose_at(tick + 1)).await.unwrap();
+            if tick % 5 == 0 {
+                latest_map_source = 77_000_000_000 + tick * 50_000_000;
+                handle
+                    .update_costmap(costmap_at(latest_map_source))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                handle.status().planner_inputs_fresh,
+                "250毫秒实际地图续收不能周期性失效"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for tick in 21_i64..=33 {
+            handle.update_odometry(map_pose_at(tick + 1)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let expired = handle.status();
+        assert!(!expired.planner_inputs_fresh);
+        assert_eq!(expired.costmap_source_timestamp_ns, latest_map_source);
+        assert!(expired.costmap_receipt_age_ms > DEFAULT_COSTMAP_TTL.as_millis() as u64);
+        assert!(
+            matches!(
+                handle.update_costmap(costmap_at(latest_map_source)).await,
+                Err(RuntimeError::StaleInput(_))
+            ),
+            "旧缓存不能通过相同源时间重放续期"
+        );
+        assert!(!handle.status().planner_inputs_fresh);
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn pose_stream_loss_fences_without_applied_heartbeat_refresh() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let (handle, task) = test_scheduler_with_ttls(

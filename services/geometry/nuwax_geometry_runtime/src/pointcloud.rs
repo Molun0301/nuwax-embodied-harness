@@ -15,6 +15,10 @@ use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
 mod dynamic_cloud;
 use dynamic_cloud::DynamicCloudFilter;
 
+#[path = "ordered_voxel_snapshot.rs"]
+mod ordered_voxel_snapshot;
+use ordered_voxel_snapshot::OrderedVoxelSnapshot;
+
 pub const VOXEL_SIZE: f32 = 0.05;
 
 /// 单次输入点云允许的 raw point 上限(防御性 sanity cap)。
@@ -147,6 +151,7 @@ pub struct CloudMapShmWriter {
     voxel_size: f32,
     session_generation: u64,
     voxels: HashSet<VoxelKey>,
+    ordered_voxels: OrderedVoxelSnapshot,
     dynamic_filter: DynamicCloudFilter,
     max_points: usize,
     last_occupancy_receipt: Option<OccupancyCommitReceipt>,
@@ -384,6 +389,7 @@ impl CloudMapShmWriter {
             voxel_size: VOXEL_SIZE,
             session_generation: 0,
             voxels: HashSet::new(),
+            ordered_voxels: OrderedVoxelSnapshot::default(),
             dynamic_filter: DynamicCloudFilter::default(),
             max_points: CM_MAX_POINTS,
             last_occupancy_receipt: None,
@@ -424,7 +430,9 @@ impl CloudMapShmWriter {
             let Some(key) = voxel_key(point, self.voxel_size) else {
                 continue;
             };
-            self.voxels.insert(key);
+            if self.voxels.insert(key) {
+                self.ordered_voxels.inserted(key, self.max_points);
+            }
             accepted += 1;
         }
         if accepted == 0 {
@@ -463,6 +471,9 @@ impl CloudMapShmWriter {
                 points,
             );
             if removed > 0 {
+                for &key in self.dynamic_filter.removed_keys() {
+                    self.ordered_voxels.removed(key, self.max_points);
+                }
                 tracing::debug!(removed, source_timestamp_ns, "三维地图已清除动态残留体素");
             }
         }
@@ -627,6 +638,7 @@ impl CloudMapShmWriter {
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels;
+        self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
         self.commit_accumulated_snapshot(occupancy_receipt)?
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
@@ -663,9 +675,8 @@ impl CloudMapShmWriter {
         // The invalid marker must become globally ordered before any payload
         // bytes in this slot are overwritten by the new snapshot.
         fence(Ordering::SeqCst);
-        let mut keys = self.voxels.iter().copied().collect::<Vec<_>>();
-        keys.sort_unstable();
-        for (index, key) in keys.into_iter().enumerate() {
+        let keys = self.ordered_voxels.ordered(&self.voxels);
+        for (index, &key) in keys.iter().enumerate() {
             let point = voxel_center_f32(key, self.voxel_size);
             let offset = buf_offset + index * CM_POINT_SIZE_BYTES;
             self.mmap[offset..offset + 4].copy_from_slice(&point[0].to_le_bytes());
@@ -707,6 +718,7 @@ impl CloudMapShmWriter {
 
     fn reset_accumulator(&mut self, session_generation: u64) {
         self.voxels.clear();
+        self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
         self.voxel_size = VOXEL_SIZE;
         self.session_generation = session_generation;
@@ -752,6 +764,7 @@ impl CloudMapShmWriter {
     fn coarsen_to_fit(&mut self) -> bool {
         if self.max_points == 0 {
             self.voxels.clear();
+            self.ordered_voxels.invalidate();
             return false;
         }
         while self.voxels.len() > self.max_points {
@@ -764,6 +777,7 @@ impl CloudMapShmWriter {
                     self.voxel_size
                 );
                 self.voxels.clear();
+                self.ordered_voxels.invalidate();
                 self.session_generation = 0;
                 return false;
             }
@@ -778,6 +792,7 @@ impl CloudMapShmWriter {
                 coarsened.insert(key);
             }
             self.voxels = coarsened;
+            self.ordered_voxels.invalidate();
             self.voxel_size = next_voxel_size;
             // 体素身份改变后，不把细网格的反证套到新的粗网格。
             self.dynamic_filter = DynamicCloudFilter::default();

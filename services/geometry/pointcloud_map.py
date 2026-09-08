@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -180,6 +181,7 @@ class PointCloudMap:
     loaded_at: datetime
     source_timestamp: datetime
     load_ms: float
+    source_point_count: Optional[int] = None
 
     def lod_points(self, lod: str) -> np.ndarray:
         normalized = str(lod or "preview").strip().lower() or "preview"
@@ -218,9 +220,77 @@ class PointCloudMap:
 class PointCloudMapCache:
     """按点云资产路径、mtime 和大小缓存只读地图。"""
 
-    def __init__(self) -> None:
+    def __init__(self, max_cache_bytes: int = 64 * 1024 * 1024) -> None:
         self._lock = threading.RLock()
-        self._items: Dict[Tuple[str, int, int], PointCloudMap] = {}
+        self._items = OrderedDict()
+        self._max_cache_bytes = max(0, int(max_cache_bytes))
+        self._cache_bytes = 0
+
+    def _cached(self, key):
+        with self._lock:
+            cached = self._items.get(key)
+            if cached is not None:
+                self._items.move_to_end(key)
+            return cached
+
+    def _remember(self, key, loaded):
+        with self._lock:
+            # 同一路径的旧文件身份退出；不同观察预算可分别缓存。
+            for old_key in list(self._items):
+                if old_key[0] == key[0] and old_key[1] != key[1]:
+                    self._cache_bytes -= self._items.pop(old_key).points_xyz.nbytes
+            previous = self._items.pop(key, None)
+            if previous is not None:
+                self._cache_bytes -= previous.points_xyz.nbytes
+            size = loaded.points_xyz.nbytes
+            if size > self._max_cache_bytes:
+                return
+            while self._items and (self._cache_bytes + size > self._max_cache_bytes
+                                   or len(self._items) >= 8):
+                _, evicted = self._items.popitem(last=False)
+                self._cache_bytes -= evicted.points_xyz.nbytes
+            self._items[key] = loaded
+            self._cache_bytes += size
+
+    def load_preview(
+        self, path: Path, *, frame_id: str = DEFAULT_MAP_FRAME,
+        source_kind: str = "map_asset", max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        should_cancel=None,
+    ) -> PointCloudMap:
+        """大资产按块校验和抽样，缓存只保留有界网页工作集。"""
+        from services.geometry.pointcloud_asset_stream import check_cancelled, read_preview_xyz
+
+        resolved = path.expanduser().resolve(strict=False)
+        check_cancelled(should_cancel)
+        identity = _file_identity(resolved)
+        if identity is None:
+            raise PointCloudMapError("点云地图不存在：%s" % resolved)
+        max_points = int(max_points)
+        if max_points <= 0 or max_points > WEB_POINTCLOUD_MAX_POINTS:
+            raise ValueError("网页点云预算必须在1到%d之间。" % WEB_POINTCLOUD_MAX_POINTS)
+        key = (str(resolved), identity, frame_id, source_kind, max_points)
+        cached = self._cached(key)
+        if cached is not None:
+            return cached
+        started_at = time.perf_counter()
+        stat_result = resolved.stat()
+        header, points, total, lower, upper = read_preview_xyz(
+            resolved, max_points, should_cancel=should_cancel,
+        )
+        revision = "sha256:%s" % _sha256_file(resolved, should_cancel=should_cancel)
+        check_cancelled(should_cancel)
+        if _file_identity(resolved) != identity:
+            raise PointCloudMapError("点云资产在读取期间被替换或修改。")
+        points.flags.writeable = False
+        loaded = PointCloudMap(
+            path=str(resolved), revision=revision, frame_id=frame_id, source_kind=source_kind,
+            point_count=len(points), points_xyz=points, bounds_min=lower, bounds_max=upper,
+            header=header, loaded_at=datetime.now(timezone.utc),
+            source_timestamp=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+            load_ms=(time.perf_counter() - started_at) * 1000.0, source_point_count=total,
+        )
+        self._remember(key, loaded)
+        return loaded
 
     def load(
         self,
@@ -275,6 +345,8 @@ class PointCloudMapCache:
         expected_suffix: str,
         reader,
     ) -> PointCloudMap:
+        from services.geometry.pointcloud_asset_stream import finite_xyz_mask, xyz_bounds
+
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.exists() or not resolved.is_file():
             raise PointCloudMapError("点云地图不存在：%s" % resolved)
@@ -284,23 +356,22 @@ class PointCloudMapCache:
                 % (expected_suffix, resolved.suffix.lower())
             )
         stat_result = resolved.stat()
-        key = (str(resolved), int(stat_result.st_mtime_ns), int(stat_result.st_size))
-        with self._lock:
-            cached = self._items.get(key)
-            if cached is not None:
-                return cached
+        identity = _file_identity(resolved)
+        key = (str(resolved), identity, frame_id, source_kind, None)
+        cached = self._cached(key)
+        if cached is not None:
+            return cached
         started_at = time.perf_counter()
         header, points_xyz = reader(resolved)
         if points_xyz.size == 0:
             raise PointCloudMapError("点云地图没有可用 x/y/z 点。")
-        finite_mask = np.isfinite(points_xyz).all(axis=1)
+        finite_mask = finite_xyz_mask(points_xyz)
         if not bool(finite_mask.all()):
             points_xyz = points_xyz[finite_mask]
         if points_xyz.size == 0:
             raise PointCloudMapError("点云地图全部点均为非有限数。")
         points_xyz = np.asarray(points_xyz, dtype=np.float32, order="C")
-        bounds_min_arr = points_xyz.min(axis=0)
-        bounds_max_arr = points_xyz.max(axis=0)
+        bounds_min_arr, bounds_max_arr = xyz_bounds(points_xyz)
         source_timestamp = datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
         content_revision = "sha256:%s" % _sha256_file(resolved)
         loaded = PointCloudMap(
@@ -317,11 +388,10 @@ class PointCloudMapCache:
             source_timestamp=source_timestamp,
             load_ms=(time.perf_counter() - started_at) * 1000.0,
         )
-        with self._lock:
-            self._items[key] = loaded
-            if len(self._items) > 8:
-                newest_keys = sorted(self._items.keys(), key=lambda item: (item[1], item[2]))[-8:]
-                self._items = {item: self._items[item] for item in newest_keys}
+        if _file_identity(resolved) != identity:
+            raise PointCloudMapError("点云资产在读取期间被替换或修改。")
+        points_xyz.flags.writeable = False
+        self._remember(key, loaded)
         return loaded
 
 
@@ -354,119 +424,14 @@ def write_pcd_binary_xyz(path: Path, points_xyz: np.ndarray) -> None:
     resolved.parent.mkdir(parents=True, exist_ok=True)
     with resolved.open("wb") as handle:
         handle.write(header.encode("ascii"))
-        handle.write(points.tobytes(order="C"))
+        handle.write(memoryview(points).cast("B"))
 
 
 def read_ply_xyz(path: Path) -> Tuple[PcdHeader, np.ndarray]:
-    """读取 PLY 顶点坐标，返回与 read_pcd_xyz 相同形状的 float32 Nx3 数组。"""
+    """分块解析PLY（多边形文件格式）顶点，保留完整XYZ数组接口。"""
+    from services.geometry.pointcloud_asset_stream import read_all_xyz
 
-    resolved = path.expanduser().resolve()
-    if not resolved.is_file():
-        raise PointCloudMapError("PLY 点云文件不存在：%s" % resolved)
-    header_lines: List[str] = []
-    with resolved.open("rb") as handle:
-        while True:
-            line_bytes = handle.readline()
-            if not line_bytes:
-                raise PointCloudMapError("PLY 文件缺少 end_header。")
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            header_lines.append(line)
-            if line == "end_header":
-                break
-        format_line = next((item for item in header_lines if item.startswith("format ")), "")
-        vertex_count = 0
-        properties: List[Tuple[str, str]] = []
-        in_vertex = False
-        for line in header_lines:
-            if line.startswith("element "):
-                parts = line.split()
-                in_vertex = len(parts) >= 3 and parts[1] == "vertex"
-                if in_vertex:
-                    vertex_count = int(parts[2])
-                    properties = []
-                continue
-            if in_vertex and line.startswith("property "):
-                parts = line.split()
-                if len(parts) >= 3:
-                    properties.append((parts[1], parts[2]))
-        if vertex_count <= 0:
-            raise PointCloudMapError("PLY 文件缺少 vertex 数量。")
-        if "binary_little_endian" in format_line:
-            ply_types = {
-                "char": "i1",
-                "uchar": "u1",
-                "int8": "i1",
-                "uint8": "u1",
-                "short": "<i2",
-                "ushort": "<u2",
-                "int16": "<i2",
-                "uint16": "<u2",
-                "int": "<i4",
-                "uint": "<u4",
-                "int32": "<i4",
-                "uint32": "<u4",
-                "float": "<f4",
-                "float32": "<f4",
-                "double": "<f8",
-                "float64": "<f8",
-            }
-            dtype_fields = []
-            for kind, name in properties:
-                numpy_type = ply_types.get(kind)
-                if numpy_type is None:
-                    raise UnsupportedPointCloudMapError("PLY 不支持顶点属性类型：%s" % kind)
-                dtype_fields.append((name, numpy_type))
-            if not dtype_fields:
-                raise PointCloudMapError("PLY 顶点没有属性定义。")
-            vertex_dtype = np.dtype(dtype_fields)
-            payload = handle.read(vertex_count * vertex_dtype.itemsize)
-            if len(payload) < vertex_count * vertex_dtype.itemsize:
-                raise PointCloudMapError("PLY 二进制数据不完整。")
-            vertices = np.frombuffer(payload, dtype=vertex_dtype, count=vertex_count)
-            if "x" not in vertices.dtype.names or "y" not in vertices.dtype.names or "z" not in vertices.dtype.names:
-                raise PointCloudMapError("PLY 顶点缺少 x/y/z 字段。")
-            xyz = np.stack(
-                [vertices["x"], vertices["y"], vertices["z"]],
-                axis=1,
-            ).astype(np.float32, copy=False)
-            header = PcdHeader(
-                fields=("x", "y", "z"),
-                size=(4, 4, 4),
-                type=("F", "F", "F"),
-                count=(1, 1, 1),
-                width=vertex_count,
-                height=1,
-                points=vertex_count,
-                data="binary",
-                header_bytes=0,
-                raw={},
-            )
-            return header, xyz
-        if "ascii" in format_line:
-            values = np.fromfile(handle, sep=" ", dtype=np.float64)
-            width = len(properties) or 3
-            if values.size < vertex_count * width:
-                raise PointCloudMapError("PLY ASCII 数据不完整。")
-            matrix = values[: vertex_count * width].reshape(vertex_count, width)
-            name_to_index = {name: index for index, (_, name) in enumerate(properties)}
-            try:
-                xyz = matrix[:, [name_to_index["x"], name_to_index["y"], name_to_index["z"]]].astype(np.float32)
-            except KeyError as exc:
-                raise PointCloudMapError("PLY 顶点缺少 x/y/z 字段。") from exc
-            header = PcdHeader(
-                fields=("x", "y", "z"),
-                size=(4, 4, 4),
-                type=("F", "F", "F"),
-                count=(1, 1, 1),
-                width=vertex_count,
-                height=1,
-                points=vertex_count,
-                data="ascii",
-                header_bytes=0,
-                raw={},
-            )
-            return header, xyz
-        raise UnsupportedPointCloudMapError("不支持的 PLY 格式：%s" % format_line)
+    return read_all_xyz(path.expanduser().resolve(), format_hint=".ply")
 
 
 def read_pcd_point_count(path: Path) -> int:
@@ -481,33 +446,27 @@ def read_pcd_point_count(path: Path) -> int:
 
 
 def read_pcd_xyz(path: Path) -> Tuple[PcdHeader, np.ndarray]:
-    """读取 PCD 文件中的 x/y/z 字段，返回 float32 Nx3 数组。"""
+    """分块读取PCD（点云数据文件），不保留整文件字节副本。"""
+    from services.geometry.pointcloud_asset_stream import read_all_xyz
 
-    with path.open("rb") as stream:
-        header = _read_pcd_header(stream)
-        if header.data == "ascii":
-            payload = stream.read().decode("utf-8", errors="replace")
-            return header, _read_ascii_xyz(header, payload)
-        if header.data == "binary":
-            payload = stream.read()
-            return header, _read_binary_xyz(header, payload)
-        if header.data == "binary_compressed":
-            raise UnsupportedPointCloudMapError("当前不支持 binary_compressed PCD 点云地图。")
-        raise UnsupportedPointCloudMapError("不支持的 PCD DATA 类型：%s" % header.data)
+    return read_all_xyz(path, format_hint=".pcd")
 
 
 def _read_pcd_header(stream) -> PcdHeader:
     raw: Dict[str, str] = {}
     header_bytes = 0
     while True:
-        line_bytes = stream.readline()
+        line_bytes = stream.readline(65537)
         if not line_bytes:
             raise PointCloudMapError("PCD 文件缺少 DATA 行。")
         header_bytes += len(line_bytes)
+        if len(line_bytes) > 65536 or header_bytes > 4 * 1024 * 1024:
+            raise PointCloudMapError("PCD 文件头过长。")
         line = line_bytes.decode("utf-8", errors="replace").strip()
         if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition(" ")
+        parts = line.split(None, 1)
+        key, value = parts[0], parts[1] if len(parts) == 2 else ""
         key_upper = key.upper()
         raw[key_upper] = value.strip()
         if key_upper == "DATA":
@@ -540,37 +499,6 @@ def _read_pcd_header(stream) -> PcdHeader:
         header_bytes=header_bytes,
         raw=raw,
     )
-
-
-def _read_ascii_xyz(header: PcdHeader, payload: str) -> np.ndarray:
-    columns = _expanded_columns(header.fields, header.count)
-    indexes = _xyz_indexes(columns)
-    row_width = len(columns)
-    values = np.fromstring(payload, sep=" ", dtype=np.float64)
-    if values.size < row_width:
-        return np.empty((0, 3), dtype=np.float32)
-    row_count = values.size // row_width
-    values = values[: row_count * row_width].reshape((row_count, row_width))
-    xyz = values[:, indexes]
-    return np.asarray(xyz, dtype=np.float32)
-
-
-def _read_binary_xyz(header: PcdHeader, payload: bytes) -> np.ndarray:
-    dtype = _pcd_binary_dtype(header)
-    if dtype.itemsize <= 0:
-        raise PointCloudMapError("PCD binary dtype 无效。")
-    available_points = len(payload) // dtype.itemsize
-    count = header.points if header.points > 0 else available_points
-    count = min(count, available_points)
-    records = np.frombuffer(payload, dtype=dtype, count=count)
-    try:
-        x = _field_values(records, "x")
-        y = _field_values(records, "y")
-        z = _field_values(records, "z")
-    except ValueError as exc:
-        raise PointCloudMapError(str(exc)) from exc
-    xyz = np.column_stack((x, y, z))
-    return np.asarray(xyz, dtype=np.float32)
 
 
 def _pcd_binary_dtype(header: PcdHeader) -> np.dtype:
@@ -647,10 +575,13 @@ def _parse_positive_int(value: Optional[str], *, default: int) -> int:
     return max(0, parsed)
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, should_cancel=None) -> str:
+    from services.geometry.pointcloud_asset_stream import check_cancelled
+
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while True:
+            check_cancelled(should_cancel)
             chunk = stream.read(1024 * 1024)
             if not chunk:
                 break
@@ -1062,6 +993,8 @@ class SavedPointCloudMapSource(PointCloudMapSource):
         self._opened = False
         self._cancelled = False
         self._closed = False
+        self._last_identity = None
+        self._last_snapshot = None
 
     def open(self) -> None:
         if self._closed or self._opened:
@@ -1081,12 +1014,24 @@ class SavedPointCloudMapSource(PointCloudMapSource):
                 source=self.source,
                 retryable=True,
             )
+        if identity == self._last_identity and self._last_snapshot is not None:
+            return self._last_snapshot
+        from services.geometry.pointcloud_asset_stream import PointCloudReadCancelled
+
+        def should_cancel():
+            return self._closed or self._cancelled or (
+                cancel_event is not None and cancel_event.is_set()
+            )
+
         try:
-            pointcloud_map = self._cache.load(
+            pointcloud_map = self._cache.load_preview(
                 self._path,
                 frame_id=self._frame_id,
                 source_kind=self._source_kind,
+                should_cancel=should_cancel,
             )
+        except PointCloudReadCancelled:
+            return None
         except UnsupportedPointCloudMapError as exc:
             raise PointCloudMapSourceError(
                 "saved_format_unsupported",
@@ -1129,7 +1074,9 @@ class SavedPointCloudMapSource(PointCloudMapSource):
             revision = "asset:%s" % computed_sha256
             revision_kind = "computed_asset_sha256"
             canonical_identity = False
-        return PointCloudMapSnapshot(
+        if should_cancel():
+            return None
+        snapshot = PointCloudMapSnapshot(
             source=self.source,
             source_epoch="path:%s:%s" % (str(self._path), identity.epoch),
             revision=revision,
@@ -1153,8 +1100,19 @@ class SavedPointCloudMapSource(PointCloudMapSource):
                 "cache_key_mtime_ns": int(pointcloud_map.source_timestamp.timestamp() * 1_000_000_000),
                 "cache_key_size": identity_after.size,
                 "load_ms": pointcloud_map.load_ms,
+                "asset_point_count": pointcloud_map.header.points,
+                "finite_point_count": pointcloud_map.source_point_count,
+                "display_point_count": pointcloud_map.point_count,
+                "display_sampled": pointcloud_map.point_count < pointcloud_map.header.points,
+                "display_sampling": "uniform-file-index",
+                "bounds_min": pointcloud_map.bounds_min,
+                "bounds_max": pointcloud_map.bounds_max,
             },
         )
+
+        self._last_identity = identity
+        self._last_snapshot = snapshot
+        return snapshot
 
     def cancel(self) -> None:
         if self._closed:
@@ -1165,6 +1123,8 @@ class SavedPointCloudMapSource(PointCloudMapSource):
         if self._closed:
             return
         self._closed = True
+        self._last_snapshot = None
+        self._last_identity = None
         self._cancelled = True
         self._opened = False
 

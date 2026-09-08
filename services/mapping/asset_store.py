@@ -680,17 +680,24 @@ class MapAssetBundleRepository:
     def _validate_pcd(managed_file: _ManagedRegularFile) -> None:
         # 复用激活/显示链的PCD解析器，从已持有的文件描述符读取，避免另建解析规则。
         import numpy as np
-        from services.geometry.pointcloud_map import read_pcd_xyz
+        from services.geometry.pointcloud_asset_stream import open_pointcloud_chunks
 
         managed_file.verify_named_entry()
         try:
-            header, points = read_pcd_xyz(Path("/proc/self/fd/%d" % managed_file.descriptor))
+            with open_pointcloud_chunks(
+                Path("/proc/self/fd/%d" % managed_file.descriptor), format_hint=".pcd",
+            ) as (header, chunks):
+                point_count = 0
+                for points in chunks:
+                    if not np.isfinite(points).all():
+                        raise MapAssetBundleValidationError("PCD 地图包含非有限点。")
+                    point_count += len(points)
         except Exception as exc:
             raise MapAssetBundleValidationError("PCD 地图不可读取：%s" % managed_file.relative_path) from exc
         managed_file.verify_named_entry()
-        if not len(points) or not np.isfinite(points).all():
+        if not point_count:
             raise MapAssetBundleValidationError("PCD 地图没有有效有限点。")
-        if header.points > 0 and len(points) != header.points:
+        if header.points > 0 and point_count != header.points:
             raise MapAssetBundleValidationError("PCD 地图点数与头部声明不一致。")
 
     @staticmethod

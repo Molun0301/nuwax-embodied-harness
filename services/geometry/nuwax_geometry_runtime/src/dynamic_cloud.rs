@@ -19,9 +19,15 @@ pub(super) struct DynamicCloudFilter {
     misses: HashMap<VoxelKey, (u8, u64)>,
     last_timestamp_ns: u64,
     sampling_phase: usize,
+    removed_keys: Vec<VoxelKey>,
 }
 
 impl DynamicCloudFilter {
+    /// 当前扫描实际移除的体素，供确定性快照同步撤销；下一次扫描清空。
+    pub(super) fn removed_keys(&self) -> &[VoxelKey] {
+        &self.removed_keys
+    }
+
     /// 只在原会话接纳成功后调用；同一帧的多束射线只能形成一次反证。
     pub(super) fn clear_observed_free_space(
         &mut self,
@@ -31,6 +37,7 @@ impl DynamicCloudFilter {
         timestamp_ns: u64,
         points: &[Point3<f64>],
     ) -> usize {
+        self.removed_keys.clear();
         if timestamp_ns == 0
             || timestamp_ns <= self.last_timestamp_ns
             || points.is_empty()
@@ -62,7 +69,10 @@ impl DynamicCloudFilter {
             evidence.0 = evidence.0.saturating_add(1);
             evidence.1 = timestamp_ns;
             if evidence.0 >= CLEAR_OBSERVATIONS {
-                removed += usize::from(voxels.remove(&key));
+                if voxels.remove(&key) {
+                    removed += 1;
+                    self.removed_keys.push(key);
+                }
                 self.misses.remove(&key);
             }
         }

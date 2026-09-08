@@ -29,7 +29,6 @@
       const VIDEO_JPEG_DECODE_TIMEOUT_MS = 3000;
       const MJPEG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
       const VIDEO_DISPLAY_FRESH_MS = 3000;
-      const VIDEO_DETECTION_FRESH_MS = 3000;
       const VIDEO_DETECTION_ALIGNMENT_MS = 1000;
       const MAP_DISPLAY_FRESH_MS = 20000;
       const MAP_DISPLAY_IDLE_MESSAGE = "未启动建图/导航/探索，隐藏缓存地图。";
@@ -138,7 +137,6 @@
         videoDetectionRevision: 0,
         videoDetectionDrawKey: "",
         videoDetectionLayoutRevision: 0,
-        visionPanelKey: "",
         visionLabelsKey: "",
         latestOverview: null,
         overviewRenderTimer: null,
@@ -250,12 +248,7 @@
         videoFrame: document.getElementById("videoFrame"),
         videoDetections: document.getElementById("videoDetections"),
         showDetections: document.getElementById("showDetections"),
-        visionDetectionStatus: document.getElementById("visionDetectionStatus"),
-        visionMessage: document.getElementById("visionMessage"),
         visionLabels: document.getElementById("visionLabels"),
-        visionCameraStatus: document.getElementById("visionCameraStatus"),
-        visionObservedAt: document.getElementById("visionObservedAt"),
-        visionTimingStatus: document.getElementById("visionTimingStatus"),
         showSemanticInstances: document.getElementById("showSemanticInstances"),
         semanticInstancesRefresh: document.getElementById("semanticInstancesRefresh"),
         semanticMemoryToggle: document.getElementById("semanticMemoryToggle"),
@@ -3534,6 +3527,9 @@
           state.appliedMapIdentity = state.receivedMapIdentity;
           state.mapGridContentKey = nextContentKey;
           const source = data.map_snapshot || data;
+          recordMediaFrame("map2d", mapSnapshotIsOffline(diagnostics) ? null : videoSourceTime(envelope.source_timestamp),
+            JSON.stringify([envelope.sequence, envelope.revision, envelope.source_timestamp, nextContentKey]),
+            JSON.stringify([source.map_name, source.source_epoch, grid.frame_id]));
           const freeViewIdentity = JSON.stringify([
             source.map_name || diagnostics.map_name || "", source.source_name || "", source.source_epoch || "",
             grid.frame_id || source.frame_id || envelope.frame_id || "",
@@ -3574,21 +3570,41 @@
         if (reason) return `地图已清空（${reason}）。`;
         return "地图已清空，等待新工作区激活。";
       }
-      function mapStreamLabel(status, diagnostics, streamBridge) {
-        if (diagnostics && diagnostics.display_suppressed_reason) return "缓存地图已隐藏";
-        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return "定位模式·已载入地图";
-        if (loadedMapAssetShouldDisplay(diagnostics)) return "已载入地图资产";
-        const messageCount = diagnostics && (diagnostics.message_count || diagnostics.update_sequence || diagnostics.sequence);
-        const revision = diagnostics && (diagnostics.content_revision || diagnostics.occupancy_content_revision || diagnostics.revision);
-        const delta = diagnostics && diagnostics.message_count_delta;
-        const bridgeStatus = streamBridge && (streamBridge.status || streamBridge.state || streamBridge.mode);
-        if (!messageCount) return status === "available" ? "首帧已缓存" : "等待首帧";
-        const live = status === "available" && (delta === undefined || delta === null || Number(delta) > 0 || diagnostics.live_mapping_ready === true || diagnostics.source_alive === true);
-        return `${live ? "实时流" : "离线资产/缓存"} · 修订 ${safeText(revision)} · 序号 ${safeText(messageCount)} · 桥接 ${displayStatus(bridgeStatus || status)}`;
+      // 仅统计被接受的新帧，不将重绘、心跳或同一缓存的重复应用计入帧率。
+      function recordMediaFrame(kind, sourceTime, frameKey, sourceKey = "") {
+        state.mediaMetrics ||= {};
+        let metric = state.mediaMetrics[kind];
+        if (!metric || metric.sourceKey !== sourceKey) {
+          metric = state.mediaMetrics[kind] = { samples: [], sourceKey, frameKey: null, sourceTime: null };
+        }
+        if (frameKey != null && metric.frameKey === frameKey) return;
+        const now = performance.now();
+        metric.samples = metric.samples.filter((time) => now - time <= 5000).slice(-599);
+        metric.samples.push(now);
+        metric.frameKey = frameKey;
+        metric.sourceTime = Number.isFinite(sourceTime) && sourceTime > 0 ? sourceTime : null;
       }
-      function updateMapStreamChip(status, diagnostics, streamBridge, timestamp) {
+      function mediaMetricText(kind, now = Date.now(), monotonicNow = performance.now()) {
+        const metric = state.mediaMetrics?.[kind];
+        if (!metric) return "-- FPS · 延迟 --";
+        metric.samples = metric.samples.filter((time) => monotonicNow - time <= 5000);
+        const samples = metric.samples;
+        const span = samples.length > 1 ? samples[samples.length - 1] - samples[0] : 0;
+        const fps = span > 0 && monotonicNow - samples[samples.length - 1] <= 2000 ? (samples.length - 1) * 1000 / span : 0;
+        const age = metric.sourceTime === null ? null : now - metric.sourceTime;
+        const delay = age !== null && Number.isFinite(age) && age >= 0 ? `${Math.round(age)} ms` : "--";
+        return `${fps.toFixed(1)} FPS · 延迟 ${delay}`;
+      }
+      function recordVideoFrameMetric() {
+        const identity = state.videoDisplayedIdentity || {};
+        recordMediaFrame("video", identity.sourceTime, state.videoFrames, `${state.videoStreamGeneration}|${identity.cameraId || ""}`);
+      }
+      function updateMapStreamChip() {
         if (!els.mapStreamStatus) return;
-        els.mapStreamStatus.textContent = `${mapStreamLabel(status, diagnostics, streamBridge)} · ${shortTime(timestamp)}`;
+        const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
+        const visible = kind === "map3d" || Boolean(state.mapGrid);
+        setVisionText(els.mapStreamStatus, visible ? mediaMetricText(kind) : "-- FPS · 延迟 --");
+        els.mapStreamStatus.title = "地图更新帧率；延迟为最新地图帧时间至当前时刻，不包含未知的传感器采集耗时。";
       }
       function updateMapHeartbeat(envelope) {
         state.lastMapHeartbeatEnvelope = envelope;
@@ -4030,56 +4046,29 @@
           els.videoEmpty.hidden = fresh;
           if (!fresh) setVisionText(els.videoEmpty, hasFrame ? "视频已中断，当前保留上次画面。" : state.videoStreamMessage || "等待摄像头视频帧。");
         }
-        const size = state.videoSourceSize;
-        setVisionText(els.videoFpsStatus, hasFrame ? `已显示 ${state.videoFrames} 帧${size ? ` · ${size.width} × ${size.height}` : ""}` : "等待视频帧");
+        setVisionText(els.videoFpsStatus, hasFrame ? mediaMetricText("video") : "-- FPS · 延迟 --");
+        els.videoFpsStatus.title = state.videoDisplayedIdentity?.timestampSource === "video_relay.write_time"
+          ? "实际显示帧率；延迟从视频中转写入时间计算。"
+          : "实际显示帧率；延迟从图像携带的帧时间计算，缺少时间时显示 --。";
       }
-      function visionDisplayState(now = Date.now()) {
+      function visionDisplayState() {
         const frame = state.videoDetectionFrame;
-        if (!videoHasFreshImage(now)) return { key: "no_video", status: "pending", label: "等待画面", message: "尚无当前可用画面，检测框已隐藏。", drawable: false };
-        if (!frame) return { key: "waiting", status: "pending", label: "等待识别", message: "视频已到达，尚未收到识别结果。", drawable: false };
-        if (frame.failed) return { key: "error", status: "error", label: "识别失败", message: frame.message || "识别阶段未成功，当前没有有效检测结果。", drawable: false };
-        if (frame.stale) return { key: "stale", status: "stale", label: "识别已过时", message: "识别来源已报告结果过期，等待新的观察。", drawable: false };
+        if (els.videoFrame.hidden || !state.videoSourceSize) return { key: "no_video", drawable: false };
+        if (!frame) return { key: "waiting", drawable: false };
         const shown = state.videoDisplayedIdentity;
-        if (!shown?.cameraId || !frame.identity.cameraId) return { key: "source_unknown", status: "degraded", label: "来源待确认", message: "画面或识别缺少相机身份，暂不叠加检测框。", drawable: false };
-        if (frame.identity.cameraId !== shown.cameraId) return { key: "camera_mismatch", status: "degraded", label: "相机不匹配", message: "识别结果来自其它相机，已隐藏检测框。", drawable: false };
-        if (frame.identity.frameId && shown.frameId && frame.identity.frameId !== shown.frameId) return { key: "frame_mismatch", status: "degraded", label: "来源不匹配", message: "图像坐标来源不一致，已隐藏检测框。", drawable: false };
+        // 慢推理继续显示最近有效框；只拒绝已明确的相机或像素尺寸不匹配。
+        if (shown?.cameraId && frame.identity.cameraId && frame.identity.cameraId !== shown.cameraId) return { key: "camera_mismatch", drawable: false };
+        if (frame.identity.frameId && shown?.frameId && frame.identity.frameId !== shown.frameId) return { key: "frame_mismatch", drawable: false };
         const size = state.videoSourceSize;
-        if (!size || size.width !== frame.width || size.height !== frame.height) return { key: "size_mismatch", status: "degraded", label: "尺寸不匹配", message: "识别尺寸与当前画面不一致，等待匹配结果。", drawable: false };
-        const sourceTime = frame.identity.sourceTime;
-        if (sourceTime === null || shown.sourceTime === null || shown.sourceTime === undefined) return { key: "time_unknown", status: "degraded", label: "时间待确认", message: "缺少输入帧时间，不能确认识别与当前画面的对应关系。", drawable: false };
-        if (now - sourceTime > VIDEO_DETECTION_FRESH_MS || sourceTime - now > VIDEO_DETECTION_ALIGNMENT_MS || now - frame.receivedAt > VIDEO_DETECTION_FRESH_MS) return { key: "stale", status: "stale", label: "识别已过时", message: "识别结果已超过显示时限，等待新的观察。", drawable: false };
-        if (Math.abs(sourceTime - shown.sourceTime) > VIDEO_DETECTION_ALIGNMENT_MS) return { key: "time_mismatch", status: "stale", label: "等待对齐", message: "识别与当前画面的来源时间相差较大，检测框已隐藏。", drawable: false };
-        const count = frame.total;
-        if (count > 0 && !state.videoDetections.length) return { key: "invalid_boxes", status: "degraded", label: "检测框无效", message: `来源报告 ${count} 个检测，但没有可绘制的有效边框。`, drawable: false };
-        const limited = count !== state.videoDetections.length || frame.truncated;
-        const label = count === 0 ? "未发现目标" : limited ? `${count} 个检测 · 显示 ${state.videoDetections.length} 个框` : `${count} 个目标`;
-        const message = frame.workerFallback ? `识别已回退到当前进程执行：${frame.workerFallbackReason || "独立工作进程不可用"}${frame.providerFallback ? `；同时使用备用模型：${frame.fallbackReason || "原模型未提供可用结果"}` : ""}`
-          : frame.fallback ? `使用回退识别：${frame.fallbackReason || "原模型未提供可用结果"}`
-          : count === 0 ? "本次识别成功，未发现目标；不表示场景中一定没有物品。"
-          : "显示同相机的近期识别；二维框不代表已知物体空间位置。";
-        return { key: count === 0 ? "empty" : "ready", status: frame.fallback ? "degraded" : "available", label, message, drawable: count > 0 };
+        if ((frame.width && size.width !== frame.width) || (frame.height && size.height !== frame.height)) return { key: "size_mismatch", drawable: false };
+        if (state.videoDetections.length) return { key: "ready", drawable: true };
+        return { key: frame.failed ? "error" : "empty", drawable: false };
       }
       function renderVisionPanel() {
         const display = visionDisplayState();
         if (!videoPanelVisible()) return display;
         const frame = state.videoDetectionFrame;
-        const key = JSON.stringify([display, frame?.identity, frame?.backend, frame?.inferenceExecution, frame?.detectorMs, frame?.waitMs]);
-        if (state.visionPanelKey !== key) {
-          state.visionPanelKey = key;
-          const statusKey = `${display.status}|${display.label}`;
-          if (state.visionStatusKey !== statusKey) {
-            state.visionStatusKey = statusKey;
-            setPill(els.visionDetectionStatus, display.status, display.label);
-          }
-          setVisionText(els.visionMessage, display.message);
-          if (els.visionMessage) els.visionMessage.dataset.level = display.status;
-          const execution = ({ worker_process: "独立工作进程", in_process: "当前进程" })[frame?.inferenceExecution];
-          setVisionText(els.visionModelStatus, `${frame?.backend || "未上报"}${execution ? ` · ${execution}` : ""}`);
-          setVisionText(els.visionCameraStatus, frame?.identity.cameraId || state.videoDisplayedIdentity?.cameraId || "未上报");
-          const timeSource = frame?.identity.timestampSource === "video_relay.write_time" ? "中转写入时间" : "输入帧时间";
-          setVisionText(els.visionObservedAt, frame?.identity.sourceTime ? `${new Date(frame.identity.sourceTime).toLocaleString()} · ${timeSource}` : "未上报输入帧时间");
-          setVisionText(els.visionTimingStatus, `${Number.isFinite(frame?.detectorMs) ? `${frame.detectorMs.toFixed(1)} 毫秒` : "未上报"} / ${Number.isFinite(frame?.waitMs) ? `${frame.waitMs.toFixed(1)} 毫秒` : "未上报"}`);
-        }
+        setVisionText(els.visionModelStatus, frame?.backend && frame.backend !== "未上报" ? frame.backend : "模型 --");
         const labelsKey = `${display.key}|${state.videoDetectionRevision}`;
         if (els.visionLabels && state.visionLabelsKey !== labelsKey) {
           state.visionLabelsKey = labelsKey;
@@ -4358,6 +4347,7 @@
         state.videoFrames += 1;
         state.videoLastFrameAt = Date.now();
         state.videoDisplayedIdentity = { ...identity, receivedAt: state.videoLastFrameAt };
+        recordVideoFrameMetric();
         state.videoSourceSize = { width: els.videoFrame.naturalWidth, height: els.videoFrame.naturalHeight };
         state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
@@ -5536,6 +5526,7 @@
         state.videoFrames += 1;
         state.videoLastFrameAt = Date.now();
         state.videoDisplayedIdentity = { ...pending.identity, receivedAt: state.videoLastFrameAt };
+        recordVideoFrameMetric();
         state.videoSourceSize = { width: els.videoFrame.naturalWidth, height: els.videoFrame.naturalHeight };
         state.videoStreamStatus = "rendering";
         els.videoFrame.hidden = false;
@@ -5560,6 +5551,7 @@
       else window.addEventListener("resize", resizeVideoOverlay);
       window.setInterval(() => {
         if (!videoPanelVisible()) return;
+        updateMapStreamChip();
         renderVideoStreamSummary();
         scheduleVideoDetectionDraw();
       }, 500);
@@ -5969,12 +5961,13 @@
       function setMapViewMode(mode) {
         const nextMode = mode === "3d" ? "3d" : "2d";
         state.mapViewMode = nextMode;
+        updateMapStreamChip();
         if (nextMode === "3d") disableMapTools(true);
         syncMapViewControls();
         window.pointcloud3d?.setVisible(nextMode === "3d");
         if (nextMode === "3d") {
           if (!window.pointcloud3d || !els.map3dContainer) {
-            setText(els.mapStreamStatus, "3D 模块加载中");
+            updateMapStreamChip();
             return;
           }
           window.pointcloud3d.init(els.map3dContainer);
@@ -5986,6 +5979,12 @@
           requestMapDraw(false);
         }
       }
+      window.addEventListener("pointcloud3d:map-frame", (event) => {
+        const frame = event.detail;
+        if (!frame) return;
+        recordMediaFrame("map3d", frame.source === "saved" ? null : frame.sourceTime, frame.frameKey, frame.sourceKey);
+        updateMapStreamChip();
+      });
       window.addEventListener("pointcloud3d:ready", () => {
         state.pointcloud3dReady = true;
         window.pointcloud3d?.setCameraMode(state.pointcloud3dCameraMode);

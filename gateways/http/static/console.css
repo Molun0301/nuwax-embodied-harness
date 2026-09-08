@@ -130,18 +130,12 @@ button{font-family:inherit;cursor:pointer}
 .video-detection-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .bbox{position:absolute;border:2px solid var(--robot);border-radius:4px}
 .bbox b{position:absolute;top:-18px;left:-2px;font-size:9.5px;font-weight:640;background:var(--robot);color:#fff;padding:1px 6px;border-radius:5px;white-space:nowrap}
-.video .ov{position:absolute;left:9px;right:9px;bottom:9px;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
+.video .ov{position:absolute;z-index:1;left:9px;right:9px;bottom:9px;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap}
 .ovchip{padding:3px 9px;border-radius:var(--pill);font-size:10px;color:var(--strong)}
 .vision-status-row{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;align-items:center;margin-top:10px;font-size:11px}
 .vision-status-row label{display:flex;align-items:center;gap:5px;color:var(--muted);white-space:nowrap}
-.vision-message{font-size:11px;color:var(--muted);line-height:1.6;margin:7px 0;overflow-wrap:anywhere}
-.vision-message[data-level="error"],.vision-message[data-level="stale"]{color:var(--bad)}
-.vision-labels{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0}
+.vision-labels{display:flex;flex-wrap:wrap;gap:5px;margin:0}
 .vision-labels span{font-size:11px;color:var(--strong);background:var(--inset);border:1px solid var(--line);padding:3px 7px;border-radius:var(--pill);overflow-wrap:anywhere;max-width:100%}
-.vision-evidence{border-top:1px solid var(--line);margin-top:8px;padding-top:7px;font-size:11px;color:var(--muted)}
-.vision-evidence summary{cursor:pointer;line-height:1.7}
-.vision-evidence dl{display:grid;grid-template-columns:74px minmax(0,1fr);gap:6px 8px;line-height:1.5;margin:8px 0 0}
-.vision-evidence dd{margin:0;color:var(--strong);overflow-wrap:anywhere}
 .vision-content{display:flex;flex-direction:column;gap:8px;min-height:min-content;flex:1}
 .vision-media,.vision-information{min-width:0;flex:none}
 .vision-media .video{flex-shrink:0}
@@ -365,7 +359,7 @@ button{font-family:inherit;cursor:pointer}
 .dock{grid-area:dock;min-height:0}
 .workspace.swapped .map-panel{grid-area:mini;min-height:420px}
 .workspace.swapped #video-perception{grid-area:hero;overflow:visible}
-.workspace.swapped .vision-content{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,240px);gap:14px;overflow:hidden}
+.workspace.swapped .vision-content{display:flex;flex-direction:column;gap:8px;overflow:hidden}
 .workspace.swapped .vision-media{display:flex;flex-direction:column;min-height:0}
 .workspace.swapped #video-perception .vision-media{flex:1}
 .workspace.swapped #video-perception .vision-media .video{flex:1;min-height:0;aspect-ratio:auto}
@@ -683,3 +677,16 @@ button{font-family:inherit;cursor:pointer}
 .service-health-details .service-health-chip{white-space:normal;overflow-wrap:anywhere;overflow:visible;text-overflow:clip}
 .service-health-more>summary{cursor:pointer;color:var(--muted);font-size:11px;padding:3px 2px}
 .service-health-more>.service-health-list{margin-top:4px}
+
+/* 模型与画面指标集中在画面底部，图例可向左侧收起。 */
+.video .ov{align-items:center;gap:4px}
+.ovchip{max-width:100%;overflow-wrap:anywhere}
+#visionModelStatus{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.legend{border-radius:var(--r);padding:0;display:flex;align-items:flex-start;gap:0}
+.legend-toggle{padding:7px 9px;cursor:pointer;list-style:none;white-space:nowrap;font-size:11px;color:var(--strong)}
+.legend-toggle::-webkit-details-marker{display:none}
+.legend-arrow{display:inline-block;margin-right:4px;transform:rotate(180deg)}
+.legend[open] .legend-arrow{transform:none}
+.legend-items{padding:7px 10px 7px 0}
+.legend:not([open]) .legend-items{display:none}
+.workspace.swapped .legend{padding:0}

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260908-map-priority">
+  <link rel="stylesheet" href="/static/console.css?v=20260908-media-metrics">
 </head>
 <body>
 <div class="app" id="app">
@@ -155,18 +155,21 @@
                 <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
               </div>
               <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
-              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip">等待地图首帧</span>
-              <div class="lgnd glass legend">
-                <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
-                <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
-                <span class="lg"><span class="sw" style="background:var(--traj)"></span>轨迹</span>
-                <span class="lg"><span class="sw" style="background:var(--plan)"></span>规划</span>
-                <span class="lg"><span class="sw" style="background:var(--robot)"></span>机器人</span>
-                <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
-                <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
-                <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
-                <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
-              </div>
+              <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip" title="地图更新帧率与最新帧延迟">-- FPS · 延迟 --</span>
+              <details class="glass legend" id="mapLegend" open>
+                <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
+                <div class="lgnd legend-items">
+                  <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
+                  <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
+                  <span class="lg"><span class="sw" style="background:var(--traj)"></span>轨迹</span>
+                  <span class="lg"><span class="sw" style="background:var(--plan)"></span>规划</span>
+                  <span class="lg"><span class="sw" style="background:var(--robot)"></span>机器人</span>
+                  <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
+                  <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
+                  <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
+                  <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
+                </div>
+              </details>
               <div id="mapPoseHud" class="map-pose-hud glass map-overlay-panel" aria-live="polite">
                 <div class="map-pose-title">位姿</div>
                 <div id="mapPoseMeta" class="kv map-pose-meta"></div>
@@ -189,27 +192,17 @@
                   <img id="videoFrame" class="video-frame" alt="机器人摄像头画面" hidden>
                   <canvas id="videoDetections" class="video-detection-canvas" hidden></canvas>
                   <div class="ov">
-                    <span id="videoFpsStatus" class="ovchip glass">等待视频帧</span>
+                    <span id="visionModelStatus" class="ovchip glass">模型 --</span>
+                    <span id="videoFpsStatus" class="ovchip glass" title="画面帧率与最新帧延迟">-- FPS · 延迟 --</span>
                   </div>
                 </div>
                 <div id="videoEmpty" class="empty panel-meta">等待摄像头数据。</div>
               </div>
               <div class="vision-information">
                 <div class="vision-status-row">
-                  <span id="visionDetectionStatus" class="pill missing">等待识别</span>
+                  <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
                   <label><input id="showDetections" type="checkbox" checked>显示检测框</label>
                 </div>
-                <p id="visionMessage" class="vision-message" role="status">收到有效图像后显示识别结果。</p>
-                <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
-                <details class="vision-evidence">
-                  <summary>识别来源与耗时</summary>
-                  <dl>
-                    <dt>模型来源</dt><dd id="visionModelStatus">未上报</dd>
-                    <dt>相机</dt><dd id="visionCameraStatus">未上报</dd>
-                    <dt>观察时间</dt><dd id="visionObservedAt">未上报</dd>
-                    <dt>检测 / 等待</dt><dd id="visionTimingStatus">未上报</dd>
-                  </dl>
-                </details>
               </div>
             </div>
           </section>
@@ -309,7 +302,7 @@
               </aside>
   <script src="/static/js/console-logs.js?v=20260906-task-log-recovery"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260908-map-priority"></script>
+  <script src="/static/js/console.js?v=20260908-media-metrics"></script>
   <script>
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
     (() => {
@@ -327,7 +320,7 @@
       }
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260907-low-latency-pose"></script>
+  <script type="module" src="/static/js/pointcloud3d.js?v=20260908-media-metrics"></script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
   <script src="/static/js/navigation.js?v=20260908-nav-height"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>

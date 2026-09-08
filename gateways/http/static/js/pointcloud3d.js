@@ -2189,6 +2189,15 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
   }));
   if (!shouldAcceptPointCloudMapEnvelope(window.pointcloud3d._pointCloudMapWatermark, envelope)) return;
   window.pointcloud3d._replaceCloudMapBuffer(envelope.xyz, envelope);
+  // 已验收的地图帧供控制台统计更新频率，不把传输心跳或相机重绘计作新帧。
+  window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {
+    detail: {
+      source: envelope.header.source,
+      sourceTime: Number(envelope.sourceTimestampNs / 1000000n),
+      frameKey: `${envelope.streamGeneration}:${envelope.revisionOrdinal}:${envelope.header.revision}`,
+      sourceKey: `${envelope.header.source}:${envelope.header.source_epoch}:${envelope.header.frame_id}`,
+    },
+  }));
 });
 
 window.addEventListener('stream:pointcloud_map.reset', () => {

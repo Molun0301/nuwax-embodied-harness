@@ -636,6 +636,13 @@
         "system.metrics": "系统进程采集",
         frontend_fallback: "前端兼容推断",
       };
+      // 常显实际连接与运行组件，其余能力状态按需查看；不改变后端健康结论。
+      const SERVICE_PRIMARY_IDS = new Set(["gateway_web", "gateway_web_fallback", "robot_data_plane", "geometry_runtime"]);
+      const SERVICE_DISPLAY_NAMES = {
+        gateway_web: "网页网关", gateway_web_fallback: "网页网关",
+        robot_data_plane: "机器人数据接入", geometry_runtime: "几何运行进程",
+        person_follow: "人物跟随", artifacts: "记忆与文件存储",
+      };
       const SERVICE_ATTENTION_STATUSES = new Set(["error", "missing", "degraded", "stale"]);
       function displayServiceSource(value) {
         const key = String(value || "").trim();
@@ -765,18 +772,27 @@
       function appendServiceHealthCard(entry, options) {
         const status = String(entry.status || "missing").toLowerCase();
         const cls = statusClass(status);
-        const card = document.createElement("article");
+        const card = document.createElement("details");
+        card.dataset.serviceId = entry.service_id;
+        card.open = Boolean(options && options.openServices && options.openServices.has(entry.service_id));
         card.className = `service-health-card ${cls} ${status}`;
         if (entry.reason) card.title = `原因：${entry.reason}`;
 
-        const top = document.createElement("div");
+        const top = document.createElement("summary");
         top.className = "service-health-top";
         const title = document.createElement("div");
         title.className = "service-health-title";
-        title.textContent = safeText(entry.display_name || entry.service_id);
+        title.textContent = SERVICE_DISPLAY_NAMES[entry.service_id] || safeText(entry.display_name || entry.service_id);
+        title.title = safeText(entry.display_name || entry.service_id);
         const pill = document.createElement("span");
         setPill(pill, status);
         top.append(title, pill);
+        if (SERVICE_ATTENTION_STATUSES.has(status)) {
+          const brief = document.createElement("span");
+          brief.className = "service-health-brief";
+          brief.textContent = safeText(entry.reason ? displayReasonLabel(entry.reason) : (entry.summary || entry.evidence || "请展开查看诊断"));
+          top.appendChild(brief);
+        }
 
         const summary = document.createElement("div");
         summary.className = "service-health-summary";
@@ -808,8 +824,11 @@
           foot.appendChild(reasonChip);
         }
 
-        card.append(top, summary, evidence, foot);
-        els.governanceMeta.appendChild(card);
+        const details = document.createElement("div");
+        details.className = "service-health-details";
+        details.append(summary, evidence, foot);
+        card.append(top, details);
+        ((options && options.target) || els.governanceMeta).appendChild(card);
       }
       function displayReasonLabel(reason) {
         // 任务 6.1.1：reason 字段为机器可读 token 时映射为中文短标签
@@ -903,6 +922,11 @@
       }
       function renderServiceStatus() {
         if (!els.governanceMeta) return;
+        // 高频状态刷新保留用户已展开的服务及其余列表。
+        const openServices = new Set(Array.from(els.governanceMeta.querySelectorAll(".service-health-card[open]"), (card) => card.dataset.serviceId));
+        const moreOpen = Boolean(els.governanceMeta.querySelector(".service-health-more[open]"));
+        const scrollHost = els.governanceMeta.parentElement;
+        const scrollTop = scrollHost.scrollTop;
         els.governanceMeta.replaceChildren();
         const summary = state.latestServiceHealth || buildLegacyServiceHealthFallback();
         const entries = Array.isArray(summary.entries) ? summary.entries : [];
@@ -913,12 +937,31 @@
           || entries.find((entry) => entry.display_name === "网关 Web 服务");
         setText(els.connectionText, displayStatus(gatewayService ? gatewayService.status : "missing"));
         setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
-        for (const entry of entries) appendServiceHealthCard(entry, {
+        const needsAttention = (entry) => SERVICE_ATTENTION_STATUSES.has(String(entry.status || "missing").toLowerCase());
+        const primary = entries.filter((entry) => needsAttention(entry) || SERVICE_PRIMARY_IDS.has(entry.service_id));
+        const secondary = entries.filter((entry) => !needsAttention(entry) && !SERVICE_PRIMARY_IDS.has(entry.service_id));
+        primary.sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)));
+        const options = {
           source: summary.source,
           generated_at: summary.generated_at,
           timestamp: summary.timestamp,
           compatibleFallback: summary.authoritative === false,
-        });
+          openServices,
+        };
+        for (const entry of primary) appendServiceHealthCard(entry, options);
+        if (secondary.length) {
+          const more = document.createElement("details");
+          more.className = "service-health-more";
+          more.open = moreOpen;
+          const label = document.createElement("summary");
+          label.textContent = `其余服务（${secondary.length}）`;
+          const list = document.createElement("div");
+          list.className = "service-health-list";
+          for (const entry of secondary) appendServiceHealthCard(entry, { ...options, target: list });
+          more.append(label, list);
+          els.governanceMeta.appendChild(more);
+        }
+        scrollHost.scrollTop = scrollTop;
       }
       function formatGB(bytes) {
         const n = Number(bytes);

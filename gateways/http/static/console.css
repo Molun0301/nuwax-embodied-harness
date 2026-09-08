@@ -155,8 +155,8 @@ button{font-family:inherit;cursor:pointer}
 
 /* ===== bottom dock · 全部并排常显 ===== */
 .dock.card{display:grid;
-  grid-template-columns:minmax(0,1.55fr) minmax(0,1fr) minmax(0,1.05fr) minmax(0,1fr);
-  min-height:252px;overflow:hidden}
+  grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.25fr);
+  height:220px;min-height:0;overflow:hidden}
 .dcol{display:flex;flex-direction:column;min-width:0;min-height:0;padding:var(--space);border-left:1px solid var(--line)}
 .dcol:first-child{border-left:0}
 .dh{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px}
@@ -353,14 +353,15 @@ button{font-family:inherit;cursor:pointer}
 .mission-layout,.mission-content{height:100%;min-height:0}
 .workspace{display:grid;height:100%;min-height:780px;
   grid-template-columns:minmax(0,1fr) clamp(340px,25vw,420px);
-  grid-template-rows:max-content max-content minmax(252px,1fr);
+  grid-template-rows:max-content minmax(180px,1fr) 220px;
   grid-template-areas:"hero mini" "hero rail" "dock dock";gap:var(--gap)}
 .map-panel{grid-area:hero;position:relative;overflow:hidden;border-radius:var(--r-xl);padding:0;min-height:0}
 #video-perception{grid-area:mini;min-height:min-content;overflow:visible}
 #video-perception .vision-media{display:flex;flex-direction:column;flex:none}
 #video-perception .video{flex:none;min-height:0;aspect-ratio:16/9}
 #video-perception .vision-information{flex:none}
-.merged-rail{grid-area:rail;min-height:0;align-self:start}
+.merged-rail{grid-area:rail;min-height:0;overflow:hidden}
+.recent-logs-panel>.ph{flex:none}
 .dock{grid-area:dock;min-height:0}
 .workspace.swapped .map-panel{grid-area:mini;min-height:420px}
 .workspace.swapped #video-perception{grid-area:hero;overflow:visible}
@@ -630,7 +631,8 @@ button{font-family:inherit;cursor:pointer}
     grid-template-rows:520px auto auto;grid-template-areas:"hero hero" "mini rail" "dock dock"}
   .workspace.swapped .map-panel{min-height:440px}
   .dock.card{height:auto;grid-template-columns:repeat(2,minmax(0,1fr))}
-  .dcol{height:240px}
+  .dcol{height:220px}
+  .recent-logs-panel{height:400px}
   .dcol:nth-child(3){border-left:0}
   .dcol:nth-child(n+3){border-top:1px solid var(--line)}
 }
@@ -646,7 +648,8 @@ button{font-family:inherit;cursor:pointer}
     grid-template-areas:"hero" "mini" "rail" "dock"}
   .workspace.swapped .map-panel{min-height:480px}
   .dock.card{grid-template-columns:minmax(0,1fr)}
-  .dcol{border-left:0;height:auto;max-height:280px;min-height:160px}
+  .dcol{border-left:0;height:auto;max-height:220px;min-height:160px}
+  .recent-logs-panel{height:320px}
   .log-workspace{overflow:auto}
   .log-workspace>*{flex-shrink:0}
   .console-log-rows{flex:none;overflow:visible}
@@ -664,3 +667,19 @@ button{font-family:inherit;cursor:pointer}
 /* 日志摘要将级别、组件和正文分行对齐，避免文字直接粘连。 */
 .recent-logs .console-log-entry{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 8px;padding:10px 0}
 .recent-logs .console-log-message{grid-column:1/-1;font-size:12px}
+
+/* 服务概览只常显核心组件与异常，证据按需展开。 */
+.service-health-list{gap:4px}
+.service-health-card{padding:0;gap:0}
+.service-health-top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 8px;padding:4px 8px;cursor:pointer;list-style:none}
+.service-health-top .pill{font-size:10px;padding:1px 6px}
+.service-health-top::-webkit-details-marker{display:none}
+.service-health-title::before{content:"›";display:inline-block;width:12px;color:var(--muted)}
+.service-health-card[open]>.service-health-top .service-health-title::before{content:"⌄"}
+.service-health-brief{grid-column:1/-1;color:var(--muted);font-size:10.5px;line-height:1.35;overflow-wrap:anywhere}
+.service-health-card.error .service-health-brief{color:var(--bad)}
+.service-health-card.missing .service-health-brief,.service-health-card.stale .service-health-brief{color:var(--warn)}
+.service-health-details{display:grid;gap:6px;padding:0 10px 10px}
+.service-health-details .service-health-chip{white-space:normal;overflow-wrap:anywhere;overflow:visible;text-overflow:clip}
+.service-health-more>summary{cursor:pointer;color:var(--muted);font-size:11px;padding:3px 2px}
+.service-health-more>.service-health-list{margin-top:4px}

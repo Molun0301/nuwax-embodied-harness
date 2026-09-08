@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260908-layout-unification">
+  <link rel="stylesheet" href="/static/console.css?v=20260908-map-priority">
 </head>
 <body>
 <div class="app" id="app">
@@ -213,17 +213,17 @@
               </div>
             </div>
           </section>
-          <section class="card panel rise merged-rail" style="animation-delay:.1s">
+          <section class="card panel rise merged-rail recent-logs-panel" style="animation-delay:.1s">
             <div class="ph">
-              <div class="t"><div class="eyebrow">地图信息</div><h2>地图摘要</h2></div>
-              <span id="mapSummaryMode" class="mchip">2D 栅格</span>
+              <div class="t"><div class="eyebrow">运行记录</div><h2>最近日志</h2></div>
+              <div class="panel-actions"><button class="btn" type="button" data-open-view="logs-view">查看全部</button><span id="logsStatus" class="pill missing">等待</span></div>
             </div>
-            <div id="mapMeta" class="kv"></div>
+            <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
           </section>
           <section class="dock card rise" style="animation-delay:.2s">
             <div class="dcol">
-              <div class="dh"><div class="t"><h3>最近日志</h3></div><button class="btn" type="button" data-open-view="logs-view">查看全部</button><span id="logsStatus" class="pill missing">等待</span></div>
-              <div class="dscroll"><div id="recentLogs" class="recent-logs"><p class="muted small">暂无运行日志。</p></div></div>
+              <div class="dh"><div class="t"><div class="eyebrow">地图信息</div><h3>地图摘要</h3></div><span id="mapSummaryMode" class="mchip">2D 栅格</span></div>
+              <div class="dscroll"><div id="mapMeta" class="kv"></div></div>
             </div>
             <div class="dcol">
               <div class="dh"><div class="t"><div class="eyebrow">运行进程</div><h3>进程矩阵</h3></div><span id="servicesStatus" class="pill missing">缺失</span></div>
@@ -309,7 +309,7 @@
               </aside>
   <script src="/static/js/console-logs.js?v=20260906-task-log-recovery"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260908-vision-display"></script>
+  <script src="/static/js/console.js?v=20260908-map-priority"></script>
   <script>
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
     (() => {

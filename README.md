@@ -4,6 +4,32 @@
 
 平台计算核心位于 `services/nuwax-workspace/`，由 Rust（系统编程语言）实现；`services/geometry/nuwax_geometry_runtime/` 负责几何运行编排，Python（编程语言）服务和网关组合这些能力。ROS2（机器人操作系统第二版）不再是当前平台计算主链。
 
+## 按需安装
+
+在 Debian/Ubuntu（操作系统）系列机器上，以普通用户在仓库根运行：
+
+```bash
+./install.sh
+```
+
+安装器自动检测处理器、可用内存、图形设备和已有配置，显示建议模块；回车确认，也可以输入编号增删。基础网关不安装视觉或语义模型；FastLIO2 与 PointLIO（两种激光惯性定位算法）选择一种即可。未知设备先使用标准接入，不根据计算板型号猜测机器人和雷达。
+
+```bash
+./install.sh install --modules core --yes  # 只安装基础网关
+./install.sh add fastlio2                  # 增加几何建图及原生定位
+./install.sh add pointlio                  # 替换为 PointLIO
+./install.sh add perception memory         # 增加视觉与本地语义记忆
+./install.sh remove perception             # 移除视觉及依赖它的跟随模块
+./install.sh list                          # 查看当前安装与配置位置
+./install.sh start                         # 前台启动；Ctrl+C 停止
+```
+
+添加 `--dry-run` 只查看计划，`--yes` 接受方案，`--repair` 重装修复。修改模块前先停止网关；再次运行沿用当前选择，重建独立依赖环境并在校验后切换，失败保留上一有效安装。默认安装位置是 `runtime_data/installation/`，地图、模型和用户数据不会随模块卸载删除，系统共享依赖也不会被卸载。
+
+安装使用 Python 3.8—3.12；编译并行数按内存和处理器自动限制。Jetson（嵌入式计算平台）的本地推理复用厂商张量库；Go2（宇树四足机器人）接入复用已有设备软件，缺失时可通过 `--wheel-dir` 提供设备安装包。导航、跟随还需配置现有运动安全守卫与执行器，定位需要传感器数据及标定；安装完成不会自动启动机器人。
+
+原有按档案生产部署、恢复和回滚命令保持可用，例如 `./install.sh deploy --help`；其厂商制品与发布准入条件独立于本机源码安装。
+
 ## 开发机验证
 
 先使用已安装项目依赖的 Python 环境，在仓库根执行：
@@ -66,7 +92,7 @@ robot.providers.publish_point_cloud(lidar_frame)
 bash scripts/start_gateway.sh
 ```
 
-部署命令说明可通过 `python scripts/bootstrap.py --help` 查看。生产服务共用 `/var/lib/nuwax_robot_bridge/settings.env` 作为用户设置覆盖文件，由 `NUWAX_USER_CONFIG_ENV_FILE` 指明；控制台保存到这里，各服务在基础配置之后读取。原来的几何、点云专用配置只保留读取兼容。没有指定统一覆盖文件的本地运行仍保存到已有配置来源，不需要修改系统目录权限。
+模块安装使用 `./install.sh start` 和安装器专属设置，配置位置通过 `./install.sh list` 查看；手工开发启动仍可使用上述命令。旧配置引导工具说明可通过 `python scripts/bootstrap.py --help` 查看。生产服务共用 `/var/lib/nuwax_robot_bridge/settings.env` 作为用户设置覆盖文件，由 `NUWAX_USER_CONFIG_ENV_FILE` 指明；控制台保存到这里，各服务在基础配置之后读取。原来的几何、点云专用配置只保留读取兼容。没有指定统一覆盖文件的本地运行仍保存到已有配置来源，不需要修改系统目录权限。
 
 几何启动器 `scripts/systemd/start_geometry_runtime.sh` 直接运行本地构建，不要求 SHA（安全散列算法）摘要或历史验收记录。只有显式设置 `NUWAX_GEOMETRY_RELEASE_MANIFEST` 时才使用已有发布包检查。合法算法组合可以先保存后构建，页面只提示当前缺少的程序或标定。
 

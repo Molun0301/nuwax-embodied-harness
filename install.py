@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding:utf-8 -*-
-"""Transactional deployment entry point used by ``install.sh``."""
+"""统一安装入口：默认模块管理，兼容现有生产部署命令。"""
 
 from __future__ import annotations
 
@@ -22,9 +21,13 @@ def _bootstrap_path() -> None:
 
 
 def main() -> int:
-    """Delegate to the stdlib-only deployment CLI and preserve its exit code."""
+    """默认进入模块向导，原有明确部署命令继续使用事务安装器。"""
     _bootstrap_path()
-    from scripts.deploy_installer.cli import main as installer_main
+    legacy_commands = {"plan", "check", "deploy", "resume", "verify", "status", "rollback", "bundle"}
+    if len(sys.argv) > 1 and sys.argv[1] in legacy_commands:
+        from scripts.deploy_installer.cli import main as installer_main
+    else:
+        from scripts.module_installer.cli import main as installer_main
 
     return int(installer_main())
 

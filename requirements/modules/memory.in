@@ -1,0 +1,6 @@
+# 本地语义记忆沿用 requirements/memory-local.in 的已批准版本。
+sentence-transformers==3.2.1
+transformers==4.46.3
+huggingface-hub==0.26.2
+sentencepiece==0.2.0
+safetensors==0.5.3

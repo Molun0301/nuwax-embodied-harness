@@ -6,12 +6,27 @@ cd "${REPO_ROOT}"
 
 bash -n \
   install.sh \
+  scripts/deploy_installer/entrypoint.sh \
   scripts/install_motion_guard_deployment.sh \
   scripts/systemd/check_motion_guard_python.sh
 
-python3 -m compileall -q -f install.py scripts/deploy_installer
+python3 -m compileall -q -f install.py scripts/deploy_installer scripts/module_installer
 ruff check scripts/deploy_installer install.py
+# 保留与现有实机解释器兼容的 Optional 注解，不自动改为联合类型语法。
+ruff check --ignore UP045 scripts/module_installer
 python3 install.py --help >/dev/null
+python3 install.py install --modules core --robot customrobot --json | python3 -c '
+import json, sys
+plan = json.load(sys.stdin)["plan"]
+assert plan["modules"] == ["core"]
+assert plan["models"] == [] and plan["builds"] == []
+'
+python3 install.py install --modules pointlio --robot customrobot --json | python3 -c '
+import json, sys
+plan = json.load(sys.stdin)["plan"]
+assert plan["modules"] == ["core", "geometry", "pointlio"]
+assert "libgoogle-glog-dev" in plan["system_packages"]
+'
 python3 install.py plan --profile go2-jetson --release-id ci-contract --go2-robot-ip 192.0.2.10 >/tmp/nuwax-install-plan.txt
 
 grep -q 'rust_build' /tmp/nuwax-install-plan.txt

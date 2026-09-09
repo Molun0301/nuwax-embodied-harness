@@ -13,7 +13,7 @@
 
 use crate::controllers::{angle_diff, Controller, PController};
 use crate::helpers::{
-    make_path2d, make_twist2_zero, pose_to_point2, pose_xy_yaw, Path2D, PoseStamped, Twist2,
+    make_path2d, make_twist2_zero, pose_to_point2, pose_xy_yaw, Path2D, Point2, PoseStamped, Twist2,
 };
 use crate::navigation_map::CostMap2D;
 use crate::path_clearance::PathClearance;
@@ -144,6 +144,7 @@ pub struct LocalPlanner {
     path_distancer: Option<PathDistancer>,
     path_clearance: Option<PathClearance>,
     costmap: Option<CostMap2D>,
+    robot_geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
     /// 上次 navigation_costmap 发布时间
     last_navigation_costmap_at: Option<std::time::Instant>,
     /// navigation_costmap 订阅者列表(sync stub;见 type alias 注释)
@@ -190,10 +191,17 @@ impl LocalPlanner {
             path_distancer: None,
             path_clearance: None,
             costmap: None,
+            robot_geometry: None,
             last_navigation_costmap_at: None,
             navigation_costmap_subs: Vec::new(),
             last_goal_reached: GoalReached::default(),
         }
+    }
+
+    /// 统一机体外形用于前瞻碰撞与当前位置自体区域消除。
+    pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
+        self.robot_geometry = Some(geometry);
+        self.path_clearance = None;
     }
 
     /// 启动跟随一条新路径(无 stored orientation;rotation 用首段方向启发式)
@@ -379,6 +387,18 @@ impl LocalPlanner {
             .as_ref()
             .zip(self.current_odom.as_ref())
             .map(|(path, odom)| path.closest_projection(pose_to_point2(odom)));
+        let rotation_target = self.current_odom.as_ref().and_then(|odom| {
+            let near_goal = self.path_distancer.as_ref().is_some_and(|path| {
+                path.distance_to_goal(pose_to_point2(odom)) < self.config.goal_tolerance
+            });
+            if near_goal {
+                self.last_segment_yaw_or_last_yaw()
+            } else if self.state == LocalPlannerState::InitialRotation {
+                self.first_segment_yaw_or_first_yaw()
+            } else {
+                None
+            }
+        });
         let mut obstacle_ahead = false;
         if let Some(pc) = self.path_clearance.as_mut() {
             if let Some(cm) = self.costmap.as_ref() {
@@ -387,14 +407,27 @@ impl LocalPlanner {
             if let Some((index, projected)) = path_progress {
                 pc.update_path_progress(index, projected);
             }
+            if let Some(odom) = self.current_odom.as_ref() {
+                let (x, y, yaw) = pose_xy_yaw(odom);
+                pc.update_robot_pose(Point2::new(x, y), yaw);
+            }
+            pc.update_rotation_target(rotation_target);
             obstacle_ahead = pc.is_obstacle_ahead();
         } else if let (Some(cm), Some(path)) = (self.costmap.as_ref(), self.path.as_ref()) {
             // 第一次：构造 path_clearance
             let mut pc = PathClearance::new(path.clone(), robot_width, 3.0);
+            if let Some(geometry) = self.robot_geometry.as_ref() {
+                pc.set_robot_geometry(geometry.clone());
+            }
+            if let Some(odom) = self.current_odom.as_ref() {
+                let (x, y, yaw) = pose_xy_yaw(odom);
+                pc.update_robot_pose(Point2::new(x, y), yaw);
+            }
             pc.update_costmap(cm.clone());
             if let Some((index, projected)) = path_progress {
                 pc.update_path_progress(index, projected);
             }
+            pc.update_rotation_target(rotation_target);
             obstacle_ahead = pc.is_obstacle_ahead();
             self.path_clearance = Some(pc);
         }
@@ -543,6 +576,25 @@ mod tests {
     use super::*;
     use crate::helpers::{make_path2d, make_pose_stamped, Point2};
     use crate::navigation_map::CostMap2D;
+
+    #[test]
+    fn final_rotation_checks_actual_goal_yaw_against_external_obstacle() {
+        use crate::helpers::{make_pose_stamped, Point2};
+        let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]],"z_min_m":-0.3,"z_max_m":0.1}"#).unwrap();
+        let mut planner = LocalPlanner::new(0.3, 10.0, 0.2);
+        planner.set_robot_geometry(geometry);
+        planner.handle_odom(make_pose_stamped("map", 1.025, 1.025, 0.0));
+        let mut map = CostMap2D::new_all_free("map", 80, 80, 0.05);
+        map.set(24, 24, crate::navigation_map::OCCUPIED);
+        planner.update_costmap(map);
+        planner.start_planning_with_orientations(
+            make_path2d(vec![Point2::new(1.025, 1.025)]),
+            Some(vec![std::f64::consts::FRAC_PI_2]),
+        );
+        let (twist, stop) = planner.step(0.3);
+        assert_eq!(twist, Twist2::ZERO);
+        assert_eq!(stop, Some(StopMessage::ObstacleFound));
+    }
 
     #[test]
     fn fresh_planner_is_idle() {

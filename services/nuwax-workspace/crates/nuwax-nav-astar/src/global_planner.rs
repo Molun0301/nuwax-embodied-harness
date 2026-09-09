@@ -20,10 +20,13 @@ use crate::controllers::angle_diff;
 use crate::goal_validator::{find_safe_goal_bfs_contiguous, GoalValidatorOptions};
 use crate::helpers::{make_path2d_empty, make_twist2_zero, pose_xy_yaw, PlannerResult};
 use crate::local_planner::{LocalPlanner, LocalPlannerState, StopMessage};
-use crate::navigation_map::{CostMap2D, GradientStrategy, NavigationMap, OCCUPIED};
+use crate::navigation_map::{CostMap2D, GradientStrategy, NavigationMap, OCCUPIED, UNKNOWN};
 use crate::position_tracker::PositionTracker;
 use crate::replan_limiter::ReplanLimiter;
-use nuwax_nav_types_messages::{NavigationStatus, Path2D, Point2, PoseStamped, Twist2};
+use nuwax_nav_types_messages::{
+    NavigationStatus, OccupancyCell, OccupancyGrid2D, Path2D, Point2, PoseStamped, RobotGeometry,
+    Twist2,
+};
 
 /// 全局规划器配置
 #[derive(Debug, Clone)]
@@ -40,7 +43,7 @@ pub struct GlobalPlannerConfig {
     pub stuck_time_window: f64,
     /// stuck 阈值（米）
     pub stuck_threshold: f64,
-    /// safe goal clearance（米）
+    /// 无模型时的目标圆形余量（米）；模型模式直接检查真实外包。
     pub safe_goal_clearance: f64,
     /// safe goal tolerance（米）
     pub safe_goal_tolerance: f64,
@@ -48,8 +51,10 @@ pub struct GlobalPlannerConfig {
     pub speed: f64,
     /// 控制频率（Hz）
     pub control_frequency: f64,
-    /// robot_width（米），用于 gradient inflate / path clearance
+    /// 无模型时的机器人宽度（米），用于距离梯度膨胀与旧局部检查。
     pub robot_width: f64,
+    /// 统一模型外形；未配置时保留独立算法调用的旧宽度参数。
+    pub robot_geometry: Option<RobotGeometry>,
     /// robot_rotation_diameter（米），用于默认 safe_goal_clearance
     pub robot_rotation_diameter: f64,
     /// Replan limiter 配置
@@ -86,6 +91,7 @@ impl Default for GlobalPlannerConfig {
             speed: 0.55,
             control_frequency: 10.0,
             robot_width: 0.5,
+            robot_geometry: None,
             robot_rotation_diameter,
             max_replan_attempts: 6,
             replan_reset_distance: 2.0,
@@ -142,6 +148,8 @@ pub struct GlobalPlanner {
     last_stuck_check: std::time::Instant,
     last_published_path: Option<Path2D>,
     pending_event: Option<GlobalPlannerEvent>,
+    /// 地图变化后先重新核对全局可达性，不能依赖局部把未知伪装成障碍。
+    map_update_pending: bool,
 }
 
 impl GlobalPlanner {
@@ -167,7 +175,10 @@ impl GlobalPlanner {
             simulation: cfg.simulation,
             navigation_costmap_interval: cfg.navigation_costmap_interval,
         };
-        let local = LocalPlanner::with_config(local_cfg);
+        let mut local = LocalPlanner::with_config(local_cfg);
+        if let Some(geometry) = cfg.robot_geometry.as_ref() {
+            local.set_robot_geometry(geometry.clone());
+        }
 
         let position_tracker = PositionTracker::new(cfg.stuck_time_window, stuck_threshold);
         let replan_limiter = ReplanLimiter::new(cfg.max_replan_attempts, cfg.replan_reset_distance);
@@ -188,6 +199,7 @@ impl GlobalPlanner {
             last_stuck_check: std::time::Instant::now(),
             last_published_path: None,
             pending_event: None,
+            map_update_pending: false,
         }
     }
 
@@ -241,8 +253,84 @@ impl GlobalPlanner {
 
     /// 接收 global costmap
     pub fn handle_global_costmap(&mut self, costmap: CostMap2D) {
+        self.map_update_pending |=
+            self.current_goal.is_some() && !self.remaining_route_is_clear(&costmap);
         self.navigation_map.update(costmap.clone());
         self.navigation_map_near.update(costmap);
+    }
+
+    /// 地图刷新仅在剩余路线失效时重规划，保持无关更新下的路径和卡住追踪。
+    fn remaining_route_is_clear(&self, map: &CostMap2D) -> bool {
+        let (Some(path), Some(odom)) = (
+            self.last_published_path.as_ref(),
+            self.current_odom.as_ref(),
+        ) else {
+            return false;
+        };
+        if path.points.is_empty()
+            || map.width() == 0
+            || map.height() == 0
+            || !map.resolution().is_finite()
+            || map.resolution() <= 0.0
+        {
+            return false;
+        }
+        let previous = self.navigation_map.binary_costmap().ok();
+        if previous.as_ref().is_none_or(|old| {
+            old.width() != map.width()
+                || old.height() != map.height()
+                || old.resolution() != map.resolution()
+                || old.frame_id() != map.frame_id()
+                || old.cell_center_world(0, 0) != map.cell_center_world(0, 0)
+        }) {
+            return false;
+        }
+        let (x, y, yaw) = pose_xy_yaw(odom);
+        let position = Point2::new(x, y);
+        let (index, projected) =
+            crate::path_distancer::PathDistancer::new(path, 0.5).closest_projection(position);
+        let points: Vec<_> = [position, projected]
+            .into_iter()
+            .chain(path.points.iter().skip(index + 1).copied())
+            .collect();
+        let Some(geometry) = self.cfg.robot_geometry.as_ref() else {
+            return points.iter().all(|point| {
+                let value = map.cell_value(*point);
+                value != UNKNOWN && value < OCCUPIED
+            });
+        };
+        let (Ok(width), Ok(height)) = (u32::try_from(map.width()), u32::try_from(map.height()))
+        else {
+            return false;
+        };
+        let first = map.cell_center_world(0, 0);
+        let origin = Point2::new(
+            first.x - map.resolution() / 2.0,
+            first.y - map.resolution() / 2.0,
+        );
+        let Ok(footprint) = geometry.grid_footprint(map.resolution(), yaw, width, height) else {
+            return false;
+        };
+        let Ok(current) = footprint.at_position(origin, position) else {
+            return false;
+        };
+        let anchor = map.world_to_cell(position);
+        let occupied_now: std::collections::HashSet<_> = current
+            .offsets
+            .iter()
+            .filter_map(|&(dx, dy)| {
+                Some((
+                    u32::try_from(i64::from(anchor.0).checked_add(dx)?).ok()?,
+                    u32::try_from(i64::from(anchor.1).checked_add(dy)?).ok()?,
+                ))
+            })
+            .collect();
+        points.windows(2).all(|segment| {
+            footprint.visit_motion(origin, (segment[0], yaw), (segment[1], yaw), |x, y| {
+                let value = map.get(x as usize, y as usize);
+                occupied_now.contains(&(x, y)) || (value != UNKNOWN && value < OCCUPIED)
+            })
+        })
     }
 
     /// 接收新 goal
@@ -292,6 +380,14 @@ impl GlobalPlanner {
     pub fn tick(&mut self, costmap: &CostMap2D) -> GlobalPlannerOutput {
         // 更新 local planner costmap
         self.local_planner.update_costmap(costmap.clone());
+
+        if self.map_update_pending && self.current_goal.is_some() {
+            self.pending_event = Some(if self._plan_path() {
+                GlobalPlannerEvent::NewPath
+            } else {
+                GlobalPlannerEvent::PlanningFailed
+            });
+        }
 
         if let Some(event) = self.pending_event.take() {
             return GlobalPlannerOutput {
@@ -435,6 +531,7 @@ impl GlobalPlanner {
     }
 
     fn _plan_path(&mut self) -> bool {
+        self.map_update_pending = false;
         self.cancel_goal_inner_keep_goal();
         let odom = match self.current_odom.as_ref() {
             Some(o) => o.clone(),
@@ -450,7 +547,11 @@ impl GlobalPlanner {
 
         let (gx, gy, _) = pose_xy_yaw(&goal);
         let (ox, oy, _) = pose_xy_yaw(&odom);
-        let safe_goal = match self._find_safe_goal(Point2::new(gx, gy)) {
+        let safe_goal = match if self.cfg.robot_geometry.is_some() {
+            Some(Point2::new(gx, gy))
+        } else {
+            self._find_safe_goal(Point2::new(gx, gy))
+        } {
             Some(g) => g,
             None => {
                 tracing::warn!("no safe goal");
@@ -460,7 +561,15 @@ impl GlobalPlanner {
             }
         };
 
-        let path = match self._find_wide_path(safe_goal, Point2::new(ox, oy)) {
+        let planned = if self.cfg.robot_geometry.is_some() {
+            self.navigation_map
+                .binary_costmap()
+                .ok()
+                .and_then(|map| self.path_with_geometry(&map, &odom, &goal))
+        } else {
+            self._find_wide_path(safe_goal, Point2::new(ox, oy))
+        };
+        let path = match planned {
             Some(p) => p,
             None => {
                 tracing::warn!("no path to safe goal");
@@ -471,7 +580,14 @@ impl GlobalPlanner {
         };
 
         self.last_published_path = Some(path.clone());
-        self.local_planner.start_planning(path);
+        let mut yaws: Vec<f64> = path
+            .points
+            .windows(2)
+            .map(|segment| (segment[1].y - segment[0].y).atan2(segment[1].x - segment[0].x))
+            .collect();
+        yaws.push(pose_xy_yaw(&goal).2);
+        self.local_planner
+            .start_planning_with_orientations(path, Some(yaws));
         self.status = NavigationStatus::Planning;
         true
     }
@@ -493,9 +609,9 @@ impl GlobalPlanner {
         if !binary.in_bounds(x, y) {
             return None;
         }
-        // 未知目标保留给 A* 的未知区域代价策略处理。
+        // 正式全局规划不能把未知目标以低于障碍阈值的代价悄悄放行。
         if binary.is_unknown(x as usize, y as usize) {
-            return Some(goal);
+            return None;
         }
         let opts = GoalValidatorOptions {
             cost_threshold: OCCUPIED,
@@ -520,9 +636,140 @@ impl GlobalPlanner {
 
     fn find_path_on_map(map: &NavigationMap, goal: Point2, robot_pos: Point2) -> Option<Path2D> {
         let costmap = map.make_gradient_costmap(1.1)?;
-        let opts = crate::astar::AStarOptions::default();
+        let opts = crate::astar::AStarOptions {
+            unknown_penalty: 1.0,
+            ..crate::astar::AStarOptions::default()
+        };
         let r = crate::astar::min_cost_astar(&costmap, robot_pos, goal, &opts).ok()?;
         r.path
+    }
+
+    /// 模型路径仅使用本次位姿的私有规划视图，原始占据图始终留在拥有方。
+    fn path_with_geometry(
+        &self,
+        source: &CostMap2D,
+        start: &PoseStamped,
+        goal: &PoseStamped,
+    ) -> Option<Path2D> {
+        let geometry = self.cfg.robot_geometry.as_ref()?;
+        geometry.validate().ok()?;
+        let width = u32::try_from(source.width()).ok()?;
+        let height = u32::try_from(source.height()).ok()?;
+        let resolution = source.resolution();
+        let (sx, sy, start_yaw) = pose_xy_yaw(start);
+        let (gx, gy, goal_yaw) = pose_xy_yaw(goal);
+        if width == 0
+            || height == 0
+            || width > i32::MAX as u32
+            || height > i32::MAX as u32
+            || !resolution.is_finite()
+            || resolution <= 0.0
+            || [sx, sy, start_yaw, gx, gy, goal_yaw]
+                .iter()
+                .any(|v| !v.is_finite())
+        {
+            return None;
+        }
+        let first_center = source.cell_center_world(0, 0);
+        let origin = Point2::new(
+            first_center.x - resolution / 2.0,
+            first_center.y - resolution / 2.0,
+        );
+        if !origin.x.is_finite() || !origin.y.is_finite() {
+            return None;
+        }
+        let mut cells = Vec::with_capacity(source.width() * source.height());
+        for y in 0..source.height() {
+            for x in 0..source.width() {
+                cells.push(match source.get(x, y) {
+                    UNKNOWN => OccupancyCell::Unknown,
+                    value if value >= OCCUPIED => OccupancyCell::Occupied,
+                    // CostMap2D中的0—99是可通行代价；正式占据接线已把原50以上分类为100。
+                    _ => OccupancyCell::Free,
+                });
+            }
+        }
+        let mut environment = OccupancyGrid2D::new(origin, resolution, width, height, cells);
+        let footprint = geometry
+            .grid_footprint(resolution, start_yaw, width, height)
+            .ok()?;
+        let start_position = Point2::new(sx, sy);
+        let goal_position = Point2::new(gx, gy);
+        footprint.clear_current_occupancy(&mut environment, start_position);
+        if !footprint.is_clear_at(&environment, start_position)
+            || !footprint.is_clear_at(&environment, goal_position)
+        {
+            return None;
+        }
+
+        // 只在私有配置空间图中过滤放不下机体的候选中心，不把它发布为传感器观测。
+        let mut centers = source.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let value = if footprint.is_clear(&environment, x, y) {
+                    let original = source.get(x as usize, y as usize);
+                    if original < OCCUPIED {
+                        original
+                    } else {
+                        0
+                    }
+                } else {
+                    OCCUPIED
+                };
+                centers.set(x as usize, y as usize, value);
+            }
+        }
+        // A*格中心不能代替真实端点；端点已按其准确相位检验，路径最后恢复原坐标。
+        for point in [start_position, goal_position] {
+            let (x, y) = environment.world_to_cell(point)?;
+            centers.set(x as usize, y as usize, 0);
+        }
+        let strategy = if start_position.distance(goal_position) > 1.5 {
+            GradientStrategy::Voronoi
+        } else {
+            GradientStrategy::Gradient
+        };
+        // 机体已在候选过滤中计算，距离梯度不能再叠加旧默认0.5米宽度。
+        let mut navigation = NavigationMap::new(0.0, strategy);
+        navigation.update(centers);
+        let mut path = Self::find_path_on_map(&navigation, goal_position, start_position)?;
+        if path.points.len() == 1 {
+            path.points = vec![start_position, goal_position];
+        } else {
+            *path.points.first_mut()? = start_position;
+            *path.points.last_mut()? = goal_position;
+        }
+        let clear_observation = |x, y| {
+            environment
+                .get(x, y)
+                .is_some_and(|cell| cell == OccupancyCell::Unknown || cell.is_known_traversable())
+        };
+        let mut yaw = start_yaw;
+        for segment in path.points.windows(2) {
+            let heading = if segment[0].distance(segment[1]) > 1e-9 {
+                (segment[1].y - segment[0].y).atan2(segment[1].x - segment[0].x)
+            } else {
+                yaw
+            };
+            if !footprint.visit_motion(
+                origin,
+                (segment[0], yaw),
+                (segment[1], heading),
+                clear_observation,
+            ) {
+                return None;
+            }
+            yaw = heading;
+        }
+        if !footprint.visit_motion(
+            origin,
+            (goal_position, yaw),
+            (goal_position, goal_yaw),
+            clear_observation,
+        ) {
+            return None;
+        }
+        Some(path)
     }
 
     /// 直接做一次规划（不修改状态机），返回 PlannerResult
@@ -532,6 +779,15 @@ impl GlobalPlanner {
         goal: PoseStamped,
         costmap: &CostMap2D,
     ) -> PlannerResult {
+        if self.cfg.robot_geometry.is_some() {
+            return match self.path_with_geometry(costmap, &start, &goal) {
+                Some(path) => {
+                    let length = path.length();
+                    PlannerResult::success(path, length, 0)
+                }
+                None => PlannerResult::failure(crate::helpers::PlannerFailure::NoPath, 0),
+            };
+        }
         let (gx, gy, _) = pose_xy_yaw(&goal);
         let (sx, sy, _) = pose_xy_yaw(&start);
         let safe = match self.find_safe_goal_on_map(costmap, Point2::new(gx, gy)) {
@@ -568,6 +824,194 @@ impl GlobalPlanner {
 mod tests {
     use super::*;
     use crate::helpers::make_pose_stamped;
+
+    fn test_geometry(half_width: f64) -> RobotGeometry {
+        RobotGeometry {
+            footprint_xy_m: vec![
+                [-0.3, -half_width],
+                [0.3, -half_width],
+                [0.3, half_width],
+                [-0.3, half_width],
+            ],
+            z_min_m: -0.3,
+            z_max_m: 0.1,
+            source: "动态规划回归".into(),
+        }
+    }
+
+    fn body_planner(half_width: f64) -> GlobalPlanner {
+        GlobalPlanner::new(GlobalPlannerConfig {
+            robot_geometry: Some(test_geometry(half_width)),
+            // 旧宽度故意与真实外形不同，确保新路径没有继续按旧默认宽度规划。
+            robot_width: 2.0,
+            ..GlobalPlannerConfig::default()
+        })
+    }
+
+    fn observed_map() -> CostMap2D {
+        let mut map = CostMap2D::new_all_free("map", 80, 80, 0.05);
+        map.set_origin(Point2::new(-2.0, -2.0));
+        map
+    }
+
+    #[test]
+    fn model_planning_clears_only_present_body_and_preserves_supplied_map() {
+        let start = make_pose_stamped("map", 0.001, 0.013, 0.0);
+        let goal = make_pose_stamped("map", 1.001, 0.013, 0.0);
+        for self_observation in [UNKNOWN, OCCUPIED] {
+            let mut map = observed_map();
+            let position = start.pose.position.to_2d();
+            let footprint = test_geometry(0.1)
+                .grid_footprint(0.05, 0.0, 80, 80)
+                .unwrap()
+                .at_position(Point2::new(-2.0, -2.0), position)
+                .unwrap();
+            let anchor = map.world_to_cell(position);
+            for (dx, dy) in footprint.offsets {
+                map.set(
+                    (i64::from(anchor.0) + dx) as usize,
+                    (i64::from(anchor.1) + dy) as usize,
+                    self_observation,
+                );
+            }
+            let mut planner = body_planner(0.1);
+            planner.handle_global_costmap(map.clone());
+            let path = planner
+                .plan_once(start.clone(), goal.clone(), &map)
+                .path
+                .expect("自体观测不能困住起点");
+            assert_eq!(path.points.first().copied(), Some(position));
+            assert_eq!(
+                path.points.last().copied(),
+                Some(goal.pose.position.to_2d())
+            );
+            assert_eq!(
+                map.get(anchor.0 as usize, anchor.1 as usize),
+                self_observation
+            );
+            assert_eq!(
+                planner
+                    .navigation_map
+                    .binary_costmap()
+                    .unwrap()
+                    .get(anchor.0 as usize, anchor.1 as usize),
+                self_observation
+            );
+            assert!(
+                planner
+                    .plan_once(goal.clone(), start.clone(), &map)
+                    .path
+                    .is_none(),
+                "改变当前位置后不能继续清除旧起点的观测"
+            );
+        }
+    }
+
+    #[test]
+    fn global_paths_do_not_cross_external_unknown_or_wall_with_or_without_model() {
+        for with_model in [false, true] {
+            for obstacle in [UNKNOWN, OCCUPIED] {
+                let mut map = observed_map();
+                for y in 0..map.height() {
+                    map.set(52, y, obstacle);
+                }
+                let mut planner = if with_model {
+                    body_planner(0.1)
+                } else {
+                    GlobalPlanner::new(GlobalPlannerConfig::default())
+                };
+                assert!(
+                    planner
+                        .plan_once(
+                            make_pose_stamped("map", 0.025, 0.025, 0.0),
+                            make_pose_stamped("map", 1.025, 0.025, 0.0),
+                            &map
+                        )
+                        .path
+                        .is_none(),
+                    "外部未知或墙不能成为全局路线"
+                );
+                assert_eq!(map.get(52, 40), obstacle);
+            }
+        }
+    }
+
+    #[test]
+    fn model_width_and_final_rotation_are_used_by_global_plan() {
+        let mut corridor = observed_map();
+        for y in 0..80 {
+            if !(37..=42).contains(&y) {
+                for x in 0..80 {
+                    corridor.set(x, y, OCCUPIED);
+                }
+            }
+        }
+        let start = make_pose_stamped("map", 0.025, 0.025, 0.0);
+        let goal = make_pose_stamped("map", 1.025, 0.025, 0.0);
+        assert!(body_planner(0.1)
+            .plan_once(start.clone(), goal.clone(), &corridor)
+            .path
+            .is_some());
+        assert!(body_planner(0.2)
+            .plan_once(start.clone(), goal, &corridor)
+            .path
+            .is_none());
+        let mut turn_map = observed_map();
+        turn_map.set(44, 44, OCCUPIED);
+        assert!(body_planner(0.1)
+            .plan_once(start.clone(), start.clone(), &turn_map)
+            .path
+            .is_some());
+        let turn_goal = make_pose_stamped("map", 0.025, 0.025, std::f64::consts::FRAC_PI_2);
+        assert!(
+            body_planner(0.1)
+                .plan_once(start, turn_goal, &turn_map)
+                .path
+                .is_none(),
+            "最终朝向旋转经过的已知障碍必须在发布前拒绝"
+        );
+    }
+
+    #[test]
+    fn changed_map_replans_before_returning_an_old_route() {
+        let mut planner = body_planner(0.1);
+        let mut map = observed_map();
+        planner.handle_global_costmap(map.clone());
+        planner.handle_odom(make_pose_stamped("map", 0.025, 0.025, 0.0));
+        planner.handle_goal_request(make_pose_stamped("map", 1.025, 0.025, 0.0));
+        assert!(planner
+            .last_published_path
+            .as_ref()
+            .is_some_and(|path| !path.points.is_empty()));
+        for y in 0..80 {
+            map.set(52, y, UNKNOWN);
+        }
+        planner.handle_global_costmap(map.clone());
+        let output = planner.tick(&map);
+        assert_eq!(output.event, Some(GlobalPlannerEvent::PlanningFailed));
+        assert!(output.path.is_none_or(|path| path.points.is_empty()));
+    }
+
+    #[test]
+    fn irrelevant_and_current_body_updates_do_not_reset_route_or_stuck_clock() {
+        let mut planner = body_planner(0.1);
+        let mut map = observed_map();
+        planner.handle_global_costmap(map.clone());
+        planner.handle_odom(make_pose_stamped("map", 0.025, 0.025, 0.0));
+        planner.handle_goal_request(make_pose_stamped("map", 1.025, 0.025, 0.0));
+        planner.tick(&map);
+        planner.tick(&map);
+        let path = planner.last_published_path.clone();
+        let clock = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        planner.last_stuck_check = clock;
+        map.set(5, 5, UNKNOWN);
+        map.set(40, 40, OCCUPIED);
+        planner.handle_global_costmap(map.clone());
+        assert!(!planner.map_update_pending);
+        planner.tick(&map);
+        assert_eq!(planner.last_published_path, path);
+        assert_eq!(planner.last_stuck_check, clock);
+    }
 
     #[test]
     fn fresh_planner_is_idle() {

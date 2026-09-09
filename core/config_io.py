@@ -28,6 +28,10 @@ except ImportError:  # pragma: no cover
 
 from core import config_registry as R
 from core.config_values import RUNTIME_VALUES, config_snapshot, read_env_values, parse_env_line, env_assignment
+from core.robot_geometry import (
+    ROBOT_GEOMETRY_SETTING_KEYS, RobotGeometryConfig, RobotGeometryError,
+    normalize_robot_geometry_setting, resolve_robot_geometry,
+)
 
 _IO_LOGGER = logging.getLogger("nuwax_robot_bridge.config_io")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -381,6 +385,39 @@ def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str
     return values
 
 
+def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
+    """只在设置查询中解析一次外形；这是下次启动输入的预览，不是进程生效证明。"""
+    keys = ROBOT_GEOMETRY_SETTING_KEYS | {"NUWAX_ACTIVE_ROBOT", "NUWAX_NAV_ROBOT_WIDTH_M"}
+    values = {key: os.environ.get(key, file_values.get(key, "")) for key in keys}
+    base = {"configuration_source": "saved_files_plus_environment", "effective_confirmed": False}
+    try:
+        geometry = resolve_robot_geometry(
+            RobotGeometryConfig.from_values(values),
+            robot_name=str(values.get("NUWAX_ACTIVE_ROBOT") or ""), base_dir=_REPO_ROOT,
+        )
+    except (RobotGeometryError, OSError) as exc:
+        return dict(base, status="error", error_code=getattr(exc, "code", "robot_geometry_model_unreadable"),
+                    error=str(exc), summary="外形预览解析失败：" + str(exc))
+    labels = {
+        "manual": "完整手填", "urdf_collision": "指定碰撞模型", "urdf_visual": "指定显示模型后备",
+        "robot_default_urdf_collision": "驱动默认碰撞模型", "robot_default_urdf_visual": "驱动默认显示模型后备",
+        "legacy_default": "兼容默认外包", "manual_override": "手填覆盖", "legacy_nav_width": "旧导航宽度",
+    }
+    source_label = "＋".join(labels.get(part, part) for part in geometry.source.split("+"))
+    center = geometry.center_xyz_m
+    display_center = tuple(0.0 if abs(value) < 1e-12 else value for value in center)
+    summary = ("外形预览（保存配置＋当前环境）：长{:.4g}米，宽{:.4g}米，高{:.4g}米；中心({:.4g},{:.4g},{:.4g})米；"
+               "高度范围[{:.4g},{:.4g}]米；来源：{}。重启几何/导航后生效，当前未核实外部进程。"
+               .format(geometry.length_m, geometry.width_m, geometry.height_m, *display_center,
+                       geometry.z_min_m, geometry.z_max_m, source_label))
+    if geometry.model_path:
+        summary += " 模型文件：{}，机体基准：{}。".format(Path(geometry.model_path).name, geometry.model_base_link)
+    return dict(base, status="resolved", summary=summary, source_label=source_label,
+                length_m=geometry.length_m, width_m=geometry.width_m, height_m=geometry.height_m,
+                center_xyz_m=list(center), model_base_link=geometry.model_base_link,
+                warnings=list(geometry.warnings), **geometry.to_runtime_dict())
+
+
 @_schema_file_snapshot()
 def build_schema() -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
@@ -399,6 +436,7 @@ def build_schema() -> Dict[str, object]:
     effective_core_vals.update(geometry_owner_vals)
     effective_core_vals.update(pointcloud3d_vals)
     effective_core_vals.update(user_vals)
+    robot_geometry_preview = _robot_geometry_preview(effective_core_vals)
     effective_vals = _collect_effective_values(effective_core_vals, go2_vals)
 
     default_vals = _collect_effective_values({}, {}, defaults=True)
@@ -455,7 +493,11 @@ def build_schema() -> Dict[str, object]:
         sections[f.section_id]["fields"].append({
             "key": f.key,
             "zh_name": f.zh_name,
-            "description": f.description,
+            "description": (
+                f.description + " " + str(robot_geometry_preview["summary"])
+                + " ".join(robot_geometry_preview.get("warnings", ()))
+                if f.key == "NUWAX_ROBOT_MODEL_PATH" else f.description
+            ),
             "type": f.type,
             "advanced": f.advanced,
             "sensitive": f.sensitive,
@@ -489,6 +531,7 @@ def build_schema() -> Dict[str, object]:
         "effect_note": "保存后按各项生效范围重启服务；编辑值来自文件，当前进程已读取值单独显示。外部进程未回报的值不标为已确认生效。",
         "geometry_backend_structure_matrix": [status.as_dict() for status in geometry_statuses],
         "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
+        "robot_geometry_preview": robot_geometry_preview,
     }
 
 
@@ -533,6 +576,11 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     v = value.strip()
     if any(char in v for char in "\r\n\0"):
         return None
+    if key in ROBOT_GEOMETRY_SETTING_KEYS:
+        try:
+            return normalize_robot_geometry_setting(key, v)
+        except RobotGeometryError:
+            return None
     if not v and (key in _NATIVE_LIO_VOXEL_KEYS or key == _NATIVE_LIO_INITIAL_MAP_FRAMES_KEY):
         # 这三项可选覆盖留空时撤销覆盖，由下次原生进程使用自身默认值。
         return ""
@@ -686,6 +734,11 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         normalized = _validate(key, raw, field.type)
         if normalized is None:
             rejected[key] = f"值不符合类型 {field.type}"
+            if key in ROBOT_GEOMETRY_SETTING_KEYS:
+                try:
+                    normalize_robot_geometry_setting(key, raw)
+                except RobotGeometryError as exc:
+                    rejected[key] = str(exc)
             continue
         if field.choices and normalized not in field.choices:
             rejected[key] = f"值必须是以下之一：{', '.join(field.choices)}"

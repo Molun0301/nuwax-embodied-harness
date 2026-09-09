@@ -3,7 +3,6 @@ import { OrbitControls } from './OrbitControls.js';
 
 const COLORS = {
   robot: 0xfbbf24,
-  robotAccent: 0x78350f,
   frontier: 0xf472b6,
   trajectory: 0x22d3ee,
   navPath: 0x22ff66,
@@ -394,6 +393,7 @@ class PointCloud3DViewer {
     this._controls = null;
     this._pointsMesh = null;
     this._robotMesh = null;
+    this._robotGeometryCenter = null;
     this._frontierGroup = null;
     this._forbiddenZoneGroup = null;
     this._semanticGroup = null;
@@ -669,7 +669,9 @@ class PointCloud3DViewer {
 
   _robotTarget(pose = this._robotPose) {
     if (!pose) return null;
-    return new THREE.Vector3(pose.x, pose.y, pose.z + FOLLOW_TARGET_HEIGHT);
+    const center = this._robotGeometryCenter?.clone() || new THREE.Vector3(0, 0, FOLLOW_TARGET_HEIGHT);
+    if (pose.quaternion) center.applyQuaternion(pose.quaternion);
+    return center.add(new THREE.Vector3(pose.x, pose.y, pose.z));
   }
 
   _settleControlsMotion() {
@@ -1225,73 +1227,79 @@ class PointCloud3DViewer {
   _ensureRobotMesh() {
     if (this._robotMesh || !this._scene) return;
     const group = new THREE.Group();
-    group.userData.kind = 'robot-dog';
+    const raw = window.__NUWAX_ROBOT_GEOMETRY__;
+    const points = raw?.footprint_xy_m;
+    const valid = Array.isArray(points) && points.length >= 3
+      && points.every(point => Array.isArray(point) && point.length === 2 && point.every(Number.isFinite))
+      && Number.isFinite(raw.z_min_m) && Number.isFinite(raw.z_max_m) && raw.z_max_m > raw.z_min_m;
+    let label = '机器人位姿（外形未提供）';
+    let description = raw?.error || '请在设置中提供机器人模型或实际长宽高。';
+    if (valid) {
+      // 与探索/导航共用机体坐标凸包；直接使用米制坐标，不居中、不贴地、不随缩放放大。
+      const shape = new THREE.Shape(points.map(([x, y]) => new THREE.Vector2(x, y)));
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth: raw.z_max_m - raw.z_min_m, bevelEnabled: false, steps: 1,
+      });
+      geometry.translate(0, 0, raw.z_min_m);
+      const material = new THREE.MeshBasicMaterial({
+        color: COLORS.robot, transparent: true, opacity: 0.18,
+        depthWrite: false, side: THREE.DoubleSide,
+      });
+      const body = new THREE.Mesh(geometry, material);
+      body.name = 'robot-envelope';
+      group.add(body);
+      const edges = new THREE.EdgesGeometry(geometry);
+      const edgeMaterial = new THREE.LineBasicMaterial({ color: COLORS.robot, transparent: true, opacity: 0.95 });
+      group.add(new THREE.LineSegments(edges, edgeMaterial));
 
-    const bodyGeometry = new THREE.BoxGeometry(0.64, 0.32, 0.22);
-    const headGeometry = new THREE.BoxGeometry(0.24, 0.26, 0.22);
-    const legGeometry = new THREE.BoxGeometry(0.1, 0.1, 0.3);
-    const bodyMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robot });
-    const accentMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robotAccent });
-    const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-    body.name = 'robot-body';
-    body.userData.role = 'body';
-    body.position.z = 0.42;
-    group.add(body);
-
-    const head = new THREE.Mesh(headGeometry, bodyMaterial);
-    head.name = 'robot-head';
-    head.userData.role = 'head';
-    head.position.set(0.43, 0, 0.46);
-    group.add(head);
-
-    for (const [name, x, y] of [
-      ['front-left', 0.22, 0.13],
-      ['front-right', 0.22, -0.13],
-      ['rear-left', -0.22, 0.13],
-      ['rear-right', -0.22, -0.13],
-    ]) {
-      const leg = new THREE.Mesh(legGeometry, accentMaterial);
-      leg.name = `robot-leg-${name}`;
-      leg.userData.role = `leg-${name}`;
-      leg.position.set(x, y, 0.16);
-      group.add(leg);
+      // 朝向箭头位于上表面内部，不扩大显示外形；机体正X为前方。
+      const cx = points.reduce((sum, point) => sum + point[0], 0) / points.length;
+      const cy = points.reduce((sum, point) => sum + point[1], 0) / points.length;
+      const radius = Math.min(...points.map((a, index) => {
+        const b = points[(index + 1) % points.length];
+        return Math.abs((b[0] - a[0]) * (cy - a[1]) - (b[1] - a[1]) * (cx - a[0])) / Math.hypot(b[0] - a[0], b[1] - a[1]);
+      }));
+      const arrow = new THREE.Shape([
+        new THREE.Vector2(cx + radius * 0.7, cy),
+        new THREE.Vector2(cx - radius * 0.5, cy + radius * 0.5),
+        new THREE.Vector2(cx - radius * 0.15, cy),
+        new THREE.Vector2(cx - radius * 0.5, cy - radius * 0.5),
+      ]);
+      const arrowGeometry = new THREE.ShapeGeometry(arrow);
+      arrowGeometry.translate(0, 0, raw.z_max_m);
+      const arrowMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robot, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+      const heading = new THREE.Mesh(arrowGeometry, arrowMaterial);
+      heading.name = 'robot-heading';
+      group.add(heading);
+      group.userData.kind = 'robot-envelope';
+      group.userData.disposableResources = [geometry, material, edges, edgeMaterial, arrowGeometry, arrowMaterial];
+      const xs = points.map(point => point[0]), ys = points.map(point => point[1]);
+      const bounds = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+      this._robotGeometryCenter = new THREE.Vector3((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2, (raw.z_min_m + raw.z_max_m) / 2);
+      label = `${String(raw.source).startsWith('legacy_default') ? '默认参考外形' : '机器人外形'} · ${(bounds[2] - bounds[0]).toFixed(2)} × ${(bounds[3] - bounds[1]).toFixed(2)} × ${(raw.z_max_m - raw.z_min_m).toFixed(2)} 米`;
+      description = `模型/手填外包，按真实米制尺寸显示；箭头指向机体前方。来源：${raw.source || '配置外形'}${String(raw.source).startsWith('legacy_default') ? '（未提供完整实际尺寸）' : ''}。模型按静态参考姿态解析，修改设置后重启服务并刷新页面。`;
+    } else {
+      // 外形未知时只有一个位姿箭头，不把符号大小当作机器人尺寸。
+      const geometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(-0.06, 0, 0), new THREE.Vector3(0.08, 0, 0),
+        new THREE.Vector3(0.03, 0.04, 0), new THREE.Vector3(0.08, 0, 0),
+        new THREE.Vector3(0.03, -0.04, 0),
+      ]);
+      const material = new THREE.LineBasicMaterial({ color: COLORS.robot });
+      group.add(new THREE.Line(geometry, material));
+      group.userData.kind = 'robot-pose';
+      group.userData.disposableResources = [geometry, material];
     }
-
-    const headingGeometry = new THREE.ConeGeometry(0.16, 0.34, 8);
-    headingGeometry.rotateZ(-Math.PI / 2);
-    const heading = new THREE.Mesh(headingGeometry, accentMaterial);
-    heading.name = 'robot-heading';
-    heading.userData.role = 'heading';
-    heading.position.set(0.64, 0, 0.46);
-    group.add(heading);
-
-    const ringGeometry = new THREE.RingGeometry(0.25, 0.31, 24);
-    const ringMaterial = new THREE.MeshBasicMaterial({
-      color: COLORS.robot,
-      transparent: true,
-      opacity: 0.48,
-      side: THREE.DoubleSide,
-    });
-    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
-    ring.name = 'robot-footprint';
-    ring.userData.role = 'footprint';
-    ring.position.z = 0.01;
-    group.add(ring);
-    group.userData.disposableResources = [
-      bodyGeometry,
-      headGeometry,
-      legGeometry,
-      bodyMaterial,
-      accentMaterial,
-      headingGeometry,
-      ringGeometry,
-      ringMaterial,
-    ];
+    if (typeof document !== 'undefined') {
+      const legend = document.getElementById('robotGeometryLegend');
+      if (legend) { legend.textContent = label; legend.title = description; }
+    }
+    group.visible = false;
     this._robotMesh = group;
     this._scene.add(group);
   }
 
-  setRobotPose(x, y, z, yaw) {
+  setRobotPose(x, y, z, yaw, orientation) {
     if (yaw === undefined) {
       yaw = z;
       z = 0;
@@ -1305,6 +1313,10 @@ class PointCloud3DViewer {
     if (!Number.isFinite(pose.x) || !Number.isFinite(pose.y)) return false;
     if (!Number.isFinite(pose.z)) pose.z = 0;
     if (!Number.isFinite(pose.yaw)) pose.yaw = 0;
+    const q = orientation && [orientation.x, orientation.y, orientation.z, orientation.w];
+    pose.quaternion = q?.every(Number.isFinite) && Math.hypot(...q) > 0
+      ? new THREE.Quaternion(...q).normalize()
+      : new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), pose.yaw);
     const previousFollowTarget = this._lastFollowTarget?.clone() || null;
     this._robotPose = pose;
 
@@ -1320,7 +1332,7 @@ class PointCloud3DViewer {
     if (this._robotMesh) {
       this._robotMesh.visible = true;
       this._robotMesh.position.set(pose.x, pose.y, pose.z);
-      this._robotMesh.rotation.z = pose.yaw;
+      this._robotMesh.quaternion.copy(pose.quaternion);
     }
 
     if (this._cameraMode === 'follow' && this._camera && this._controls) {
@@ -1859,8 +1871,8 @@ class PointCloud3DViewer {
   _applyCachedSceneState() {
     if (this._hasPointCloudSnapshot) this._rebuildPointCloud();
     if (this._robotPose) {
-      const { x, y, z, yaw } = this._robotPose;
-      this.setRobotPose(x, y, z, yaw);
+      const { x, y, z, yaw, quaternion } = this._robotPose;
+      this.setRobotPose(x, y, z, yaw, quaternion);
     }
     this.updateFrontiers(this._frontiers);
     this.updateTrajectory(this._trajectory);
@@ -1932,6 +1944,7 @@ class PointCloud3DViewer {
     this._camera = null;
     this._controls = null;
     this._robotMesh = null;
+    this._robotGeometryCenter = null;
     this._frontierGroup = null;
     this._forbiddenZoneGroup = null;
     this._forbiddenZones = [];
@@ -2082,6 +2095,7 @@ window.addEventListener('stream:localization.pose', (e) => {
     Number(pos.y),
     Number(pos.z || 0),
     yawFromValue(d),
+    d.orientation,
   );
 });
 

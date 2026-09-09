@@ -39,6 +39,14 @@ impl WavefrontGoalSelector {
         }
     }
 
+    /// 探索源提供本次位姿对应的机体轮廓。
+    pub fn set_grid_footprint(
+        &mut self,
+        footprint: Option<nuwax_nav_types_messages::GridFootprint>,
+    ) {
+        self.detector.set_grid_footprint(footprint);
+    }
+
     /// 当前 detector 摘要
     #[must_use]
     pub fn diagnostics(&self) -> &crate::diagnostics::WavefrontDiagnostics {
@@ -61,13 +69,26 @@ impl WavefrontGoalSelector {
         now: Timestamp,
         id_source: &mut dyn FrontierGoalIdSource,
     ) -> Result<GoalSelection, WavefrontError> {
+        self.select_goal_with_observations(robot_pose, costmap, None, session, now, id_source)
+    }
+
+    /// 规划副本只供选点；信息增益可显式取原观测，不能把自体清除当新观测。
+    pub fn select_goal_with_observations(
+        &mut self,
+        robot_pose: Point2,
+        costmap: &OccupancyGrid2D,
+        observations: Option<&OccupancyGrid2D>,
+        session: &mut crate::session::ExplorationSession,
+        now: Timestamp,
+        id_source: &mut dyn FrontierGoalIdSource,
+    ) -> Result<GoalSelection, WavefrontError> {
         let cfg = self.detector.config().clone();
         let physical_costmap = costmap;
         let inflated_costmap = inflate_obstacles(costmap, cfg.obstacle_inflation_radius_m);
         let costmap = &inflated_costmap;
 
         // 低增益是局部目标的反馈，不能在检查其它可达前沿之前结束全图探索。
-        let no_gain_reason = session.check_information_gain(costmap, &cfg);
+        let no_gain_reason = session.check_information_gain(observations.unwrap_or(costmap), &cfg);
 
         // 2. detect
         let outcome = self
@@ -264,6 +285,33 @@ mod tests {
             self.0.set(v + 1);
             format!("f-{v}")
         }
+    }
+
+    #[test]
+    fn self_occupancy_view_does_not_count_as_new_sensor_information() {
+        let cfg = WavefrontConfig::default();
+        let mut observations =
+            OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 30, 30, OccupancyCell::Free);
+        observations.set(15, 15, OccupancyCell::Unknown);
+        let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],"z_min_m":-0.2,"z_max_m":0.2}"#).unwrap();
+        let mut planning = observations.clone();
+        geometry
+            .grid_footprint(0.1, 0.0, 30, 30)
+            .unwrap()
+            .clear_current_occupancy(&mut planning, Point2::new(1.55, 1.55));
+        let mut session = crate::session::ExplorationSession::new();
+        let observed_count = session.information_count(&observations, &cfg);
+        let mut selector = WavefrontGoalSelector::new(cfg);
+        let mut ids = crate::test_helpers::TestIdSource::default();
+        let _ = selector.select_goal_with_observations(
+            Point2::new(1.55, 1.55),
+            &planning,
+            Some(&observations),
+            &mut session,
+            Timestamp::default(),
+            &mut ids,
+        );
+        assert_eq!(session.last_information_count, Some(observed_count));
     }
 
     #[test]

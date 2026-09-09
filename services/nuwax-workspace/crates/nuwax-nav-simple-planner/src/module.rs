@@ -97,6 +97,11 @@ pub struct SimplePlannerModule {
 }
 
 impl SimplePlannerModule {
+    /// 普通目标消息之外保留同一请求的最终朝向。
+    pub fn set_goal_yaw(&mut self, yaw: f64) {
+        self.planner.set_goal_yaw(yaw);
+    }
+
     /// Construct with the default planner configuration.
     #[must_use]
     pub fn new() -> Self {

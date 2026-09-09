@@ -30,6 +30,7 @@ pub mod geometry;
 pub mod goal;
 pub mod grid;
 pub mod path;
+pub mod robot_geometry;
 pub mod sensors;
 pub mod visual;
 
@@ -40,5 +41,6 @@ pub use geometry::*;
 pub use goal::*;
 pub use grid::*;
 pub use path::*;
+pub use robot_geometry::*;
 pub use sensors::*;
 pub use visual::*;

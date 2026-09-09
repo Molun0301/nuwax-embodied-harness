@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # 先解析共同配置并统一旧通道别名，再物化启动参数。
 source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+# 模型/手填设置只在启动时解析，两个进程消费同一机体坐标外形。
+NUWAX_ROBOT_GEOMETRY_JSON="$("${NUWAX_PYTHON_BIN:-python3}" "${REPO_ROOT}/scripts/resolve_robot_geometry.py")"
+export NUWAX_ROBOT_GEOMETRY_JSON
 RUNTIME_BINARY="${NUWAX_GEOMETRY_RUNTIME_BINARY:-${REPO_ROOT}/services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime}"
 RELEASE_CHECKER="${REPO_ROOT}/services/geometry/release_manifest.py"
 RELEASE_MANIFEST="${NUWAX_GEOMETRY_RELEASE_MANIFEST:-}"

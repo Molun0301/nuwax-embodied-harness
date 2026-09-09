@@ -10,7 +10,8 @@ use std::cell::RefCell;
 use nuwax_explore_wavefront::selector::WavefrontGoalSelector;
 use nuwax_explore_wavefront::session::ExplorationSession;
 use nuwax_explore_wavefront::{
-    FrontierGoalIdSeed, FrontierGoalIdSource, GoalSelection, StopReason, WavefrontConfig, WavefrontError,
+    FrontierGoalIdSeed, FrontierGoalIdSource, GoalSelection, StopReason, WavefrontConfig,
+    WavefrontError,
 };
 use nuwax_nav_types_messages::geometry::Point2;
 use nuwax_nav_types_messages::grid::OccupancyGrid2D;
@@ -54,6 +55,7 @@ pub struct WavefrontGoalSourceAdapter {
     max_navigation_retries: u32,
     blacklist_radius_m: f64,
     max_consecutive_failures: u32,
+    robot_geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
 }
 
 impl WavefrontGoalSourceAdapter {
@@ -83,6 +85,7 @@ impl WavefrontGoalSourceAdapter {
             max_navigation_retries: 1,
             blacklist_radius_m,
             max_consecutive_failures,
+            robot_geometry: None,
         }
     }
 
@@ -90,6 +93,11 @@ impl WavefrontGoalSourceAdapter {
     #[must_use]
     pub fn with_default_id(name: impl Into<Cow<'static, str>>, config: WavefrontConfig) -> Self {
         Self::new(name, config, Box::new(CountingIdSource::default()))
+    }
+
+    /// 采用模型/用户设置解析出的统一机体外形。
+    pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
+        self.robot_geometry = Some(geometry);
     }
 
     /// 替换 id source(便于上层注入 deterministic generator)
@@ -179,18 +187,31 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             ));
         }
         // 优先用 snapshot 中的 costmap,否则用缓存
-        let costmap_opt: Option<OccupancyGrid2D> = state
-            .global_costmap
-            .cloned()
-            .or_else(|| self.cached_costmap.borrow().clone());
-        let Some(mut costmap) = costmap_opt else {
+        let cached_costmap = self.cached_costmap.borrow();
+        let Some(observations) = state.global_costmap.or(cached_costmap.as_ref()) else {
             self.last_error = Some("missing costmap".to_string());
             return Ok(ExplorationPoll::SourceUnavailable(
                 "missing costmap".to_string(),
             ));
         };
+        let mut costmap = observations.clone();
 
         let robot_pose = state.robot_position();
+        if let Some(geometry) = self.robot_geometry.as_ref() {
+            let footprint = geometry
+                .grid_footprint(
+                    costmap.resolution,
+                    state.robot_pose.pose.orientation.yaw(),
+                    costmap.width,
+                    costmap.height,
+                )
+                .map_err(ExploreError::SourceError)?;
+            // 当前机体已经占据这一区域，范围约束在随后施加，不写回规范地图。
+            footprint.clear_current_occupancy(&mut costmap, robot_pose);
+            self.selector.set_grid_footprint(Some(footprint));
+        } else {
+            self.selector.set_grid_footprint(None);
+        }
         if let Some(boundary) = &self.boundary {
             if !boundary.contains(Point2::new(robot_pose.x, robot_pose.y)) {
                 self.last_error = Some("robot pose outside exploration boundary".to_owned());
@@ -216,12 +237,13 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             }
         }
         let now = state.now;
-        match self.selector.select_goal_at(
+        match self.selector.select_goal_with_observations(
             Point2 {
                 x: robot_pose.x,
                 y: robot_pose.y,
             },
             &costmap,
+            Some(observations),
             &mut self.session,
             now,
             &mut *self.id_source,
@@ -389,6 +411,41 @@ mod tests {
             }
         }
         grid
+    }
+
+    #[test]
+    fn current_body_observation_does_not_block_frontier_and_does_not_change_source_map() {
+        use nuwax_nav_types_messages::RobotGeometry;
+        let geometry = RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.15],[0.3,-0.15],[0.3,0.15],[-0.3,0.15]],"z_min_m":-0.3,"z_max_m":0.1}"#).unwrap();
+        for self_return in [
+            OccupancyCell::Unknown,
+            OccupancyCell::Occupied,
+            OccupancyCell::Cost(83),
+        ] {
+            let mut grid = frontier_grid();
+            let position = Point2::new(2.25, 2.25);
+            let footprint = geometry
+                .grid_footprint(grid.resolution, 0.0, grid.width, grid.height)
+                .unwrap();
+            for &(dx, dy) in &footprint.offsets {
+                grid.set((4 + dx) as u32, (4 + dy) as u32, self_return);
+            }
+            let original = grid.clone();
+            let mut adapter = WavefrontGoalSourceAdapter::with_default_id(
+                "wavefront",
+                WavefrontConfig::default(),
+            );
+            adapter.set_robot_geometry(geometry.clone());
+            adapter.begin().unwrap();
+            let mut state = sample_state(Some(&grid), Timestamp::default());
+            state.robot_pose.pose.position.x = position.x;
+            state.robot_pose.pose.position.y = position.y;
+            assert!(
+                matches!(adapter.poll_goal(&state).unwrap(), ExplorationPoll::Goal(_)),
+                "当前机体的缺测或回波不得困住起点"
+            );
+            assert_eq!(grid, original, "自体处理只能作用于规划视图");
+        }
     }
 
     #[test]

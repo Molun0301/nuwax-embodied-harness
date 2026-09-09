@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from core.config_values import config_value, raw_value, read_env_values, record_value, user_config_values
+from core.robot_geometry import RobotGeometryConfig
 from core.logging_utils import (
     CorrelationContextFilter,
     DeduplicatingLogFilter,
@@ -534,6 +535,7 @@ class RobotDriverConfig:
     """当前激活机器人入口配置。"""
 
     active_robot: str = ""
+    geometry: RobotGeometryConfig = field(default_factory=RobotGeometryConfig)
 
 
 @dataclass
@@ -1073,6 +1075,19 @@ def load_config() -> NuwaxRobotBridgeConfig:
     )
     robot = RobotDriverConfig(
         active_robot=_cfg_str("NUWAX_ACTIVE_ROBOT", "").strip().lower(),
+        geometry=RobotGeometryConfig.from_values({
+            "NUWAX_ROBOT_MODEL_PATH": _cfg_str("NUWAX_ROBOT_MODEL_PATH", ""),
+            "NUWAX_ROBOT_MODEL_BASE_LINK": _cfg_str("NUWAX_ROBOT_MODEL_BASE_LINK", ""),
+            "NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON": _cfg_str("NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON", ""),
+            "NUWAX_ROBOT_LENGTH_M": _cfg_str("NUWAX_ROBOT_LENGTH_M", ""),
+            "NUWAX_ROBOT_WIDTH_M": _cfg_str("NUWAX_ROBOT_WIDTH_M", ""),
+            "NUWAX_ROBOT_HEIGHT_M": _cfg_str("NUWAX_ROBOT_HEIGHT_M", ""),
+            "NUWAX_ROBOT_CENTER_X_M": _cfg_str("NUWAX_ROBOT_CENTER_X_M", ""),
+            "NUWAX_ROBOT_CENTER_Y_M": _cfg_str("NUWAX_ROBOT_CENTER_Y_M", ""),
+            "NUWAX_ROBOT_CENTER_Z_M": _cfg_str("NUWAX_ROBOT_CENTER_Z_M", ""),
+            # 只继承确实配置的旧宽度，不能把三维默认值写成通用外形的手填覆盖。
+            "NUWAX_NAV_ROBOT_WIDTH_M": _raw_value("NUWAX_NAV_ROBOT_WIDTH_M", ""),
+        }),
     )
 
     return NuwaxRobotBridgeConfig(

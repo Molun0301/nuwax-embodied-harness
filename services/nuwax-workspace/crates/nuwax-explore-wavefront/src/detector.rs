@@ -124,6 +124,7 @@ pub struct WavefrontDetector {
     config: WavefrontConfig,
     classification: ClassificationGrid,
     diagnostics: WavefrontDiagnostics,
+    grid_footprint: Option<nuwax_nav_types_messages::GridFootprint>,
 }
 
 impl WavefrontDetector {
@@ -134,7 +135,16 @@ impl WavefrontDetector {
             config,
             classification: ClassificationGrid::new(0, 0),
             diagnostics: WavefrontDiagnostics::default(),
+            grid_footprint: None,
         }
+    }
+
+    /// 设置本次位姿对应的机体轮廓；输入地图已经由拥有方区分自体区域。
+    pub fn set_grid_footprint(
+        &mut self,
+        footprint: Option<nuwax_nav_types_messages::GridFootprint>,
+    ) {
+        self.grid_footprint = footprint;
     }
 
     /// 当前配置(只读)
@@ -178,17 +188,36 @@ impl WavefrontDetector {
         self.diagnostics.last_candidates.clear();
         // 非自由起点没有已证实的通行路径，不能任意投影到墙另一侧。
         let start_cell = GridPoint::new(start_x, start_y);
-        match start_footprint_state(costmap, start_cell, self.config.obstacle_inflation_radius_m) {
-            StartFootprintState::Blocked => return Ok(DetectionOutcome::NoReachableFreeSpace),
-            StartFootprintState::Unobserved => {
-                return Err(WavefrontError::RobotFootprintUnobserved(
-                    robot_pose.x,
-                    robot_pose.y,
-                ));
+        let footprint_map = if let Some(footprint) = self.grid_footprint.as_ref() {
+            let mut view = costmap.clone();
+            for y in 0..costmap.height {
+                for x in 0..costmap.width {
+                    if !footprint.is_clear(costmap, x, y) {
+                        view.set(x, y, OccupancyCell::Inflated);
+                    }
+                }
             }
-            StartFootprintState::Traversable => {}
-        }
-        let footprint_map = footprint_safe_map(costmap, self.config.obstacle_inflation_radius_m);
+            if footprint.is_clear_at(costmap, robot_pose) {
+                view.set(start_x, start_y, OccupancyCell::Free);
+            }
+            view
+        } else {
+            match start_footprint_state(
+                costmap,
+                start_cell,
+                self.config.obstacle_inflation_radius_m,
+            ) {
+                StartFootprintState::Blocked => return Ok(DetectionOutcome::NoReachableFreeSpace),
+                StartFootprintState::Unobserved => {
+                    return Err(WavefrontError::RobotFootprintUnobserved(
+                        robot_pose.x,
+                        robot_pose.y,
+                    ));
+                }
+                StartFootprintState::Traversable => {}
+            }
+            footprint_safe_map(costmap, self.config.obstacle_inflation_radius_m)
+        };
         if !cell_at(&footprint_map, start_x, start_y).is_known_traversable() {
             return Ok(DetectionOutcome::NoReachableFreeSpace);
         }
@@ -276,7 +305,16 @@ impl WavefrontDetector {
                     start_cell,
                     costmap,
                     &safe_reachable,
-                    self.config.obstacle_inflation_radius_m,
+                    self.grid_footprint.as_ref().map_or(
+                        self.config.obstacle_inflation_radius_m,
+                        |footprint| {
+                            footprint
+                                .offsets
+                                .iter()
+                                .map(|&(x, y)| x.abs().max(y.abs()) as f64 * costmap.resolution)
+                                .fold(0.0, f64::max)
+                        },
+                    ),
                 ) else {
                     continue;
                 };

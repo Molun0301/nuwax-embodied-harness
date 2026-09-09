@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use crate::inflation::{blocked_at_inflation, inflate_obstacles};
 use crate::NavError;
 use nuwax_nav_types_messages::grid::OCCUPANCY_OBSTACLE_THRESHOLD;
-use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D, Point2};
+use nuwax_nav_types_messages::{
+    GridFootprint, OccupancyCell, OccupancyGrid2D, Point2, RobotGeometry,
+};
 
 /// Costmap：稀疏 + 历史最大高度模型。
 #[derive(Debug, Clone)]
@@ -22,6 +24,9 @@ pub struct Costmap {
     occupancy: Option<OccupancyGrid2D>,
     /// 有界地图的物理轮廓下限，不能通过卡住降级或后续地图更新减小。
     occupancy_inflation_floor: f64,
+    /// 本次规划使用的真实机体轮廓，仅存在于当前位置规划副本。
+    robot_footprint: Option<GridFootprint>,
+    current_robot_position: Option<Point2>,
 }
 
 impl Costmap {
@@ -54,6 +59,8 @@ impl Costmap {
             blocked_dirty: true,
             occupancy: None,
             occupancy_inflation_floor: 0.0,
+            robot_footprint: None,
+            current_robot_position: None,
         })
     }
 
@@ -74,6 +81,8 @@ impl Costmap {
             blocked_dirty: true,
             occupancy: None,
             occupancy_inflation_floor: 0.0,
+            robot_footprint: None,
+            current_robot_position: None,
         }
     }
 
@@ -108,6 +117,36 @@ impl Costmap {
         map.occupancy = Some(grid);
         map.occupancy_inflation_floor = inflation_radius;
         Ok(map)
+    }
+
+    /// 从原地图生成当前位置的规划视图，自体清除不会积累或写回输入。
+    pub fn planning_view(
+        &self,
+        position: Point2,
+        yaw: f64,
+        geometry: &RobotGeometry,
+    ) -> Result<Self, NavError> {
+        let mut view = self.clone();
+        if let Some(grid) = view.occupancy.as_mut() {
+            let footprint = geometry
+                .grid_footprint(grid.resolution, yaw, grid.width, grid.height)
+                .map_err(|reason| NavError::InvalidInput {
+                    field: "robot_geometry",
+                    reason,
+                })?;
+            footprint.clear_current_occupancy(grid, position);
+            // 高度表是同一占据图的派生表示，不能残留自体障碍。
+            view.heights.retain(|&(x, y), _| {
+                u32::try_from(x)
+                    .ok()
+                    .zip(u32::try_from(y).ok())
+                    .and_then(|(x, y)| grid.get(x, y))
+                    .is_none_or(|value| !value.is_known_traversable())
+            });
+            view.robot_footprint = Some(footprint);
+            view.current_robot_position = Some(position);
+        }
+        Ok(view)
     }
 
     /// 已知自由格才能成为有界地图上的通行点，未知和图外不能被端点解堵放行。
@@ -150,6 +189,18 @@ impl Costmap {
         let Some(grid) = self.occupancy.as_ref() else {
             return true;
         };
+        if let Some(footprint) = self.robot_footprint.as_ref() {
+            if let Some(position) = self
+                .current_robot_position
+                .filter(|position| self.world_to_cell(position.x, position.y) == (ix, iy))
+            {
+                return footprint.is_clear_at(grid, position);
+            }
+            return u32::try_from(ix)
+                .ok()
+                .zip(u32::try_from(iy).ok())
+                .is_some_and(|(x, y)| footprint.is_clear(grid, x, y));
+        }
         let radius = (self.effective_radius(radius) / self.cell_size).ceil() as i64;
         if radius < 0
             || radius >= i64::from(grid.width)
@@ -189,6 +240,60 @@ impl Costmap {
     ) -> bool {
         self.has_footprint_clearance(start.0, start.1, inflation_radius)
             && self.has_footprint_clearance(goal.0, goal.1, inflation_radius)
+    }
+
+    /// 真实起终点共享规划副本，保留其格内位置。
+    pub(crate) fn permits_positions(&self, start: Point2, goal: Point2, radius: f64) -> bool {
+        if let (Some(grid), Some(footprint)) =
+            (self.occupancy.as_ref(), self.robot_footprint.as_ref())
+        {
+            return footprint.is_clear_at(grid, start) && footprint.is_clear_at(grid, goal);
+        }
+        self.permits_endpoints(
+            self.world_to_cell(start.x, start.y),
+            self.world_to_cell(goal.x, goal.y),
+            radius,
+        )
+    }
+
+    /// 发布前按真实路径方向检查模型扫掠，防止全局与局部使用不同朝向。
+    pub(crate) fn path_has_observed_clearance(
+        &self,
+        path: &[Point2],
+        start_yaw: f64,
+        final_yaw: Option<f64>,
+    ) -> bool {
+        let (Some(grid), Some(footprint)) =
+            (self.occupancy.as_ref(), self.robot_footprint.as_ref())
+        else {
+            return true;
+        };
+        let mut yaw = start_yaw;
+        for segment in path.windows(2) {
+            let start = segment[0];
+            let end = segment[1];
+            let heading = if start.distance(end) > 1e-9 {
+                (end.y - start.y).atan2(end.x - start.x)
+            } else {
+                yaw
+            };
+            if !footprint.visit_motion(grid.origin, (start, yaw), (end, heading), |x, y| {
+                grid.get(x, y).is_some_and(|value| {
+                    matches!(value, OccupancyCell::Unknown) || value.is_known_traversable()
+                })
+            }) {
+                return false;
+            }
+            yaw = heading;
+        }
+        if let (Some(&end), Some(target)) = (path.last(), final_yaw) {
+            return footprint.visit_motion(grid.origin, (end, yaw), (end, target), |x, y| {
+                grid.get(x, y).is_some_and(|value| {
+                    matches!(value, OccupancyCell::Unknown) || value.is_known_traversable()
+                })
+            });
+        }
+        true
     }
 
     fn origin(&self) -> Point2 {
@@ -261,6 +366,8 @@ impl Costmap {
         self.blocked_dirty = false;
         self.occupancy = None;
         self.occupancy_inflation_floor = 0.0;
+        self.robot_footprint = None;
+        self.current_robot_position = None;
     }
 
     /// 是否被阻塞（按当前默认 inflation_radius）。

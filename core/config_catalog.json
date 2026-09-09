@@ -1878,5 +1878,122 @@
     ],
     "apply_scope": "重启导航栈与几何运行时后生效",
     "description": "MLS连续坡道的坡度上限；楼梯还要独立核对离散高度与踏面。"
+  },
+  "NUWAX_ROBOT_MODEL_PATH": {
+    "zh_name": "机器人外形模型路径",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "本地URDF（统一机器人描述格式）模型路径，相对路径按项目根解析。碰撞几何优先，整个模型没有碰撞几何时才使用显示几何并标明来源；完整手填长宽高时不依赖模型。留空使用驱动自带默认模型或兼容默认。"
+  },
+  "NUWAX_ROBOT_MODEL_BASE_LINK": {
+    "zh_name": "模型机体基准连杆",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "模型外形转换到此连杆坐标。留空依次选择base_link、base、trunk或模型根连杆；偏移、轮廓和高度均相对此基准，不是世界坐标。"
+  },
+  "NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON": {
+    "zh_name": "模型静态参考关节位置",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "填写关节名到数字的JSON（结构化文本格式）对象；转动关节用弧度，移动关节用米。未填写使用模型零位，仅表示静态参考外包，不是实时腿部姿态；显式值超出关节限位会报错。"
+  },
+  "NUWAX_ROBOT_LENGTH_M": {
+    "zh_name": "机器人外包长度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体X轴的外包长度，必须大于0；手填优先，留空从模型或现有默认取得。完整手填长宽高时直接采用盒外包，不读取模型。"
+  },
+  "NUWAX_ROBOT_WIDTH_M": {
+    "zh_name": "机器人外包宽度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体Y轴的外包宽度，必须大于0；手填优先，留空从模型或现有默认取得。无显式模型且本项为空时兼容确实配置的旧导航宽度，不反向改写旧设置。"
+  },
+  "NUWAX_ROBOT_HEIGHT_M": {
+    "zh_name": "机器人外包高度（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "沿机体Z轴的外包总高度，必须大于0；手填优先，留空从模型或现有默认取得。本项不是三维导航支撑面净空，也不代替机体到支撑面的标定距离。"
+  },
+  "NUWAX_ROBOT_CENTER_X_M": {
+    "zh_name": "外包中心X偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的X坐标；留空保留模型偏移，完整手填长宽高时默认为0。"
+  },
+  "NUWAX_ROBOT_CENTER_Y_M": {
+    "zh_name": "外包中心Y偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的Y坐标；留空保留模型偏移，完整手填长宽高时默认为0。"
+  },
+  "NUWAX_ROBOT_CENTER_Z_M": {
+    "zh_name": "外包中心Z偏移（米）",
+    "type": "str",
+    "default": "",
+    "section_id": "robot",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "core/robot_geometry.py"
+    ],
+    "apply_scope": "重启网关、几何运行时及导航后端后生效",
+    "description": "外包中心相对机体基准的Z坐标；留空保留模型偏移，完整手填长宽高时默认为0。高度上下界由中心加减半高确定，不从地面高度猜测。"
   }
 }

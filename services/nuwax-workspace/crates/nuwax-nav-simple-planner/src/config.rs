@@ -25,6 +25,8 @@ pub struct SimplePlannerConfig {
     pub obstacle_height_threshold: f64,
     /// 默认膨胀半径（米）
     pub inflation_radius: f64,
+    /// 统一模型/设置解析的机体外形；无配置时保留独立算法调用的旧参数。
+    pub robot_geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
 
     /// lookahead 距离：沿 A* 路径往前多少米发布 waypoint
     pub lookahead_distance: f64,
@@ -61,6 +63,7 @@ impl Default for SimplePlannerConfig {
             cell_size: 0.3,
             obstacle_height_threshold: 0.15,
             inflation_radius: 0.2,
+            robot_geometry: None,
             lookahead_distance: 1.0,
             replan_rate: 5.0,
             waypoint_rate: 30.0,

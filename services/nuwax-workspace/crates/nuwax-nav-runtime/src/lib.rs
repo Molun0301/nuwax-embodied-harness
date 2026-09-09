@@ -823,7 +823,21 @@ fn production_local_backend(
     kind: LocalExecutionBackendKind,
 ) -> Result<BasicInProcessLocalBackend, RuntimeError> {
     match kind {
-        LocalExecutionBackendKind::BasicInProcess => Ok(BasicInProcessLocalBackend::production()),
+        LocalExecutionBackendKind::BasicInProcess => {
+            let mut backend = BasicInProcessLocalBackend::production();
+            if let Some(value) = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+            {
+                let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
+                    .map_err(|reason| RuntimeError::InvalidInput {
+                    field: "robot_geometry",
+                    reason,
+                })?;
+                backend.0.set_robot_geometry(geometry);
+            }
+            Ok(backend)
+        }
         LocalExecutionBackendKind::SurfaceInProcess => Err(RuntimeError::InvalidInput {
             field: "body_to_support_z_m",
             reason: "三维后端必须通过显式配置构造，缺少机体到支撑面的标定".into(),

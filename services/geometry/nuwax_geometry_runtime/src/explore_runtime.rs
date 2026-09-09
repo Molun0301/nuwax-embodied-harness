@@ -1561,9 +1561,20 @@ fn build_controller(
     policy: ExplorationArbitrationPolicy,
     config: &ExploreStartConfig,
 ) -> ExplorationController {
+    build_controller_with_geometry(policy, config, None)
+}
+
+fn build_controller_with_geometry(
+    policy: ExplorationArbitrationPolicy,
+    config: &ExploreStartConfig,
+    geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
+) -> ExplorationController {
     let mut controller = ExplorationController::new(policy);
     let mut adapter =
         WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+    if let Some(geometry) = geometry {
+        adapter.set_robot_geometry(geometry);
+    }
     adapter.configure_constraints(
         config.boundary.clone(),
         config.max_navigation_retries,
@@ -1579,7 +1590,12 @@ fn build_profile_controller(
     surface: Option<&SurfaceExplorationMode>,
 ) -> Result<ExplorationController, String> {
     let Some(surface) = surface else {
-        return Ok(build_controller(policy, config));
+        let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
+            .transpose()?;
+        return Ok(build_controller_with_geometry(policy, config, geometry));
     };
     if !surface.accepting {
         return Err("surface exploration input owner is stopped".into());
@@ -3201,9 +3217,7 @@ impl ExploreRuntimeHandle {
                 ),
             };
             drop(guard);
-            return self
-                .finish_session(None, reason, message)
-                .await;
+            return self.finish_session(None, reason, message).await;
         }
 
         if guard.active_child.is_some() {

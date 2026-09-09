@@ -4189,6 +4189,7 @@ fn apply_simple_planner_goal(
     ) {
         return module_input_error("simple_planner.goal_pose", error);
     }
+    module.set_goal_yaw(pose.pose.orientation.yaw());
     Ok(OwnerInput::Accepted((envelope, boundary)))
 }
 
@@ -4646,7 +4647,13 @@ async fn run_simple_planner(
     let mut goal_pose =
         typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let mut module = SimplePlannerModule::new();
+    let robot_geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
+        .transpose().map_err(NavStackError::InvalidConfig)?;
+    let mut module = SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
+        robot_geometry, ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
+    }).map_err(|error| module_error("simple_planner.robot_geometry", error))?;
     let planner_runtime_generation = saturating_i64(runtime_generation());
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut latest_occupancy_body: Option<Vec<u8>> = None;
@@ -4996,7 +5003,13 @@ async fn run_astar_planner(
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
     let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let config = nuwax_nav_astar::GlobalPlannerConfig::default();
+    let robot_geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
+        .transpose().map_err(NavStackError::InvalidConfig)?;
+    let config = nuwax_nav_astar::GlobalPlannerConfig {
+        robot_geometry, ..nuwax_nav_astar::GlobalPlannerConfig::default()
+    };
     let mut module = ReplanningAStarPlannerModule::new(config);
     NavigationInterface::start(&mut module)
         .map_err(|error| module_error("astar_planner", error))?;

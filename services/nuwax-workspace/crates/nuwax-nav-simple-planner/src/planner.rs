@@ -48,7 +48,7 @@ pub fn plan_on_costmap(
     let start_cell = costmap.world_to_cell(start.x, start.y);
     let goal_cell = costmap.world_to_cell(goal.x, goal.y);
 
-    if !costmap.permits_endpoints(start_cell, goal_cell, effective_radius) {
+    if !costmap.permits_positions(start, goal, effective_radius) {
         return Ok(None);
     }
 
@@ -97,11 +97,13 @@ pub struct SimplePlanner {
     robot_x: f64,
     robot_y: f64,
     robot_z: f64,
+    robot_yaw: f64,
     has_odom: bool,
     /// 目标坐标
     goal_x: Option<f64>,
     goal_y: Option<f64>,
     goal_z: f64,
+    goal_yaw: Option<f64>,
     /// Stuck 状态
     stuck: StuckState,
     /// 当前 effective inflation（stuck escalation 可缩小）
@@ -136,10 +138,12 @@ impl SimplePlanner {
             robot_x: 0.0,
             robot_y: 0.0,
             robot_z: 0.0,
+            robot_yaw: 0.0,
             has_odom: false,
             goal_x: None,
             goal_y: None,
             goal_z: 0.0,
+            goal_yaw: None,
             cached_path: None,
             last_plan_time: 0.0,
             current_wp: None,
@@ -209,7 +213,13 @@ impl SimplePlanner {
         self.robot_x = pose.position.x;
         self.robot_y = pose.position.y;
         self.robot_z = pose.position.z;
+        self.robot_yaw = pose.orientation.yaw();
         self.has_odom = true;
+    }
+
+    /// 保留实际目标朝向，供发布路径前的模型扫掠核对。
+    pub fn set_goal_yaw(&mut self, yaw: f64) {
+        self.goal_yaw = Some(yaw);
     }
 
     /// 当前是否有 odom。
@@ -227,6 +237,7 @@ impl SimplePlanner {
         self.goal_x = Some(goal.x);
         self.goal_y = Some(goal.y);
         self.goal_z = goal.z;
+        self.goal_yaw = None;
         self.costmap
             .set_inflation_radius(self.config.inflation_radius);
         self.effective_inflation = self.costmap.inflation_radius();
@@ -289,11 +300,28 @@ impl SimplePlanner {
         let ry = self.robot_y;
         let gx = self.goal_x.expect("checked above");
         let gy = self.goal_y.expect("checked above");
+        let planning_view = if let Some(geometry) = self.config.robot_geometry.as_ref() {
+            match self
+                .costmap
+                .planning_view(Point2::new(rx, ry), self.robot_yaw, geometry)
+            {
+                Ok(view) => Some(view),
+                Err(error) => {
+                    tracing::warn!(%error, "机器人规划外形不可用");
+                    self.cached_path = None;
+                    self.current_wp = None;
+                    return (Some(None), true, false);
+                }
+            }
+        } else {
+            None
+        };
         let goal_dist = ((gx - rx).powi(2) + (gy - ry).powi(2)).sqrt();
         if goal_dist <= self.config.goal_reached_threshold {
-            if !self.costmap.permits_endpoints(
-                self.costmap.world_to_cell(rx, ry),
-                self.costmap.world_to_cell(gx, gy),
+            let costmap = planning_view.as_ref().unwrap_or(&self.costmap);
+            if !costmap.permits_positions(
+                Point2::new(rx, ry),
+                Point2::new(gx, gy),
                 self.effective_inflation,
             ) {
                 self.cached_path = None;
@@ -339,7 +367,7 @@ impl SimplePlanner {
         }
 
         let path = plan_on_costmap(
-            &self.costmap,
+            planning_view.as_ref().unwrap_or(&self.costmap),
             Point2 { x: rx, y: ry },
             Point2 { x: gx, y: gy },
             Some(self.config.max_expansions),
@@ -351,6 +379,14 @@ impl SimplePlanner {
         self.current_wp = None;
         match path {
             Ok(Some(p)) => {
+                if !planning_view
+                    .as_ref()
+                    .unwrap_or(&self.costmap)
+                    .path_has_observed_clearance(&p, self.robot_yaw, self.goal_yaw)
+                {
+                    tracing::warn!("实际路径朝向会扫过已观测障碍，拒绝发布该路线");
+                    return (Some(None), true, escalated);
+                }
                 self.cached_path = Some(p.clone());
                 (Some(Some(p)), true, escalated)
             }
@@ -407,7 +443,7 @@ impl SimplePlanner {
                     y: self.robot_y,
                     z: self.robot_z,
                 },
-                orientation: Quaternion::IDENTITY,
+                orientation: Quaternion::from_yaw(self.robot_yaw),
             },
         })
     }
@@ -416,6 +452,45 @@ impl SimplePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_view_starts_from_self_returns_but_keeps_surrounding_obstacles() {
+        use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D, RobotGeometry};
+        let geometry = RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]],"z_min_m":-0.3,"z_max_m":0.1}"#).unwrap();
+        let start = Point2::new(0.025, 0.025);
+        let goal = Point2::new(1.025, 0.025);
+        for value in [OccupancyCell::Unknown, OccupancyCell::Occupied] {
+            let mut grid =
+                OccupancyGrid2D::filled(Point2::new(-2.0, -2.0), 0.05, 80, 80, OccupancyCell::Free);
+            let footprint = geometry.grid_footprint(0.05, 0.0, 80, 80).unwrap();
+            for &(dx, dy) in &footprint.offsets {
+                grid.set((40 + dx) as u32, (40 + dy) as u32, value);
+            }
+            let map = Costmap::from_occupancy(grid.clone(), 0.2).unwrap();
+            let view = map.planning_view(start, 0.0, &geometry).unwrap();
+            assert!(plan_on_costmap(&view, start, goal, None, None)
+                .unwrap()
+                .is_some());
+            assert!(!map.is_known_free(40, 40));
+            let moved = map
+                .planning_view(Point2::new(0.825, 0.025), 0.0, &geometry)
+                .unwrap();
+            assert!(
+                !moved.is_known_free(40, 40),
+                "当前位置移动后不能继续清除旧位置"
+            );
+            for y in 0..80 {
+                grid.set(52, y, OccupancyCell::Occupied);
+            }
+            let wall = Costmap::from_occupancy(grid, 0.2)
+                .unwrap()
+                .planning_view(start, 0.0, &geometry)
+                .unwrap();
+            assert!(plan_on_costmap(&wall, start, goal, None, None)
+                .unwrap()
+                .is_none());
+        }
+    }
 
     #[test]
     fn bounded_planner_keeps_footprint_clear_of_unknown_corners() {

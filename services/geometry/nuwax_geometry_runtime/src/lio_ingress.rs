@@ -163,6 +163,8 @@ pub(crate) struct RegistrationBinding {
     pub(crate) envelope_sha256: [u8; 32],
     pub(crate) frozen_odom_from_body: Isometry3<f64>,
     pub(crate) base_anchor_map_from_odom: Isometry3<f64>,
+    pub(crate) registration_map_from_odom: Isometry3<f64>,
+    pub(crate) registration_correction_revision: u64,
     /// 同一配对扫描的雷达原点；缺少原生标定的旧输入不进行动态清理。
     pub(crate) sensor_origin_map: Option<[f64; 3]>,
     /// Epoch observed when this registered cloud becomes an admitted
@@ -1241,9 +1243,11 @@ impl CommonLioIngress {
             envelope_sha256,
             frozen_odom_from_body,
             base_anchor_map_from_odom,
+            registration_map_from_odom: base_anchor.effective_isometry(),
+            registration_correction_revision: base_anchor.correction_revision,
             sensor_origin_map: self.sensor_origin_body.map(|origin| {
-                let point =
-                    (base_anchor_map_from_odom * frozen_odom_from_body).transform_point(&origin);
+                let point = (base_anchor.effective_isometry() * frozen_odom_from_body)
+                    .transform_point(&origin);
                 [point.x, point.y, point.z]
             }),
             frame_capture_relocalization_epoch: registration_mode_token
@@ -3264,10 +3268,12 @@ impl LioIngressSink for LioIngressRoutingGate {
         &self,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<(), String> {
-        if *shutdown_rx.borrow() || matches!(
-            *self.state.lock(),
-            LioRoutingState::Poisoned | LioRoutingState::Closed
-        ) {
+        if *shutdown_rx.borrow()
+            || matches!(
+                *self.state.lock(),
+                LioRoutingState::Poisoned | LioRoutingState::Closed
+            )
+        {
             return Err("LIO routing gate closed before startup readiness".to_owned());
         }
         // 生产输入来自稍后启动的 gRPC 服务；此处只确认订阅可收数据。
@@ -3418,6 +3424,27 @@ async fn accept_public_cloud_with_correction(
     )
     .await?;
     if !committed {
+        let stale = runtime
+            .handle
+            .mapping_adapter
+            .as_ref()
+            .is_some_and(|mapping| {
+                mapping
+                    .lock()
+                    .map_odom_transform_snapshot()
+                    .is_some_and(|transform| {
+                        transform.correction_revision
+                            != accepted.binding.registration_correction_revision
+                    })
+            });
+        if stale {
+            tracing::debug!(
+                event = "lio.cloud.retired_correction",
+                source_sequence = accepted.binding.cloud_source_sequence,
+                "丢弃旧校正版本下注册的迟到扫描"
+            );
+            return Ok(());
+        }
         return Err("registered LIO cloud handoff committed no map revision".to_owned());
     }
     Ok(())
@@ -5903,6 +5930,8 @@ mod tests {
             map_frame_generation: 13,
             envelope_sha256: [0x5a; 32],
             frozen_odom_from_body: Isometry3::identity(),
+            registration_map_from_odom: Isometry3::identity(),
+            registration_correction_revision: 0,
             base_anchor_map_from_odom: Isometry3::identity(),
             frame_capture_relocalization_epoch: None,
         };

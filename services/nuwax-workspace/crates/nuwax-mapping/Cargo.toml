@@ -8,6 +8,7 @@ authors.workspace = true
 description = "nuwax 建图板块"
 
 [dependencies]
+nuwax-gtsam = { path = "../nuwax-gtsam" }
 nuwax-types = { path = "../nuwax-types" }
 nuwax-numeric = { path = "../nuwax-numeric" }
 nuwax-core = { path = "../nuwax-core" }

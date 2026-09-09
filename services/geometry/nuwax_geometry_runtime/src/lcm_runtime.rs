@@ -2902,8 +2902,13 @@ async fn geometry_runtime_blocking_revision_prepare_settles_before_resource_clea
     let pending = first_blocked_production_shutdown(&mut fixture, "revision-prepare").await;
     fixture.topology_control().release_revision_prepare();
     wait_for_topology_condition("occupancy preparation actually returned", || {
-        fixture.topology_control().events().iter().any(|event| event == "revision-prepare-finished")
-    }).await;
+        fixture
+            .topology_control()
+            .events()
+            .iter()
+            .any(|event| event == "revision-prepare-finished")
+    })
+    .await;
     fixture.assert_downstream_held_before_task_settlement();
     finish_clean_production_shutdown(pending, &fixture, "revision-prepare").await;
 }
@@ -3814,14 +3819,7 @@ fn canonical_mapping_observation(
     odom_pose: &PoseState,
     base_frame: &str,
 ) -> Result<CanonicalMappingObservation, String> {
-    let map_from_odom = nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(
-            transform.translation[0],
-            transform.translation[1],
-            transform.translation[2],
-        ),
-        nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, transform.yaw_radians),
-    );
+    let map_from_odom = transform.effective_isometry();
     canonical_mapping_observation_from_isometry(
         &transform.map_frame_id,
         &transform.odom_frame_id,
@@ -4044,6 +4042,15 @@ pub(crate) struct CanonicalCorrectionSnapshot {
     pub(crate) effective_map_from_odom: nalgebra::Isometry3<f64>,
 }
 
+#[derive(Clone)]
+struct PgoApplyContext {
+    mapping: Arc<parking_lot::Mutex<MappingAdapter>>,
+    cloud_writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
+    map_revision_tx: broadcast::Sender<MapRevisionEvent>,
+    cloud_map_tx: broadcast::Sender<CloudMapNotification>,
+    navigation: Option<NavigationMap3DPublishContext>,
+}
+
 pub(crate) struct GeometryCanonicalCorrectionApplier {
     expected_identity: crate::correction_coordinator::CorrectionOwnerRuntimeIdentity,
     map_frame_id: String,
@@ -4053,6 +4060,7 @@ pub(crate) struct GeometryCanonicalCorrectionApplier {
     transport: LcmTransport,
     tf_binding: (LcmTopic, LcmMessageType),
     current: Arc<parking_lot::RwLock<Option<CanonicalCorrectionSnapshot>>>,
+    pgo: std::sync::OnceLock<PgoApplyContext>,
 }
 
 impl GeometryCanonicalCorrectionApplier {
@@ -4090,7 +4098,27 @@ impl GeometryCanonicalCorrectionApplier {
             transport,
             tf_binding,
             current: Arc::new(parking_lot::RwLock::new(None)),
+            pgo: std::sync::OnceLock::new(),
         })
+    }
+
+    pub(crate) fn bind_mapping(&self, handle: &GeometryRuntimeHandle) -> Result<(), String> {
+        let mapping = handle
+            .mapping_adapter
+            .as_ref()
+            .ok_or("PGO缺少地图拥有方")?
+            .clone();
+        self.pgo
+            .set(PgoApplyContext {
+                mapping: mapping.clone(),
+                cloud_writer: handle.cloud_map_writer.clone(),
+                map_revision_tx: handle.map_revision_tx.clone(),
+                cloud_map_tx: handle.cloud_map_tx.clone(),
+                navigation: handle.navigation_map_3d_publish_context(),
+            })
+            .map_err(|_| "PGO地图已绑定")?;
+        mapping.lock().enable_pgo_history();
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> Option<CanonicalCorrectionSnapshot> {
@@ -4215,6 +4243,80 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         if cancellation.is_cancelled() {
             return Err(ApplyError::Cancelled);
         }
+        let needs_map = matches!(
+            transaction.backend,
+            crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo
+                | crate::correction_coordinator::CorrectionCandidateBackend::NativePgo
+        );
+        let mut rebuilt = if needs_map {
+            let context = self.pgo.get().ok_or_else(|| {
+                ApplyError::Failed("PGO地图管线未绑定，拒绝仅应用位姿校正".into())
+            })?;
+            if transaction.trajectory.last().is_none_or(|node| {
+                node.source_timestamp_ns as u64 != transaction.source_timestamp_ns
+                    || !canonical_isometry_near(
+                        &crate::pgo_map::optimized_pose(node),
+                        &(transaction.absolute_left_correction * transaction.frozen_odom_from_body),
+                    )
+            }) {
+                return Err(ApplyError::Failed(
+                    "PGO轨迹与当前校正/原始里程计不一致".into(),
+                ));
+            }
+            let (scans, spec, config) = {
+                let mapping = context.mapping.lock();
+                let session = mapping.snapshot();
+                let anchor = mapping
+                    .map_odom_transform_snapshot()
+                    .ok_or_else(|| ApplyError::Failed("PGO地图锚点缺失".into()))?;
+                if session.session_id != transaction.mapping_session_id
+                    || session.session_generation != transaction.mapping_session_generation
+                    || mapping.global_frame_generation() != transaction.map_frame_generation
+                    || !canonical_isometry_near(
+                        &anchor.base_isometry(),
+                        &transaction.base_anchor_map_from_odom,
+                    )
+                {
+                    return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
+                }
+                mapping.pgo_rebuild_input().map_err(ApplyError::Failed)?
+            };
+            let trajectory = transaction.trajectory.clone();
+            let anchor = transaction.base_anchor_map_from_odom;
+            let frame = self.map_frame_id.clone();
+            let cancelled = cancellation.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::pgo_map::rebuild(scans, trajectory, anchor, spec, config, frame, || {
+                        cancelled.is_cancelled()
+                    })
+                })
+                .await
+                .map_err(|e| ApplyError::Failed(format!("PGO重建任务失败：{e}")))?
+                .map_err(ApplyError::Failed)?,
+            )
+        } else {
+            None
+        };
+        let mut backend_restore =
+            if let (Some(context), Some(map)) = (self.pgo.get(), rebuilt.as_mut()) {
+                let client = context
+                    .mapping
+                    .lock()
+                    .backend_checkpoint_client()
+                    .map_err(ApplyError::Failed)?;
+                let receiver = client
+                    .restore_checkpoint(std::mem::take(&mut map.backend_checkpoint))
+                    .map_err(|e| ApplyError::Failed(format!("PGO后端准备失败：{e:?}")))?;
+                Some(
+                    receiver
+                        .await
+                        .map_err(|e| ApplyError::Failed(e.to_string()))?
+                        .map_err(ApplyError::Failed)?,
+                )
+            } else {
+                None
+            };
         let mut shared = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
@@ -4280,6 +4382,33 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             &self.body_frame_id,
         )
         .map_err(ApplyError::Failed)?;
+        let prepared_map = if let (Some(context), Some(map)) = (self.pgo.get(), rebuilt.as_ref()) {
+            let writer = context.cloud_writer.lock();
+            writer
+                .as_ref()
+                .ok_or_else(|| ApplyError::Failed("PGO点云写入端不可用".into()))?
+                .validate_checkpoint(
+                    map.cloud.voxel_size,
+                    map.cloud.point_count,
+                    &map.cloud.xyz_f32_le,
+                )
+                .map_err(ApplyError::Failed)?;
+            drop(writer);
+            Some(
+                context
+                    .mapping
+                    .lock()
+                    .prepare_pgo_install(
+                        map.occupancy.clone(),
+                        transaction.source_timestamp_ns,
+                        transaction.absolute_left_correction,
+                        transaction.correction_revision,
+                    )
+                    .map_err(ApplyError::Failed)?,
+            )
+        } else {
+            None
+        };
         let tf_frame = crate::typed_codec::build_typed_frame(
             self.tf_binding.0.clone(),
             self.tf_binding.1.clone(),
@@ -4302,6 +4431,40 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             operation.poison(error.clone());
             return Err(ApplyError::Failed(error));
         }
+        let mut map_event = None;
+        let mut output_occupancy_revision = transaction.occupancy_revision;
+        let mut output_cloud_revision = transaction.cloud_revision;
+        let mut output_commit_id = transaction.mapping_commit_id;
+        if let (Some(context), Some(map), Some(prepared)) =
+            (self.pgo.get(), rebuilt.take(), prepared_map)
+        {
+            let result = (|| -> Result<(), String> {
+                let mut writer = context.cloud_writer.lock();
+                let cloud = writer
+                    .as_mut()
+                    .ok_or("PGO点云写入端不可用")?
+                    .install_prepared_accumulator(&prepared.receipt, map.accumulator)?;
+                drop(writer);
+                // 不可取消窗口内任何不确定失败都进入原有故障终态，不继续生成混合坐标的地图。
+                backend_restore
+                    .take()
+                    .ok_or("PGO后端准备句柄缺失")?
+                    .commit()?;
+                output_occupancy_revision = prepared.map.revision;
+                output_cloud_revision = cloud.receipt.cloud_revision;
+                output_commit_id = prepared.receipt.commit_id;
+                let next_map = prepared.map.clone();
+                map_event = Some(prepared.event.clone());
+                context.mapping.lock().commit_pgo_install(prepared)?;
+                shared.map = next_map;
+                shared.cloud_map_revision = output_cloud_revision;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                operation.poison(error.clone());
+                return Err(ApplyError::Failed(error));
+            }
+        }
         apply_canonical_mapping_observation_locked(&mut shared, &observation);
         *self.current.write() = Some(CanonicalCorrectionSnapshot {
             runtime_generation: transaction.runtime_generation,
@@ -4310,9 +4473,9 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             mapping_session_id: transaction.mapping_session_id,
             mapping_session_generation: transaction.mapping_session_generation,
             map_frame_generation: transaction.map_frame_generation,
-            mapping_commit_id: transaction.mapping_commit_id,
-            occupancy_revision: transaction.occupancy_revision,
-            cloud_revision: transaction.cloud_revision,
+            mapping_commit_id: output_commit_id,
+            occupancy_revision: output_occupancy_revision,
+            cloud_revision: output_cloud_revision,
             correction_revision: transaction.correction_revision,
             source_timestamp_ns: transaction.source_timestamp_ns,
             committed_map_source_timestamp_ns: transaction.committed_map_source_timestamp_ns,
@@ -4325,6 +4488,23 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         if let Err(error) = operation.mark_state_committed() {
             operation.poison(error.clone());
             return Err(ApplyError::Failed(error));
+        }
+        drop(shared);
+        if let (Some(context), Some(event)) = (self.pgo.get(), map_event) {
+            let _ = context.map_revision_tx.send(event);
+            if let Err(error) = publish_latest_canonical_cloud_map_with_navigation(
+                &self.transport,
+                &context.cloud_writer,
+                &self.state,
+                &context.cloud_map_tx,
+                &self.map_frame_id,
+                context.navigation.as_ref(),
+            )
+            .await
+            {
+                operation.poison(error.clone());
+                return Err(ApplyError::Failed(error));
+            }
         }
         tracing::info!(
             event = "geometry.correction.applied",
@@ -4339,8 +4519,6 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         );
         Ok(())
     }
-
-
 }
 
 fn pose_state_from_isometry(
@@ -4716,7 +4894,12 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
             x: pose.x,
             y: pose.y,
             z: pose.z,
-            orientation: nuwax_nav_types_messages::geometry::Quaternion { x: pose.qx, y: pose.qy, z: pose.qz, w: pose.qw },
+            orientation: nuwax_nav_types_messages::geometry::Quaternion {
+                x: pose.qx,
+                y: pose.qy,
+                z: pose.qz,
+                w: pose.qw,
+            },
             frame_id: self.expected_map_frame.to_string(),
             source_timestamp_ns: pose.timestamp_ns,
             received_monotonic_ns,
@@ -6979,14 +7162,26 @@ fn build_exploration_surface_map(
 ) -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String> {
     let points = schema::navigation_map_3d_points(message).map_err(|error| error.to_string())?;
     let mut snapshot = nuwax_nav_mls_planner::SurfaceSnapshot::from_points(
-        &points, geometry, message.source_voxel_size,
-    ).map_err(|error| error.to_string())?;
+        &points,
+        geometry,
+        message.source_voxel_size,
+    )
+    .map_err(|error| error.to_string())?;
     if let Some(mask) = message.virtual_obstacles.as_ref() {
-        let blocked = mask.data.iter().map(|value| *value == 100).collect::<Vec<_>>();
-        snapshot = snapshot.with_virtual_obstacles(
-            [mask.info.origin.position[0], mask.info.origin.position[1]],
-            f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32, &blocked,
-        ).map_err(|error| error.to_string())?;
+        let blocked = mask
+            .data
+            .iter()
+            .map(|value| *value == 100)
+            .collect::<Vec<_>>();
+        snapshot = snapshot
+            .with_virtual_obstacles(
+                [mask.info.origin.position[0], mask.info.origin.position[1]],
+                f64::from(mask.info.resolution),
+                mask.info.width as u32,
+                mask.info.height as u32,
+                &blocked,
+            )
+            .map_err(|error| error.to_string())?;
     }
     Ok(Arc::new(snapshot))
 }
@@ -6995,11 +7190,14 @@ fn register_surface_map_build(
     control: &GeometryRuntimeTaskControl,
     ticket: crate::explore_runtime::SurfaceMapTicket,
     completed: tokio::sync::mpsc::Sender<SurfaceMapComputation>,
-    compute: impl FnOnce() -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String> + Send + 'static,
+    compute: impl FnOnce() -> Result<Arc<nuwax_nav_mls_planner::SurfaceSnapshot>, String>
+        + Send
+        + 'static,
 ) -> Result<(), String> {
     control.register_retained("surface-map-build", async move {
         // 注册接纳后才启动实际计算；保留任务始终等待阻塞工作句柄结束。
-        let result = tokio::task::spawn_blocking(compute).await
+        let result = tokio::task::spawn_blocking(compute)
+            .await
             .map_err(|error| format!("surface map worker join failed: {error}"))
             .and_then(|result| result);
         let _ = completed.send((ticket, result)).await;
@@ -7017,7 +7215,10 @@ async fn run_owned_surface_map_consumer(
 ) -> Result<(), String> {
     let (computed_tx, mut computed_rx) = tokio::sync::mpsc::channel::<SurfaceMapComputation>(1);
     let mut computing = false;
-    let mut latest_pending: Option<(schema::NavigationMap3D, crate::explore_runtime::SurfaceMapTicket)> = None;
+    let mut latest_pending: Option<(
+        schema::NavigationMap3D,
+        crate::explore_runtime::SurfaceMapTicket,
+    )> = None;
     let terminal = loop {
         if !computing {
             if let Some((message, ticket)) = latest_pending.take() {
@@ -7028,7 +7229,9 @@ async fn run_owned_surface_map_consumer(
                 match register_surface_map_build(&control, ticket, completed, compute) {
                     Ok(()) => computing = true,
                     Err(error) => {
-                        explore.finish_surface_map_update(rejected_ticket, Err(error)).await;
+                        explore
+                            .finish_surface_map_update(rejected_ticket, Err(error))
+                            .await;
                     }
                 }
             }
@@ -7334,12 +7537,20 @@ pub async fn spawn_geometry_runtime(
 
     let mut owned_subscriptions = Vec::with_capacity(3);
     let surface_config = if nav_runtime.configured_profile() == crate::nav_runtime::PROFILE_MLS3D {
-        Some(nuwax_nav_stack::surface_config::SurfaceNavigationConfig::from_env()
-            .map_err(|error| error.to_string()).and_then(|config| {
-                if config.geometry.world_frame == map_frame { Ok(config) }
-                else { Err("surface navigation config does not match Geometry map frame".into()) }
-            }))
-    } else { None };
+        Some(
+            nuwax_nav_stack::surface_config::SurfaceNavigationConfig::from_env()
+                .map_err(|error| error.to_string())
+                .and_then(|config| {
+                    if config.geometry.world_frame == map_frame {
+                        Ok(config)
+                    } else {
+                        Err("surface navigation config does not match Geometry map frame".into())
+                    }
+                }),
+        )
+    } else {
+        None
+    };
     let tf_subscription = match transport
         .subscribe_owned(tf_topic.clone(), Some(tf_msg_type.clone()))
         .await
@@ -7389,17 +7600,22 @@ pub async fn spawn_geometry_runtime(
     owned_subscriptions.push(("navigation-state-consumer", nav_subscription));
 
     if surface_config.as_ref().is_some_and(Result::is_ok) {
-        let surface_subscription = transport.subscribe_owned(
-            LcmTopic::new("/nav/map3d").expect("固定三维地图通道"),
-            Some(LcmMessageType::new("nuwax_msgs.NavigationMap3D").expect("三维地图消息类型")),
-        ).await;
+        let surface_subscription = transport
+            .subscribe_owned(
+                LcmTopic::new("/nav/map3d").expect("固定三维地图通道"),
+                Some(LcmMessageType::new("nuwax_msgs.NavigationMap3D").expect("三维地图消息类型")),
+            )
+            .await;
         match surface_subscription {
-            Ok(subscription) => owned_subscriptions.insert(0, ("surface-map-consumer", subscription)),
+            Ok(subscription) => {
+                owned_subscriptions.insert(0, ("surface-map-consumer", subscription))
+            }
             Err(error) => {
                 let rollback = rollback_owned_geometry_subscriptions(owned_subscriptions).await;
                 return Err(RealLcmBackendUnavailable::transport(format!(
                     "surface-map subscribe acknowledgement failed: {error}; rollback={rollback:?}"
-                )).into());
+                ))
+                .into());
             }
         }
     }
@@ -7489,11 +7705,21 @@ pub async fn spawn_geometry_runtime(
     };
 
     if let Some(config) = surface_config.as_ref() {
-        if let Err(error) = config { warn!(%error, "surface exploration configuration unavailable; mapping remains enabled"); }
-        let boot_nonce = mapping_adapter.as_ref().map(|mapping| mapping.lock().mapping_commit_boot_nonce().to_be_bytes())
+        if let Err(error) = config {
+            warn!(%error, "surface exploration configuration unavailable; mapping remains enabled");
+        }
+        let boot_nonce = mapping_adapter
+            .as_ref()
+            .map(|mapping| mapping.lock().mapping_commit_boot_nonce().to_be_bytes())
             .unwrap_or([0; 16]);
-        explore_runtime.configure_surface_source(config.clone(), nav_runtime.producer_runtime_generation(), boot_nonce)
-            .await.expect("新建探索拥有方尚未接收用户会话");
+        explore_runtime
+            .configure_surface_source(
+                config.clone(),
+                nav_runtime.producer_runtime_generation(),
+                boot_nonce,
+            )
+            .await
+            .expect("新建探索拥有方尚未接收用户会话");
     }
 
     let mut task_owner = Some(GeometryRuntimeTaskOwner::start(
@@ -7565,11 +7791,21 @@ pub async fn spawn_geometry_runtime(
         let (name, subscription) = owned_subscriptions.pop().expect("三维地图订阅已经确认");
         debug_assert_eq!(name, "surface-map-consumer");
         register_geometry_startup_persistent(
-            &task_control, &mut task_owner, &handle, &mut owned_subscriptions, &mut pending_children,
+            &task_control,
+            &mut task_owner,
+            &handle,
+            &mut owned_subscriptions,
+            &mut pending_children,
             "surface-map-consumer",
-            run_owned_surface_map_consumer(subscription, explore_runtime.clone(), config, task_control.clone(),
-                task_control.shutdown_request_receiver()),
-        ).await?;
+            run_owned_surface_map_consumer(
+                subscription,
+                explore_runtime.clone(),
+                config,
+                task_control.clone(),
+                task_control.shutdown_request_receiver(),
+            ),
+        )
+        .await?;
     }
 
     let cancel_shutdown_rx = task_control.shutdown_receiver();
@@ -7877,7 +8113,7 @@ async fn ingest_mapping_points_with_backend(
     source_timestamp_ns: u64,
     state: &Arc<RwLock<SharedState>>,
     source_fenced: bool,
-    expected_generations: Option<(u64, u64)>,
+    expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     task_control: Option<&GeometryRuntimeTaskControl>,
@@ -7959,7 +8195,7 @@ async fn ingest_mapping_points_with_backend_owned(
     source_timestamp_ns: u64,
     state: &Arc<RwLock<SharedState>>,
     source_fenced: bool,
-    expected_generations: Option<(u64, u64)>,
+    expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
@@ -7982,7 +8218,11 @@ async fn ingest_mapping_points_with_backend_owned(
                 cloud_commit: None,
             });
         }
-        if let Some((expected_session_generation, expected_frame_generation)) = expected_generations
+        if let Some((
+            expected_session_generation,
+            expected_frame_generation,
+            _expected_correction_revision,
+        )) = expected_generations
         {
             if adapter.snapshot().session_generation != expected_session_generation
                 || adapter.global_frame_generation() != expected_frame_generation
@@ -7993,6 +8233,26 @@ async fn ingest_mapping_points_with_backend_owned(
                     reason: "registration permit mapping generation is stale".to_owned(),
                 });
             }
+        }
+        if expected_generations.is_some_and(|(_, _, revision)| {
+            adapter
+                .map_odom_transform_snapshot()
+                .map_or(0, |value| value.correction_revision)
+                != revision
+        }) {
+            return Ok(MappingIngestCommit {
+                outcome: MappingIngestOutcome {
+                    sensor_origin_map: None,
+                    accepted_map_points: Vec::new(),
+                    occupancy_event: None,
+                    occupancy_receipt: None,
+                    #[cfg(test)]
+                    occupancy_committed: false,
+                    session_generation: adapter.snapshot().session_generation,
+                    source_timestamp_ns,
+                },
+                cloud_commit: None,
+            });
         }
         let odom_xy = (adapter.last_sensor_origin[0], adapter.last_sensor_origin[1]);
         adapter.prepare_backend_compute(
@@ -8005,7 +8265,7 @@ async fn ingest_mapping_points_with_backend_owned(
             source_fenced,
         )?
     };
-    let Some(prepared) = prepared else {
+    let Some(mut prepared) = prepared else {
         let adapter = mapping.lock();
         return Ok(MappingIngestCommit {
             outcome: MappingIngestOutcome {
@@ -8021,6 +8281,10 @@ async fn ingest_mapping_points_with_backend_owned(
             cloud_commit: None,
         });
     };
+    // 建图射线与三维清理必须使用该扫描冻结的真实传感器原点，不能读取更晚的机体位置。
+    if let Some(origin) = sensor_origin_map {
+        prepared.input.sensor_origin_map = origin;
+    }
     let token = prepared.token.clone();
     let completion_rx = match prepared.worker.submit(prepared.token, prepared.input) {
         Ok(receiver) => receiver,
@@ -8594,7 +8858,14 @@ async fn navigation_map_3d_publication_metadata(
     state: &Arc<RwLock<SharedState>>,
     frame_id: &str,
 ) -> Result<NavigationMap3DPublicationMetadata, String> {
-    let (session, map_frame_generation, occupancy_receipt, boot_nonce, configured_frame, virtual_obstacles) = {
+    let (
+        session,
+        map_frame_generation,
+        occupancy_receipt,
+        boot_nonce,
+        configured_frame,
+        virtual_obstacles,
+    ) = {
         let mapping = context.mapping.lock();
         (
             mapping.snapshot(),
@@ -8602,7 +8873,11 @@ async fn navigation_map_3d_publication_metadata(
             mapping.latest_occupancy_commit_receipt(),
             mapping.mapping_commit_boot_nonce(),
             mapping.configured_map_frame_id().to_owned(),
-            if publication.receipt.is_some() { mapping.virtual_obstacles_snapshot()? } else { None },
+            if publication.receipt.is_some() {
+                mapping.virtual_obstacles_snapshot()?
+            } else {
+                None
+            },
         )
     };
     if session.session_generation != publication.notification.session_generation
@@ -8676,26 +8951,40 @@ async fn navigation_map_3d_publication_metadata(
         if mask.revision != occupancy_receipt.occupancy_revision
             || mask.timestamp_ns != occupancy_receipt.source_timestamp_ns
             || mask.frame_id != frame_id
-            || mask.width != shared.map.width || mask.height != shared.map.height
+            || mask.width != shared.map.width
+            || mask.height != shared.map.height
             || mask.resolution != shared.map.resolution
-            || mask.origin_x != shared.map.origin_x || mask.origin_y != shared.map.origin_y
+            || mask.origin_x != shared.map.origin_x
+            || mask.origin_y != shared.map.origin_y
         {
-            return Err("NavigationMap3D virtual obstacles do not match the committed occupancy geometry".into());
+            return Err(
+                "NavigationMap3D virtual obstacles do not match the committed occupancy geometry"
+                    .into(),
+            );
         }
         let stamp_sec = i32::try_from(mask.timestamp_ns / 1_000_000_000)
             .map_err(|_| "virtual obstacle timestamp exceeds i32".to_string())?;
         let stamp_nsec = (mask.timestamp_ns % 1_000_000_000) as i32;
         metadata.virtual_obstacles = Some(schema::OccupancyGrid {
             header: schema::Header {
-                seq: i32::try_from(mask.revision).map_err(|_| "virtual obstacle revision exceeds i32".to_string())?,
-                stamp_sec, stamp_nsec, frame_id: mask.frame_id,
+                seq: i32::try_from(mask.revision)
+                    .map_err(|_| "virtual obstacle revision exceeds i32".to_string())?,
+                stamp_sec,
+                stamp_nsec,
+                frame_id: mask.frame_id,
             },
             info: schema::MapMetaData {
-                map_load_time_sec: stamp_sec, map_load_time_nsec: stamp_nsec,
+                map_load_time_sec: stamp_sec,
+                map_load_time_nsec: stamp_nsec,
                 resolution: mask.resolution,
-                width: i32::try_from(mask.width).map_err(|_| "virtual obstacle width exceeds i32".to_string())?,
-                height: i32::try_from(mask.height).map_err(|_| "virtual obstacle height exceeds i32".to_string())?,
-                origin: schema::Pose { position: [mask.origin_x, mask.origin_y, 0.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+                width: i32::try_from(mask.width)
+                    .map_err(|_| "virtual obstacle width exceeds i32".to_string())?,
+                height: i32::try_from(mask.height)
+                    .map_err(|_| "virtual obstacle height exceeds i32".to_string())?,
+                origin: schema::Pose {
+                    position: [mask.origin_x, mask.origin_y, 0.0],
+                    orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                },
             },
             data: mask.data,
         });
@@ -9604,7 +9893,7 @@ pub(crate) async fn handoff_registered_lio_cloud_fenced(
         adapter_timestamp_ns,
         source_timestamp_ns,
         map_frame,
-        Some((expected_session_generation, expected_frame_generation)),
+        Some((expected_session_generation, expected_frame_generation, 0)),
         sensor_origin_map,
     )
     .await
@@ -9688,12 +9977,21 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         Some((
             binding.mapping_session_generation,
             binding.map_frame_generation,
+            binding.registration_correction_revision,
         )),
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
     )
     .await?;
+    if !commit.outcome.accepted_map_points.is_empty() {
+        handle
+            .mapping_adapter
+            .as_ref()
+            .ok_or("mapping adapter unavailable")?
+            .lock()
+            .record_pgo_scan(binding, points, source_timestamp_ns, adapter_timestamp_ns)?;
+    }
     let occupancy_committed = commit.outcome.occupancy_event.is_some();
     if !occupancy_committed {
         let accepted = !commit.outcome.accepted_map_points.is_empty();
@@ -9772,7 +10070,7 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         return Err("registered LIO correction receipt identity mismatch".to_owned());
     }
 
-    let map_from_body = binding.base_anchor_map_from_odom * binding.frozen_odom_from_body;
+    let map_from_body = binding.registration_map_from_odom * binding.frozen_odom_from_body;
     let body_from_map = map_from_body.inverse();
     let body_points = points
         .iter()
@@ -9921,12 +10219,21 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         Some((
             binding.mapping_session_generation,
             binding.map_frame_generation,
+            binding.registration_correction_revision,
         )),
         Some(initial_mode.epoch),
         Some(correction.relocalization_mode_fence()),
         binding.sensor_origin_map,
     )
     .await?;
+    if !commit.outcome.accepted_map_points.is_empty() {
+        handle
+            .mapping_adapter
+            .as_ref()
+            .ok_or("mapping adapter unavailable")?
+            .lock()
+            .record_pgo_scan(binding, points, source_timestamp_ns, adapter_timestamp_ns)?;
+    }
     if commit.outcome.occupancy_event.is_none() {
         return Ok(false);
     }
@@ -10114,7 +10421,7 @@ async fn registered_lio_correction_input(
         return Err("registered LIO correction receipt identity mismatch".to_owned());
     }
 
-    let map_from_body = binding.base_anchor_map_from_odom * binding.frozen_odom_from_body;
+    let map_from_body = binding.registration_map_from_odom * binding.frozen_odom_from_body;
     let body_from_map = map_from_body.inverse();
     let body_points = points
         .iter()
@@ -10260,7 +10567,7 @@ async fn registered_lio_read_only_correction_frame(
         return Err("relocalization committed map/cloud receipt identity mismatch".to_owned());
     }
 
-    let map_from_body = binding.base_anchor_map_from_odom * binding.frozen_odom_from_body;
+    let map_from_body = binding.registration_map_from_odom * binding.frozen_odom_from_body;
     let body_from_map = map_from_body.inverse();
     let body_points = points
         .iter()
@@ -10346,7 +10653,7 @@ async fn handoff_registered_lio_cloud_inner(
     adapter_timestamp_ns: u64,
     source_timestamp_ns: u64,
     map_frame: &str,
-    expected_generations: Option<(u64, u64)>,
+    expected_generations: Option<(u64, u64, u64)>,
     sensor_origin_map: Option<[f64; 3]>,
 ) -> Result<bool, String> {
     let commit = commit_registered_lio_cloud_inner(
@@ -10386,7 +10693,7 @@ async fn commit_registered_lio_cloud_inner(
     adapter_timestamp_ns: u64,
     source_timestamp_ns: u64,
     map_frame: &str,
-    expected_generations: Option<(u64, u64)>,
+    expected_generations: Option<(u64, u64, u64)>,
     expected_relocalization_epoch: Option<u64>,
     relocalization_mode: Option<Arc<crate::correction_coordinator::RelocalizationModeFence>>,
     sensor_origin_map: Option<[f64; 3]>,
@@ -10707,17 +11014,18 @@ pub fn test_lcm_url() -> String {
 /// - 默认创建隔离的 cloud-map SHM；`build_handle_for_tests_without_cloud_writer` 覆盖 writer 缺失路径
 /// - 立即返回,适合 `#[tokio::test]` async 测试
 pub async fn build_handle_for_tests() -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
-    build_handle_for_tests_with_cloud_writer(true).await
+    build_handle_for_tests_with_cloud_writer(true, None).await
 }
 
 /// 构造测试句柄并显式禁用 cloud-map writer，覆盖 fail-closed 路径。
 pub async fn build_handle_for_tests_without_cloud_writer(
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
-    build_handle_for_tests_with_cloud_writer(false).await
+    build_handle_for_tests_with_cloud_writer(false, None).await
 }
 
 async fn build_handle_for_tests_with_cloud_writer(
     with_cloud_writer: bool,
+    backend_override: Option<crate::mapping_backend::MappingBackendSpec>,
 ) -> Result<GeometryRuntimeHandle, RealLcmBackendUnavailable> {
     let (cloud_map_tx, _) = broadcast::channel::<CloudMapNotification>(4);
     let (nav_state_tx, _) = broadcast::channel::<NavigationUpdate>(8);
@@ -10745,14 +11053,21 @@ async fn build_handle_for_tests_with_cloud_writer(
     let transport = LcmTransport::new_real(&crate::lcm_runtime::test_lcm_url())
         .expect("test real LCM 启动失败,需先 apt-get install -y liblcm-dev 1.3~1.5");
     // Phase 3: 测试 helper 也构造 mapping_adapter,便于 unit test 走完整链路。
-    let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(
-        MappingAdapter::new_with_frames_and_sequence_store(
+    let mapping_adapter = Some(Arc::new(parking_lot::Mutex::new(match backend_override {
+        Some(backend) => MappingAdapter::new_with_frames_and_optional_sequence_store(
+            MappingAdapterConfig::from_env(),
+            backend,
+            "map",
+            "odom",
+            Some(sequence_store.clone()),
+        ),
+        None => MappingAdapter::new_with_frames_and_sequence_store(
             MappingAdapterConfig::from_env(),
             "map",
             "odom",
             sequence_store.clone(),
         ),
-    )));
+    })));
     // Phase 3: 测试 helper 也构造 occupancy_shm(走 /tmp 测试路径)
     // 注意:必须包含 per-call 唯一后缀(monotonic counter),否则并行
     // cargo test 跑多次 build_handle_for_tests 时,多个
@@ -11626,10 +11941,17 @@ mod mapping_feed_tests {
         }
 
         fn commit(&self, timestamp_ns: u64) -> CommittedMappingCloudMap {
-            self.commit_points(timestamp_ns, &[Point3::new(0.5, 0.0, 0.0), Point3::new(1.0, 1.0, 0.5)])
+            self.commit_points(
+                timestamp_ns,
+                &[Point3::new(0.5, 0.0, 0.0), Point3::new(1.0, 1.0, 0.5)],
+            )
         }
 
-        fn commit_points(&self, timestamp_ns: u64, points: &[Point3<f64>]) -> CommittedMappingCloudMap {
+        fn commit_points(
+            &self,
+            timestamp_ns: u64,
+            points: &[Point3<f64>],
+        ) -> CommittedMappingCloudMap {
             let mut mapping = self.context.mapping.lock();
             let outcome = ingest_mapping_points(
                 &mut mapping,
@@ -11658,42 +11980,81 @@ mod mapping_feed_tests {
 
     #[tokio::test]
     async fn navigation_map_3d_virtual_obstacles_keep_commit_identity_and_block_both_floors() {
-        let root = std::env::temp_dir().join(format!("nuwax-nav3d-virtual-mask-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("nuwax-nav3d-virtual-mask-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         let _cleanup = Cleanup(root.clone());
         let zone_path = root.join("禁区.json");
         std::fs::write(&zone_path, br#"{"schema_version":1,"maps":{"test-map":{"map_name":"test-map","generation":1,"zones":[{"id":"line","shape":"line","mode":"inside","frame_id":"map","vertices":[{"x":0.0,"y":-5.0},{"x":0.0,"y":5.0}],"stroke_width_m":0.1}]}}}"#).unwrap();
-        let store = Arc::new(crate::sequence_state::SequenceStateStore::open(&root.join("sequence.json")).unwrap());
+        let store = Arc::new(
+            crate::sequence_state::SequenceStateStore::open(&root.join("sequence.json")).unwrap(),
+        );
         let mut mapping = MappingAdapter::new_with_frames_sequence_store_and_forbidden_zones(
-            mapping_config(), crate::mapping_backend::MappingBackendSpec::Voxel, "map", "odom", store, zone_path.clone(),
+            mapping_config(),
+            crate::mapping_backend::MappingBackendSpec::Voxel,
+            "map",
+            "odom",
+            store,
+            zone_path.clone(),
         );
         mapping.start_session("test-session", "test-map").unwrap();
-        let fixture = NavigationMap3DFixture::with_mapping(Arc::new(parking_lot::Mutex::new(mapping)));
+        let fixture =
+            NavigationMap3DFixture::with_mapping(Arc::new(parking_lot::Mutex::new(mapping)));
         let mut points = Vec::new();
         for z in [0.0, 3.0] {
             for x in -30..30 {
                 for y in -30..30 {
-                    points.push(Point3::new((f64::from(x) + 0.5) * 0.1, (f64::from(y) + 0.5) * 0.1, z));
+                    points.push(Point3::new(
+                        (f64::from(x) + 0.5) * 0.1,
+                        (f64::from(y) + 0.5) * 0.1,
+                        z,
+                    ));
                 }
             }
         }
         fixture.commit_points(1_700_000_000_000_000_000, &points);
-        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
-        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer)
+            .unwrap()
+            .unwrap();
+        let metadata = navigation_map_3d_publication_metadata(
+            &fixture.context,
+            &publication,
+            &fixture.state,
+            "map",
+        )
+        .await
+        .unwrap();
         let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
         let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         let mask = message.virtual_obstacles.as_ref().unwrap();
         assert_eq!(i64::from(mask.header.seq), message.committed_map.revision);
-        assert_eq!((mask.header.stamp_sec, mask.header.stamp_nsec), (message.cloud.header.stamp_sec, message.cloud.header.stamp_nsec));
+        assert_eq!(
+            (mask.header.stamp_sec, mask.header.stamp_nsec),
+            (
+                message.cloud.header.stamp_sec,
+                message.cloud.header.stamp_nsec
+            )
+        );
         assert!(mask.data.contains(&0) && mask.data.contains(&100));
         assert!(mask.data.iter().all(|value| matches!(value, 0 | 100)));
         let geometry = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2,
-        ).unwrap().geometry;
+            "map".into(),
+            0.5,
+            0.2,
+            0.6,
+            0.1,
+            0.15,
+            18.0,
+            0.2,
+        )
+        .unwrap()
+        .geometry;
         let mut unmasked = message.clone();
         unmasked.virtual_obstacles = None;
         let free = build_exploration_surface_map(&unmasked, geometry.clone()).unwrap();
@@ -11702,23 +12063,59 @@ mod mapping_feed_tests {
             let start = free.locate_support([-2.0, 0.0, z]).unwrap().support_xyz;
             let goal = free.locate_support([2.0, 0.0, z]).unwrap().support_xyz;
             assert!(free.plan(start, goal).is_ok(), "物理三维图原本连通");
-            assert!(protected.plan(start, goal).is_err(), "纯虚拟细线必须阻断两层路径");
+            assert!(
+                protected.plan(start, goal).is_err(),
+                "纯虚拟细线必须阻断两层路径"
+            );
         }
         std::fs::write(&zone_path, b"{broken-json").unwrap();
-        let unchanged = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let unchanged = navigation_map_3d_publication_metadata(
+            &fixture.context,
+            &publication,
+            &fixture.state,
+            "map",
+        )
+        .await
+        .unwrap();
         assert_eq!(unchanged, metadata, "未应用文件不得泄漏进已提交三维消息");
         {
             let mut mapping = fixture.context.mapping.lock();
-            assert!(mapping.refresh_forbidden_zones(&fixture.state, &fixture.map_tx).unwrap());
+            assert!(mapping
+                .refresh_forbidden_zones(&fixture.state, &fixture.map_tx)
+                .unwrap());
         }
-        assert!(navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.is_err(),
-            "只更新二维禁区后不得伪造一条新传感器点云提交");
+        assert!(
+            navigation_map_3d_publication_metadata(
+                &fixture.context,
+                &publication,
+                &fixture.state,
+                "map"
+            )
+            .await
+            .is_err(),
+            "只更新二维禁区后不得伪造一条新传感器点云提交"
+        );
         fixture.commit_points(1_700_000_001_000_000_000, &points);
-        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
-        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer)
+            .unwrap()
+            .unwrap();
+        let metadata = navigation_map_3d_publication_metadata(
+            &fixture.context,
+            &publication,
+            &fixture.state,
+            "map",
+        )
+        .await
+        .unwrap();
         let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
         let blocked = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
-        assert!(blocked.virtual_obstacles.as_ref().unwrap().data.iter().all(|value| *value == 100));
+        assert!(blocked
+            .virtual_obstacles
+            .as_ref()
+            .unwrap()
+            .data
+            .iter()
+            .all(|value| *value == 100));
         let closed = build_exploration_surface_map(&blocked, geometry).unwrap();
         assert!(closed.locate_support([-2.0, 0.0, 0.0]).is_err());
         assert!(closed.locate_support([-2.0, 0.0, 3.0]).is_err());
@@ -11951,20 +12348,36 @@ mod mapping_feed_tests {
     async fn surface_pose_provider_preserves_real_height_and_complete_orientation() {
         let state = Arc::new(RwLock::new(SharedState::default()));
         state.write().await.pose = PoseState {
-            x: 1.0, y: 2.0, z: 3.5, qx: 0.1, qy: -0.2, qz: 0.3, qw: 0.86_f64.sqrt(),
-            frame_id: "map".into(), timestamp_ns: crate::explore_runtime::now_unix_nanos(),
+            x: 1.0,
+            y: 2.0,
+            z: 3.5,
+            qx: 0.1,
+            qy: -0.2,
+            qz: 0.3,
+            qw: 0.86_f64.sqrt(),
+            frame_id: "map".into(),
+            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
             ..PoseState::default()
         };
         let provider = SharedStatePoseProvider {
-            state, expected_map_frame: Arc::from("map"),
+            state,
+            expected_map_frame: Arc::from("map"),
             freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
             max_receipt_age: Duration::from_secs(1),
         };
-        let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider).await.unwrap();
+        let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider)
+            .await
+            .unwrap();
         assert_eq!((pose.x, pose.y, pose.z), (1.0, 2.0, 3.5));
-        assert_eq!(pose.orientation, nuwax_nav_types_messages::geometry::Quaternion {
-            x: 0.1, y: -0.2, z: 0.3, w: 0.86_f64.sqrt(),
-        });
+        assert_eq!(
+            pose.orientation,
+            nuwax_nav_types_messages::geometry::Quaternion {
+                x: 0.1,
+                y: -0.2,
+                z: 0.3,
+                w: 0.86_f64.sqrt(),
+            }
+        );
         assert!(pose.source_timestamp_ns > 0 && pose.received_monotonic_ns > 0);
     }
 
@@ -11972,48 +12385,91 @@ mod mapping_feed_tests {
     async fn surface_build_is_retained_until_actual_blocking_work_finishes() {
         let fixture = NavigationMap3DFixture::new();
         fixture.commit(1_700_000_000_000_000_000);
-        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer).unwrap().unwrap();
-        let metadata = navigation_map_3d_publication_metadata(&fixture.context, &publication, &fixture.state, "map").await.unwrap();
+        let (_, _, publication) = latest_canonical_cloud_publication(&fixture.writer)
+            .unwrap()
+            .unwrap();
+        let metadata = navigation_map_3d_publication_metadata(
+            &fixture.context,
+            &publication,
+            &fixture.state,
+            "map",
+        )
+        .await
+        .unwrap();
         let frame = build_navigation_map_3d_publication_frame(&publication, &metadata).unwrap();
         let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
         let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2,
-        ).unwrap();
-        explore.configure_surface_source(Ok(config), 37, message.commit_boot_nonce).await.unwrap();
-        let ticket = explore.begin_surface_map_update(&message, crate::explore_runtime::now_monotonic_nanos())
-            .await.unwrap().unwrap();
+            "map".into(),
+            0.5,
+            0.2,
+            0.6,
+            0.1,
+            0.15,
+            18.0,
+            0.2,
+        )
+        .unwrap();
+        explore
+            .configure_surface_source(Ok(config), 37, message.commit_boot_nonce)
+            .await
+            .unwrap();
+        let ticket = explore
+            .begin_surface_map_update(&message, crate::explore_runtime::now_monotonic_nanos())
+            .await
+            .unwrap()
+            .unwrap();
         let (control, registrations) = GeometryRuntimeTaskControl::channel();
         let mut owner = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::channel(1);
         struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
         impl Drop for Gate {
-            fn drop(&mut self) { *self.0.0.lock().unwrap() = true; self.0.1.notify_all(); }
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
         }
-        let gate = Gate(Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())));
+        let gate = Gate(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
         let worker_gate = gate.0.clone();
         let entered = Arc::new(tokio::sync::Notify::new());
         let worker_entered = entered.clone();
         register_surface_map_build(&control, ticket.clone(), completed_tx.clone(), move || {
             worker_entered.notify_one();
             let mut released = worker_gate.0.lock().unwrap();
-            while !*released { released = worker_gate.1.wait(released).unwrap(); }
+            while !*released {
+                released = worker_gate.1.wait(released).unwrap();
+            }
             Err("受控计算已真实结束".into())
-        }).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), entered.notified()).await.unwrap();
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
         control.request_stop();
         let mut stopping = Box::pin(owner.shutdown());
-        assert!(tokio::time::timeout(Duration::from_millis(25), stopping.as_mut()).await.is_err(),
-            "阻塞计算尚未结束时不能报告拥有方关闭完成");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), stopping.as_mut())
+                .await
+                .is_err(),
+            "阻塞计算尚未结束时不能报告拥有方关闭完成"
+        );
         let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_attempted = attempted.clone();
-        assert!(register_surface_map_build(&control, ticket, completed_tx, move || {
-            worker_attempted.store(true, std::sync::atomic::Ordering::Release);
-            Err("不应启动".into())
-        }).is_err());
+        assert!(
+            register_surface_map_build(&control, ticket, completed_tx, move || {
+                worker_attempted.store(true, std::sync::atomic::Ordering::Release);
+                Err("不应启动".into())
+            })
+            .is_err()
+        );
         assert!(!attempted.load(std::sync::atomic::Ordering::Acquire));
         drop(gate);
-        let outcome = tokio::time::timeout(Duration::from_secs(1), stopping).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), stopping)
+            .await
+            .unwrap();
         assert!(outcome.producers_settled());
         assert!(outcome.result.is_ok());
         assert!(completed_rx.recv().await.unwrap().1.is_err());
@@ -13340,6 +13796,7 @@ mod mapping_feed_tests {
             absolute_left_correction: correction,
             effective_map_from_odom: effective,
             frozen_odom_source_timestamp_ns: source_timestamp_ns,
+            trajectory: Vec::new(),
             frozen_odom_from_body: frozen_odom,
         };
         let cancellation = crate::correction_coordinator::CorrectionRequestCancellation::new();
@@ -13485,8 +13942,7 @@ mod mapping_feed_tests {
             CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionRequestCancellation,
         };
         for backend in [
-            CorrectionCandidateBackend::LibraryPgo,
-            CorrectionCandidateBackend::NativePgo,
+            // PGО的大校正与最新里程计由实装地图测试覆盖；只读地图的重定位沿此应用测试。
             CorrectionCandidateBackend::Relocalization,
         ] {
             for (scan_delta, latest_delta) in [
@@ -13591,6 +14047,7 @@ mod mapping_feed_tests {
                     absolute_left_correction: correction,
                     effective_map_from_odom: anchor * correction,
                     frozen_odom_source_timestamp_ns: frozen_timestamp_ns,
+                    trajectory: Vec::new(),
                     frozen_odom_from_body: frozen,
                 };
                 // 公共位姿较新而同刻里程计缺失时，拒绝候选并保留既有公共状态。
@@ -13780,6 +14237,7 @@ mod mapping_feed_tests {
             absolute_left_correction: new_effective,
             effective_map_from_odom: new_effective,
             frozen_odom_source_timestamp_ns: source_timestamp_ns,
+            trajectory: Vec::new(),
             frozen_odom_from_body,
         };
 
@@ -13881,6 +14339,456 @@ mod mapping_feed_tests {
         assert!((shared.pose.y - expected_map_from_body.translation.vector.y).abs() < 1.0e-9);
         assert!((shared.pose.z - expected_map_from_body.translation.vector.z).abs() < 1.0e-9);
         assert_eq!(shared.pose.timestamp_ns, source_timestamp_ns);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pgo_large_corrections_rebuild_both_maps_and_fence_late_scans() {
+        use crate::correction_coordinator::{
+            CanonicalCorrectionApplier, CanonicalCorrectionTransaction, CorrectionCandidateBackend,
+            CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec,
+            CorrectionRequestCancellation, CorrectionTransportOwner,
+        };
+        use crate::mapping_backend::{MappingBackendSpec, RaytracingBackendSpec};
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+        use nuwax_codec::lcm::native_pgo::OptimizedKeyframe;
+
+        // 人为给定已接受的完整优化轨迹，专门验证大校正的生产坐标/地图提交，不替代回环检测测试。
+        for backend in [
+            CorrectionCandidateBackend::LibraryPgo,
+            CorrectionCandidateBackend::NativePgo,
+        ] {
+            for map_backend in [
+                MappingBackendSpec::Voxel,
+                MappingBackendSpec::Raytracing(RaytracingBackendSpec::default()),
+            ] {
+                let handle = build_handle_for_tests_with_cloud_writer(true, Some(map_backend))
+                    .await
+                    .unwrap();
+                let mapping = handle.mapping_adapter.as_ref().unwrap().clone();
+                let baseline = build_handle_for_tests_with_cloud_writer(true, Some(map_backend))
+                    .await
+                    .unwrap();
+                baseline
+                    .mapping_adapter
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .start_session("pgo-truth", "pgo-truth-map")
+                    .unwrap();
+                let identity = CorrectionOwnerRuntimeIdentity {
+                    runtime_generation: 7,
+                    backend_generation: 7,
+                    correction_lease: CorrectionLeaseId {
+                        boot_nonce: 42,
+                        generation: 7,
+                    },
+                };
+                let tf = (
+                    LcmTopic::new("/test/pgo-complete/tf").unwrap(),
+                    LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
+                );
+                let applier = GeometryCanonicalCorrectionApplier::new(
+                    identity.clone(),
+                    "map",
+                    "odom",
+                    "base_link",
+                    handle.state.clone(),
+                    handle.transport.clone(),
+                    tf.clone(),
+                )
+                .unwrap();
+                applier.bind_mapping(&handle).unwrap();
+                mapping
+                    .lock()
+                    .start_session("pgo-complete", "pgo-complete-map")
+                    .unwrap();
+                let owner = CorrectionTransportOwner::start(
+                    CorrectionOwnerSpec::None,
+                    identity.clone(),
+                    "unused",
+                    Arc::new(RecordingCorrectionFrameSink::default()),
+                )
+                .await
+                .unwrap();
+                let origin = Isometry3::from_parts(
+                    Translation3::new(4.0, -2.0, 0.4),
+                    UnitQuaternion::from_euler_angles(0.0, 0.0, 0.35),
+                );
+                let world: Vec<_> = (0..12)
+                    .flat_map(|x| {
+                        (0..10).map(move |y| {
+                            Point3::new(x as f64 * 0.25 + 0.012, y as f64 * 0.25 + 0.018, -0.312)
+                        })
+                    })
+                    .chain((0..10).flat_map(|y| {
+                        (0..5).map(move |z| {
+                            Point3::new(3.012, y as f64 * 0.25 + 0.018, z as f64 * 0.25 + 0.018)
+                        })
+                    }))
+                    .collect();
+                let raw: Vec<_> = [0.0, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0]
+                    .into_iter()
+                    .map(|x| origin * Isometry3::translation(x, 0.0, 0.0))
+                    .collect();
+                let turn = UnitQuaternion::from_euler_angles(0.0, 0.0, std::f64::consts::FRAC_PI_2);
+                let optimized = vec![
+                    origin,
+                    origin * Isometry3::translation(0.5, 0.0, 0.0),
+                    origin * Isometry3::translation(1.0, 0.0, 0.0),
+                    origin * Isometry3::translation(1.5, 0.0, 0.0),
+                    origin * Isometry3::from_parts(Translation3::new(0.5, 1.0, 0.0), turn),
+                    origin * Isometry3::from_parts(Translation3::new(0.5, 1.5, 0.0), turn),
+                    origin * Isometry3::from_parts(Translation3::new(0.5, 2.0, 0.0), turn),
+                ];
+                let mut pending = None;
+                for index in [0usize, 1, 2, 3, 4, 6] {
+                    let stamp = (index as u64 + 1) * 1_000_000_000;
+                    handoff_lio_odometry(
+                        &baseline,
+                        &pose_state_from_isometry(&optimized[index], "odom", stamp),
+                        "base_link",
+                        &tf,
+                    )
+                    .await
+                    .unwrap();
+                    let (truth_generation, truth_frame, truth_origin) = {
+                        let adapter = baseline.mapping_adapter.as_ref().unwrap().lock();
+                        let transform = adapter.map_odom_transform_snapshot().unwrap();
+                        (
+                            adapter.snapshot().session_generation,
+                            adapter.global_frame_generation(),
+                            (transform.base_isometry()
+                                * optimized[index]
+                                * Point3::new(0.2, -0.1, 0.05))
+                            .coords
+                            .into(),
+                        )
+                    };
+                    assert!(handoff_registered_lio_cloud_fenced(
+                        &baseline,
+                        &world,
+                        12,
+                        (index as u64 + 1) * 300_000_000,
+                        stamp,
+                        "map",
+                        truth_generation,
+                        truth_frame,
+                        Some(truth_origin)
+                    )
+                    .await
+                    .unwrap());
+                    handoff_lio_odometry_with_correction(
+                        &handle,
+                        &pose_state_from_isometry(&raw[index], "odom", stamp),
+                        "base_link",
+                        &tf,
+                        &applier,
+                    )
+                    .await
+                    .unwrap();
+                    let (points, binding) = {
+                        let adapter = mapping.lock();
+                        let transform = adapter.map_odom_transform_snapshot().unwrap();
+                        let anchor = transform.base_isometry();
+                        let body: Vec<_> = world
+                            .iter()
+                            .map(|point| optimized[index].inverse() * anchor.inverse() * point)
+                            .collect();
+                        let odom: Vec<_> = body.iter().map(|point| raw[index] * point).collect();
+                        let registered = adapter.register_odom_cloud_to_map(&odom, "odom").unwrap();
+                        let sensor = transform.effective_isometry()
+                            * raw[index]
+                            * Point3::new(0.2, -0.1, 0.05);
+                        (
+                            registered.points,
+                            crate::lio_ingress::RegistrationBinding {
+                                sensor_origin_map: Some(sensor.coords.into()),
+                                runtime_generation: 7,
+                                cloud_source_sequence: index as i64 + 1,
+                                correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
+                                    source_sequence: index as i64 + 1,
+                                    source_timestamp_ns: stamp as i64,
+                                },
+                                mapping_session_id: adapter.snapshot().session_id,
+                                mapping_session_generation: adapter.snapshot().session_generation,
+                                map_frame_generation: adapter.global_frame_generation(),
+                                envelope_sha256: [index as u8 + 1; 32],
+                                frozen_odom_from_body: raw[index],
+                                base_anchor_map_from_odom: anchor,
+                                registration_map_from_odom: transform.effective_isometry(),
+                                registration_correction_revision: transform.correction_revision,
+                                frame_capture_relocalization_epoch: Some(0),
+                            },
+                        )
+                    };
+                    assert!(handoff_registered_lio_cloud_with_correction(
+                        &handle,
+                        &points,
+                        12,
+                        (index as u64 + 1) * 300_000_000,
+                        stamp,
+                        "map",
+                        "base_link",
+                        &binding,
+                        &owner.ingress()
+                    )
+                    .await
+                    .unwrap());
+                    if index == 4 {
+                        // 第6帧在第2次校正之前已注册，且新的里程计已到达；校正后它必须被拒绝。
+                        let latest_stamp = 6_000_000_000;
+                        handoff_lio_odometry_with_correction(
+                            &handle,
+                            &pose_state_from_isometry(&raw[5], "odom", latest_stamp),
+                            "base_link",
+                            &tf,
+                            &applier,
+                        )
+                        .await
+                        .unwrap();
+                        let adapter = mapping.lock();
+                        let transform = adapter.map_odom_transform_snapshot().unwrap();
+                        let body: Vec<_> = world
+                            .iter()
+                            .map(|p| {
+                                optimized[5].inverse() * transform.base_isometry().inverse() * p
+                            })
+                            .collect();
+                        let odom: Vec<_> = body.iter().map(|p| raw[5] * p).collect();
+                        let old = adapter.register_odom_cloud_to_map(&odom, "odom").unwrap();
+                        let mut old_binding = binding.clone();
+                        old_binding.cloud_source_sequence = 6;
+                        old_binding.correlated_odometry = crate::lio_ingress::CorrelatedOdometry {
+                            source_sequence: 6,
+                            source_timestamp_ns: latest_stamp as i64,
+                        };
+                        old_binding.frozen_odom_from_body = raw[5];
+                        old_binding.envelope_sha256 = [6; 32];
+                        pending = Some((old.points, old_binding));
+                    }
+                    if index == 2 || index == 4 {
+                        let _guard = handle.mapping_lifecycle_lock.lock().await;
+                        let revision = if index == 2 { 1 } else { 2 };
+                        let receipt = mapping.lock().latest_occupancy_commit_receipt().unwrap();
+                        let previous_cloud = handle.state.read().await.cloud_map_revision;
+                        let correction = optimized[index] * raw[index].inverse();
+                        let trajectory = (0..=index)
+                            .map(|i| {
+                                let q = optimized[i].rotation.quaternion();
+                                OptimizedKeyframe {
+                                    source_timestamp_ns: (i as i64 + 1) * 1_000_000_000,
+                                    translation_m: optimized[i].translation.vector.into(),
+                                    rotation_xyzw: [q.i, q.j, q.k, q.w],
+                                }
+                            })
+                            .collect();
+                        let transaction = CanonicalCorrectionTransaction {
+                            runtime_generation: 7,
+                            backend_generation: 7,
+                            backend,
+                            candidate_sequence: revision,
+                            payload_sha256: [revision as u8; 32],
+                            correction_revision: revision,
+                            mapping_session_id: binding.mapping_session_id.clone(),
+                            mapping_session_generation: binding.mapping_session_generation,
+                            mapping_commit_id: receipt.commit_id,
+                            occupancy_revision: receipt.occupancy_revision,
+                            cloud_revision: previous_cloud,
+                            map_frame_generation: binding.map_frame_generation,
+                            source_timestamp_ns: stamp,
+                            committed_map_source_timestamp_ns: stamp,
+                            map_frame_id: "map".into(),
+                            odom_frame_id: "odom".into(),
+                            body_frame_id: "base_link".into(),
+                            correction_lease: identity.correction_lease,
+                            base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
+                            absolute_left_correction: correction,
+                            effective_map_from_odom: binding.base_anchor_map_from_odom * correction,
+                            frozen_odom_source_timestamp_ns: stamp,
+                            frozen_odom_from_body: raw[index],
+                            trajectory,
+                        };
+                        if index == 2 {
+                            let cancelled = CorrectionRequestCancellation::new();
+                            cancelled.cancel();
+                            assert!(applier
+                                .apply_transaction(transaction.clone(), cancelled)
+                                .await
+                                .is_err());
+                            let mut invalid = transaction.clone();
+                            invalid.trajectory[0].translation_m[0] += 1.0;
+                            assert!(applier
+                                .apply_transaction(invalid, CorrectionRequestCancellation::new())
+                                .await
+                                .is_err());
+                            assert!(applier.snapshot().is_none());
+                            assert_eq!(
+                                handle.state.read().await.map.revision,
+                                receipt.occupancy_revision
+                            );
+                            assert_eq!(
+                                handle.state.read().await.cloud_map_revision,
+                                previous_cloud
+                            );
+                            assert_eq!(
+                                mapping
+                                    .lock()
+                                    .map_odom_transform_snapshot()
+                                    .unwrap()
+                                    .correction_revision,
+                                0
+                            );
+                        }
+                        let cancellation = CorrectionRequestCancellation::new();
+                        applier
+                            .apply_transaction(transaction, cancellation.clone())
+                            .await
+                            .unwrap();
+                        cancellation
+                            .operation()
+                            .mark_coordinator_finalized()
+                            .unwrap();
+                        cancellation.finish_canonical_commit();
+                        let shared = handle.state.read().await;
+                        assert!(shared.map.revision > receipt.occupancy_revision);
+                        assert!(shared.cloud_map_revision > previous_cloud);
+                        let selected = if index == 4 { 5 } else { index };
+                        let expected = binding.base_anchor_map_from_odom * optimized[selected];
+                        assert!(
+                            (nalgebra::Vector3::new(shared.pose.x, shared.pose.y, shared.pose.z)
+                                - expected.translation.vector)
+                                .norm()
+                                < 1e-8
+                        );
+                        assert_eq!(
+                            shared.pose.timestamp_ns,
+                            (selected as u64 + 1) * 1_000_000_000
+                        );
+                        let rotation = UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                            shared.pose.qw,
+                            shared.pose.qx,
+                            shared.pose.qy,
+                            shared.pose.qz,
+                        ));
+                        assert!(
+                            rotation.angle_to(&expected.rotation) < 1e-8,
+                            "公共位姿朝向必须与优化地图一致"
+                        );
+                        drop(shared);
+                        let mut adapter = mapping.lock();
+                        let lease = adapter.begin_backend_checkpoint_export().unwrap();
+                        assert!(
+                            adapter
+                                .prepare_backend_checkpoint_flush(&lease, stamp + 1)
+                                .unwrap()
+                                .is_none(),
+                            "已重建地图不能再用旧坐标末帧刷新"
+                        );
+                        adapter.finish_backend_checkpoint_export(&lease);
+                    }
+                    if index == 4 {
+                        let (points, old) = pending.take().unwrap();
+                        let before = handle.state.read().await.map.revision;
+                        assert!(!handoff_registered_lio_cloud_with_correction(
+                            &handle,
+                            &points,
+                            12,
+                            1_800_000_000,
+                            6_000_000_000,
+                            "map",
+                            "base_link",
+                            &old,
+                            &owner.ingress()
+                        )
+                        .await
+                        .unwrap());
+                        assert_eq!(handle.state.read().await.map.revision, before);
+                    }
+                    if index >= 2 {
+                        let actual_grid = mapping.lock().raw_map_snapshot().unwrap();
+                        let truth_grid = baseline
+                            .mapping_adapter
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .raw_map_snapshot()
+                            .unwrap();
+                        assert_eq!(
+                            (actual_grid.width, actual_grid.height),
+                            (truth_grid.width, truth_grid.height)
+                        );
+                        assert!(
+                            (actual_grid.origin_x - truth_grid.origin_x).abs() < 1e-8
+                                && (actual_grid.origin_y - truth_grid.origin_y).abs() < 1e-8
+                        );
+                        assert_eq!(
+                            actual_grid.data, truth_grid.data,
+                            "重建及后续二维地图必须与直接真实轨迹建图一致"
+                        );
+                        let cloud = handle
+                            .cloud_map_writer
+                            .lock()
+                            .as_ref()
+                            .unwrap()
+                            .committed_snapshot()
+                            .unwrap();
+                        let actual: Vec<_> = cloud
+                            .xyz_f32_le
+                            .chunks_exact(12)
+                            .map(|p| {
+                                Point3::new(
+                                    f32::from_le_bytes(p[0..4].try_into().unwrap()) as f64,
+                                    f32::from_le_bytes(p[4..8].try_into().unwrap()) as f64,
+                                    f32::from_le_bytes(p[8..12].try_into().unwrap()) as f64,
+                                )
+                            })
+                            .collect();
+                        let worst = actual
+                            .iter()
+                            .map(|p| {
+                                world
+                                    .iter()
+                                    .map(|q| (p - q).norm())
+                                    .fold(f64::INFINITY, f64::min)
+                            })
+                            .fold(0.0, f64::max);
+                        assert!(
+                            worst < 0.045,
+                            "{backend:?}/{map_backend:?} 第{}帧地图仍有旧坐标点，误差{worst}",
+                            index + 1
+                        );
+                        println!("大校正校验 {backend:?}/{map_backend:?} frame={} cloud_points={} worst={worst:.6}",index+1,actual.len());
+                    }
+                }
+                owner.shutdown().await.unwrap();
+                mapping.lock().stop_session("pgo-complete").unwrap();
+                mapping
+                    .lock()
+                    .start_session("pgo-restarted", "pgo-restarted-map")
+                    .unwrap();
+                handoff_lio_odometry_with_correction(
+                    &handle,
+                    &pose_state_from_isometry(&origin, "odom", 9_000_000_000),
+                    "base_link",
+                    &tf,
+                    &applier,
+                )
+                .await
+                .unwrap();
+                let restarted = mapping.lock();
+                assert_eq!(
+                    restarted
+                        .map_odom_transform_snapshot()
+                        .unwrap()
+                        .correction_revision,
+                    0
+                );
+                assert!(
+                    restarted.pgo_rebuild_input().unwrap().0.is_empty(),
+                    "新会话不能重放上一会话原始扫描"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14020,6 +14928,8 @@ mod mapping_feed_tests {
                                 &sequence.to_be_bytes(),
                             ),
                             frozen_odom_from_body: odom,
+                            registration_map_from_odom: nalgebra::Isometry3::identity(),
+                            registration_correction_revision: 0,
                             base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
                             frame_capture_relocalization_epoch: Some(0),
                         },
@@ -14136,6 +15046,8 @@ mod mapping_feed_tests {
             map_frame_generation,
             envelope_sha256: [0x5a; 32],
             frozen_odom_from_body,
+            registration_map_from_odom: base_anchor_map_from_odom,
+            registration_correction_revision: 0,
             base_anchor_map_from_odom,
             frame_capture_relocalization_epoch: Some(0),
         };
@@ -14261,7 +15173,10 @@ mod mapping_feed_tests {
         assert!(revision_rx.try_recv().is_err());
         assert_eq!(sink.staged.lock().await.len(), 1);
         assert_eq!(handle.state.read().await.map.revision, before_revision);
-        assert_eq!(handle.state.read().await.cloud_map_revision, before_cloud_revision);
+        assert_eq!(
+            handle.state.read().await.cloud_map_revision,
+            before_cloud_revision
+        );
 
         // A read-only relocalization payload may only be republished while
         // its exact committed receipt is still current.  Advancing the
@@ -14346,6 +15261,8 @@ mod mapping_feed_tests {
             map_frame_generation: 1,
             envelope_sha256: [0x77; 32],
             frozen_odom_from_body: nalgebra::Isometry3::identity(),
+            registration_map_from_odom: nalgebra::Isometry3::identity(),
+            registration_correction_revision: 0,
             base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
             frame_capture_relocalization_epoch: Some(captured.epoch),
         };
@@ -14589,8 +15506,13 @@ mod mapping_feed_tests {
     #[tokio::test]
     async fn canonical_pose_remains_readable_while_tf_publication_is_blocked() {
         let mut handle = build_handle_for_tests().await.unwrap();
-        handle.mapping_adapter.as_ref().unwrap().lock()
-            .start_session("unblocked-pose-session", "warehouse").unwrap();
+        handle
+            .mapping_adapter
+            .as_ref()
+            .unwrap()
+            .lock()
+            .start_session("unblocked-pose-session", "warehouse")
+            .unwrap();
         let backend = MappingFeedRecordingBackend::new(
             LcmTopic::new("/test/mapping/pose-readable-odom").unwrap(),
         );
@@ -14615,20 +15537,31 @@ mod mapping_feed_tests {
                     LcmTopic::new("/test/mapping/pose-readable-tf").unwrap(),
                     LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
                 ),
-            ).await
+            )
+            .await
         });
         tokio::time::timeout(Duration::from_secs(1), backend.publish_started.notified())
-            .await.expect("坐标变换发布进入阻塞器");
+            .await
+            .expect("坐标变换发布进入阻塞器");
         tokio::time::timeout(Duration::from_millis(50), changes.changed())
-            .await.expect("规范提交应先通知位姿消费者").unwrap();
+            .await
+            .expect("规范提交应先通知位姿消费者")
+            .unwrap();
         let shared = tokio::time::timeout(Duration::from_millis(50), state.read())
-            .await.expect("远程发布不能持有共享数据锁");
+            .await
+            .expect("远程发布不能持有共享数据锁");
         assert_eq!(shared.pose.timestamp_ns, 123_456_789);
         assert_eq!(shared.latest_transform_entries().len(), 2);
         drop(shared);
         assert!(lifecycle.try_lock().is_err(), "原建图生命周期围栏保持有效");
-        let error = tokio::time::timeout(MAP_FANOUT_SINK_TIMEOUT + Duration::from_secs(1), publication)
-            .await.unwrap().unwrap().expect_err("原发布超时必须仍返回失败");
+        let error = tokio::time::timeout(
+            MAP_FANOUT_SINK_TIMEOUT + Duration::from_secs(1),
+            publication,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("原发布超时必须仍返回失败");
         assert!(error.contains("timed out"));
         assert!(lifecycle.try_lock().is_ok());
     }

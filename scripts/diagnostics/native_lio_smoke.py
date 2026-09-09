@@ -217,25 +217,25 @@ class GatewayMappingSession:
 
 
 def closed_motion_state(seconds):
-    """解析闭合轨迹：8秒初始化、36秒运动，同步返回位置、加速度、偏航和偏航角速度。"""
+    """解析闭合轨迹：8秒初始化、72秒运动，同步返回位置、加速度、偏航和偏航角速度。"""
     seconds = np.asarray(seconds, dtype=float)
-    active = (seconds >= 8.0) & (seconds < 44.0)
-    omega = 2 * np.pi / 36.0
-    phase = np.clip(seconds - 8.0, 0.0, 36.0) * omega
+    active = (seconds >= 8.0) & (seconds < 80.0)
+    omega = 2 * np.pi / 72.0
+    phase = np.clip(seconds - 8.0, 0.0, 72.0) * omega
     sine, cosine = np.sin(phase), np.cos(phase)
-    position = np.stack((1 - cosine, .5 * sine ** 3, np.zeros_like(phase)), axis=-1)
-    acceleration = np.stack((omega ** 2 * cosine,
-        1.5 * omega ** 2 * (2 * sine * cosine ** 2 - sine ** 3), np.zeros_like(phase)), axis=-1)
+    position = np.stack((1.5 * (1 - cosine), .75 * sine ** 3, np.zeros_like(phase)), axis=-1)
+    acceleration = np.stack((1.5 * omega ** 2 * cosine,
+        2.25 * omega ** 2 * (2 * sine * cosine ** 2 - sine ** 3), np.zeros_like(phase)), axis=-1)
     acceleration = np.where(active[..., None], acceleration, 0.0)
-    yaw = .2 * (1 - cosine)
-    yaw_rate = np.where(active, .2 * omega * sine, 0.0)
+    yaw = .3 * (1 - cosine)
+    yaw_rate = np.where(active, .3 * omega * sine, 0.0)
     return position, acceleration, yaw, yaw_rate
 
 
 def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False,
                 correction_backend="none", motion_loop=False):
-    if motion_loop and frame_count < 450:
-        raise ValueError("闭合运动模拟需要至少450帧")
+    if motion_loop and frame_count < 850:
+        raise ValueError("闭合运动模拟需要至少850帧")
     root = ROOT
     evidence = output_dir
     # 仅在资源确已退出后删除；清理失败时保留路径供继续处理。
@@ -326,11 +326,13 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             bridge = RuntimeInputBridge(runtime_provider=remote, point_cloud_provider=sensors)
             assert bridge.start()
             stub.StartMapping(pb2.StartMappingRequest(session_id="offline-real", map_name=map_name), timeout=3)
-        values = np.linspace(-3, 3, 20)
+        values = np.linspace(-4, 4, 41) if motion_loop else np.linspace(-3, 3, 20)
+        wall = 4.0 if motion_loop else 3.0
+        heights = np.linspace(-1, 2, 16 if motion_loop else 10)
         # 世界场景为地面与两面墙，静止/运动观测的时间与重力来自同一合成场景。
         points = np.asarray([(x, y, -1.) for x in values for y in values]
-            + [(3., y, z) for y in values for z in np.linspace(-1, 2, 10)]
-            + [(x, 3., z) for x in values for z in np.linspace(-1, 2, 10)], dtype="<f4")
+            + [(wall, y, z) for y in values for z in heights]
+            + [(x, wall, z) for x in values for z in heights], dtype="<f4")
         world_points = points.copy()
         points = np.ascontiguousarray(
             ((points @ world_from_body) - body_from_sensor_translation) @ body_from_sensor_rotation,
@@ -533,14 +535,14 @@ def main():
     parser.add_argument("--runtime-binary", type=Path, default=ROOT / "services/geometry/nuwax_geometry_runtime/target/debug/nuwax-geometry-runtime")
     parser.add_argument("--output-dir", type=Path, help="保留原生日志；未设置时使用自动清理的临时目录")
     parser.add_argument("--frames", type=int, default=60)
-    parser.add_argument("--motion-loop", action="store_true", help="按真实时间运行闭合运动轨迹，需至少450帧")
+    parser.add_argument("--motion-loop", action="store_true", help="按真实时间运行闭合运动轨迹，需至少850帧")
     parser.add_argument("--gateway", action="store_true", help="通过真实HTTP/MCP创建、激活与控制建图")
     parser.add_argument("--correction-backend", choices=("none", "library_pgo", "native_pgo"), default="none", help="选择实际校正后端，核对原生定位与位姿图优化组合")
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error("--frames 必须大于零")
-    if args.motion_loop and args.frames < 450:
-        parser.error("--motion-loop 需要至少450帧以覆盖完整初始化、运动与返回")
+    if args.motion_loop and args.frames < 850:
+        parser.error("--motion-loop 需要至少850帧以覆盖完整初始化、运动与返回")
     if args.backend == "all" and args.executable is not None:
         parser.error("--executable 仅适用于单个后端")
     if args.output_dir is not None:

@@ -1703,7 +1703,7 @@ const OUTPUT_SILENCE_WINDOW: Duration = Duration::from_millis(200);
 #[cfg(feature = "nuwax-lio-test-child")]
 const RAYTRACING_CANDIDATE_CADENCE_WAIT: Duration = Duration::from_millis(300);
 #[cfg(feature = "nuwax-lio-test-child")]
-const CORRECTION_CANDIDATE_MAX_BODY_BYTES: usize = 4_096 - 8;
+const CORRECTION_CANDIDATE_MAX_BODY_BYTES: usize = 256 * 1024 - 8;
 #[cfg(feature = "nuwax-lio-test-child")]
 const CORRECTION_FINALIZATION_TARGET: &str = "nuwax_geometry_runtime::correction_finalization";
 #[cfg(feature = "nuwax-lio-test-child")]
@@ -2317,12 +2317,7 @@ fn wait_for_child_exit(child_pid: u32, child_start_time: u64, scenario: &str) {
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
-fn wait_for_process_identity_exit(
-    pid: u32,
-    start_time: u64,
-    timeout: Duration,
-    scenario: &str,
-) {
+fn wait_for_process_identity_exit(pid: u32, start_time: u64, timeout: Duration, scenario: &str) {
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(|| panic!("{scenario}: process identity deadline overflow"));
@@ -2413,7 +2408,7 @@ fn wait_for_native_pgo_status(
         let status = decode_native_pgo_status(&next_frame(runtime, stream, scenario));
         assert_eq!(
             status.schema_version,
-            native_pgo::NATIVE_PGO_SCHEMA_VERSION_V1
+            native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2
         );
         assert_eq!(status.backend, native_pgo::NATIVE_PGO_BACKEND);
         assert_eq!(status.runtime_generation, generation as i64);
@@ -2474,7 +2469,7 @@ fn observe_native_pgo_exchange(
     let request = decode_native_pgo_request(&request_frame);
     assert_eq!(
         request.schema_version,
-        native_pgo::NATIVE_PGO_SCHEMA_VERSION_V1
+        native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2
     );
     assert_eq!(request.identity.backend, native_pgo::NATIVE_PGO_BACKEND);
     assert_eq!(request.identity.runtime_generation, generation as i64);
@@ -2768,6 +2763,7 @@ struct DecodedCorrectionCandidate {
     correction_lease_generation: u64,
     translation_m: [f64; 3],
     rotation_xyzw: [f64; 4],
+    trajectory: Vec<native_pgo::OptimizedKeyframe>,
     payload_sha256: [u8; 32],
 }
 
@@ -2869,10 +2865,29 @@ fn encode_candidate_lcm_string(value: &str, encoded: &mut Vec<u8>) {
 }
 
 #[cfg(feature = "nuwax-lio-test-child")]
+fn encode_candidate_trajectory(nodes: &[native_pgo::OptimizedKeyframe], encoded: &mut Vec<u8>) {
+    // 按私有第二版列式数组独立重编码，摘要覆盖整个优化轨迹。
+    encoded.extend_from_slice(&(nodes.len() as i32).to_be_bytes());
+    for node in nodes {
+        encoded.extend_from_slice(&node.source_timestamp_ns.to_be_bytes());
+    }
+    for node in nodes {
+        for value in node.translation_m {
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    for node in nodes {
+        for value in node.rotation_xyzw {
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "nuwax-lio-test-child")]
 fn native_candidate_payload_sha256(result: &native_pgo::NativePgoResult) -> [u8; 32] {
     let identity = &result.request.identity;
     let mut encoded = Vec::with_capacity(512);
-    encoded.extend_from_slice(&1_i32.to_be_bytes());
+    encoded.extend_from_slice(&2_i32.to_be_bytes());
     encoded.extend_from_slice(&native_pgo::NATIVE_PGO_BACKEND.to_be_bytes());
     encoded.extend_from_slice(
         &native_pgo::NATIVE_PGO_TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3.to_be_bytes(),
@@ -2917,6 +2932,7 @@ fn native_candidate_payload_sha256(result: &native_pgo::NativePgoResult) -> [u8;
     {
         encoded.extend_from_slice(&value.to_be_bytes());
     }
+    encode_candidate_trajectory(&result.trajectory, &mut encoded);
     nuwax_codec::sha256_bytes(&encoded)
 }
 
@@ -2933,7 +2949,7 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     );
     let mut cursor = CandidateWireCursor::new(&frame.payload);
     let schema_version = cursor.read_i32("schema_version").unwrap();
-    assert_eq!(schema_version, 1, "unsupported correction candidate schema");
+    assert_eq!(schema_version, 2, "unsupported correction candidate schema");
     let backend = cursor.read_i32("backend").unwrap();
     assert!(
         (1..=3).contains(&backend),
@@ -3000,6 +3016,36 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
     let mut rotation_xyzw = [0.0; 4];
     for (axis, value) in rotation_xyzw.iter_mut().enumerate() {
         *value = cursor.read_f64(&format!("rotation_xyzw[{axis}]")).unwrap();
+    }
+    let count = cursor.read_i32("optimized_keyframe_count").unwrap();
+    assert!((0..=2000).contains(&count));
+    let mut trajectory = (0..count)
+        .map(|_| native_pgo::OptimizedKeyframe {
+            source_timestamp_ns: cursor
+                .read_positive_u64("optimized_source_timestamp_ns")
+                .unwrap() as i64,
+            translation_m: [0.0; 3],
+            rotation_xyzw: [0.0; 4],
+        })
+        .collect::<Vec<_>>();
+    for node in &mut trajectory {
+        for value in &mut node.translation_m {
+            *value = cursor.read_f64("optimized_translation_m").unwrap();
+        }
+    }
+    for node in &mut trajectory {
+        for value in &mut node.rotation_xyzw {
+            *value = cursor.read_f64("optimized_rotation_xyzw").unwrap();
+        }
+    }
+    native_pgo::validate_optimized_keyframes(&trajectory).unwrap();
+    if backend != 3 {
+        assert_eq!(
+            trajectory
+                .last()
+                .map(|node| node.source_timestamp_ns as u64),
+            Some(source_timestamp_ns)
+        );
     }
     let payload_sha256 = cursor.take("payload_sha256").unwrap();
     cursor.finish().unwrap();
@@ -3149,6 +3195,7 @@ fn decode_correction_candidate(frame: &RawLcmFrame) -> DecodedCorrectionCandidat
         correction_lease_generation,
         translation_m,
         rotation_xyzw,
+        trajectory,
         payload_sha256,
     }
 }
@@ -6655,7 +6702,7 @@ fn native_pgo_production_binary_real_lcm_v2_reaches_canonical_applier() {
             )
             .build();
     let old_cancel = native_pgo::seal_native_pgo_status(native_pgo::NativePgoStatus {
-        schema_version: native_pgo::NATIVE_PGO_SCHEMA_VERSION_V1,
+        schema_version: native_pgo::NATIVE_PGO_SCHEMA_VERSION_V2,
         backend: native_pgo::NATIVE_PGO_BACKEND,
         runtime_generation: 1,
         backend_generation: 1,
@@ -9024,7 +9071,7 @@ fn matrix_read_proof_transform(
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn matrix_reencode_candidate_preimage(candidate: &DecodedCorrectionCandidate) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(512);
-    encoded.extend_from_slice(&1_i32.to_be_bytes());
+    encoded.extend_from_slice(&2_i32.to_be_bytes());
     encoded.extend_from_slice(&candidate.backend.to_be_bytes());
     encoded.extend_from_slice(&candidate.transform_semantics.to_be_bytes());
     encoded.extend_from_slice(&candidate.runtime_generation.to_be_bytes());
@@ -9067,6 +9114,7 @@ fn matrix_reencode_candidate_preimage(candidate: &DecodedCorrectionCandidate) ->
     {
         encoded.extend_from_slice(&value.to_be_bytes());
     }
+    encode_candidate_trajectory(&candidate.trajectory, &mut encoded);
     encoded
 }
 

@@ -9,7 +9,7 @@ use super::optimizer::{cost_strictly_improved, graph_cost, OptimizerConfig};
 use super::pgo::{PoseEdge, PoseGraph};
 use super::registration::evaluate_loop_registration;
 use super::PgoOptimizer;
-use crate::relocalization::{IcpConfig, IcpSolver};
+use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
 
 /// Configuration for the complete loop-closure coordinator.
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +30,16 @@ pub struct LoopClosurePipelineConfig {
     pub min_loop_overlap_ratio: f64,
     /// ICP configuration used to create loop measurements.
     pub icp: IcpConfig,
+    /// 原Dimos库内路径使用点到平面匹配；点到点供离散点集调用方明确选择。
+    pub point_to_plane: bool,
+    /// 匹配前的关键帧和子图体素大小。
+    pub submap_resolution_m: f64,
+    /// 历史子图在目标节点两侧各保留的关键帧数。
+    pub loop_submap_half_range: usize,
+    /// 开始回环搜索所需的最少关键帧数。
+    pub min_keyframes_for_loop_search: usize,
+    /// 两次接纳回环之间的最短源时间间隔。
+    pub min_loop_interval_secs: f64,
     /// Pose-graph optimizer configuration.
     pub optimizer: OptimizerConfig,
 }
@@ -38,16 +48,21 @@ impl Default for LoopClosurePipelineConfig {
     fn default() -> Self {
         Self {
             keyframe_translation: 0.5,
-            keyframe_rotation: 0.2,
-            loop_search_radius: 1.0,
-            min_loop_separation_secs: 30.0,
+            keyframe_rotation: 10.0_f64.to_radians(),
+            loop_search_radius: 2.0,
+            min_loop_separation_secs: 20.0,
             min_keyframe_points: 10,
-            max_loop_mse: 0.05,
+            max_loop_mse: 0.3,
             min_loop_overlap_ratio: 0.5,
             icp: IcpConfig {
                 max_correspondence_distance: 1.0,
                 ..IcpConfig::default()
             },
+            point_to_plane: true,
+            submap_resolution_m: 0.2,
+            loop_submap_half_range: 10,
+            min_keyframes_for_loop_search: 10,
+            min_loop_interval_secs: 5.0,
             optimizer: OptimizerConfig::default(),
         }
     }
@@ -310,11 +325,12 @@ impl LoopClosureCoordinator {
         });
         let node_id = self.graph.add_node(timestamp.floor() as i64, initial_pose);
         if let Some((previous_id, previous_pose)) = previous {
-            self.graph.add_edge(PoseEdge::new(
-                previous_id,
-                node_id,
-                previous_pose.inverse() * local_pose,
-            ));
+            self.graph.add_edge(
+                PoseEdge::new(previous_id, node_id, previous_pose.inverse() * local_pose)
+                    .with_information(Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                        1e4, 1e4, 1e6, 1e6, 1e6, 1e6,
+                    ))),
+            );
         } else {
             self.graph.fix_first_node();
         }
@@ -323,17 +339,27 @@ impl LoopClosureCoordinator {
             StoredKeyframe {
                 timestamp,
                 local_pose,
-                points: points.to_vec(),
+                points: voxel_downsample(points, self.config.submap_resolution_m),
             },
         );
 
         let loop_result = self.find_and_measure_loop(node_id);
         let result = if let Some(record) = loop_result {
-            let information_scale = 1.0 / record.mse.max(1e-6);
+            // 与Dimos的Pose3噪声模型一致，但本库切空间顺序是平移在前。
+            // 米平方的匹配误差不能当作弧度平方的旋转方差。
+            let information_scale = 1.0 / record.mse.max(1e-4);
+            let loop_information = Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                information_scale,
+                information_scale,
+                information_scale,
+                20.0,
+                20.0,
+                20.0,
+            ));
             let mut optimized_graph = self.graph.clone();
             optimized_graph.add_edge(
                 PoseEdge::new(record.from, record.to, record.measurement)
-                    .with_information(Matrix6::identity() * information_scale),
+                    .with_information(loop_information),
             );
             let initial_cost = graph_cost(&optimized_graph);
             let historic_id = record.from;
@@ -386,6 +412,20 @@ impl LoopClosureCoordinator {
 
     fn find_and_measure_loop(&self, current_id: u64) -> Option<LoopClosureRecord> {
         let current = self.keyframes.get(&current_id)?;
+        if self.keyframes.len() < self.config.min_keyframes_for_loop_search {
+            return None;
+        }
+        if self
+            .loops
+            .last()
+            .and_then(|record| self.keyframes.get(&record.to))
+            .is_some_and(|previous| {
+                current.timestamp - previous.timestamp < self.config.min_loop_interval_secs
+            })
+        {
+            return None;
+        }
+        let current_pose = self.graph.nodes.get(&current_id)?.pose;
         let mut candidates: Vec<(f64, u64, &StoredKeyframe)> = self
             .keyframes
             .iter()
@@ -395,34 +435,10 @@ impl LoopClosureCoordinator {
                         >= self.config.min_loop_separation_secs
             })
             .filter_map(|(id, historic)| {
-                let distance = (current.local_pose.translation.vector
-                    - historic.local_pose.translation.vector)
+                let distance = (current_pose.translation.vector
+                    - self.graph.nodes[id].pose.translation.vector)
                     .norm();
                 if distance > self.config.loop_search_radius {
-                    return None;
-                }
-                // 时间间隔和邻近位置不能证明回环；必须确实离开过历史邻域再返回。
-                // 这也排除相邻关键帧、原地转向及沿重复结构的缓慢直行。
-                let departed = self
-                    .keyframes
-                    .range((
-                        std::ops::Bound::Excluded(*id),
-                        std::ops::Bound::Excluded(current_id),
-                    ))
-                    .any(|(_, middle)| {
-                        (middle.local_pose.translation.vector
-                            - historic.local_pose.translation.vector)
-                            .norm()
-                            > self.config.loop_search_radius
-                    });
-                if !departed {
-                    tracing::debug!(
-                        event = "pgo.loop.rejected",
-                        reason = "not_revisited",
-                        current_id,
-                        historic_id = *id,
-                        "轨迹尚未离开并重访历史邻域"
-                    );
                     return None;
                 }
                 Some((distance, *id, historic))
@@ -430,10 +446,20 @@ impl LoopClosureCoordinator {
             .collect();
         candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
 
-        for (_, historic_id, historic) in candidates {
+        for (_, historic_id, _historic) in candidates {
             // 两帧点分别属于各自机体坐标，先用里程计相对位姿对齐。
             // 从单位变换直接匹配会在转向或重复结构中收敛到错误回环。
-            let historic_from_current = historic.local_pose.inverse() * current.local_pose;
+            let historic_pose = self.graph.nodes.get(&historic_id)?.pose;
+            let historic_from_current = historic_pose.inverse() * current_pose;
+            let first = historic_id.saturating_sub(self.config.loop_submap_half_range as u64);
+            let last = (historic_id + self.config.loop_submap_half_range as u64)
+                .min(current_id.saturating_sub(1));
+            let mut target = Vec::new();
+            for (id, keyframe) in self.keyframes.range(first..=last) {
+                let target_from_body = historic_pose.inverse() * self.graph.nodes.get(id)?.pose;
+                target.extend(keyframe.points.iter().map(|point| target_from_body * point));
+            }
+            let target = voxel_downsample(&target, self.config.submap_resolution_m);
             let seeded_points: Vec<_> = current
                 .points
                 .iter()
@@ -442,8 +468,39 @@ impl LoopClosureCoordinator {
             if seeded_points.iter().any(|point| !is_finite_point(point)) {
                 continue;
             }
-            let registration =
-                IcpSolver::new(self.config.icp).align(&seeded_points, &historic.points);
+            let registration = if self.config.point_to_plane {
+                let source: Vec<[f64; 3]> = seeded_points.iter().map(|p| p.coords.into()).collect();
+                let target_array: Vec<[f64; 3]> = target.iter().map(|p| p.coords.into()).collect();
+                match nuwax_gtsam::point_to_plane(
+                    &source,
+                    &target_array,
+                    self.config.icp.max_correspondence_distance,
+                    self.config.icp.max_iterations,
+                ) {
+                    Ok(result) => {
+                        let q = result.transformation.rotation_xyzw;
+                        IcpResult {
+                            transformation: Isometry3::from_parts(
+                                Translation3::from(nalgebra::Vector3::from(
+                                    result.transformation.translation,
+                                )),
+                                nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                                    q[3], q[0], q[1], q[2],
+                                )),
+                            ),
+                            mse: result.mse,
+                            iterations: result.iterations as usize,
+                            converged: result.converged != 0,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error,"回环点到平面匹配失败");
+                        continue;
+                    }
+                }
+            } else {
+                IcpSolver::new(self.config.icp).align(&seeded_points, &target)
+            };
             if !registration.converged
                 || !registration.mse.is_finite()
                 || registration.mse > self.config.max_loop_mse
@@ -454,7 +511,7 @@ impl LoopClosureCoordinator {
             // 不能用少量被筛选内点的低误差证明整帧回环；在最终变换上独立核对两帧。
             let evidence = evaluate_loop_registration(
                 &seeded_points,
-                &historic.points,
+                &target,
                 &registration.transformation,
                 self.config.icp.max_correspondence_distance,
             );
@@ -510,6 +567,18 @@ impl LoopClosureCoordinator {
 }
 
 fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosurePipelineError> {
+    if config.min_keyframes_for_loop_search < 3
+        || config.min_keyframes_for_loop_search > 2000
+        || config.loop_submap_half_range > 100
+        || !config.submap_resolution_m.is_finite()
+        || config.submap_resolution_m <= 0.0
+        || !config.min_loop_interval_secs.is_finite()
+        || config.min_loop_interval_secs < 0.0
+    {
+        return Err(LoopClosurePipelineError::InvalidConfig(
+            "invalid submap or loop search configuration",
+        ));
+    }
     if !config.keyframe_translation.is_finite() || config.keyframe_translation < 0.0 {
         return Err(LoopClosurePipelineError::InvalidConfig(
             "keyframe_translation must be finite and non-negative",

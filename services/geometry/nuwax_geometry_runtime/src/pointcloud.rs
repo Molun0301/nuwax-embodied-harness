@@ -150,7 +150,7 @@ pub struct CloudMapShmWriter {
     revision: u64,
     voxel_size: f32,
     session_generation: u64,
-    voxels: HashSet<VoxelKey>,
+    voxels: HashSet<(i32, i32, i32)>,
     ordered_voxels: OrderedVoxelSnapshot,
     dynamic_filter: DynamicCloudFilter,
     max_points: usize,
@@ -252,6 +252,13 @@ pub(crate) struct CommittedCloudMapSnapshot {
     pub xyz_f32_le: Vec<u8>,
     /// Exact SHA-256 identity of the packed XYZ payload.
     pub xyz_sha256: [u8; 32],
+}
+
+/// 私有重建得到的完整累积状态，包含尚未达到删除门限的动态反证。
+pub(crate) struct PreparedCloudAccumulator {
+    voxels: HashSet<(i32, i32, i32)>,
+    voxel_size: f32,
+    dynamic_filter: DynamicCloudFilter,
 }
 
 pub(crate) struct CorrelatedCloudMapCommit {
@@ -615,6 +622,35 @@ impl CloudMapShmWriter {
         decode_checkpoint_voxels(voxel_size, point_count, xyz_f32_le, self.max_points).map(|_| ())
     }
 
+    pub(crate) fn take_prepared_accumulator(&mut self) -> PreparedCloudAccumulator {
+        PreparedCloudAccumulator {
+            voxels: std::mem::take(&mut self.voxels),
+            voxel_size: self.voxel_size,
+            dynamic_filter: std::mem::take(&mut self.dynamic_filter),
+        }
+    }
+
+    pub(crate) fn install_prepared_accumulator(
+        &mut self,
+        receipt: &OccupancyCommitReceipt,
+        prepared: PreparedCloudAccumulator,
+    ) -> Result<CorrelatedCloudMapCommit, String> {
+        self.revision
+            .checked_add(1)
+            .ok_or("cloud-map revision exhausted")?;
+        self.validate_occupancy_receipt_for_generation(receipt, receipt.session_generation)?;
+        if prepared.voxels.is_empty() || prepared.voxels.len() > self.max_points {
+            return Err("PGO点云状态超过容量".into());
+        }
+        self.session_generation = receipt.session_generation;
+        self.voxel_size = prepared.voxel_size;
+        self.voxels = prepared.voxels;
+        self.dynamic_filter = prepared.dynamic_filter;
+        self.ordered_voxels.invalidate();
+        self.commit_accumulated_snapshot(receipt)?
+            .ok_or_else(|| "PGO点云发布失败".into())
+    }
+
     /// Restore one persisted map-frame cloud checkpoint into the live voxel
     /// accumulator and publish it as the first non-empty revision of the new
     /// mapping generation. Subsequent lidar frames continue from these voxels.
@@ -897,6 +933,40 @@ fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pgo_accumulator_install_preserves_pending_dynamic_evidence() {
+        let mut source = CloudMapShmWriter::new(&test_path("pgo-private-dynamic")).unwrap();
+        let mut target = CloudMapShmWriter::new(&test_path("pgo-installed-dynamic")).unwrap();
+        let origin = Some([0.025; 3]);
+        let person = [Point3::new(2.025, 0.025, 0.025)];
+        let background = [Point3::new(4.025, 0.025, 0.025)];
+        source.accumulate_mapping_scan(1, &person, origin, 1);
+        source.accumulate_mapping_scan(1, &background, origin, 2);
+        source.accumulate_mapping_scan(1, &background, origin, 3);
+        assert!(source.voxels.contains(&(40, 0, 0)));
+        let receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 1,
+                sequence: 1,
+            },
+            session_id: "pgo-dynamic".into(),
+            session_generation: 2,
+            occupancy_revision: 1,
+            source_timestamp_ns: 3,
+            backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        target
+            .install_prepared_accumulator(&receipt, source.take_prepared_accumulator())
+            .unwrap();
+        assert!(target.voxels.contains(&(40, 0, 0)));
+        // 私有重建已有两次有效反证；安装后的第三次必须直接删除，不能重新计票。
+        assert!(target.accumulate_mapping_scan(2, &background, origin, 4));
+        assert!(!target.voxels.contains(&(40, 0, 0)));
+        source.cleanup_product_owned_file().unwrap();
+        target.cleanup_product_owned_file().unwrap();
+    }
 
     #[test]
     fn dynamic_cloud_checkpoint_and_session_reset_keep_only_committed_geometry() {

@@ -50,15 +50,15 @@ mod preflight_only_contract {
     use crate::mapping_commit::MappingCommitId;
     use crate::owner_profile::CorrectionBackend;
 
-    const CORRECTION_SCHEMA_VERSION_V1: i32 = 1;
+    const CORRECTION_SCHEMA_VERSION_V2: i32 = 2;
     const CORRECTION_BACKEND_LIBRARY_PGO: i32 = 1;
     const CORRECTION_BACKEND_NATIVE_PGO: i32 = 2;
     const CORRECTION_BACKEND_RELOCALIZATION: i32 = 3;
     const CORRECTION_TRANSFORM_ABSOLUTE_LEFT_SE3: i32 = 1;
-    const CORRECTION_CANDIDATE_FINGERPRINT_V1: [u8; 8] = 0x8510_78c0_24d5_b010_u64.to_be_bytes();
+    const CORRECTION_CANDIDATE_FINGERPRINT_V2: [u8; 8] = 0x05057b4c757c80f3u64.to_be_bytes();
     const CORRECTION_CANDIDATE_MESSAGE_TYPE: &str = "nuwax_msgs.CorrectionCandidate";
     const MAX_IDENTITY_STRING_BYTES: usize = 255;
-    const MAX_WIRE_PAYLOAD_BYTES: usize = 4_096;
+    const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
     const MAX_REGISTERED_CLOUD_POINTS: u64 = 100_000;
     const QUATERNION_NORM_TOLERANCE: f64 = 1.0e-6;
     const MAX_TRANSLATION_ABS_METERS: f64 = 1_000_000.0;
@@ -116,7 +116,7 @@ mod preflight_only_contract {
         b"nuwax.geometry.relocalize.source-commitment.v1\0";
     const RELOCALIZATION_TERMINAL_PROOF_DOMAIN_V1: &[u8] =
         b"nuwax.geometry.relocalize.terminal-proof.v1\0";
-    const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
+    const RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES: usize = 4096;
     const RELOCALIZATION_MAX_INLINE_EVIDENCE_PREIMAGE_BYTES: usize = 4_096;
     const RELOCALIZATION_MAX_EVIDENCE_PREFIX_BYTES: usize = 16_384;
     const RELOCALIZATION_MAX_EVIDENCE_SUFFIX_BYTES: usize = 4_096;
@@ -282,6 +282,7 @@ mod preflight_only_contract {
     pub(crate) struct CorrectionCandidate {
         pub(crate) identity: CorrectionCandidateIdentity,
         pub(crate) transform: CorrectionTransform,
+        pub(crate) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
         pub(crate) payload_sha256: [u8; 32],
     }
 
@@ -290,9 +291,18 @@ mod preflight_only_contract {
             identity: CorrectionCandidateIdentity,
             transform: CorrectionTransform,
         ) -> Result<Self, CorrectionRejectReason> {
+            Self::seal_with_trajectory(identity, transform, Vec::new())
+        }
+
+        pub(crate) fn seal_with_trajectory(
+            identity: CorrectionCandidateIdentity,
+            transform: CorrectionTransform,
+            trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
+        ) -> Result<Self, CorrectionRejectReason> {
             let mut candidate = Self {
                 identity,
                 transform,
+                trajectory,
                 payload_sha256: [0; 32],
             };
             candidate.validate_fields()?;
@@ -470,13 +480,30 @@ mod preflight_only_contract {
             if (norm_squared - 1.0).abs() > QUATERNION_NORM_TOLERANCE {
                 return Err(CorrectionRejectReason::InvalidRotation);
             }
+            native_pgo_codec::validate_optimized_keyframes(&self.trajectory).map_err(|_| {
+                CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory")
+            })?;
+            if self.identity.backend == CorrectionCandidateBackend::Relocalization
+                && !self.trajectory.is_empty()
+            {
+                return Err(CorrectionRejectReason::InvalidIdentity(
+                    "relocalization cannot rebuild mapping trajectory",
+                ));
+            }
+            if self.trajectory.last().is_some_and(|frame| {
+                frame.source_timestamp_ns as u64 != self.identity.source_timestamp_ns
+            }) {
+                return Err(CorrectionRejectReason::InvalidIdentity(
+                    "trajectory does not end at source frame",
+                ));
+            }
             Ok(())
         }
 
         fn encode_body_prefix(&self) -> Result<Vec<u8>, CorrectionRejectReason> {
             let identity = &self.identity;
             let mut out = Vec::with_capacity(512);
-            out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V1.to_be_bytes());
+            out.extend_from_slice(&CORRECTION_SCHEMA_VERSION_V2.to_be_bytes());
             out.extend_from_slice(&identity.backend.wire_code().to_be_bytes());
             out.extend_from_slice(&identity.transform_semantics.wire_code().to_be_bytes());
             encode_positive_i64(identity.runtime_generation, &mut out)?;
@@ -518,6 +545,11 @@ mod preflight_only_contract {
             for value in self.transform.rotation_xyzw {
                 out.extend_from_slice(&value.to_be_bytes());
             }
+            out.extend_from_slice(
+                &native_pgo_codec::encode_optimized_keyframes(&self.trajectory).map_err(|_| {
+                    CorrectionRejectReason::InvalidIdentity("invalid optimized trajectory")
+                })?,
+            );
             Ok(out)
         }
 
@@ -532,7 +564,7 @@ mod preflight_only_contract {
                 .encode_body_prefix()
                 .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
             out.extend_from_slice(&self.payload_sha256);
-            if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V1.len() {
+            if out.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
                 return Err(CorrectionWireError::Invalid(
                     "correction candidate exceeds wire size bound".into(),
                 ));
@@ -544,8 +576,8 @@ mod preflight_only_contract {
         pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CorrectionWireError> {
             let body = self.encode_body()?;
             let mut out =
-                Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V1.len() + body.len());
-            out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V1);
+                Vec::with_capacity(CORRECTION_CANDIDATE_FINGERPRINT_V2.len() + body.len());
+            out.extend_from_slice(&CORRECTION_CANDIDATE_FINGERPRINT_V2);
             out.extend_from_slice(&body);
             Ok(out)
         }
@@ -557,12 +589,12 @@ mod preflight_only_contract {
                 ));
             }
             let (fingerprint, body) = encoded
-                .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V1.len())
+                .split_at_checked(CORRECTION_CANDIDATE_FINGERPRINT_V2.len())
                 .ok_or(CorrectionWireError::Truncated {
-                    need: CORRECTION_CANDIDATE_FINGERPRINT_V1.len(),
+                    need: CORRECTION_CANDIDATE_FINGERPRINT_V2.len(),
                     have: encoded.len(),
                 })?;
-            if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V1 {
+            if fingerprint != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
                 return Err(CorrectionWireError::Invalid(
                     "correction candidate fingerprint mismatch".into(),
                 ));
@@ -573,14 +605,14 @@ mod preflight_only_contract {
         /// Decode a generated LCM body after the transport checked and stripped
         /// the single top-level fingerprint.
         pub(crate) fn decode_body(encoded: &[u8]) -> Result<Self, CorrectionWireError> {
-            if encoded.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V1.len() {
+            if encoded.len() > MAX_WIRE_PAYLOAD_BYTES - CORRECTION_CANDIDATE_FINGERPRINT_V2.len() {
                 return Err(CorrectionWireError::Invalid(
                     "correction candidate exceeds wire size bound".into(),
                 ));
             }
             let mut cursor = WireCursor::new(encoded);
             let schema_version = cursor.read_i32()?;
-            if schema_version != CORRECTION_SCHEMA_VERSION_V1 {
+            if schema_version != CORRECTION_SCHEMA_VERSION_V2 {
                 return Err(CorrectionWireError::Invalid(format!(
                     "unsupported correction schema version {schema_version}"
                 )));
@@ -644,6 +676,24 @@ mod preflight_only_contract {
             for value in &mut rotation_xyzw {
                 *value = cursor.read_f64()?;
             }
+            let trajectory_start = cursor.offset;
+            let trajectory_count = cursor.read_i32()?;
+            if !(0..=2000).contains(&trajectory_count) {
+                return Err(CorrectionWireError::Invalid(
+                    "invalid trajectory count".into(),
+                ));
+            }
+            let trajectory_end = cursor.offset + trajectory_count as usize * 64;
+            let trajectory = native_pgo_codec::decode_optimized_keyframes(
+                cursor.bytes.get(trajectory_start..trajectory_end).ok_or(
+                    CorrectionWireError::Truncated {
+                        need: trajectory_end,
+                        have: cursor.bytes.len(),
+                    },
+                )?,
+            )
+            .map_err(|error| CorrectionWireError::Invalid(error.to_string()))?;
+            cursor.offset = trajectory_end;
             let payload_sha256 = cursor.read_array::<32>()?;
             cursor.finish()?;
             let candidate = Self {
@@ -673,6 +723,7 @@ mod preflight_only_contract {
                     translation_m,
                     rotation_xyzw,
                 },
+                trajectory,
                 payload_sha256,
             };
             candidate
@@ -1344,6 +1395,7 @@ mod preflight_only_contract {
         body_frame_id: String,
         next_candidate_sequence: u64,
         first_source_timestamp_ns: Option<u64>,
+        keyframe_source_timestamps_ns: Vec<u64>,
         last_source_timestamp_ns: Option<u64>,
         mapping_commit_boot_nonce: Option<u128>,
         last_commit_sequence: u64,
@@ -1388,6 +1440,7 @@ mod preflight_only_contract {
                         body_frame_id,
                         next_candidate_sequence: 0,
                         first_source_timestamp_ns: None,
+                        keyframe_source_timestamps_ns: Vec::new(),
                         last_source_timestamp_ns: None,
                         mapping_commit_boot_nonce: None,
                         last_commit_sequence: 0,
@@ -1452,6 +1505,7 @@ mod preflight_only_contract {
                     map_frame_generation: input.map_frame_generation,
                 });
                 self.first_source_timestamp_ns = None;
+                self.keyframe_source_timestamps_ns.clear();
                 self.last_source_timestamp_ns = None;
                 self.mapping_commit_boot_nonce = None;
                 self.last_commit_sequence = 0;
@@ -1476,6 +1530,13 @@ mod preflight_only_contract {
                     &input.body_points,
                 )
                 .map_err(|error| CorrectionOwnerError::Pipeline(error.to_string()))?;
+            if matches!(
+                result,
+                ProcessFrameResult::KeyframeAdded { .. } | ProcessFrameResult::LoopClosed { .. }
+            ) {
+                self.keyframe_source_timestamps_ns
+                    .push(input.registered_cloud.source_timestamp_ns);
+            }
             self.last_source_timestamp_ns = Some(input.registered_cloud.source_timestamp_ns);
             self.mapping_commit_boot_nonce = Some(input.mapping_commit_id.boot_nonce);
             self.last_commit_sequence = input.mapping_commit_id.sequence;
@@ -1493,7 +1554,22 @@ mod preflight_only_contract {
                 .next_candidate_sequence
                 .checked_add(1)
                 .ok_or(CorrectionOwnerError::CandidateSequenceExhausted)?;
-            let candidate = CorrectionCandidate::seal(
+            let trajectory = self
+                .coordinator
+                .corrections()
+                .keyframes()
+                .iter()
+                .zip(&self.keyframe_source_timestamps_ns)
+                .map(|(frame, stamp)| {
+                    let transform = CorrectionTransform::from_isometry(&frame.optimized_pose);
+                    native_pgo_codec::OptimizedKeyframe {
+                        source_timestamp_ns: *stamp as i64,
+                        translation_m: transform.translation_m,
+                        rotation_xyzw: transform.rotation_xyzw,
+                    }
+                })
+                .collect();
+            let candidate = CorrectionCandidate::seal_with_trajectory(
                 correction_candidate_identity(
                     CorrectionCandidateBackend::LibraryPgo,
                     &self.identity,
@@ -1504,6 +1580,7 @@ mod preflight_only_contract {
                     &input,
                 ),
                 CorrectionTransform::from_isometry(&correction),
+                trajectory,
             )
             .map_err(CorrectionOwnerError::CandidateRejected)?;
             self.next_candidate_sequence = next_candidate_sequence;
@@ -2244,6 +2321,7 @@ mod preflight_only_contract {
         pub(crate) frozen_odom_from_body: Isometry3<f64>,
         /// 冻结里程计自己的采样时间，可能略早于对应扫描。
         pub(crate) frozen_odom_source_timestamp_ns: u64,
+        pub(crate) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
     }
 
     #[async_trait::async_trait]
@@ -2558,6 +2636,7 @@ mod preflight_only_contract {
                         .identity
                         .correlated_odom
                         .source_timestamp_ns,
+                    trajectory: candidate.trajectory.clone(),
                 };
                 state.in_flight = Some(InFlightCorrection {
                     prepared,
@@ -3806,7 +3885,8 @@ mod preflight_only_contract {
                     && (record.session_generation == 0
                         || record.backend_generation == 0
                         || record.activation_identity_sha256.is_none()
-                        || (record.cloud_target_required && !Self::has_complete_target_proof(record)))
+                        || (record.cloud_target_required
+                            && !Self::has_complete_target_proof(record)))
                 {
                     return None;
                 }
@@ -4460,7 +4540,7 @@ mod preflight_only_contract {
                             "validated correction lacks a transform".to_owned(),
                         )
                     })?;
-                    let candidate = CorrectionCandidate::seal(
+                    let candidate = CorrectionCandidate::seal_with_trajectory(
                         correction_candidate_identity(
                             CorrectionCandidateBackend::NativePgo,
                             &self.identity,
@@ -4474,6 +4554,7 @@ mod preflight_only_contract {
                             translation_m: transform.translation_m(),
                             rotation_xyzw: transform.rotation_xyzw(),
                         },
+                        result.trajectory.clone(),
                     )
                     .map_err(|error| CorrectionRuntimeError::NativePgo(error.to_string()))?;
                     Ok(CandidateProduction::Candidate {
@@ -4515,7 +4596,7 @@ mod preflight_only_contract {
         }
         let odom = CorrectionTransform::from_isometry(&input.correlated_odom.odom_from_body);
         Ok(native_pgo_codec::NativePgoRequest {
-            schema_version: native_pgo_codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: native_pgo_codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             identity: native_pgo_codec::NativePgoRequestIdentity {
                 backend: native_pgo_codec::NATIVE_PGO_BACKEND,
                 runtime_generation: checked_i64("runtime generation", owner.runtime_generation)?,
@@ -5694,7 +5775,8 @@ mod preflight_only_contract {
                 Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
             };
         } else {
-            let root = PathBuf::from(runtime_data.unwrap_or_else(|| OsString::from("runtime_data")));
+            let root =
+                PathBuf::from(runtime_data.unwrap_or_else(|| OsString::from("runtime_data")));
             if root.as_os_str().is_empty() {
                 return Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned());
             }
@@ -10335,7 +10417,7 @@ mod preflight_only_contract {
             .map_err(|error| CorrectionRuntimeError::Transport(error.to_string()))?;
         let message_type = LcmMessageType::new(CORRECTION_CANDIDATE_MESSAGE_TYPE)
             .map_err(|error| CorrectionRuntimeError::Transport(error.to_string()))?;
-        if message_type.fingerprint() != CORRECTION_CANDIDATE_FINGERPRINT_V1 {
+        if message_type.fingerprint() != CORRECTION_CANDIDATE_FINGERPRINT_V2 {
             return Err(CorrectionRuntimeError::Transport(
                 "correction candidate fingerprint registry mismatch".to_owned(),
             ));
@@ -11126,19 +11208,16 @@ mod preflight_only_contract {
         }
 
         const GENERATED_PAYLOAD_SHA256: [u8; 32] = [
-            0xb9, 0xc5, 0xa8, 0x81, 0x10, 0xd9, 0x96, 0x8b, 0x19, 0x09, 0xa3, 0x63, 0xc8, 0x1e,
-            0xa0, 0x61, 0xe8, 0x36, 0xc0, 0x16, 0x54, 0xc5, 0xb5, 0x9f, 0x51, 0xdc, 0xea, 0x3c,
-            0xe3, 0xa6, 0x49, 0xe3,
+            15, 153, 227, 199, 234, 144, 47, 204, 248, 232, 226, 108, 76, 48, 122, 141, 208, 225,
+            86, 117, 119, 76, 205, 173, 72, 202, 151, 243, 146, 244, 101, 187,
         ];
         const GENERATED_BODY_SHA256: [u8; 32] = [
-            0xbf, 0x04, 0xc6, 0xcb, 0x93, 0xa5, 0x61, 0xb5, 0xc0, 0xca, 0x23, 0xda, 0x94, 0x1b,
-            0x9a, 0xd4, 0xb2, 0x67, 0x55, 0x08, 0x7e, 0x91, 0x82, 0x10, 0xea, 0x5e, 0x65, 0xf3,
-            0x20, 0x94, 0x1e, 0xb8,
+            70, 16, 162, 128, 141, 41, 212, 41, 201, 60, 75, 22, 137, 225, 145, 62, 219, 95, 155,
+            142, 169, 86, 192, 119, 167, 4, 122, 125, 222, 251, 87, 121,
         ];
         const GENERATED_WIRE_SHA256: [u8; 32] = [
-            0xd0, 0xf7, 0xb3, 0x8d, 0xe8, 0xd8, 0x8a, 0x2c, 0x2c, 0x1c, 0xdc, 0x2f, 0xe8, 0xc6,
-            0xcb, 0x51, 0x26, 0x04, 0xb8, 0xc2, 0xd8, 0x25, 0x80, 0xf2, 0x83, 0x20, 0xe8, 0x3f,
-            0x98, 0xee, 0xb0, 0x52,
+            161, 79, 141, 116, 212, 233, 28, 125, 35, 3, 9, 228, 226, 211, 1, 77, 48, 145, 154, 79,
+            104, 125, 81, 12, 146, 78, 60, 177, 58, 216, 13, 75,
         ];
 
         fn exact_hex(bytes: &[u8]) -> String {
@@ -11230,12 +11309,7 @@ mod preflight_only_contract {
                 ))
             );
             assert_eq!(
-                terminal_store_root_from(
-                    Some(OsString::new()),
-                    None,
-                    None,
-                    current_directory,
-                ),
+                terminal_store_root_from(Some(OsString::new()), None, None, current_directory,),
                 Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())
             );
         }
@@ -11290,11 +11364,7 @@ mod preflight_only_contract {
                 }
                 let reopened = RelocalizationTerminalStore::open_at(root)
                     .expect("释放后重新打开同一生产解析目录");
-                match reopened.snapshot(
-                    &result.request_id,
-                    request_identity,
-                    activation_identity,
-                ) {
+                match reopened.snapshot(&result.request_id, request_identity, activation_identity) {
                     RelocalizationTerminalSnapshot::Terminal(replayed) => {
                         assert_eq!(replayed.encode_to_vec(), result.encode_to_vec());
                     }
@@ -11932,6 +12002,7 @@ mod preflight_only_contract {
             };
             let correction = Isometry3::translation(-1.0, -2.0, -3.0);
             let candidate = CorrectionCandidate {
+                trajectory: Vec::new(),
                 identity: CorrectionCandidateIdentity {
                     backend: CorrectionCandidateBackend::Relocalization,
                     transform_semantics: CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
@@ -14783,7 +14854,9 @@ mod preflight_only_contract {
                     _ => panic!("first admission must execute"),
                 };
                 let token = control.reserve_backend_generation(&token, 13).unwrap();
-                let token = control.bind_activation_identity(&token, [4; 32], 11).unwrap();
+                let token = control
+                    .bind_activation_identity(&token, [4; 32], 11)
+                    .unwrap();
                 if has_target {
                     control.with_staged_record_mut(&token, |record| record.immutable_target = None);
                 }
@@ -15298,7 +15371,7 @@ assert wire[:8] == fingerprint
 assert wire[8:16] != fingerprint
 candidate = CorrectionCandidate.decode(wire)
 assert candidate.encode() == wire
-assert candidate.schema_version == 1
+assert candidate.schema_version == 2
 assert candidate.transform_semantics == 1
 assert candidate.body_frame_id == candidate.points_frame_id == "robot_body"
 assert candidate.occupancy_revision != candidate.cloud_revision
@@ -15309,7 +15382,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .arg(&temp)
                 .arg(&wire_path)
                 .arg(
-                    CORRECTION_CANDIDATE_FINGERPRINT_V1
+                    CORRECTION_CANDIDATE_FINGERPRINT_V2
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>(),
@@ -15394,16 +15467,16 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             assert_eq!(
                 applied.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"b9c5a88110d9968b1909a363c81ea061e836c01654c5b59f51dcea3ce3a649e3","disposition":"Applied","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Applied","candidate_processed_delivered":true}"#
             );
             assert_eq!(
                 already_applied.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"b9c5a88110d9968b1909a363c81ea061e836c01654c5b59f51dcea3ce3a649e3","disposition":"AlreadyApplied","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"AlreadyApplied","candidate_processed_delivered":true}"#
             );
             let rejected_json = rejected.to_string();
             assert_eq!(
                 rejected_json,
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"b9c5a88110d9968b1909a363c81ea061e836c01654c5b59f51dcea3ce3a649e3","disposition":"Rejected","reject_reason":"invalid identity: field=\"mapping\\identity\"\ncontrol=\u0001","candidate_processed_delivered":true}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Rejected","reject_reason":"invalid identity: field=\"mapping\\identity\"\ncontrol=\u0001","candidate_processed_delivered":true}"#
             );
             let decoded: serde_json::Value =
                 serde_json::from_str(&rejected_json).expect("finalization event is valid JSON");
@@ -15440,7 +15513,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             assert_eq!(
                 event.to_string(),
-                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"b9c5a88110d9968b1909a363c81ea061e836c01654c5b59f51dcea3ce3a649e3","disposition":"Applied","candidate_processed_delivered":false}"#
+                r#"{"event":"nuwax_correction_candidate_finalized_v1","runtime_generation":11,"backend_generation":12,"session_generation":13,"candidate_sequence":1,"payload_sha256":"0f99e3c7ea902fccf8e8e26c4c307a8dd0e15675774ccdad48ca97f392f465bb","disposition":"Applied","candidate_processed_delivered":false}"#
             );
             let output = captured.snapshot();
             assert_eq!(output.matches(CANDIDATE_FINALIZATION_EVENT_NAME).count(), 1);
@@ -16312,6 +16385,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 odom_frame_id: "robot_odom".into(),
                 body_frame_id: "robot_body".into(),
                 pipeline: LoopClosurePipelineConfig {
+                    point_to_plane: false,
+                    min_keyframes_for_loop_search: 3,
+                    loop_submap_half_range: 0,
                     keyframe_translation: 0.1,
                     keyframe_rotation: 0.05,
                     loop_search_radius: 0.5,
@@ -17285,7 +17361,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .0
                 .channel()
                 .ends_with(&owner_identity().runtime_generation.to_string()));
-            assert_eq!(binding.1.fingerprint(), CORRECTION_CANDIDATE_FINGERPRINT_V1);
+            assert_eq!(binding.1.fingerprint(), CORRECTION_CANDIDATE_FINGERPRINT_V2);
 
             let ingress = owner.ingress();
             assert!(ingress.is_open());
@@ -17620,6 +17696,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             );
 
             let pipeline = LoopClosurePipelineConfig {
+                point_to_plane: false,
+                min_keyframes_for_loop_search: 3,
+                loop_submap_half_range: 0,
                 keyframe_translation: 0.1,
                 keyframe_rotation: 0.05,
                 loop_search_radius: 0.5,
@@ -17754,7 +17833,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     let q = candidate.transform.rotation_xyzw;
                     effective = anchor
                         * Isometry3::from_parts(
-                            Translation3::from(nalgebra::Vector3::from(candidate.transform.translation_m)),
+                            Translation3::from(nalgebra::Vector3::from(
+                                candidate.transform.translation_m,
+                            )),
                             UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
                                 q[3], q[0], q[1], q[2],
                             )),
@@ -17863,12 +17944,12 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let candidate = sample_candidate(1, 100);
             let body = candidate.encode_body().expect("encode candidate body");
             let encoded = candidate.encode_wire().expect("encode candidate");
-            assert_eq!(&encoded[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V1);
+            assert_eq!(&encoded[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V2);
             assert_eq!(&encoded[8..], body);
-            assert_ne!(&body[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V1);
+            assert_ne!(&body[..8], &CORRECTION_CANDIDATE_FINGERPRINT_V2);
             assert_eq!(candidate.payload_sha256, GENERATED_PAYLOAD_SHA256);
-            assert_eq!(body.len(), 541);
-            assert_eq!(encoded.len(), 549);
+            assert_eq!(body.len(), 545);
+            assert_eq!(encoded.len(), 553);
             assert_eq!(sha256_bytes(&body), GENERATED_BODY_SHA256);
             assert_eq!(sha256_bytes(&encoded), GENERATED_WIRE_SHA256);
             assert_eq!(CorrectionCandidate::decode_body(&body).unwrap(), candidate);
@@ -17883,7 +17964,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut unsupported_semantics = encoded.clone();
             unsupported_semantics[16..20].copy_from_slice(&2_i32.to_be_bytes());
             assert!(CorrectionCandidate::decode_wire(&unsupported_semantics).is_err());
-            let mut double_fingerprint = CORRECTION_CANDIDATE_FINGERPRINT_V1.to_vec();
+            let mut double_fingerprint = CORRECTION_CANDIDATE_FINGERPRINT_V2.to_vec();
             double_fingerprint.extend_from_slice(&encoded);
             assert!(CorrectionCandidate::decode_wire(&double_fingerprint).is_err());
             assert!(CorrectionCandidate::decode_wire(&body).is_err());
@@ -17916,7 +17997,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let message_type = LcmMessageType::new(CORRECTION_CANDIDATE_MESSAGE_TYPE).unwrap();
             assert_eq!(
                 message_type.fingerprint(),
-                CORRECTION_CANDIDATE_FINGERPRINT_V1
+                CORRECTION_CANDIDATE_FINGERPRINT_V2
             );
             let mut subscription = subscriber
                 .subscribe_owned(topic.clone(), Some(message_type.clone()))
@@ -17941,7 +18022,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 candidate
             );
             assert_eq!(received.payload, candidate.encode_body().unwrap());
-            let mut generated_wire = CORRECTION_CANDIDATE_FINGERPRINT_V1.to_vec();
+            let mut generated_wire = CORRECTION_CANDIDATE_FINGERPRINT_V2.to_vec();
             generated_wire.extend_from_slice(&received.payload);
             assert_eq!(generated_wire, candidate.encode_wire().unwrap());
             assert_fresh_lcm_gen_decodes(&generated_wire);

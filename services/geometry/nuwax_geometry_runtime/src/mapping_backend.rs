@@ -1512,7 +1512,7 @@ fn encode_checkpoint_occupancy(
     Ok(())
 }
 
-fn export_mapping_kernel_checkpoint(kernel: &MappingKernel) -> Result<Vec<u8>, String> {
+pub(crate) fn export_mapping_kernel_checkpoint(kernel: &MappingKernel) -> Result<Vec<u8>, String> {
     let dirty = match kernel {
         MappingKernel::Voxel(voxel) => voxel.dirty_since_candidate,
         MappingKernel::Raytracing(ray) => ray.dirty_since_candidate,
@@ -2046,7 +2046,7 @@ fn candidate_due(last_received_at_ns: u64, received_at_ns: u64) -> bool {
         || received_at_ns.saturating_sub(last_received_at_ns) >= MAPPING_CANDIDATE_INTERVAL_NS
 }
 
-fn flush_candidate(
+pub(crate) fn flush_candidate(
     kernel: &mut MappingKernel,
     input: &MappingBackendInput,
     token: &MappingComputeToken,
@@ -2166,7 +2166,7 @@ pub(crate) fn validate_backend_input(
     Ok(())
 }
 
-fn compute_candidate_in_place(
+pub(crate) fn compute_candidate_in_place(
     kernel: &mut MappingKernel,
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
@@ -2200,10 +2200,7 @@ fn compute_candidate_in_place(
     let (live_window_occupancy, latest_frame_occupancy) = match kernel {
         MappingKernel::Voxel(voxel) => {
             let point_count = voxel.current_window.len();
-            if !candidate_due(
-                voxel.last_candidate_received_at_ns,
-                input.received_at_ns,
-            ) {
+            if !candidate_due(voxel.last_candidate_received_at_ns, input.received_at_ns) {
                 return Ok(None);
             }
             let live_points = voxel.current_window.make_contiguous();
@@ -2220,10 +2217,7 @@ fn compute_candidate_in_place(
             let Some(previous) = ray.last_occupancy.as_ref() else {
                 return Ok(None);
             };
-            if !candidate_due(
-                ray.last_candidate_received_at_ns,
-                input.received_at_ns,
-            ) {
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
                 return Ok(None);
             }
             let cleared = cleared_previous_occupancy(previous, input);
@@ -2236,10 +2230,7 @@ fn compute_candidate_in_place(
         }
         MappingKernel::Raytracing(ray) => {
             let point_count = ray.stable_points.len();
-            if !candidate_due(
-                ray.last_candidate_received_at_ns,
-                input.received_at_ns,
-            ) {
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
                 return Ok(None);
             }
             let live = build_occupancy(&ray.stable_points, input, config)?;

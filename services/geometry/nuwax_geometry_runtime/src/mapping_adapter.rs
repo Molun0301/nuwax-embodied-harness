@@ -93,6 +93,18 @@ impl MapFrameContract {
     }
 }
 
+/// 已校验但尚未发布的PGO地图安装数据。
+pub(crate) struct PreparedPgoInstall {
+    pub map: MapState,
+    pub event: MapRevisionEvent,
+    pub receipt: OccupancyCommitReceipt,
+    raw_map: MapState,
+    persistent: PersistentOccupancyGrid,
+    transform: MapOdomTransformSnapshot,
+    expected_session: MappingSessionSnapshot,
+    expected_revision: u64,
+}
+
 /// 只读平面位姿快照。位置使用目标 frame，yaw 绕 +Z，单位为弧度。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlanarPoseSnapshot {
@@ -104,7 +116,7 @@ pub struct PlanarPoseSnapshot {
 ///
 /// 首个有效 odom pose `T_odom_base(0)` 建立
 /// `T_map_odom = inverse(T_odom_base(0))`，因此首帧 base 位于 map 原点。
-/// 该变换在 reset 前保持不变；`generation` 在每次重新锚定时单调递增。
+/// 原锚点在重置前固定；有效变换为锚点左乘已提交校正，修订随PGO地图同时更新。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapOdomTransformSnapshot {
     pub map_frame_id: String,
@@ -113,6 +125,9 @@ pub struct MapOdomTransformSnapshot {
     pub yaw_radians: f64,
     pub anchor_odom_pose: PlanarPoseSnapshot,
     pub latest_map_pose: PlanarPoseSnapshot,
+    pub latest_odom_pose: PlanarPoseSnapshot,
+    pub correction: nalgebra::Isometry3<f64>,
+    pub correction_revision: u64,
     pub generation: u64,
 }
 
@@ -137,6 +152,9 @@ impl MapOdomTransformSnapshot {
             translation,
             yaw_radians,
             anchor_odom_pose,
+            latest_odom_pose: anchor_odom_pose,
+            correction: nalgebra::Isometry3::identity(),
+            correction_revision: 0,
             latest_map_pose: PlanarPoseSnapshot {
                 position: [0.0, 0.0, 0.0],
                 yaw_radians: 0.0,
@@ -145,19 +163,29 @@ impl MapOdomTransformSnapshot {
         }
     }
 
+    pub(crate) fn base_isometry(&self) -> nalgebra::Isometry3<f64> {
+        nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(nalgebra::Vector3::from(self.translation)),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, self.yaw_radians),
+        )
+    }
+
+    pub(crate) fn effective_isometry(&self) -> nalgebra::Isometry3<f64> {
+        self.base_isometry() * self.correction
+    }
+
     fn transform_position(&self, position: [f64; 3]) -> [f64; 3] {
-        let (sin_yaw, cos_yaw) = self.yaw_radians.sin_cos();
-        [
-            cos_yaw * position[0] - sin_yaw * position[1] + self.translation[0],
-            sin_yaw * position[0] + cos_yaw * position[1] + self.translation[1],
-            position[2] + self.translation[2],
-        ]
+        (self.effective_isometry() * nalgebra::Point3::from(position))
+            .coords
+            .into()
     }
 
     fn transform_pose(&self, pose: PlanarPoseSnapshot) -> PlanarPoseSnapshot {
+        let rotation = self.effective_isometry().rotation
+            * nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, pose.yaw_radians);
         PlanarPoseSnapshot {
             position: self.transform_position(pose.position),
-            yaw_radians: normalize_yaw(self.yaw_radians + pose.yaw_radians),
+            yaw_radians: normalize_yaw(rotation.euler_angles().2),
         }
     }
 }
@@ -1002,6 +1030,8 @@ struct ActiveMappingCheckpointExport {
 /// - `readiness()` —— 综合字段,给 Python diagnostics + runtime_diagnostics 对账
 pub struct MappingAdapter {
     config: MappingAdapterConfig,
+    pgo_history: Option<crate::pgo_map::ScanHistory>,
+    pgo_materialized_sequence: u64,
     mapping_backend: MappingBackendSpec,
     #[cfg(test)]
     mapping_kernel: MappingKernel,
@@ -1183,7 +1213,7 @@ impl MappingAdapter {
         adapter
     }
 
-    fn new_with_frames_and_optional_sequence_store(
+    pub(crate) fn new_with_frames_and_optional_sequence_store(
         config: MappingAdapterConfig,
         mapping_backend: MappingBackendSpec,
         map_frame_id: impl Into<String>,
@@ -1217,6 +1247,8 @@ impl MappingAdapter {
         let session_capacity = session.capacity();
         Self {
             config,
+            pgo_history: None,
+            pgo_materialized_sequence: 0,
             mapping_backend,
             #[cfg(test)]
             mapping_kernel: mapping_backend.into_kernel(session_capacity),
@@ -1845,7 +1877,9 @@ impl MappingAdapter {
         if self.in_flight_compute.is_some() {
             return Ok(None);
         }
-        if self.next_source_frame_sequence == 0 {
+        if self.next_source_frame_sequence == 0
+            || self.next_source_frame_sequence <= self.pgo_materialized_sequence
+        {
             return Ok(None);
         }
         let worker = self.backend_checkpoint_client()?;
@@ -2220,6 +2254,160 @@ impl MappingAdapter {
 
     pub(crate) fn set_legacy_checkpoint_reconstructed(&mut self, reconstructed: bool) {
         self.lifecycle.legacy_checkpoint_reconstructed = reconstructed;
+    }
+
+    pub(crate) fn enable_pgo_history(&mut self) {
+        self.pgo_history
+            .get_or_insert_with(crate::pgo_map::ScanHistory::default);
+    }
+
+    pub(crate) fn record_pgo_scan(
+        &mut self,
+        binding: &crate::lio_ingress::RegistrationBinding,
+        points: &[Point3<f64>],
+        source_timestamp_ns: u64,
+        received_at_ns: u64,
+    ) -> Result<(), String> {
+        if self.pgo_history.is_none() {
+            return Ok(());
+        }
+        if !self.is_active()
+            || self.lifecycle.session_id != binding.mapping_session_id
+            || self.lifecycle.session_generation != binding.mapping_session_generation
+            || self.frame_generation != binding.map_frame_generation
+            || self
+                .map_odom_transform
+                .as_ref()
+                .map_or(0, |t| t.correction_revision)
+                != binding.registration_correction_revision
+        {
+            return Err("PGO扫描归档来源已过期".into());
+        }
+        self.pgo_history.as_mut().unwrap().record(
+            source_timestamp_ns,
+            received_at_ns,
+            binding,
+            points,
+        )
+    }
+
+    pub(crate) fn pgo_rebuild_input(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::pgo_map::ArchivedScan>,
+            MappingBackendSpec,
+            MappingBackendComputeConfig,
+        ),
+        String,
+    > {
+        self.backend_checkpoint_client()?;
+        if self.checkpoint_activation_digest.is_some() {
+            return Err("已激活资产缺少原始PGO历史，不能以新扫描覆盖旧地图".into());
+        }
+        Ok((
+            self.pgo_history
+                .as_ref()
+                .ok_or("PGO地图历史未绑定")?
+                .snapshot(),
+            self.mapping_backend,
+            self.backend_compute_config(),
+        ))
+    }
+
+    pub(crate) fn prepare_pgo_install(
+        &mut self,
+        grid: OccupancyGrid,
+        source_timestamp_ns: u64,
+        correction: nalgebra::Isometry3<f64>,
+        correction_revision: u64,
+    ) -> Result<PreparedPgoInstall, String> {
+        self.backend_checkpoint_client()?;
+        if self.checkpoint_export.is_some() {
+            return Err("PGO地图提交与检查点导出冲突".into());
+        }
+        validate_checkpoint_grid(&grid, &self.map_frame_id)?;
+        let mut transform = self
+            .map_odom_transform
+            .clone()
+            .ok_or("PGO地图没有原始锚点")?;
+        if correction_revision
+            != transform
+                .correction_revision
+                .checked_add(1)
+                .ok_or("PGO校正修订溢出")?
+        {
+            return Err("PGO地图校正修订不连续".into());
+        }
+        transform.correction = correction;
+        transform.correction_revision = correction_revision;
+        transform.latest_map_pose = transform.transform_pose(transform.latest_odom_pose);
+        let expected_session = self.snapshot();
+        let expected_revision = self.revision;
+        let revision = self.reserve_next_revision(self.global_revision.max(self.revision))?;
+        let raw_map = MapState {
+            width: grid.width,
+            height: grid.height,
+            resolution: grid.resolution as f32,
+            origin_x: grid.origin[0],
+            origin_y: grid.origin[1],
+            frame_id: grid.frame_id.clone(),
+            revision,
+            timestamp_ns: source_timestamp_ns,
+            data: grid.data.clone(),
+        };
+        let loaded = self
+            .applied_forbidden_zones
+            .clone()
+            .unwrap_or_else(|| self.load_forbidden_zones());
+        let map = self.compose_forbidden_zones(&raw_map, &loaded)?;
+        let receipt = self.reserve_occupancy_commit_receipt(
+            revision,
+            source_timestamp_ns,
+            self.mapping_backend.kind(),
+            self.backend_generation,
+        )?;
+        let event = MapRevisionEvent::from_effective_and_raw(&map, &raw_map, &self.lifecycle);
+        Ok(PreparedPgoInstall {
+            map,
+            event,
+            receipt,
+            raw_map,
+            persistent: PersistentOccupancyGrid::from_grid(grid)?,
+            transform,
+            expected_session,
+            expected_revision,
+        })
+    }
+
+    pub(crate) fn commit_pgo_install(
+        &mut self,
+        prepared: PreparedPgoInstall,
+    ) -> Result<(), String> {
+        if !self.is_active()
+            || self.lifecycle.session_id != prepared.expected_session.session_id
+            || self.lifecycle.session_generation != prepared.expected_session.session_generation
+            || self.revision != prepared.expected_revision
+        {
+            return Err("PGO地图准备结果已过期".into());
+        }
+        self.revision = prepared.map.revision;
+        self.global_revision = self.global_revision.max(self.revision);
+        self.lifecycle.revision = self.revision;
+        self.persistent_grid = Some(prepared.persistent);
+        self.raw_map = Some(prepared.raw_map);
+        self.last_occupancy_commit_receipt = Some(prepared.receipt);
+        self.checkpoint_installed = true;
+        self.pgo_materialized_sequence = self.next_source_frame_sequence;
+        self.last_sensor_origin = prepared.transform.latest_map_pose.position;
+        self.session.feed_pose(
+            self.last_sensor_origin[0],
+            self.last_sensor_origin[1],
+            self.last_sensor_origin[2],
+        );
+        self.map_odom_transform = Some(prepared.transform);
+        *self.map_odom_transform_cache.write() = self.map_odom_transform.clone();
+        Ok(())
     }
 
     pub fn install_checkpoint(
@@ -2875,6 +3063,9 @@ impl MappingAdapter {
         };
         if let Some(transform) = self.map_odom_transform.as_mut() {
             transform.latest_map_pose = map_pose;
+            if source_frame_id == self.odom_frame_id {
+                transform.latest_odom_pose = source_pose;
+            }
         }
         *self.map_odom_transform_cache.write() = self.map_odom_transform.clone();
         self.last_sensor_origin = map_pose.position;
@@ -3208,6 +3399,10 @@ impl MappingAdapter {
     }
 
     fn reset_accumulator_detached(&mut self) -> Option<MappingBackendRetirement> {
+        if let Some(history) = self.pgo_history.as_mut() {
+            history.clear();
+        }
+        self.pgo_materialized_sequence = self.next_source_frame_sequence;
         self.in_flight_compute = None;
         self.checkpoint_export = None;
         let retirement = match self.detach_backend_worker() {
@@ -4455,7 +4650,7 @@ mod tests {
         let initial = adapter
             .feed_pose_in_frame(10.0, 5.0, 2.0, std::f64::consts::FRAC_PI_2, "odom")
             .expect("nonzero odom anchor");
-        assert_eq!(initial.position, [0.0, 0.0, 0.0]);
+        assert!(initial.position.iter().all(|value| value.abs() < 1e-12));
         assert_close(initial.yaw_radians, 0.0);
 
         adapter

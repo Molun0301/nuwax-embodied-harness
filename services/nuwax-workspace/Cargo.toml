@@ -17,6 +17,7 @@ members = [
     "crates/nuwax-tf",
     # 建图、点云与激光惯性里程计
     "crates/nuwax-mapping",
+    "crates/nuwax-gtsam",
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",
     "crates/nuwax-lio-backends",

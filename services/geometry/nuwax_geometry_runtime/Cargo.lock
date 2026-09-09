@@ -1510,6 +1510,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-gtsam"
+version = "0.1.0"
+
+[[package]]
 name = "nuwax-lcm"
 version = "0.1.0"
 dependencies = [
@@ -1551,6 +1555,7 @@ dependencies = [
  "nalgebra 0.33.3",
  "ndarray",
  "nuwax-core",
+ "nuwax-gtsam",
  "nuwax-numeric",
  "nuwax-protocol",
  "nuwax-stream",

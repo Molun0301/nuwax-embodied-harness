@@ -1,4 +1,4 @@
-//! Typed V1 native-PGO request, result, and status codecs.
+//! 原生PGO第二版协议：校正携完整优化轨迹，基本传感器证明保持原定义。
 //!
 //! The repository IDL is authoritative. `*_body` functions operate on the
 //! generated body without the top-level eight-byte LCM fingerprint; `*_wire`
@@ -8,14 +8,14 @@
 use crate::{hash::sha256_bytes, CodecError, CodecResult};
 
 /// Locked `nuwax_msgs.NativePgoRequest` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_REQUEST_FINGERPRINT_V1: [u8; 8] = 0xa714_e98d_60d0_b620_u64.to_be_bytes();
+pub const NATIVE_PGO_REQUEST_FINGERPRINT_V2: [u8; 8] = 0xa714e98d60d0b620u64.to_be_bytes();
 /// Locked `nuwax_msgs.NativePgoResult` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_RESULT_FINGERPRINT_V1: [u8; 8] = 0x3de0_8d72_be10_8e4b_u64.to_be_bytes();
+pub const NATIVE_PGO_RESULT_FINGERPRINT_V2: [u8; 8] = 0xadd11e19aa0ec18bu64.to_be_bytes();
 /// Locked `nuwax_msgs.NativePgoStatus` V1 fingerprint from lcm-gen 1.5.2.
-pub const NATIVE_PGO_STATUS_FINGERPRINT_V1: [u8; 8] = 0x3091_8591_82a5_7b03_u64.to_be_bytes();
+pub const NATIVE_PGO_STATUS_FINGERPRINT_V2: [u8; 8] = 0x3091859182a57b03u64.to_be_bytes();
 
 /// First immutable native-PGO wire schema.
-pub const NATIVE_PGO_SCHEMA_VERSION_V1: i32 = 1;
+pub const NATIVE_PGO_SCHEMA_VERSION_V2: i32 = 2;
 /// Native-PGO backend code, aligned with `CorrectionCandidate`.
 pub const NATIVE_PGO_BACKEND: i32 = 2;
 /// Full SE(3) correction applied on the left of the frozen odometry pose.
@@ -138,15 +138,15 @@ pub const NATIVE_PGO_REASON_CHILD_EXITED: i32 = 13;
 pub const NATIVE_PGO_REASON_CHILD_CRASHED: i32 = 14;
 
 /// Request self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_REQUEST_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.request.v1\0";
+pub const NATIVE_PGO_REQUEST_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.request.v2\0";
 /// Result self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_RESULT_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.result.v1\0";
+pub const NATIVE_PGO_RESULT_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.result.v2\0";
 /// Status self-digest domain, including its NUL terminator.
-pub const NATIVE_PGO_STATUS_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.status.v1\0";
+pub const NATIVE_PGO_STATUS_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.status.v2\0";
 /// Loop-proof digest domain, including its NUL terminator.
 pub const NATIVE_PGO_LOOP_PROOF_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.loop-proof.v1\0";
 /// Optimized-graph digest domain, including its NUL terminator.
-pub const NATIVE_PGO_OPTIMIZED_GRAPH_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.optimized-graph.v1\0";
+pub const NATIVE_PGO_OPTIMIZED_GRAPH_HASH_DOMAIN: &[u8] = b"nuwax.native-pgo.optimized-graph.v2\0";
 
 const BODY_POINTS_HASH_DOMAIN: &[u8] = b"nuwax.correction.body-points.v1\0";
 const ODOM_POSE_HASH_DOMAIN: &[u8] = b"nuwax.correction.odom-from-body.v1\0";
@@ -352,12 +352,92 @@ pub struct NativePgoResult {
     pub optimization_final_cost: f64,
     /// Canonical optimized-graph metadata digest.
     pub optimized_graph_sha256: [u8; 32],
+    /// 校正必须同时提供完整优化轨迹，不允许只移动公共位姿。
+    pub trajectory: Vec<OptimizedKeyframe>,
     /// Typed rejection reason for `DISPOSITION_REJECTED`.
     pub rejection_reason_code: i32,
     /// Bounded rejection detail for `DISPOSITION_REJECTED`.
     pub rejection_reason: String,
     /// Self-digest over the canonical body prefix.
     pub result_payload_sha256: [u8; 32],
+}
+
+/// 精确源时间对应的优化机体位姿，供规范地图与位姿一起重建。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OptimizedKeyframe {
+    pub source_timestamp_ns: i64,
+    pub translation_m: [f64; 3],
+    pub rotation_xyzw: [f64; 4],
+}
+
+/// 校验轨迹的边界、真实顺序和完整刚体变换；空轨迹表示未提供地图更新。
+pub fn validate_optimized_keyframes(frames: &[OptimizedKeyframe]) -> Result<(), String> {
+    if frames.len() > MAX_NATIVE_PGO_GRAPH_NODES as usize {
+        return Err("trajectory exceeds node bound".into());
+    }
+    let mut previous = None;
+    for frame in frames {
+        if frame.source_timestamp_ns < 0
+            || previous.is_some_and(|stamp| stamp >= frame.source_timestamp_ns)
+        {
+            return Err("trajectory source timestamps must increase".into());
+        }
+        validate_transform(&frame.translation_m, &frame.rotation_xyzw, "trajectory")?;
+        previous = Some(frame.source_timestamp_ns);
+    }
+    Ok(())
+}
+
+/// 与生成LCM类型相同的列式轨迹编码。
+pub fn encode_optimized_keyframes(frames: &[OptimizedKeyframe]) -> CodecResult<Vec<u8>> {
+    validate_optimized_keyframes(frames).map_err(encode_error)?;
+    let mut out = Vec::with_capacity(4 + 64 * frames.len());
+    out.extend_from_slice(&(frames.len() as i32).to_be_bytes());
+    for frame in frames {
+        out.extend_from_slice(&frame.source_timestamp_ns.to_be_bytes());
+    }
+    for frame in frames {
+        for value in frame.translation_m {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    for frame in frames {
+        for value in frame.rotation_xyzw {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// 解码独立轨迹载荷，先检查长度再分配，拒绝尾随数据。
+pub fn decode_optimized_keyframes(body: &[u8]) -> CodecResult<Vec<OptimizedKeyframe>> {
+    let mut cursor = Cursor::new(body);
+    let result = decode_trajectory(&mut cursor)?;
+    cursor.finish("optimized trajectory")?;
+    Ok(result)
+}
+
+fn decode_trajectory(cursor: &mut Cursor<'_>) -> CodecResult<Vec<OptimizedKeyframe>> {
+    let count = cursor.read_i32()?;
+    if count < 0 || i64::from(count) > MAX_NATIVE_PGO_GRAPH_NODES {
+        return Err(decode_error("invalid trajectory count".into()));
+    }
+    let count = count as usize;
+    if cursor.input.len().saturating_sub(cursor.offset) < count * 64 {
+        return Err(decode_error("truncated trajectory".into()));
+    }
+    let mut frames = vec![OptimizedKeyframe::default(); count];
+    for frame in &mut frames {
+        frame.source_timestamp_ns = cursor.read_i64()?;
+    }
+    for frame in &mut frames {
+        frame.translation_m = cursor.read_f64_array()?;
+    }
+    for frame in &mut frames {
+        frame.rotation_xyzw = cursor.read_f64_array()?;
+    }
+    validate_optimized_keyframes(&frames).map_err(decode_error)?;
+    Ok(frames)
 }
 
 /// Typed native-PGO owner lifecycle, health, terminal, and cancellation event.
@@ -503,6 +583,7 @@ pub fn compute_native_pgo_optimized_graph_sha256(
     {
         canonical.extend_from_slice(&value.to_be_bytes());
     }
+    canonical.extend_from_slice(&encode_optimized_keyframes(&result.trajectory)?);
     Ok(sha256_bytes(&canonical))
 }
 
@@ -581,7 +662,7 @@ pub fn encode_native_pgo_request_body(message: &NativePgoRequest) -> CodecResult
 /// Encodes a complete generated request value including its fingerprint.
 pub fn encode_native_pgo_request_wire(message: &NativePgoRequest) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_REQUEST_FINGERPRINT_V1,
+        NATIVE_PGO_REQUEST_FINGERPRINT_V2,
         encode_native_pgo_request_body(message)?,
     )
 }
@@ -599,7 +680,7 @@ pub fn decode_native_pgo_request_body(body: &[u8]) -> CodecResult<NativePgoReque
 pub fn decode_native_pgo_request_wire(wire: &[u8]) -> CodecResult<NativePgoRequest> {
     decode_wire(
         wire,
-        NATIVE_PGO_REQUEST_FINGERPRINT_V1,
+        NATIVE_PGO_REQUEST_FINGERPRINT_V2,
         "nuwax_msgs.NativePgoRequest",
         decode_native_pgo_request_body,
     )
@@ -616,7 +697,7 @@ pub fn encode_native_pgo_result_body(message: &NativePgoResult) -> CodecResult<V
 /// Encodes a complete generated result value including its fingerprint.
 pub fn encode_native_pgo_result_wire(message: &NativePgoResult) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_RESULT_FINGERPRINT_V1,
+        NATIVE_PGO_RESULT_FINGERPRINT_V2,
         encode_native_pgo_result_body(message)?,
     )
 }
@@ -634,7 +715,7 @@ pub fn decode_native_pgo_result_body(body: &[u8]) -> CodecResult<NativePgoResult
 pub fn decode_native_pgo_result_wire(wire: &[u8]) -> CodecResult<NativePgoResult> {
     decode_wire(
         wire,
-        NATIVE_PGO_RESULT_FINGERPRINT_V1,
+        NATIVE_PGO_RESULT_FINGERPRINT_V2,
         "nuwax_msgs.NativePgoResult",
         decode_native_pgo_result_body,
     )
@@ -651,7 +732,7 @@ pub fn encode_native_pgo_status_body(message: &NativePgoStatus) -> CodecResult<V
 /// Encodes a complete generated status value including its fingerprint.
 pub fn encode_native_pgo_status_wire(message: &NativePgoStatus) -> CodecResult<Vec<u8>> {
     encode_wire(
-        NATIVE_PGO_STATUS_FINGERPRINT_V1,
+        NATIVE_PGO_STATUS_FINGERPRINT_V2,
         encode_native_pgo_status_body(message)?,
     )
 }
@@ -669,7 +750,7 @@ pub fn decode_native_pgo_status_body(body: &[u8]) -> CodecResult<NativePgoStatus
 pub fn decode_native_pgo_status_wire(wire: &[u8]) -> CodecResult<NativePgoStatus> {
     decode_wire(
         wire,
-        NATIVE_PGO_STATUS_FINGERPRINT_V1,
+        NATIVE_PGO_STATUS_FINGERPRINT_V2,
         "nuwax_msgs.NativePgoStatus",
         decode_native_pgo_status_body,
     )
@@ -768,6 +849,7 @@ fn encode_result_body_prefix(message: &NativePgoResult) -> CodecResult<Vec<u8>> 
     out.extend_from_slice(&message.optimization_initial_cost.to_be_bytes());
     out.extend_from_slice(&message.optimization_final_cost.to_be_bytes());
     out.extend_from_slice(&message.optimized_graph_sha256);
+    out.extend_from_slice(&encode_optimized_keyframes(&message.trajectory)?);
     out.extend_from_slice(&message.rejection_reason_code.to_be_bytes());
     encode_string(&message.rejection_reason, &mut out)?;
     Ok(out)
@@ -944,6 +1026,7 @@ fn decode_result_body_from_cursor(cursor: &mut Cursor<'_>) -> CodecResult<Native
         optimization_initial_cost: cursor.read_f64()?,
         optimization_final_cost: cursor.read_f64()?,
         optimized_graph_sha256: cursor.read_array()?,
+        trajectory: decode_trajectory(cursor)?,
         rejection_reason_code: cursor.read_i32()?,
         rejection_reason: cursor.read_string(MAX_REASON_BYTES, "rejection_reason")?,
         result_payload_sha256: cursor.read_array()?,
@@ -1388,6 +1471,16 @@ fn validate_result_fields(message: &NativePgoResult) -> Result<(), String> {
 }
 
 fn validate_correction_result(message: &NativePgoResult) -> Result<(), String> {
+    validate_optimized_keyframes(&message.trajectory)?;
+    if message.trajectory.len() as i64 != message.optimized_graph_node_count
+        || message
+            .trajectory
+            .last()
+            .map(|frame| frame.source_timestamp_ns)
+            != Some(message.request.identity.source_timestamp_ns)
+    {
+        return Err("correction requires the complete source-bound trajectory".into());
+    }
     if message.transform_semantics != NATIVE_PGO_TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3 {
         return Err("CORRECTION requires absolute-left full-SE(3) semantics".into());
     }
@@ -1460,6 +1553,9 @@ fn validate_graph_metadata(message: &NativePgoResult) -> Result<(), String> {
 }
 
 fn validate_zero_correction_fields(message: &NativePgoResult) -> Result<(), String> {
+    if !message.trajectory.is_empty() {
+        return Err("non-correction must not carry trajectory".into());
+    }
     let f64_zero = message
         .translation_m
         .iter()
@@ -1666,7 +1762,7 @@ fn no_terminal_or_cancel(message: &NativePgoStatus) -> bool {
 }
 
 fn validate_schema_version(schema_version: i32) -> Result<(), String> {
-    if schema_version == NATIVE_PGO_SCHEMA_VERSION_V1 {
+    if schema_version == NATIVE_PGO_SCHEMA_VERSION_V2 {
         Ok(())
     } else {
         Err(format!(
@@ -2018,7 +2114,7 @@ mod tests {
             },
         };
         seal_native_pgo_request(NativePgoRequest {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             identity,
             registered_body_coordinate_count: 6,
             registered_body_points_xyz: vec![1.25, 2.5, 3.75, -1.0, -2.0, -3.0],
@@ -2033,7 +2129,7 @@ mod tests {
 
     fn no_candidate_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_NO_CANDIDATE,
             result_timestamp_ns: 43,
@@ -2045,7 +2141,7 @@ mod tests {
 
     fn correction_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_CORRECTION,
             result_timestamp_ns: 44,
@@ -2057,6 +2153,13 @@ mod tests {
             loop_source_node_id: 0,
             loop_target_node_id: 1,
             loop_inlier_count: 20,
+            trajectory: (0..3)
+                .map(|i| OptimizedKeyframe {
+                    source_timestamp_ns: request.identity.source_timestamp_ns - 2 + i,
+                    translation_m: [i as f64, 0.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
             optimized_graph_node_count: 3,
             optimized_graph_edge_count: 3,
             optimized_graph_loop_edge_count: 1,
@@ -2072,7 +2175,7 @@ mod tests {
 
     fn cancelled_result(request: &NativePgoRequest) -> NativePgoResult {
         seal_native_pgo_result(NativePgoResult {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: NATIVE_PGO_DISPOSITION_REJECTED,
             result_timestamp_ns: 45,
@@ -2085,7 +2188,7 @@ mod tests {
 
     fn ready_status() -> NativePgoStatus {
         seal_native_pgo_status(NativePgoStatus {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: NATIVE_PGO_BACKEND,
             runtime_generation: 7,
             backend_generation: 3,
@@ -2103,7 +2206,7 @@ mod tests {
 
     fn cancelled_status(request: &NativePgoRequest) -> NativePgoStatus {
         seal_native_pgo_status(NativePgoStatus {
-            schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: NATIVE_PGO_BACKEND,
             runtime_generation: 7,
             backend_generation: 3,
@@ -2125,15 +2228,15 @@ mod tests {
     fn fresh_lcm_gen_fingerprints_are_locked() {
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoRequest", 0).unwrap(),
-            NATIVE_PGO_REQUEST_FINGERPRINT_V1
+            NATIVE_PGO_REQUEST_FINGERPRINT_V2
         );
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoResult", 0).unwrap(),
-            NATIVE_PGO_RESULT_FINGERPRINT_V1
+            NATIVE_PGO_RESULT_FINGERPRINT_V2
         );
         assert_eq!(
             crate::hash::fingerprint("nuwax_msgs.NativePgoStatus", 0).unwrap(),
-            NATIVE_PGO_STATUS_FINGERPRINT_V1
+            NATIVE_PGO_STATUS_FINGERPRINT_V2
         );
     }
 
@@ -2278,7 +2381,7 @@ mod tests {
         let request = request();
         let request_body = encode_native_pgo_request_body(&request).unwrap();
         let request_wire = encode_native_pgo_request_wire(&request).unwrap();
-        assert_eq!(&request_wire[..8], &NATIVE_PGO_REQUEST_FINGERPRINT_V1);
+        assert_eq!(&request_wire[..8], &NATIVE_PGO_REQUEST_FINGERPRINT_V2);
         assert_eq!(&request_wire[8..], request_body);
         assert_eq!(
             decode_native_pgo_request_body(&request_body).unwrap(),
@@ -2292,7 +2395,7 @@ mod tests {
         let result = correction_result(&request);
         let result_body = encode_native_pgo_result_body(&result).unwrap();
         let result_wire = encode_native_pgo_result_wire(&result).unwrap();
-        assert_eq!(&result_wire[..8], &NATIVE_PGO_RESULT_FINGERPRINT_V1);
+        assert_eq!(&result_wire[..8], &NATIVE_PGO_RESULT_FINGERPRINT_V2);
         assert_eq!(&result_wire[8..], result_body);
         assert_eq!(decode_native_pgo_result_body(&result_body).unwrap(), result);
         assert_eq!(decode_native_pgo_result_wire(&result_wire).unwrap(), result);
@@ -2300,7 +2403,7 @@ mod tests {
         let status = cancelled_status(&request);
         let status_body = encode_native_pgo_status_body(&status).unwrap();
         let status_wire = encode_native_pgo_status_wire(&status).unwrap();
-        assert_eq!(&status_wire[..8], &NATIVE_PGO_STATUS_FINGERPRINT_V1);
+        assert_eq!(&status_wire[..8], &NATIVE_PGO_STATUS_FINGERPRINT_V2);
         assert_eq!(&status_wire[8..], status_body);
         assert_eq!(decode_native_pgo_status_body(&status_body).unwrap(), status);
         assert_eq!(decode_native_pgo_status_wire(&status_wire).unwrap(), status);
@@ -2327,12 +2430,23 @@ mod tests {
 
     #[test]
     fn correction_proof_maxima_and_graph_relations_are_fail_closed() {
-        let request = request();
+        let mut request = request();
+        request.identity.source_timestamp_ns = 5000;
+        request.identity.registered_cloud.source_timestamp_ns = 5000;
+        request.identity.committed_map.source_timestamp_ns = 5000;
+        request = seal_native_pgo_request(request).unwrap();
         let mut maximum = correction_result(&request);
         maximum.loop_source_node_id = MAX_NATIVE_PGO_GRAPH_NODES - 1;
         maximum.loop_target_node_id = 0;
         maximum.loop_inlier_count = MAX_NATIVE_PGO_LOOP_INLIERS;
         maximum.optimized_graph_node_count = MAX_NATIVE_PGO_GRAPH_NODES;
+        maximum.trajectory = (0..MAX_NATIVE_PGO_GRAPH_NODES)
+            .map(|i| OptimizedKeyframe {
+                source_timestamp_ns: 5000 - MAX_NATIVE_PGO_GRAPH_NODES + 1 + i,
+                translation_m: [i as f64 * 0.01, 0.0, 0.0],
+                rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            })
+            .collect();
         maximum.optimized_graph_edge_count = MAX_NATIVE_PGO_GRAPH_EDGES;
         maximum.optimized_graph_loop_edge_count = MAX_NATIVE_PGO_GRAPH_LOOP_EDGES;
         maximum.optimization_iterations = MAX_NATIVE_PGO_OPTIMIZATION_ITERATIONS;
@@ -2391,7 +2505,7 @@ mod tests {
         let statuses = [
             ready_status(),
             seal_native_pgo_status(NativePgoStatus {
-                schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+                schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
                 backend: NATIVE_PGO_BACKEND,
                 runtime_generation: 7,
                 backend_generation: 3,
@@ -2406,7 +2520,7 @@ mod tests {
             })
             .unwrap(),
             seal_native_pgo_status(NativePgoStatus {
-                schema_version: NATIVE_PGO_SCHEMA_VERSION_V1,
+                schema_version: NATIVE_PGO_SCHEMA_VERSION_V2,
                 backend: NATIVE_PGO_BACKEND,
                 runtime_generation: 7,
                 backend_generation: 3,
@@ -2543,17 +2657,17 @@ mod tests {
         assert_eq!(request_wire.len(), 583);
         assert_eq!(
             hex(&sha256_bytes(&request_wire)),
-            "cf09db2306cd61467f0000cb9ce0f0ff58fa85952a8d883420409bb474accab6"
+            "a274800c8d7ba751cc520cba4a4ac706642eab179e87778f2b721ce19dd5123d"
         );
-        assert_eq!(result_wire.len(), 729);
+        assert_eq!(result_wire.len(), 925);
         assert_eq!(
             hex(&sha256_bytes(&result_wire)),
-            "7b27c9efa1f8652c4acdfedf31dba9b86759a4d046db383cffdc78638ec68ccc"
+            "164f1d6055179e5eeb859ee5ad9d57475658659e286c956f806785d2183771cd"
         );
         assert_eq!(status_wire.len(), 550);
         assert_eq!(
             hex(&sha256_bytes(&status_wire)),
-            "957b277814351c95890bafe1a8c3a29bd4253614ed6eddc2e559ed40ff4f1829"
+            "be249c8ef74ae26757c175340d8b76d9fb812376df468d1cadfa879d8b2fa687"
         );
     }
 
@@ -2679,13 +2793,13 @@ mod tests {
 #include "nuwax_msgs_NativePgoResult.h"
 #include "nuwax_msgs_NativePgoStatus.h"
 
-_Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_SCHEMA_VERSION_V1 == 1, "request schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_SCHEMA_VERSION_V2 == 2, "request schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_BACKEND_NATIVE_PGO == 2, "request backend");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_REGISTERED_BODY_POINT_COUNT == 100000LL, "request point max");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000, "request coordinate max");
 _Static_assert(NUWAX_MSGS_NATIVEPGOREQUEST_MAX_COMMITTED_MAP_CELL_COUNT == 67108864, "request map max");
 
-_Static_assert(NUWAX_MSGS_NATIVEPGORESULT_SCHEMA_VERSION_V1 == 1, "result schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGORESULT_SCHEMA_VERSION_V2 == 2, "result schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_BACKEND_NATIVE_PGO == 2, "result backend");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_REJECTION_CANCELLED == 5, "cancelled result");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_GRAPH_NODES == 2000LL, "node max");
@@ -2694,7 +2808,7 @@ _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_GRAPH_LOOP_EDGES == 1998LL, "loop 
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_LOOP_INLIERS == 20000LL, "inlier max");
 _Static_assert(NUWAX_MSGS_NATIVEPGORESULT_MAX_OPTIMIZATION_ITERATIONS == 300, "iteration max");
 
-_Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_SCHEMA_VERSION_V1 == 1, "status schema");
+_Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_SCHEMA_VERSION_V2 == 2, "status schema");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_EVENT_CANCEL_ACKNOWLEDGED == 8, "cancel ack event");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_TERMINAL_CANCELLED == 4, "cancel terminal");
 _Static_assert(NUWAX_MSGS_NATIVEPGOSTATUS_CANCEL_ACKNOWLEDGED == 2, "cancel ack");
@@ -2727,7 +2841,7 @@ static int nibble(char value) {
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     if ((uint64_t) __nuwax_msgs_NativePgoRequest_get_hash() != UINT64_C(0xa714e98d60d0b620)) return 20;
-    if ((uint64_t) __nuwax_msgs_NativePgoResult_get_hash() != UINT64_C(0x3de08d72be108e4b)) return 21;
+    if ((uint64_t) __nuwax_msgs_NativePgoResult_get_hash() != UINT64_C(0xadd11e19aa0ec18b)) return 21;
     if ((uint64_t) __nuwax_msgs_NativePgoStatus_get_hash() != UINT64_C(0x3091859182a57b03)) return 22;
 
     size_t hex_length = strlen(argv[2]);
@@ -2755,13 +2869,13 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from nuwax_msgs import NativePgoRequest, NativePgoResult, NativePgoStatus
 
-assert NativePgoRequest.SCHEMA_VERSION_V1 == 1
+assert NativePgoRequest.SCHEMA_VERSION_V2 == 2
 assert NativePgoRequest.BACKEND_NATIVE_PGO == 2
 assert NativePgoRequest.MAX_REGISTERED_BODY_POINT_COUNT == 100000
 assert NativePgoRequest.MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000
 assert NativePgoRequest.MAX_COMMITTED_MAP_CELL_COUNT == 67108864
 
-assert NativePgoResult.SCHEMA_VERSION_V1 == 1
+assert NativePgoResult.SCHEMA_VERSION_V2 == 2
 assert NativePgoResult.BACKEND_NATIVE_PGO == 2
 assert NativePgoResult.REJECTION_CANCELLED == 5
 assert NativePgoResult.MAX_GRAPH_NODES == 2000
@@ -2770,14 +2884,14 @@ assert NativePgoResult.MAX_GRAPH_LOOP_EDGES == 1998
 assert NativePgoResult.MAX_LOOP_INLIERS == 20000
 assert NativePgoResult.MAX_OPTIMIZATION_ITERATIONS == 300
 
-assert NativePgoStatus.SCHEMA_VERSION_V1 == 1
+assert NativePgoStatus.SCHEMA_VERSION_V2 == 2
 assert NativePgoStatus.EVENT_CANCEL_ACKNOWLEDGED == 8
 assert NativePgoStatus.TERMINAL_CANCELLED == 4
 assert NativePgoStatus.CANCEL_ACKNOWLEDGED == 2
 assert NativePgoStatus.REASON_CANCELLED == 11
 
 assert NativePgoRequest().get_hash() == 0xa714e98d60d0b620
-assert NativePgoResult().get_hash() == 0x3de08d72be108e4b
+assert NativePgoResult().get_hash() == 0xadd11e19aa0ec18b
 assert NativePgoStatus().get_hash() == 0x3091859182a57b03
 
 for cls, encoded_hex in zip(
@@ -2805,13 +2919,13 @@ using Request = nuwax_msgs::NativePgoRequest;
 using Result = nuwax_msgs::NativePgoResult;
 using Status = nuwax_msgs::NativePgoStatus;
 
-static_assert(Request::SCHEMA_VERSION_V1 == 1, "request schema");
+static_assert(Request::SCHEMA_VERSION_V2 == 2, "request schema");
 static_assert(Request::BACKEND_NATIVE_PGO == 2, "request backend");
 static_assert(Request::MAX_REGISTERED_BODY_POINT_COUNT == 100000LL, "request point max");
 static_assert(Request::MAX_REGISTERED_BODY_COORDINATE_COUNT == 300000, "request coordinate max");
 static_assert(Request::MAX_COMMITTED_MAP_CELL_COUNT == 67108864, "request map max");
 
-static_assert(Result::SCHEMA_VERSION_V1 == 1, "result schema");
+static_assert(Result::SCHEMA_VERSION_V2 == 2, "result schema");
 static_assert(Result::BACKEND_NATIVE_PGO == 2, "result backend");
 static_assert(Result::REJECTION_CANCELLED == 5, "cancelled result");
 static_assert(Result::MAX_GRAPH_NODES == 2000LL, "node max");
@@ -2822,7 +2936,7 @@ static_assert(Result::MAX_OPTIMIZATION_ITERATIONS == 300, "iteration max");
 static_assert(std::is_same<decltype(Result::MAX_GRAPH_NODES), const int64_t>::value,
               "graph maxima must remain int64");
 
-static_assert(Status::SCHEMA_VERSION_V1 == 1, "status schema");
+static_assert(Status::SCHEMA_VERSION_V2 == 2, "status schema");
 static_assert(Status::EVENT_CANCEL_ACKNOWLEDGED == 8, "cancel ack event");
 static_assert(Status::TERMINAL_CANCELLED == 4, "cancel terminal");
 static_assert(Status::CANCEL_ACKNOWLEDGED == 2, "cancel ack");
@@ -2849,7 +2963,7 @@ static int roundtrip(const std::vector<uint8_t>& input) {
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     if (static_cast<uint64_t>(Request::getHash()) != UINT64_C(0xa714e98d60d0b620)) return 20;
-    if (static_cast<uint64_t>(Result::getHash()) != UINT64_C(0x3de08d72be108e4b)) return 21;
+    if (static_cast<uint64_t>(Result::getHash()) != UINT64_C(0xadd11e19aa0ec18b)) return 21;
     if (static_cast<uint64_t>(Status::getHash()) != UINT64_C(0x3091859182a57b03)) return 22;
 
     std::string encoded_hex(argv[2]);

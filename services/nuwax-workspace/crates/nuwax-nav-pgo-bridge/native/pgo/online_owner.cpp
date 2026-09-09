@@ -76,15 +76,15 @@ static_assert(Result::MAX_OPTIMIZATION_ITERATIONS == 300);
 static_assert(Request::MAX_REGISTERED_BODY_POINT_COUNT >= Result::MAX_LOOP_INLIERS);
 static_assert(kMaxStatusWireBytes == 2'037);
 
-constexpr char kRequestHashDomain[] = "nuwax.native-pgo.request.v1\0";
-constexpr char kResultHashDomain[] = "nuwax.native-pgo.result.v1\0";
-constexpr char kStatusHashDomain[] = "nuwax.native-pgo.status.v1\0";
+constexpr char kRequestHashDomain[] = "nuwax.native-pgo.request.v2\0";
+constexpr char kResultHashDomain[] = "nuwax.native-pgo.result.v2\0";
+constexpr char kStatusHashDomain[] = "nuwax.native-pgo.status.v2\0";
 constexpr char kBodyPointsHashDomain[] = "nuwax.correction.body-points.v1\0";
 constexpr char kOdomPoseHashDomain[] = "nuwax.correction.odom-from-body.v1\0";
 constexpr char kMapBoundaryHashDomain[] =
     "nuwax.correction.committed-map-boundary.v1\0";
 constexpr char kLoopProofHashDomain[] = "nuwax.native-pgo.loop-proof.v1\0";
-constexpr char kGraphHashDomain[] = "nuwax.native-pgo.optimized-graph.v1\0";
+constexpr char kGraphHashDomain[] = "nuwax.native-pgo.optimized-graph.v2\0";
 
 class DigestBuilder {
 public:
@@ -470,7 +470,7 @@ std::optional<RequestValidationError> validateRequest(const Request& request,
         return std::optional<RequestValidationError>(
             RequestValidationError{Status::REASON_INVALID_REQUEST, std::move(reason)});
     };
-    if (request.schema_version != Request::SCHEMA_VERSION_V1 ||
+    if (request.schema_version != Request::SCHEMA_VERSION_V2 ||
         request.backend != Request::BACKEND_NATIVE_PGO) {
         return invalid("unsupported request schema or backend");
     }
@@ -748,7 +748,7 @@ bool sealStatus(Status& status) {
 
 Result resultBase(const Request& request) {
     Result result{};
-    result.schema_version = Result::SCHEMA_VERSION_V1;
+    result.schema_version = Result::SCHEMA_VERSION_V2;
     result.backend = Result::BACKEND_NATIVE_PGO;
     copyRequestIdentity(request, result);
     result.result_timestamp_ns = timestampNowNs();
@@ -809,6 +809,12 @@ std::optional<Digest> optimizedGraphHash(const Request& request, const Result& r
     for (double value : result.rotation_xyzw) {
         if (!appendBigEndianDouble(builder, value)) return std::nullopt;
     }
+    if (!appendBigEndian(builder,result.trajectory_count)) return std::nullopt;
+    for (auto stamp:result.trajectory_timestamp_ns) if (!appendBigEndian(builder,stamp)) return std::nullopt;
+    for (const auto& pose:result.trajectory_translation_m) for (double value:pose)
+        if (!appendBigEndianDouble(builder,value)) return std::nullopt;
+    for (const auto& pose:result.trajectory_rotation_xyzw) for (double value:pose)
+        if (!appendBigEndianDouble(builder,value)) return std::nullopt;
     return builder.finish();
 }
 
@@ -830,6 +836,23 @@ bool graphShapeWithinLimits(const SimplePGO& graph, bool correction_required) {
 }
 
 bool correctionProofWithinLimits(const Result& result) {
+    if (result.trajectory_count!=result.optimized_graph_node_count || result.trajectory_count<3
+        || result.trajectory_timestamp_ns.size()!=static_cast<std::size_t>(result.trajectory_count)
+        || result.trajectory_translation_m.size()!=static_cast<std::size_t>(result.trajectory_count)
+        || result.trajectory_rotation_xyzw.size()!=static_cast<std::size_t>(result.trajectory_count)) return false;
+    int64_t previous=-1;
+    for (int32_t i=0;i<result.trajectory_count;++i) {
+        const auto stamp=result.trajectory_timestamp_ns[i];
+        if (stamp<=previous || stamp>result.source_timestamp_ns
+            || result.trajectory_translation_m[i].size()!=3
+            || result.trajectory_rotation_xyzw[i].size()!=4) return false;
+        previous=stamp;
+        double norm=0;
+        for (double value:result.trajectory_translation_m[i]) if (!std::isfinite(value)) return false;
+        for (double value:result.trajectory_rotation_xyzw[i]) { if (!std::isfinite(value)) return false; norm+=value*value; }
+        if (std::abs(norm-1.0)>1e-6) return false;
+    }
+    if (previous!=result.source_timestamp_ns) return false;
     if (result.result_disposition != Result::DISPOSITION_CORRECTION ||
         result.transform_semantics != Result::TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3 ||
         result.optimized_graph_node_count < 3 ||
@@ -902,6 +925,12 @@ std::optional<Result> correctionResult(const Request& request, const RigidPose& 
     result.loop_target_node_id = target_node;
     result.loop_inlier_count = inlier_count;
     result.optimized_graph_node_count = static_cast<int64_t>(graph.keyPosesSe3().size());
+    result.trajectory_count=static_cast<int32_t>(graph.keyPosesSe3().size());
+    for (const auto& node:graph.keyPosesSe3()) {
+        result.trajectory_timestamp_ns.push_back(static_cast<int64_t>(node.local.sec)*1'000'000'000+node.local.nsec);
+        result.trajectory_translation_m.push_back({node.global.t.x,node.global.t.y,node.global.t.z});
+        result.trajectory_rotation_xyzw.push_back({node.global.q.x,node.global.q.y,node.global.q.z,node.global.q.w});
+    }
     result.optimized_graph_edge_count = static_cast<int64_t>(graph.constraintCountSe3());
     result.optimized_graph_loop_edge_count =
         static_cast<int64_t>(graph.loopConstraintCountSe3());
@@ -926,7 +955,7 @@ Status ownerStatus(const OnlinePgoOptions& options, int64_t status_sequence,
                    int32_t event_kind, int32_t health_state, int32_t terminal_state,
                    int32_t reason_code, const std::string& reason) {
     Status status{};
-    status.schema_version = Status::SCHEMA_VERSION_V1;
+    status.schema_version = Status::SCHEMA_VERSION_V2;
     status.backend = Status::BACKEND_NATIVE_PGO;
     status.runtime_generation = options.runtime_generation;
     status.backend_generation = options.backend_generation;
@@ -945,7 +974,7 @@ Status requestStatus(const Request& request, int64_t status_sequence, int32_t ev
                      int32_t health_state, int32_t terminal_state, int32_t cancel_state,
                      int32_t reason_code, const std::string& reason) {
     Status status{};
-    status.schema_version = Status::SCHEMA_VERSION_V1;
+    status.schema_version = Status::SCHEMA_VERSION_V2;
     status.backend = Status::BACKEND_NATIVE_PGO;
     status.runtime_generation = request.runtime_generation;
     status.backend_generation = request.backend_generation;
@@ -1059,7 +1088,7 @@ bool sameRequestIdentity(const Request& left, const Request& right) {
 }
 
 bool validateCancelMessage(const Status& status, const OnlinePgoOptions& options) {
-    if (status.schema_version != Status::SCHEMA_VERSION_V1 ||
+    if (status.schema_version != Status::SCHEMA_VERSION_V2 ||
         status.backend != Status::BACKEND_NATIVE_PGO ||
         status.runtime_generation != options.runtime_generation ||
         status.backend_generation != options.backend_generation || status.status_sequence <= 0 ||
@@ -1431,7 +1460,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
         target->size() > kMaxSubmapPoints) {
         IcpResult result;
         result.disposition = IcpDisposition::Failure;
-        result.error = "ICP cloud exceeds the frozen V1 proof limits";
+        result.error = "ICP cloud exceeds the frozen V2 proof limits";
         return result;
     }
     if (source->size() < kMinIcpInliers || target->size() < kMinIcpInliers) {
@@ -1505,7 +1534,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
             if (inlier_count > Result::MAX_LOOP_INLIERS) {
                 IcpResult result;
                 result.disposition = IcpDisposition::Failure;
-                result.error = "ICP inlier proof exceeds the frozen V1 limit";
+                result.error = "ICP inlier proof exceeds the frozen V2 limit";
                 return result;
             }
         }
@@ -1583,9 +1612,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, false)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "pose graph violates the frozen V1 limits"),
+                               "pose graph violates the frozen V2 limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "pose graph violates the frozen V1 limits"};
+                "pose graph violates the frozen V2 limits"};
     }
     if (trial.graph.keyPosesSe3().size() >= kMaxGraphNodes) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
@@ -1618,9 +1647,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, false)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "keyframe exceeds the frozen V1 graph limits"),
+                               "keyframe exceeds the frozen V2 graph limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "keyframe exceeds the frozen V1 graph limits"};
+                "keyframe exceeds the frozen V2 graph limits"};
     }
     PointCloud::Ptr body_cloud = requestBodyCloud(request, options.submap_resolution_m);
     if (body_cloud->size() < kMinIcpInliers ||
@@ -1685,9 +1714,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     }
     if (!graphShapeWithinLimits(trial.graph, true)) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "loop edge exceeds the frozen V1 graph limits"),
+                               "loop edge exceeds the frozen V2 graph limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "loop edge exceeds the frozen V1 graph limits"};
+                "loop edge exceeds the frozen V2 graph limits"};
     }
     const Se3OptimizationSummary optimization =
         trial.graph.smoothAndUpdateSe3(*cancelled);
@@ -1717,9 +1746,9 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     if (!graphShapeWithinLimits(trial.graph, true) || optimization.iterations < 1 ||
         optimization.iterations > Result::MAX_OPTIMIZATION_ITERATIONS) {
         return {rejectedResult(request, Result::REJECTION_RESOURCE_LIMIT,
-                               "optimized proof exceeds the frozen V1 limits"),
+                               "optimized proof exceeds the frozen V2 limits"),
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
-                "optimized proof exceeds the frozen V1 limits"};
+                "optimized proof exceeds the frozen V2 limits"};
     }
     if (cancelled->load()) return cancelledRequest(request);
     const RigidPose correction = trial.graph.offsetSe3();

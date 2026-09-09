@@ -8,7 +8,16 @@ fn main() {
     let source = PathBuf::from("native/pgo");
     std::fs::create_dir_all(&build).expect("create native build directory");
 
-    let configure = Command::new("cmake")
+    let mut configuration = Command::new("cmake");
+    if let Some(toolchain) = env::var_os("CMAKE_TOOLCHAIN_FILE") {
+        configuration.arg(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            PathBuf::from(toolchain).display()
+        ));
+    } else if env::var("HOST").ok() != env::var("TARGET").ok() {
+        panic!("PGO跨架构构建需要显式CMAKE_TOOLCHAIN_FILE");
+    }
+    let configure = configuration
         .args([
             "-S",
             source.to_str().unwrap(),
@@ -19,7 +28,14 @@ fn main() {
         .expect("run cmake configure for native PGO");
     assert!(configure.success(), "native PGO cmake configure failed");
     let compile = Command::new("cmake")
-        .args(["--build", build.to_str().unwrap(), "--config", "Release"])
+        .args([
+            "--build",
+            build.to_str().unwrap(),
+            "--config",
+            "Release",
+            "--parallel",
+        ])
+        .arg(env::var("CMAKE_BUILD_PARALLEL_LEVEL").unwrap_or_else(|_| "2".into()))
         .status()
         .expect("build native PGO");
     assert!(compile.success(), "native PGO build failed");
@@ -28,6 +44,14 @@ fn main() {
     assert!(binary.is_file(), "native PGO artifact missing");
     println!("cargo:rustc-env=NUWAX_PGO_NATIVE_BIN={}", binary.display());
     println!("cargo:rerun-if-changed=native/pgo");
+    println!("cargo:rerun-if-changed=../nuwax-gtsam/native");
+    for name in [
+        "CMAKE_PREFIX_PATH",
+        "CMAKE_TOOLCHAIN_FILE",
+        "CMAKE_BUILD_PARALLEL_LEVEL",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoRequest.lcm");
     println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoResult.lcm");
     println!("cargo:rerun-if-changed=../../lcmtypes/nuwax_msgs/NativePgoStatus.lcm");

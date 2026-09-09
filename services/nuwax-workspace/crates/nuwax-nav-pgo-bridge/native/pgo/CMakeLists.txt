@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../nuwax-gtsam/native" "${CMAKE_CURRENT_BINARY_DIR}/gtsam-core")
 pkg_check_modules(LCM REQUIRED IMPORTED_TARGET lcm)
 pkg_check_modules(PCL REQUIRED IMPORTED_TARGET pcl_common pcl_filters pcl_kdtree pcl_registration)
 find_program(LCM_GEN_EXECUTABLE lcm-gen)
@@ -47,7 +48,7 @@ add_executable(
 target_include_directories(pgo PRIVATE "${NATIVE_PGO_GENERATED_DIR}")
 target_link_libraries(
   pgo
-  PRIVATE PkgConfig::LCM PkgConfig::PCL OpenSSL::Crypto Threads::Threads
+  PRIVATE PkgConfig::LCM PkgConfig::PCL OpenSSL::Crypto Threads::Threads nuwax_gtsam
 )
 target_compile_options(pgo PRIVATE -Wall -Wextra -Wpedantic -O2)
 
@@ -67,6 +68,7 @@ set_tests_properties(
 )
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests.cpp")
   add_executable(pgo_tests tests.cpp simple_pgo.cpp commons.cpp)
+  target_link_libraries(pgo_tests PRIVATE nuwax_gtsam)
   target_compile_options(pgo_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
   add_test(NAME pgo_non_finite_safety COMMAND pgo_tests)
   set_tests_properties(pgo_non_finite_safety PROPERTIES TIMEOUT 5)

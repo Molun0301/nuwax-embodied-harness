@@ -108,10 +108,10 @@ mod tests {
             ("nuwax_msgs.LioOdometryEnvelope", 0x742d_9b06_c0c7_a223),
             ("nuwax_msgs.LioCloudEnvelope", 0xdcd4_ae0f_83a9_a81b),
             ("nuwax_msgs.LioStatus", 0x6d7a_e636_d8ba_41b2),
-            ("nuwax_msgs.CorrectionCandidate", 0x8510_78c0_24d5_b010),
-            ("nuwax_msgs.NativePgoRequest", 0xa714_e98d_60d0_b620),
-            ("nuwax_msgs.NativePgoResult", 0x3de0_8d72_be10_8e4b),
-            ("nuwax_msgs.NativePgoStatus", 0x3091_8591_82a5_7b03),
+            ("nuwax_msgs.CorrectionCandidate", 0x05057b4c757c80f3),
+            ("nuwax_msgs.NativePgoRequest", 0xa714e98d60d0b620),
+            ("nuwax_msgs.NativePgoResult", 0xadd11e19aa0ec18b),
+            ("nuwax_msgs.NativePgoStatus", 0x3091859182a57b03),
         ];
         assert_eq!(STRUCT_SEEDS.len(), expected.len());
         for (fqn, upstream_fp) in expected {

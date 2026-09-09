@@ -59,6 +59,11 @@ impl DynamicCloudFilter {
         let stride = points.len().div_ceil(MAX_RAYS);
         let phase = self.sampling_phase % stride;
         self.sampling_phase = self.sampling_phase.wrapping_add(1);
+        // 全部历史体素都被当前回波或其邻格保护时，不可能产生删除反证。
+        // 先证明这一条件，可省去整帧在空空间里的重复射线遍历；采样相位仍正常推进。
+        if voxels.iter().all(|key| has_nearby_hit(&hits, *key)) {
+            return 0;
+        }
         let mut free = HashSet::new();
         for point in points.iter().skip(phase).step_by(stride) {
             trace_free_voxels(voxels, &hits, voxel_size, origin, point, &mut free);
@@ -81,6 +86,9 @@ impl DynamicCloudFilter {
 }
 
 fn has_nearby_hit(hits: &HashSet<VoxelKey>, key: VoxelKey) -> bool {
+    if hits.contains(&key) {
+        return true;
+    }
     (-1..=1).any(|x| {
         (-1..=1).any(|y| {
             (-1..=1).any(|z| {

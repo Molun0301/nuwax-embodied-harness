@@ -1,7 +1,7 @@
 package nuwax_msgs;
 
 struct CorrectionCandidate {
-    const int32_t SCHEMA_VERSION_V1 = 1;
+    const int32_t SCHEMA_VERSION_V2 = 2;
     const int32_t BACKEND_LIBRARY_PGO = 1;
     const int32_t BACKEND_NATIVE_PGO = 2;
     const int32_t BACKEND_RELOCALIZATION = 3;
@@ -60,5 +60,10 @@ struct CorrectionCandidate {
     // Quaternion component order is x, y, z, w.
     double rotation_xyzw[4];
     // SHA-256 over the canonical candidate fields preceding this digest.
+    // 完整优化关键帧，时间精确保留源纳秒，位姿属于优化后的里程计世界坐标。
+    int32_t trajectory_count;
+    int64_t trajectory_timestamp_ns[trajectory_count];
+    double trajectory_translation_m[trajectory_count][3];
+    double trajectory_rotation_xyzw[trajectory_count][4];
     byte payload_sha256[32];
 }

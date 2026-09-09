@@ -2,7 +2,7 @@
 //! - `voxels` — 体素地图
 //! - `pointclouds` — 点云与占据
 //! - `relocalization` — 重定位（ICP）
-//! - `loop_closure` — 回环检测 + PGO（自研 Gauss-Newton）
+//! - `loop_closure` — 回环检测 + PGO（GTSAM位姿图优化）
 //! - `models` — Costmap 数据类
 //! - `utils` — 工具（distance 等）
 

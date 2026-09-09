@@ -1,7 +1,7 @@
 package nuwax_msgs;
 
 struct NativePgoResult {
-    const int32_t SCHEMA_VERSION_V1 = 1;
+    const int32_t SCHEMA_VERSION_V2 = 2;
     const int32_t BACKEND_NATIVE_PGO = 2;
     const int32_t TRANSFORM_ABSOLUTE_LEFT_CORRECTION_SE3 = 1;
     const int32_t DISPOSITION_NO_CANDIDATE = 1;
@@ -79,6 +79,12 @@ struct NativePgoResult {
     double optimization_initial_cost;
     double optimization_final_cost;
     byte optimized_graph_sha256[32];
+    // 完整优化关键帧，时间精确保留源纳秒，位姿属于优化后的里程计世界坐标。
+    int32_t trajectory_count;
+    int64_t trajectory_timestamp_ns[trajectory_count];
+    double trajectory_translation_m[trajectory_count][3];
+    double trajectory_rotation_xyzw[trajectory_count][4];
+
     // REJECTED requires a typed rejection reason and detail; other dispositions use zero/empty.
     int32_t rejection_reason_code;
     string rejection_reason;

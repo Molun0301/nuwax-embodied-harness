@@ -35,8 +35,9 @@ pub fn se3_log_to_vector6(pose: &Isometry3<f64>) -> Vector6<f64> {
     // 小角度近似：V^{-1} ≈ I - 0.5 [ω]× + (1/12) [ω]×²
     let theta_sq = rotation.norm_squared();
     let translation = if theta_sq < 1e-12 {
-        // 小角度：V^{-1} ≈ I
-        t
+        // 小角度也保留旋转和平移的耦合，不能直接把平移当作李代数分量。
+        let omega_skew = skew3(&rotation);
+        t - 0.5 * omega_skew * t + (1.0 / 12.0) * omega_skew * (omega_skew * t)
     } else {
         let theta = theta_sq.sqrt();
         let a = 0.5;

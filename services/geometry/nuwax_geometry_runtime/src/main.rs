@@ -43,6 +43,7 @@ mod nav_runtime;
 mod occupancy_shm;
 mod owner_profile;
 mod persistent_occupancy;
+mod pgo_map;
 mod pointcloud;
 mod rpc_runtime;
 mod runtime_diagnostics;
@@ -327,19 +328,17 @@ impl PendingLioIngress {
                 body_from_sensor,
                 pair_max_skew,
                 ..
-            } => {
-                lio_ingress::NativeLioIngress::with_runtime(
-                    spec,
-                    handle,
-                    public_odometry,
-                    public_cloud,
-                    tf,
-                    body_from_sensor,
-                    pair_max_skew,
-                )
-                .map(|ingress| PreparedLioIngress::Native(Arc::new(ingress)))
-                .map_err(|error| error.to_string())
-            }
+            } => lio_ingress::NativeLioIngress::with_runtime(
+                spec,
+                handle,
+                public_odometry,
+                public_cloud,
+                tf,
+                body_from_sensor,
+                pair_max_skew,
+            )
+            .map(|ingress| PreparedLioIngress::Native(Arc::new(ingress)))
+            .map_err(|error| error.to_string()),
         }
     }
 }
@@ -351,20 +350,16 @@ impl PreparedLioIngress {
         correction_applier: Arc<lcm_runtime::GeometryCanonicalCorrectionApplier>,
     ) -> Arc<dyn lio_owner::LioIngressSink> {
         match self {
-            Self::Device(inner) => {
-                Arc::new(lio_ingress::CorrectionAwareLioIngress::device(
-                    inner,
-                    correction_ingress,
-                    correction_applier,
-                ))
-            }
-            Self::Native(ingress) => {
-                Arc::new(lio_ingress::CorrectionAwareLioIngress::native(
-                    ingress,
-                    correction_ingress,
-                    correction_applier,
-                ))
-            }
+            Self::Device(inner) => Arc::new(lio_ingress::CorrectionAwareLioIngress::device(
+                inner,
+                correction_ingress,
+                correction_applier,
+            )),
+            Self::Native(ingress) => Arc::new(lio_ingress::CorrectionAwareLioIngress::native(
+                ingress,
+                correction_ingress,
+                correction_applier,
+            )),
         }
     }
 }
@@ -1394,7 +1389,10 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
         return None;
     }
     if args.next().is_some() {
-        error!(event = "process.failed", "--print-release-artifacts 不接受其它参数");
+        error!(
+            event = "process.failed",
+            "--print-release-artifacts 不接受其它参数"
+        );
         return Some(ExitCode::from(2));
     }
 
@@ -1417,7 +1415,10 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
             Some(ExitCode::SUCCESS)
         }
         Err(error) => {
-            error!(event = "process.failed", "序列化 release artifact discovery 失败: {error}");
+            error!(
+                event = "process.failed",
+                "序列化 release artifact discovery 失败: {error}"
+            );
             Some(ExitCode::from(2))
         }
     }
@@ -1470,7 +1471,10 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
-            error!(event = "process.failed", "geometry runtime 初始化 Tokio 失败: {error}");
+            error!(
+                event = "process.failed",
+                "geometry runtime 初始化 Tokio 失败: {error}"
+            );
             return ExitCode::from(2);
         }
     };
@@ -1729,6 +1733,16 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             return rollback_mapping_and_lio(runtime_owner, ingress_gate, ExitCode::from(4)).await;
         }
     };
+    if matches!(
+        &correction,
+        correction_coordinator::CorrectionOwnerSpec::LibraryPgo { .. }
+            | correction_coordinator::CorrectionOwnerSpec::NativePgo { .. }
+    ) {
+        if let Err(error) = correction_applier.bind_mapping(&bridge) {
+            error!(%error,"PGO地图管线绑定失败");
+            return rollback_mapping_and_lio(runtime_owner, ingress_gate, ExitCode::from(4)).await;
+        }
+    }
     let correction_sink = match correction_coordinator::GeometryCorrectionSink::new_for_spec(
         correction_identity.clone(),
         &correction,

@@ -1090,7 +1090,7 @@ fn prepare_request(
     backend_generation: i64,
     request_sequence: i64,
 ) -> Result<NativePgoRequest, OnlinePgoError> {
-    if request.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V1
+    if request.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V2
         || request.identity.backend != codec::NATIVE_PGO_BACKEND
         || request.identity.runtime_generation != runtime_generation
         || request.identity.backend_generation != backend_generation
@@ -1165,7 +1165,7 @@ async fn publish_cancel(
         .checked_add(1)
         .ok_or_else(|| OnlinePgoError::Protocol("cancel status sequence exhausted".into()))?;
     let status = NativePgoStatus {
-        schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+        schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
         backend: codec::NATIVE_PGO_BACKEND,
         runtime_generation: runtime.runtime_generation,
         backend_generation: runtime.backend_generation,
@@ -1442,7 +1442,7 @@ fn validate_owner_identity(
     runtime_generation: i64,
     backend_generation: i64,
 ) -> Result<(), OnlinePgoError> {
-    if status.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V1
+    if status.schema_version != codec::NATIVE_PGO_SCHEMA_VERSION_V2
         || status.backend != codec::NATIVE_PGO_BACKEND
         || status.runtime_generation != runtime_generation
         || status.backend_generation != backend_generation
@@ -1562,7 +1562,7 @@ mod tests {
         let point_count = i64::try_from(points.len() / 3).unwrap();
         let occupancy = vec![0_i8, 20, 80, -1];
         let request = NativePgoRequest {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             identity: codec::NativePgoRequestIdentity {
                 backend: codec::NATIVE_PGO_BACKEND,
                 runtime_generation,
@@ -1624,7 +1624,7 @@ mod tests {
 
     fn no_candidate(request: &NativePgoRequest) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_NO_CANDIDATE,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1663,7 +1663,7 @@ mod tests {
 
     fn correction(request: &NativePgoRequest) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_CORRECTION,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1675,6 +1675,13 @@ mod tests {
             loop_source_node_id: 2,
             loop_target_node_id: 0,
             loop_inlier_count: 24,
+            trajectory: (0..3)
+                .map(|i| codec::OptimizedKeyframe {
+                    source_timestamp_ns: request.identity.source_timestamp_ns - 2 + i,
+                    translation_m: [i as f64, 0.0, 0.0],
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
             optimized_graph_node_count: 3,
             optimized_graph_edge_count: 3,
             optimized_graph_loop_edge_count: 1,
@@ -1690,7 +1697,7 @@ mod tests {
 
     fn rejected(request: &NativePgoRequest, cancelled: bool) -> NativePgoResult {
         codec::seal_native_pgo_result(NativePgoResult {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             request: request.echo(),
             result_disposition: codec::NATIVE_PGO_DISPOSITION_REJECTED,
             result_timestamp_ns: request.identity.source_timestamp_ns,
@@ -1720,7 +1727,7 @@ mod tests {
         reason: &str,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: request.identity.runtime_generation,
             backend_generation: request.identity.backend_generation,
@@ -1745,7 +1752,7 @@ mod tests {
         health_state: i32,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation,
             backend_generation,
@@ -1768,7 +1775,7 @@ mod tests {
         status_sequence: i64,
     ) -> NativePgoStatus {
         codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: request.identity.runtime_generation,
             backend_generation: request.identity.backend_generation,
@@ -2129,7 +2136,7 @@ mod tests {
         let topics = OnlinePgoTopics::for_runtime(14, 5).unwrap();
         let request = prepare_request(complete_request(14, 5, 1, 4_000_000_000), 14, 5, 1).unwrap();
         let wrong_generation = codec::seal_native_pgo_status(NativePgoStatus {
-            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V1,
+            schema_version: codec::NATIVE_PGO_SCHEMA_VERSION_V2,
             backend: codec::NATIVE_PGO_BACKEND,
             runtime_generation: 14,
             backend_generation: 6,

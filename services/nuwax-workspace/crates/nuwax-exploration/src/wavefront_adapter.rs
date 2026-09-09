@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use nuwax_explore_wavefront::selector::WavefrontGoalSelector;
 use nuwax_explore_wavefront::session::ExplorationSession;
 use nuwax_explore_wavefront::{
-    FrontierGoalIdSeed, FrontierGoalIdSource, GoalSelection, StopReason, WavefrontConfig,
+    FrontierGoalIdSeed, FrontierGoalIdSource, GoalSelection, StopReason, WavefrontConfig, WavefrontError,
 };
 use nuwax_nav_types_messages::geometry::Point2;
 use nuwax_nav_types_messages::grid::OccupancyGrid2D;
@@ -270,9 +270,17 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
                     // MEDIUM-2 修正:用户 stop_movement 走独立 reason
                     StopReason::UserCancelled => crate::ExplorationStopReason::UserCancelled,
                 };
+                self.last_error = None;
                 self.last_goal = None;
                 self.last_frontiers.clear();
                 Ok(ExplorationPoll::Stop(facade_stop))
+            }
+            Err(e @ WavefrontError::RobotFootprintUnobserved(..)) => {
+                // 初图缺测属于输入不可用，等待后续真实地图补齐；原父任务截止和取消仍有效。
+                let msg = e.to_string();
+                self.last_error = Some(msg.clone());
+                self.last_frontiers.clear();
+                Ok(ExplorationPoll::SourceUnavailable(msg))
             }
             Err(e) => {
                 let msg = format!("{e}");
@@ -391,6 +399,60 @@ mod tests {
         let s = sample_state(None, Timestamp::default());
         let poll = ad.poll_goal(&s).unwrap();
         assert!(matches!(poll, ExplorationPoll::SourceUnavailable(_)));
+    }
+
+    #[test]
+    fn initial_unknown_footprint_waits_then_selects_goal_after_real_observation() {
+        let mut controller =
+            crate::ExplorationController::new(crate::ExplorationArbitrationPolicy::FirstAvailable);
+        controller.add_source_boxed(Box::new(WavefrontGoalSourceAdapter::with_default_id(
+            "wavefront",
+            WavefrontConfig::default(),
+        )));
+        controller.begin_exploration().unwrap();
+        let mut incomplete = frontier_grid();
+        incomplete.set(4, 4, OccupancyCell::Unknown);
+        let mut state = sample_state(Some(&incomplete), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        assert!(matches!(controller.poll_next_goal(&state).unwrap(),
+            ExplorationPoll::SourceUnavailable(reason) if reason.contains("not fully observed")));
+        assert!(controller.is_active(), "缺测不能关闭探索控制器");
+        assert!(controller.frontier_snapshot().is_empty());
+
+        let complete = frontier_grid();
+        state.global_costmap = Some(&complete);
+        assert!(
+            matches!(
+                controller.poll_next_goal(&state).unwrap(),
+                ExplorationPoll::Goal(_)
+            ),
+            "后续真实地图补齐后应直接产生前沿目标，不必重启探索"
+        );
+        controller
+            .stop_with_reason(crate::ExplorationStopReason::UserCancelled)
+            .unwrap();
+        controller.begin_exploration().unwrap();
+        state.global_costmap = Some(&incomplete);
+        assert!(matches!(
+            controller.poll_next_goal(&state).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+        let mut blocked = frontier_grid();
+        blocked.set(4, 4, OccupancyCell::Cost(50));
+        state.global_costmap = Some(&blocked);
+        assert!(matches!(
+            controller.poll_next_goal(&state).unwrap(),
+            ExplorationPoll::Stop(crate::ExplorationStopReason::NoReachableFreeSpace)
+        ));
+        assert!(
+            controller
+                .diagnostics()
+                .sources
+                .iter()
+                .all(|source| source.last_error.is_none()),
+            "已知障碍终态不能继续携带上一轮缺测诊断"
+        );
     }
 
     #[test]

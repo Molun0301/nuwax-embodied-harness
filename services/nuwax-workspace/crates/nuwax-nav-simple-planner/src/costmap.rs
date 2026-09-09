@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::inflation::{blocked_at_inflation, inflate_obstacles};
 use crate::NavError;
+use nuwax_nav_types_messages::grid::OCCUPANCY_OBSTACLE_THRESHOLD;
 use nuwax_nav_types_messages::{OccupancyCell, OccupancyGrid2D, Point2};
 
 /// Costmap：稀疏 + 历史最大高度模型。
@@ -98,7 +99,7 @@ impl Costmap {
                 if matches!(
                     grid.get(x, y),
                     Some(OccupancyCell::Occupied | OccupancyCell::Inflated)
-                ) || matches!(grid.get(x, y), Some(OccupancyCell::Cost(value)) if value >= 50)
+                ) || matches!(grid.get(x, y), Some(OccupancyCell::Cost(value)) if value >= OCCUPANCY_OBSTACLE_THRESHOLD)
                 {
                     map.heights.insert((i64::from(x), i64::from(y)), 1.0);
                 }
@@ -118,11 +119,8 @@ impl Costmap {
         if ix < 0 || iy < 0 || ix >= i64::from(grid.width) || iy >= i64::from(grid.height) {
             return false;
         }
-        match grid.get(ix as u32, iy as u32) {
-            Some(OccupancyCell::Free) => true,
-            Some(OccupancyCell::Cost(value)) => value < 50,
-            _ => false,
-        }
+        grid.get(ix as u32, iy as u32)
+            .is_some_and(OccupancyCell::is_known_traversable)
     }
 
     /// 是否由有界占据图构建。

@@ -3189,16 +3189,20 @@ impl ExploreRuntimeHandle {
         }
 
         if let Some(reason) = evaluate_stop_conditions(&guard, now_ns) {
+            let message = match guard.last_poll.as_ref() {
+                Some(ExplorationPoll::SourceUnavailable(detail))
+                    if reason == ExplorationStopReason::NoReachableFreeSpace =>
+                {
+                    format!("exploration inputs unavailable at duration limit: {detail}")
+                }
+                _ => format!(
+                    "exploration stop condition reached: {}",
+                    stop_reason_str(reason)
+                ),
+            };
             drop(guard);
             return self
-                .finish_session(
-                    None,
-                    reason,
-                    format!(
-                        "exploration stop condition reached: {}",
-                        stop_reason_str(reason)
-                    ),
-                )
+                .finish_session(None, reason, message)
                 .await;
         }
 
@@ -4221,6 +4225,15 @@ fn evaluate_stop_conditions(
     if conditions.max_duration_ms.is_some_and(|limit_ms| {
         now_ns.saturating_sub(guard.started_at_ns) >= limit_ms.saturating_mul(1_000_000)
     }) {
+        // 一直缺少可用起点、尚未选择目标时，期限耗尽不能伪装成探索成功。
+        if guard.child_sequence == 0
+            && matches!(
+                guard.last_poll.as_ref(),
+                Some(ExplorationPoll::SourceUnavailable(_))
+            )
+        {
+            return Some(ExplorationStopReason::NoReachableFreeSpace);
+        }
         return Some(ExplorationStopReason::DurationExceeded);
     }
     if guard.active_child.is_none()
@@ -7446,6 +7459,70 @@ mod tests {
 
         assert_eq!(completed.status, STATUS_FAILED);
         assert_eq!(completed.last_stop_reason, "no_reachable_free_space");
+    }
+
+    #[tokio::test]
+    async fn unobserved_origin_wait_recovers_and_preserves_cancel_and_duration_limit() {
+        for scenario in ["recover", "cancel", "duration"] {
+            let (handle, sink) = configured_handle();
+            let mut incomplete = frontier_costmap(1);
+            incomplete.grid.set(4, 4, OccupancyCell::Unknown);
+            ingest_committed_costmap_fixture(&handle, incomplete, 1)
+                .await
+                .unwrap();
+            handle
+                .start_with_config(
+                    "req-initial-observation",
+                    ExploreStartConfig {
+                        motion_admission: crate::nav_runtime::test_motion_admission(),
+                        stop_conditions: ExploreStopConditions {
+                            max_duration_ms: Some(1_000),
+                            ..ExploreStopConditions::default()
+                        },
+                        ..ExploreStartConfig::default()
+                    },
+                )
+                .await;
+            let waiting = handle.tick((2.0, 2.0)).await;
+            assert_eq!(waiting.status, STATUS_PENDING);
+            assert!(waiting.message.contains("not fully observed"));
+            assert!(sink.submitted.lock().unwrap().is_empty());
+
+            match scenario {
+                "recover" => {
+                    ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
+                        .await
+                        .unwrap();
+                    let active = handle.tick((2.0, 2.0)).await;
+                    assert_eq!(active.status, STATUS_ACTIVE);
+                    assert!(!active.child_task_id.is_empty());
+                    assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+                    let mut guard = handle.inner.lock().await;
+                    guard.started_at_ns = now_unix_nanos() - 2_000_000_000;
+                    guard.last_poll = Some(ExplorationPoll::SourceUnavailable(
+                        "later input wait".into(),
+                    ));
+                    assert_eq!(
+                        evaluate_stop_conditions(&guard, now_unix_nanos()),
+                        Some(ExplorationStopReason::DurationExceeded),
+                        "已选择目标后的原限时规则保持"
+                    );
+                }
+                "cancel" => {
+                    let stopped = handle.stop("req-initial-observation").await;
+                    assert_eq!(stopped.status, STATUS_CANCELLED);
+                    assert!(sink.submitted.lock().unwrap().is_empty());
+                }
+                _ => {
+                    handle.inner.lock().await.started_at_ns = now_unix_nanos() - 2_000_000_000;
+                    let stopped = handle.tick((2.0, 2.0)).await;
+                    assert_eq!(stopped.last_stop_reason, "no_reachable_free_space");
+                    assert_eq!(stopped.status, STATUS_FAILED);
+                    assert!(stopped.message.contains("not fully observed"));
+                    assert!(sink.submitted.lock().unwrap().is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]

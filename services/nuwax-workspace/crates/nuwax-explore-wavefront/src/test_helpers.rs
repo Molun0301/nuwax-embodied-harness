@@ -5,8 +5,7 @@
 //! 本模块通过 `DetectionOutcomeKind` 摘要 + `DetectorError` 摘要让 integration tests
 //! 验证行为而不接触 internal types。
 //!
-//! `test-internals` feature(默认 enabled)只影响本模块 cfg gate,
-//! 生产 crate consumer 不引用 test_helpers。
+//! `test-internals`由测试开发依赖启用，生产默认关闭；生产消费者不引用本模块。
 
 #![doc(hidden)]
 
@@ -26,11 +25,13 @@ pub enum DetectionOutcomeKind {
     NoReachableFreeSpace,
 }
 
-/// detector error 摘要(集成 test 不直接接触 crate-private `WavefrontError`)。
+/// 检测错误摘要，供集成测试隔离生产错误类型的具体实现。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetectorError {
     /// 机器人位姿在栅格外(包含 (x, y))
     OutOfBounds { x_m: f64, y_m: f64 },
+    /// 起点轮廓观测尚未完整。
+    FootprintUnobserved { x_m: f64, y_m: f64 },
 }
 
 impl DetectorError {
@@ -40,6 +41,9 @@ impl DetectorError {
         match self {
             Self::OutOfBounds { x_m, y_m } => {
                 format!("robot pose out of grid bounds: ({x_m}, {y_m})")
+            }
+            Self::FootprintUnobserved { x_m, y_m } => {
+                format!("robot footprint not fully observed at: ({x_m}, {y_m})")
             }
         }
     }
@@ -66,6 +70,9 @@ pub fn detect_kind(
         .map_err(|e| match e {
             crate::detector::WavefrontError::RobotPoseOutOfBounds(x, y) => {
                 DetectorError::OutOfBounds { x_m: x, y_m: y }
+            }
+            crate::detector::WavefrontError::RobotFootprintUnobserved(x, y) => {
+                DetectorError::FootprintUnobserved { x_m: x, y_m: y }
             }
         })?;
     Ok(match out {

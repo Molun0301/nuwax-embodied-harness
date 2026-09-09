@@ -3,8 +3,7 @@
 //! 公共 API:仅 `new(config)` + `diagnostics()`。
 //! `detect_candidates` 为 `pub(crate)`,输出 crate-private `DetectionOutcome`。
 //!
-//! 内部类型 (`DetectionOutcome` / `FrontierCluster` / `FrontierCandidate` /
-//! `WavefrontError`) 全部 `pub(crate)`;**不**列入稳定公共 API。
+//! 检测结果与候选类型保持包内可见；`WavefrontError`作为公共返回类型公开。
 
 use thiserror::Error;
 
@@ -22,6 +21,9 @@ pub enum WavefrontError {
     /// 机器人位姿在栅格外
     #[error("robot pose out of grid bounds: ({0}, {1})")]
     RobotPoseOutOfBounds(f64, f64),
+    /// 起点轮廓尚无完整观测；不能据此派发导航，也不能把初图缺测当永久围困。
+    #[error("robot footprint not fully observed at: ({0}, {1})")]
+    RobotFootprintUnobserved(f64, f64),
 }
 
 /// 检测结果(crate-private;selector 消费它产生 `GoalSelection`)。
@@ -152,7 +154,7 @@ impl WavefrontDetector {
     /// 流程(方案 §4.8 + v18 HIGH-2 修正):
     /// 1. robot -> cell;越界返回 `RobotPoseOutOfBounds`
     /// 2. 清空 classification
-    /// 3. 起点必须是自由格，不能穿越未知区域或障碍寻找替代起点。
+    /// 3. 起点圆盘须已知可通行；缺测等待，已知障碍拒绝，不寻找替代起点。
     /// 4. 主 BFS 只遍历可达自由格，并禁止穿过对角墙角。
     /// 5. 收集 frontier cluster:仅从 MAP_CLOSED 区域相邻的 frontier seed 出发
     ///    (满足 v18 "reachable frontier 语义闭环")
@@ -176,11 +178,18 @@ impl WavefrontDetector {
         self.diagnostics.last_candidates.clear();
         // 非自由起点没有已证实的通行路径，不能任意投影到墙另一侧。
         let start_cell = GridPoint::new(start_x, start_y);
-        if cell_at(costmap, start_x, start_y) != OccupancyCell::Free {
-            return Ok(DetectionOutcome::NoReachableFreeSpace);
+        match start_footprint_state(costmap, start_cell, self.config.obstacle_inflation_radius_m) {
+            StartFootprintState::Blocked => return Ok(DetectionOutcome::NoReachableFreeSpace),
+            StartFootprintState::Unobserved => {
+                return Err(WavefrontError::RobotFootprintUnobserved(
+                    robot_pose.x,
+                    robot_pose.y,
+                ));
+            }
+            StartFootprintState::Traversable => {}
         }
         let footprint_map = footprint_safe_map(costmap, self.config.obstacle_inflation_radius_m);
-        if cell_at(&footprint_map, start_x, start_y) != OccupancyCell::Free {
+        if !cell_at(&footprint_map, start_x, start_y).is_known_traversable() {
             return Ok(DetectionOutcome::NoReachableFreeSpace);
         }
         let safe_reachable = reachable_free_region(start_cell, &footprint_map);
@@ -326,15 +335,66 @@ fn cell_at(grid: &OccupancyGrid2D, x: u32, y: u32) -> OccupancyCell {
     grid.cells[idx]
 }
 
+/// 起点安全性只看真实圆盘；任何已知障碍优先于未观测状态，不能延后已证实的阻挡。
+enum StartFootprintState {
+    Traversable,
+    Unobserved,
+    Blocked,
+}
+
+fn start_footprint_state(
+    grid: &OccupancyGrid2D,
+    start: GridPoint,
+    radius_m: f64,
+) -> StartFootprintState {
+    let radius = (radius_m.max(0.0) / grid.resolution).ceil() as i64;
+    if !radius_m.is_finite()
+        || !grid.resolution.is_finite()
+        || grid.resolution <= 0.0
+        || radius >= i64::from(grid.width)
+        || radius >= i64::from(grid.height)
+    {
+        return StartFootprintState::Blocked;
+    }
+    let mut unobserved = false;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let x = i64::from(start.x) + dx;
+            let y = i64::from(start.y) + dy;
+            let cell =
+                if x >= 0 && y >= 0 && x < i64::from(grid.width) && y < i64::from(grid.height) {
+                    grid.get(x as u32, y as u32)
+                } else {
+                    None
+                };
+            match cell {
+                None | Some(OccupancyCell::Unknown) => unobserved = true,
+                Some(value) if !value.is_known_traversable() => {
+                    return StartFootprintState::Blocked
+                }
+                _ => {}
+            }
+        }
+    }
+    if unobserved {
+        StartFootprintState::Unobserved
+    } else {
+        StartFootprintState::Traversable
+    }
+}
+
 fn is_traversable_step(from: GridPoint, to: GridPoint, grid: &OccupancyGrid2D) -> bool {
-    if cell_at(grid, to.x, to.y) != OccupancyCell::Free {
+    if !cell_at(grid, to.x, to.y).is_known_traversable() {
         return false;
     }
     // 八邻域的对角步必须有两个自由正交邻格，不能从两面墙之间穿角。
     from.x == to.x
         || from.y == to.y
-        || (cell_at(grid, from.x, to.y) == OccupancyCell::Free
-            && cell_at(grid, to.x, from.y) == OccupancyCell::Free)
+        || (cell_at(grid, from.x, to.y).is_known_traversable()
+            && cell_at(grid, to.x, from.y).is_known_traversable())
 }
 
 /// frontier 判定:unknown + 至少一个 free 邻居 + strict `>` 占用阈值排除。
@@ -350,7 +410,7 @@ pub(crate) fn is_frontier_point(
     let mut has_free = false;
     for n in neighbors8(p, grid).iter() {
         let nc = cell_at(grid, n.x, n.y);
-        if nc == OccupancyCell::Free {
+        if nc.is_known_traversable() {
             has_free = true;
         }
         if occupancy_value(nc) > cfg.occupancy_threshold {
@@ -367,7 +427,7 @@ fn has_reachable_neighbor(
     classification: &ClassificationGrid,
 ) -> bool {
     for n in neighbors8(p, grid).iter() {
-        if cell_at(grid, n.x, n.y) == OccupancyCell::Free
+        if cell_at(grid, n.x, n.y).is_known_traversable()
             && classification
                 .get(n.x, n.y)
                 .contains(PointClassification::MAP_CLOSED)
@@ -404,7 +464,7 @@ fn footprint_safe_map(grid: &OccupancyGrid2D, radius_m: f64) -> OccupancyGrid2D 
                     && ny >= 0
                     && nx < i64::from(grid.width)
                     && ny < i64::from(grid.height)
-                    && cell_at(grid, nx as u32, ny as u32) == OccupancyCell::Free
+                    && cell_at(grid, nx as u32, ny as u32).is_known_traversable()
             });
             if !free {
                 safe.set(x, y, OccupancyCell::Inflated);
@@ -457,7 +517,7 @@ fn choose_approach_position(
         })
         .filter(|(cell, frontier)| {
             *cell != robot_cell
-                && cell_at(grid, cell.x, cell.y) == OccupancyCell::Free
+                && cell_at(grid, cell.x, cell.y).is_known_traversable()
                 && classification.contains_flags(cell.x, cell.y, PointClassification::MAP_CLOSED)
                 && frontier_visible_from(*cell, *frontier, grid)
         })
@@ -481,7 +541,7 @@ fn frontier_visible_from(start: GridPoint, target: GridPoint, grid: &OccupancyGr
     let sy = (ty - y).signum();
     let mut error = dx + dy;
     while (x, y) != (tx, ty) {
-        if cell_at(grid, x as u32, y as u32) != OccupancyCell::Free {
+        if !cell_at(grid, x as u32, y as u32).is_known_traversable() {
             return false;
         }
         let twice = 2 * error;
@@ -562,6 +622,52 @@ mod tests {
             .detect_candidates(Point2 { x: 999.0, y: 999.0 }, &grid, &session)
             .unwrap_err();
         assert_eq!(err, WavefrontError::RobotPoseOutOfBounds(999.0, 999.0));
+    }
+
+    #[test]
+    fn low_cost_terrain_is_reachable_but_threshold_and_unknown_block_footprint() {
+        let mut grid =
+            OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.05, 40, 40, OccupancyCell::Unknown);
+        for y in 5..35 {
+            for x in 5..35 {
+                grid.set(x, y, OccupancyCell::Cost(49));
+            }
+        }
+        let mut detector = WavefrontDetector::new(WavefrontConfig::default());
+        let robot = Point2::new(1.025, 1.025);
+        let session = ExplorationSession::new();
+        let result = detector.detect_candidates(robot, &grid, &session).unwrap();
+        assert!(
+            matches!(result, DetectionOutcome::Candidates(ref goals) if !goals.is_empty()),
+            "低于导航障碍阈值的已知地面必须可生成真实前沿目标"
+        );
+        for blocked in [OccupancyCell::Cost(50), OccupancyCell::Occupied] {
+            grid.set(24, 20, blocked);
+            assert!(
+                matches!(
+                    detector.detect_candidates(robot, &grid, &session).unwrap(),
+                    DetectionOutcome::NoReachableFreeSpace
+                ),
+                "轮廓内的障碍或未知不可放行"
+            );
+            grid.set(24, 20, OccupancyCell::Cost(49));
+        }
+        grid.set(24, 20, OccupancyCell::Unknown);
+        assert!(
+            matches!(
+                detector.detect_candidates(robot, &grid, &session),
+                Err(WavefrontError::RobotFootprintUnobserved(..))
+            ),
+            "缺测必须等待，不能派发目标"
+        );
+        grid.set(16, 20, OccupancyCell::Cost(50));
+        assert!(
+            matches!(
+                detector.detect_candidates(robot, &grid, &session).unwrap(),
+                DetectionOutcome::NoReachableFreeSpace
+            ),
+            "已知障碍优先于轮廓中同时存在的未知"
+        );
     }
 
     #[test]

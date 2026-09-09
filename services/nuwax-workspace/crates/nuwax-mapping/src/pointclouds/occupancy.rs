@@ -611,15 +611,11 @@ impl PointCloudOccupancyBuilder {
         for row in 1..self.height.saturating_sub(1) {
             for col in 1..self.width.saturating_sub(1) {
                 let idx = (row * self.width + col) as usize;
-                let valid = [
-                    (row, col),
-                    (row - 1, col),
-                    (row + 1, col),
-                    (row, col - 1),
-                    (row, col + 1),
-                ]
-                .iter()
-                .all(|(r, c)| observed[(*r * self.width + *c) as usize]);
+                // Sobel实际消费整个3×3邻域，斜角缺测也必须保留未知。
+                // 仅检查十字邻域会把缺测填充值0当作真实高度，制造随世界高度变化的假台阶。
+                let valid = (row - 1..=row + 1).all(|r| {
+                    (col - 1..=col + 1).all(|c| observed[(r * self.width + c) as usize])
+                });
                 if !valid {
                     continue;
                 }
@@ -689,6 +685,46 @@ mod tests {
         assert_eq!(g.metadata.height, 11);
         // make_costmap2d 默认全 255（UNKNOWN）
         assert_eq!(g.get(0, 0), Some(255));
+    }
+
+    #[test]
+    fn height_cost_requires_full_gradient_support_and_is_height_translation_invariant() {
+        let builder = PointCloudOccupancyBuilder::new(Point3::origin(), 0.05, 13, 13, (0.0, 0.0));
+        let config = PointCloudOccConfig::default();
+        let below = builder.build_with_config(&[Point3::new(0.3, 0.3, -0.45)], &config);
+        let above = builder.build_with_config(&[Point3::new(0.3, 0.3, 0.55)], &config);
+        assert_eq!(
+            below.data, above.data,
+            "只平移世界高度不能改变平地的通行代价"
+        );
+        assert_eq!(
+            below.data[below.index(6, 6)],
+            0,
+            "完整邻域支撑的平面仍为自由"
+        );
+        assert_eq!(
+            below.data[below.index(7, 7)],
+            -1,
+            "十字邻域有效但斜角无观测时，不能把默认高度0当成台阶"
+        );
+
+        let points: Vec<_> = (0..13)
+            .flat_map(|row| {
+                (0..13).map(move |col| {
+                    Point3::new(
+                        f64::from(col) * 0.05,
+                        f64::from(row) * 0.05,
+                        if col < 7 { -0.45 } else { 0.55 },
+                    )
+                })
+            })
+            .collect();
+        let step = builder.build_with_config(&points, &config);
+        assert_eq!(
+            step.data[step.index(6, 6)],
+            100,
+            "完整观测的真实高度突变仍必须保留"
+        );
     }
 
     #[test]

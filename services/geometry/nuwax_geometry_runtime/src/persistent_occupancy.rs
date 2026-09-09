@@ -1,16 +1,13 @@
 //! 在线与离线 Geometry 共用的持久 canonical occupancy 累加器。
 
 use nuwax_mapping::OccupancyGrid;
+use nuwax_nav_types_messages::grid::OCCUPANCY_OBSTACLE_THRESHOLD;
 
 fn normalize_frame_id(frame_id: &str) -> String {
     frame_id.trim().trim_start_matches('/').to_string()
 }
 
-/// Occupancy values below this threshold are treated as traversable for the
-/// purpose of temporal cell hysteresis.  This is the same threshold used by
-/// navigation and the debug map renderer; values are still retained verbatim
-/// when a cell is first accepted or after a confirmed state change.
-const OCCUPANCY_OBSTACLE_THRESHOLD: i8 = 65;
+/// 占据类与导航共用阈值，避免导航判障碍的旧代价与新自由观测被误认为同类。
 pub(crate) const OCCUPANCY_CHANGE_CONFIRMATIONS: u8 = 3;
 
 /// Persistent 2D occupancy state independent from the bounded point-cloud
@@ -252,7 +249,7 @@ impl PersistentOccupancyGrid {
 }
 
 fn occupancy_class(value: i8) -> u8 {
-    u8::from(value >= OCCUPANCY_OBSTACLE_THRESHOLD)
+    u8::from(value >= OCCUPANCY_OBSTACLE_THRESHOLD as i8)
 }
 
 pub(crate) fn snap_grid_index(value: f64) -> f64 {

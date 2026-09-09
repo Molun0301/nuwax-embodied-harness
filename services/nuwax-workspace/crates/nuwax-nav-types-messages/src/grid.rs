@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::geometry::Point2;
 
+/// 已知占据代价达到此值即不可通行；建图迟滞、探索与二维导航共用。
+pub const OCCUPANCY_OBSTACLE_THRESHOLD: u8 = 50;
+
 /// 单元状态(基础枚举,等价 Python cost map 的离散状态)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +28,18 @@ pub enum OccupancyCell {
     Inflated,
     /// 一般 cost(0..=100,与 C++ costmap 等价)
     Cost(u8),
+}
+
+impl OccupancyCell {
+    /// 已知且低于障碍阈值才可通行，未知、占据和膨胀格始终拒绝。
+    #[must_use]
+    pub fn is_known_traversable(self) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Cost(value) => value < OCCUPANCY_OBSTACLE_THRESHOLD,
+            _ => false,
+        }
+    }
 }
 
 /// 2D 占据栅格

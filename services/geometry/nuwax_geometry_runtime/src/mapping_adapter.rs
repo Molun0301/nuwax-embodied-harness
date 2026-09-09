@@ -3743,6 +3743,27 @@ mod tests {
     }
 
     #[test]
+    fn persistent_grid_confirms_changes_across_navigation_cost_threshold() {
+        for (old, new) in [(50, 49), (56, 0), (49, 50)] {
+            let seed = observed_grid((0.0, 0.0), 1, 1, old);
+            let unknown = observed_grid((0.0, 0.0), 1, 1, -1);
+            let observation = observed_grid((0.0, 0.0), 1, 1, new);
+            let mut persistent = PersistentOccupancyGrid::from_grid(seed).unwrap();
+            for _ in 0..2 {
+                assert!(!persistent.merge(&unknown, &observation).unwrap());
+                assert_eq!(persistent.grid.data, vec![old]);
+            }
+            // 未观测必须打断反证累计，不能把间断的观测凑成连续证据。
+            persistent.merge(&unknown, &unknown).unwrap();
+            for _ in 0..2 {
+                assert!(!persistent.merge(&unknown, &observation).unwrap());
+            }
+            assert!(persistent.merge(&unknown, &observation).unwrap());
+            assert_eq!(persistent.grid.data, vec![new]);
+        }
+    }
+
+    #[test]
     fn persistent_grid_ignores_unknown_and_single_frame_contradictions() {
         let seed = observed_grid((0.0, 0.0), 1, 1, 100);
         let mut persistent =

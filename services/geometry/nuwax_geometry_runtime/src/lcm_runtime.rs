@@ -4121,6 +4121,7 @@ impl GeometryCanonicalCorrectionApplier {
             || transaction.map_frame_generation == 0
             || transaction.occupancy_revision == 0
             || transaction.cloud_revision == 0
+            || transaction.frozen_odom_source_timestamp_ns > transaction.source_timestamp_ns
             || match transaction.backend {
                 crate::correction_coordinator::CorrectionCandidateBackend::Relocalization => {
                     transaction.committed_map_source_timestamp_ns > transaction.source_timestamp_ns
@@ -4224,20 +4225,6 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         }
         self.validate_transaction(&transaction)
             .map_err(ApplyError::Failed)?;
-        let frozen_odom = pose_state_from_isometry(
-            &transaction.frozen_odom_from_body,
-            &self.odom_frame_id,
-            transaction.source_timestamp_ns,
-        );
-        let observation = canonical_mapping_observation_from_isometry(
-            &self.map_frame_id,
-            &self.odom_frame_id,
-            transaction.correction_revision,
-            &transaction.effective_map_from_odom,
-            &frozen_odom,
-            &self.body_frame_id,
-        )
-        .map_err(ApplyError::Failed)?;
         if shared.map.revision != transaction.occupancy_revision
             || shared.map.timestamp_ns != transaction.committed_map_source_timestamp_ns
             || normalize_frame(&shared.map.frame_id) != self.map_frame_id
@@ -4247,6 +4234,52 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 "canonical map/cloud state no longer matches correction receipt".to_owned(),
             ));
         }
+        let odom = if shared.pose.timestamp_ns > transaction.frozen_odom_source_timestamp_ns {
+            // 校正的证明属于冻结扫描，但公共输出不能覆盖已经提交的较新运动。
+            // 原共享状态锁同时保护位姿与规范坐标树，不从外部设备或异步缓存补位姿。
+            let latest = shared
+                .tf_tree
+                .lookup(&self.body_frame_id)
+                .ok()
+                .and_then(transform_to_entry)
+                .filter(|entry| {
+                    entry.parent == self.odom_frame_id
+                        && entry.child == self.body_frame_id
+                        && entry.stamp_ns == shared.pose.timestamp_ns
+                        && normalize_frame(&shared.pose.frame_id) == self.map_frame_id
+                })
+                .ok_or_else(|| {
+                    ApplyError::Failed(
+                        "newer canonical pose has no matching odometry transform".to_owned(),
+                    )
+                })?;
+            PoseState {
+                x: latest.tx,
+                y: latest.ty,
+                z: latest.tz,
+                qx: latest.rx,
+                qy: latest.ry,
+                qz: latest.rz,
+                qw: latest.rw,
+                frame_id: self.odom_frame_id.clone(),
+                timestamp_ns: latest.stamp_ns,
+            }
+        } else {
+            pose_state_from_isometry(
+                &transaction.frozen_odom_from_body,
+                &self.odom_frame_id,
+                transaction.frozen_odom_source_timestamp_ns,
+            )
+        };
+        let observation = canonical_mapping_observation_from_isometry(
+            &self.map_frame_id,
+            &self.odom_frame_id,
+            transaction.correction_revision,
+            &transaction.effective_map_from_odom,
+            &odom,
+            &self.body_frame_id,
+        )
+        .map_err(ApplyError::Failed)?;
         let tf_frame = crate::typed_codec::build_typed_frame(
             self.tf_binding.0.clone(),
             self.tf_binding.1.clone(),
@@ -4293,8 +4326,21 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             operation.poison(error.clone());
             return Err(ApplyError::Failed(error));
         }
+        tracing::info!(
+            event = "geometry.correction.applied",
+            backend = ?transaction.backend,
+            candidate_sequence = transaction.candidate_sequence,
+            correction_revision = transaction.correction_revision,
+            source_timestamp_ns = transaction.source_timestamp_ns,
+            pose_timestamp_ns = observation.map_pose.timestamp_ns,
+            correction_translation_m = ?transaction.absolute_left_correction.translation.vector,
+            correction_rotation_deg = transaction.absolute_left_correction.rotation.angle().to_degrees(),
+            "规范位姿校正已提交"
+        );
         Ok(())
     }
+
+
 }
 
 fn pose_state_from_isometry(
@@ -13293,6 +13339,7 @@ mod mapping_feed_tests {
             base_anchor_map_from_odom: base_anchor,
             absolute_left_correction: correction,
             effective_map_from_odom: effective,
+            frozen_odom_source_timestamp_ns: source_timestamp_ns,
             frozen_odom_from_body: frozen_odom,
         };
         let cancellation = crate::correction_coordinator::CorrectionRequestCancellation::new();
@@ -13431,6 +13478,189 @@ mod mapping_feed_tests {
         subscription.unsubscribe().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn correction_of_delayed_scan_preserves_newer_odometry_pose_and_timestamp() {
+        use crate::correction_coordinator::{
+            CanonicalCorrectionApplier, CanonicalCorrectionTransaction, CorrectionCandidateBackend,
+            CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionRequestCancellation,
+        };
+        for backend in [
+            CorrectionCandidateBackend::LibraryPgo,
+            CorrectionCandidateBackend::NativePgo,
+            CorrectionCandidateBackend::Relocalization,
+        ] {
+            for (scan_delta, latest_delta) in [
+                (0, Some(100_000_000)),
+                (100_000_000, Some(50_000_000)),
+                (100_000_000, None),
+            ] {
+                let handle = build_handle_for_tests().await.unwrap();
+                let frozen_timestamp_ns = 60_000_000_000;
+                let source_timestamp_ns = frozen_timestamp_ns + scan_delta;
+                let latest_timestamp_ns = frozen_timestamp_ns + latest_delta.unwrap_or(0);
+                let identity = CorrectionOwnerRuntimeIdentity {
+                    runtime_generation: 7,
+                    backend_generation: 7,
+                    correction_lease: CorrectionLeaseId {
+                        boot_nonce: 42,
+                        generation: 7,
+                    },
+                };
+                let tf = (
+                    LcmTopic::new("/test/delayed-pgo/tf").unwrap(),
+                    LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
+                );
+                let applier = GeometryCanonicalCorrectionApplier::new(
+                    identity.clone(),
+                    "map",
+                    "odom",
+                    "base_link",
+                    handle.state.clone(),
+                    handle.transport.clone(),
+                    tf,
+                )
+                .unwrap();
+                let anchor = nalgebra::Isometry3::from_parts(
+                    nalgebra::Translation3::new(2.0, -1.0, 0.3),
+                    nalgebra::UnitQuaternion::from_euler_angles(0.1, -0.1, 0.4),
+                );
+                let correction = nalgebra::Isometry3::from_parts(
+                    nalgebra::Translation3::new(-0.15, 0.02, 0.01),
+                    nalgebra::UnitQuaternion::from_euler_angles(0.02, 0.01, -0.03),
+                );
+                let frozen = nalgebra::Isometry3::translation(0.15, 0.0, 0.0);
+                let latest = nalgebra::Isometry3::from_parts(
+                    nalgebra::Translation3::new(0.25, 0.01, 0.0),
+                    nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.01, 0.1),
+                );
+                let latest_pose = pose_state_from_isometry(&latest, "odom", latest_timestamp_ns);
+                let latest_observation = canonical_mapping_observation_from_isometry(
+                    "map",
+                    "odom",
+                    1,
+                    &anchor,
+                    &latest_pose,
+                    "base_link",
+                )
+                .unwrap();
+                {
+                    let mut shared = handle.state.write().await;
+                    shared.map = MapState {
+                        width: 1,
+                        height: 1,
+                        resolution: 0.1,
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        frame_id: "map".into(),
+                        revision: 11,
+                        timestamp_ns: source_timestamp_ns,
+                        data: vec![0],
+                    };
+                    shared.cloud_map_revision = 21;
+                    // 点云仍在处理时，较新的真实里程计已经发布到规范状态和坐标树。
+                    if latest_delta.is_some() {
+                        apply_canonical_mapping_observation_locked(
+                            &mut shared,
+                            &latest_observation,
+                        );
+                    }
+                }
+                let transaction = CanonicalCorrectionTransaction {
+                    runtime_generation: 7,
+                    backend_generation: 7,
+                    backend,
+                    candidate_sequence: 1,
+                    payload_sha256: [3; 32],
+                    correction_revision: 1,
+                    mapping_session_id: "delayed-pgo".into(),
+                    mapping_session_generation: 1,
+                    mapping_commit_id: crate::mapping_commit::MappingCommitId {
+                        boot_nonce: 43,
+                        sequence: 1,
+                    },
+                    occupancy_revision: 11,
+                    cloud_revision: 21,
+                    map_frame_generation: 1,
+                    source_timestamp_ns,
+                    committed_map_source_timestamp_ns: source_timestamp_ns,
+                    map_frame_id: "map".into(),
+                    odom_frame_id: "odom".into(),
+                    body_frame_id: "base_link".into(),
+                    correction_lease: identity.correction_lease,
+                    base_anchor_map_from_odom: anchor,
+                    absolute_left_correction: correction,
+                    effective_map_from_odom: anchor * correction,
+                    frozen_odom_source_timestamp_ns: frozen_timestamp_ns,
+                    frozen_odom_from_body: frozen,
+                };
+                // 公共位姿较新而同刻里程计缺失时，拒绝候选并保留既有公共状态。
+                if latest_delta.is_some() {
+                    let latest_tree = {
+                        let mut shared = handle.state.write().await;
+                        std::mem::replace(&mut shared.tf_tree, Arc::new(TfTree::new()))
+                    };
+                    assert!(applier
+                        .apply_transaction(
+                            transaction.clone(),
+                            CorrectionRequestCancellation::new()
+                        )
+                        .await
+                        .is_err());
+                    assert!(applier.snapshot().is_none());
+                    {
+                        let mut shared = handle.state.write().await;
+                        assert_eq!(shared.pose.timestamp_ns, latest_timestamp_ns);
+                        shared.tf_tree = latest_tree;
+                    }
+                }
+                let cancellation = CorrectionRequestCancellation::new();
+                applier
+                    .apply_transaction(transaction, cancellation.clone())
+                    .await
+                    .unwrap();
+                cancellation
+                    .operation()
+                    .mark_coordinator_finalized()
+                    .unwrap();
+                cancellation.finish_canonical_commit();
+                let shared = handle.state.read().await;
+                let expected = anchor
+                    * correction
+                    * if latest_delta.is_some() {
+                        latest
+                    } else {
+                        frozen
+                    };
+                let actual = nalgebra::Isometry3::from_parts(
+                    nalgebra::Translation3::new(shared.pose.x, shared.pose.y, shared.pose.z),
+                    nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                        shared.pose.qw,
+                        shared.pose.qx,
+                        shared.pose.qy,
+                        shared.pose.qz,
+                    )),
+                );
+                println!("延迟校正 backend={backend:?} source={source_timestamp_ns} latest={latest_timestamp_ns} published={} error={:?}",
+                shared.pose.timestamp_ns, expected.inverse()*actual);
+                assert_eq!(
+                    shared.pose.timestamp_ns, latest_timestamp_ns,
+                    "校正不能倒退公共位姿的源时间"
+                );
+                assert!(canonical_isometry_near(&actual, &expected));
+                let tree_pose = shared.tf_tree.lookup("base_link").unwrap();
+                assert_eq!(
+                    transform_to_entry(tree_pose).unwrap().stamp_ns,
+                    latest_timestamp_ns
+                );
+                assert_eq!(
+                    applier.snapshot().unwrap().source_timestamp_ns,
+                    source_timestamp_ns,
+                    "候选证明仍属于原扫描，不能伪造为较新里程计来源"
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn correction_commit_cannot_be_overwritten_by_stale_odometry_snapshot() {
         let handle = build_handle_for_tests()
@@ -13549,6 +13779,7 @@ mod mapping_feed_tests {
             base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
             absolute_left_correction: new_effective,
             effective_map_from_odom: new_effective,
+            frozen_odom_source_timestamp_ns: source_timestamp_ns,
             frozen_odom_from_body,
         };
 
@@ -13650,6 +13881,200 @@ mod mapping_feed_tests {
         assert!((shared.pose.y - expected_map_from_body.translation.vector.y).abs() < 1.0e-9);
         assert!((shared.pose.z - expected_map_from_body.translation.vector.z).abs() < 1.0e-9);
         assert_eq!(shared.pose.timestamp_ns, source_timestamp_ns);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn library_pgo_partial_scan_simulation_keeps_canonical_pose_with_map() {
+        use crate::correction_coordinator::{
+            CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec,
+            CorrectionTransportOwner, GeometryCorrectionSink,
+        };
+        use nuwax_mapping::loop_closure::LoopClosurePipelineConfig;
+
+        // 准确里程计下改变视野：少量相似点块不能代表整帧回环。
+        let patch: Vec<_> = (0..5)
+            .flat_map(|x| {
+                (0..4).flat_map(move |y| {
+                    (0..3).map(move |z| {
+                        Point3::new(
+                            3.0 + x as f64 * 0.07 + (z * z) as f64 * 0.003,
+                            2.0 + y as f64 * 0.09 + (x * z) as f64 * 0.002,
+                            0.4 + z as f64 * 0.08 + (x * x) as f64 * 0.001,
+                        )
+                    })
+                })
+            })
+            .collect();
+        let mut historical = patch.clone();
+        historical.extend((0..400).map(|i| {
+            Point3::new(
+                -4.0 + i as f64 * 0.0001,
+                i as f64 * 0.02,
+                0.1 + (i % 7) as f64 * 0.1 + i as f64 * 0.00003,
+            )
+        }));
+        let mut current: Vec<_> = patch
+            .iter()
+            .map(|point| point + nalgebra::Vector3::new(0.6, 0.2, 0.1))
+            .collect();
+        current.extend((0..400).map(|i| {
+            Point3::new(
+                8.0 + i as f64 * 0.0001,
+                -i as f64 * 0.02,
+                0.1 + (i % 11) as f64 * 0.1 + i as f64 * 0.00003,
+            )
+        }));
+        let mut runs = Vec::new();
+        for enabled in [false, true] {
+            let handle = build_handle_for_tests().await.unwrap();
+            let mapping = handle.mapping_adapter.as_ref().unwrap();
+            mapping
+                .lock()
+                .start_session("pgo-simulation", "pgo-simulation-map")
+                .unwrap();
+            let identity = CorrectionOwnerRuntimeIdentity {
+                runtime_generation: 7,
+                backend_generation: 7,
+                correction_lease: CorrectionLeaseId {
+                    boot_nonce: 42,
+                    generation: 7,
+                },
+            };
+            let tf = (
+                LcmTopic::new("/test/pgo-simulation/tf").unwrap(),
+                LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
+            );
+            let applier = Arc::new(
+                GeometryCanonicalCorrectionApplier::new(
+                    identity.clone(),
+                    "map",
+                    "odom",
+                    "base_link",
+                    handle.state.clone(),
+                    handle.transport.clone(),
+                    tf.clone(),
+                )
+                .unwrap(),
+            );
+            let spec = if enabled {
+                CorrectionOwnerSpec::LibraryPgo {
+                    map_frame_id: "map".into(),
+                    odom_frame_id: "odom".into(),
+                    body_frame_id: "base_link".into(),
+                    pipeline: LoopClosurePipelineConfig::default(),
+                }
+            } else {
+                CorrectionOwnerSpec::None
+            };
+            let sink = Arc::new(
+                GeometryCorrectionSink::new_for_spec(
+                    identity.clone(),
+                    &spec,
+                    "map",
+                    "odom",
+                    "base_link",
+                    applier.clone(),
+                )
+                .unwrap(),
+            );
+            let owner = CorrectionTransportOwner::start(spec, identity, &test_lcm_url(), sink)
+                .await
+                .unwrap();
+            let mut samples = Vec::new();
+            for (sequence, seconds, x) in [
+                (1, 1, 0.0),
+                (2, 11, 2.0),
+                (3, 61, 0.6),
+                (4, 62, 4.0),
+                (5, 63, 4.7),
+            ] {
+                let source_timestamp_ns = seconds * 1_000_000_000;
+                let odom = nalgebra::Isometry3::translation(x, 0.0, 0.0);
+                let pose = pose_state_from_isometry(&odom, "odom", source_timestamp_ns);
+                handoff_lio_odometry_with_correction(&handle, &pose, "base_link", &tf, &applier)
+                    .await
+                    .unwrap();
+                let (map_points, binding) = {
+                    let adapter = mapping.lock();
+                    let registered = adapter
+                        .register_odom_cloud_to_map(
+                            if sequence <= 2 { &historical } else { &current },
+                            "odom",
+                        )
+                        .unwrap();
+                    let snapshot = adapter.snapshot();
+                    (
+                        registered.points,
+                        crate::lio_ingress::RegistrationBinding {
+                            sensor_origin_map: Some([x, 0.0, 0.0]),
+                            runtime_generation: 7,
+                            cloud_source_sequence: sequence,
+                            correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
+                                source_sequence: sequence,
+                                source_timestamp_ns: source_timestamp_ns as i64,
+                            },
+                            mapping_session_id: snapshot.session_id,
+                            mapping_session_generation: snapshot.session_generation,
+                            map_frame_generation: adapter.global_frame_generation(),
+                            envelope_sha256: crate::map_checksum::sha256_bytes(
+                                &sequence.to_be_bytes(),
+                            ),
+                            frozen_odom_from_body: odom,
+                            base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
+                            frame_capture_relocalization_epoch: Some(0),
+                        },
+                    )
+                };
+                assert!(handoff_registered_lio_cloud_with_correction(
+                    &handle,
+                    &map_points,
+                    12,
+                    sequence as u64 * 300_000_000,
+                    source_timestamp_ns,
+                    "map",
+                    "base_link",
+                    &binding,
+                    &owner.ingress()
+                )
+                .await
+                .unwrap());
+                let shared = handle.state.read().await;
+                let public = &shared.pose;
+                let error = ((public.x - x).powi(2) + public.y.powi(2) + public.z.powi(2)).sqrt();
+                let rotation_error = nalgebra::UnitQuaternion::from_quaternion(
+                    nalgebra::Quaternion::new(public.qw, public.qx, public.qy, public.qz),
+                )
+                .angle();
+                let cloud = handle
+                    .cloud_map_writer
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .committed_snapshot()
+                    .unwrap();
+                println!("生产模拟 pgo={enabled} sequence={sequence} source={source_timestamp_ns} odom_x={x:.3} public=({:.3},{:.3},{:.3}) error_m={error:.6} error_deg={:.6} points={} correction={}",
+                    public.x,public.y,public.z,rotation_error.to_degrees(),cloud.point_count,
+                    applier.snapshot().map_or(0, |s| s.correction_revision));
+                samples.push((error, rotation_error, cloud.xyz_f32_le.to_vec()));
+            }
+            owner.shutdown().await.unwrap();
+            runs.push(samples);
+        }
+        for (index, (baseline, corrected)) in runs[0].iter().zip(&runs[1]).enumerate() {
+            assert_eq!(
+                baseline.2,
+                corrected.2,
+                "相同输入的规范点云应相同，帧{}",
+                index + 1
+            );
+            assert!(
+                corrected.0 < 1e-6 && corrected.1 < 1e-6,
+                "点云正确但公共位姿被错误校正，帧{}：平移={}，旋转={}",
+                index + 1,
+                corrected.0,
+                corrected.1
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

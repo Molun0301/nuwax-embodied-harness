@@ -5,6 +5,7 @@
 
 mod features;
 pub mod module;
+pub(crate) mod nearest;
 mod ransac;
 pub mod relocalize;
 pub mod runtime;

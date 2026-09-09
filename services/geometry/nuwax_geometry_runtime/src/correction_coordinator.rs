@@ -1507,6 +1507,23 @@ mod preflight_only_contract {
             )
             .map_err(CorrectionOwnerError::CandidateRejected)?;
             self.next_candidate_sequence = next_candidate_sequence;
+            if let Some(record) = self.coordinator.loops().last() {
+                tracing::info!(
+                    event = "pgo.loop.candidate",
+                    candidate_sequence = next_candidate_sequence,
+                    source_timestamp_ns = input.registered_cloud.source_timestamp_ns,
+                    historic_id = record.from,
+                    current_id = record.to,
+                    source_inliers = record.source_inliers,
+                    target_inliers = record.target_inliers,
+                    source_overlap = record.source_overlap,
+                    target_overlap = record.target_overlap,
+                    mse = record.mse,
+                    correction_translation_m = ?correction.translation.vector,
+                    correction_rotation_deg = correction.rotation.angle().to_degrees(),
+                    "库内回环生成位姿校正候选"
+                );
+            }
             Ok(Some(candidate))
         }
     }
@@ -2225,6 +2242,8 @@ mod preflight_only_contract {
         pub(crate) absolute_left_correction: Isometry3<f64>,
         pub(crate) effective_map_from_odom: Isometry3<f64>,
         pub(crate) frozen_odom_from_body: Isometry3<f64>,
+        /// 冻结里程计自己的采样时间，可能略早于对应扫描。
+        pub(crate) frozen_odom_source_timestamp_ns: u64,
     }
 
     #[async_trait::async_trait]
@@ -2535,6 +2554,10 @@ mod preflight_only_contract {
                     absolute_left_correction,
                     effective_map_from_odom,
                     frozen_odom_from_body: staged.frozen_odom_from_body,
+                    frozen_odom_source_timestamp_ns: candidate
+                        .identity
+                        .correlated_odom
+                        .source_timestamp_ns,
                 };
                 state.in_flight = Some(InFlightCorrection {
                     prepared,
@@ -16719,6 +16742,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut second_input = frame(2, 200, 1.0);
             second_input.base_anchor_map_from_odom = base_anchor;
             second_input.cloud_revision = 42;
+            second_input.correlated_odom.proof.source_timestamp_ns = 150;
             let second_candidate = candidate_for_frame(&second_input, 2, correction_two);
             sink.stage_frame(&second_input).await.unwrap();
             assert_eq!(
@@ -16735,6 +16759,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert_eq!(transactions.len(), 2);
             assert_eq!(transactions[0].correction_revision, 1);
             assert_eq!(transactions[1].correction_revision, 2);
+            assert_eq!(transactions[1].frozen_odom_source_timestamp_ns, 150);
+            assert_eq!(transactions[1].source_timestamp_ns, 200);
             assert_ne!(
                 transactions[1].correction_revision,
                 transactions[1].occupancy_revision

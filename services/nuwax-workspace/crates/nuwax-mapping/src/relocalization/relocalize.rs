@@ -1,6 +1,6 @@
 //! Feature-based global relocalization followed by local ICP refinement.
 
-use kiddo::KdTree;
+use super::nearest::NearestPointIndex;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 
 use super::features::{
@@ -59,7 +59,9 @@ impl IcpSolver {
     /// `source` 与 `target` 是两组 3D 点；返回 source → target 的刚体变换。
     #[must_use]
     pub fn align(&self, source: &[Point3<f64>], target: &[Point3<f64>]) -> IcpResult {
-        if source.is_empty() || target.is_empty() {
+        if source.is_empty() || target.is_empty()
+            || source.iter().chain(target).any(|p| p.coords.iter().any(|v| !v.is_finite()))
+        {
             return IcpResult {
                 transformation: Isometry3::identity(),
                 mse: f64::INFINITY,
@@ -68,11 +70,8 @@ impl IcpSolver {
             };
         }
 
-        // 构建 target KD-tree
-        let mut tree: KdTree<f64, 3> = KdTree::new();
-        for (i, p) in target.iter().enumerate() {
-            tree.add(&[p.x, p.y, p.z], i as u64);
-        }
+        // 目标在本次匹配中不变；静态构建支持大量共轴的墙面、地面或重复采样点。
+        let tree = NearestPointIndex::new(target);
 
         let mut current = Isometry3::identity();
         let mut prev_mse = f64::INFINITY;
@@ -82,15 +81,13 @@ impl IcpSolver {
             let transformed: Vec<Point3<f64>> = source.iter().map(|p| current * p).collect();
 
             // 阶段 2：最近邻 + 过滤 outlier
-            // kiddo v5 nearest_one::<A>() 返回 NearestNeighbour<A, T>：
-            //   .distance = 距离平方（已过滤 Item=K 的 DistanceMetric）
-            //   .item     = T = 索引
             let max_corr_sq = self.config.max_correspondence_distance.powi(2);
             let mut correspondences: Vec<(Point3<f64>, Point3<f64>)> = Vec::new();
             for sp in &transformed {
-                let nn = tree.nearest_one::<kiddo::SquaredEuclidean>(&[sp.x, sp.y, sp.z]);
-                if nn.distance <= max_corr_sq && (nn.item as usize) < target.len() {
-                    correspondences.push((*sp, target[nn.item as usize]));
+                if let Some((index, distance_squared)) = tree.nearest(sp) {
+                    if distance_squared <= max_corr_sq {
+                        correspondences.push((*sp, target[index]));
+                    }
                 }
             }
 

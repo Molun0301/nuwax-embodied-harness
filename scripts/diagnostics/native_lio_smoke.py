@@ -216,7 +216,26 @@ class GatewayMappingSession:
         assert self.runtime._log_stream_handler not in logging.getLogger().handlers
 
 
-def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False, correction_backend="none"):
+def closed_motion_state(seconds):
+    """解析闭合轨迹：8秒初始化、36秒运动，同步返回位置、加速度、偏航和偏航角速度。"""
+    seconds = np.asarray(seconds, dtype=float)
+    active = (seconds >= 8.0) & (seconds < 44.0)
+    omega = 2 * np.pi / 36.0
+    phase = np.clip(seconds - 8.0, 0.0, 36.0) * omega
+    sine, cosine = np.sin(phase), np.cos(phase)
+    position = np.stack((1 - cosine, .5 * sine ** 3, np.zeros_like(phase)), axis=-1)
+    acceleration = np.stack((omega ** 2 * cosine,
+        1.5 * omega ** 2 * (2 * sine * cosine ** 2 - sine ** 3), np.zeros_like(phase)), axis=-1)
+    acceleration = np.where(active[..., None], acceleration, 0.0)
+    yaw = .2 * (1 - cosine)
+    yaw_rate = np.where(active, .2 * omega * sine, 0.0)
+    return position, acceleration, yaw, yaw_rate
+
+
+def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False,
+                correction_backend="none", motion_loop=False):
+    if motion_loop and frame_count < 450:
+        raise ValueError("闭合运动模拟需要至少450帧")
     root = ROOT
     evidence = output_dir
     # 仅在资源确已退出后删除；清理失败时保留路径供继续处理。
@@ -308,10 +327,11 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             assert bridge.start()
             stub.StartMapping(pb2.StartMappingRequest(session_id="offline-real", map_name=map_name), timeout=3)
         values = np.linspace(-3, 3, 20)
-        # 静止机器人观察地面与两面墙，时间与重力均来自同一合成场景。
+        # 世界场景为地面与两面墙，静止/运动观测的时间与重力来自同一合成场景。
         points = np.asarray([(x, y, -1.) for x in values for y in values]
             + [(3., y, z) for y in values for z in np.linspace(-1, 2, 10)]
             + [(x, 3., z) for x in values for z in np.linspace(-1, 2, 10)], dtype="<f4")
+        world_points = points.copy()
         points = np.ascontiguousarray(
             ((points @ world_from_body) - body_from_sensor_translation) @ body_from_sensor_rotation,
             dtype="<f4",
@@ -325,13 +345,32 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         publish_latencies = []
         pose_samples = []
         pose_timestamps = []
+        pose_quaternions = []
         input_started = time.monotonic()
         for frame_index in range(frame_count):
             stamp = first_stamp + frame_index * 100_000_000
             for offset in range(0, 100_000_000, 5_000_000):
                 imu_sequence += 1
+                acceleration, gyro = acceleration_sensor, (0, 0, 0)
+                if motion_loop:
+                    _, world_accel, yaw, yaw_rate = closed_motion_state(frame_index * .1 + offset / 1e9)
+                    c, s = np.cos(yaw), np.sin(yaw)
+                    yaw_rotation = np.asarray([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+                    rotation = yaw_rotation @ world_from_body
+                    acceleration = tuple(body_from_sensor_rotation.T @ rotation.T
+                        @ (world_accel + np.asarray([0, 0, 9.81])))
+                    gyro = tuple(body_from_sensor_rotation.T @ rotation.T @ np.asarray([0, 0, yaw_rate]))
                 sensors.publish_imu(CanonicalImuSample(sensor_id="imu", source_sequence=imu_sequence,
-                    timestamp_ns=stamp + offset, accel_mps2=acceleration_sensor, gyro_rps=(0, 0, 0), **common))
+                    timestamp_ns=stamp + offset, accel_mps2=acceleration, gyro_rps=gyro, **common))
+            if motion_loop:
+                # 每个点按自己的扫描时间生成，不能用整帧末态伪造运动中的原始扫描。
+                position, _, yaw, _ = closed_motion_state(frame_index * .1 + offsets.astype(float) / 1e9)
+                delta = world_points - position
+                c, s = np.cos(yaw), np.sin(yaw)
+                unyawed = np.stack((c * delta[:, 0] + s * delta[:, 1],
+                    -s * delta[:, 0] + c * delta[:, 1], delta[:, 2]), axis=-1)
+                points = np.ascontiguousarray(((unyawed @ world_from_body)
+                    - body_from_sensor_translation) @ body_from_sensor_rotation, dtype="<f4")
             publish_started = time.monotonic()
             sensors.publish_point_cloud(CanonicalLidarFrame(sensor_id="lidar", source_sequence=frame_index + 1,
                 timestamp_ns=stamp, point_count=len(points), xyz_f32_le=points.tobytes(),
@@ -343,7 +382,12 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             if observed_pose.timestamp_ns >= first_stamp:
                 pose_samples.append([observed_pose.position.x, observed_pose.position.y, observed_pose.position.z])
                 pose_timestamps.append(observed_pose.timestamp_ns)
-            time.sleep(.05)
+                pose_quaternions.append([observed_pose.orientation.x, observed_pose.orientation.y,
+                    observed_pose.orientation.z, observed_pose.orientation.w])
+            if motion_loop:
+                time.sleep(max(0, input_started + (frame_index + 1) * .1 - time.monotonic()))
+            else:
+                time.sleep(.05)
         input_elapsed_s = time.monotonic() - input_started
         deadline = time.monotonic() + 5
         minimum_final_stamp = first_stamp + max(1, frame_count - 5) * 100_000_000
@@ -354,6 +398,8 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             if pose.timestamp_ns >= first_stamp:
                 pose_samples.append([pose.position.x, pose.position.y, pose.position.z])
                 pose_timestamps.append(pose.timestamp_ns)
+                pose_quaternions.append([pose.orientation.x, pose.orientation.y,
+                    pose.orientation.z, pose.orientation.w])
             if (readiness.ready and pose.timestamp_ns >= minimum_final_stamp
                     and bridge.counters.emitted_lio_measurement_count == frame_count) or time.monotonic() >= deadline:
                 break
@@ -369,20 +415,45 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         assert finite_pose, "真实算法输出包含非有限位姿"
         pose_samples.append([pose.position.x, pose.position.y, pose.position.z])
         pose_timestamps.append(pose.timestamp_ns)
+        pose_quaternions.append([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
         positions = np.asarray(pose_samples)
         max_position_m = float(np.linalg.norm(positions, axis=1).max())
         max_drift_m = float(np.linalg.norm(positions - positions[0], axis=1).max())
         pose_evidence = {"synthetic": True, "backend": backend,
             "positions_m": pose_samples, "max_position_m": max_position_m,
-            "max_drift_m": max_drift_m, "body_pitch_rad": body_pitch,
+            ("max_displacement_m" if motion_loop else "max_drift_m"): max_drift_m, "body_pitch_rad": body_pitch,
+            "orientation_xyzw": pose_quaternions,
             "source_timestamps_ns": pose_timestamps,
             "body_from_sensor": body_from_sensor, "acceleration_sensor_mps2": acceleration_sensor}
-        (evidence / (backend + "静止位姿核对.json")).write_text(
+        motion_metrics = {}
+        if motion_loop:
+            source_seconds = (np.asarray(pose_timestamps, dtype=np.int64) - first_stamp) / 1e9
+            expected_positions, _, expected_yaw, _ = closed_motion_state(source_seconds)
+            errors = np.linalg.norm(positions - expected_positions, axis=1)
+            sy, cy = np.sin(expected_yaw / 2), np.cos(expected_yaw / 2)
+            sp, cp = np.sin(body_pitch / 2), np.cos(body_pitch / 2)
+            expected_quaternions = np.stack((-sy * sp, cy * sp, sy * cp, cy * cp), axis=-1)
+            quaternions = np.asarray(pose_quaternions)
+            norms = np.linalg.norm(quaternions, axis=1)
+            assert np.all(np.isfinite(quaternions)) and np.all(norms > 0), "运动位姿朝向无效"
+            products = np.abs(np.sum((quaternions / norms[:, None]) * expected_quaternions, axis=1))
+            angle_errors = np.degrees(2 * np.arccos(np.clip(products, 0, 1)))
+            motion_metrics = {"max_position_error_m": float(errors.max()),
+                "final_position_error_m": float(errors[-1]),
+                "p95_position_error_m": float(np.percentile(errors, 95)),
+                "max_orientation_error_deg": float(angle_errors.max())}
+            pose_evidence.update({"motion_loop": True, "expected_positions_m": expected_positions.tolist(),
+                "position_errors_m": errors.tolist(), "orientation_errors_deg": angle_errors.tolist(), **motion_metrics})
+        (evidence / (backend + ("闭合运动位姿核对.json" if motion_loop else "静止位姿核对.json"))).write_text(
             json.dumps(pose_evidence, ensure_ascii=False, indent=2), encoding="utf-8")
-        assert np.all(np.isfinite(positions)), "连续静止位姿包含非有限值"
-        assert max_position_m < .5 and max_drift_m < .2, (
-            "静止合成输入位姿发散：最大位置=%.3f米，最大偏移=%.3f米" % (max_position_m, max_drift_m)
-        )
+        assert np.all(np.isfinite(positions)), "连续位姿包含非有限值"
+        if motion_loop:
+            assert motion_metrics["max_position_error_m"] < .25, "合成运动轨迹误差超限：%s" % motion_metrics
+            assert motion_metrics["max_orientation_error_deg"] < 2, "合成运动朝向误差超限：%s" % motion_metrics
+        else:
+            assert max_position_m < .5 and max_drift_m < .2, (
+                "静止合成输入位姿发散：最大位置=%.3f米，最大偏移=%.3f米" % (max_position_m, max_drift_m)
+            )
         assert len(set(pose_timestamps)) >= max(2, frame_count // 4), "原生位姿未持续更新"
         assert pose.timestamp_ns >= minimum_final_stamp, "原生位姿未跟随末段输入"
         if gateway is not None:
@@ -409,7 +480,8 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             "publish_p95_ms": float(np.percentile(publish_latencies, 95)),
             "mapping_ready": readiness.ready, "pose_timestamp_ns": pose.timestamp_ns,
             "finite_pose": finite_pose, "max_position_m": max_position_m,
-            "max_drift_m": max_drift_m}, ensure_ascii=False))
+            ("max_displacement_m" if motion_loop else "max_drift_m"): max_drift_m,
+            "motion_loop": motion_loop, **motion_metrics}, ensure_ascii=False))
         if gateway is not None:
             gateway.close()
             gateway = None
@@ -461,11 +533,14 @@ def main():
     parser.add_argument("--runtime-binary", type=Path, default=ROOT / "services/geometry/nuwax_geometry_runtime/target/debug/nuwax-geometry-runtime")
     parser.add_argument("--output-dir", type=Path, help="保留原生日志；未设置时使用自动清理的临时目录")
     parser.add_argument("--frames", type=int, default=60)
+    parser.add_argument("--motion-loop", action="store_true", help="按真实时间运行闭合运动轨迹，需至少450帧")
     parser.add_argument("--gateway", action="store_true", help="通过真实HTTP/MCP创建、激活与控制建图")
     parser.add_argument("--correction-backend", choices=("none", "library_pgo", "native_pgo"), default="none", help="选择实际校正后端，核对原生定位与位姿图优化组合")
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error("--frames 必须大于零")
+    if args.motion_loop and args.frames < 450:
+        parser.error("--motion-loop 需要至少450帧以覆盖完整初始化、运动与返回")
     if args.backend == "all" and args.executable is not None:
         parser.error("--executable 仅适用于单个后端")
     if args.output_dir is not None:
@@ -477,7 +552,7 @@ def main():
             executable = args.executable or ROOT / ("services/nuwax-workspace/crates/nuwax-lio-backends/native/%s/cpp/result/bin/%s_native" % (backend, backend))
             if not executable.is_file():
                 parser.error("原生程序尚未构建：%s" % executable)
-            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway, args.correction_backend)
+            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway, args.correction_backend, args.motion_loop)
 
 
 if __name__ == "__main__":

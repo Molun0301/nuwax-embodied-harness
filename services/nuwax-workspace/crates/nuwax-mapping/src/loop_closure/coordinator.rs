@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use super::optimizer::{cost_strictly_improved, graph_cost, OptimizerConfig};
 use super::pgo::{PoseEdge, PoseGraph};
+use super::registration::evaluate_loop_registration;
 use super::PgoOptimizer;
 use crate::relocalization::{IcpConfig, IcpSolver};
 
@@ -25,6 +26,8 @@ pub struct LoopClosurePipelineConfig {
     pub min_keyframe_points: usize,
     /// Maximum accepted ICP mean squared error.
     pub max_loop_mse: f64,
+    /// 最终匹配在当前及历史扫描中各自至少覆盖的点比例。
+    pub min_loop_overlap_ratio: f64,
     /// ICP configuration used to create loop measurements.
     pub icp: IcpConfig,
     /// Pose-graph optimizer configuration.
@@ -40,6 +43,7 @@ impl Default for LoopClosurePipelineConfig {
             min_loop_separation_secs: 30.0,
             min_keyframe_points: 10,
             max_loop_mse: 0.05,
+            min_loop_overlap_ratio: 0.5,
             icp: IcpConfig {
                 max_correspondence_distance: 1.0,
                 ..IcpConfig::default()
@@ -186,8 +190,16 @@ pub struct LoopClosureRecord {
     pub to: u64,
     /// ICP measurement from current body coordinates into the historic body frame.
     pub measurement: Isometry3<f64>,
-    /// ICP mean squared error.
+    /// 最终双向对应的均方误差。
     pub mse: f64,
+    /// 当前扫描中落在对应距离内的点数。
+    pub source_inliers: usize,
+    /// 历史扫描中落在对应距离内的点数。
+    pub target_inliers: usize,
+    /// 当前扫描中实际对应的点比例。
+    pub source_overlap: f64,
+    /// 历史扫描中实际对应的点比例。
+    pub target_overlap: f64,
 }
 
 /// Result of processing one mapping frame.
@@ -386,7 +398,34 @@ impl LoopClosureCoordinator {
                 let distance = (current.local_pose.translation.vector
                     - historic.local_pose.translation.vector)
                     .norm();
-                (distance <= self.config.loop_search_radius).then_some((distance, *id, historic))
+                if distance > self.config.loop_search_radius {
+                    return None;
+                }
+                // 时间间隔和邻近位置不能证明回环；必须确实离开过历史邻域再返回。
+                // 这也排除相邻关键帧、原地转向及沿重复结构的缓慢直行。
+                let departed = self
+                    .keyframes
+                    .range((
+                        std::ops::Bound::Excluded(*id),
+                        std::ops::Bound::Excluded(current_id),
+                    ))
+                    .any(|(_, middle)| {
+                        (middle.local_pose.translation.vector
+                            - historic.local_pose.translation.vector)
+                            .norm()
+                            > self.config.loop_search_radius
+                    });
+                if !departed {
+                    tracing::debug!(
+                        event = "pgo.loop.rejected",
+                        reason = "not_revisited",
+                        current_id,
+                        historic_id = *id,
+                        "轨迹尚未离开并重访历史邻域"
+                    );
+                    return None;
+                }
+                Some((distance, *id, historic))
             })
             .collect();
         candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
@@ -400,21 +439,55 @@ impl LoopClosureCoordinator {
                 .iter()
                 .map(|point| historic_from_current * point)
                 .collect();
+            if seeded_points.iter().any(|point| !is_finite_point(point)) {
+                continue;
+            }
             let registration =
                 IcpSolver::new(self.config.icp).align(&seeded_points, &historic.points);
-            if registration.converged
-                && registration.mse.is_finite()
-                && registration.mse <= self.config.max_loop_mse
-                && is_finite_pose(&registration.transformation)
+            if !registration.converged
+                || !registration.mse.is_finite()
+                || registration.mse > self.config.max_loop_mse
+                || !is_finite_pose(&registration.transformation)
             {
-                return Some(LoopClosureRecord {
-                    from: historic_id,
-                    to: current_id,
-                    // 求解器返回历史坐标中的残差，约束须还原为完整机体间变换。
-                    measurement: registration.transformation * historic_from_current,
-                    mse: registration.mse,
-                });
+                continue;
             }
+            // 不能用少量被筛选内点的低误差证明整帧回环；在最终变换上独立核对两帧。
+            let evidence = evaluate_loop_registration(
+                &seeded_points,
+                &historic.points,
+                &registration.transformation,
+                self.config.icp.max_correspondence_distance,
+            );
+            if let Some(reason) = evidence.rejection_reason(
+                self.config.min_keyframe_points,
+                self.config.min_loop_overlap_ratio,
+                self.config.max_loop_mse,
+            ) {
+                tracing::debug!(
+                    event = "pgo.loop.rejected",
+                    reason,
+                    current_id,
+                    historic_id,
+                    source_inliers = evidence.source_inliers,
+                    target_inliers = evidence.target_inliers,
+                    source_overlap = evidence.source_overlap,
+                    target_overlap = evidence.target_overlap,
+                    mse = evidence.mse,
+                    "回环点云匹配缺少充分几何证据"
+                );
+                continue;
+            }
+            return Some(LoopClosureRecord {
+                from: historic_id,
+                to: current_id,
+                // 求解器返回历史坐标中的残差，约束须还原为完整机体间变换。
+                measurement: registration.transformation * historic_from_current,
+                mse: evidence.mse,
+                source_inliers: evidence.source_inliers,
+                target_inliers: evidence.target_inliers,
+                source_overlap: evidence.source_overlap,
+                target_overlap: evidence.target_overlap,
+            });
         }
         None
     }
@@ -460,6 +533,14 @@ fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosureP
     if config.min_keyframe_points < 3 {
         return Err(LoopClosurePipelineError::InvalidConfig(
             "min_keyframe_points must be at least three",
+        ));
+    }
+    if !config.min_loop_overlap_ratio.is_finite()
+        || config.min_loop_overlap_ratio <= 0.0
+        || config.min_loop_overlap_ratio > 1.0
+    {
+        return Err(LoopClosurePipelineError::InvalidConfig(
+            "min_loop_overlap_ratio must be finite and within (0, 1]",
         ));
     }
     if !config.max_loop_mse.is_finite() || config.max_loop_mse < 0.0 {

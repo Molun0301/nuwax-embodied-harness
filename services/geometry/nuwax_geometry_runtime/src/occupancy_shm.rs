@@ -1,12 +1,10 @@
 #![allow(dead_code)]
 
-//! OccupancyGrid process-shared mmap sidecar.
+//! 占据栅格进程间共享映射。
 //!
-//! Layout v2 uses two payload slots and a process-shared atomic publication header. A writer
-//! marks the global write sequence odd before touching the inactive slot, verifies and flushes
-//! that slot, atomically publishes `(generation, active_slot)`, then marks the sequence even.
-//! Readers only accept a snapshot when the sequence is stable/even before and after copying and
-//! the slot checksum matches. The active slot is never modified in place.
+//! 双槽布局在非活动槽准备完整载荷，提交时通过原子发布头更新代次与槽位。
+//! 读者核对前后稳定序列和槽位摘要，活动槽不原位修改。
+//! 在线交付依赖共享内存可见性，运行时映射不承担断电后的地图资产恢复。
 
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
@@ -73,8 +71,7 @@ struct MapWriteIdentity {
     data_checksum: [u8; 32],
 }
 
-/// Opaque proof that one complete occupancy payload was flushed into an
-/// inactive slot without changing the reader-visible global header.
+/// 完整占据载荷已准备到非活动槽，读者可见的发布头尚未改变。
 ///
 /// The token is deliberately non-`Clone`: dropping it aborts publication.
 /// `commit_prepared` also validates the writer/session/base-state epoch, so a
@@ -317,8 +314,7 @@ impl OccupancyGridShmWriter {
         Ok(self.commit_prepared(prepared)?.revision)
     }
 
-    /// Write, verify, and flush a map into an inactive slot while leaving the
-    /// reader-visible global publication header unchanged.
+    /// 在非活动槽写入并校验地图，保持读者可见的发布头不变。
     pub(crate) fn prepare_occupancy(
         &mut self,
         map: &MapState,
@@ -426,7 +422,7 @@ impl OccupancyGridShmWriter {
         })
     }
 
-    /// Atomically expose a previously flushed inactive slot.
+    /// 原子发布已经完整准备的非活动槽。
     ///
     /// All fallible validation happens before the first global-header store.
     /// The mmap is transient process-shared state (startup truncates it), so
@@ -626,16 +622,15 @@ impl OccupancyGridShmWriter {
             .copy_from_slice(map.frame_id.as_bytes());
         self.mmap[payload_offset..payload_end].copy_from_slice(map_data_bytes(map));
 
-        let persisted_checksum =
+        let staged_checksum =
             crate::map_checksum::sha256_bytes(&self.mmap[payload_offset..payload_end]);
-        if persisted_checksum != identity.data_checksum {
+        if staged_checksum != identity.data_checksum {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "inactive occupancy slot checksum verification failed",
             ));
         }
-        self.mmap
-            .flush_range(slot_offset, SLOT_HEADER_BYTES + map.data.len())?;
+        // 读者与写者共享页缓存；提交的原子序列承担可见性，不在此等待磁盘刷新。
         Ok(())
     }
 
@@ -1348,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_exposes_only_the_exact_flushed_prepare_token() {
+    fn commit_exposes_only_the_exact_prepared_token() {
         let path = test_path("prepare_commit");
         let _ = std::fs::remove_file(&path);
         let mut writer = OccupancyGridShmWriter::new(&path).expect("create");

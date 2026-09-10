@@ -22,7 +22,31 @@ use std::{
 };
 
 const MAX_ARCHIVED_POINTS: usize = 8_000_000;
-const REBUILD_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const REBUILD_BUDGET: Duration = Duration::from_secs(3);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum RebuildError {
+    #[error("PGO地图重建已取消")]
+    Cancelled,
+    #[error("PGO地图重建超过计算预算")]
+    BudgetExceeded,
+    #[error("PGO缺少完整原始扫描历史，不能替换当前地图")]
+    HistoryUnavailable,
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl From<String> for RebuildError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl From<&str> for RebuildError {
+    fn from(error: &str) -> Self {
+        Self::Invalid(error.into())
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ArchivedScan {
@@ -38,12 +62,14 @@ pub(crate) struct ArchivedScan {
 pub(crate) struct ScanHistory {
     scans: BTreeMap<u64, ArchivedScan>,
     point_count: usize,
+    incomplete: bool,
 }
 
 impl ScanHistory {
     pub fn clear(&mut self) {
         self.scans.clear();
         self.point_count = 0;
+        self.incomplete = false;
     }
 
     pub fn record(
@@ -53,6 +79,9 @@ impl ScanHistory {
         binding: &RegistrationBinding,
         points: &[Point3<f64>],
     ) -> Result<(), String> {
+        if self.incomplete {
+            return Ok(());
+        }
         if let Some(existing) = self.scans.get(&source_timestamp_ns) {
             return if existing.envelope_sha256 == binding.envelope_sha256 {
                 Ok(())
@@ -61,7 +90,17 @@ impl ScanHistory {
             };
         }
         if self.point_count.saturating_add(points.len()) > MAX_ARCHIVED_POINTS {
-            return Err("PGO历史扫描超过800万点上限，不能以不完整历史发布地图校正".into());
+            tracing::warn!(
+                event = "pgo.history.exhausted",
+                archived_points = self.point_count,
+                incoming_points = points.len(),
+                "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续"
+            );
+            // 已有公共地图仍然有效；锁存历史不完整，不能保留后缀并冒充完整历史。
+            self.scans.clear();
+            self.point_count = 0;
+            self.incomplete = true;
+            return Ok(());
         }
         let body_from_map =
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
@@ -85,8 +124,11 @@ impl ScanHistory {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> Vec<ArchivedScan> {
-        self.scans.values().cloned().collect()
+    pub fn snapshot(&self) -> Result<Vec<ArchivedScan>, RebuildError> {
+        if self.incomplete {
+            return Err(RebuildError::HistoryUnavailable);
+        }
+        Ok(self.scans.values().cloned().collect())
     }
 }
 
@@ -132,8 +174,20 @@ pub(crate) fn rebuild(
     spec: MappingBackendSpec,
     config: MappingBackendComputeConfig,
     frame_id: String,
+    budget: Duration,
     cancelled: impl Fn() -> bool,
-) -> Result<RebuiltMap, String> {
+) -> Result<RebuiltMap, RebuildError> {
+    let start = Instant::now();
+    let check = || {
+        if cancelled() {
+            Err(RebuildError::Cancelled)
+        } else if start.elapsed() >= budget {
+            Err(RebuildError::BudgetExceeded)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     validate_optimized_keyframes(&trajectory)?;
     let first = trajectory
         .first()
@@ -145,6 +199,7 @@ pub(crate) fn rebuild(
     }
     let mut keyframes = Vec::with_capacity(trajectory.len());
     for node in &trajectory {
+        check()?;
         let frame = scans
             .binary_search_by_key(&(node.source_timestamp_ns as u64), |s| {
                 s.source_timestamp_ns
@@ -167,7 +222,6 @@ pub(crate) fn rebuild(
     let path =
         std::env::temp_dir().join(format!("nuwax-pgo-rebuild-{}.mmap", uuid::Uuid::new_v4()));
     let mut cloud = TemporaryCloud(CloudMapShmWriter::new(&path).map_err(|e| e.to_string())?);
-    let start = Instant::now();
     let mut kernel_time = Duration::ZERO;
     let mut cloud_time = Duration::ZERO;
     let mut processed = 0;
@@ -176,9 +230,7 @@ pub(crate) fn rebuild(
         let mut persistent: Option<PersistentOccupancyGrid> = None;
         let mut last_input = None;
         for (index, scan) in scans.iter().enumerate() {
-            if cancelled() || start.elapsed() > REBUILD_BUDGET {
-                return Err("PGO地图重建已取消或超过计算预算".into());
-            }
+            check()?;
             let time = (scan.source_timestamp_ns as i128 - first as i128) as f64 / 1e9;
             let map_from_body = anchor
                 * timeline
@@ -204,20 +256,31 @@ pub(crate) fn rebuild(
             let phase = Instant::now();
             mapping_backend::validate_backend_input(&kernel, &input)?;
             if let Some(candidate) =
-                mapping_backend::compute_candidate_in_place(&mut kernel, &input, config)?
+                mapping_backend::compute_candidate_in_place_with_interval(
+                    &mut kernel, &input, config, mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
+                )?
             {
-                persistent = Some(match candidate.backend_kind {
-                    MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
-                        persistent.as_ref(),
-                        &candidate.live_window_occupancy,
-                        &candidate.latest_frame_occupancy,
-                    )?,
+                match candidate.backend_kind {
+                    MappingBackendKind::Voxel => {
+                        // 私有重建独占累加器，无须为每次候选复制完整历史栅格。
+                        if persistent.is_none() {
+                            persistent = Some(PersistentOccupancyGrid::from_grid(
+                                candidate.live_window_occupancy.clone(),
+                            )?);
+                        }
+                        persistent.as_mut().unwrap().merge(
+                            &candidate.live_window_occupancy,
+                            &candidate.latest_frame_occupancy,
+                        )?;
+                    }
                     MappingBackendKind::Raytracing => PersistentOccupancyGrid::stage_authoritative(
                         &candidate.live_window_occupancy,
-                    )?,
-                });
+                    )
+                    .map(|grid| persistent = Some(grid))?,
+                }
             }
             kernel_time += phase.elapsed();
+            check()?;
             let phase = Instant::now();
             if !cloud.accumulate_mapping_scan(
                 1,
@@ -256,9 +319,7 @@ pub(crate) fn rebuild(
                 }
             });
         }
-        if cancelled() || start.elapsed() > REBUILD_BUDGET {
-            return Err("PGO地图重建已取消或超过计算预算".into());
-        }
+        check()?;
         cloud
             .commit_accumulated()
             .ok_or("PGO重建点云无法完成快照")?;
@@ -272,7 +333,14 @@ pub(crate) fn rebuild(
     let cleanup = cloud
         .cleanup_product_owned_file()
         .map_err(|e| format!("PGO临时点云清理失败：{e}"));
-    let result = result.and_then(|value| cleanup.map(|()| value));
+    // 清理失败仍属于真实故障，不能被预算拒绝掩盖。
+    let result = cleanup
+        .map_err(RebuildError::from)
+        .and(result)
+        .and_then(|value| {
+            check()?;
+            Ok(value)
+        });
     tracing::info!(
         event = "pgo.map.rebuilt",
         frames = scans.len(),
@@ -281,6 +349,8 @@ pub(crate) fn rebuild(
         cloud_ms = cloud_time.as_millis() as u64,
         elapsed_ms = start.elapsed().as_millis() as u64,
         success = result.is_ok(),
+        error = ?result.as_ref().err(),
+        budget_ms = budget.as_millis() as u64,
         "PGO私有地图重建结束"
     );
     #[cfg(test)]
@@ -294,9 +364,51 @@ pub(crate) fn rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    #[ignore = "三百八十五帧规模基准，使用release构建独立执行"]
-    fn pgo_rebuild_recorded_scale_budget() {
+    fn archive_capacity_disables_only_complete_history_and_resets_with_session() {
+        let binding = RegistrationBinding {
+            runtime_generation: 1,
+            cloud_source_sequence: 1,
+            correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
+                source_sequence: 1,
+                source_timestamp_ns: 1,
+            },
+            mapping_session_id: "bounded-history".into(),
+            mapping_session_generation: 1,
+            map_frame_generation: 1,
+            envelope_sha256: [1; 32],
+            frozen_odom_from_body: Isometry3::identity(),
+            base_anchor_map_from_odom: Isometry3::identity(),
+            registration_map_from_odom: Isometry3::identity(),
+            registration_correction_revision: 0,
+            sensor_origin_map: Some([0.0; 3]),
+            frame_capture_relocalization_epoch: None,
+        };
+        let mut history = ScanHistory::default();
+        let points = [Point3::new(1.0, 2.0, 3.0)];
+        history.record(1, 1, &binding, &points).unwrap();
+        assert_eq!(history.snapshot().unwrap().len(), 1);
+        // 只注入容量计数，避免为边界回归分配数百兆字节数据。
+        history.point_count = MAX_ARCHIVED_POINTS;
+        history.record(2, 2, &binding, &points).unwrap();
+        assert!(matches!(
+            history.snapshot(),
+            Err(RebuildError::HistoryUnavailable)
+        ));
+        assert_eq!(history.point_count, 0);
+        assert!(history.scans.is_empty());
+        history.record(3, 3, &binding, &points).unwrap();
+        assert!(matches!(
+            history.snapshot(),
+            Err(RebuildError::HistoryUnavailable)
+        ));
+        history.clear();
+        history.record(4, 4, &binding, &points).unwrap();
+        assert_eq!(history.snapshot().unwrap()[0].source_timestamp_ns, 4);
+    }
+
+    fn scale_input(frame_count: usize) -> (Vec<ArchivedScan>, Vec<OptimizedKeyframe>) {
         let world: Vec<_> = (0..41)
             .flat_map(|x| {
                 (0..41)
@@ -309,7 +421,7 @@ mod tests {
                 (0..16).map(move |z| Point3::new(-4.0 + x as f64 * 0.2, 4.0, -1.0 + z as f64 * 0.2))
             }))
             .collect();
-        let scans = (0..385)
+        let scans = (0..frame_count as u64)
             .map(|i| {
                 let pose = Isometry3::translation(i as f64 / 150.0, 0.0, 0.0);
                 ArchivedScan {
@@ -326,13 +438,22 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let trajectory = [0, 384]
+        let trajectory = [0, frame_count - 1]
             .map(|i| OptimizedKeyframe {
                 source_timestamp_ns: scans[i].source_timestamp_ns as i64,
                 translation_m: scans[i].odom_from_body.translation.vector.into(),
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             })
             .to_vec();
+        (scans, trajectory)
+    }
+
+    fn rebuild_scale(
+        frames: usize,
+        budget: Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<RebuiltMap, RebuildError> {
+        let (scans, trajectory) = scale_input(frames);
         rebuild(
             scans,
             trajectory,
@@ -345,8 +466,46 @@ mod tests {
                 window_capacity: 100_000,
             },
             "map".into(),
-            || false,
+            budget,
+            cancelled,
         )
-        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "三百八十五帧规模基准，使用release构建独立执行"]
+    fn pgo_rebuild_recorded_scale_budget() {
+        rebuild_scale(385, REBUILD_BUDGET, || false).unwrap();
+    }
+
+    #[test]
+    #[ignore = "接近归档容量的长历史规模基准，使用release构建独立执行"]
+    fn pgo_rebuild_long_history_budget() {
+        for frames in [770, 1540, 2400] {
+            match rebuild_scale(frames, REBUILD_BUDGET, || false) {
+                Ok(_) => eprintln!("长历史 frames={frames} 在正式预算内完成"),
+                Err(RebuildError::BudgetExceeded) => {
+                    eprintln!("长历史 frames={frames} 正式预算耗尽，完整结果未交付");
+                    // 仅基准允许延长计算来测量全量成本；生产拥有方仍固定使用3秒预算。
+                    rebuild_scale(frames, Duration::from_secs(30), || false).unwrap();
+                }
+                Err(error) => panic!("长历史重建出现非预算错误：{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pgo_rebuild_distinguishes_budget_and_mid_replay_cancellation() {
+        assert!(matches!(
+            rebuild_scale(8, Duration::ZERO, || false),
+            Err(RebuildError::BudgetExceeded)
+        ));
+        let checks = std::cell::Cell::new(0);
+        let cancelled = rebuild_scale(8, Duration::from_secs(30), || {
+            checks.set(checks.get() + 1);
+            checks.get() == 8
+        });
+        assert!(matches!(cancelled, Err(RebuildError::Cancelled)));
+        // 已取消的私有重建不污染下一次重建的内核或临时点云。
+        rebuild_scale(8, Duration::from_secs(30), || false).unwrap();
     }
 }

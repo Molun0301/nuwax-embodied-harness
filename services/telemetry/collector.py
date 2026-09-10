@@ -38,6 +38,7 @@ TELEMETRY_LOGGER = logging.getLogger("nuwax_robot_bridge.telemetry")
 # 不绑定任何机器人型号；“python” 因过宽（会误纳无关解释器进程）被刻意排除。
 _DEFAULT_PROCESS_KEYWORDS = (
     "gateway",
+    "nuwax-log-query",
     "nuwax-geometry-runtime",
     "nuwax-nav-stack",
     "nuwax-lcm-runtime",
@@ -58,6 +59,7 @@ class ProcessIdentity:
 
 
 _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
+    ("log_query", "日志历史查询", "nuwax-log-query"),
     ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
     ("gateway_supervisor", "网关守护脚本", "nuwax-gateway-supervisor"),
     ("geometry_runtime", "Native geometry runtime", "nuwax-geometry-runtime"),

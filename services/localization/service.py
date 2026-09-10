@@ -271,6 +271,7 @@ class LocalizationService:
         provider_name = provider.provider_name
 
         # 从平台几何运行时获取位姿数据（provider IO，不持锁；不触及共享会话状态）
+        backend_snapshot = self._capture_backend_state(provider)
         current_pose, frame_tree = self._capture_provider_data(provider)
 
         # 以下读改写会话与状态机的段落统一加锁；发布动作（StreamBus/EventBus/StateStore）延后到锁外。
@@ -304,6 +305,7 @@ class LocalizationService:
                 provider=provider,
                 current_pose=current_pose,
                 session_frame_id=session.frame_id,
+                backend_state=backend_snapshot,
             )
             self._last_diagnostics = diagnostics
 
@@ -470,8 +472,10 @@ class LocalizationService:
         provider = None
         current_pose = None
         frame_tree = None
+        backend_snapshot = None
         if refresh:
             provider = self._get_localization_provider()
+            backend_snapshot = self._capture_backend_state(provider)
             current_pose, frame_tree = self._capture_provider_data(provider)
 
         resolved_geometry_asset = self._clone_metadata(geometry_asset) if geometry_asset is not None else None
@@ -559,6 +563,7 @@ class LocalizationService:
                     frame_tree=frame_tree,
                     metadata=metadata,
                     force_relocalize=force_relocalize,
+                    backend_state=backend_snapshot,
                 )
             committed_epoch = self._session_mutation_epoch
             snapshot_publication, committed_session = publication
@@ -609,6 +614,7 @@ class LocalizationService:
         frame_tree,
         metadata: Optional[Dict[str, object]],
         force_relocalize: bool,
+        backend_state: Dict[str, object],
     ):
         """Apply already-captured provider data while the caller owns ``_lock``."""
 
@@ -616,6 +622,7 @@ class LocalizationService:
             provider=provider,
             current_pose=current_pose,
             session_frame_id=session.frame_id,
+            backend_state=backend_state,
         )
         self._last_diagnostics = diagnostics
         if force_relocalize or self._state_machine.current_state == "idle":
@@ -1098,6 +1105,7 @@ class LocalizationService:
         provider: LocalizationProvider,
         current_pose: Optional[object],
         session_frame_id: Optional[str],
+        backend_state: Optional[Dict[str, object]] = None,
     ) -> LocalizationDiagnostics:
         """构建平台定位诊断信息。"""
 
@@ -1109,7 +1117,8 @@ class LocalizationService:
         backend_name = provider.provider_name
 
         # 尝试获取后端的原始状态
-        backend_state = self._capture_backend_state(provider)
+        if backend_state is None:
+            backend_state = self._capture_backend_state(provider)
 
         # 坐标系匹配检查
         frame_id_match = True
@@ -1444,7 +1453,9 @@ class LocalizationService:
         return provider
 
     def _capture_provider_data(self, provider: LocalizationProvider):
-        return provider.get_current_pose(), provider.get_frame_tree()
+        # 坐标树读取可能阻塞；结束后再领取最新位姿，不让早先位姿跟随树查询等待。
+        frame_tree = provider.get_frame_tree()
+        return provider.get_current_pose(), frame_tree
 
     @classmethod
     def _clone_metadata(cls, value):

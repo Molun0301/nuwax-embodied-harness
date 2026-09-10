@@ -111,7 +111,8 @@ test = false
 bench = false
 
 [profile.release]
-opt-level = "z"
+# 几何内核需要实时吞吐，不能用体积优先优化压低重建与在线输入处理速度。
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

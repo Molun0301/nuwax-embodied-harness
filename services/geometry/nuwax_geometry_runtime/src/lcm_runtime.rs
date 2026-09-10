@@ -4061,6 +4061,7 @@ pub(crate) struct GeometryCanonicalCorrectionApplier {
     tf_binding: (LcmTopic, LcmMessageType),
     current: Arc<parking_lot::RwLock<Option<CanonicalCorrectionSnapshot>>>,
     pgo: std::sync::OnceLock<PgoApplyContext>,
+    rebuild_budget: Duration,
 }
 
 impl GeometryCanonicalCorrectionApplier {
@@ -4099,6 +4100,7 @@ impl GeometryCanonicalCorrectionApplier {
             tf_binding,
             current: Arc::new(parking_lot::RwLock::new(None)),
             pgo: std::sync::OnceLock::new(),
+            rebuild_budget: crate::pgo_map::REBUILD_BUDGET,
         })
     }
 
@@ -4238,6 +4240,19 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         cancellation: crate::correction_coordinator::CorrectionRequestCancellation,
     ) -> Result<(), crate::correction_coordinator::CanonicalCorrectionApplyError> {
         use crate::correction_coordinator::CanonicalCorrectionApplyError as ApplyError;
+        use crate::correction_coordinator::CorrectionRejectReason;
+        use crate::pgo_map::RebuildError;
+
+        let preparation_error = |error| match error {
+            RebuildError::Cancelled => ApplyError::Cancelled,
+            RebuildError::BudgetExceeded => {
+                ApplyError::PreparationRejected(CorrectionRejectReason::RebuildBudgetExceeded)
+            }
+            RebuildError::HistoryUnavailable => {
+                ApplyError::PreparationRejected(CorrectionRejectReason::IncompleteScanHistory)
+            }
+            RebuildError::Invalid(error) => ApplyError::Failed(error),
+        };
 
         let operation = cancellation.operation();
         if cancellation.is_cancelled() {
@@ -4279,21 +4294,29 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 {
                     return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
                 }
-                mapping.pgo_rebuild_input().map_err(ApplyError::Failed)?
+                mapping.pgo_rebuild_input().map_err(preparation_error)?
             };
             let trajectory = transaction.trajectory.clone();
             let anchor = transaction.base_anchor_map_from_odom;
             let frame = self.map_frame_id.clone();
             let cancelled = cancellation.clone();
+            let budget = self.rebuild_budget;
             Some(
                 tokio::task::spawn_blocking(move || {
-                    crate::pgo_map::rebuild(scans, trajectory, anchor, spec, config, frame, || {
-                        cancelled.is_cancelled()
-                    })
+                    crate::pgo_map::rebuild(
+                        scans,
+                        trajectory,
+                        anchor,
+                        spec,
+                        config,
+                        frame,
+                        budget,
+                        || cancelled.is_cancelled(),
+                    )
                 })
                 .await
                 .map_err(|e| ApplyError::Failed(format!("PGO重建任务失败：{e}")))?
-                .map_err(ApplyError::Failed)?,
+                .map_err(preparation_error)?,
             )
         } else {
             None
@@ -8338,6 +8361,19 @@ async fn ingest_mapping_points_with_backend_owned(
             });
         }
     };
+    let preparation = mapping.lock().prepare_backend_completion(completion);
+    let prepared_completion = match tokio::task::spawn_blocking(move || preparation.compute()).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
+            let retirement = fence_failed_mapping_backend(mapping, lifecycle_lock, explore_projection_gate,
+                committed_map_authority, map_revision_latest_tx, &token.session_id).await.err();
+            return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                source_frame_id: frame_id.to_owned(), target_frame_id,
+                reason: format!("mapping commit preparation failed: {error}; retirement={retirement:?}"),
+            });
+        }
+    };
     let commit_result: Result<
         MappingIngestCommit,
         (
@@ -8351,7 +8387,7 @@ async fn ingest_mapping_points_with_backend_owned(
         let mut shared_guard = Some(state.write().await);
         let mut adapter = mapping.lock();
         let target_frame_id = adapter.configured_map_frame_id().to_owned();
-        let mut completion = Some(completion);
+        let mut completion = Some(prepared_completion);
         let fence_violation = match (expected_relocalization_epoch, relocalization_mode.as_ref()) {
             (Some(expected_epoch), Some(mode)) => {
                 let snapshot = mode.snapshot();
@@ -8364,8 +8400,8 @@ async fn ingest_mapping_points_with_backend_owned(
             let completion = completion
                 .take()
                 .expect("mapping completion is present before relocalization fence");
-            let token = completion.token.clone();
-            let resolution = completion.resolution;
+            let token = completion.completion.token.clone();
+            let resolution = completion.completion.resolution;
             match resolution.abort() {
                 Err(error) => Some(Err((
                     target_frame_id.clone(),
@@ -8401,7 +8437,7 @@ async fn ingest_mapping_points_with_backend_owned(
         let mut commit_result = if let Some(fence_commit) = fence_commit {
             fence_commit
         } else {
-            let completion_result = adapter.commit_backend_completion(
+            let completion_result = adapter.commit_prepared_backend_completion(
                 completion.expect("mapping completion is present without a relocalization fence"),
                 &mut *shared_guard
                     .as_mut()
@@ -14387,7 +14423,7 @@ mod mapping_feed_tests {
                     LcmTopic::new("/test/pgo-complete/tf").unwrap(),
                     LcmMessageType::new("tf2_msgs.TFMessage").unwrap(),
                 );
-                let applier = GeometryCanonicalCorrectionApplier::new(
+                let mut applier = GeometryCanonicalCorrectionApplier::new(
                     identity.clone(),
                     "map",
                     "odom",
@@ -14639,6 +14675,48 @@ mod mapping_feed_tests {
                                 0
                             );
                         }
+                        let pose_before = handle.state.read().await.pose.clone();
+                        let cloud_before = handle
+                            .cloud_map_writer
+                            .lock()
+                            .as_ref()
+                            .unwrap()
+                            .committed_snapshot()
+                            .unwrap();
+                        applier.rebuild_budget = Duration::ZERO;
+                        let rejection = applier
+                            .apply_transaction(
+                                transaction.clone(),
+                                CorrectionRequestCancellation::new(),
+                            )
+                            .await;
+                        assert!(matches!(rejection, Err(
+                            crate::correction_coordinator::CanonicalCorrectionApplyError::PreparationRejected(
+                                crate::correction_coordinator::CorrectionRejectReason::RebuildBudgetExceeded
+                            )
+                        )));
+                        applier.rebuild_budget = crate::pgo_map::REBUILD_BUDGET;
+                        assert_eq!(
+                            handle.state.read().await.map.revision,
+                            receipt.occupancy_revision
+                        );
+                        assert_eq!(handle.state.read().await.cloud_map_revision, previous_cloud);
+                        assert_eq!(
+                            handle.state.read().await.pose.timestamp_ns,
+                            pose_before.timestamp_ns
+                        );
+                        assert_eq!(handle.state.read().await.pose.x, pose_before.x);
+                        assert_eq!(
+                            handle
+                                .cloud_map_writer
+                                .lock()
+                                .as_ref()
+                                .unwrap()
+                                .committed_snapshot()
+                                .unwrap()
+                                .xyz_f32_le,
+                            cloud_before.xyz_f32_le
+                        );
                         let cancellation = CorrectionRequestCancellation::new();
                         applier
                             .apply_transaction(transaction, cancellation.clone())
@@ -16605,7 +16683,7 @@ mod mapping_feed_tests {
             &handle,
             &[Point3::new(1.0, 0.0, 0.0)],
             12,
-            10_100_000_000,
+            10_000_000_000 + crate::mapping_backend::MAPPING_CANDIDATE_INTERVAL_NS / 2,
             1,
             "map",
         )

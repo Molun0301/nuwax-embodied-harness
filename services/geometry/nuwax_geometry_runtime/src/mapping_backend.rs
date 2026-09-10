@@ -35,8 +35,9 @@ const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 const PREINSTALL_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
-// 持续真实输入的候选最迟间隔；为导航500毫秒接收期限保留构图与传输余量。
-pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
+// 在线最多30次/秒，仍只消费真实新输入；历史回放保持原有计算节拍。
+pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 33_333_333;
+pub(crate) const REPLAY_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAPPING_BACKEND_CHECKPOINT_MAGIC: [u8; 8] = *b"NWMBCKP\0";
@@ -2025,8 +2026,7 @@ fn build_occupancy(
         frame_id: &input.registered_frame_id,
         timestamp: input.source_timestamp_ns as f64 / 1_000_000_000.0,
     };
-    CostMapper::from_pointcloud_auto(&cloud, &occupancy_config(config), config.resolution)
-        .map(|(_, occupancy, _)| occupancy)
+    CostMapper::occupancy_from_pointcloud_auto(&cloud, &occupancy_config(config), config.resolution)
         .map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))
 }
 
@@ -2041,9 +2041,9 @@ fn cleared_previous_occupancy(
     cleared
 }
 
-fn candidate_due(last_received_at_ns: u64, received_at_ns: u64) -> bool {
+fn candidate_due(last_received_at_ns: u64, received_at_ns: u64, interval_ns: u64) -> bool {
     last_received_at_ns == 0
-        || received_at_ns.saturating_sub(last_received_at_ns) >= MAPPING_CANDIDATE_INTERVAL_NS
+        || received_at_ns.saturating_sub(last_received_at_ns) >= interval_ns
 }
 
 pub(crate) fn flush_candidate(
@@ -2171,6 +2171,16 @@ pub(crate) fn compute_candidate_in_place(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<Option<MappingBackendCandidate>, String> {
+    compute_candidate_in_place_with_interval(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS)
+}
+
+/// 历史回放自行选择构图节拍；点云接纳与累积仍逐帧执行。
+pub(crate) fn compute_candidate_in_place_with_interval(
+    kernel: &mut MappingKernel,
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+    candidate_interval_ns: u64,
+) -> Result<Option<MappingBackendCandidate>, String> {
     if input.registered_points_map.is_empty() {
         return Ok(None);
     }
@@ -2189,7 +2199,7 @@ pub(crate) fn compute_candidate_in_place(
             ray.validate_checkpoint_budget()?;
             ray.dirty_since_candidate = true;
             // 每帧更新体素，但只有真正构图时才导出并排序完整历史点集。
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
                 return Ok(None);
             }
             ray.refresh_stable_points();
@@ -2200,7 +2210,7 @@ pub(crate) fn compute_candidate_in_place(
     let (live_window_occupancy, latest_frame_occupancy) = match kernel {
         MappingKernel::Voxel(voxel) => {
             let point_count = voxel.current_window.len();
-            if !candidate_due(voxel.last_candidate_received_at_ns, input.received_at_ns) {
+            if !candidate_due(voxel.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
                 return Ok(None);
             }
             let live_points = voxel.current_window.make_contiguous();
@@ -2217,7 +2227,7 @@ pub(crate) fn compute_candidate_in_place(
             let Some(previous) = ray.last_occupancy.as_ref() else {
                 return Ok(None);
             };
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
                 return Ok(None);
             }
             let cleared = cleared_previous_occupancy(previous, input);
@@ -2230,7 +2240,7 @@ pub(crate) fn compute_candidate_in_place(
         }
         MappingKernel::Raytracing(ray) => {
             let point_count = ray.stable_points.len();
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns) {
+            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
                 return Ok(None);
             }
             let live = build_occupancy(&ray.stable_points, input, config)?;
@@ -2458,7 +2468,7 @@ mod tests {
             compute_candidate_in_place(&mut kernel, &input(sequence), compute_config()).unwrap();
         }
         let mut skipped = input(4);
-        skipped.received_at_ns = 3_100_000_000;
+        skipped.received_at_ns = 3_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
         skipped.source_timestamp_ns = skipped.received_at_ns;
         assert!(
             compute_candidate_in_place(&mut kernel, &skipped, compute_config())
@@ -2654,7 +2664,7 @@ mod tests {
                     );
                 }
             }
-            assert!(candidate_count >= 5, "恒定小图也需持续交付真实候选");
+            assert!(candidate_count >= 14, "100毫秒真实输入在完成后端初始化后应逐次交付，不再被250毫秒门槛丢弃");
             let mut empty = input(17);
             empty.registered_points_map.clear();
             empty.source_timestamp_ns = 79_000_000_000;
@@ -2697,8 +2707,8 @@ mod tests {
         assert!(commit_completion(first).expect("first compute").is_some());
 
         let mut skipped_input = input(2);
-        skipped_input.source_timestamp_ns = 1_100_000_000;
-        skipped_input.received_at_ns = 1_100_000_000;
+        skipped_input.source_timestamp_ns = 1_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
+        skipped_input.received_at_ns = skipped_input.source_timestamp_ns;
         let mut skipped_token = token(2);
         skipped_token.source_timestamp_ns = skipped_input.source_timestamp_ns;
         let skipped = client
@@ -2832,8 +2842,8 @@ mod tests {
         }
 
         let mut skipped_input = input(4);
-        skipped_input.source_timestamp_ns = 3_100_000_000;
-        skipped_input.received_at_ns = 3_100_000_000;
+        skipped_input.source_timestamp_ns = 3_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
+        skipped_input.received_at_ns = skipped_input.source_timestamp_ns;
         let mut skipped_token = token(4);
         skipped_token.source_timestamp_ns = skipped_input.source_timestamp_ns;
         let skipped = client

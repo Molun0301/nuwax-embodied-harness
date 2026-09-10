@@ -463,6 +463,73 @@ pub(crate) struct PreparedMappingCompute {
     pub(crate) input: MappingBackendInput,
 }
 
+/// 捕获不可变候选与配置；大图合并、文件读取和编码在拥有方工作任务内完成。
+pub(crate) struct MappingCommitPreparation {
+    completion: MappingBackendCompletion,
+    persistent: Option<Arc<PersistentOccupancyGrid>>,
+    session: MappingSessionSnapshot,
+    zone_path: Option<PathBuf>,
+    zone_cache: crate::forbidden_zones::ForbiddenZoneCache,
+    sequence_store: Option<Arc<crate::sequence_state::SequenceStateStore>>,
+}
+
+pub(crate) struct PreparedBackendCompletion {
+    pub(crate) completion: MappingBackendCompletion,
+    map: Result<Option<PreparedCandidateMap>, String>,
+}
+
+struct PreparedCandidateMap {
+    persistent: PersistentOccupancyGrid,
+    raw: MapState,
+    effective: MapState,
+    event: MapRevisionEvent,
+    zones: crate::forbidden_zones::LoadedForbiddenZones,
+    zone_cache: crate::forbidden_zones::ForbiddenZoneCache,
+}
+
+impl MappingCommitPreparation {
+    pub(crate) fn compute(mut self) -> PreparedBackendCompletion {
+        let map = self.prepare_map();
+        PreparedBackendCompletion { completion: self.completion, map }
+    }
+
+    fn prepare_map(&mut self) -> Result<Option<PreparedCandidateMap>, String> {
+        let Some(candidate) = self.completion.result.as_ref().ok().and_then(|value| value.as_ref()) else {
+            return Ok(None);
+        };
+        let persistent = if candidate.backend_kind == MappingBackendKind::Raytracing {
+            PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy)?
+        } else {
+            PersistentOccupancyGrid::stage_voxel(self.persistent.as_deref(),
+                &candidate.live_window_occupancy, &candidate.latest_frame_occupancy)?
+        };
+        let grid = &persistent.grid;
+        let floor = self.completion.token.base_occupancy_revision;
+        let revision = match &self.sequence_store {
+            Some(store) => store.reserve_map_revision(floor).map_err(|error| error.to_string())?,
+            None => floor.checked_add(1).filter(|value| *value <= i32::MAX as u64)
+                .ok_or_else(|| "map revision exhausted".to_string())?,
+        };
+        let raw = MapState {
+            width: grid.width, height: grid.height, resolution: grid.resolution as f32,
+            origin_x: grid.origin[0], origin_y: grid.origin[1], frame_id: grid.frame_id.clone(),
+            revision, timestamp_ns: candidate.source_timestamp_ns, data: grid.data.clone(),
+        };
+        let zones = match self.zone_path.as_deref() {
+            Some(path) => self.zone_cache.load(path, &self.session.map_name),
+            None => crate::forbidden_zones::LoadedForbiddenZones {
+                signature: format!("disabled:{}", self.session.map_name), generation: 0,
+                zones: Vec::new(), status: crate::forbidden_zones::ZoneLoadStatus::Empty,
+            },
+        };
+        let effective = crate::forbidden_zones::compose_effective_map(&raw, &zones)?;
+        self.session.revision = revision;
+        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
+        Ok(Some(PreparedCandidateMap { persistent, raw, effective, event, zones,
+                                    zone_cache: self.zone_cache.clone() }))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedMappingFlush {
     pub(crate) worker: MappingBackendClient,
@@ -1095,7 +1162,7 @@ pub struct MappingAdapter {
     latest_accepted_point_count: usize,
     /// Stable 2D map state.  Unlike `session`, this grid never rolls old cells
     /// out merely because the bounded point budget is full.
-    persistent_grid: Option<PersistentOccupancyGrid>,
+    persistent_grid: Option<Arc<PersistentOccupancyGrid>>,
     checkpoint_installed: bool,
     checkpoint_activation_digest: Option<[u8; 32]>,
     /// Optional production-only shared forbidden-zone document.
@@ -2038,11 +2105,27 @@ impl MappingAdapter {
         true
     }
 
-    pub(crate) fn commit_backend_completion(
+    pub(crate) fn prepare_backend_completion(&self, completion: MappingBackendCompletion) -> MappingCommitPreparation {
+        MappingCommitPreparation {
+            completion, persistent: self.persistent_grid.clone(), session: self.lifecycle.clone(),
+            zone_path: self.forbidden_zones_path.clone(), zone_cache: self.forbidden_zone_cache.lock().clone(),
+            sequence_store: self.sequence_store.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_backend_completion(&mut self, completion: MappingBackendCompletion,
+                                           shared: &mut SharedState) -> Result<Option<CommittedMappingCandidate>, String> {
+        let prepared = self.prepare_backend_completion(completion).compute();
+        self.commit_prepared_backend_completion(prepared, shared)
+    }
+
+    pub(crate) fn commit_prepared_backend_completion(
         &mut self,
-        completion: MappingBackendCompletion,
+        prepared: PreparedBackendCompletion,
         shared: &mut SharedState,
     ) -> Result<Option<CommittedMappingCandidate>, String> {
+        let PreparedBackendCompletion { completion, map } = prepared;
         let MappingBackendCompletion {
             token,
             accepted_points_map,
@@ -2087,7 +2170,14 @@ impl MappingAdapter {
             self.in_flight_compute = None;
             return Err(error);
         }
-        match self.commit_backend_candidate(token, candidate, resolution, shared) {
+        let map = match map {
+            Ok(map) => map,
+            Err(error) => {
+                self.in_flight_compute = None;
+                return Err(error);
+            }
+        };
+        match self.commit_backend_candidate(token, candidate, resolution, map, shared) {
             Ok(committed) => Ok(Some(committed)),
             Err(error) => {
                 self.in_flight_compute = None;
@@ -2144,77 +2234,36 @@ impl MappingAdapter {
         token: MappingComputeToken,
         candidate: MappingBackendCandidate,
         resolution: MappingBackendCommitHandle,
+        map: Option<PreparedCandidateMap>,
         shared: &mut SharedState,
     ) -> Result<CommittedMappingCandidate, String> {
-        let mut next_persistent = if candidate.backend_kind == MappingBackendKind::Raytracing {
-            PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy.clone())?
-        } else {
-            match self.persistent_grid.clone() {
-                Some(persistent) => persistent,
-                None => {
-                    PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy.clone())?
-                }
-            }
-        };
-        if candidate.backend_kind != MappingBackendKind::Raytracing {
-            next_persistent.merge(
-                &candidate.live_window_occupancy,
-                &candidate.latest_frame_occupancy,
-            )?;
-        }
-        let grid = next_persistent.grid.clone();
-        let revision_floor = shared
-            .map
-            .revision
-            .max(self.revision)
-            .max(self.global_revision);
+        let revision_floor = shared.map.revision.max(self.revision).max(self.global_revision);
         if revision_floor != token.base_occupancy_revision {
             self.stale_completion_count = self.stale_completion_count.saturating_add(1);
             return Err("mapping candidate base occupancy revision changed".to_owned());
         }
-        let next_revision = self.reserve_next_revision(revision_floor)?;
-        let raw_map = MapState {
-            width: grid.width,
-            height: grid.height,
-            resolution: grid.resolution as f32,
-            origin_x: grid.origin[0],
-            origin_y: grid.origin[1],
-            frame_id: grid.frame_id,
-            revision: next_revision,
-            timestamp_ns: candidate.source_timestamp_ns,
-            data: grid.data,
-        };
-        let loaded = self.load_forbidden_zones();
-        let effective_map = self.compose_forbidden_zones(&raw_map, &loaded)?;
+        let prepared = map.ok_or_else(|| "mapping candidate preparation is missing".to_string())?;
+        let next_revision = prepared.raw.revision;
         let occupancy_receipt = self.reserve_occupancy_commit_receipt(
-            next_revision,
-            candidate.source_timestamp_ns,
-            candidate.backend_kind,
-            candidate.backend_generation,
+            next_revision, candidate.source_timestamp_ns, candidate.backend_kind, candidate.backend_generation,
         )?;
-        self.persistent_grid = Some(next_persistent);
-        self.record_forbidden_zone_application(&loaded, next_revision);
+        self.persistent_grid = Some(Arc::new(prepared.persistent));
+        self.record_forbidden_zone_application(&prepared.zones, next_revision);
+        *self.forbidden_zone_cache.lock() = prepared.zone_cache;
         self.global_revision = next_revision;
         self.revision = next_revision;
         self.lifecycle.revision = next_revision;
         self.last_built_generation = self.session.generation();
         self.last_built_point_count = self.session.current_size();
         self.last_built_received_at_ns = candidate.received_at_ns;
-        shared.map = effective_map;
-        let event =
-            MapRevisionEvent::from_effective_and_raw(&shared.map, &raw_map, &self.lifecycle);
+        shared.map = prepared.effective;
         self.last_occupancy_commit_receipt = Some(occupancy_receipt.clone());
-        self.raw_map = Some(raw_map);
+        self.raw_map = Some(prepared.raw);
         Ok(CommittedMappingCandidate {
-            token: token.clone(),
-            resolution,
-            accepted_map_points: candidate.accepted_points_map,
-            event: Some(event),
-            session_generation: token.session_generation,
-            source_timestamp_ns: token.source_timestamp_ns,
-            backend_kind: candidate.backend_kind,
-            backend_generation: candidate.backend_generation,
-            occupancy_receipt: Some(occupancy_receipt),
+            token: token.clone(), resolution, accepted_map_points: candidate.accepted_points_map,
+            event: Some(prepared.event), session_generation: token.session_generation,
+            source_timestamp_ns: token.source_timestamp_ns, backend_kind: candidate.backend_kind,
+            backend_generation: candidate.backend_generation, occupancy_receipt: Some(occupancy_receipt),
         })
     }
 
@@ -2299,17 +2348,17 @@ impl MappingAdapter {
             MappingBackendSpec,
             MappingBackendComputeConfig,
         ),
-        String,
+        crate::pgo_map::RebuildError,
     > {
         self.backend_checkpoint_client()?;
         if self.checkpoint_activation_digest.is_some() {
-            return Err("已激活资产缺少原始PGO历史，不能以新扫描覆盖旧地图".into());
+            return Err(crate::pgo_map::RebuildError::HistoryUnavailable);
         }
         Ok((
             self.pgo_history
                 .as_ref()
                 .ok_or("PGO地图历史未绑定")?
-                .snapshot(),
+                .snapshot()?,
             self.mapping_backend,
             self.backend_compute_config(),
         ))
@@ -2394,7 +2443,7 @@ impl MappingAdapter {
         self.revision = prepared.map.revision;
         self.global_revision = self.global_revision.max(self.revision);
         self.lifecycle.revision = self.revision;
-        self.persistent_grid = Some(prepared.persistent);
+        self.persistent_grid = Some(Arc::new(prepared.persistent));
         self.raw_map = Some(prepared.raw_map);
         self.last_occupancy_commit_receipt = Some(prepared.receipt);
         self.checkpoint_installed = true;
@@ -2443,7 +2492,7 @@ impl MappingAdapter {
             self.backend_generation,
         )?;
         self.checkpoint_installed = true;
-        self.persistent_grid = Some(persistent_grid);
+        self.persistent_grid = Some(Arc::new(persistent_grid));
         self.record_forbidden_zone_application(&loaded, next_revision);
         self.global_revision = next_revision;
         self.revision = next_revision;
@@ -3293,8 +3342,8 @@ impl MappingAdapter {
                 }
             }
         } else {
-            match self.persistent_grid.clone() {
-                Some(persistent) => persistent,
+            match self.persistent_grid.as_deref() {
+                Some(persistent) => persistent.clone(),
                 None => match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
                     Ok(persistent) => persistent,
                     Err(error) => {
@@ -3355,7 +3404,7 @@ impl MappingAdapter {
                     return false;
                 }
             };
-            self.persistent_grid = Some(next_persistent);
+            self.persistent_grid = Some(Arc::new(next_persistent));
             self.record_forbidden_zone_application(&loaded, next_revision);
             self.global_revision = next_revision;
             self.revision = next_revision;
@@ -4527,16 +4576,18 @@ mod tests {
 
         let restarted_store =
             Arc::new(SequenceStateStore::open(&path).expect("restarted geometry sequence store"));
+        let reserved_floor = restarted_store.current_map_revision();
         let mut restarted_adapter = active_persistent_adapter(restarted_store);
         assert_eq!(restarted_adapter.current_revision(), 0);
-        assert_eq!(restarted_adapter.global_revision(), first_revision);
+        assert!(reserved_floor >= first_revision);
+        assert_eq!(restarted_adapter.global_revision(), reserved_floor);
         restarted_adapter.feed_pointcloud(&[Point3::new(1.0, 0.0, 2.0)]);
         let restarted_state = Arc::new(RwLock::new(SharedState::default()));
         assert!(restarted_adapter.build_and_publish(&restarted_state, None));
         assert!(restarted_adapter.current_revision() > first_revision);
         assert_eq!(
             restarted_state.try_read().unwrap().map.revision,
-            first_revision + 1
+            reserved_floor + 1
         );
     }
 
@@ -4916,14 +4967,14 @@ mod tests {
                 &[Point3::new(1.0, 0.0, 0.0)],
                 (1.0, 0.0),
                 16,
-                1_100_000_000,
+                1_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2,
                 "map",
-                1_100_000_000,
+                1_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2,
             )
             .expect("second frame accepted");
         assert!(
             !adapter.build_and_publish(&state, None),
-            "100ms high-rate updates should be coalesced into the next bounded rebuild"
+            "小于构图最小间隔的输入应合并到下次构图"
         );
         assert_eq!(adapter.current_revision(), 1);
     }
@@ -5284,6 +5335,47 @@ mod tests {
         );
         assert_eq!(adapter.current_revision(), 0);
         assert_eq!(state.blocking_read().map.revision, committed_revision);
+    }
+
+    #[test]
+    fn slow_commit_preparation_keeps_adapter_and_pose_state_available() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut adapter = active_adapter(sample_config());
+        let prepared = adapter.prepare_backend_compute(&[Point3::new(1.0, 0.0, 1.0)],
+            (0.0, 0.0), 12, 1_000_000_000, "map", 1_000_000_000, false).unwrap().unwrap();
+        let completion = prepared.worker.submit(prepared.token, prepared.input).unwrap()
+            .blocking_recv().unwrap();
+        let root = sequence_test_path("slow-prepare");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        nix::unistd::mkfifo(&root, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        adapter.forbidden_zones_path = Some(root.clone());
+        let preparation = adapter.prepare_backend_completion(completion);
+        let work = std::thread::spawn(move || preparation.compute());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut writer = loop {
+            match std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(&root) {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to rendezvous with actual map preparation: {error}"),
+            }
+        };
+        // 管道已有读者但尚未结束，实际文件读取仍阻塞；状态与位姿可以独立访问。
+        assert!(!work.is_finished());
+        assert!(adapter.snapshot().active);
+        let shared = Arc::new(RwLock::new(SharedState::default()));
+        shared.try_write().unwrap().pose.timestamp_ns = 2_000_000_000;
+        assert_eq!(shared.try_read().unwrap().pose.timestamp_ns, 2_000_000_000);
+        // 模拟读取失败的文档，仍沿原禁区全阻断语义完成候选，不能卡住准备拥有方。
+        writer.write_all(b"invalid document").unwrap();
+        drop(writer);
+        let completion = work.join().unwrap();
+        let committed = adapter.commit_prepared_backend_completion(completion, &mut shared.try_write().unwrap()).unwrap().unwrap();
+        assert_eq!(shared.try_read().unwrap().pose.timestamp_ns, 2_000_000_000);
+        adapter.resolve_backend_completion(&committed.token, committed.resolution, true).unwrap();
+        std::fs::remove_file(root).unwrap();
     }
 
     #[test]

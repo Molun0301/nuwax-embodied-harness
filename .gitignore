@@ -22,6 +22,7 @@ GO2_inner_slam/
 artifacts/
 .venv_model_download/
 .venv/
+.nuwax-test-env/
 memory_models_20260402.tar.zst
 runtime_data/
 

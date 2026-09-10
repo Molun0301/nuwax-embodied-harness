@@ -5541,12 +5541,15 @@ impl GeometryRuntime for GeometryRuntimeService {
                         ));
                     }
                 };
+                let preparation = adapter.lock().prepare_backend_completion(completion);
+                let completion = tokio::task::spawn_blocking(move || preparation.compute()).await
+                    .map_err(|error| Status::internal(format!("mapping checkpoint preparation failed: {error}")))?;
                 let mut projection_guard = bridge.lock_explore_projection_owned().await;
                 let lifecycle_guard = bridge.mapping_lifecycle_lock.lock().await;
                 let mut shared = bridge.state.write().await;
                 let committed_result = {
                     let mut adapter_guard = adapter.lock();
-                    adapter_guard.commit_backend_completion(completion, &mut shared)
+                    adapter_guard.commit_prepared_backend_completion(completion, &mut shared)
                 };
                 drop(shared);
                 let committed = committed_result

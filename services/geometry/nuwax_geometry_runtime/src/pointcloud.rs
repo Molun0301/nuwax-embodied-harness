@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use memmap2::MmapMut;
 use nalgebra::Point3;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
 
@@ -746,9 +746,8 @@ impl CloudMapShmWriter {
         self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8]
             .copy_from_slice(&revision.to_le_bytes());
         self.revision = revision;
-        if let Err(e) = self.mmap.flush_range(0, buf_offset + data_size) {
-            error!("累积地图 mmap flush 失败: {}", e);
-        }
+        // 这是启动时重新初始化的进程间通信映射；上方发布屏障保证可见性。
+        // 地图资产有独立持久化流程，实时提交不等待整段文件同步写盘。
         Some((revision, point_count, self.voxel_size))
     }
 

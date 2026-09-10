@@ -25,6 +25,7 @@ _logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import numpy as np
+from pydantic_core import to_json as _model_json_bytes
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
@@ -1047,6 +1048,20 @@ def _encode_ws_frame(frame: StreamFrame) -> str | bytes:
             return _encode_map_binary_frame(frame)
         except (TypeError, ValueError, AttributeError):
             pass
+    if frame.topic in {"localization.pose", "localization.trajectory", "localization.frame_tree"}:
+        # 规范定位对象由原生序列化器直接编码，避免每个轨迹点先转字典再走 Python JSON。
+        # 外部诊断和非有限值继续走原有严格投影，不改变其错误显示语义。
+        try:
+            values = _stream_frame_values(frame)
+            values["timestamp"] = frame.timestamp.isoformat()
+            encoded = _model_json_bytes({"type": "stream.frame", "frame": values},
+                                        fallback=_stream_json_default, inf_nan_mode="constants")
+            # 模型默认会将非有限向量写为 null；沿原严格诊断显示原值，不能伪装成缺失坐标。
+            if not any(marker in encoded for marker in
+                       (b"NaN", b"Infinity", b'"x":null', b'"y":null', b'"z":null', b'"w":null')):
+                return encoded.decode("utf-8")
+        except (TypeError, ValueError):
+            pass
     return _stream_json_dumps({"type": "stream.frame", "frame": frame})
 
 
@@ -1166,7 +1181,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
     async def video_mjpeg_stream(
         request: Request,
         camera_id: Optional[str] = None,
-        fps: float = 15.0,
+        fps: Optional[float] = None,
     ):
         source_status = runtime.perception_service.video_frame_source_status()
         source_camera_id = str(source_status.get("camera_id") or "front_camera")
@@ -1193,34 +1208,36 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     "message": "Rust 视频中转尚未收到帧数据。",
                 },
             )
-        requested_fps = float(fps or 15.0)
-        if not math.isfinite(requested_fps):
-            requested_fps = 15.0
-        frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 24.0)
+        # 默认随输入到达交付；显式请求的帧率仅作为发送上限。
+        requested_fps = float(fps) if fps is not None else 0.0
+        if not math.isfinite(requested_fps) or requested_fps < 0:
+            requested_fps = 0.0
+        frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 60.0) if requested_fps else 0.0
 
         async def frame_generator():
             shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
             attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
             last_sent_sequence = -1
-            next_frame_at = time.monotonic()
+            next_frame_at = 0.0
             try:
-                while not await request.is_disconnected():
-                    if attached:
+                if not attached:
+                    return
+                while True:
+                    multipart, sequence = await _SHARED_MJPEG_SOURCE.wait_for_frame(last_sent_sequence)
+                    if multipart is None:
+                        return
+                    remaining = next_frame_at - time.monotonic()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        # 等待发送限额时只领取最新帧，不补发已经过时的候选。
                         multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
-                        # 与原来每连接一个 reader 等价：同一帧只发一次。
-                        if multipart is not None and sequence != last_sent_sequence:
-                            last_sent_sequence = sequence
-                            yield multipart
-                    # 按绝对节奏安排下一次读取，晚唤醒不累积到后续每一帧。
-                    next_frame_at += frame_interval_sec
-                    now = time.monotonic()
-                    if now - next_frame_at > frame_interval_sec:
-                        next_frame_at = now
-                    await asyncio.sleep(max(0.0, next_frame_at - now))
+                    last_sent_sequence = sequence
+                    next_frame_at = time.monotonic() + frame_interval_sec
+                    yield multipart
             finally:
                 if attached:
-                    # 原实现从不关闭 reader，每个连接泄漏一个 fd 和一份 mmap。
-                    _SHARED_MJPEG_SOURCE.release()
+                    # 读者退出由拥有方等待，不能阻塞网页事件循环。
+                    await _run_blocking(_SHARED_MJPEG_SOURCE.release)
 
         return StreamingResponse(
             frame_generator(),
@@ -1315,7 +1332,8 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                             if isinstance(probe, dict) and probe.get("type") == "stream.ping":
                                 request_id = probe.get("request_id")
                                 if isinstance(request_id, str) and 0 < len(request_id) <= 64:
-                                    await _send_ws_json(websocket, {"type": "stream.pong", "request_id": request_id})
+                                    await _send_ws_json(websocket, {"type": "stream.pong", "request_id": request_id,
+                                                                   "server_timestamp_ns": str(time.time_ns())})
                         receive_task = asyncio.create_task(websocket.receive())
                     if frame_task not in done:
                         continue
@@ -1377,13 +1395,7 @@ def _positive_int(value: object, default: int) -> int:
 
 
 class _SharedMjpegFrameSource:
-    """进程内共享的最新 MJPEG 帧。
-
-    原实现每个 MJPEG 连接各开一个 SHM reader，各自 pread、各自拼 bytes、各自格式化
-    multipart，N 个客户端就是 N 倍读取和 N 倍拼装，而且 reader 从不关闭，每个连接
-    泄漏一个 fd 和一份 mmap。这里一帧只读一次、只格式化一次，所有连接引用同一份
-    不可变 bytes；最后一个消费者离开时关闭 reader。
-    """
+    """单个读线程共享最新视频帧；连接等待通知，不各自定时读共享内存。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1393,51 +1405,118 @@ class _SharedMjpegFrameSource:
         self._cached_multipart = None
         self._cached_sequence = -1
         self._camera_id = ""
+        self._worker = None
+        self._stop = None
+        self._waiters = set()
 
     def acquire(self, shm_path: str, *, camera_id: str = "front_camera") -> bool:
         if VideoShmReader is None:
             return False
         with self._lock:
-            if self._reader is not None and (self._shm_path != shm_path or self._camera_id != camera_id):
-                if self._consumers:
+            if self._reader is not None:
+                if self._shm_path != shm_path or self._camera_id != camera_id:
                     return False
-                self._reset_locked()
-            if self._reader is None:
-                self._reader = VideoShmReader(shm_path)
-                self._shm_path = shm_path
-                self._camera_id = camera_id
+            else:
+                reader = VideoShmReader(shm_path)
+                stop = threading.Event()
+                worker = threading.Thread(target=self._read_loop, args=(reader, stop, camera_id),
+                                          name="video-shm-reader", daemon=True)
+                self._reader, self._stop, self._worker = reader, stop, worker
+                self._shm_path, self._camera_id = shm_path, camera_id
+                self._cached_multipart, self._cached_sequence = None, -1
+                try:
+                    worker.start()
+                except BaseException:
+                    self._reader = self._stop = self._worker = None
+                    reader.close()
+                    raise
             self._consumers += 1
             return True
+
+    @staticmethod
+    def _notify(waiter) -> None:
+        if not waiter.done():
+            waiter.set_result(None)
+
+    def _read_loop(self, reader, stop, camera_id) -> None:
+        try:
+            while not stop.is_set():
+                result = reader.read_latest()
+                if result is not None:
+                    data, sequence, timestamp_ns = result
+                    multipart = _format_mjpeg_frame(data, camera_id=camera_id,
+                                                    sequence=sequence, timestamp_ns=timestamp_ns)
+                    with self._lock:
+                        if self._reader is not reader or stop.is_set():
+                            return
+                        self._cached_multipart = multipart
+                        self._cached_sequence += 1
+                        waiters = tuple(self._waiters)
+                        self._waiters.clear()
+                    for loop, waiter in waiters:
+                        try:
+                            loop.call_soon_threadsafe(self._notify, waiter)
+                        except RuntimeError:
+                            pass  # 已关闭的连接循环不再接收通知。
+                # 共享内存尚无通知描述符，只有拥有方做短轮询，不给每个连接新增定时器。
+                stop.wait(0.003)
+        except Exception:
+            _logger.exception("视频共享读取失败，结束当前视频连接。")
+        finally:
+            reader.close()
+            with self._lock:
+                if self._reader is reader:
+                    self._cached_multipart = None
+                    stop.set()
+                    waiters = tuple(self._waiters)
+                    self._waiters.clear()
+                else:
+                    waiters = ()
+            for loop, waiter in waiters:
+                try:
+                    loop.call_soon_threadsafe(self._notify, waiter)
+                except RuntimeError:
+                    pass
+
+    def latest_multipart(self) -> Tuple[Optional[bytes], int]:
+        with self._lock:
+            return self._cached_multipart, self._cached_sequence
+
+    async def wait_for_frame(self, after_sequence: int) -> Tuple[Optional[bytes], int]:
+        loop = asyncio.get_running_loop()
+        while True:
+            waiter = loop.create_future()
+            entry = (loop, waiter)
+            with self._lock:
+                if self._stop is None or self._stop.is_set():
+                    return None, self._cached_sequence
+                if self._cached_multipart is not None and self._cached_sequence != after_sequence:
+                    return self._cached_multipart, self._cached_sequence
+                self._waiters.add(entry)
+            try:
+                await waiter
+            finally:
+                with self._lock:
+                    self._waiters.discard(entry)
 
     def release(self) -> None:
         with self._lock:
             self._consumers = max(0, self._consumers - 1)
-            if self._consumers == 0:
-                self._reset_locked()
-
-    def _reset_locked(self) -> None:
-        if self._reader is not None:
-            self._reader.close()
-        self._reader = None
-        self._shm_path = None
-        self._cached_multipart = None
-        self._cached_sequence = -1
-
-    def latest_multipart(self) -> Tuple[Optional[bytes], int]:
-        """返回 (已格式化的 multipart 帧, 序号)。没有新帧时返回上一帧的同一份缓存。"""
-
-        with self._lock:
-            if self._reader is None:
-                return None, -1
-            result = self._reader.read_latest()
-            if result is not None:
-                frame_data, sequence, timestamp_ns = result
-                self._cached_multipart = _format_mjpeg_frame(
-                    frame_data, camera_id=self._camera_id, sequence=sequence, timestamp_ns=timestamp_ns,
-                )
-                # 本地修订号保证写者重启并复用源序号时，新帧仍可下发。
-                self._cached_sequence += 1
-            return self._cached_multipart, self._cached_sequence
+            if self._consumers or self._reader is None:
+                return
+            stop, worker = self._stop, self._worker
+            stop.set()
+            # 最后一个消费者关闭时撤销本代；新连接可以创建自己的读取拥有方。
+            self._reader = self._worker = self._stop = None
+            self._cached_multipart = None
+            waiters = tuple(self._waiters)
+            self._waiters.clear()
+        for loop, waiter in waiters:
+            try:
+                loop.call_soon_threadsafe(self._notify, waiter)
+            except RuntimeError:
+                pass
+        worker.join()
 
 
 _SHARED_MJPEG_SOURCE = _SharedMjpegFrameSource()

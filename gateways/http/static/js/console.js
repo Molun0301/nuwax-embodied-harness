@@ -2215,7 +2215,7 @@
         });
       }
       function mapGridDataSignature(grid) {
-        const data = grid && Array.isArray(grid.data) ? grid.data : [];
+        const data = grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) ? grid.data : [];
         if (!data.length) return "empty";
         let hash = 2166136261;
         for (let index = 0; index < data.length; index += 1) {
@@ -2401,12 +2401,12 @@
       }
       function shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared) {
         if (goalInteractionReason()) {
-          if (grid && Array.isArray(grid.data) && grid.width && grid.height) {
+          if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && grid.width && grid.height) {
             return { display: true, reason: "goal_pick" };
           }
         }
         if (cleared) return { display: false, status: "cleared", message: mapClearedMessage(diagnostics) };
-        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) {
+        if (!grid || !(Array.isArray(grid.data) || grid.data instanceof Int8Array) || !grid.width || !grid.height) {
           return { display: false, status: status === "error" ? "error" : "missing", message: errorReason(envelope, "无 occupancy_grid，占据栅格不可用。") };
         }
         const activeReason = activeSpatialContextReason();
@@ -2551,7 +2551,7 @@
         const scale = cameraScale(anchor);
         state.mapViewport = { centerX: canvas.width / 2, centerY: canvas.height / 2, scale, zoom: mapViewZoom(), robotLocked: anchor.locked };
         if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(mapViewZoom() * 100)}%`;
-        if (!grid || !Array.isArray(grid.data) || !grid.width || !grid.height) return;
+        if (!grid || !(Array.isArray(grid.data) || grid.data instanceof Int8Array) || !grid.width || !grid.height) return;
         const width = Number(grid.width);
         const height = Number(grid.height);
         const offscreen = ensureMapBaseCanvas(ctx, grid);
@@ -3574,7 +3574,7 @@
         state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
         let displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
         if (!displayDecision.display && !cleared && status === "available"
-            && grid && Array.isArray(grid.data) && grid.width && grid.height
+            && grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && grid.width && grid.height
             && state.pendingMapPose?.frame.status === "available"
             && pendingMapPoseMatches(state.receivedMapIdentity)) {
           displayDecision = { display: true, reason: "localization_pose_stream" };
@@ -3587,8 +3587,8 @@
         setPill(els.mapStatus, status);
         const pinCheckpoint = shouldPinLocalizationCheckpointDisplay(diagnostics);
         const incomingIsLive = !mapSnapshotIsOffline(diagnostics);
-        const keepCheckpointGrid = pinCheckpoint && incomingIsLive && state.mapGrid && Array.isArray(state.mapGrid.data);
-        if (grid && Array.isArray(grid.data) && !keepCheckpointGrid) {
+        const keepCheckpointGrid = pinCheckpoint && incomingIsLive && state.mapGrid && (Array.isArray(state.mapGrid.data) || state.mapGrid.data instanceof Int8Array);
+        if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && !keepCheckpointGrid) {
           const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
           const baseDirty = state.mapGridContentKey !== nextContentKey;
           state.mapGrid = grid;
@@ -3651,6 +3651,7 @@
         metric.samples.push(now);
         metric.frameKey = frameKey;
         metric.sourceTime = Number.isFinite(sourceTime) && sourceTime > 0 ? sourceTime : null;
+        metric.displayedAt = Date.now();
       }
       function displayedMapPoseAllowed(kind, pose) {
         if (!pose || pose !== state.pose || state.mapStreamReady !== true || state.lastLocalizationEnvelope?.status !== "available") return false;
@@ -3665,6 +3666,19 @@
         }
         return true;
       }
+      function activeStreamClockEstimate() {
+        const estimate = state.streamClockEstimate;
+        if (!estimate || estimate.epoch !== state.streamConnectionEpoch || performance.now() - estimate.measuredAt > 30000) return null;
+        const elapsed = performance.now() - estimate.measuredAt;
+        if (Math.abs(Date.now() - estimate.clientWallAt - elapsed) > 50) return null;
+        return estimate;
+      }
+      function clockCalibrationHint(rawAge) {
+        const estimate = activeStreamClockEstimate();
+        if (!estimate) return "尚未估算两端时钟偏差，当前显示包含时钟偏差。";
+        const raw = Number.isFinite(rawAge) ? `原始时间差 ${Math.round(rawAge)} ms；` : "";
+        return `${raw}服务端相对浏览器时钟 ${Math.round(estimate.offsetMs)} ms；校时估计的不确定性至少 ±${Math.ceil(estimate.rttMs / 2)} ms，不是精确物理测量。`;
+      }
       function recordDisplayedMapPose(kind, pose, displayedAt = Date.now()) {
         if (!displayedMapPoseAllowed(kind, pose)) return;
         state.displayedPoseMetrics ||= {};
@@ -3673,14 +3687,16 @@
         if (previous?.pose === pose && previous.mapKey === mapKey) return;
         // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
         const sourceTime = typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN;
-        const age = displayedAt - sourceTime;
-        state.displayedPoseMetrics[kind] = { pose, mapKey, ageMs: Number.isFinite(sourceTime) && Number.isFinite(age) && age >= 0 ? age : null };
+        const rawAgeMs = displayedAt - sourceTime;
+        const estimate = activeStreamClockEstimate();
+        const age = rawAgeMs + (estimate?.offsetMs || 0);
+        state.displayedPoseMetrics[kind] = { pose, mapKey, rawAgeMs, calibrated: Boolean(estimate), ageMs: Number.isFinite(sourceTime) && Number.isFinite(age) && age >= 0 ? age : null };
         updateMapStreamChip();
       }
       function mapPoseLatencyText(kind) {
         const metric = state.displayedPoseMetrics?.[kind];
         if (!metric || !displayedMapPoseAllowed(kind, metric.pose) || metric.mapKey !== state.appliedMapIdentity?.key || metric.ageMs === null) return "--";
-        return `${Math.round(metric.ageMs)} ms`;
+        return `${metric.calibrated ? "≈" : ""}${Math.round(metric.ageMs)} ms`;
       }
       function mediaMetricText(kind, now = Date.now(), monotonicNow = performance.now()) {
         const metric = state.mediaMetrics?.[kind];
@@ -3691,8 +3707,9 @@
         const span = samples.length > 1 ? samples[samples.length - 1] - samples[0] : 0;
         const fps = span > 0 && monotonicNow - samples[samples.length - 1] <= 2000 ? (samples.length - 1) * 1000 / span : 0;
         if (mapMetric) return `${fps.toFixed(1)} FPS · 位姿延迟 ${mapPoseLatencyText(kind)}`;
-        const age = metric.sourceTime === null ? null : now - metric.sourceTime;
-        const delay = age !== null && Number.isFinite(age) && age >= 0 ? `${Math.round(age)} ms` : "--";
+        const estimate = activeStreamClockEstimate();
+        const age = metric.sourceTime === null ? null : (metric.displayedAt ?? now) - metric.sourceTime + (estimate?.offsetMs || 0);
+        const delay = age !== null && Number.isFinite(age) && age >= 0 ? `${estimate ? "≈" : ""}${Math.round(age)} ms` : "--";
         return `${fps.toFixed(1)} FPS · 延迟 ${delay}`;
       }
       function recordVideoFrameMetric() {
@@ -3703,7 +3720,7 @@
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
         setVisionText(els.mapStreamStatus, mediaMetricText(kind));
-        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知，包含两端时钟偏差，不等于纯网络时延。";
+        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);
@@ -3728,7 +3745,7 @@
           return;
         }
         setPill(els.mapStatus, status);
-        if (grid && Array.isArray(grid.data)) {
+        if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array)) {
           els.mapEmpty.hidden = true;
           els.mapEmpty.textContent = "";
         } else {
@@ -4097,7 +4114,7 @@
       function buildVideoFrameSrc(data) {
         if (data.stream_url) {
           const url = new URL(data.stream_url, window.location.origin);
-          if (!url.searchParams.get("fps")) url.searchParams.set("fps", "15");
+          // 默认跟随新帧通知；显式 fps 参数仍作为用户选择的发送上限。
           return url.toString();
         }
         return data.data_uri || data.uri || "";
@@ -4155,8 +4172,9 @@
         }
         setVisionText(els.videoFpsStatus, hasFrame ? mediaMetricText("video") : "-- FPS · 延迟 --");
         els.videoFpsStatus.title = state.videoDisplayedIdentity?.timestampSource === "video_relay.write_time"
-          ? "实际显示帧率；延迟从视频中转写入时间计算。"
+          ? "实际显示帧率；延迟在每帧显示时采样，从视频中转写入时间计算。"
           : "实际显示帧率；延迟从图像携带的帧时间计算，缺少时间时显示 --。";
+        els.videoFpsStatus.title += clockCalibrationHint((state.mediaMetrics?.video?.displayedAt ?? Date.now()) - (state.videoDisplayedIdentity?.sourceTime || NaN));
       }
       function visionDisplayState() {
         const frame = state.videoDetectionFrame;
@@ -5010,7 +5028,7 @@
           if (bytes.byteLength - 13 - headerLength !== cells) return null;
           const data = new Int8Array(buffer, 13 + headerLength, cells);
           if (data.some((value) => value < -1 || value > 100)) return null;
-          grid.data = Array.from(data);
+          grid.data = data; // 保留已校验的字节视图，不展开为逐格 JavaScript 数字数组。
           return frame;
         } catch (_) {
           return null;
@@ -5259,14 +5277,24 @@
         }
         if (now < (state.connectionProbeDue || 0)) return;
         const requestId = `${state.streamConnectionEpoch}:${state.connectionProbeSequence = (state.connectionProbeSequence || 0) + 1}`;
-        state.connectionProbe = { requestId, sentAt: now };
+        state.connectionProbe = { requestId, sentAt: now, sentWallAt: Date.now() };
         socket.send(JSON.stringify({ type: "stream.ping", request_id: requestId }));
       }
       function acceptConnectionPong(message) {
         const probe = state.connectionProbe;
         if (!probe || message.request_id !== probe.requestId) return;
         const now = performance.now();
-        setText(els.lastReceive, `${Math.round(now - probe.sentAt)} ms`);
+        const rttMs = now - probe.sentAt;
+        setText(els.lastReceive, `${Math.round(rttMs)} ms`);
+        const serverMs = Number(message.server_timestamp_ns) / 1000000;
+        const clientWallAt = Date.now();
+        if (Number.isFinite(serverMs) && serverMs > 0 && Number.isFinite(probe.sentWallAt)) {
+          const sample = { rttMs, offsetMs: serverMs - (probe.sentWallAt + rttMs / 2),
+            measuredAt: now, clientWallAt, epoch: state.streamConnectionEpoch };
+          state.streamClockSamples = (state.streamClockSamples || []).filter(item => item.epoch === sample.epoch && now - item.measuredAt < 30000);
+          state.streamClockSamples.push(sample);
+          state.streamClockEstimate = state.streamClockSamples.reduce((best, item) => item.rttMs < best.rttMs ? item : best, sample);
+        }
         state.connectionProbe = null;
         state.connectionProbeDue = now + 5000;
       }

@@ -1,9 +1,8 @@
 //! Crash-durable monotonic sequence allocation for the geometry producer.
 //!
-//! One process holds an exclusive flock for the lifetime of this store. Each
-//! reservation is written through a temporary file, fsynced, atomically
-//! renamed, and followed by a parent-directory fsync before it becomes visible
-//! to callers.
+//! 单进程持有文件锁；地图修订按号段持久化上界，段内分配只更新内存。
+//! 重启跳过全部已保留号码，保持旧格式可读取、不回退、不复用。
+//! 生产者代次仍在返回前单独持久化。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -16,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const SEQUENCE_STATE_SCHEMA_VERSION: u32 = 1;
+const MAP_REVISION_BLOCK_SIZE: u64 = 1024;
 const PRODUCTION_SEQUENCE_STATE_PATH: &str =
     "/var/lib/nuwax_robot_bridge/geometry/sequence_state.json";
 
@@ -42,6 +42,7 @@ impl Default for SequenceState {
 #[derive(Debug)]
 struct SequenceStateInner {
     state: SequenceState,
+    last_map_revision: u64,
     poisoned: Option<String>,
 }
 
@@ -123,18 +124,18 @@ impl SequenceStateStore {
             parent,
             _process_lock: process_lock,
             inner: Mutex::new(SequenceStateInner {
+                last_map_revision: state.map_revision,
                 state,
                 poisoned: None,
             }),
         })
     }
 
-    /// Persist and reserve the next globally monotonic positive LCM i32 map
-    /// revision above both the durable state and the supplied local floor.
+    /// 返回高于已分配值及调用方下界的修订，号段不足时先持久化新上界。
     pub(crate) fn reserve_map_revision(&self, floor: u64) -> Result<u64, SequenceStateError> {
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
-        let effective_floor = inner.state.map_revision.max(floor);
+        let effective_floor = inner.last_map_revision.max(floor);
         let next =
             effective_floor
                 .checked_add(1)
@@ -151,10 +152,14 @@ impl SequenceStateStore {
             });
         }
 
-        let mut candidate = inner.state.clone();
-        candidate.map_revision = next;
-        self.persist_or_poison(&mut inner, &candidate)?;
-        inner.state = candidate;
+        if next > inner.state.map_revision {
+            let mut candidate = inner.state.clone();
+            candidate.map_revision = next.saturating_add(MAP_REVISION_BLOCK_SIZE - 1)
+                .min(i32::MAX as u64);
+            self.persist_or_poison(&mut inner, &candidate)?;
+            inner.state = candidate;
+        }
+        inner.last_map_revision = next;
         Ok(next)
     }
 
@@ -181,7 +186,7 @@ impl SequenceStateStore {
     }
 
     pub(crate) fn current_map_revision(&self) -> u64 {
-        self.inner.lock().state.map_revision
+        self.inner.lock().last_map_revision
     }
 
     #[cfg(test)]
@@ -374,9 +379,9 @@ mod tests {
 
         let second = SequenceStateStore::open(&path).expect("restarted store");
         assert_eq!(second.current_producer_runtime_generation(), 1);
-        assert_eq!(second.current_map_revision(), 1);
+        assert_eq!(second.current_map_revision(), MAP_REVISION_BLOCK_SIZE);
         assert_eq!(second.reserve_producer_runtime_generation().unwrap(), 2);
-        assert_eq!(second.reserve_map_revision(0).unwrap(), 2);
+        assert_eq!(second.reserve_map_revision(0).unwrap(), MAP_REVISION_BLOCK_SIZE + 1);
     }
 
     #[test]
@@ -401,10 +406,31 @@ mod tests {
         drop(first);
 
         let reopened = SequenceStateStore::open(&path).expect("reopen durable state");
-        assert_eq!(reopened.current_map_revision(), 1);
+        assert_eq!(reopened.current_map_revision(), MAP_REVISION_BLOCK_SIZE);
         assert_eq!(reopened.current_producer_runtime_generation(), 1);
-        assert_eq!(reopened.reserve_map_revision(0).unwrap(), 2);
+        assert_eq!(reopened.reserve_map_revision(0).unwrap(), MAP_REVISION_BLOCK_SIZE + 1);
         assert_eq!(reopened.reserve_producer_runtime_generation().unwrap(), 2);
+    }
+
+    #[test]
+    fn reserved_map_block_needs_no_disk_access_and_restart_skips_unused_numbers() {
+        let path = test_path("reserved-block");
+        let store = SequenceStateStore::open(&path).unwrap();
+        assert_eq!(store.reserve_map_revision(0).unwrap(), 1);
+        let durable = fs::read(&path).unwrap();
+        // 让下一次实际持久化失败；段内号码仍有原持久化上界保护。
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        for revision in 2..=MAP_REVISION_BLOCK_SIZE {
+            assert_eq!(store.reserve_map_revision(0).unwrap(), revision);
+        }
+        assert!(store.reserve_map_revision(0).is_err());
+        assert_eq!(store.current_map_revision(), MAP_REVISION_BLOCK_SIZE);
+        drop(store);
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, durable).unwrap();
+        let reopened = SequenceStateStore::open(&path).unwrap();
+        assert_eq!(reopened.reserve_map_revision(0).unwrap(), MAP_REVISION_BLOCK_SIZE + 1);
     }
 
     #[test]

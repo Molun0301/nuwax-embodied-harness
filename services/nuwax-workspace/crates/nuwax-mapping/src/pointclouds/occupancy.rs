@@ -337,21 +337,53 @@ fn correlate_axis(
     axis: usize,
     weights: &[f64],
 ) -> Vec<f32> {
-    let radius = (weights.len() / 2) as i32;
     let mut output = vec![0.0_f32; input.len()];
-    for row in 0..height {
-        for column in 0..width {
-            let mut value = 0.0_f64;
-            for (kernel_index, weight) in weights.iter().enumerate() {
-                let offset = kernel_index as i32 - radius;
-                let (source_row, source_column) = if axis == 0 {
-                    (reflect_index(row as i32 + offset, height), column)
-                } else {
-                    (row, reflect_index(column as i32 + offset, width))
-                };
-                value += f64::from(input[source_row * width + source_column]) * weight;
+    if input.is_empty() || weights.is_empty() {
+        return output;
+    }
+    let radius = (weights.len() / 2) as i32;
+    let mut values = vec![0.0_f64; width];
+    if axis == 0 {
+        for row in 0..height {
+            values.fill(0.0);
+            for (index, weight) in weights.iter().enumerate() {
+                let source = reflect_index(row as i32 + index as i32 - radius, height);
+                let source_row = &input[source * width..(source + 1) * width];
+                // 连续列独立计算，允许编译器向量化；每个像素仍按原权重顺序双精度累加。
+                for (value, point) in values.iter_mut().zip(source_row) {
+                    *value += f64::from(*point) * weight;
+                }
             }
-            output[row * width + column] = value as f32;
+            for (target, value) in output[row * width..(row + 1) * width]
+                .iter_mut()
+                .zip(&values)
+            {
+                *target = *value as f32;
+            }
+        }
+    } else {
+        // 每行只扩展一次反射边界，把内层索引查找改为连续窗口读取。
+        let sources: Vec<_> = (0..width + weights.len() - 1)
+            .map(|position| reflect_index(position as i32 - radius, width))
+            .collect();
+        let mut padded = vec![0.0_f32; sources.len()];
+        for row in 0..height {
+            values.fill(0.0);
+            let source_row = &input[row * width..(row + 1) * width];
+            for (point, source) in padded.iter_mut().zip(&sources) {
+                *point = source_row[*source];
+            }
+            for (index, weight) in weights.iter().enumerate() {
+                for (value, point) in values.iter_mut().zip(&padded[index..index + width]) {
+                    *value += f64::from(*point) * weight;
+                }
+            }
+            for (target, value) in output[row * width..(row + 1) * width]
+                .iter_mut()
+                .zip(&values)
+            {
+                *target = *value as f32;
+            }
         }
     }
     output
@@ -613,9 +645,8 @@ impl PointCloudOccupancyBuilder {
                 let idx = (row * self.width + col) as usize;
                 // Sobel实际消费整个3×3邻域，斜角缺测也必须保留未知。
                 // 仅检查十字邻域会把缺测填充值0当作真实高度，制造随世界高度变化的假台阶。
-                let valid = (row - 1..=row + 1).all(|r| {
-                    (col - 1..=col + 1).all(|c| observed[(r * self.width + c) as usize])
-                });
+                let valid = (row - 1..=row + 1)
+                    .all(|r| (col - 1..=col + 1).all(|c| observed[(r * self.width + c) as usize]));
                 if !valid {
                     continue;
                 }
@@ -673,6 +704,43 @@ impl PointCloudOccupancyBuilder {
 mod tests {
     use super::*;
     use crate::cost_mapper::SimplePointCloud2;
+
+    #[test]
+    fn reflected_filter_matches_scalar_reference_bit_for_bit() {
+        // 保留修改前的标量计算作为独立参照，覆盖窄图、大核、边缘与两条滤波轴。
+        for (width, height) in [(1, 1), (2, 3), (17, 11), (127, 91)] {
+            let input: Vec<f32> = (0..width * height)
+                .map(|i| ((i as f64 * 1.713).sin() * 17.0) as f32)
+                .collect();
+            for weights in [
+                vec![-1.0, 0.0, 1.0],
+                vec![1.0, 2.0, 1.0],
+                (-8..=8).map(|x| (-f64::from(x * x) / 8.0).exp()).collect(),
+            ] {
+                for axis in [0, 1] {
+                    let actual = correlate_axis(&input, width, height, axis, &weights);
+                    for row in 0..height {
+                        for column in 0..width {
+                            let mut expected = 0.0_f64;
+                            for (index, weight) in weights.iter().enumerate() {
+                                let offset = index as i32 - (weights.len() / 2) as i32;
+                                let (r, c) = if axis == 0 {
+                                    (reflect_index(row as i32 + offset, height), column)
+                                } else {
+                                    (row, reflect_index(column as i32 + offset, width))
+                                };
+                                expected += f64::from(input[r * width + c]) * weight;
+                            }
+                            assert_eq!(
+                                actual[row * width + column].to_bits(),
+                                (expected as f32).to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn small_grid() -> CostMap2D {
         make_costmap2d(11, 11, 0.1)

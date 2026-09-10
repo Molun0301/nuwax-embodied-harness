@@ -845,6 +845,8 @@ mod preflight_only_contract {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum CorrectionRejectReason {
         Stopped,
+        RebuildBudgetExceeded,
+        IncompleteScanHistory,
         InvalidIdentity(&'static str),
         NonFiniteTransform,
         TranslationOutOfBounds,
@@ -2337,6 +2339,9 @@ mod preflight_only_contract {
     pub(crate) enum CanonicalCorrectionApplyError {
         #[error("correction request was canceled")]
         Cancelled,
+        /// 仅用于领取规范提交前可确认回滚的准备拒绝；不能用于提交结果不确定的失败。
+        #[error("correction preparation rejected: {0}")]
+        PreparationRejected(CorrectionRejectReason),
         #[error("{0}")]
         Failed(String),
     }
@@ -2717,6 +2722,24 @@ mod preflight_only_contract {
                             Ok(CorrectionDisposition::Rejected(
                                 CorrectionRejectReason::Stopped,
                             ))
+                        }
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                (Err(CanonicalCorrectionApplyError::PreparationRejected(reason)), phase)
+                    if !phase.is_post_claim() =>
+                {
+                    operation.cancel_pending();
+                    match state.coordinator.abort(&reservation.prepared) {
+                        Ok(()) => {
+                            state.staged = None;
+                            tracing::warn!(
+                                event = "geometry.correction.preparation_rejected",
+                                %reason,
+                                correction_revision = state.correction_revision,
+                                "校正准备已回滚，保留当前有效地图与位姿"
+                            );
+                            Ok(CorrectionDisposition::Rejected(reason))
                         }
                         Err(error) => Err(error.to_string()),
                     }
@@ -16663,6 +16686,142 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             }
         }
 
+        struct PreparationRejectingApplier {
+            reject_next: AtomicBool,
+            after_claim: bool,
+            reason: CorrectionRejectReason,
+            accepted: RecordingCanonicalApplier,
+        }
+
+        #[async_trait::async_trait]
+        impl CanonicalCorrectionApplier for PreparationRejectingApplier {
+            async fn apply_transaction(
+                &self,
+                transaction: CanonicalCorrectionTransaction,
+                cancellation: CorrectionRequestCancellation,
+            ) -> Result<(), CanonicalCorrectionApplyError> {
+                if self.reject_next.swap(false, Ordering::AcqRel) {
+                    if self.after_claim {
+                        assert!(cancellation.operation().try_claim(&cancellation));
+                    }
+                    return Err(CanonicalCorrectionApplyError::PreparationRejected(
+                        self.reason.clone(),
+                    ));
+                }
+                self.accepted
+                    .apply_transaction(transaction, cancellation)
+                    .await
+            }
+        }
+
+        #[tokio::test]
+        async fn preparation_rejection_keeps_finalizer_alive_releases_lifecycle_and_accepts_next_candidate(
+        ) {
+            for reason in [
+                CorrectionRejectReason::RebuildBudgetExceeded,
+                CorrectionRejectReason::IncompleteScanHistory,
+            ] {
+                let applier = Arc::new(PreparationRejectingApplier {
+                    reject_next: AtomicBool::new(true),
+                    after_claim: false,
+                    reason: reason.clone(),
+                    accepted: RecordingCanonicalApplier::new(false),
+                });
+                let sink = Arc::new(
+                    GeometryCorrectionSink::new(
+                        owner_identity(),
+                        "robot_map",
+                        "robot_odom",
+                        "robot_body",
+                        applier.clone(),
+                    )
+                    .unwrap(),
+                );
+                let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
+                let waiters = Arc::new(CandidateApplyWaiters::default());
+                let mut finalizer =
+                    CanonicalPublishFinalizerSupervisor::start(sink.clone(), waiters.clone());
+                for sequence in [1, 2] {
+                    let input = frame(sequence, sequence * 100, 0.0);
+                    let candidate =
+                        candidate_for_frame(&input, sequence as u64, Isometry3::identity());
+                    sink.stage_frame(&input).await.unwrap();
+                    let cancellation = CorrectionRequestCancellation::new();
+                    let lease = Arc::new(CorrectionRequestLease::new(
+                        cancellation,
+                        Some(lifecycle.clone().lock_owned().await),
+                    ));
+                    let key = CandidateApplyKey {
+                        candidate_sequence: candidate.identity.candidate_sequence,
+                        payload_sha256: candidate.payload_sha256,
+                    };
+                    let apply_rx = waiters.register(key, lease).unwrap();
+                    let (outcome, outcome_rx) = oneshot::channel();
+                    finalizer
+                        .ingress
+                        .sender
+                        .send(CanonicalFinalizerJob {
+                            key,
+                            candidate,
+                            lease: waiters.claim_apply(key).unwrap(),
+                            release_lease_on_completion: true,
+                            outcome,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(outcome_rx.await.unwrap().is_ok());
+                    let disposition = apply_rx.await.unwrap().unwrap();
+                    assert_eq!(
+                        disposition,
+                        if sequence == 1 {
+                            CorrectionDisposition::Rejected(reason.clone())
+                        } else {
+                            CorrectionDisposition::Applied
+                        }
+                    );
+                    assert_eq!(sink.correction_revision().await, sequence as u64 - 1);
+                    assert!(lifecycle.try_lock().is_ok());
+                    assert!(!finalizer.is_finished());
+                }
+                assert_eq!(applier.accepted.transactions().await.len(), 1);
+                finalizer.shutdown().await.unwrap();
+                sink.stop().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn preparation_rejection_after_claim_is_still_poisoned() {
+            let applier = Arc::new(PreparationRejectingApplier {
+                reject_next: AtomicBool::new(true),
+                after_claim: true,
+                reason: CorrectionRejectReason::RebuildBudgetExceeded,
+                accepted: RecordingCanonicalApplier::new(false),
+            });
+            let sink = GeometryCorrectionSink::new(
+                owner_identity(),
+                "robot_map",
+                "robot_odom",
+                "robot_body",
+                applier,
+            )
+            .unwrap();
+            let input = frame(1, 100, 0.0);
+            sink.stage_frame(&input).await.unwrap();
+            let (calls, hook) = test_fail_stop_counter();
+            let cancellation = CorrectionRequestCancellation::with_fail_stop(hook);
+            let operation = cancellation.operation();
+            assert!(sink
+                .apply_candidate(
+                    candidate_for_frame(&input, 1, Isometry3::identity()),
+                    cancellation,
+                )
+                .await
+                .is_err());
+            assert_eq!(operation.phase(), CanonicalOperationPhase::Poisoned);
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert_eq!(sink.correction_revision().await, 0);
+        }
+
         #[derive(Default)]
         struct GatedCanonicalApplier {
             before_publish: tokio::sync::Notify,
@@ -18890,12 +19049,12 @@ pub(crate) use preflight_only_contract::{
     CanonicalCorrectionApplyError, CanonicalCorrectionTransaction, CommittedMapProof,
     CorrectionCandidateBackend, CorrectionFrameIngress, CorrectionFrameInput, CorrectionLeaseId,
     CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec, CorrectionPhaseAControl,
-    CorrectionProcessStopAttempt, CorrectionRequestCancellation, CorrectionRuntimeError,
-    CorrectionTransportOwner, CorrelatedOdomProof, FrozenCorrelatedOdom, GeometryCorrectionSink,
-    RegisteredCloudProof, RelocalizationCommandError, RelocalizationCommandIngress,
-    RelocalizationCommandWaiter, RelocalizationModeFence, RelocalizationTerminalSnapshot,
-    RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1, RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
-    RELOCALIZATION_SOURCE_POLICY_VERSION_V1,
+    CorrectionProcessStopAttempt, CorrectionRejectReason, CorrectionRequestCancellation,
+    CorrectionRuntimeError, CorrectionTransportOwner, CorrelatedOdomProof, FrozenCorrelatedOdom,
+    GeometryCorrectionSink, RegisteredCloudProof, RelocalizationCommandError,
+    RelocalizationCommandIngress, RelocalizationCommandWaiter, RelocalizationModeFence,
+    RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1,
+    RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION_V1,
 };
 
 #[cfg(test)]

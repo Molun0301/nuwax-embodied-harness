@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+import asyncio
+import multiprocessing
 import base64
 from collections import OrderedDict
 import heapq
@@ -19,6 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from core.logging_utils import _redact_sensitive_text, _is_sensitive_key
+from core.process_title import set_process_title
 
 _TEXT_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d[,.]\d+)\s+\[(?P<level>\w+)\]\s+\[(?P<component>[^]]+)\]\s*(?P<message>.*)$")
 _RUST_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\dT\S+)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<message>.*)$")
@@ -584,34 +588,156 @@ def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
     return result
 
 
+def _render_log_response(log_file, options, export_format):
+    result = query_logs(log_file, **options)
+    if export_format is None:
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), {}
+    rows = reversed(result["entries"])
+    if export_format == "jsonl":
+        content = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in rows)
+    else:
+        content = "".join(f'{entry["timestamp"]} [{entry["level"]}] [{entry["component"]}] {entry["message"]}\n'
+            + json.dumps({key: value for key, value in entry.items() if key not in
+                {"timestamp", "level", "component", "message", "exception"}}, ensure_ascii=False)
+            + "\n" + (entry.get("exception") or "") + "\n" for entry in rows)
+    return content.encode("utf-8"), {"X-Logs-Has-More": str(result["has_more"]).lower(),
+                                    "X-Logs-Next-Before": result["next_before"] or ""}
+
+
+def _log_query_process(connection):
+    """只读取日志并复用原索引；不构造设备、网关运行时或业务服务。"""
+    set_process_title("nuwax-log-query")
+    if hasattr(os, "nice"):
+        os.nice(10)  # 历史扫描让出调度优先级，给实时采集和交付保留余量。
+    try:
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            try:
+                connection.send((True, _render_log_response(*request)))
+            except Exception as error:
+                connection.send((False, f"{type(error).__name__}: {error}"))
+    except (EOFError, BrokenPipeError):
+        pass
+    finally:
+        connection.close()
+
+
+class _LogQueryWorker:
+    """路由拥有的单查询进程；取消不释放尚在处理的请求槽，关闭回收只读计算。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._process = None
+        self._connection = None
+        self._slot = None
+
+    def _execute(self, log_file, options, export_format):
+        with self._lock:
+            if self._stopped.is_set():
+                raise RuntimeError("日志查询拥有方已关闭")
+            if self._process is not None and not self._process.is_alive():
+                self._process.join()
+                self._connection.close()
+                self._process = self._connection = None
+            if self._process is None:
+                context = multiprocessing.get_context("spawn")
+                # 生产启动器使用 exec -a 命名，Python 3.8 的 sys.executable 可能为空。
+                # 使用当前真实解释器，不能让子进程尝试执行显示名称或空路径。
+                if not sys.executable and sys.platform.startswith("linux"):
+                    context.set_executable(os.readlink("/proc/self/exe"))
+                parent, child = context.Pipe()
+                process = context.Process(target=_log_query_process, args=(child,), name="nuwax-log-query")
+                try:
+                    process.start()
+                except BaseException:
+                    parent.close()
+                    child.close()
+                    raise
+                child.close()
+                self._process, self._connection = process, parent
+            process, connection = self._process, self._connection
+        connection.send((log_file, options, export_format))
+        while not self._stopped.is_set():
+            if connection.poll(.1):
+                ok, result = connection.recv()
+                if not ok:
+                    raise RuntimeError(result)
+                return result
+            if not process.is_alive():
+                raise RuntimeError(f"日志查询进程已退出：{process.exitcode}")
+        raise RuntimeError("日志查询已随网关关闭")
+
+    async def query(self, log_file, options, export_format=None):
+        if self._slot is None:
+            self._slot = asyncio.Semaphore(1)
+        await self._slot.acquire()
+        try:
+            future = asyncio.get_running_loop().run_in_executor(None, self._execute,
+                                                                log_file, options, export_format)
+        except BaseException:
+            self._slot.release()
+            raise
+        def completed(done):
+            self._slot.release()
+            # 调用者已经断开时也领取真实错误，不遗留未消费的任务异常。
+            if not done.cancelled():
+                done.exception()
+        future.add_done_callback(completed)
+        return await asyncio.shield(future)
+
+    def close(self):
+        with self._lock:
+            self._stopped.set()
+            process, connection = self._process, self._connection
+        if process is None:
+            return
+        # 进程只做查询；服务关闭不等待任意大小历史扫描完成。
+        if process.is_alive():
+            process.terminate()
+        process.join(2)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        if process.is_alive():
+            raise RuntimeError("日志查询进程尚未退出")
+        connection.close()
+        with self._lock:
+            self._process = self._connection = None
+
+
 def build_logs_router(runtime, access_manager=None) -> APIRouter:
-    """沿用控制台访问边界，不额外增加一套日志权限状态。"""
-    router = APIRouter()
+    """沿用控制台访问边界，独立查询进程随路由生命周期关闭。"""
+    worker = _LogQueryWorker()
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await run_in_threadpool(worker.close)
+    router = APIRouter(lifespan=lifespan)
+
+    def options(limit, before, level, source, component, query, request_id, task_id):
+        return dict(log_dir=runtime.config.logging.log_dir, limit=limit, before=before,
+                    level=level, source=source, component=component, query=query,
+                    request_id=request_id, task_id=task_id)
 
     @router.get("/api/logs")
     async def logs(limit: int = Query(200, ge=1, le=1000), before: str = "", level: str = "", source: str = "",
                    component: str = "", query: str = "", request_id: str = "", task_id: str = ""):
-        return await run_in_threadpool(query_logs, runtime.config.logging.log_file, log_dir=runtime.config.logging.log_dir, limit=limit, before=before,
-                                       level=level, source=source, component=component, query=query,
-                                       request_id=request_id, task_id=task_id)
+        content, _ = await worker.query(runtime.config.logging.log_file,
+            options(limit, before, level, source, component, query, request_id, task_id))
+        return Response(content, media_type="application/json")
 
     @router.get("/api/logs/export")
     async def export_logs(limit: int = Query(10000, ge=1, le=100000), before: str = "", level: str = "", source: str = "",
                           component: str = "", query: str = "", request_id: str = "", task_id: str = "",
                           format: str = Query("jsonl", pattern="^(jsonl|text)$")):
-        def render():
-            result = query_logs(runtime.config.logging.log_file, log_dir=runtime.config.logging.log_dir, limit=limit, before=before, level=level, source=source,
-                                component=component, query=query, request_id=request_id, task_id=task_id)
-            rows = reversed(result["entries"])
-            if format == "jsonl":
-                content = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in rows)
-            else:
-                content = "".join(f'{entry["timestamp"]} [{entry["level"]}] [{entry["component"]}] {entry["message"]}\n'
-                                  + json.dumps({key: value for key, value in entry.items() if key not in {"timestamp", "level", "component", "message", "exception"}}, ensure_ascii=False)
-                                  + "\n" + (entry.get("exception") or "") + "\n" for entry in rows)
-            return content, result
-        content, result = await run_in_threadpool(render)
+        content, headers = await worker.query(runtime.config.logging.log_file,
+            options(limit, before, level, source, component, query, request_id, task_id), format)
+        headers["Content-Disposition"] = f'attachment; filename="nuwax-logs.{"jsonl" if format == "jsonl" else "txt"}"'
         return Response(content, media_type="application/x-ndjson" if format == "jsonl" else "text/plain",
-                        headers={"Content-Disposition": f'attachment; filename="nuwax-logs.{"jsonl" if format == "jsonl" else "txt"}"',
-                                 "X-Logs-Has-More": str(result["has_more"]).lower(), "X-Logs-Next-Before": result["next_before"] or ""})
+                        headers=headers)
     return router

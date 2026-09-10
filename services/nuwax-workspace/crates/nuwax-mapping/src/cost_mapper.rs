@@ -316,17 +316,30 @@ impl CostMapper {
         occupancy_cfg: &OccupancyConfig,
         resolution: f64,
     ) -> Result<(Self, OccupancyGrid, Costmap), MappingError> {
-        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
-        let mut grid = build_occupancy_auto(cloud, resolution, &pointcloud_config)?;
-        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
+        let grid = Self::occupancy_from_pointcloud_auto(cloud, occupancy_cfg, resolution)?;
 
         let mut normalized_config = occupancy_cfg.clone();
-        normalized_config.pointcloud = pointcloud_config;
+        normalized_config.pointcloud = selected_pointcloud_config(occupancy_cfg);
         let mapper = Self::new(CostMapperConfig {
             config: normalized_config,
         });
         let costmap = mapper.convert(&grid);
         Ok((mapper, grid, costmap))
+    }
+
+    /// 只生成占据栅格；不为只消费栅格的建图拥有方分配并逐格转换未使用的代价图。
+    ///
+    /// # Errors
+    /// 配置、分辨率或地图范围无效时返回与完整转换入口相同的错误。
+    pub fn occupancy_from_pointcloud_auto<P: PointCloud2Like + ?Sized>(
+        cloud: &P,
+        occupancy_cfg: &OccupancyConfig,
+        resolution: f64,
+    ) -> Result<OccupancyGrid, MappingError> {
+        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
+        let mut grid = build_occupancy_auto(cloud, resolution, &pointcloud_config)?;
+        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
+        Ok(grid)
     }
 }
 

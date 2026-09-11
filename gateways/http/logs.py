@@ -1,4 +1,4 @@
-"""统一日志历史查询与导出。磁盘扫描在线程中执行，按记录游标翻页。"""
+"""统一日志历史查询与导出。路由使用独立查询进程，按记录游标翻页。"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -588,8 +588,8 @@ def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
     return result
 
 
-def _render_log_response(log_file, options, export_format):
-    result = query_logs(log_file, **options)
+def _render_log_response(log_file, options, export_format, *, reader=None):
+    result = (query_logs if reader is None else reader)(log_file, **options)
     if export_format is None:
         return json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), {}
     rows = reversed(result["entries"])
@@ -605,22 +605,25 @@ def _render_log_response(log_file, options, export_format):
 
 
 def _log_query_process(connection):
-    """只读取日志并复用原索引；不构造设备、网关运行时或业务服务。"""
+    """只读取日志并维护派生索引；不构造设备、网关运行时或业务服务。"""
+    from .log_index import LogHistoryReader
     set_process_title("nuwax-log-query")
     if hasattr(os, "nice"):
         os.nice(10)  # 历史扫描让出调度优先级，给实时采集和交付保留余量。
+    reader = LogHistoryReader()
     try:
         while True:
             request = connection.recv()
             if request is None:
                 return
             try:
-                connection.send((True, _render_log_response(*request)))
+                connection.send((True, _render_log_response(*request, reader=reader.query)))
             except Exception as error:
                 connection.send((False, f"{type(error).__name__}: {error}"))
     except (EOFError, BrokenPipeError):
         pass
     finally:
+        reader.close()
         connection.close()
 
 

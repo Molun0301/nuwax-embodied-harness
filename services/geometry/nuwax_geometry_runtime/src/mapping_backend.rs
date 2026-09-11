@@ -483,8 +483,34 @@ struct MappingBackendExportJob {
 
 struct MappingBackendRestoreJob {
     transaction_id: u128,
-    payload: Vec<u8>,
+    input: MappingBackendRestoreInput,
     completion: tokio::sync::oneshot::Sender<Result<MappingBackendCommitHandle, String>>,
+}
+
+enum MappingBackendRestoreInput {
+    Encoded(Vec<u8>),
+    Prepared(PreparedMappingBackendRestore),
+}
+
+/// 已在后台完整解码验证的内核；跨入提交区时只转移拥有权。
+pub(crate) struct PreparedMappingBackendRestore {
+    kernel: MappingKernel,
+    encoded: Vec<u8>,
+    spec: MappingBackendSpec,
+    config: MappingBackendComputeConfig,
+}
+
+pub(crate) fn prepare_mapping_backend_restore(
+    spec: MappingBackendSpec,
+    config: MappingBackendComputeConfig,
+    payload: Vec<u8>,
+) -> Result<PreparedMappingBackendRestore, String> {
+    Ok(PreparedMappingBackendRestore {
+        kernel: restore_mapping_kernel_checkpoint(spec, config, &payload)?,
+        encoded: payload,
+        spec,
+        config,
+    })
 }
 
 struct MappingBackendFlushJob {
@@ -802,11 +828,31 @@ impl MappingBackendWorker {
                                 .send(export_mapping_kernel_checkpoint(&kernel));
                         }
                         MappingBackendCommand::RestoreCheckpoint(job) => {
-                            let result = restore_mapping_kernel_checkpoint(
-                                spec,
-                                compute_config,
-                                &job.payload,
-                            );
+                            let result = match job.input {
+                                MappingBackendRestoreInput::Encoded(payload) => {
+                                    restore_mapping_kernel_checkpoint(
+                                        spec,
+                                        compute_config,
+                                        &payload,
+                                    )
+                                }
+                                MappingBackendRestoreInput::Prepared(prepared) => {
+                                    if prepared.spec == spec
+                                        && prepared.config.window_capacity
+                                            == compute_config.window_capacity
+                                        && prepared.config.resolution.to_bits()
+                                            == compute_config.resolution.to_bits()
+                                        && prepared.config.occupancy_algo
+                                            == compute_config.occupancy_algo
+                                        && prepared.config.initial_safe_radius_meters.to_bits()
+                                            == compute_config.initial_safe_radius_meters.to_bits()
+                                    {
+                                        Ok(prepared.kernel)
+                                    } else {
+                                        Err("预解码地图后端与当前配置不匹配".into())
+                                    }
+                                }
+                            };
                             match result {
                                 Ok(restored) => {
                                     let (resolution, resolution_rx) =
@@ -1024,6 +1070,26 @@ impl MappingBackendClient {
         tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
         MappingBackendSubmitError,
     > {
+        self.restore_input(MappingBackendRestoreInput::Encoded(payload))
+    }
+
+    pub(crate) fn restore_prepared_checkpoint(
+        &self,
+        prepared: PreparedMappingBackendRestore,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
+        MappingBackendSubmitError,
+    > {
+        self.restore_input(MappingBackendRestoreInput::Prepared(prepared))
+    }
+
+    fn restore_input(
+        &self,
+        input: MappingBackendRestoreInput,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
+        MappingBackendSubmitError,
+    > {
         if self.stopped.load(Ordering::Acquire) {
             return Err(MappingBackendSubmitError::WorkerStopped);
         }
@@ -1033,7 +1099,7 @@ impl MappingBackendClient {
             .try_send(MappingBackendCommand::RestoreCheckpoint(
                 MappingBackendRestoreJob {
                     transaction_id: uuid::Uuid::new_v4().as_u128(),
-                    payload,
+                    input,
                     completion,
                 },
             )) {
@@ -2042,8 +2108,7 @@ fn cleared_previous_occupancy(
 }
 
 fn candidate_due(last_received_at_ns: u64, received_at_ns: u64, interval_ns: u64) -> bool {
-    last_received_at_ns == 0
-        || received_at_ns.saturating_sub(last_received_at_ns) >= interval_ns
+    last_received_at_ns == 0 || received_at_ns.saturating_sub(last_received_at_ns) >= interval_ns
 }
 
 pub(crate) fn flush_candidate(
@@ -2199,7 +2264,11 @@ pub(crate) fn compute_candidate_in_place_with_interval(
             ray.validate_checkpoint_budget()?;
             ray.dirty_since_candidate = true;
             // 每帧更新体素，但只有真正构图时才导出并排序完整历史点集。
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
+            if !candidate_due(
+                ray.last_candidate_received_at_ns,
+                input.received_at_ns,
+                candidate_interval_ns,
+            ) {
                 return Ok(None);
             }
             ray.refresh_stable_points();
@@ -2210,7 +2279,11 @@ pub(crate) fn compute_candidate_in_place_with_interval(
     let (live_window_occupancy, latest_frame_occupancy) = match kernel {
         MappingKernel::Voxel(voxel) => {
             let point_count = voxel.current_window.len();
-            if !candidate_due(voxel.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
+            if !candidate_due(
+                voxel.last_candidate_received_at_ns,
+                input.received_at_ns,
+                candidate_interval_ns,
+            ) {
                 return Ok(None);
             }
             let live_points = voxel.current_window.make_contiguous();
@@ -2227,7 +2300,11 @@ pub(crate) fn compute_candidate_in_place_with_interval(
             let Some(previous) = ray.last_occupancy.as_ref() else {
                 return Ok(None);
             };
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
+            if !candidate_due(
+                ray.last_candidate_received_at_ns,
+                input.received_at_ns,
+                candidate_interval_ns,
+            ) {
                 return Ok(None);
             }
             let cleared = cleared_previous_occupancy(previous, input);
@@ -2240,7 +2317,11 @@ pub(crate) fn compute_candidate_in_place_with_interval(
         }
         MappingKernel::Raytracing(ray) => {
             let point_count = ray.stable_points.len();
-            if !candidate_due(ray.last_candidate_received_at_ns, input.received_at_ns, candidate_interval_ns) {
+            if !candidate_due(
+                ray.last_candidate_received_at_ns,
+                input.received_at_ns,
+                candidate_interval_ns,
+            ) {
                 return Ok(None);
             }
             let live = build_occupancy(&ray.stable_points, input, config)?;
@@ -2664,7 +2745,10 @@ mod tests {
                     );
                 }
             }
-            assert!(candidate_count >= 14, "100毫秒真实输入在完成后端初始化后应逐次交付，不再被250毫秒门槛丢弃");
+            assert!(
+                candidate_count >= 14,
+                "100毫秒真实输入在完成后端初始化后应逐次交付，不再被250毫秒门槛丢弃"
+            );
             let mut empty = input(17);
             empty.registered_points_map.clear();
             empty.source_timestamp_ns = 79_000_000_000;

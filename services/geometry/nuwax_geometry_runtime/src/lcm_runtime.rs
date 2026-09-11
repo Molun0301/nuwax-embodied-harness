@@ -4045,6 +4045,7 @@ pub(crate) struct CanonicalCorrectionSnapshot {
 #[derive(Clone)]
 struct PgoApplyContext {
     mapping: Arc<parking_lot::Mutex<MappingAdapter>>,
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_writer: Arc<parking_lot::Mutex<Option<CloudMapShmWriter>>>,
     map_revision_tx: broadcast::Sender<MapRevisionEvent>,
     cloud_map_tx: broadcast::Sender<CloudMapNotification>,
@@ -4062,6 +4063,8 @@ pub(crate) struct GeometryCanonicalCorrectionApplier {
     current: Arc<parking_lot::RwLock<Option<CanonicalCorrectionSnapshot>>>,
     pgo: std::sync::OnceLock<PgoApplyContext>,
     rebuild_budget: Duration,
+    #[cfg(test)]
+    background_prepare_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl GeometryCanonicalCorrectionApplier {
@@ -4101,6 +4104,8 @@ impl GeometryCanonicalCorrectionApplier {
             current: Arc::new(parking_lot::RwLock::new(None)),
             pgo: std::sync::OnceLock::new(),
             rebuild_budget: crate::pgo_map::REBUILD_BUDGET,
+            #[cfg(test)]
+            background_prepare_gate: None,
         })
     }
 
@@ -4113,6 +4118,7 @@ impl GeometryCanonicalCorrectionApplier {
         self.pgo
             .set(PgoApplyContext {
                 mapping: mapping.clone(),
+                lifecycle_lock: handle.mapping_lifecycle_lock.clone(),
                 cloud_writer: handle.cloud_map_writer.clone(),
                 map_revision_tx: handle.map_revision_tx.clone(),
                 cloud_map_tx: handle.cloud_map_tx.clone(),
@@ -4125,6 +4131,149 @@ impl GeometryCanonicalCorrectionApplier {
 
     pub(crate) fn snapshot(&self) -> Option<CanonicalCorrectionSnapshot> {
         self.current.read().clone()
+    }
+
+    async fn prepare_background_pgo(
+        &self,
+        transaction: &crate::correction_coordinator::CanonicalCorrectionTransaction,
+        cancellation: &crate::correction_coordinator::CorrectionRequestCancellation,
+    ) -> Result<
+        (crate::pgo_map::RebuiltMap, (u64, u64, u64)),
+        crate::correction_coordinator::CanonicalCorrectionApplyError,
+    > {
+        use crate::correction_coordinator::{
+            CanonicalCorrectionApplyError as ApplyError, CorrectionRejectReason as Reject,
+        };
+        let context = self
+            .pgo
+            .get()
+            .ok_or_else(|| ApplyError::Failed("PGO地图管线未绑定".into()))?;
+        let snapshot = |after| {
+            let mapping = context.mapping.lock();
+            let session = mapping.snapshot();
+            if !session.active
+                || session.session_id != transaction.mapping_session_id
+                || session.session_generation != transaction.mapping_session_generation
+            {
+                return Err(ApplyError::PreparationRejected(
+                    Reject::MappingSessionMismatch,
+                ));
+            }
+            if mapping.global_frame_generation() != transaction.map_frame_generation {
+                return Err(ApplyError::PreparationRejected(
+                    Reject::MapFrameGenerationMismatch,
+                ));
+            }
+            let anchor = mapping
+                .map_odom_transform_snapshot()
+                .ok_or_else(|| ApplyError::Failed("PGO地图锚点缺失".into()))?;
+            if anchor.correction_revision.checked_add(1) != Some(transaction.correction_revision) {
+                return Err(ApplyError::PreparationRejected(Reject::OutOfOrderCandidate));
+            }
+            if !canonical_isometry_near(
+                &anchor.base_isometry(),
+                &transaction.base_anchor_map_from_odom,
+            ) {
+                return Err(ApplyError::Failed("PGO地图锚点不匹配".into()));
+            }
+            mapping
+                .pgo_replay_input_since(after)
+                .map_err(pgo_preparation_error)
+        };
+        // 上次校正完成前进入最新槽的旧证明可被跳过，不能把正常并发当作拥有方故障。
+        if self.current.read().as_ref().is_some_and(|current| {
+            current.mapping_session_generation == transaction.mapping_session_generation
+                && (transaction.occupancy_revision <= current.occupancy_revision
+                    || transaction.cloud_revision <= current.cloud_revision)
+        }) {
+            return Err(ApplyError::PreparationRejected(
+                Reject::OccupancyRevisionMismatch,
+            ));
+        }
+        let (scans, spec, config, backend_generation) = snapshot(0)?;
+        self.validate_transaction(transaction)
+            .map_err(ApplyError::Failed)?;
+        #[cfg(test)]
+        if let Some((entered, release)) = self.background_prepare_gate.as_ref() {
+            entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
+                _ = release.notified() => {},
+            }
+        }
+        let trajectory = transaction.trajectory.clone();
+        let anchor = transaction.base_anchor_map_from_odom;
+        let frame = self.map_frame_id.clone();
+        let budget = self.rebuild_budget;
+        let cancelled = cancellation.clone();
+        let (mut builder, mut prepared) = tokio::task::spawn_blocking(move || {
+            let stopped = || cancelled.is_cancelled();
+            let builder = crate::pgo_map::ReplayBuilder::new(
+                &scans, trajectory, anchor, spec, config, frame, budget, &stopped,
+            )?;
+            builder.advance(&scans, &stopped)
+        })
+        .await
+        .map_err(|error| ApplyError::Failed(format!("PGO后台准备任务失败：{error}")))?
+        .map_err(pgo_preparation_error)?;
+        loop {
+            builder
+                .check(&|| cancellation.is_cancelled())
+                .map_err(pgo_preparation_error)?;
+            let guard = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
+                _ = tokio::time::sleep(builder.remaining_budget()) => return Err(pgo_preparation_error(crate::pgo_map::RebuildError::BudgetExceeded)),
+                guard = context.lifecycle_lock.clone().lock_owned() => guard,
+            };
+            builder
+                .check(&|| cancellation.is_cancelled())
+                .map_err(pgo_preparation_error)?;
+            let (tail, _, _, current_backend_generation) = snapshot(builder.latest_timestamp_ns())?;
+            if current_backend_generation != backend_generation {
+                return Err(ApplyError::PreparationRejected(
+                    Reject::BackendGenerationMismatch,
+                ));
+            }
+            if tail.is_empty()
+                && context
+                    .mapping
+                    .lock()
+                    .pgo_replay_tail_is_current(prepared.source_timestamp_ns)
+            {
+                let expected = {
+                    let shared = self.state.read().await;
+                    (
+                        shared.map.revision,
+                        shared.map.timestamp_ns,
+                        shared.cloud_map_revision,
+                    )
+                };
+                let rebuilt = builder
+                    .finish(prepared, &|| cancellation.is_cancelled())
+                    .map_err(pgo_preparation_error)?;
+                cancellation.retain_background_lifecycle_guard(guard);
+                return Ok((rebuilt, expected));
+            }
+            drop(guard);
+            if tail.is_empty() {
+                // 已接纳扫描的规范提交或归档尚未完成；等待期间不占用实时输入围栏。
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+                }
+                continue;
+            }
+            let cancelled = cancellation.clone();
+            (builder, prepared) = tokio::task::spawn_blocking(move || {
+                builder.advance(&tail, &|| cancelled.is_cancelled())
+            })
+            .await
+            .map_err(|error| ApplyError::Failed(format!("PGO后台追赶任务失败：{error}")))?
+            .map_err(pgo_preparation_error)?;
+        }
     }
 
     fn validate_transaction(
@@ -4230,6 +4379,24 @@ impl GeometryCanonicalCorrectionApplier {
     }
 }
 
+fn pgo_preparation_error(
+    error: crate::pgo_map::RebuildError,
+) -> crate::correction_coordinator::CanonicalCorrectionApplyError {
+    use crate::correction_coordinator::{
+        CanonicalCorrectionApplyError as ApplyError, CorrectionRejectReason,
+    };
+    match error {
+        crate::pgo_map::RebuildError::Cancelled => ApplyError::Cancelled,
+        crate::pgo_map::RebuildError::BudgetExceeded => {
+            ApplyError::PreparationRejected(CorrectionRejectReason::RebuildBudgetExceeded)
+        }
+        crate::pgo_map::RebuildError::HistoryUnavailable => {
+            ApplyError::PreparationRejected(CorrectionRejectReason::IncompleteScanHistory)
+        }
+        crate::pgo_map::RebuildError::Invalid(error) => ApplyError::Failed(error),
+    }
+}
+
 #[async_trait]
 impl crate::correction_coordinator::CanonicalCorrectionApplier
     for GeometryCanonicalCorrectionApplier
@@ -4263,6 +4430,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo
                 | crate::correction_coordinator::CorrectionCandidateBackend::NativePgo
         );
+        let mut background_expected = None;
         let mut rebuilt = if needs_map {
             let context = self.pgo.get().ok_or_else(|| {
                 ApplyError::Failed("PGO地图管线未绑定，拒绝仅应用位姿校正".into())
@@ -4278,46 +4446,61 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     "PGO轨迹与当前校正/原始里程计不一致".into(),
                 ));
             }
-            let (scans, spec, config) = {
-                let mapping = context.mapping.lock();
-                let session = mapping.snapshot();
-                let anchor = mapping
-                    .map_odom_transform_snapshot()
-                    .ok_or_else(|| ApplyError::Failed("PGO地图锚点缺失".into()))?;
-                if session.session_id != transaction.mapping_session_id
-                    || session.session_generation != transaction.mapping_session_generation
-                    || mapping.global_frame_generation() != transaction.map_frame_generation
-                    || !canonical_isometry_near(
-                        &anchor.base_isometry(),
-                        &transaction.base_anchor_map_from_odom,
-                    )
-                {
-                    return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
-                }
-                mapping.pgo_rebuild_input().map_err(preparation_error)?
-            };
-            let trajectory = transaction.trajectory.clone();
-            let anchor = transaction.base_anchor_map_from_odom;
-            let frame = self.map_frame_id.clone();
-            let cancelled = cancellation.clone();
-            let budget = self.rebuild_budget;
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    crate::pgo_map::rebuild(
-                        scans,
-                        trajectory,
-                        anchor,
-                        spec,
-                        config,
-                        frame,
-                        budget,
-                        || cancelled.is_cancelled(),
-                    )
-                })
-                .await
-                .map_err(|e| ApplyError::Failed(format!("PGO重建任务失败：{e}")))?
-                .map_err(preparation_error)?,
-            )
+            if cancellation.is_background_mapping() {
+                let started = std::time::Instant::now();
+                let prepared = self
+                    .prepare_background_pgo(&transaction, &cancellation)
+                    .await;
+                tracing::info!(event = "pgo.map.background_prepared",
+                    source_timestamp_ns = transaction.source_timestamp_ns,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    success = prepared.is_ok(), error = ?prepared.as_ref().err(),
+                    "PGO后台地图准备结束，实时输入保持独立推进");
+                let (map, expected) = prepared?;
+                background_expected = Some(expected);
+                Some(map)
+            } else {
+                let (scans, spec, config) = {
+                    let mapping = context.mapping.lock();
+                    let session = mapping.snapshot();
+                    let anchor = mapping
+                        .map_odom_transform_snapshot()
+                        .ok_or_else(|| ApplyError::Failed("PGO地图锚点缺失".into()))?;
+                    if session.session_id != transaction.mapping_session_id
+                        || session.session_generation != transaction.mapping_session_generation
+                        || mapping.global_frame_generation() != transaction.map_frame_generation
+                        || !canonical_isometry_near(
+                            &anchor.base_isometry(),
+                            &transaction.base_anchor_map_from_odom,
+                        )
+                    {
+                        return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
+                    }
+                    mapping.pgo_rebuild_input().map_err(preparation_error)?
+                };
+                let trajectory = transaction.trajectory.clone();
+                let anchor = transaction.base_anchor_map_from_odom;
+                let frame = self.map_frame_id.clone();
+                let cancelled = cancellation.clone();
+                let budget = self.rebuild_budget;
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::pgo_map::rebuild(
+                            scans,
+                            trajectory,
+                            anchor,
+                            spec,
+                            config,
+                            frame,
+                            budget,
+                            || cancelled.is_cancelled(),
+                        )
+                    })
+                    .await
+                    .map_err(|e| ApplyError::Failed(format!("PGO重建任务失败：{e}")))?
+                    .map_err(preparation_error)?,
+                )
+            }
         } else {
             None
         };
@@ -4328,9 +4511,11 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     .lock()
                     .backend_checkpoint_client()
                     .map_err(ApplyError::Failed)?;
-                let receiver = client
-                    .restore_checkpoint(std::mem::take(&mut map.backend_checkpoint))
-                    .map_err(|e| ApplyError::Failed(format!("PGO后端准备失败：{e:?}")))?;
+                let receiver = match map.prepared_backend.take() {
+                    Some(prepared) => client.restore_prepared_checkpoint(prepared),
+                    None => client.restore_checkpoint(std::mem::take(&mut map.backend_checkpoint)),
+                }
+                .map_err(|e| ApplyError::Failed(format!("PGO后端准备失败：{e:?}")))?;
                 Some(
                     receiver
                         .await
@@ -4350,10 +4535,15 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         }
         self.validate_transaction(&transaction)
             .map_err(ApplyError::Failed)?;
-        if shared.map.revision != transaction.occupancy_revision
-            || shared.map.timestamp_ns != transaction.committed_map_source_timestamp_ns
+        let expected = background_expected.unwrap_or((
+            transaction.occupancy_revision,
+            transaction.committed_map_source_timestamp_ns,
+            transaction.cloud_revision,
+        ));
+        if shared.map.revision != expected.0
+            || shared.map.timestamp_ns != expected.1
             || normalize_frame(&shared.map.frame_id) != self.map_frame_id
-            || shared.cloud_map_revision != transaction.cloud_revision
+            || shared.cloud_map_revision != expected.2
         {
             return Err(ApplyError::Failed(
                 "canonical map/cloud state no longer matches correction receipt".to_owned(),
@@ -4423,7 +4613,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     .lock()
                     .prepare_pgo_install(
                         map.occupancy.clone(),
-                        transaction.source_timestamp_ns,
+                        map.source_timestamp_ns,
                         transaction.absolute_left_correction,
                         transaction.correction_revision,
                     )
@@ -4458,6 +4648,11 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
         let mut output_occupancy_revision = transaction.occupancy_revision;
         let mut output_cloud_revision = transaction.cloud_revision;
         let mut output_commit_id = transaction.mapping_commit_id;
+        let output_map_source_timestamp_ns = rebuilt
+            .as_ref()
+            .map_or(transaction.committed_map_source_timestamp_ns, |map| {
+                map.source_timestamp_ns
+            });
         if let (Some(context), Some(map), Some(prepared)) =
             (self.pgo.get(), rebuilt.take(), prepared_map)
         {
@@ -4501,7 +4696,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             cloud_revision: output_cloud_revision,
             correction_revision: transaction.correction_revision,
             source_timestamp_ns: transaction.source_timestamp_ns,
-            committed_map_source_timestamp_ns: transaction.committed_map_source_timestamp_ns,
+            committed_map_source_timestamp_ns: output_map_source_timestamp_ns,
             map_frame_id: transaction.map_frame_id,
             odom_frame_id: transaction.odom_frame_id,
             body_frame_id: transaction.body_frame_id,
@@ -8362,15 +8557,27 @@ async fn ingest_mapping_points_with_backend_owned(
         }
     };
     let preparation = mapping.lock().prepare_backend_completion(completion);
-    let prepared_completion = match tokio::task::spawn_blocking(move || preparation.compute()).await {
+    let prepared_completion = match tokio::task::spawn_blocking(move || preparation.compute()).await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
-            let retirement = fence_failed_mapping_backend(mapping, lifecycle_lock, explore_projection_gate,
-                committed_map_authority, map_revision_latest_tx, &token.session_id).await.err();
+            let retirement = fence_failed_mapping_backend(
+                mapping,
+                lifecycle_lock,
+                explore_projection_gate,
+                committed_map_authority,
+                map_revision_latest_tx,
+                &token.session_id,
+            )
+            .await
+            .err();
             return Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
-                source_frame_id: frame_id.to_owned(), target_frame_id,
-                reason: format!("mapping commit preparation failed: {error}; retirement={retirement:?}"),
+                source_frame_id: frame_id.to_owned(),
+                target_frame_id,
+                reason: format!(
+                    "mapping commit preparation failed: {error}; retirement={retirement:?}"
+                ),
             });
         }
     };
@@ -10173,10 +10380,16 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         frame_capture_relocalization_epoch: frame_capture_epoch,
         relocalization_mode_epoch: None,
     };
-    match correction
-        .submit_with_lifecycle_guard(input, lifecycle_guard)
-        .await
-    {
+    let submitted = if correction.supports_background_mapping() {
+        drop(lifecycle_guard);
+        correction.submit_mapping_background(input)
+    } else {
+        correction
+            .submit_with_lifecycle_guard(input, lifecycle_guard)
+            .await
+            .map(|_| ())
+    };
+    match submitted {
         Ok(_) | Err(crate::correction_coordinator::CorrectionRuntimeError::Stopped) => {}
         Err(error) => return Err(error.to_string()),
     }
@@ -10314,10 +10527,16 @@ pub(crate) async fn handoff_registered_lio_cloud_replay_with_correction(
         &commit,
     )
     .await?;
-    correction
-        .submit(input)
-        .await
-        .map_err(|error| error.to_string())?;
+    if correction.supports_background_mapping() {
+        correction
+            .submit_mapping_background(input)
+            .map_err(|error| error.to_string())?;
+    } else {
+        correction
+            .submit(input)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     {
         let _lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
         if correction.relocalization_mode_snapshot() != initial_mode {
@@ -14379,6 +14598,15 @@ mod mapping_feed_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pgo_large_corrections_rebuild_both_maps_and_fence_late_scans() {
+        pgo_large_corrections_case(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pgo_background_corrections_rebuild_both_maps_and_fence_late_scans() {
+        pgo_large_corrections_case(true).await;
+    }
+
+    async fn pgo_large_corrections_case(background: bool) {
         use crate::correction_coordinator::{
             CanonicalCorrectionApplier, CanonicalCorrectionTransaction, CorrectionCandidateBackend,
             CorrectionLeaseId, CorrectionOwnerRuntimeIdentity, CorrectionOwnerSpec,
@@ -14389,6 +14617,13 @@ mod mapping_feed_tests {
         use nuwax_codec::lcm::native_pgo::OptimizedKeyframe;
 
         // 人为给定已接受的完整优化轨迹，专门验证大校正的生产坐标/地图提交，不替代回环检测测试。
+        let new_cancellation = || {
+            if background {
+                CorrectionRequestCancellation::for_background_mapping()
+            } else {
+                CorrectionRequestCancellation::new()
+            }
+        };
         for backend in [
             CorrectionCandidateBackend::LibraryPgo,
             CorrectionCandidateBackend::NativePgo,
@@ -14603,7 +14838,11 @@ mod mapping_feed_tests {
                         pending = Some((old.points, old_binding));
                     }
                     if index == 2 || index == 4 {
-                        let _guard = handle.mapping_lifecycle_lock.lock().await;
+                        let _guard = if background {
+                            None
+                        } else {
+                            Some(handle.mapping_lifecycle_lock.lock().await)
+                        };
                         let revision = if index == 2 { 1 } else { 2 };
                         let receipt = mapping.lock().latest_occupancy_commit_receipt().unwrap();
                         let previous_cloud = handle.state.read().await.cloud_map_revision;
@@ -14645,7 +14884,7 @@ mod mapping_feed_tests {
                             trajectory,
                         };
                         if index == 2 {
-                            let cancelled = CorrectionRequestCancellation::new();
+                            let cancelled = new_cancellation();
                             cancelled.cancel();
                             assert!(applier
                                 .apply_transaction(transaction.clone(), cancelled)
@@ -14654,7 +14893,7 @@ mod mapping_feed_tests {
                             let mut invalid = transaction.clone();
                             invalid.trajectory[0].translation_m[0] += 1.0;
                             assert!(applier
-                                .apply_transaction(invalid, CorrectionRequestCancellation::new())
+                                .apply_transaction(invalid, new_cancellation())
                                 .await
                                 .is_err());
                             assert!(applier.snapshot().is_none());
@@ -14685,10 +14924,7 @@ mod mapping_feed_tests {
                             .unwrap();
                         applier.rebuild_budget = Duration::ZERO;
                         let rejection = applier
-                            .apply_transaction(
-                                transaction.clone(),
-                                CorrectionRequestCancellation::new(),
-                            )
+                            .apply_transaction(transaction.clone(), new_cancellation())
                             .await;
                         assert!(matches!(rejection, Err(
                             crate::correction_coordinator::CanonicalCorrectionApplyError::PreparationRejected(
@@ -14717,11 +14953,76 @@ mod mapping_feed_tests {
                                 .xyz_f32_le,
                             cloud_before.xyz_f32_le
                         );
-                        let cancellation = CorrectionRequestCancellation::new();
-                        applier
-                            .apply_transaction(transaction, cancellation.clone())
-                            .await
-                            .unwrap();
+                        let cancellation = new_cancellation();
+                        if background && index == 2 {
+                            let entered = Arc::new(tokio::sync::Notify::new());
+                            let release = Arc::new(tokio::sync::Notify::new());
+                            applier.background_prepare_gate =
+                                Some((entered.clone(), release.clone()));
+                            let cancelled = new_cancellation();
+                            let (result, ()) = tokio::join!(
+                                applier.apply_transaction(transaction.clone(), cancelled.clone()),
+                                async {
+                                    entered.notified().await;
+                                    let guard = tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        handle.mapping_lifecycle_lock.lock(),
+                                    )
+                                    .await
+                                    .expect("后台准备不能占住实时输入生命周期锁");
+                                    cancelled.cancel();
+                                    drop(guard);
+                                }
+                            );
+                            assert!(matches!(result, Err(crate::correction_coordinator::CanonicalCorrectionApplyError::Cancelled)));
+                            assert_eq!(
+                                handle.state.read().await.map.revision,
+                                receipt.occupancy_revision
+                            );
+                            let mut stale = transaction.clone();
+                            stale.mapping_session_generation += 1;
+                            assert!(matches!(applier.apply_transaction(stale, new_cancellation()).await,
+                                Err(crate::correction_coordinator::CanonicalCorrectionApplyError::PreparationRejected(
+                                    crate::correction_coordinator::CorrectionRejectReason::MappingSessionMismatch))));
+                            let (result, ()) = tokio::join!(
+                                applier.apply_transaction(transaction, cancellation.clone()),
+                                async {
+                                    entered.notified().await;
+                                    let guard = tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        handle.mapping_lifecycle_lock.lock(),
+                                    )
+                                    .await
+                                    .expect("慢历史准备期间新位姿必须能进入原拥有方");
+                                    assert!(handoff_lio_odometry_with_correction(
+                                        &handle,
+                                        &pose_state_from_isometry(&raw[index], "odom", stamp + 1),
+                                        "base_link",
+                                        &tf,
+                                        &applier
+                                    )
+                                    .await
+                                    .unwrap());
+                                    assert_eq!(
+                                        handle.state.read().await.pose.timestamp_ns,
+                                        stamp + 1
+                                    );
+                                    drop(guard);
+                                    release.notify_one();
+                                }
+                            );
+                            result.unwrap();
+                            applier.background_prepare_gate = None;
+                            assert!(
+                                handle.mapping_lifecycle_lock.try_lock().is_err(),
+                                "领取提交后围栏由最终处理租约保留"
+                            );
+                        } else {
+                            applier
+                                .apply_transaction(transaction, cancellation.clone())
+                                .await
+                                .unwrap();
+                        }
                         cancellation
                             .operation()
                             .mark_coordinator_finalized()
@@ -14741,6 +15042,7 @@ mod mapping_feed_tests {
                         assert_eq!(
                             shared.pose.timestamp_ns,
                             (selected as u64 + 1) * 1_000_000_000
+                                + u64::from(background && index == 2)
                         );
                         let rotation = UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
                             shared.pose.qw,

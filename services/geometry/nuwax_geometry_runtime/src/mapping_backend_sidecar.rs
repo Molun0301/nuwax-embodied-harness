@@ -721,7 +721,12 @@ pub(super) fn run_worker_loop(
                 let _ = job.completion.send(sidecar.export_checkpoint());
             }
             MappingBackendCommand::RestoreCheckpoint(job) => {
-                let result = sidecar.restore_checkpoint(job.transaction_id, &job.payload);
+                // 独立进程保留既有跨进程编码合同；进程内后端直接接收预解码内核。
+                let payload = match job.input {
+                    MappingBackendRestoreInput::Encoded(payload) => payload,
+                    MappingBackendRestoreInput::Prepared(prepared) => prepared.encoded,
+                };
+                let result = sidecar.restore_checkpoint(job.transaction_id, &payload);
                 match result {
                     Ok(()) => {
                         let (resolution, resolution_rx) =

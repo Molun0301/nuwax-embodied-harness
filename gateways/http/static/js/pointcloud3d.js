@@ -1,5 +1,6 @@
 import * as THREE from './three.module.min.js';
 import { OrbitControls } from './OrbitControls.js';
+import { PointCloudProcessor } from './pointcloud-processing.js?v=20260911-background-preprocess';
 
 const COLORS = {
   robot: 0xfbbf24,
@@ -143,15 +144,6 @@ const FLOOR_COLORS = Object.freeze({
   structure: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor)),
   object: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.objectColor)),
 });
-const FLOOR_BIN_SIZE_M = 0.08;
-const FLOOR_BAND_HALF_M = 0.12;
-const FLOOR_MIN_SEPARATION_M = 1.5;
-const FLOOR_DEFAULT_STORY_HEIGHT_M = 2.8;
-const FLOOR_CEILING_GAP_M = 0.2;
-const FLOOR_ANALYSIS_MAX_POINTS = 200_000;
-const STRUCTURE_COLUMN_SIZE_M = 0.18;
-const STRUCTURE_MIN_VERTICAL_SPAN_M = 0.45;
-const POINT_SAMPLING_MIN_SOURCE_POINTS = 4096;
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const MAX_POINTS = Math.floor(MAX_BUFFER_BYTES / (3 * 4));
 const CAMERA_MODES = new Set(['free', 'follow']);
@@ -384,8 +376,9 @@ function navigationEventMatchesExploration(detail, identity) {
     && eventIdentity.requestId === identity.requestId;
 }
 
-class PointCloud3DViewer {
+class PointCloud3DViewer extends PointCloudProcessor {
   constructor() {
+    super({ stylePresets: POINT_STYLE_PRESETS, heightColorStops: HEIGHT_COLOR_STOPS, floorColors: FLOOR_COLORS });
     this._container = null;
     this._renderer = null;
     this._scene = null;
@@ -438,9 +431,21 @@ class PointCloud3DViewer {
     this._pointCloudSourcePoints = null;
     this._displayedPointCount = 0;
     this._initialized = false;
+    this._cloudWorker = null;
+    this._cloudWorkerFailed = false;
+    this._cloudRunning = null;
+    this._cloudPending = null;
+    this._cloudEpoch = 0;
+    this._cloudJobId = 0;
+    this._cloudContextKey = null;
+    this._cloudSourceKey = null;
+    this._cloudDisposed = false;
+    this._cloudLoadToken = 0;
   }
 
   init(container) {
+    this._cloudDisposed = false;
+    this._cloudWorkerFailed = false;
     if (this._initialized) {
       this.resize();
       this._requestRender();
@@ -615,7 +620,7 @@ class PointCloud3DViewer {
     if (this._pointCloudDrawDiagnosticPending) {
       this._pointCloudDrawDiagnosticPending = false;
       window.dispatchEvent(new CustomEvent('pointcloud3d:content-drawn', {
-        detail: { points: this._renderer.info?.render?.points ?? null, revision: this._lastCloudMapRevision ?? null },
+        detail: { points: this._renderer.info?.render?.points ?? null, revision: this._renderedCloudMapRevision ?? this._lastCloudMapRevision ?? null },
       }));
     }
     if (this._interactionActive || controlsChanged) {
@@ -794,233 +799,6 @@ class PointCloud3DViewer {
     return reset;
   }
 
-  _measurePointCloud(positions) {
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    for (let i = 0; i < positions.length; i += 3) {
-      const x = positions[i];
-      const y = positions[i + 1];
-      const z = positions[i + 2];
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z;
-      if (z > maxZ) maxZ = z;
-    }
-    const center = new THREE.Vector3(
-      (minX + maxX) / 2,
-      (minY + maxY) / 2,
-      (minZ + maxZ) / 2,
-    );
-    const radius = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2;
-    return {
-      xMin: minX,
-      xMax: maxX,
-      yMin: minY,
-      yMax: maxY,
-      zMin: minZ,
-      zMax: maxZ,
-      bounds: new THREE.Sphere(center, radius),
-    };
-  }
-
-  _colorByHeight(positions, zMin, zMax, gradientScale = 1, blueBandHeightM = null) {
-    const count = positions.length / 3;
-    const colors = new Uint8Array(count * 3);
-    if (count === 0) return colors;
-    const range = zMax - zMin || 1;
-    const scale = Number.isFinite(gradientScale) && gradientScale > 0 ? gradientScale : 1;
-    const gradientStart = Number.isFinite(blueBandHeightM) && blueBandHeightM >= 0
-      ? zMin + blueBandHeightM
-      : zMin + range * (0.5 - 0.5 / scale);
-    for (let i = 0; i < count; i++) {
-      const t = THREE.MathUtils.clamp(
-        (positions[i * 3 + 2] - gradientStart) * scale / range,
-        0,
-        1,
-      );
-      const scaled = t * (HEIGHT_COLOR_STOPS.length - 1);
-      const lower = Math.min(Math.floor(scaled), HEIGHT_COLOR_STOPS.length - 2);
-      const blend = scaled - lower;
-      const from = HEIGHT_COLOR_STOPS[lower];
-      const to = HEIGHT_COLOR_STOPS[lower + 1];
-      colors[i * 3] = Math.round(from[0] + (to[0] - from[0]) * blend);
-      colors[i * 3 + 1] = Math.round(from[1] + (to[1] - from[1]) * blend);
-      colors[i * 3 + 2] = Math.round(from[2] + (to[2] - from[2]) * blend);
-    }
-    return colors;
-  }
-
-  _floorLevels(positions, measurement) {
-    if (this._floorLevelSource === positions && this._floorLevelCache) {
-      return this._floorLevelCache;
-    }
-
-    // A smoothed Z histogram is the browser-only fallback for XYZ clouds without classifications.
-    const histogram = new Map();
-    const pointCount = Math.floor(positions.length / 3);
-    const analysisStride = Math.max(1, Math.ceil(pointCount / FLOOR_ANALYSIS_MAX_POINTS));
-    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += analysisStride) {
-      const z = positions[pointIndex * 3 + 2];
-      if (!Number.isFinite(z)) continue;
-      const bin = Math.round(z / FLOOR_BIN_SIZE_M);
-      histogram.set(bin, (histogram.get(bin) || 0) + 1);
-    }
-
-    const scores = new Map();
-    let maxScore = 0;
-    for (const [bin, count] of histogram) {
-      const score = count
-        + 0.65 * ((histogram.get(bin - 1) || 0) + (histogram.get(bin + 1) || 0))
-        + 0.25 * ((histogram.get(bin - 2) || 0) + (histogram.get(bin + 2) || 0));
-      scores.set(bin, score);
-      if (score > maxScore) maxScore = score;
-    }
-
-    const minimumScore = Math.max(3, maxScore * 0.12);
-    const peaks = [...scores.entries()]
-      .filter(([bin, score]) => (
-        score >= minimumScore
-        && score >= (scores.get(bin - 1) || 0)
-        && score >= (scores.get(bin + 1) || 0)
-      ))
-      .sort((left, right) => right[1] - left[1]);
-    const selected = [];
-    for (const [bin, score] of peaks) {
-      let weightedZ = 0;
-      let weight = 0;
-      for (let neighbour = -1; neighbour <= 1; neighbour += 1) {
-        const count = histogram.get(bin + neighbour) || 0;
-        weightedZ += (bin + neighbour) * FLOOR_BIN_SIZE_M * count;
-        weight += count;
-      }
-      const z = weight ? weightedZ / weight : bin * FLOOR_BIN_SIZE_M;
-      if (selected.some((candidate) => Math.abs(candidate.z - z) < FLOOR_MIN_SEPARATION_M)) continue;
-      selected.push({ z, score });
-    }
-
-    const levels = selected.length
-      ? selected.map((candidate) => candidate.z).sort((left, right) => left - right)
-      : [measurement.zMin];
-    this._floorLevelSource = positions;
-    this._floorLevelCache = Object.freeze(levels);
-    return this._floorLevelCache;
-  }
-
-  _selectFloorLevel(levels, robotZ = this._robotPose?.z) {
-    if (!levels.length) return null;
-    const height = Number(robotZ);
-    if (!Number.isFinite(height)) return levels[0];
-    const belowRobot = levels.filter((level) => level <= height + 0.45);
-    const candidates = belowRobot.length ? belowRobot : levels;
-    return candidates.reduce((closest, level) => (
-      Math.abs(level - height) < Math.abs(closest - height) ? level : closest
-    ));
-  }
-
-  _activeFloorContext(positions, measurement) {
-    const levels = this._floorLevels(positions, measurement);
-    const floorZ = this._selectFloorLevel(levels);
-    if (!Number.isFinite(floorZ)) return null;
-    const floorIndex = levels.indexOf(floorZ);
-    const nextFloorZ = floorIndex >= 0 ? levels[floorIndex + 1] : null;
-    const fallbackTop = Math.min(
-      measurement.zMax + FLOOR_BAND_HALF_M,
-      floorZ + FLOOR_DEFAULT_STORY_HEIGHT_M,
-    );
-    const storyMax = Math.max(
-      floorZ + FLOOR_BAND_HALF_M,
-      Number.isFinite(nextFloorZ) ? nextFloorZ - FLOOR_CEILING_GAP_M : fallbackTop,
-    );
-    return {
-      floorZ,
-      levels,
-      groundMin: floorZ - FLOOR_BAND_HALF_M,
-      groundMax: floorZ + FLOOR_BAND_HALF_M,
-      storyMax,
-    };
-  }
-
-  _filterPointCloudForFloor(positions, floorContext, filterMode) {
-    if (!floorContext) return positions;
-    const upper = filterMode === 'ground' ? floorContext.groundMax : floorContext.storyMax;
-    const filtered = new Float32Array(positions.length);
-    let writeOffset = 0;
-    for (let offset = 0; offset < positions.length; offset += 3) {
-      const x = positions[offset];
-      const y = positions[offset + 1];
-      const z = positions[offset + 2];
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-      if (z < floorContext.groundMin || z > upper) continue;
-      filtered[writeOffset] = x;
-      filtered[writeOffset + 1] = y;
-      filtered[writeOffset + 2] = z;
-      writeOffset += 3;
-    }
-    return filtered.subarray(0, writeOffset);
-  }
-
-  _pointColumnKey(x, y) {
-    return `${Math.floor(x / STRUCTURE_COLUMN_SIZE_M)},${Math.floor(y / STRUCTURE_COLUMN_SIZE_M)}`;
-  }
-
-  _verticalStructureColumns(positions, floorContext) {
-    const columns = new Map();
-    for (let offset = 0; offset < positions.length; offset += 3) {
-      const z = positions[offset + 2];
-      if (z <= floorContext.groundMax) continue;
-      const key = this._pointColumnKey(positions[offset], positions[offset + 1]);
-      const span = columns.get(key);
-      if (span) {
-        if (z < span.min) span.min = z;
-        if (z > span.max) span.max = z;
-      } else {
-        columns.set(key, { min: z, max: z });
-      }
-    }
-    return new Set(
-      [...columns.entries()]
-        .filter(([, span]) => span.max - span.min >= STRUCTURE_MIN_VERTICAL_SPAN_M)
-        .map(([key]) => key),
-    );
-  }
-
-  _pointCloudColors(positions, measurement, floorContext = null) {
-    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
-    if (preset.colorMode === 'height') {
-      return this._colorByHeight(
-        positions,
-        measurement.zMin,
-        measurement.zMax,
-        preset.heightGradientScale,
-        preset.blueBandHeightM,
-      );
-    }
-
-    const count = Math.floor(positions.length / 3);
-    const colors = new Uint8Array(count * 3);
-    const verticalColumns = preset.colorMode === 'structure' && floorContext
-      ? this._verticalStructureColumns(positions, floorContext)
-      : null;
-    for (let i = 0; i < count; i++) {
-      const offset = i * 3;
-      let color = FLOOR_COLORS.context;
-      if (preset.colorMode === 'mono') {
-        color = FLOOR_COLORS.context;
-      } else if (floorContext && positions[offset + 2] <= floorContext.groundMax) {
-        color = FLOOR_COLORS.ground;
-      } else if (preset.colorMode === 'structure' && floorContext) {
-        const column = this._pointColumnKey(positions[offset], positions[offset + 1]);
-        color = verticalColumns.has(column) ? FLOOR_COLORS.structure : FLOOR_COLORS.object;
-      }
-      colors[offset] = color[0];
-      colors[offset + 1] = color[1];
-      colors[offset + 2] = color[2];
-    }
-    return colors;
-  }
-
   _disposePointsMesh() {
     if (!this._pointsMesh) return;
     this._scene?.remove(this._pointsMesh);
@@ -1032,9 +810,9 @@ class PointCloud3DViewer {
   _emitPointCount() {
     this._pointCloudDrawDiagnosticPending = true;
     const bufferedPoints = Math.floor(this._allPositions.length / 3);
-    const sourcePoints = Number.isFinite(this._pointCloudSourcePoints)
+    const sourcePoints = this._renderedPointCloudSourcePoints ?? (Number.isFinite(this._pointCloudSourcePoints)
       ? Math.max(bufferedPoints, Math.floor(this._pointCloudSourcePoints))
-      : bufferedPoints;
+      : bufferedPoints);
     window.dispatchEvent(new CustomEvent('pointcloud3d:point-count', {
       detail: {
         points: this._displayedPointCount,
@@ -1045,7 +823,7 @@ class PointCloud3DViewer {
     }));
   }
 
-  _renderPointCloudPositions(positions, sourceMeasurement = null, floorContext = null) {
+  _renderPointCloudPositions(positions, sourceMeasurement = null, floorContext = null, colors = null) {
     if (!this._scene) return;
     const previousBounds = this._pointCloudBounds;
     if (!positions.length) {
@@ -1069,12 +847,15 @@ class PointCloud3DViewer {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setAttribute('color', new THREE.Uint8BufferAttribute(
-      this._pointCloudColors(positions, measurement, floorContext),
+      colors || this._pointCloudColors(positions, measurement, floorContext),
       3,
       true,
     ));
-    geo.boundingSphere = measurement.bounds.clone();
-    this._pointCloudBounds = measurement.bounds.clone();
+    // 工作线程只传普通数值；图形资源及其拥有权留在主线程。
+    const { center, radius } = measurement.bounds;
+    const bounds = new THREE.Sphere(new THREE.Vector3(center.x, center.y, center.z), radius);
+    geo.boundingSphere = bounds;
+    this._pointCloudBounds = bounds.clone();
     if (this._pointsMesh) {
       this._pointsMesh.geometry.dispose();
       this._pointsMesh.geometry = geo;
@@ -1107,88 +888,174 @@ class PointCloud3DViewer {
     this._requestRender();
   }
 
-  _rebuildPointCloud() {
-    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
-    const src = this._allPositions;
-    if (this._floorLevelSource && this._floorLevelSource !== src) {
-      this._floorLevelSource = null;
-      this._floorLevelCache = null;
-    }
-    if (!src.length) {
-      this._activeFloorZ = null;
-      this._renderPointCloudPositions(new Float32Array(0));
-      return;
-    }
-    const sourceMeasurement = this._measurePointCloud(src);
-    const floorContext = preset.floorFilter
-      ? this._activeFloorContext(src, sourceMeasurement)
-      : null;
-    const visibleSource = floorContext
-      ? this._filterPointCloudForFloor(src, floorContext, preset.floorFilter)
-      : src;
-    const measurement = visibleSource.length ? this._measurePointCloud(visibleSource) : null;
-    this._activeFloorZ = floorContext?.floorZ ?? null;
-    if (this._isLiveCloudMapSnapshot) {
-      const positions = preset.liveSpacingM
-        ? this._spatiallySamplePointCloud(visibleSource, preset.liveSpacingM)
-        : visibleSource;
-      this._renderPointCloudPositions(positions, measurement, floorContext);
-      return;
-    }
-    const totalPts = Math.floor(visibleSource.length / 3);
-    const configuredStride = Math.max(1, Math.round((LOD_STRIDE[this._lod] || 1) * preset.sampleStride));
-    const stride = totalPts <= POINT_SAMPLING_MIN_SOURCE_POINTS ? 1 : configuredStride;
-    const sampledCount = Math.min(Math.ceil(totalPts / stride), MAX_POINTS);
-    if (sampledCount === 0) {
-      this._renderPointCloudPositions(new Float32Array(0));
-      return;
-    }
-
-    const pos = new Float32Array(sampledCount * 3);
-    for (let i = 0, j = 0; i < sampledCount; i++, j += stride) {
-      pos[i * 3] = visibleSource[j * 3];
-      pos[i * 3 + 1] = visibleSource[j * 3 + 1];
-      pos[i * 3 + 2] = visibleSource[j * 3 + 2];
-    }
-    this._renderPointCloudPositions(pos, measurement, floorContext);
+  _invalidatePointCloudWork() {
+    this._cloudEpoch += 1;
+    this._cloudPending = null;
+    this._cloudContextKey = null;
   }
 
-  _spatiallySamplePointCloud(positions, spacingM) {
-    const spacing = Number(spacingM);
-    if (!positions.length || !Number.isFinite(spacing) || spacing <= 0) return positions;
-    const inverseSpacing = 1 / spacing;
-    const occupied = new Set();
-    const sampled = new Float32Array(positions.length);
-    let writeOffset = 0;
-    for (let offset = 0; offset < positions.length; offset += 3) {
-      const x = positions[offset];
-      const y = positions[offset + 1];
-      const z = positions[offset + 2];
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-      const gridX = Math.floor(x * inverseSpacing);
-      const gridY = Math.floor(y * inverseSpacing);
-      const gridZ = Math.floor(z * inverseSpacing);
-      const key = (
-        Math.imul(gridX, 73856093)
-        ^ Math.imul(gridY, 19349663)
-        ^ Math.imul(gridZ, 83492791)
-      ) >>> 0;
-      if (occupied.has(key)) continue;
-      occupied.add(key);
-      sampled[writeOffset] = (gridX + 0.5) * spacing;
-      sampled[writeOffset + 1] = (gridY + 0.5) * spacing;
-      sampled[writeOffset + 2] = (gridZ + 0.5) * spacing;
-      writeOffset += 3;
+  _pointCloudComputeError(message, fatal = false) {
+    if (fatal) {
+      this._cloudWorkerFailed = true;
+      this._cloudWorker?.terminate();
+      this._cloudWorker = null;
+      this._cloudRunning = null;
+      this._cloudPending = null;
     }
-    return sampled.slice(0, writeOffset);
+    window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
+      detail: { pointcloudComputeError: message, pointcloudComputeMode: fatal ? 'worker_failed' : 'worker' },
+    }));
+    window.dispatchEvent(new CustomEvent('pointcloud3d:status', { detail: { state: 'error', message } }));
+  }
+
+  _ensurePointCloudWorker() {
+    if (this._cloudWorker || this._cloudWorkerFailed) return this._cloudWorker;
+    try {
+      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260911-background-preprocess', import.meta.url), {
+        type: 'module', name: 'nuwax-pointcloud-preprocess',
+      });
+      this._cloudWorker = worker;
+      worker.onmessage = ({ data }) => {
+        if (this._cloudDisposed || this._cloudWorker !== worker) return;
+        const job = this._cloudRunning;
+        if (!job || data?.id !== job.id) {
+          this._pointCloudComputeError('点云工作线程返回了不匹配的请求', true);
+          return;
+        }
+        this._cloudRunning = null;
+        try {
+          if (job.epoch === this._cloudEpoch) {
+            if (data.error) this._pointCloudComputeError(String(data.error));
+            else this._applyPreparedPointCloud(job, data.result);
+          }
+        } catch (error) {
+          this._pointCloudComputeError(String(error?.message || error), true);
+        }
+        this._startNextPointCloudWork();
+      };
+      worker.onerror = (event) => {
+        if (this._cloudWorker !== worker) return;
+        event.preventDefault?.();
+        this._pointCloudComputeError(event.message || '点云工作线程启动或执行失败', true);
+      };
+      worker.onmessageerror = () => {
+        if (this._cloudWorker === worker) this._pointCloudComputeError('无法读取点云工作线程结果', true);
+      };
+      return worker;
+    } catch (error) {
+      this._pointCloudComputeError(String(error?.message || error), true);
+      return null;
+    }
+  }
+
+  _startNextPointCloudWork() {
+    if (this._cloudDisposed || this._cloudRunning || !this._cloudPending) return;
+    const worker = this._ensurePointCloudWorker();
+    if (!worker) return;
+    const job = this._cloudPending;
+    this._cloudPending = null;
+    this._cloudRunning = job;
+    job.startedAt = performance.now();
+    try {
+      // 源快照仍用于重绘与样式切换，不能转移其缓冲并使主线程缓存失效。
+      // 只在领取单个在途任务时克隆；等待中的候选只保留最新引用。
+      worker.postMessage({ id: job.id, positions: job.positions, config: this._processingConfig, options: job.options });
+    } catch (error) {
+      this._pointCloudComputeError(String(error?.message || error), true);
+    }
+  }
+
+  _applyPreparedPointCloud(job, result) {
+    if (this._cloudDisposed || job.epoch !== this._cloudEpoch) return;
+    if (!result || !(result.positions instanceof Float32Array) || !(result.colors instanceof Uint8Array)
+        || result.positions.length % 3 !== 0 || result.positions.byteLength > MAX_BUFFER_BYTES
+        || result.colors.length !== result.positions.length) {
+      throw new Error('点云工作线程返回的显示缓冲非法');
+    }
+    if (result.positions.length && (!result.measurement?.bounds
+        || ![result.measurement.bounds.center?.x, result.measurement.bounds.center?.y,
+          result.measurement.bounds.center?.z, result.measurement.bounds.radius].every(Number.isFinite))) {
+      throw new Error('点云工作线程返回的显示范围非法');
+    }
+    const floor = result.floorContext;
+    if (floor && this._selectFloorLevel(floor.levels, this._robotPose?.z) !== floor.floorZ) {
+      // 计算期间机器人换层；不把旧层安装到当前视图，也不在主线程重扫点云。
+      if (job.positions === this._allPositions) {
+        this._floorLevelSource = job.positions;
+        this._floorLevelCache = floor.levels;
+      }
+      this._rebuildPointCloud();
+      return;
+    }
+    this._activeFloorZ = floor?.floorZ ?? null;
+    if (job.positions === this._allPositions) {
+      this._floorLevelSource = floor ? job.positions : null;
+      this._floorLevelCache = floor?.levels ?? null;
+    }
+    this._renderedCloudMapRevision = job.revision;
+    this._renderedPointCloudSourcePoints = job.positions.length / 3;
+    this._renderPointCloudPositions(result.positions, result.measurement, floor, result.colors);
+    window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
+      detail: {
+        pointcloudComputeMode: job.mode,
+        pointcloudComputeError: '',
+        pointcloudComputeMs: result.computeMs ?? null,
+        pointcloudWorkerRoundTripMs: job.startedAt == null ? null : performance.now() - job.startedAt,
+      },
+    }));
+  }
+
+  _rebuildPointCloud() {
+    if (this._cloudDisposed) return;
+    const src = this._allPositions;
+    if (src.byteLength > MAX_BUFFER_BYTES || src.length % 3 !== 0) {
+      this._invalidatePointCloudWork();
+      this._pointCloudComputeError('点云显示缓冲超过容量或XYZ长度不完整');
+      return;
+    }
+    const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
+    const floorTarget = preset.floorFilter && this._floorLevelSource === src
+      ? this._selectFloorLevel(this._floorLevelCache || []) : null;
+    const contextKey = JSON.stringify([this._cloudSourceKey, this._pointStyle, this._lod, this._isLiveCloudMapSnapshot, floorTarget]);
+    if (contextKey !== this._cloudContextKey) {
+      this._invalidatePointCloudWork();
+      this._cloudContextKey = contextKey;
+    }
+    if (!this._scene) return;
+    const job = {
+      id: ++this._cloudJobId, epoch: this._cloudEpoch, positions: src,
+      revision: this._lastCloudMapRevision ?? null,
+      options: { style: this._pointStyle, lod: this._lod, live: this._isLiveCloudMapSnapshot, robotZ: this._robotPose?.z },
+      mode: typeof Worker === 'undefined' ? 'synchronous_no_worker' : 'worker',
+    };
+    if (!src.length) {
+      this._invalidatePointCloudWork();
+      job.epoch = this._cloudEpoch;
+      this._applyPreparedPointCloud(job, this._preparePointCloud());
+    } else if (typeof Worker === 'undefined') {
+      // 无工作线程的环境明确报告同步路径，不能伪称隔离完成。
+      this._applyPreparedPointCloud(job, this._preparePointCloud());
+    } else {
+      // 同一来源的持续更新允许在途结果先显示，避免快输入令所有结果饿死。
+      // 换来源、换样式、换层、重连或关闭则由代次撤销旧结果。
+      this._cloudPending = job;
+      this._startNextPointCloudWork();
+    }
   }
 
   async loadPointCloud(url, lod = 'preview') {
+    if (this._cloudDisposed) return;
+    const token = ++this._cloudLoadToken;
+    this._invalidatePointCloudWork();
     this._lod = lod;
     try {
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = await resp.arrayBuffer();
+      if (this._cloudDisposed || token !== this._cloudLoadToken) return;
+      if (buf.byteLength > MAX_BUFFER_BYTES || buf.byteLength % 12 !== 0) throw new Error('点云文件超过容量或XYZ长度不完整');
+      this._cloudSourceKey = JSON.stringify(['asset', url, token]);
+      this._lastCloudMapRevision = null;
       this._allPositions = new Float32Array(buf);
       this._hasPointCloudSnapshot = true;
       this._isLiveCloudMapSnapshot = false;
@@ -1198,11 +1065,19 @@ class PointCloud3DViewer {
         detail: { state: 'loaded', points: this._allPositions.length / 3, lod }
       }));
     } catch (e) {
+      if (this._cloudDisposed || token !== this._cloudLoadToken) return;
       window.dispatchEvent(new CustomEvent('pointcloud3d:status', { detail: { state: 'error', message: e.message } }));
     }
   }
 
   appendPoints(float32Array) {
+    if (this._cloudDisposed) return;
+    if (float32Array.length % 3 !== 0 || this._allPositions.byteLength + float32Array.byteLength > MAX_BUFFER_BYTES) {
+      throw new Error('追加点云超过显示容量或XYZ长度不完整');
+    }
+    this._cloudLoadToken += 1;
+    this._cloudSourceKey = 'legacy-append';
+    this._lastCloudMapRevision = null;
     const merged = new Float32Array(this._allPositions.length + float32Array.length);
     merged.set(this._allPositions);
     merged.set(float32Array, this._allPositions.length);
@@ -1214,6 +1089,10 @@ class PointCloud3DViewer {
   }
 
   _replaceCloudMapBuffer(xyzArray, identity) {
+    if (this._cloudDisposed) return;
+    this._cloudLoadToken += 1;
+    this._cloudSourceKey = JSON.stringify([identity.header.source, identity.header.source_epoch,
+      identity.header.frame_id, String(identity.streamGeneration ?? '')]);
     this._lastCloudMapRevision = identity.header.revision;
     this._pointCloudMapWatermark = identity;
     this._hasPointCloudSnapshot = true;
@@ -1906,6 +1785,12 @@ class PointCloud3DViewer {
   }
 
   dispose() {
+    this._cloudDisposed = true;
+    this._cloudLoadToken += 1;
+    this._invalidatePointCloudWork();
+    this._cloudWorker?.terminate();
+    this._cloudWorker = null;
+    this._cloudRunning = null;
     if (this._rafId) cancelAnimationFrame(this._rafId);
     const canvas = this._renderer?.domElement;
     canvas?.removeEventListener?.('pointerdown', this._semanticPointerDownHandler);
@@ -2203,7 +2088,7 @@ window.addEventListener('stream:pointcloud_map.meta', (e) => {
 
 // 统一实时/保存点云 binary 信封接收
 window.addEventListener('stream:pointcloud_map.binary', (e) => {
-  if (!window.pointcloud3d) return;
+  if (!window.pointcloud3d || window.pointcloud3d._cloudDisposed) return;
   const buffer = e.detail?.buffer;
   let envelope;
   try {
@@ -2242,7 +2127,7 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
       pointcloudAcceptedRevision: envelope.header.revision, pointcloudAcceptedGeneration: String(envelope.streamGeneration),
       pointcloudAcceptedSourceEpoch: envelope.header.source_epoch },
   }));
-  // 已验收的地图帧供控制台统计更新频率，不把传输心跳或相机重绘计作新帧。
+  // 已接纳源快照的更新率；实际绘制另由content-drawn报告，不把工作线程完成冒充显示完成。
   window.dispatchEvent(new CustomEvent('pointcloud3d:map-frame', {
     detail: {
       source: envelope.header.source,
@@ -2255,6 +2140,8 @@ window.addEventListener('stream:pointcloud_map.binary', (e) => {
 
 window.addEventListener('stream:pointcloud_map.reset', () => {
   if (!window.pointcloud3d) return;
+  window.pointcloud3d._invalidatePointCloudWork();
+  window.pointcloud3d._cloudLoadToken += 1;
   window.pointcloud3d._pointCloudMapWatermark = null;
 });
 

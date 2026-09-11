@@ -124,6 +124,22 @@ impl ScanHistory {
         Ok(())
     }
 
+    pub fn latest_timestamp_ns(&self) -> Option<u64> {
+        self.scans.last_key_value().map(|(stamp, _)| *stamp)
+    }
+
+    pub fn snapshot_after(&self, after: u64) -> Result<Vec<ArchivedScan>, RebuildError> {
+        if self.incomplete {
+            return Err(RebuildError::HistoryUnavailable);
+        }
+        use std::ops::Bound::{Excluded, Unbounded};
+        Ok(self
+            .scans
+            .range((Excluded(after), Unbounded))
+            .map(|(_, scan)| scan.clone())
+            .collect())
+    }
+
     pub fn snapshot(&self) -> Result<Vec<ArchivedScan>, RebuildError> {
         if self.incomplete {
             return Err(RebuildError::HistoryUnavailable);
@@ -137,6 +153,8 @@ pub(crate) struct RebuiltMap {
     pub cloud: CommittedCloudMapSnapshot,
     pub backend_checkpoint: Vec<u8>,
     pub accumulator: crate::pointcloud::PreparedCloudAccumulator,
+    pub source_timestamp_ns: u64,
+    pub prepared_backend: Option<mapping_backend::PreparedMappingBackendRestore>,
 }
 
 pub(crate) fn optimized_pose(frame: &OptimizedKeyframe) -> Isometry3<f64> {
@@ -166,74 +184,164 @@ impl Drop for TemporaryCloud {
     }
 }
 
-/// 只使用已接纳扫描和原建图内核，不构造新的传感器观测或并行公共地图写入端。
-pub(crate) fn rebuild(
-    scans: Vec<ArchivedScan>,
-    trajectory: Vec<OptimizedKeyframe>,
-    anchor: Isometry3<f64>,
+/// 私有重放拥有方保留内核和动态反证；追赶只追加新扫描，不反复重算历史前缀。
+pub(crate) struct ReplayBuilder {
+    kernel: mapping_backend::MappingKernel,
     spec: MappingBackendSpec,
-    config: MappingBackendComputeConfig,
+    persistent: Option<PersistentOccupancyGrid>,
+    cloud: TemporaryCloud,
+    timeline: CorrectionTimeline,
+    anchor: Isometry3<f64>,
+    first_timestamp_ns: i64,
     frame_id: String,
+    config: MappingBackendComputeConfig,
+    last_input: Option<MappingBackendInput>,
+    processed: usize,
+    started: Instant,
     budget: Duration,
-    cancelled: impl Fn() -> bool,
-) -> Result<RebuiltMap, RebuildError> {
-    let start = Instant::now();
-    let check = || {
-        if cancelled() {
-            Err(RebuildError::Cancelled)
-        } else if start.elapsed() >= budget {
-            Err(RebuildError::BudgetExceeded)
-        } else {
-            Ok(())
+    kernel_time: Duration,
+    cloud_time: Duration,
+}
+
+pub(crate) struct PreparedReplay {
+    occupancy: OccupancyGrid,
+    cloud: CommittedCloudMapSnapshot,
+    backend_checkpoint: Vec<u8>,
+    pub source_timestamp_ns: u64,
+    prepared_backend: Option<mapping_backend::PreparedMappingBackendRestore>,
+}
+
+impl ReplayBuilder {
+    pub(crate) fn new(
+        scans: &[ArchivedScan],
+        trajectory: Vec<OptimizedKeyframe>,
+        anchor: Isometry3<f64>,
+        spec: MappingBackendSpec,
+        config: MappingBackendComputeConfig,
+        frame_id: String,
+        budget: Duration,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, RebuildError> {
+        let started = Instant::now();
+        check_budget(started, budget, cancelled)?;
+        validate_optimized_keyframes(&trajectory)?;
+        let first = trajectory
+            .first()
+            .ok_or("PGO结果缺少完整优化轨迹")?
+            .source_timestamp_ns;
+        if !scans
+            .windows(2)
+            .all(|pair| pair[0].source_timestamp_ns < pair[1].source_timestamp_ns)
+        {
+            return Err("PGO归档扫描必须按真实源时间严格递增".into());
         }
-    };
-    check()?;
-    validate_optimized_keyframes(&trajectory)?;
-    let first = trajectory
-        .first()
-        .ok_or("PGO结果缺少完整优化轨迹")?
-        .source_timestamp_ns;
-    let last = trajectory.last().unwrap().source_timestamp_ns as u64;
-    if scans.last().map(|s| s.source_timestamp_ns) != Some(last) {
-        return Err("PGO轨迹与已接纳扫描尾部不一致".into());
+        let mut keyframes = Vec::with_capacity(trajectory.len());
+        for node in &trajectory {
+            check_budget(started, budget, cancelled)?;
+            let frame = scans
+                .binary_search_by_key(&(node.source_timestamp_ns as u64), |s| {
+                    s.source_timestamp_ns
+                })
+                .ok()
+                .map(|index| &scans[index])
+                .ok_or("PGO轨迹引用了未保存的原始扫描")?;
+            keyframes.push(CorrectionKeyframe {
+                timestamp: (node.source_timestamp_ns - first) as f64 / 1e9,
+                local_pose: frame.odom_from_body,
+                optimized_pose: optimized_pose(node),
+            });
+        }
+        let first_delta = keyframes[0].local_pose.inverse() * keyframes[0].optimized_pose;
+        if first_delta.translation.vector.norm() > 1e-6 || first_delta.rotation.angle() > 1e-6 {
+            return Err("PGO优化改变了固定首节点".into());
+        }
+        let timeline = CorrectionTimeline::new(keyframes).map_err(|e| e.to_string())?;
+        let path =
+            std::env::temp_dir().join(format!("nuwax-pgo-rebuild-{}.mmap", uuid::Uuid::new_v4()));
+        let cloud = TemporaryCloud(CloudMapShmWriter::new(&path).map_err(|e| e.to_string())?);
+        Ok(Self {
+            kernel: spec.into_kernel(config.window_capacity),
+            spec,
+            persistent: None,
+            cloud,
+            timeline,
+            anchor,
+            first_timestamp_ns: first,
+            frame_id,
+            config,
+            last_input: None,
+            processed: 0,
+            started,
+            budget,
+            kernel_time: Duration::ZERO,
+            cloud_time: Duration::ZERO,
+        })
     }
-    let mut keyframes = Vec::with_capacity(trajectory.len());
-    for node in &trajectory {
-        check()?;
-        let frame = scans
-            .binary_search_by_key(&(node.source_timestamp_ns as u64), |s| {
-                s.source_timestamp_ns
-            })
-            .ok()
-            .map(|index| &scans[index])
-            .ok_or("PGO轨迹引用了未保存的原始扫描")?;
-        keyframes.push(CorrectionKeyframe {
-            timestamp: (node.source_timestamp_ns - first) as f64 / 1e9,
-            local_pose: frame.odom_from_body,
-            optimized_pose: optimized_pose(node),
-        });
+
+    pub(crate) fn check(&self, cancelled: &impl Fn() -> bool) -> Result<(), RebuildError> {
+        check_budget(self.started, self.budget, cancelled)
     }
-    // 图的第一个节点必须保持原锚定；不能把全图平移伪装成回环优化。
-    let first_delta = keyframes[0].local_pose.inverse() * keyframes[0].optimized_pose;
-    if first_delta.translation.vector.norm() > 1e-6 || first_delta.rotation.angle() > 1e-6 {
-        return Err("PGO优化改变了固定首节点".into());
+
+    pub(crate) fn remaining_budget(&self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
     }
-    let timeline = CorrectionTimeline::new(keyframes).map_err(|e| e.to_string())?;
-    let path =
-        std::env::temp_dir().join(format!("nuwax-pgo-rebuild-{}.mmap", uuid::Uuid::new_v4()));
-    let mut cloud = TemporaryCloud(CloudMapShmWriter::new(&path).map_err(|e| e.to_string())?);
-    let mut kernel_time = Duration::ZERO;
-    let mut cloud_time = Duration::ZERO;
-    let mut processed = 0;
-    let result = (|| {
-        let mut kernel = spec.into_kernel(config.window_capacity);
-        let mut persistent: Option<PersistentOccupancyGrid> = None;
-        let mut last_input = None;
-        for (index, scan) in scans.iter().enumerate() {
-            check()?;
-            let time = (scan.source_timestamp_ns as i128 - first as i128) as f64 / 1e9;
-            let map_from_body = anchor
-                * timeline
+
+    pub(crate) fn latest_timestamp_ns(&self) -> u64 {
+        self.last_input
+            .as_ref()
+            .map_or(0, |input| input.source_timestamp_ns)
+    }
+
+    pub(crate) fn advance(
+        mut self,
+        scans: &[ArchivedScan],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Self, PreparedReplay), RebuildError> {
+        let result = self
+            .append(scans, cancelled)
+            .and_then(|()| self.prepare(cancelled))
+            .and_then(|mut prepared| {
+                prepared.prepared_backend = Some(mapping_backend::prepare_mapping_backend_restore(
+                    self.spec,
+                    self.config,
+                    std::mem::take(&mut prepared.backend_checkpoint),
+                )?);
+                // 已得到经过验证的内核，不把序列化副本继续保留到实时提交区。
+                prepared.backend_checkpoint = Vec::new();
+                self.check(cancelled)?;
+                Ok(prepared)
+            });
+        match result {
+            Ok(prepared) => Ok((self, prepared)),
+            Err(error) => {
+                self.cloud
+                    .cleanup_product_owned_file()
+                    .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        scans: &[ArchivedScan],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), RebuildError> {
+        for scan in scans {
+            self.check(cancelled)?;
+            if self
+                .last_input
+                .as_ref()
+                .is_some_and(|input| scan.source_timestamp_ns <= input.source_timestamp_ns)
+            {
+                return Err("PGO追赶扫描与已处理前缀重叠或回退".into());
+            }
+            let time =
+                (scan.source_timestamp_ns as i128 - self.first_timestamp_ns as i128) as f64 / 1e9;
+            // 轨迹尾部之后复用最后一个已求解校正，原始新里程计继续按真实时间推进。
+            let map_from_body = self.anchor
+                * self
+                    .timeline
                     .correct_pose(time, &scan.odom_from_body)
                     .map_err(|e| e.to_string())?;
             let points: Vec<_> = scan
@@ -246,43 +354,44 @@ pub(crate) fn rebuild(
                 session_id: "pgo-private-rebuild".into(),
                 session_generation: 1,
                 backend_generation: 1,
-                frame_sequence: index as u64 + 1,
+                frame_sequence: self.processed as u64 + 1,
                 source_timestamp_ns: scan.source_timestamp_ns,
                 received_at_ns: scan.received_at_ns,
-                registered_frame_id: frame_id.clone(),
+                registered_frame_id: self.frame_id.clone(),
                 sensor_origin_map: origin.coords.into(),
                 registered_points_map: points,
             };
             let phase = Instant::now();
-            mapping_backend::validate_backend_input(&kernel, &input)?;
-            if let Some(candidate) =
-                mapping_backend::compute_candidate_in_place_with_interval(
-                    &mut kernel, &input, config, mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
-                )?
-            {
+            mapping_backend::validate_backend_input(&self.kernel, &input)?;
+            if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
+                &mut self.kernel,
+                &input,
+                self.config,
+                mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
+            )? {
                 match candidate.backend_kind {
                     MappingBackendKind::Voxel => {
-                        // 私有重建独占累加器，无须为每次候选复制完整历史栅格。
-                        if persistent.is_none() {
-                            persistent = Some(PersistentOccupancyGrid::from_grid(
+                        if self.persistent.is_none() {
+                            self.persistent = Some(PersistentOccupancyGrid::from_grid(
                                 candidate.live_window_occupancy.clone(),
                             )?);
                         }
-                        persistent.as_mut().unwrap().merge(
+                        self.persistent.as_mut().unwrap().merge(
                             &candidate.live_window_occupancy,
                             &candidate.latest_frame_occupancy,
                         )?;
                     }
-                    MappingBackendKind::Raytracing => PersistentOccupancyGrid::stage_authoritative(
-                        &candidate.live_window_occupancy,
-                    )
-                    .map(|grid| persistent = Some(grid))?,
+                    MappingBackendKind::Raytracing => {
+                        self.persistent = Some(PersistentOccupancyGrid::stage_authoritative(
+                            &candidate.live_window_occupancy,
+                        )?);
+                    }
                 }
             }
-            kernel_time += phase.elapsed();
-            check()?;
+            self.kernel_time += phase.elapsed();
+            self.check(cancelled)?;
             let phase = Instant::now();
-            if !cloud.accumulate_mapping_scan(
+            if !self.cloud.accumulate_mapping_scan(
                 1,
                 &input.registered_points_map,
                 Some(input.sensor_origin_map),
@@ -290,11 +399,20 @@ pub(crate) fn rebuild(
             ) {
                 return Err("PGO重建点云无法接纳原始扫描".into());
             }
-            cloud_time += phase.elapsed();
-            processed += 1;
-            last_input = Some(input);
+            self.cloud_time += phase.elapsed();
+            self.processed += 1;
+            self.last_input = Some(input);
         }
-        let input = last_input.ok_or("PGO重建没有扫描")?;
+        self.check(cancelled)
+    }
+
+    /// 全量物化与后端编码仍在后台；只有已经物化的相同尾部才能进入最终提交。
+    pub(crate) fn prepare(
+        &mut self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<PreparedReplay, RebuildError> {
+        self.check(cancelled)?;
+        let input = self.last_input.as_ref().ok_or("PGO重建没有扫描")?;
         let token = MappingComputeToken {
             token_id: 1,
             session_id: input.session_id.clone(),
@@ -305,59 +423,134 @@ pub(crate) fn rebuild(
             prepared_at_ns: input.received_at_ns,
             base_occupancy_revision: 0,
         };
-        if let Some(candidate) =
-            mapping_backend::flush_candidate(&mut kernel, &input, &token, config)?
+        // 物化候选不能改变继续追赶的节拍或持久栅格；否则分批边界会改变同输入结果。
+        let mut output_kernel = self.kernel.clone();
+        let occupancy = if let Some(candidate) =
+            mapping_backend::flush_candidate(&mut output_kernel, input, &token, self.config)?
         {
-            persistent = Some(match candidate.backend_kind {
+            match candidate.backend_kind {
                 MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
-                    persistent.as_ref(),
+                    self.persistent.as_ref(),
                     &candidate.live_window_occupancy,
                     &candidate.latest_frame_occupancy,
                 )?,
                 MappingBackendKind::Raytracing => {
                     PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy)?
                 }
-            });
-        }
-        check()?;
-        cloud
+            }
+            .grid
+        } else {
+            self.persistent
+                .as_ref()
+                .ok_or("PGO重建没有占据地图")?
+                .grid
+                .clone()
+        };
+        self.check(cancelled)?;
+        self.cloud
             .commit_accumulated()
             .ok_or("PGO重建点云无法完成快照")?;
-        Ok(RebuiltMap {
-            occupancy: persistent.ok_or("PGO重建没有占据地图")?.grid,
-            cloud: cloud.committed_snapshot().ok_or("PGO重建点云快照缺失")?,
-            backend_checkpoint: mapping_backend::export_mapping_kernel_checkpoint(&kernel)?,
-            accumulator: cloud.take_prepared_accumulator(),
-        })
+        let prepared = PreparedReplay {
+            occupancy,
+            cloud: self
+                .cloud
+                .committed_snapshot()
+                .ok_or("PGO重建点云快照缺失")?,
+            backend_checkpoint: mapping_backend::export_mapping_kernel_checkpoint(&output_kernel)?,
+            source_timestamp_ns: input.source_timestamp_ns,
+            prepared_backend: None,
+        };
+        self.check(cancelled)?;
+        Ok(prepared)
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        prepared: PreparedReplay,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<RebuiltMap, RebuildError> {
+        self.check(cancelled)?;
+        if prepared.source_timestamp_ns != self.latest_timestamp_ns() {
+            return Err("PGO准备快照落后于私有重放尾部".into());
+        }
+        let result = RebuiltMap {
+            occupancy: prepared.occupancy,
+            cloud: prepared.cloud,
+            backend_checkpoint: prepared.backend_checkpoint,
+            accumulator: self.cloud.take_prepared_accumulator(),
+            source_timestamp_ns: prepared.source_timestamp_ns,
+            prepared_backend: prepared.prepared_backend,
+        };
+        self.cloud
+            .cleanup_product_owned_file()
+            .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+        self.check(cancelled)?;
+        Ok(result)
+    }
+}
+
+fn check_budget(
+    started: Instant,
+    budget: Duration,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), RebuildError> {
+    if cancelled() {
+        Err(RebuildError::Cancelled)
+    } else if started.elapsed() >= budget {
+        Err(RebuildError::BudgetExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+/// 同步受管调用仍要求冻结扫描尾部；后台追赶复用同一个私有重放实现。
+pub(crate) fn rebuild(
+    scans: Vec<ArchivedScan>,
+    trajectory: Vec<OptimizedKeyframe>,
+    anchor: Isometry3<f64>,
+    spec: MappingBackendSpec,
+    config: MappingBackendComputeConfig,
+    frame_id: String,
+    budget: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<RebuiltMap, RebuildError> {
+    let started = Instant::now();
+    let frames = scans.len();
+    let mut processed = 0;
+    let mut kernel_time = Duration::ZERO;
+    let mut cloud_time = Duration::ZERO;
+    let result = (|| {
+        check_budget(started, budget, &cancelled)?;
+        if scans.last().map(|scan| scan.source_timestamp_ns)
+            != trajectory
+                .last()
+                .map(|node| node.source_timestamp_ns as u64)
+        {
+            return Err("PGO轨迹与已接纳扫描尾部不一致".into());
+        }
+        let mut builder = ReplayBuilder::new(
+            &scans, trajectory, anchor, spec, config, frame_id, budget, &cancelled,
+        )?;
+        let appended = builder.append(&scans, &cancelled);
+        processed = builder.processed;
+        kernel_time = builder.kernel_time;
+        cloud_time = builder.cloud_time;
+        match appended.and_then(|()| builder.prepare(&cancelled)) {
+            Ok(prepared) => builder.finish(prepared, &cancelled),
+            Err(error) => {
+                builder
+                    .cloud
+                    .cleanup_product_owned_file()
+                    .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                Err(error)
+            }
+        }
     })();
-    let cleanup = cloud
-        .cleanup_product_owned_file()
-        .map_err(|e| format!("PGO临时点云清理失败：{e}"));
-    // 清理失败仍属于真实故障，不能被预算拒绝掩盖。
-    let result = cleanup
-        .map_err(RebuildError::from)
-        .and(result)
-        .and_then(|value| {
-            check()?;
-            Ok(value)
-        });
-    tracing::info!(
-        event = "pgo.map.rebuilt",
-        frames = scans.len(),
-        processed,
-        kernel_ms = kernel_time.as_millis() as u64,
-        cloud_ms = cloud_time.as_millis() as u64,
-        elapsed_ms = start.elapsed().as_millis() as u64,
-        success = result.is_ok(),
-        error = ?result.as_ref().err(),
-        budget_ms = budget.as_millis() as u64,
-        "PGO私有地图重建结束"
-    );
-    #[cfg(test)]
-    eprintln!(
-        "重建计时 frames={processed} kernel={kernel_time:?} cloud={cloud_time:?} total={:?}",
-        start.elapsed()
-    );
+    tracing::info!(event = "pgo.map.rebuilt", frames, processed,
+        kernel_ms = kernel_time.as_millis() as u64, cloud_ms = cloud_time.as_millis() as u64,
+        elapsed_ms = started.elapsed().as_millis() as u64, success = result.is_ok(),
+        error = ?result.as_ref().err(), budget_ms = budget.as_millis() as u64,
+        "PGO私有地图重建结束");
     result
 }
 
@@ -446,6 +639,101 @@ mod tests {
             })
             .to_vec();
         (scans, trajectory)
+    }
+
+    #[test]
+    fn background_catchup_preserves_replay_cadence_maps_and_checkpoint() {
+        let (scans, mut trajectory) = scale_input(31);
+        let cutoff = 12;
+        trajectory[1].source_timestamp_ns = scans[cutoff].source_timestamp_ns as i64;
+        trajectory[1].translation_m = (scans[cutoff].odom_from_body.translation.vector
+            + nalgebra::Vector3::new(-0.04, 0.03, 0.0))
+        .into();
+        let mut complete_trajectory = trajectory.clone();
+        complete_trajectory.push(OptimizedKeyframe {
+            source_timestamp_ns: scans.last().unwrap().source_timestamp_ns as i64,
+            translation_m: (scans.last().unwrap().odom_from_body.translation.vector
+                + nalgebra::Vector3::new(-0.04, 0.03, 0.0))
+            .into(),
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        });
+        let config = MappingBackendComputeConfig {
+            resolution: 0.05,
+            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
+            initial_safe_radius_meters: 0.0,
+            window_capacity: 10_000,
+        };
+        let anchor = Isometry3::translation(0.73, -1.15, 0.04);
+        for spec in [
+            MappingBackendSpec::Voxel,
+            MappingBackendSpec::raytracing_defaults(),
+        ] {
+            let expected = rebuild(
+                scans.clone(),
+                complete_trajectory.clone(),
+                anchor,
+                spec,
+                config,
+                "map".into(),
+                Duration::from_secs(10),
+                || false,
+            )
+            .unwrap();
+            let mut builder = ReplayBuilder::new(
+                &scans[..=cutoff],
+                trajectory.clone(),
+                anchor,
+                spec,
+                config,
+                "map".into(),
+                Duration::from_secs(10),
+                &|| false,
+            )
+            .unwrap();
+            let mut start = 0;
+            let mut prepared = None;
+            for end in [13, 14, 19, 26, 31] {
+                builder.append(&scans[start..end], &|| false).unwrap();
+                prepared = Some(builder.prepare(&|| false).unwrap());
+                start = end;
+            }
+            let actual = builder.finish(prepared.unwrap(), &|| false).unwrap();
+            assert_eq!(
+                actual.source_timestamp_ns,
+                scans.last().unwrap().source_timestamp_ns
+            );
+            let a = &actual.occupancy;
+            let b = &expected.occupancy;
+            assert_eq!(
+                (
+                    a.width,
+                    a.height,
+                    a.resolution,
+                    a.origin,
+                    a.origin_orientation,
+                    &a.frame_id,
+                    &a.data
+                ),
+                (
+                    b.width,
+                    b.height,
+                    b.resolution,
+                    b.origin,
+                    b.origin_orientation,
+                    &b.frame_id,
+                    &b.data
+                ),
+                "分批追赶不能改变占据结果"
+            );
+            assert_eq!(
+                actual.cloud.xyz_f32_le, expected.cloud.xyz_f32_le,
+                "动态清理与点云一致"
+            );
+            assert_eq!(
+                actual.backend_checkpoint, expected.backend_checkpoint,
+                "继续建图的内核状态一致"
+            );
+        }
     }
 
     fn rebuild_scale(

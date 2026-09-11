@@ -2123,6 +2123,10 @@ mod preflight_only_contract {
         phase: AtomicU8,
         notify: tokio::sync::Notify,
         operation: CanonicalOperationControl,
+        background_mapping: AtomicBool,
+        background_mode: std::sync::OnceLock<(Arc<RelocalizationModeFence>, u64)>,
+        // 后台准备完成后才领取；最终处理租约负责释放，提交中毒时继续保留围栏。
+        background_lifecycle_guard: parking_lot::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     }
 
     /// Request-scoped cancellation shared by ingress, transport, sink, and
@@ -2139,6 +2143,9 @@ mod preflight_only_contract {
                     phase: AtomicU8::new(REQUEST_ACTIVE),
                     notify: tokio::sync::Notify::new(),
                     operation: CanonicalOperationControl::production(),
+                    background_mapping: AtomicBool::new(false),
+                    background_mode: std::sync::OnceLock::new(),
+                    background_lifecycle_guard: parking_lot::Mutex::new(None),
                 }),
             }
         }
@@ -2150,12 +2157,40 @@ mod preflight_only_contract {
                     phase: AtomicU8::new(REQUEST_ACTIVE),
                     notify: tokio::sync::Notify::new(),
                     operation: CanonicalOperationControl::with_fail_stop(fail_stop),
+                    background_mapping: AtomicBool::new(false),
+                    background_mode: std::sync::OnceLock::new(),
+                    background_lifecycle_guard: parking_lot::Mutex::new(None),
                 }),
             }
         }
 
         pub(crate) fn operation(&self) -> CanonicalOperationControl {
             self.inner.operation.clone()
+        }
+
+        pub(crate) fn for_background_mapping() -> Self {
+            let cancellation = Self::new();
+            cancellation
+                .inner
+                .background_mapping
+                .store(true, Ordering::Release);
+            cancellation
+        }
+
+        pub(crate) fn is_background_mapping(&self) -> bool {
+            self.inner.background_mapping.load(Ordering::Acquire)
+        }
+
+        pub(crate) fn retain_background_lifecycle_guard(
+            &self,
+            guard: tokio::sync::OwnedMutexGuard<()>,
+        ) {
+            let previous = self.inner.background_lifecycle_guard.lock().replace(guard);
+            assert!(previous.is_none(), "后台校正不能重复领取生命周期围栏");
+        }
+
+        fn release_background_lifecycle_guard(&self) {
+            self.inner.background_lifecycle_guard.lock().take();
         }
 
         pub(crate) fn cancel(&self) {
@@ -2186,7 +2221,14 @@ mod preflight_only_contract {
             matches!(
                 self.inner.phase.load(Ordering::Acquire),
                 REQUEST_CANCELLED | REQUEST_COMMITTING_CANCELLED | REQUEST_COMMITTED_CANCELLED
-            )
+            ) || self
+                .inner
+                .background_mode
+                .get()
+                .is_some_and(|(fence, epoch)| {
+                    let mode = fence.snapshot();
+                    mode.active || mode.epoch != *epoch
+                })
         }
 
         pub(crate) async fn cancelled(&self) {
@@ -2985,6 +3027,7 @@ mod preflight_only_contract {
 
         fn release(&self) {
             self.lifecycle_guard.lock().take();
+            self.cancellation.release_background_lifecycle_guard();
         }
 
         fn has_lifecycle_guard(&self) -> bool {
@@ -4360,7 +4403,58 @@ mod preflight_only_contract {
         lease: Arc<CorrectionRequestLease>,
     }
 
+    /// 普通建图的最新校正输入；原串行生产任务消费，不在实时回调中等待历史计算。
+    struct BackgroundCorrectionQueue {
+        pending: parking_lot::Mutex<Option<CorrectionFrameInput>>,
+        ready: Notify,
+        mode: Arc<RelocalizationModeFence>,
+    }
+
+    impl BackgroundCorrectionQueue {
+        fn replace(&self, input: CorrectionFrameInput) {
+            let mut pending = self.pending.lock();
+            if pending.as_ref().is_some_and(|current| {
+                current.mapping_session_generation > input.mapping_session_generation
+                    || (current.mapping_session_generation == input.mapping_session_generation
+                        && current.registered_cloud.source_timestamp_ns
+                            >= input.registered_cloud.source_timestamp_ns)
+            }) {
+                return;
+            }
+            *pending = Some(input);
+            drop(pending);
+            self.ready.notify_one();
+        }
+
+        async fn receive(queue: &Option<Arc<Self>>) -> CorrectionFrameRequest {
+            let Some(queue) = queue else {
+                return std::future::pending().await;
+            };
+            loop {
+                let notified = queue.ready.notified();
+                if let Some(input) = queue.pending.lock().take() {
+                    let cancellation = CorrectionRequestCancellation::for_background_mapping();
+                    let _ = cancellation.inner.background_mode.set((
+                        Arc::clone(&queue.mode),
+                        input.frame_capture_relocalization_epoch,
+                    ));
+                    let lease = Arc::new(CorrectionRequestLease::new(cancellation.clone(), None));
+                    // 后台输入的最终结果由原拥有方日志报告，没有同步等待者。
+                    let (response, _receiver) = oneshot::channel();
+                    return CorrectionFrameRequest {
+                        input,
+                        response,
+                        cancellation,
+                        lease,
+                    };
+                }
+                notified.await;
+            }
+        }
+    }
+
     struct CandidateProducerContext {
+        background: Option<Arc<BackgroundCorrectionQueue>>,
         publisher: Option<LcmTransport>,
         binding: Option<(LcmTopic, LcmMessageType)>,
         finalizer: CanonicalPublishFinalizerIngress,
@@ -4731,6 +4825,7 @@ mod preflight_only_contract {
     /// Cloneable admission endpoint; the retained lifetime owner remains non-Clone.
     #[derive(Clone)]
     pub(crate) struct CorrectionFrameIngress {
+        background: Option<Arc<BackgroundCorrectionQueue>>,
         sender: mpsc::Sender<CorrectionFrameRequest>,
         admission_open: Arc<AtomicBool>,
         admission_rx: watch::Receiver<bool>,
@@ -4738,6 +4833,33 @@ mod preflight_only_contract {
     }
 
     impl CorrectionFrameIngress {
+        pub(crate) fn supports_background_mapping(&self) -> bool {
+            self.background.is_some()
+        }
+
+        pub(crate) fn submit_mapping_background(
+            &self,
+            input: CorrectionFrameInput,
+        ) -> Result<(), CorrectionRuntimeError> {
+            let _admission_guard = correction_frame_admission_fence().lock();
+            if !self.admission_open.load(Ordering::Acquire) {
+                return Err(CorrectionRuntimeError::Stopped);
+            }
+            let mode = self.relocalization_mode.snapshot();
+            if mode.active
+                || mode.epoch != input.frame_capture_relocalization_epoch
+                || input.relocalization_mode_epoch.is_some()
+            {
+                return Ok(());
+            }
+            let queue = self
+                .background
+                .as_ref()
+                .ok_or(CorrectionRuntimeError::IngressClosed)?;
+            queue.replace(input);
+            Ok(())
+        }
+
         pub(crate) async fn submit(
             &self,
             input: CorrectionFrameInput,
@@ -9875,6 +9997,17 @@ mod preflight_only_contract {
             sink: Arc<dyn CorrectionCandidateSink>,
             relocalization_mode: Arc<RelocalizationModeFence>,
         ) -> Result<Self, CorrectionRuntimeError> {
+            let background = matches!(
+                &spec,
+                CorrectionOwnerSpec::LibraryPgo { .. } | CorrectionOwnerSpec::NativePgo { .. }
+            )
+            .then(|| {
+                Arc::new(BackgroundCorrectionQueue {
+                    pending: parking_lot::Mutex::new(None),
+                    ready: Notify::new(),
+                    mode: Arc::clone(&relocalization_mode),
+                })
+            });
             let relocalization_frames = match &spec {
                 CorrectionOwnerSpec::Relocalization {
                     map_frame_id,
@@ -9977,6 +10110,7 @@ mod preflight_only_contract {
             let finalizer_ingress = finalizer.ingress();
             let cleanup_ingress = cleanup.ingress();
             let ingress = CorrectionFrameIngress {
+                background: background.clone(),
                 sender: request_tx,
                 admission_open: Arc::clone(&admission_open),
                 admission_rx: admission_rx.clone(),
@@ -10015,6 +10149,7 @@ mod preflight_only_contract {
                             request_rx,
                             admission_rx,
                             CandidateProducerContext {
+                                background,
                                 publisher,
                                 binding: producer_binding,
                                 finalizer: finalizer_ingress.clone(),
@@ -10501,9 +10636,13 @@ mod preflight_only_contract {
         mut admission_rx: watch::Receiver<bool>,
         context: CandidateProducerContext,
     ) -> Result<(), CorrectionRuntimeError> {
+        let background = context.background.clone();
         let run_result =
             run_candidate_producer_loop(&mut owner, &mut requests, &mut admission_rx, context)
                 .await;
+        if let Some(queue) = background {
+            queue.pending.lock().take();
+        }
         while let Ok(request) = requests.try_recv() {
             request.cancellation.cancel();
             let _ = request.response.send(Err(CorrectionRuntimeError::Stopped));
@@ -10630,6 +10769,7 @@ mod preflight_only_contract {
         context: CandidateProducerContext,
     ) -> Result<(), CorrectionRuntimeError> {
         let CandidateProducerContext {
+            background,
             publisher,
             binding,
             finalizer,
@@ -10660,12 +10800,18 @@ mod preflight_only_contract {
                     };
                     request
                 }
+                request = BackgroundCorrectionQueue::receive(&background) => request,
             };
             if request.cancellation.is_cancelled() {
                 continue;
             }
             let stage_result = tokio::select! {
                 biased;
+                _ = wait_for_admission_close(admission_rx) => {
+                    request.cancellation.cancel();
+                    sink.discard_frame(&request.input).await;
+                    break;
+                }
                 _ = request.cancellation.cancelled() => {
                     sink.discard_frame(&request.input).await;
                     continue;
@@ -10686,10 +10832,19 @@ mod preflight_only_contract {
                 continue;
             }
             let staged_input = request.input.clone();
-            let production = match owner
-                .submit_frame(request.input, &request.cancellation)
-                .await
-            {
+            let produced = {
+                let producing = owner.submit_frame(request.input, &request.cancellation);
+                tokio::pin!(producing);
+                tokio::select! {
+                    biased;
+                    _ = wait_for_admission_close(admission_rx) => {
+                        request.cancellation.cancel();
+                        producing.await
+                    }
+                    result = &mut producing => result,
+                }
+            };
+            let production = match produced {
                 Ok(production) => production,
                 Err(CorrectionRuntimeError::CandidateOwner(error)) => {
                     request.cancellation.cancel();
@@ -16224,6 +16379,108 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             }
         }
 
+        #[derive(Default)]
+        struct PausedBackgroundStage {
+            entered: Notify,
+            release: Notify,
+            staged: parking_lot::Mutex<Vec<u64>>,
+            discarded: parking_lot::Mutex<Vec<u64>>,
+        }
+
+        #[async_trait::async_trait]
+        impl CorrectionCandidateSink for PausedBackgroundStage {
+            async fn stage_frame(&self, input: &CorrectionFrameInput) -> Result<(), String> {
+                let first = {
+                    let mut staged = self.staged.lock();
+                    staged.push(input.mapping_commit_id.sequence);
+                    staged.len() == 1
+                };
+                if first {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(())
+            }
+            async fn discard_frame(&self, input: &CorrectionFrameInput) {
+                self.discarded.lock().push(input.mapping_commit_id.sequence);
+            }
+            async fn apply_candidate(
+                &self,
+                _: CorrectionCandidate,
+                _: CorrectionRequestCancellation,
+            ) -> Result<CorrectionDisposition, String> {
+                Err("两帧夹具不应产生回环候选".into())
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn background_mapping_coalesces_without_waiting_and_shutdown_cancels_pending_stage() {
+            for stop_while_paused in [false, true] {
+                let sink = Arc::new(PausedBackgroundStage::default());
+                let owner = CorrectionTransportOwner::start(
+                    transport_library_spec(),
+                    owner_identity(),
+                    &crate::lcm_runtime::test_lcm_url(),
+                    sink.clone(),
+                )
+                .await
+                .unwrap();
+                let ingress = owner.ingress();
+                assert!(ingress.supports_background_mapping());
+                ingress
+                    .submit_mapping_background(frame(1, 1_000_000_000, 0.0))
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), sink.entered.notified())
+                    .await
+                    .unwrap();
+                for sequence in 2..=100 {
+                    ingress
+                        .submit_mapping_background(frame(sequence, sequence * 1_000_000_000, 2.0))
+                        .unwrap();
+                }
+                assert_eq!(sink.staged.lock().as_slice(), &[1]);
+                assert_eq!(
+                    ingress
+                        .background
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .mapping_commit_id
+                        .sequence,
+                    100
+                );
+                if !stop_while_paused {
+                    sink.release.notify_one();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while sink.discarded.lock().len() < 2 {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(sink.staged.lock().as_slice(), &[1, 100]);
+                }
+                tokio::time::timeout(Duration::from_secs(2), owner.shutdown())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!ingress.is_open());
+                assert!(ingress
+                    .background
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .is_none());
+                assert!(ingress
+                    .submit_mapping_background(frame(101, 101_000_000_000, 2.0))
+                    .is_err());
+            }
+        }
+
         #[tokio::test]
         async fn captured_frame_epoch_is_rechecked_before_enqueue() {
             let sink = Arc::new(NativeFinalizingSink::default());
@@ -16537,6 +16794,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let cleanup = CorrectionCleanupSupervisor::start(cleanup_sink);
             let (finalizer_tx, finalizer_rx) = mpsc::channel(CORRECTION_INPUT_QUEUE_CAPACITY);
             let ingress = CorrectionFrameIngress {
+                background: None,
                 sender: request_tx,
                 admission_open: Arc::clone(&admission_open),
                 admission_rx: admission_rx.clone(),
@@ -16547,6 +16805,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 request_rx,
                 admission_rx,
                 CandidateProducerContext {
+                    background: None,
                     publisher: Some(publisher),
                     binding: Some(binding),
                     finalizer: CanonicalPublishFinalizerIngress {

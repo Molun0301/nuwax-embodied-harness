@@ -2351,6 +2351,22 @@ impl MappingAdapter {
         crate::pgo_map::RebuildError,
     > {
         self.backend_checkpoint_client()?;
+        let (scans, spec, config, _) = self.pgo_replay_input_since(0)?;
+        Ok((scans, spec, config))
+    }
+
+    pub(crate) fn pgo_replay_input_since(
+        &self,
+        after_timestamp_ns: u64,
+    ) -> Result<
+        (
+            Vec<crate::pgo_map::ArchivedScan>,
+            MappingBackendSpec,
+            MappingBackendComputeConfig,
+            u64,
+        ),
+        crate::pgo_map::RebuildError,
+    > {
         if self.checkpoint_activation_digest.is_some() {
             return Err(crate::pgo_map::RebuildError::HistoryUnavailable);
         }
@@ -2358,10 +2374,24 @@ impl MappingAdapter {
             self.pgo_history
                 .as_ref()
                 .ok_or("PGO地图历史未绑定")?
-                .snapshot()?,
+                .snapshot_after(after_timestamp_ns)?,
             self.mapping_backend,
             self.backend_compute_config(),
+            self.backend_generation,
         ))
+    }
+
+    pub(crate) fn pgo_replay_tail_is_current(&self, timestamp_ns: u64) -> bool {
+        self.is_active()
+            && self.in_flight_compute.is_none()
+            && self.pending_backend_retirement.is_none()
+            && self.checkpoint_export.is_none()
+            && self.latest_pointcloud_timestamp_ns == timestamp_ns
+            && self
+                .pgo_history
+                .as_ref()
+                .and_then(|history| history.latest_timestamp_ns())
+                == Some(timestamp_ns)
     }
 
     pub(crate) fn prepare_pgo_install(

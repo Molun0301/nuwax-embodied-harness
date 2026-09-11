@@ -153,9 +153,8 @@ static std_msgs::Header make_source_header(
     return header;
 }
 
-// Publish the lidar point cloud in the sensor frame (g_sensor_frame_id).
-// `cloud` is Point-LIO's undistorted scan in the sensor's own frame
-// (get_body_cloud), so points are published as-is with no world registration.
+// 密集点已按扫描内估计轨迹补偿到同源位姿对应的传感器坐标。
+// 保留完整输出点数；世界注册仍由Geometry按这一对位姿与点云执行。
 static void publish_lidar(PointCloudXYZI::Ptr cloud, uint64_t timestamp_ns, const std::string& topic = "") {
     const std::string& chan = topic.empty() ? g_lidar_topic : topic;
     if (!g_lcm || !cloud || cloud->empty() || chan.empty()) { return; }

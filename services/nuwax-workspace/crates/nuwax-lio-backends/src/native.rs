@@ -88,8 +88,11 @@ pub struct NativeLioConfig {
     pub extrinsic_rotation_row_major: [f64; 9],
     pub host_ip: String,
     pub lidar_ip: String,
+    /// 设备裸包聚合频率；规范输入本身已经携带完整扫描边界。
     pub lidar_frequency_hz: f64,
+    /// 设备裸包模式的点云输出上限；规范完整扫描按每个真实新解交付。
     pub pointcloud_frequency_hz: f64,
+    /// 设备裸包模式的位姿输出上限；规范输入仍保留原始源时间递增门。
     pub odometry_frequency_hz: f64,
     pub debug: bool,
     /// 扫描下采样体素边长；未配置时保留原生程序默认值，单位为米。

@@ -15,6 +15,22 @@ inline constexpr int kNativeInputImuQueueCapacity =
 inline constexpr int kNativeInputCloudQueueCapacity = 30;
 static_assert(kNativeInputCloudQueueCapacity >= kNativeInputBurstGroups);
 
+// 每轮有界地处理惯性批次，遇到首个完整扫描立即交给估计器。
+// 不能一次排空所有点云，否则后一扫描会覆盖尚未计算的前一扫描。
+inline constexpr int kNativeInputDispatchBudget = 64;
+
+template <typename Context, typename ScanReady, typename Running>
+int dispatch_native_input_until_scan(Context& context, ScanReady scan_ready, Running running) {
+    int handled = 0;
+    while (handled < kNativeInputDispatchBudget && running() && !scan_ready()) {
+        const int result = context.handleTimeout(0);
+        if (result < 0) return -1;
+        if (result == 0) break;
+        ++handled;
+    }
+    return handled;
+}
+
 template <typename Subscription>
 bool configure_native_input_subscription(
     Subscription* subscription,

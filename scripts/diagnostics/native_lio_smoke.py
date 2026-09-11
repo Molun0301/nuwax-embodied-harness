@@ -233,9 +233,15 @@ def closed_motion_state(seconds):
 
 
 def run_backend(backend, executable, runtime_binary, output_dir, frame_count, gateway_mode=False,
-                correction_backend="none", motion_loop=False):
-    if motion_loop and frame_count < 850:
-        raise ValueError("闭合运动模拟需要至少850帧")
+                correction_backend="none", motion_loop=False, realtime_source=False,
+                scan_period_ms=100.0):
+    if not np.isfinite(scan_period_ms) or not 10 <= scan_period_ms <= 4000:
+        raise ValueError("合成扫描周期必须为10至4000毫秒的有限数值")
+    scan_period_ns = int(round(scan_period_ms * 1_000_000))
+    scan_period_s = scan_period_ns / 1e9
+    scan_end_offset_ns = ((scan_period_ns - 1) // 5_000_000) * 5_000_000
+    if motion_loop and frame_count * scan_period_s < 85:
+        raise ValueError("闭合运动模拟需覆盖至少85秒")
     root = ROOT
     evidence = output_dir
     # 仅在资源确已退出后删除；清理失败时保留路径供继续处理。
@@ -338,11 +344,12 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             ((points @ world_from_body) - body_from_sensor_translation) @ body_from_sensor_rotation,
             dtype="<f4",
         )
-        offsets = np.linspace(0, 95_000_000, len(points), dtype="<u8")
+        offsets = np.linspace(0, scan_end_offset_ns, len(points), dtype="<u8")
         common = dict(clock_domain="unix_ns", frame_id="synthetic_lidar",
             registration_state="sensor", registration_frame_id="synthetic_lidar",
             calibration_ref="known-synthetic-identity", payload_ownership="inline")
-        first_stamp = time.time_ns() - 10_000_000_000
+        # 实时诊断把首个完整扫描放在当前时刻之前；点与惯性从不预写未来时间。
+        first_stamp = time.time_ns() - (scan_period_ns if realtime_source else 10_000_000_000)
         imu_sequence = 0
         publish_latencies = []
         pose_samples = []
@@ -350,12 +357,12 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         pose_quaternions = []
         input_started = time.monotonic()
         for frame_index in range(frame_count):
-            stamp = first_stamp + frame_index * 100_000_000
-            for offset in range(0, 100_000_000, 5_000_000):
+            stamp = first_stamp + frame_index * scan_period_ns
+            for offset in range(0, scan_period_ns, 5_000_000):
                 imu_sequence += 1
                 acceleration, gyro = acceleration_sensor, (0, 0, 0)
                 if motion_loop:
-                    _, world_accel, yaw, yaw_rate = closed_motion_state(frame_index * .1 + offset / 1e9)
+                    _, world_accel, yaw, yaw_rate = closed_motion_state(frame_index * scan_period_s + offset / 1e9)
                     c, s = np.cos(yaw), np.sin(yaw)
                     yaw_rotation = np.asarray([[c, -s, 0], [s, c, 0], [0, 0, 1]])
                     rotation = yaw_rotation @ world_from_body
@@ -366,7 +373,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
                     timestamp_ns=stamp + offset, accel_mps2=acceleration, gyro_rps=gyro, **common))
             if motion_loop:
                 # 每个点按自己的扫描时间生成，不能用整帧末态伪造运动中的原始扫描。
-                position, _, yaw, _ = closed_motion_state(frame_index * .1 + offsets.astype(float) / 1e9)
+                position, _, yaw, _ = closed_motion_state(frame_index * scan_period_s + offsets.astype(float) / 1e9)
                 delta = world_points - position
                 c, s = np.cos(yaw), np.sin(yaw)
                 unyawed = np.stack((c * delta[:, 0] + s * delta[:, 1],
@@ -386,13 +393,13 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
                 pose_timestamps.append(observed_pose.timestamp_ns)
                 pose_quaternions.append([observed_pose.orientation.x, observed_pose.orientation.y,
                     observed_pose.orientation.z, observed_pose.orientation.w])
-            if motion_loop:
-                time.sleep(max(0, input_started + (frame_index + 1) * .1 - time.monotonic()))
+            if motion_loop or realtime_source:
+                time.sleep(max(0, input_started + (frame_index + 1) * scan_period_s - time.monotonic()))
             else:
                 time.sleep(.05)
         input_elapsed_s = time.monotonic() - input_started
         deadline = time.monotonic() + 5
-        minimum_final_stamp = first_stamp + max(1, frame_count - 5) * 100_000_000
+        minimum_final_stamp = first_stamp + max(1, frame_count - 5) * scan_period_ns
         # 就绪可能早于最后一批发布/计算，沿原期限等待发布线程排空和源时间推进。
         while True:
             readiness = stub.GetMappingReadiness(pb2.Empty(), timeout=2)
@@ -478,6 +485,8 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             "control_plane": "http_mcp" if gateway_mode else "grpc",
             "sent_frames": bridge.counters.emitted_lio_measurement_count,
             "input_elapsed_s": input_elapsed_s,
+            "scan_period_ms": scan_period_ns / 1e6,
+            "source_timing": "synthetic_completed_scan" if realtime_source else "synthetic_offset_10s",
             "publish_mean_ms": float(np.mean(publish_latencies)),
             "publish_p95_ms": float(np.percentile(publish_latencies, 95)),
             "mapping_ready": readiness.ready, "pose_timestamp_ns": pose.timestamp_ns,
@@ -535,14 +544,18 @@ def main():
     parser.add_argument("--runtime-binary", type=Path, default=ROOT / "services/geometry/nuwax_geometry_runtime/target/debug/nuwax-geometry-runtime")
     parser.add_argument("--output-dir", type=Path, help="保留原生日志；未设置时使用自动清理的临时目录")
     parser.add_argument("--frames", type=int, default=60)
-    parser.add_argument("--motion-loop", action="store_true", help="按真实时间运行闭合运动轨迹，需至少850帧")
+    parser.add_argument("--motion-loop", action="store_true", help="按真实时间运行闭合运动轨迹，需覆盖至少85秒")
+    parser.add_argument("--realtime-source", action="store_true", help="合成完整扫描按本机实时时钟交付；用于逐帧时效测量")
+    parser.add_argument("--scan-period-ms", type=float, default=100.0, help="合成扫描周期，默认100毫秒；65毫秒可对照Go2输入节拍")
     parser.add_argument("--gateway", action="store_true", help="通过真实HTTP/MCP创建、激活与控制建图")
     parser.add_argument("--correction-backend", choices=("none", "library_pgo", "native_pgo"), default="none", help="选择实际校正后端，核对原生定位与位姿图优化组合")
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error("--frames 必须大于零")
-    if args.motion_loop and args.frames < 850:
-        parser.error("--motion-loop 需要至少850帧以覆盖完整初始化、运动与返回")
+    if not np.isfinite(args.scan_period_ms) or not 10 <= args.scan_period_ms <= 4000:
+        parser.error("--scan-period-ms 必须为10至4000毫秒的有限数值")
+    if args.motion_loop and args.frames * args.scan_period_ms < 85000:
+        parser.error("--motion-loop 需要覆盖至少85秒的初始化、运动与返回")
     if args.backend == "all" and args.executable is not None:
         parser.error("--executable 仅适用于单个后端")
     if args.output_dir is not None:
@@ -554,7 +567,7 @@ def main():
             executable = args.executable or ROOT / ("services/nuwax-workspace/crates/nuwax-lio-backends/native/%s/cpp/result/bin/%s_native" % (backend, backend))
             if not executable.is_file():
                 parser.error("原生程序尚未构建：%s" % executable)
-            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway, args.correction_backend, args.motion_loop)
+            run_backend(backend, executable, args.runtime_binary.resolve(), Path(output_path), args.frames, args.gateway, args.correction_backend, args.motion_loop, args.realtime_source, args.scan_period_ms)
 
 
 if __name__ == "__main__":

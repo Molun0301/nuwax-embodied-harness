@@ -146,7 +146,7 @@ def module_system_packages(modules: Iterable[str], robot: str = "customrobot") -
     if "geometry" in selected:
         packages.extend(("curl", "git", "cmake", "protobuf-compiler", "libssl-dev", "liblcm-bin", "libpcl-dev"))
     if selected & {"fastlio2", "pointlio"}:
-        packages.extend(("cmake", "git", "patch", "libeigen3-dev", "libpcl-dev"))
+        packages.extend(("cmake", "git", "patch", "liblcm-bin", "libeigen3-dev", "libpcl-dev"))
     if "pointlio" in selected:
         packages.append("libgoogle-glog-dev")
     if "perception" in selected:

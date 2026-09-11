@@ -111,6 +111,8 @@ FetchContent_MakeAvailable(dimos_lcm)
 # LCM
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCM REQUIRED lcm)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../common/native_lcm_types.cmake")
+nuwax_generate_native_lcm_types("${dimos_lcm_SOURCE_DIR}")
 
 # Eigen3
 find_package(Eigen3 REQUIRED)
@@ -142,7 +144,7 @@ target_include_directories(fastlio2_native PRIVATE
   ${FASTLIO_PATCHED_DIR}/src
   ${FASTLIO_SOURCE_DIR}/include
   ${FASTLIO_SOURCE_DIR}/src
-  ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
+  ${NUWAX_NATIVE_LCM_INCLUDE_DIR}
   ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}

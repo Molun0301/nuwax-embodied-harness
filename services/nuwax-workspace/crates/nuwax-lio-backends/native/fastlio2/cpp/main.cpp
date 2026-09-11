@@ -575,10 +575,11 @@ static void run_main_iter(
         }
     }
     const bool first_output = !has_last_output_source_timestamp;
+    // 完整规范扫描按真实新解发布；仅SDK裸包模式继续使用配置的输出节拍。
     bool cloud_due = scan_publish_en && !g_lidar_topic.empty() &&
-                     (first_output || now - last_pc_publish >= pc_interval);
+                     (g_external_input || first_output || now - last_pc_publish >= pc_interval);
     const bool odometry_due = !g_odometry_topic.empty() &&
-                              (first_output || now - last_odom_publish >= odom_interval);
+                              (g_external_input || first_output || now - last_odom_publish >= odom_interval);
     nav_msgs::Odometry odometry;
     PointCloudXYZI::Ptr cloud;
     uint64_t source_timestamp_ns = 0;
@@ -823,6 +824,18 @@ int main(int argc, char** argv) {
 
     while (g_running.load()) {
         auto loop_start = std::chrono::high_resolution_clock::now();
+        if (g_external_input) {
+            const int received = nuwax_lio::dispatch_native_input_until_scan(lcm, [] {
+                std::lock_guard<std::mutex> lock(g_pc_mutex);
+                return g_frame_has_timestamp;
+            }, [] { return g_running.load(); });
+            if (received < 0) {
+                fprintf(stderr, "[fastlio2] 规范输入通信读取失败\n");
+                g_typed_input_failed.store(true);
+                g_running.store(false);
+            }
+            if (!g_running.load()) break;
+        }
         auto now = std::chrono::steady_clock::now();
         run_main_iter(
             now,
@@ -839,8 +852,7 @@ int main(int argc, char** argv) {
             dense_publish_en
         );
 
-        // Drain LCM messages.
-        lcm.handleTimeout(0);
+        if (!g_external_input) lcm.handleTimeout(0);
 
         // Rate control (~main_freq, 5kHz default).
         auto loop_end = std::chrono::high_resolution_clock::now();

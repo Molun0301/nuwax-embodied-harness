@@ -535,13 +535,47 @@ fn incoming_until_shutdown(
                     }
                 }
                 accepted = listener.accept() => {
-                    let item = accepted.map(|(stream, _peer)| stream);
+                    // 自建 incoming 不会应用 Tonic 构建器的 TCP 设置，必须配置实际连接。
+                    // 小位姿帧直接交付，避免小包合并与延迟确认叠加出约40毫秒等待。
+                    let item = accepted.and_then(|(stream, _peer)| {
+                        stream.set_nodelay(true)?;
+                        Ok(stream)
+                    });
                     Some((item, Some((listener, request_rx, listener_closed_tx))))
                 }
             }
         },
     );
     (incoming, graceful_rx)
+}
+
+#[cfg(test)]
+mod incoming_socket_tests {
+    use super::*;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn accepted_socket_is_immediate_and_listener_shutdown_preserves_response_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, control) = server::shutdown_channel();
+        let (incoming, _) = incoming_until_shutdown(listener, control);
+        tokio::pin!(incoming);
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut accepted = incoming.next().await.unwrap().unwrap();
+        assert!(accepted.nodelay().unwrap(), "必须检查真实套接字，构建器设置不会覆盖自建连接流");
+        accepted.write_all(b"pose").await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pose");
+        shutdown.request_shutdown();
+        assert!(tokio::time::timeout(Duration::from_millis(30), incoming.next()).await.is_err());
+        assert!(TcpStream::connect(address).await.is_err(), "停止后不得接纳新连接");
+        accepted.write_all(b"done").await.unwrap();
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"done", "已有连接仍可完成原响应排空");
+    }
 }
 
 async fn wait_for_grpc_health(addr: SocketAddr) -> Result<StartupHealth, String> {

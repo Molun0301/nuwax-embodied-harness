@@ -1198,6 +1198,7 @@ class GatewayRuntime:
         )
         self._pointcloud_map_source_switch: Optional[PointCloudMapSourceSwitch] = None
         self._pointcloud_map_stream_stop = threading.Event()
+        self._pointcloud_map_stream_wake = threading.Event()
         self._pointcloud_map_stream_thread: Optional[threading.Thread] = None
         self._pointcloud_map_current_snapshot: Optional[PointCloudMapSnapshot] = None
         self._pointcloud_map_pending_source_error: Optional[PointCloudMapSourceError] = None
@@ -1868,6 +1869,7 @@ class GatewayRuntime:
                 raise
 
             self._pointcloud_map_stream_stop.clear()
+            self._pointcloud_map_stream_wake.clear()
             self._pointcloud_map_current_snapshot = None
             self._pointcloud_map_pending_source_error = None
             self._pointcloud_map_refresh_requested = False
@@ -1904,6 +1906,7 @@ class GatewayRuntime:
             if thread is None and source_switch is None:
                 return
             self._pointcloud_map_stream_stop.set()
+            self._pointcloud_map_stream_wake.set()
             self._pointcloud_map_refresh_requested = False
             self._pointcloud_map_stop_pending = True
 
@@ -1956,6 +1959,8 @@ class GatewayRuntime:
         thread = threading.current_thread()
         try:
             while not self._pointcloud_map_stream_stop.is_set():
+                # 先清除本轮通知；读取期间到达的新通知会留到下一轮，避免丢唤醒。
+                self._pointcloud_map_stream_wake.clear()
                 iteration_failed = False
                 source_error = None
                 try:
@@ -2036,8 +2041,14 @@ class GatewayRuntime:
                 else:
                     wait_sec = self._POINTCLOUD_MAP_POLL_INTERVAL_SEC
                     error_backoff_sec = self._POINTCLOUD_MAP_POLL_INTERVAL_SEC
-                if self._pointcloud_map_stream_stop.wait(wait_sec):
-                    break
+                if iteration_failed or retryable_source_error:
+                    # 坏来源仍按原预算退避，不能被高频地图通知带入忙循环。
+                    if self._pointcloud_map_stream_stop.wait(wait_sec):
+                        break
+                else:
+                    # 停止可能早于本轮 clear，不能因丢掉唤醒信号而等待整个回退周期。
+                    if not self._pointcloud_map_stream_stop.is_set():
+                        self._pointcloud_map_stream_wake.wait(wait_sec)
         finally:
             self._finalize_pointcloud_map_stream(source_switch, thread)
 
@@ -2307,11 +2318,11 @@ class GatewayRuntime:
             if (
                 thread is None
                 or not thread.is_alive()
-                or self._pointcloud_map_current_snapshot is None
                 or self._pointcloud_map_stream_stop.is_set()
             ):
                 return
             self._pointcloud_map_refresh_requested = True
+            self._pointcloud_map_stream_wake.set()
 
     def _publish_runtime_governance_stream_frame(self) -> None:
         self.stream_bus.publish(

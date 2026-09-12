@@ -23,6 +23,10 @@ use std::{
 
 const MAX_ARCHIVED_POINTS: usize = 8_000_000;
 pub(crate) const REBUILD_BUDGET: Duration = Duration::from_secs(3);
+// 后台准备按小段让出计算资源；累计历史耗时不再成为丢弃回环的条件。
+pub(crate) const REPLAY_SLICE: Duration = Duration::from_millis(8);
+pub(crate) const REPLAY_YIELD: Duration = Duration::from_millis(2);
+const REPLAY_SLICE_MAX_FRAMES: usize = 16;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum RebuildError {
@@ -165,31 +169,12 @@ pub(crate) fn optimized_pose(frame: &OptimizedKeyframe) -> Isometry3<f64> {
     )
 }
 
-// 即使后台重建发生异常展开，也必须释放本次独占的临时共享内存文件。
-struct TemporaryCloud(CloudMapShmWriter);
-impl std::ops::Deref for TemporaryCloud {
-    type Target = CloudMapShmWriter;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl std::ops::DerefMut for TemporaryCloud {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-impl Drop for TemporaryCloud {
-    fn drop(&mut self) {
-        let _ = self.0.cleanup_product_owned_file();
-    }
-}
-
 /// 私有重放拥有方保留内核和动态反证；追赶只追加新扫描，不反复重算历史前缀。
 pub(crate) struct ReplayBuilder {
     kernel: mapping_backend::MappingKernel,
     spec: MappingBackendSpec,
     persistent: Option<PersistentOccupancyGrid>,
-    cloud: TemporaryCloud,
+    cloud: CloudMapShmWriter,
     timeline: CorrectionTimeline,
     anchor: Isometry3<f64>,
     first_timestamp_ns: i64,
@@ -199,6 +184,7 @@ pub(crate) struct ReplayBuilder {
     processed: usize,
     started: Instant,
     budget: Duration,
+    background: bool,
     kernel_time: Duration,
     cloud_time: Duration,
 }
@@ -256,9 +242,7 @@ impl ReplayBuilder {
             return Err("PGO优化改变了固定首节点".into());
         }
         let timeline = CorrectionTimeline::new(keyframes).map_err(|e| e.to_string())?;
-        let path =
-            std::env::temp_dir().join(format!("nuwax-pgo-rebuild-{}.mmap", uuid::Uuid::new_v4()));
-        let cloud = TemporaryCloud(CloudMapShmWriter::new(&path).map_err(|e| e.to_string())?);
+        let cloud = CloudMapShmWriter::new_private().map_err(|e| e.to_string())?;
         Ok(Self {
             kernel: spec.into_kernel(config.window_capacity),
             spec,
@@ -273,17 +257,45 @@ impl ReplayBuilder {
             processed: 0,
             started,
             budget,
+            background: false,
             kernel_time: Duration::ZERO,
             cloud_time: Duration::ZERO,
         })
     }
 
     pub(crate) fn check(&self, cancelled: &impl Fn() -> bool) -> Result<(), RebuildError> {
-        check_budget(self.started, self.budget, cancelled)
+        if self.background {
+            if cancelled() {
+                Err(RebuildError::Cancelled)
+            } else {
+                Ok(())
+            }
+        } else {
+            check_budget(self.started, self.budget, cancelled)
+        }
     }
 
-    pub(crate) fn remaining_budget(&self) -> Duration {
-        self.budget.saturating_sub(self.started.elapsed())
+    pub(crate) fn into_background(mut self) -> Self {
+        self.background = true;
+        self
+    }
+
+    /// 每个切片至少推进一帧；单次内核调用不可抢占，片间由异步拥有方让出资源。
+    pub(crate) fn append_slice(
+        mut self,
+        scans: &[ArchivedScan],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Self, usize), RebuildError> {
+        let started = Instant::now();
+        let mut processed = 0;
+        for scan in scans.iter().take(REPLAY_SLICE_MAX_FRAMES) {
+            self.append(std::slice::from_ref(scan), cancelled)?;
+            processed += 1;
+            if started.elapsed() >= REPLAY_SLICE {
+                break;
+            }
+        }
+        Ok((self, processed))
     }
 
     pub(crate) fn latest_timestamp_ns(&self) -> u64 {
@@ -299,18 +311,7 @@ impl ReplayBuilder {
     ) -> Result<(Self, PreparedReplay), RebuildError> {
         let result = self
             .append(scans, cancelled)
-            .and_then(|()| self.prepare(cancelled))
-            .and_then(|mut prepared| {
-                prepared.prepared_backend = Some(mapping_backend::prepare_mapping_backend_restore(
-                    self.spec,
-                    self.config,
-                    std::mem::take(&mut prepared.backend_checkpoint),
-                )?);
-                // 已得到经过验证的内核，不把序列化副本继续保留到实时提交区。
-                prepared.backend_checkpoint = Vec::new();
-                self.check(cancelled)?;
-                Ok(prepared)
-            });
+            .and_then(|()| self.prepare_inner(cancelled, true));
         match result {
             Ok(prepared) => Ok((self, prepared)),
             Err(error) => {
@@ -411,6 +412,14 @@ impl ReplayBuilder {
         &mut self,
         cancelled: &impl Fn() -> bool,
     ) -> Result<PreparedReplay, RebuildError> {
+        self.prepare_inner(cancelled, false)
+    }
+
+    fn prepare_inner(
+        &mut self,
+        cancelled: &impl Fn() -> bool,
+        typed_restore: bool,
+    ) -> Result<PreparedReplay, RebuildError> {
         self.check(cancelled)?;
         let input = self.last_input.as_ref().ok_or("PGO重建没有扫描")?;
         let token = MappingComputeToken {
@@ -450,15 +459,30 @@ impl ReplayBuilder {
         self.cloud
             .commit_accumulated()
             .ok_or("PGO重建点云无法完成快照")?;
+        let (backend_checkpoint, prepared_backend) = if typed_restore {
+            (
+                Vec::new(),
+                Some(mapping_backend::prepare_computed_mapping_backend_restore(
+                    self.spec,
+                    self.config,
+                    output_kernel,
+                )?),
+            )
+        } else {
+            (
+                mapping_backend::export_mapping_kernel_checkpoint(&output_kernel)?,
+                None,
+            )
+        };
         let prepared = PreparedReplay {
             occupancy,
             cloud: self
                 .cloud
                 .committed_snapshot()
                 .ok_or("PGO重建点云快照缺失")?,
-            backend_checkpoint: mapping_backend::export_mapping_kernel_checkpoint(&output_kernel)?,
+            backend_checkpoint,
             source_timestamp_ns: input.source_timestamp_ns,
-            prepared_backend: None,
+            prepared_backend,
         };
         self.check(cancelled)?;
         Ok(prepared)
@@ -485,6 +509,15 @@ impl ReplayBuilder {
             .cleanup_product_owned_file()
             .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
         self.check(cancelled)?;
+        tracing::info!(
+            event = "pgo.map.background_ready",
+            frames = self.processed,
+            kernel_ms = self.kernel_time.as_millis() as u64,
+            cloud_ms = self.cloud_time.as_millis() as u64,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            background = self.background,
+            "PGO私有地图已完整准备"
+        );
         Ok(result)
     }
 }
@@ -757,6 +790,159 @@ mod tests {
             budget,
             cancelled,
         )
+    }
+
+    #[test]
+    fn background_slices_preserve_progress_after_old_deadline_and_cancel() {
+        let (scans, trajectory) = scale_input(48);
+        let config = MappingBackendComputeConfig {
+            resolution: 0.05,
+            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
+            initial_safe_radius_meters: 0.0,
+            window_capacity: 10_000,
+        };
+        for spec in [
+            MappingBackendSpec::Voxel,
+            MappingBackendSpec::raytracing_defaults(),
+        ] {
+            let expected = rebuild(
+                scans.clone(),
+                trajectory.clone(),
+                Isometry3::identity(),
+                spec,
+                config,
+                "map".into(),
+                Duration::from_secs(30),
+                || false,
+            )
+            .unwrap();
+            let mut builder = ReplayBuilder::new(
+                &scans,
+                trajectory.clone(),
+                Isometry3::identity(),
+                spec,
+                config,
+                "map".into(),
+                REBUILD_BUDGET,
+                &|| false,
+            )
+            .unwrap()
+            .into_background();
+            // 注入已经超过旧截止时间的历史年龄，核对继续推进而非清空后从头再来。
+            builder.started = Instant::now() - Duration::from_secs(4);
+            let mut cursor = 0;
+            let mut slices = 0;
+            while cursor < scans.len() {
+                let (next, count) = builder.append_slice(&scans[cursor..], &|| false).unwrap();
+                assert!((1..=REPLAY_SLICE_MAX_FRAMES).contains(&count));
+                builder = next;
+                cursor += count;
+                slices += 1;
+                assert_eq!(builder.processed, cursor);
+            }
+            assert!(slices >= 3);
+            let (builder, prepared) = builder.advance(&[], &|| false).unwrap();
+            let actual = builder.finish(prepared, &|| false).unwrap();
+            assert_eq!(actual.occupancy.data, expected.occupancy.data);
+            assert_eq!(actual.cloud.xyz_f32_le, expected.cloud.xyz_f32_le);
+            assert_eq!(actual.source_timestamp_ns, expected.source_timestamp_ns);
+            assert!(actual.prepared_backend.is_some());
+            let builder = ReplayBuilder::new(
+                &scans,
+                trajectory.clone(),
+                Isometry3::identity(),
+                spec,
+                config,
+                "map".into(),
+                REBUILD_BUDGET,
+                &|| false,
+            )
+            .unwrap()
+            .into_background();
+            assert!(matches!(
+                builder.append_slice(&scans, &|| true),
+                Err(RebuildError::Cancelled)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "长历史后台进度与片间调度基准，使用release构建独立执行"]
+    async fn pgo_background_long_history_finishes_without_starving_executor() {
+        let (scans, trajectory) = scale_input(2400);
+        let scans: Arc<[ArchivedScan]> = scans.into();
+        let started = Instant::now();
+        let config = MappingBackendComputeConfig {
+            resolution: 0.05,
+            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
+            initial_safe_radius_meters: 0.0,
+            window_capacity: 100_000,
+        };
+        let mut builder = ReplayBuilder::new(
+            &scans,
+            trajectory,
+            Isometry3::identity(),
+            MappingBackendSpec::Voxel,
+            config,
+            "map".into(),
+            Duration::MAX,
+            &|| false,
+        )
+        .unwrap()
+        .into_background();
+        let mut cursor = 0;
+        let mut slices = 0;
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tick_stop = stopped.clone();
+        let ticker = tokio::spawn(async move {
+            let mut previous = Instant::now();
+            let mut max_gap = Duration::ZERO;
+            let mut ticks = 0;
+            while !tick_stop.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                max_gap = max_gap.max(previous.elapsed());
+                previous = Instant::now();
+                ticks += 1;
+            }
+            (max_gap, ticks)
+        });
+        while cursor < scans.len() {
+            let input = scans.clone();
+            let (next, count) = tokio::task::spawn_blocking(move || {
+                builder.append_slice(&input[cursor..], &|| false)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            builder = next;
+            cursor += count;
+            slices += 1;
+            tokio::time::sleep(REPLAY_YIELD).await;
+        }
+        let output = tokio::task::spawn_blocking(move || {
+            let (builder, prepared) = builder.advance(&[], &|| false).unwrap();
+            builder.finish(prepared, &|| false).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            output.source_timestamp_ns,
+            scans.last().unwrap().source_timestamp_ns
+        );
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        let (max_gap, ticks) = ticker.await.unwrap();
+        assert!(ticks > 10);
+        assert!(
+            max_gap < Duration::from_millis(100),
+            "异步执行器被阻塞：{max_gap:?}"
+        );
+        eprintln!(
+            "后台2400帧完成：elapsed_ms={} slices={} points={} tick_max_gap_ms={}",
+            started.elapsed().as_millis(),
+            slices,
+            output.cloud.point_count,
+            max_gap.as_secs_f64() * 1000.0
+        );
     }
 
     #[test]

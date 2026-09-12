@@ -146,7 +146,7 @@ pub(crate) fn cloud_map_active_slot(revision: u64) -> Option<u32> {
 pub struct CloudMapShmWriter {
     mmap: MmapMut,
     shm_path: std::path::PathBuf,
-    shm_identity: ProductOwnedMmapIdentity,
+    shm_identity: Option<ProductOwnedMmapIdentity>,
     revision: u64,
     voxel_size: f32,
     session_generation: u64,
@@ -259,6 +259,7 @@ pub(crate) struct PreparedCloudAccumulator {
     voxels: HashSet<(i32, i32, i32)>,
     voxel_size: f32,
     dynamic_filter: DynamicCloudFilter,
+    ordered_voxels: OrderedVoxelSnapshot,
 }
 
 pub(crate) struct CorrelatedCloudMapCommit {
@@ -380,17 +381,38 @@ impl CloudMapShmWriter {
             .open(shm_path)?;
         let shm_identity = capture_product_owned_mmap(shm_path, &file)?;
         file.set_len(CM_TOTAL_SIZE as u64)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
-        mmap[8..12].copy_from_slice(&CM_SHM_VERSION.to_le_bytes());
-        mmap[12..CM_HEADER_SIZE].fill(0);
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
         info!(
             "累积地图双缓冲 mmap 已创建: {:?} ({} bytes)",
             shm_path, CM_TOTAL_SIZE
         );
-        Ok(Self {
+        Ok(Self::from_mapping(
             mmap,
-            shm_path: shm_path.to_path_buf(),
+            shm_path.to_path_buf(),
+            Some(shm_identity),
+        ))
+    }
+
+    /// 私有重建不对外发布，使用匿名内存，避免每次纠偏创建和删除临时映射文件。
+    pub(crate) fn new_private() -> std::io::Result<Self> {
+        Ok(Self::from_mapping(
+            MmapMut::map_anon(CM_TOTAL_SIZE)?,
+            Default::default(),
+            None,
+        ))
+    }
+
+    fn from_mapping(
+        mut mmap: MmapMut,
+        shm_path: std::path::PathBuf,
+        shm_identity: Option<ProductOwnedMmapIdentity>,
+    ) -> Self {
+        mmap[0..8].copy_from_slice(&CM_SHM_MAGIC.to_le_bytes());
+        mmap[8..12].copy_from_slice(&CM_SHM_VERSION.to_le_bytes());
+        mmap[12..CM_HEADER_SIZE].fill(0);
+        Self {
+            mmap,
+            shm_path,
             shm_identity,
             revision: 0,
             voxel_size: VOXEL_SIZE,
@@ -402,11 +424,14 @@ impl CloudMapShmWriter {
             last_occupancy_receipt: None,
             last_cloud_receipt: None,
             typed_publish_state: Arc::new(TypedCloudPublishState::new()),
-        })
+        }
     }
 
     pub(crate) fn cleanup_product_owned_file(&mut self) -> std::io::Result<()> {
-        unlink_product_owned_mmap(&self.shm_path, self.shm_identity)
+        match self.shm_identity {
+            Some(identity) => unlink_product_owned_mmap(&self.shm_path, identity),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn typed_publish_state(&self) -> Arc<TypedCloudPublishState> {
@@ -627,6 +652,7 @@ impl CloudMapShmWriter {
             voxels: std::mem::take(&mut self.voxels),
             voxel_size: self.voxel_size,
             dynamic_filter: std::mem::take(&mut self.dynamic_filter),
+            ordered_voxels: std::mem::take(&mut self.ordered_voxels),
         }
     }
 
@@ -646,7 +672,7 @@ impl CloudMapShmWriter {
         self.voxel_size = prepared.voxel_size;
         self.voxels = prepared.voxels;
         self.dynamic_filter = prepared.dynamic_filter;
-        self.ordered_voxels.invalidate();
+        self.ordered_voxels = prepared.ordered_voxels;
         self.commit_accumulated_snapshot(receipt)?
             .ok_or_else(|| "PGO点云发布失败".into())
     }

@@ -8,12 +8,15 @@ use thiserror::Error;
 use super::optimizer::{cost_strictly_improved, graph_cost, OptimizerConfig};
 use super::pgo::{PoseEdge, PoseGraph};
 use super::registration::evaluate_loop_registration;
+use super::scan_context::ScanContext;
 use super::PgoOptimizer;
 use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
 
 /// Configuration for the complete loop-closure coordinator.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopClosurePipelineConfig {
+    /// 启用与里程计距离无关的地点检索；几何门验证可单独关闭它以隔离候选来源。
+    pub scan_context_enabled: bool,
     /// Translation required before a frame becomes a keyframe.
     pub keyframe_translation: f64,
     /// Rotation angle required before a frame becomes a keyframe.
@@ -47,12 +50,13 @@ pub struct LoopClosurePipelineConfig {
 impl Default for LoopClosurePipelineConfig {
     fn default() -> Self {
         Self {
+            scan_context_enabled: true,
             keyframe_translation: 0.5,
             keyframe_rotation: 10.0_f64.to_radians(),
             loop_search_radius: 2.0,
             min_loop_separation_secs: 20.0,
             min_keyframe_points: 10,
-            max_loop_mse: 0.3,
+            max_loop_mse: 0.04,
             min_loop_overlap_ratio: 0.5,
             icp: IcpConfig {
                 max_correspondence_distance: 1.0,
@@ -194,6 +198,7 @@ struct StoredKeyframe {
     timestamp: f64,
     local_pose: Isometry3<f64>,
     points: Vec<Point3<f64>>,
+    context: ScanContext,
 }
 
 /// An accepted point-cloud loop edge.
@@ -215,6 +220,8 @@ pub struct LoopClosureRecord {
     pub source_overlap: f64,
     /// 历史扫描中实际对应的点比例。
     pub target_overlap: f64,
+    /// 由独立对应支撑估计的有界信息矩阵，平移在前、旋转在后。
+    pub information: Matrix6<f64>,
 }
 
 /// Result of processing one mapping frame.
@@ -325,12 +332,26 @@ impl LoopClosureCoordinator {
         });
         let node_id = self.graph.add_node(timestamp.floor() as i64, initial_pose);
         if let Some((previous_id, previous_pose)) = previous {
-            self.graph.add_edge(
-                PoseEdge::new(previous_id, node_id, previous_pose.inverse() * local_pose)
-                    .with_information(Matrix6::from_diagonal(&nalgebra::Vector6::new(
-                        1e4, 1e4, 1e6, 1e6, 1e6, 1e6,
-                    ))),
-            );
+            let delta = previous_pose.inverse() * local_pose;
+            // LIO没有提供关键帧增量协方差时采用随运动增长的保守噪声模型。
+            // 不能把垂直/旋转固定成近乎无误差，否则回环无法纠正长期累计漂移。
+            let distance = delta.translation.vector.norm();
+            let translation_sigma = 0.02 + 0.02 * distance;
+            let rotation_sigma =
+                0.5_f64.to_radians() * (1.0 + distance) + 0.05 * delta.rotation.angle();
+            let translation_information = translation_sigma.powi(-2);
+            let rotation_information = rotation_sigma.powi(-2);
+            self.graph
+                .add_edge(PoseEdge::new(previous_id, node_id, delta).with_information(
+                    Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                        translation_information,
+                        translation_information,
+                        translation_information,
+                        rotation_information,
+                        rotation_information,
+                        rotation_information,
+                    )),
+                ));
         } else {
             self.graph.fix_first_node();
         }
@@ -340,26 +361,16 @@ impl LoopClosureCoordinator {
                 timestamp,
                 local_pose,
                 points: voxel_downsample(points, self.config.submap_resolution_m),
+                context: ScanContext::new(points, local_pose.rotation),
             },
         );
 
         let loop_result = self.find_and_measure_loop(node_id);
         let result = if let Some(record) = loop_result {
-            // 与Dimos的Pose3噪声模型一致，但本库切空间顺序是平移在前。
-            // 米平方的匹配误差不能当作弧度平方的旋转方差。
-            let information_scale = 1.0 / record.mse.max(1e-4);
-            let loop_information = Matrix6::from_diagonal(&nalgebra::Vector6::new(
-                information_scale,
-                information_scale,
-                information_scale,
-                20.0,
-                20.0,
-                20.0,
-            ));
             let mut optimized_graph = self.graph.clone();
             optimized_graph.add_edge(
                 PoseEdge::new(record.from, record.to, record.measurement)
-                    .with_information(loop_information),
+                    .with_information(record.information),
             );
             let initial_cost = graph_cost(&optimized_graph);
             let historic_id = record.from;
@@ -425,37 +436,19 @@ impl LoopClosureCoordinator {
         {
             return None;
         }
-        let current_pose = self.graph.nodes.get(&current_id)?.pose;
-        let mut candidates: Vec<(f64, u64, &StoredKeyframe)> = self
-            .keyframes
-            .iter()
-            .filter(|(id, historic)| {
-                **id != current_id
-                    && (current.timestamp - historic.timestamp).abs()
-                        >= self.config.min_loop_separation_secs
-            })
-            .filter_map(|(id, historic)| {
-                let distance = (current_pose.translation.vector
-                    - self.graph.nodes[id].pose.translation.vector)
-                    .norm();
-                if distance > self.config.loop_search_radius {
-                    return None;
-                }
-                Some((distance, *id, historic))
-            })
-            .collect();
-        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let candidates = self.loop_candidates(current_id);
 
-        for (_, historic_id, _historic) in candidates {
-            // 两帧点分别属于各自机体坐标，先用里程计相对位姿对齐。
-            // 从单位变换直接匹配会在转向或重复结构中收敛到错误回环。
+        for (historic_id, historic_from_current) in candidates {
             let historic_pose = self.graph.nodes.get(&historic_id)?.pose;
-            let historic_from_current = historic_pose.inverse() * current_pose;
             let first = historic_id.saturating_sub(self.config.loop_submap_half_range as u64);
             let last = (historic_id + self.config.loop_submap_half_range as u64)
                 .min(current_id.saturating_sub(1));
             let mut target = Vec::new();
             for (id, keyframe) in self.keyframes.range(first..=last) {
+                // 当前时段的邻帧不能混入历史目标，否则会用自身里程计证明回环。
+                if current.timestamp - keyframe.timestamp < self.config.min_loop_separation_secs {
+                    continue;
+                }
                 let target_from_body = historic_pose.inverse() * self.graph.nodes.get(id)?.pose;
                 target.extend(keyframe.points.iter().map(|point| target_from_body * point));
             }
@@ -513,7 +506,11 @@ impl LoopClosureCoordinator {
                 &seeded_points,
                 &target,
                 &registration.transformation,
-                self.config.icp.max_correspondence_distance,
+                if self.config.point_to_plane {
+                    self.config.icp.max_correspondence_distance.min(0.3)
+                } else {
+                    self.config.icp.max_correspondence_distance
+                },
             );
             if let Some(reason) = evidence.rejection_reason(
                 self.config.min_keyframe_points,
@@ -534,6 +531,23 @@ impl LoopClosureCoordinator {
                 );
                 continue;
             }
+            // 对应点相关，最多按64个独立支撑计权；保留2厘米与0.5度方差下限。
+            // 用几何力臂把米平方换成弧度平方，不直接将匹配误差充作角度方差。
+            let support = evidence
+                .source_inliers
+                .min(evidence.unique_target_inliers)
+                .min(64) as f64;
+            let position_variance = (evidence.mse / support).max(0.02_f64.powi(2));
+            let rotation_variance = (position_variance / evidence.lever_arm_m2.max(0.25))
+                .max(0.5_f64.to_radians().powi(2));
+            let information = Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                position_variance.recip(),
+                position_variance.recip(),
+                position_variance.recip(),
+                rotation_variance.recip(),
+                rotation_variance.recip(),
+                rotation_variance.recip(),
+            ));
             return Some(LoopClosureRecord {
                 from: historic_id,
                 to: current_id,
@@ -544,9 +558,85 @@ impl LoopClosureCoordinator {
                 target_inliers: evidence.target_inliers,
                 source_overlap: evidence.source_overlap,
                 target_overlap: evidence.target_overlap,
+                information,
             });
         }
         None
+    }
+
+    /// 每个关键帧最多四次几何配准，描述子只精比六个环键近邻。
+    fn loop_candidates(&self, current_id: u64) -> Vec<(u64, Isometry3<f64>)> {
+        let current = &self.keyframes[&current_id];
+        let current_pose = self.graph.nodes[&current_id].pose;
+        let mut spatial = Vec::new();
+        let mut descriptors = Vec::new();
+        for (id, historic) in self.keyframes.iter().filter(|(id, historic)| {
+            **id != current_id
+                && (current.timestamp - historic.timestamp).abs()
+                    >= self.config.min_loop_separation_secs
+        }) {
+            let distance = (current_pose.translation.vector
+                - self.graph.nodes[id].pose.translation.vector)
+                .norm();
+            if distance <= self.config.loop_search_radius {
+                spatial.push((distance, *id));
+            }
+            descriptors.push((current.context.ring_distance(&historic.context), *id));
+        }
+        spatial.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        descriptors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut candidates: Vec<_> = spatial
+            .iter()
+            .take(2)
+            .map(|(_, id)| (*id, self.graph.nodes[id].pose.inverse() * current_pose))
+            .collect();
+        let mut matches: Vec<_> = descriptors
+            .iter()
+            .filter(|_| self.config.scan_context_enabled)
+            .take(6)
+            .filter_map(|(_, id)| {
+                current
+                    .context
+                    .align_to(&self.keyframes[id].context)
+                    .map(|(score, yaw)| (score, *id, yaw))
+            })
+            .collect();
+        matches.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, id, yaw) in matches {
+            let historic = &self.keyframes[&id];
+            let rotation = historic.context.level_from_body.inverse()
+                * nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw)
+                * current.context.level_from_body;
+            let center = |points: &[Point3<f64>]| {
+                points
+                    .iter()
+                    .fold(nalgebra::Vector3::zeros(), |sum, p| sum + p.coords)
+                    / points.len() as f64
+            };
+            let translation = center(&historic.points) - rotation * center(&current.points);
+            let seed = Isometry3::from_parts(Translation3::from(translation), rotation);
+            // 距离初值可能已受漂移影响，同一历史地点允许描述子提供另一条独立初值。
+            if candidates.iter().any(|(existing, pose)| {
+                *existing == id
+                    && (pose.inverse() * seed).translation.vector.norm() < 0.1
+                    && pose.rotation.angle_to(&rotation) < 0.05
+            }) {
+                continue;
+            }
+            candidates.push((id, seed));
+            if candidates.len() == 4 {
+                break;
+            }
+        }
+        for (_, id) in spatial.into_iter().skip(2) {
+            if candidates.len() >= 4 {
+                break;
+            }
+            if candidates.iter().all(|(existing, _)| *existing != id) {
+                candidates.push((id, self.graph.nodes[&id].pose.inverse() * current_pose));
+            }
+        }
+        candidates
     }
 
     fn refresh_timeline(&mut self) -> Result<(), LoopClosurePipelineError> {
@@ -665,4 +755,92 @@ fn has_valid_correction(before: &PoseGraph, after: &PoseGraph) -> bool {
                 delta.translation.vector.norm() > 1e-12 || delta.rotation.angle() > 1e-12
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::UnitQuaternion;
+
+    #[test]
+    fn distant_return_uses_descriptor_and_removes_translation_and_yaw_drift() {
+        let world: Vec<_> = (0..60)
+            .flat_map(|sector| {
+                (0..3).map(move |k| {
+                    let angle = (sector as f64 + 0.3) * std::f64::consts::TAU / 60.0;
+                    let radius = 2.0 + ((sector * 7 + k * 13) % 17) as f64;
+                    Point3::new(
+                        radius * angle.cos(),
+                        radius * angle.sin(),
+                        (sector % 5) as f64 * 0.3,
+                    )
+                })
+            })
+            .collect();
+        let mut coordinator = LoopClosureCoordinator::new(LoopClosurePipelineConfig {
+            point_to_plane: false,
+            min_loop_separation_secs: 1000.0,
+            submap_resolution_m: 0.01,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut last = ProcessFrameResult::InsufficientPoints;
+        let mut raw = Isometry3::identity();
+        let mut truth = Isometry3::identity();
+        for i in 0..=30 {
+            let x = if i <= 15 {
+                i as f64 * 0.5
+            } else {
+                (30 - i) as f64 * 0.5
+            };
+            let yaw = if i == 30 { std::f64::consts::PI } else { 0.0 };
+            truth = Isometry3::from_parts(
+                Translation3::new(x, 0.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, yaw),
+            );
+            raw = Isometry3::from_parts(
+                Translation3::new(x + i as f64 * 0.1, 0.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, yaw + i as f64 / 150.0),
+            );
+            let body: Vec<_> = world.iter().map(|p| truth.inverse() * p).collect();
+            last = coordinator
+                .process_frame(if i == 30 { 1000.0 } else { i as f64 }, raw, &body)
+                .unwrap();
+        }
+        assert!(
+            matches!(last, ProcessFrameResult::LoopClosed { historic_id: 0, .. }),
+            "{last:?}"
+        );
+        let corrected = coordinator
+            .corrections()
+            .correct_pose(1000.0, &raw)
+            .unwrap();
+        let error = truth.inverse() * corrected;
+        eprintln!(
+            "三米/0.2弧度回程漂移修正后：平移={}米，旋转={}度",
+            error.translation.vector.norm(),
+            error.rotation.angle().to_degrees()
+        );
+        assert!(error.translation.vector.norm() < 0.10, "{error:?}");
+        assert!(error.rotation.angle() < 1.0_f64.to_radians(), "{error:?}");
+        assert_eq!(coordinator.graph.nodes[&0].pose, Isometry3::identity());
+        let current_id = *coordinator.keyframes.last_key_value().unwrap().0;
+        assert!(coordinator.loop_candidates(current_id).len() <= 4);
+    }
+
+    #[test]
+    fn point_to_plane_rejects_unobservable_single_plane_loop() {
+        let target: Vec<[f64; 3]> = (-20..=20)
+            .flat_map(|x| (-20..=20).map(move |y| [x as f64 * 0.1, y as f64 * 0.1, 0.0]))
+            .collect();
+        let source: Vec<_> = target
+            .iter()
+            .map(|p| [p[0] + 0.1, p[1] - 0.1, p[2] + 0.05])
+            .collect();
+        let result = nuwax_gtsam::point_to_plane(&source, &target, 1.0, 50).unwrap();
+        assert_eq!(
+            result.converged, 0,
+            "单平面不能证明完整六自由度回环：{result:?}"
+        );
+    }
 }

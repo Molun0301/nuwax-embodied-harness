@@ -4193,6 +4193,7 @@ impl GeometryCanonicalCorrectionApplier {
         let (scans, spec, config, backend_generation) = snapshot(0)?;
         self.validate_transaction(transaction)
             .map_err(ApplyError::Failed)?;
+        cancellation.begin_background_preparation();
         #[cfg(test)]
         if let Some((entered, release)) = self.background_prepare_gate.as_ref() {
             entered.notify_one();
@@ -4205,42 +4206,93 @@ impl GeometryCanonicalCorrectionApplier {
         let trajectory = transaction.trajectory.clone();
         let anchor = transaction.base_anchor_map_from_odom;
         let frame = self.map_frame_id.clone();
-        let budget = self.rebuild_budget;
         let cancelled = cancellation.clone();
-        let (mut builder, mut prepared) = tokio::task::spawn_blocking(move || {
-            let stopped = || cancelled.is_cancelled();
-            let builder = crate::pgo_map::ReplayBuilder::new(
-                &scans, trajectory, anchor, spec, config, frame, budget, &stopped,
-            )?;
-            builder.advance(&scans, &stopped)
+        let initial: Arc<[crate::pgo_map::ArchivedScan]> = scans.into();
+        let builder_scans = initial.clone();
+        let mut builder = tokio::task::spawn_blocking(move || {
+            crate::pgo_map::ReplayBuilder::new(
+                &builder_scans,
+                trajectory,
+                anchor,
+                spec,
+                config,
+                frame,
+                Duration::MAX,
+                &|| cancelled.is_cancelled(),
+            )
+            .map(crate::pgo_map::ReplayBuilder::into_background)
         })
         .await
         .map_err(|error| ApplyError::Failed(format!("PGO后台准备任务失败：{error}")))?
         .map_err(pgo_preparation_error)?;
+        let mut pending = initial;
+        let mut cursor = 0;
+        let mut prepared = None;
         loop {
             builder
                 .check(&|| cancellation.is_cancelled())
                 .map_err(pgo_preparation_error)?;
-            let guard = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
-                _ = tokio::time::sleep(builder.remaining_budget()) => return Err(pgo_preparation_error(crate::pgo_map::RebuildError::BudgetExceeded)),
-                guard = context.lifecycle_lock.clone().lock_owned() => guard,
-            };
-            builder
-                .check(&|| cancellation.is_cancelled())
-                .map_err(pgo_preparation_error)?;
-            let (tail, _, _, current_backend_generation) = snapshot(builder.latest_timestamp_ns())?;
-            if current_backend_generation != backend_generation {
+            // 每段开始都检查会话退休；该快照只核对身份，不复制未处理的历史前缀。
+            let (_, _, _, generation) = snapshot(u64::MAX)?;
+            if generation != backend_generation {
                 return Err(ApplyError::PreparationRejected(
                     Reject::BackendGenerationMismatch,
                 ));
             }
+            if cursor < pending.len() {
+                let slice = pending.clone();
+                let cancelled = cancellation.clone();
+                let (advanced, count) = tokio::task::spawn_blocking(move || {
+                    builder.append_slice(&slice[cursor..], &|| cancelled.is_cancelled())
+                })
+                .await
+                .map_err(|error| ApplyError::Failed(format!("PGO后台分段重放失败：{error}")))?
+                .map_err(pgo_preparation_error)?;
+                builder = advanced;
+                cursor += count;
+                prepared = None;
+                // 一项在途工作，加片间休息；不占满异步执行器或逐帧派生并发任务。
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
+                    _ = tokio::time::sleep(crate::pgo_map::REPLAY_YIELD) => {},
+                }
+                continue;
+            }
+            let (tail, _, _, _) = snapshot(builder.latest_timestamp_ns())?;
+            if !tail.is_empty() {
+                pending = tail.into();
+                cursor = 0;
+                continue;
+            }
+            if prepared.is_none() {
+                let cancelled = cancellation.clone();
+                let (advanced, output) = tokio::task::spawn_blocking(move || {
+                    builder.advance(&[], &|| cancelled.is_cancelled())
+                })
+                .await
+                .map_err(|error| ApplyError::Failed(format!("PGO后台物化失败：{error}")))?
+                .map_err(pgo_preparation_error)?;
+                builder = advanced;
+                prepared = Some(output);
+            }
+            let guard = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
+                guard = context.lifecycle_lock.clone().lock_owned() => guard,
+            };
+            let (tail, _, _, generation) = snapshot(builder.latest_timestamp_ns())?;
+            if generation != backend_generation {
+                return Err(ApplyError::PreparationRejected(
+                    Reject::BackendGenerationMismatch,
+                ));
+            }
+            let output = prepared.as_ref().expect("后台物化结果已准备");
             if tail.is_empty()
                 && context
                     .mapping
                     .lock()
-                    .pgo_replay_tail_is_current(prepared.source_timestamp_ns)
+                    .pgo_replay_tail_is_current(output.source_timestamp_ns)
             {
                 let expected = {
                     let shared = self.state.read().await;
@@ -4251,28 +4303,23 @@ impl GeometryCanonicalCorrectionApplier {
                     )
                 };
                 let rebuilt = builder
-                    .finish(prepared, &|| cancellation.is_cancelled())
+                    .finish(prepared.take().unwrap(), &|| cancellation.is_cancelled())
                     .map_err(pgo_preparation_error)?;
                 cancellation.retain_background_lifecycle_guard(guard);
                 return Ok((rebuilt, expected));
             }
             drop(guard);
             if tail.is_empty() {
-                // 已接纳扫描的规范提交或归档尚未完成；等待期间不占用实时输入围栏。
+                // 在线扫描尚在提交，复用已物化结果，等待时释放实时输入围栏。
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {},
                 }
-                continue;
+            } else {
+                pending = tail.into();
+                cursor = 0;
             }
-            let cancelled = cancellation.clone();
-            (builder, prepared) = tokio::task::spawn_blocking(move || {
-                builder.advance(&tail, &|| cancelled.is_cancelled())
-            })
-            .await
-            .map_err(|error| ApplyError::Failed(format!("PGO后台追赶任务失败：{error}")))?
-            .map_err(pgo_preparation_error)?;
         }
     }
 
@@ -14922,16 +14969,18 @@ mod mapping_feed_tests {
                             .unwrap()
                             .committed_snapshot()
                             .unwrap();
-                        applier.rebuild_budget = Duration::ZERO;
-                        let rejection = applier
-                            .apply_transaction(transaction.clone(), new_cancellation())
-                            .await;
-                        assert!(matches!(rejection, Err(
+                        if !background {
+                            applier.rebuild_budget = Duration::ZERO;
+                            let rejection = applier
+                                .apply_transaction(transaction.clone(), new_cancellation())
+                                .await;
+                            assert!(matches!(rejection, Err(
                             crate::correction_coordinator::CanonicalCorrectionApplyError::PreparationRejected(
                                 crate::correction_coordinator::CorrectionRejectReason::RebuildBudgetExceeded
                             )
                         )));
-                        applier.rebuild_budget = crate::pgo_map::REBUILD_BUDGET;
+                            applier.rebuild_budget = crate::pgo_map::REBUILD_BUDGET;
+                        }
                         assert_eq!(
                             handle.state.read().await.map.revision,
                             receipt.occupancy_revision

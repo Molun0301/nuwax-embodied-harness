@@ -718,6 +718,7 @@ fn refresh_voxels(
     hits: &AHashSet<VoxelKey>,
     removed: &[VoxelKey],
     voxel_size: f32,
+    parallel: bool,
 ) {
     let r = NORMAL_NEIGHBOR_RADIUS;
     let mut dirty: AHashSet<VoxelKey> = AHashSet::new();
@@ -730,14 +731,23 @@ fn refresh_voxels(
             }
         }
     }
-    let updates: Vec<(VoxelKey, Option<Vector3<f32>>, u32)> = dirty
-        .par_iter()
-        .filter(|k| map.voxels.contains_key(k))
-        .map(|&k| {
-            let (normal, recency) = pooled_normal_and_recency(&map.voxels, k, voxel_size);
-            (k, normal, recency)
-        })
-        .collect();
+    let update = |&k: &VoxelKey| {
+        let (normal, recency) = pooled_normal_and_recency(&map.voxels, k, voxel_size);
+        (k, normal, recency)
+    };
+    let updates: Vec<(VoxelKey, Option<Vector3<f32>>, u32)> = if parallel {
+        dirty
+            .par_iter()
+            .filter(|k| map.voxels.contains_key(k))
+            .map(update)
+            .collect()
+    } else {
+        dirty
+            .iter()
+            .filter(|k| map.voxels.contains_key(k))
+            .map(update)
+            .collect()
+    };
     for (k, n, rec) in updates {
         if let Some(c) = map.voxels.get_mut(&k) {
             c.normal = n;
@@ -936,6 +946,12 @@ impl PreparedRayUpdate {
         update_map_prevalidated(map, self.origin, &self.points, &self.config);
         self.points
     }
+
+    /// 后台历史重放只占用当前工作线程，不向全局并行池扇出射线或法线任务。
+    pub fn apply_serial(self, map: &mut VoxelMap) -> Vec<(f32, f32, f32)> {
+        update_map_with_parallelism(map, self.origin, &self.points, &self.config, false);
+        self.points
+    }
 }
 
 /// 校验并应用一帧更新，校验失败时不修改地图。
@@ -958,6 +974,16 @@ pub(crate) fn update_map_prevalidated(
     points: &[(f32, f32, f32)],
     cfg: &Config,
 ) -> AHashSet<VoxelKey> {
+    update_map_with_parallelism(map, origin, points, cfg, true)
+}
+
+fn update_map_with_parallelism(
+    map: &mut VoxelMap,
+    origin: (f32, f32, f32),
+    points: &[(f32, f32, f32)],
+    cfg: &Config,
+    parallel: bool,
+) -> AHashSet<VoxelKey> {
     let inv = 1.0_f32 / cfg.voxel_size;
     let max_range_sq = if cfg.max_range > 0.0 {
         cfg.max_range * cfg.max_range
@@ -972,43 +998,48 @@ pub(crate) fn update_map_prevalidated(
     let origin_voxel = world_to_voxel(origin.0, origin.1, origin.2, inv);
     let step = cfg.ray_subsample as usize;
     let voxels = &map.voxels;
-    let misses: AHashSet<VoxelKey> = points
-        .par_iter()
-        .enumerate()
-        .fold(AHashSet::new, |mut misses, (i, &p)| {
-            if i % step != 0 {
-                return misses;
-            }
-            let dx = p.0 - origin.0;
-            let dy = p.1 - origin.1;
-            let dz = p.2 - origin.2;
-            if dx * dx + dy * dy + dz * dz > max_range_sq {
-                return misses;
-            }
-            let endpoint = world_to_voxel(p.0, p.1, p.2, inv);
-            find_misses_along_ray(
-                &mut misses,
-                voxels,
-                origin,
-                p,
-                cfg.voxel_size,
-                cfg.shadow_depth,
-                cfg.grace_depth,
-                cfg.graze_cos,
-                frame,
-                cfg.recency_window,
-                origin_voxel,
-                endpoint,
-            );
-            misses
-        })
-        .reduce(AHashSet::new, |mut a, mut b| {
-            if a.len() < b.len() {
-                std::mem::swap(&mut a, &mut b);
-            }
-            a.extend(b);
-            a
-        });
+    let trace = |mut misses: AHashSet<VoxelKey>, (i, &p): (usize, &(f32, f32, f32))| {
+        if i % step != 0 {
+            return misses;
+        }
+        let dx = p.0 - origin.0;
+        let dy = p.1 - origin.1;
+        let dz = p.2 - origin.2;
+        if dx * dx + dy * dy + dz * dz > max_range_sq {
+            return misses;
+        }
+        let endpoint = world_to_voxel(p.0, p.1, p.2, inv);
+        find_misses_along_ray(
+            &mut misses,
+            voxels,
+            origin,
+            p,
+            cfg.voxel_size,
+            cfg.shadow_depth,
+            cfg.grace_depth,
+            cfg.graze_cos,
+            frame,
+            cfg.recency_window,
+            origin_voxel,
+            endpoint,
+        );
+        misses
+    };
+    let misses: AHashSet<VoxelKey> = if parallel {
+        points
+            .par_iter()
+            .enumerate()
+            .fold(AHashSet::new, trace)
+            .reduce(AHashSet::new, |mut a, mut b| {
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                a.extend(b);
+                a
+            })
+    } else {
+        points.iter().enumerate().fold(AHashSet::new(), trace)
+    };
 
     for v in &hits {
         let c = map.voxels.entry(*v).or_insert_with(|| Voxel {
@@ -1034,7 +1065,7 @@ pub(crate) fn update_map_prevalidated(
         }
     }
 
-    refresh_voxels(map, &hits, &removed, cfg.voxel_size);
+    refresh_voxels(map, &hits, &removed, cfg.voxel_size, parallel);
 
     hits
 }
@@ -1406,6 +1437,35 @@ mod tests {
             encode_voxel_map_checkpoint(&restored).expect("encode restored continuation"),
             encode_voxel_map_checkpoint(&original).expect("encode original continuation")
         );
+    }
+
+    #[test]
+    fn serial_background_replay_matches_parallel_normals_health_and_checkpoint() {
+        let cfg = basic_config();
+        let mut serial = VoxelMap::default();
+        let mut parallel = VoxelMap::default();
+        for frame in 0..8 {
+            let mut points: Vec<_> = (0..30)
+                .flat_map(|x| {
+                    (0..20).map(move |y| (1.0 + x as f32 * 0.08, -0.8 + y as f32 * 0.08, -0.4))
+                })
+                .collect();
+            // 近障碍离开后由后续实测射线清除，同时核对法线缓存和健康值。
+            points.extend((0..15).map(|z| {
+                (
+                    if frame < 3 { 1.5 } else { 3.5 },
+                    0.1,
+                    z as f32 * 0.08 - 0.3,
+                )
+            }));
+            let update = PreparedRayUpdate::new((0.0, 0.0, 0.0), points, cfg.clone()).unwrap();
+            update.clone().apply_serial(&mut serial);
+            update.apply(&mut parallel);
+            assert_eq!(
+                encode_voxel_map_checkpoint(&serial).unwrap(),
+                encode_voxel_map_checkpoint(&parallel).unwrap()
+            );
+        }
     }
 
     #[test]

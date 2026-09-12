@@ -2124,6 +2124,8 @@ mod preflight_only_contract {
         notify: tokio::sync::Notify,
         operation: CanonicalOperationControl,
         background_mapping: AtomicBool,
+        background_preparing: AtomicBool,
+        background_prepare_notify: Notify,
         background_mode: std::sync::OnceLock<(Arc<RelocalizationModeFence>, u64)>,
         // 后台准备完成后才领取；最终处理租约负责释放，提交中毒时继续保留围栏。
         background_lifecycle_guard: parking_lot::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
@@ -2144,6 +2146,8 @@ mod preflight_only_contract {
                     notify: tokio::sync::Notify::new(),
                     operation: CanonicalOperationControl::production(),
                     background_mapping: AtomicBool::new(false),
+                    background_preparing: AtomicBool::new(false),
+                    background_prepare_notify: Notify::new(),
                     background_mode: std::sync::OnceLock::new(),
                     background_lifecycle_guard: parking_lot::Mutex::new(None),
                 }),
@@ -2158,6 +2162,8 @@ mod preflight_only_contract {
                     notify: tokio::sync::Notify::new(),
                     operation: CanonicalOperationControl::with_fail_stop(fail_stop),
                     background_mapping: AtomicBool::new(false),
+                    background_preparing: AtomicBool::new(false),
+                    background_prepare_notify: Notify::new(),
                     background_mode: std::sync::OnceLock::new(),
                     background_lifecycle_guard: parking_lot::Mutex::new(None),
                 }),
@@ -2179,6 +2185,26 @@ mod preflight_only_contract {
 
         pub(crate) fn is_background_mapping(&self) -> bool {
             self.inner.background_mapping.load(Ordering::Acquire)
+        }
+
+        pub(crate) fn begin_background_preparation(&self) {
+            assert!(self.is_background_mapping());
+            self.inner
+                .background_preparing
+                .store(true, Ordering::Release);
+            self.inner.background_prepare_notify.notify_waiters();
+        }
+
+        async fn background_preparation_started(&self) {
+            loop {
+                let notified = self.inner.background_prepare_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.inner.background_preparing.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
         }
 
         pub(crate) fn retain_background_lifecycle_guard(
@@ -4497,7 +4523,7 @@ mod preflight_only_contract {
     }
 
     enum CorrectionCandidateOwner {
-        Local(CorrectionOwnerHandle),
+        Local(Option<CorrectionOwnerHandle>),
         NativePgo(Box<NativePgoCandidateOwner>),
     }
 
@@ -4542,7 +4568,9 @@ mod preflight_only_contract {
                         body_frame_id,
                     })))
                 }
-                local => Ok(Self::Local(CorrectionOwnerHandle::start(local, identity)?)),
+                local => Ok(Self::Local(Some(CorrectionOwnerHandle::start(
+                    local, identity,
+                )?))),
             }
         }
 
@@ -4562,16 +4590,37 @@ mod preflight_only_contract {
             cancellation: &CorrectionRequestCancellation,
         ) -> Result<CandidateProduction, CorrectionRuntimeError> {
             match self {
-                Self::Local(owner) => owner
-                    .submit_frame(input)
-                    .map(|candidate| match candidate {
-                        Some(candidate) => CandidateProduction::Candidate {
-                            candidate: Box::new(candidate),
-                            delivery: CandidateDelivery::PrivateCorrectionTransport,
-                        },
-                        None => CandidateProduction::NoCandidate,
+                Self::Local(owner) => {
+                    let mut local = owner.take().ok_or_else(|| {
+                        CorrectionRuntimeError::WorkerJoin("库内回环拥有方缺失".into())
+                    })?;
+                    let cancelled = cancellation.clone();
+                    // 描述子、配准及图优化都有实际计算成本；保持一个在途拥有方，
+                    // 在阻塞工作执行器运行，关闭分支必须等待同一个任务返回。
+                    let (restored, result) = tokio::task::spawn_blocking(move || {
+                        let result = if cancelled.is_cancelled() {
+                            Ok(None)
+                        } else {
+                            local.submit_frame(input)
+                        };
+                        (local, result)
                     })
-                    .map_err(CorrectionRuntimeError::CandidateOwner),
+                    .await
+                    .map_err(|error| CorrectionRuntimeError::WorkerJoin(error.to_string()))?;
+                    *owner = Some(restored);
+                    if cancellation.is_cancelled() {
+                        return Ok(CandidateProduction::Cancelled);
+                    }
+                    result
+                        .map(|candidate| match candidate {
+                            Some(candidate) => CandidateProduction::Candidate {
+                                candidate: Box::new(candidate),
+                                delivery: CandidateDelivery::PrivateCorrectionTransport,
+                            },
+                            None => CandidateProduction::NoCandidate,
+                        })
+                        .map_err(CorrectionRuntimeError::CandidateOwner)
+                }
                 Self::NativePgo(native) => native.submit_frame(input, cancellation).await,
             }
         }
@@ -4579,7 +4628,14 @@ mod preflight_only_contract {
         async fn shutdown(self) -> Result<(), CorrectionRuntimeError> {
             match self {
                 Self::Local(owner) => {
-                    owner.shutdown();
+                    // 图和关键帧析构也由原工作拥有方收尾，避免大历史释放占住异步线程。
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(owner) = owner {
+                            owner.shutdown();
+                        }
+                    })
+                    .await
+                    .map_err(|error| CorrectionRuntimeError::WorkerJoin(error.to_string()))?;
                     Ok(())
                 }
                 Self::NativePgo(mut native) => {
@@ -10600,18 +10656,28 @@ mod preflight_only_contract {
     ) -> CandidateApplyWaitOutcome {
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
-        let event = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => CandidateApplyWaitOutcome::CancelledBeforeCommit,
-            _ = wait_for_admission_close(admission_rx) => {
-                cancellation.cancel();
-                CandidateApplyWaitOutcome::AdmissionClosedBeforeCommit
-            }
-            result = &mut apply_rx => CandidateApplyWaitOutcome::Ack(result),
-            _ = &mut deadline => {
-                cancellation.cancel();
-                CandidateApplyWaitOutcome::TimedOutBeforeCommit
-            }
+        let mut background_preparing = false;
+        let event = loop {
+            break tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CandidateApplyWaitOutcome::CancelledBeforeCommit,
+                _ = wait_for_admission_close(admission_rx) => {
+                    cancellation.cancel();
+                    CandidateApplyWaitOutcome::AdmissionClosedBeforeCommit
+                }
+                result = &mut apply_rx => CandidateApplyWaitOutcome::Ack(result),
+                _ = cancellation.background_preparation_started(),
+                    if cancellation.is_background_mapping() && !background_preparing => {
+                    // 交付截止时间只监督尚未到达拥有方的候选。历史计算开始后由分段取消
+                    // 与原提交看门狗监督，不能在五秒时再次抹掉已经推进的后台重建。
+                    background_preparing = true;
+                    continue;
+                }
+                _ = &mut deadline, if !background_preparing => {
+                    cancellation.cancel();
+                    CandidateApplyWaitOutcome::TimedOutBeforeCommit
+                }
+            };
         };
         match event {
             CandidateApplyWaitOutcome::CancelledBeforeCommit
@@ -16801,7 +16867,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 relocalization_mode: phase_a.relocalization_mode(),
             };
             let worker = tokio::spawn(run_candidate_producer(
-                CorrectionCandidateOwner::Local(owner),
+                CorrectionCandidateOwner::Local(Some(owner)),
                 request_rx,
                 admission_rx,
                 CandidateProducerContext {
@@ -16898,6 +16964,92 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             }
             assert!(sink.staged_sequences.lock().is_empty());
             assert!(sink.discarded_sequences.lock().contains(&3));
+        }
+
+        #[tokio::test]
+        async fn background_preparation_outlives_delivery_timeout_but_keeps_cancel_and_missing_delivery(
+        ) {
+            for delivered in [true, false] {
+                let cancellation = CorrectionRequestCancellation::for_background_mapping();
+                let key = CandidateApplyKey {
+                    candidate_sequence: 1,
+                    payload_sha256: [7; 32],
+                };
+                let waiters = CandidateApplyWaiters::default();
+                let receiver = waiters
+                    .register(
+                        key,
+                        Arc::new(CorrectionRequestLease::new(cancellation.clone(), None)),
+                    )
+                    .unwrap();
+                let (_admission, mut admission_rx) = watch::channel(true);
+                let (outcome, ()) = tokio::join!(
+                    await_candidate_apply(
+                        receiver,
+                        &cancellation,
+                        &mut admission_rx,
+                        Duration::from_millis(20),
+                        &waiters,
+                        key
+                    ),
+                    async {
+                        if delivered {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            cancellation.begin_background_preparation();
+                            // 开始准备不能唤醒取消等待者；完成时间超过原交付窗口。
+                            tokio::time::sleep(Duration::from_millis(45)).await;
+                            assert!(!cancellation.is_cancelled());
+                            waiters.complete(key, Ok(CorrectionDisposition::Applied));
+                        }
+                    }
+                );
+                if delivered {
+                    assert!(matches!(
+                        outcome,
+                        CandidateApplyWaitOutcome::Ack(Ok(Ok(CorrectionDisposition::Applied)))
+                    ));
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        CandidateApplyWaitOutcome::TimedOutBeforeCommit
+                    ));
+                    assert!(cancellation.is_cancelled());
+                    waiters.remove(key);
+                }
+            }
+            let cancellation = CorrectionRequestCancellation::for_background_mapping();
+            cancellation.begin_background_preparation();
+            let key = CandidateApplyKey {
+                candidate_sequence: 2,
+                payload_sha256: [8; 32],
+            };
+            let waiters = CandidateApplyWaiters::default();
+            let receiver = waiters
+                .register(
+                    key,
+                    Arc::new(CorrectionRequestLease::new(cancellation.clone(), None)),
+                )
+                .unwrap();
+            let (_admission, mut admission_rx) = watch::channel(true);
+            let (outcome, ()) = tokio::join!(
+                await_candidate_apply(
+                    receiver,
+                    &cancellation,
+                    &mut admission_rx,
+                    Duration::from_millis(20),
+                    &waiters,
+                    key
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    cancellation.cancel();
+                }
+            );
+            assert!(matches!(
+                outcome,
+                CandidateApplyWaitOutcome::CancelledBeforeCommit
+            ));
+            assert!(waiters.pending.lock().is_empty());
         }
 
         struct RecordingCanonicalApplier {

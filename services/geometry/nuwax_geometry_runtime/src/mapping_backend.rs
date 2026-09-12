@@ -500,14 +500,30 @@ pub(crate) struct PreparedMappingBackendRestore {
     config: MappingBackendComputeConfig,
 }
 
-pub(crate) fn prepare_mapping_backend_restore(
+/// 私有重放已经逐帧验证并完成物化，同进程提交直接转移内核。
+/// 射线隔离进程仍需要原协议字节，但无需在发送端再次解码同一内核。
+pub(crate) fn prepare_computed_mapping_backend_restore(
     spec: MappingBackendSpec,
     config: MappingBackendComputeConfig,
-    payload: Vec<u8>,
+    kernel: MappingKernel,
 ) -> Result<PreparedMappingBackendRestore, String> {
+    let encoded = match (spec, &kernel) {
+        (MappingBackendSpec::Voxel, MappingKernel::Voxel(voxel)) => {
+            // 省去编码不代表绕过原检查点的容量界限；仍须能被正式保存和恢复。
+            let length = mapping_backend_voxel_checkpoint_encoded_len(voxel)?;
+            if length > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES {
+                return Err("私有体素内核超过可保存的检查点容量".into());
+            }
+            Vec::new()
+        }
+        (MappingBackendSpec::Raytracing(_), MappingKernel::Raytracing(_)) => {
+            export_mapping_kernel_checkpoint(&kernel)?
+        }
+        _ => return Err("私有重放内核与地图后端类型不匹配".into()),
+    };
     Ok(PreparedMappingBackendRestore {
-        kernel: restore_mapping_kernel_checkpoint(spec, config, &payload)?,
-        encoded: payload,
+        kernel,
+        encoded,
         spec,
         config,
     })
@@ -1378,11 +1394,19 @@ impl RaytracingKernel {
     }
 
     fn commit_prepared_map_frame(&mut self) -> Result<(), String> {
+        self.commit_prepared_map_frame_with_parallelism(true)
+    }
+
+    fn commit_prepared_map_frame_with_parallelism(&mut self, parallel: bool) -> Result<(), String> {
         let prepared = self
             .prepared_update
             .take()
             .ok_or_else(|| "RAYTRACING_UPDATE_REJECTED: no prepared frame".to_owned())?;
-        self.input = prepared.apply(&mut self.map);
+        self.input = if parallel {
+            prepared.apply(&mut self.map)
+        } else {
+            prepared.apply_serial(&mut self.map)
+        };
         self.stable_points_dirty = true;
         Ok(())
     }
@@ -2236,7 +2260,7 @@ pub(crate) fn compute_candidate_in_place(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    compute_candidate_in_place_with_interval(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS)
+    compute_candidate_with_parallelism(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS, true)
 }
 
 /// 历史回放自行选择构图节拍；点云接纳与累积仍逐帧执行。
@@ -2245,6 +2269,16 @@ pub(crate) fn compute_candidate_in_place_with_interval(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
     candidate_interval_ns: u64,
+) -> Result<Option<MappingBackendCandidate>, String> {
+    compute_candidate_with_parallelism(kernel, input, config, candidate_interval_ns, false)
+}
+
+fn compute_candidate_with_parallelism(
+    kernel: &mut MappingKernel,
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+    candidate_interval_ns: u64,
+    parallel: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
     if input.registered_points_map.is_empty() {
         return Ok(None);
@@ -2260,7 +2294,7 @@ pub(crate) fn compute_candidate_in_place_with_interval(
         MappingKernel::Raytracing(ray) => {
             ray.prepare_map_frame(input.sensor_origin_map, &input.registered_points_map)?;
             ray.validate_retained_state_bound()?;
-            ray.commit_prepared_map_frame()?;
+            ray.commit_prepared_map_frame_with_parallelism(parallel)?;
             ray.validate_checkpoint_budget()?;
             ray.dirty_since_candidate = true;
             // 每帧更新体素，但只有真正构图时才导出并排序完整历史点集。

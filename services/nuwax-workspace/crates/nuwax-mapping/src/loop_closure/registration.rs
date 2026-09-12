@@ -17,6 +17,7 @@ pub(super) struct LoopRegistrationEvidence {
     pub mse: f64,
     pub source_spread: f64,
     pub target_spread: f64,
+    pub lever_arm_m2: f64,
 }
 
 impl LoopRegistrationEvidence {
@@ -79,6 +80,8 @@ pub(super) fn evaluate_loop_registration(
     let target_support: Vec<_> = matched_targets.iter().map(|index| target[*index]).collect();
     let source_inliers = source_support.len();
     let total = source_inliers + target_inliers;
+    let (source_spread, source_radius) = axis_spread(&source_support);
+    let (target_spread, target_radius) = axis_spread(&target_support);
     LoopRegistrationEvidence {
         source_inliers,
         target_inliers,
@@ -90,14 +93,15 @@ pub(super) fn evaluate_loop_registration(
         } else {
             squared_error / total as f64
         },
-        source_spread: axis_spread(&source_support),
-        target_spread: axis_spread(&target_support),
+        source_spread,
+        target_spread,
+        lever_arm_m2: source_radius.min(target_radius),
     }
 }
 
-fn axis_spread(points: &[Point3<f64>]) -> f64 {
+fn axis_spread(points: &[Point3<f64>]) -> (f64, f64) {
     if points.len() < 3 {
-        return 0.0;
+        return (0.0, 0.0);
     }
     // 先减首点再求质心，避免地图原点较远时大坐标平方的相消误差。
     let origin = points[0];
@@ -110,12 +114,15 @@ fn axis_spread(points: &[Point3<f64>]) -> f64 {
         sum + delta * delta.transpose()
     }) / points.len() as f64;
     if covariance.iter().any(|value| !value.is_finite()) {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let mut eigenvalues = covariance.symmetric_eigen().eigenvalues.as_slice().to_vec();
     eigenvalues.sort_by(f64::total_cmp);
     if eigenvalues[2] <= f64::EPSILON {
-        return 0.0;
+        return (0.0, 0.0);
     }
-    (eigenvalues[1] / eigenvalues[2]).max(0.0)
+    (
+        (eigenvalues[1] / eigenvalues[2]).max(0.0),
+        covariance.trace().max(0.0),
+    )
 }

@@ -10,6 +10,7 @@ pub mod optimizer;
 pub mod pgo;
 pub mod pgo_auto;
 mod registration;
+mod scan_context;
 pub mod se3;
 pub mod utils;
 

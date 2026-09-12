@@ -56,6 +56,8 @@ scripts/ci/release_gates/*
 **/goldens/
 **/recordings/
 *.md
+# 对外建图说明随代码维护，开发文档仍由上方目录规则排除。
+!/docs/公开文档/双LIO建图与回环纠偏.md
 services/geometry/nuwax_geometry_runtime/src/bin/nuwax-lio-test-child.rs
 
 # 本轮本地 release gate 与格式说明不入库。

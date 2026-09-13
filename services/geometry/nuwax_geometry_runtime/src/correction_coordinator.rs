@@ -1538,6 +1538,16 @@ mod preflight_only_contract {
             ) {
                 self.keyframe_source_timestamps_ns
                     .push(input.registered_cloud.source_timestamp_ns);
+                tracing::info!(
+                    event = "pgo.keyframe",
+                    source_timestamp_ns = input.registered_cloud.source_timestamp_ns,
+                    session_generation = input.mapping_session_generation,
+                    keyframe_id = self.keyframe_source_timestamps_ns.len() - 1,
+                    point_count = input.body_points.len(),
+                    odom_translation_m = ?input.correlated_odom.odom_from_body.translation.vector,
+                    odom_rotation_xyzw = ?input.correlated_odom.odom_from_body.rotation.coords,
+                    "记录回环关键帧的原始里程计依据"
+                );
             }
             self.last_source_timestamp_ns = Some(input.registered_cloud.source_timestamp_ns);
             self.mapping_commit_boot_nonce = Some(input.mapping_commit_id.boot_nonce);
@@ -1600,6 +1610,10 @@ mod preflight_only_contract {
                     mse = record.mse,
                     correction_translation_m = ?correction.translation.vector,
                     correction_rotation_deg = correction.rotation.angle().to_degrees(),
+                    correction_rotation_xyzw = ?correction.rotation.coords,
+                    measurement_translation_m = ?record.measurement.translation.vector,
+                    measurement_rotation_xyzw = ?record.measurement.rotation.coords,
+                    odometry_innovation = record.odometry_innovation,
                     "库内回环生成位姿校正候选"
                 );
             }

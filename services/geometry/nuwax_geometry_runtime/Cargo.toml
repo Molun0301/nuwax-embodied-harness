@@ -12,6 +12,8 @@ path = "src/lib.rs"
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。
 
 [dependencies]
+# 体素键只在进程内索引，使用工作区已有的带随机密钥快速散列。
+ahash = "0.8.12"
 libc = "0.2"
 nuwax-core = { path = "../../nuwax-workspace/crates/nuwax-core" }
 # nuwax-workspace path deps（LCM-first）。

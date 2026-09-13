@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use ahash::AHashSet as HashSet;
 use std::io::{Error, ErrorKind};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -10,6 +10,10 @@ use nalgebra::Point3;
 use tracing::{info, warn};
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
+
+#[path = "voxel_index.rs"]
+mod voxel_index;
+use voxel_index::VoxelIndex;
 
 #[path = "dynamic_cloud.rs"]
 mod dynamic_cloud;
@@ -150,7 +154,7 @@ pub struct CloudMapShmWriter {
     revision: u64,
     voxel_size: f32,
     session_generation: u64,
-    voxels: HashSet<(i32, i32, i32)>,
+    voxels: VoxelIndex,
     ordered_voxels: OrderedVoxelSnapshot,
     dynamic_filter: DynamicCloudFilter,
     max_points: usize,
@@ -256,7 +260,7 @@ pub(crate) struct CommittedCloudMapSnapshot {
 
 /// 私有重建得到的完整累积状态，包含尚未达到删除门限的动态反证。
 pub(crate) struct PreparedCloudAccumulator {
-    voxels: HashSet<(i32, i32, i32)>,
+    voxels: VoxelIndex,
     voxel_size: f32,
     dynamic_filter: DynamicCloudFilter,
     ordered_voxels: OrderedVoxelSnapshot,
@@ -417,7 +421,7 @@ impl CloudMapShmWriter {
             revision: 0,
             voxel_size: VOXEL_SIZE,
             session_generation: 0,
-            voxels: HashSet::new(),
+            voxels: VoxelIndex::new(),
             ordered_voxels: OrderedVoxelSnapshot::default(),
             dynamic_filter: DynamicCloudFilter::default(),
             max_points: CM_MAX_POINTS,
@@ -484,23 +488,36 @@ impl CloudMapShmWriter {
         if points.is_empty()
             || points.len() > POINTCLOUD_MAX_FRAME_POINTS
             || session_generation == 0
-            || points
-                .iter()
-                .any(|point| voxel_key([point.x, point.y, point.z], self.voxel_size).is_none())
             || sensor_origin_map.is_some_and(|origin| voxel_key(origin, self.voxel_size).is_none())
         {
             return false;
         }
+        // 一次计算全部体素键，同时完成有限值/范围校验；失败前不改变任何累加状态。
+        let key_voxel_size = self.voxel_size;
+        let Some(mut hits) = points
+            .iter()
+            .map(|point| voxel_key([point.x, point.y, point.z], self.voxel_size))
+            .collect::<Option<HashSet<_>>>()
+        else {
+            return false;
+        };
         if self.session_generation != session_generation {
             self.reset_accumulator(session_generation);
+            if self.voxel_size != key_voxel_size {
+                hits = points
+                    .iter()
+                    .filter_map(|point| voxel_key([point.x, point.y, point.z], self.voxel_size))
+                    .collect();
+            }
         }
         if let Some(origin) = sensor_origin_map {
-            let removed = self.dynamic_filter.clear_observed_free_space(
+            let removed = self.dynamic_filter.clear_observed_free_space_with_hits(
                 &mut self.voxels,
                 self.voxel_size,
                 origin,
                 source_timestamp_ns,
                 points,
+                &hits,
             );
             if removed > 0 {
                 for &key in self.dynamic_filter.removed_keys() {
@@ -509,7 +526,16 @@ impl CloudMapShmWriter {
                 tracing::debug!(removed, source_timestamp_ns, "三维地图已清除动态残留体素");
             }
         }
-        self.accumulate_mapping_frame(session_generation, points)
+        if self.voxel_size != key_voxel_size {
+            // 切换自适应粗化会话时保留原接纳/过滤语义，常规扫描复用已经验证的键。
+            return self.accumulate_mapping_frame(session_generation, points);
+        }
+        for key in hits {
+            if self.voxels.insert(key) {
+                self.ordered_voxels.inserted(key, self.max_points);
+            }
+        }
+        self.coarsen_to_fit()
     }
 
     /// Serialize the current voxel centroids into the double-buffered SHM.
@@ -699,7 +725,7 @@ impl CloudMapShmWriter {
         self.validate_occupancy_receipt_for_generation(occupancy_receipt, session_generation)?;
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
-        self.voxels = voxels;
+        self.voxels = voxels.into();
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
         self.commit_accumulated_snapshot(occupancy_receipt)?
@@ -844,7 +870,7 @@ impl CloudMapShmWriter {
             }
             let previous_voxel_size = self.voxel_size;
             let previous = std::mem::take(&mut self.voxels);
-            let mut coarsened = HashSet::with_capacity(previous.len().min(self.max_points));
+            let mut coarsened = VoxelIndex::with_capacity(previous.len().min(self.max_points));
             for previous_key in previous {
                 let point = voxel_center_f64(previous_key, previous_voxel_size);
                 let Some(key) = voxel_key(point, next_voxel_size) else {
@@ -1047,7 +1073,7 @@ mod tests {
                 CM_MAX_POINTS
             )
             .unwrap(),
-            writer.voxels
+            *writer.voxels
         );
         writer.begin_session(3).unwrap();
         assert!(writer.accumulate_mapping_scan(3, &person, origin, 1));

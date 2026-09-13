@@ -26,7 +26,8 @@ pub(crate) const REBUILD_BUDGET: Duration = Duration::from_secs(3);
 // 后台准备按小段让出计算资源；累计历史耗时不再成为丢弃回环的条件。
 pub(crate) const REPLAY_SLICE: Duration = Duration::from_millis(8);
 pub(crate) const REPLAY_YIELD: Duration = Duration::from_millis(2);
-const REPLAY_SLICE_MAX_FRAMES: usize = 16;
+// 时间片仍是首要边界，轻帧不再因16帧上限反复休眠；每帧继续检查取消。
+const REPLAY_SLICE_MAX_FRAMES: usize = 128;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum RebuildError {
@@ -174,17 +175,21 @@ pub(crate) struct ReplayBuilder {
     kernel: mapping_backend::MappingKernel,
     spec: MappingBackendSpec,
     persistent: Option<PersistentOccupancyGrid>,
-    cloud: CloudMapShmWriter,
+    cloud: Option<CloudMapShmWriter>,
+    cloud_worker: Option<CloudStageWorker>,
     timeline: CorrectionTimeline,
     anchor: Isometry3<f64>,
     first_timestamp_ns: i64,
     frame_id: String,
     config: MappingBackendComputeConfig,
-    last_input: Option<MappingBackendInput>,
+    last_input: Option<Arc<MappingBackendInput>>,
     processed: usize,
     started: Instant,
     budget: Duration,
     background: bool,
+    background_parallel_available: bool,
+    #[cfg(test)]
+    force_parallel_lanes: bool,
     kernel_time: Duration,
     cloud_time: Duration,
 }
@@ -247,7 +252,8 @@ impl ReplayBuilder {
             kernel: spec.into_kernel(config.window_capacity),
             spec,
             persistent: None,
-            cloud,
+            cloud: Some(cloud),
+            cloud_worker: None,
             timeline,
             anchor,
             first_timestamp_ns: first,
@@ -258,6 +264,9 @@ impl ReplayBuilder {
             started,
             budget,
             background: false,
+            background_parallel_available: false,
+            #[cfg(test)]
+            force_parallel_lanes: false,
             kernel_time: Duration::ZERO,
             cloud_time: Duration::ZERO,
         })
@@ -277,6 +286,8 @@ impl ReplayBuilder {
 
     pub(crate) fn into_background(mut self) -> Self {
         self.background = true;
+        self.background_parallel_available =
+            std::thread::available_parallelism().is_ok_and(|count| count.get() >= 4);
         self
     }
 
@@ -295,6 +306,8 @@ impl ReplayBuilder {
                 break;
             }
         }
+        // 回收在阻塞工作内完成，异步拥有方跨片只保留本地点云，不承担线程等待。
+        self.recover_cloud_worker()?;
         Ok((self, processed))
     }
 
@@ -315,9 +328,11 @@ impl ReplayBuilder {
         match result {
             Ok(prepared) => Ok((self, prepared)),
             Err(error) => {
-                self.cloud
-                    .cleanup_product_owned_file()
-                    .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                if let Some(cloud) = self.cloud.as_mut() {
+                    cloud
+                        .cleanup_product_owned_file()
+                        .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                }
                 Err(error)
             }
         }
@@ -351,7 +366,7 @@ impl ReplayBuilder {
                 .map(|point| map_from_body * point)
                 .collect();
             let origin = map_from_body * scan.sensor_origin_body;
-            let input = MappingBackendInput {
+            let input = Arc::new(MappingBackendInput {
                 session_id: "pgo-private-rebuild".into(),
                 session_generation: 1,
                 backend_generation: 1,
@@ -361,51 +376,89 @@ impl ReplayBuilder {
                 registered_frame_id: self.frame_id.clone(),
                 sensor_origin_map: origin.coords.into(),
                 registered_points_map: points,
-            };
-            let phase = Instant::now();
+            });
+            let validation_started = Instant::now();
             mapping_backend::validate_backend_input(&self.kernel, &input)?;
-            if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
-                &mut self.kernel,
-                &input,
-                self.config,
-                mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
-            )? {
-                match candidate.backend_kind {
-                MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
-                    MappingBackendKind::Voxel => {
-                        if self.persistent.is_none() {
-                            self.persistent = Some(PersistentOccupancyGrid::from_grid(
-                                candidate.live_window_occupancy.clone(),
-                            )?);
-                        }
-                        self.persistent.as_mut().unwrap().merge(
-                            &candidate.live_window_occupancy,
-                            &candidate.latest_frame_occupancy,
-                        )?;
-                    }
-                    MappingBackendKind::Raytracing => {
-                        self.persistent = Some(PersistentOccupancyGrid::stage_authoritative(
-                            &candidate.live_window_occupancy,
-                        )?);
-                    }
-                }
+            self.kernel_time += validation_started.elapsed();
+            let use_parallel = self.cloud_worker.is_some()
+                || (self.background
+                    && self.background_parallel_available
+                    && self.processed >= 8
+                    && self.kernel_time.as_nanos() / self.processed as u128 >= 250_000
+                    && self.cloud_time.as_nanos() / self.processed as u128 >= 250_000);
+            #[cfg(test)]
+            let use_parallel = use_parallel || (self.background && self.force_parallel_lanes);
+            if !use_parallel || !self.append_parallel_stages(&input, cancelled)? {
+                let phase = Instant::now();
+                append_kernel_stage(
+                    &mut self.kernel,
+                    &mut self.persistent,
+                    &input,
+                    self.config,
+                    self.background,
+                )?;
+                self.kernel_time += phase.elapsed();
+                self.check(cancelled)?;
+                let phase = Instant::now();
+                append_cloud_stage(self.cloud.as_mut().expect("本地点云已保留"), &input)?;
+                self.cloud_time += phase.elapsed();
             }
-            self.kernel_time += phase.elapsed();
-            self.check(cancelled)?;
-            let phase = Instant::now();
-            if !self.cloud.accumulate_mapping_scan(
-                1,
-                &input.registered_points_map,
-                Some(input.sensor_origin_map),
-                scan.source_timestamp_ns,
-            ) {
-                return Err("PGO重建点云无法接纳原始扫描".into());
-            }
-            self.cloud_time += phase.elapsed();
             self.processed += 1;
             self.last_input = Some(input);
         }
         self.check(cancelled)
+    }
+
+    /// 复用本次重建的点云工作线程，同一帧只有二维和三维两路在途计算。
+    fn append_parallel_stages(
+        &mut self,
+        input: &Arc<MappingBackendInput>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<bool, RebuildError> {
+        if self.cloud_worker.is_none() {
+            let cloud = self.cloud.take().expect("启动前点云由本地拥有");
+            match CloudStageWorker::start(cloud) {
+                Ok(worker) => self.cloud_worker = Some(worker),
+                Err(cloud) => {
+                    self.cloud = Some(cloud);
+                    self.background_parallel_available = false;
+                    return Ok(false);
+                }
+            }
+        }
+        self.cloud_worker.as_mut().unwrap().submit(input.clone())?;
+        let started = Instant::now();
+        // 禁止两阶段并行中再启动高度投影线程，最多两路计算。
+        let kernel_result = append_kernel_stage(
+            &mut self.kernel,
+            &mut self.persistent,
+            input,
+            self.config,
+            false,
+        );
+        self.kernel_time += started.elapsed();
+        let was_cancelled = cancelled();
+        let reply = self.cloud_worker.as_mut().unwrap().receive()?;
+        self.cloud_time += reply.elapsed;
+        if reply.source_timestamp_ns != input.source_timestamp_ns
+            || reply.frame_sequence != input.frame_sequence
+        {
+            return Err("PGO点云阶段回复与当前扫描不匹配".into());
+        }
+        kernel_result?;
+        if was_cancelled {
+            return Err(RebuildError::Cancelled);
+        }
+        reply.result?;
+        self.check(cancelled)?;
+        Ok(true)
+    }
+
+    fn recover_cloud_worker(&mut self) -> Result<(), RebuildError> {
+        if let Some(worker) = self.cloud_worker.take() {
+            self.cloud = Some(worker.finish()?);
+        }
+        Ok(())
     }
 
     /// 全量物化与后端编码仍在后台；只有已经物化的相同尾部才能进入最终提交。
@@ -422,6 +475,7 @@ impl ReplayBuilder {
         typed_restore: bool,
     ) -> Result<PreparedReplay, RebuildError> {
         self.check(cancelled)?;
+        self.recover_cloud_worker()?;
         let input = self.last_input.as_ref().ok_or("PGO重建没有扫描")?;
         let token = MappingComputeToken {
             token_id: 1,
@@ -439,7 +493,9 @@ impl ReplayBuilder {
             mapping_backend::flush_candidate(&mut output_kernel, input, &token, self.config)?
         {
             match candidate.backend_kind {
-                MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
+                MappingBackendKind::SlamToolbox => {
+                    return Err("二维算法不得进入三维回环重建".into())
+                }
                 MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
                     self.persistent.as_ref(),
                     &candidate.live_window_occupancy,
@@ -459,6 +515,8 @@ impl ReplayBuilder {
         };
         self.check(cancelled)?;
         self.cloud
+            .as_mut()
+            .expect("物化前点云线程已回收")
             .commit_accumulated()
             .ok_or("PGO重建点云无法完成快照")?;
         let (backend_checkpoint, prepared_backend) = if typed_restore {
@@ -480,6 +538,8 @@ impl ReplayBuilder {
             occupancy,
             cloud: self
                 .cloud
+                .as_ref()
+                .expect("物化前点云线程已回收")
                 .committed_snapshot()
                 .ok_or("PGO重建点云快照缺失")?,
             backend_checkpoint,
@@ -499,15 +559,24 @@ impl ReplayBuilder {
         if prepared.source_timestamp_ns != self.latest_timestamp_ns() {
             return Err("PGO准备快照落后于私有重放尾部".into());
         }
+        if self.cloud_worker.is_some() {
+            return Err("PGO点云线程尚未在后台回收".into());
+        }
         let result = RebuiltMap {
             occupancy: prepared.occupancy,
             cloud: prepared.cloud,
             backend_checkpoint: prepared.backend_checkpoint,
-            accumulator: self.cloud.take_prepared_accumulator(),
+            accumulator: self
+                .cloud
+                .as_mut()
+                .expect("提交前点云已回收")
+                .take_prepared_accumulator(),
             source_timestamp_ns: prepared.source_timestamp_ns,
             prepared_backend: prepared.prepared_backend,
         };
         self.cloud
+            .as_mut()
+            .expect("提交前点云已回收")
             .cleanup_product_owned_file()
             .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
         self.check(cancelled)?;
@@ -522,6 +591,153 @@ impl ReplayBuilder {
         );
         Ok(result)
     }
+}
+
+struct CloudStageReply {
+    source_timestamp_ns: u64,
+    frame_sequence: u64,
+    result: Result<(), RebuildError>,
+    elapsed: Duration,
+}
+
+/// 每次重建独立拥有；关闭回复端后再等待，避免未领取回执阻塞退出。
+struct CloudStageWorker {
+    input: Option<std::sync::mpsc::SyncSender<Arc<MappingBackendInput>>>,
+    replies: Option<std::sync::mpsc::Receiver<CloudStageReply>>,
+    join: Option<std::thread::JoinHandle<Result<CloudMapShmWriter, RebuildError>>>,
+}
+
+impl CloudStageWorker {
+    fn start(cloud: CloudMapShmWriter) -> Result<Self, CloudMapShmWriter> {
+        let (initialize, initialized) = std::sync::mpsc::sync_channel::<CloudMapShmWriter>(1);
+        let (input, requests) = std::sync::mpsc::sync_channel::<Arc<MappingBackendInput>>(1);
+        let (replies, receiver) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("pgo-cloud".into())
+            .spawn(move || {
+                let mut cloud = initialized
+                    .recv()
+                    .map_err(|_| RebuildError::Invalid("PGO点云初始化通道关闭".into()))?;
+                while let Ok(input) = requests.recv() {
+                    let started = Instant::now();
+                    let result = append_cloud_stage(&mut cloud, &input);
+                    let reply = CloudStageReply {
+                        source_timestamp_ns: input.source_timestamp_ns,
+                        frame_sequence: input.frame_sequence,
+                        result,
+                        elapsed: started.elapsed(),
+                    };
+                    if replies.send(reply).is_err() {
+                        break;
+                    }
+                }
+                Ok(cloud)
+            });
+        let Ok(join) = join else {
+            return Err(cloud);
+        };
+        if let Err(error) = initialize.send(cloud) {
+            drop(input);
+            drop(receiver);
+            let _ = join.join();
+            return Err(error.0);
+        }
+        Ok(Self {
+            input: Some(input),
+            replies: Some(receiver),
+            join: Some(join),
+        })
+    }
+
+    fn submit(&mut self, input: Arc<MappingBackendInput>) -> Result<(), RebuildError> {
+        self.input
+            .as_ref()
+            .ok_or("PGO点云工作已关闭")?
+            .send(input)
+            .map_err(|_| RebuildError::Invalid("PGO点云工作线程已退出".into()))
+    }
+
+    fn receive(&mut self) -> Result<CloudStageReply, RebuildError> {
+        self.replies
+            .as_ref()
+            .ok_or("PGO点云回复已关闭")?
+            .recv()
+            .map_err(|_| RebuildError::Invalid("PGO点云工作线程未交付结果".into()))
+    }
+
+    fn finish(mut self) -> Result<CloudMapShmWriter, RebuildError> {
+        drop(self.input.take());
+        drop(self.replies.take());
+        self.join
+            .take()
+            .expect("点云线程由本对象拥有")
+            .join()
+            .map_err(|_| RebuildError::Invalid("PGO点云工作线程异常退出".into()))?
+    }
+}
+
+impl Drop for CloudStageWorker {
+    fn drop(&mut self) {
+        drop(self.input.take());
+        drop(self.replies.take());
+        if let Some(join) = self.join.take() {
+            if let Ok(Ok(mut cloud)) = join.join() {
+                let _ = cloud.cleanup_product_owned_file();
+            }
+        }
+    }
+}
+
+fn append_kernel_stage(
+    kernel: &mut mapping_backend::MappingKernel,
+    persistent: &mut Option<PersistentOccupancyGrid>,
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+    parallel_projection: bool,
+) -> Result<(), RebuildError> {
+    if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
+        kernel,
+        input,
+        config,
+        mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
+        parallel_projection,
+    )? {
+        match candidate.backend_kind {
+            MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
+            MappingBackendKind::Voxel => {
+                if persistent.is_none() {
+                    *persistent = Some(PersistentOccupancyGrid::from_grid(
+                        candidate.live_window_occupancy.clone(),
+                    )?);
+                }
+                persistent.as_mut().unwrap().merge(
+                    &candidate.live_window_occupancy,
+                    &candidate.latest_frame_occupancy,
+                )?;
+            }
+            MappingBackendKind::Raytracing => {
+                *persistent = Some(PersistentOccupancyGrid::stage_authoritative(
+                    &candidate.live_window_occupancy,
+                )?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_cloud_stage(
+    cloud: &mut CloudMapShmWriter,
+    input: &MappingBackendInput,
+) -> Result<(), RebuildError> {
+    if !cloud.accumulate_mapping_scan(
+        1,
+        &input.registered_points_map,
+        Some(input.sensor_origin_map),
+        input.source_timestamp_ns,
+    ) {
+        return Err("PGO重建点云无法接纳原始扫描".into());
+    }
+    Ok(())
 }
 
 fn check_budget(
@@ -573,10 +789,11 @@ pub(crate) fn rebuild(
         match appended.and_then(|()| builder.prepare(&cancelled)) {
             Ok(prepared) => builder.finish(prepared, &cancelled),
             Err(error) => {
-                builder
-                    .cloud
-                    .cleanup_product_owned_file()
-                    .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                if let Some(cloud) = builder.cloud.as_mut() {
+                    cloud
+                        .cleanup_product_owned_file()
+                        .map_err(|e| format!("PGO临时点云清理失败：{e}"))?;
+                }
                 Err(error)
             }
         }
@@ -634,6 +851,31 @@ mod tests {
         history.clear();
         history.record(4, 4, &binding, &points).unwrap();
         assert_eq!(history.snapshot().unwrap()[0].source_timestamp_ns, 4);
+    }
+
+    #[test]
+    fn cloud_stage_stop_joins_even_with_unclaimed_reply() {
+        let cloud = CloudMapShmWriter::new_private().unwrap();
+        let mut worker =
+            CloudStageWorker::start(cloud).unwrap_or_else(|_| panic!("无法创建测试点云线程"));
+        for sequence in 1..=2 {
+            worker
+                .submit(Arc::new(MappingBackendInput {
+                    session_id: "private-test".into(),
+                    session_generation: 1,
+                    backend_generation: 1,
+                    frame_sequence: sequence,
+                    source_timestamp_ns: sequence,
+                    received_at_ns: sequence,
+                    registered_frame_id: "map".into(),
+                    sensor_origin_map: [0.0; 3],
+                    registered_points_map: vec![Point3::new(sequence as f64, 0.0, 0.0)],
+                }))
+                .unwrap();
+        }
+        // 回复端未领取也必须能关闭，不能在等待线程时被已满回复通道卡住。
+        let mut cloud = worker.finish().unwrap();
+        assert!(cloud.commit_accumulated().unwrap().1 >= 1);
     }
 
     fn scale_input(frame_count: usize) -> (Vec<ArchivedScan>, Vec<OptimizedKeyframe>) {
@@ -830,14 +1072,21 @@ mod tests {
             )
             .unwrap()
             .into_background();
+            builder.force_parallel_lanes = true;
             // 注入已经超过旧截止时间的历史年龄，核对继续推进而非清空后从头再来。
             builder.started = Instant::now() - Duration::from_secs(4);
             let mut cursor = 0;
             let mut slices = 0;
             while cursor < scans.len() {
-                let (next, count) = builder.append_slice(&scans[cursor..], &|| false).unwrap();
+                // 强制分批交付归档，验证进度跨批保留，不依赖机器速度或生产帧数上限。
+                let end = (cursor + 16).min(scans.len());
+                let (next, count) = builder
+                    .append_slice(&scans[cursor..end], &|| false)
+                    .unwrap();
                 assert!((1..=REPLAY_SLICE_MAX_FRAMES).contains(&count));
                 builder = next;
+                assert!(builder.cloud_worker.is_none(), "工作线程不能越过阻塞计算片");
+                assert!(builder.cloud.is_some());
                 cursor += count;
                 slices += 1;
                 assert_eq!(builder.processed, cursor);
@@ -865,6 +1114,79 @@ mod tests {
                 builder.append_slice(&scans, &|| true),
                 Err(RebuildError::Cancelled)
             ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "固定扰动扫描的串行/双阶段性能与完整地图等价对照"]
+    async fn pgo_fixed_dynamic_stage_benchmark() {
+        let (mut scans, trajectory) = scale_input(320);
+        for (frame, scan) in scans.iter_mut().enumerate() {
+            for (index, point) in Arc::make_mut(&mut scan.body_points).iter_mut().enumerate() {
+                point.x += 0.08 * (frame as f64 * 0.19 + index as f64 * 0.03).sin();
+                point.z += 0.08 * (frame as f64 * 0.17 + index as f64 * 0.02).cos();
+            }
+        }
+        let scans: Arc<[ArchivedScan]> = scans.into();
+        let config = MappingBackendComputeConfig {
+            resolution: 0.05,
+            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
+            initial_safe_radius_meters: 0.0,
+            window_capacity: 1_000_000,
+        };
+        let mut reference: Option<RebuiltMap> = None;
+        for parallel in [false, true] {
+            let mut builder = ReplayBuilder::new(
+                &scans,
+                trajectory.clone(),
+                Isometry3::identity(),
+                MappingBackendSpec::Voxel,
+                config,
+                "map".into(),
+                Duration::MAX,
+                &|| false,
+            )
+            .unwrap()
+            .into_background();
+            builder.background_parallel_available = false;
+            builder.force_parallel_lanes = parallel;
+            let started = Instant::now();
+            let mut cursor = 0;
+            while cursor < scans.len() {
+                let input = scans.clone();
+                let (next, count) = tokio::task::spawn_blocking(move || {
+                    builder.append_slice(&input[cursor..], &|| false)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                builder = next;
+                cursor += count;
+                assert!(builder.cloud_worker.is_none());
+                tokio::time::sleep(REPLAY_YIELD).await;
+            }
+            let kernel_ms = builder.kernel_time.as_secs_f64() * 1000.0;
+            let cloud_ms = builder.cloud_time.as_secs_f64() * 1000.0;
+            let output = tokio::task::spawn_blocking(move || {
+                let (builder, prepared) = builder.advance(&[], &|| false).unwrap();
+                builder.finish(prepared, &|| false).unwrap()
+            })
+            .await
+            .unwrap();
+            eprintln!("固定扰动 parallel={parallel} elapsed_ms={:.3} kernel_ms={kernel_ms:.3} cloud_ms={cloud_ms:.3} points={}",
+                started.elapsed().as_secs_f64()*1000.0, output.cloud.point_count);
+            if let Some(reference) = &reference {
+                assert_eq!(output.occupancy.data, reference.occupancy.data);
+                assert_eq!(output.occupancy.origin, reference.occupancy.origin);
+                assert_eq!(
+                    (output.occupancy.width, output.occupancy.height),
+                    (reference.occupancy.width, reference.occupancy.height)
+                );
+                assert_eq!(output.cloud.xyz_f32_le, reference.cloud.xyz_f32_le);
+                assert_eq!(output.source_timestamp_ns, reference.source_timestamp_ns);
+            } else {
+                reference = Some(output);
+            }
         }
     }
 
@@ -921,12 +1243,17 @@ mod tests {
             slices += 1;
             tokio::time::sleep(REPLAY_YIELD).await;
         }
+        let kernel_ms = builder.kernel_time.as_secs_f64() * 1000.0;
+        let cloud_ms = builder.cloud_time.as_secs_f64() * 1000.0;
+        let materialize_started = Instant::now();
         let output = tokio::task::spawn_blocking(move || {
             let (builder, prepared) = builder.advance(&[], &|| false).unwrap();
             builder.finish(prepared, &|| false).unwrap()
         })
         .await
         .unwrap();
+        let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("后台阶段 kernel_ms={kernel_ms:.3} cloud_ms={cloud_ms:.3} materialize_ms={materialize_ms:.3}");
         assert_eq!(
             output.source_timestamp_ns,
             scans.last().unwrap().source_timestamp_ns

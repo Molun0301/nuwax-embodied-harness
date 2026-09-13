@@ -1249,6 +1249,8 @@ impl MappingBackendSpec {
                 last_candidate_point_count: 0,
                 last_candidate_received_at_ns: 0,
                 dirty_since_candidate: false,
+                live_height_cache: Default::default(),
+                latest_height_cache: Default::default(),
             }),
             Self::Raytracing(spec) => MappingKernel::Raytracing(RaytracingKernel {
                 config: spec.config(),
@@ -1342,6 +1344,9 @@ impl MappingKernel {
 #[derive(Clone)]
 pub(crate) struct VoxelKernel {
     current_window: VecDeque<Point3<f64>>,
+    // 派生结果不进入检查点；原始窗口与输入仍是可恢复真值。
+    live_height_cache: nuwax_mapping::pointclouds::occupancy::HeightCostCache,
+    latest_height_cache: nuwax_mapping::pointclouds::occupancy::HeightCostCache,
     capacity: usize,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1963,6 +1968,8 @@ fn restore_mapping_kernel_checkpoint(
                 last_candidate_point_count,
                 last_candidate_received_at_ns,
                 dirty_since_candidate: false,
+                live_height_cache: Default::default(),
+                latest_height_cache: Default::default(),
             }))
         }
         MappingBackendSpec::Raytracing(ray_spec) => {
@@ -2117,6 +2124,16 @@ fn build_occupancy(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<OccupancyGrid, String> {
+    build_occupancy_with_cache(points, input, config, None, false)
+}
+
+fn build_occupancy_with_cache(
+    points: &[Point3<f64>],
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+    cache: Option<&mut nuwax_mapping::pointclouds::occupancy::HeightCostCache>,
+    parallel_projection: bool,
+) -> Result<OccupancyGrid, String> {
     let cloud = BorrowedBackendCloud {
         points,
         sensor_origin: nalgebra::point![
@@ -2127,8 +2144,12 @@ fn build_occupancy(
         frame_id: &input.registered_frame_id,
         timestamp: input.source_timestamp_ns as f64 / 1_000_000_000.0,
     };
-    CostMapper::occupancy_from_pointcloud_auto(&cloud, &occupancy_config(config), config.resolution)
-        .map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))
+    match cache {
+        Some(cache) => CostMapper::occupancy_from_pointcloud_auto_cached(
+            &cloud, &occupancy_config(config), config.resolution, cache, parallel_projection),
+        None => CostMapper::occupancy_from_pointcloud_auto(
+            &cloud, &occupancy_config(config), config.resolution),
+    }.map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))
 }
 
 fn cleared_previous_occupancy(
@@ -2170,8 +2191,8 @@ pub(crate) fn flush_candidate(
                 voxel.dirty_since_candidate = false;
                 return Ok(None);
             }
-            let live = build_occupancy(voxel.current_window.make_contiguous(), input, config)?;
-            let latest = build_occupancy(&input.registered_points_map, input, config)?;
+            let live = build_occupancy_with_cache(voxel.current_window.make_contiguous(), input, config, Some(&mut voxel.live_height_cache), false)?;
+            let latest = build_occupancy_with_cache(&input.registered_points_map, input, config, Some(&mut voxel.latest_height_cache), false)?;
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = voxel.current_window.len();
             voxel.dirty_since_candidate = false;
@@ -2271,7 +2292,7 @@ pub(crate) fn compute_candidate_in_place(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    compute_candidate_with_parallelism(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS, true)
+    compute_candidate_with_parallelism(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS, true, false)
 }
 
 /// 历史回放自行选择构图节拍；点云接纳与累积仍逐帧执行。
@@ -2280,8 +2301,9 @@ pub(crate) fn compute_candidate_in_place_with_interval(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
     candidate_interval_ns: u64,
+    parallel_projection: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    compute_candidate_with_parallelism(kernel, input, config, candidate_interval_ns, false)
+    compute_candidate_with_parallelism(kernel, input, config, candidate_interval_ns, false, parallel_projection)
 }
 
 fn compute_candidate_with_parallelism(
@@ -2290,6 +2312,7 @@ fn compute_candidate_with_parallelism(
     config: MappingBackendComputeConfig,
     candidate_interval_ns: u64,
     parallel: bool,
+    parallel_projection: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
     if input.registered_points_map.is_empty() {
         return Ok(None);
@@ -2333,8 +2356,8 @@ fn compute_candidate_with_parallelism(
             }
             let live_points = voxel.current_window.make_contiguous();
             let result = (
-                build_occupancy(live_points, input, config)?,
-                build_occupancy(&input.registered_points_map, input, config)?,
+                build_occupancy_with_cache(live_points, input, config, Some(&mut voxel.live_height_cache), parallel_projection)?,
+                build_occupancy_with_cache(&input.registered_points_map, input, config, Some(&mut voxel.latest_height_cache), false)?,
             );
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = point_count;
@@ -2938,6 +2961,8 @@ mod tests {
             last_candidate_point_count: 1,
             last_candidate_received_at_ns: 7,
             dirty_since_candidate: false,
+                live_height_cache: Default::default(),
+                latest_height_cache: Default::default(),
         });
         let mut non_finite =
             export_mapping_kernel_checkpoint(&one_point).expect("encode one point");

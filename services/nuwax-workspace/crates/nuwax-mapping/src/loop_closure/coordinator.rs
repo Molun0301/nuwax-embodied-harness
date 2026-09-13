@@ -9,6 +9,7 @@ use super::optimizer::{cost_strictly_improved, graph_cost, OptimizerConfig};
 use super::pgo::{PoseEdge, PoseGraph};
 use super::registration::evaluate_loop_registration;
 use super::scan_context::ScanContext;
+use super::se3::{se3_adjoint, se3_log_to_vector6};
 use super::PgoOptimizer;
 use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
 
@@ -17,6 +18,18 @@ use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
 pub struct LoopClosurePipelineConfig {
     /// 启用与里程计距离无关的地点检索；几何门验证可单独关闭它以隔离候选来源。
     pub scan_context_enabled: bool,
+    /// 对比里程计路径及候选之间的带协方差闭合误差，数值为马氏距离平方上限。
+    pub max_loop_innovation: f64,
+    /// 至少由多少次分离的观测确认同一回环，单次匹配不能直接改写整图。
+    pub loop_confirmation_frames: usize,
+    /// 确认观测之间的最短源时间间隔。
+    pub loop_confirmation_interval_secs: f64,
+    /// 原生LIO重力对齐朝向的软先验，保留偏航和平移自由度；None用于非惯性数据。
+    pub gravity_prior_sigma_rad: Option<f64>,
+    /// 未提供增量协方差时的基础标准差，同一模型用于图边和一致性检查。
+    pub odometry_translation_sigma_m: f64,
+    /// 里程计增量旋转的基础标准差，单位弧度。
+    pub odometry_rotation_sigma_rad: f64,
     /// Translation required before a frame becomes a keyframe.
     pub keyframe_translation: f64,
     /// Rotation angle required before a frame becomes a keyframe.
@@ -51,6 +64,12 @@ impl Default for LoopClosurePipelineConfig {
     fn default() -> Self {
         Self {
             scan_context_enabled: true,
+            max_loop_innovation: 30.0,
+            loop_confirmation_frames: 2,
+            loop_confirmation_interval_secs: 1.0,
+            gravity_prior_sigma_rad: Some(1.0_f64.to_radians()),
+            odometry_translation_sigma_m: 0.02,
+            odometry_rotation_sigma_rad: 0.5_f64.to_radians(),
             keyframe_translation: 0.5,
             keyframe_rotation: 10.0_f64.to_radians(),
             loop_search_radius: 2.0,
@@ -199,6 +218,7 @@ struct StoredKeyframe {
     local_pose: Isometry3<f64>,
     points: Vec<Point3<f64>>,
     context: ScanContext,
+    odometry_covariance: Matrix6<f64>,
 }
 
 /// An accepted point-cloud loop edge.
@@ -222,6 +242,12 @@ pub struct LoopClosureRecord {
     pub target_overlap: f64,
     /// 由独立对应支撑估计的有界信息矩阵，平移在前、旋转在后。
     pub information: Matrix6<f64>,
+    /// 独立原始里程计闭合检查的马氏距离平方。
+    pub odometry_innovation: f64,
+}
+
+struct PendingLoop {
+    records: Vec<LoopClosureRecord>,
 }
 
 /// Result of processing one mapping frame.
@@ -275,6 +301,7 @@ pub struct LoopClosureCoordinator {
     keyframes: BTreeMap<u64, StoredKeyframe>,
     loops: Vec<LoopClosureRecord>,
     timeline: CorrectionTimeline,
+    pending_loop: Option<PendingLoop>,
 }
 
 impl LoopClosureCoordinator {
@@ -287,6 +314,7 @@ impl LoopClosureCoordinator {
             keyframes: BTreeMap::new(),
             loops: Vec::new(),
             timeline: CorrectionTimeline::default(),
+            pending_loop: None,
         })
     }
 
@@ -314,7 +342,10 @@ impl LoopClosureCoordinator {
                 return Err(LoopClosurePipelineError::InvalidCorrectionTimeline);
             }
             let delta = last.local_pose.inverse() * local_pose;
-            if delta.translation.vector.norm() < self.config.keyframe_translation
+            let confirmation_due = self.pending_loop.is_some()
+                && timestamp - last.timestamp >= self.config.loop_confirmation_interval_secs;
+            if !confirmation_due
+                && delta.translation.vector.norm() < self.config.keyframe_translation
                 && delta.rotation.angle() < self.config.keyframe_rotation
             {
                 return Ok(ProcessFrameResult::BelowKeyframeThreshold);
@@ -331,16 +362,25 @@ impl LoopClosureCoordinator {
             self.graph.nodes[&previous_id].pose * (previous_pose.inverse() * local_pose)
         });
         let node_id = self.graph.add_node(timestamp.floor() as i64, initial_pose);
+        let mut odometry_covariance = Matrix6::zeros();
         if let Some((previous_id, previous_pose)) = previous {
             let delta = previous_pose.inverse() * local_pose;
             // LIO没有提供关键帧增量协方差时采用随运动增长的保守噪声模型。
             // 不能把垂直/旋转固定成近乎无误差，否则回环无法纠正长期累计漂移。
             let distance = delta.translation.vector.norm();
-            let translation_sigma = 0.02 + 0.02 * distance;
-            let rotation_sigma =
-                0.5_f64.to_radians() * (1.0 + distance) + 0.05 * delta.rotation.angle();
+            let translation_sigma = self.config.odometry_translation_sigma_m * (1.0 + distance);
+            let rotation_sigma = self.config.odometry_rotation_sigma_rad * (1.0 + distance)
+                + 0.05 * delta.rotation.angle();
             let translation_information = translation_sigma.powi(-2);
             let rotation_information = rotation_sigma.powi(-2);
+            odometry_covariance = Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                translation_sigma.powi(2),
+                translation_sigma.powi(2),
+                translation_sigma.powi(2),
+                rotation_sigma.powi(2),
+                rotation_sigma.powi(2),
+                rotation_sigma.powi(2),
+            ));
             self.graph
                 .add_edge(PoseEdge::new(previous_id, node_id, delta).with_information(
                     Matrix6::from_diagonal(&nalgebra::Vector6::new(
@@ -362,25 +402,31 @@ impl LoopClosureCoordinator {
                 local_pose,
                 points: voxel_downsample(points, self.config.submap_resolution_m),
                 context: ScanContext::new(points, local_pose.rotation),
+                odometry_covariance,
             },
         );
 
         let loop_result = self.find_and_measure_loop(node_id);
-        let result = if let Some(record) = loop_result {
+        let confirmed = self.confirm_loop(loop_result, timestamp);
+        let result = if let Some(records) = confirmed {
             let mut optimized_graph = self.graph.clone();
-            optimized_graph.add_edge(
-                PoseEdge::new(record.from, record.to, record.measurement)
-                    .with_information(record.information),
-            );
-            let initial_cost = graph_cost(&optimized_graph);
-            let historic_id = record.from;
-            let final_cost =
-                PgoOptimizer::with_config(self.config.optimizer).optimize(&mut optimized_graph);
+            for record in &records {
+                optimized_graph.add_edge(
+                    PoseEdge::new(record.from, record.to, record.measurement)
+                        .with_information(record.information),
+                );
+            }
+            let gravity = self.gravity_priors();
+            let initial_cost =
+                graph_cost(&optimized_graph) + gravity_cost(&optimized_graph, &gravity);
+            let historic_id = records.last().unwrap().from;
+            let final_cost = PgoOptimizer::with_config(self.config.optimizer)
+                .optimize_with_gravity(&mut optimized_graph, &gravity);
             if cost_strictly_improved(initial_cost, final_cost)
                 && has_valid_correction(&self.graph, &optimized_graph)
             {
                 self.graph = optimized_graph;
-                self.loops.push(record);
+                self.loops.extend(records);
                 ProcessFrameResult::LoopClosed {
                     node_id,
                     historic_id,
@@ -419,6 +465,7 @@ impl LoopClosureCoordinator {
         self.keyframes.clear();
         self.loops.clear();
         self.timeline = CorrectionTimeline::default();
+        self.pending_loop = None;
     }
 
     fn find_and_measure_loop(&self, current_id: u64) -> Option<LoopClosureRecord> {
@@ -548,7 +595,7 @@ impl LoopClosureCoordinator {
                 rotation_variance.recip(),
                 rotation_variance.recip(),
             ));
-            return Some(LoopClosureRecord {
+            let mut record = LoopClosureRecord {
                 from: historic_id,
                 to: current_id,
                 // 求解器返回历史坐标中的残差，约束须还原为完整机体间变换。
@@ -559,7 +606,33 @@ impl LoopClosureCoordinator {
                 source_overlap: evidence.source_overlap,
                 target_overlap: evidence.target_overlap,
                 information,
-            });
+                odometry_innovation: 0.0,
+            };
+            record.odometry_innovation = self.loop_innovation(&record);
+            tracing::info!(
+                event = "pgo.loop.measured",
+                current_id,
+                historic_id,
+                mse = record.mse,
+                source_overlap = record.source_overlap,
+                target_overlap = record.target_overlap,
+                measurement_translation_m = ?record.measurement.translation.vector,
+                measurement_rotation_xyzw = ?record.measurement.rotation.coords,
+                innovation = record.odometry_innovation,
+                "记录回环配准与里程计一致性依据"
+            );
+            if record.odometry_innovation > self.config.max_loop_innovation {
+                tracing::info!(
+                    event = "pgo.loop.rejected",
+                    reason = "odometry_inconsistent",
+                    current_id,
+                    historic_id,
+                    innovation = record.odometry_innovation,
+                    "点云匹配与独立里程计路径不一致"
+                );
+                continue;
+            }
+            return Some(record);
         }
         None
     }
@@ -654,9 +727,189 @@ impl LoopClosureCoordinator {
         self.timeline = CorrectionTimeline::new(keyframes)?;
         Ok(())
     }
+
+    fn gravity_priors(&self) -> Vec<(u64, nuwax_gtsam::GravityPrior)> {
+        let Some(sigma) = self.config.gravity_prior_sigma_rad else {
+            return Vec::new();
+        };
+        self.keyframes
+            .iter()
+            .map(|(&id, frame)| {
+                (
+                    id,
+                    nuwax_gtsam::GravityPrior {
+                        direction_body: (frame.local_pose.rotation.inverse()
+                            * nalgebra::Vector3::z())
+                        .into(),
+                        sigma,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 右扰动协方差随原始里程计增量传播，不能用已优化路径自证回环。
+    fn odometry_between(&self, from: u64, to: u64) -> Option<(Isometry3<f64>, Matrix6<f64>)> {
+        if from == to {
+            self.keyframes.get(&from)?;
+            return Some((Isometry3::identity(), Matrix6::zeros()));
+        }
+        if from > to {
+            let (pose, covariance) = self.odometry_between(to, from)?;
+            let adjoint = se3_adjoint(&pose);
+            return Some((pose.inverse(), adjoint * covariance * adjoint.transpose()));
+        }
+        let mut pose = Isometry3::identity();
+        let mut covariance = Matrix6::zeros();
+        let mut previous = self.keyframes.get(&from)?.local_pose;
+        for (_, frame) in self.keyframes.range(from.saturating_add(1)..=to) {
+            let delta = previous.inverse() * frame.local_pose;
+            (pose, covariance) =
+                compose_uncertainty((pose, covariance), (delta, frame.odometry_covariance));
+            previous = frame.local_pose;
+        }
+        Some((pose, covariance))
+    }
+
+    fn loop_innovation(&self, record: &LoopClosureRecord) -> f64 {
+        let Some((prediction, covariance)) = self.odometry_between(record.from, record.to) else {
+            return f64::INFINITY;
+        };
+        let Some(measurement_covariance) = record.information.try_inverse() else {
+            return f64::INFINITY;
+        };
+        innovation_squared(
+            &record.measurement,
+            &prediction,
+            covariance + measurement_covariance,
+        )
+    }
+
+    fn pair_innovation(&self, first: &LoopClosureRecord, second: &LoopClosureRecord) -> f64 {
+        let Some(historic) = self.odometry_between(second.from, first.from) else {
+            return f64::INFINITY;
+        };
+        let Some(current) = self.odometry_between(first.to, second.to) else {
+            return f64::INFINITY;
+        };
+        let (Some(a), Some(b)) = (
+            first.information.try_inverse(),
+            second.information.try_inverse(),
+        ) else {
+            return f64::INFINITY;
+        };
+        let (prediction, covariance) = compose_uncertainty(
+            compose_uncertainty(historic, (first.measurement, a)),
+            current,
+        );
+        innovation_squared(&second.measurement, &prediction, covariance + b)
+    }
+
+    fn confirm_loop(
+        &mut self,
+        record: Option<LoopClosureRecord>,
+        timestamp: f64,
+    ) -> Option<Vec<LoopClosureRecord>> {
+        if self.pending_loop.as_ref().is_some_and(|pending| {
+            timestamp - self.keyframes[&pending.records.last().unwrap().to].timestamp > 10.0
+        }) {
+            self.pending_loop = None;
+        }
+        let record = record?;
+        if self.config.loop_confirmation_frames == 1 {
+            return Some(vec![record]);
+        }
+        let consistent = self.pending_loop.as_ref().is_some_and(|pending| {
+            pending.records.iter().all(|previous| {
+                self.pair_innovation(previous, &record) <= self.config.max_loop_innovation
+            })
+        });
+        if !consistent {
+            tracing::info!(
+                event = "pgo.loop.awaiting_confirmation",
+                current_id = record.to,
+                historic_id = record.from,
+                replaced = self.pending_loop.is_some(),
+                "等待间隔观测确认回环"
+            );
+            self.pending_loop = Some(PendingLoop {
+                records: vec![record],
+            });
+            return None;
+        }
+        let pending = self.pending_loop.as_mut().unwrap();
+        if timestamp - self.keyframes[&pending.records.last().unwrap().to].timestamp
+            < self.config.loop_confirmation_interval_secs
+        {
+            return None;
+        }
+        pending.records.push(record);
+        if pending.records.len() < self.config.loop_confirmation_frames {
+            return None;
+        }
+        Some(self.pending_loop.take().unwrap().records)
+    }
+}
+
+fn compose_uncertainty(
+    first: (Isometry3<f64>, Matrix6<f64>),
+    second: (Isometry3<f64>, Matrix6<f64>),
+) -> (Isometry3<f64>, Matrix6<f64>) {
+    let adjoint = se3_adjoint(&second.0.inverse());
+    (
+        first.0 * second.0,
+        adjoint * first.1 * adjoint.transpose() + second.1,
+    )
+}
+
+fn innovation_squared(
+    measured: &Isometry3<f64>,
+    predicted: &Isometry3<f64>,
+    covariance: Matrix6<f64>,
+) -> f64 {
+    let error = se3_log_to_vector6(&(measured.inverse() * predicted));
+    let symmetric = (covariance + covariance.transpose()) * 0.5;
+    let value = symmetric
+        .cholesky()
+        .map_or(f64::INFINITY, |factor| error.dot(&factor.solve(&error)));
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn gravity_cost(graph: &PoseGraph, priors: &[(u64, nuwax_gtsam::GravityPrior)]) -> f64 {
+    priors
+        .iter()
+        .map(|(id, prior)| {
+            let error = graph.nodes[id].pose.rotation
+                * nalgebra::Vector3::from(prior.direction_body)
+                - nalgebra::Vector3::z();
+            0.5 * error.norm_squared() / prior.sigma.powi(2)
+        })
+        .sum()
 }
 
 fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosurePipelineError> {
+    if config.loop_confirmation_frames == 0
+        || config.loop_confirmation_frames > 8
+        || !config.max_loop_innovation.is_finite()
+        || config.max_loop_innovation <= 0.0
+        || !config.loop_confirmation_interval_secs.is_finite()
+        || config.loop_confirmation_interval_secs <= 0.0
+        || config
+            .gravity_prior_sigma_rad
+            .is_some_and(|sigma| !sigma.is_finite() || sigma <= 0.0)
+        || !config.odometry_translation_sigma_m.is_finite()
+        || config.odometry_translation_sigma_m <= 0.0
+        || !config.odometry_rotation_sigma_rad.is_finite()
+        || config.odometry_rotation_sigma_rad <= 0.0
+    {
+        return Err(LoopClosurePipelineError::InvalidConfig(
+            "invalid loop consistency or gravity configuration",
+        ));
+    }
     if config.min_keyframes_for_loop_search < 3
         || config.min_keyframes_for_loop_search > 2000
         || config.loop_submap_half_range > 100
@@ -762,6 +1015,159 @@ mod tests {
     use super::*;
     use nalgebra::UnitQuaternion;
 
+    fn consistency_fixture() -> LoopClosureCoordinator {
+        let mut owner = LoopClosureCoordinator::new(LoopClosurePipelineConfig {
+            min_loop_separation_secs: 10_000.0,
+            keyframe_translation: 0.1,
+            ..Default::default()
+        })
+        .unwrap();
+        let points: Vec<_> = (0..20)
+            .map(|i| Point3::new(i as f64 * 0.1, (i % 3) as f64 * 0.2, (i % 5) as f64 * 0.2))
+            .collect();
+        for i in 0..=11 {
+            owner
+                .process_frame(
+                    i as f64,
+                    Isometry3::translation(i as f64 * 0.5, 0., 0.),
+                    &points,
+                )
+                .unwrap();
+        }
+        owner
+    }
+
+    fn measured_loop(to: u64, x: f64, yaw: f64) -> LoopClosureRecord {
+        LoopClosureRecord {
+            from: 0,
+            to,
+            measurement: Isometry3::from_parts(
+                Translation3::new(x, 0., 0.),
+                UnitQuaternion::from_euler_angles(0., 0., yaw),
+            ),
+            mse: 0.022755389991151544,
+            source_inliers: 102,
+            target_inliers: 117,
+            source_overlap: 0.593,
+            target_overlap: 0.672,
+            information: Matrix6::from_diagonal(&nalgebra::Vector6::new(
+                2500., 2500., 2500., 10000., 10000., 10000.,
+            )),
+            odometry_innovation: 0.,
+        }
+    }
+
+    #[test]
+    fn short_odometry_path_rejects_large_angle_even_with_low_registration_error() {
+        let owner = consistency_fixture();
+        let bad = measured_loop(10, 5., 41.1338_f64.to_radians());
+        assert!(owner.loop_innovation(&bad) > owner.config.max_loop_innovation);
+        let good = measured_loop(10, 4.9, 0.);
+        assert!(owner.loop_innovation(&good) < owner.config.max_loop_innovation);
+        assert_eq!(owner.odometry_between(0, 0).unwrap().1, Matrix6::zeros());
+    }
+
+    #[test]
+    fn single_or_inconsistent_loop_never_rewrites_graph_and_reset_discards_votes() {
+        let mut owner = consistency_fixture();
+        let edges = owner.graph.num_edges();
+        assert!(owner
+            .confirm_loop(Some(measured_loop(9, 4.4, 0.)), 9.)
+            .is_none());
+        assert!(owner.loops.is_empty());
+        assert_eq!(owner.graph.num_edges(), edges);
+        assert!(owner
+            .confirm_loop(Some(measured_loop(10, 5., 0.5)), 10.)
+            .is_none());
+        assert_eq!(owner.pending_loop.as_ref().unwrap().records.len(), 1);
+        assert!(owner
+            .confirm_loop(Some(measured_loop(10, 4.9, 0.)), 10.)
+            .is_none());
+        let confirmed = owner
+            .confirm_loop(Some(measured_loop(11, 5.4, 0.)), 11.)
+            .unwrap();
+        assert_eq!(confirmed.len(), 2);
+        owner.confirm_loop(Some(measured_loop(10, 4.9, 0.)), 10.);
+        owner.reset();
+        assert!(owner.pending_loop.is_none());
+    }
+
+    #[test]
+    fn uncertainty_composition_matches_finite_difference_in_rotated_translated_frame() {
+        use super::super::se3::se3_exp_from_vector6;
+        let a = Isometry3::from_parts(
+            Translation3::new(2., -3., 1.),
+            UnitQuaternion::from_euler_angles(0.2, -0.3, 0.6),
+        );
+        let b = Isometry3::from_parts(
+            Translation3::new(-1., 2., 0.5),
+            UnitQuaternion::from_euler_angles(-0.1, 0.4, -0.2),
+        );
+        let qa = Matrix6::from_diagonal(&nalgebra::Vector6::new(
+            0.01, 0.02, 0.03, 0.001, 0.002, 0.003,
+        ));
+        let qb = Matrix6::identity() * 0.001;
+        let (_, actual) = compose_uncertainty((a, qa), (b, qb));
+        let mut jacobian = Matrix6::zeros();
+        for i in 0..6 {
+            let mut dx = nalgebra::Vector6::zeros();
+            dx[i] = 1e-6;
+            let perturbed = a * se3_exp_from_vector6(&dx) * b;
+            jacobian.set_column(
+                i,
+                &(se3_log_to_vector6(&((a * b).inverse() * perturbed)) / 1e-6),
+            );
+        }
+        assert!((actual - (jacobian * qa * jacobian.transpose() + qb)).norm() < 1e-7);
+    }
+
+    #[test]
+    fn gravity_prior_resists_map_tilt_while_allowing_yaw_correction() {
+        let mut graph = PoseGraph::new();
+        for x in [0., 1., 0.2] {
+            graph.add_node(0, Isometry3::translation(x, 0., 0.));
+        }
+        graph.fix_first_node();
+        graph.add_edge(
+            PoseEdge::new(0, 1, Isometry3::translation(1., 0., 0.))
+                .with_information(Matrix6::identity() * 1000.),
+        );
+        graph.add_edge(
+            PoseEdge::new(1, 2, Isometry3::translation(-0.8, 0., 0.))
+                .with_information(Matrix6::identity() * 1000.),
+        );
+        graph.add_edge(
+            PoseEdge::new(
+                0,
+                2,
+                Isometry3::from_parts(
+                    Translation3::new(0., 0., 0.),
+                    UnitQuaternion::from_euler_angles(0.1, 0., 0.2),
+                ),
+            )
+            .with_information(Matrix6::identity() * 100.),
+        );
+        let mut unguarded = graph.clone();
+        let _ = PgoOptimizer::default().optimize(&mut unguarded);
+        let priors: Vec<_> = (0..3)
+            .map(|id| {
+                (
+                    id,
+                    nuwax_gtsam::GravityPrior {
+                        direction_body: [0., 0., 1.],
+                        sigma: 0.005,
+                    },
+                )
+            })
+            .collect();
+        let cost = PgoOptimizer::default().optimize_with_gravity(&mut graph, &priors);
+        let (roll, _, yaw) = graph.nodes[&2].pose.rotation.euler_angles();
+        assert!(roll.abs() < 0.002 && yaw.abs() > 0.01, "{roll} {yaw}");
+        assert!(unguarded.nodes[&2].pose.rotation.euler_angles().0.abs() > roll.abs() * 5.);
+        assert!((cost - graph_cost(&graph) - gravity_cost(&graph, &priors)).abs() < 1e-7);
+        assert_eq!(graph.nodes[&0].pose, Isometry3::identity());
+    }
+
     #[test]
     fn distant_return_uses_descriptor_and_removes_translation_and_yaw_drift() {
         let world: Vec<_> = (0..60)
@@ -780,6 +1186,8 @@ mod tests {
         let mut coordinator = LoopClosureCoordinator::new(LoopClosurePipelineConfig {
             point_to_plane: false,
             min_loop_separation_secs: 1000.0,
+            // 本例明确注入强噪声里程计，图边和一致性检查共同使用该不确定性。
+            odometry_translation_sigma_m: 0.2,
             submap_resolution_m: 0.01,
             ..Default::default()
         })
@@ -787,7 +1195,8 @@ mod tests {
         let mut last = ProcessFrameResult::InsufficientPoints;
         let mut raw = Isometry3::identity();
         let mut truth = Isometry3::identity();
-        for i in 0..=30 {
+        for step in 0..=31 {
+            let i = step.min(30);
             let x = if i <= 15 {
                 i as f64 * 0.5
             } else {
@@ -804,7 +1213,15 @@ mod tests {
             );
             let body: Vec<_> = world.iter().map(|p| truth.inverse() * p).collect();
             last = coordinator
-                .process_frame(if i == 30 { 1000.0 } else { i as f64 }, raw, &body)
+                .process_frame(
+                    if step >= 30 {
+                        1000.0 + (step - 30) as f64 * 1.1
+                    } else {
+                        i as f64
+                    },
+                    raw,
+                    &body,
+                )
                 .unwrap();
         }
         assert!(
@@ -813,7 +1230,7 @@ mod tests {
         );
         let corrected = coordinator
             .corrections()
-            .correct_pose(1000.0, &raw)
+            .correct_pose(1001.1, &raw)
             .unwrap();
         let error = truth.inverse() * corrected;
         eprintln!(

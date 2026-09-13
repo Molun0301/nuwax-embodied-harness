@@ -75,7 +75,8 @@ set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-empty-neighbours.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-initial-map-frames.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-static-bias-initialization.patch"
-  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-scan-output-deskew.patch")
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-scan-output-deskew.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-voxel-membership.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
 foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
@@ -123,6 +124,12 @@ foreach(POINTLIO_PATCH IN LISTS POINTLIO_PATCHES)
   endif()
 endforeach()
 
+if(NOT LIVOX_COMMON_DIR)
+  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+endif()
+include("${LIVOX_COMMON_DIR}/native_plane_fit.cmake")
+nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${POINTLIO_PATCHED_DIR}")
+
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
   GIT_TAG main
@@ -132,7 +139,7 @@ FetchContent_MakeAvailable(dimos_lcm)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCM REQUIRED lcm)
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../common/native_lcm_types.cmake")
+include("${LIVOX_COMMON_DIR}/native_lcm_types.cmake")
 nuwax_generate_native_lcm_types("${dimos_lcm_SOURCE_DIR}")
 
 find_package(Eigen3 REQUIRED)
@@ -175,9 +182,6 @@ add_executable(pointlio_native
   ${FASTLIO_SOURCE_DIR}/src/parameters.cpp
 )
 
-if(NOT LIVOX_COMMON_DIR)
-  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
-endif()
 
 target_include_directories(pointlio_native PRIVATE
   ${POINTLIO_PATCHED_DIR}/src

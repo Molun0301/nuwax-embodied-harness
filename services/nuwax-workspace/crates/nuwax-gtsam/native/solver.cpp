@@ -11,6 +11,25 @@
 #include <stdexcept>
 
 namespace {
+// 仅约束重力方向，偏航和平移保持自由；右扰动雅可比与Pose3坐标顺序一致。
+class GravityDirectionFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
+    gtsam::Vector3 body_up_;
+public:
+    GravityDirectionFactor(gtsam::Key key, const gtsam::Vector3& body_up, double sigma)
+        : gtsam::NoiseModelFactor1<gtsam::Pose3>(gtsam::noiseModel::Isotropic::Sigma(3,sigma),key),
+          body_up_(body_up) {}
+    gtsam::Vector evaluateError(const gtsam::Pose3& value, gtsam::OptionalMatrixType H) const override {
+        const gtsam::Matrix3 rotation=value.rotation().matrix();
+        if (H) {
+            gtsam::Matrix3 cross;
+            cross << 0,-body_up_.z(),body_up_.y(),body_up_.z(),0,-body_up_.x(),-body_up_.y(),body_up_.x(),0;
+            *H=gtsam::Matrix::Zero(3,6);
+            H->block<3,3>(0,0)=-rotation*cross;
+        }
+        return rotation*body_up_-gtsam::Vector3(0,0,1);
+    }
+};
+
 gtsam::Pose3 pose(const NuwaxGraphPose& value) {
     const auto& q = value.rotation_xyzw;
     for (double v : value.translation) if (!std::isfinite(v)) throw std::invalid_argument("non-finite translation");
@@ -31,6 +50,17 @@ extern "C" int nuwax_gtsam_optimize(
     double gradient_tolerance, double initial_lambda, double lambda_scale,
     NuwaxCancel cancelled, void* cancel_context, NuwaxGraphPose* output,
     NuwaxGraphResult* result, char* error, std::size_t error_capacity) noexcept {
+    return nuwax_gtsam_optimize_with_gravity(initial,fixed,node_count,edges,edge_count,nullptr,
+        max_iterations,gradient_tolerance,initial_lambda,lambda_scale,cancelled,cancel_context,
+        output,result,error,error_capacity);
+}
+
+extern "C" int nuwax_gtsam_optimize_with_gravity(
+    const NuwaxGraphPose* initial, const std::uint8_t* fixed, std::size_t node_count,
+    const NuwaxGraphEdge* edges, std::size_t edge_count, const NuwaxGravityPrior* gravity,
+    std::uint32_t max_iterations, double gradient_tolerance, double initial_lambda, double lambda_scale,
+    NuwaxCancel cancelled, void* cancel_context, NuwaxGraphPose* output,
+    NuwaxGraphResult* result, char* error, std::size_t error_capacity) noexcept {
     try {
         if (!initial || !fixed || !output || !result || node_count == 0 || node_count > 2000
             || edge_count > 8000 || (edge_count && !edges) || max_iterations > 300)
@@ -42,6 +72,17 @@ extern "C" int nuwax_gtsam_optimize(
         bool anchored=false;
         for (std::size_t i=0;i<node_count;++i) {
             values.insert(i,pose(initial[i]));
+            if (gravity) {
+                const auto& prior=gravity[i];
+                if (!std::isfinite(prior.sigma) || prior.sigma<0)
+                    throw std::invalid_argument("invalid gravity prior sigma");
+                if (prior.sigma>0) {
+                    const gtsam::Vector3 up(prior.direction_body[0],prior.direction_body[1],prior.direction_body[2]);
+                    if (!up.allFinite() || std::abs(up.norm()-1)>1e-6)
+                        throw std::invalid_argument("gravity direction must be unit length");
+                    graph.emplace_shared<GravityDirectionFactor>(i,up,prior.sigma);
+                }
+            }
             if (fixed[i]) {
                 graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(i,pose(initial[i]),
                     gtsam::noiseModel::Isotropic::Variance(6,1e-12));

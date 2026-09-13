@@ -1,6 +1,6 @@
 //! 为规范快照维护确定性字典序；新增点排序后线性合并，删除按当前集合核对。
 
-use std::collections::HashSet;
+use ahash::AHashSet as HashSet;
 
 type VoxelKey = (i32, i32, i32);
 

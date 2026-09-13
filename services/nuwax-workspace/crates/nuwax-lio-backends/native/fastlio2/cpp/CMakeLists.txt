@@ -101,6 +101,12 @@ if(NOT FASTLIO_PATCH_RESULT EQUAL 0)
 endif()
 
 # dimos-lcm C++ message headers
+if(NOT LIVOX_COMMON_DIR)
+  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+endif()
+include("${LIVOX_COMMON_DIR}/native_plane_fit.cmake")
+nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${FASTLIO_PATCHED_DIR}")
+
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
   GIT_TAG main
@@ -111,7 +117,7 @@ FetchContent_MakeAvailable(dimos_lcm)
 # LCM
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCM REQUIRED lcm)
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../common/native_lcm_types.cmake")
+include("${LIVOX_COMMON_DIR}/native_lcm_types.cmake")
 nuwax_generate_native_lcm_types("${dimos_lcm_SOURCE_DIR}")
 
 # Eigen3
@@ -136,9 +142,6 @@ add_executable(fastlio2_native
 )
 
 # Shared Livox common headers (livox_sdk_config.hpp etc.)
-if(NOT LIVOX_COMMON_DIR)
-  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
-endif()
 
 target_include_directories(fastlio2_native PRIVATE
   ${FASTLIO_PATCHED_DIR}/src

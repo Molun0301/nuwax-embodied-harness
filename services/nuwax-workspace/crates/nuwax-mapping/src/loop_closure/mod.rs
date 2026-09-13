@@ -52,6 +52,15 @@ impl PgoOptimizer {
     /// 优化位姿图，返回最终代价（caller 用于判定收敛 / fallback）
     #[must_use]
     pub fn optimize(&self, graph: &mut PoseGraph) -> f64 {
+        self.optimize_with_gravity(graph, &[])
+    }
+
+    /// 原生LIO管线携带重力方向，避免回环把全局地图的竖直方向当作自由校正量。
+    pub fn optimize_with_gravity(
+        &self,
+        graph: &mut PoseGraph,
+        gravity: &[(u64, nuwax_gtsam::GravityPrior)],
+    ) -> f64 {
         if !self.config.is_valid() {
             return f64::NAN;
         }
@@ -77,6 +86,13 @@ impl PgoOptimizer {
             .map(|id| to_wire(&graph.nodes[id].pose))
             .collect();
         let fixed: Vec<_> = ids.iter().map(|id| graph.nodes[id].fixed).collect();
+        let mut gravity_by_index = vec![nuwax_gtsam::GravityPrior::default(); ids.len()];
+        for &(id, prior) in gravity {
+            let Some(&at) = index.get(&id) else {
+                return f64::NAN;
+            };
+            gravity_by_index[at as usize] = prior;
+        }
         let mut edges = Vec::with_capacity(graph.edges.len());
         for edge in &graph.edges {
             let (Some(&from), Some(&to)) = (index.get(&edge.from), index.get(&edge.to)) else {
@@ -90,10 +106,11 @@ impl PgoOptimizer {
                 information,
             });
         }
-        let result = match nuwax_gtsam::optimize(
+        let result = match nuwax_gtsam::optimize_with_gravity(
             &poses,
             &fixed,
             &edges,
+            (!gravity.is_empty()).then_some(gravity_by_index.as_slice()),
             self.config.max_iterations,
             self.config.gradient_tolerance,
             self.config.initial_lambda,

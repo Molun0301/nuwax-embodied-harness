@@ -16,7 +16,8 @@
 use crate::models::{Costmap, MapMeta};
 use crate::occupancy::types::{MapMetaData, OccupancyGrid, OccupancyValue};
 use crate::pointclouds::occupancy::{
-    build_occupancy_auto, MappingError, PointCloudOccAlgo, PointCloudOccConfig,
+    build_occupancy_auto, build_occupancy_auto_cached, HeightCostCache, MappingError,
+    PointCloudOccAlgo, PointCloudOccConfig,
 };
 use crate::pointclouds::PointCloudOccupancyBuilder;
 use nalgebra::{Isometry3, Point3};
@@ -338,6 +339,29 @@ impl CostMapper {
     ) -> Result<OccupancyGrid, MappingError> {
         let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
         let mut grid = build_occupancy_auto(cloud, resolution, &pointcloud_config)?;
+        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
+        Ok(grid)
+    }
+
+    /// 复用相同高度剖面的派生代价，当前安全半径、帧和时间仍逐次计算。
+    ///
+    /// # Errors
+    /// 与无缓存占据栅格入口使用相同配置及边界校验。
+    pub fn occupancy_from_pointcloud_auto_cached<P: PointCloud2Like + ?Sized>(
+        cloud: &P,
+        occupancy_cfg: &OccupancyConfig,
+        resolution: f64,
+        cache: &mut HeightCostCache,
+        parallel_projection: bool,
+    ) -> Result<OccupancyGrid, MappingError> {
+        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
+        let mut grid = build_occupancy_auto_cached(
+            cloud,
+            resolution,
+            &pointcloud_config,
+            cache,
+            parallel_projection,
+        )?;
         apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
         Ok(grid)
     }

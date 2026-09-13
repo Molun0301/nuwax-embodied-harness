@@ -24,6 +24,14 @@ pub struct GraphEdge {
     pub information: [f64; 36],
 }
 
+/// 机体坐标中的向上方向与角度噪声；零噪声哨兵表示该节点没有方向先验。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GravityPrior {
+    pub direction_body: [f64; 3],
+    pub sigma: f64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct RawResult {
@@ -44,12 +52,13 @@ pub struct Optimization {
 }
 
 unsafe extern "C" {
-    fn nuwax_gtsam_optimize(
+    fn nuwax_gtsam_optimize_with_gravity(
         initial: *const GraphPose,
         fixed: *const u8,
         node_count: usize,
         edges: *const GraphEdge,
         edge_count: usize,
+        gravity: *const GravityPrior,
         max_iterations: u32,
         gradient_tolerance: f64,
         initial_lambda: f64,
@@ -82,12 +91,38 @@ pub fn optimize(
     lambda_scale: f64,
     cancelled: Option<&AtomicBool>,
 ) -> Result<Optimization, String> {
+    optimize_with_gravity(
+        poses,
+        fixed,
+        edges,
+        None,
+        max_iterations,
+        gradient_tolerance,
+        initial_lambda,
+        lambda_scale,
+        cancelled,
+    )
+}
+
+/// 可选重力先验不约束偏航；与旧入口共用边、固定节点、取消及完整提交语义。
+pub fn optimize_with_gravity(
+    poses: &[GraphPose],
+    fixed: &[bool],
+    edges: &[GraphEdge],
+    gravity: Option<&[GravityPrior]>,
+    max_iterations: usize,
+    gradient_tolerance: f64,
+    initial_lambda: f64,
+    lambda_scale: f64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Optimization, String> {
     if poses.is_empty()
         || poses.len() > 2000
         || fixed.len() != poses.len()
         || edges.len() > 8000
         || max_iterations == 0
         || max_iterations > 300
+        || gravity.is_some_and(|priors| priors.len() != poses.len())
     {
         return Err("invalid graph bounds".into());
     }
@@ -105,12 +140,13 @@ pub fn optimize(
     // 输入/输出数组长度在同一次同步调用中固定，所有指针存活到原生函数返回。
     // 原生端捕获全部异常，成功才写入完整结果，不能跨语言展开栈或保留内存引用。
     let status = unsafe {
-        nuwax_gtsam_optimize(
+        nuwax_gtsam_optimize_with_gravity(
             poses.as_ptr(),
             fixed.as_ptr(),
             poses.len(),
             edges.as_ptr(),
             edges.len(),
+            gravity.map_or(std::ptr::null(), |priors| priors.as_ptr()),
             max_iterations as u32,
             gradient_tolerance,
             initial_lambda,

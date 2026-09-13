@@ -70,13 +70,17 @@ impl PersistentOccupancyGrid {
         // but expanding for both keeps this helper correct for direct callers.
         changed |= self.expand_to_include(latest)?;
 
+        // 列投影与行号无关、行投影与列号无关；按原浮点公式各计算一次。
+        let accumulated_projection = GridProjection::new(&self.grid, accumulated);
+        let latest_projection = GridProjection::new(&self.grid, latest);
+
         for row in 0..accumulated.height {
             for col in 0..accumulated.width {
                 let incoming = accumulated.data[accumulated.index(row, col)];
                 if incoming < 0 {
                     continue;
                 }
-                let target = self.project_cell(accumulated, row, col)?;
+                let target = accumulated_projection.project(row, col)?;
                 if self.grid.data[target] < 0 {
                     self.grid.data[target] = incoming;
                     self.pending_values[target] = -1;
@@ -96,7 +100,7 @@ impl PersistentOccupancyGrid {
                 if incoming < 0 {
                     continue;
                 }
-                let target = self.project_cell(latest, row, col)?;
+                let target = latest_projection.project(row, col)?;
                 observed[target] = true;
                 let existing = self.grid.data[target];
                 if existing < 0 {
@@ -228,6 +232,7 @@ impl PersistentOccupancyGrid {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn project_cell(&self, source: &OccupancyGrid, row: u32, col: u32) -> Result<usize, String> {
         let world_x = source.origin[0] + (col as f64 + 0.5) * source.resolution;
         let world_y = source.origin[1] + (row as f64 + 0.5) * source.resolution;
@@ -245,6 +250,76 @@ impl PersistentOccupancyGrid {
             return Err("persistent/live cell projects outside persistent grid".to_string());
         }
         Ok(self.grid.index(target_row as u32, target_col as u32))
+    }
+}
+
+/// 行列缓存沿原公式计算，未知单元仍不触发投影错误。
+struct GridProjection {
+    source_origin: [f64; 3],
+    source_resolution: f64,
+    target_origin: [f64; 3],
+    target_resolution: f64,
+    rows: Vec<Option<i64>>,
+    columns: Vec<Option<i64>>,
+    width: u32,
+    height: u32,
+}
+
+impl GridProjection {
+    fn new(target: &OccupancyGrid, source: &OccupancyGrid) -> Self {
+        // 长条大图回退逐格计算，避免行列缓存比地图本身更大。
+        let cache_axes = source.width <= 16_384 && source.height <= 16_384;
+        let axis = |axis: usize, count: u32| {
+            (0..if cache_axes { count } else { 0 })
+                .map(|index| {
+                    let world = source.origin[axis] + (index as f64 + 0.5) * source.resolution;
+                    checked_grid_index(
+                        snap_grid_index((world - target.origin[axis]) / target.resolution).floor(),
+                    )
+                    .ok()
+                })
+                .collect()
+        };
+        Self {
+            source_origin: source.origin,
+            source_resolution: source.resolution,
+            target_origin: target.origin,
+            target_resolution: target.resolution,
+            rows: axis(1, source.height),
+            columns: axis(0, source.width),
+            width: target.width,
+            height: target.height,
+        }
+    }
+
+    fn project(&self, row: u32, col: u32) -> Result<usize, String> {
+        let (target_col, target_row) = if self.rows.is_empty() {
+            let x = self.source_origin[0] + (col as f64 + 0.5) * self.source_resolution;
+            let y = self.source_origin[1] + (row as f64 + 0.5) * self.source_resolution;
+            (
+                checked_grid_index(
+                    snap_grid_index((x - self.target_origin[0]) / self.target_resolution).floor(),
+                )?,
+                checked_grid_index(
+                    snap_grid_index((y - self.target_origin[1]) / self.target_resolution).floor(),
+                )?,
+            )
+        } else {
+            (
+                self.columns[col as usize]
+                    .ok_or_else(|| "grid coordinate is not representable".to_string())?,
+                self.rows[row as usize]
+                    .ok_or_else(|| "grid coordinate is not representable".to_string())?,
+            )
+        };
+        if target_col < 0
+            || target_row < 0
+            || target_col >= i64::from(self.width)
+            || target_row >= i64::from(self.height)
+        {
+            return Err("persistent/live cell projects outside persistent grid".to_string());
+        }
+        Ok((target_row as u32 * self.width + target_col as u32) as usize)
     }
 }
 
@@ -305,4 +380,46 @@ pub(crate) fn validate_checkpoint_grid(
         return Err("checkpoint occupancy values must be within [-1, 100]".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn long_thin_grid_keeps_projection_memory_bounded() {
+        let target = OccupancyGrid::with_frame(40_000, 1, 0.05, "map");
+        let source = OccupancyGrid::with_frame(20_000, 1, 0.05, "map");
+        let persistent = PersistentOccupancyGrid::from_grid(target.clone()).unwrap();
+        let projection = GridProjection::new(&target, &source);
+        assert!(projection.rows.is_empty() && projection.columns.is_empty());
+        for col in [0, 1, 16_383, 16_384, 19_999] {
+            assert_eq!(
+                projection.project(0, col),
+                persistent.project_cell(&source, 0, col)
+            );
+        }
+    }
+
+    #[test]
+    fn cached_axes_match_original_cell_projection_including_boundaries() {
+        for origin in [[-20.05, 3.15, 0.0], [0.0, 0.0, 0.0], [1e6, -1e6, 0.0]] {
+            let mut target = OccupancyGrid::with_frame(127, 139, 0.05, "map");
+            target.origin = origin;
+            let persistent = PersistentOccupancyGrid::from_grid(target.clone()).unwrap();
+            for shift in [-2.0, -1e-7, 0.0, 0.5, 1.0, 8.0] {
+                let mut source = OccupancyGrid::with_frame(31, 37, 0.05, "map");
+                source.origin = [origin[0] + shift * 0.05, origin[1] - shift * 0.05, 0.0];
+                let projection = GridProjection::new(&target, &source);
+                for row in 0..source.height {
+                    for col in 0..source.width {
+                        assert_eq!(
+                            projection.project(row, col),
+                            persistent.project_cell(&source, row, col)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -211,6 +211,23 @@ pub fn project_to_occupancy<P: PointCloud2Like + ?Sized>(
     Ok(())
 }
 
+/// 同一内核的高度代价派生缓存；最多保留一份剖面和结果，不作为地图真值。
+#[derive(Clone, Debug, Default)]
+pub struct HeightCostCache {
+    entry: Option<std::sync::Arc<CachedHeightCost>>,
+}
+
+#[derive(Debug)]
+struct CachedHeightCost {
+    width: u32,
+    height: u32,
+    resolution: f64,
+    origin_xy: (f64, f64),
+    config: PointCloudOccConfig,
+    height_bits: Vec<u32>,
+    data: Vec<i8>,
+}
+
 /// Build an occupancy grid using the original DimOS automatic map bounds.
 ///
 /// Finite XYZ points define the XY extent. The function adds 1 m padding on
@@ -225,6 +242,30 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
     cloud: &P,
     resolution: f64,
     cfg: &PointCloudOccConfig,
+) -> Result<crate::occupancy::types::OccupancyGrid, MappingError> {
+    build_occupancy_auto_impl(cloud, resolution, cfg, None, false)
+}
+
+/// 高度剖面、边界和配置逐项相同时复用平滑/梯度结果；帧与时间仍来自当前输入。
+///
+/// # Errors
+/// 配置和边界校验与无缓存入口相同。
+pub fn build_occupancy_auto_cached<P: PointCloud2Like + ?Sized>(
+    cloud: &P,
+    resolution: f64,
+    cfg: &PointCloudOccConfig,
+    cache: &mut HeightCostCache,
+    parallel_projection: bool,
+) -> Result<crate::occupancy::types::OccupancyGrid, MappingError> {
+    build_occupancy_auto_impl(cloud, resolution, cfg, Some(cache), parallel_projection)
+}
+
+fn build_occupancy_auto_impl<P: PointCloud2Like + ?Sized>(
+    cloud: &P,
+    resolution: f64,
+    cfg: &PointCloudOccConfig,
+    cache: Option<&mut HeightCostCache>,
+    parallel_projection: bool,
 ) -> Result<crate::occupancy::types::OccupancyGrid, MappingError> {
     cfg.validate(resolution)?;
     let source_points = cloud.points();
@@ -284,7 +325,16 @@ pub fn build_occupancy_auto<P: PointCloud2Like + ?Sized>(
         height,
         (origin_x, origin_y),
     );
-    let mut grid = builder.build_with_config(&points, cfg);
+    let mut grid = match cache {
+        Some(cache) if cfg.algo == PointCloudOccAlgo::HeightCost => {
+            builder.build_height_cost_cached(&points, cfg, Some(cache), parallel_projection)
+        }
+        Some(cache) => {
+            cache.entry = None;
+            builder.build_with_config(&points, cfg)
+        }
+        None => builder.build_with_config(&points, cfg),
+    };
     grid.frame_id = cloud.frame_id().to_string();
     grid.ts = cloud.timestamp();
     Ok(grid)
@@ -567,25 +617,24 @@ impl PointCloudOccupancyBuilder {
         points: &[Point3<f64>],
         cfg: &PointCloudOccConfig,
     ) -> crate::occupancy::types::OccupancyGrid {
+        self.build_height_cost_cached(points, cfg, None, false)
+    }
+
+    fn build_height_cost_cached(
+        &self,
+        points: &[Point3<f64>],
+        cfg: &PointCloudOccConfig,
+        cache: Option<&mut HeightCostCache>,
+        parallel_projection: bool,
+    ) -> crate::occupancy::types::OccupancyGrid {
         let mut grid = self.empty_grid();
         let width = self.width as usize;
         let height = self.height as usize;
         let len = width * height;
-        let mut min_height = vec![f32::NAN; len];
-        let mut max_height = vec![f32::NAN; len];
-        for &point in points {
-            let Some((row, col)) = self.world_to_cell_rounded(point) else {
-                continue;
-            };
-            let idx = (row * self.width + col) as usize;
-            let point_height = point.z as f32;
-            if min_height[idx].is_nan() || point_height < min_height[idx] {
-                min_height[idx] = point_height;
-            }
-            if max_height[idx].is_nan() || point_height > max_height[idx] {
-                max_height[idx] = point_height;
-            }
-        }
+        let parallel_projection = parallel_projection
+            && points.len() >= 2_000_000
+            && std::thread::available_parallelism().is_ok_and(|count| count.get() >= 4);
+        let (mut min_height, max_height) = self.height_extrema(points, parallel_projection);
 
         let mut heights = vec![f32::NAN; len];
         let mut observed = vec![false; len];
@@ -604,6 +653,28 @@ impl PointCloudOccupancyBuilder {
         if !observed.iter().any(|value| *value) {
             return grid;
         }
+
+        // 精确比较浮点位模式，包括缺测和正负零；不以散列碰撞或近似相等跳过计算。
+        if let Some(entry) = cache.as_ref().and_then(|cache| cache.entry.as_ref()) {
+            if entry.width == self.width
+                && entry.height == self.height
+                && entry.resolution == self.resolution
+                && entry.origin_xy == self.origin_xy
+                && entry.config == *cfg
+                && entry.height_bits.len() == heights.len()
+                && entry
+                    .height_bits
+                    .iter()
+                    .zip(&heights)
+                    .all(|(bits, value)| *bits == value.to_bits())
+            {
+                grid.data.copy_from_slice(&entry.data);
+                return grid;
+            }
+        }
+        let height_bits = cache
+            .as_ref()
+            .map(|_| heights.iter().map(|height| height.to_bits()).collect());
 
         if cfg.smoothing_sigma > 0.0 {
             // 高度和权重的输入都已不再需要 min/max；直接复用 min_height 和 heights，
@@ -663,7 +734,68 @@ impl PointCloudOccupancyBuilder {
                 grid.data[idx] = cost;
             }
         }
+        if let Some(cache) = cache {
+            cache.entry = Some(std::sync::Arc::new(CachedHeightCost {
+                width: self.width,
+                height: self.height,
+                resolution: self.resolution,
+                origin_xy: self.origin_xy,
+                config: *cfg,
+                height_bits: height_bits.expect("缓存输入剖面已捕获"),
+                data: grid.data.clone(),
+            }));
+        }
         grid
+    }
+
+    fn height_extrema_serial(&self, points: &[Point3<f64>]) -> (Vec<f32>, Vec<f32>) {
+        let mut min_height = vec![f32::NAN; self.width as usize * self.height as usize];
+        let mut max_height = vec![f32::NAN; self.width as usize * self.height as usize];
+        for &point in points {
+            let Some((row, col)) = self.world_to_cell_rounded(point) else {
+                continue;
+            };
+            let idx = (row * self.width + col) as usize;
+            let point_height = point.z as f32;
+            if min_height[idx].is_nan() || point_height < min_height[idx] {
+                min_height[idx] = point_height;
+            }
+            if max_height[idx].is_nan() || point_height > max_height[idx] {
+                max_height[idx] = point_height;
+            }
+        }
+
+        (min_height, max_height)
+    }
+
+    fn height_extrema(&self, points: &[Point3<f64>], parallel: bool) -> (Vec<f32>, Vec<f32>) {
+        if !parallel {
+            return self.height_extrema_serial(points);
+        }
+        // 只增加一个作用域工作线程，创建失败直接串行；退出此作用域前完成全部等待。
+        std::thread::scope(|scope| {
+            let (first, second) = points.split_at(points.len() / 2);
+            let worker = std::thread::Builder::new()
+                .name("pgo-height".into())
+                .spawn_scoped(scope, || self.height_extrema_serial(first));
+            let Ok(worker) = worker else {
+                return self.height_extrema_serial(points);
+            };
+            let (second_min, second_max) = self.height_extrema_serial(second);
+            let (mut min_height, mut max_height) = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            // 按原输入左右半段顺序归并，相等值保留先出现者，正负零也与串行相同。
+            for index in 0..min_height.len() {
+                if min_height[index].is_nan() || second_min[index] < min_height[index] {
+                    min_height[index] = second_min[index];
+                }
+                if max_height[index].is_nan() || second_max[index] > max_height[index] {
+                    max_height[index] = second_max[index];
+                }
+            }
+            (min_height, max_height)
+        })
     }
 
     /// World → cell (row, col)
@@ -738,6 +870,140 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn height_cache_reuses_only_exact_profiles_and_preserves_metadata() {
+        let mut cache = HeightCostCache::default();
+        let mut config = PointCloudOccConfig::default();
+        let points: Vec<_> = (-8..=8)
+            .flat_map(|x| {
+                (-8..=8).map(move |y| {
+                    Point3::new(
+                        x as f64 * 0.05,
+                        y as f64 * 0.05,
+                        if x > 2 && y > 2 { 0.3 } else { -0.5 },
+                    )
+                })
+            })
+            .collect();
+        let mut cloud =
+            SimplePointCloud2::with_metadata(points.clone(), Point3::origin(), "first", 1.0);
+        let first = build_occupancy_auto_cached(&cloud, 0.05, &config, &mut cache, false).unwrap();
+        let entry = cache.entry.clone().unwrap();
+        cloud.points.extend(points.clone());
+        cloud.points.reverse();
+        cloud.timestamp = 2.0;
+        cloud.frame_id = "second".into();
+        let repeated =
+            build_occupancy_auto_cached(&cloud, 0.05, &config, &mut cache, false).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&entry, cache.entry.as_ref().unwrap()),
+            "相同剖面未复用"
+        );
+        assert_eq!(first.data, repeated.data);
+        assert_eq!(repeated.ts, 2.0);
+        assert_eq!(repeated.frame_id, "second");
+        for change in 0..6 {
+            match change {
+                0 => cloud.points.push(Point3::new(0.0, 0.0, 0.1)),
+                1 => cloud.points.retain(|p| p.x != 0.0 || p.y != 0.0),
+                2 => config.smoothing_sigma = 0.0,
+                3 => cloud.points.push(Point3::new(-1.23, 2.34, -0.0)),
+                4 => cloud.points.push(Point3::new(f64::NAN, 0.0, 0.0)),
+                _ => config.algo = PointCloudOccAlgo::Simple,
+            }
+            let cached =
+                build_occupancy_auto_cached(&cloud, 0.05, &config, &mut cache, false).unwrap();
+            let reference = build_occupancy_auto(&cloud, 0.05, &config).unwrap();
+            assert_eq!(
+                cached.data, reference.data,
+                "剖面/配置变化后出现旧代价：{change}"
+            );
+            assert_eq!(cached.origin, reference.origin);
+            assert_eq!(
+                (cached.width, cached.height),
+                (reference.width, reference.height)
+            );
+            assert_eq!(cached.ts, reference.ts);
+            assert_eq!(cached.frame_id, reference.frame_id);
+        }
+        assert!(cache.entry.is_none());
+    }
+
+    #[test]
+    fn parallel_height_extrema_preserve_serial_bits_and_occupancy() {
+        let points: Vec<_> = (0..70_000)
+            .map(|index| {
+                Point3::new(
+                    -1.0 + (index % 43) as f64 * 0.05,
+                    -1.0 + (index / 43 % 41) as f64 * 0.05,
+                    match index % 7 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        _ => (index % 19) as f64 * 0.031,
+                    },
+                )
+            })
+            .collect();
+        let builder = PointCloudOccupancyBuilder::new(Point3::origin(), 0.05, 67, 71, (-1.1, -1.1));
+        let serial = builder.height_extrema(&points, false);
+        let parallel = builder.height_extrema(&points, true);
+        for (expected, actual) in serial
+            .0
+            .iter()
+            .chain(&serial.1)
+            .zip(parallel.0.iter().chain(&parallel.1))
+        {
+            assert_eq!(expected.to_bits(), actual.to_bits(), "并行改变了原点序极值");
+        }
+        let cloud = SimplePointCloud2::with_metadata(
+            points.into_iter().cycle().take(2_000_000).collect(),
+            Point3::origin(),
+            "map",
+            4.0,
+        );
+        let config = PointCloudOccConfig::default();
+        let mut cache = HeightCostCache::default();
+        let parallel =
+            build_occupancy_auto_cached(&cloud, 0.05, &config, &mut cache, true).unwrap();
+        let serial = build_occupancy_auto(&cloud, 0.05, &config).unwrap();
+        assert_eq!(parallel.data, serial.data);
+        assert_eq!(parallel.origin, serial.origin);
+        assert_eq!(
+            (parallel.width, parallel.height),
+            (serial.width, serial.height)
+        );
+    }
+
+    #[test]
+    #[ignore = "不同窗口规模的作用域并行投影成本，使用release单独运行"]
+    fn height_projection_parallel_scale_benchmark() {
+        let builder =
+            PointCloudOccupancyBuilder::new(Point3::origin(), 0.05, 201, 201, (-5.0, -5.0));
+        for count in [100_000, 500_000, 1_000_000, 2_000_000] {
+            let points: Vec<_> = (0..count)
+                .map(|index| {
+                    Point3::new(
+                        -4.0 + (index % 161) as f64 * 0.05,
+                        -4.0 + (index / 161 % 161) as f64 * 0.05,
+                        (index % 19) as f64 * 0.031,
+                    )
+                })
+                .collect();
+            for parallel in [false, true] {
+                let started = std::time::Instant::now();
+                for _ in 0..30 {
+                    std::hint::black_box(
+                        builder.height_extrema(std::hint::black_box(&points), parallel),
+                    );
+                }
+                eprintln!(
+                    "投影成本 points={count} parallel={parallel} mean_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0 / 30.0
+                );
             }
         }
     }

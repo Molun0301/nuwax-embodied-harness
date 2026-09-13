@@ -229,7 +229,58 @@ async fn typed_stream(
         protocol_topic(channel).map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
     let message_type = LcmMessageType::new(type_name)
         .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
+    if type_name == "nav_msgs.OccupancyGrid" && planar_navigation_enabled() {
+        return planar_navigation_stream(transport,topic).await;
+    }
     Ok(transport.subscribe(topic, Some(message_type)).await)
+}
+
+fn planar_navigation_enabled()->bool {
+    std::env::var("NUWAX_GEOMETRY_PIPELINE").as_deref()==Ok("slam_2d")
+}
+
+/// 每个消费者独立核对运行、会话和观测顺序，清空与切域先向执行者交付撤销。
+async fn planar_navigation_stream(transport:&LcmTransport,topic:LcmTopic)->NavStackResult<LcmFrameStream> {
+    use nuwax_codec::lcm::planar_navigation::{self,Admission};
+    let message_type=LcmMessageType::new(planar_navigation::TYPE_NAME)
+        .map_err(|e|NavStackError::InvalidConfig(e.to_string()))?;
+    let stream=transport.subscribe(topic,Some(message_type)).await;
+    let mapped=stream.scan((Admission::default(),std::time::Instant::now()),|(admission,last_diagnostic),item| {
+        let mut output=Vec::new();
+        match item {
+            Err(error)=>output.push(Err(error)),
+            Ok(frame)=>{
+                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d|d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
+                match planar_navigation::decode_body(&frame.payload)
+                    .map_err(|e|e.to_string())
+                    .and_then(|map|admission.admit(&map,now).map(|changed|(map,changed))) {
+                    Ok((map,changed))=>{
+                        let convert=|grid:&schema::OccupancyGrid| -> TransportResult<RawLcmFrame> {
+                            let mut translated=frame.clone();
+                            translated.payload=schema::encode_occupancy_grid_body(grid)?;
+                            translated.msg_type=LcmMessageType::new("nav_msgs.OccupancyGrid")
+                                .map_err(|e|nuwax_transport::TransportError::MessageType(e.to_string()))?;
+                            Ok(translated)
+                        };
+                        if changed || map.cleared {
+                            let cleared=schema::OccupancyGrid {header:map.grid.header.clone(),..Default::default()};
+                            output.push(convert(&cleared));
+                        }
+                        if !map.cleared {output.push(convert(&map.grid));}
+                    },
+                    Err(error)=>{
+                        if last_diagnostic.elapsed()>=Duration::from_secs(1) {
+                            eprintln!("二维导航观测拒收：{error}");
+                            *last_diagnostic=std::time::Instant::now();
+                        }
+                    },
+                }
+            },
+        }
+        futures::future::ready(Some(futures::stream::iter(output)))
+    }).flatten();
+    Ok(Box::pin(mapped))
 }
 
 #[cfg(all(
@@ -1162,7 +1213,7 @@ fn decode_guarded_costmap_input(payload: &[u8]) -> OwnerInputResult<GuardedCostm
         Ok(costmap) => costmap,
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
-    // 探索目标位于已知自由区，局部执行保留未知格的不可通行语义。
+    // 保留未知类别；全局规划拒绝未知区域，局部碰撞只判定真实占据障碍。
     Ok(OwnerInput::Accepted(GuardedCostmapInput {
         observation: nuwax_nav_runtime::CostmapObservation {
             costmap: nuwax_nav_runtime::ExecutionMap::Planar(costmap),
@@ -1242,7 +1293,8 @@ async fn run_guarded_nav_scheduler(
     let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
     let poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
     let paths = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.PathEnvelope").await?;
-    let costmaps = typed_stream(&transport, &node.inputs[3], "nav_msgs.OccupancyGrid").await?;
+    let costmap_type = if planar_navigation_enabled() {nuwax_codec::lcm::planar_navigation::TYPE_NAME} else {"nav_msgs.OccupancyGrid"};
+    let costmaps = typed_stream(&transport, &node.inputs[3], costmap_type).await?;
     let cancels = typed_stream(&transport, &node.inputs[4], "nuwax_msgs.CancelNavigation").await?;
     let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
         .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".to_string());
@@ -1267,6 +1319,7 @@ async fn run_guarded_nav_scheduler(
         cancels,
         status,
         Some(source_max_age),
+        planar_navigation_enabled(),
     );
     let task_future = async move {
         task.await
@@ -1501,6 +1554,7 @@ async fn run_guarded_nav_loop<M, T>(
     mut cancels: LcmFrameStream,
     mut status: tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
     source_max_age: Option<Duration>,
+    planar_mode: bool,
 ) -> NavStackResult<()>
 where
     M: Stream<Item = TransportResult<T>> + Unpin + Send,
@@ -1517,6 +1571,7 @@ where
     let mut accepted_planner_generation: Option<([u8; 32], i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut surface_authority: Option<GuardedMapAuthority> = None;
+    let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();
     let mut publications = GuardedStatusPublications::default();
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut last_cancel_terminal: Option<GuardedCancelTerminal> = None;
@@ -1645,6 +1700,7 @@ where
                         &mut goal_buffer,
                         *goal,
                         surface_authority.as_ref(),
+                        planar_mode,
                     )
                     .await?;
                 }
@@ -1670,7 +1726,44 @@ where
                     .map_err(|error| module_error("guarded map input", error))?;
                 let (decoded, received_at) = match frame {
                     GuardedMapFrame::Planar(frame) => {
-                        (decode_guarded_costmap_input(&frame.payload)?, None)
+                        let body = if planar_mode {
+                            let value=match nuwax_codec::lcm::planar_navigation::decode_body(&frame.payload) {
+                                Ok(value)=>value,
+                                Err(error)=>{diagnostics.reject("planar_navigation",&error.to_string());continue;}
+                            };
+                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .map(|d|d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
+                            let changed=match planar_admission.admit(&value,now) {
+                                Ok(changed)=>changed,
+                                Err(error)=>{diagnostics.reject("planar_navigation",&error);continue;}
+                            };
+                            let authority=GuardedMapAuthority {
+                                committed_map:schema::CommittedMapIdentity {
+                                    session_id:value.session_id.clone(),session_generation:value.session_generation,
+                                    revision:value.map_revision,payload_sha256:value.map_payload_sha256,frame_id:value.grid.header.frame_id.clone(),
+                                },
+                                producer_runtime_generation:value.runtime_generation,
+                                map_frame_generation:0,cloud_revision:0,commit_boot_nonce:[0;16],
+                            };
+                            if changed || value.cleared {
+                                scheduler.invalidate_map("二维导航来源已撤销或切换").await
+                                    .map_err(|e|module_error("planar map invalidation",e))?;
+                                goal_buffer.costmap_observed=false;
+                                goal_buffer.active_goal_sha256=None;
+                                if value.cleared || !goal_buffer.pending_goal.as_ref().is_some_and(|goal|authority.permits_goal(goal)) {
+                                    goal_buffer.pending_goal=None;
+                                }
+                                let snapshot=scheduler.status();
+                                publish_guarded_nav_observation(transport,node,snapshot.clone(),&telemetry,
+                                    Some(false),&mut publications).await?;
+                                clear_terminal_session_after_publication(&mut active_session,&mut telemetry,&snapshot);
+                            }
+                            surface_authority=if value.cleared {None} else {Some(authority)};
+                            if value.cleared {continue;}
+                            schema::encode_occupancy_grid_body(&value.grid)
+                                .map_err(|e|NavStackError::Internal(e.to_string()))?
+                        } else {frame.payload.to_vec()};
+                        (decode_guarded_costmap_input(&body)?, None)
                     }
                     #[cfg(feature = "mls")]
                     GuardedMapFrame::Surface(update) => {
@@ -1775,6 +1868,7 @@ where
                         &mut goal_buffer,
                         *goal,
                         surface_authority.as_ref(),
+                        planar_mode,
                     )
                     .await?;
                 }
@@ -1875,6 +1969,7 @@ where
                     &mut goal_buffer,
                     goal_envelope,
                     surface_authority.as_ref(),
+                    planar_mode,
                 )
                 .await?;
             }
@@ -2436,8 +2531,9 @@ async fn activate_or_defer_guarded_goal(
     goal_buffer: &mut PlannerGoalBuffer,
     goal_envelope: schema::GoalEnvelope,
     surface_authority: Option<&GuardedMapAuthority>,
+    planar_mode:bool,
 ) -> NavStackResult<()> {
-    if node.id == "surface_nav_scheduler"
+    if (node.id == "surface_nav_scheduler" || planar_mode)
         && !surface_authority.is_some_and(|map| map.permits_goal(&goal_envelope))
     {
         goal_buffer.costmap_observed = false;
@@ -8279,7 +8375,9 @@ mod guarded_tests {
     }
 
     impl GuardedLoopHarness {
-        async fn spawn() -> Self {
+        async fn spawn() -> Self {Self::spawn_with_planar_mode(false).await}
+
+        async fn spawn_with_planar_mode(planar_mode:bool) -> Self {
             static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let loop_id = NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8359,6 +8457,7 @@ mod guarded_tests {
                     cancel_stream,
                     status,
                     None,
+                    planar_mode,
                 )
                 .await
             });
@@ -8755,6 +8854,47 @@ mod guarded_tests {
             harness.wait_for_session("cold-order-goal").await;
             harness.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn planar_observation_clear_fences_active_scheduler_and_rejects_replay() {
+        use nuwax_codec::lcm::planar_navigation::{self,PlanarNavigationMap};
+        let harness=GuardedLoopHarness::spawn_with_planar_mode(true).await;
+        let goal=sealed_goal("planar-goal");
+        let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let mut grid=schema::decode_occupancy_grid_body(&guarded_costmap_body(1)).unwrap();
+        grid.header.stamp_sec=(timestamp/1_000_000_000) as i32;
+        grid.header.stamp_nsec=(timestamp%1_000_000_000) as i32;
+        let value=PlanarNavigationMap {
+            runtime_generation:goal.producer_runtime_generation,session_id:goal.committed_map_session_id.clone(),
+            session_generation:goal.committed_map_session_generation,map_revision:goal.committed_map_revision,
+            map_payload_sha256:goal.committed_map_payload_sha256,observation_revision:1,source_sequence:0,
+            source_timestamp_ns:timestamp,cleared:false,grid,
+        };
+        let body=planar_navigation::encode_body(&value).unwrap();
+        send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,body.clone());
+        harness.send_pose(1);harness.wait_for_pose(1).await;
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while harness.scheduler.status().costmap_source_timestamp_ns!=timestamp {
+                assert!(!harness.loop_task.is_finished());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        harness.send_goal(&goal);harness.wait_for_session("planar-goal").await;
+        harness.send_path(&sealed_path(&goal));
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while harness.motion_call_count("twist:")==0 {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.unwrap();
+        let cleared=PlanarNavigationMap {cleared:true,observation_revision:2,
+            grid:Default::default(),..value};
+        send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,
+            planar_navigation::encode_body(&cleared).unwrap());
+        harness.wait_for_zero().await;
+        assert!(!harness.scheduler.status().planner_inputs_fresh);
+        send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,body);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!harness.scheduler.status().planner_inputs_fresh);
+        harness.shutdown().await;
     }
 
     #[tokio::test]
@@ -10517,7 +10657,7 @@ mod guarded_tests {
     }
 
     #[test]
-    fn guarded_controller_holds_a_path_through_unknown_cells() {
+    fn guarded_controller_preserves_unknown_and_stops_for_observed_obstacle() {
         use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig};
         use nuwax_nav_astar::navigation_map::{OCCUPIED, UNKNOWN};
 
@@ -10573,12 +10713,21 @@ mod guarded_tests {
             vec![Point2::new(1.0, 0.5), Point2::new(2.0, 0.5)],
         ));
 
-        let (twist, stop) = planner.step(0.3);
-        assert_eq!(
-            stop,
-            Some(nuwax_nav_astar::local_planner::StopMessage::ObstacleFound)
-        );
-        assert_eq!(twist, Twist2::ZERO);
+        let (_, stop) = planner.step(0.3);
+        assert_eq!(stop, None, "未知格保留未知语义，不能冒充已观测障碍");
+        let mut observed=schema::decode_occupancy_grid_body(&grid_body).unwrap();
+        observed.data[5*width+15]=100;
+        let body=schema::encode_occupancy_grid_body(&observed).unwrap();
+        let input=match decode_guarded_costmap_input(&body).unwrap() {
+            OwnerInput::Accepted(input)=>input,
+            OwnerInput::Rejected(reason)=>panic!("实测障碍拒收：{reason}"),
+        };
+        if let nuwax_nav_runtime::ExecutionMap::Planar(map)=input.observation.costmap {
+            planner.update_costmap(map);
+        } else {panic!("二维障碍被转换为其它地图");}
+        let (twist,stop)=planner.step(0.3);
+        assert_eq!(stop,Some(nuwax_nav_astar::local_planner::StopMessage::ObstacleFound));
+        assert_eq!(twist,Twist2::ZERO);
     }
 
     #[test]

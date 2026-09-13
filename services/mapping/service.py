@@ -373,7 +373,8 @@ class MappingService:
                 stream_snapshot = snapshot
                 stream_event_payload = dict(event_payload)
                 if prepared_display is not None:
-                    display_metadata = {**prepared_display.metadata, **frame_metadata}
+                    # 物理显示层保留自己的内容摘要，不能被有效导航层摘要覆盖。
+                    display_metadata = {**frame_metadata, **prepared_display.metadata}
                     stream_frame_metadata = self._build_map_frame_metadata(
                         display_metadata,
                         update_sequence=snapshot.update_sequence,

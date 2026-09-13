@@ -7,20 +7,16 @@
 //! 读取 `NUWAX_GEOMETRY_RUNTIME_*` env + nuwax-workspace LCM channel。
 //!
 //! 启动顺序：
-//! 1. 预检 LCM backend、owner profile、Mapping、typed channel/frame、Correction 与 LIO 配置
-//! 2. 创建 Tokio runtime，初始化 tracing，解析路径并预绑定 gRPC listener
-//! 3. 创建 prepared Geometry runtime，再创建唯一共享的 relocalization fence（inactive `E0`）
-//! 4. 构造 runtime-free native LIO probe，并在任何 raw frame 可达前绑定共享 fence
-//! 5. 构造 routing gate 并启动 LIO owner，等待 subscription ACK 与首个有效 raw pair
-//! 6. 启动 Geometry/Mapping runtime，注册 root task owner，并取得 TF/path/nav subscribe ACK
-//! 7. 用同一个共享 fence 启动 Correction owner
-//! 8. 转移 sealed LIO pair，绑定 runtime、Correction ingress 与 routing gate
-//! 9. native 路径切到 deferred 模式并发布 startup odometry
-//! 10. 保留 retained cloud，等待精确的 `StartMapping` 会话再 replay
-//! 11. 组合持有 LIO、Mapping、Correction、Geometry task、gate 与 replay owner
-//! 12. 启动 video relay、LCM RPC 与 tonic，HealthCheck 成功后写 ready file
-//! 13. Stop 先撤销 ready/全部准入，再按 video、RPC、retained settlement、owned unsubscribe、
-//!     Geometry task join、Correction、Mapping、LIO、产品 mmap 清理的顺序退出
+//! 1. 预检互斥执行链、通信、坐标和所选后端配置。
+//! 2. 创建异步运行时、日志和远程监听器。
+//! 3. 取得真实运行代际，创建唯一共享重定位围栏。
+//! 4. 准备所选输入拥有方：三维订阅/算法，或二维独立工作进程。
+//! 5. 启动公共Geometry与建图任务；二维模式不创建点云共享内存。
+//! 6. 使用同一围栏启动校正拥有方；二维内部回环随栅格候选提交。
+//! 7. 绑定所选输入，保留所有监督句柄，再开放远程接口及进程就绪。
+//! 8. 正式建图会话开始后才接纳二维扫描；不等待首帧来发布进程就绪。
+//! 9. 停止先撤销就绪和准入，依次收尾远程服务、公共任务、校正、
+//!    建图后端、输入/二维子进程，最后清理共享内存。
 
 // Phase 4: `pub` 而非私有 —— 兄弟模块(lcm_runtime/server)需要 `crate::channel_registry::*`。
 pub mod channel_registry;
@@ -37,6 +33,9 @@ mod native_lio_owner;
 // 声明,补回 `mod map_checksum;`。
 mod map_checksum;
 mod mapping_adapter;
+mod slam2d_owner;
+mod planar_artifacts;
+mod planar_navigation;
 mod mapping_backend;
 mod mapping_commit;
 mod nav_runtime;
@@ -264,6 +263,7 @@ fn prefer_sticky_runtime_terminal(
 }
 
 struct StartupPreflight {
+    planar: Option<slam2d_owner::Settings>,
     owner_profile: owner_profile::OwnerProfile,
     mapping_backend: mapping_backend::MappingBackendSpec,
     channel_bindings: channel_registry::ValidatedChannelBindings,
@@ -366,10 +366,23 @@ impl PreparedLioIngress {
 
 impl StartupPreflight {
     fn from_env() -> Result<Self, String> {
-        let owner_profile = owner_profile::OwnerProfile::from_env()
+        let planar = slam2d_owner::Settings::from_env()?;
+        let configured_profile = owner_profile::OwnerProfile::from_env()
             .map_err(|error| format!("invalid Geometry owner profile: {error}"))?;
+        let owner_profile = if planar.is_some() {
+            owner_profile::OwnerProfile::planar()
+        } else {
+            configured_profile
+        };
+        if planar.is_none() && owner_profile.mapping() == owner_profile::MappingBackend::SlamToolbox
+        {
+            return Err("slam_toolbox后端必须通过slam_2d执行链选择".into());
+        }
         let mapping_backend =
             mapping_backend::MappingBackendSpec::from_env(match owner_profile.mapping() {
+                owner_profile::MappingBackend::SlamToolbox => {
+                    mapping_backend::MappingBackendKind::SlamToolbox
+                }
                 owner_profile::MappingBackend::Voxel => mapping_backend::MappingBackendKind::Voxel,
                 owner_profile::MappingBackend::Raytracing => {
                     mapping_backend::MappingBackendKind::Raytracing
@@ -384,6 +397,17 @@ impl StartupPreflight {
             .map_err(|error| format!("LCM_PATH_PREFLIGHT_FAILED: {error}"))?;
         let frame_bindings =
             lcm_runtime::ValidatedFrameBindings::from_env().map_err(|error| error.to_string())?;
+        if let Some(settings) = &planar {
+            let (map, odom, body) = frame_bindings.as_parts();
+            if (
+                settings.template.map_frame_id.as_str(),
+                settings.template.odom_frame_id.as_str(),
+                settings.template.body_frame_id.as_str(),
+            ) != (map, odom, body)
+            {
+                return Err("二维配置坐标必须与Geometry公共坐标绑定一致".into());
+            }
+        }
         let correction = correction_coordinator::CorrectionOwnerSpec::preflight(
             owner_profile.correction(),
             &frame_bindings,
@@ -418,6 +442,7 @@ impl StartupPreflight {
             }
         };
         Ok(Self {
+            planar,
             owner_profile,
             mapping_backend,
             channel_bindings,
@@ -1518,6 +1543,7 @@ fn main() -> ExitCode {
 
 async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflight) -> ExitCode {
     let StartupPreflight {
+        planar,
         owner_profile,
         mapping_backend,
         channel_bindings,
@@ -1714,6 +1740,14 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     let ingress_gate = Arc::new(lio_ingress::LioIngressRoutingGate::new(
         pending_ingress.probe(),
     ));
+    let (lio, planar_binding, planar_bind_tx) = if let Some(settings) = planar {
+        match slam2d_owner::start(settings, prepared_runtime.transport(),
+            runtime_generation as u64, relocalization_mode_fence.clone(), tf_binding.clone(),
+            channel_bindings.binding(channel_registry::ChannelKey::PlanarNavigation)).await {
+            Ok((owner,binding,tx)) => (owner,Some(binding),Some(tx)),
+            Err(error) => { error!(%error,"二维拥有方启动失败"); return ExitCode::from(4); }
+        }
+    } else {
     let lio = match lio_owner::LioOwnerHandle::start(
         prepared_runtime.transport(),
         lio_spec,
@@ -1727,6 +1761,8 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             error!("Geometry LIO owner 启动失败: {}", error);
             return ExitCode::from(4);
         }
+    };
+        (lio,None,None)
     };
     let spawned_runtime = match lcm_runtime::spawn_geometry_runtime(
         prepared_runtime,
@@ -1743,6 +1779,11 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         }
     };
     let bridge = spawned_runtime.handle.clone();
+    let is_planar = planar_binding.is_some();
+    if let Some(binding) = planar_binding {
+        bridge.mapping_adapter.as_ref().expect("生产建图适配器").lock().planar = Some(binding);
+    }
+    if let Some(tx) = planar_bind_tx { let _ = tx.send(bridge.clone()); }
     let runtime_owner = lio_owner::GeometryRuntimeOwner::new(spawned_runtime, lio);
     let correction_identity = correction_coordinator::CorrectionOwnerRuntimeIdentity {
         runtime_generation: runtime_generation as u64,
@@ -1791,14 +1832,13 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             return rollback_mapping_and_lio(runtime_owner, ingress_gate, ExitCode::from(4)).await;
         }
     };
-    let correction_owner = match correction_coordinator::CorrectionTransportOwner::start_with_relocalization_mode_fence(
-        correction,
-        correction_identity,
-        &correction_provider,
-        correction_sink,
-        relocalization_mode_fence,
-    )
-    .await
+    let correction_owner_result = if is_planar {
+        correction_coordinator::CorrectionTransportOwner::start_planar(correction_identity,&correction_provider,correction_sink,relocalization_mode_fence,
+            (lio_bindings.map_frame.clone(),lio_bindings.odom_frame.clone(),lio_bindings.body_frame.clone())).await
+    } else {
+        correction_coordinator::CorrectionTransportOwner::start_with_relocalization_mode_fence(correction,correction_identity,&correction_provider,correction_sink,relocalization_mode_fence).await
+    };
+    let correction_owner = match correction_owner_result
     {
         Ok(owner) => owner,
         Err(error) => {
@@ -1813,6 +1853,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     };
     let correction_phase_a = correction_owner.phase_a_control();
     let relocalization_ingress = correction_owner.relocalization_ingress();
+    if !is_planar {
     let prepared_ingress = match pending_ingress.bind_runtime(
         bridge.clone(),
         lio_bindings.public_odometry.clone(),
@@ -1852,6 +1893,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             ExitCode::from(4),
         )
         .await;
+    }
     }
     let deferred_replay = None;
     let mut runtime_owner = GeometryProductionOwner::new(

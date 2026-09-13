@@ -559,6 +559,7 @@ impl GeometryOfflineReplayOwner {
     ) -> Result<PersistentOccupancyGrid, String> {
         self.validate_candidate_identity(candidate, sequence, timestamp)?;
         match candidate.backend_kind {
+            MappingBackendKind::SlamToolbox => Err("二维算法不得进入三维离线回放".into()),
             MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
                 self.canonical_occupancy.as_ref(),
                 &candidate.live_window_occupancy,

@@ -1975,7 +1975,13 @@ pub async fn compute_readiness(
     let tf = observations.tf_fresh && observations.tf_complete;
     let costmap = observations.planner_observed && observations.planner_fresh;
     let cmd_vel_sink_ready = observations.motion_sink_fresh && observations.motion_sink_ready;
+    let planar_admitted=handle.mapping_adapter.as_ref().is_none_or(|adapter|{
+        let a=adapter.lock();
+        a.planar.as_ref().is_none_or(|binding|a.is_active() && a.planar_ready
+            && a.planar_error.is_none() && binding.navigation.fresh())
+    });
     let planner = profile_supported
+        && planar_admitted
         && stack_health.fresh
         && observations.planner_fresh
         && observations.planner_ready
@@ -1992,6 +1998,7 @@ pub async fn compute_readiness(
     };
     let ready = lcm_backend && tf && costmap && planner && cmd_vel_sink_ready;
     let mut blockers = Vec::new();
+    if !planar_admitted {blockers.push(NavigationReadinessCode::PlannerNotReady);}
     if !lcm_backend {
         blockers.push(NavigationReadinessCode::LcmBackendUnavailable);
     }

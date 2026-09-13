@@ -371,6 +371,7 @@ impl ReplayBuilder {
                 mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
             )? {
                 match candidate.backend_kind {
+                MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
                     MappingBackendKind::Voxel => {
                         if self.persistent.is_none() {
                             self.persistent = Some(PersistentOccupancyGrid::from_grid(
@@ -438,6 +439,7 @@ impl ReplayBuilder {
             mapping_backend::flush_candidate(&mut output_kernel, input, &token, self.config)?
         {
             match candidate.backend_kind {
+                MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
                 MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
                     self.persistent.as_ref(),
                     &candidate.live_window_occupancy,

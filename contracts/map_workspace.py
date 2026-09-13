@@ -305,6 +305,7 @@ class MapGeometryAssetType(StrEnum):
     NAVIGATION_MAP = "navigation_map"
     PCD = "pcd"
     MAPPING_DATABASE = "mapping_database"
+    PLANAR_GRAPH = "planar_graph"
     NUWAX_MAPPING_OCCUPANCY_GRID = "nuwax_mapping_occupancy_grid"
     NUWAX_MAPPING_COSTMAP = "nuwax_mapping_costmap"
     NUWAX_MAPPING_CLOUD_MAP = "nuwax_mapping_cloud_map"
@@ -343,7 +344,7 @@ class MapGeometryAssetBinding(ContractModel):
     map_name: str = Field(description="所属地图名称。")
     geometry_stack: str = Field(default="nuwax_geometry_runtime", description="当前绑定的几何栈标识。")
     frame_id: Optional[str] = Field(default=None, description="该几何资产的主图层坐标系。")
-    mapping_database_path: str = Field(description="建图数据库文件路径。")
+    mapping_database_path: str = Field(description="完整建图数据库或二维图档案文件路径。")
     pcd_path: Optional[str] = Field(default=None, description="PCD 点云地图资产路径。")
     occupancy_projection: str = Field(description="占据栅格投影来源说明。")
     costmap_source: str = Field(description="代价地图来源说明。")

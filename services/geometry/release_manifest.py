@@ -16,7 +16,8 @@ _REQUIRED_SINGLETON_ROLES = {
     "geometry_runtime",
     "build_input_closure",
 }
-_OPTIONAL_STANDALONE_ROLES = {"offline_mapping_cli"}
+_PLANAR_ROLES = {"planar_worker", "planar_core", "planar_driver", "planar_sources"}
+_OPTIONAL_STANDALONE_ROLES = {"offline_mapping_cli"} | _PLANAR_ROLES
 _NATIVE_LIO_ROLE_PREFIX = "native_lio_payload:"
 _SUPPORTED_LIO_BACKENDS = {"device", "fastlio2", "pointlio"}
 _SUPPORTED_MAPPING_BACKENDS = {"voxel", "raytracing"}
@@ -60,6 +61,12 @@ def _selected_backends(environment: Optional[Mapping[str, str]] = None) -> Tuple
 
 
 def _selected_artifact_roles(environment: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+    values = environment if environment is not None else os.environ
+    pipeline = values.get("NUWAX_GEOMETRY_PIPELINE", "lio_3d")
+    if pipeline not in {"lio_3d", "slam_2d"}:
+        raise ReleaseManifestError("Geometry执行链选择非法")
+    if pipeline == "slam_2d":
+        return tuple(sorted(_PLANAR_ROLES))
     lio, _mapping, correction = _selected_backends(environment)
     roles = []
     if lio != "device":
@@ -327,7 +334,6 @@ def verify_release_manifest(
     raw_selected_lio_roles = payload.get("selected_native_lio_roles")
     if (
         not isinstance(raw_available_lio_roles, list)
-        or not raw_available_lio_roles
         or any(
             not isinstance(role, str)
             or role not in _SUPPORTED_LIO_BACKENDS - {"device"}
@@ -434,7 +440,7 @@ def verify_release_manifest(
             | {
                 role
                 for role in seen_roles
-                if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
+                if role.startswith(_NATIVE_LIO_ROLE_PREFIX) or role.startswith("planar_library:")
             }
         )
         unexpected_roles = seen_roles - allowed_roles
@@ -448,6 +454,11 @@ def verify_release_manifest(
         )
         if actual_lio_roles != tuple(sorted(expected_lio_roles)):
             raise ReleaseManifestError("release manifest native LIO available artifact 集合不精确")
+        planar_roles = seen_roles & _PLANAR_ROLES
+        if planar_roles and planar_roles != _PLANAR_ROLES:
+            raise ReleaseManifestError("二维发布必须同时包含工作程序、核心、驱动和源码许可")
+        if not raw_available_lio_roles and planar_roles != _PLANAR_ROLES:
+            raise ReleaseManifestError("缺少原生前端的发布必须是完整二维制品集合")
         conditional_roles = seen_roles & {"native_pgo_payload", "group_guardian"}
         if conditional_roles not in (set(), {"native_pgo_payload", "group_guardian"}):
             raise ReleaseManifestError(
@@ -463,7 +474,7 @@ def verify_release_manifest(
             selected_conditional_roles = {
                 role for role in seen_roles
                 if role.startswith(_NATIVE_LIO_ROLE_PREFIX)
-                or role in {"native_pgo_payload", "group_guardian"}
+                or role in {"native_pgo_payload", "group_guardian"} | _PLANAR_ROLES
             }
             if not selected_artifact_roles.issubset(selected_conditional_roles):
                 raise ReleaseManifestError(
@@ -647,6 +658,15 @@ def exec_verified_release(manifest_path: Optional[Path], proof_output: Path) -> 
         environment = dict(os.environ)
         selected_roles = set(_selected_artifact_roles(environment))
         inheritable_roles = {"geometry_runtime"} | selected_roles
+        if "planar_worker" in selected_roles:
+            inheritable_roles.update(role for role in by_role if role.startswith("planar_library:"))
+            worker = by_role["planar_worker"]
+            environment["NUWAX_GEOMETRY_SLAM2D_BINARY"] = "/proc/self/fd/%d" % worker.fd
+            environment["NUWAX_GEOMETRY_SLAM2D_LIBRARY_PATH"] = ":".join(sorted({str(artifact.path.parent) for artifact in proof.artifacts
+                if artifact.role in {"planar_core", "planar_driver"} or artifact.role.startswith("planar_library:")}))
+            environment[_LIO_BACKEND_ENV] = "device"
+        else:
+            environment.pop("NUWAX_GEOMETRY_SLAM2D_LIBRARY_PATH", None)
         for artifact in proof.artifacts:
             if artifact.fd is not None:
                 os.set_inheritable(artifact.fd, artifact.role in inheritable_roles)

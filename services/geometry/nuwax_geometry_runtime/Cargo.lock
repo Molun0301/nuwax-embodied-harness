@@ -1470,6 +1470,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "libc",
  "memmap2",
  "nalgebra 0.33.3",
  "nix",
@@ -1477,6 +1478,7 @@ dependencies = [
  "nuwax-core",
  "nuwax-exploration",
  "nuwax-explore-wavefront",
+ "nuwax-lcm",
  "nuwax-lio-backends",
  "nuwax-mapping",
  "nuwax-mapping-cloud",
@@ -1492,6 +1494,7 @@ dependencies = [
  "nuwax-nav-visual-servoing",
  "nuwax-protocol",
  "nuwax-rpc",
+ "nuwax-slam-2d-runtime",
  "nuwax-tf",
  "nuwax-transport",
  "parking_lot",
@@ -1878,6 +1881,24 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "nuwax-slam-2d-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "nix",
+ "nuwax-codec",
+ "nuwax-lcm",
+ "nuwax-rpc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

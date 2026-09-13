@@ -29,3 +29,18 @@ class StreamingSensorSampleProvider(BaseProvider, Protocol):
 
     def unsubscribe_sensor_sample(self, subscription_id: Optional[int]) -> None:
         """取消规范化传感器样本订阅。"""
+
+
+class ManagedSensorSource(Protocol):
+    """装配方显式移交的独占传感器资源；外部共享提供器不进入此接口。"""
+
+    provider: StreamingSensorSampleProvider
+
+    def start(self) -> None:
+        """启动来源资源，允许尚未收到首帧。"""
+
+    def stop(self) -> None:
+        """回收真实来源；失败时保留资源供下一次收尾。"""
+
+    def is_ready(self) -> bool:
+        """报告连接接收循环已准备好。"""

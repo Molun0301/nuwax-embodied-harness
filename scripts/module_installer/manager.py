@@ -322,12 +322,16 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
 def _verify_prefix(prefix: Path, modules: Sequence[str]) -> None:
     needed = ["venv/bin/python", "start.sh", "settings.env"]
     if "geometry" in modules:
-        needed += ["bin/nuwax-geometry-runtime", "bin/nuwax-mapping-cli"]
+        needed += ["bin/nuwax-geometry-runtime"]
+        if "slam2d" not in modules:
+            needed += ["bin/nuwax-mapping-cli"]
     if "navigation" in modules:
         needed += ["bin/nuwax-nav-stack"]
     if "follow" in modules:
         needed += ["bin/nuwax-person-follow"]
     needed += [f"bin/{name}_native" for name in ("fastlio2", "pointlio") if name in modules]
+    if "slam2d" in modules:
+        needed += ["bin/nuwax-slam-2d-worker", "lib/libnuwax_slam_toolbox.so.1", "lib/libnuwax_slamtec.so.1"]
     missing = [name for name in needed if not (prefix / name).is_file()]
     if missing:
         raise InstallError("安装产物不完整：" + ", ".join(missing))

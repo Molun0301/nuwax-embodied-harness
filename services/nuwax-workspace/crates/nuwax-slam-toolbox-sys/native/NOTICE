@@ -1,0 +1,20 @@
+二维算法第三方来源与许可说明
+
+上游：https://github.com/SteveMacenski/slam_toolbox
+固定版本：2.10.0，提交6953058b8994c7e750277fd8f39b984453abf63c。
+原始文件摘要见upstream.json，修改补丁见patches目录。
+
+Karto主要源码按其原始文件头所述LGPL-3.0-or-later提供，许可证见LICENSE.karto。
+slam_toolbox根许可证为LGPL-2.1，见LICENSE.slam_toolbox；所用Ceres残差头保留原版权。
+nanoflann保留其原BSD声明。部分Karto辅助头有上游Creative Commons声明，
+本地引入保留原文，发布材料须完成文件级许可核对，不能以根许可证替代该声明。
+Ceres、Eigen、Boost、TBB及其依赖由构建环境提供，按各自许可分发。
+
+本目录bridge.cpp、bridge.h、solver.cpp、solver.h及Karto补丁由Nuwax维护，
+以LGPL-3.0-or-later提供；Rust侧薄接口以Apache-2.0提供。
+分发原生动态库时须附对应源码、修改、许可证和重建/替换说明。
+本文件不把整个工作区或第三方混合来源改标为Apache-2.0。
+
+本项目额外修正归档加载失败时的传感器注册清理，见0003补丁；注销仅匹配本对象指针，并清空已释放的数据集索引。
+
+本地补丁0004：无效扫描束先跳过，使用宽整数验证相关栅格索引，避免哨兵相加的有符号溢出。

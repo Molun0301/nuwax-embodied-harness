@@ -15,6 +15,9 @@
 //!   structured messages（禁止写 ad-hoc bytes）
 //! - env 解析入口统一走 `channel_registry`
 
+#[path = "server_planar.rs"]
+mod planar;
+
 use nuwax_codec::{lcm::schema, CodecError, CodecResult};
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use prost::Message;
@@ -68,6 +71,7 @@ pub struct GeometryRuntimeService {
     native_raw_sensor_frame: Option<String>,
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
+    graph_artifacts: Arc<parking_lot::Mutex<crate::planar_artifacts::Store>>,
     deferred_replay: Option<Arc<crate::lio_ingress::NativeDeferredReplayControl>>,
     activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl,
     relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
@@ -696,6 +700,7 @@ impl GeometryRuntimeService {
             native_raw_sensor_frame: None,
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
+            graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
             deferred_replay: None,
             activation_receipts: crate::correction_coordinator::ActivatedTargetReceiptControl::new(
                 1,
@@ -760,6 +765,7 @@ impl GeometryRuntimeService {
             native_raw_input_binding,
             native_raw_sensor_frame,
             mapping_transition: shutdown.mapping_transition.clone(),
+            graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
             deferred_replay: shutdown.deferred_replay.clone(),
             shutdown: Some(shutdown),
             activation_receipts,
@@ -810,6 +816,10 @@ impl GeometryRuntimeService {
     ) -> MappingSessionState {
         let mut state = mapping_session_state(snapshot, message);
         self.activation_receipts.decorate_current_state(&mut state);
+        if let Some(binding)=self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone()) {
+            state.runtime_generation=binding.client.identity().runtime_generation;
+            state.planar_mode=if self.bridge.mapping_adapter.as_ref().unwrap().lock().planar_localization {"localization"}else{"mapping"}.into();
+        }
         state
     }
 
@@ -1419,6 +1429,7 @@ fn mapping_session_state(
     message: impl Into<String>,
 ) -> MappingSessionState {
     MappingSessionState {
+        target_kind:String::new(),target_graph_sha256:Vec::new(),planar_mode:String::new(),
         success: true,
         phase: snapshot.phase.as_str().to_string(),
         message: message.into(),
@@ -1732,6 +1743,18 @@ fn canonical_backend_sha256(
     checkpoint: &MappingBackendCheckpoint,
     expected_map_frame_id: &str,
 ) -> Result<[u8; 32], String> {
+    if checkpoint.backend_kind=="slam_toolbox" {
+        validate_planar_checkpoint(checkpoint)?;
+        let mut out=b"nuwax.geometry.planar-backend-checkpoint.v1\0".to_vec();
+        out.extend_from_slice(&checkpoint.schema_version.to_be_bytes());
+        canonical_push_string(&mut out,&checkpoint.backend_kind)?;
+        canonical_push_string(&mut out,&checkpoint.source_session_id)?;
+        for n in [checkpoint.source_session_generation,checkpoint.payload_size,checkpoint.created_at_ns] {out.extend_from_slice(&n.to_be_bytes());}
+        out.extend_from_slice(&checkpoint.content_sha256);
+        canonical_append_occupancy_receipt(&mut out,checkpoint.occupancy_receipt.as_ref().unwrap())?;
+        out.extend_from_slice(&canonical_occupancy_sha256(checkpoint.canonical_occupancy_checkpoint.as_ref().unwrap())?);
+        return Ok(crate::map_checksum::sha256_bytes(&out));
+    }
     let content_sha256 = canonical_hash32(&checkpoint.content_sha256, "content_sha256")?;
     let occupancy_receipt = checkpoint
         .occupancy_receipt
@@ -1849,7 +1872,7 @@ fn canonical_activation_identity_preimage(
     out.extend_from_slice(
         &crate::correction_coordinator::RELOCALIZATION_SOURCE_POLICY_VERSION_V1.to_be_bytes(),
     );
-    out.extend_from_slice(&crate::correction_coordinator::relocalization_source_policy_sha256_v1());
+    out.extend_from_slice(&if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_source_policy_sha256()}else{crate::correction_coordinator::relocalization_source_policy_sha256_v1()});
     out.extend_from_slice(
         &crate::correction_coordinator::RELOCALIZATION_DEADLINE_POLICY_VERSION_V1.to_be_bytes(),
     );
@@ -1860,7 +1883,7 @@ fn canonical_activation_identity_preimage(
         &crate::correction_coordinator::RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1.to_be_bytes(),
     );
     out.extend_from_slice(
-        &crate::correction_coordinator::relocalization_algorithm_options_sha256_v1(),
+        &if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_algorithm_policy_sha256()}else{crate::correction_coordinator::relocalization_algorithm_options_sha256_v1()},
     );
     Ok(out)
 }
@@ -2039,6 +2062,10 @@ async fn activate_map_r1(
         )
     };
 
+    if selected_backend_kind==crate::mapping_backend::MappingBackendKind::SlamToolbox {
+        return service.activate_planar_map(request,identity_class).await;
+    }
+
     let occupancy_checkpoint = request
         .checkpoint
         .take()
@@ -2143,6 +2170,7 @@ async fn activate_map_r1(
     .map_err(Status::invalid_argument)?;
     let activation_request_identity_sha256 = crate::map_checksum::sha256_bytes(&request_preimage);
     let seed = crate::correction_coordinator::ActivationReceiptSeed {
+        planar_target: None,
         activation_request_id: identity_class.request_id().to_owned(),
         activation_request_identity_sha256,
         asset_manifest_sha256: identity_class.asset_manifest_sha256(),
@@ -3736,10 +3764,33 @@ fn validate_mapping_checkpoint_receipts(
     Ok(())
 }
 
+fn validate_planar_checkpoint(checkpoint:&MappingBackendCheckpoint)->Result<(),String> {
+    let reference=checkpoint.graph_artifact.as_ref().ok_or("二维图必须通过分块制品引用加载")?;
+    if checkpoint.schema_version!=1 || checkpoint.backend_kind!="slam_toolbox" || checkpoint.target_kind!="planar_graph"
+        || checkpoint.created_at_ns==0 || checkpoint.source_session_id.is_empty() || checkpoint.source_session_generation==0
+        || !checkpoint.payload.is_empty() || checkpoint.cloud_receipt.is_some() || checkpoint.canonical_cloud_checkpoint.is_some()
+        || reference.size!=checkpoint.payload_size || reference.sha256!=checkpoint.content_sha256
+        || reference.size==0 || reference.size>nuwax_slam_2d_runtime::archive::MAX_ARCHIVE || reference.sha256.len()!=32 {
+        return Err("二维完整图检查点类型、身份或预算非法".into());
+    }
+    let receipt=checkpoint.occupancy_receipt.as_ref().ok_or("二维图缺少规范占据收据")?;
+    validate_mapping_commit_identity(receipt.commit_id.as_ref(),"二维图")?;
+    let grid=checkpoint.canonical_occupancy_checkpoint.as_ref().ok_or("二维图缺少物理栅格")?;
+    canonical_occupancy_sha256(grid)?;
+    let meta=grid.meta.as_ref().ok_or("二维栅格缺少几何")?;
+    if receipt.session_id!=checkpoint.source_session_id || receipt.session_generation!=checkpoint.source_session_generation
+        || receipt.backend_kind!="slam_toolbox" || receipt.backend_generation==0 || receipt.occupancy_revision!=meta.revision
+        || receipt.source_timestamp_ns!=meta.timestamp_ns || meta.timestamp_ns==0 || meta.revision==0 {
+        return Err("二维图物理栅格与规范收据身份冲突".into());
+    }
+    Ok(())
+}
+
 fn validate_mapping_backend_checkpoint(
     checkpoint: &MappingBackendCheckpoint,
     expected_backend: crate::mapping_backend::MappingBackendKind,
 ) -> Result<(), String> {
+    if expected_backend==crate::mapping_backend::MappingBackendKind::SlamToolbox {return validate_planar_checkpoint(checkpoint);}
     if checkpoint.schema_version
         != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
     {
@@ -4929,6 +4980,199 @@ impl GeometryRuntimeService {
     }
 }
 
+impl GeometryRuntimeService {
+    async fn export_planar_checkpoint(&self)->Result<MappingBackendCheckpoint,String> {
+        use nuwax_slam_2d_runtime::{protocol::Operation,archive};
+        let _transition=self.mapping_transition.lock().await;
+        self.ensure_running_admission("ExportMappingBackendCheckpoint").await.map_err(|e|e.to_string())?;
+        let adapter=self.bridge.mapping_adapter.as_ref().ok_or("二维适配器不可用")?.clone();
+        let binding=adapter.lock().planar.clone().ok_or("二维拥有方不可用")?;
+        let _operation=binding.operation.lock().await;
+        let epoch=binding.fence.snapshot();
+        if epoch.active {return Err("重定位期间不允许导出图".into());}
+        let session=adapter.lock().snapshot();
+        let status=binding.client.status().await?;
+        if status.session.as_ref().is_none_or(|s|s.session_id!=session.session_id || s.session_generation!=session.session_generation) {
+            return Err("二维导出会话身份不一致".into());
+        }
+        let pause=Operation::SetPaused{session_id:session.session_id.clone(),session_generation:session.session_generation,paused:true};
+        binding.control_until_settled(pause).await?;
+        let result=async {
+            let response=binding.control_until_settled(Operation::ExportGraph{session_id:session.session_id.clone(),
+                session_generation:session.session_generation,unix_offset_ns:i64::try_from(binding.settings.unix_offset_ns).map_err(|_|"时钟偏移越界")?}).await?;
+            let artifact=response.artifact.ok_or("二维导出未返回制品")?;
+            let client=binding.client.current();
+            let exported=async {
+                let mut file=client.open_artifact(&artifact).await?;
+                let (file,metadata,cells)=tokio::task::spawn_blocking(move|| {
+                    let metadata=archive::verify(&mut file)?;
+                    let (_,cells)=archive::grid(&mut file)?;
+                    Ok::<_,String>((file,metadata,cells))
+                }).await.map_err(|e|e.to_string())??;
+                let mut snapshot=nuwax_slam_2d_runtime::protocol::Snapshot {
+                    snapshot_id:1,session:metadata.session.clone(),estimate:metadata.estimate.clone(),width:metadata.width,height:metadata.height,
+                    resolution:metadata.resolution,origin:metadata.origin,payload_size:metadata.members[2].size,
+                    data_sha256:metadata.members[2].sha256,file_name:String::new(),
+                };
+                // 定位静态图保留档案来源，但归属当前实际会话。
+                snapshot.session=binding.session(&session.session_id,&session.map_name,session.session_generation);
+                if adapter.lock().planar_revision<snapshot.estimate.graph_revision {
+                    let preparation=adapter.lock().prepare_planar_map(snapshot,cells.clone(),metadata.source_unix_timestamp_ns);
+                    let prepared=tokio::task::spawn_blocking(move||preparation.compute()).await.map_err(|e|e.to_string())??;
+                    let _projection=self.bridge.lock_explore_projection_owned().await;
+                    let _lifecycle=self.bridge.mapping_lifecycle_lock.lock().await;
+                    if binding.fence.snapshot()!=epoch {return Err("二维导出跨越重定位代际".into());}
+                    let mut state=self.bridge.state.write().await;
+                    let (map,event)=adapter.lock().commit_planar_export(prepared,state.map.revision)?;
+                    state.map=map;drop(state);let _=self.bridge.map_revision_tx.send(event);
+                }
+                let (current,map,receipt)={
+                    let a=adapter.lock();
+                    (a.snapshot(),a.raw_map_snapshot().ok_or("二维导出缺少规范物理栅格")?,a.latest_occupancy_commit_receipt().ok_or("二维导出缺少规范提交收据")?)
+                };
+                if current.session_id!=session.session_id || current.session_generation!=session.session_generation
+                    || map.width!=metadata.width || map.height!=metadata.height || map.resolution!=metadata.resolution as f32
+                    || [map.origin_x,map.origin_y]!=metadata.origin || map.data!=cells || map.timestamp_ns!=metadata.source_unix_timestamp_ns
+                    || receipt.occupancy_revision!=map.revision || receipt.source_timestamp_ns!=map.timestamp_ns {
+                    return Err("二维图档案与规范物理栅格或收据不一致".into());
+                }
+                let canonical=occupancy_checkpoint_proto(&map);
+                let store=self.graph_artifacts.clone();let size=artifact.payload_size;let sha=artifact.sha256;
+                let reference=tokio::task::spawn_blocking(move||store.lock().insert(file,size,sha)).await.map_err(|e|e.to_string())??;
+                Ok(MappingBackendCheckpoint{schema_version:1,backend_kind:"slam_toolbox".into(),source_session_generation:session.session_generation,
+                    source_session_id:session.session_id.clone(),content_sha256:artifact.sha256.to_vec(),payload_size:artifact.payload_size,
+                    created_at_ns:now_ns(),occupancy_receipt:Some(occupancy_commit_receipt_proto(&receipt)),canonical_occupancy_checkpoint:Some(canonical),
+                    graph_artifact:Some(reference),target_kind:"planar_graph".into(),..Default::default()})
+            }.await;
+            let released=binding.control_until_settled(Operation::ReleaseArtifact{artifact}).await;
+            match (exported,released) {(Ok(v),Ok(_))=>Ok(v),(Err(e),_)=>Err(e),(Ok(_),Err(e))=>Err(e)}
+        }.await;
+        if status.active {
+            if let Err(e)=binding.control_until_settled(Operation::SetPaused{session_id:session.session_id,session_generation:session.session_generation,paused:false}).await {
+                adapter.lock().planar_ready=false;return Err(e);
+            }
+        }
+        result
+    }
+    async fn start_planar_mapping(
+        &self,
+        request: StartMappingRequest,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<Response<MappingSessionState>, Status> {
+        use nuwax_slam_2d_runtime::protocol::Operation;
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("建图适配器不可用"))?
+            .clone();
+        let binding = adapter
+            .lock()
+            .planar
+            .clone()
+            .ok_or_else(|| Status::unavailable("二维拥有方不可用"))?;
+        let worker_status=binding.client.status().await.map_err(Status::unavailable)?;
+        if worker_status.localization && adapter.lock().snapshot().map_name==request.map_name {
+            return self.continue_planar_mapping(request,cancellation).await;
+        }
+        let _operation=binding.operation.lock().await;
+        let start_epoch = binding.fence.snapshot();
+        if start_epoch.active {
+            return Err(Status::failed_precondition("重定位期间不允许开始二维会话"));
+        }
+        let snapshot = {
+            let mut projection = self.bridge.lock_explore_projection_owned().await;
+            let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+            self.ensure_running_admission("StartMapping").await?;
+            if self.bridge.explore.blocks_mapping_mutation().await {
+                return Err(Status::failed_precondition("探索仍持有地图会话"));
+            }
+            let admission = adapter
+                .lock()
+                .prepare_session_start_admission(&request.session_id, &request.map_name)
+                .map_err(mapping_lifecycle_status)?;
+            if let crate::mapping_adapter::MappingSessionStartAdmission::Replay(snapshot) =
+                admission
+            {
+                if !adapter.lock().planar_ready {
+                    return Err(Status::unavailable("二维会话尚未就绪"));
+                }
+                return Ok(Response::new(
+                    self.mapping_state_with_receipt(snapshot, "二维会话已启动"),
+                ));
+            }
+            self.activation_receipts
+                .retire_for_mapping_change()
+                .map_err(Status::resource_exhausted)?;
+            let snapshot = adapter
+                .lock()
+                .start_session(&request.session_id, &request.map_name)
+                .map_err(mapping_lifecycle_status)?;
+            self.bridge
+                .revoke_committed_map_projection_locked(&mut projection)
+                .map_err(Status::unavailable)?;
+            let mut state = self.bridge.state.write().await;
+            state.map = Default::default();
+            state.pose = Default::default();
+            state.transforms.clear();
+            state.tf_tree = Arc::new(nuwax_tf::TfTree::new());
+            binding.install_sensor_edge(&mut state);
+            state.pose_changed.send_replace(());
+            drop(state);
+            *self.bridge.occupancy_shm_current.write().await = None;
+            snapshot
+        };
+        let session = binding.session(
+            &snapshot.session_id,
+            &snapshot.map_name,
+            snapshot.session_generation,
+        );
+        let result = binding.execute(Operation::Start { session }).await;
+        let mut projection = self.bridge.lock_explore_projection_owned().await;
+        let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+        let admission = self.ensure_running_admission("StartMapping").await;
+        let failure = if *cancellation.borrow() {
+            Some("二维会话请求已取消".to_string())
+        } else if binding.fence.snapshot() != start_epoch {
+            Some("二维会话初始化跨越重定位代际".into())
+        } else {
+            result
+                .err()
+                .or_else(|| admission.err().map(|e| e.to_string()))
+        };
+        if let Some(error) = failure {
+            let _ = adapter.lock().force_stop_started_session_detached(
+                &snapshot.session_id,
+                snapshot.session_generation,
+            );
+            let _ = self
+                .bridge
+                .revoke_committed_map_projection_locked(&mut projection);
+            drop(_lifecycle);
+            drop(projection);
+            let stopped = binding
+                .execute(Operation::Stop {
+                    session_id: snapshot.session_id,
+                    session_generation: snapshot.session_generation,
+                })
+                .await;
+            return Err(Status::unavailable(match stopped {
+                Ok(_) => error,
+                Err(stop) => format!("{error}；二维清理失败：{stop}"),
+            }));
+        }
+        {
+            let mut adapter = adapter.lock();
+            adapter.planar_epoch = start_epoch.epoch;
+            adapter.planar_ready = true;
+        }
+        Ok(Response::new(self.mapping_state_with_receipt(
+            snapshot,
+            "二维会话已启动，等待扫描",
+        )))
+    }
+}
+
 #[tonic::async_trait]
 impl GeometryRuntime for GeometryRuntimeService {
     // ========================================================================
@@ -4977,6 +5221,13 @@ impl GeometryRuntime for GeometryRuntimeService {
             video_frame_sequence: 0,
             video_fps_estimate: 0,
             lcm_backend: diag.lcm_backend,
+            geometry_pipeline: if self.bridge.mapping_adapter.as_ref().is_some_and(|a|a.lock().planar.is_some()) { "slam_2d" } else { "lio_3d" }.into(),
+            runtime_generation: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
+                .map(|b|b.client.identity().runtime_generation).unwrap_or(0),
+            planar_input_config: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
+                .map(|b|serde_json::to_string(&b.settings.template).expect("已验证二维配置")).unwrap_or_default(),
+            planar_unix_offset_ns: self.bridge.mapping_adapter.as_ref().and_then(|a|a.lock().planar.clone())
+                .map(|b|b.settings.unix_offset_ns as i64).unwrap_or(0),
         }))
     }
 
@@ -5125,6 +5376,18 @@ impl GeometryRuntime for GeometryRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
+        if adapter.lock().planar.is_some() {
+            let service=self.clone();
+            let (cancel_tx,cancel_rx)=watch::channel(false);
+            let mut waiter=StartMappingRpcWaiter::new(cancel_tx);
+            let task=self.bridge.register_planar_operation(async move {
+                let _transition=mapping_transition;
+                Ok(service.start_planar_mapping(request,cancel_rx).await)
+            }).map_err(Status::unavailable)?;
+            let result=task.await.map_err(|e|Status::internal(format!("二维会话任务异常：{e}")))?.map_err(Status::unavailable)?;
+            waiter.complete();
+            return result;
+        }
         if self.deferred_replay.is_some() {
             self.shutdown.as_ref().ok_or_else(|| {
                 Status::failed_precondition(
@@ -5408,8 +5671,17 @@ impl GeometryRuntime for GeometryRuntimeService {
                 .retire_for_mapping_change()
                 .map(|_| ())
         };
+        let planar=adapter.lock().planar.clone();
+        adapter.lock().planar_ready=false;
         drop(lifecycle_guard);
         drop(projection_guard);
+        if let Some(binding)=planar {
+            crate::planar_navigation::revoke(&self.bridge,&binding,&binding.session(
+                &transition.snapshot.session_id,&transition.snapshot.map_name,transition.snapshot.session_generation)).await.map_err(Status::unavailable)?;
+            binding.execute(nuwax_slam_2d_runtime::protocol::Operation::Stop {
+                session_id:transition.snapshot.session_id.clone(),session_generation:transition.snapshot.session_generation,
+            }).await.map_err(Status::unavailable)?;
+        }
         let backend_retirement = finish_backend_retirement(
             &adapter,
             &self.bridge.mapping_lifecycle_lock,
@@ -5456,6 +5728,16 @@ impl GeometryRuntime for GeometryRuntimeService {
         )))
     }
 
+    async fn transfer_graph_artifact(&self,request:Request<GraphArtifactTransferRequest>)->Result<Response<GraphArtifactTransferResponse>,Status> {
+        self.ensure_running_admission("TransferGraphArtifact").await?;
+        let store=self.graph_artifacts.clone();
+        let request=request.into_inner();
+        let receiver=self.bridge.register_planar_operation(async move {
+            tokio::task::spawn_blocking(move||store.lock().transfer(request)).await.map_err(|e|e.to_string())?
+        }).map_err(Status::unavailable)?;
+        receiver.await.map_err(|_|Status::unavailable("二维制品保留任务未返回"))?
+            .map(Response::new).map_err(Status::failed_precondition)
+    }
     async fn export_mapping_backend_checkpoint(
         &self,
         _req: Request<Empty>,
@@ -5466,6 +5748,11 @@ impl GeometryRuntime for GeometryRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("mapping adapter is unavailable"))?
             .clone();
+        if adapter.lock().planar.is_some() {
+            let service=self.clone();
+            let receiver=self.bridge.register_planar_operation(async move {service.export_planar_checkpoint().await}).map_err(Status::unavailable)?;
+            return receiver.await.map_err(|_|Status::unavailable("二维图导出保留任务未返回"))?.map(Response::new).map_err(Status::failed_precondition);
+        }
         let owned_service = self.clone();
         tokio::spawn(async move {
         let bridge = owned_service.bridge.clone();
@@ -5785,6 +6072,8 @@ impl GeometryRuntime for GeometryRuntimeService {
                     cloud_receipt: Some(cloud_receipt),
                     canonical_occupancy_checkpoint: Some(canonical_occupancy_checkpoint),
                     canonical_cloud_checkpoint: Some(canonical_cloud_checkpoint),
+                    graph_artifact: None,
+                    target_kind: String::new(),
                 };
                 validate_mapping_backend_checkpoint(&checkpoint, backend_kind)
                     .map_err(Status::internal)?;
@@ -5814,6 +6103,11 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<MappingSessionState>, Status> {
         let service = self.clone();
         let request = req.into_inner();
+        if self.bridge.mapping_adapter.as_ref().is_some_and(|a|a.lock().planar.is_some()) {
+            let receiver=self.bridge.register_planar_operation(async move {Ok(activate_map_r1(service,request).await)})
+                .map_err(Status::unavailable)?;
+            return receiver.await.map_err(|_|Status::unavailable("二维激活保留任务未返回"))?.map_err(Status::unavailable)?;
+        }
         tokio::spawn(async move { activate_map_r1(service, request).await })
             .await
             .map_err(|error| {
@@ -5836,6 +6130,22 @@ impl GeometryRuntime for GeometryRuntimeService {
             .clone()
             .lock_owned()
             .await;
+        if req.get_ref().target_kind=="planar_graph" {
+            let request=req.into_inner();let task_request=request.clone();let service=self.clone();
+            let work:crate::correction_coordinator::PlanarCommandWork=Box::new(move|context|Box::pin(async move {
+                let bridge=service.bridge.clone();
+                let receiver=bridge.register_planar_operation(async move {Ok(service.run_planar_relocalization(task_request,context).await)});
+                match receiver {
+                    Ok(receiver)=>match receiver.await {
+                        Ok(Ok(outcome))=>outcome,
+                        _=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerFailed,detail:"二维重定位保留任务未返回".into(),correction_revision:0,evidence:Vec::new()},
+                    },
+                    Err(e)=>crate::correction_coordinator::PlanarCommandOutcome{disposition:RelocalizeDisposition::OwnerStopped,detail:e,correction_revision:0,evidence:Vec::new()},
+                }
+            }));
+            let waiter=ingress.admit_planar(request,lifecycle_guard,work).await.map_err(relocalization_command_status)?;
+            return waiter.wait().await.map(Response::new).map_err(relocalization_command_status);
+        }
         let waiter: crate::correction_coordinator::RelocalizationCommandWaiter = ingress
             .admit_with_lifecycle_guard(req.into_inner(), lifecycle_guard)
             .await
@@ -6607,7 +6917,7 @@ impl GeometryRuntime for GeometryRuntimeService {
     ) -> Result<Response<MappingReadiness>, Status> {
         use crate::mapping_adapter::MappingReadiness as MappingReadinessDetail;
         // parking_lot Mutex guard 不能直接跨 await 持有,这里把锁解开再算。
-        let (snapshot, lifecycle) = {
+        let (snapshot, lifecycle, planar) = {
             let lcm_backend = self.bridge.lcm_backend_available;
             match &self.bridge.mapping_adapter {
                 Some(arc) => {
@@ -6615,12 +6925,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                     (
                         MappingReadinessDetail::compute(Some(&*g), lcm_backend),
                         Some(g.snapshot()),
+                        g.planar.as_ref().and_then(|binding|binding.diagnostics(&g.snapshot())),
                     )
                 }
-                None => (MappingReadinessDetail::compute(None, lcm_backend), None),
+                None => (MappingReadinessDetail::compute(None, lcm_backend), None, None),
             }
         };
         let message_json = serde_json::to_string(&serde_json::json!({
+            "planar": planar,
             "lcm_backend": snapshot.lcm_backend,
             "adapter_present": snapshot.adapter_present,
             "odom_count": snapshot.odom_count,
@@ -6630,6 +6942,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             "global_consumer_ready": snapshot.global_consumer_ready,
             "frame_generation": snapshot.frame_generation,
             "last_error": snapshot.last_error,
+            "mapping_backend_kind": lifecycle.as_ref().map(|state| state.mapping_backend_kind.as_str()),
             "mapping_phase": lifecycle.as_ref().map(|state| state.phase.as_str()),
             "mapping_session_id": lifecycle.as_ref().map(|state| state.session_id.as_str()),
             "map_name": lifecycle.as_ref().map(|state| state.map_name.as_str()),
@@ -7187,6 +7500,59 @@ impl GeometryRuntime for GeometryRuntimeService {
     // default 拼 typed suffix。删除 stale "B6 blocker" / "Phase 5 才完成"
     // 注释 —— typed payload 编码与 LcmTransport.publish 调用已是当前正确路径。
 
+    async fn publish_laser_scan(
+        &self,
+        req: Request<PublishLaserScanRequest>,
+    ) -> Result<Response<PublishResult>, Status> {
+        self.ensure_running_admission("PublishLaserScan").await?;
+        let request = req.into_inner();
+        let scan = nuwax_codec::lcm::planar::decode(&request.payload)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+        let adapter = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("建图适配器不可用"))?;
+        let (binding, session) = {
+            let adapter = adapter.lock();
+            if !adapter.is_active() || !adapter.planar_ready {
+                return Err(Status::failed_precondition("二维会话未就绪"));
+            }
+            (
+                adapter
+                    .planar
+                    .clone()
+                    .ok_or_else(|| Status::failed_precondition("当前为三维执行链"))?,
+                adapter.snapshot(),
+            )
+        };
+        if request.session_id != session.session_id
+            || request.session_generation != session.session_generation
+            || scan.runtime_generation as u64 != binding.client.identity().runtime_generation
+        {
+            return Err(Status::failed_precondition("二维扫描运行或会话身份已过期"));
+        }
+        if binding.fence.snapshot().active {
+            binding.route_relocalization_scan(&scan).await.map_err(Status::failed_precondition)?;
+            return Ok(Response::new(PublishResult{success:true,message:"二维扫描已交付本次重定位候选".into()}));
+        }
+        binding
+            .client
+            .publish_scan(session.session_generation, &scan)
+            .await
+            .map_err(Status::unavailable)?;
+        binding.navigation.capture(
+            session.session_generation,
+            binding.fence.snapshot().epoch,
+            scan,
+        );
+        Ok(Response::new(PublishResult {
+            success: true,
+            message: "二维扫描已发送".into(),
+        }))
+    }
+
     async fn publish_odom(
         &self,
         req: Request<PublishOdomRequest>,
@@ -7226,6 +7592,65 @@ impl GeometryRuntime for GeometryRuntimeService {
             frame_id,
             timestamp_ns: ts_ns,
         };
+        let planar = self
+            .bridge
+            .mapping_adapter
+            .as_ref()
+            .and_then(|a| a.lock().planar.clone());
+        if let Some(binding) = planar {
+            self.ensure_running_admission("PublishOdom").await?;
+            if binding.settings.template.odometry_source
+                != nuwax_slam_2d_runtime::protocol::OdometrySource::Device
+            {
+                return Err(Status::failed_precondition(
+                    "激光里程计模式不接纳设备里程计",
+                ));
+            }
+            let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+            let adapter = self.bridge.mapping_adapter.as_ref().expect("二维适配器");
+            let session = adapter.lock().snapshot();
+            let request = req.get_ref();
+            if !session.active
+                || !adapter.lock().planar_ready
+                || request.session_id != session.session_id
+                || request.session_generation != session.session_generation
+                || request.runtime_generation != binding.client.identity().runtime_generation
+            {
+                return Err(Status::failed_precondition("二维里程计会话或运行身份无效"));
+            }
+            if [x, y, z, qx, qy, qz, qw].iter().any(|v| !v.is_finite())
+                || qx.abs() > 1e-5
+                || qy.abs() > 1e-5
+                || (qz * qz + qw * qw - 1.0).abs() > 1e-3
+                || ts_ns == 0
+            {
+                return Err(Status::invalid_argument(
+                    "二维里程计要求有效采样时间和归一化平面姿态",
+                ));
+            }
+            let sample = nuwax_slam_2d_runtime::input::TimedPose {
+                timestamp_ns: ts_ns,
+                clock_domain: request.clock_domain.clone(),
+                clock_id: request.clock_id.clone(),
+                odom_frame_id: pose_state.frame_id,
+                body_frame_id: binding.settings.template.body_frame_id.clone(),
+                pose: [x, y, 2.0 * qz.atan2(qw)],
+            };
+            if binding.fence.snapshot().active {
+                binding.route_relocalization_odom(sample.clone()).await.map_err(Status::failed_precondition)?;
+                binding.navigation.capture_odometry(session.session_generation,sample).map_err(Status::failed_precondition)?;
+                return Ok(Response::new(PublishResult{success:true,message:"二维里程计已交付本次重定位候选".into()}));
+            }
+            binding
+                .execute(nuwax_slam_2d_runtime::protocol::Operation::Odometry { sample:sample.clone() })
+                .await
+                .map_err(Status::unavailable)?;
+            binding.navigation.capture_odometry(session.session_generation,sample).map_err(Status::failed_precondition)?;
+            return Ok(Response::new(PublishResult {
+                success: true,
+                message: "二维里程计已接纳".into(),
+            }));
+        }
         let payload = match typed_codec::encode_odometry_payload(&pose_state, &self.base_frame_id) {
             Ok(payload) => payload,
             Err(error) => {
@@ -7273,6 +7698,9 @@ impl GeometryRuntime for GeometryRuntimeService {
         &self,
         req: Request<PublishPointCloudRequest>,
     ) -> Result<Response<PublishResult>, Status> {
+        if self.bridge.mapping_adapter.as_ref().is_some_and(|a|a.lock().planar.is_some()) {
+            return Err(Status::failed_precondition("二维执行链不接纳三维点云"));
+        }
         let Some((topic, msg_type)) = self.point_cloud_binding.clone() else {
             return Ok(Response::new(PublishResult {
                 success: false,
@@ -9010,6 +9438,7 @@ mod lifecycle_tests {
         let activation_request_identity_sha256 = [0x31; 32];
         let token = match service.activation_receipts.stage_or_replay(
             crate::correction_coordinator::ActivationReceiptSeed {
+                planar_target: None,
                 activation_request_id: "relocalize-r1-gate".to_owned(),
                 activation_request_identity_sha256,
                 asset_manifest_sha256: Some([0x32; 32]),
@@ -10579,6 +11008,8 @@ mod lifecycle_tests {
             }),
             canonical_occupancy_checkpoint: Some(canonical_occupancy_checkpoint),
             canonical_cloud_checkpoint: Some(canonical_cloud_checkpoint),
+            graph_artifact: None,
+            target_kind: String::new(),
         }
     }
 

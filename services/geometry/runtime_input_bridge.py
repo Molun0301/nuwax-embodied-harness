@@ -1829,8 +1829,22 @@ def build_default_runtime_input_bridge(
     localization_provider: Optional[StreamingLocalizationProvider] = None,
     point_cloud_provider: Optional[StreamingPointCloudProvider] = None,
     sensor_sample_provider: Optional[StreamingSensorSampleProvider] = None,
+    sensor_source_owner=None,
 ) -> RuntimeInputBridge:
     """工厂方法，集中默认值，便于测试与生产链路复用。"""
+    pipeline_reader = getattr(runtime_provider, "get_geometry_pipeline", None)
+    pipeline = pipeline_reader().get("geometry_pipeline") if callable(pipeline_reader) else os.environ.get("NUWAX_GEOMETRY_PIPELINE", "lio_3d")
+    configured = os.environ.get("NUWAX_GEOMETRY_PIPELINE", "lio_3d")
+    if pipeline != configured:
+        raise RuntimeError("Geometry实际执行链与网关配置不同，请重启对应服务")
+    if pipeline == "slam_2d":
+        from services.geometry.planar_input_bridge import PlanarRuntimeInputBridge
+        return PlanarRuntimeInputBridge(
+            runtime_provider=runtime_provider, sensor_sample_provider=sensor_sample_provider,
+            localization_provider=localization_provider, sensor_source_owner=sensor_source_owner,
+        )
+    if pipeline != "lio_3d":
+        raise ValueError("未知Geometry执行链")
     return RuntimeInputBridge(
         runtime_provider=runtime_provider,
         localization_provider=localization_provider,

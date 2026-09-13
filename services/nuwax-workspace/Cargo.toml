@@ -21,6 +21,9 @@ members = [
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",
     "crates/nuwax-lio-backends",
+    "crates/nuwax-slam-toolbox-sys",
+    "crates/nuwax-slam-toolbox",
+    "crates/nuwax-slam-2d-runtime",
     # 导航编排与探索
     "crates/nuwax-nav-stack",
     "crates/nuwax-exploration",

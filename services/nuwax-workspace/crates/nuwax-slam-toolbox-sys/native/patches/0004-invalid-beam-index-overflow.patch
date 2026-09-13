@@ -1,0 +1,18 @@
+--- a/upstream/karto/src/Mapper.cpp
++++ b/upstream/karto/src/Mapper.cpp
+@@ -1204,9 +1204,12 @@
+   kt_int32s * pAngleIndexPointer = pOffsets->GetArrayPointer();
+   for (kt_int32u i = 0; i < nPoints; i++) {
+     // ignore points that fall off the grid
+-    kt_int32s pointGridIndex = gridPositionIndex + pAngleIndexPointer[i];
+-    if (!math::IsUpTo(pointGridIndex,
+-      m_pCorrelationGrid->GetDataSize()) || pAngleIndexPointer[i] == INVALID_SCAN)
++    // 无效束哨兵不能参与索引相加；宽类型先完成边界校验，避免有符号溢出。
++    if (pAngleIndexPointer[i] == INVALID_SCAN) {
++      continue;
++    }
++    const kt_int64s pointGridIndex = static_cast<kt_int64s>(gridPositionIndex) + pAngleIndexPointer[i];
++    if (pointGridIndex < 0 || pointGridIndex >= m_pCorrelationGrid->GetDataSize())
+     {
+       continue;
+     }

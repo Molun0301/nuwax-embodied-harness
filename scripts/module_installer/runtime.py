@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -16,7 +17,7 @@ if _SPEC is None or _SPEC.loader is None:
 _VALUES = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_VALUES)
 
-_MODULES = {"core", "geometry", "fastlio2", "pointlio", "navigation", "perception", "follow", "memory"}
+_MODULES = {"core", "geometry", "slam2d", "fastlio2", "pointlio", "navigation", "perception", "follow", "memory"}
 _CONFIG_PATH_KEYS = (
     "NUWAX_BOOTSTRAP_ENV_FILE",
     "GO2_DATA_PLANE_ENV_FILE",
@@ -126,11 +127,13 @@ def write_runtime(
     selected = set(modules)
     if selected - _MODULES:
         raise ValueError("安装配置包含未知模块")
+    if "slam2d" in selected and selected.intersection({"fastlio2", "pointlio"}):
+        raise ValueError("二维与三维执行链必须互斥")
     if {"fastlio2", "pointlio"}.issubset(selected):
         raise ValueError("FastLIO2 与 PointLIO 只能安装一种")
     if robot not in {"customrobot", "go2"}:
         raise ValueError("不支持的机器人接入类型")
-    if selected & {"fastlio2", "pointlio", "navigation"} and "geometry" not in selected:
+    if selected & {"fastlio2", "pointlio", "slam2d", "navigation"} and "geometry" not in selected:
         raise ValueError("定位算法和导航需要几何模块")
     if "follow" in selected and not {"navigation", "perception"}.issubset(selected):
         raise ValueError("人员跟随需要导航与视觉感知模块")
@@ -167,6 +170,8 @@ def write_runtime(
         "NUWAX_PERSON_FOLLOW_BINARY": str(binary_dir / "nuwax-person-follow"),
         "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": str(binary_dir / f"{backend}_native") if backend != "device" else "",
         "NUWAX_GEOMETRY_LIO_BACKEND": backend,
+        "NUWAX_GEOMETRY_PIPELINE": "slam_2d" if "slam2d" in selected else "lio_3d",
+        "NUWAX_GEOMETRY_SLAM2D_BINARY": str(binary_dir / "nuwax-slam-2d-worker") if "slam2d" in selected else "",
         "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": "",
         "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE": "",
@@ -176,6 +181,17 @@ def write_runtime(
         "NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD": "false",
         "NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD": "false",
     })
+    if "slam2d" in selected:
+        fixed["LD_LIBRARY_PATH"] = str(prefix / "lib") + ":" + str(prefix / "lib64")
+        fixed["NUWAX_GEOMETRY_CORRECTION_BACKEND"] = "none"
+        fixed["NUWAX_GEOMETRY_MAPPING_BACKEND"] = "voxel"
+        fixed["NUWAX_NAV_PROFILE"] = "simple-2d"
+        raw_device = values.get("NUWAX_GEOMETRY_SLAM2D_DEVICE", "").strip()
+        if raw_device:
+            device = json.loads(raw_device)
+            if device.get("driver", "slamtec") == "slamtec":
+                device["library_path"] = str(prefix / "lib/libnuwax_slamtec.so.1")
+                values["NUWAX_GEOMETRY_SLAM2D_DEVICE"] = json.dumps(device, ensure_ascii=False, separators=(",", ":"))
     values.update(fixed)
     enabled = {
         "NUWAX_GEOMETRY_ENABLED": geometry,

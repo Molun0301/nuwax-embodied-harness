@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from services.geometry.checkpoint_payload import FrozenPayload, payload_digest, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
+
 import fcntl
 import hashlib
 import json
@@ -31,7 +33,7 @@ MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION = 1
 MAX_MAPPING_BACKEND_CHECKPOINT_BYTES = 64 * 1024 * 1024
 DEFAULT_ORPHAN_GRACE_SECONDS = 24 * 60 * 60
 DEFAULT_STORE_LOCK_TIMEOUT_SECONDS = 30.0
-SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel"})
+SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel", "slam_toolbox"})
 CLOUD_MAP_PAYLOAD_SCHEMA_VERSION = 1
 MAX_CLOUD_MAP_VOXEL_SIZE = 1_048_576.0
 
@@ -95,16 +97,16 @@ class MappingBackendCheckpoint:
     content_sha256: bytes
     payload_size: int
     created_at_ns: int
-    payload: bytes
+    payload: Union[bytes, FrozenPayload]
     occupancy_receipt: Mapping[str, object]
-    cloud_receipt: Mapping[str, object]
+    cloud_receipt: Optional[Mapping[str, object]]
 
 
 @dataclass(frozen=True)
 class StoredMappingBackendCheckpoint:
     checkpoint: MappingBackendCheckpoint
     occupancy_asset: Mapping[str, object]
-    cloud_asset: Mapping[str, object]
+    cloud_asset: Optional[Mapping[str, object]]
     selector_path: Path
     manifest_sha256: str
     manifest_path: Path
@@ -163,6 +165,11 @@ class MappingBackendCheckpointStore:
         )
         self._clock_ns = clock_ns
 
+    def _payload_limit(self, backend_kind):
+        if backend_kind == "slam_toolbox" and self._max_payload_bytes == MAX_MAPPING_BACKEND_CHECKPOINT_BYTES:
+            return MAX_PLANAR_ARCHIVE_BYTES
+        return self._max_payload_bytes
+
     @property
     def version_dir(self) -> Path:
         return self._version_dir
@@ -173,7 +180,7 @@ class MappingBackendCheckpointStore:
         checkpoint: MappingBackendCheckpoint,
         *,
         occupancy_asset: Mapping[str, object],
-        cloud_asset: Mapping[str, object],
+        cloud_asset: Optional[Mapping[str, object]],
         max_payload_bytes: int = MAX_MAPPING_BACKEND_CHECKPOINT_BYTES,
     ) -> Tuple[
         MappingBackendCheckpoint,
@@ -188,10 +195,7 @@ class MappingBackendCheckpointStore:
             occupancy_asset,
             sha256_encoding="bytes",
         )
-        validated_cloud_asset = _validate_cloud_asset(
-            cloud_asset,
-            sha256_encoding="bytes",
-        )
+        validated_cloud_asset = _validate_optional_cloud(cloud_asset, validated_checkpoint.backend_kind, sha256_encoding="bytes")
         _validate_asset_bindings(
             validated_checkpoint,
             validated_occupancy_asset,
@@ -208,7 +212,7 @@ class MappingBackendCheckpointStore:
         checkpoint: MappingBackendCheckpoint,
         *,
         occupancy_asset: Mapping[str, object],
-        cloud_asset: Mapping[str, object],
+        cloud_asset: Optional[Mapping[str, object]],
         fault_injector: Optional[FaultInjector] = None,
     ) -> StoredMappingBackendCheckpoint:
         """Validate and publish object, manifest, then stable selector."""
@@ -217,9 +221,7 @@ class MappingBackendCheckpointStore:
         validated_occupancy_asset = _validate_occupancy_asset(
             occupancy_asset, sha256_encoding="bytes"
         )
-        validated_cloud_asset = _validate_cloud_asset(
-            cloud_asset, sha256_encoding="bytes"
-        )
+        validated_cloud_asset = _validate_optional_cloud(cloud_asset, validated.backend_kind, sha256_encoding="bytes")
         _validate_asset_bindings(
             validated,
             validated_occupancy_asset,
@@ -261,10 +263,10 @@ class MappingBackendCheckpointStore:
                     access.objects_fd,
                     payload_temp_name,
                     paths.objects / payload_temp_name,
-                    maximum_bytes=self._max_payload_bytes,
+                    maximum_bytes=self._payload_limit(validated.backend_kind),
                     description="temporary checkpoint payload",
                 )
-                reopened_sha256 = hashlib.sha256(reopened_payload).digest()
+                reopened_sha256 = payload_digest(reopened_payload)
                 if reopened_sha256 != validated.content_sha256:
                     raise MappingBackendCheckpointValidationError(
                         "temporary checkpoint payload SHA-256 changed after fsync"
@@ -284,7 +286,7 @@ class MappingBackendCheckpointStore:
                     object_path,
                     validated.payload,
                     temp_identity=payload_temp_identity,
-                    maximum_bytes=self._max_payload_bytes,
+                    maximum_bytes=self._payload_limit(validated.backend_kind),
                     description="checkpoint object",
                 )
                 payload_temp_name = None
@@ -491,19 +493,21 @@ class MappingBackendCheckpointStore:
             minimum=1,
             maximum=_U64_MAX,
         )
-        payload = _require_bytes(checkpoint.payload, "payload")
+        payload = checkpoint.payload
+        if not isinstance(payload, bytes) and not (backend_kind == "slam_toolbox" and isinstance(payload, FrozenPayload)):
+            raise MappingBackendCheckpointValidationError("检查点载荷必须是字节串或二维私有只读文件")
         payload_size = _require_integer(
             checkpoint.payload_size,
             "payload_size",
             minimum=1,
-            maximum=self._max_payload_bytes,
+            maximum=self._payload_limit(backend_kind),
         )
         if len(payload) != payload_size:
             raise MappingBackendCheckpointValidationError(
                 f"payload_size mismatch: declared={payload_size} actual={len(payload)}"
             )
         content_sha256 = _require_sha256_bytes(checkpoint.content_sha256)
-        actual_sha256 = hashlib.sha256(payload).digest()
+        actual_sha256 = payload_digest(payload)
         if actual_sha256 != content_sha256:
             raise MappingBackendCheckpointValidationError(
                 "content_sha256 does not match checkpoint payload"
@@ -515,12 +519,14 @@ class MappingBackendCheckpointStore:
             backend_kind=backend_kind,
             boot_nonce_encoding="bytes",
         )
-        cloud_receipt = _validate_cloud_receipt(
-            checkpoint.cloud_receipt,
-            source_session_generation=source_session_generation,
-            boot_nonce_encoding="bytes",
-        )
-        _validate_receipt_order(occupancy_receipt, cloud_receipt)
+        cloud_receipt = None
+        if backend_kind == "slam_toolbox":
+            if checkpoint.cloud_receipt is not None:
+                raise MappingBackendCheckpointValidationError("二维图不能携带三维收据")
+        else:
+            cloud_receipt = _validate_cloud_receipt(checkpoint.cloud_receipt,
+                source_session_generation=source_session_generation, boot_nonce_encoding="bytes")
+            _validate_receipt_order(occupancy_receipt, cloud_receipt)
         return MappingBackendCheckpoint(
             schema_version=schema_version,
             backend_kind=backend_kind,
@@ -538,7 +544,7 @@ class MappingBackendCheckpointStore:
         self,
         checkpoint: MappingBackendCheckpoint,
         occupancy_asset: Mapping[str, object],
-        cloud_asset: Mapping[str, object],
+        cloud_asset: Optional[Mapping[str, object]],
     ) -> Dict[str, object]:
         return {
             "schema_version": checkpoint.schema_version,
@@ -553,13 +559,13 @@ class MappingBackendCheckpointStore:
             },
             "canonical_receipts": {
                 "occupancy": _receipt_document(checkpoint.occupancy_receipt),
-                "cloud": _receipt_document(checkpoint.cloud_receipt),
+                "cloud": _receipt_document(checkpoint.cloud_receipt) if checkpoint.cloud_receipt is not None else None,
             },
             "canonical_assets": {
                 "occupancy": _asset_document(
                     occupancy_asset, sha256_field="raw_data_sha256"
                 ),
-                "cloud": _asset_document(cloud_asset, sha256_field="xyz_sha256"),
+                "cloud": _asset_document(cloud_asset, sha256_field="xyz_sha256") if cloud_asset is not None else None,
             },
         }
 
@@ -663,14 +669,14 @@ class MappingBackendCheckpointStore:
             access.objects_fd,
             object_path.name,
             object_path,
-            maximum_bytes=self._max_payload_bytes,
+            maximum_bytes=self._payload_limit(backend_kind),
             description="checkpoint object",
         )
         if len(payload) != payload_size:
             raise MappingBackendCheckpointValidationError(
                 "checkpoint object size does not match manifest"
             )
-        content_sha256 = hashlib.sha256(payload).digest()
+        content_sha256 = payload_digest(payload)
         if content_sha256.hex() != payload_sha256:
             raise MappingBackendCheckpointValidationError(
                 "checkpoint object SHA-256 does not match manifest"
@@ -695,20 +701,20 @@ class MappingBackendCheckpointStore:
             backend_kind=backend_kind,
             boot_nonce_encoding="hex",
         )
-        cloud_receipt = _validate_cloud_receipt(
-            receipts["cloud"],
-            source_session_generation=source_session_generation,
-            boot_nonce_encoding="hex",
-        )
-        _validate_receipt_order(occupancy_receipt, cloud_receipt)
+        cloud_receipt = None
+        if backend_kind == "slam_toolbox":
+            if receipts["cloud"] is not None:
+                raise MappingBackendCheckpointValidationError("二维图清单不能携带三维收据")
+        else:
+            cloud_receipt = _validate_cloud_receipt(receipts["cloud"],
+                source_session_generation=source_session_generation, boot_nonce_encoding="hex")
+            _validate_receipt_order(occupancy_receipt, cloud_receipt)
         assets = _require_mapping(manifest["canonical_assets"], "canonical_assets")
         _require_exact_fields(assets, ("occupancy", "cloud"), "canonical_assets")
         occupancy_asset = _validate_occupancy_asset(
             assets["occupancy"], sha256_encoding="hex"
         )
-        cloud_asset = _validate_cloud_asset(
-            assets["cloud"], sha256_encoding="hex"
-        )
+        cloud_asset = _validate_optional_cloud(assets["cloud"], backend_kind, sha256_encoding="hex")
         checkpoint = self._validate_checkpoint(
             MappingBackendCheckpoint(
                 schema_version=schema_version,
@@ -790,7 +796,8 @@ class MappingBackendCheckpointStore:
             identity = _FileIdentity(metadata.st_dev, metadata.st_ino)
             with os.fdopen(fd, "wb", closefd=True) as stream:
                 fd = None
-                stream.write(data)
+                for chunk in payload_chunks(data):
+                    stream.write(chunk)
                 stream.flush()
                 _inject_fault(fault_injector, written_phase)
                 os.fsync(stream.fileno())
@@ -1654,10 +1661,18 @@ def _validate_cloud_asset(
     }
 
 
+def _validate_optional_cloud(value, backend_kind, *, sha256_encoding):
+    if backend_kind == "slam_toolbox":
+        if value is not None:
+            raise MappingBackendCheckpointValidationError("二维完整图不能携带三维资产")
+        return None
+    return _validate_cloud_asset(value, sha256_encoding=sha256_encoding)
+
+
 def _validate_asset_bindings(
     checkpoint: MappingBackendCheckpoint,
     occupancy_asset: Mapping[str, object],
-    cloud_asset: Mapping[str, object],
+    cloud_asset: Optional[Mapping[str, object]],
 ) -> None:
     if int(occupancy_asset["source_occupancy_revision"]) != int(
         checkpoint.occupancy_receipt["occupancy_revision"]
@@ -1671,6 +1686,10 @@ def _validate_asset_bindings(
         raise MappingBackendCheckpointValidationError(
             "occupancy asset timestamp does not match canonical occupancy receipt"
         )
+    if checkpoint.backend_kind == "slam_toolbox":
+        if cloud_asset is not None or checkpoint.cloud_receipt is not None:
+            raise MappingBackendCheckpointValidationError("二维完整图不能携带三维资产")
+        return
     if int(cloud_asset["source_cloud_revision"]) != int(
         checkpoint.cloud_receipt["cloud_revision"]
     ):
@@ -1973,7 +1992,10 @@ def _read_regular_file_at(
             )
         with os.fdopen(fd, "rb", closefd=True) as stream:
             fd = -1
-            data = stream.read(maximum_bytes + 1)
+            if maximum_bytes > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES:
+                data = FrozenPayload(iter(lambda: stream.read(1024 * 1024), b""), maximum_bytes=maximum_bytes)
+            else:
+                data = stream.read(maximum_bytes + 1)
         if len(data) > maximum_bytes:
             raise MappingBackendCheckpointValidationError(
                 f"{description} exceeds maximum size {maximum_bytes}"

@@ -102,6 +102,7 @@ def handle_relocalize_active_map(
             "requested_by": requested_by or "unknown",
             "request_id": params.optional_str(payload, "request_id"),
             "logical_timeout_ms": int(float(timeout_sec) * 1000.0),
+            **({"planar_seed": payload["planar_seed"]} if "planar_seed" in payload else {}),
         },
     )
     ctx.refresh_workspace_snapshots(refresh_localization=False)

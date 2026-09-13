@@ -252,6 +252,7 @@ fn ray_config_checkpoint_matches(config: &Config, checkpoint: RayConfigCheckpoin
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[doc(hidden)]
 pub enum MappingBackendSpec {
+    SlamToolbox,
     Voxel,
     Raytracing(RaytracingBackendSpec),
 }
@@ -259,6 +260,7 @@ pub enum MappingBackendSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum MappingBackendKind {
+    SlamToolbox,
     Voxel,
     Raytracing,
 }
@@ -266,6 +268,7 @@ pub enum MappingBackendKind {
 impl MappingBackendKind {
     pub(crate) const fn stable_name(self) -> &'static str {
         match self {
+            Self::SlamToolbox => "slam_toolbox",
             Self::Voxel => "voxel",
             Self::Raytracing => "raytracing",
         }
@@ -703,6 +706,7 @@ impl MappingBackendWorker {
         backend_generation: u64,
         compute_config: MappingBackendComputeConfig,
     ) -> Result<Self, String> {
+        if matches!(spec,MappingBackendSpec::SlamToolbox){return Err("二维算法由Geometry独立进程拥有方管理".into());}
         Self::start_inner(spec, backend_generation, compute_config, None)
     }
 
@@ -1165,6 +1169,7 @@ impl MappingBackendSpec {
     #[doc(hidden)]
     pub fn from_env(selected: MappingBackendKind) -> Result<Self, String> {
         match selected {
+            MappingBackendKind::SlamToolbox => Ok(Self::SlamToolbox),
             MappingBackendKind::Voxel => Ok(Self::Voxel),
             MappingBackendKind::Raytracing => {
                 Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?))
@@ -1178,6 +1183,7 @@ impl MappingBackendSpec {
         lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, String> {
         match selected {
+            MappingBackendKind::SlamToolbox => Ok(Self::SlamToolbox),
             MappingBackendKind::Voxel => Ok(Self::Voxel),
             MappingBackendKind::Raytracing => Ok(Self::Raytracing(
                 RaytracingBackendSpec::from_lookup(lookup)?,
@@ -1187,6 +1193,7 @@ impl MappingBackendSpec {
 
     pub(crate) const fn stable_name(self) -> &'static str {
         match self {
+            Self::SlamToolbox => "slam_toolbox",
             Self::Voxel => "voxel",
             Self::Raytracing(_) => "raytracing",
         }
@@ -1194,6 +1201,7 @@ impl MappingBackendSpec {
 
     pub(crate) const fn kind(self) -> MappingBackendKind {
         match self {
+            Self::SlamToolbox => MappingBackendKind::SlamToolbox,
             Self::Voxel => MappingBackendKind::Voxel,
             Self::Raytracing(_) => MappingBackendKind::Raytracing,
         }
@@ -1234,6 +1242,7 @@ impl MappingBackendSpec {
 
     pub(crate) fn into_kernel(self, window_capacity: usize) -> MappingKernel {
         match self {
+            Self::SlamToolbox => unreachable!("二维进程不能进入点云内核"),
             Self::Voxel => MappingKernel::Voxel(VoxelKernel {
                 current_window: VecDeque::new(),
                 capacity: window_capacity,
@@ -1781,6 +1790,7 @@ fn decode_mapping_checkpoint_header(
     }
     let backend_kind = reader.read_u8()?;
     let expected_kind = match spec {
+        MappingBackendSpec::SlamToolbox => 2,
         MappingBackendSpec::Voxel => MAPPING_BACKEND_KIND_VOXEL,
         MappingBackendSpec::Raytracing(_) => MAPPING_BACKEND_KIND_RAYTRACING,
     };
@@ -1889,6 +1899,7 @@ fn restore_mapping_kernel_checkpoint(
     decode_mapping_checkpoint_header(&mut reader, spec)?;
 
     match spec {
+        MappingBackendSpec::SlamToolbox => Err("二维图检查点须由二维工作进程恢复".into()),
         MappingBackendSpec::Voxel => {
             let capacity = usize::try_from(reader.read_u64()?).map_err(|_| {
                 "MAPPING_BACKEND_CHECKPOINT_INVALID: voxel capacity exceeds usize".to_owned()

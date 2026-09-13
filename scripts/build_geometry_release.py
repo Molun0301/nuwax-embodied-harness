@@ -142,6 +142,7 @@ _BUILD_ENV_KEYS = (
     "RUSTC", "RUSTDOC", "RUSTFLAGS", "RUSTUP_TOOLCHAIN",
     "CARGO_ENCODED_RUSTFLAGS", "CARGO_HOME", "CARGO_TARGET_DIR",
     "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_TARGET", "TARGET",
+    "NUWAX_GEOMETRY_PIPELINE", "CMAKE_PREFIX_PATH", "CMAKE_TOOLCHAIN_FILE",
 )
 _RERUN_CHANGED = re.compile(r"cargo:rerun-if-changed=([^\"{}]+)")
 _RERUN_FORMATTED = re.compile(r'println!\(\s*"cargo:rerun-if-changed=\{([A-Za-z_][A-Za-z0-9_]*)\}"')
@@ -263,7 +264,12 @@ def _resolve_rerun_inputs(package_roots):
             raw_rerun_paths.append(value)
         if encoded.count("cargo:rerun-if-changed=") != len(raw_rerun_paths):
             raise RuntimeError("build.rs rerun-if-changed 未被完整解析: %s" % build_script)
-        if "cargo:rerun-if-env-changed=" in encoded and not _RERUN_ENV.findall(encoded):
+        parsed_env_count = len(_RERUN_ENV.findall(encoded))
+        loop_pattern = re.compile(r'for\s+(\w+)\s+in\s+\[((?:\s*"[A-Z][A-Z0-9_]*"\s*,?)+)\s*\]\s*\{\s*println!\(\s*"cargo:rerun-if-env-changed=\{\1\}"\s*\);\s*\}', re.DOTALL)
+        for match in loop_pattern.finditer(encoded):
+            environment_keys.update(re.findall(r'"([A-Z][A-Z0-9_]*)"', match.group(2)))
+            parsed_env_count += 1
+        if encoded.count("cargo:rerun-if-env-changed=") != parsed_env_count:
             raise RuntimeError("build.rs 含无法静态解析的 rerun-if-env-changed: %s" % build_script)
         for raw in raw_rerun_paths:
             candidate = (package_root / raw.strip()).resolve(strict=True)
@@ -299,6 +305,9 @@ def _capture_build_input_closure(cargo, manifests, *, env):
     rerun_files, environment_keys = _resolve_rerun_inputs(tuple(package_roots))
     inputs = set(_iter_build_inputs(tuple(package_roots)))
     inputs.update(rerun_files)
+    if env.get("NUWAX_GEOMETRY_PIPELINE") == "slam_2d":
+        inputs.update(_iter_build_inputs((REPO_ROOT / "drivers/sensors/slamtec_native",)))
+        inputs.update(REPO_ROOT / "scripts" / name for name in ("build_slam2d.sh", "build_slamtec_driver.sh", "package_slam2d.py", "prepare_slam2d_dependencies.py"))
     cargo_config = REPO_ROOT / "services" / "nuwax-workspace" / ".cargo" / "config.toml"
     if cargo_config.is_file() and not cargo_config.is_symlink():
         inputs.add(cargo_config)
@@ -360,6 +369,8 @@ def _profile_native_lio_contract(profile_path):
     # type: (Path) -> List[Tuple[str, str]]
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
     declared = payload.get("metadata", {}).get("geometry_release", {}).get("native_lio_payloads")
+    if declared == [] and payload.get("geometry_pipeline") == "slam_2d":
+        return []
     if not isinstance(declared, list) or not declared:
         raise ValueError("发布 profile 必须声明非空 native_lio_payloads")
     result = []
@@ -526,7 +537,7 @@ def _fsync_stage_payload(directory_fd):
     os.fsync(directory_fd)
 
 
-def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, environment=None):
+def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, environment=None, planar_bundle=None):
     # type: (Path, Sequence[Tuple[str, Path]], Path, Path, Mapping[str, object], Optional[Mapping[str, str]]) -> Path
     selected_roles = set(_selected_artifact_roles(environment))
     selected_lio_roles = {
@@ -559,8 +570,18 @@ def _create_stage(parent, native_lio, runtime, mapping_cli, build_inputs, *, env
         generation_root = stable_stage / "generation"
         generation_root.mkdir(mode=0o700)
         try:
-            sources = [("geometry_runtime", runtime, True),
-                       ("offline_mapping_cli", mapping_cli, True)]
+            sources = [("geometry_runtime", runtime, True)]
+            if mapping_cli is not None:
+                sources.append(("offline_mapping_cli", mapping_cli, True))
+            if "planar_worker" in selected_roles:
+                if planar_bundle is None:
+                    raise RuntimeError("二维发布缺少同次构建的完整算法包")
+                manifest = json.loads((planar_bundle / "manifest.json").read_text())
+                for entry in manifest["artifacts"]:
+                    source = planar_bundle / entry["path"]
+                    if _sha256_file(source) != entry["sha256"] or source.stat().st_size != entry["size"]:
+                        raise RuntimeError("二维打包制品发生变化")
+                    sources.append((entry["role"], source, entry["executable"]))
             if "native_pgo_payload" in selected_roles:
                 sources.extend((role, path, True) for role, path in _embedded_artifacts(runtime))
             # generation 封存 profile 声明的全部 native LIO；运行时再按 selected 角色注入。
@@ -1235,6 +1256,7 @@ def _build_parser():
     # type: () -> argparse.ArgumentParser
     parser = argparse.ArgumentParser(description="构建 Geometry immutable release artifact set")
     parser.add_argument("--cargo", default="cargo")
+    parser.add_argument("--profile", type=Path, default=_PROFILE_PATH)
     parser.add_argument("--native-lio", action="append", default=[], metavar="/ABS/PATH")
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument(
@@ -1279,17 +1301,41 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
         build_env = dict(os.environ)
         build_env["CARGO_TARGET_DIR"] = isolated_target
         before = _capture_build_input_closure(args.cargo, manifests, env=build_env)
-        geometry_manifest, cli_manifest = manifests
+        geometry_manifest, cli_manifest = manifests[:2]
         _run((args.cargo, "build", "--release", "--locked", "--manifest-path",
               str(geometry_manifest)), env=build_env)
-        _run((args.cargo, "build", "--release", "--locked", "--manifest-path",
-              str(cli_manifest), "--bin", "nuwax-mapping-cli"), env=build_env)
+        planar = build_env.get("NUWAX_GEOMETRY_PIPELINE") == "slam_2d"
+        if not planar:
+            _run((args.cargo, "build", "--release", "--locked", "--manifest-path",
+                  str(cli_manifest), "--bin", "nuwax-mapping-cli"), env=build_env)
         geometry_target = _cargo_target_directory(args.cargo, geometry_manifest, env=build_env)
         cli_target = _cargo_target_directory(args.cargo, cli_manifest, env=build_env)
-        runtime = _validate_source(geometry_target / "release" / "nuwax-geometry-runtime",
+        target_relative = Path(build_env["CARGO_BUILD_TARGET"]) if build_env.get("CARGO_BUILD_TARGET") else Path()
+        runtime = _validate_source(geometry_target / target_relative / "release" / "nuwax-geometry-runtime",
                                    "geometry_runtime", executable=True)
-        mapping_cli = _validate_source(cli_target / "release" / "nuwax-mapping-cli",
+        mapping_cli = None if planar else _validate_source(cli_target / target_relative / "release" / "nuwax-mapping-cli",
                                        "offline_mapping_cli", executable=True)
+        planar_bundle = None
+        if build_env.get("NUWAX_GEOMETRY_PIPELINE") == "slam_2d":
+            sys.path.insert(0, str(REPO_ROOT))
+            from scripts.package_slam2d import package
+            worker_manifest = REPO_ROOT / "services/nuwax-workspace/Cargo.toml"
+            _run((args.cargo, "build", "--release", "--locked", "--manifest-path", str(worker_manifest), "-p", "nuwax-slam-2d-runtime", "--features", "worker"), env=build_env)
+            driver_build = Path(isolated_target) / "slamtec"
+            command = ["cmake", "-S", str(REPO_ROOT / "drivers/sensors/slamtec_native"), "-B", str(driver_build), "-DCMAKE_BUILD_TYPE=Release"]
+            if build_env.get("CMAKE_TOOLCHAIN_FILE"):
+                command.append("-DCMAKE_TOOLCHAIN_FILE=" + build_env["CMAKE_TOOLCHAIN_FILE"])
+            _run(command, env=build_env)
+            _run(("cmake", "--build", str(driver_build), "--parallel", build_env.get("CMAKE_BUILD_PARALLEL_LEVEL", "2")), env=build_env)
+            planar_bundle = Path(isolated_target) / "planar-package"
+            machine = (build_env.get("CARGO_BUILD_TARGET") or _rust_host(_command_evidence((build_env.get("RUSTC") or "rustc", "--version", "--verbose"), env=build_env))).split("-")[0]
+            multiarch = "aarch64-linux-gnu" if machine == "aarch64" else "x86_64-linux-gnu"
+            prefixes = [Path(p) for p in build_env.get("CMAKE_PREFIX_PATH", "").split(":") if p]
+            roots = [p / part for p in prefixes for part in ("lib", "lib64", "lib/" + multiarch)]
+            sysroot = Path(build_env.get("PKG_CONFIG_SYSROOT_DIR", "/"))
+            roots += [sysroot / "usr/local/lib", sysroot / "usr/lib" / multiarch, sysroot / "lib" / multiarch]
+            package(geometry_target / target_relative / "release/nuwax-slam-2d-worker", driver_build / "libnuwax_slamtec.so.1.0.0", planar_bundle,
+                library_roots=roots, notice_roots=[p / "share/doc" for p in prefixes] + [p / "share/nuwax-slam2d" for p in prefixes])
         stage = _create_stage(
             stage_parent,
             native_lio,
@@ -1297,6 +1343,7 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
             mapping_cli,
             before,
             environment=build_env,
+            planar_bundle=planar_bundle,
         )
         try:
             after = _capture_build_input_closure(args.cargo, manifests, env=build_env)
@@ -1318,12 +1365,19 @@ def _build_and_stage(args, native_lio, manifests, stage_parent):
 
 def main(argv=None):
     # type: (Optional[Sequence[str]]) -> int
+    global _PROFILE_PATH
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _PROFILE_PATH = args.profile.resolve(strict=True)
+    profile = json.loads(_PROFILE_PATH.read_text())
+    if profile.get("geometry_pipeline") == "slam_2d":
+        os.environ["NUWAX_GEOMETRY_PIPELINE"] = "slam_2d"
     _validate_mode_arguments(parser, args)
     geometry_manifest = REPO_ROOT / "services" / "geometry" / "nuwax_geometry_runtime" / "Cargo.toml"
     cli_manifest = REPO_ROOT / "services" / "nuwax-workspace" / "crates" / "nuwax-mapping-cli" / "Cargo.toml"
     manifests = (geometry_manifest, cli_manifest)
+    if os.environ.get("NUWAX_GEOMETRY_PIPELINE") == "slam_2d":
+        manifests += (REPO_ROOT / "services/nuwax-workspace/crates/nuwax-slam-2d-runtime/Cargo.toml",)
     if args.finalize_existing_stage is not None:
         return _finalize_existing_stage(args, manifests)
 

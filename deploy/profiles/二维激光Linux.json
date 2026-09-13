@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "planar-linux64",
+  "geometry_pipeline": "slam_2d",
+  "architectures": ["x86_64", "aarch64"],
+  "supported_os": {"ubuntu": ["20.04", "22.04", "24.04"], "debian": ["11", "12"]},
+  "metadata": {
+    "geometry_release": {"native_lio_payloads": []},
+    "description": "二维完整图执行链；配置实际传感器、标定和时钟后使用。实机验收单独执行。"
+  }
+}

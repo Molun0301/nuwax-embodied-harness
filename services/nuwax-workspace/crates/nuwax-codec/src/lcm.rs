@@ -54,6 +54,10 @@ pub mod native_pgo;
 pub mod person_follow;
 /// Repository-native person-follow command codec.
 pub mod person_follow_command;
+/// 规范二维扫描的有界LCM编码。
+pub mod planar;
+/// 带规范图身份的二维实时导航观测。
+pub mod planar_navigation;
 /// Codecs generated from the locked DimOS LCM schemas.
 pub mod schema;
 /// Canonical sensor input wire codecs.

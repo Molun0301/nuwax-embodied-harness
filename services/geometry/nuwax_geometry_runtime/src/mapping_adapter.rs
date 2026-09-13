@@ -487,6 +487,91 @@ struct PreparedCandidateMap {
     zone_cache: crate::forbidden_zones::ForbiddenZoneCache,
 }
 
+/// 二维整图在生命周期锁外准备，只携带原会话和基础修订回到提交端。
+pub(crate) struct PlanarMapPreparation {
+    has_observation: bool,
+    snapshot: nuwax_slam_2d_runtime::protocol::Snapshot,
+    data: Vec<i8>,
+    timestamp: u64,
+    base_revision: u64,
+    backend_generation: u64,
+    session: MappingSessionSnapshot,
+    zone_path: Option<PathBuf>,
+    zone_cache: crate::forbidden_zones::ForbiddenZoneCache,
+    sequence_store: Option<Arc<crate::sequence_state::SequenceStateStore>>,
+}
+pub(crate) struct PreparedPlanarMap {
+    has_observation: bool,
+    snapshot: nuwax_slam_2d_runtime::protocol::Snapshot,
+    base_revision: u64,
+    backend_generation: u64,
+    map: PreparedCandidateMap,
+}
+impl PlanarMapPreparation {
+    pub(crate) fn compute(mut self) -> Result<PreparedPlanarMap, String> {
+        let grid = OccupancyGrid {
+            data: self.data,
+            width: self.snapshot.width,
+            height: self.snapshot.height,
+            resolution: self.snapshot.resolution,
+            origin: [self.snapshot.origin[0], self.snapshot.origin[1], 0.0],
+            origin_orientation: [0.0, 0.0, 0.0, 1.0],
+            frame_id: self.snapshot.session.map_frame_id.clone(),
+            ts: self.timestamp as f64 / 1e9,
+        };
+        validate_checkpoint_grid(&grid, &self.snapshot.session.map_frame_id)?;
+        let persistent = PersistentOccupancyGrid::from_grid(grid)?;
+        let revision = match &self.sequence_store {
+            Some(store) => store
+                .reserve_map_revision(self.base_revision)
+                .map_err(|e| e.to_string())?,
+            None => self
+                .base_revision
+                .checked_add(1)
+                .filter(|v| *v <= i32::MAX as u64)
+                .ok_or("地图修订耗尽")?,
+        };
+        let grid = &persistent.grid;
+        let raw = MapState {
+            width: grid.width,
+            height: grid.height,
+            resolution: grid.resolution as f32,
+            origin_x: grid.origin[0],
+            origin_y: grid.origin[1],
+            frame_id: grid.frame_id.clone(),
+            revision,
+            timestamp_ns: self.timestamp,
+            data: grid.data.clone(),
+        };
+        let zones = match self.zone_path.as_deref() {
+            Some(path) => self.zone_cache.load(path, &self.session.map_name),
+            None => crate::forbidden_zones::LoadedForbiddenZones {
+                signature: format!("disabled:{}", self.session.map_name),
+                generation: 0,
+                zones: Vec::new(),
+                status: crate::forbidden_zones::ZoneLoadStatus::Empty,
+            },
+        };
+        let effective = crate::forbidden_zones::compose_effective_map(&raw, &zones)?;
+        self.session.revision = revision;
+        let event = MapRevisionEvent::from_effective_and_raw(&effective, &raw, &self.session);
+        Ok(PreparedPlanarMap {
+            has_observation: self.has_observation,
+            snapshot: self.snapshot,
+            base_revision: self.base_revision,
+            backend_generation: self.backend_generation,
+            map: PreparedCandidateMap {
+                persistent,
+                raw,
+                effective,
+                event,
+                zones,
+                zone_cache: self.zone_cache,
+            },
+        })
+    }
+}
+
 impl MappingCommitPreparation {
     pub(crate) fn compute(mut self) -> PreparedBackendCompletion {
         let map = self.prepare_map();
@@ -1051,7 +1136,7 @@ pub(crate) struct MappingStopTransition {
     pub(crate) retirement: Option<MappingBackendRetirement>,
 }
 
-enum MappingSessionStartAdmission {
+pub(crate) enum MappingSessionStartAdmission {
     Replay(MappingSessionSnapshot),
     Ready {
         session_id: String,
@@ -1096,6 +1181,12 @@ struct ActiveMappingCheckpointExport {
 ///   (Phase 5 桥接层保持 feed_* 函数签名不变,只在 call site 加 +1)
 /// - `readiness()` —— 综合字段,给 Python diagnostics + runtime_diagnostics 对账
 pub struct MappingAdapter {
+    pub(crate) planar: Option<crate::slam2d_owner::Binding>,
+    pub(crate) planar_ready: bool,
+    pub(crate) planar_localization: bool,
+    pub(crate) planar_revision: u64,
+    pub(crate) planar_epoch: u64,
+    pub(crate) planar_error: Option<String>,
     config: MappingAdapterConfig,
     pgo_history: Option<crate::pgo_map::ScanHistory>,
     pgo_materialized_sequence: u64,
@@ -1313,6 +1404,12 @@ impl MappingAdapter {
         #[cfg(test)]
         let session_capacity = session.capacity();
         Self {
+            planar: None,
+            planar_ready: false,
+            planar_localization: false,
+            planar_revision: 0,
+            planar_epoch: 0,
+            planar_error: None,
             config,
             pgo_history: None,
             pgo_materialized_sequence: 0,
@@ -1523,31 +1620,36 @@ impl MappingAdapter {
             }) => (session_id, map_name, session_generation, backend_generation),
             Err(error) => return Err(Self::reject_staged_worker(staged_worker, error)),
         };
-        let worker = match staged_worker {
-            Some(worker) => {
-                let client = worker.client();
-                if client.backend_generation() != backend_generation
-                    || client.backend_kind() != self.mapping_backend.kind()
-                {
-                    return Err(Self::reject_staged_worker(
-                        Some(worker),
-                        MappingLifecycleError::Backend(
-                            "staged mapping backend worker identity mismatch".to_owned(),
-                        ),
-                    ));
+        let worker = if self.mapping_backend.kind() == MappingBackendKind::SlamToolbox {
+            Self::settle_rejected_staged_worker(staged_worker)?;
+            None
+        } else {
+            Some(match staged_worker {
+                Some(worker) => {
+                    let client = worker.client();
+                    if client.backend_generation() != backend_generation
+                        || client.backend_kind() != self.mapping_backend.kind()
+                    {
+                        return Err(Self::reject_staged_worker(
+                            Some(worker),
+                            MappingLifecycleError::Backend(
+                                "staged mapping backend worker identity mismatch".to_owned(),
+                            ),
+                        ));
+                    }
+                    worker
                 }
-                worker
-            }
-            None => MappingBackendWorker::start(
-                self.mapping_backend,
-                backend_generation,
-                self.backend_compute_config(),
-            )
-            .map_err(MappingLifecycleError::Backend)?,
+                None => MappingBackendWorker::start(
+                    self.mapping_backend,
+                    backend_generation,
+                    self.backend_compute_config(),
+                )
+                .map_err(MappingLifecycleError::Backend)?,
+            })
         };
         self.reset_for_new_session();
         self.backend_generation = backend_generation;
-        self.mapping_worker = Some(worker);
+        self.mapping_worker = worker;
         self.next_session_generation = generation;
         self.lifecycle = MappingSessionSnapshot {
             phase: MappingSessionPhase::Active,
@@ -1563,7 +1665,7 @@ impl MappingAdapter {
         Ok(self.snapshot())
     }
 
-    fn prepare_session_start_admission(
+    pub(crate) fn prepare_session_start_admission(
         &self,
         session_id: &str,
         map_name: &str,
@@ -2531,6 +2633,145 @@ impl MappingAdapter {
         self.last_occupancy_commit_receipt = Some(receipt);
         self.raw_map = Some(raw_map);
         Ok((map, event))
+    }
+
+    pub(crate) fn planar_navigation_source(
+        &self,
+    ) -> Option<(
+        Arc<PersistentOccupancyGrid>,
+        Option<crate::forbidden_zones::LoadedForbiddenZones>,
+    )> {
+        Some((
+            self.persistent_grid.clone()?,
+            self.applied_forbidden_zones.clone(),
+        ))
+    }
+
+    pub(crate) fn prepare_planar_map(
+        &self,
+        snapshot: nuwax_slam_2d_runtime::protocol::Snapshot,
+        data: Vec<i8>,
+        timestamp: u64,
+    ) -> PlanarMapPreparation {
+        PlanarMapPreparation {
+            has_observation: true,
+            snapshot,
+            data,
+            timestamp,
+            base_revision: self.revision.max(self.global_revision),
+            backend_generation: self.backend_generation,
+            session: self.lifecycle.clone(),
+            zone_path: self.forbidden_zones_path.clone(),
+            zone_cache: self.forbidden_zone_cache.lock().clone(),
+            sequence_store: self.sequence_store.clone(),
+        }
+    }
+
+    pub(crate) fn prepare_planar_continuation(&self,session_id:&str,map_name:&str)->Result<(u64,u64),String> {
+        if self.planar.is_none() || session_id.trim().is_empty() || map_name!=self.lifecycle.map_name || self.planar_revision==0 {
+            return Err("二维续建必须绑定已有定位地图和有效会话".into());
+        }
+        Ok((self.next_session_generation.checked_add(1).ok_or("二维续建会话代次耗尽")?,self.backend_generation.checked_add(1).ok_or("二维续建后端代次耗尽")?))
+    }
+    pub(crate) fn start_planar_continuation(&mut self,session_id:&str,map_name:&str)->Result<MappingSessionSnapshot,String> {
+        let (generation,backend)=self.prepare_planar_continuation(session_id,map_name)?;
+        self.reset_for_new_session();self.next_session_generation=generation;self.backend_generation=backend;
+        self.lifecycle=MappingSessionSnapshot{phase:MappingSessionPhase::Active,session_id:session_id.to_owned(),map_name:map_name.to_owned(),
+            session_generation:generation,revision:0,active:true,idempotent_replay:false,legacy_checkpoint_reconstructed:false,mapping_backend_kind:"slam_toolbox".into()};
+        Ok(self.snapshot())
+    }
+    pub(crate) fn prepare_planar_activation(&self,snapshot:nuwax_slam_2d_runtime::protocol::Snapshot,data:Vec<i8>,timestamp:u64,backend_generation:u64)->PlanarMapPreparation {
+        let session=MappingSessionSnapshot {phase:MappingSessionPhase::Active,session_id:snapshot.session.session_id.clone(),map_name:snapshot.session.map_name.clone(),
+            session_generation:snapshot.session.session_generation,revision:0,active:true,idempotent_replay:false,legacy_checkpoint_reconstructed:false,mapping_backend_kind:"slam_toolbox".into()};
+        let mut preparation=self.prepare_planar_map(snapshot,data,timestamp);
+        preparation.has_observation=false;preparation.session=session;preparation.backend_generation=backend_generation;
+        preparation
+    }
+    fn transform_for_planar_estimate(&self,estimate:&nuwax_slam_2d_runtime::protocol::Estimate)->MapOdomTransformSnapshot {
+        let planar_pose=|p:[f64;3]|PlanarPoseSnapshot{position:[p[0],p[1],0.0],yaw_radians:p[2]};
+        let mut transform=self.map_odom_transform.clone().unwrap_or_else(||MapOdomTransformSnapshot::from_anchor(
+            &self.map_frame_id,&self.odom_frame_id,planar_pose(estimate.anchor_odom_from_base),self.frame_generation.saturating_add(1).max(1)));
+        let effective=nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(estimate.map_from_odom[0],estimate.map_from_odom[1],0.0),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0,0.0,estimate.map_from_odom[2]));
+        transform.correction=transform.base_isometry().inverse()*effective;
+        transform.latest_map_pose=planar_pose(estimate.map_from_base);transform.latest_odom_pose=planar_pose(estimate.odom_from_base);
+        transform.correction_revision=transform.correction_revision.max(estimate.graph_revision);transform
+    }
+    pub(crate) fn apply_planar_relocalization(&mut self,estimate:&nuwax_slam_2d_runtime::protocol::Estimate)->Result<MapOdomTransformSnapshot,String> {
+        let revision=self.map_odom_transform.as_ref().map_or(0,|t|t.correction_revision).checked_add(1).ok_or("二维校正修订耗尽")?;
+        self.frame_generation=self.frame_generation.checked_add(1).ok_or("二维坐标代次耗尽")?;
+        self.map_odom_transform=None;
+        let mut transform=self.update_planar_localization(estimate)?;
+        transform.correction_revision=revision;
+        self.map_odom_transform=Some(transform.clone());*self.map_odom_transform_cache.write()=Some(transform.clone());
+        Ok(transform)
+    }
+    pub(crate) fn update_planar_localization(&mut self,estimate:&nuwax_slam_2d_runtime::protocol::Estimate)->Result<MapOdomTransformSnapshot,String> {
+        if !self.is_active() || !self.planar_ready || self.planar_revision!=estimate.graph_revision || estimate.disposition=="match_rejected" {return Err("二维定位来源不可接纳".into());}
+        let transform=self.transform_for_planar_estimate(estimate);
+        self.frame_generation=transform.generation;self.global_frame_established=true;
+        self.map_odom_transform=Some(transform.clone());*self.map_odom_transform_cache.write()=Some(transform.clone());
+        Ok(transform)
+    }
+    /// 安装二维同一图修订的物理栅格和有效地图坐标校正。
+    pub(crate) fn commit_planar_snapshot(
+        &mut self,
+        prepared: PreparedPlanarMap,
+        revision_floor: u64,
+    ) -> Result<(MapState, MapRevisionEvent), String> {
+        self.commit_planar_snapshot_inner(prepared,revision_floor,false)
+    }
+    pub(crate) fn commit_planar_export(&mut self,prepared:PreparedPlanarMap,revision_floor:u64)->Result<(MapState,MapRevisionEvent),String> {
+        self.commit_planar_snapshot_inner(prepared,revision_floor,true)
+    }
+    fn commit_planar_snapshot_inner(&mut self,prepared:PreparedPlanarMap,revision_floor:u64,export:bool)->Result<(MapState,MapRevisionEvent),String> {
+        let snapshot = &prepared.snapshot;
+        let session = &snapshot.session;
+        let estimate = &snapshot.estimate;
+        if self.mapping_backend.kind() != MappingBackendKind::SlamToolbox
+            || (!self.is_active() && !(export && self.lifecycle.phase==MappingSessionPhase::Stopped))
+            || (!self.planar_ready && !export)
+            || self.backend_generation != prepared.backend_generation
+            || self.revision.max(self.global_revision) != prepared.base_revision
+            || prepared.map.raw.revision <= revision_floor
+            || self.lifecycle.session_id != session.session_id
+            || self.lifecycle.session_generation != session.session_generation
+            || self.lifecycle.map_name != session.map_name
+            || estimate.graph_revision <= self.planar_revision
+        {
+            return Err("二维候选已过期或会话未就绪".into());
+        }
+        let transform=prepared.has_observation.then(||self.transform_for_planar_estimate(estimate));
+        let map = prepared.map;
+        let revision = map.raw.revision;
+        let receipt = self.reserve_occupancy_commit_receipt(
+            revision,
+            map.raw.timestamp_ns,
+            MappingBackendKind::SlamToolbox,
+            self.backend_generation,
+        )?;
+        self.checkpoint_installed = true;
+        self.persistent_grid = Some(Arc::new(map.persistent));
+        self.record_forbidden_zone_application(&map.zones, revision);
+        *self.forbidden_zone_cache.lock() = map.zone_cache;
+        self.global_revision = revision;
+        self.revision = revision;
+        self.lifecycle.revision = revision;
+        self.last_occupancy_commit_receipt = Some(receipt);
+        self.raw_map = Some(map.raw);
+        let result = (map.effective, map.event);
+        if let Some(transform)=transform {
+        self.frame_generation = transform.generation;
+        self.global_frame_established = true;
+        self.last_sensor_origin = transform.latest_map_pose.position;
+        self.session
+            .feed_pose(self.last_sensor_origin[0], self.last_sensor_origin[1], 0.0);
+        self.map_odom_transform = Some(transform);
+        *self.map_odom_transform_cache.write() = self.map_odom_transform.clone();
+        }
+        self.planar_revision = estimate.graph_revision;
+        self.planar_error = None;
+        Ok(result)
     }
 
     pub fn has_checkpoint(&self) -> bool {
@@ -3528,6 +3769,7 @@ impl MappingAdapter {
     }
 
     fn restart_backend_worker_after_reset(&mut self) {
+        if self.mapping_backend.kind()==MappingBackendKind::SlamToolbox {return;}
         if self.is_active() && self.pending_backend_retirement.is_none() {
             match MappingBackendWorker::start(
                 self.mapping_backend,
@@ -3542,6 +3784,10 @@ impl MappingAdapter {
 
     /// Reset per-session mapping data while preserving process-wide generations and revision.
     pub fn reset_for_new_session(&mut self) {
+        self.planar_ready = false;
+        self.planar_localization = false;
+        self.planar_revision = 0;
+        self.planar_error = None;
         self.reset_accumulator();
         // RPC/session projection must read zero until this session commits its first map.
         // `global_revision` deliberately survives so unversioned occupancy consumers never
@@ -3665,6 +3911,10 @@ impl MappingReadiness {
                     .frame_contract(&a.map_frame_id)
                     .ready_for_global_consumers();
                 let checkpoint_ready = a.has_checkpoint();
+                if a.planar.is_some() {
+                    last_error = a.planar_error.clone();
+                    if !a.planar_ready {last_error.get_or_insert_with(||"二维会话未就绪".into());}
+                }
                 if !a.is_active() {
                     last_error.get_or_insert_with(|| {
                         "mapping session 未启动;调用 StartMapping 后才接收输入".to_string()
@@ -3706,6 +3956,8 @@ impl MappingReadiness {
         if let Some(adapter) = adapter {
             let checkpoint_ready = adapter.has_checkpoint();
             ready = lcm_backend_available
+                && adapter.is_active()
+                && (adapter.planar.is_none() || (adapter.planar_ready && adapter.planar_error.is_none()))
                 && (adapter.has_data() || checkpoint_ready)
                 && global_consumer_ready
                 && (pointcloud_count > 0 || checkpoint_ready)

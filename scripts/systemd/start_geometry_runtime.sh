@@ -16,6 +16,7 @@ INTERNAL_READY_FILE="${READY_FILE}.runtime"
 EXEC_PROOF_FILE="${READY_FILE}.release"
 PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 HEALTH_TIMEOUT="${NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT:-30}"
+GEOMETRY_PIPELINE="${NUWAX_GEOMETRY_PIPELINE:-lio_3d}"
 LIO_BACKEND="${NUWAX_GEOMETRY_LIO_BACKEND:-device}"
 MAPPING_BACKEND="${NUWAX_GEOMETRY_MAPPING_BACKEND:-voxel}"
 CORRECTION_BACKEND="${NUWAX_GEOMETRY_CORRECTION_BACKEND:-none}"
@@ -115,6 +116,11 @@ case "${HEALTH_TIMEOUT}" in
 esac
 [[ "${HEALTH_TIMEOUT}" -gt 0 ]] \
   || fail "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT must be greater than zero"
+case "${GEOMETRY_PIPELINE}" in
+  lio_3d|slam_2d) ;;
+  *) fail "NUWAX_GEOMETRY_PIPELINE必须为lio_3d或slam_2d" ;;
+esac
+export NUWAX_GEOMETRY_PIPELINE="${GEOMETRY_PIPELINE}"
 case "${LIO_BACKEND}" in
   device|fastlio2|pointlio) ;;
   *) fail "NUWAX_GEOMETRY_LIO_BACKEND must be device, fastlio2, or pointlio" ;;
@@ -141,8 +147,13 @@ export NUWAX_GEOMETRY_CORRECTION_BACKEND="${CORRECTION_BACKEND}"
 # 开发启动使用项目数据目录；systemd（系统服务管理器）仍可显式指定持久化路径。
 export NUWAX_GEOMETRY_SEQUENCE_STATE_PATH="${NUWAX_GEOMETRY_SEQUENCE_STATE_PATH:-${REPO_ROOT}/runtime_data/geometry/sequence_state.json}"
 export NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH="${NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH:-${REPO_ROOT}/runtime_data/geometry/exploration_ownership_journal.json}"
+if [[ "${GEOMETRY_PIPELINE}" == "slam_2d" ]]; then
+  export NUWAX_GEOMETRY_SLAM2D_BINARY="${NUWAX_GEOMETRY_SLAM2D_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-slam-2d-worker}"
+  printf 'nuwax-geometry-runtime launcher: pipeline=slam_2d mapping=slam_toolbox\n'
+else
 printf 'nuwax-geometry-runtime launcher: owner profile lio=%s mapping=%s correction=%s\n' \
   "${LIO_BACKEND}" "${MAPPING_BACKEND}" "${CORRECTION_BACKEND}"
+fi
 
 if [[ -n "${RELEASE_MANIFEST}" ]]; then
   NUWAX_GEOMETRY_RUNTIME_READY_FILE="${INTERNAL_READY_FILE}" \

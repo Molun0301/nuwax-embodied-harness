@@ -29,13 +29,17 @@ MODULES: dict[str, ModuleSpec] = {
     "geometry": ModuleSpec(
         "geometry", "几何建图", "定位与地图运行时；可使用设备已有里程计。", ("core",),
     ),
+    "slam2d": ModuleSpec(
+        "slam2d", "二维激光建图", "二维扫描建图、图定位与思岚雷达驱动；需要配置实际传感器与外参。",
+        ("geometry",), ("fastlio2", "pointlio"),
+    ),
     "fastlio2": ModuleSpec(
         "fastlio2", "FastLIO2 激光惯性定位", "安装原生 FastLIO2，需要真实点云、惯性输入及标定。",
-        ("geometry",), ("pointlio",),
+        ("geometry",), ("pointlio", "slam2d"),
     ),
     "pointlio": ModuleSpec(
         "pointlio", "PointLIO 激光惯性定位", "安装原生 PointLIO，与 FastLIO2 选择一个即可。",
-        ("geometry",), ("fastlio2",),
+        ("geometry",), ("fastlio2", "slam2d"),
     ),
     "navigation": ModuleSpec(
         "navigation", "导航探索", "导航独立程序与运动守卫；运行仍需要真实执行器及标定。", ("geometry",),
@@ -149,6 +153,8 @@ def module_system_packages(modules: Iterable[str], robot: str = "customrobot") -
         packages.extend(("cmake", "git", "patch", "liblcm-bin", "libeigen3-dev", "libpcl-dev"))
     if "pointlio" in selected:
         packages.append("libgoogle-glog-dev")
+    if "slam2d" in selected:
+        packages.extend(("libeigen3-dev", "libgoogle-glog-dev", "libgflags-dev", "libboost-dev", "libboost-serialization-dev", "libboost-filesystem-dev", "libboost-thread-dev", "libboost-system-dev", "libboost-chrono-dev", "libboost-atomic-dev"))
     if "perception" in selected:
         packages.append("git")
     if robot == "go2":

@@ -250,6 +250,7 @@ class LcmChannelConfig:
     tf_static: str = "/tf_static#tf2_msgs.TFMessage"
     point_cloud: str = "/go2/lidar/points#sensor_msgs.PointCloud2"
     occupancy: str = "/map/occupancy#nav_msgs.OccupancyGrid"
+    planar_navigation: str = "/nav/planar_occupancy#nuwax_msgs.PlanarNavigationMap"
     cmd_vel: str = "/cmd_vel#geometry_msgs.Twist"
     initial_pose: str = "/localization/initial_pose#geometry_msgs.PoseWithCovarianceStamped"
     goal_pose: str = "/nav/goal#nuwax_msgs.GoalEnvelope"
@@ -272,6 +273,7 @@ class LcmChannelConfig:
         "tf_static": "tf2_msgs.TFMessage",
         "point_cloud": "sensor_msgs.PointCloud2",
         "occupancy": "nav_msgs.OccupancyGrid",
+        "planar_navigation": "nuwax_msgs.PlanarNavigationMap",
         "cmd_vel": "geometry_msgs.Twist",
         "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
         "goal_pose": "nuwax_msgs.GoalEnvelope",
@@ -294,6 +296,7 @@ class LcmChannelConfig:
             "tf_static": "tf2_msgs.TFMessage",
             "point_cloud": "sensor_msgs.PointCloud2",
             "occupancy": "nav_msgs.OccupancyGrid",
+            "planar_navigation": "nuwax_msgs.PlanarNavigationMap",
             "cmd_vel": "geometry_msgs.Twist",
             "initial_pose": "geometry_msgs.PoseWithCovarianceStamped",
             "goal_pose": "nuwax_msgs.GoalEnvelope",
@@ -337,6 +340,7 @@ class LcmChannelConfig:
             "tf_static": self.tf_static,
             "point_cloud": self.point_cloud,
             "occupancy": self.occupancy,
+            "planar_navigation": self.planar_navigation,
             "cmd_vel": self.cmd_vel,
             "initial_pose": self.initial_pose,
             "goal_pose": self.goal_pose,
@@ -367,6 +371,9 @@ class PlatformGeometryConfig:
     lcm_url: str = field(default_factory=build_default_lcm_url)
     lcm_backend: str = "real-lcm"
     # Geometry Runtime owner profile 三个正交选择轴；Rust 启动预检会再次严格校验。
+    pipeline: str = "lio_3d"
+    slam2d_config: str = ""
+    slam2d_device: str = ""
     lio_backend: str = "device"
     mapping_backend: str = "voxel"
     correction_backend: str = "none"
@@ -389,6 +396,7 @@ class PlatformGeometryConfig:
             "runtime_ready_file": self.runtime_ready_file,
             "lcm_url": self.lcm_url,
             "lcm_backend": self.lcm_backend,
+            "geometry_pipeline": self.pipeline,
             "owner_profile": {
                 "lio": self.lio_backend,
                 "mapping": self.mapping_backend,

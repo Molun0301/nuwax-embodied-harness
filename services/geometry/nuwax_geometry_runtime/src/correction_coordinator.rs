@@ -3283,6 +3283,13 @@ mod preflight_only_contract {
         sha256_bytes(&relocalization_algorithm_options_preimage_v1())
     }
 
+    pub(crate) fn planar_source_policy_sha256()->[u8;32] {
+        sha256_bytes(b"nuwax.planar-source.v1;fresh-after-arm;max-age-ns=500000000;accepted-scans=3;strict-sequence;matched-odometry")
+    }
+    pub(crate) fn planar_algorithm_policy_sha256()->[u8;32] {
+        sha256_bytes(b"nuwax.planar-relocalization.v1;karto-2.10.0;explicit-se2-seed;candidate-process;static-graph;canonical-tf")
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub(crate) enum ActivationJournalStep {
         BackendRestoreSubmission,
@@ -3319,6 +3326,7 @@ mod preflight_only_contract {
 
     #[derive(Clone, Debug)]
     pub(crate) struct ActivationReceiptSeed {
+        pub(crate) planar_target: Option<Arc<crate::planar_artifacts::Target>>,
         pub(crate) activation_request_id: String,
         pub(crate) activation_request_identity_sha256: [u8; 32],
         pub(crate) asset_manifest_sha256: Option<[u8; 32]>,
@@ -3386,6 +3394,8 @@ mod preflight_only_contract {
         seed: ActivationReceiptSeed,
         immutable_target: Option<crate::pointcloud::ImmutableActivatedTarget>,
         cloud_target_required: bool,
+        planar_target_required: bool,
+        planar_receipt: Option<crate::mapping_commit::OccupancyCommitReceipt>,
         epoch: u64,
         state: PermanentActivationState,
         activation_identity_sha256: Option<[u8; 32]>,
@@ -3524,6 +3534,8 @@ mod preflight_only_contract {
         fn release_immutable_target(record: &mut PermanentActivationRecord) {
             record.immutable_target = None;
             record.seed.immutable_target = None;
+            record.seed.planar_target = None;
+            record.planar_receipt = None;
             if let Some(terminal) = record.terminal.as_mut() {
                 terminal.relocalization_target_available = false;
             }
@@ -3536,6 +3548,12 @@ mod preflight_only_contract {
                 || record.activation_identity_sha256.is_none()
             {
                 return false;
+            }
+            if let Some(target)=record.seed.planar_target.as_ref() {
+                return record.planar_receipt.as_ref().is_some_and(|receipt|
+                    receipt.session_generation==record.session_generation && receipt.backend_generation==record.backend_generation
+                    && receipt.backend_kind==crate::mapping_backend::MappingBackendKind::SlamToolbox
+                    && record.target_receipt_sha256==Some(target.receipt(record.activation_identity_sha256.unwrap(),receipt)));
             }
             let (Some(target), Some(target_receipt_sha256), Some(proof)) = (
                 record.immutable_target.as_ref(),
@@ -3585,6 +3603,8 @@ mod preflight_only_contract {
             self.with_staged_record(token, |_| ()).is_some()
         }
 
+        pub(crate) fn has_request(&self,id:&str)->bool {self.inner.ledger.lock().records.contains_key(id)}
+
         pub(crate) fn stage_or_replay(
             &self,
             mut seed: ActivationReceiptSeed,
@@ -3617,7 +3637,7 @@ mod preflight_only_contract {
                 if record.seed.activation_request_identity_sha256
                     != seed.activation_request_identity_sha256
                     || record.state == PermanentActivationState::Staged
-                        && record.immutable_target != seed.immutable_target
+                        && (record.immutable_target != seed.immutable_target || record.seed.planar_target != seed.planar_target)
                 {
                     self.apply_record(
                         &mut base_state,
@@ -3713,6 +3733,8 @@ mod preflight_only_contract {
             ledger.records.insert(
                 request_id.clone(),
                 PermanentActivationRecord {
+                    planar_target_required: seed.planar_target.is_some(),
+                    planar_receipt: None,
                     seed,
                     cloud_target_required: immutable_target.is_some(),
                     immutable_target,
@@ -3848,6 +3870,21 @@ mod preflight_only_contract {
                 .flatten()
         }
 
+        pub(crate) fn store_planar_proof(&self,token:&ActivationToken,receipt:crate::mapping_commit::OccupancyCommitReceipt)->Option<[u8;32]> {
+            self.with_staged_record_mut(token,|record| {
+                let target=record.seed.planar_target.as_ref()?;
+                let digest=target.receipt(record.activation_identity_sha256?,&receipt);
+                record.planar_receipt=Some(receipt);record.target_receipt_sha256=Some(digest);
+                Some(digest)
+            }).flatten()
+        }
+        pub(crate) fn current_sealed_planar_target(&self)->Option<(Arc<crate::planar_artifacts::Target>,crate::proto::MappingSessionState)> {
+            let before=self.phase_snapshot();if before.0 {return None;}
+            let ledger=self.inner.ledger.lock();
+            let record=ledger.records.get(ledger.current.as_ref()?)?;
+            if self.phase_snapshot()!=before || record.epoch!=before.1 || !Self::sealed_target_available(record) {return None;}
+            Some((record.seed.planar_target.clone()?,record.terminal.clone()?))
+        }
         pub(crate) fn immutable_target(
             &self,
             token: &ActivationToken,
@@ -3977,7 +4014,7 @@ mod preflight_only_contract {
                     && (record.session_generation == 0
                         || record.backend_generation == 0
                         || record.activation_identity_sha256.is_none()
-                        || (record.cloud_target_required
+                        || ((record.cloud_target_required || record.planar_target_required)
                             && !Self::has_complete_target_proof(record)))
                 {
                     return None;
@@ -4145,6 +4182,10 @@ mod preflight_only_contract {
             disposition: crate::proto::ActivationReceiptDisposition,
             target_available: bool,
         ) {
+            if let Some(target)=record.seed.planar_target.as_ref() {
+                state.target_kind="planar_graph".into();state.target_graph_sha256=target.sha.to_vec();
+            }
+
             self.apply_policy_identity(state);
             state.activation_receipt_disposition = disposition as i32;
             state.backend_generation = record.backend_generation;
@@ -4174,6 +4215,10 @@ mod preflight_only_contract {
                 .map(|digest| digest.to_vec())
                 .unwrap_or_default();
             state.relocalization_target_available = target_available;
+            if record.planar_target_required {
+                state.source_policy_sha256=planar_source_policy_sha256().to_vec();
+                state.algorithm_options_sha256=planar_algorithm_policy_sha256().to_vec();
+            }
         }
     }
 
@@ -5441,7 +5486,30 @@ mod preflight_only_contract {
         }
     }
 
+    pub(crate) struct PlanarCommandOutcome {
+        pub disposition:crate::proto::RelocalizeDisposition,
+        pub detail:String,
+        pub correction_revision:u64,
+        pub evidence:Vec<u8>,
+    }
+    pub(crate) type PlanarCommandWork = Box<dyn FnOnce(PlanarCommandContext)->std::pin::Pin<Box<dyn std::future::Future<Output=PlanarCommandOutcome>+Send>>+Send>;
+    struct PlanarClaim {request_id:String,identity:[u8;32],reply:oneshot::Sender<bool>}
+    pub(crate) struct PlanarCommandContext {
+        pub epoch:u64,
+        pub deadline:Instant,
+        pub request_identity:[u8;32],
+        request_id:String,
+        claim:mpsc::Sender<PlanarClaim>,
+    }
+    impl PlanarCommandContext {
+        pub async fn claim(&self)->bool {
+            let (tx,rx)=oneshot::channel();
+            if self.claim.send(PlanarClaim{request_id:self.request_id.clone(),identity:self.request_identity,reply:tx}).await.is_err() {return false;}
+            rx.await.unwrap_or(false)
+        }
+    }
     struct RelocalizationAdmissionRequest {
+        planar_work: Option<PlanarCommandWork>,
         request: crate::proto::RelocalizeRequest,
         capacity_lease: Arc<RelocalizationWaiterCapacityLease>,
         response: oneshot::Sender<Result<RelocalizationCommandWaiter, RelocalizationCommandError>>,
@@ -5470,7 +5538,7 @@ mod preflight_only_contract {
             &self,
             request: crate::proto::RelocalizeRequest,
         ) -> Result<RelocalizationCommandWaiter, RelocalizationCommandError> {
-            self.admit_inner(request, None).await
+            self.admit_inner(request, None, None).await
         }
 
         pub(crate) async fn admit_with_lifecycle_guard(
@@ -5478,13 +5546,17 @@ mod preflight_only_contract {
             request: crate::proto::RelocalizeRequest,
             lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
         ) -> Result<RelocalizationCommandWaiter, RelocalizationCommandError> {
-            self.admit_inner(request, Some(lifecycle_guard)).await
+            self.admit_inner(request, Some(lifecycle_guard), None).await
         }
 
+        pub(crate) async fn admit_planar(&self,request:crate::proto::RelocalizeRequest,lifecycle:tokio::sync::OwnedMutexGuard<()>,work:PlanarCommandWork)->Result<RelocalizationCommandWaiter,RelocalizationCommandError> {
+            self.admit_inner(request,Some(lifecycle),Some(work)).await
+        }
         async fn admit_inner(
             &self,
             request: crate::proto::RelocalizeRequest,
             mapping_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+            planar_work: Option<PlanarCommandWork>,
         ) -> Result<RelocalizationCommandWaiter, RelocalizationCommandError> {
             if !self.admission_open.load(Ordering::Acquire) {
                 return Err(RelocalizationCommandError::Stopped);
@@ -5502,6 +5574,7 @@ mod preflight_only_contract {
             let capacity_lease = Arc::new(RelocalizationWaiterCapacityLease::new(waiter_permit));
             let (response, response_rx) = oneshot::channel();
             let admission = RelocalizationAdmissionRequest {
+                planar_work,
                 request,
                 capacity_lease,
                 response,
@@ -5693,7 +5766,8 @@ mod preflight_only_contract {
             relocalization_digest(&request.activation_identity_sha256, "activation identity")?;
         let target_receipt =
             relocalization_digest(&request.target_receipt_sha256, "target receipt")?;
-        let target_cloud = relocalization_digest(&request.target_cloud_sha256, "target cloud")?;
+        let planar=request.target_kind=="planar_graph";
+        let target_cloud = if planar {[0;32]}else{relocalization_digest(&request.target_cloud_sha256, "target cloud")?};
         let asset_manifest =
             relocalization_digest(&request.asset_manifest_sha256, "asset manifest")?;
         let asset_bundle = relocalization_digest(&request.asset_bundle_sha256, "asset bundle")?;
@@ -5726,6 +5800,16 @@ mod preflight_only_contract {
         );
         out.extend_from_slice(&request.algorithm_options_version.to_be_bytes());
         out.extend_from_slice(&algorithm_options);
+        if planar {
+            if !request.target_cloud_sha256.is_empty() || request.target_cloud_revision!=0 {return Err("二维重定位不能携带点云身份".into());}
+            let seed=request.planar_seed.as_ref().ok_or("二维重定位缺少明确初始位置")?;
+            if [seed.x,seed.y,seed.yaw].iter().any(|v|!v.is_finite()) || seed.yaw.abs()>std::f64::consts::PI {return Err("二维重定位初值非法".into());}
+            out.extend_from_slice(b"nuwax.geometry.planar-relocalize.v1\0");
+            out.extend_from_slice(&relocalization_digest(&request.target_graph_sha256,"target graph")?);
+            for v in [seed.x,seed.y,seed.yaw] {out.extend_from_slice(&v.to_bits().to_be_bytes());}
+        } else if !request.target_kind.is_empty() || request.planar_seed.is_some() || !request.target_graph_sha256.is_empty() {
+            return Err("不支持的重定位目标类型".into());
+        }
         Ok(out)
     }
 
@@ -5741,7 +5825,7 @@ mod preflight_only_contract {
         if request.runtime_generation == 0
             || request.session_generation == 0
             || request.backend_generation == 0
-            || request.target_cloud_revision == 0
+            || (request.target_kind!="planar_graph" && request.target_cloud_revision == 0)
         {
             return Err("RELOCALIZATION_IDENTITY_GENERATION_INVALID".to_owned());
         }
@@ -5749,8 +5833,8 @@ mod preflight_only_contract {
             relocalization_digest(&request.activation_identity_sha256, "activation identity")?;
         let target_receipt_sha256 =
             relocalization_digest(&request.target_receipt_sha256, "target receipt")?;
-        let target_cloud_sha256 =
-            relocalization_digest(&request.target_cloud_sha256, "target cloud")?;
+        let target_cloud_sha256 = if request.target_kind=="planar_graph" {[0;32]} else {
+            relocalization_digest(&request.target_cloud_sha256, "target cloud")?};
         let asset_manifest_sha256 =
             relocalization_digest(&request.asset_manifest_sha256, "asset manifest")?;
         let asset_bundle_sha256 =
@@ -5762,11 +5846,11 @@ mod preflight_only_contract {
         let algorithm_options_sha256 =
             relocalization_digest(&request.algorithm_options_sha256, "algorithm options")?;
         if request.source_policy_version != RELOCALIZATION_SOURCE_POLICY_VERSION_V1
-            || source_policy_sha256 != relocalization_source_policy_sha256_v1()
+            || source_policy_sha256 != if request.target_kind=="planar_graph" {planar_source_policy_sha256()}else{relocalization_source_policy_sha256_v1()}
             || request.deadline_policy_version != RELOCALIZATION_DEADLINE_POLICY_VERSION_V1
             || deadline_policy_sha256 != relocalization_deadline_policy_sha256_v1()
             || request.algorithm_options_version != RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1
-            || algorithm_options_sha256 != relocalization_algorithm_options_sha256_v1()
+            || algorithm_options_sha256 != if request.target_kind=="planar_graph" {planar_algorithm_policy_sha256()}else{relocalization_algorithm_options_sha256_v1()}
         {
             return Err("RELOCALIZATION_POLICY_IDENTITY_MISMATCH".to_owned());
         }
@@ -7017,6 +7101,7 @@ mod preflight_only_contract {
                 odom_frame_id,
                 body_frame_id,
                 None,
+                None,
             )
         }
 
@@ -7054,6 +7139,7 @@ mod preflight_only_contract {
                 odom_frame_id,
                 body_frame_id,
                 Some(runtime),
+                None,
             )
         }
 
@@ -7064,13 +7150,14 @@ mod preflight_only_contract {
             odom_frame_id: String,
             body_frame_id: String,
             runtime: Option<RelocalizationRuntimeContext>,
+            prepared_store: Option<RelocalizationTerminalStore>,
         ) -> Self {
             let (sender, receiver) = mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
             let (terminal_query_sender, terminal_query_receiver) =
                 mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
             let (detached_tx, detached_rx) = mpsc::unbounded_channel();
-            let terminal_store = RelocalizationTerminalStore::open()
-                .expect("durable relocalization terminal store must open before admission");
+            let terminal_store = prepared_store.unwrap_or_else(||RelocalizationTerminalStore::open()
+                .expect("durable relocalization terminal store must open before admission"));
             let ingress = RelocalizationCommandIngress {
                 sender,
                 terminal_query_sender,
@@ -7134,6 +7221,8 @@ mod preflight_only_contract {
     }
 
     struct RelocalizationCommandActor {
+        planar_pending:Option<(ValidatedRelocalizeRequest,u64,u64,Instant,PlanarCommandWork)>,
+        planar_inflight:bool,
         ledger: RelocalizationCommandLedger,
         waiter_responses: HashMap<u64, oneshot::Sender<crate::proto::RelocalizeResult>>,
         waiter_requests: HashMap<u64, (String, [u8; 32], Arc<RelocalizationWaiterCapacityLease>)>,
@@ -7175,6 +7264,7 @@ mod preflight_only_contract {
             terminal_store: RelocalizationTerminalStore,
         ) -> Self {
             Self {
+                planar_pending:None,planar_inflight:false,
                 ledger: RelocalizationCommandLedger::default(),
                 waiter_responses: HashMap::new(),
                 waiter_requests: HashMap::new(),
@@ -7509,6 +7599,7 @@ mod preflight_only_contract {
                 capacity_lease,
                 response,
                 mapping_lifecycle_guard,
+                planar_work,
             } = admission;
             // Production gRPC admission supplies this guard.  It remains
             // alive through ledger activation and the admission response, so
@@ -7542,7 +7633,7 @@ mod preflight_only_contract {
                     return Ok(());
                 }
             };
-            if self.execution.is_some()
+            if (self.execution.is_some() || self.planar_inflight)
                 && self.ledger.request(&request.request.request_id).is_none()
             {
                 let waiter = Self::immediate_waiter(
@@ -7676,16 +7767,12 @@ mod preflight_only_contract {
                     }
                 }
             };
-            if let (Some((admission_ordinal, mode_epoch, logical_deadline)), Some(runtime)) =
-                (started, runtime)
-            {
-                self.begin_runtime_execution(
-                    request,
-                    admission_ordinal,
-                    mode_epoch,
-                    logical_deadline,
-                    runtime,
-                )?;
+            if let Some((ordinal,epoch,deadline))=started {
+                if request.request.target_kind=="planar_graph" {
+                    if let Some(work)=planar_work {
+                        self.planar_pending=Some((request,ordinal,epoch,deadline,work));self.planar_inflight=true;
+                    } else {self.settle_active(crate::proto::RelocalizeDisposition::TargetUnavailable,"二维重定位执行器不可用")?;}
+                } else if let Some(runtime)=runtime {self.begin_runtime_execution(request,ordinal,epoch,deadline,runtime)?;}
             }
             let _ = response.send(Ok(waiter));
             drop(claim_guard);
@@ -8598,48 +8685,64 @@ mod preflight_only_contract {
     }
 
     async fn run_relocalization_ledger_loop(
-        actor: &mut RelocalizationCommandActor,
-        admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
-        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
-        detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
-        detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>,
-        phase_a: &CorrectionPhaseAControl,
-    ) -> Result<(), CorrectionRuntimeError> {
-        let mut admission_rx = phase_a.admission_tx.subscribe();
+        actor:&mut RelocalizationCommandActor,
+        admissions:&mut mpsc::Receiver<RelocalizationAdmissionRequest>,
+        terminal_queries:&mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
+        detached:&mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
+        detached_tx:&mpsc::UnboundedSender<RelocalizationWaiterEvent>,
+        phase_a:&CorrectionPhaseAControl,
+    )->Result<(),CorrectionRuntimeError> {
+        let mut admission_rx=phase_a.admission_tx.subscribe();
+        let (claims,mut claim_rx)=mpsc::channel::<PlanarClaim>(1);
+        let mut tasks=tokio::task::JoinSet::new();
+        let mut stopping=false;
         loop {
-            let deadline = actor.ledger.active_identity().map(|active| active.3);
-            tokio::select! {
-                biased;
-                _ = wait_for_admission_close(&mut admission_rx) => {
-                    admissions.close();
-                    actor.settle_active(
-                        crate::proto::RelocalizeDisposition::OwnerStopped,
-                        "RELOCALIZATION_OWNER_STOPPED_PRECLAIM",
-                    )?;
-                    return Ok(());
-                }
-                query = terminal_queries.recv() => match query {
-                    Some(query) => actor.handle_terminal_query(query),
-                    None => return Err(CorrectionRuntimeError::IngressClosed),
+            if let Some((request,ordinal,epoch,deadline,work))=actor.planar_pending.take() {
+                let context=PlanarCommandContext {epoch,deadline,request_identity:request.identity_sha256,
+                    request_id:request.request.request_id.clone(),claim:claims.clone()};
+                tasks.spawn(async move {(request,ordinal,work(context).await)});
+            }
+            if stopping && tasks.is_empty() {return Ok(());}
+            let deadline=actor.ledger.active_identity().and_then(|active|(active.4==RelocalizationClaimPhase::Preclaim).then_some(active.3));
+            tokio::select! {biased;
+                _=wait_for_admission_close(&mut admission_rx),if !stopping=>{
+                    stopping=true;admissions.close();
+                    actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,"RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;
                 },
-                event = detached.recv() => match event {
-                    Some(RelocalizationWaiterEvent::Detached(waiter_id)) => {
-                        actor.handle_detached(waiter_id)?;
-                    }
-                    None => return Err(CorrectionRuntimeError::IngressClosed),
+                query=terminal_queries.recv()=>match query {Some(q)=>actor.handle_terminal_query(q),None=>return Err(CorrectionRuntimeError::IngressClosed)},
+                event=detached.recv()=>match event {Some(RelocalizationWaiterEvent::Detached(id))=>actor.handle_detached(id)?,None=>return Err(CorrectionRuntimeError::IngressClosed)},
+                _=wait_until_optional_instant(deadline),if deadline.is_some()=>{
+                    actor.settle_active(crate::proto::RelocalizeDisposition::DeadlineExceeded,"RELOCALIZATION_LOGICAL_DEADLINE_EXCEEDED_PRECLAIM")?;
                 },
-                admission = admissions.recv() => match admission {
-                    Some(admission) => {
-                        actor.handle_admission(admission, detached_tx, None, phase_a)?
-                    }
-                    None => return Err(CorrectionRuntimeError::IngressClosed),
+                claim=claim_rx.recv()=>if let Some(claim)=claim {
+                    let fence=phase_a.command_claim_fence();let _guard=fence.lock();
+                    let valid=!stopping && phase_a.is_open() && actor.ledger.active_identity().is_some_and(|active|
+                        active.0==claim.request_id && active.1==claim.identity && Instant::now()<active.3);
+                    let applied=valid && actor.ledger.mark_postclaim(&claim.request_id,claim.identity).is_ok();
+                    let _=claim.reply.send(applied);
                 },
-                _ = wait_until_optional_instant(deadline), if deadline.is_some() => {
-                    actor.settle_active(
-                        crate::proto::RelocalizeDisposition::DeadlineExceeded,
-                        "RELOCALIZATION_LOGICAL_DEADLINE_EXCEEDED_PRECLAIM",
-                    )?;
-                }
+                joined=tasks.join_next(),if !tasks.is_empty()=>match joined {
+                    Some(Ok((request,ordinal,outcome)))=>{
+                        actor.planar_inflight=false;
+                        if actor.ledger.terminal(&request.request.request_id).is_none() {
+                            let terminal=if outcome.evidence.is_empty() {
+                                actor.terminal_result(&request,Some(ordinal),outcome.disposition,&outcome.detail)
+                            } else {
+                                let disclosure=build_relocalization_evidence_disclosure_v1(&outcome.evidence,None).map_err(|e|CorrectionRuntimeError::Apply(e.to_string()))?;
+                                StoredRelocalizationResult::new(build_relocalization_result(&request.request,request.identity_sha256,outcome.disposition,0,None,Vec::new(),
+                                    sha256_bytes(&outcome.evidence),disclosure,outcome.correction_revision,outcome.detail))
+                            };
+                            let terminal=actor.settle_terminal_durable(&request.request.request_id,request.identity_sha256,terminal)?;
+                            actor.notify_terminal(terminal);
+                        }
+                    },
+                    Some(Err(e))=>{phase_a.begin();return Err(CorrectionRuntimeError::WorkerJoin(format!("二维重定位保留任务异常：{e}")));},
+                    None=>{},
+                },
+                admission=admissions.recv(),if !stopping=>match admission {
+                    Some(a)=>actor.handle_admission(a,detached_tx,None,phase_a)?,
+                    None=>{stopping=true;actor.settle_active(crate::proto::RelocalizeDisposition::OwnerStopped,"RELOCALIZATION_OWNER_STOPPED_PRECLAIM")?;},
+                },
             }
         }
     }
@@ -8867,6 +8970,7 @@ mod preflight_only_contract {
     ) -> crate::proto::RelocalizeResult {
         let detail = detail.into();
         let mut result = crate::proto::RelocalizeResult {
+            target_kind:request.target_kind.clone(),target_graph_sha256:request.target_graph_sha256.clone(),
             schema_version: RELOCALIZATION_SCHEMA_VERSION_V1,
             request_id: request.request_id.clone(),
             request_identity_sha256: request_identity_sha256.to_vec(),
@@ -10053,6 +10157,16 @@ mod preflight_only_contract {
             sink: Arc<dyn CorrectionCandidateSink>,
             relocalization_mode: Arc<RelocalizationModeFence>,
         ) -> Result<Self, CorrectionRuntimeError> {
+            Self::start_inner(spec,identity,provider,sink,relocalization_mode,None).await
+        }
+
+        pub(crate) async fn start_planar(identity:CorrectionOwnerRuntimeIdentity,provider:&str,sink:Arc<dyn CorrectionCandidateSink>,mode:Arc<RelocalizationModeFence>,frames:(String,String,String))->Result<Self,CorrectionRuntimeError> {
+            Self::start_inner(CorrectionOwnerSpec::None,identity,provider,sink,mode,Some(frames)).await
+        }
+
+        async fn start_inner(spec:CorrectionOwnerSpec,identity:CorrectionOwnerRuntimeIdentity,provider:&str,sink:Arc<dyn CorrectionCandidateSink>,relocalization_mode:Arc<RelocalizationModeFence>,planar_frames:Option<(String,String,String)>)->Result<Self,CorrectionRuntimeError> {
+            let planar_only=planar_frames.is_some();
+            let mut planar_store=if planar_only {Some(RelocalizationTerminalStore::open().map_err(CorrectionRuntimeError::Apply)?)} else {None};
             let background = matches!(
                 &spec,
                 CorrectionOwnerSpec::LibraryPgo { .. } | CorrectionOwnerSpec::NativePgo { .. }
@@ -10074,7 +10188,7 @@ mod preflight_only_contract {
                     odom_frame_id.clone(),
                     body_frame_id.clone(),
                 )),
-                _ => None,
+                _ => planar_frames,
             };
             let candidate_owner = if relocalization_frames.is_some() {
                 None
@@ -10173,6 +10287,10 @@ mod preflight_only_contract {
                 relocalization_mode: phase_a.relocalization_mode(),
             };
             let (producer_worker, relocalization) = match relocalization_frames {
+                Some((map_frame_id, odom_frame_id, body_frame_id)) if planar_only => {
+                    drop(request_rx);
+                    (None,Some(RelocalizationOwnerSupervisor::start_inner(phase_a.clone(),identity.clone(),map_frame_id,odom_frame_id,body_frame_id,None,planar_store.take())))
+                },
                 Some((map_frame_id, odom_frame_id, body_frame_id)) => (
                     None,
                     Some(RelocalizationOwnerSupervisor::start_runtime(
@@ -11967,6 +12085,8 @@ mod preflight_only_contract {
         #[test]
         fn relocalization_terminal_proof_v1_matches_independent_full_result_golden() {
             let result = crate::proto::RelocalizeResult {
+                target_kind: String::new(),
+                target_graph_sha256: Vec::new(),
                 schema_version: 1,
                 request_id: "req-golden".to_owned(),
                 request_identity_sha256: vec![1; 32],
@@ -12399,6 +12519,9 @@ mod preflight_only_contract {
             target_cloud_revision: u64,
         ) -> crate::proto::RelocalizeRequest {
             crate::proto::RelocalizeRequest {
+                planar_seed: None,
+                target_kind: String::new(),
+                target_graph_sha256: Vec::new(),
                 schema_version: RELOCALIZATION_SCHEMA_VERSION_V1,
                 request_id: request_id.to_owned(),
                 runtime_generation: 2,
@@ -12461,6 +12584,7 @@ mod preflight_only_contract {
             actor
                 .handle_admission(
                     RelocalizationAdmissionRequest {
+                        planar_work: None,
                         request: raw_request.clone(),
                         capacity_lease: Arc::new(RelocalizationWaiterCapacityLease::new(
                             first_permit,
@@ -12499,6 +12623,7 @@ mod preflight_only_contract {
             actor
                 .handle_admission(
                     RelocalizationAdmissionRequest {
+                        planar_work: None,
                         request: raw_request,
                         capacity_lease: Arc::new(RelocalizationWaiterCapacityLease::new(
                             replay_permit,
@@ -12967,6 +13092,7 @@ mod preflight_only_contract {
             actor
                 .handle_admission(
                     RelocalizationAdmissionRequest {
+                        planar_work: None,
                         request: overflow_request,
                         capacity_lease,
                         response,
@@ -13234,6 +13360,7 @@ mod preflight_only_contract {
             request.target_cloud_sha256 = target_sha256.to_vec();
             let control = phase_a.activated_target_receipts();
             let seed = ActivationReceiptSeed {
+                planar_target: None,
                 activation_request_id: "activation-relocalization-runtime".to_owned(),
                 activation_request_identity_sha256: [4; 32],
                 asset_manifest_sha256: Some([9; 32]),
@@ -15017,6 +15144,7 @@ mod preflight_only_contract {
 
         fn activation_seed(request_id: &str, identity_byte: u8) -> ActivationReceiptSeed {
             ActivationReceiptSeed {
+                planar_target: None,
                 activation_request_id: request_id.to_owned(),
                 activation_request_identity_sha256: [identity_byte; 32],
                 asset_manifest_sha256: Some([2; 32]),
@@ -16732,6 +16860,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 body_frame_id: "robot_body".into(),
                 pipeline: LoopClosurePipelineConfig {
                     point_to_plane: false,
+                    loop_confirmation_frames: 1,
+                    gravity_prior_sigma_rad: None,
                     min_keyframes_for_loop_search: 3,
                     loop_submap_half_range: 0,
                     keyframe_translation: 0.1,
@@ -18267,6 +18397,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
             let pipeline = LoopClosurePipelineConfig {
                 point_to_plane: false,
+                loop_confirmation_frames: 1,
+                gravity_prior_sigma_rad: None,
                 min_keyframes_for_loop_search: 3,
                 loop_submap_half_range: 0,
                 keyframe_translation: 0.1,
@@ -19325,6 +19457,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let capacity_lease = Arc::new(RelocalizationWaiterCapacityLease::new(waiter_permit));
             let (detached_tx, _detached_rx) = mpsc::unbounded_channel();
             let admission = RelocalizationAdmissionRequest {
+                planar_work: None,
                 request: relocalization_command_request("phase-a-window", 7),
                 capacity_lease,
                 response,
@@ -19463,6 +19596,7 @@ pub(crate) use preflight_only_contract::{
     CorrectionProcessStopAttempt, CorrectionRejectReason, CorrectionRequestCancellation,
     CorrectionRuntimeError, CorrectionTransportOwner, CorrelatedOdomProof, FrozenCorrelatedOdom,
     GeometryCorrectionSink, RegisteredCloudProof, RelocalizationCommandError,
+    PlanarCommandWork, PlanarCommandContext, PlanarCommandOutcome, planar_source_policy_sha256, planar_algorithm_policy_sha256,
     RelocalizationCommandIngress, RelocalizationCommandWaiter, RelocalizationModeFence,
     RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1,
     RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION_V1,

@@ -1682,7 +1682,7 @@ class GatewayRuntime:
             self.platform_geometry_runtime.start_external_debug_observers()
         except Exception:
             RUNTIME_LOGGER.debug("启动外部几何 debug observer 失败。", exc_info=True)
-        if self._pointcloud_map_stream_subscription_id is None:
+        if getattr(self.config.geometry, "pipeline", "lio_3d") != "slam_2d" and self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
                 topics=("map.frame",),
@@ -1704,7 +1704,7 @@ class GatewayRuntime:
                 self._localization_stream_unsubscriber = localization_unsubscriber if callable(localization_unsubscriber) else None
 
         point_cloud_subscriber = getattr(providers, "subscribe_point_cloud", None)
-        if callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
+        if getattr(self.config.geometry, "pipeline", "lio_3d") != "slam_2d" and callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
             self._point_cloud_stream_subscription_id = point_cloud_subscriber(self._publish_point_cloud_stream_frame)
 
     def _publish_navigation_bootstrap_stream_frames(self) -> None:
@@ -1851,6 +1851,8 @@ class GatewayRuntime:
         return PointCloudMapSourceSwitch(live_source, saved_source)
 
     def _start_pointcloud_map_stream(self) -> None:
+        if getattr(self.config.geometry, "pipeline", "lio_3d") == "slam_2d":
+            return
         with self._lock:
             thread = self._pointcloud_map_stream_thread
             if thread is not None and thread.is_alive():
@@ -2596,6 +2598,8 @@ class GatewayRuntime:
                     {
                         "map_name": {"type": "string"},
                         "request_id": {"type": "string"},
+                        "planar_seed": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3,
+                            "description": "二维地图初始位置[x米, y米, 偏航弧度]；缺省使用近期位置或图中保存位置作为匹配初值。"},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
                 ),
@@ -10368,6 +10372,8 @@ class GatewayRuntime:
 
         if capability_name not in _LIVE_GEOMETRY_INPUT_CAPABILITY_NAMES:
             return False
+        if getattr(getattr(getattr(self, "config", None), "geometry", None), "pipeline", "lio_3d") == "slam_2d":
+            return True
         providers = getattr(getattr(self, "robot", None), "providers", None)
         return isinstance(providers, (
             StreamingSensorSampleProvider,
@@ -10411,11 +10417,22 @@ class GatewayRuntime:
             providers, StreamingPointCloudProvider
         ) else None
         sensor_sample_provider = providers if isinstance(providers, StreamingSensorSampleProvider) else None
+        source_owner = None
+        geometry_config = getattr(getattr(self, "config", None), "geometry", None)
+        device_config = getattr(geometry_config, "slam2d_device", "").strip()
+        if getattr(geometry_config, "pipeline", "lio_3d") == "slam_2d" and device_config:
+            from drivers.entry import create_planar_sensor_source
+            live = remote_provider.get_geometry_pipeline()
+            if live.get("geometry_pipeline") != "slam_2d":
+                raise RuntimeError("二维设备配置与实际Geometry执行链不一致")
+            source_owner = create_planar_sensor_source(device_config, live["planar_input_config"])
+            sensor_sample_provider = source_owner.provider
         bridge = build_default_runtime_input_bridge(
             runtime_provider=remote_provider,
             localization_provider=localization_provider,
             point_cloud_provider=point_cloud_provider,
             sensor_sample_provider=sensor_sample_provider,
+            **({"sensor_source_owner": source_owner} if source_owner is not None else {}),
         )
         # 先接管资源引用，完整启动后才提交可复用状态；回滚失败仍保留清理拥有权。
         self._input_bridge = bridge
@@ -14158,7 +14175,10 @@ class GatewayRuntime:
             return None
         map_asset = getattr(active_workspace, "map_asset", None)
         if bool(getattr(map_asset, "finalized", False)):
-            return None
+            reader = getattr(getattr(self, "platform_geometry_runtime", None), "get_mapping_session_context", None)
+            context = reader() if callable(reader) else None
+            if not isinstance(context, dict) or context.get("planar_mode") != "mapping" or context.get("active") is not True:
+                return None
         if not self._exploration_snapshot_matches_active_map(active_workspace):
             RUNTIME_LOGGER.warning(
                 "跳过探索后自动完成地图：live 地图快照不属于当前激活地图 map_name=%s trigger=%s",

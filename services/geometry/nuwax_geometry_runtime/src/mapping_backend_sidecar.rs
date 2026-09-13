@@ -1283,6 +1283,7 @@ fn encode_candidate(
     encoder.u64(candidate.source_timestamp_ns);
     encoder.u64(candidate.received_at_ns);
     encoder.u8(match candidate.backend_kind {
+        MappingBackendKind::SlamToolbox => return Err("二维算法不得进入点云工作进程".into()),
         MappingBackendKind::Voxel => 0,
         MappingBackendKind::Raytracing => 1,
     });

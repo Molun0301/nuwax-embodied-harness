@@ -132,7 +132,7 @@ def _exploration_post_rpc_lock(lock, deadline_monotonic, rpc_name):
 # 与 core.settings._normalize_lcm_backend 保持一致，只允许生产后端。
 _CANONICAL_LCM_BACKENDS: FrozenSet[str] = frozenset({"real-lcm"})
 _SUPPORTED_MAPPING_BACKEND_KINDS: FrozenSet[str] = frozenset(
-    {"raytracing", "voxel"}
+    {"raytracing", "voxel", "slam_toolbox"}
 )
 
 if TYPE_CHECKING:
@@ -2916,8 +2916,11 @@ class PlatformGeometryRuntime:
         data_plane_status = data_plane_status or self._build_data_plane_status()
         map_stream = dict(self._map_stream_tracker)
         tf_chain = self._build_tf_chain_status(tf_localization_status=tf_localization_status)
+        planar = getattr(self.config, "pipeline", "lio_3d") == "slam_2d"
+        backend_ready = (live_map_status.get("mapping_diagnostics") or {}).get("ready") is True
         first_frame_ready = bool(
-            live_map_status.get("occupancy_grid_ready")
+            (not planar or backend_ready)
+            and live_map_status.get("occupancy_grid_ready")
             and int(live_map_status.get("occupancy_message_count") or 0) > 0
             and live_map_status.get("occupancy_has_publisher") is not False
         )
@@ -2927,10 +2930,12 @@ class PlatformGeometryRuntime:
             or str(self._activation_result_from_snapshot(activation_snapshot).get("backend_mode") or "") == "mapping_localization"
         )
         streaming_ready = bool(first_frame_ready and map_stream.get("streaming"))
-        streaming_required = not localization_process
+        # 二维图按关键帧变化，连续扫描和坐标就绪不要求静止地图制造新修订。
+        streaming_required = not localization_process and not planar
         map_ready = bool(first_frame_ready and (streaming_ready or not streaming_required))
         localization_ready = bool(map_ready and tf_chain.get("ready"))
         bridge_alive, health_message = self._probe_geometry_runtime_health()
+        localization_ready = localization_ready and bridge_alive
         if not bridge_alive:
             message = "等待 nuwax-geometry-runtime gRPC HealthCheck：%s" % (health_message or "pending")
             waiting_for = "geometry_runtime_health"
@@ -3289,6 +3294,7 @@ class PlatformGeometryRuntime:
             diagnostics = list(self._runtime_diagnostics)
             started = self._runtime_started
         return {
+            "geometry_pipeline": getattr(self.config, "pipeline", "lio_3d"),
             "phase": phase,
             "state": phase,
             "message": message,
@@ -3836,6 +3842,8 @@ class PlatformGeometryRuntime:
                 "algorithm_options_version",
                 "algorithm_options_sha256",
             )
+            if activation.get("target_kind") == "planar_graph":
+                fields += ("target_kind", "target_graph_sha256")
             return {field_name: activation.get(field_name) for field_name in fields}
 
     def get_validated_relocalization_receipt(
@@ -3936,6 +3944,8 @@ class PlatformGeometryRuntime:
                 "correction_revision",
                 "terminal_proof_sha256",
             )
+            if payload.get("target_kind") == "planar_graph":
+                fields += ("target_kind", "target_graph_sha256", "planar_seed")
             if any(field_name not in payload for field_name in fields):
                 raise ValueError("重定位成功终态缺少可持久化身份字段。")
             return {field_name: payload[field_name] for field_name in fields}
@@ -3945,6 +3955,7 @@ class PlatformGeometryRuntime:
         *,
         request_id: str,
         logical_timeout_ms: int,
+        planar_seed: Optional[List[float]] = None,
         map_name: str,
         asset_manifest_sha256: str,
         activation_receipt: Dict[str, object],
@@ -3996,6 +4007,7 @@ class PlatformGeometryRuntime:
             activation_state=activation,
             request_id=request_id,
             logical_timeout_ms=logical_timeout_ms,
+            **({"planar_seed": planar_seed} if planar_seed is not None else {}),
         )
         with self._runtime_state_lock:
             if not self._map_activation_snapshot_still_current_locked(snapshot):
@@ -4086,6 +4098,27 @@ class PlatformGeometryRuntime:
                 == str(snapshot.bundle.manifest_sha256 or "").lower()
             )
 
+    def resolve_planar_relocalization_seed(self, value=None):
+        with self._runtime_state_lock:
+            activation = self._activation_result_from_snapshot(self._map_activation_snapshot_locked())
+        if activation.get("target_kind") != "planar_graph":
+            if value is not None:
+                raise ValueError("当前三维地图不接受二维初始位置")
+            return None
+        if value is None:
+            provider = self.get_geometry_runtime_provider()
+            pose = provider.get_current_pose() if provider is not None else None
+            if pose is not None and 0 <= time.time() - pose.timestamp.timestamp() <= 1.0:
+                q = pose.orientation
+                value = [pose.position.x, pose.position.y, math.atan2(2 * (q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))]
+            else:
+                value = activation.get("planar_default_seed")
+        if not isinstance(value, (list, tuple)) or len(value) != 3 or any(isinstance(v, bool) or not isinstance(v, (int,float)) or not math.isfinite(v) for v in value):
+            raise ValueError("二维重定位初始位置必须为三个有限数值")
+        if abs(value[2]) > math.pi:
+            raise ValueError("二维重定位偏航角应在负π到π范围内")
+        return [float(v) for v in value]
+
     def relocalize_active_map(
         self,
         *,
@@ -4093,6 +4126,7 @@ class PlatformGeometryRuntime:
         asset_manifest_sha256: str,
         request_id: Optional[str] = None,
         logical_timeout_ms: int = 10_000,
+        planar_seed: Optional[List[float]] = None,
     ) -> Dict[str, object]:
         provider = self.get_geometry_runtime_provider()
         if provider is None:
@@ -4108,6 +4142,7 @@ class PlatformGeometryRuntime:
             activation_state=activation,
             request_id=request_id,
             logical_timeout_ms=logical_timeout_ms,
+            **({"planar_seed": planar_seed} if planar_seed is not None else {}),
         )
         if not bool(result.get("success")):
             raise GeometryRuntimeRelocalizationRejected(result)
@@ -4902,7 +4937,7 @@ class PlatformGeometryRuntime:
             "source_occupancy_revision": int(meta.revision),
             "source_cloud_revision": int(
                 checkpoint_bundle.cloud_asset["source_cloud_revision"]
-            ),
+            ) if checkpoint_bundle.cloud_asset is not None else None,
             "source_timestamp_ns": timestamp_ns,
             "content_sha256": checkpoint_bundle.checkpoint.content_sha256.hex(),
             "payload_size": checkpoint_bundle.checkpoint.payload_size,
@@ -5063,6 +5098,8 @@ class PlatformGeometryRuntime:
                 checkpoint_bundle,
             )
 
+        planar_graph = checkpoint_bundle is not None and checkpoint_bundle.backend_kind == "slam_toolbox"
+        stored_backend_checkpoint = checkpoint_bundle.publish_to(resolved_bundle_root) if planar_graph else None
         previous_asset = bundle.geometry_asset
         parameter_summary = self._build_parameter_summary()
         profile_summary = self._clone_metadata(parameter_summary.get("profile") or {})
@@ -5070,6 +5107,8 @@ class PlatformGeometryRuntime:
             resolved_bundle_root,
             bundle.map_name,
         )
+        if planar_graph:
+            mapping_database_path = stored_backend_checkpoint.object_path
         pcd_path = self._bundle_pcd_asset_path(resolved_bundle_root)
         mapping_database_relative = self._bundle_relative_path(
             resolved_bundle_root,
@@ -5089,30 +5128,36 @@ class PlatformGeometryRuntime:
                     "revision": checkpoint_mapping_context.get("revision"),
                 }
             )
-        database_metadata = self._materialize_backend_state(mapping_database_path)
-        if checkpoint_bundle is not None and (
-            not bool(database_metadata.get("database_present"))
-            or not self._is_usable_mapping_db_file(mapping_database_path)
-        ):
-            database_metadata = self._materialize_native_bundle_database(
-                mapping_database_path,
-                bundle=bundle,
-                checkpoint_bundle=checkpoint_bundle,
-                mapping_context=checkpoint_mapping_context or {},
-            )
-        if export_backend_checkpoint and (
-            not bool(database_metadata.get("database_present"))
-            or not self._is_usable_mapping_db_file(mapping_database_path)
-        ):
-            raise RuntimeError(
-                "finalized 地图资产包缺少可用的建图数据库"
-            )
+        if planar_graph:
+            database_metadata = {"database_present": True, "database_source_kind": "planar_graph",
+                "database_target_path": str(mapping_database_path), "payload_size": checkpoint_bundle.checkpoint.payload_size}
+        else:
+            database_metadata = self._materialize_backend_state(mapping_database_path)
+            if checkpoint_bundle is not None and (
+                not bool(database_metadata.get("database_present"))
+                or not self._is_usable_mapping_db_file(mapping_database_path)
+            ):
+                database_metadata = self._materialize_native_bundle_database(
+                    mapping_database_path,
+                    bundle=bundle,
+                    checkpoint_bundle=checkpoint_bundle,
+                    mapping_context=checkpoint_mapping_context or {},
+                )
+            if export_backend_checkpoint and (
+                not bool(database_metadata.get("database_present"))
+                or not self._is_usable_mapping_db_file(mapping_database_path)
+            ):
+                raise RuntimeError(
+                    "finalized 地图资产包缺少可用的建图数据库"
+                )
         # Native save derives every persisted geometry asset from one fenced bundle.
         nav2_map_metadata = self._materialize_nav2_map_assets(
             bundle,
             bundle_root=resolved_bundle_root,
         )
-        if skip_pcd_export:
+        if planar_graph:
+            pcd_metadata = {"pcd_present": False, "pcd_source_kind": "not_applicable_planar_graph"}
+        elif skip_pcd_export:
             pcd_metadata = {
                 "pcd_present": self._is_usable_pcd_file(pcd_path),
                 "pcd_source_kind": "skipped_for_activation",
@@ -5125,19 +5170,17 @@ class PlatformGeometryRuntime:
             )
         else:
             pcd_metadata = self._materialize_pcd_asset(pcd_path)
-        stored_backend_checkpoint = None
         if checkpoint_bundle is not None:
             if not bool(nav2_map_metadata.get("present")):
                 raise RuntimeError(
                     "canonical mapping checkpoint could not materialize Nav2 assets"
                 )
-            if not bool(pcd_metadata.get("pcd_present")):
+            if not planar_graph and not bool(pcd_metadata.get("pcd_present")):
                 raise RuntimeError(
                     "canonical mapping checkpoint could not materialize its PCD asset"
                 )
-            stored_backend_checkpoint = checkpoint_bundle.publish_to(
-                resolved_bundle_root
-            )
+            if stored_backend_checkpoint is None:
+                stored_backend_checkpoint = checkpoint_bundle.publish_to(resolved_bundle_root)
         if export_backend_checkpoint and stored_backend_checkpoint is None:
             raise RuntimeError("finalized 地图资产包缺少 backend checkpoint")
         backend_checkpoint_metadata = None
@@ -5181,7 +5224,7 @@ class PlatformGeometryRuntime:
         database_quality = dict(persisted_quality_metrics.get("database") or {})
         database_required = bool(database_quality.get("required", True))
         database_present = bool(database_quality.get("present", False))
-        database_asset_type = MapGeometryAssetType.MAPPING_DATABASE
+        database_asset_type = MapGeometryAssetType.PLANAR_GRAPH if planar_graph else MapGeometryAssetType.MAPPING_DATABASE
         asset_refs = []
         if database_required or database_present:
             asset_refs.append(
@@ -5214,17 +5257,18 @@ class PlatformGeometryRuntime:
                     metadata={"required": True, "state_kind": "navigation_map_yaml"},
                 )
             )
-        asset_refs.append(
-            MapGeometryAssetRef(
-                asset_type=MapGeometryAssetType.PCD,
-                path=pcd_relative,
-                frame_id=bundle.frame_id,
-                profile_summary=profile_summary,
-                built_at=built_at,
-                quality_metrics=dict(persisted_quality_metrics.get("pcd") or {}),
-                metadata={"required": False},
+        if not planar_graph:
+            asset_refs.append(
+                MapGeometryAssetRef(
+                    asset_type=MapGeometryAssetType.PCD,
+                    path=pcd_relative,
+                    frame_id=bundle.frame_id,
+                    profile_summary=profile_summary,
+                    built_at=built_at,
+                    quality_metrics=dict(persisted_quality_metrics.get("pcd") or {}),
+                    metadata={"required": False},
+                )
             )
-        )
         persisted_database_metadata = self._relativize_bundle_metadata(
             database_metadata,
             resolved_bundle_root,
@@ -5242,7 +5286,7 @@ class PlatformGeometryRuntime:
             geometry_stack=self.config.stack,
             frame_id=bundle.frame_id,
             mapping_database_path=mapping_database_relative,
-            pcd_path=pcd_relative,
+            pcd_path=None if planar_graph else pcd_relative,
             occupancy_projection=self.config.mapping.occupancy_projection,
             costmap_source=str(self.config.navigation.costmap_source),
             parameter_summary=parameter_summary,
@@ -5251,6 +5295,7 @@ class PlatformGeometryRuntime:
             assets=list(asset_refs),
             built_at=built_at,
             metadata={
+                "target_kind": "planar_graph" if planar_graph else "cloud_map",
                 **(dict(previous_asset.metadata) if previous_asset is not None else {}),
                 "geometry_asset_path": self._bundle_relative_path(
                     resolved_bundle_root,
@@ -7154,6 +7199,7 @@ class PlatformGeometryRuntime:
         nav2_map_metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         diagnostics = []
+        planar_graph = database_metadata.get("database_source_kind") == "planar_graph"
         nav2_map_metadata = dict(nav2_map_metadata or {})
         database_present = bool(database_metadata.get("database_present", False))
         external_stack = self._uses_external_geometry_stack()
@@ -7168,7 +7214,7 @@ class PlatformGeometryRuntime:
             )
         )
         native_checkpoint_ready = bool(
-            native_checkpoint_switch_supported and nav2_map_present
+            native_checkpoint_switch_supported and nav2_map_present and (not planar_graph or database_present)
         )
         database_required = not external_stack and not native_checkpoint_ready
         pcd_present = bool(pcd_metadata.get("pcd_present", False))
@@ -7217,7 +7263,7 @@ class PlatformGeometryRuntime:
                     "message": "未找到建图状态数据库；当前资产包使用导航地图作为定位检查点。",
                 }
             )
-        if database_present and not live_streaming_ready:
+        if database_present and not live_streaming_ready and not planar_graph:
             diagnostics.append(
                 {
                     "level": "warning",
@@ -7237,7 +7283,7 @@ class PlatformGeometryRuntime:
                     "message": "地图资产包 PCD 点云无效（点数过少或为模板占位文件），请重新建图。",
                     }
                 )
-        if not pcd_present:
+        if not pcd_present and not planar_graph:
             diagnostics.append(
                 {
                     "level": "warning",
@@ -7282,7 +7328,7 @@ class PlatformGeometryRuntime:
                 native_checkpoint_switch_supported or external_stack
             ),
             "source_mode": (
-                "live_streaming_checkpoint" if live_streaming_ready
+                "planar_graph_checkpoint" if planar_graph else "live_streaming_checkpoint" if live_streaming_ready
                 else "native_occupancy_checkpoint" if native_checkpoint_ready
                 else "mapping_database_checkpoint" if external_stack and backend_checkpoint_ready
                 else "navigation_map_checkpoint" if external_stack and nav2_map_present
@@ -9220,6 +9266,9 @@ class PlatformGeometryRuntime:
                 or int(response.get("session_generation") or 0) <= 0
             ):
                 raise RuntimeError("StartMapping 未确认匹配的 ACTIVE Rust 会话。")
+            if response.get("planar_mode") == "mapping" and active_bundle is not None:
+                new_session_started = True
+                self.clear_active_map_asset(reason="二维图进入新的续建会话，旧激活目标已退役")
             context = {
                 **dict(response),
                 "session_id": session_id,

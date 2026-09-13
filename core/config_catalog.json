@@ -1995,5 +1995,75 @@
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
     "description": "外包中心相对机体基准的Z坐标；留空保留模型偏移，完整手填长宽高时默认为0。高度上下界由中心加减半高确定，不从地面高度猜测。"
+  },
+  "NUWAX_GEOMETRY_PIPELINE": {
+    "zh_name": "几何执行链",
+    "type": "str",
+    "default": "lio_3d",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
+      "services/geometry/planar_input_bridge.py"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "选择二维激光建图或三维激光惯性链；保存后重启Geometry与网关，二维链不启动三维点云拥有方。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_CONFIG": {
+    "zh_name": "二维扫描与算法配置",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
+      "services/geometry/planar_input_bridge.py"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "JSON（结构化数据）对象，明确sensor_id、frame_id、map_frame_id、odom_frame_id、body_frame_id、clock_domain、clock_id、calibration_ref、odometry_source及core_config；core_config.base_from_laser必须为真实平面外参。monotonic_ns时clock_id可写local_boot，由拥有方在启动时解析为真实boot_id。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_DEVICE": {
+    "zh_name": "二维雷达连接配置",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "gateways/runtime.py",
+      "drivers/entry.py",
+      "drivers/common/planar_source.py"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "可选JSON对象，包含思岚雷达port、baudrate、scan_mode等；为空时消费机器人标准二维扫描提供器。"
+  },
+  "NUWAX_GEOMETRY_SLAM2D_BINARY": {
+    "zh_name": "二维算法程序路径",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "scripts/systemd/start_geometry_runtime.sh",
+      "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs"
+    ],
+    "apply_scope": "重启Geometry与网关后生效",
+    "description": "可选显式程序路径，未配置时使用公共工作区release目录的nuwax-slam-2d-worker。"
+  },
+  "NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION": {
+    "zh_name": "二维导航实时观测通道",
+    "type": "str",
+    "default": "/nav/planar_occupancy#nuwax_msgs.PlanarNavigationMap",
+    "section_id": "lcm",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
+    ],
+    "apply_scope": "重启网关、Geometry及导航后端后生效",
+    "aliases": [
+      "NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL"
+    ],
+    "description": "二维执行链专用派生观测，携带规范地图身份和新鲜扫描时间；不得与规范占据栅格通道重合。"
   }
 }

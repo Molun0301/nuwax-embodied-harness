@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -422,6 +423,9 @@ class MapCatalogRepository:
             "algorithm_options_version",
             "algorithm_options_sha256",
         }
+        planar = payload.get("target_kind") == "planar_graph"
+        if planar:
+            required_fields.update({"target_kind", "target_graph_sha256"})
         if set(payload) != required_fields:
             raise ValueError("地图激活成功凭据字段不完整或包含未知字段。")
         target_name = MapCatalogRepository._require_bounded_string(
@@ -480,7 +484,7 @@ class MapCatalogRepository:
             "deadline_policy_version",
             "algorithm_options_version",
         )
-        if target_available:
+        if target_available and not planar:
             positive_fields += ("cloud_source_revision",)
         for field_name in positive_fields:
             value = MapCatalogRepository._require_positive_int(
@@ -515,7 +519,7 @@ class MapCatalogRepository:
             "algorithm_options_sha256",
         )
         if target_available:
-            digest_fields += ("target_receipt_sha256", "cloud_source_sha256")
+            digest_fields += ("target_receipt_sha256", "target_graph_sha256" if planar else "cloud_source_sha256")
         for field_name in digest_fields:
             receipt[field_name] = MapCatalogRepository._require_sha256(
                 payload.get(field_name),
@@ -530,6 +534,8 @@ class MapCatalogRepository:
                 if payload.get(field_name) != empty_value:
                     raise ValueError("二维地图激活凭据不能携带不完整的三维目标身份。")
                 receipt[field_name] = empty_value
+        if planar and (receipt["mapping_backend_kind"] != "slam_toolbox" or not target_available or payload.get("cloud_source_revision") != 0 or payload.get("cloud_source_sha256") != ""):
+            raise ValueError("二维完整图激活凭据不能冒充三维目标")
         receipt["relocalization_target_available"] = target_available
         receipt["trusted_identity"] = True
         return receipt
@@ -827,7 +833,7 @@ class MapCatalogRepository:
             "algorithm_options_version",
             "algorithm_options_sha256",
         )
-        return tuple(receipt.get(field_name) for field_name in fields)
+        return tuple(receipt.get(field_name) for field_name in fields + ("target_kind", "target_graph_sha256", "planar_seed"))
 
     def begin_relocalization_durable(
         self,
@@ -835,6 +841,7 @@ class MapCatalogRepository:
         request_id: str,
         logical_timeout_ms: int,
         activation_receipt: Dict[str, object],
+        planar_seed: Optional[List[float]] = None,
     ) -> Dict[str, object]:
         """在 RPC dispatch 前持久化绑定 sealed target 的重定位 intent。"""
 
@@ -843,7 +850,7 @@ class MapCatalogRepository:
                 activation_receipt
             )
             if activation.get("relocalization_target_available") is not True:
-                raise ValueError("当前二维地图没有可供重定位使用的三维点云目标。")
+                raise ValueError("当前地图没有已封存的重定位目标。")
             resolved_request_id = self._require_relocalization_request_id(
                 request_id
             )
@@ -857,6 +864,7 @@ class MapCatalogRepository:
                 request_id=resolved_request_id,
                 logical_timeout_ms=timeout_ms,
                 activation_receipt=activation,
+                planar_seed=planar_seed,
             )
             existing = self.get_relocalization_intent()
             if existing is not None:
@@ -969,13 +977,25 @@ class MapCatalogRepository:
             return payload
 
     @staticmethod
+    def _validate_planar_seed(value):
+        if not isinstance(value, (list, tuple)) or len(value) != 3 or any(isinstance(v, bool) or not isinstance(v, (float,int)) or not math.isfinite(v) for v in value) or abs(value[2]) > math.pi:
+            raise ValueError("二维初始位置必须为有限的x、y、偏航角")
+        return [float(v) for v in value]
+
+    @staticmethod
     def _relocalization_intent_identity(
         *,
         request_id: str,
         logical_timeout_ms: int,
         activation_receipt: Dict[str, object],
+        planar_seed: Optional[List[float]] = None,
     ) -> Dict[str, object]:
+        if activation_receipt.get("target_kind") == "planar_graph":
+            planar_seed = MapCatalogRepository._validate_planar_seed(planar_seed)
+        elif planar_seed is not None:
+            raise ValueError("三维重定位不能携带二维初值")
         return {
+            **({"planar_seed": planar_seed} if planar_seed is not None else {}),
             "request_id": request_id,
             "logical_timeout_ms": logical_timeout_ms,
             "target_map_name": activation_receipt["target_map_name"],
@@ -1016,6 +1036,8 @@ class MapCatalogRepository:
             "target_receipt_sha256",
             "asset_bundle_sha256",
         )
+        if "planar_seed" in payload:
+            fields += ("planar_seed",)
         return {field_name: payload[field_name] for field_name in fields}
 
     def _validate_relocalization_intent(
@@ -1039,6 +1061,9 @@ class MapCatalogRepository:
             "asset_bundle_sha256",
             "terminal_receipt",
         }
+        if isinstance(payload, dict) and "planar_seed" in payload:
+            required_fields.add("planar_seed")
+            self._validate_planar_seed(payload["planar_seed"])
         if not isinstance(payload, dict) or set(payload) != required_fields:
             raise ValueError("重定位 durable intent 字段不完整或包含未知字段。")
         if payload.get("schema_version") != _RELOCALIZATION_INTENT_SCHEMA_VERSION:
@@ -1131,7 +1156,7 @@ class MapCatalogRepository:
             ("target_receipt_sha256", "target_receipt_sha256"),
             ("asset_bundle_sha256", "asset_bundle_sha256"),
         )
-        if any(receipt[left] != intent[right] for left, right in pairs):
+        if any(receipt[left] != intent[right] for left, right in pairs) or ("planar_seed" in intent and receipt.get("planar_seed") != intent["planar_seed"]):
             raise ValueError("重定位 terminal receipt 与 durable intent 不一致。")
 
     def _require_trusted_activation_receipt(
@@ -1369,7 +1394,7 @@ class MapCatalogRepository:
             "correction_revision",
             "terminal_proof_sha256",
         )
-        return tuple(receipt.get(field_name) for field_name in fields)
+        return tuple(receipt.get(field_name) for field_name in fields + ("target_kind", "target_graph_sha256", "planar_seed"))
 
     @staticmethod
     def _validate_relocalization_receipt(
@@ -1405,6 +1430,11 @@ class MapCatalogRepository:
             "correction_revision",
             "terminal_proof_sha256",
         }
+        planar = isinstance(payload, dict) and payload.get("target_kind") == "planar_graph"
+        if planar:
+            required_fields.update({"target_kind", "target_graph_sha256", "planar_seed"})
+            MapCatalogRepository._validate_planar_seed(payload.get("planar_seed"))
+            MapCatalogRepository._require_sha256(payload.get("target_graph_sha256"), "二维图摘要")
         if not isinstance(payload, dict) or set(payload) != required_fields:
             raise ValueError("重定位终态凭据字段不完整或包含未知字段。")
         schema_version = payload.get("schema_version")
@@ -1452,6 +1482,10 @@ class MapCatalogRepository:
             "candidate_sequence",
             "correction_revision",
         )
+        if planar:
+            positive_fields = tuple(k for k in positive_fields if k not in {"target_cloud_revision", "candidate_sequence"})
+            if payload.get("target_cloud_revision") != 0 or payload.get("candidate_sequence") != 0 or payload.get("target_cloud_sha256") != "" or payload.get("candidate_payload_sha256") != "":
+                raise ValueError("二维重定位不能携带三维候选凭据")
         for field_name in positive_fields:
             receipt[field_name] = MapCatalogRepository._require_positive_int(
                 payload.get(field_name),
@@ -1482,6 +1516,8 @@ class MapCatalogRepository:
             "evidence_sha256",
             "terminal_proof_sha256",
         )
+        if planar:
+            digest_fields = tuple(k for k in digest_fields if k not in {"target_cloud_sha256", "candidate_payload_sha256"})
         for field_name in digest_fields:
             receipt[field_name] = MapCatalogRepository._require_sha256(
                 payload.get(field_name),

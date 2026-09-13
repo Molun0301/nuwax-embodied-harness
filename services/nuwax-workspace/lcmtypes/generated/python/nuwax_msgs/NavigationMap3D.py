@@ -136,3 +136,4 @@ class NavigationMap3D(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", NavigationMap3D._get_packed_fingerprint())[0]
+

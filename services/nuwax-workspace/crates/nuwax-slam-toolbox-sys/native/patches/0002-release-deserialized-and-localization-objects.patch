@@ -1,0 +1,66 @@
+--- a/upstream/karto/include/karto_sdk/Karto.h
++++ b/upstream/karto/include/karto_sdk/Karto.h
+@@ -702,6 +702,7 @@
+ private:
+   Name m_Name;
+   ParameterManager * m_pParameterManager;
++  void ResetParametersBeforeLoad();
+   /**
+ * Serialization: class Object
+ */
+@@ -710,6 +711,8 @@
+   void serialize(Archive & ar, const unsigned int version)
+   {
+     ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(NonCopyable);
++    // 反序列化会替换指针，先释放默认构造生成的参数表。
++    if (Archive::is_loading::value) { ResetParametersBeforeLoad(); }
+     ar & BOOST_SERIALIZATION_NVP(m_pParameterManager);
+     ar & BOOST_SERIALIZATION_NVP(m_Name);
+   }
+@@ -6957,7 +6960,8 @@
+     if (Archive::is_loading::value) {
+       m_ppLookupArray = new LookupArray * [m_Capacity];
+       for (kt_int32u i = 0; i < m_Capacity; i++) {
+-        m_ppLookupArray[i] = new LookupArray();
++        // 指针对象由Boost恢复，不能预先创建后再被覆盖。
++        m_ppLookupArray[i] = nullptr;
+       }
+     }
+     ar & boost::serialization::make_array<LookupArray *>(m_ppLookupArray, m_Capacity);
+--- a/upstream/karto/src/Karto.cpp
++++ b/upstream/karto/src/Karto.cpp
+@@ -78,6 +78,12 @@
+ {
+ }
+ 
++void Object::ResetParametersBeforeLoad()
++{
++  delete m_pParameterManager;
++  m_pParameterManager = nullptr;
++}
++
+ Object::~Object()
+ {
+   delete m_pParameterManager;
+--- a/upstream/karto/src/Mapper.cpp
++++ b/upstream/karto/src/Mapper.cpp
+@@ -2984,6 +2984,9 @@
+     // free hat!
+     // No need to delete from m_scans as those pointers will be freed memory
+     oldLSV.vertex->RemoveObject();
++    // 节点已从图和求解器移除，窗口拥有方负责释放节点本身。
++    delete oldLSV.vertex;
++    oldLSV.vertex = nullptr;
+     m_pMapperSensorManager->RemoveScan(oldLSV.scan);
+     if (oldLSV.scan) {
+       delete oldLSV.scan;
+@@ -3001,6 +3004,9 @@
+     LocalizationScanVertex& oldLSV = m_LocalizationScanVertices.front();
+     RemoveNodeFromGraph(oldLSV.vertex);
+     oldLSV.vertex->RemoveObject();
++    // 节点已从图和求解器移除，窗口拥有方负责释放节点本身。
++    delete oldLSV.vertex;
++    oldLSV.vertex = nullptr;
+     m_pMapperSensorManager->RemoveScan(oldLSV.scan);
+     if (oldLSV.scan)
+     {

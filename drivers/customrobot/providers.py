@@ -14,7 +14,7 @@ from contracts.geometry import Twist, Vector3
 from contracts.image import CameraInfo, ImageFrame
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotState, SafetyState
-from contracts.sensors import CanonicalImuSample, CanonicalLidarFrame, SensorClockDomain, SensorSample
+from contracts.sensors import CanonicalLaserScan, CanonicalImuSample, CanonicalLidarFrame, SensorClockDomain, SensorSample
 from providers.motion import MotionControl
 
 
@@ -40,6 +40,7 @@ class CustomRobotProviderBundle:
         self._robot_state: Optional[RobotState] = None
         self._imu: Optional[IMUState] = None
         self._point_cloud: Optional[PointCloudFrame] = None
+        self._laser_scan: Optional[CanonicalLaserScan] = None
         self._images: Dict[str, ImageFrame] = {}
         self._camera_infos: Dict[str, CameraInfo] = {}
         self._subscriptions: Dict[int, tuple] = {}
@@ -56,6 +57,7 @@ class CustomRobotProviderBundle:
             self._robot_state = None
             self._imu = None
             self._point_cloud = None
+            self._laser_scan = None
             self._images.clear()
         if was_started and self._motion_control is not None:
             self._motion_control.stop_motion()
@@ -196,15 +198,19 @@ class CustomRobotProviderBundle:
             return self._point_cloud if self._started else None
 
     def publish_sensor_sample(self, sample: SensorSample) -> bool:
-        """发布带真实时间与标定引用的规范 LiDAR/IMU 数据。"""
+        """发布带真实时间与标定引用的二维/三维雷达及惯性数据。"""
 
-        if not isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame)):
-            raise TypeError("规范输入必须是 CanonicalImuSample 或 CanonicalLidarFrame。")
+        if not isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame, CanonicalLaserScan)):
+            raise TypeError("规范输入必须是二维/三维雷达样本或惯性样本。")
         with self._lock:
             if not self._started:
                 return False
-        # 规范高频输入优先交给算法；显示用快照不改变源时间域，也不阻塞投递。
+            if isinstance(sample, CanonicalLaserScan):
+                self._laser_scan = sample
+        # 规范高频输入优先交给算法；回调中的停止不会被返回后的旧缓存写入覆盖。
         self._notify("sensor_sample", sample)
+        if isinstance(sample, CanonicalLaserScan):
+            return True
         timestamp = datetime.now(timezone.utc)
         if sample.clock_domain == SensorClockDomain.UNIX_NS:
             try:
@@ -232,6 +238,17 @@ class CustomRobotProviderBundle:
                 },
             ))
         return True
+
+    def publish_laser_scan(self, scan: CanonicalLaserScan) -> bool:
+        """从通用机器人装配注入规范二维雷达。"""
+        if not isinstance(scan, CanonicalLaserScan):
+            raise TypeError("二维高频输入必须是CanonicalLaserScan")
+        return self.publish_sensor_sample(scan)
+
+    def get_latest_laser_scan_sample(self) -> Optional[CanonicalLaserScan]:
+        """返回只读规范扫描；停止后不返回旧缓存。"""
+        with self._lock:
+            return self._laser_scan if self._started else None
 
     def get_sensor_topology(self) -> Optional[SensorTopology]:
         return self._sensor_topology.model_copy(deep=True) if self._sensor_topology else None

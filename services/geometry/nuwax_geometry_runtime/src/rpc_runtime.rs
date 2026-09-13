@@ -44,6 +44,7 @@ enum GeometryRpcMethod {
     StopExploration,
     GetExplorationState,
     GetExplorationDiagnostics,
+    PublishLaserScan,
     PublishOdom,
     PublishPointCloud,
 }
@@ -73,6 +74,7 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::StopExploration,
     GeometryRpcMethod::GetExplorationState,
     GeometryRpcMethod::GetExplorationDiagnostics,
+    GeometryRpcMethod::PublishLaserScan,
     GeometryRpcMethod::PublishOdom,
     GeometryRpcMethod::PublishPointCloud,
 ];
@@ -104,6 +106,7 @@ impl GeometryRpcMethod {
             Self::StopExploration => "stop_exploration",
             Self::GetExplorationState => "get_exploration_state",
             Self::GetExplorationDiagnostics => "get_exploration_diagnostics",
+            Self::PublishLaserScan => "publish_laser_scan",
             Self::PublishOdom => "publish_odom",
             Self::PublishPointCloud => "publish_point_cloud",
         }
@@ -251,6 +254,7 @@ impl GeometryRpcHandler {
             GeometryRpcMethod::GetExplorationDiagnostics => {
                 call_unary!(Empty, get_exploration_diagnostics)
             }
+            GeometryRpcMethod::PublishLaserScan => call_unary!(PublishLaserScanRequest, publish_laser_scan),
             GeometryRpcMethod::PublishOdom => call_unary!(PublishOdomRequest, publish_odom),
             GeometryRpcMethod::PublishPointCloud => {
                 call_unary!(PublishPointCloudRequest, publish_point_cloud)

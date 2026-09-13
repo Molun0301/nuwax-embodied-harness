@@ -1,4 +1,5 @@
 (() => {
+      const PLANAR_PIPELINE = window.__NUWAX_GEOMETRY_PIPELINE__ === "slam_2d";
       const CANVAS_THEME = {
         mapBackground: "#020617",
         mapUnknown: [51, 65, 85],
@@ -19,7 +20,7 @@
         initialPosePickStroke: "#fdba74",
         navPath: "#22ff66",
       };
-      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"];
+      const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"].filter(name => !PLANAR_PIPELINE || !["pointcloud_map", "pointcloud"].includes(name));
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
@@ -2945,6 +2946,7 @@
         }
       }
       function syncPointcloud3dState() {
+        if (PLANAR_PIPELINE) return;
         const navigationFrame = state.latestStreamFrames["navigation.state"];
         const navigationContext = navigationFrame && navigationFrame.payload;
         const navigationExplorationValidated = navigationGoalMatchesExploration(
@@ -3943,6 +3945,12 @@
       }
       function updateGovernance(envelope) {
         const data = envelope.runtime_governance || (envelope.data && envelope.data.runtime_governance) || envelope.data || {};
+        const pipeline = data.metadata?.geometry_runtime?.geometry_pipeline;
+        if (pipeline && pipeline !== (PLANAR_PIPELINE ? "slam_2d" : "lio_3d")) {
+          // 服务重启后重新装配页面，浏览器回收旧连接、线程和图形资源。
+          window.location.reload();
+          return;
+        }
         state.latestGovernance = data;
         data.status = data.status || (envelope.status ? statusOf(envelope) : undefined);
         if (data.service_health) {
@@ -4732,7 +4740,7 @@
         "video.detections",
         "tasks.state",
         "system.metrics"
-      ];
+      ].filter(topic => !PLANAR_PIPELINE || !topic.startsWith("pointcloud"));
       const POINTCLOUD3D_STREAM_TOPICS = new Set([
         "map.frame",
         "map.heartbeat",
@@ -5434,7 +5442,7 @@
           updateOverviewForFrame = false;
         }
         if (updateOverviewForFrame) updateStreamOverview(frame);
-        if (POINTCLOUD3D_STREAM_TOPICS.has(frame.topic)) {
+        if (!PLANAR_PIPELINE && POINTCLOUD3D_STREAM_TOPICS.has(frame.topic)) {
           window.dispatchEvent(new CustomEvent(`stream:${frame.topic}`, {
             detail: pointcloud3dStreamDetail(frame),
           }));
@@ -6092,6 +6100,8 @@
         if (els.map2dActionControls) els.map2dActionControls.hidden = is3d;
         if (els.map3dCameraControls) els.map3dCameraControls.hidden = !is3d;
         if (els.mapModeToggle) {
+          els.mapModeToggle.hidden = PLANAR_PIPELINE;
+          els.mapModeToggle.disabled = PLANAR_PIPELINE;
           els.mapModeToggle.textContent = is3d ? "切换 2D" : "切换 3D";
           els.mapModeToggle.dataset.mapView = is3d ? "3d" : "2d";
           els.mapModeToggle.setAttribute("aria-pressed", is3d ? "true" : "false");
@@ -6133,7 +6143,7 @@
         }
       }
       function setMapViewMode(mode) {
-        const nextMode = mode === "3d" ? "3d" : "2d";
+        const nextMode = !PLANAR_PIPELINE && mode === "3d" ? "3d" : "2d";
         state.mapViewMode = nextMode;
         updateMapStreamChip();
         if (nextMode === "3d") disableMapTools(true);

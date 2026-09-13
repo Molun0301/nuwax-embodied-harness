@@ -299,6 +299,7 @@
                 <div id="semanticMemoryList" class="semantic-memory-list" aria-label="记忆物品列表"></div>
                 <p class="semantic-memory-footnote">地图只显示有空间依据的物体位置。观察记录表示曾在此处见过物品。</p>
               </aside>
+  <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js"></script>
   <script src="/static/js/console.js?v=20260910-stream-latency-2"></script>
@@ -320,7 +321,11 @@
       }
     })();
   </script>
-  <script type="module" src="/static/js/pointcloud3d.js?v=20260911-background-preprocess"></script>
+  <script type="module">
+    if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
+      await import("/static/js/pointcloud3d.js?v=20260912-pipeline");
+    }
+  </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
   <script src="/static/js/navigation.js?v=20260908-nav-height"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>

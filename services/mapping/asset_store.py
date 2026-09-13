@@ -29,6 +29,7 @@ _BUNDLE_FILE_NAME = "bundle.json"
 _MANIFEST_FILE_NAME = "manifest.json"
 _MANIFEST_SCHEMA_VERSION = 1
 _STAGING_PREFIX = ".current.tmp-"
+_PLANAR_EXCHANGE_JOURNAL = ".planar-exchange-v1.json"
 _MAX_GEOREFERENCE_JSON_BYTES = 64 * 1024
 _MAX_MANIFEST_JSON_BYTES = 4 * 1024 * 1024
 _MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024
@@ -50,6 +51,11 @@ class MapAssetBundleError(RuntimeError):
 
 class MapAssetBundleValidationError(MapAssetBundleError):
     """A finalized or candidate bundle failed integrity validation."""
+
+
+class MapAssetCommitUncertainError(MapAssetBundleError):
+    """目录交换尚未完成持久对账；暂存目录仍由交换日志拥有。"""
+    preserve_staging = True
 
 
 class MapAlreadyFinalizedError(MapAssetBundleError):
@@ -112,6 +118,7 @@ class MapAssetBundleRepository:
         *,
         migrate_legacy: bool = True,
     ) -> Optional[MapAssetBundle]:
+        self._recover_planar_exchange(map_name)
         current_dir = self._current_dir(map_name)
         if current_dir.exists() or current_dir.is_symlink():
             return self._load_validated_bundle(map_name, current_dir)
@@ -127,6 +134,8 @@ class MapAssetBundleRepository:
     ) -> Optional[ValidatedMapAssetBundleSnapshot]:
         """只读加载 modern current，并在同一稳定目录视图中返回地理参考原文。"""
 
+        if (self._map_dir(map_name) / _PLANAR_EXCHANGE_JOURNAL).exists():
+            raise MapAssetBundleValidationError("二维资产交换尚未完成持久对账")
         current_dir = self._current_dir(map_name)
         if not current_dir.exists() and not current_dir.is_symlink():
             return None
@@ -184,7 +193,10 @@ class MapAssetBundleRepository:
         bundle: MapAssetBundle,
         *,
         staging_dir: Path,
+        expected_previous_manifest_sha256: Optional[str] = None,
     ) -> MapAssetBundle:
+        if expected_previous_manifest_sha256 is not None:
+            return self._replace_planar_bundle(bundle, staging_dir=staging_dir, expected_previous_manifest_sha256=expected_previous_manifest_sha256)
         map_name = str(bundle.map_name or "").strip()
         staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
         current = self._current_dir(map_name)
@@ -238,6 +250,100 @@ class MapAssetBundleRepository:
             if staging.exists() or staging.is_symlink():
                 self.discard_staging_directory(map_name, staging)
             raise
+
+    def _recover_planar_exchange(self, map_name):
+        from services.mapping.catalog import MapCatalogRepository
+        map_dir = self._map_dir(map_name)
+        journal = map_dir / _PLANAR_EXCHANGE_JOURNAL
+        if not journal.exists() and not journal.is_symlink():
+            return
+        with MapCatalogRepository(str(self._root_dir)).map_activation_guard():
+            if not journal.exists() and not journal.is_symlink():
+                return
+            record = _parse_json_object(_read_regular_file(journal, "二维目录交换日志", maximum_bytes=4096), "二维目录交换日志")
+            if set(record) != {"schema_version", "previous", "candidate", "staging", "previous_directory", "candidate_directory"} or record["schema_version"] != 1:
+                raise MapAssetBundleValidationError("二维目录交换日志字段非法")
+            previous = _validate_sha256(record["previous"], "原清单摘要")
+            candidate = _validate_sha256(record["candidate"], "新清单摘要")
+            staging = self._require_staging_directory(map_name, map_dir / str(record["staging"]), must_exist=False)
+            current = self._load_validated_bundle(map_name, self._current_dir(map_name))
+            if current.manifest_sha256 not in {previous, candidate}:
+                raise MapAssetBundleValidationError("二维目录交换当前身份无法确定，保留全部资源")
+            identity = record["previous_directory" if current.manifest_sha256 == candidate else "candidate_directory"]
+            if not isinstance(identity, list) or len(identity) != 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in identity):
+                raise MapAssetBundleValidationError("二维交换目录身份非法")
+            if staging.exists() or staging.is_symlink():
+                metadata = staging.lstat()
+                if not stat.S_ISDIR(metadata.st_mode) or [metadata.st_dev, metadata.st_ino] != identity:
+                    raise MapAssetBundleValidationError("二维交换退役目录被替换，拒绝清理")
+            # 先证明current引用持久，再删除只属于本次事务的另一目录。
+            _fsync_directory(map_dir)
+            if staging.exists():
+                self.discard_staging_directory(map_name, staging)
+            journal.unlink()
+            _fsync_directory(map_dir)
+
+    def _replace_planar_bundle(self, bundle, *, staging_dir, expected_previous_manifest_sha256):
+        from services.mapping.catalog import MapCatalogRepository
+        expected = _validate_sha256(expected_previous_manifest_sha256, "二维续建原清单摘要")
+        map_name = bundle.map_name
+        self._recover_planar_exchange(map_name)
+        staging = self._require_staging_directory(map_name, staging_dir, must_exist=True)
+        current = self._current_dir(map_name)
+        journal = current.parent / _PLANAR_EXCHANGE_JOURNAL
+        if bundle.geometry_asset is None or bundle.geometry_asset.metadata.get("target_kind") != "planar_graph":
+            raise MapAssetBundleValidationError("只有明确二维完整图续建允许替换current")
+        preserve_staging = False
+        try:
+            self._write_candidate_bundle(bundle, staging)
+            candidate_sha = _sha256_bytes(self._write_manifest(map_name, staging))
+            with _StableDirectoryTree(staging) as candidate_tree:
+                manifest_sha, validated = self._validate_open_directory(map_name, candidate_tree, expected_manifest_sha256=candidate_sha)
+                _fsync_tree(candidate_tree)
+                catalog = MapCatalogRepository(str(self._root_dir))
+                with catalog.map_activation_guard():
+                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
+                        raise MapAssetBundleValidationError("地图激活或重定位事务尚未收尾，不能交换二维资产")
+                    with _StableDirectoryTree(current) as previous_tree:
+                        previous_sha, previous = self._validate_open_directory(map_name, previous_tree)
+                        if previous_sha != expected:
+                            if previous_sha == candidate_sha:
+                                return previous
+                            raise MapAlreadyFinalizedError(map_name, previous_sha, candidate_sha)
+                        if previous.geometry_asset is None or previous.geometry_asset.metadata.get("target_kind") != "planar_graph":
+                            raise MapAssetBundleValidationError("二维续建不能覆盖其它类型地图")
+                        old_checkpoint = previous.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
+                        new_checkpoint = validated.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
+                        if old_checkpoint.get("object_sha256") == new_checkpoint.get("object_sha256"):
+                            return previous
+                        candidate_tree.verify_all()
+                        previous_tree.verify_all()
+                        self._inject_fault("before_planar_exchange")
+                        old_stat, new_stat = current.stat(), staging.stat()
+                        record = {"schema_version": 1, "previous": previous_sha, "candidate": candidate_sha, "staging": staging.name,
+                            "previous_directory": [old_stat.st_dev, old_stat.st_ino], "candidate_directory": [new_stat.st_dev, new_stat.st_ino]}
+                        _atomic_write_relative(current.parent, _PLANAR_EXCHANGE_JOURNAL, _canonical_json_bytes(record))
+                        preserve_staging = True
+                        _exchange_directories(candidate_tree.parent_descriptor, staging.name, current.name)
+                        candidate_tree.rebind_root_after_rename(current.name)
+                        previous_tree.rebind_root_after_rename(staging.name)
+                        self._inject_fault("before_planar_directory_fsync")
+                        os.fsync(candidate_tree.parent_descriptor)
+                        self._inject_fault("after_planar_exchange")
+                        committed = validated.model_copy(update={"manifest_sha256": manifest_sha}, deep=True)
+                    self.discard_staging_directory(map_name, staging)
+                    journal.unlink()
+                    os.fsync(candidate_tree.parent_descriptor)
+                    preserve_staging = False
+            return committed
+        except Exception as error:
+            if preserve_staging or journal.exists():
+                preserve_staging = True
+                raise MapAssetCommitUncertainError("二维资产目录交换需要按日志对账：%s" % error) from error
+            raise
+        finally:
+            if not preserve_staging and (staging.exists() or staging.is_symlink()):
+                self.discard_staging_directory(map_name, staging)
 
     def current_directory(self, map_name: str) -> Path:
         """Return the fixed bundle root; callers must still load through validation."""
@@ -540,7 +646,7 @@ class MapAssetBundleRepository:
             or database_quality.get("present") is True
             or geometry_asset.mapping_database_path in manifested_paths
             or any(
-                asset.asset_type == MapGeometryAssetType.MAPPING_DATABASE
+                asset.asset_type in {MapGeometryAssetType.MAPPING_DATABASE, MapGeometryAssetType.PLANAR_GRAPH}
                 for asset in geometry_asset.assets
             )
         )
@@ -1745,6 +1851,20 @@ def _entry_exists_at(parent_descriptor: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _exchange_directories(parent_descriptor, source_name, target_name):
+    if any(not name or "/" in name or name in {".", ".."} for name in (source_name, target_name)):
+        raise MapAssetBundleValidationError("二维资产交换名称非法")
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise OSError(errno.ENOTSUP, "二维资产原子交换要求renameat2")
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(parent_descriptor, os.fsencode(source_name), parent_descriptor, os.fsencode(target_name), 2) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
 
 
 def _rename_directory_noreplace(

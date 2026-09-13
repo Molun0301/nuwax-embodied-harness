@@ -43,6 +43,8 @@ _POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
 _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
 _GEOMETRY_OWNER_TARGET = "geometry_owner_profile_env"
 _GEOMETRY_OWNER_KEYS = frozenset({
+    "NUWAX_GEOMETRY_PIPELINE", "NUWAX_GEOMETRY_SLAM2D_CONFIG",
+    "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_SLAM2D_BINARY",
     "NUWAX_GEOMETRY_LIO_BACKEND",
     "NUWAX_GEOMETRY_MAPPING_BACKEND",
     "NUWAX_GEOMETRY_CORRECTION_BACKEND",
@@ -574,6 +576,16 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key in {"NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE"}:
+        if not v:
+            return ""
+        try:
+            parsed = json.loads(v)
+            if not isinstance(parsed, dict):
+                return None
+            return json.dumps(parsed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        except (ValueError, TypeError):
+            return None
     if any(char in v for char in "\r\n\0"):
         return None
     if key in ROBOT_GEOMETRY_SETTING_KEYS:

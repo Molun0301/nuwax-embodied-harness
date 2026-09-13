@@ -517,6 +517,27 @@ impl std::fmt::Debug for LioOwnerHandle {
 }
 
 impl LioOwnerHandle {
+    /// 根拥有方保留二维监督任务，关闭回执在真实子进程回收后完成。
+    pub(crate) fn supervised_planar<F, Fut>(run: F) -> Self
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (request_tx, request_rx) = watch::channel(false);
+        #[cfg(test)]
+        let (completion_tx, completion_rx) = watch::channel(None);
+        let supervisor = tokio::spawn(async move {
+            let result = run(request_rx).await;
+            #[cfg(test)]
+            completion_tx.send_replace(Some(result.clone()));
+            result
+        });
+        Self {
+            shutdown: LioShutdownControl { request_tx, #[cfg(test)] completion_rx },
+            supervisor: Some(supervisor), terminal: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn shutdown_control_for_tests(&self) -> LioShutdownControl {
         self.shutdown.clone()

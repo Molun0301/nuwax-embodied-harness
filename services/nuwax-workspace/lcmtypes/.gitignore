@@ -41,3 +41,7 @@ generated/python/nuwax_msgs/*
 !generated/python/nuwax_msgs/LioCloudEnvelope.py
 !generated/python/nuwax_msgs/LioStatus.py
 !generated/python/nuwax_msgs/NavigationMap3D.py
+!generated/python/nuwax_msgs/PlanarNavigationMap.py
+
+# 二维扫描与导航绑定共同属于正式跨语言输入契约。
+!generated/python/nuwax_msgs/PlanarScan.py

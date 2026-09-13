@@ -19,6 +19,7 @@ RUST_VERSION = "1.88.0"
 _NATIVE_ROOT = Path("services/nuwax-workspace/crates/nuwax-lio-backends/native")
 _WORKSPACE = "services/nuwax-workspace/Cargo.toml"
 _RUST_BUILDS = {
+    "slam2d": (_WORKSPACE, "nuwax-slam-2d-runtime", "nuwax-slam-2d-worker", ("worker",)),
     "geometry": (
         "services/geometry/nuwax_geometry_runtime/Cargo.toml",
         "nuwax-geometry-runtime", "nuwax-geometry-runtime", (),
@@ -48,7 +49,7 @@ def describe_builds(modules: Iterable[str]) -> tuple[str, ...]:
     for name, (_, _, binary, _) in _RUST_BUILDS.items():
         if name in selected:
             descriptions.append(f"使用 Rust（系统编程语言）{RUST_VERSION} 构建 {binary}")
-    if "geometry" in selected:
+    if "geometry" in selected and "slam2d" not in selected:
         descriptions.append("构建地图导出与工作区操作所需的 nuwax-mapping-cli")
     return tuple(descriptions)
 
@@ -277,6 +278,8 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     selected = set(modules)
     if not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1:
         raise ValueError("编译并行数必须是正整数。")
+    if "slam2d" in selected and selected.intersection({"fastlio2", "pointlio"}):
+        raise ValueError("二维算法与三维前端必须互斥选择")
     if {"fastlio2", "pointlio"}.issubset(selected):
         raise ValueError("FastLIO2 与 PointLIO 每次只能选择一种。")
     binaries = {}  # type: Dict[str, str]
@@ -294,8 +297,13 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
     rust_modules = [name for name in _RUST_BUILDS if name in selected]
     if rust_modules:
         cargo, environment = _rust_toolchain(cache, run)
+        if "slam2d" in selected:
+            from scripts.prepare_slam2d_dependencies import build_dependencies
+            build_dependencies(prefix, cache / "slam2d-dependencies", jobs=jobs, run=run)
+            environment = {**environment, "CMAKE_PREFIX_PATH": str(prefix), "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs)}
+            _cmake(root / "drivers/sensors/slamtec_native", cache / "build/slamtec", prefix, jobs, run)
         recipes = [_RUST_BUILDS[name] for name in rust_modules]
-        if "geometry" in selected:
+        if "geometry" in selected and "slam2d" not in selected:
             recipes.append(_MAPPING_BUILD)
         for manifest, package, binary_name, features in recipes:
             if not (root / manifest).with_name("Cargo.lock").is_file():
@@ -316,6 +324,21 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
             shutil.copyfile(built, installed)
             installed.chmod(0o755)
             binaries[binary_name] = str(installed)
+            if binary_name == "nuwax-slam-2d-worker":
+                from scripts.package_slam2d import elf_info
+                _machine, _needed, search = elf_info(built)
+                native = next((p for p in search if (p / "libnuwax_slam_toolbox.so.1").is_file()), None)
+                if native is None:
+                    raise RuntimeError("二维工作程序未绑定本次原生核心")
+                run(("cmake", "--install", str(native), "--prefix", str(prefix)))
+                sources = prefix / "share/nuwax-slam2d/native"
+                if sources.exists():
+                    shutil.rmtree(sources)
+                shutil.copytree(root / "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native", sources)
+                driver_sources = prefix / "share/nuwax-slam2d/slamtec"
+                if driver_sources.exists():
+                    shutil.rmtree(driver_sources)
+                shutil.copytree(root / "drivers/sensors/slamtec_native", driver_sources)
     return binaries
 
 
@@ -327,7 +350,9 @@ def prune_build_cache(cache: Path, removed: Iterable[str], selected: Iterable[st
     removed, selected = set(removed), set(selected)
     targets = [cache / "build/native" / name for name in ("fastlio2", "pointlio")
                if name in removed and name not in selected]
-    if not selected.intersection({"fastlio2", "pointlio"}):
+    if "slam2d" in removed and "slam2d" not in selected:
+        targets.extend((cache / "slam2d-dependencies", cache / "build/slamtec"))
+    if not selected.intersection({"fastlio2", "pointlio", "slam2d"}):
         targets.extend((cache / "build/native", cache / "sources"))
     if not selected.intersection(_RUST_BUILDS):
         targets.append(cache / "build/rust")

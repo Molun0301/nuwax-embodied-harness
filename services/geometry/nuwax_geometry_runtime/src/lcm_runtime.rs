@@ -40,7 +40,7 @@ use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame};
 use nuwax_tf::{make_transform, TfTree, TransformStamped};
 use nuwax_transport::LcmTransport;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
@@ -2611,6 +2611,27 @@ async fn finish_fatal_production_shutdown(
 
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planar_preparation_remains_root_owned_after_waiter_drop_and_before_mapping_retirement() {
+    let mut fixture=lifecycle_fixture_with_topology_control(65,"planar-prepare",|_|{}).await;
+    let handle=fixture.handle();
+    let (entered_tx,entered_rx)=oneshot::channel();
+    let (release_tx,release_rx)=std::sync::mpsc::channel();
+    let waiter=handle.register_planar_operation(async move {
+        tokio::task::spawn_blocking(move|| {
+            let _=entered_tx.send(());
+            release_rx.recv().expect("释放二维准备");
+        }).await.map_err(|e|e.to_string())?;
+        Ok(())
+    }).expect("登记二维保留任务");
+    entered_rx.await.expect("二维阻塞准备已开始");
+    drop(waiter);
+    let pending=first_blocked_production_shutdown(&mut fixture,"planar-prepare").await;
+    release_tx.send(()).unwrap();
+    finish_clean_production_shutdown(pending,&fixture,"planar-prepare").await;
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup() {
     // Real retained cloud-map clear, blocked at its canonical publication fence.
     {
@@ -3024,6 +3045,20 @@ impl GeometryRuntimeHandle {
         self.task_control.clone()
     }
 
+    /// 二维候选读取、阻塞准备和发布进入原保留任务集合，关闭先等它真实收尾。
+    pub(crate) fn register_planar_operation<T: Send + 'static>(
+        &self, future:impl Future<Output=Result<T,String>> + Send + 'static,
+    )->Result<oneshot::Receiver<Result<T,String>>,String> {
+        let control=self.task_control().ok_or("二维提交缺少根任务拥有方")?;
+        let (tx,rx)=oneshot::channel();
+        control.register_retained("planar-observation",async move {
+            let result=future.await;
+            let _=tx.send(result);
+            Ok(())
+        })?;
+        Ok(rx)
+    }
+
     fn revoke_committed_map_projection_parts_locked(
         committed_map_authority: &Arc<std::sync::Mutex<Option<schema::CommittedMapIdentity>>>,
         map_revision_latest_tx: &watch::Sender<Option<MapRevisionEvent>>,
@@ -3357,6 +3392,14 @@ fn entry_to_transform(entry: &TransformEntry) -> Option<TransformStamped> {
     transform.stamp_secs = i64::try_from(entry.stamp_ns / 1_000_000_000).ok()?;
     transform.stamp_nanos = u32::try_from(entry.stamp_ns % 1_000_000_000).ok()?;
     Some(transform)
+}
+
+/// 已验证的二维静态外参随规范位姿在同一共享状态锁内安装。
+pub(crate) fn apply_sensor_extrinsic_locked(state:&mut SharedState,entry:&TransformEntry) {
+    if let Some(transform)=entry_to_transform(entry) {state.tf_tree.set(transform);}
+    if let Some(current)=state.transforms.iter_mut().find(|value|value.child==entry.child) {
+        *current=entry.clone();
+    } else {state.transforms.push(entry.clone());}
 }
 
 fn transform_to_entry(transform: TransformStamped) -> Option<TransformEntry> {
@@ -3779,10 +3822,10 @@ fn parse_pose_stamped_payload(payload: &[u8]) -> Option<PoseState> {
     })
 }
 
-struct CanonicalMappingObservation {
+pub(crate) struct CanonicalMappingObservation {
     map_pose: PoseState,
     transforms: [TransformEntry; 2],
-    tf_payload: Vec<u8>,
+    pub(crate) tf_payload: Vec<u8>,
 }
 
 fn normalized_quaternion_and_yaw(pose: &PoseState) -> Result<([f64; 4], f64), String> {
@@ -3830,7 +3873,7 @@ fn canonical_mapping_observation(
     )
 }
 
-fn canonical_mapping_observation_from_isometry(
+pub(crate) fn canonical_mapping_observation_from_isometry(
     map_frame_id: &str,
     odom_frame_id: &str,
     transform_generation: u64,
@@ -4000,7 +4043,7 @@ async fn apply_canonical_mapping_observation(
     apply_canonical_mapping_observation_locked(&mut state, observation);
 }
 
-fn apply_canonical_mapping_observation_locked(
+pub(crate) fn apply_canonical_mapping_observation_locked(
     state: &mut SharedState,
     observation: &CanonicalMappingObservation,
 ) {
@@ -4780,6 +4823,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
             pose_timestamp_ns = observation.map_pose.timestamp_ns,
             correction_translation_m = ?transaction.absolute_left_correction.translation.vector,
             correction_rotation_deg = transaction.absolute_left_correction.rotation.angle().to_degrees(),
+            correction_rotation_xyzw = ?transaction.absolute_left_correction.rotation.coords,
             "规范位姿校正已提交"
         );
         Ok(())
@@ -7892,12 +7936,13 @@ pub async fn spawn_geometry_runtime(
     // Product mmap creation is deliberately after all owned subscribe ACKs.
     // Subscription rollback therefore cannot leave an unowned mmap behind.
     let cm_shm_path = crate::pointcloud::cloud_map_shm_path();
-    let cm_writer = match CloudMapShmWriter::new(&cm_shm_path) {
+    let cm_writer = if mapping_backend.kind() == crate::mapping_backend::MappingBackendKind::SlamToolbox { None } else { match CloudMapShmWriter::new(&cm_shm_path) {
         Ok(writer) => Some(writer),
         Err(error) => {
             warn!("累积地图 mmap 初始化失败（降级为无 cloud_map 模式）: {error}");
             None
         }
+    }
     };
     let cm_writer = Arc::new(parking_lot::Mutex::new(cm_writer));
 

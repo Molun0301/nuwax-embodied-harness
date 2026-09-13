@@ -19,13 +19,16 @@ if TYPE_CHECKING:
 _CONSOLE_HTML = Path(__file__).resolve().parent / "static" / "console.html"
 
 
-def render_console_page(pointcloud3d_config: Any = None, robot_geometry: Any = None) -> str:
+def render_console_page(pointcloud3d_config: Any = None, robot_geometry: Any = None, geometry_pipeline: str = "lio_3d") -> str:
     """注入当前网关配置对应的点云样式与米制机器人外形。"""
 
     payload = to_jsonable(pointcloud3d_config) if pointcloud3d_config is not None else {}
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     geometry = json.dumps(robot_geometry, ensure_ascii=False, allow_nan=False, separators=(",", ":")).replace("</", "<\\/")
+    if geometry_pipeline not in {"lio_3d", "slam_2d"}:
+        raise ValueError("未知几何执行链")
     return (_CONSOLE_HTML.read_text(encoding="utf-8")
+            .replace('"__GEOMETRY_PIPELINE__"', json.dumps(geometry_pipeline))
             .replace('"__POINTCLOUD3D_CONFIG__"', encoded)
             .replace('"__ROBOT_GEOMETRY__"', geometry))
 
@@ -46,7 +49,8 @@ def build_console_router(runtime: GatewayRuntime) -> APIRouter:
             except (RobotGeometryError, OSError) as exc:
                 # 外形错误不妨碍打开控制台修正设置，也不伪造另一套显示尺寸。
                 geometry = {"error": str(exc)}
-            return render_console_page(getattr(runtime.config.gateway, "pointcloud3d", None), geometry)
+            return render_console_page(getattr(runtime.config.gateway, "pointcloud3d", None), geometry,
+                                       getattr(runtime.config.geometry, "pipeline", "lio_3d"))
 
         return HTMLResponse(await run_in_threadpool(render))
 

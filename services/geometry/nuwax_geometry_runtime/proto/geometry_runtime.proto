@@ -144,6 +144,9 @@ message MappingSessionState {
   bytes deadline_policy_sha256 = 27;
   uint32 algorithm_options_version = 28;
   bytes algorithm_options_sha256 = 29;
+  string target_kind = 30;
+  bytes target_graph_sha256 = 31;
+  string planar_mode = 32;
 }
 
 message CloudMapCheckpoint {
@@ -180,6 +183,26 @@ message CanonicalCloudCommitReceipt {
   uint32 point_count = 6;
 }
 
+message GraphArtifactRef {
+  string id = 1;
+  uint64 size = 2;
+  bytes sha256 = 3;
+}
+
+message GraphArtifactTransferRequest {
+  // 1初始化，2写入，3封存，4读取，5释放；初始化身份由上传方随机生成。
+  uint32 action = 1;
+  GraphArtifactRef artifact = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+}
+message GraphArtifactTransferResponse {
+  GraphArtifactRef artifact = 1;
+  uint64 offset = 2;
+  bool sealed = 3;
+  bytes data = 4;
+}
+
 message MappingBackendCheckpoint {
   uint32 schema_version = 1;
   string backend_kind = 2;
@@ -193,6 +216,8 @@ message MappingBackendCheckpoint {
   CanonicalCloudCommitReceipt cloud_receipt = 10;
   OccupancyGridData canonical_occupancy_checkpoint = 11;
   CloudMapCheckpoint canonical_cloud_checkpoint = 12;
+  GraphArtifactRef graph_artifact = 13;
+  string target_kind = 14;
 }
 
 message ActivateMapRequest {
@@ -229,6 +254,8 @@ enum RelocalizeDisposition {
   RELOCALIZE_DISPOSITION_OWNER_STOPPED = 15;
 }
 
+message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
+
 message RelocalizeRequest {
   uint32 schema_version = 1;
   string request_id = 2;
@@ -250,6 +277,9 @@ message RelocalizeRequest {
   uint64 logical_timeout_ms = 18;
   uint32 algorithm_options_version = 19;
   bytes algorithm_options_sha256 = 20;
+  string target_kind = 21;
+  bytes target_graph_sha256 = 22;
+  PlanarSeed planar_seed = 23;
 }
 
 enum RelocalizationTerminalStatus {
@@ -333,6 +363,8 @@ message RelocalizeResult {
   // Fields 29 and 30 are deliberately excluded from the frozen v1 terminal-
   // proof preimage, which remains protobuf fields 1 through 28 only.
   bytes evidence_disclosure_v1 = 30;
+  string target_kind = 31;
+  bytes target_graph_sha256 = 32;
 }
 
 // === 视频帧共享内存 ===
@@ -354,6 +386,10 @@ message HealthCheckResponse {
   uint64 video_frame_sequence = 5;
   uint32 video_fps_estimate = 6;
   string lcm_backend = 7;
+  string geometry_pipeline = 8;
+  uint64 runtime_generation = 9;
+  string planar_input_config = 10;
+  int64 planar_unix_offset_ns = 11;
 }
 
 // === 累积地图共享内存引用 ===
@@ -613,7 +649,19 @@ message ExplorationDiagnostics {
 }
 
 // === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
-message PublishOdomRequest { Pose pose = 1; }
+message PublishOdomRequest {
+  Pose pose = 1;
+  string clock_domain = 2;
+  string clock_id = 3;
+  string session_id = 4;
+  uint64 session_generation = 5;
+  uint64 runtime_generation = 6;
+}
+message PublishLaserScanRequest {
+  bytes payload = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+}
 message PointCloudField {
   string name = 1;
   uint32 offset = 2;
@@ -724,6 +772,7 @@ service GeometryRuntime {
   rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
   rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
   rpc GetMappingState(Empty) returns (MappingSessionState);
+  rpc TransferGraphArtifact(GraphArtifactTransferRequest) returns (GraphArtifactTransferResponse);
   rpc ExportMappingBackendCheckpoint(Empty) returns (MappingBackendCheckpoint);
   rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
   rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
@@ -767,6 +816,7 @@ service GeometryRuntime {
   rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
 
   // 输入发布兼容
+  rpc PublishLaserScan(PublishLaserScanRequest) returns (PublishResult);
   rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
   rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
 }

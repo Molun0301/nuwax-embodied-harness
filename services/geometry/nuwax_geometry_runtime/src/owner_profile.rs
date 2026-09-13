@@ -44,6 +44,7 @@ impl LioBackend {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MappingBackend {
+    SlamToolbox,
     Voxel,
     Raytracing,
 }
@@ -51,6 +52,7 @@ pub(crate) enum MappingBackend {
 impl MappingBackend {
     pub(crate) const fn stable_name(self) -> &'static str {
         match self {
+            Self::SlamToolbox => "slam_toolbox",
             Self::Voxel => "voxel",
             Self::Raytracing => "raytracing",
         }
@@ -58,6 +60,7 @@ impl MappingBackend {
 
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "slam_toolbox" => Some(Self::SlamToolbox),
             "voxel" => Some(Self::Voxel),
             "raytracing" => Some(Self::Raytracing),
             _ => None,
@@ -274,6 +277,7 @@ pub(crate) struct OwnerProfile {
 }
 
 impl OwnerProfile {
+    pub(crate) fn planar() -> Self { Self { lio:LioBackend::Device, mapping:MappingBackend::SlamToolbox, correction:CorrectionBackend::None } }
     pub(crate) fn validate(input: OwnerProfileInput) -> Result<Self, ProfileValidationError> {
         validate_writer(CanonicalOutput::Map, &input.map_writer)?;
         validate_writer(CanonicalOutput::Correction, &input.correction_writer)?;

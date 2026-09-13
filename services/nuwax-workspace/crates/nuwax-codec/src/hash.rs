@@ -326,6 +326,8 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),
     ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
     ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),
+    ("nuwax_msgs.PlanarNavigationMap", u64::from_be_bytes(crate::lcm::planar_navigation::FINGERPRINT).rotate_right(1)),
+    ("nuwax_msgs.PlanarScan", 0x14c1_fbf5_9745_c1cb_u64),
     ("nuwax_msgs.PersonFollowTarget", 0xa4d8_55f7_31c5_8fed_u64),
     ("nuwax_msgs.PersonFollowCommand", 0x3b56_bc67_ec81_a3f4_u64),
     ("nuwax_msgs.LioOdometryEnvelope", 0xba16_cd83_6063_d111_u64),

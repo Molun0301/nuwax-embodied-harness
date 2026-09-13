@@ -261,6 +261,11 @@ impl NavTopicConfig {
         ] {
             config.set(port, channel);
         }
+        if std::env::var("NUWAX_GEOMETRY_PIPELINE").as_deref()==Ok("slam_2d") {
+            config.set("occupancy", configured_channel(
+                &["NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL","NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION"],
+                "/nav/planar_occupancy"));
+        }
         config
     }
 

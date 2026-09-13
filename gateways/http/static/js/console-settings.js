@@ -130,11 +130,28 @@ function renderConfigSchema(schema) {
     }
     host.appendChild(block);
   }
+  syncGeometryPipelineFields();
   host.classList.toggle("show-adv", forceAdvanced);
   if (navLinks.length) navLinks[0].classList.add("on");
   setupConfigScrollSpy(host, navLinks);
   if (!host.children.length) {
     host.innerHTML = '<div class="empty panel-meta">无匹配设置项。</div>';
+  }
+}
+function syncGeometryPipelineFields() {
+  const selected = document.getElementById("cfg__NUWAX_GEOMETRY_PIPELINE")?.value
+    || configState.dirty.get("NUWAX_GEOMETRY_PIPELINE")
+    || window.__NUWAX_GEOMETRY_PIPELINE__ || "lio_3d";
+  const planar = selected === "slam_2d";
+  for (const row of document.querySelectorAll("#configSections [data-key]")) {
+    const key = row.dataset.key;
+    const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
+      "NUWAX_GEOMETRY_CORRECTION_BACKEND"].includes(key)
+      || key.startsWith("NUWAX_GATEWAY_POINTCLOUD3D_");
+    const disabled = planar && spatial;
+    for (const input of row.querySelectorAll("input,select,textarea")) input.disabled = disabled;
+    row.style.opacity = disabled ? "0.5" : "";
+    if (spatial) row.title = disabled ? "该设置仅用于三维执行链" : "";
   }
 }
 function setupConfigScrollSpy(host, navLinks) {
@@ -195,7 +212,7 @@ function buildConfigRow(f) {
     input.type = "number";
     if (f.type === "float") input.step = "any";
     input.value = f.value == null ? "" : f.value;
-  } else if (f.type === "json" && !f.sensitive) {
+  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE"].includes(f.key)) && !f.sensitive) {
     input = document.createElement("textarea");
     input.rows = 3;
     input.value = f.value == null ? "" : f.value;
@@ -323,6 +340,7 @@ function onConfigInput(key, input, row) {
   if (changed) configState.dirty.set(key, input.value);
   else configState.dirty.delete(key);
   updateConfigDirty();
+  if (key === "NUWAX_GEOMETRY_PIPELINE") syncGeometryPipelineFields();
 }
 function updateConfigDirty() {
   const el = document.getElementById("configDirty");

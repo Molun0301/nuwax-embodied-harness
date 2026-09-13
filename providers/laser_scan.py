@@ -6,7 +6,7 @@ from threading import RLock
 from typing import Callable, Dict, Optional, Protocol
 
 from contracts.pointcloud import LaserScanFrame
-from contracts.sensors import SensorDescriptor
+from contracts.sensors import CanonicalLaserScan, SensorDescriptor, SensorSample
 
 
 class LaserScanConverter(Protocol):
@@ -36,6 +36,8 @@ class StreamingLaserScanProvider:
         self._adapter = adapter
         self._lock = RLock()
         self._latest: Optional[LaserScanFrame] = None
+        self._latest_canonical: Optional[CanonicalLaserScan] = None
+        self._canonical_subscriptions: Dict[int, Callable[[SensorSample], None]] = {}
         self._subscriptions: Dict[int, Callable[[LaserScanFrame], None]] = {}
         self._next_subscription_id = 1
         self._started = False
@@ -70,6 +72,8 @@ class StreamingLaserScanProvider:
             if not self._started:
                 return False
             self._started = False
+            self._latest = None
+            self._latest_canonical = None
             return True
 
     def publish(self, scan: object) -> bool:
@@ -96,6 +100,47 @@ class StreamingLaserScanProvider:
                     self._callback_error_count += 1
                     self._last_error = str(exc)
         return True
+
+    def publish_sensor_sample(self, scan: CanonicalLaserScan) -> bool:
+        """规范扫描回调同步执行；耗时消费者负责自己的有界队列。"""
+        if not isinstance(scan, CanonicalLaserScan):
+            raise TypeError("二维提供器仅接收规范二维扫描")
+        descriptor = self._descriptor
+        if (scan.sensor_id != descriptor.sensor_id or scan.frame_id != descriptor.frame_id
+                or scan.clock_domain != descriptor.clock_domain or scan.clock_id != descriptor.clock_id
+                or scan.calibration_ref != descriptor.calibration_ref):
+            raise ValueError("二维样本与已绑定的传感器描述不一致")
+        with self._lock:
+            if not self._started:
+                return False
+            self._latest_canonical = scan
+            self._published_count += 1
+            callbacks = list(self._canonical_subscriptions.values())
+        for callback in callbacks:
+            try:
+                callback(scan)
+            except Exception as exc:
+                with self._lock:
+                    self._callback_error_count += 1
+                    self._last_error = str(exc)
+        return True
+
+    def get_latest_laser_scan_sample(self) -> Optional[CanonicalLaserScan]:
+        with self._lock:
+            return self._latest_canonical if self._started else None
+
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> int:
+        if not callable(callback):
+            raise TypeError("规范扫描回调必须可调用")
+        with self._lock:
+            subscription_id = self._next_subscription_id
+            self._next_subscription_id += 1
+            self._canonical_subscriptions[subscription_id] = callback
+            return subscription_id
+
+    def unsubscribe_sensor_sample(self, subscription_id: Optional[int]) -> None:
+        with self._lock:
+            self._canonical_subscriptions.pop(subscription_id, None)
 
     def get_latest_laser_scan(self) -> Optional[LaserScanFrame]:
         with self._lock:
@@ -134,6 +179,8 @@ class StreamingLaserScanProvider:
                 "available": self._started,
                 "has_latest": self._latest is not None,
                 "subscriber_count": len(self._subscriptions),
+                "canonical_subscriber_count": len(self._canonical_subscriptions),
+                "has_canonical_sample": self._latest_canonical is not None,
                 "published_count": self._published_count,
                 "dropped_latest_count": self._dropped_latest_count,
                 "callback_error_count": self._callback_error_count,

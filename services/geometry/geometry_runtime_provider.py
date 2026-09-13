@@ -5,6 +5,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
+from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
 
 from contextlib import contextmanager
@@ -69,7 +70,7 @@ _EXPLORATION_CHILD_NAV_OWNER_KIND = int(
     pb2.NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
 )
 _MAX_MOTION_ADMISSION_GENERATION = (1 << 63) - 1
-_SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel"})
+_SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel", "slam_toolbox"})
 _RELOCALIZE_SUCCESS_DISPOSITIONS = frozenset(
     {
         int(pb2.RELOCALIZE_DISPOSITION_APPLIED),
@@ -252,7 +253,7 @@ class MappingBackendCheckpointExportBundle:
 
     checkpoint: MappingBackendCheckpoint
     occupancy_asset: Mapping[str, object]
-    cloud_asset: Mapping[str, object]
+    cloud_asset: Optional[Mapping[str, object]]
     canonical_occupancy_checkpoint_bytes: bytes
     canonical_cloud_checkpoint_bytes: bytes
 
@@ -266,6 +267,8 @@ class MappingBackendCheckpointExportBundle:
         return message
 
     def canonical_cloud_checkpoint(self):
+        if self.checkpoint.backend_kind == "slam_toolbox":
+            return None
         message = pb2.CloudMapCheckpoint()
         message.ParseFromString(self.canonical_cloud_checkpoint_bytes)
         return message
@@ -281,6 +284,27 @@ class MappingBackendCheckpointExportBundle:
             occupancy_asset=self.occupancy_asset,
             cloud_asset=self.cloud_asset,
         )
+
+
+def _planar_checkpoint_export_bundle_from_proto(response, payload):
+    if not isinstance(payload, FrozenPayload) or response.target_kind != "planar_graph" or response.payload:
+        raise ValueError("二维完整图导出缺少流式载荷或类型不符")
+    if response.HasField("cloud_receipt") or response.HasField("canonical_cloud_checkpoint"):
+        raise ValueError("二维完整图不能携带三维数据")
+    receipt = _require_proto_message_field(response, "occupancy_receipt")
+    grid = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
+    meta = _require_proto_message_field(grid, "meta")
+    data = bytes(grid.data)
+    checkpoint = MappingBackendCheckpoint(schema_version=response.schema_version, backend_kind=response.backend_kind,
+        source_session_id=response.source_session_id, source_session_generation=response.source_session_generation,
+        content_sha256=bytes(response.content_sha256), payload_size=response.payload_size, created_at_ns=response.created_at_ns,
+        payload=payload, occupancy_receipt=_occupancy_receipt_dict(receipt), cloud_receipt=None)
+    asset = dict(raw_data_sha256=hashlib.sha256(data).digest(), raw_data_size=len(data), width=meta.width, height=meta.height,
+        resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y, frame_id=meta.frame_id,
+        source_occupancy_revision=meta.revision, timestamp_ns=meta.timestamp_ns)
+    checkpoint, asset, _ = MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint, occupancy_asset=asset, cloud_asset=None)
+    return MappingBackendCheckpointExportBundle(checkpoint, _freeze_checkpoint_value(asset), None,
+        grid.SerializeToString(deterministic=True), b"")
 
 
 def _require_proto_message_field(message, field_name: str):
@@ -344,8 +368,10 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 
 
 def _checkpoint_export_bundle_from_proto(
-    response,
+    response, payload=None,
 ) -> MappingBackendCheckpointExportBundle:
+    if str(response.backend_kind) == "slam_toolbox":
+        return _planar_checkpoint_export_bundle_from_proto(response, payload)
     occupancy_receipt = _require_proto_message_field(response, "occupancy_receipt")
     cloud_receipt = _require_proto_message_field(response, "cloud_receipt")
     occupancy_checkpoint = _require_proto_message_field(
@@ -471,9 +497,19 @@ def _mapping_commit_identity_proto(value: Mapping[str, object]):
 def _mapping_backend_checkpoint_proto(
     stored: StoredMappingBackendCheckpoint,
     occupancy_checkpoint,
-    cloud_checkpoint,
+    cloud_checkpoint, graph_artifact=None,
 ):
     checkpoint = stored.checkpoint
+    if checkpoint.backend_kind == "slam_toolbox":
+        receipt = checkpoint.occupancy_receipt
+        if graph_artifact is None or cloud_checkpoint is not None:
+            raise ValueError("二维检查点必须使用图制品引用")
+        return pb2.MappingBackendCheckpoint(schema_version=checkpoint.schema_version, backend_kind=checkpoint.backend_kind,
+            source_session_id=checkpoint.source_session_id, source_session_generation=checkpoint.source_session_generation,
+            content_sha256=checkpoint.content_sha256, payload_size=checkpoint.payload_size, created_at_ns=checkpoint.created_at_ns,
+            occupancy_receipt=pb2.CanonicalOccupancyCommitReceipt(commit_id=_mapping_commit_identity_proto(receipt["commit_id"]),
+                **{k:v for k,v in receipt.items() if k != "commit_id"}), canonical_occupancy_checkpoint=occupancy_checkpoint,
+            graph_artifact=graph_artifact, target_kind="planar_graph")
     occupancy_receipt = checkpoint.occupancy_receipt
     cloud_receipt = checkpoint.cloud_receipt
     return pb2.MappingBackendCheckpoint(
@@ -585,6 +621,21 @@ def _canonical_commit_identity_bytes(identity, field_name: str) -> bytes:
 
 
 def _canonical_backend_sha256(checkpoint) -> bytes:
+    if checkpoint.backend_kind == "slam_toolbox":
+        receipt = _require_proto_message_field(checkpoint, "occupancy_receipt")
+        preimage = bytearray(b"nuwax.geometry.planar-backend-checkpoint.v1\0")
+        preimage.extend(struct.pack(">I", checkpoint.schema_version))
+        preimage.extend(_canonical_string_bytes(checkpoint.backend_kind))
+        preimage.extend(_canonical_string_bytes(checkpoint.source_session_id))
+        preimage.extend(struct.pack(">QQQ", checkpoint.source_session_generation, checkpoint.payload_size, checkpoint.created_at_ns))
+        preimage.extend(_require_digest_bytes(checkpoint.content_sha256, "content_sha256"))
+        preimage.extend(_canonical_commit_identity_bytes(receipt.commit_id, "occupancy receipt commit_id"))
+        preimage.extend(_canonical_string_bytes(receipt.session_id))
+        preimage.extend(struct.pack(">QQQ", receipt.session_generation, receipt.occupancy_revision, receipt.source_timestamp_ns))
+        preimage.extend(_canonical_string_bytes(receipt.backend_kind))
+        preimage.extend(struct.pack(">Q", receipt.backend_generation))
+        preimage.extend(_canonical_occupancy_sha256(checkpoint.canonical_occupancy_checkpoint))
+        return hashlib.sha256(preimage).digest()
     occupancy_receipt = _require_proto_message_field(checkpoint, "occupancy_receipt")
     cloud_receipt = _require_proto_message_field(checkpoint, "cloud_receipt")
     occupancy_checkpoint = _require_proto_message_field(
@@ -694,7 +745,7 @@ def _canonical_relocalize_request_sha256(request) -> bytes:
     )
     preimage.extend(struct.pack(">Q", int(request.target_cloud_revision)))
     preimage.extend(
-        _require_digest_bytes(request.target_cloud_sha256, "target_cloud_sha256")
+        bytes(32) if request.target_kind == "planar_graph" else _require_digest_bytes(request.target_cloud_sha256, "target_cloud_sha256")
     )
     preimage.extend(
         _require_digest_bytes(request.asset_manifest_sha256, "asset_manifest_sha256")
@@ -721,6 +772,12 @@ def _canonical_relocalize_request_sha256(request) -> bytes:
             "algorithm_options_sha256",
         )
     )
+    if request.target_kind == "planar_graph":
+        if request.target_cloud_revision or request.target_cloud_sha256 or not request.HasField("planar_seed"):
+            raise ValueError("二维重定位请求身份非法")
+        preimage.extend(b"nuwax.geometry.planar-relocalize.v1\0")
+        preimage.extend(_require_digest_bytes(request.target_graph_sha256, "target_graph_sha256"))
+        preimage.extend(struct.pack(">ddd", request.planar_seed.x, request.planar_seed.y, request.planar_seed.yaw))
     return hashlib.sha256(preimage).digest()
 
 
@@ -2037,6 +2094,47 @@ def _bind_relocalize_mode1_evidence_v1(
         raise ValueError("Relocalize candidate scope is not bound to evidence")
 
 
+def _validate_planar_relocalize_proof(response):
+    if response.target_cloud_revision or response.target_cloud_sha256 or response.candidate_sequence or response.candidate_payload_sha256 or response.candidate_payload_preimage_v1:
+        raise ValueError("二维重定位回执不能包含三维候选")
+    _require_digest_bytes(response.target_graph_sha256, "target_graph_sha256")
+    _validate_relocalize_evidence_disclosure_v1(response)
+    if int(response.disposition) in _RELOCALIZE_SUCCESS_DISPOSITIONS:
+        disclosure = bytes(response.evidence_disclosure_v1)
+        offset = len(_RELOCALIZE_EVIDENCE_DISCLOSURE_DOMAIN_V1) + 4
+        if disclosure[offset] != 0:
+            raise ValueError("二维重定位要求完整有界证据")
+        evidence = json.loads(disclosure[offset + 9:].decode("utf-8"))
+        if (evidence.get("schema_version") != 1 or evidence.get("target_kind") != "planar_graph"
+            or bytes(evidence["request_identity_sha256"]) != bytes(response.request_identity_sha256)
+            or bytes(evidence["target_graph_sha256"]) != bytes(response.target_graph_sha256)
+            or bytes(evidence["target_receipt_sha256"]) != bytes(response.target_receipt_sha256)
+            or evidence["runtime_generation"] != response.runtime_generation
+            or evidence["session_id"] != response.session_id or evidence["session_generation"] != response.session_generation
+            or evidence["correction_revision"] != response.correction_revision or response.correction_revision <= 0
+            or not evidence["previous_process"] or evidence["previous_process"] == evidence["committed_process"]):
+            raise ValueError("二维重定位证据与实际提交身份不符")
+        scans = evidence["accepted_scans"]
+        if len(scans) < 3 or len({item[0] for item in scans}) != len(scans) or any(len(bytes(item[2])) != 32 for item in scans):
+            raise ValueError("二维重定位缺少三次不同扫描的匹配证据")
+        source = evidence["source_unix_ns"]
+        committed = evidence["committed_unix_ns"]
+        estimate = evidence["estimate"]
+        if not 0 <= committed - source <= 500_000_000 or estimate["source_sequence"] != scans[-1][0] or source != scans[-1][1]:
+            raise ValueError("二维重定位来源不是本次提交的新鲜匹配")
+        if estimate["disposition"] != "accepted" or estimate["matching_response"] < 0.3 or any(
+            not math.isfinite(value) for key in ("map_from_base", "map_from_odom", "odom_from_base") for value in estimate[key]):
+            raise ValueError("二维重定位匹配结果非法")
+    elif response.correction_revision:
+        raise ValueError("未应用二维重定位不能声明校正修订")
+    proof = bytes(response.terminal_proof_sha256)
+    if int(response.disposition) == int(pb2.RELOCALIZE_DISPOSITION_BUSY):
+        if proof:
+            raise ValueError("忙碌回执不能携带终态证明")
+    elif len(proof) != 32 or _canonical_relocalize_terminal_proof_sha256(response) != proof:
+        raise ValueError("二维重定位终态证明非法")
+
+
 def _validate_relocalize_result_proofs(response) -> None:
     if int(response.schema_version) != _RELOCALIZE_SCHEMA_VERSION_V1:
         raise ValueError("Relocalize result schema version is unsupported")
@@ -2058,7 +2156,11 @@ def _validate_relocalize_result_proofs(response) -> None:
         "deadline_policy_sha256",
         "algorithm_options_sha256",
     ):
-        _require_digest_bytes(getattr(response, field_name), field_name)
+        if field_name != "target_cloud_sha256" or response.target_kind != "planar_graph":
+            _require_digest_bytes(getattr(response, field_name), field_name)
+    if response.target_kind == "planar_graph":
+        _validate_planar_relocalize_proof(response)
+        return
 
     candidate_sequence = int(response.candidate_sequence)
     candidate_payload_sha256 = bytes(response.candidate_payload_sha256 or b"")
@@ -3343,6 +3445,7 @@ class GeometryRuntimeProvider:
         self._last_occupancy_grid_revision = 0
         self._last_map_stream_observation = None
         self._mapping_identity: Optional[_MappingIdentity] = None
+        self._planar_input_active = False
         self._mapping_checkpoint_provenance: Optional[
             _MappingCheckpointProvenance
         ] = None
@@ -4033,6 +4136,9 @@ class GeometryRuntimeProvider:
         except ValueError:
             activation_disposition_name = "unknown"
         return {
+            "planar_mode": str(getattr(response, "planar_mode", "") or ""),
+            "target_kind": str(getattr(response, "target_kind", "") or ""),
+            "target_graph_sha256": bytes(getattr(response, "target_graph_sha256", b"") or b"").hex(),
             "success": bool(getattr(response, "success", False)),
             "phase": str(getattr(response, "phase", "") or ""),
             "message": str(getattr(response, "message", "") or ""),
@@ -4117,6 +4223,8 @@ class GeometryRuntimeProvider:
         except ValueError:
             disposition_name = "unknown"
         return {
+            "target_kind": str(response.target_kind),
+            "target_graph_sha256": bytes(response.target_graph_sha256).hex(),
             "success": disposition in _RELOCALIZE_SUCCESS_DISPOSITIONS,
             "schema_version": int(getattr(response, "schema_version", 0) or 0),
             "request_id": str(getattr(response, "request_id", "") or ""),
@@ -4252,6 +4360,7 @@ class GeometryRuntimeProvider:
         transition_epoch: int,
         *,
         identity: Optional[_MappingIdentity] = None,
+        input_active: Optional[bool] = None,
         checkpoint_provenance: Optional[_MappingCheckpointProvenance] = None,
         preserve_checkpoint_provenance: bool = False,
         deadline_monotonic: Optional[float] = None,
@@ -4279,6 +4388,8 @@ class GeometryRuntimeProvider:
                     self._mapping_identity = identity
                     if not preserve_checkpoint_provenance:
                         self._mapping_checkpoint_provenance = checkpoint_provenance
+                if input_active is not None:
+                    self._planar_input_active = input_active
                 self._mapping_transition_inflight = False
                 return True
 
@@ -4287,6 +4398,7 @@ class GeometryRuntimeProvider:
         self._mapping_transition_epoch += 1
         self._mapping_transition_inflight = False
         self._mapping_identity = None
+        self._planar_input_active = False
         self._mapping_checkpoint_provenance = None
         self._last_occupancy_grid = None
         self._last_occupancy_grid_identity = None
@@ -4424,6 +4536,7 @@ class GeometryRuntimeProvider:
         if not self._finish_mapping_transition(
             transition_epoch,
             identity=identity,
+            input_active=True,
             checkpoint_provenance=None,
             preserve_checkpoint_provenance=bool(payload["idempotent_replay"]),
             deadline_monotonic=deadline_monotonic,
@@ -4432,6 +4545,57 @@ class GeometryRuntimeProvider:
                 "StartMapping 完成时 mapping transition 已被断连或新代际取代。"
             )
         return payload
+
+    def _graph_transfer(self, action, reference, *, offset=0, data=b""):
+        request = pb2.GraphArtifactTransferRequest(action=action, artifact=reference, offset=offset, data=data)
+        for attempt in range(3):
+            try:
+                response = self._stub.TransferGraphArtifact(request, timeout=_heavy_deadline_sec())
+                break
+            except grpc.RpcError as error:
+                if attempt == 2 or error.code() not in {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE}:
+                    raise
+                # 相同制品、偏移和字节重放，不能换身份重写未决分块。
+        if not response.HasField("artifact") or response.artifact != reference:
+            raise RuntimeError("二维图传输回执身份冲突")
+        return response
+
+    def _download_graph_artifact(self, reference):
+        if reference.size <= 0 or reference.size > MAX_PLANAR_ARCHIVE_BYTES or len(reference.sha256) != 32:
+            raise ValueError("二维图传输引用非法")
+        def chunks():
+            offset = 0
+            while offset < reference.size:
+                response = self._graph_transfer(4, reference, offset=offset)
+                data = bytes(response.data)
+                if not response.sealed or not data or len(data) > min(1024 * 1024, reference.size - offset):
+                    raise RuntimeError("二维图下载分块非法")
+                offset += len(data)
+                yield data
+        try:
+            payload = FrozenPayload(chunks())
+            if len(payload) != reference.size or payload._digest != bytes(reference.sha256):
+                raise ValueError("二维图下载摘要不一致")
+            return payload
+        finally:
+            self._graph_transfer(5, reference)
+
+    def _upload_graph_artifact(self, checkpoint):
+        reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=checkpoint.payload_size, sha256=checkpoint.content_sha256)
+        try:
+            self._graph_transfer(1, reference)
+            offset = 0
+            for data in payload_chunks(checkpoint.payload):
+                response = self._graph_transfer(2, reference, offset=offset, data=data)
+                offset += len(data)
+                if response.offset != offset:
+                    raise RuntimeError("二维图上传位置回执不一致")
+            if not self._graph_transfer(3, reference).sealed:
+                raise RuntimeError("二维图上传未封存")
+            return reference
+        except Exception:
+            self._graph_transfer(5, reference)
+            raise
 
     def export_mapping_backend_checkpoint(
         self,
@@ -4451,7 +4615,8 @@ class GeometryRuntimeProvider:
                 "ExportMappingBackendCheckpoint",
                 exc,
             ) from exc
-        return _checkpoint_export_bundle_from_proto(response)
+        payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
+        return _checkpoint_export_bundle_from_proto(response, payload)
 
     def _selected_mapping_backend_state(self) -> Dict[str, Any]:
         state = self.get_mapping_state()
@@ -4622,7 +4787,7 @@ class GeometryRuntimeProvider:
                 )
         if (
             stored_backend_checkpoint is None
-            and selected_backend_kind == "raytracing"
+            and selected_backend_kind in {"raytracing", "slam_toolbox"}
         ):
             raise RuntimeError(
                 "BACKEND_CHECKPOINT_REQUIRED: raytracing map activation requires "
@@ -4641,7 +4806,7 @@ class GeometryRuntimeProvider:
         )
 
         cloud_checkpoint = None
-        if stored_backend_checkpoint is not None and resolved_pcd_path is None:
+        if stored_backend_checkpoint is not None and resolved_pcd_path is None and selected_backend_kind != "slam_toolbox":
             raise ValueError(
                 "mapping backend checkpoint requires its contained canonical PCD"
             )
@@ -4715,7 +4880,7 @@ class GeometryRuntimeProvider:
                 xyz_sha256=xyz_sha256,
                 payload_schema_version=payload_schema_version,
             )
-        if stored_backend_checkpoint is not None and cloud_checkpoint is None:
+        if stored_backend_checkpoint is not None and cloud_checkpoint is None and selected_backend_kind != "slam_toolbox":
             raise ValueError(
                 "mapping backend checkpoint canonical PCD is missing or unreadable"
             )
@@ -4797,13 +4962,15 @@ class GeometryRuntimeProvider:
         )
         if cloud_checkpoint is not None:
             request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
+        graph_artifact = None
         if stored_backend_checkpoint is not None:
-            assert cloud_checkpoint is not None
+            if selected_backend_kind == "slam_toolbox":
+                graph_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint)
             request.mapping_backend_checkpoint.CopyFrom(
                 _mapping_backend_checkpoint_proto(
                     stored_backend_checkpoint,
                     occupancy_checkpoint,
-                    cloud_checkpoint,
+                    cloud_checkpoint, graph_artifact=graph_artifact,
                 )
             )
         request.asset_bundle_sha256 = _canonical_asset_bundle_sha256(
@@ -5011,14 +5178,14 @@ class GeometryRuntimeProvider:
                 or len(payload["activation_request_identity_sha256"]) != 64
                 or len(payload["activation_identity_sha256"]) != 64
                 or (
-                    cloud_checkpoint is not None
+                    (cloud_checkpoint is not None or selected_backend_kind == "slam_toolbox")
                     and (
                         len(payload["target_receipt_sha256"]) != 64
                         or not payload["relocalization_target_available"]
                     )
                 )
                 or (
-                    cloud_checkpoint is None
+                    cloud_checkpoint is None and selected_backend_kind != "slam_toolbox"
                     and (
                         bool(payload["target_receipt_sha256"])
                         or payload["relocalization_target_available"]
@@ -5047,6 +5214,7 @@ class GeometryRuntimeProvider:
             transition_finished = self._finish_mapping_transition(
                 transition_epoch,
                 identity=identity,
+                input_active=selected_backend_kind == "slam_toolbox",
                 checkpoint_provenance=checkpoint_provenance,
             )
         except Exception as exc:
@@ -5060,8 +5228,18 @@ class GeometryRuntimeProvider:
             raise outcome_unknown(
                 "ActivateMap 完成时 mapping transition 已被断连或新代际取代。"
             )
+        if graph_artifact is not None:
+            self._graph_transfer(5, graph_artifact)
+        planar_default_seed = None
+        if selected_backend_kind == "slam_toolbox":
+            graph_payload = stored_backend_checkpoint.checkpoint.payload
+            header_size = int.from_bytes(graph_payload[8:12], "little")
+            if graph_payload[:8] != b"NWS2D001" or not 0 < header_size <= 65536:
+                raise ValueError("二维图档案头无效")
+            planar_default_seed = json.loads(graph_payload[12:12 + header_size])["estimate"]["map_from_base"]
         return {
             **payload,
+            "planar_default_seed": planar_default_seed,
             "asset_manifest_sha256": asset_manifest_sha256,
             "mapping_database_path": Path(mapping_database_path).as_posix(),
             "pcd_path": Path(pcd_path).as_posix() if resolved_pcd_path is not None else None,
@@ -5079,6 +5257,7 @@ class GeometryRuntimeProvider:
                 )
             ),
             "checkpoint_kind": (
+                "occupancy_grid+planar_graph" if selected_backend_kind == "slam_toolbox" else
                 "occupancy_grid+cloud_map+mapping_backend"
                 if stored_backend_checkpoint is not None
                 else (
@@ -5122,6 +5301,7 @@ class GeometryRuntimeProvider:
         activation_state: Mapping[str, object],
         request_id: Optional[str] = None,
         logical_timeout_ms: int = 10_000,
+        planar_seed: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("relocalize")
         if not self._connected or not self._stub:
@@ -5158,7 +5338,7 @@ class GeometryRuntimeProvider:
             target_cloud_revision=int(state.get("cloud_source_revision") or 0),
             target_cloud_sha256=_require_digest_bytes(
                 state.get("cloud_source_sha256"), "target_cloud_sha256"
-            ),
+            ) if state.get("target_kind") != "planar_graph" else b"",
             asset_manifest_sha256=_require_digest_bytes(
                 state.get("asset_manifest_sha256"), "asset_manifest_sha256"
             ),
@@ -5181,13 +5361,22 @@ class GeometryRuntimeProvider:
                 state.get("algorithm_options_sha256"), "algorithm_options_sha256"
             ),
         )
+        if state.get("target_kind") == "planar_graph":
+            if planar_seed is None:
+                raise ValueError("二维重定位及其终态查询必须提供相同的planar_seed初始位置")
+            values = tuple(float(v) for v in planar_seed)
+            if len(values) != 3 or any(not math.isfinite(v) for v in values) or abs(values[2]) > math.pi:
+                raise ValueError("二维重定位初始位置必须是有限的x、y和偏航角")
+            request.target_kind = "planar_graph"
+            request.target_graph_sha256 = _require_digest_bytes(state.get("target_graph_sha256"), "target_graph_sha256")
+            request.planar_seed.CopyFrom(pb2.PlanarSeed(x=values[0], y=values[1], yaw=values[2]))
         if (
             request.runtime_generation <= 0
             or not request.session_id
             or not request.map_name
             or request.session_generation <= 0
             or request.backend_generation <= 0
-            or request.target_cloud_revision <= 0
+            or (request.target_kind != "planar_graph" and request.target_cloud_revision <= 0)
             or request.source_policy_version <= 0
             or request.deadline_policy_version <= 0
             or request.algorithm_options_version <= 0
@@ -5205,7 +5394,9 @@ class GeometryRuntimeProvider:
             request
         ).hex()
         if (
-            payload["schema_version"] != 1
+            payload["target_kind"] != request.target_kind
+            or payload["target_graph_sha256"] != bytes(request.target_graph_sha256).hex()
+            or payload["schema_version"] != 1
             or payload["request_id"] != request.request_id
             or payload["request_identity_sha256"]
             != expected_request_identity_sha256
@@ -5239,6 +5430,8 @@ class GeometryRuntimeProvider:
             or payload["disposition_name"] == "unknown"
         ):
             raise RuntimeError("Relocalize returned a mismatched terminal identity")
+        if request.target_kind == "planar_graph":
+            payload["planar_seed"] = list(values)
         return payload
 
     def get_relocalization_terminal(
@@ -5247,6 +5440,7 @@ class GeometryRuntimeProvider:
         activation_state: Mapping[str, object],
         request_id: str,
         logical_timeout_ms: int,
+        planar_seed: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[str, Any]:
         """只读查询已存在 request 的权威终态，不创建或推进请求。"""
 
@@ -5280,7 +5474,7 @@ class GeometryRuntimeProvider:
             target_cloud_revision=int(state.get("cloud_source_revision") or 0),
             target_cloud_sha256=_require_digest_bytes(
                 state.get("cloud_source_sha256"), "target_cloud_sha256"
-            ),
+            ) if state.get("target_kind") != "planar_graph" else b"",
             asset_manifest_sha256=_require_digest_bytes(
                 state.get("asset_manifest_sha256"), "asset_manifest_sha256"
             ),
@@ -5304,6 +5498,15 @@ class GeometryRuntimeProvider:
                 "algorithm_options_sha256",
             ),
         )
+        if state.get("target_kind") == "planar_graph":
+            if planar_seed is None:
+                raise ValueError("二维重定位及其终态查询必须提供相同的planar_seed初始位置")
+            values = tuple(float(v) for v in planar_seed)
+            if len(values) != 3 or any(not math.isfinite(v) for v in values) or abs(values[2]) > math.pi:
+                raise ValueError("二维重定位初始位置必须是有限的x、y和偏航角")
+            relocalize_request.target_kind = "planar_graph"
+            relocalize_request.target_graph_sha256 = _require_digest_bytes(state.get("target_graph_sha256"), "target_graph_sha256")
+            relocalize_request.planar_seed.CopyFrom(pb2.PlanarSeed(x=values[0], y=values[1], yaw=values[2]))
         request_identity = _canonical_relocalize_request_sha256(
             relocalize_request
         )
@@ -5397,6 +5600,8 @@ class GeometryRuntimeProvider:
         if not has_terminal:
             raise RuntimeError("terminal query response omitted terminal proof")
         terminal = self._relocalize_result_payload(response.terminal)
+        if relocalize_request.target_kind == "planar_graph":
+            terminal["planar_seed"] = list(values)
         if (
             terminal.get("request_id") != resolved_request_id
             or terminal.get("request_identity_sha256") != request_identity.hex()
@@ -5454,6 +5659,7 @@ class GeometryRuntimeProvider:
                     self._mapping_transition_epoch += 1
                 # STOPPED 后保留同一身份的最终栅格，供 save-map 收尾读取。
                 self._mapping_identity = stopped_identity
+                self._planar_input_active = False
                 self._mapping_checkpoint_provenance = None
         return payload
 
@@ -5473,9 +5679,8 @@ class GeometryRuntimeProvider:
         误当作 mapping capability ready。该方法与
         `runtime_diagnostics.rs::mapping_readiness` 对账。
 
-        返回 True —— runtime 健康 + mapping adapter 已就绪(有点云数据)。
-        返回 False —— 未连接 / backend 不可用 / mapping adapter 未实装 /
-                      无点云数据。
+        返回 True 表示所选二维或三维建图拥有方已有有效规范地图。
+        未连接、输入未就绪、会话停止或后端失败时返回 False。
         """
         diagnostics = self.get_mapping_diagnostics()
         return bool(diagnostics and diagnostics.get("ready", False))
@@ -8458,6 +8663,61 @@ class GeometryRuntimeProvider:
     # === 输入桥 ===
     # Rust proto PublishOdom 接受 PublishOdomRequest（仅 pose 字段；速度由 nuwax-nav-stack
     # 内部从 pose 增量计算，不再走 gRPC facade）。速度参数保留以兼容旧调用方签名，丢弃。
+    def get_geometry_pipeline(self) -> Dict[str, Any]:
+        """读取实际进程的执行链和运行代际，用于输入桥和网页能力绑定。"""
+        self._raise_if_stopping("get_geometry_pipeline")
+        if not self._stub:
+            raise RuntimeError("Geometry尚未连接")
+        response = self._stub.HealthCheck(pb2.HealthCheckRequest(), timeout=_read_deadline_sec())
+        return {
+            "healthy": bool(response.healthy),
+            "geometry_pipeline": str(response.geometry_pipeline or "lio_3d"),
+            "runtime_generation": int(response.runtime_generation),
+            "planar_input_config": json.loads(response.planar_input_config) if response.planar_input_config else None,
+            "planar_unix_offset_ns": int(response.planar_unix_offset_ns),
+        }
+
+    def capture_planar_input_context(self, runtime_generation: int):
+        """回调捕获当前会话，排队数据始终携带此身份，发送时不能改绑。"""
+        with self._map_state_lock:
+            if self._stopping or self._mapping_transition_inflight or self._mapping_identity is None or not self._planar_input_active:
+                return None
+            identity = self._mapping_identity
+            return {
+                "session_id": identity[0],
+                "session_generation": identity[2],
+                "runtime_generation": runtime_generation,
+            }
+
+    def publish_laser_scan(self, scan, context: Dict[str, Any]) -> bool:
+        """发送规范二维扫描；成功表示通信接纳，算法就绪由运行状态表达。"""
+        from services.geometry.planar_wire import encode_planar_scan
+        self._raise_if_stopping("publish_laser_scan")
+        if not self._stub:
+            return False
+        payload = encode_planar_scan(scan, int(context["runtime_generation"]))
+        response = self._stub.PublishLaserScan(pb2.PublishLaserScanRequest(
+            payload=payload, session_id=context["session_id"],
+            session_generation=context["session_generation"],
+        ), timeout=_read_deadline_sec())
+        return bool(response.success)
+
+    def publish_planar_odometry(self, pose, timestamp_ns: int, clock_domain: str,
+                                clock_id: str, context: Dict[str, Any]) -> bool:
+        """设备里程计保留源时间和时钟身份，禁止使用回调接收时间补齐。"""
+        self._raise_if_stopping("publish_planar_odometry")
+        if not self._stub:
+            return False
+        response = self._stub.PublishOdom(pb2.PublishOdomRequest(
+            pose=pb2.Pose(
+                position=pb2.Vec3(x=pose.position.x, y=pose.position.y, z=pose.position.z),
+                orientation=pb2.Quat(x=pose.orientation.x, y=pose.orientation.y,
+                                     z=pose.orientation.z, w=pose.orientation.w),
+                frame_id=pose.frame_id, timestamp_ns=timestamp_ns,
+            ), clock_domain=clock_domain, clock_id=clock_id, **context,
+        ), timeout=_read_deadline_sec())
+        return bool(response.success)
+
     def publish_odom(self, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,
                      lvx: float = 0, lvy: float = 0, lvz: float = 0,
                      avx: float = 0, avy: float = 0, avz: float = 0,

@@ -776,6 +776,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
         # LCM backend 只允许生产值 real-lcm。
         lcm_backend=_normalize_lcm_backend(_cfg_str("NUWAX_LCM_BACKEND", "real-lcm")),
         # Geometry Runtime owner profile；枚举与组合由 Web 配置和 Rust 启动预检双重校验。
+        pipeline=_cfg_str("NUWAX_GEOMETRY_PIPELINE", "lio_3d"),
+        slam2d_config=_cfg_str("NUWAX_GEOMETRY_SLAM2D_CONFIG", ""),
+        slam2d_device=_cfg_str("NUWAX_GEOMETRY_SLAM2D_DEVICE", ""),
         lio_backend=_cfg_str("NUWAX_GEOMETRY_LIO_BACKEND", "device"),
         mapping_backend=_cfg_str("NUWAX_GEOMETRY_MAPPING_BACKEND", "voxel"),
         correction_backend=_cfg_str("NUWAX_GEOMETRY_CORRECTION_BACKEND", "none"),
@@ -903,6 +906,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "NUWAX_LCM_CHANNEL_OCCUPANCY",
                 "/map/occupancy#nav_msgs.OccupancyGrid",
             ),
+            planar_navigation=_cfg_str("NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION", "/nav/planar_occupancy#nuwax_msgs.PlanarNavigationMap"),
             cmd_vel=_cfg_str("NUWAX_LCM_CHANNEL_CMD_VEL", "/cmd_vel#geometry_msgs.Twist"),
             goal_pose=_cfg_str(
                 "NUWAX_LCM_CHANNEL_GOAL_POSE",

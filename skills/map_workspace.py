@@ -1562,9 +1562,20 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             )
         existing = self.get_map_asset_bundle(map_name=resolved_name)
+        previous_manifest = None
         if existing is not None:
-            return existing
-        if asset.finalized:
+            context_reader = getattr(self._geometry_runtime, "get_mapping_session_context", None)
+            context = context_reader() if callable(context_reader) else None
+            planar_continue = (existing.geometry_asset is not None
+                and existing.geometry_asset.metadata.get("target_kind") == "planar_graph"
+                and isinstance(context, dict) and context.get("active") is True
+                and context.get("planar_mode") == "mapping" and context.get("map_name") == resolved_name)
+            if not planar_continue:
+                return existing
+            previous_manifest = existing.manifest_sha256
+            if georeference is None and existing.georeference is not None:
+                georeference = existing.georeference.contract
+        if asset.finalized and existing is None:
             raise GatewayError(
                 "地图元数据标记为 finalized，但 current 资产包不存在。",
                 error_code="map_asset_bundle_missing",
@@ -1710,9 +1721,10 @@ class MapWorkspaceService:
             finalized_bundle = self._asset_repository.finalize_map_asset_bundle(
                 prepared_bundle,
                 staging_dir=staging_dir,
+                **({"expected_previous_manifest_sha256": previous_manifest} if previous_manifest is not None else {}),
             )
         except Exception as exc:
-            if staging_dir.exists():
+            if staging_dir.exists() and not getattr(exc, "preserve_staging", False):
                 self._asset_repository.discard_staging_directory(
                     resolved_name,
                     staging_dir,
@@ -1726,6 +1738,10 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             ) from exc
 
+        return self._record_finalized_map_asset(asset, finalized_bundle, reason, metadata)
+
+    def _record_finalized_map_asset(self, asset, finalized_bundle, reason, metadata):
+        resolved_name = finalized_bundle.map_name
         now = (
             datetime.now(asset.updated_at.tzinfo)
             if asset.updated_at.tzinfo is not None
@@ -2421,6 +2437,7 @@ class MapWorkspaceService:
                     pending["target_manifest_sha256"]
                 ),
                 activation_receipt=activation_receipt,
+                **({"planar_seed": pending["planar_seed"]} if "planar_seed" in pending else {}),
             )
             status = str(query.get("status") or "").strip().lower()
             if status in {"pending", "not_found"}:
@@ -2590,6 +2607,8 @@ class MapWorkspaceService:
                 and durable_receipt.get("asset_manifest_sha256")
                 == bundle_manifest_sha256
             ):
+                if request_metadata.get("planar_seed") is not None and list(request_metadata["planar_seed"]) != durable_receipt.get("planar_seed"):
+                    raise ValueError("相同重定位请求不能更换二维初始位置")
                 session = self._localization_service.get_active_session()
                 if session is None:
                     raise GatewayError(
@@ -2709,10 +2728,16 @@ class MapWorkspaceService:
                 if requested_id is not None
                 else "relocalize:%s" % uuid.uuid4().hex
             )
+            planar_seed = None
+            if activation_receipt.get("target_kind") == "planar_graph":
+                planar_seed = self._geometry_runtime.resolve_planar_relocalization_seed(request_metadata.get("planar_seed"))
+            elif request_metadata.get("planar_seed") is not None:
+                raise ValueError("三维地图不接受二维初始位置")
             pending_intent = self._repository.begin_relocalization_durable(
                 request_id=resolved_request_id,
                 logical_timeout_ms=logical_timeout_ms,
                 activation_receipt=activation_receipt,
+                **({"planar_seed": planar_seed} if planar_seed is not None else {}),
             )
             pending_intent = (
                 self._repository.mark_relocalization_backend_dispatching(
@@ -2725,6 +2750,7 @@ class MapWorkspaceService:
                     asset_manifest_sha256=bundle_manifest_sha256,
                     request_id=resolved_request_id,
                     logical_timeout_ms=logical_timeout_ms,
+                    **({"planar_seed": planar_seed} if planar_seed is not None else {}),
                 )
             except GeometryRuntimeRelocalizationRejected as exc:
                 result = dict(exc.result)

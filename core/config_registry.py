@@ -231,6 +231,7 @@ _REGULAR_KEYS = frozenset({
     "NUWAX_GATEWAY_TELEMETRY_ENABLED", "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC",
     "NUWAX_LOG_LEVEL",
     "NUWAX_GEOMETRY_ENABLED",
+    "NUWAX_GEOMETRY_PIPELINE",
     "NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
     "NUWAX_GEOMETRY_CORRECTION_BACKEND",
     "NUWAX_MAPPING_PROFILE_NAME", "NUWAX_MAPPING_PROFILE_ENABLED",
@@ -248,6 +249,7 @@ _REGULAR_KEYS = frozenset({
 
 # 枚举型键的可选值（用于前端下拉）。
 _CHOICES: Dict[str, Tuple[str, ...]] = {
+    "NUWAX_GEOMETRY_PIPELINE": ("lio_3d", "slam_2d"),
     "NUWAX_LOG_LEVEL": ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
     "NUWAX_GEOMETRY_LIO_BACKEND": ("device", "fastlio2", "pointlio"),
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("voxel", "raytracing"),
@@ -258,6 +260,7 @@ _CHOICES: Dict[str, Tuple[str, ...]] = {
 
 
 _CHOICE_LABELS: Dict[str, Tuple[str, ...]] = {
+    "NUWAX_GEOMETRY_PIPELINE": ("三维激光惯性建图", "二维激光建图"),
     "NUWAX_GEOMETRY_LIO_BACKEND": ("设备里程计", "快速激光惯性定位（FastLIO2）", "逐点激光惯性定位（Point-LIO）"),
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("体素窗口", "射线追踪"),
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("不启用校正", "库内位姿图优化", "原生位姿图优化", "重定位校正"),

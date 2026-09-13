@@ -88,6 +88,7 @@ from contracts.perception import BoundingBox2D, Detection2D, Detection3D, Observ
 from contracts.pointcloud import LaserScanFrame, PointCloudFrame, PointField, PointFieldDataType
 from contracts.sensors import (
     CanonicalImuSample,
+    CanonicalLaserScan,
     CanonicalLidarFrame,
     CanonicalLioMeasurement,
     PayloadOwnership,
@@ -148,6 +149,7 @@ __all__ = [
     "CapabilityMatrix",
     "CapabilityRiskLevel",
     "CanonicalImuSample",
+    "CanonicalLaserScan",
     "CanonicalLidarFrame",
     "CanonicalLioMeasurement",
     "ContractModel",

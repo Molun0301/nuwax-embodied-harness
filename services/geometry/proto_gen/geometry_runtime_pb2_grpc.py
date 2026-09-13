@@ -116,6 +116,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingSessionState.FromString,
                 _registered_method=True)
+        self.TransferGraphArtifact = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/TransferGraphArtifact',
+                request_serializer=geometry__runtime__pb2.GraphArtifactTransferRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.GraphArtifactTransferResponse.FromString,
+                _registered_method=True)
         self.ExportMappingBackendCheckpoint = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/ExportMappingBackendCheckpoint',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
@@ -225,6 +230,11 @@ class GeometryRuntimeStub(object):
                 '/nuwax.geometry.GeometryRuntime/GetExplorationDiagnostics',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.ExplorationDiagnostics.FromString,
+                _registered_method=True)
+        self.PublishLaserScan = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/PublishLaserScan',
+                request_serializer=geometry__runtime__pb2.PublishLaserScanRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.PublishResult.FromString,
                 _registered_method=True)
         self.PublishOdom = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/PublishOdom',
@@ -341,6 +351,12 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetMappingState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TransferGraphArtifact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -491,9 +507,15 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PublishOdom(self, request, context):
+    def PublishLaserScan(self, request, context):
         """输入发布兼容
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PublishOdom(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -586,6 +608,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.GetMappingState,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.MappingSessionState.SerializeToString,
+            ),
+            'TransferGraphArtifact': grpc.unary_unary_rpc_method_handler(
+                    servicer.TransferGraphArtifact,
+                    request_deserializer=geometry__runtime__pb2.GraphArtifactTransferRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.GraphArtifactTransferResponse.SerializeToString,
             ),
             'ExportMappingBackendCheckpoint': grpc.unary_unary_rpc_method_handler(
                     servicer.ExportMappingBackendCheckpoint,
@@ -696,6 +723,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.GetExplorationDiagnostics,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.ExplorationDiagnostics.SerializeToString,
+            ),
+            'PublishLaserScan': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishLaserScan,
+                    request_deserializer=geometry__runtime__pb2.PublishLaserScanRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.PublishResult.SerializeToString,
             ),
             'PublishOdom': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishOdom,
@@ -1143,6 +1175,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/GetMappingState',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.MappingSessionState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TransferGraphArtifact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/TransferGraphArtifact',
+            geometry__runtime__pb2.GraphArtifactTransferRequest.SerializeToString,
+            geometry__runtime__pb2.GraphArtifactTransferResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1737,6 +1796,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/GetExplorationDiagnostics',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.ExplorationDiagnostics.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PublishLaserScan(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/PublishLaserScan',
+            geometry__runtime__pb2.PublishLaserScanRequest.SerializeToString,
+            geometry__runtime__pb2.PublishResult.FromString,
             options,
             channel_credentials,
             insecure,

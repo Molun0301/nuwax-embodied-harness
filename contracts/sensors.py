@@ -207,6 +207,78 @@ class SensorSample(ContractModel):
         return self
 
 
+class CanonicalLaserScan(SensorSample):
+    """二维极坐标扫描；距离、角度与时间保持同一光束索引。"""
+
+    sample_kind: Literal[SensorKind.LIDAR_2D] = SensorKind.LIDAR_2D
+    beam_count: int = Field(ge=1, le=32768)
+    angular_layout: Literal["uniform", "explicit"]
+    angle_min_rad: Optional[float] = None
+    angle_increment_rad: Optional[float] = None
+    angles_f32_le: Optional[bytes] = None
+    ranges_f32_le: bytes
+    # 0为坏测量，1为有效回波，2为设备明确声明的量程内无返回。
+    beam_states_u8: bytes
+    range_min_m: float = Field(ge=0)
+    range_max_m: float = Field(gt=0)
+    intensities_f32_le: Optional[bytes] = None
+    scan_duration_ns: int = Field(ge=0, le=5_000_000_000)
+    time_offsets_ns_le: Optional[bytes] = None
+    timestamp_quality: Literal["hardware", "estimated", "receipt"]
+    time_offsets_quality: Literal["unavailable", "hardware", "estimated"] = "unavailable"
+    timing_uncertainty_ns: Optional[int] = Field(default=None, ge=0)
+    motion_compensated: bool = False
+
+    @model_validator(mode="after")
+    def _validate_planar_payload(self) -> "CanonicalLaserScan":
+        if self.payload_ownership != PayloadOwnership.INLINE:
+            raise ValueError("当前二维扫描只支持已实现的内联载荷")
+        if self.registration_state != RegistrationState.SENSOR:
+            raise ValueError("规范二维扫描必须保留雷达原始极坐标")
+        if not math.isfinite(self.range_min_m) or not math.isfinite(self.range_max_m) or self.range_max_m <= self.range_min_m:
+            raise ValueError("二维扫描量程无效")
+        count = self.beam_count
+        if len(self.ranges_f32_le) != count * 4 or len(self.beam_states_u8) != count:
+            raise ValueError("二维距离或状态载荷长度不匹配")
+        states = np.frombuffer(self.beam_states_u8, dtype=np.uint8)
+        ranges = np.frombuffer(self.ranges_f32_le, dtype="<f4")
+        if np.any(states > 2):
+            raise ValueError("未知光束状态")
+        hits = states == 1
+        if np.any(~np.isfinite(ranges[hits])) or np.any(ranges[hits] < self.range_min_m) or np.any(ranges[hits] > self.range_max_m):
+            raise ValueError("有效回波必须在真实量程内")
+        if self.angular_layout == "uniform":
+            if self.angles_f32_le is not None or self.angle_min_rad is None or self.angle_increment_rad is None:
+                raise ValueError("等角扫描必须给出起始角和步进，不能同时提供角度数组")
+            if not math.isfinite(self.angle_min_rad) or not math.isfinite(self.angle_increment_rad) or self.angle_increment_rad == 0:
+                raise ValueError("等角扫描角度参数非法")
+            if abs(self.angle_increment_rad) * (count - 1) > 2 * math.pi + 1e-5:
+                raise ValueError("二维扫描角跨度超过一圈")
+        else:
+            if self.angle_min_rad is not None or self.angle_increment_rad is not None:
+                raise ValueError("显式角度扫描不能同时声明等角参数")
+            if self.angles_f32_le is None or len(self.angles_f32_le) != count * 4:
+                raise ValueError("显式角度载荷长度不匹配")
+            if not np.all(np.isfinite(np.frombuffer(self.angles_f32_le, dtype="<f4"))):
+                raise ValueError("二维扫描包含非法角度")
+        if self.intensities_f32_le is not None:
+            if len(self.intensities_f32_le) != count * 4 or not np.all(np.isfinite(np.frombuffer(self.intensities_f32_le, dtype="<f4"))):
+                raise ValueError("二维强度载荷无效")
+        if self.time_offsets_ns_le is None:
+            if self.time_offsets_quality != "unavailable":
+                raise ValueError("没有逐束时间不能声明逐束时间质量")
+        else:
+            if len(self.time_offsets_ns_le) != count * 8 or self.time_offsets_quality == "unavailable":
+                raise ValueError("逐束时间载荷或质量声明不完整")
+            # 角度重排后时间可以非单调，但每个偏移必须落在真实采集窗口内。
+            offsets = np.frombuffer(self.time_offsets_ns_le, dtype="<u8")
+            if np.any(offsets > self.scan_duration_ns):
+                raise ValueError("逐束时间超出扫描采集窗口")
+        if self.timestamp_ns + self.scan_duration_ns > (1 << 64) - 1:
+            raise ValueError("二维扫描采集结束时间溢出")
+        return self
+
+
 class CanonicalLidarFrame(SensorSample):
     """规范化 3D LiDAR 帧；高频字段使用 little-endian bytes 或外置载荷引用。"""
 

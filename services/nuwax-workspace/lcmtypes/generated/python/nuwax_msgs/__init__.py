@@ -8,3 +8,5 @@ from .LioOdometryEnvelope import LioOdometryEnvelope as LioOdometryEnvelope
 from .LioCloudEnvelope import LioCloudEnvelope as LioCloudEnvelope
 from .LioStatus import LioStatus as LioStatus
 from .NavigationMap3D import NavigationMap3D as NavigationMap3D
+from .PlanarNavigationMap import PlanarNavigationMap as PlanarNavigationMap
+from .PlanarScan import PlanarScan as PlanarScan

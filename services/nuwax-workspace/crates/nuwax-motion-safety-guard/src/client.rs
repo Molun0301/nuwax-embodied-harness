@@ -122,12 +122,20 @@ pub struct CommandConfirmation {
 }
 
 /// Correlated proof that the actuator accepted a zero command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ZeroConfirmation {
     /// Non-empty guard-generated zero acknowledgement id.
     pub zero_ack_id: String,
     /// Guard-side monotonic time sampled after zero application.
     pub applied_monotonic_ns: u64,
+    /// 是否取得实际速度或保证制动的停稳证明。
+    pub stationary_confirmed: bool,
+    /// 命令确认、待确认或最终证明种类。
+    pub confirmation_kind: String,
+    /// 实测停稳反馈的来源时间，未使用反馈时为零。
+    pub feedback_source_timestamp_ns: u64,
+    /// 同机单调时钟下的确认截止，零表示没有在途确认。
+    pub stationary_deadline_monotonic_ns: u64,
 }
 
 /// Result of an ordinary global stop operation.
@@ -228,6 +236,7 @@ pub struct MotionGuardClient {
     lease_tuple: Option<LeaseTuple>,
     sequence: u64,
     poison_reason: Option<String>,
+    require_stationary: bool,
 }
 
 impl MotionGuardClient {
@@ -256,6 +265,7 @@ impl MotionGuardClient {
             lease_tuple: None,
             sequence: 0,
             poison_reason: None,
+            require_stationary: std::env::var("NUWAX_NAV_CAPABILITIES_JSON").ok().is_some_and(|v| !v.trim().is_empty()),
         })
     }
 
@@ -339,6 +349,43 @@ impl MotionGuardClient {
             .ok_or_else(|| "RESOURCE_FENCED response has no ZeroAck".to_string())
             .and_then(validate_zero_ack)
             .or_else(|message| client.protocol_error(message))
+    }
+
+    /// 紧急命令围栏完成后，在独立连接查询原操作的停稳终态；不占用300毫秒命令预算。
+    pub async fn confirm_stationary_after_fence(config:ClientConfig,operation_id:&str,zero:ZeroConfirmation)->Result<ZeroConfirmation,MotionGuardClientError> {
+        if zero.stationary_deadline_monotonic_ns==0 {
+            if !zero.stationary_confirmed && std::env::var("NUWAX_NAV_CAPABILITIES_JSON").ok().is_some_and(|v|!v.trim().is_empty()) {
+                return Err(MotionGuardClientError::Protocol("已标定运动链缺少实际停稳或保证制动证明".into()));
+            }
+            return Ok(zero);
+        }
+        let mut client=Self::connect_with_config(config).await?;
+        client.wait_stationary(operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
+    }
+
+    async fn wait_stationary(&mut self,operation_id:&str,source:GuardSource,namespace:OperationNamespace,zero:ZeroConfirmation)->Result<ZeroConfirmation,MotionGuardClientError> {
+        let deadline=zero.stationary_deadline_monotonic_ns;
+        if deadline==0 {
+            if self.require_stationary && !zero.stationary_confirmed {
+                return self.protocol_error("已标定运动链缺少实际停稳或保证制动证明");
+            }
+            return Ok(zero);
+        }
+        if deadline>monotonic_ns()?.saturating_add(32_000_000_000) {return self.protocol_error("停稳确认截止超出有界预算");}
+        while monotonic_ns()?<=deadline {
+            let request=MotionGuardRequest {api_version:API_VERSION,request_id:new_request_id(),operation:Some(motion_guard_request::Operation::GetOperationResult(GetOperationResultRequest {
+                source:source as i32,operation_id:operation_id.into(),operation_namespace:namespace as i32,
+            }))};
+            let outcome=self.exchange_allowing_acks(request,OutcomeKind::GetOperationResult,&[AckCode::Zeroed,AckCode::ResourceFenced]).await?;
+            let motion_guard_response::Outcome::GetOperationResult(value)=outcome else {unreachable!("已检查响应种类")};
+            if !value.resolved || value.target_operation_id!=operation_id {return self.protocol_error("停稳查询与原停止操作不一致");}
+            let observed=value.zero_ack.ok_or_else(||"停稳查询缺少原归零标识".to_owned()).and_then(validate_zero_ack).or_else(|e|self.protocol_error(e))?;
+            if observed.zero_ack_id!=zero.zero_ack_id {return self.protocol_error("停稳查询更换了原归零标识");}
+            if observed.stationary_confirmed {return Ok(observed);}
+            if observed.confirmation_kind=="unconfirmed" {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(MotionGuardClientError::Remote{code:"MOTION_STOP_UNCONFIRMED".into(),message:"执行器未在保证制动期限内确认停稳".into(),retryable:false,operation_id:operation_id.into()})
     }
 
     /// Returns the source identity fixed for every request from this client.
@@ -429,6 +476,10 @@ impl MotionGuardClient {
             unreachable!("exchange already correlated the outcome")
         };
 
+        if operation.zero_ack.as_ref().is_some_and(|zero|zero.stationary_deadline_monotonic_ns>0 || zero.confirmation_kind=="unconfirmed" || (self.require_stationary && !zero.stationary_confirmed)) {
+            return self.protocol_error("恢复围栏的原停止操作尚未取得停稳证明");
+        }
+
         let state_request = MotionGuardRequest {
             api_version: API_VERSION,
             request_id: new_request_id(),
@@ -476,7 +527,7 @@ impl MotionGuardClient {
                 StopAllMotionRequest {
                     envelope: Some(GlobalStopEnvelope {
                         source: GuardSource::GatewayManual as i32,
-                        operation_id,
+                        operation_id: operation_id.clone(),
                         payload_sha256: Vec::new(),
                         issued_monotonic_ns: issued,
                         deadline_monotonic_ns: deadline,
@@ -506,6 +557,7 @@ impl MotionGuardClient {
             .or_else(|message| self.protocol_error(message))?;
         self.lease_tuple = None;
         self.sequence = 0;
+        let zero=self.wait_stationary(&operation_id,GuardSource::GatewayManual,OperationNamespace::GlobalStop,zero).await?;
         Ok(GlobalStopConfirmation {
             zero,
             lease_revoked: response.lease_revoked,
@@ -653,7 +705,7 @@ impl MotionGuardClient {
         if response.applied_monotonic_ns == 0 {
             return self.protocol_error("ZEROED stop response has no application timestamp");
         }
-        Ok(zero)
+        self.wait_stationary(&operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
     }
 
     /// Atomically revokes the active lease, applies zero, and waits for fencing proof.
@@ -689,7 +741,7 @@ impl MotionGuardClient {
             .or_else(|message| self.protocol_error(message))?;
         self.lease_tuple = None;
         self.sequence = 0;
-        Ok(zero)
+        self.wait_stationary(&operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
     }
 
     fn validate_acquire(
@@ -1040,6 +1092,10 @@ fn validate_zero_ack(zero: ZeroAck) -> Result<ZeroConfirmation, String> {
     Ok(ZeroConfirmation {
         zero_ack_id: zero.zero_ack_id,
         applied_monotonic_ns: zero.applied_monotonic_ns,
+        stationary_confirmed: zero.stationary_confirmed,
+        confirmation_kind: zero.confirmation_kind,
+        feedback_source_timestamp_ns: zero.feedback_source_timestamp_ns,
+        stationary_deadline_monotonic_ns: zero.stationary_deadline_monotonic_ns,
     })
 }
 
@@ -1343,6 +1399,7 @@ mod tests {
             zero: ZeroConfirmation {
                 zero_ack_id: "zero-hold-17".into(),
                 applied_monotonic_ns: 13,
+                ..Default::default()
             },
             recovery_fence_token: [5; 32],
         }
@@ -1363,12 +1420,14 @@ mod tests {
             zero_ack: Some(ZeroAck {
                 zero_ack_id: proof.zero.zero_ack_id.clone(),
                 applied_monotonic_ns: proof.zero.applied_monotonic_ns,
+                ..Default::default()
             }),
             motion_stop_generation: proof.motion_stop_generation,
             recovery_fence_token: proof.recovery_fence_token.to_vec(),
             recovery_fence_held: true,
         };
         let state = GetGuardStateResponse {
+            last_zero_confirmation: None,
             result: Some(GuardResult {
                 ack: AckCode::Received as i32,
                 lease: LeaseState::Idle as i32,

@@ -48,7 +48,6 @@
   "NUWAX_GEOMETRY_RUNTIME_READY_FILE": "几何服务的就绪记录文件，供启动和网关连接检查使用。",
   "NUWAX_GEOMETRY_RUNTIME_PROCESS_NAME": "运行管理和状态报告使用的几何进程名称。",
   "NUWAX_GEOMETRY_RUNTIME_LOG_NAME": "运行管理记录的几何日志名称。",
-  "NUWAX_NAV_PROFILE": "导航方案：simple-2d、replanning-astar或mls-3d；默认simple-2d。三维方案需要实际机体到支撑面标定与机器人通行参数。",
   "NUWAX_EXPLORE_ARBITRATION": "探索 source arbitration；当前生产构建只 qualification prefer_wavefront。",
   "NUWAX_GEOMETRY_ODOM_TOPIC": "里程计话题（实机由 Unitree 驱动发布 /utlidar/robot_odom,settings.py 默认 /utlidar/robot_odom 与 .env.example 对齐）",
   "NUWAX_GEOMETRY_TF_TOPIC": "TF 话题（settings.py / tf_static 配套使用,默认 /tf）"

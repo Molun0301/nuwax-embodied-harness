@@ -17,7 +17,7 @@ const ON: Luma<u8> = Luma([255]);
 const OFF: Luma<u8> = Luma([0]);
 
 /// 以 `(ix, iy)` 为键、z 索引列表为值的体素列索引。
-pub type ColumnIz = AHashMap<(i32, i32), Vec<i32>>;
+pub type ColumnIz = im::HashMap<(i32, i32), Vec<i32>, ahash::RandomState>;
 
 /// A cell is standable if it has at least the robot's height of clear space
 /// above it.
@@ -72,7 +72,7 @@ pub fn extract_surfaces(
 
 /// Standable cells in one column: any cell with robot clearance above, plus
 /// the topmost cell.
-fn standable_in_column(
+pub(crate) fn standable_in_column(
     ix: i32,
     iy: i32,
     zs: &[i32],
@@ -236,7 +236,7 @@ mod tests {
 
     fn run(cells: &[VoxelKey], clearance: i32, closing: u32) -> Vec<VoxelKey> {
         let map = voxel_map(cells);
-        let mut by_col = ColumnIz::new();
+        let mut by_col = ColumnIz::default();
         let mut out = Vec::new();
         extract_surfaces(&map, clearance, closing, &mut by_col, &mut out);
         out

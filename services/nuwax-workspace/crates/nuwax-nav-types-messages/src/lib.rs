@@ -24,6 +24,8 @@
 #![warn(missing_docs)]
 
 pub mod diagnostics;
+pub mod navigation_capabilities;
+pub use navigation_capabilities::{MotionLimits, MotionModel, NavigationCapabilities, ObservationKind, ObservationModel, TerrainLimits};
 pub mod dimos;
 pub mod frames;
 pub mod geometry;
@@ -44,3 +46,5 @@ pub use path::*;
 pub use robot_geometry::*;
 pub use sensors::*;
 pub use visual::*;
+
+pub use nuwax_types::navigation::GoalOptions;

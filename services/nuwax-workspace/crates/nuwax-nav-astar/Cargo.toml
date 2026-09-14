@@ -8,6 +8,7 @@ authors.workspace = true
 description = "nuwax 纯 Rust replanning A* 导航核心（min-cost 8 邻接 A*、safe goal、replan limiter、局部跟随与全局编排）"
 
 [dependencies]
+nuwax-nav-control = { path = "../nuwax-nav-control" }
 # 共享数值与栅格基础
 nuwax-numeric = { path = "../nuwax-numeric" }
 

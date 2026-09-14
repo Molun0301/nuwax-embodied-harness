@@ -6,3 +6,4 @@ lcm-gen 1.5.2
 
 from .Time import Time as Time
 from .Header import Header as Header
+from .Bool import Bool as Bool

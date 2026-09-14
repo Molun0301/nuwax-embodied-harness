@@ -468,6 +468,11 @@ _GEOMETRY_ONLY_CAPABILITY_NAMES = frozenset(
 )
 _MOTION_STACK_CAPABILITY_NAMES = frozenset(
     {
+        "navigate_to_floor",
+        "resume_floor_navigation",
+        "explore_building",
+        "resume_building_exploration",
+        "resume_exploration",
         "navigate_to_pose",
         "navigate_to_named_location",
         "find_target",
@@ -721,6 +726,12 @@ def _map_georeference_input_schema() -> Dict[str, object]:
             "map_plane_z_m",
         ),
     )
+
+
+def _exploration_return_policy_schema() -> Dict[str, Any]:
+    """两条探索链共用的显式行程预算模式。"""
+    from contracts.exploration_mission import ExplorationReturnPolicy
+    return ExplorationReturnPolicy.model_json_schema()
 
 
 def _exploration_stop_conditions_schema() -> Dict[str, object]:
@@ -1164,6 +1175,14 @@ class GatewayRuntime:
         )
         # 启停等待组件退出时不占用数据锁，避免与点云读取回调形成锁反转。
         self._lifecycle_lock = threading.RLock()
+        self._building_catalog_repository = None
+        self._building_navigation_service = None
+        self._building_exploration_service = None
+        self._exploration_finalize_lock = threading.Lock()
+        self._exploration_finalize_executor = None
+        self._exploration_finalize_futures = {}
+        self._exploration_finalize_closing = False
+        self._exploration_finalize_wakeup = threading.Event()
         self._closed = False
         self._lock = threading.RLock()
         self._started = False
@@ -1305,6 +1324,7 @@ class GatewayRuntime:
                 self.robot.manifest.robot_name,
                 self.robot.manifest.robot_model,
             )
+            pending_floor=self._pending_floor_execution() or self._pending_building_exploration()
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
@@ -1316,14 +1336,15 @@ class GatewayRuntime:
             self._start_safety_watchdog_loop()
             self._start_data_frame_stream_sources()
             # 地图工作区仅由 MCP activate_map 显式切换，启动时不自动恢复。
-            if self.config.runtime_data.map_active_restore_on_start:
+            if self.config.runtime_data.map_active_restore_on_start and pending_floor is None:
                 try:
                     self.map_workspace_service.restore_active_workspace(load_memory_history=True)
                 except Exception:
                     RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
             else:
                 RUNTIME_LOGGER.info(
-                    "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
+                    "存在未决跨层任务，地图恢复由原任务核对设施后执行。" if pending_floor is not None
+                    else "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
                 )
             self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
             self._refresh_dynamic_capability_matrix()
@@ -1436,6 +1457,7 @@ class GatewayRuntime:
             if not self._started:
                 if not self._closed:
                     self.task_manager.shutdown(wait=True)
+                    self._join_exploration_finalizers()
                     self._close_dispatch_resources()
                     self._closed = True
                 return
@@ -1465,6 +1487,7 @@ class GatewayRuntime:
                     "motion guard global stop was not confirmed during gateway shutdown"
                 )
             self.task_manager.shutdown(wait=True)
+            self._join_exploration_finalizers()
             try:
                 self._settle_relocalization_owner_before_geometry_stop(
                     operation="gateway_stop",
@@ -1560,6 +1583,11 @@ class GatewayRuntime:
     def _close_dispatch_resources(self) -> None:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
 
+        building_service = getattr(self, "_building_navigation_service", None)
+        if building_service is not None:
+            for provider in building_service.providers.values():
+                provider.close()
+            self._building_navigation_service = None
         log_handler = getattr(self, "_log_stream_handler", None)
         if log_handler is not None:
             logging.getLogger().removeHandler(log_handler)
@@ -3097,6 +3125,35 @@ class GatewayRuntime:
                 output_schema=_schema_object({"instances": {"type": "array", "items": {"type": "object"}}}),
                 exposed_to_agent=False,
             ),
+            _descriptor("list_buildings", "列出建筑楼层", "读取楼层目录、活动地图与设施接入配置，不发送设施动作。",
+                execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.LOW,input_schema=_schema_object({}),output_schema=_schema_object({"buildings":{"type":"array","items":{"type":"object"}},"active_map_name":{"type":["string","null"]}})),
+            _descriptor("register_building", "登记建筑楼层", "登记完整楼层目录及设施连接，核对已保存二维图摘要和目录修订。",
+                execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"topology":{"type":"object"},"expected_revision":{"type":"integer","minimum":0,"default":0}},required=("topology",)),output_schema=_schema_object({"building":{"type":"object"}})),
+            _descriptor("get_floor_navigation_state", "读取跨层任务状态", "读取持久跨层阶段、实际设施反馈和待对账操作。",
+                execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.LOW,input_schema=_schema_object({}),output_schema=_schema_object({"state":{"type":["object","null"]}})),
+            _descriptor("pause_exploration", "暂停并保存探索", "请求原单层探索停车并保存完整地图与进度，查询原任务元数据确认保存结果。",execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"request_id":{"type":"string","minLength":1}},required=("request_id",)),output_schema=_schema_object({"task_id":{"type":"string"},"checkpoint_id":{"type":"string"},"checkpoint_pending":{"type":"boolean"}})),
+            _descriptor("list_exploration_checkpoints", "读取探索检查点", "读取最近已保存检查点及其地图是否仍可恢复。",execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({}),output_schema=_schema_object({"checkpoints":{"type":"array"}})),
+            _descriptor("resume_exploration", "恢复单层探索", "核对冻结进度和完整地图，实际定位后继续探索或返航。",execution_mode=CapabilityExecutionMode.ASYNC_TASK,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"checkpoint_id":{"type":"string","minLength":1},"timeout_sec":{"type":"number","exclusiveMinimum":0}},required=("checkpoint_id",)),output_schema=_schema_object({"task":{"type":"object"}}),
+                required_resources=(RuntimeResource.BASE_MOTION.value,RuntimeResource.NAVIGATION.value),timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,cancel_supported=True),
+            _descriptor("get_building_exploration_state","读取逐层探索进度","读取冻结楼层顺序、已保存层图与当前子任务。",execution_mode=CapabilityExecutionMode.SYNC,risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({}),output_schema=_schema_object({"state":{"type":["object","null"]}})),
+            _descriptor("explore_building","逐层探索建筑","按冻结的楼层顺序通过已登记设施探索并保存各层地图；未知层从已验证抵达位姿建立新图。",execution_mode=CapabilityExecutionMode.ASYNC_TASK,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"building_id":{"type":"string"},"floor_ids":{"type":"array","items":{"type":"string"}},"stop_conditions":_exploration_stop_conditions_schema(),"per_floor_timeout_sec":{"type":"number","exclusiveMinimum":0,"maximum":3600,"default":300},"timeout_sec":{"type":"number","exclusiveMinimum":0,"maximum":43200,"default":7200}},required=("building_id",)),
+                required_resources=(RuntimeResource.BUILDING_WORKFLOW.value,),timeout_sec=7200,cancel_supported=True),
+            _descriptor("resume_building_exploration","恢复逐层探索","核对已保存进度和当前子任务，继续原楼层顺序。",execution_mode=CapabilityExecutionMode.ASYNC_TASK,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"request_id":{"type":"string"}},required=("request_id",)),required_resources=(RuntimeResource.BUILDING_WORKFLOW.value,),timeout_sec=7200,cancel_supported=True),
+            _descriptor("navigate_to_floor", "导航到楼层位姿", "冻结目标楼层和完整图，经已登记设施连接导航到目标；设施缺失或不能定位时明确失败。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"building_id":{"type":"string"},"floor_id":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"yaw_rad":{"type":"number","default":0.0},"timeout_sec":{"type":"number","exclusiveMinimum":0,"maximum":7200,"default":600}},required=("building_id","x","y")),
+                required_resources=(RuntimeResource.BASE_MOTION.value,RuntimeResource.NAVIGATION.value,RuntimeResource.MAP_WORKSPACE.value),timeout_sec=600,cancel_supported=True),
+            _descriptor("resume_floor_navigation", "恢复跨层任务", "核对冻结请求并先停车，查询原设施未决操作后继续；不会重新解释目标楼层。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({"request_id":{"type":"string"}},required=("request_id",)),
+                required_resources=(RuntimeResource.BASE_MOTION.value,RuntimeResource.NAVIGATION.value,RuntimeResource.MAP_WORKSPACE.value),timeout_sec=600,cancel_supported=True),
             _descriptor(
                 "navigate_to_pose",
                 "导航到位姿",
@@ -3232,6 +3289,7 @@ class GatewayRuntime:
                         "strategy": {"type": "string", "default": "wavefront"},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
                         "stop_conditions": _exploration_stop_conditions_schema(),
+                        "return_policy": _exploration_return_policy_schema(),
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
                     }
@@ -3279,6 +3337,7 @@ class GatewayRuntime:
                             },
                         },
                         "stop_conditions": _exploration_stop_conditions_schema(),
+                        "return_policy": _exploration_return_policy_schema(),
                         "max_navigation_retries": {"type": "integer", "minimum": 0, "default": 1},
                         "blacklist_radius_m": {"type": "number", "minimum": 0.0, "default": 0.75},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
@@ -3314,6 +3373,7 @@ class GatewayRuntime:
                         "strategy": {"type": "string", "default": "frontier"},
                         "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
                         "stop_conditions": _exploration_stop_conditions_schema(),
+                        "return_policy": _exploration_return_policy_schema(),
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
                         "search_refresh_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.8},
                         "verify_similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.55},
@@ -3474,6 +3534,17 @@ class GatewayRuntime:
             "review_scene_space": partial(memory_skills.handle_review_scene_space, self._skill_ctx),
             "remember_current_scene": partial(memory_skills.handle_remember_current_scene, self._skill_ctx),
             "list_semantic_instances": partial(memory_skills.handle_list_semantic_instances, self._skill_ctx),
+            "list_buildings": self._handle_list_buildings,
+            "register_building": self._handle_register_building,
+            "get_floor_navigation_state": self._handle_get_floor_navigation_state,
+            "pause_exploration": self._handle_pause_exploration,
+            "list_exploration_checkpoints": self._handle_list_exploration_checkpoints,
+            "resume_exploration": self._handle_resume_exploration,
+            "explore_building": self._handle_explore_building,
+            "resume_building_exploration": self._handle_resume_building_exploration,
+            "get_building_exploration_state": self._handle_get_building_exploration_state,
+            "navigate_to_floor": self._handle_navigate_to_floor,
+            "resume_floor_navigation": self._handle_resume_floor_navigation,
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
             "cancel_navigation": self._handle_cancel_navigation,
@@ -3853,10 +3924,21 @@ class GatewayRuntime:
                 category=SkillCategory.MEMORY,
                 capability_name="list_semantic_instances",
             ),
+            SkillDescriptor(name="list_buildings",display_name="列出建筑楼层",description="读取建筑楼层目录与设施连接。",category=SkillCategory.TASK,capability_name="list_buildings"),
+            SkillDescriptor(name="register_building",display_name="登记建筑楼层",description="登记楼层完整图和有向设施连接。",category=SkillCategory.TASK,capability_name="register_building"),
+            SkillDescriptor(name="get_floor_navigation_state",display_name="跨层任务状态",description="读取跨层阶段及设施待对账状态。",category=SkillCategory.TASK,capability_name="get_floor_navigation_state"),
+            SkillDescriptor(name="pause_exploration",display_name="暂停并保存探索",description="原任务停车后保存完整地图与探索进度。",category=SkillCategory.TASK,capability_name="pause_exploration"),
+            SkillDescriptor(name="list_exploration_checkpoints",display_name="探索检查点",description="读取已保存检查点与可恢复状态。",category=SkillCategory.TASK,capability_name="list_exploration_checkpoints"),
+            SkillDescriptor(name="resume_exploration",display_name="恢复单层探索",description="核对完整地图并实际定位后恢复探索。",category=SkillCategory.TASK,capability_name="resume_exploration"),
+            SkillDescriptor(name="explore_building",display_name="逐层探索建筑",description="通过已登记设施探索各层并保存地图。",category=SkillCategory.TASK,capability_name="explore_building"),
+            SkillDescriptor(name="resume_building_exploration",display_name="恢复逐层探索",description="核对原进度并继续既定楼层顺序。",category=SkillCategory.TASK,capability_name="resume_building_exploration"),
+            SkillDescriptor(name="get_building_exploration_state",display_name="逐层探索进度",description="读取逐层探索的真实完成情况。",category=SkillCategory.TASK,capability_name="get_building_exploration_state"),
+            SkillDescriptor(name="navigate_to_floor",display_name="导航到楼层位姿",description="通过已登记设施导航至冻结的楼层位姿。",category=SkillCategory.TASK,capability_name="navigate_to_floor"),
+            SkillDescriptor(name="resume_floor_navigation",display_name="恢复跨层任务",description="先核对停车与原设施操作，再继续原冻结目标。",category=SkillCategory.TASK,capability_name="resume_floor_navigation"),
             SkillDescriptor(
                 name="navigate_to_pose",
                 display_name="导航到位姿",
-                description="把机器人导航到指定二维目标位姿。",
+                description="按当前建图链导航到指定二维或三维目标位姿，并确认最终位置与朝向。",
                 category=SkillCategory.TASK,
                 capability_name="navigate_to_pose",
             ),
@@ -4138,6 +4220,8 @@ class GatewayRuntime:
             message=f"能力 {descriptor.name} 调用开始。",
         )
         try:
+            if self._requires_motion_admission(descriptor) or descriptor.name in {"activate_map", "start_mapping", "delete_map", "finalize_active_map", "relocalize_active_map"}:
+                self._assert_floor_execution_allows_public_request(descriptor.name)
             if descriptor.name in {"explore_area", "explore_area_v2"}:
                 self._ensure_geometry_runtime_for_invoke(capability_name)
                 payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
@@ -5346,7 +5430,11 @@ class GatewayRuntime:
             "error": self.task_manager.get_task_error(task_id),
             "error_payload": self.task_manager.get_task_error_payload(task_id),
         }
-        receipt = self.task_manager.get_task_spec(task_id).metadata.get("map_asset_finalize")
+        metadata = self.task_manager.get_task_spec(task_id).metadata
+        checkpoint = metadata.get("exploration_checkpoint")
+        if isinstance(checkpoint, dict):
+            snapshot["exploration_checkpoint"] = dict(checkpoint)
+        receipt = metadata.get("map_asset_finalize")
         if isinstance(receipt, dict):
             snapshot["map_asset_finalize"] = dict(receipt)
             if isinstance(snapshot["result"], dict):
@@ -6548,6 +6636,169 @@ class GatewayRuntime:
         )
         return result
 
+    def _get_building_catalog(self):
+        from services.mapping.catalog import MapCatalogRepository
+        from services.navigation.building_catalog import BuildingCatalog
+        with self._lifecycle_lock:
+            if self._building_catalog_repository is None:
+                self._building_catalog_repository = BuildingCatalog(MapCatalogRepository(self.config.runtime_data.map_catalog_root))
+            return self._building_catalog_repository
+
+    def _get_building_navigation_service(self):
+        from services.navigation.building_execution import BuildingNavigationService
+        from services.navigation.facilities import load_facility_providers
+        with self._lifecycle_lock:
+            if self._closed:
+                raise GatewayError("网关已关闭，不能创建设施连接。",error_code="runtime_closed")
+            if self._building_navigation_service is None:
+                self._building_navigation_service=BuildingNavigationService(self._get_building_catalog(),load_facility_providers(self.config.geometry.navigation.facility_providers_json))
+            return self._building_navigation_service
+
+    def _pending_floor_execution(self):
+        from services.navigation.building_execution import BuildingExecutionJournal
+        root=getattr(self.config.runtime_data,"map_catalog_root",None)
+        if not root or not (Path(root)/"building_execution.json").exists():
+            return None
+        state=BuildingExecutionJournal(self._get_building_catalog()).load()
+        return state if state is not None and not state.terminal else None
+
+    def _assert_floor_execution_allows_public_request(self, capability_name: str) -> None:
+        if capability_name in {"resume_floor_navigation","resume_building_exploration"}:
+            return
+        # 未决设施恢复前，不自动启动新的公开运动或切换地图。
+        workflow=self._pending_building_exploration()
+        if workflow is not None:
+            raise GatewayError("逐层探索尚未完成，请继续原工作流。",error_code="building_exploration_pending",http_status=409,
+                details={"request_id":workflow.request.request_id,"recommended_next_tool":"resume_building_exploration"})
+        state=self._pending_floor_execution()
+        if state is not None:
+            raise GatewayError("已有跨层任务正在执行或等待设施对账，请先恢复该冻结请求。",error_code="floor_execution_pending",http_status=409,
+                details={"request_id":state.request.request_id,"stage":state.stage,"recommended_next_tool":"resume_floor_navigation"})
+
+    def _get_building_exploration_service(self):
+        from services.navigation.building_exploration import BuildingExplorationService
+        with self._lifecycle_lock:
+            if self._building_exploration_service is None:
+                self._building_exploration_service=BuildingExplorationService(self._get_building_catalog())
+            return self._building_exploration_service
+
+    def _pending_building_exploration(self):
+        root=getattr(self.config.runtime_data,"map_catalog_root",None)
+        if not root or not (Path(root)/"building_exploration.json").exists():return None
+        state=self._get_building_exploration_service().load()
+        return state if state is not None and not state.terminal else None
+
+    def _handle_pause_exploration(self, arguments, *, requested_by=None):
+        from gateways.exploration_checkpoint import request_pause
+        return request_pause(self, self._require_str(arguments, "request_id"))
+
+    def _handle_list_exploration_checkpoints(self, arguments, *, requested_by=None):
+        from gateways.exploration_checkpoint import store
+        return {"checkpoints": store(self).list()}
+
+    def _handle_resume_exploration(self, arguments, *, requested_by=None, request_context=None):
+        from gateways.exploration_checkpoint import store
+        saved = store(self).load(self._require_str(arguments, "checkpoint_id"))
+        if saved.pipeline != self.config.geometry.pipeline:
+            raise GatewayError("检查点与当前二维/三维链路不一致。")
+        admission = self._require_motion_admission(arguments, "resume_exploration")
+        request = saved.request.model_copy(update={"request_id": self._build_runtime_request_id("explore_resume"),
+            "resume_progress_json": saved.geometry_progress_json}, deep=True)
+        return self._submit_exploration_task(request=request, motion_admission=admission, poll_interval_sec=0.2,
+            timeout_sec=self._resolve_async_timeout("resume_exploration", arguments, minimum_sec=0.1), requested_by=requested_by,
+            request_context=request_context, task_metadata={"resumed_checkpoint_id": saved.checkpoint_id}, capability_name="explore_area_v2")
+
+    def _handle_get_building_exploration_state(self,arguments,*,requested_by=None):
+        return {"state":self._get_building_exploration_service().load()}
+
+    def _handle_explore_building(self,arguments,*,requested_by=None,request_context=None):
+        from contracts.building_navigation import BuildingExplorationRequest
+        topology=self._get_building_catalog().get(self._require_str(arguments,"building_id"))
+        if topology is None:raise GatewayError("建筑目录不存在。")
+        wanted=arguments.get("floor_ids") or [floor.floor_id for floor in topology.floors if floor.enabled]
+        by_id={floor.floor_id:floor for floor in topology.floors}
+        if not isinstance(wanted,list) or any(item not in by_id or not by_id[item].enabled for item in wanted):raise GatewayError("逐层探索包含未登记或不可用楼层。")
+        request=BuildingExplorationRequest(request_id=self._build_runtime_request_id("building_explore"),building_id=topology.building_id,
+            topology_revision=topology.revision,floors=tuple(by_id[item] for item in wanted),stop_conditions=self._exploration_stop_conditions(arguments),
+            per_floor_timeout_sec=self._float(arguments,"per_floor_timeout_sec",300.0),timeout_sec=self._float(arguments,"timeout_sec",7200.0))
+        return self._submit_building_exploration(arguments,request,False,requested_by,request_context)
+
+    def _handle_resume_building_exploration(self,arguments,*,requested_by=None,request_context=None):
+        state=self._get_building_exploration_service().load()
+        if state is None or state.terminal or state.request.request_id!=self._require_str(arguments,"request_id"):
+            raise GatewayError("没有匹配的未决逐层探索。")
+        return self._submit_building_exploration(arguments,state.request,True,requested_by,request_context)
+
+    def _submit_building_exploration(self,arguments,request,resume,requested_by,request_context):
+        from gateways.building_exploration import GatewayBuildingExplorationPorts
+        capability="resume_building_exploration" if resume else "explore_building"
+        admission=self._require_motion_admission(arguments,capability)
+        service=self._get_building_exploration_service()
+        descriptor=self.capability_registry.get_descriptor(capability)
+        def runner(context):
+            ports=GatewayBuildingExplorationPorts(self,context,admission,requested_by=requested_by)
+            result=service.run(request,ports,resume=resume)
+            if not context.commit_success({"building_request_id":request.request_id,"completed_floors":list(result.completed_floors),"no_active_child":True}):
+                ports.interrupt_barrier({"no_active_child":True});context.ensure_active()
+            return {"request_id":request.request_id,"building_exploration":result}
+        return self._run_with_motion_admission(admission,lambda:self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
+            required_resources=list(descriptor.required_resources),timeout_sec=request.timeout_sec,requested_by=requested_by,deferred_interrupt=True,
+            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context)))
+
+    def _handle_list_buildings(self, arguments, *, requested_by=None):
+        del arguments,requested_by
+        catalog=self._get_building_catalog()
+        return {"buildings":catalog.list(),"active_map_name":self.map_workspace_service.get_active_map_name()}
+
+    def _handle_register_building(self, arguments, *, requested_by=None):
+        del requested_by
+        from contracts.building_navigation import BuildingTopology
+        self._assert_floor_execution_allows_public_request("register_building")
+        topology=BuildingTopology.model_validate(arguments.get("topology"))
+        return {"building":self._get_building_catalog().save(topology,expected_revision=int(arguments.get("expected_revision",0)))}
+
+    def _handle_get_floor_navigation_state(self, arguments, *, requested_by=None):
+        del arguments,requested_by
+        from services.navigation.building_execution import BuildingExecutionJournal
+        return {"state":BuildingExecutionJournal(self._get_building_catalog()).load()}
+
+    def _handle_navigate_to_floor(self, arguments, *, requested_by=None, request_context=None):
+        from contracts.building_navigation import FloorPose
+        service=self._get_building_navigation_service()
+        request=service.catalog.freeze_navigation(request_id=self._build_runtime_request_id("floor_nav"),building_id=self._require_str(arguments,"building_id"),
+            target_floor_id=str(arguments["floor_id"]) if "floor_id" in arguments else None,
+            target_pose=FloorPose(x=self._require_float(arguments,"x"),y=self._require_float(arguments,"y"),yaw_rad=self._float(arguments,"yaw_rad",0.0)),
+            timeout_sec=self._float(arguments,"timeout_sec",600.0),supported_connections=service.supported_connections(str(arguments.get("building_id") or "")))
+        return self._submit_floor_navigation(arguments,request,False,requested_by,request_context)
+
+    def _handle_resume_floor_navigation(self, arguments, *, requested_by=None, request_context=None):
+        service=self._get_building_navigation_service()
+        state=service.journal.load()
+        if state is None or state.terminal or state.request.request_id!=self._require_str(arguments,"request_id"):
+            raise GatewayError("没有匹配的未决跨层请求。",error_code="floor_resume_request_mismatch",http_status=409)
+        service.catalog.validate_frozen(state.request)
+        return self._submit_floor_navigation(arguments,state.request,True,requested_by,request_context)
+
+    def _submit_floor_navigation(self, arguments, request, resume, requested_by, request_context):
+        from gateways.building_navigation import GatewayBuildingPorts
+        capability="resume_floor_navigation" if resume else "navigate_to_floor"
+        admission=self._require_motion_admission(arguments,capability)
+        service=self._get_building_navigation_service()
+        descriptor=self.capability_registry.get_descriptor(capability)
+        def runner(context):
+            self._ensure_motion_runtime_for_backend_call(capability,admission,deadline_monotonic=context.timeout_deadline_monotonic())
+            context.ensure_active()
+            ports=GatewayBuildingPorts(self,context,admission,requested_by=requested_by)
+            result=service.run(request,ports,resume=resume)
+            proof={"building_request_id":request.request_id,"target_floor_id":request.target_floor_id,**dict(ports.last_zero or {})}
+            if not context.commit_success(proof):
+                ports.interrupt_barrier(ports.stop_navigation(None),reconciled=True)
+                context.ensure_active()
+            return {"request_id":request.request_id,"building_navigation":result}
+        return self._run_with_motion_admission(admission,lambda:self.task_manager.submit(capability,runner,input_payload=request.model_dump(mode="json"),
+            requested_by=requested_by,required_resources=list(descriptor.required_resources),timeout_sec=request.timeout_sec,deferred_interrupt=True,
+            metadata=self._build_task_request_metadata(capability_name=capability,requested_by=requested_by,request_context=request_context)))
+
     def _handle_navigate_to_pose(
         self,
         arguments: Dict[str, Any],
@@ -7238,6 +7489,7 @@ class GatewayRuntime:
             strategy=strategy,
             max_duration_sec=max_duration_sec,
             stop_conditions=stop_conditions,
+            return_policy=arguments.get("return_policy"),
             boundary_line_segments=boundary_segments,
             metadata=request_metadata,
         )
@@ -7320,6 +7572,7 @@ class GatewayRuntime:
             strategy=str(arguments.get("strategy") or "frontier"),
             max_duration_sec=max_duration_sec,
             stop_conditions=stop_conditions,
+            return_policy=arguments.get("return_policy"),
             metadata={
                 "requested_by": requested_by or "unknown",
                 "search_query": query,
@@ -10270,29 +10523,11 @@ class GatewayRuntime:
                     source.encode("utf-8")
                 ).hexdigest()
 
+            # 传输层的JSON-RPC编号可被不同调用者反复使用，不能作为持久重定位身份。
+            # 只有显式业务request_id表达重试；省略时为这次受理生成独立标识。
             request_id = str(payload.get("request_id") or "").strip()
             if not request_id:
-                rpc_request_id = (request_context or {}).get("rpc_request_id")
-                if rpc_request_id is not None and rpc_request_id != "":
-                    rpc_request_id_text = str(rpc_request_id).strip()
-                    if rpc_request_id_text.startswith("relocalize:"):
-                        request_id = rpc_request_id_text
-                    else:
-                        request_id = json.dumps(
-                            {
-                                "kind": "mcp_rpc_request_id",
-                                "value": rpc_request_id,
-                            },
-                            ensure_ascii=True,
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        )
-            if not request_id:
-                request_id = str(
-                    (request_context or {}).get("request_id") or ""
-                ).strip()
-            if not request_id:
-                request_id = uuid.uuid4().hex
+                request_id = "relocalize:" + uuid.uuid4().hex
             request_id = canonical_relocalize_request_id(request_id)
             payload["request_id"] = request_id
             if request_context is not None and not str(
@@ -12905,6 +13140,10 @@ class GatewayRuntime:
                     )
                 context.ensure_active()
                 request = self._exploration_with_motion_admission(request, motion_admission)
+                checkpoint_id = (task_metadata or {}).get("resumed_checkpoint_id")
+                if checkpoint_id:
+                    from gateways.exploration_checkpoint import prepare_resume
+                    prepare_resume(self, context, request, checkpoint_id, requested_by)
                 if request.map_name:
                     self.map_workspace_service.ensure_workspace(
                         map_name=request.map_name,
@@ -13114,7 +13353,8 @@ class GatewayRuntime:
                         sleep_sec = min(sleep_sec, remaining_sec)
                     time.sleep(sleep_sec)
             except GeometryRuntimeRpcError as exc:
-                if not exploration_start_attempted:
+                if not exploration_start_attempted or getattr(exc,"exploration_rpc_dispatched",True) is False:
+                    exploration_start_attempted=False
                     if context.is_cancel_requested() or context.is_timed_out():
                         context.acknowledge_interrupt_barrier(
                             {"request_id": request.request_id, "backend_not_started": True}
@@ -13124,7 +13364,7 @@ class GatewayRuntime:
                         "探索启动准备失败：%s" % exc,
                         error_code="exploration_preparation_failed",
                         http_status=503,
-                        details=self._geometry_runtime_rpc_details(exc),
+                        details={**self._geometry_runtime_rpc_details(exc),"request_id":request.request_id,"backend_not_started":True},
                     ) from exc
                 self._raise_exploration_rpc_failure_after_barrier(
                     context,
@@ -13151,6 +13391,15 @@ class GatewayRuntime:
                                 "terminal_status": "not_started",
                             }
                         )
+                if backend_started and context.is_cancel_requested():
+                    try:
+                        from gateways.exploration_checkpoint import save_after_stop
+                        save_after_stop(self, context, request)
+                    except Exception as error:
+                        self.task_manager.update_task_metadata(context.task_id, {"exploration_checkpoint": {"status": "failed", "message": str(error)}})
+                        RUNTIME_LOGGER.exception("探索已停车，但检查点保存失败 request_id=%s", request.request_id)
+                elif context.is_cancel_requested() and self.task_manager.get_task_spec(context.task_id).metadata.get("pause_checkpoint_id"):
+                    self.task_manager.update_task_metadata(context.task_id, {"exploration_checkpoint": {"status": "failed", "message": "探索尚未建立可保存的地图和进度"}})
                 raise
             finally:
                 interrupted = context.is_cancel_requested() or context.is_timed_out()
@@ -14031,41 +14280,66 @@ class GatewayRuntime:
             deadline_monotonic=deadline_monotonic,
         )
 
+    def _record_exploration_finalize_failure(self, *, map_name, exploration_request_id, task_id, status, reason):
+        receipt={"status":status,"map_name":map_name,"exploration_request_id":exploration_request_id,"task_id":task_id,
+                 "manifest_sha256":None,"error":{"message":reason}}
+        if task_id:
+            self.task_manager.update_task_metadata(task_id,{"map_asset_finalize":receipt})
+
+    def _join_exploration_finalizers(self) -> None:
+        lock=getattr(self,"_exploration_finalize_lock",None)
+        if lock is None:
+            return
+        with lock:
+            self._exploration_finalize_closing=True
+            self._exploration_finalize_wakeup.set()
+            executor=self._exploration_finalize_executor
+            self._exploration_finalize_executor=None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
     def _schedule_exploration_workspace_finalize(
         self, *, map_name: str, trigger: str,
         exploration_request_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> None:
-        """探索任务先标记 succeeded，地图资产发布放到后台，避免阻塞 get_task_status。"""
-
-        def _run_finalize() -> None:
+        """原请求的存图在单个受管工作线程执行，关闭前必须等待实际完成。"""
+        from concurrent.futures import ThreadPoolExecutor
+        key=(map_name,exploration_request_id,task_id)
+        expected=self.platform_geometry_runtime.get_mapping_session_context()
+        identity=(expected.get("session_id"),expected.get("session_generation")) if isinstance(expected,dict) else None
+        def fail(status,reason):
+            self._record_exploration_finalize_failure(map_name=map_name,exploration_request_id=exploration_request_id,task_id=task_id,status=status,reason=reason)
+        def run_finalize():
             try:
                 try:
-                    self.navigation_service.refresh_exploration()
-                except Exception:
-                    RUNTIME_LOGGER.debug("探索 finalize 前 refresh_exploration 忽略异常", exc_info=True)
-                try:
-                    delay_sec = max(0.0, float(runtime_value("NUWAX_EXPLORE_FINALIZE_DELAY_SEC", "8")))
-                except (TypeError, ValueError):
-                    delay_sec = 8.0
-                if delay_sec > 0.0:
-                    time.sleep(delay_sec)
-                self._finalize_workspace_assets_after_task(
-                    map_name=map_name, trigger=trigger,
-                    exploration_request_id=exploration_request_id, task_id=task_id,
-                )
-            except Exception:
-                RUNTIME_LOGGER.exception(
-                    "探索任务后台发布地图资产失败 map_name=%s trigger=%s",
-                    map_name,
-                    trigger,
-                )
-
-        threading.Thread(
-            target=_run_finalize,
-            name="explore_finalize_%s" % (map_name or "unknown"),
-            daemon=True,
-        ).start()
+                    delay=max(0.0,float(runtime_value("NUWAX_EXPLORE_FINALIZE_DELAY_SEC","0")))
+                except (TypeError,ValueError):
+                    delay=0.0
+                self._exploration_finalize_wakeup.wait(delay)
+                current=self.platform_geometry_runtime.get_mapping_session_context()
+                if identity is None or not isinstance(current,dict) or (current.get("session_id"),current.get("session_generation"))!=identity or current.get("map_name")!=map_name:
+                    fail("skipped","原探索建图会话已改变，不保存另一会话的地图。")
+                    return
+                context=self.navigation_service.refresh_exploration()
+                if exploration_request_id and self._exploration_state_request_id(context)!=exploration_request_id:
+                    fail("skipped","原探索请求已被替换，不保存新请求的地图。")
+                    return
+                self._finalize_workspace_assets_after_task(map_name=map_name,trigger=trigger,exploration_request_id=exploration_request_id,task_id=task_id)
+            except Exception as error:
+                RUNTIME_LOGGER.exception("受管探索存图失败 map_name=%s",map_name)
+                fail("failed",str(error))
+        with self._exploration_finalize_lock:
+            if key in self._exploration_finalize_futures:
+                return
+            self._exploration_finalize_futures={k:v for k,v in self._exploration_finalize_futures.items() if not v.done()}
+            if self._exploration_finalize_closing or len(self._exploration_finalize_futures)>=8:
+                fail("failed","网关存图已关闭或有界队列已满。")
+                return
+            if self._exploration_finalize_executor is None:
+                self._exploration_finalize_executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix="探索存图")
+            future=self._exploration_finalize_executor.submit(run_finalize)
+            self._exploration_finalize_futures[key]=future
 
     @staticmethod
     def _exploration_task_progress_payload(
@@ -14177,7 +14451,9 @@ class GatewayRuntime:
         if bool(getattr(map_asset, "finalized", False)):
             reader = getattr(getattr(self, "platform_geometry_runtime", None), "get_mapping_session_context", None)
             context = reader() if callable(reader) else None
-            if not isinstance(context, dict) or context.get("planar_mode") != "mapping" or context.get("active") is not True:
+            if not isinstance(context, dict) or context.get("active") is not True or context.get("map_name") != map_name:
+                return None
+            if self.config.geometry.pipeline == "slam_2d" and context.get("planar_mode") != "mapping":
                 return None
         if not self._exploration_snapshot_matches_active_map(active_workspace):
             RUNTIME_LOGGER.warning(
@@ -14242,6 +14518,10 @@ class GatewayRuntime:
 
         DynamicCheck = Tuple[Callable[[], bool], Optional[str]]
         dynamic_support: Dict[str, DynamicCheck] = {
+            "explore_building": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d", "逐层探索要求二维完整执行链。"),
+            "resume_building_exploration": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d", "逐层探索恢复要求二维完整执行链。"),
+            "navigate_to_floor": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d" and str(getattr(getattr(geometry_config,"navigation",None),"facility_providers_json","{}")).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层导航不可用。"),
+            "resume_floor_navigation": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d" and str(getattr(getattr(geometry_config,"navigation",None),"facility_providers_json","{}")).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层恢复不可用。"),
             "capture_image": (
                 lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",

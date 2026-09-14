@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_GoalEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xd86d6b22642db6cfLL
+    uint64_t hash = (uint64_t)0x558c14a217070464LL
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
@@ -42,6 +42,11 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
          + __int32_t_hash_recursive(&cp)
          + __geometry_msgs_Point_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
+         + __byte_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
+         + __int8_t_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
@@ -134,6 +139,21 @@ int __nuwax_msgs_GoalEnvelope_encode_array(void *buf, int offset, int maxlen, co
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_m), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_rad), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].navigation_configuration_sha256, 32);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -206,6 +226,16 @@ int __nuwax_msgs_GoalEnvelope_encoded_array_size(const nuwax_msgs_GoalEnvelope *
         size += __byte_encoded_array_size(p[element].motion_guard_boot_nonce, 16);
 
         size += __int64_t_encoded_array_size(&(p[element].motion_stop_generation), 1);
+
+        size += __int8_t_encoded_array_size(&(p[element].allow_reverse), 1);
+
+        size += __double_encoded_array_size(&(p[element].position_tolerance_m), 1);
+
+        size += __double_encoded_array_size(&(p[element].yaw_tolerance_rad), 1);
+
+        size += __byte_encoded_array_size(p[element].navigation_configuration_sha256, 32);
+
+        size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
 
         size += __byte_encoded_array_size(p[element].payload_sha256, 32);
 
@@ -293,6 +323,21 @@ int __nuwax_msgs_GoalEnvelope_decode_array(const void *buf, int offset, int maxl
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_m), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_rad), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].navigation_configuration_sha256, 32);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].payload_sha256, 32);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -353,6 +398,16 @@ int __nuwax_msgs_GoalEnvelope_decode_array_cleanup(nuwax_msgs_GoalEnvelope *p, i
         __byte_decode_array_cleanup(p[element].motion_guard_boot_nonce, 16);
 
         __int64_t_decode_array_cleanup(&(p[element].motion_stop_generation), 1);
+
+        __int8_t_decode_array_cleanup(&(p[element].allow_reverse), 1);
+
+        __double_decode_array_cleanup(&(p[element].position_tolerance_m), 1);
+
+        __double_decode_array_cleanup(&(p[element].yaw_tolerance_rad), 1);
+
+        __byte_decode_array_cleanup(p[element].navigation_configuration_sha256, 32);
+
+        __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
 
         __byte_decode_array_cleanup(p[element].payload_sha256, 32);
 
@@ -432,6 +487,16 @@ int __nuwax_msgs_GoalEnvelope_clone_array(const nuwax_msgs_GoalEnvelope *p, nuwa
         __byte_clone_array(p[element].motion_guard_boot_nonce, q[element].motion_guard_boot_nonce, 16);
 
         __int64_t_clone_array(&(p[element].motion_stop_generation), &(q[element].motion_stop_generation), 1);
+
+        __int8_t_clone_array(&(p[element].allow_reverse), &(q[element].allow_reverse), 1);
+
+        __double_clone_array(&(p[element].position_tolerance_m), &(q[element].position_tolerance_m), 1);
+
+        __double_clone_array(&(p[element].yaw_tolerance_rad), &(q[element].yaw_tolerance_rad), 1);
+
+        __byte_clone_array(p[element].navigation_configuration_sha256, q[element].navigation_configuration_sha256, 32);
+
+        __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
 
         __byte_clone_array(p[element].payload_sha256, q[element].payload_sha256, 32);
 

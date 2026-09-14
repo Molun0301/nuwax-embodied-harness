@@ -85,8 +85,21 @@ pub trait Module: Send + Sync + 'static {
     fn tick(&mut self) -> Result<ModuleOutput, NavError>;
 }
 
+type PlanningResult = (
+    SimplePlanner,
+    (Option<Option<Vec<crate::Point2>>>, bool, bool),
+);
+struct PlanningJob {
+    handle: std::thread::JoinHandle<PlanningResult>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    map_generation: u64,
+}
+
 /// Lifecycle wrapper around [`SimplePlanner`].
 pub struct SimplePlannerModule {
+    background_planning: bool,
+    planning_job: Option<PlanningJob>,
+    map_generation: u64,
     config: SimplePlannerConfig,
     planner: SimplePlanner,
     running: bool,
@@ -97,8 +110,90 @@ pub struct SimplePlannerModule {
 }
 
 impl SimplePlannerModule {
+    /// 生产拥有方启用单个后台规划工作，输入及停止仍在原调度线程处理。
+    pub fn enable_background_planning(&mut self) {
+        self.background_planning = true;
+    }
+
+    fn cancel_planning(&mut self) {
+        if let Some(job) = &self.planning_job {
+            job.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn finish_planning(&mut self) -> Result<(), NavError> {
+        self.cancel_planning();
+        if let Some(job) = self.planning_job.take() {
+            job.handle
+                .join()
+                .map_err(|_| NavError::Internal("二维规划工作线程异常退出".into()))?;
+        }
+        Ok(())
+    }
+    fn planning_step(
+        &mut self,
+    ) -> Result<(Option<Option<Vec<crate::Point2>>>, bool, bool), NavError> {
+        if !self.background_planning {
+            return Ok(self.planner.replan_once(self.clock_seconds));
+        }
+        if self
+            .planning_job
+            .as_ref()
+            .is_some_and(|job| job.handle.is_finished())
+        {
+            let job = self.planning_job.take().expect("已完成工作存在");
+            let (computed, result) = job
+                .handle
+                .join()
+                .map_err(|_| NavError::Internal("二维规划工作线程异常退出".into()))?;
+            if !job.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                && (result.0.as_ref().is_some_and(Option::is_some)
+                    || job.map_generation == self.map_generation)
+                && self.planner.accept_plan(&computed)
+            {
+                return Ok(result);
+            }
+        }
+        if self.planning_job.is_none()
+            && self.active_goal.is_some()
+            && self.planner.needs_replan(self.clock_seconds)
+        {
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut computed = self.planner.clone();
+            computed.set_cancellation(cancelled.clone());
+            let now = self.clock_seconds;
+            let handle = std::thread::Builder::new()
+                .name("二维路径规划".into())
+                .spawn(move || {
+                    let output = computed.replan_once(now);
+                    (computed, output)
+                })
+                .map_err(|error| NavError::Internal(format!("二维规划线程启动失败：{error}")))?;
+            self.planning_job = Some(PlanningJob {
+                handle,
+                cancelled,
+                map_generation: self.map_generation,
+            });
+        }
+        Ok((None, false, false))
+    }
+
+    /// 当前目标的执行选项在收到位置后显式设置。
+    pub fn set_goal_options(
+        &mut self,
+        options: nuwax_nav_types_messages::GoalOptions,
+    ) -> Result<(), NavError> {
+        self.cancel_planning();
+        self.planner.set_goal_options(options)
+    }
+    /// 与最近位置路径同序的机体朝向。
+    pub fn planned_yaws(&self) -> Option<&[f64]> {
+        self.planner.cached_yaws()
+    }
+
     /// 普通目标消息之外保留同一请求的最终朝向。
     pub fn set_goal_yaw(&mut self, yaw: f64) {
+        self.cancel_planning();
         self.planner.set_goal_yaw(yaw);
     }
 
@@ -115,6 +210,9 @@ impl SimplePlannerModule {
     /// Returns the same validation error as [`SimplePlanner::new`].
     pub fn with_config(config: SimplePlannerConfig) -> Result<Self, NavError> {
         Ok(Self {
+            background_planning: false,
+            planning_job: None,
+            map_generation: 0,
             planner: SimplePlanner::new(config.clone())?,
             config,
             running: false,
@@ -134,8 +232,10 @@ impl SimplePlannerModule {
     /// 用已经分类的有界占据图更新规划输入，保留未知区与地图几何。
     pub fn on_occupancy_grid(&mut self, grid: OccupancyGrid2D) -> Result<(), NavError> {
         self.ensure_running()?;
-        let costmap = crate::Costmap::from_occupancy(grid, self.config.inflation_radius)?;
-        self.planner.replace_costmap(costmap);
+        let update = self.planner.update_occupancy(grid)?;
+        tracing::trace!(changed_cells = update.changed_cells, changed_blocks = update.changed_blocks,
+            obstacle_changes = update.obstacle_changes, full_rebuild = update.full_rebuild, "二维占据代价更新");
+        self.map_generation = self.map_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -184,6 +284,15 @@ impl SimplePlannerModule {
     }
 }
 
+impl Drop for SimplePlannerModule {
+    fn drop(&mut self) {
+        // 错误返回和正常停止均回收实际线程，不能遗留孤立计算。
+        if let Err(error) = self.finish_planning() {
+            tracing::error!(%error, "二维规划关闭失败");
+        }
+    }
+}
+
 impl Default for SimplePlannerModule {
     fn default() -> Self {
         Self::new()
@@ -208,6 +317,7 @@ impl Module for SimplePlannerModule {
         if !self.running {
             return Ok(());
         }
+        self.finish_planning()?;
         self.planner.cancel_navigation();
         self.active_goal = None;
         if self.last_pose.is_some() {
@@ -244,6 +354,7 @@ impl Module for SimplePlannerModule {
         self.ensure_running()?;
         validate_frame(&goal.frame_id, &self.config.world_frame, "goal.frame_id")?;
         validate_point(goal.point, "goal")?;
+        self.cancel_planning();
         self.planner.set_goal(goal.point, self.clock_seconds);
         self.active_goal = Some(goal);
         self.pending_hold = None;
@@ -253,6 +364,7 @@ impl Module for SimplePlannerModule {
     fn on_stop_movement(&mut self, stop: bool) -> Result<(), NavError> {
         self.ensure_running()?;
         if stop {
+            self.cancel_planning();
             self.planner.on_stop_movement(true);
             self.active_goal = None;
             self.pending_hold = Some(HoldReason::StopRequested);
@@ -284,9 +396,7 @@ impl Module for SimplePlannerModule {
         self.clock_seconds += TICK_PERIOD_MS as f64 / 1_000.0;
 
         if let (Some(pose), Some(goal)) = (self.last_pose.as_ref(), self.active_goal.as_ref()) {
-            if pose.pose.position.to_2d().distance(goal.point.to_2d())
-                <= self.config.goal_reached_threshold
-            {
+            if self.planner.goal_pose_reached() {
                 let map = self.planner.costmap();
                 if !map.permits_endpoints(
                     map.world_to_cell(pose.pose.position.x, pose.pose.position.y),
@@ -295,13 +405,14 @@ impl Module for SimplePlannerModule {
                 ) {
                     return self.safety_hold(HoldReason::PlanningFailed);
                 }
+                self.cancel_planning();
                 self.planner.cancel_navigation();
                 self.active_goal = None;
                 return self.safety_hold(HoldReason::GoalReached);
             }
         }
 
-        let (plan, did_replan, _) = self.planner.replan_once(self.clock_seconds);
+        let (plan, did_replan, _) = self.planning_step()?;
         match plan {
             Some(Some(path)) => {
                 let mut waypoint = self.planner.update_waypoint().ok_or_else(|| {
@@ -379,6 +490,157 @@ fn validate_point(point: Point3, field: &'static str) -> Result<(), NavError> {
 mod tests {
     use super::*;
     use nuwax_nav_types_messages::{OccupancyCell, Point2, Pose3};
+
+    fn open_room_module() -> (SimplePlannerModule, OccupancyGrid2D) {
+        let geometry = nuwax_nav_types_messages::RobotGeometry {
+            footprint_xy_m: vec![[-0.2, -0.15], [0.2, -0.15], [0.2, 0.15], [-0.2, 0.15]],
+            z_min_m: -0.2,
+            z_max_m: 0.2,
+            source: "单元仿真".into(),
+        };
+        let mut module = SimplePlannerModule::with_config(SimplePlannerConfig {
+            robot_geometry: Some(geometry),
+            ..SimplePlannerConfig::default()
+        })
+        .unwrap();
+        module.start().unwrap();
+        let grid = OccupancyGrid2D::filled(Point2::new(0.0, 0.0), 0.1, 80, 40, OccupancyCell::Free);
+        module.on_occupancy_grid(grid.clone()).unwrap();
+        module
+            .on_odometry(PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(1.05, 1.05, 0.0),
+                    orientation: crate::Quaternion::from_yaw(0.0),
+                },
+                NavFrameId::Map,
+            ))
+            .unwrap();
+        (module, grid)
+    }
+    fn target(x: f64, y: f64) -> PointStamped {
+        PointStamped {
+            frame_id: NavFrameId::Map,
+            stamp: Timestamp::default(),
+            point: Point3::new(x, y, 0.0),
+        }
+    }
+    fn wait_for_job(module: &SimplePlannerModule) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !module.planning_job.as_ref().unwrap().handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台规划未在测试预算内结束"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn goal_completion_uses_request_position_and_final_yaw_tolerances() {
+        let (mut module, _) = open_room_module();
+        module.on_goal(target(1.35, 1.05)).unwrap();
+        module
+            .set_goal_options(nuwax_nav_types_messages::GoalOptions {
+                position_tolerance_m: 0.1,
+                yaw_tolerance_rad: 0.05,
+                ..Default::default()
+            })
+            .unwrap();
+        module.set_goal_yaw(1.0);
+        assert!(matches!(module.tick().unwrap(), ModuleOutput::Plan { .. }));
+        module
+            .on_odometry(PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(1.35, 1.05, 0.0),
+                    orientation: crate::Quaternion::from_yaw(0.0),
+                },
+                NavFrameId::Map,
+            ))
+            .unwrap();
+        assert!(!matches!(
+            module.tick().unwrap(),
+            ModuleOutput::SafetyHold {
+                reason: HoldReason::GoalReached,
+                ..
+            }
+        ));
+        module
+            .on_odometry(PoseStamped::from_pose(
+                Pose3 {
+                    position: Point3::new(1.35, 1.05, 0.0),
+                    orientation: crate::Quaternion::from_yaw(1.0),
+                },
+                NavFrameId::Map,
+            ))
+            .unwrap();
+        assert!(matches!(
+            module.tick().unwrap(),
+            ModuleOutput::SafetyHold {
+                reason: HoldReason::GoalReached,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ordinary_route_survives_observation_but_forward_obstacle_revokes_it() {
+        let (mut module, mut grid) = open_room_module();
+        module.on_goal(target(4.05, 1.05)).unwrap();
+        let output = module.tick().unwrap();
+        assert!(matches!(output, ModuleOutput::Plan { .. }), "{output:?}");
+        assert!(
+            module.planned_yaws().is_none(),
+            "覆盖没有显式朝向数组的普通路径"
+        );
+        let path = module.planner.cached_path().unwrap().to_vec();
+        grid.set(65, 30, OccupancyCell::Occupied);
+        module.on_occupancy_grid(grid.clone()).unwrap();
+        assert_eq!(module.planner.cached_path().unwrap(), path);
+        grid.set(30, 10, OccupancyCell::Occupied);
+        module.on_occupancy_grid(grid).unwrap();
+        assert!(module.planner.cached_path().is_none());
+    }
+    #[test]
+    fn background_replacement_and_cancel_reject_old_results_and_join_owner() {
+        let (mut module, _) = open_room_module();
+        module.enable_background_planning();
+        module.on_goal(target(4.05, 1.05)).unwrap();
+        assert_eq!(module.tick().unwrap(), ModuleOutput::Idle);
+        wait_for_job(&module);
+        module.on_goal(target(2.05, 1.05)).unwrap();
+        assert_eq!(module.tick().unwrap(), ModuleOutput::Idle);
+        wait_for_job(&module);
+        let output = module.tick().unwrap();
+        let ModuleOutput::Plan { path, .. } = output else {
+            panic!("新目标未产生路径：{output:?}")
+        };
+        assert_eq!(path.points.last(), Some(&Point2::new(2.05, 1.05)));
+        module.on_goal(target(4.05, 1.05)).unwrap();
+        module.tick().unwrap();
+        module.on_stop_movement(true).unwrap();
+        assert!(matches!(
+            module.tick().unwrap(),
+            ModuleOutput::SafetyHold {
+                reason: HoldReason::StopRequested,
+                ..
+            }
+        ));
+        module.stop().unwrap();
+        assert!(module.planning_job.is_none());
+        assert!(module.planner.cached_path().is_none());
+    }
+    #[test]
+    fn background_result_is_checked_against_new_obstacles() {
+        let (mut module, mut grid) = open_room_module();
+        module.enable_background_planning();
+        module.on_goal(target(4.05, 1.05)).unwrap();
+        module.tick().unwrap();
+        wait_for_job(&module);
+        grid.set(30, 10, OccupancyCell::Occupied);
+        module.on_occupancy_grid(grid).unwrap();
+        assert_eq!(module.tick().unwrap(), ModuleOutput::Idle);
+        assert!(module.planner.cached_path().is_none());
+        module.stop().unwrap();
+    }
 
     #[test]
     fn occupancy_input_restores_configured_footprint_after_terrain_shrink() {

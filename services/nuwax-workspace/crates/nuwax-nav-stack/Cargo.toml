@@ -110,6 +110,8 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
     "guard-runtime",
+    "dep:nuwax-map-chunks",
+    "dep:nuwax-rpc",
     "dep:nuwax-nav-mls-planner",
     "click-goal",
 ]
@@ -156,6 +158,7 @@ full = [
 ]
 
 [dependencies]
+nuwax-nav-control = { path = "../nuwax-nav-control" }
 nuwax-core = { path = "../nuwax-core" }
 # ---- Foundation(协议层与基础类型):不直接使用,留给上游 crate 各自引用
 # stack 是纯数据编排 + dry-run,不消费 Foundation 的具体类型
@@ -200,11 +203,14 @@ nuwax-nav-visual-query = { path = "../nuwax-nav-visual-query", optional = true }
 nuwax-nav-bbox-tracker = { path = "../nuwax-nav-bbox-tracker", optional = true }
 # ---- MLS Planner(可选)----
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
+nuwax-map-chunks = { path = "../nuwax-map-chunks", optional = true }
+nuwax-rpc = { path = "../nuwax-rpc", features = ["link-liblcm"], optional = true }
 
 # 通用依赖(必须出现在共享 workspace.dependencies 中)
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 bitflags = { workspace = true }
 sha2 = "0.10"
 futures = { workspace = true, optional = true }
@@ -212,6 +218,7 @@ futures = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 # 单元测试可读 fixture / JSON
 serde_json = { workspace = true }
 pretty_assertions = { workspace = true }

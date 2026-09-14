@@ -6,20 +6,23 @@ use nuwax_nav_types_messages::geometry::Point2;
 use crate::config::WavefrontConfig;
 use crate::grid::occupancy_value;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GoalFailureRecord {
     point: Point2,
     failures: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlacklistedGoal {
     point: Point2,
     radius_m: f64,
 }
 
 /// 2D 单位方向(可为零;`from_delta` 拒绝零长度 / NaN)。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Direction2 {
     /// 单位向量 x 分量
     pub x: f64,
@@ -47,8 +50,11 @@ impl Direction2 {
 }
 
 /// 探索会话状态:已发布 goal / 方向 / no-gain 计数 / 连续失败计数。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExplorationSession {
+    /// 随同一探索会话推进的区域等待状态。
+    pub(crate) regional_schedule: nuwax_explore_routing::RegionalSchedule,
     /// 已发布的历史 goal(用于 explored_goals_score)
     pub(crate) explored_goals: Vec<Point2>,
     /// 上一 goal 方向(用于 momentum)
@@ -70,6 +76,23 @@ pub struct ExplorationSession {
 }
 
 impl ExplorationSession {
+    /// 恢复只接纳有界、有限且自洽的确认历史；动态地图缓存不进入此载荷。
+    pub fn validate_checkpoint(&self)->Result<(),String> {
+        let valid_point=|p:Point2|p.x.is_finite() && p.y.is_finite() && p.x.abs()<=1e9 && p.y.abs()<=1e9;
+        if self.explored_goals.len()>65536 || self.failed_goals.len()>65536 || self.blacklisted_goals.len()>65536
+            || self.explored_goals.iter().any(|p|!valid_point(*p))
+            || self.failed_goals.iter().any(|p|!valid_point(p.point))
+            || self.blacklisted_goals.iter().any(|p|!valid_point(p.point) || !p.radius_m.is_finite() || !(0.0..=1e6).contains(&p.radius_m))
+            || self.last_information_completed_goals>self.explored_goals.len()
+            || self.exploration_direction.is_some_and(|d|!d.x.is_finite() || !d.y.is_finite() || (d.x.hypot(d.y)-1.0).abs()>1e-6)
+        {return Err("二维探索进度无效或超过有界历史容量".into());}
+        Ok(())
+    }
+
+    /// 已确认导航终态推动的区域决策轮数。
+    pub fn regional_completed_rounds(&self) -> u64 {
+        self.regional_schedule.completed_rounds()
+    }
     /// 构造空 session
     #[must_use]
     pub fn new() -> Self {
@@ -105,6 +128,7 @@ impl ExplorationSession {
 
     /// 记录导航到达。只有收到真实到达反馈后，目标才进入已探索集合。
     pub fn record_goal_reached(&mut self, goal: Point2) {
+        self.regional_schedule.record_outcome([goal.x, goal.y, 0.0]);
         self.mark_explored_goal(goal);
         self.consecutive_failures = 0;
         self.failed_goals
@@ -122,6 +146,7 @@ impl ExplorationSession {
         max_retries: u32,
         blacklist_radius_m: f64,
     ) -> bool {
+        self.regional_schedule.record_outcome([goal.x, goal.y, 0.0]);
         self.record_failure();
         let radius_m = blacklist_radius_m.max(0.0);
         let match_radius = radius_m.max(1.0e-6);
@@ -276,6 +301,7 @@ impl ExplorationSession {
 
     /// 清理 no-frontier 选择历史，但保留导航失败、retry 与 blacklist 状态。
     pub fn reset_information_history(&mut self) {
+        self.regional_schedule.reset();
         self.explored_goals.clear();
         self.exploration_direction = None;
         self.last_information_count = None;

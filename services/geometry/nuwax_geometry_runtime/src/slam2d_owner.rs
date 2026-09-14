@@ -18,21 +18,10 @@ pub(crate) struct Settings {
 }
 impl Settings {
     pub fn from_env() -> Result<Option<Self>, String> {
-        match std::env::var("NUWAX_GEOMETRY_PIPELINE")
-            .unwrap_or_else(|_| "lio_3d".into())
-            .as_str()
-        {
-            "lio_3d" => return Ok(None),
-            "slam_2d" => {}
-            _ => return Err("NUWAX_GEOMETRY_PIPELINE必须为lio_3d或slam_2d".into()),
-        }
-        if !matches!(
-            std::env::var("NUWAX_NAV_PROFILE")
-                .unwrap_or_else(|_| "simple-2d".into())
-                .as_str(),
-            "simple-2d" | "replanning-astar"
-        ) {
-            return Err("二维执行链要求平面导航配置".into());
+        let pipeline = nuwax_nav_stack::ProductionPipeline::from_env()
+            .map_err(|error| error.to_string())?;
+        if pipeline == nuwax_nav_stack::ProductionPipeline::Lio3D {
+            return Ok(None);
         }
         let text = std::env::var("NUWAX_GEOMETRY_SLAM2D_CONFIG")
             .map_err(|_| "二维链缺少明确传感器、坐标、时钟与标定配置")?;
@@ -735,23 +724,6 @@ async fn commit(
         nalgebra::Translation3::new(estimate.map_from_odom[0], estimate.map_from_odom[1], 0.0),
         nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, estimate.map_from_odom[2]),
     );
-    let odom = PoseState {
-        x: estimate.odom_from_base[0],
-        y: estimate.odom_from_base[1],
-        qz: (estimate.odom_from_base[2] * 0.5).sin(),
-        qw: (estimate.odom_from_base[2] * 0.5).cos(),
-        frame_id: snapshot.session.odom_frame_id.clone(),
-        timestamp_ns: timestamp,
-        ..Default::default()
-    };
-    let observation = lcm_runtime::canonical_mapping_observation_from_isometry(
-        &snapshot.session.map_frame_id,
-        &snapshot.session.odom_frame_id,
-        snapshot.session.session_generation,
-        &effective,
-        &odom,
-        &snapshot.session.body_frame_id,
-    )?;
     let preparation = bridge
         .mapping_adapter
         .as_ref()
@@ -767,6 +739,13 @@ async fn commit(
         return Err("二维候选跨越重定位代际".into());
     }
     let mut state = bridge.state.write().await;
+    let odom=planar_commit_odometry(&binding.navigation,&snapshot.session,estimate,
+        binding.settings.unix_offset_ns,state.pose.timestamp_ns)?;
+    let observation = lcm_runtime::canonical_mapping_observation_from_isometry(
+        &snapshot.session.map_frame_id,&snapshot.session.odom_frame_id,
+        snapshot.session.session_generation,&effective,&odom,&snapshot.session.body_frame_id,
+    )?;
+
     let adapter = bridge.mapping_adapter.as_ref().ok_or("二维适配器不可用")?;
     let (map, event) = adapter
         .lock()
@@ -776,11 +755,82 @@ async fn commit(
     binding.install_sensor_edge(&mut state);
     drop(state);
     let _ = bridge.map_revision_tx.send(event);
-    publish_tf(bridge, binding, observation.tf_payload, timestamp).await?;
+    publish_tf(bridge, binding, observation.tf_payload, odom.timestamp_ns).await?;
     Ok(())
 }
 
-/// 同一已提交图修订中的连续里程计沿现有有效校正更新位置，不能提前使用尚未提交的回环。
+/// 新图提交时保留较新的已接纳原始里程计，避免地图计算把公共位姿倒退到旧扫描。
+fn planar_commit_odometry(
+    navigation:&crate::planar_navigation::Owner,session:&Session,
+    estimate:&nuwax_slam_2d_runtime::protocol::Estimate,unix_offset_ns:i128,latest_unix_ns:u64,
+)->Result<PoseState,String> {
+    let mut timestamp=u64::try_from(i128::from(estimate.source_timestamp_ns)+unix_offset_ns)
+        .map_err(|_|"二维提交采样时间越界")?;
+    let mut pose=estimate.odom_from_base;
+    if session.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Device && latest_unix_ns>timestamp {
+        let native=u64::try_from(i128::from(latest_unix_ns)-unix_offset_ns).map_err(|_|"二维设备时间越界")?;
+        pose=navigation.odometry_at(session.session_generation,native,&session.clock_domain,&session.clock_id)?
+            .ok_or("新图提交缺少已发布位姿的原始设备采样")?;
+        timestamp=latest_unix_ns;
+    }
+    Ok(PoseState{x:pose[0],y:pose[1],qz:(pose[2]*0.5).sin(),qw:(pose[2]*0.5).cos(),
+        frame_id:session.odom_frame_id.clone(),timestamp_ns:timestamp,..Default::default()})
+}
+
+/// 设备里程计只沿当前已提交有效校正更新位置，不提前使用待提交回环。
+/// 同会话的新鲜匹配证明输入有效；原生图可领先规范提交，但不能倒退或自相矛盾。
+fn device_pose_has_current_basis(
+    status:&nuwax_slam_2d_runtime::protocol::Status, session_id:&str, generation:u64,
+    revision:u64, sample:&nuwax_slam_2d_runtime::input::TimedPose,
+)->bool {
+    let (Some(session),Some(estimate))=(&status.session,&status.last_estimate) else{return false;};
+    status.active && !status.paused && !status.stopping && status.last_error.is_none()
+        && session.session_id==session_id && session.session_generation==generation
+        && session.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Device
+        && session.odom_frame_id==sample.odom_frame_id && session.body_frame_id==sample.body_frame_id
+        && session.clock_domain==sample.clock_domain && session.clock_id==sample.clock_id
+        && estimate.graph_revision==status.graph_revision && status.graph_revision>=revision
+        && estimate.clock_domain==sample.clock_domain && estimate.clock_id==sample.clock_id
+        && estimate.source_timestamp_ns>0 && sample.timestamp_ns>=estimate.source_timestamp_ns
+        && sample.timestamp_ns-estimate.source_timestamp_ns<=500_000_000
+        && matches!(estimate.disposition.as_str(),"accepted"|"initialized"|"motion_skipped")
+}
+
+/// 调用方已持原生命周期锁，并取得原生里程计接纳回执；此处不推进地图修订。
+pub(crate) async fn publish_device_odometry(
+    bridge:&GeometryRuntimeHandle,binding:&Binding,
+    session:&crate::mapping_adapter::MappingSessionSnapshot,
+    sample:&nuwax_slam_2d_runtime::input::TimedPose,
+    status:&nuwax_slam_2d_runtime::protocol::Status,
+)->Result<bool,String> {
+    let fence=binding.fence.snapshot();
+    if fence.active{return Ok(false);}
+    let adapter=bridge.mapping_adapter.as_ref().ok_or("二维适配器不存在")?;
+    let transform={
+        let a=adapter.lock();let current=a.snapshot();
+        if !current.active || !a.planar_ready || a.planar_epoch!=fence.epoch
+            || current.session_id!=session.session_id || current.session_generation!=session.session_generation
+            || !device_pose_has_current_basis(status,&session.session_id,session.session_generation,a.planar_revision,sample) {return Ok(false);}
+        let Some(transform)=a.map_odom_transform_snapshot() else{return Ok(false);};
+        transform
+    };
+    let native_session=status.session.as_ref().expect("已核对原生会话");
+    if native_session.map_name!=session.map_name{return Ok(false);}
+    let timestamp=binding.settings.unix_stamp(sample.timestamp_ns)?;
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos()as u64;
+    if timestamp>now.saturating_add(50_000_000) || now.saturating_sub(timestamp)>200_000_000 {return Ok(false);}
+    let odom=PoseState{x:sample.pose[0],y:sample.pose[1],qz:(sample.pose[2]*0.5).sin(),qw:(sample.pose[2]*0.5).cos(),
+        frame_id:native_session.odom_frame_id.clone(),timestamp_ns:timestamp,..Default::default()};
+    let observation=lcm_runtime::canonical_mapping_observation_from_isometry(
+        &native_session.map_frame_id,&native_session.odom_frame_id,transform.generation,&transform.effective_isometry(),&odom,&native_session.body_frame_id)?;
+    let mut state=bridge.state.write().await;
+    if timestamp<=state.pose.timestamp_ns{return Ok(false);}
+    lcm_runtime::apply_canonical_mapping_observation_locked(&mut state,&observation);
+    binding.install_sensor_edge(&mut state);drop(state);
+    publish_tf(bridge,binding,observation.tf_payload,timestamp).await?;
+    Ok(true)
+}
+
 async fn update_pose(
     bridge: &GeometryRuntimeHandle,
     binding: &Binding,
@@ -890,4 +940,56 @@ pub(crate) async fn publish_tf(
         .await
         .map_err(|_| "二维规范坐标发布超时".to_string())?
         .map_err(|e| e.to_string())
+}
+
+
+#[cfg(test)]
+mod device_pose_tests {
+    use super::*;
+    use nuwax_slam_2d_runtime::{input::TimedPose,protocol::{Status,Estimate,OdometrySource}};
+    #[test]
+    fn device_pose_requires_fresh_same_graph_scanning_basis() {
+        let session=Session{session_id:"mapping-session".into(),map_name:"当前层".into(),session_generation:3,sensor_id:"scan".into(),
+            frame_id:"laser".into(),map_frame_id:"map".into(),odom_frame_id:"odom".into(),body_frame_id:"base".into(),
+            clock_domain:"unix_ns".into(),clock_id:String::new(),calibration_ref:"测试标定".into(),odometry_source:OdometrySource::Device,core_config:serde_json::json!({})};
+        let estimate=Estimate{source_timestamp_ns:1_000_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),source_sequence:10,
+            graph_revision:2,optimizations:0,anchor_odom_from_base:[0.0;3],odom_from_base:[0.0;3],map_from_base:[0.0;3],map_from_odom:[0.0;3],
+            covariance:[0.0;9],matching_response:1.0,local_response:1.0,disposition:"motion_skipped".into(),node_count:1,edge_count:0};
+        let mut status=Status{active:true,session:Some(session),last_estimate:Some(estimate),graph_revision:2,..Default::default()};
+        let sample=TimedPose{timestamp_ns:1_050_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),odom_frame_id:"odom".into(),body_frame_id:"base".into(),pose:[1.0,2.0,0.2]};
+        assert!(device_pose_has_current_basis(&status,"mapping-session",3,2,&sample));
+        assert!(!device_pose_has_current_basis(&status,"old-session",3,2,&sample));
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",4,2,&sample));
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,3,&sample));
+        // 候选图推进不暂停旧规范图上的设备位姿；新变换只在图提交时应用。
+        status.graph_revision=3;
+        status.last_estimate.as_mut().unwrap().graph_revision=3;
+        assert!(device_pose_has_current_basis(&status,"mapping-session",3,2,&sample));
+        status.last_estimate.as_mut().unwrap().graph_revision=4;
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&sample));
+        status.last_estimate.as_mut().unwrap().graph_revision=3;
+        let navigation=crate::planar_navigation::Owner::default();
+        navigation.capture_odometry(3,sample.clone()).unwrap();
+        let session=status.session.as_ref().unwrap();let estimate=status.last_estimate.as_ref().unwrap();
+        let odom=planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns).unwrap();
+        assert_eq!(odom.timestamp_ns,sample.timestamp_ns);assert_eq!([odom.x,odom.y],sample.pose[..2]);
+        let effective=nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(3.0,-2.0,0.0),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0,0.0,std::f64::consts::FRAC_PI_2));
+        let observation=lcm_runtime::canonical_mapping_observation_from_isometry("map","odom",3,&effective,&odom,"base").unwrap();
+        let mut state=lcm_runtime::SharedState::default();
+        lcm_runtime::apply_canonical_mapping_observation_locked(&mut state,&observation);
+        assert_eq!(state.pose.timestamp_ns,sample.timestamp_ns);
+        assert!((state.pose.x-1.0).abs()<1e-9 && (state.pose.y+1.0).abs()<1e-9);
+        assert!(planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns+1).is_err());
+        let mut wrong=session.clone();wrong.session_generation=4;
+        assert!(planar_commit_odometry(&navigation,&wrong,estimate,0,sample.timestamp_ns).is_err());
+        let mut stale=sample.clone();stale.timestamp_ns=1_600_000_000;
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&stale));
+        stale.timestamp_ns=900_000_000;
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&stale));
+        status.last_estimate.as_mut().unwrap().disposition="match_rejected".into();
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&sample));
+        status.last_estimate=None;
+        assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&sample),"激活后的静态资产不能提供新鲜位姿依据");
+    }
 }

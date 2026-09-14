@@ -18,6 +18,7 @@ module = []
 viz = []
 
 [dependencies]
+nuwax-nav-control = { path = "../nuwax-nav-control" }
 # Foundation 类型与错误统一来源
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
@@ -27,4 +28,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+nuwax-nav-astar = { path = "../nuwax-nav-astar" }
 approx = { workspace = true }

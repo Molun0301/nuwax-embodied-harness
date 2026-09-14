@@ -1839,20 +1839,6 @@
     "apply_scope": "重启导航栈与几何运行时后生效",
     "description": "离散台阶两侧所需连续踏面深度，配合最大台阶高度和坡度使用。"
   },
-  "NUWAX_NAV_PROFILE": {
-    "zh_name": "导航规划方案",
-    "type": "str",
-    "default": "simple-2d",
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "core/settings.py",
-      "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs",
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/profile.rs"
-    ],
-    "apply_scope": "重启网关、导航栈与几何运行时后生效",
-    "description": "二维路径、动态重规划或楼梯/斜坡三维导航；三维方案需要实际支撑面标定。"
-  },
   "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M": {
     "zh_name": "可通行最大台阶高度（米）",
     "type": "float",
@@ -1997,17 +1983,19 @@
     "description": "外包中心相对机体基准的Z坐标；留空保留模型偏移，完整手填长宽高时默认为0。高度上下界由中心加减半高确定，不从地面高度猜测。"
   },
   "NUWAX_GEOMETRY_PIPELINE": {
-    "zh_name": "几何执行链",
+    "zh_name": "建图、探索与导航执行链",
     "type": "str",
     "default": "lio_3d",
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
+      "contracts/navigation_pipeline.py",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/production_pipeline.rs",
       "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
       "services/geometry/planar_input_bridge.py"
     ],
-    "apply_scope": "重启Geometry与网关后生效",
-    "description": "选择二维激光建图或三维激光惯性链；保存后重启Geometry与网关，二维链不启动三维点云拥有方。"
+    "apply_scope": "重启网关、几何运行时与导航栈后生效",
+    "description": "两条互斥完整链：三维激光惯性建图、三维表面探索及地形导航；二维激光建图、波前探索及平面导航。导航方案随执行链确定，保存后重启网关、几何与导航。"
   },
   "NUWAX_GEOMETRY_SLAM2D_CONFIG": {
     "zh_name": "二维扫描与算法配置",
@@ -2065,5 +2053,33 @@
       "NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL"
     ],
     "description": "二维执行链专用派生观测，携带规范地图身份和新鲜扫描时间；不得与规范占据栅格通道重合。"
+  },
+  "NUWAX_NAV_CAPABILITIES_JSON": {
+    "zh_name": "导航与探索能力标定",
+    "type": "str",
+    "default": "",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "contracts/navigation_capabilities.py",
+      "services/nuwax-workspace/crates/nuwax-nav-types-messages/src/navigation_capabilities.rs",
+      "services/navigation/motion_safety_guard/stop_confirmation.py",
+      "services/navigation/motion_safety_guard/mode_confirmation.py"
+    ],
+    "apply_scope": "重启运动守卫、几何运行时与导航栈后生效",
+    "description": "填写版本1的导航标定JSON（结构化文本），包含标定标识和实际速度、加减速、保证制动与转向能力，可附传感器视域及地形限制。停止命令先确认，停稳另按真实速度或保证制动上界确认；要求专门步态时用terrain.required_locomotion_mode指定提供器的命名模式，并核对实际反馈。留空不声明高级能力；实机值来自设备配置与测量。"
+  },
+  "NUWAX_FACILITY_PROVIDERS_JSON": {
+    "zh_name": "跨楼层设施提供器",
+    "type": "str",
+    "default": "{}",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "consumers": [
+      "services/navigation/facilities/http_provider.py",
+      "gateways/runtime.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "填写提供器标识到标准设施HTTP（超文本传输协议）桥接配置的映射。每项包含type=http、base_url及可选authorization_env（认证环境变量名）。空对象表示没有设施控制能力；楼层和入口出口通过建筑目录登记。"
   }
 }

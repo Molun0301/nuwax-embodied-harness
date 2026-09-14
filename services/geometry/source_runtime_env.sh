@@ -23,3 +23,7 @@ for _geometry_override in "${NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE:-}" "${NUWAX_GAT
 done
 unset _geometry_override
 normalize_config_aliases
+
+# 导航由建图链唯一决定；显式旧覆盖错配时在创建任何算法资源前失败。
+NUWAX_NAV_PROFILE="$("${NUWAX_PYTHON_BIN:-python3}" "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/resolve_navigation_pipeline.py")" || return 1
+export NUWAX_NAV_PROFILE

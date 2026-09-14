@@ -2,7 +2,7 @@
 //!
 //! 仅当新点高度大于该 cell 已有最大高度时覆盖；阻塞缓存由脏标记触发重建。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::inflation::{blocked_at_inflation, inflate_obstacles};
 use crate::NavError;
@@ -27,6 +27,19 @@ pub struct Costmap {
     /// 本次规划使用的真实机体轮廓，仅存在于当前位置规划副本。
     robot_footprint: Option<GridFootprint>,
     current_robot_position: Option<Point2>,
+}
+
+/// 完整占据输入的消费变化；不表示原生构图或传输已经是差量。
+#[derive(Debug, Default)]
+pub struct OccupancyUpdateStats {
+    /// 与上次完整输入不同的格数。
+    pub changed_cells: usize,
+    /// 覆盖变化的32格边长块数。
+    pub changed_blocks: usize,
+    /// 进入或退出障碍类别的格数。
+    pub obstacle_changes: usize,
+    /// 首帧或布局、半径变化重新构建。
+    pub full_rebuild: bool,
 }
 
 impl Costmap {
@@ -117,6 +130,52 @@ impl Costmap {
         map.occupancy = Some(grid);
         map.occupancy_inflation_floor = inflation_radius;
         Ok(map)
+    }
+
+    /// 只读原占据视图；规划副本上的自体处理沿既有接口完成。
+    pub fn occupancy_grid(&self) -> Option<&OccupancyGrid2D> {
+        self.occupancy.as_ref()
+    }
+
+    /// 同布局只更新真实变化的障碍索引；删除和未知变化不继承历史最大高度。
+    pub fn replace_occupancy(&mut self, grid: OccupancyGrid2D, inflation_radius: f64) -> Result<OccupancyUpdateStats, NavError> {
+        let compatible = self.occupancy.as_ref().is_some_and(|old| {
+            old.width == grid.width && old.height == grid.height && old.resolution == grid.resolution
+                && old.origin == grid.origin && old.cells.len() == grid.cells.len()
+                && self.robot_footprint.is_none() && self.inflation_radius == inflation_radius
+        });
+        if !compatible {
+            let replacement = Self::from_occupancy(grid, inflation_radius.max(self.occupancy_inflation_floor))?;
+            let stats = OccupancyUpdateStats { changed_cells: replacement.occupancy.as_ref().unwrap().cells.len(),
+                changed_blocks: (replacement.occupancy.as_ref().unwrap().width as usize).div_ceil(32) * (replacement.occupancy.as_ref().unwrap().height as usize).div_ceil(32),
+                obstacle_changes: replacement.heights.len(), full_rebuild: true };
+            *self = replacement;
+            return Ok(stats);
+        }
+        let obstacle = |cell: OccupancyCell| matches!(cell, OccupancyCell::Occupied | OccupancyCell::Inflated)
+            || matches!(cell, OccupancyCell::Cost(value) if value >= OCCUPANCY_OBSTACLE_THRESHOLD);
+        let mut stats = OccupancyUpdateStats::default();
+        let mut blocks = BTreeSet::new();
+        let old = self.occupancy.as_ref().unwrap();
+        for (row, (before, after)) in old.cells.chunks(grid.width as usize).zip(grid.cells.chunks(grid.width as usize)).enumerate() {
+            for (block, (a, b)) in before.chunks(32).zip(after.chunks(32)).enumerate() {
+                if a == b { continue; }
+                blocks.insert((block, row / 32));
+                for (offset, (&previous, &value)) in a.iter().zip(b).enumerate() {
+                    if previous == value { continue; }
+                    stats.changed_cells += 1;
+                    if obstacle(previous) != obstacle(value) {
+                        let key = ((block * 32 + offset) as i64, row as i64);
+                        if obstacle(value) { self.heights.insert(key, 1.0); } else { self.heights.remove(&key); }
+                        stats.obstacle_changes += 1;
+                    }
+                }
+            }
+        }
+        stats.changed_blocks = blocks.len();
+        self.blocked_dirty |= stats.obstacle_changes > 0;
+        self.occupancy = Some(grid);
+        Ok(stats)
     }
 
     /// 从原地图生成当前位置的规划视图，自体清除不会积累或写回输入。
@@ -278,9 +337,8 @@ impl Costmap {
                 yaw
             };
             if !footprint.visit_motion(grid.origin, (start, yaw), (end, heading), |x, y| {
-                grid.get(x, y).is_some_and(|value| {
-                    matches!(value, OccupancyCell::Unknown) || value.is_known_traversable()
-                })
+                grid.get(x, y)
+                    .is_some_and(|value| value.is_known_traversable())
             }) {
                 return false;
             }
@@ -288,9 +346,8 @@ impl Costmap {
         }
         if let (Some(&end), Some(target)) = (path.last(), final_yaw) {
             return footprint.visit_motion(grid.origin, (end, yaw), (end, target), |x, y| {
-                grid.get(x, y).is_some_and(|value| {
-                    matches!(value, OccupancyCell::Unknown) || value.is_known_traversable()
-                })
+                grid.get(x, y)
+                    .is_some_and(|value| value.is_known_traversable())
             });
         }
         true
@@ -429,5 +486,81 @@ impl Costmap {
     #[must_use]
     pub fn heights(&self) -> &HashMap<(i64, i64), f64> {
         &self.heights
+    }
+}
+
+#[cfg(test)]
+mod occupancy_update_tests {
+    use super::*;
+    #[test]
+    fn incremental_occupancy_matches_fresh_build_after_deletions_and_layout_changes() {
+        let mut grid = OccupancyGrid2D::new(Point2::new(-1.25, -0.75), 0.1, 70, 65, vec![OccupancyCell::Free; 4550]);
+        let mut incremental = Costmap::from_occupancy(grid.clone(), 0.15).unwrap();
+        for frame in 0..80 {
+            let previous = incremental.clone();
+            for i in 0..20 {
+                let index = (frame * 67 + i * 53) % grid.cells.len();
+                grid.cells[index] = match (frame + i) % 5 { 0 => OccupancyCell::Occupied, 1 => OccupancyCell::Free, 2 => OccupancyCell::Unknown, 3 => OccupancyCell::Cost(56), _ => OccupancyCell::Cost(12) };
+            }
+            if frame == 30 { grid.origin.x += 0.07; }
+            if frame == 60 { grid.resolution = 0.08; }
+            let stats = incremental.replace_occupancy(grid.clone(), 0.15).unwrap();
+            assert_eq!(stats.full_rebuild, frame == 30 || frame == 60);
+            let rebuilt = Costmap::from_occupancy(grid.clone(), 0.15).unwrap();
+            assert_eq!(incremental.heights(), rebuilt.heights());
+            assert_eq!(incremental.blocked_cells(), rebuilt.blocked_cells());
+            for i in 0..100 {
+                let x = ((i * 13 + frame) % grid.width as usize) as i64;
+                let y = ((i * 7 + frame) % grid.height as usize) as i64;
+                assert_eq!(incremental.is_blocked(x, y), rebuilt.is_blocked(x, y));
+            }
+            assert_ne!(previous.occupancy_grid().unwrap().cells, grid.cells);
+        }
+        let stats = incremental.replace_occupancy(grid.clone(), 0.15).unwrap();
+        assert_eq!((stats.changed_cells, stats.changed_blocks, stats.obstacle_changes), (0, 0, 0));
+        let before = incremental.clone();
+        grid.cells.pop();
+        assert!(incremental.replace_occupancy(grid, 0.15).is_err());
+        assert_eq!(before.heights(), incremental.heights());
+        assert_eq!(before.occupancy_grid().unwrap().cells, incremental.occupancy_grid().unwrap().cells);
+    }
+    #[test]
+    fn changed_block_contains_both_sides_of_a_removed_door() {
+        let mut grid = OccupancyGrid2D::new(Point2::new(0.0, 0.0), 0.1, 64, 64, vec![OccupancyCell::Free; 4096]);
+        for y in 0..64 { grid.set(31, y, OccupancyCell::Occupied); }
+        let mut map = Costmap::from_occupancy(grid.clone(), 0.2).unwrap();
+        map.rebuild_blocked();
+        assert!(map.is_blocked(32, 31));
+        for y in 28..36 { grid.set(31, y, OccupancyCell::Free); }
+        let stats = map.replace_occupancy(grid, 0.2).unwrap();
+        assert_eq!(stats.changed_blocks, 2);
+        assert_eq!(stats.obstacle_changes, 8);
+        assert!(!map.is_blocked(32, 31));
+        assert!(!map.blocked_cells().contains(&(32, 31)));
+    }
+}
+
+#[cfg(test)]
+mod occupancy_update_measurements {
+    use super::*;
+    #[test]
+    #[ignore = "固定规模派生基准，按任务显式运行"]
+    fn fixed_local_change_retains_large_map_obstacle_index() {
+        for side in [256, 1024, 2048] {
+            let mut grid = OccupancyGrid2D::new(Point2::new(0.0, 0.0), 0.05, side, side, vec![OccupancyCell::Free; side as usize * side as usize]);
+            for (i, cell) in grid.cells.iter_mut().enumerate() { if i % 10 == 0 { *cell = OccupancyCell::Occupied; } }
+            let mut cache = Costmap::from_occupancy(grid.clone(), 0.15).unwrap();
+            let mut full_times = Vec::new(); let mut local_times = Vec::new();
+            for frame in 0..11 {
+                for y in 40..45 { for x in 40..45 { grid.set(x, y, if frame % 2 == 0 { OccupancyCell::Occupied } else { OccupancyCell::Free }); } }
+                let input = grid.clone(); let start = std::time::Instant::now();
+                let full = Costmap::from_occupancy(input, 0.15).unwrap(); full_times.push(start.elapsed().as_micros());
+                let input = grid.clone(); let start = std::time::Instant::now();
+                let stats = cache.replace_occupancy(input, 0.15).unwrap(); local_times.push(start.elapsed().as_micros());
+                assert_eq!(cache.heights(), full.heights()); assert_eq!(stats.changed_blocks, 1); assert!(!stats.full_rebuild);
+            }
+            full_times.sort_unstable(); local_times.sort_unstable();
+            println!("cells={} full_build_us={} incremental_build_us={}", grid.cells.len(), full_times[5], local_times[5]);
+        }
     }
 }

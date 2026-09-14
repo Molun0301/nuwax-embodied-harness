@@ -442,6 +442,24 @@ impl RpcClient {
         self.call(args, self.inner.default_timeout).await
     }
 
+    /// 在本次调用范围内拥有响应订阅，不创建常驻分发任务；适合有界分块补取。
+    pub async fn call_scoped(&self, args: RpcArgs, timeout: Duration) -> RpcResult<Value> {
+        let mut subscription = self.inner.transport.subscribe(&self.inner.topics.response).await?;
+        let id = next_correlation_id();
+        let request = RpcRequest { name: self.inner.rpc_name.clone(), args, id: Some(id) };
+        let result = tokio::time::timeout(timeout, async {
+            self.inner.transport.publish(&self.inner.topics.request, pickle::encode_request(&request)?).await?;
+            loop {
+                let payload = subscription.recv().await?;
+                let response = pickle::decode_response(&payload)?;
+                if response.id.map(f64::to_bits) != Some(id.to_bits()) { continue; }
+                if let Some(exception) = response.exception { return Err(RpcError::RemoteException(exception)); }
+                return Ok(response.res.unwrap_or(Value::Null));
+            }
+        }).await;
+        result.unwrap_or_else(|_| Err(RpcError::Timeout { timeout_ms: duration_millis(timeout) }))
+    }
+
     /// Call the remote handler and wait for its correlated response.
     pub async fn call(&self, args: RpcArgs, timeout: Duration) -> RpcResult<Value> {
         self.ensure_response_task().await?;

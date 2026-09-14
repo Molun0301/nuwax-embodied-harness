@@ -1,6 +1,6 @@
 //! 单一原生线程拥有算法。控制回执可重试，扫描只保留最新待处理帧。
 use crate::{
-    input::{compose, deskew_scan, inverse, normalize, PoseHistory},
+    input::{compose, deskew_scan, inverse, normalize, PoseHistory, TimedPose},
     protocol::*,
 };
 use nuwax_codec::lcm::planar::PlanarScan;
@@ -33,11 +33,13 @@ struct ScanPacket {
 struct Inbox {
     commands: VecDeque<PendingControl>,
     scan: Option<ScanPacket>,
+    odometry_changed: bool,
     closed: bool,
 }
 struct Shared {
     identity: Identity,
     status: Mutex<Status>,
+    history: Mutex<PoseHistory>,
     inbox: Mutex<Inbox>,
     wake: Condvar,
     session_generation: AtomicU64,
@@ -58,6 +60,7 @@ impl WorkerOwner {
         let shared = Arc::new(Shared {
             identity,
             status: Mutex::new(Status::default()),
+            history: Mutex::new(PoseHistory::default()),
             inbox: Mutex::new(Inbox::default()),
             wake: Condvar::new(),
             session_generation: AtomicU64::new(0),
@@ -102,6 +105,22 @@ impl Drop for WorkerOwner {
         let _ = self.close_and_join();
     }
 }
+// 历史与就绪状态只在这段短临界区共同核对，原生匹配/构图不持该锁。
+fn accept_odometry(shared:&Shared,sample:&TimedPose)->Result<(),String> {
+    let mut history=shared.history.lock().unwrap();
+    let status=shared.status.lock().unwrap();
+    if !status.active || status.stopping || shared.stopped.load(Ordering::Acquire) {
+        return Err("二维会话未开始或已停止".into());
+    }
+    let session=status.session.as_ref().ok_or("二维会话未绑定")?;
+    if shared.session_generation.load(Ordering::Acquire)!=session.session_generation
+        || sample.odom_frame_id!=session.odom_frame_id || sample.body_frame_id!=session.body_frame_id
+        || sample.clock_domain!=session.clock_domain || sample.clock_id!=session.clock_id {
+        return Err("二维里程计坐标、时钟或活动代次不属于当前会话".into());
+    }
+    history.push(sample.clone())
+}
+
 impl WorkerHandle {
     pub fn reject_input(&self, error: String) {
         let mut status = self.shared.status.lock().unwrap();
@@ -170,6 +189,18 @@ impl RpcHandler for WorkerHandle {
             );
         }
         let sequence = request.command_sequence;
+        if let Operation::Odometry{sample}=&request.operation {
+            let error={
+                let mut inbox=self.shared.inbox.lock().unwrap();
+                if inbox.closed {Some("二维输入拥有方已关闭".into())}
+                else {
+                    let result=accept_odometry(&self.shared,sample);
+                    if result.is_ok() {inbox.odometry_changed=true;self.shared.wake.notify_one();}
+                    result.err()
+                }
+            };
+            return RpcResponse::ok(rpc.id,serde_json::to_value(self.response(sequence,error)).unwrap());
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut inbox = self.shared.inbox.lock().unwrap();
@@ -196,7 +227,6 @@ impl RpcHandler for WorkerHandle {
 struct Algorithm {
     slam: Option<Slam>,
     session: Option<Session>,
-    history: PoseHistory,
     device_anchor: Option<[f64; 3]>,
     waiting: Option<(ScanPacket, Instant)>,
     last_graph_estimate: Option<Estimate>,
@@ -283,7 +313,7 @@ impl Algorithm {
                     self.slam = Some(slam);
                     self.session = Some(session.clone());
                     self.highest_session = session.session_generation;
-                    self.history.clear();
+                    shared.history.lock().unwrap().clear();
                     self.device_anchor = None;
                     self.waiting = None;
                     self.last_graph_estimate = None;
@@ -307,23 +337,12 @@ impl Algorithm {
                     }
                     shared.session_generation.store(0, Ordering::Release);
                     self.waiting = None;
-                    self.history.clear();
+                    shared.history.lock().unwrap().clear();
                     // 停止接纳后保留静止图，允许最后快照和后续资产导出。
                     shared.status.lock().unwrap().active = false;
                 }
                 Operation::Odometry { sample } => {
-                    if self.slam.is_none() || !shared.status.lock().unwrap().active {
-                        return Err("二维会话未开始或已停止".into());
-                    }
-                    let session = self.session.as_ref().ok_or("二维会话未绑定")?;
-                    if sample.odom_frame_id != session.odom_frame_id
-                        || sample.body_frame_id != session.body_frame_id
-                        || sample.clock_domain != session.clock_domain
-                        || sample.clock_id != session.clock_id
-                    {
-                        return Err("二维里程计坐标或时钟不属于当前会话".into());
-                    }
-                    self.history.push(sample.clone())?;
+                    accept_odometry(shared,sample)?;
                 }
                 Operation::Snapshot {
                     session_id,
@@ -530,7 +549,7 @@ impl Algorithm {
                     shared.session_generation.store(0, Ordering::Release);
                     self.slam.take();
                     self.waiting = None;
-                    self.history.clear();
+                    shared.history.lock().unwrap().clear();
                     let mut status = shared.status.lock().unwrap();
                     status.stopping = true;
                     status.active = false;
@@ -650,9 +669,10 @@ impl Algorithm {
             if scan.timestamp_quality == 3 {
                 return Err("接收时间不能冒充二维扫描采样时间".into());
             }
+            let history=shared.history.lock().unwrap();
             let odometry = match session.odometry_source {
                 OdometrySource::Laser => None,
-                OdometrySource::Device => match self.history.at(
+                OdometrySource::Device => match history.at(
                     scan.timestamp_ns as u64,
                     &scan.clock_domain,
                     &scan.clock_id,
@@ -679,13 +699,14 @@ impl Algorithm {
             let slam = self.slam.as_mut().unwrap();
             let c = slam.config();
             let prepared = if session.odometry_source == OdometrySource::Device {
-                match deskew_scan(scan, &self.history, c.base_from_laser)? {
+                match deskew_scan(scan, &history, c.base_from_laser)? {
                     Some(scan) => scan,
                     None => return Ok(None),
                 }
             } else {
                 scan.clone()
             };
+            drop(history);
             shared.status.lock().unwrap().motion_compensation = if scan.motion_compensated {
                 "upstream"
             } else if prepared.motion_compensated {
@@ -793,7 +814,6 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
     let mut algorithm = Algorithm {
         slam: None,
         session: None,
-        history: PoseHistory::default(),
         device_anchor: None,
         waiting: None,
         last_graph_estimate: None,
@@ -807,9 +827,9 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
         loaded: None,
     };
     loop {
-        let (command, scan) = {
+        let (command, scan, odometry_changed) = {
             let mut inbox = shared.inbox.lock().unwrap();
-            while !inbox.closed && inbox.commands.is_empty() && inbox.scan.is_none() {
+            while !inbox.closed && inbox.commands.is_empty() && inbox.scan.is_none() && !inbox.odometry_changed {
                 if let Some((_, started)) = &algorithm.waiting {
                     let remaining =
                         std::time::Duration::from_millis(250).saturating_sub(started.elapsed());
@@ -831,7 +851,8 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
             } else {
                 None
             };
-            (command, scan)
+            let odometry_changed=std::mem::take(&mut inbox.odometry_changed);
+            (command, scan, odometry_changed)
         };
         if algorithm
             .waiting
@@ -843,23 +864,20 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
             status.rejected_scans += 1;
             status.last_error = Some("扫描等待里程计超时".into());
         }
+        let mut retry_waiting=odometry_changed && scan.is_none();
         if let Some(command) = command {
-            let retry_waiting = matches!(command.request.operation, Operation::Odometry { .. });
-            let response = algorithm.control(&command.request, &shared);
-            let _ = command.reply.send(response);
-
-            if retry_waiting {
-                if let Some((packet, started)) = algorithm.waiting.take() {
-                    if started.elapsed().as_millis() <= 250 {
-                        algorithm.scan(packet, &shared);
-                        if let Some((_, retry_started)) = algorithm.waiting.as_mut() {
-                            *retry_started = started;
-                        }
-                    } else {
-                        let mut s = shared.status.lock().unwrap();
-                        s.rejected_scans += 1;
-                        s.last_error = Some("扫描等待里程计超时".into());
-                    }
+            retry_waiting|=matches!(command.request.operation,Operation::Odometry{..});
+            let response=algorithm.control(&command.request,&shared);
+            let _=command.reply.send(response);
+        }
+        if retry_waiting {
+            if let Some((packet,started))=algorithm.waiting.take() {
+                if started.elapsed().as_millis()<=250 {
+                    algorithm.scan(packet,&shared);
+                    if let Some((_,retry_started))=algorithm.waiting.as_mut(){*retry_started=started;}
+                } else {
+                    let mut status=shared.status.lock().unwrap();status.rejected_scans+=1;
+                    status.last_error=Some("扫描等待里程计超时".into());
                 }
             }
         }
@@ -873,4 +891,40 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
     algorithm.slam.take();
     let _ = algorithm.clear_snapshot();
     exit_guard.normal = true;
+}
+
+#[cfg(test)]
+mod odometry_ingress_tests {
+    use super::*;
+    // 不运行算法命令消费线程，模拟原生匹配/构图正在占用计算线程。
+    // 接纳必须真正写入同一历史，不能只把请求排队并返回假完成。
+    #[tokio::test]
+    async fn odometry_receipt_does_not_wait_for_algorithm_and_keeps_source_fences() {
+        let identity=Identity{runtime_generation:7,owner_nonce:"a".repeat(32)};
+        let session=Session{session_id:"current".into(),map_name:"测试地图".into(),session_generation:3,
+            sensor_id:"laser".into(),frame_id:"laser".into(),map_frame_id:"map".into(),odom_frame_id:"odom".into(),body_frame_id:"body".into(),
+            clock_domain:"unix_ns".into(),clock_id:String::new(),calibration_ref:"校验".into(),odometry_source:OdometrySource::Device,core_config:serde_json::json!({})};
+        let shared=Arc::new(Shared{identity:identity.clone(),status:Mutex::new(Status{active:true,session:Some(session),..Default::default()}),
+            history:Mutex::new(PoseHistory::default()),inbox:Mutex::new(Inbox::default()),wake:Condvar::new(),
+            session_generation:AtomicU64::new(3),stopped:AtomicBool::new(false),exit:watch::channel(false).0});
+        let handle=WorkerHandle{shared:shared.clone()};
+        let request=|sample:TimedPose|RpcRequest{name:identity.rpc_name(),id:Some(1.0),args:(vec![serde_json::to_value(Request{version:VERSION,identity:identity.clone(),command_sequence:1,operation:Operation::Odometry{sample}}).unwrap()],Default::default())};
+        let sample=TimedPose{timestamp_ns:1_000_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),odom_frame_id:"odom".into(),body_frame_id:"body".into(),pose:[1.0,2.0,0.1]};
+        let reply=tokio::time::timeout(std::time::Duration::from_millis(100),handle.handle(request(sample.clone()))).await.expect("原生线程没有消费请求也必须完成接纳");
+        let reply:Response=serde_json::from_value(reply.res.unwrap()).unwrap();assert_eq!(reply.error,None);
+        assert_eq!(shared.history.lock().unwrap().at(sample.timestamp_ns,"unix_ns","").unwrap(),Some(sample.pose));
+        assert!(shared.inbox.lock().unwrap().commands.is_empty());assert!(shared.inbox.lock().unwrap().odometry_changed);
+        for fault in 0..4 {
+            let mut bad=sample.clone();bad.timestamp_ns+=1;
+            match fault {
+                0=>bad.timestamp_ns-=2,
+                1=>bad.clock_id="另一时钟".into(),
+                2=>{shared.session_generation.store(0,Ordering::Release);},
+                _=>{shared.session_generation.store(3,Ordering::Release);shared.inbox.lock().unwrap().closed=true;},
+            }
+            let reply:Response=serde_json::from_value(handle.handle(request(bad)).await.res.unwrap()).unwrap();
+            assert!(reply.error.is_some(),"故障{fault}");
+        }
+        assert_eq!(shared.history.lock().unwrap().at(sample.timestamp_ns,"unix_ns","").unwrap(),Some(sample.pose));
+    }
 }

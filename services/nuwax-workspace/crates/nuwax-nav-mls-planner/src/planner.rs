@@ -661,11 +661,11 @@ fn cells_to_waypoints(
 }
 
 /// Clearance and step limits the smoother holds the path to.
-struct WallCost {
-    clearance_m: f32,
-    buffer_m: f32,
-    buffer_weight: f32,
-    voxel_size: f32,
+pub(crate) struct WallCost {
+    pub(crate) clearance_m: f32,
+    pub(crate) buffer_m: f32,
+    pub(crate) buffer_weight: f32,
+    pub(crate) voxel_size: f32,
 }
 
 /// Replace runs of cells with straight chords that come no closer to a wall and
@@ -723,7 +723,7 @@ fn string_pull(
 
 /// Worst wall penalty and total climb along the straight segment a -> b. None if
 /// it leaves the surface, exceeds step_cells, or enters the hard clearance.
-fn segment_metrics(
+pub(crate) fn segment_metrics(
     plg: &PlannerGraph,
     a: VoxelKey,
     b: VoxelKey,
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn snap_picks_in_column_cell() {
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(&strip(20), &mut lookup);
         let cell = snap_pose_to_cell(&lookup, (0.5, 0.0, 0.1), VOXEL, Z_TOL).unwrap();
         assert_eq!(cell, (5, 0, 0));
@@ -1057,14 +1057,14 @@ mod tests {
     fn snap_rejects_a_missing_column_instead_of_relocating_the_endpoint() {
         let mut cells = strip(20);
         cells.retain(|c| c.0 != 2);
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(&cells, &mut lookup);
         assert!(snap_pose_to_cell(&lookup, (0.25, 0.0, 0.1), VOXEL, Z_TOL).is_none());
     }
 
     #[test]
     fn snap_rejects_outside_z_tolerance() {
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(&strip(20), &mut lookup);
         assert!(snap_pose_to_cell(&lookup, (0.5, 0.0, 2.0), VOXEL, 1.5).is_none());
     }

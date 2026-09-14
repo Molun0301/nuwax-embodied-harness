@@ -25,6 +25,7 @@ bench = ["dep:ndarray"]
 test-internals = []
 
 [dependencies]
+nuwax-explore-routing = { path = "../nuwax-explore-routing" }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
 tokio = { workspace = true, optional = true, features = ["time"] }

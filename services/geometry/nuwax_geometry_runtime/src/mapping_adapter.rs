@@ -1255,6 +1255,8 @@ pub struct MappingAdapter {
     /// out merely because the bounded point budget is full.
     persistent_grid: Option<Arc<PersistentOccupancyGrid>>,
     checkpoint_installed: bool,
+    /// 带三维资产的新会话在真实坐标对齐提交前不融合扫描。
+    pub(crate) checkpoint_localization_required: bool,
     checkpoint_activation_digest: Option<[u8; 32]>,
     /// Optional production-only shared forbidden-zone document.
     forbidden_zones_path: Option<PathBuf>,
@@ -1455,6 +1457,7 @@ impl MappingAdapter {
             latest_accepted_point_count: 0,
             persistent_grid: None,
             checkpoint_installed: false,
+            checkpoint_localization_required: false,
             checkpoint_activation_digest: None,
             forbidden_zones_path: None,
             forbidden_zone_cache: parking_lot::Mutex::new(
@@ -2104,6 +2107,9 @@ impl MappingAdapter {
         source_timestamp_ns: u64,
         source_fenced: bool,
     ) -> Result<Option<PreparedMappingCompute>, nuwax_mapping::SessionError> {
+        if self.checkpoint_localization_required {
+            return Ok(None);
+        }
         if self.checkpoint_export.is_some() || self.in_flight_compute.is_some() {
             self.coalesced_frame_count = self.coalesced_frame_count.saturating_add(1);
             return Ok(None);
@@ -3452,6 +3458,38 @@ impl MappingAdapter {
         self.map_odom_transform.clone()
     }
 
+    /// 原重定位事务在领取提交前核对真实会话、锚点和连续修订。
+    pub(crate) fn prepare_relocalization_registration(
+        &self,
+        transaction: &crate::correction_coordinator::CanonicalCorrectionTransaction,
+    ) -> Result<MapOdomTransformSnapshot, String> {
+        self.backend_checkpoint_client()?;
+        if self.lifecycle.session_id != transaction.mapping_session_id
+            || self.lifecycle.session_generation != transaction.mapping_session_generation
+            || self.frame_generation != transaction.map_frame_generation
+        {
+            return Err("重定位注册变换与当前地图会话不一致".into());
+        }
+        let mut transform = self.map_odom_transform.clone().ok_or("重定位注册缺少固定锚点")?;
+        let anchor_error = transform.base_isometry().inverse() * transaction.base_anchor_map_from_odom;
+        if anchor_error.translation.vector.norm() > 1e-9 || anchor_error.rotation.angle() > 1e-9
+            || transform.correction_revision.checked_add(1) != Some(transaction.correction_revision)
+        {
+            return Err("重定位注册的锚点或校正修订不一致".into());
+        }
+        transform.correction = transaction.absolute_left_correction;
+        transform.correction_revision = transaction.correction_revision;
+        transform.latest_map_pose = transform.transform_pose(transform.latest_odom_pose);
+        Ok(transform)
+    }
+
+    /// 调用方保留原生命周期锁，与规范位姿同一事务提交注册变换。
+    pub(crate) fn commit_relocalization_registration(&mut self, transform: MapOdomTransformSnapshot) {
+        *self.map_odom_transform_cache.write() = Some(transform.clone());
+        self.map_odom_transform = Some(transform);
+        self.checkpoint_localization_required = false;
+    }
+
     /// Shared read-only transform snapshot for high-rate pose publication.
     /// The cache is updated with the adapter and cleared on every map reset.
     pub(crate) fn map_odom_transform_cache(
@@ -3756,6 +3794,7 @@ impl MappingAdapter {
         self.persistent_grid = None;
         self.checkpoint_installed = false;
         self.checkpoint_activation_digest = None;
+        self.checkpoint_localization_required = false;
         self.raw_map = None;
         self.last_occupancy_commit_receipt = None;
         self.forbidden_zone_signature.clear();

@@ -6,6 +6,7 @@ struct PlanarNavigationMap {
     int64_t runtime_generation;
     string session_id;
     int64_t session_generation;
+    int64_t map_frame_generation;
     int64_t map_revision;
     byte map_payload_sha256[32];
     int64_t observation_revision;

@@ -10,3 +10,16 @@ from .LioStatus import LioStatus as LioStatus
 from .NavigationMap3D import NavigationMap3D as NavigationMap3D
 from .PlanarNavigationMap import PlanarNavigationMap as PlanarNavigationMap
 from .PlanarScan import PlanarScan as PlanarScan
+from .NavigationMapBlock import NavigationMapBlock as NavigationMapBlock
+from .GoalEnvelope import GoalEnvelope as GoalEnvelope
+from .CancelNavigation import CancelNavigation as CancelNavigation
+from .CorrectionCandidate import CorrectionCandidate as CorrectionCandidate
+from .Frontier import Frontier as Frontier
+from .FrontierList import FrontierList as FrontierList
+from .NativePgoRequest import NativePgoRequest as NativePgoRequest
+from .NativePgoResult import NativePgoResult as NativePgoResult
+from .NativePgoStatus import NativePgoStatus as NativePgoStatus
+from .NavigationState import NavigationState as NavigationState
+from .PathEnvelope import PathEnvelope as PathEnvelope
+from .PersonFollowCommand import PersonFollowCommand as PersonFollowCommand
+from .PersonFollowTarget import PersonFollowTarget as PersonFollowTarget

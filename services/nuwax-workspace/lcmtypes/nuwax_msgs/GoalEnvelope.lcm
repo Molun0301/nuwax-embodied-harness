@@ -23,6 +23,12 @@ struct GoalEnvelope {
     int64_t motion_guard_generation;
     byte motion_guard_boot_nonce[16];
     int64_t motion_stop_generation;
+    int8_t allow_reverse;
+    double position_tolerance_m;
+    double yaw_tolerance_rad;
+    byte navigation_configuration_sha256[32];
+    // 目标产生时的规范地图坐标代际。
+    int64_t map_frame_generation;
     byte payload_sha256[32];
     geometry_msgs.PoseStamped goal;
 }

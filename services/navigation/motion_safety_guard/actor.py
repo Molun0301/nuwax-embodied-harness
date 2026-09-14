@@ -78,7 +78,7 @@ class GuardActor:
         if thread is None:
             return
         self._queue.put(_STOP)
-        thread.join(timeout=2.0)
+        thread.join(timeout=max(2.0, self._core.stop_confirmation_timeout_seconds + 1.0))
         if thread.is_alive():
             raise RuntimeError("motion guard actor did not stop")
         self.thread_id = None
@@ -90,7 +90,7 @@ class GuardActor:
             raise RuntimeError("motion guard actor is not running")
         call = _FenceCall()
         self._queue.put(call)
-        if not call.completed.wait(timeout_seconds):
+        if not call.completed.wait(max(timeout_seconds, self._core.stop_confirmation_timeout_seconds + 1.0)):
             raise TimeoutError("motion guard graceful fence timed out")
         if call.error is not None:
             raise call.error
@@ -108,7 +108,7 @@ class GuardActor:
                 return
             if isinstance(item, _FenceCall):
                 try:
-                    self._core.initialize_zero_fence()
+                    self._core.initialize_zero_fence(prepare_mode=False)
                 except BaseException as exc:
                     item.error = exc
                 finally:

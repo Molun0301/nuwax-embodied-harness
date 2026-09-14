@@ -1,6 +1,26 @@
 //! 匹配期间不变的三维最近邻索引，允许共面、共轴及重复坐标。
 
 use nalgebra::Point3;
+use std::{cmp::Ordering, collections::BinaryHeap};
+
+#[derive(PartialEq)]
+struct Neighbor {
+    index: usize,
+    distance: f64,
+}
+impl Eq for Neighbor {}
+impl PartialOrd for Neighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Neighbor {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then(self.index.cmp(&other.index))
+    }
+}
 
 struct IndexedPoint {
     point: Point3<f64>,
@@ -13,6 +33,20 @@ pub(crate) struct NearestPointIndex {
 }
 
 impl NearestPointIndex {
+    /// 返回按距离和原始索引稳定排序的有限近邻，退化轴仍按元素中位数递归。
+    pub(crate) fn nearest_n(&self, point: &Point3<f64>, count: usize) -> Vec<(usize, f64)> {
+        let count = count.min(self.points.len());
+        if count == 0 || point.coords.iter().any(|v| !v.is_finite()) {
+            return Vec::new();
+        }
+        let mut heap = BinaryHeap::with_capacity(count);
+        search_many(&self.points, point, count, &mut heap);
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|n| (n.index, n.distance))
+            .collect()
+    }
+
     pub(crate) fn new(points: &[Point3<f64>]) -> Self {
         let mut indexed: Vec<_> = points
             .iter()
@@ -44,6 +78,42 @@ impl NearestPointIndex {
         let mut best = None;
         search(&self.points, point, &mut best);
         best
+    }
+}
+
+fn search_many(
+    points: &[IndexedPoint],
+    query: &Point3<f64>,
+    count: usize,
+    heap: &mut BinaryHeap<Neighbor>,
+) {
+    if points.is_empty() {
+        return;
+    }
+    let middle = points.len() / 2;
+    let node = &points[middle];
+    let distance = (node.point - query).norm_squared();
+    if distance.is_finite() {
+        let candidate = Neighbor {
+            index: node.source_index,
+            distance,
+        };
+        if heap.len() < count {
+            heap.push(candidate);
+        } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+            heap.pop();
+            heap.push(candidate);
+        }
+    }
+    let delta = query[node.axis] - node.point[node.axis];
+    let (near, far) = if delta <= 0.0 {
+        (&points[..middle], &points[middle + 1..])
+    } else {
+        (&points[middle + 1..], &points[..middle])
+    };
+    search_many(near, query, count, heap);
+    if heap.len() < count || delta * delta <= heap.peek().map_or(f64::INFINITY, |n| n.distance) {
+        search_many(far, query, count, heap);
     }
 }
 
@@ -107,6 +177,30 @@ fn search(points: &[IndexedPoint], query: &Point3<f64>, best: &mut Option<(usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_neighbors_equal_exhaustive_unique_positions_on_planes_and_axes() {
+        let mut points: Vec<_> = (0..100)
+            .flat_map(|x| (0..100).map(move |y| Point3::new(x as f64 * 0.1, y as f64 * 0.1, 0.0)))
+            .collect();
+        points.extend(vec![Point3::origin(); 100]);
+        let tree = NearestPointIndex::new(&points);
+        for query in [
+            Point3::new(3.3, 4.1, 0.0),
+            Point3::new(-1.0, 5.0, 1.0),
+            Point3::new(5.0, 5.0, -0.1),
+        ] {
+            let mut expected: Vec<_> = points[..10000]
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, (p - query).norm_squared()))
+                .collect();
+            expected.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            for count in [0, 1, 3, 32, 70] {
+                assert_eq!(tree.nearest_n(&query, count), expected[..count]);
+            }
+        }
+    }
 
     #[test]
     fn balanced_index_matches_exhaustive_search_for_degenerate_and_spatial_clouds() {

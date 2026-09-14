@@ -1,5 +1,6 @@
 #include "bridge.h"
 #include "solver.h"
+#include "incremental_grid.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -68,6 +69,7 @@ struct Context {
   bool poisoned=false,localization=false,near_seed=false,has_source=false,resume_pending=false;
   int odometry_mode=-1;
   std::vector<int8_t> grid;
+  karto::IncrementalOccupancyGrid grid_cache;
   explicit Context(NwSlamConfig c):config(c),threads(tbb::global_control::max_allowed_parallelism,c.solver_threads),solver(c.solver_threads) {
     dataset=std::make_unique<karto::Dataset>();
     mapper=std::make_unique<karto::Mapper>(); configure(*mapper);
@@ -275,7 +277,7 @@ extern "C" int nw_slam_grid(void* ptr,NwSlamGrid* out,char* error,size_t capacit
     double w=(max_x-min_x+2*c.config.range_threshold)/c.config.resolution+4;
     double h=(max_y-min_y+2*c.config.range_threshold)/c.config.resolution+4;
     require(std::isfinite(w*h)&&w<=8192&&h<=8192&&w*h<=max_grid_cells,"地图范围超过内存预算");
-    std::unique_ptr<karto::OccupancyGrid> map(karto::OccupancyGrid::CreateFromScans(scans,c.config.resolution,2,0.1));
+    auto* map=c.grid_cache.update(scans,c.config.resolution,2,0.1);
     require(bool(map),"栅格生成失败");
     auto origin=map->GetCoordinateConverter()->GetOffset();
     *out={c.revision,static_cast<uint32_t>(map->GetWidth()),static_cast<uint32_t>(map->GetHeight()),map->GetResolution(),origin.GetX(),origin.GetY()};

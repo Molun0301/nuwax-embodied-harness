@@ -1,4 +1,9 @@
 //! 二维实时障碍只形成导航派生观测；规范地图身份和源时间由Geometry拥有方核对。
+mod mask_cache;
+mod local_observation;
+mod rays;
+#[cfg(test)]
+use rays::trace_rays;
 use crate::{lcm_runtime::GeometryRuntimeHandle, slam2d_owner::Binding};
 use nuwax_codec::lcm::{
     planar::PlanarScan,
@@ -17,6 +22,8 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct Owner {
+    mask_cache: parking_lot::Mutex<mask_cache::ForbiddenMaskCache>,
+    local_observation: parking_lot::Mutex<local_observation::LocalObservation>,
     scans: parking_lot::Mutex<VecDeque<(u64, u64, Arc<PlanarScan>)>>,
     odometry: parking_lot::Mutex<(u64,nuwax_slam_2d_runtime::input::PoseHistory)>,
     revision: AtomicI64,
@@ -35,6 +42,12 @@ impl Owner {
         let mut history=self.odometry.lock();
         if history.0!=generation {history.0=generation;history.1.clear();}
         history.1.push(sample)
+    }
+    /// 在原会话历史中取得已发布位姿的真实设备采样；不使用外推补造时间。
+    pub(crate) fn odometry_at(&self,generation:u64,timestamp_ns:u64,domain:&str,clock:&str)->Result<Option<[f64;3]>,String> {
+        let history=self.odometry.lock();
+        if history.0!=generation {return Ok(None);}
+        history.1.at(timestamp_ns,domain,clock)
     }
     fn next_revision(&self) -> Result<i64, String> {
         self.revision
@@ -61,6 +74,7 @@ pub(crate) async fn revoke(
 ) -> Result<(), String> {
     binding.navigation.source_stamp.store(0, Ordering::Release);
     let value = PlanarNavigationMap {
+        map_frame_generation: bridge.mapping_adapter.as_ref().map_or(0, |a| i64::try_from(a.lock().global_frame_generation()).unwrap_or(-1)),
         runtime_generation: binding.client.identity().runtime_generation as i64,
         session_id: session.session_id.clone(),
         session_generation: session.session_generation as i64,
@@ -90,6 +104,49 @@ async fn publish(
     .map_err(|_| "二维导航观测发布超时".to_string())?
     .map_err(|e| e.to_string())
 }
+struct ObservationInput {
+    scan: Arc<PlanarScan>,
+    odom_from_base: [f64;3],
+    basis_revision: u64,
+    minimum_rays: usize,
+}
+impl Owner {
+    // 调用方已核对原生新鲜匹配依据；局部扫描只使用同会话实际历史，不冒充新的匹配结果。
+    fn latest_device_observation(&self,session:&Session,basis:&Estimate,epoch:u64,latest:&nuwax_slam_2d_runtime::input::TimedPose)->Result<Option<ObservationInput>,String> {
+        if session.odometry_source!=nuwax_slam_2d_runtime::protocol::OdometrySource::Device
+            || !matches!(basis.disposition.as_str(),"initialized"|"accepted"|"motion_skipped")
+            || basis.source_timestamp_ns==0 || basis.clock_domain!=session.clock_domain || basis.clock_id!=session.clock_id
+            || latest.timestamp_ns<basis.source_timestamp_ns || latest.timestamp_ns-basis.source_timestamp_ns>500_000_000
+            || latest.clock_domain!=session.clock_domain || latest.clock_id!=session.clock_id
+            || latest.odom_frame_id!=session.odom_frame_id || latest.body_frame_id!=session.body_frame_id {
+            return Ok(None);
+        }
+        let scans=self.scans.lock();let history=self.odometry.lock();
+        if history.0!=session.session_generation {return Ok(None);}
+        for (generation,source_epoch,scan) in scans.iter().rev() {
+            if *generation!=session.session_generation || *source_epoch!=epoch || scan.validate().is_err()
+                || scan.sensor_id!=session.sensor_id || scan.frame_id!=session.frame_id || scan.calibration_ref!=session.calibration_ref
+                || scan.clock_domain!=session.clock_domain || scan.clock_id!=session.clock_id || scan.timestamp_quality==3
+                || (scan.source_sequence as u64)<basis.source_sequence {continue;}
+            let end=(scan.timestamp_ns as u64).checked_add(scan.scan_duration_ns as u64);
+            if end.is_none_or(|end|end>latest.timestamp_ns) {continue;}
+            let minimum_rays=16_usize.max(scan.beam_count as usize/10);
+            if scan.beam_states_u8.iter().filter(|&&state|matches!(state,1|2)).count()<minimum_rays {continue;}
+            let Some(odom_from_base)=history.1.at(scan.timestamp_ns as u64,&scan.clock_domain,&scan.clock_id)? else {continue;};
+            return Ok(Some(ObservationInput{scan:Arc::clone(scan),odom_from_base,basis_revision:basis.graph_revision,minimum_rays}));
+        }
+        Ok(None)
+    }
+}
+
+pub(crate) async fn observe_device_latest(
+    bridge:&GeometryRuntimeHandle,binding:&Binding,session:&Session,basis:&Estimate,
+    latest:&nuwax_slam_2d_runtime::input::TimedPose,epoch:u64,
+)->Result<(),String> {
+    let Some(input)=binding.navigation.latest_device_observation(session,basis,epoch,latest)? else{return Ok(());};
+    observe_source(bridge,binding,session,input,epoch).await
+}
+
 pub(crate) async fn observe(
     bridge: &GeometryRuntimeHandle,
     binding: &Binding,
@@ -97,47 +154,32 @@ pub(crate) async fn observe(
     estimate: &Estimate,
     epoch: u64,
 ) -> Result<(), String> {
-    if !matches!(
-        estimate.disposition.as_str(),
-        "initialized" | "accepted" | "motion_skipped"
-    ) {
-        return Ok(());
-    }
-    let timestamp = binding.settings.unix_stamp(estimate.source_timestamp_ns)? as i64;
-    if timestamp > now_ns() + 50_000_000
-        || now_ns().saturating_sub(timestamp) > planar_navigation::MAX_SOURCE_AGE_NS
-    {
-        return Ok(());
-    }
-    if binding.navigation.last_published.lock().as_ref()
-        == Some(&(session.session_generation, estimate.source_sequence))
-    {
-        return Ok(());
-    }
-    let scan = binding
-        .navigation
-        .scans
-        .lock()
-        .iter()
-        .find(|(generation, source_epoch, scan)| {
-            *generation == session.session_generation
-                && *source_epoch == epoch
-                && scan.source_sequence as u64 == estimate.source_sequence
-                && scan.timestamp_ns as u64 == estimate.source_timestamp_ns
-        })
-        .map(|(_, _, scan)| scan.clone());
-    let Some(scan) = scan else { return Ok(()) };
-    let scan=if session.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Device && !scan.motion_compensated && scan.time_offsets_quality==1 {
-        let owner=binding.navigation.clone();let source=scan.clone();let generation=session.session_generation;
-        let offset=session.core_config["base_from_laser"].as_array().ok_or("二维导航外参缺失")?;
-        let extrinsic=[offset[0].as_f64().ok_or("二维外参非法")?,offset[1].as_f64().ok_or("二维外参非法")?,offset[2].as_f64().ok_or("二维外参非法")?];
-        let corrected=tokio::task::spawn_blocking(move|| {
-            let history=owner.odometry.lock();
-            if history.0!=generation {return Ok(None);}
-            nuwax_slam_2d_runtime::input::deskew_scan(&source,&history.1,extrinsic)
-        }).await.map_err(|e|e.to_string())??;
-        let Some(corrected)=corrected else {return Ok(())};Arc::new(corrected)
-    } else {scan};
+    if !matches!(estimate.disposition.as_str(),"initialized"|"accepted"|"motion_skipped") {return Ok(());}
+    let scan=binding.navigation.scans.lock().iter().find(|(generation,source_epoch,scan)|
+        *generation==session.session_generation && *source_epoch==epoch
+        && scan.source_sequence as u64==estimate.source_sequence && scan.timestamp_ns as u64==estimate.source_timestamp_ns)
+        .map(|(_,_,scan)|Arc::clone(scan));
+    let Some(scan)=scan else{return Ok(());};
+    observe_source(bridge,binding,session,ObservationInput{scan,odom_from_base:estimate.odom_from_base,basis_revision:estimate.graph_revision,minimum_rays:0},epoch).await
+}
+
+async fn observe_source(bridge:&GeometryRuntimeHandle,binding:&Binding,session:&Session,input:ObservationInput,epoch:u64)->Result<(),String> {
+    let ObservationInput{scan,odom_from_base,basis_revision,minimum_rays}=input;
+    let source_sequence=scan.source_sequence as u64;let source_timestamp_ns=scan.timestamp_ns as u64;
+    let timestamp=binding.settings.unix_stamp(source_timestamp_ns)? as i64;
+    if timestamp>now_ns()+50_000_000 || now_ns().saturating_sub(timestamp)>planar_navigation::MAX_SOURCE_AGE_NS {return Ok(());}
+    if binding.navigation.last_published.lock().as_ref().is_some_and(|&(generation,sequence)|generation==session.session_generation&&sequence>=source_sequence) {return Ok(());}
+    let offset=session.core_config["base_from_laser"].as_array().ok_or("二维导航外参缺失")?;
+    let extrinsic=[offset[0].as_f64().ok_or("二维外参非法")?,offset[1].as_f64().ok_or("二维外参非法")?,offset[2].as_f64().ok_or("二维外参非法")?];
+    let owner=binding.navigation.clone();let generation=session.session_generation;
+    let device_odometry=session.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Device;
+    let rays=tokio::task::spawn_blocking(move|| {
+        let history=owner.odometry.lock();
+        if device_odometry && history.0!=generation {return Ok(None);}
+        nuwax_slam_2d_runtime::input::navigation_rays(&scan,if device_odometry {Some(&history.1)} else {None},extrinsic)
+    }).await.map_err(|e|e.to_string())??;
+    let Some(rays)=rays else {return Ok(())};
+    if rays.len()<minimum_rays {return Ok(());}
     let (grid, zones, transform, authority) = {
         let _lifecycle = bridge.mapping_lifecycle_lock.lock().await;
         let Some(adapter) = &bridge.mapping_adapter else {
@@ -148,7 +190,7 @@ pub(crate) async fn observe(
         if !current.active
             || !a.planar_ready
             || a.planar_epoch != epoch
-            || a.planar_revision != estimate.graph_revision
+            || a.planar_revision > basis_revision
             || current.session_id != session.session_id
             || current.session_generation != session.session_generation
         {
@@ -176,17 +218,9 @@ pub(crate) async fn observe(
         };
         (grid, zones, transform, authority)
     };
-    let extrinsic = binding.settings.template.core_config["base_from_laser"]
-        .as_array()
-        .ok_or("缺少二维外参")?;
-    let extrinsic = [
-        extrinsic[0].as_f64().unwrap(),
-        extrinsic[1].as_f64().unwrap(),
-        extrinsic[2].as_f64().unwrap(),
-    ];
     let odom = nalgebra::Isometry3::from_parts(
-        nalgebra::Translation3::new(estimate.odom_from_base[0], estimate.odom_from_base[1], 0.0),
-        nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, estimate.odom_from_base[2]),
+        nalgebra::Translation3::new(odom_from_base[0], odom_from_base[1], 0.0),
+        nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, odom_from_base[2]),
     );
     let pose = transform.effective_isometry() * odom;
     let map_pose = [
@@ -195,9 +229,9 @@ pub(crate) async fn observe(
         pose.rotation.euler_angles().2,
     ];
     let source_stamp = grid.grid.ts;
+    let navigation = Arc::clone(&binding.navigation);
     let merged = tokio::task::spawn_blocking(move || {
-        let mut grid = grid.grid.clone();
-        trace_scan(&mut grid, &scan, map_pose, extrinsic);
+        let grid = navigation.local_observation.lock().compose(&grid.grid, &rays, map_pose)?;
         let raw = crate::lcm_runtime::MapState {
             width: grid.width,
             height: grid.height,
@@ -209,21 +243,19 @@ pub(crate) async fn observe(
             timestamp_ns: timestamp as u64,
             data: grid.data,
         };
-        match zones {
-            Some(zones) => crate::forbidden_zones::compose_effective_map(&raw, &zones),
-            None => Ok(raw),
-        }
+        navigation.mask_cache.lock().apply(raw, zones.as_ref())
     })
     .await
     .map_err(|e| e.to_string())??;
     let mut value = PlanarNavigationMap {
+        map_frame_generation: i64::try_from(transform.generation).map_err(|_| "二维地图坐标代际越界")?,
         runtime_generation: binding.client.identity().runtime_generation as i64,
         session_id: session.session_id.clone(),
         session_generation: session.session_generation as i64,
         map_revision: authority.revision,
         map_payload_sha256: authority.payload_sha256,
         observation_revision: 0,
-        source_sequence: estimate.source_sequence as i64,
+        source_sequence: source_sequence as i64,
         source_timestamp_ns: timestamp,
         cleared: false,
         grid: schema::OccupancyGrid {
@@ -247,6 +279,7 @@ pub(crate) async fn observe(
             data: merged.data,
         },
     };
+    let _projection = bridge.lock_explore_projection_owned().await;
     let _lifecycle = bridge.mapping_lifecycle_lock.lock().await;
     let adapter = bridge.mapping_adapter.as_ref().ok_or("二维适配器不可用")?;
     {
@@ -256,10 +289,16 @@ pub(crate) async fn observe(
             || !a.planar_ready
             || a.planar_epoch != epoch
             || binding.fence.snapshot().epoch != epoch
+            || binding.fence.snapshot().active
+            || current.session_id != session.session_id
             || current.session_generation != session.session_generation
             || current.revision != authority.revision as u64
-            || a.planar_revision != estimate.graph_revision
+            || a.planar_revision > basis_revision
             || now_ns().saturating_sub(timestamp) > planar_navigation::MAX_SOURCE_AGE_NS
+            || a.global_frame_generation() != value.map_frame_generation as u64
+            || binding.navigation.source_stamp.load(Ordering::Acquire)>=timestamp
+            || binding.navigation.last_published.lock().as_ref().is_some_and(|&(generation,sequence)|
+                generation==session.session_generation && sequence>=source_sequence)
         {
             return Ok(());
         }
@@ -272,73 +311,17 @@ pub(crate) async fn observe(
         .source_stamp
         .store(timestamp, Ordering::Release);
     *binding.navigation.last_published.lock() =
-        Some((session.session_generation, estimate.source_sequence));
+        Some((session.session_generation, source_sequence));
+    drop(_lifecycle);
+    bridge.explore.ingest_planar_navigation(&value).await?;
     Ok(())
 }
 
 /// 只覆盖本帧实际测到的自由射线和回波，坏测量保留原地图未知/占据状态。
-fn trace_scan(
-    grid: &mut nuwax_mapping::OccupancyGrid,
-    scan: &PlanarScan,
-    pose: [f64; 3],
-    extrinsic: [f64; 3],
-) {
-    let (sin, cos) = pose[2].sin_cos();
-    let origin = [
-        pose[0] + cos * extrinsic[0] - sin * extrinsic[1],
-        pose[1] + sin * extrinsic[0] + cos * extrinsic[1],
-    ];
-    let index = |x: f64, y: f64| -> Option<usize> {
-        let x = ((x - grid.origin[0]) / grid.resolution).floor() as i64;
-        let y = ((y - grid.origin[1]) / grid.resolution).floor() as i64;
-        (x >= 0 && y >= 0 && x < grid.width as i64 && y < grid.height as i64)
-            .then(|| (y as usize) * grid.width as usize + x as usize)
-    };
-    let mut endpoints = Vec::new();
-    for beam in 0..scan.beam_count as usize {
-        let state = scan.beam_states_u8[beam];
-        if state == 0 {
-            continue;
-        }
-        let measured = f32::from_le_bytes(
-            scan.ranges_f32_le[beam * 4..beam * 4 + 4]
-                .try_into()
-                .unwrap(),
-        ) as f64;
-        let range = if state == 2 {
-            scan.range_max_m
-        } else {
-            measured
-        };
-        let angle = if scan.angular_layout == 1 {
-            scan.angle_min_rad + beam as f64 * scan.angle_increment_rad
-        } else {
-            f32::from_le_bytes(
-                scan.angles_f32_le[beam * 4..beam * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as f64
-        };
-        let angle = pose[2] + extrinsic[2] + angle;
-        let (dy, dx) = angle.sin_cos();
-        let steps = (range / (grid.resolution * 0.5)).ceil() as usize;
-        let limit = ((grid.width + grid.height) as usize * 3).min(steps);
-        for step in 0..limit {
-            let d = (step as f64) * grid.resolution * 0.5;
-            let Some(cell) = index(origin[0] + d * dx, origin[1] + d * dy) else {
-                break;
-            };
-            grid.data[cell] = 0;
-        }
-        if state == 1 {
-            if let Some(cell) = index(origin[0] + range * dx, origin[1] + range * dy) {
-                endpoints.push(cell);
-            }
-        }
-    }
-    for cell in endpoints {
-        grid.data[cell] = 100;
-    }
+#[cfg(test)]
+fn trace_scan(grid:&mut nuwax_mapping::OccupancyGrid,scan:&PlanarScan,pose:[f64;3],extrinsic:[f64;3]) {
+    let rays=nuwax_slam_2d_runtime::input::navigation_rays(scan,None,extrinsic).unwrap().unwrap();
+    trace_rays(grid,&rays,pose).unwrap();
 }
 
 #[cfg(test)]
@@ -360,7 +343,7 @@ mod tests {
             angle_increment_rad: 1.0,
             range_min_m: 0.05,
             range_max_m: 3.0,
-            scan_duration_ns: 1,
+            scan_duration_ns: 0,
             timestamp_quality: 1,
             time_offsets_quality: 0,
             timing_uncertainty_ns: -1,
@@ -371,6 +354,43 @@ mod tests {
             intensities_f32_le: vec![],
             time_offsets_ns_le: vec![],
         }
+    }
+    #[test]
+    fn fresh_device_scan_uses_real_history_without_fabricating_native_match() {
+        use nuwax_slam_2d_runtime::{input::TimedPose,protocol::OdometrySource};
+        let session=Session{session_id:"current".into(),map_name:"测试图".into(),session_generation:3,sensor_id:"laser".into(),frame_id:"laser".into(),
+            map_frame_id:"map".into(),odom_frame_id:"odom".into(),body_frame_id:"body".into(),clock_domain:"unix_ns".into(),clock_id:String::new(),
+            calibration_ref:"cal".into(),odometry_source:OdometrySource::Device,core_config:serde_json::json!({"base_from_laser":[0.0,0.0,0.0]})};
+        let basis=Estimate{source_timestamp_ns:1_000_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),source_sequence:5,
+            graph_revision:8,optimizations:0,anchor_odom_from_base:[0.0;3],odom_from_base:[99.0;3],map_from_base:[0.0;3],map_from_odom:[0.0;3],
+            covariance:[0.0;9],matching_response:1.0,local_response:1.0,disposition:"accepted".into(),node_count:1,edge_count:0};
+        let first=TimedPose{timestamp_ns:1_000_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),odom_frame_id:"odom".into(),body_frame_id:"body".into(),pose:[0.0;3]};
+        let mut latest=first.clone();latest.timestamp_ns=1_200_000_000;latest.pose=[0.2,0.0,0.0];
+        let mut observation=scan(1);observation.beam_count=36;observation.angle_increment_rad=0.1;
+        observation.ranges_f32_le=(0..36).flat_map(|_|2f32.to_le_bytes()).collect();observation.beam_states_u8=vec![1;36];
+        observation.timestamp_ns=1_100_000_000;observation.source_sequence=7;
+        observation.validate().unwrap();
+        let owner=Owner::default();owner.capture_odometry(3,first.clone()).unwrap();owner.capture_odometry(3,latest.clone()).unwrap();
+        owner.capture(3,9,observation.clone());
+        let input=owner.latest_device_observation(&session,&basis,9,&latest).unwrap().unwrap();
+        assert_eq!(input.scan.source_sequence,7);assert_eq!(input.scan.timestamp_ns,1_100_000_000);
+        assert_eq!(input.odom_from_base,[0.1,0.0,0.0]);assert_eq!(input.basis_revision,8);
+        assert_eq!(basis.source_sequence,5);assert_eq!(basis.odom_from_base,[99.0;3]);
+        assert!(owner.latest_device_observation(&session,&basis,10,&latest).unwrap().is_none());
+        for fault in 0..4 {
+            let invalid=Owner::default();invalid.capture_odometry(3,first.clone()).unwrap();invalid.capture_odometry(3,latest.clone()).unwrap();
+            let mut changed=observation.clone();
+            match fault {
+                0=>changed.calibration_ref="其它标定".into(),
+                1=>changed.timestamp_quality=3,
+                2=>changed.beam_states_u8.fill(0),
+                _=>changed.scan_duration_ns=200_000_000,
+            }
+            invalid.capture(3,9,changed);
+            assert!(invalid.latest_device_observation(&session,&basis,9,&latest).unwrap().is_none(),"故障{fault}");
+        }
+        latest.timestamp_ns=1_600_000_000;
+        assert!(owner.latest_device_observation(&session,&basis,9,&latest).unwrap().is_none());
     }
     #[test]
     fn current_scan_clears_moved_obstacle_and_preserves_unobserved_cells() {

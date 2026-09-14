@@ -45,6 +45,8 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::nav_runtime::MotionAdmissionProof;
+use nuwax_exploration::mission::{ReturnPolicy, MissionProgress, MissionPose};
+use crate::explore_mission::{MissionCalibration, MissionRoutes, ExplorationCheckpoint, configuration_digest, mission_pose, pose3};
 
 pub const STATUS_IDLE: &str = "IDLE";
 pub const STATUS_ACCEPTED: &str = "ACCEPTED";
@@ -122,6 +124,7 @@ pub fn stop_reason_str(r: ExplorationStopReason) -> &'static str {
         ExplorationStopReason::NoFrontierTimeout => "no_frontier_timeout",
         ExplorationStopReason::DurationExceeded => "duration_exceeded",
         ExplorationStopReason::MaxGoalsReached => "max_goals_reached",
+        ExplorationStopReason::DistanceBudgetReached => "distance_budget_reached",
         ExplorationStopReason::MapRevisionChanged => "map_revision_changed",
         _ => "unsupported_stop_reason",
     }
@@ -178,6 +181,8 @@ pub struct ExploreStopConditions {
 pub struct ExploreStartConfig {
     pub strategy: String,
     pub arbitration: String,
+    pub return_policy: ReturnPolicy,
+    pub resume_progress_json: String,
     pub motion_admission: MotionAdmissionProof,
     pub boundary: Option<ExplorationBoundary>,
     pub stop_conditions: ExploreStopConditions,
@@ -188,6 +193,8 @@ pub struct ExploreStartConfig {
 impl Default for ExploreStartConfig {
     fn default() -> Self {
         Self {
+            return_policy: ReturnPolicy::default(),
+            resume_progress_json: String::new(),
             strategy: "wavefront".to_string(),
             arbitration: POLICY_PREFER_WAVEFRONT.to_string(),
             motion_admission: MotionAdmissionProof::default(),
@@ -220,6 +227,8 @@ impl ExploreStartConfig {
                 "3D exploration max_coverage_pct requires a known volume and is unsupported".into(),
             );
         }
+        self.return_policy.validate()?;
+        if !self.resume_progress_json.is_empty(){ExplorationCheckpoint::parse(&self.resume_progress_json)?;}
         let policy = try_parse_arbitration_policy(&self.arbitration)?;
         if policy == ExplorationArbitrationPolicy::PreferTare {
             return Err(
@@ -348,6 +357,8 @@ pub(crate) fn build_wavefront_goal_intent(
         None => (String::new(), Vec::new(), [0; 32]),
     };
     Ok(schema::GoalIntent {
+        map_frame_generation: 0,
+                        options: Default::default(),
         producer: "wavefront".to_string(),
         producer_epoch: producer_epoch as i64,
         priority: 100,
@@ -397,6 +408,8 @@ pub struct ChildNavigationTicket {
 /// Admission failure returned before a child navigation lease becomes active.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildNavigationSubmitError {
+    /// 输入修订前进，释放候选等待新观察，不记为目标失败。
+    SourceChanged(String),
     /// Navigation is temporarily unable to accept the goal; retry without feedback.
     RetryableReadiness(String),
     /// The request is permanently rejected and must enter goal-failure policy.
@@ -409,6 +422,7 @@ impl ChildNavigationSubmitError {
     fn reason(&self) -> &str {
         match self {
             Self::RetryableReadiness(reason)
+            | Self::SourceChanged(reason)
             | Self::Rejected(reason)
             | Self::SessionInvalidated(reason) => reason,
         }
@@ -510,6 +524,8 @@ fn take_early_cancel_terminal(
 
 #[async_trait]
 pub trait ExploreNavigationSink: Send + Sync {
+    /// 实际坐标拥有方的当前代际；测试替身可没有该观察能力。
+    fn current_map_frame_generation(&self) -> Result<Option<i64>, String> { Ok(None) }
     /// Snapshot the authoritative navigation cancel generation for a frozen intent.
     fn current_cancel_generation(&self) -> Result<u64, String> {
         Ok(0)
@@ -571,6 +587,7 @@ pub struct ExploreRuntimeSnapshot {
     pub rollover_recovery_eligible: bool,
     pub global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot,
     pub ownership_reconciliation_receipt: Option<ExplorationOwnershipReconciliationReceipt>,
+    pub mission_progress_json: String,
 }
 
 impl Default for ExploreRuntimeSnapshot {
@@ -589,6 +606,7 @@ impl Default for ExploreRuntimeSnapshot {
             rollover_recovery_eligible: false,
             global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
             ownership_reconciliation_receipt: None,
+            mission_progress_json: String::new(),
         }
     }
 }
@@ -812,6 +830,7 @@ impl DurableReconciliationSnapshot {
             rollover_recovery_eligible: false,
             global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
             ownership_reconciliation_receipt: Some(receipt),
+            mission_progress_json: String::new(),
         }
     }
 }
@@ -1415,8 +1434,20 @@ pub struct ExploreRuntimeInner {
     surface_mode: Option<SurfaceExplorationMode>,
     /// 最近一次有效地图输入的本地接收时刻，不参与地图身份。
     costmap_received_monotonic_ns: u64,
+    costmap_receipt_ttl: Duration,
     committed_map: Option<schema::CommittedMapIdentity>,
+    costmap_frame_generation: i64,
     active_config: Option<ExploreStartConfig>,
+    mission: Option<MissionProgress>,
+    mission_calibration: Option<MissionCalibration>,
+    return_reason: Option<ExplorationStopReason>,
+    return_goal_id: Option<String>,
+    return_failures: u32,
+    next_return_route_check: Option<Instant>,
+    return_after_cancellation: bool,
+    progress_stopped_ns: Option<u64>,
+    progress_map_name: String,
+    progress_origin: Option<(String,i64,i64)>,
     active_child: Option<ActiveChildNavigation>,
     pending_child_dispatch: Option<ChildNavigationRequest>,
     pending_child_cancellation: Option<PendingChildCancellation>,
@@ -1432,6 +1463,20 @@ pub struct ExploreRuntimeInner {
 }
 
 impl ExploreRuntimeInner {
+    /// 复用本次运行捕获的地图与标定，所有距离查询在释放探索锁后执行。
+    fn mission_routes(&self) -> Result<MissionRoutes, String> {
+        let config = self.active_config.as_ref().ok_or("活动探索配置缺失")?;
+        if let Some(mode) = self.surface_mode.as_ref() {
+            let map = mode.receiver.snapshot().map_err(|e| e.to_string())?
+                .ok_or("返航三维图缺失")?;
+            Ok(MissionRoutes::Surface { map, config: mode.config.clone()?,
+                boundary: config.boundary.as_ref().map(|b| b.vertices().iter().map(|p| [p.x, p.y]).collect()).unwrap_or_default() })
+        } else {
+            let map = self.costmap_input.as_ref().ok_or("返航二维图缺失")?;
+            MissionRoutes::planar(map.grid.clone(), self.mission_calibration.as_ref().ok_or("返航标定缺失")?, config)
+        }
+    }
+
     fn new() -> Self {
         Self {
             controller: build_controller(
@@ -1448,8 +1493,20 @@ impl ExploreRuntimeInner {
             costmap_input: None,
             surface_mode: None,
             costmap_received_monotonic_ns: 0,
+            costmap_receipt_ttl: DEFAULT_COSTMAP_RECEIPT_TTL,
             committed_map: None,
+            costmap_frame_generation: 0,
             active_config: None,
+            mission: None,
+            mission_calibration: None,
+            return_reason: None,
+            return_goal_id: None,
+            return_failures: 0,
+            next_return_route_check: None,
+            return_after_cancellation: false,
+            progress_stopped_ns: None,
+            progress_map_name: String::new(),
+            progress_origin: None,
             active_child: None,
             pending_child_dispatch: None,
             pending_child_cancellation: None,
@@ -1547,6 +1604,7 @@ impl ExploreRuntimeInner {
             rollover_recovery_eligible,
             global_stop_reconciliation,
             ownership_reconciliation_receipt,
+            mission_progress_json: self.mission.as_ref().map(|p|serde_json::to_string(p).expect("有效行程载荷")).unwrap_or_default(),
         }
     }
 }
@@ -1561,27 +1619,29 @@ fn build_controller(
     policy: ExplorationArbitrationPolicy,
     config: &ExploreStartConfig,
 ) -> ExplorationController {
-    build_controller_with_geometry(policy, config, None)
+    build_controller_with_geometry(policy, config, None, None).expect("无观察标定的默认控制器")
 }
 
 fn build_controller_with_geometry(
     policy: ExplorationArbitrationPolicy,
     config: &ExploreStartConfig,
     geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
-) -> ExplorationController {
+    observation: Option<nuwax_nav_types_messages::ObservationModel>,
+) -> Result<ExplorationController,String> {
     let mut controller = ExplorationController::new(policy);
     let mut adapter =
         WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
     if let Some(geometry) = geometry {
         adapter.set_robot_geometry(geometry);
     }
+    if let Some(model)=observation {adapter.set_observation_model(model).map_err(|error|error.to_string())?;}
     adapter.configure_constraints(
         config.boundary.clone(),
         config.max_navigation_retries,
         config.blacklist_radius_m,
     );
     controller.add_source(adapter);
-    controller
+    Ok(controller)
 }
 
 fn build_profile_controller(
@@ -1589,13 +1649,14 @@ fn build_profile_controller(
     config: &ExploreStartConfig,
     surface: Option<&SurfaceExplorationMode>,
 ) -> Result<ExplorationController, String> {
+    let observation=nuwax_nav_types_messages::NavigationCapabilities::from_env()?.and_then(|profile|profile.observation);
     let Some(surface) = surface else {
         let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
             .transpose()?;
-        return Ok(build_controller_with_geometry(policy, config, geometry));
+        return build_controller_with_geometry(policy, config, geometry, observation);
     };
     if !surface.accepting {
         return Err("surface exploration input owner is stopped".into());
@@ -1607,6 +1668,7 @@ fn build_profile_controller(
         surface.receiver.clone(),
     )
     .map_err(|error| error.to_string())?;
+    if let Some(model)=observation {adapter.set_observation_model(model).map_err(|error|error.to_string())?;}
     adapter
         .configure_constraints(
             config.boundary.clone(),
@@ -1972,7 +2034,7 @@ impl ExploreRuntimeHandle {
                 return false;
             }
             match result {
-                Ok(snapshot) => match mode.receiver.replace(Some(snapshot)) {
+                Ok(snapshot) => match mode.receiver.observe(snapshot) {
                     Ok(()) => {
                         mode.installed_cloud_revision = Some(ticket.cloud_revision);
                         mode.input_ready = true;
@@ -2276,6 +2338,7 @@ impl ExploreRuntimeHandle {
                     global_stop_reconciliation:
                         ExplorationGlobalStopReconciliationSnapshot::default(),
                     ownership_reconciliation_receipt: None,
+            mission_progress_json: String::new(),
                 };
             }
             guard.surface_mode.is_some()
@@ -2318,11 +2381,19 @@ impl ExploreRuntimeHandle {
                 rollover_recovery_eligible: false,
                 global_stop_reconciliation: ExplorationGlobalStopReconciliationSnapshot::default(),
                 ownership_reconciliation_receipt: None,
+            mission_progress_json: String::new(),
             };
             drop(guard);
             return snapshot;
         }
 
+        let mission_calibration = if config.return_policy.enabled() {
+            let surface=guard.surface_mode.as_ref().and_then(|m|m.config.as_ref().ok());
+            match MissionCalibration::capture(surface) {
+                Ok(value)=>Some(value),
+                Err(error)=>{let snapshot=guard.snapshot(STATUS_REJECTED,error);drop(guard);return self.store_snapshot(snapshot);}
+            }
+        } else {None};
         let mut controller =
             match build_profile_controller(policy, &config, guard.surface_mode.as_ref()) {
                 Ok(controller) => controller,
@@ -2347,6 +2418,24 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
+        let restored=if config.resume_progress_json.is_empty(){None}else{
+            let result=(|| {
+                let saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
+                let map_name=self.navigation_sink.read().as_ref().ok_or("导航地图来源缺失")?.current_map_name()?;
+                if saved.map_name!=map_name || saved.map_frame_id!=self.expected_map_frame.as_ref()
+                    || saved.configuration_sha256!=configuration_digest(&config)
+                    || saved.navigation_configuration_sha256!=nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()? {
+                    return Err("探索进度与当前地图、请求或机器人标定不匹配".into());
+                }
+                if config.return_policy.enabled()!=saved.mission.is_some(){return Err("探索进度缺少行程或请求未启用行程".into());}
+                controller.restore_checkpoint(&saved.sources).map_err(|e|e.to_string())?;
+                Ok::<_,String>(saved)
+            })();
+            match result {Ok(saved)=>Some(saved),Err(error)=>{
+                let _=controller.end_exploration();let snapshot=guard.snapshot(STATUS_REJECTED,error);drop(guard);return self.store_snapshot(snapshot);
+            }}
+        };
+
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         guard.controller = controller;
         guard.arbitration = policy;
@@ -2359,7 +2448,18 @@ impl ExploreRuntimeHandle {
         guard.last_stop = None;
         guard.last_frontier_goal = None;
         guard.last_poll = None;
-        guard.active_config = Some(config.clone());
+        let mut active_config=config.clone();
+        // 恢复载荷只在新控制器安装时使用，不随运行期配置克隆反复复制。
+        active_config.resume_progress_json.clear();
+        guard.active_config = Some(active_config);
+        guard.mission = None;
+        guard.mission_calibration = mission_calibration;
+        guard.return_reason = None;
+        guard.next_return_route_check = None;
+        guard.return_goal_id = None;
+        guard.return_failures = 0;
+        guard.return_after_cancellation = false;
+        guard.progress_stopped_ns=None;guard.progress_map_name.clear();guard.progress_origin=None;
         guard.active_child = None;
         guard.pending_child_dispatch = None;
         guard.pending_child_cancellation = None;
@@ -2369,6 +2469,10 @@ impl ExploreRuntimeHandle {
         guard.child_sequence = 0;
         guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
+        if let Some(saved)=restored {
+            guard.mission=saved.mission;guard.return_reason=saved.return_reason;guard.reached_goals=saved.reached_goals;
+            guard.started_at_ns=guard.started_at_ns.saturating_sub(saved.elapsed_ns);
+        }
         guard.no_frontier_since = None;
         let frontier_update = guard.update_frontiers(Vec::new());
         let snapshot = guard.snapshot(
@@ -2809,6 +2913,17 @@ impl ExploreRuntimeHandle {
             .await
     }
 
+    async fn cancel_child_for_return(&self,generation:u64,reason:ExplorationStopReason)->ExploreRuntimeSnapshot {
+        let mut guard=self.inner.lock().await;
+        if generation!=guard.generation || !guard.controller.is_active() || guard.pending_child_cancellation.is_some(){return self.snapshot();}
+        let Some(child)=guard.active_child.clone() else{return guard.snapshot(STATUS_ACTIVE,"返航等待派发");};
+        guard.return_after_cancellation=true;
+        guard.pending_child_dispatch=None;
+        guard.pending_child_cancellation=Some(PendingChildCancellation {action:PendingChildAction {reason,message:"行程条件已满足，先停车再返航".into()},ticket:None,failure:None,dispatch_in_flight:true,early_terminals:Vec::new()});
+        let snapshot=guard.snapshot(STATUS_STOPPING,"返航等待当前子目标物理停稳");self.store_snapshot(snapshot);drop(guard);
+        self.dispatch_child_cancellation(child,false).await
+    }
+
     async fn begin_child_action(
         &self,
         request_id: Option<&str>,
@@ -2827,6 +2942,14 @@ impl ExploreRuntimeHandle {
                 snapshot.request_id = requested_id.to_string();
                 return snapshot;
             }
+        }
+        if guard.return_after_cancellation {
+            // 用户取消、故障或关闭覆盖返航意图，共用已经在途的停车事务。
+            guard.return_after_cancellation=false;
+            guard.generation=self.generation.fetch_add(1,Ordering::SeqCst)+1;
+            let _=guard.controller.stop_with_reason(action.reason);
+            guard.last_stop=Some(action.reason);guard.last_stop_reason=stop_reason_str(action.reason).into();
+            if let Some(pending)=guard.pending_child_cancellation.as_mut(){pending.action=action.clone();}
         }
         if guard.pending_child_cancellation.is_some() {
             let (failure, dispatch_in_flight) = guard
@@ -2889,6 +3012,7 @@ impl ExploreRuntimeHandle {
         guard.pending_child_dispatch = None;
 
         let Some(child) = guard.active_child.clone() else {
+            guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
             let status = status_for_stop_reason(action.reason);
             let message = action.message;
             let frontier_update = if matches!(status, STATUS_PENDING | STATUS_ACTIVE) {
@@ -3204,20 +3328,62 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
-        if let Some(reason) = evaluate_stop_conditions(&guard, now_ns) {
-            let message = match guard.last_poll.as_ref() {
-                Some(ExplorationPoll::SourceUnavailable(detail))
-                    if reason == ExplorationStopReason::NoReachableFreeSpace =>
-                {
-                    format!("exploration inputs unavailable at duration limit: {detail}")
+        let mission_policy=guard.active_config.as_ref().map(|c|c.return_policy.clone()).unwrap_or_default();
+        if mission_policy.enabled() {
+            let frame_generation=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
+            if frame_generation>0 && guard.committed_map.is_some() {
+                let current=mission_pose(&pose);
+                let speed=guard.mission_calibration.as_ref().expect("预算启动已捕获标定").maximum_sample_speed_mps;
+                if let Err(error)=current.validate(){drop(guard);return self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,error).await;}
+                let progress=guard.mission.get_or_insert_with(||MissionProgress::new(current.clone()).expect("位姿载荷已验证"));
+                if let Err(error)=progress.observe(&current,pose.source_timestamp_ns,frame_generation as u64,speed) {
+                    drop(guard);return self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,error).await;
                 }
-                _ => format!(
-                    "exploration stop condition reached: {}",
-                    stop_reason_str(reason)
-                ),
-            };
+            }
+        }
+        let mut return_balance_reached = false;
+        if mission_policy.maximum_distance_m.is_some() && guard.active_child.is_some()
+            && guard.mission.as_ref().is_some_and(|progress| !progress.returning)
+            && guard.next_return_route_check.is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            let progress = guard.mission.clone().expect("进度已存在");
+            let routes = guard.mission_routes();
+            guard.next_return_route_check = Some(Instant::now() + Duration::from_secs(1));
             drop(guard);
-            return self.finish_session(None, reason, message).await;
+            let query = routes.and_then(|routes| routes.distance(&mission_pose(&pose), &progress.home))
+                .and_then(|homeward| mission_policy.should_return(progress.travelled_m, homeward));
+            guard = self.inner.lock().await;
+            if generation != guard.generation || !guard.controller.is_active()
+                || guard.pending_child_cancellation.is_some()
+            { return self.snapshot(); }
+            return_balance_reached = match query {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(guard);
+                    return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                        format!("活动探索返航路线核验失败：{error}")).await;
+                }
+            };
+        }
+        let condition=if guard.return_reason.is_none(){evaluate_stop_conditions(&guard,now_ns)}else{None};
+        let exhausted=return_balance_reached || guard.mission.as_ref().is_some_and(|p|!p.returning && mission_policy.maximum_distance_m.is_some_and(|limit|p.travelled_m+mission_policy.reserve_distance_m>=limit));
+        if exhausted || condition.is_some() {
+            let reason=if exhausted {ExplorationStopReason::DistanceBudgetReached}else{condition.expect("条件已存在")};
+            let can_return=exhausted || mission_policy.return_on_completion && reason.terminal_kind()==ExplorationTerminalKind::Succeeded;
+            if can_return && guard.mission.is_some() {
+                guard.return_reason=Some(reason);
+                guard.mission.as_mut().expect("已检查进度").returning=true;
+                if guard.active_child.is_some() {
+                    drop(guard);return self.cancel_child_for_return(generation,reason).await;
+                }
+                guard.pending_child_dispatch=None;
+            } else {
+                let message=match guard.last_poll.as_ref() {
+                    Some(ExplorationPoll::SourceUnavailable(detail)) if reason==ExplorationStopReason::NoReachableFreeSpace=>format!("exploration inputs unavailable at duration limit: {detail}"),
+                    _=>format!("exploration stop condition reached: {}",stop_reason_str(reason)),
+                };
+                drop(guard);return self.finish_session(None,reason,message).await;
+            }
         }
 
         if guard.active_child.is_some() {
@@ -3272,7 +3438,7 @@ impl ExploreRuntimeHandle {
         }
         if guard.costmap_received_monotonic_ns == 0
             || now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
-                > DEFAULT_COSTMAP_RECEIPT_TTL.as_nanos() as u64
+                > guard.costmap_receipt_ttl.as_nanos() as u64
         {
             guard.no_frontier_since = None;
             let snapshot = guard.snapshot(
@@ -3310,6 +3476,10 @@ impl ExploreRuntimeHandle {
                 .read()
                 .clone()
                 .ok_or_else(|| "navigation sink unavailable".to_string())?;
+            let input_frame_generation = guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation);
+            if sink.current_map_frame_generation()?.is_some_and(|current| current != input_frame_generation) {
+                return Err("committed map coordinate generation is waiting for current input".into());
+            }
             Ok::<_, String>((
                 committed_map,
                 sink.current_cancel_generation()?,
@@ -3326,6 +3496,10 @@ impl ExploreRuntimeHandle {
                 return self.store_snapshot(snapshot);
             }
         };
+        if guard.progress_origin.is_none() {
+            let frame=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
+            if frame>0 {guard.progress_origin=Some((committed_map.session_id.clone(),committed_map.session_generation,frame));guard.progress_map_name=expected_map_name.clone();}
+        }
         let mut state = ExplorationStateSnapshot::new(
             PoseStamped {
                 frame_id: if surface_mode {
@@ -3352,7 +3526,12 @@ impl ExploreRuntimeHandle {
             },
         );
         state.global_costmap = costmap.as_ref().map(|costmap| &costmap.grid);
-        let poll_result = guard.controller.poll_next_goal(&state);
+        let selection_started=Instant::now();
+        let mut poll_result = if guard.mission.as_ref().is_some_and(|p|p.returning) {
+            Ok(ExplorationPoll::Pending)
+        }else{guard.controller.poll_next_goal_with_deferred_stop(&state,mission_policy.enabled())};
+        let selection_ms=selection_started.elapsed().as_secs_f64()*1000.0;
+        if selection_ms>50.0 {tracing::warn!(selection_ms,"探索目标计算超过50毫秒");}
         let diagnostics = guard.controller.diagnostics();
         guard.last_selected_source = diagnostics.selected_source.unwrap_or_else(|| {
             if surface_mode {
@@ -3364,6 +3543,65 @@ impl ExploreRuntimeHandle {
         let source_frontiers = guard.controller.frontier_snapshot();
         let frontier_update = guard.update_frontiers(source_frontiers);
 
+        if let Some(progress)=guard.mission.clone() {
+            let natural=matches!(&poll_result,Ok(ExplorationPoll::Stop(reason)) if reason.terminal_kind()==ExplorationTerminalKind::Succeeded);
+            let candidate=match &poll_result {Ok(ExplorationPoll::Goal(goal))=>Some(goal.clone()),_=>None};
+            let returning=progress.returning || natural && mission_policy.return_on_completion;
+            if returning || candidate.is_some() {
+                let start=mission_pose(&pose);
+                let routes=guard.mission_routes();
+                let parent_id=guard.last_request_id.clone();
+                // 有界真实路线查询不持探索锁；取消仍可立即撤销原父任务。
+                drop(guard);
+                let query=(|| {
+                    let routes=routes?;
+                    let homeward=routes.distance(&start,&progress.home)?;
+                    let can_visit=if let Some(goal)=candidate.as_ref() {
+                        let target=MissionPose {position:[goal.pose.pose.position.x,goal.pose.pose.position.y,goal.pose.pose.position.z],orientation_xyzw:{let q=goal.pose.pose.orientation;[q.x,q.y,q.z,q.w]}};
+                        routes.distance(&start,&target).and_then(|outward|routes.distance(&target,&progress.home).map(|back|mission_policy.can_visit(progress.travelled_m,outward,back)))
+                    }else{Ok(false)};
+                    Ok::<_,String>((homeward,can_visit))
+                })();
+                guard=self.inner.lock().await;
+                if generation!=guard.generation || !guard.controller.is_active() || guard.last_request_id!=parent_id {
+                    return self.snapshot();
+                }
+                let (homeward,can_visit)=match query {Ok(v)=>v,Err(error)=>{
+                    drop(guard);self.publish_frontiers(frontier_update);
+                    return self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,format!("返航路线核验失败：{error}")).await;
+                }};
+                let can_visit = match can_visit {
+                    Ok(value) => value,
+                    Err(error) => {
+                        // 候选不可通行交回源的重试与区域调度，不能伪报预算耗尽。
+                        let goal = candidate.as_ref().expect("仅候选路线查询会失败");
+                        if let Err(feedback_error) = guard.controller.report_goal_feedback(
+                            &goal.id, ExplorationGoalFeedback::Failed(format!("候选往返路线不可通行：{error}")),
+                        ) {
+                            drop(guard); self.publish_frontiers(frontier_update);
+                            return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                                format!("候选路线失败反馈未完成：{feedback_error}")).await;
+                        }
+                        guard.last_poll = Some(ExplorationPoll::Pending);
+                        guard.no_frontier_since = None;
+                        let snapshot = guard.snapshot(STATUS_PENDING, format!("候选往返路线不可通行，等待其它候选：{error}"));
+                        drop(guard); self.publish_frontiers(frontier_update);
+                        return self.store_snapshot(snapshot);
+                    }
+                };
+                if returning || !can_visit {
+                    if let Some(goal)=candidate.as_ref(){let _=guard.controller.report_goal_feedback(&goal.id,ExplorationGoalFeedback::Cancelled);}
+                    let reason=if progress.returning {guard.return_reason.unwrap_or(ExplorationStopReason::DistanceBudgetReached)}else if natural {match poll_result {Ok(ExplorationPoll::Stop(reason))=>reason,_=>unreachable!()}}else{ExplorationStopReason::DistanceBudgetReached};
+                    guard.return_reason=Some(reason);
+                    guard.mission.as_mut().expect("同一运行进度").returning=true;
+                    let mut home=FrontierGoal::new(format!("{}.return.{}",parent_id,guard.child_sequence+1),PoseStamped {frame_id:state.robot_pose.frame_id.clone(),stamp:state.now,pose:pose3(&progress.home)},0.0);
+                    home.producer="mission_return".into();home.distance_cost=Some(homeward as f32);
+                    guard.return_goal_id=Some(home.id.clone());
+                    poll_result=Ok(ExplorationPoll::Goal(home));
+                }
+            }
+        }
+
         match poll_result {
             Ok(ExplorationPoll::Goal(goal)) => {
                 guard.last_frontier_goal = Some(goal.clone());
@@ -3374,8 +3612,12 @@ impl ExploreRuntimeHandle {
                     format!("{}.nav.{}", guard.last_request_id, guard.child_sequence);
                 let mut navigation_goal = frontier_goal_to_navigation_goal(&goal);
                 navigation_goal.id = child_request_id.clone();
+                if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) {
+                    navigation_goal.position_tolerance_m=0.1;
+                    navigation_goal.yaw_tolerance_rad=0.2;
+                }
                 let config = guard.active_config.clone().unwrap_or_default();
-                let intent = match build_wavefront_goal_intent(
+                let mut intent = match build_wavefront_goal_intent(
                     guard.session_generation,
                     cancel_generation,
                     &guard.last_request_id,
@@ -3398,6 +3640,11 @@ impl ExploreRuntimeHandle {
                             .await;
                     }
                 };
+                if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) {
+                    intent.options=nuwax_nav_types_messages::GoalOptions {allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.2};
+                    intent.goal_sha256=schema::goal_intent_action_sha256(&intent.goal,&intent.options).expect("原目标有效且返航选项固定");
+                }
+                intent.map_frame_generation = guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation);
                 let request = ChildNavigationRequest {
                     parent_request_id: guard.last_request_id.clone(),
                     request_id: child_request_id,
@@ -3425,6 +3672,12 @@ impl ExploreRuntimeHandle {
                     .and_then(|config| config.stop_conditions.no_frontier_timeout_ms)
                     .unwrap_or(DEFAULT_NO_FRONTIER_STABILITY.as_millis() as u64);
                 if first_no_frontier.elapsed() >= Duration::from_millis(limit_ms) {
+                    if mission_policy.return_on_completion && guard.mission.is_some() {
+                        guard.return_reason=Some(ExplorationStopReason::NoFrontierTimeout);
+                        guard.mission.as_mut().expect("已检查进度").returning=true;
+                        let snapshot=guard.snapshot(STATUS_PENDING,"探索前沿已稳定结束，准备返航");
+                        drop(guard);self.publish_frontiers(frontier_update);return self.store_snapshot(snapshot);
+                    }
                     drop(guard);
                     self.publish_frontiers(frontier_update);
                     return self
@@ -3592,6 +3845,14 @@ impl ExploreRuntimeHandle {
             return self.snapshot();
         }
         let reason = error.reason().to_string();
+        if matches!(error, ChildNavigationSubmitError::SourceChanged(_)) {
+            guard.pending_child_dispatch = None;
+            guard.no_frontier_since = None;
+            let _ = guard.controller.report_goal_feedback(&request.frontier_goal_id, ExplorationGoalFeedback::Cancelled);
+            let snapshot = guard.snapshot(STATUS_PENDING, format!("waiting for refreshed exploration input: {reason}"));
+            drop(guard);
+            return self.store_snapshot(snapshot);
+        }
         if error.is_retryable() {
             guard.pending_child_dispatch = Some(request);
             let snapshot = guard.snapshot(
@@ -3860,6 +4121,13 @@ impl ExploreRuntimeHandle {
                 .take()
                 .expect("active child checked above");
             guard.no_frontier_since = None;
+            if guard.return_after_cancellation && pending.failure.is_none() {
+                guard.return_after_cancellation=false;
+                let snapshot=guard.snapshot(STATUS_ACTIVE,"当前子目标已物理停稳，等待返航路线与新租约");
+                drop(guard);return Ok(self.store_snapshot(snapshot));
+            }
+            guard.return_after_cancellation=false;
+            guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
             let (status, message, frontier_update) = if let Some(error) = pending.failure {
                 let _ = guard
                     .controller
@@ -3893,10 +4161,37 @@ impl ExploreRuntimeHandle {
         }
 
         let frontier_goal_id = active_child.frontier_goal_id.clone();
+        if guard.return_goal_id.as_deref()==Some(frontier_goal_id.as_str()) {
+            guard.active_child=None;
+            guard.no_frontier_since=None;
+            let reason=guard.return_reason.unwrap_or(ExplorationStopReason::DistanceBudgetReached);
+            match &result {
+                ChildNavigationResult::Reached(_)=>{
+                    let distance=guard.mission.as_ref().map_or(0.0,|p|p.travelled_m);
+                    drop(guard);return Ok(Box::pin(self.finish_session(None,reason,format!("返航已到达并停稳，累计行程{distance:.3}米"))).await);
+                }
+                ChildNavigationResult::Failed{reason:failure,..}=>{
+                    guard.return_failures=guard.return_failures.saturating_add(1);
+                    if guard.return_failures>guard.active_config.as_ref().map_or(0,|c|c.max_navigation_retries){
+                        let message=format!("返航失败且已停稳：{failure}");drop(guard);
+                        return Ok(Box::pin(self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,message)).await);
+                    }
+                    let snapshot=guard.snapshot(STATUS_ACTIVE,format!("返航已停稳，重新核验路线：{failure}"));drop(guard);return Ok(self.store_snapshot(snapshot));
+                }
+                _=>return Err("返航收到没有取消事务的取消终态".into()),
+            }
+        }
+        let input_interrupted=matches!(&result,ChildNavigationResult::Failed{reason,..} if reason.starts_with("SafetyFailed cause=StaleInput:"));
         let feedback = match &result {
             ChildNavigationResult::Reached(_) => ExplorationGoalFeedback::Reached,
             ChildNavigationResult::Failed { reason, .. } => {
-                ExplorationGoalFeedback::Failed(reason.clone())
+                if input_interrupted {
+                    tracing::warn!(child_request_id,frontier_goal_id,%reason,"子导航输入中断且已停车，等待新鲜输入，不将前沿列入黑名单");
+                    ExplorationGoalFeedback::InputUnavailable(reason.clone())
+                }else{
+                    tracing::warn!(child_request_id, frontier_goal_id, %reason, "探索子导航失败，进入原重试策略");
+                    ExplorationGoalFeedback::Failed(reason.clone())
+                }
             }
             ChildNavigationResult::Cancelled(_) | ChildNavigationResult::CancelFailed { .. } => {
                 return Err("unexpected cancellation terminal without a pending action".to_string())
@@ -3914,6 +4209,7 @@ impl ExploreRuntimeHandle {
         let frontiers = guard.controller.frontier_snapshot();
         let frontier_update = guard.update_frontiers(frontiers);
         let message = match result {
+            ChildNavigationResult::Failed {..} if input_interrupted => "child navigation input interrupted; waiting for fresh inputs",
             ChildNavigationResult::Reached(_) => {
                 "child navigation reached; selecting next frontier"
             }
@@ -3943,7 +4239,7 @@ impl ExploreRuntimeHandle {
         &self,
         snapshot: ExploreCostmapSnapshot,
     ) -> Result<bool, String> {
-        self.ingest_costmap_with_identity(snapshot, None).await
+        self.ingest_costmap_with_identity(snapshot, None, 0, None).await
     }
 
     pub async fn ingest_committed_costmap_snapshot(
@@ -3951,15 +4247,44 @@ impl ExploreRuntimeHandle {
         snapshot: ExploreCostmapSnapshot,
         committed_map: schema::CommittedMapIdentity,
     ) -> Result<bool, String> {
-        self.ingest_costmap_with_identity(snapshot, Some(committed_map))
+        self.ingest_costmap_with_identity(snapshot, Some(committed_map), 0, None)
             .await
+    }
+
+    pub(crate) async fn ingest_committed_costmap_snapshot_in_frame(&self, snapshot: ExploreCostmapSnapshot,
+        committed_map: schema::CommittedMapIdentity, frame_generation: i64,
+    ) -> Result<bool, String> {
+        self.ingest_costmap_with_identity(snapshot, Some(committed_map), frame_generation, None).await
+    }
+
+    /// 二维探索消费与导航一致的真实扫描派生视图，保持原规范地图身份与源时效。
+    pub(crate) async fn ingest_planar_navigation(&self, value: &nuwax_codec::lcm::planar_navigation::PlanarNavigationMap) -> Result<bool, String> {
+        use nuwax_nav_types_messages::grid::OccupancyCell;
+        value.validate().map_err(|e| e.to_string())?;
+        if value.cleared { return Err("撤销消息不能作为二维探索图".into()); }
+        if value.source_timestamp_ns as u64 > now_unix_nanos().saturating_add(50_000_000) { return Err("二维派生探索源位于未来".into()); }
+        let source_age = now_unix_nanos().saturating_sub(value.source_timestamp_ns as u64);
+        let ttl = Duration::from_nanos(nuwax_codec::lcm::planar_navigation::MAX_SOURCE_AGE_NS as u64);
+        if source_age > ttl.as_nanos() as u64 { return Err("二维派生探索源已经过期".into()); }
+        let snapshot = ExploreCostmapSnapshot { grid: OccupancyGrid2D::new(
+            nuwax_nav_types_messages::geometry::Point2::new(value.grid.info.origin.position[0], value.grid.info.origin.position[1]),
+            f64::from(value.grid.info.resolution), value.grid.info.width as u32, value.grid.info.height as u32,
+            value.grid.data.iter().map(|v| match v { -1 => OccupancyCell::Unknown, 0 => OccupancyCell::Free, _ => OccupancyCell::Occupied }).collect()),
+            frame_id: value.grid.header.frame_id.clone() };
+        let identity = schema::CommittedMapIdentity { session_id: value.session_id.clone(), session_generation: value.session_generation,
+            revision: value.map_revision, payload_sha256: value.map_payload_sha256, frame_id: value.grid.header.frame_id.clone() };
+        self.ingest_costmap_with_identity(snapshot, Some(identity), value.map_frame_generation,
+            Some((now_monotonic_nanos().saturating_sub(source_age), ttl))).await
     }
 
     async fn ingest_costmap_with_identity(
         &self,
         snapshot: ExploreCostmapSnapshot,
         committed_map: Option<schema::CommittedMapIdentity>,
+        frame_generation: i64,
+        observation: Option<(u64, Duration)>,
     ) -> Result<bool, String> {
+        if frame_generation < 0 { return Err("二维探索坐标代际无效".into()); }
         validate_costmap_snapshot(&snapshot, self.expected_map_frame.as_ref())?;
         if let Some(identity) = committed_map.as_ref() {
             if identity.session_id.trim().is_empty()
@@ -3980,11 +4305,14 @@ impl ExploreRuntimeHandle {
             guard.costmap_input = Some(snapshot);
             return Ok(changed);
         }
+        let (received, ttl) = observation.unwrap_or_else(|| (now_monotonic_nanos(), DEFAULT_COSTMAP_RECEIPT_TTL));
         if guard.costmap_input.as_ref() == Some(&snapshot)
             && guard.committed_map.as_ref() == committed_map.as_ref()
+            && guard.costmap_frame_generation == frame_generation
         {
             // 新的输入接收事件可以续期，状态查询或缓存读取不会进入这里。
-            guard.costmap_received_monotonic_ns = now_monotonic_nanos();
+            guard.costmap_received_monotonic_ns = received;
+            guard.costmap_receipt_ttl = ttl;
             return Ok(false);
         }
         if let Some(identity) = committed_map.as_ref() {
@@ -3992,15 +4320,21 @@ impl ExploreRuntimeHandle {
                 let same_session = identity.session_id == current.session_id
                     && identity.session_generation == current.session_generation;
                 same_session
-                    && (identity.revision < current.revision
+                    && (frame_generation < guard.costmap_frame_generation || identity.revision < current.revision
                         || (identity.revision == current.revision && identity != current))
             }) {
                 return Err("committed costmap identity is stale or conflicting".to_string());
             }
         }
+        let finish_request = if guard.controller.is_active() && guard.committed_map.as_ref().zip(committed_map.as_ref()).is_some_and(|(old, new)|
+            old.session_id != new.session_id || old.session_generation != new.session_generation || guard.costmap_frame_generation != frame_generation) {
+            Some(guard.last_request_id.clone())
+        } else { None };
         // 缺少提交身份的输入必须清除旧身份，避免把未提交栅格冒充为已提交快照。
         guard.committed_map = committed_map;
-        guard.costmap_received_monotonic_ns = now_monotonic_nanos();
+        guard.costmap_frame_generation = frame_generation;
+        guard.costmap_received_monotonic_ns = received;
+        guard.costmap_receipt_ttl = ttl;
 
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(snapshot);
@@ -4016,6 +4350,9 @@ impl ExploreRuntimeHandle {
         drop(guard);
         *self.readiness_cache.lock() = readiness;
         self.publish_frontiers(frontier_update);
+        if let Some(request_id) = finish_request {
+            self.finish_session(Some(&request_id), ExplorationStopReason::MapRevisionChanged, "二维探索地图域或坐标代际变化".into()).await;
+        }
 
         Ok(true)
     }
@@ -4155,6 +4492,27 @@ impl ExploreRuntimeHandle {
         }
     }
 
+    pub(crate) async fn checkpoint_progress(&self,request_id:&str)->Result<String,String> {
+        let guard=self.inner.lock().await;
+        if request_id.is_empty() || request_id!=guard.last_request_id{return Err("探索进度请求身份不匹配".into());}
+        if guard.controller.is_active() || guard.active_child.is_some() || guard.pending_child_cancellation.is_some() || guard.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries(){
+            return Err("探索进度只可在原任务停止且导航拥有权已确认释放后保存".into());
+        }
+        let config=guard.active_config.as_ref().ok_or("探索配置不存在")?;
+        let map=guard.committed_map.as_ref().ok_or("探索已提交地图不存在")?;
+        let frame=guard.surface_mode.as_ref().and_then(|m|m.latest.as_ref()).map_or(guard.costmap_frame_generation,|t|t.map_frame_generation);
+        let origin=guard.progress_origin.as_ref().ok_or("探索尚未消费有效坐标输入")?;
+        if origin.0!=map.session_id || origin.1!=map.session_generation || origin.2!=frame{return Err("探索历史的坐标域已变化，不能保存成当前地图进度".into());}
+        let saved=ExplorationCheckpoint {schema_version:1,request_id:request_id.into(),map_name:guard.progress_map_name.clone(),map_frame_id:self.expected_map_frame.to_string(),
+            origin_session_id:origin.0.clone(),origin_session_generation:origin.1,origin_frame_generation:origin.2,
+            configuration_sha256:configuration_digest(config),navigation_configuration_sha256:nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()?,
+            elapsed_ns:guard.progress_stopped_ns.unwrap_or_else(now_unix_nanos).saturating_sub(guard.started_at_ns),reached_goals:guard.reached_goals,mission:guard.mission.clone(),return_reason:guard.return_reason,
+            sources:guard.controller.checkpoint().map_err(|e|e.to_string())?};
+        let payload=serde_json::to_string(&saved).map_err(|e|e.to_string())?;
+        ExplorationCheckpoint::parse(&payload)?;
+        Ok(payload)
+    }
+
     pub async fn diagnostics(&self) -> ControllerDiagnosticsView {
         let guard = self.inner.lock().await;
         let diagnostics = guard.controller.diagnostics();
@@ -4263,7 +4621,7 @@ fn evaluate_stop_conditions(
         if guard.committed_map.is_some()
             && guard.costmap_received_monotonic_ns != 0
             && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
-                <= DEFAULT_COSTMAP_RECEIPT_TTL.as_nanos() as u64
+                <= guard.costmap_receipt_ttl.as_nanos() as u64
             && coverage_pct(&costmap.grid, config.boundary.as_ref())
                 .is_some_and(|coverage| coverage >= max_coverage)
         {
@@ -6151,6 +6509,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_revision_change_reselects_without_blacklisting_the_frontier() {
+        let (handle, sink) = configured_handle();
+        sink.submit_errors.lock().unwrap().push_back(ChildNavigationSubmitError::SourceChanged("普通修订前进".into()));
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("source-refresh", "prefer_wavefront").await;
+        let pending = handle.tick((2.0, 2.0)).await;
+        assert_eq!(pending.status, STATUS_PENDING);
+        assert!(pending.message.contains("refreshed exploration input"));
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2).await.unwrap();
+        let active = handle.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        let submitted = sink.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 2);
+        assert_eq!(submitted[0].goal.target.pose.position, submitted[1].goal.target.pose.position);
+    }
+
+    #[tokio::test]
     async fn child_dispatch_rejects_nonrecoverable_lease_identity() {
         for invalid_lease in [
             ChildNavigationLease {
@@ -7893,6 +8268,180 @@ mod tests {
         let next = handle.tick((2.0, 2.0)).await;
         assert_eq!(next.status, STATUS_ACTIVE);
         assert_ne!(next.child_task_id, active.child_task_id);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restores_confirmed_source_in_new_generation_and_rejects_wrong_binding() {
+        let (handle,_)=configured_handle();
+        ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
+        handle.inner.lock().await.costmap_frame_generation=1;
+        handle.start("checkpoint-origin","prefer_wavefront").await;
+        let active=handle.tick((2.0,2.0)).await;
+        assert!(handle.checkpoint_progress("checkpoint-origin").await.is_err());
+        let old_lease=active_child_lease(&handle).await;
+        handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&old_lease))).await.unwrap();
+        handle.stop("checkpoint-origin").await;
+        let checkpoint=handle.checkpoint_progress("checkpoint-origin").await.unwrap();
+        let saved=ExplorationCheckpoint::parse(&checkpoint).unwrap();
+        assert_eq!(saved.reached_goals,1);
+        assert!(handle.checkpoint_progress("another-parent").await.is_err());
+        let (resumed,sink)=configured_handle();
+        ingest_committed_costmap_fixture(&resumed,frontier_costmap(2),2).await.unwrap();
+        resumed.inner.lock().await.costmap_frame_generation=2;
+        let mut config=handle.inner.lock().await.active_config.clone().unwrap();
+        config.resume_progress_json=checkpoint.clone();
+        let accepted=resumed.start_with_config("checkpoint-new-parent",config.clone()).await;
+        assert_eq!(accepted.status,STATUS_ACCEPTED,"{}",accepted.message);
+        assert_eq!(resumed.inner.lock().await.controller.checkpoint().unwrap()[0].payload,saved.sources[0].payload);
+        assert!(resumed.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&old_lease))).await.is_err());
+        let next=resumed.tick((2.0,2.0)).await;
+        assert_eq!(next.status,STATUS_ACTIVE,"{}",next.message);
+        assert_ne!(next.child_task_id,active.child_task_id);
+        assert!(resumed.report_navigation_result(&next.child_task_id,ChildNavigationResult::Reached(terminal_proof(&old_lease))).await.is_err());
+        assert_eq!(sink.submitted.lock().unwrap().len(),1);
+        for variation in ["map","config","source"] {
+            let (other,sink)=configured_handle();
+            let mut candidate=config.clone();
+            if variation=="config"{candidate.max_navigation_retries+=1;}else{
+                let mut value:serde_json::Value=serde_json::from_str(&checkpoint).unwrap();
+                if variation=="map"{value["map_name"]=serde_json::json!("other-map");}else{value["sources"][0]["payload"]=serde_json::json!("{}");}
+                candidate.resume_progress_json=value.to_string();
+            }
+            let rejected=other.start_with_config("bad-restore",candidate).await;
+            assert_eq!(rejected.status,STATUS_REJECTED,"{}",rejected.message);
+            assert!(!other.is_active().await);assert!(sink.submitted.lock().unwrap().is_empty());
+        }
+    }
+
+    async fn enable_test_mission(handle:&ExploreRuntimeHandle,limit:Option<f64>) {
+        let mut guard=handle.inner.lock().await;
+        guard.active_config.as_mut().unwrap().return_policy=ReturnPolicy {maximum_distance_m:limit,reserve_distance_m:0.0,return_on_completion:true};
+        guard.mission_calibration=Some(crate::explore_mission::tests::calibration());
+        guard.costmap_frame_generation=1;
+    }
+
+    #[tokio::test]
+    async fn mission_unreachable_candidate_is_not_budget_exhaustion() {
+        use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
+        struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>);
+        impl ExplorationGoalSource for CandidateSource {
+            fn source_name(&self) -> std::borrow::Cow<'static, str> { "wavefront".into() }
+            fn begin(&mut self) -> ExploreResult<()> { Ok(()) }
+            fn end(&mut self) -> ExploreResult<()> { Ok(()) }
+            fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExploreResult<ExplorationPoll> {
+                let mut pose = state.robot_pose.clone();
+                // 首次给出未知区域目标，失败反馈后提供可通行的替代目标。
+                pose.pose.position.x = if self.0.lock().unwrap().is_empty() { 5.0 } else { 2.5 };
+                Ok(ExplorationPoll::Goal(FrontierGoal::new("candidate", pose, 1.0)))
+            }
+            fn report_goal_feedback(&mut self, _: &str, feedback: ExplorationGoalFeedback) -> ExploreResult<()> {
+                self.0.lock().unwrap().push(feedback); Ok(())
+            }
+            fn diagnostics(&self) -> ExplorationSourceDiagnostics {
+                ExplorationSourceDiagnostics { source_name: "wavefront".into(), is_active: true, last_goal_id: None, last_error: None }
+            }
+        }
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("mission-route-failure", "prefer_wavefront").await;
+        enable_test_mission(&handle, None).await;
+        let feedback = Arc::new(StdMutex::new(Vec::new()));
+        let mut controller = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+        controller.add_source(CandidateSource(feedback.clone()));
+        controller.begin_exploration().unwrap();
+        handle.inner.lock().await.controller = controller;
+        let waiting = handle.tick((2.0, 2.0)).await;
+        assert_eq!(waiting.status, STATUS_PENDING, "{}", waiting.message);
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(matches!(feedback.lock().unwrap()[0], ExplorationGoalFeedback::Failed(_)));
+        assert!(handle.inner.lock().await.return_reason.is_none());
+        let active = handle.tick((2.0, 2.0)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        assert_eq!(sink.submitted.lock().unwrap()[0].frontier_goal_id, "candidate");
+    }
+
+    #[tokio::test]
+    async fn mission_unreachable_home_fails_without_return_dispatch() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("mission-home-failure", "prefer_wavefront").await;
+        enable_test_mission(&handle, None).await;
+        handle.inner.lock().await.mission = Some(MissionProgress::new(MissionPose {
+            position: [5.0, 5.0, 0.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }).unwrap());
+        let failed = handle.tick((2.0, 2.0)).await;
+        assert_eq!(failed.status, STATUS_FAILED, "{}", failed.message);
+        assert!(failed.message.contains("返航路线核验失败"));
+        assert!(sink.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mission_budget_dispatches_home_and_requires_matching_terminal() {
+        let (handle,sink)=configured_handle();
+        ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
+        handle.start("mission-small-budget","prefer_wavefront").await;
+        enable_test_mission(&handle,Some(0.01)).await;
+        let active=handle.tick((2.0,2.0)).await;
+        assert_eq!(active.status,STATUS_ACTIVE,"{}",active.message);
+        let requests=sink.submitted.lock().unwrap().clone();
+        assert_eq!(requests.len(),1);
+        assert!(requests[0].frontier_goal_id.contains(".return."));
+        assert_eq!(requests[0].intent.options.position_tolerance_m,0.1);
+        assert_eq!(requests[0].intent.goal.pose.position,[2.0,2.0,0.0]);
+        let lease=active_child_lease(&handle).await;
+        assert!(handle.report_navigation_result("old-child",ChildNavigationResult::Reached(terminal_proof(&lease))).await.is_err());
+        assert_eq!(handle.snapshot().status,STATUS_ACTIVE);
+        let done=handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&lease))).await.unwrap();
+        assert_eq!(done.status,STATUS_SUCCEEDED);assert_eq!(done.last_stop_reason,"distance_budget_reached");
+        assert_eq!(sink.submitted.lock().unwrap().len(),1);
+    }
+
+    #[tokio::test]
+    async fn mission_active_goal_reserves_current_return_route_before_limit() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("mission-active-budget", "prefer_wavefront").await;
+        handle.tick((2.0, 2.0)).await;
+        enable_test_mission(&handle, Some(1.5)).await;
+        let mut progress = MissionProgress::new(MissionPose {
+            position: [1.3, 2.0, 0.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }).unwrap();
+        progress.travelled_m = 1.0;
+        handle.inner.lock().await.mission = Some(progress);
+        let stopping = handle.tick((2.0, 2.0)).await;
+        assert_eq!(stopping.status, STATUS_STOPPING, "{}", stopping.message);
+        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(handle.inner.lock().await.return_reason, Some(ExplorationStopReason::DistanceBudgetReached));
+    }
+
+    #[tokio::test]
+    async fn mission_return_cancel_waits_for_zero_and_user_cancel_wins() {
+        for user_cancel in [false,true] {
+            let (handle,sink)=configured_handle();
+            ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
+            handle.start("mission-cancel","prefer_wavefront").await;
+            let active=handle.tick((2.0,2.0)).await;
+            let lease=active_child_lease(&handle).await;
+            enable_test_mission(&handle,Some(2.0)).await;
+            {let mut guard=handle.inner.lock().await;let mut p=MissionProgress::new(MissionPose {position:[2.0,2.0,0.0],orientation_xyzw:[0.0,0.0,0.0,1.0]}).unwrap();p.travelled_m=2.1;guard.mission=Some(p);}
+            assert_eq!(handle.tick((2.0,2.0)).await.status,STATUS_STOPPING);
+            assert_eq!(sink.cancelled.lock().unwrap().len(),1);
+            assert!(handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&lease))).await.is_err());
+            if user_cancel {assert_eq!(handle.stop("mission-cancel").await.status,STATUS_STOPPING);}
+            let proof=zero_proof(&lease,1);
+            let after=handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Cancelled(proof)).await.unwrap();
+            if user_cancel {
+                assert_eq!(after.status,STATUS_CANCELLED);
+                handle.tick((2.0,2.0)).await;
+                assert_eq!(sink.submitted.lock().unwrap().len(),1);
+            }else{
+                assert_eq!(after.status,STATUS_ACTIVE);
+                let home=handle.tick((2.0,2.0)).await;
+                assert_eq!(home.status,STATUS_ACTIVE,"{}",home.message);
+                let requests=sink.submitted.lock().unwrap();assert_eq!(requests.len(),2);assert!(requests[1].frontier_goal_id.contains(".return."));
+            }
+        }
     }
 
     #[tokio::test]

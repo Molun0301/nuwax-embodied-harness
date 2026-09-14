@@ -203,15 +203,12 @@ NAV_DB_SQLITE_FALLBACK_ENABLED: bool = _cfg_bool("NUWAX_NAV_DB_SQLITE_FALLBACK_E
 # Phase 6：nav profile / explore arbitration / real-lcm 强约束
 # ============================================================
 # 这些 module-level 常量直接对接 nuwax-geometry-runtime (Rust) 装配面:
-# - NUWAX_NAV_PROFILE    → Rust `nav_runtime.rs` 读取,选择 simple-2d /
-#                          replanning-astar / cmu-native / mls3d / exploration-native;
-#                          默认 simple-2d,与 nuwax-nav-stack foundation 组合对齐。
+# 导航方案由几何执行链固定决定，不再作为独立可编辑设置。
 # - NUWAX_EXPLORE_ARBITRATION → 当前只允许 prefer_wavefront；未 qualification
 #                          的 native source 会在配置加载期显式拒绝，禁止静默降级。
 # - NUWAX_REAL_LCM_REQUIRED → true 时要求真实 LCM 可用；上游不可用时
 #                          进程 exit 1 + LCM_BACKEND_UNAVAILABLE。
 #                          默认 false 由环境侧决策。
-NAV_PROFILE: str = _cfg_str("NUWAX_NAV_PROFILE", "simple-2d").strip() or "simple-2d"
 EXPLORE_ARBITRATION: str = (
     _normalize_explore_arbitration(_cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront"))
 )
@@ -862,6 +859,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         navigation=NavigationBackendConfig(
+            facility_providers_json=_cfg_str("NUWAX_FACILITY_PROVIDERS_JSON", "{}"),
             goal_channel=_cfg_str("NUWAX_NAV_GOAL_CHANNEL", "/nav/goal"),
             cancel_channel=_cfg_str("NUWAX_NAV_CANCEL_CHANNEL", "/nav/cancel"),
             state_channel=_cfg_str("NUWAX_NAV_STATE_CHANNEL", "/nav/state"),

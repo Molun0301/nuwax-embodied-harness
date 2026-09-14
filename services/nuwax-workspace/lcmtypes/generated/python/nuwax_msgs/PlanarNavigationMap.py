@@ -12,11 +12,11 @@ import nav_msgs
 class PlanarNavigationMap(object):
     """ 规范地图与本次新鲜扫描合成的二维导航观测；不会成为规范地图写入端。 """
 
-    __slots__ = ["schema_version", "runtime_generation", "session_id", "session_generation", "map_revision", "map_payload_sha256", "observation_revision", "source_sequence", "source_timestamp_ns", "cleared", "grid"]
+    __slots__ = ["schema_version", "runtime_generation", "session_id", "session_generation", "map_frame_generation", "map_revision", "map_payload_sha256", "observation_revision", "source_sequence", "source_timestamp_ns", "cleared", "grid"]
 
-    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int8_t", "nav_msgs.OccupancyGrid"]
+    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "int64_t", "int8_t", "nav_msgs.OccupancyGrid"]
 
-    __dimensions__ = [None, None, None, None, None, [32], None, None, None, None, None]
+    __dimensions__ = [None, None, None, None, None, None, [32], None, None, None, None, None]
 
     def __init__(self):
         self.schema_version = 0
@@ -26,6 +26,8 @@ class PlanarNavigationMap(object):
         self.session_id = ""
         """ LCM Type: string """
         self.session_generation = 0
+        """ LCM Type: int64_t """
+        self.map_frame_generation = 0
         """ LCM Type: int64_t """
         self.map_revision = 0
         """ LCM Type: int64_t """
@@ -54,7 +56,7 @@ class PlanarNavigationMap(object):
         buf.write(struct.pack('>I', len(__session_id_encoded)+1))
         buf.write(__session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.session_generation, self.map_revision))
+        buf.write(struct.pack(">qqq", self.session_generation, self.map_frame_generation, self.map_revision))
         buf.write(bytearray(self.map_payload_sha256[:32]))
         buf.write(struct.pack(">qqqb", self.observation_revision, self.source_sequence, self.source_timestamp_ns, self.cleared))
         assert self.grid._get_packed_fingerprint() == nav_msgs.OccupancyGrid._get_packed_fingerprint()
@@ -76,7 +78,7 @@ class PlanarNavigationMap(object):
         self.schema_version, self.runtime_generation = struct.unpack(">iq", buf.read(12))
         __session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
-        self.session_generation, self.map_revision = struct.unpack(">qq", buf.read(16))
+        self.session_generation, self.map_frame_generation, self.map_revision = struct.unpack(">qqq", buf.read(24))
         self.map_payload_sha256 = buf.read(32)
         self.observation_revision, self.source_sequence, self.source_timestamp_ns, self.cleared = struct.unpack(">qqqb", buf.read(25))
         self.grid = nav_msgs.OccupancyGrid._decode_one(buf)
@@ -86,7 +88,7 @@ class PlanarNavigationMap(object):
     def _get_hash_recursive(parents):
         if PlanarNavigationMap in parents: return 0
         newparents = parents + [PlanarNavigationMap]
-        tmphash = (0x789f673f6095c824+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x55e5987faf7e4385+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

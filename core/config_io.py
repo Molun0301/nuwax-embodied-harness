@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore
 
 from core import config_registry as R
+from contracts.navigation_pipeline import resolve_navigation_profile
 from core.config_values import RUNTIME_VALUES, config_snapshot, read_env_values, parse_env_line, env_assignment
 from core.robot_geometry import (
     ROBOT_GEOMETRY_SETTING_KEYS, RobotGeometryConfig, RobotGeometryError,
@@ -43,6 +44,7 @@ _POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
 _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
 _GEOMETRY_OWNER_TARGET = "geometry_owner_profile_env"
 _GEOMETRY_OWNER_KEYS = frozenset({
+    "NUWAX_NAV_PROFILE",
     "NUWAX_GEOMETRY_PIPELINE", "NUWAX_GEOMETRY_SLAM2D_CONFIG",
     "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_SLAM2D_BINARY",
     "NUWAX_GEOMETRY_LIO_BACKEND",
@@ -588,6 +590,19 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
             return None
     if any(char in v for char in "\r\n\0"):
         return None
+    if key == "NUWAX_FACILITY_PROVIDERS_JSON":
+        try:
+            from contracts.building_navigation import normalize_facility_provider_configuration
+            return normalize_facility_provider_configuration(v)
+        except (ValueError, TypeError):
+            return None
+    if key == "NUWAX_NAV_CAPABILITIES_JSON":
+        try:
+            from contracts.navigation_capabilities import parse_navigation_capabilities
+            profile = parse_navigation_capabilities(v)
+            return "" if profile is None else profile.model_dump_json()
+        except (ValueError, TypeError):
+            return None
     if key in ROBOT_GEOMETRY_SETTING_KEYS:
         try:
             return normalize_robot_geometry_setting(key, v)
@@ -760,6 +775,9 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
 
     backups: Dict[str, str] = {}
     for target_file, kv in per_target.items():
+        if "NUWAX_GEOMETRY_PIPELINE" in kv:
+            # 两项在同一文件、同一原子写入中配对，旧导航覆盖不能跨维度继承。
+            kv["NUWAX_NAV_PROFILE"] = resolve_navigation_profile(kv["NUWAX_GEOMETRY_PIPELINE"])
         path = _target_path(target_file)
         with _target_lock(path):
             original = path.read_text(encoding="utf-8") if path.exists() else ""

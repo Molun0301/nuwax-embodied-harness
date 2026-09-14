@@ -20,6 +20,8 @@ class RuntimeResource(StrEnum):
     # 两者并发会竞态改写 workspace/记忆库/会话绑定。
     # 共用此资源令牌使它们互斥（冲突即 ResourceConflictError 快速失败，非排队）。
     MAP_WORKSPACE = "map_workspace"
+    # 逐层编排只持此资源，实际导航/地图资源由原子任务持有。
+    BUILDING_WORKFLOW = "building_workflow"
 
 
 class ResourceLease(ContractModel):

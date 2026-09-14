@@ -21,10 +21,11 @@ uint64_t __nuwax_msgs_PlanarNavigationMap_hash_recursive(const __lcm_hash_ptr *p
     cp.v = __nuwax_msgs_PlanarNavigationMap_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x789f673f6095c824LL
+    uint64_t hash = (uint64_t)0x55e5987faf7e4385LL
          + __int32_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
+         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __byte_hash_recursive(&cp)
@@ -65,6 +66,9 @@ int __nuwax_msgs_PlanarNavigationMap_encode_array(void *buf, int offset, int max
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
@@ -119,6 +123,8 @@ int __nuwax_msgs_PlanarNavigationMap_encoded_array_size(const nuwax_msgs_PlanarN
 
         size += __int64_t_encoded_array_size(&(p[element].session_generation), 1);
 
+        size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
+
         size += __int64_t_encoded_array_size(&(p[element].map_revision), 1);
 
         size += __byte_encoded_array_size(p[element].map_payload_sha256, 32);
@@ -160,6 +166,9 @@ int __nuwax_msgs_PlanarNavigationMap_decode_array(const void *buf, int offset, i
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
+        if (thislen < 0) return thislen; else pos += thislen;
+
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -198,6 +207,8 @@ int __nuwax_msgs_PlanarNavigationMap_decode_array_cleanup(nuwax_msgs_PlanarNavig
         __string_decode_array_cleanup(&(p[element].session_id), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].session_generation), 1);
+
+        __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].map_revision), 1);
 
@@ -250,6 +261,8 @@ int __nuwax_msgs_PlanarNavigationMap_clone_array(const nuwax_msgs_PlanarNavigati
         __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
         __int64_t_clone_array(&(p[element].session_generation), &(q[element].session_generation), 1);
+
+        __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
 
         __int64_t_clone_array(&(p[element].map_revision), &(q[element].map_revision), 1);
 

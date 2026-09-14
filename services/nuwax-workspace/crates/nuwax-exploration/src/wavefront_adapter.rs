@@ -95,7 +95,16 @@ impl WavefrontGoalSourceAdapter {
         Self::new(name, config, Box::new(CountingIdSource::default()))
     }
 
-    /// 采用模型/用户设置解析出的统一机体外形。
+    /// 接入同一导航标定中的传感器观察模型。
+    pub fn set_observation_model(
+        &mut self,
+        model: nuwax_nav_types_messages::ObservationModel,
+    ) -> ExploreResult<()> {
+        self.selector
+            .set_observation_model(model)
+            .map_err(|error| ExploreError::SourceError(error.to_string()))
+    }
+    /// 使用原拥有方捕获的机体外形。
     pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
         self.robot_geometry = Some(geometry);
     }
@@ -148,6 +157,17 @@ impl WavefrontInputReceiver for WavefrontGoalSourceAdapter {
 }
 
 impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
+    fn checkpoint(&self)->ExploreResult<String> {
+        self.session.validate_checkpoint().map_err(ExploreError::SourceError)?;
+        serde_json::to_string(&(1_u32,&self.session)).map_err(|e|ExploreError::SourceError(e.to_string()))
+    }
+    fn restore_checkpoint(&mut self,payload:&str)->ExploreResult<()> {
+        if self.last_goal.is_some() || payload.len()>1_048_576{return Err(ExploreError::SourceError("二维探索恢复时已有目标或载荷过大".into()));}
+        let (version,session):(u32,ExplorationSession)=serde_json::from_str(payload).map_err(|e|ExploreError::SourceError(e.to_string()))?;
+        if version!=1{return Err(ExploreError::SourceError("二维探索进度版本不支持".into()));}
+        session.validate_checkpoint().map_err(ExploreError::SourceError)?;
+        self.session=session;self.last_frontiers.clear();Ok(())
+    }
     fn source_name(&self) -> Cow<'static, str> {
         self.name.clone()
     }
@@ -325,6 +345,9 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         }
         let point = goal.pose.pose.position.to_2d();
         match feedback {
+            ExplorationGoalFeedback::InputUnavailable(reason) => {
+                self.last_error = Some(format!("等待导航输入恢复：{reason}"));
+            }
             ExplorationGoalFeedback::Reached => {
                 self.session.record_goal_reached(point);
                 self.last_error = None;
@@ -411,6 +434,66 @@ mod tests {
             }
         }
         grid
+    }
+
+    #[test]
+    fn input_interruption_leaves_planar_frontier_eligible_after_repeated_stops() {
+        let mut source =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        source.configure_constraints(None, 0, 0.75);
+        source.begin().unwrap();
+        let map = frontier_grid();
+        let mut state = sample_state(Some(&map), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        for _ in 0..3 {
+            let ExplorationPoll::Goal(goal) = source.poll_goal(&state).unwrap() else {
+                panic!("输入中断不能耗尽前沿预算")
+            };
+            source
+                .report_goal_feedback(
+                    &goal.id,
+                    ExplorationGoalFeedback::InputUnavailable("输入超时，已停车".into()),
+                )
+                .unwrap();
+            assert!(!source
+                .session
+                .is_blacklisted(goal.pose.pose.position.to_2d()));
+            assert_eq!(source.session.regional_completed_rounds(), 0);
+        }
+    }
+
+    #[test]
+    fn calibrated_planar_source_uses_visible_frontier_cells_and_observation_yaw() {
+        let mut source =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        source
+            .set_observation_model(nuwax_nav_types_messages::ObservationModel {
+                kind: nuwax_nav_types_messages::ObservationKind::Planar,
+                min_range_m: 0.05,
+                max_range_m: 2.8,
+                horizontal_fov_rad: std::f64::consts::FRAC_PI_2,
+                vertical_min_rad: 0.0,
+                vertical_max_rad: 0.0,
+                sensor_translation_body_m: [0.0; 3],
+                sensor_rotation_body_xyzw: [0.0, 0.0, 0.0, 1.0],
+                max_rays: 128,
+            })
+            .unwrap();
+        source.begin().unwrap();
+        let map = frontier_grid();
+        let mut state = sample_state(Some(&map), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        let ExplorationPoll::Goal(goal) = source.poll_goal(&state).unwrap() else {
+            panic!("可见前沿应形成目标")
+        };
+        assert_eq!(
+            goal.metadata.get("gain_basis").map(String::as_str),
+            Some("calibrated_visible_frontier_cells")
+        );
+        assert!(goal.information_gain.unwrap() > 0.0);
+        assert!(goal.pose.pose.orientation.yaw().is_finite());
     }
 
     #[test]
@@ -579,6 +662,65 @@ mod tests {
         };
         let s = sample_state(Some(&grid), Timestamp::default());
         let _ = ad.poll_goal(&s).unwrap();
+    }
+
+    #[test]
+    fn planar_regional_age_ignores_old_feedback_cancellation_and_session_restart() {
+        let mut adapter =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        let grid = frontier_grid();
+        let mut state = sample_state(Some(&grid), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        adapter.begin().unwrap();
+        let ExplorationPoll::Goal(selected) = adapter.poll_goal(&state).unwrap() else {
+            panic!("需要安全目标");
+        };
+        adapter
+            .report_goal_feedback("old-goal", ExplorationGoalFeedback::Failed("late".into()))
+            .unwrap();
+        assert_eq!(adapter.session.regional_completed_rounds(), 0);
+        adapter
+            .report_goal_feedback(
+                &selected.id,
+                ExplorationGoalFeedback::Failed("blocked".into()),
+            )
+            .unwrap();
+        adapter
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert_eq!(adapter.session.regional_completed_rounds(), 1);
+        adapter.end().unwrap();
+        adapter.begin().unwrap();
+        assert_eq!(adapter.session.regional_completed_rounds(), 0);
+        let ExplorationPoll::Goal(selected) = adapter.poll_goal(&state).unwrap() else {
+            panic!("需要安全目标");
+        };
+        adapter
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert_eq!(adapter.session.regional_completed_rounds(), 0);
+    }
+
+    #[test]
+    fn production_planar_source_reports_shared_regional_selection() {
+        let mut source =
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+        source.begin().unwrap();
+        let map = frontier_grid();
+        let mut state = sample_state(Some(&map), Timestamp::default());
+        state.robot_pose.pose.position.x = 2.25;
+        state.robot_pose.pose.position.y = 2.25;
+        let ExplorationPoll::Goal(goal) = source.poll_goal(&state).unwrap() else {
+            panic!("安全前沿应可用");
+        };
+        assert_eq!(
+            goal.metadata.get("selection_method").map(String::as_str),
+            Some("regional_route")
+        );
+        assert!(goal
+            .distance_cost
+            .is_some_and(|cost| cost.is_finite() && cost > 0.0));
     }
 
     #[test]

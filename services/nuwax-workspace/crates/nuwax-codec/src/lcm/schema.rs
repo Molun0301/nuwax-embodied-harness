@@ -20,7 +20,7 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xe2dc_6882_37b9_a31b_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xdd19bb819d6c3e44_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
 pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0xf11d_70cc_600f_1ab1_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
@@ -30,7 +30,7 @@ pub const ODOMETRY_FINGERPRINT: [u8; 8] = 0x94e1_7f94_648c_f0e4_u64.to_be_bytes(
 /// `sensor_msgs.PointCloud2` fingerprint from `dimos-lcm==0.1.3`.
 pub const POINT_CLOUD2_FINGERPRINT: [u8; 8] = 0xf5eb_3da1_c285_3175_u64.to_be_bytes();
 /// `lcm-gen 1.5.2` 生成的三维导航地图消息指纹。
-pub const NAVIGATION_MAP_3D_FINGERPRINT: [u8; 8] = 0xc0e90c625980fcd6_u64.to_be_bytes();
+pub const NAVIGATION_MAP_3D_FINGERPRINT: [u8; 8] = 0xd11d6dd10d5490b8_u64.to_be_bytes();
 /// `sensor_msgs.Imu` fingerprint from the canonical DimOS nested Quaternion/Vector3 schema.
 pub const IMU_FINGERPRINT: [u8; 8] = 0x31ab_205c_8dd5_7aa8_u64.to_be_bytes();
 /// `tf2_msgs.TFMessage` fingerprint from `dimos-lcm==0.1.3`.
@@ -49,7 +49,7 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 /// The checked-in `FrontierList.lcm` declares a fixed array of this size.
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
-pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 4;
+pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 6;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -129,6 +129,10 @@ pub struct CommittedMapIdentity {
 /// 由唯一导航租约 owner 准入的共享 producer 请求。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalIntent {
+    /// 目标来源的坐标代际，普通地图修订前进不能改变它。
+    pub map_frame_generation: i64,
+    /// 随原目标封存的倒车与到达约束。
+    pub options: nuwax_types::navigation::GoalOptions,
     /// 稳定 producer 名称，例如 `public-navigation` 或 `wavefront`。
     pub producer: String,
     /// 首次创建该 intent 的 producer 实例代次。
@@ -167,8 +171,20 @@ pub struct GoalIntent {
 
 /// 计算单个目标位姿的规范摘要。
 pub fn goal_intent_goal_sha256(goal: &PoseStamped) -> CodecResult<[u8; 32]> {
-    let canonical = encode_pose_stamped_body(goal)?;
+    goal_intent_action_sha256(goal, &nuwax_types::navigation::GoalOptions::default())
+}
+
+/// 目标位姿与执行约束共同决定请求摘要。
+pub fn goal_intent_action_sha256(goal: &PoseStamped, options: &nuwax_types::navigation::GoalOptions) -> CodecResult<[u8;32]> {
+    options.validate().map_err(CodecError::LcmEncode)?;
+    let mut canonical=encode_pose_stamped_body(goal)?;
+    encode_goal_options(options,&mut canonical);
     Ok(crate::hash::sha256_bytes(&canonical))
+}
+fn encode_goal_options(options:&nuwax_types::navigation::GoalOptions,out:&mut Vec<u8>) {
+    out.push(u8::from(options.allow_reverse));
+    out.extend_from_slice(&options.position_tolerance_m.to_be_bytes());
+    out.extend_from_slice(&options.yaw_tolerance_rad.to_be_bytes());
 }
 
 /// 计算单个边界身份和多边形的规范摘要。
@@ -194,7 +210,13 @@ pub fn goal_intent_boundary_sha256(
 /// Versioned navigation goal with public identity and lease ownership.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GoalEnvelope {
-    /// Wire schema version. Only version 4 is currently accepted.
+    /// 随目标摘要封存的地图坐标代际。
+    pub map_frame_generation: i64,
+    /// 几何与控制组件必须一致的启动参数摘要。
+    pub navigation_configuration_sha256: [u8;32],
+    /// 随目标载荷摘要封存的执行约束。
+    pub options: nuwax_types::navigation::GoalOptions,
+    /// 当前线格式版本为6。
     pub schema_version: i32,
     /// Single public business identifier; API `goal_id` maps here losslessly.
     pub session_id: String,
@@ -245,7 +267,7 @@ pub struct GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// Wire schema version. Only version 4 is currently accepted.
+    /// 当前线格式版本为6。
     pub schema_version: i32,
     /// Public business identifier copied from the goal envelope.
     pub session_id: String,
@@ -549,7 +571,7 @@ pub struct PointCloud2 {
 /// 复用规范地图身份与真实点云提交回执的三维导航地图。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavigationMap3D {
-    /// 当前消息版本，固定为1。
+    /// 当前消息版本，固定为2。
     pub schema_version: i32,
     /// 复用导航生产者的持久运行代际，生效与清空消息均必须为正。
     pub producer_runtime_generation: i64,
@@ -571,6 +593,8 @@ pub struct NavigationMap3D {
     pub cleared: bool,
     /// 同次占据提交中的纯虚拟禁区；不包含二维物理投影。
     pub virtual_obstacles: Option<OccupancyGrid>,
+    /// 固定精度完整根；有该字段时不另携带全量云。
+    pub fine: Option<nuwax_map_chunks::Transfer>,
     /// 位于规范地图坐标系的三维点云。
     pub cloud: PointCloud2,
 }
@@ -578,7 +602,7 @@ pub struct NavigationMap3D {
 impl Default for NavigationMap3D {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             producer_runtime_generation: 0,
             committed_map: CommittedMapIdentity::default(),
             map_frame_generation: 0,
@@ -589,6 +613,7 @@ impl Default for NavigationMap3D {
             commit_sequence: 0,
             cleared: false,
             virtual_obstacles: None,
+            fine: None,
             cloud: PointCloud2::default(),
         }
     }
@@ -596,7 +621,7 @@ impl Default for NavigationMap3D {
 
 /// 校验三维导航地图身份、内部云头及有限三维点布局。
 pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), String> {
-    if message.schema_version != 1 {
+    if message.schema_version != 2 {
         return Err("unsupported NavigationMap3D schema_version".into());
     }
     if message.producer_runtime_generation <= 0 {
@@ -698,7 +723,35 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
             return Err("NavigationMap3D virtual obstacles require finite axis-aligned XY geometry and 0/100 cells".into());
         }
     }
-    validate_navigation_map_3d_cloud(&message.cloud, message.cleared)
+    if let Some(fine) = &message.fine {
+        let root = nuwax_map_chunks::Manifest::decode(&fine.root, fine.root_sha256)?;
+        if message.cleared || root.domain != navigation_map_3d_domain(message)
+            || root.revision != message.cloud_revision as u64
+            || root.source_timestamp_ns != message.source_timestamp_ns as u64
+            || root.voxel_size_m != message.source_voxel_size || root.blocks.is_empty() {
+            return Err("精细根与三维规范提交不一致".into());
+        }
+        let blocks = root.blocks.iter().map(|b| (b.sha256, b)).collect::<std::collections::BTreeMap<_, _>>();
+        let mut total = 0_usize;
+        for (hash, bytes) in &fine.included {
+            total = total.checked_add(bytes.len()).ok_or("精细块大小溢出")?;
+            if total > 512 * 1024 || nuwax_map_chunks::digest(bytes) != *hash { return Err("携带精细块超预算或摘要错误".into()); }
+            let reference = blocks.get(hash).ok_or("携带精细块不属于根清单")?;
+            let decoded = nuwax_map_chunks::decode_block(bytes)?;
+            if decoded.len() != reference.points as usize || nuwax_map_chunks::block_geometry_digest(&decoded) != reference.geometry_sha256 || decoded.values().any(|e| e.observed_ns > root.source_timestamp_ns) {
+                return Err("携带精细块证据与根不符".into());
+            }
+        }
+    }
+    validate_navigation_map_3d_cloud(&message.cloud, message.cleared || message.fine.is_some())
+}
+
+/// 分块根直接复用同一消息的地图域。
+pub fn navigation_map_3d_domain(message: &NavigationMap3D) -> nuwax_map_chunks::Domain {
+    nuwax_map_chunks::Domain { session: message.committed_map.session_id.clone(),
+        generation: message.committed_map.session_generation as u64,
+        frame_generation: message.map_frame_generation as u64,
+        producer_generation: message.producer_runtime_generation as u64 }
 }
 
 fn validate_navigation_map_3d_cloud(cloud: &PointCloud2, cleared: bool) -> Result<(), String> {
@@ -819,6 +872,7 @@ fn navigation_map_3d_coordinate(cloud: &PointCloud2, offset: usize, bytes: usize
 /// 校验消息并按真实布局提取单精度三维点；清空返回空列表，非法缩窄明确拒绝。
 pub fn navigation_map_3d_points(message: &NavigationMap3D) -> CodecResult<Vec<(f32, f32, f32)>> {
     validate_navigation_map_3d(message).map_err(CodecError::LcmDecode)?;
+    if message.fine.is_some() { return Err(CodecError::LcmDecode("精细地图必须先完成缺片补取，再按空间范围读取".into())); }
     if message.cleared {
         return Ok(Vec::new());
     }
@@ -889,6 +943,20 @@ pub fn encode_navigation_map_3d_body(message: &NavigationMap3D) -> CodecResult<V
             .as_ref()
             .unwrap_or(&OccupancyGrid::default()),
     )?);
+    out.push(u8::from(message.fine.is_some()));
+    if let Some(fine) = &message.fine {
+        out.extend_from_slice(&fine.root_sha256);
+        out.extend_from_slice(&(fine.root.len() as i32).to_be_bytes());
+        out.extend_from_slice(&fine.root);
+        out.extend_from_slice(&(fine.included.len() as i32).to_be_bytes());
+        for (hash, bytes) in &fine.included {
+            out.extend_from_slice(hash);
+            out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+    } else {
+        out.extend_from_slice(&[0; 40]);
+    }
     out.extend_from_slice(&encode_point_cloud2_body(&message.cloud)?);
     Ok(out)
 }
@@ -953,6 +1021,26 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         }
         None
     };
+    let has_fine = match cursor.read_u8()? { 0 => false, 1 => true, _ => return Err(CodecError::LcmDecode("has_fine_map必须为0或1".into())) };
+    let root_sha256 = cursor.read_exact(32)?.try_into().unwrap();
+    let length = cursor.read_i32()?;
+    if length < 0 || length as usize > nuwax_map_chunks::MAX_MANIFEST_BYTES { return Err(CodecError::LcmDecode("精细根长度无效".into())); }
+    let root = cursor.read_exact(length as usize)?.to_vec();
+    let count = cursor.read_i32()?;
+    if !(0..=16384).contains(&count) { return Err(CodecError::LcmDecode("携带精细块数量无效".into())); }
+    let mut included = std::collections::BTreeMap::new();
+    let mut total = 0;
+    for _ in 0..count {
+        let hash = cursor.read_exact(32)?.try_into().unwrap();
+        let length = cursor.read_i32()?;
+        if length < 0 || length as usize > nuwax_map_chunks::MAX_BLOCK_BYTES { return Err(CodecError::LcmDecode("精细块长度无效".into())); }
+        total += length as usize;
+        if total > 512 * 1024 { return Err(CodecError::LcmDecode("携带精细块总长超预算".into())); }
+        if included.insert(hash, cursor.read_exact(length as usize)?.to_vec()).is_some() { return Err(CodecError::LcmDecode("携带精细块重复".into())); }
+    }
+    let fine = if has_fine { Some(nuwax_map_chunks::Transfer { root, root_sha256, included }) }
+        else if root.is_empty() && included.is_empty() && root_sha256 == [0; 32] { None }
+        else { return Err(CodecError::LcmDecode("空精细根不能携带隐藏数据".into())); };
     let cloud_body = cursor.read_exact(cursor.remaining())?;
     let cloud = decode_point_cloud2(&with_fingerprint(
         POINT_CLOUD2_FINGERPRINT,
@@ -970,6 +1058,7 @@ pub fn decode_navigation_map_3d_body(encoded: &[u8]) -> CodecResult<NavigationMa
         commit_sequence,
         cleared,
         virtual_obstacles,
+        fine,
         cloud,
     };
     validate_navigation_map_3d(&message).map_err(CodecError::LcmDecode)?;
@@ -1248,6 +1337,9 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.motion_guard_generation.to_be_bytes());
     out.extend_from_slice(&message.motion_guard_boot_nonce);
     out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
+    encode_goal_options(&message.options, out);
+    out.extend_from_slice(&message.navigation_configuration_sha256);
+    out.extend_from_slice(&message.map_frame_generation.to_be_bytes());
     Ok(())
 }
 
@@ -1291,6 +1383,10 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         .try_into()
         .expect("16-byte motion guard boot nonce");
     let motion_stop_generation = cursor.read_i64()?;
+    let allow_reverse=match cursor.read_exact(1)?[0] {0=>false,1=>true,_=>return Err(CodecError::LcmDecode("allow_reverse must be 0 or 1".into()))};
+    let options=nuwax_types::navigation::GoalOptions {allow_reverse,position_tolerance_m:cursor.read_f64()?,yaw_tolerance_rad:cursor.read_f64()?};
+    let navigation_configuration_sha256=cursor.read_exact(32)?.try_into().expect("32-byte configuration digest");
+    let map_frame_generation = cursor.read_i64()?;
     let payload_sha256 = cursor
         .read_exact(32)?
         .try_into()
@@ -1300,6 +1396,9 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
         pose: decode_pose_body(cursor)?,
     };
     Ok(GoalEnvelope {
+        map_frame_generation,
+        navigation_configuration_sha256,
+        options,
         schema_version,
         session_id,
         owner_kind,
@@ -1330,6 +1429,8 @@ fn validate_goal_envelope_semantics(
     message: &GoalEnvelope,
     check_digest: bool,
 ) -> Result<(), String> {
+    message.options.validate()?;
+    if message.map_frame_generation < 0 { return Err("map_frame_generation must be non-negative".into()); }
     validate_navigation_identity(
         message.schema_version,
         &message.session_id,
@@ -2710,7 +2811,7 @@ mod navigation_map_3d_tests {
     #[test]
     fn invalid_identities_and_cloud_headers_are_rejected() {
         let mutations: &[fn(&mut NavigationMap3D)] = &[
-            |m| m.schema_version = 2,
+            |m| m.schema_version = 3,
             |m| m.producer_runtime_generation = 0,
             |m| m.committed_map.session_id.clear(),
             |m| m.committed_map.session_id.push('\0'),
@@ -2836,6 +2937,7 @@ mod navigation_map_3d_tests {
         corrupted.push(0);
         assert!(decode_navigation_map_3d(&corrupted).is_err());
         let clear_offset = wire.len()
+            - 41 // 空精细根的标志、摘要和两个长度字段。
             - encode_point_cloud2_body(&message.cloud).unwrap().len()
             - encode_occupancy_grid_body(&OccupancyGrid::default())
                 .unwrap()
@@ -2853,6 +2955,31 @@ mod navigation_map_3d_tests {
         corrupted = wire;
         corrupted[0] ^= 1;
         assert!(decode_navigation_map_3d(&corrupted).is_err());
+    }
+
+    #[test]
+    fn fine_root_round_trip_and_commit_binding_rejects_mixed_source() {
+        use nuwax_map_chunks::{Block, BlockRef, Domain, Evidence, Manifest, Transfer, digest, encode_block};
+        let mut message = live_map();
+        let block = Block::from([(1, Evidence { observed_ns: message.source_timestamp_ns as u64, hits: 2 })]);
+        let bytes = encode_block(&block).unwrap(); let hash = digest(&bytes);
+        let root = Manifest { version: 1, domain: Domain { session: message.committed_map.session_id.clone(),
+            generation: message.committed_map.session_generation as u64, frame_generation: message.map_frame_generation as u64,
+            producer_generation: message.producer_runtime_generation as u64 }, revision: message.cloud_revision as u64,
+            source_timestamp_ns: message.source_timestamp_ns as u64, voxel_size_m: message.source_voxel_size,
+            blocks: vec![BlockRef { key: [0; 3], sha256: hash, geometry_sha256: nuwax_map_chunks::block_geometry_digest(&block), points: 1 }] };
+        let root_bytes = root.encode().unwrap();
+        message.fine = Some(Transfer { root_sha256: digest(&root_bytes), root: root_bytes,
+            included: std::collections::BTreeMap::from([(hash, bytes)]) });
+        message.cloud.width = 0; message.cloud.row_step = 0; message.cloud.data.clear();
+        let wire = encode_navigation_map_3d(&message).unwrap();
+        assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
+        assert!(navigation_map_3d_points(&message).is_err());
+        message.map_frame_generation += 1;
+        assert!(validate_navigation_map_3d(&message).is_err());
+        message.map_frame_generation -= 1;
+        message.fine.as_mut().unwrap().included.values_mut().next().unwrap()[16] ^= 1;
+        assert!(validate_navigation_map_3d(&message).is_err());
     }
 
     #[test]
@@ -2895,6 +3022,7 @@ mod navigation_map_3d_tests {
             "nav_msgs/OccupancyGrid",
             "sensor_msgs/PointField",
             "sensor_msgs/PointCloud2",
+            "nuwax_msgs/NavigationMapBlock",
             "nuwax_msgs/NavigationMap3D",
         ];
         for python in [false, true] {
@@ -2912,6 +3040,8 @@ mod navigation_map_3d_tests {
             run(command);
         }
         for file in [
+            "nuwax_msgs_NavigationMapBlock.c",
+            "nuwax_msgs_NavigationMapBlock.h",
             "nuwax_msgs_NavigationMap3D.c",
             "nuwax_msgs_NavigationMap3D.h",
         ] {

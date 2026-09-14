@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include "lcm/lcm_coretypes.h"
-#include "lcm/lcm.h"
+#include <lcm/lcm_coretypes.h>
+#include <lcm/lcm.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +86,19 @@ struct _nuwax_msgs_GoalEnvelope
      */
     uint8_t    motion_guard_boot_nonce[16];
     int64_t    motion_stop_generation;
+    int8_t     allow_reverse;
+    double     position_tolerance_m;
+    double     yaw_tolerance_rad;
+
+    /**
+     * LCM Type: byte[32]
+     */
+    uint8_t    navigation_configuration_sha256[32];
+
+    /**
+     * 目标产生时的规范地图坐标代际。
+     */
+    int64_t    map_frame_generation;
 
     /**
      * LCM Type: byte[32]

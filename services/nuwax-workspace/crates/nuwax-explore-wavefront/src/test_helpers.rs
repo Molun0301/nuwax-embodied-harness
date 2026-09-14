@@ -28,6 +28,8 @@ pub enum DetectionOutcomeKind {
 /// 检测错误摘要，供集成测试隔离生产错误类型的具体实现。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetectorError {
+    /// 观察标定或计算不成立。
+    InvalidObservation(String),
     /// 机器人位姿在栅格外(包含 (x, y))
     OutOfBounds { x_m: f64, y_m: f64 },
     /// 起点轮廓观测尚未完整。
@@ -39,6 +41,7 @@ impl DetectorError {
     #[must_use]
     pub fn to_display(&self) -> String {
         match self {
+            Self::InvalidObservation(reason) => format!("invalid observation model: {reason}"),
             Self::OutOfBounds { x_m, y_m } => {
                 format!("robot pose out of grid bounds: ({x_m}, {y_m})")
             }
@@ -68,6 +71,7 @@ pub fn detect_kind(
     let out = detector
         .detect_candidates(robot_pose, costmap, session)
         .map_err(|e| match e {
+            crate::detector::WavefrontError::InvalidObservation(reason) => DetectorError::InvalidObservation(reason),
             crate::detector::WavefrontError::RobotPoseOutOfBounds(x, y) => {
                 DetectorError::OutOfBounds { x_m: x, y_m: y }
             }

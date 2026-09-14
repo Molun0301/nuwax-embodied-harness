@@ -146,7 +146,10 @@ function syncGeometryPipelineFields() {
   for (const row of document.querySelectorAll("#configSections [data-key]")) {
     const key = row.dataset.key;
     const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
-      "NUWAX_GEOMETRY_CORRECTION_BACKEND"].includes(key)
+      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
+      "NUWAX_NAV_ROBOT_HEIGHT_M", "NUWAX_NAV_SURFACE_VOXEL_SIZE_M",
+      "NUWAX_NAV_MIN_STAIR_TREAD_M", "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M",
+      "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
       || key.startsWith("NUWAX_GATEWAY_POINTCLOUD3D_");
     const disabled = planar && spatial;
     for (const input of row.querySelectorAll("input,select,textarea")) input.disabled = disabled;

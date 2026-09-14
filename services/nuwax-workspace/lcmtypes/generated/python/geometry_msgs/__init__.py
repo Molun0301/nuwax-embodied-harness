@@ -11,3 +11,7 @@ from .PoseWithCovariance import PoseWithCovariance as PoseWithCovariance
 from .Vector3 import Vector3 as Vector3
 from .Twist import Twist as Twist
 from .TwistWithCovariance import TwistWithCovariance as TwistWithCovariance
+from .PointStamped import PointStamped as PointStamped
+from .PoseStamped import PoseStamped as PoseStamped
+from .Transform import Transform as Transform
+from .TransformStamped import TransformStamped as TransformStamped

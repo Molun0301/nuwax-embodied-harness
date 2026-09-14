@@ -151,6 +151,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.MappingCloudAuthority.FromString,
                 _registered_method=True)
+        self.GetNavigationMapBlock = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetNavigationMapBlock',
+                request_serializer=geometry__runtime__pb2.NavigationMapBlockRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.NavigationMapBlockResponse.FromString,
+                _registered_method=True)
         self.SubmitMappingCloudGoal = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/SubmitMappingCloudGoal',
                 request_serializer=geometry__runtime__pb2.MappingCloudGoalRequest.SerializeToString,
@@ -225,6 +230,11 @@ class GeometryRuntimeStub(object):
                 '/nuwax.geometry.GeometryRuntime/GetExplorationState',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.ExplorationState.FromString,
+                _registered_method=True)
+        self.GetExplorationProgress = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetExplorationProgress',
+                request_serializer=geometry__runtime__pb2.ExplorationProgressRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.ExplorationProgressResponse.FromString,
                 _registered_method=True)
         self.GetExplorationDiagnostics = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/GetExplorationDiagnostics',
@@ -399,6 +409,12 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetNavigationMapBlock(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SubmitMappingCloudGoal(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -496,6 +512,12 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetExplorationState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetExplorationProgress(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -644,6 +666,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.MappingCloudAuthority.SerializeToString,
             ),
+            'GetNavigationMapBlock': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetNavigationMapBlock,
+                    request_deserializer=geometry__runtime__pb2.NavigationMapBlockRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.NavigationMapBlockResponse.SerializeToString,
+            ),
             'SubmitMappingCloudGoal': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitMappingCloudGoal,
                     request_deserializer=geometry__runtime__pb2.MappingCloudGoalRequest.FromString,
@@ -718,6 +745,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.GetExplorationState,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.ExplorationState.SerializeToString,
+            ),
+            'GetExplorationProgress': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetExplorationProgress,
+                    request_deserializer=geometry__runtime__pb2.ExplorationProgressRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.ExplorationProgressResponse.SerializeToString,
             ),
             'GetExplorationDiagnostics': grpc.unary_unary_rpc_method_handler(
                     servicer.GetExplorationDiagnostics,
@@ -1375,6 +1407,33 @@ class GeometryRuntime(object):
             _registered_method=True)
 
     @staticmethod
+    def GetNavigationMapBlock(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetNavigationMapBlock',
+            geometry__runtime__pb2.NavigationMapBlockRequest.SerializeToString,
+            geometry__runtime__pb2.NavigationMapBlockResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def SubmitMappingCloudGoal(request,
             target,
             options=(),
@@ -1769,6 +1828,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/GetExplorationState',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.ExplorationState.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetExplorationProgress(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetExplorationProgress',
+            geometry__runtime__pb2.ExplorationProgressRequest.SerializeToString,
+            geometry__runtime__pb2.ExplorationProgressResponse.FromString,
             options,
             channel_credentials,
             insecure,

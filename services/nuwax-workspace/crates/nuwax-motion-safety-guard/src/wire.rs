@@ -77,6 +77,7 @@ mod tests {
                     zero_ack: Some(ZeroAck {
                         zero_ack_id: "zero-17".to_string(),
                         applied_monotonic_ns: 44,
+                        ..Default::default()
                     }),
                 },
             )),

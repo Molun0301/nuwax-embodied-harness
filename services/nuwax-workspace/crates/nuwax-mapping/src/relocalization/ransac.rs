@@ -1,4 +1,4 @@
-use kiddo::KdTree;
+use super::nearest::NearestPointIndex;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 
 use super::features::FeatureMatch;
@@ -219,17 +219,13 @@ fn failed_result(iterations: usize) -> RansacResult {
     }
 }
 
-fn point_tree(points: &[Point3<f64>]) -> KdTree<f64, 3> {
-    let mut tree = KdTree::new();
-    for (index, point) in points.iter().enumerate() {
-        tree.add(&[point.x, point.y, point.z], index as u64);
-    }
-    tree
+fn point_tree(points: &[Point3<f64>]) -> NearestPointIndex {
+    NearestPointIndex::new(points)
 }
 
 fn evaluate_with_tree(
     source: &[Point3<f64>],
-    target_tree: &KdTree<f64, 3>,
+    target_tree: &NearestPointIndex,
     transform: Isometry3<f64>,
     threshold: f64,
 ) -> AlignmentScore {
@@ -238,14 +234,10 @@ fn evaluate_with_tree(
     let mut squared_error = 0.0;
     for point in source {
         let transformed = transform * point;
-        let neighbour = target_tree.nearest_one::<kiddo::SquaredEuclidean>(&[
-            transformed.x,
-            transformed.y,
-            transformed.z,
-        ]);
-        if neighbour.distance <= threshold_sq {
+        let Some((_,distance))=target_tree.nearest(&transformed) else {continue;};
+        if distance <= threshold_sq {
             inlier_count += 1;
-            squared_error += neighbour.distance;
+            squared_error += distance;
         }
     }
     AlignmentScore {

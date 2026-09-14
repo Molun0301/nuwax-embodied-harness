@@ -39,6 +39,9 @@ pub struct FrontierDebugSummary {
 /// Wavefront detector 摘要诊断。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WavefrontDiagnostics {
+    /// 本轮栅格派生与连通簇更新工作量。
+    #[serde(default)]
+    pub incremental: crate::incremental::IncrementalFrontierStats,
     /// 最近一次检测候选摘要(只读摘要,不暴露 cell list / mask)
     pub last_candidates: Vec<FrontierDebugSummary>,
     /// 最近一次 select 路径:`NoFrontier` / `Stop(...)` / `Goal(...)`

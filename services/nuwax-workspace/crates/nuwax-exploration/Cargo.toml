@@ -28,6 +28,8 @@ spec-summary = [
 ]
 
 [dependencies]
+serde_json = { workspace = true }
+nuwax-explore-routing = { path = "../nuwax-explore-routing" }
 nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true }
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }

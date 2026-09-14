@@ -222,7 +222,7 @@ mod tests {
         let cells: Vec<VoxelKey> = (0..n)
             .flat_map(|x| (0..n).map(move |y| (x, y, 0)))
             .collect();
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(&cells, &mut lookup);
         let mut sc = SurfaceCells::default();
         build_surface_cells(&mut sc, &lookup, 0.1, 2);

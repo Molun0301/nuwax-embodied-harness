@@ -1298,9 +1298,13 @@ async fn run_guarded_nav_scheduler(
     let cancels = typed_stream(&transport, &node.inputs[4], "nuwax_msgs.CancelNavigation").await?;
     let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
         .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".to_string());
+    let mut scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
+    if planar_navigation_enabled() {
+        scheduler_config.costmap_ttl = Duration::from_nanos(nuwax_codec::lcm::planar_navigation::MAX_SOURCE_AGE_NS as u64);
+    }
     let (scheduler, task) = nuwax_nav_runtime::spawn_production_scheduler(
         std::path::PathBuf::from(socket_path),
-        nuwax_nav_runtime::SchedulerConfig::default(),
+        scheduler_config,
     )
     .await
     .map_err(|error| module_error("guarded_nav_scheduler.connect", error))?;
@@ -1406,6 +1410,7 @@ impl GuardedMapAuthority {
 
     fn permits_goal(&self, goal: &schema::GoalEnvelope) -> bool {
         self.producer_runtime_generation == goal.producer_runtime_generation
+            && self.map_frame_generation == goal.map_frame_generation
             && self.committed_map.session_id == goal.committed_map_session_id
             && self.committed_map.session_generation == goal.committed_map_session_generation
             && self.committed_map.frame_id == goal.committed_map_frame_id
@@ -1726,6 +1731,7 @@ where
                     .map_err(|error| module_error("guarded map input", error))?;
                 let (decoded, received_at) = match frame {
                     GuardedMapFrame::Planar(frame) => {
+                        let mut source_received_at = None;
                         let body = if planar_mode {
                             let value=match nuwax_codec::lcm::planar_navigation::decode_body(&frame.payload) {
                                 Ok(value)=>value,
@@ -1737,16 +1743,20 @@ where
                                 Ok(changed)=>changed,
                                 Err(error)=>{diagnostics.reject("planar_navigation",&error);continue;}
                             };
+                            source_received_at = Instant::now().checked_sub(Duration::from_nanos(now.saturating_sub(value.source_timestamp_ns).max(0) as u64));
                             let authority=GuardedMapAuthority {
                                 committed_map:schema::CommittedMapIdentity {
                                     session_id:value.session_id.clone(),session_generation:value.session_generation,
                                     revision:value.map_revision,payload_sha256:value.map_payload_sha256,frame_id:value.grid.header.frame_id.clone(),
                                 },
                                 producer_runtime_generation:value.runtime_generation,
-                                map_frame_generation:0,cloud_revision:0,commit_boot_nonce:[0;16],
+                                map_frame_generation:value.map_frame_generation,cloud_revision:0,commit_boot_nonce:[0;16],
                             };
                             if changed || value.cleared {
-                                scheduler.invalidate_map("二维导航来源已撤销或切换").await
+                                // 切域的同一输入共享来源时间基准，避免首帧被自己的处理时刻拒绝。
+                                // 显式清空继续建立当前水位，清空前采样不能迟到恢复执行。
+                                let invalidated_at=if value.cleared {Instant::now()} else {source_received_at.unwrap_or_else(Instant::now)};
+                                scheduler.invalidate_map_received("二维导航来源已撤销或切换",tokio::time::Instant::from_std(invalidated_at)).await
                                     .map_err(|e|module_error("planar map invalidation",e))?;
                                 goal_buffer.costmap_observed=false;
                                 goal_buffer.active_goal_sha256=None;
@@ -1763,7 +1773,7 @@ where
                             schema::encode_occupancy_grid_body(&value.grid)
                                 .map_err(|e|NavStackError::Internal(e.to_string()))?
                         } else {frame.payload.to_vec()};
-                        (decode_guarded_costmap_input(&body)?, None)
+                        (decode_guarded_costmap_input(&body)?, source_received_at)
                     }
                     #[cfg(feature = "mls")]
                     GuardedMapFrame::Surface(update) => {
@@ -1785,7 +1795,7 @@ where
                                 .map_err(|error| module_error("surface map invalidation", error))?;
                             goal_buffer.costmap_observed = false;
                             goal_buffer.active_goal_sha256 = None;
-                            if update.snapshot.is_err()
+                            if (update.snapshot.is_err() && !update.awaiting_build)
                                 || !goal_buffer
                                     .pending_goal
                                     .as_ref()
@@ -1890,7 +1900,7 @@ where
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let goal_envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let goal_envelope = match decode_configured_goal_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         publish_guarded_rejection(
@@ -2359,6 +2369,7 @@ where
                         );
                         let session_id = buffered_goal.session_id.clone();
                         let session = nuwax_nav_runtime::NavSession {
+            options: buffered_goal.options,
                             goal_pose: pose_from_schema(&buffered_goal.goal)?,
                             session_id: session_id.clone(),
                             execution_identity: guarded_goal_execution_identity(&buffered_goal),
@@ -2652,6 +2663,7 @@ async fn activate_guarded_goal(
     candidate_telemetry.progress = 0.0;
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
+            options: goal_envelope.options,
             goal_pose: pose_from_schema(&goal_envelope.goal)?,
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
@@ -2959,10 +2971,16 @@ async fn publish_guarded_nav_observation(
     planner_observation: Option<bool>,
     publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
+    let frames=publications.frames(node, &status, telemetry, planner_observation)?;
+    #[cfg(test)]
+    let receipts=frames.iter().map(|frame|frame.payload.to_vec()).collect::<Vec<_>>();
     transport
-        .publish_batch(publications.frames(node, &status, telemetry, planner_observation)?)
+        .publish_batch(frames)
         .await
-        .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))
+        .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))?;
+    #[cfg(test)]
+    guarded_tests::record_test_publication(&receipts);
+    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -3104,6 +3122,12 @@ fn guarded_rejection_status(
     input: &str,
     reason: &str,
 ) -> nuwax_nav_runtime::SchedulerStatus {
+    // 停车中的原因和已确认终态不能被迟到路径的协议拒绝覆盖。
+    if input=="path" && (status.last_terminal.is_some() || matches!(status.phase,
+        nuwax_nav_runtime::SchedulerPhase::Cancelling|nuwax_nav_runtime::SchedulerPhase::Fencing|nuwax_nav_runtime::SchedulerPhase::Failed)) {
+        tracing::debug!(reason,session_id=?status.session_id,"迟到路径被拒绝，保留原停车或终态原因");
+        return status;
+    }
     status.message = format!("REJECTED {input}: {reason}");
     status
 }
@@ -4243,6 +4267,16 @@ fn validate_newer_source_timestamp(
     }
 }
 
+fn decode_configured_goal_envelope(payload:&[u8])->nuwax_codec::CodecResult<schema::GoalEnvelope> {
+    let message=schema::decode_goal_envelope_body(payload)?;
+    let expected=nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env()
+        .map_err(nuwax_codec::CodecError::LcmDecode)?;
+    if message.navigation_configuration_sha256!=expected {
+        return Err(nuwax_codec::CodecError::LcmDecode("navigation configuration differs across owners".into()));
+    }
+    Ok(message)
+}
+
 #[cfg(feature = "simple-2d")]
 fn apply_simple_planner_goal(
     module: &mut nuwax_nav_simple_planner::module::SimplePlannerModule,
@@ -4286,6 +4320,7 @@ fn apply_simple_planner_goal(
         return module_input_error("simple_planner.goal_pose", error);
     }
     module.set_goal_yaw(pose.pose.orientation.yaw());
+    module.set_goal_options(envelope.options).map_err(|error|module_error("simple_planner.goal_options",error))?;
     Ok(OwnerInput::Accepted((envelope, boundary)))
 }
 
@@ -4536,7 +4571,7 @@ async fn run_native_planner_path_adapter(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match schema::decode_goal_envelope_body(&frame.payload) {
+                let goal = match decode_configured_goal_envelope(&frame.payload) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -4608,7 +4643,7 @@ async fn run_native_planner_path_adapter(
                         &transport,
                         &node.outputs[0],
                         VersionedPathPublication {
-                            goal,
+                    path_yaws: None,                            goal,
                             planner_runtime_generation: accepted_generation,
                             path_revision: key.path_revision,
                             path: &path,
@@ -4659,7 +4694,7 @@ async fn run_native_planner_path_adapter(
                             &transport,
                             &node.outputs[0],
                             VersionedPathPublication {
-                                goal,
+                    path_yaws: None,                                goal,
                                 planner_runtime_generation: accepted_generation,
                                 path_revision: key.path_revision,
                                 path: &path,
@@ -4700,7 +4735,7 @@ async fn run_native_planner_path_adapter(
                                     &transport,
                                     &node.outputs[0],
                                     VersionedPathPublication {
-                                        goal,
+                    path_yaws: None,                                        goal,
                                         planner_runtime_generation: generation,
                                         path_revision,
                                         path: &path,
@@ -4748,8 +4783,9 @@ async fn run_simple_planner(
         .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
         .transpose().map_err(NavStackError::InvalidConfig)?;
     let mut module = SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
-        robot_geometry, ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
+        robot_geometry, motion_limits: nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(NavStackError::InvalidConfig)?.map(|profile|profile.motion), ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
     }).map_err(|error| module_error("simple_planner.robot_geometry", error))?;
+    module.enable_background_planning();
     let planner_runtime_generation = saturating_i64(runtime_generation());
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut latest_occupancy_body: Option<Vec<u8>> = None;
@@ -4874,7 +4910,7 @@ async fn run_simple_planner(
             }
             message = goal_pose.next() => {
                 let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("simple_planner.goal_pose", &error.to_string());
@@ -4952,6 +4988,7 @@ async fn run_simple_planner(
                 let output = Module::tick(&mut module)
                     .map_err(|error| module_tick_error("simple_planner.tick", error))?;
                 let mut publication = SimpleOutputPublication {
+                    path_yaws: module.planned_yaws(),
                     active_goal: active_goal.as_ref(),
                     active_boundary: active_boundary.as_ref(),
                     map_resolution: active_map_resolution,
@@ -4973,6 +5010,7 @@ async fn run_simple_planner(
 
 #[cfg(feature = "simple-2d")]
 struct SimpleOutputPublication<'a> {
+    path_yaws: Option<&'a [f64]>,
     active_goal: Option<&'a schema::GoalEnvelope>,
     active_boundary: Option<&'a NavigationBoundary>,
     map_resolution: f64,
@@ -5004,7 +5042,7 @@ async fn publish_simple_output(
                 transport,
                 &node.outputs[1],
                 VersionedPathPublication {
-                    goal: publication.active_goal.ok_or_else(|| {
+                    path_yaws: publication.path_yaws,                    goal: publication.active_goal.ok_or_else(|| {
                         NavStackError::Internal(
                             "simple planner path has no active GoalEnvelope".into(),
                         )
@@ -5047,7 +5085,7 @@ async fn publish_simple_output(
                 transport,
                 &node.outputs[1],
                 VersionedPathPublication {
-                    goal: publication.active_goal.ok_or_else(|| {
+                    path_yaws: None,                    goal: publication.active_goal.ok_or_else(|| {
                         NavStackError::Internal(
                             "simple planner hold has no active GoalEnvelope".into(),
                         )
@@ -5278,7 +5316,7 @@ async fn run_astar_planner(
             }
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("astar_planner.goal", &error.to_string());
@@ -5378,7 +5416,7 @@ async fn run_astar_planner(
                         &transport,
                         &node.outputs[1],
                         VersionedPathPublication {
-                            goal: active_goal.as_ref().ok_or_else(|| {
+                    path_yaws: None,                            goal: active_goal.as_ref().ok_or_else(|| {
                                 NavStackError::Internal(
                                     "A* path has no active GoalEnvelope".into(),
                                 )
@@ -6241,6 +6279,7 @@ async fn publish_point(
     feature = "mls"
 ))]
 struct VersionedPathPublication<'a> {
+    path_yaws: Option<&'a [f64]>,
     goal: &'a schema::GoalEnvelope,
     planner_runtime_generation: i64,
     path_revision: i64,
@@ -6262,6 +6301,9 @@ fn build_versioned_path_envelope(
     if !publication.boundary_safe || publication.path.points.is_empty() {
         return Ok(None);
     }
+    if publication.path_yaws.is_some_and(|yaws| yaws.len()!=publication.path.points.len() || yaws.iter().any(|yaw|!yaw.is_finite())) {
+        return Err(NavStackError::InvalidConfig("oriented path dimensions or yaw are invalid".into()));
+    }
     let stamp = Timestamp::from_unix(
         source_timestamp_ns / 1_000_000_000,
         (source_timestamp_ns % 1_000_000_000) as u32,
@@ -6276,13 +6318,16 @@ fn build_versioned_path_envelope(
             .enumerate()
             .map(|(index, point)| {
                 // 中途沿下一段方向前进；最后一点恢复用户要求的目标朝向。
-                let orientation_xyzw = publication.path.points.get(index + 1).map_or(
+                let mut orientation_xyzw = publication.path.points.get(index + 1).map_or(
                     publication.goal.goal.pose.orientation_xyzw,
                     |next| {
                         let half_yaw = (next.y - point.y).atan2(next.x - point.x) * 0.5;
                         [0.0, 0.0, half_yaw.sin(), half_yaw.cos()]
                     },
                 );
+                if let Some(yaw)=publication.path_yaws.and_then(|yaws|yaws.get(index)) {
+                    orientation_xyzw=[0.0,0.0,(yaw*0.5).sin(),(yaw*0.5).cos()];
+                }
                 schema::PoseStamped {
                     header: header.clone(),
                     pose: schema::Pose {
@@ -6793,7 +6838,7 @@ mod simple_tests {
         );
         let envelope = build_versioned_path_envelope(
             VersionedPathPublication {
-                goal: &goal,
+                    path_yaws: None,                goal: &goal,
                 planner_runtime_generation: 1,
                 path_revision: 1,
                 path: &path,
@@ -7191,7 +7236,7 @@ mod simple_tests {
         };
         let envelope = build_versioned_path_envelope(
             VersionedPathPublication {
-                goal: active_goal.as_ref().expect("active map-b goal"),
+                    path_yaws: None,                goal: active_goal.as_ref().expect("active map-b goal"),
                 planner_runtime_generation: 23,
                 path_revision: 1,
                 path: &path,
@@ -7344,6 +7389,7 @@ mod guarded_tests {
         let mut status = harness.scheduler.subscribe_status();
         let feeder =
             GuardedContentionFeeder::spawn(harness.poses.clone(), harness.costmaps.clone());
+        harness.publication_probe.lock().unwrap().ledgers=Some((Arc::clone(&feeder.pose_ledger),Arc::clone(&feeder.costmap_ledger)));
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while status.borrow().applied_commands <= applied_baseline {
@@ -7356,7 +7402,7 @@ mod guarded_tests {
         .await
         .expect("post-baseline applied command");
         let twist_ready_dispatch = feeder.dequeued_by_source();
-        let applied = tokio::time::timeout(Duration::from_secs(1), async {
+        let (applied,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .commands
@@ -7371,14 +7417,14 @@ mod guarded_tests {
                     && twist.linear[1] == expected_twist.linear.y
                     && twist.angular[2] == expected_twist.angular_z
                 {
-                    return twist;
+                    return (twist,frame.payload.to_vec());
                 }
             }
         })
         .await
         .expect("bounded status Twist publication");
         feeder.assert_ready_evidence("Twist");
-        feeder.assert_status_dispatch_bound(twist_ready_dispatch);
+        feeder.assert_status_dispatch_bound(twist_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(applied.linear[0], expected_twist.linear.x);
         assert_eq!(applied.linear[1], expected_twist.linear.y);
         assert_eq!(applied.angular[2], expected_twist.angular_z);
@@ -7396,7 +7442,7 @@ mod guarded_tests {
         .expect("Succeeded terminal status");
         let terminal_ready_dispatch = feeder.dequeued_by_source();
 
-        let zero = tokio::time::timeout(Duration::from_secs(1), async {
+        let (zero,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .commands
@@ -7408,18 +7454,18 @@ mod guarded_tests {
                     schema::decode_twist(&prefixed(schema::TWIST_FINGERPRINT, &frame.payload))
                         .expect("real status ZERO");
                 if twist.linear == [0.0; 3] && twist.angular == [0.0; 3] {
-                    return twist;
+                    return (twist,frame.payload.to_vec());
                 }
             }
         })
         .await
         .expect("bounded status ZERO publication");
         feeder.assert_ready_evidence("ZERO");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(zero.linear, [0.0; 3]);
         assert_eq!(zero.angular, [0.0; 3]);
 
-        let reached = tokio::time::timeout(Duration::from_secs(1), async {
+        let (reached,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .reached
@@ -7429,17 +7475,17 @@ mod guarded_tests {
                     .expect("reached frame");
                 let reached = schema::decode_bool_body(&frame.payload).expect("Succeeded bool");
                 if reached.data {
-                    return reached;
+                    return (reached,frame.payload.to_vec());
                 }
             }
         })
         .await
         .expect("bounded Succeeded bool publication");
         feeder.assert_ready_evidence("Succeeded Bool");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert!(reached.data);
 
-        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+        let (terminal,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .states
@@ -7453,14 +7499,14 @@ mod guarded_tests {
                     && !state.zero_ack_id.is_empty()
                     && state.zero_applied_monotonic_ns > 0
                 {
-                    return state;
+                    return (state,frame.payload.to_vec());
                 }
             }
         })
         .await
         .expect("bounded terminal NavigationState publication");
         feeder.assert_ready_evidence("terminal NavigationState");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch);
+        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(
             harness.scheduler.status().last_terminal,
             Some(TerminalOutcome::Succeeded)
@@ -8217,8 +8263,7 @@ mod guarded_tests {
             )
         }
 
-        fn assert_status_dispatch_bound(&self, before: (usize, usize)) {
-            let after = self.dequeued_by_source();
+        fn assert_status_dispatch_bound(&self, before: (usize, usize),after:(usize,usize)) {
             // 状态就绪后最多分派一次位姿批次和一次地图；合并读取不等于多次分派。
             assert!(
                 after.0.saturating_sub(before.0) <= MAX_REPLACEABLE_POSE_BATCH,
@@ -8356,6 +8401,22 @@ mod guarded_tests {
         assert!(normal_b.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    #[derive(Default)]
+    struct PublicationProbe {
+        ledgers:Option<(Arc<GuardedDequeueLedger>,Arc<GuardedDequeueLedger>)>,
+        entries:std::collections::BTreeMap<Vec<u8>,(usize,usize)>,
+    }
+    tokio::task_local! {static PUBLICATION_PROBE:Arc<Mutex<PublicationProbe>>;}
+    pub(super) fn record_test_publication(receipts:&[Vec<u8>]) {
+        let _=PUBLICATION_PROBE.try_with(|probe| {
+            let mut probe=probe.lock().unwrap();
+            if let Some((pose,map))=&probe.ledgers {
+                let counts=(pose.dequeued.load(std::sync::atomic::Ordering::SeqCst),map.dequeued.load(std::sync::atomic::Ordering::SeqCst));
+                for payload in receipts {probe.entries.entry(payload.clone()).or_insert(counts);}
+            }
+        });
+    }
+
     struct GuardedLoopHarness {
         goals: GuardedTestSender,
         poses: GuardedTestSender,
@@ -8363,6 +8424,7 @@ mod guarded_tests {
         costmaps: GuardedTestSender,
         cancels: GuardedTestSender,
         commands: LcmFrameStream,
+        publication_probe:Arc<Mutex<PublicationProbe>>,
         states: LcmFrameStream,
         reached: LcmFrameStream,
         shutdown: Option<oneshot::Sender<()>>,
@@ -8375,6 +8437,15 @@ mod guarded_tests {
     }
 
     impl GuardedLoopHarness {
+        async fn publication_dispatches(&self,payload:&[u8])->(usize,usize) {
+            // 网络接收者可能先于发送者的完成回调被唤醒，等待同一载荷回执落地。
+            tokio::time::timeout(Duration::from_secs(1),async {
+                loop {
+                    if let Some(counts)=self.publication_probe.lock().unwrap().entries.get(payload).copied(){return counts;}
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("真实发送回执未落地")
+        }
         async fn spawn() -> Self {Self::spawn_with_planar_mode(false).await}
 
         async fn spawn_with_planar_mode(planar_mode:bool) -> Self {
@@ -8444,7 +8515,8 @@ mod guarded_tests {
                 .await
                 .expect("guarded reached test stream");
             let loop_transport = transport.clone();
-            let loop_task = tokio::spawn(async move {
+            let publication_probe=Arc::new(Mutex::new(PublicationProbe::default()));
+            let loop_task = tokio::spawn(PUBLICATION_PROBE.scope(Arc::clone(&publication_probe),async move {
                 run_guarded_nav_loop(
                     &node,
                     &loop_transport,
@@ -8460,7 +8532,7 @@ mod guarded_tests {
                     planar_mode,
                 )
                 .await
-            });
+            }));
 
             Self {
                 goals,
@@ -8469,6 +8541,7 @@ mod guarded_tests {
                 costmaps,
                 cancels,
                 commands,
+                publication_probe,
                 states,
                 reached,
                 shutdown: Some(shutdown),
@@ -8861,11 +8934,12 @@ mod guarded_tests {
         use nuwax_codec::lcm::planar_navigation::{self,PlanarNavigationMap};
         let harness=GuardedLoopHarness::spawn_with_planar_mode(true).await;
         let goal=sealed_goal("planar-goal");
-        let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64-100_000_000;
         let mut grid=schema::decode_occupancy_grid_body(&guarded_costmap_body(1)).unwrap();
         grid.header.stamp_sec=(timestamp/1_000_000_000) as i32;
         grid.header.stamp_nsec=(timestamp%1_000_000_000) as i32;
         let value=PlanarNavigationMap {
+            map_frame_generation: goal.map_frame_generation,
             runtime_generation:goal.producer_runtime_generation,session_id:goal.committed_map_session_id.clone(),
             session_generation:goal.committed_map_session_generation,map_revision:goal.committed_map_revision,
             map_payload_sha256:goal.committed_map_payload_sha256,observation_revision:1,source_sequence:0,
@@ -8995,6 +9069,7 @@ mod guarded_tests {
         harness
             .scheduler
             .start_session(nuwax_nav_runtime::NavSession {
+            options: Default::default(),
                 goal_pose: pose_from_schema(&blocker.goal).expect("valid goal pose"),
                 session_id: blocker.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&blocker),
@@ -9535,6 +9610,21 @@ mod guarded_tests {
     }
 
     #[test]
+    fn late_path_rejection_keeps_parking_and_terminal_cause_and_receipts() {
+        for (phase,terminal) in [
+            (SchedulerPhase::Fencing,None),(SchedulerPhase::Cancelling,None),
+            (SchedulerPhase::Failed,Some(nuwax_nav_runtime::TerminalOutcome::SafetyFailed)),
+            (SchedulerPhase::Idle,Some(nuwax_nav_runtime::TerminalOutcome::Succeeded)),
+            (SchedulerPhase::Idle,Some(nuwax_nav_runtime::TerminalOutcome::Cancelled)),
+        ] {
+            let status=nuwax_nav_runtime::SchedulerStatus{phase,last_terminal:terminal,
+                message:"原始停车原因及确认结果".into(),session_id:Some("original".into()),
+                pose_source_timestamp_ns:17,costmap_source_timestamp_ns:23,..Default::default()};
+            assert_eq!(guarded_rejection_status(status.clone(),"path","no active navigation session"),status);
+        }
+    }
+
+    #[test]
     fn terminal_cleanup_preserves_every_qualified_outcome() {
         for (outcome, phase) in [
             (TerminalOutcome::Cancelled, SchedulerPhase::Idle),
@@ -9944,6 +10034,7 @@ mod guarded_tests {
         path_identity.path_payload_sha256 = [0x11; 32];
         handle
             .start_session(nuwax_nav_runtime::NavSession {
+            options: Default::default(),
                 goal_pose: pose_from_schema(&goal_a.goal).expect("valid goal pose"),
                 session_id: goal_a.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(&goal_a),
@@ -11207,7 +11298,7 @@ mod tests {
         let path = update.path.expect("A* map-b path");
         let envelope = build_versioned_path_envelope(
             VersionedPathPublication {
-                goal: active_goal.as_ref().expect("active map-b goal"),
+                    path_yaws: None,                goal: active_goal.as_ref().expect("active map-b goal"),
                 planner_runtime_generation: 29,
                 path_revision: 1,
                 path: &path,
@@ -11435,6 +11526,7 @@ mod boundary_tests {
     any(feature = "cmu-native", feature = "explore", feature = "mls")
 ))]
 mod native_adapter_tests {
+    static NATIVE_GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
 
     fn goal() -> schema::GoalEnvelope {
@@ -12046,6 +12138,7 @@ mod native_adapter_tests {
     #[cfg(feature = "mls")]
     #[tokio::test]
     async fn mls_real_lcm_adapter_rejects_old_and_future_before_canonical_publish() {
+        let _generation_guard=NATIVE_GENERATION_TEST_LOCK.lock().unwrap();
         use nuwax_nav_mls_planner::lcm_worker::{
             encode_worker_event_body, PlannerResult, WorkerEvent,
         };
@@ -12165,6 +12258,7 @@ mod native_adapter_tests {
 
     #[test]
     fn restart_generation_is_cleared_before_a_new_ready_generation() {
+        let _generation_guard=NATIVE_GENERATION_TEST_LOCK.lock().unwrap();
         #[cfg(any(feature = "cmu-native", feature = "explore"))]
         {
             FAR_READY_GENERATION.store(12, Ordering::Release);

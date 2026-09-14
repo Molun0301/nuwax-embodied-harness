@@ -209,6 +209,8 @@ class MappingBackendConfig:
 class NavigationBackendConfig:
     """nuwax-nav-stack 导航后端配置。"""
 
+    facility_providers_json: str = "{}"
+
     goal_channel: str = "/nav/goal"
     cancel_channel: str = "/nav/cancel"
     state_channel: str = "/nav/state"

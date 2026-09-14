@@ -59,5 +59,6 @@ pub mod transformer;
 pub mod voxel;
 
 pub use surface::{
-    SurfaceError, SurfaceFrontier, SurfaceLocation, SurfaceSnapshot, SurfaceTransition,
+    SurfaceObservation, SurfaceObservations, SurfaceBodyEnvelope, SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceError, SurfaceFrontier, SurfaceFrontierCacheStats,
+    SurfaceLocation, SurfaceMapBuild, SurfaceMapBuilder, SurfaceSnapshot, SurfaceTransition,
 };

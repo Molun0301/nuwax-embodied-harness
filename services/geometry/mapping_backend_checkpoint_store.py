@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from services.geometry.checkpoint_payload import FrozenPayload, payload_digest, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
+from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, validate_fine_archive
 
 import fcntl
 import hashlib
@@ -100,6 +101,7 @@ class MappingBackendCheckpoint:
     payload: Union[bytes, FrozenPayload]
     occupancy_receipt: Mapping[str, object]
     cloud_receipt: Optional[Mapping[str, object]]
+    fine_archive: Optional[Union[bytes, FrozenPayload]] = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +296,9 @@ class MappingBackendCheckpointStore:
                 _fsync_directory_fd(access.objects_fd, paths.objects)
                 _inject_fault(fault_injector, "objects_directory_fsynced")
 
+                if validated.fine_archive is not None:
+                    self._publish_fine_archive(access, validated.fine_archive, fault_injector)
+
                 manifest_document = self._manifest_document(
                     validated,
                     validated_occupancy_asset,
@@ -471,6 +476,25 @@ class MappingBackendCheckpointStore:
         finally:
             access.close()
 
+    def _publish_fine_archive(self, access, payload, fault_injector):
+        """精细块资产先于引用它的清单落盘，失败只留下可回收的无引用对象。"""
+        name = f".tmp-checkpoint-{uuid.uuid4().hex}.bin"
+        identity = None
+        try:
+            identity = self._write_temp_file(
+                access.objects_fd, name, access.paths.objects / name, payload,
+                written_phase="payload_temp_written", fsynced_phase="payload_file_fsynced",
+                fault_injector=fault_injector,
+            )
+            final_name = f"sha256-{payload_digest(payload).hex()}.bin"
+            self._install_immutable(access.objects_fd, name, final_name, access.paths.objects / final_name,
+                payload, temp_identity=identity, maximum_bytes=MAX_FINE_ARCHIVE_BYTES, description="精细地图资产")
+            name = None
+            _fsync_directory_fd(access.objects_fd, access.paths.objects)
+        finally:
+            if name is not None and identity is not None:
+                _unlink_at_if_same(access.objects_fd, name, identity)
+
     def _validate_checkpoint(
         self, checkpoint: MappingBackendCheckpoint
     ) -> MappingBackendCheckpoint:
@@ -527,6 +551,15 @@ class MappingBackendCheckpointStore:
             cloud_receipt = _validate_cloud_receipt(checkpoint.cloud_receipt,
                 source_session_generation=source_session_generation, boot_nonce_encoding="bytes")
             _validate_receipt_order(occupancy_receipt, cloud_receipt)
+        if checkpoint.fine_archive is not None:
+            if backend_kind == "slam_toolbox":
+                raise MappingBackendCheckpointValidationError("二维检查点不能携带三维精细资产")
+            try:
+                validate_fine_archive(checkpoint.fine_archive, session=source_session_id,
+                    generation=source_session_generation, cloud_revision=cloud_receipt["cloud_revision"],
+                    source_timestamp_ns=cloud_receipt["source_timestamp_ns"])
+            except (ValueError, TypeError) as error:
+                raise MappingBackendCheckpointValidationError(str(error)) from error
         return MappingBackendCheckpoint(
             schema_version=schema_version,
             backend_kind=backend_kind,
@@ -538,6 +571,7 @@ class MappingBackendCheckpointStore:
             payload=payload,
             occupancy_receipt=occupancy_receipt,
             cloud_receipt=cloud_receipt,
+            fine_archive=checkpoint.fine_archive,
         )
 
     def _manifest_document(
@@ -546,7 +580,7 @@ class MappingBackendCheckpointStore:
         occupancy_asset: Mapping[str, object],
         cloud_asset: Optional[Mapping[str, object]],
     ) -> Dict[str, object]:
-        return {
+        document = {
             "schema_version": checkpoint.schema_version,
             "backend_kind": checkpoint.backend_kind,
             "source_session_id": checkpoint.source_session_id,
@@ -568,6 +602,10 @@ class MappingBackendCheckpointStore:
                 "cloud": _asset_document(cloud_asset, sha256_field="xyz_sha256") if cloud_asset is not None else None,
             },
         }
+        if checkpoint.fine_archive is not None:
+            sha = payload_digest(checkpoint.fine_archive).hex()
+            document["fine_archive"] = {"sha256": sha, "path": _object_relative_path(sha), "size": len(checkpoint.fine_archive)}
+        return document
 
     def _load_optional(
         self,
@@ -652,7 +690,7 @@ class MappingBackendCheckpointStore:
                 "payload",
                 "canonical_receipts",
                 "canonical_assets",
-            ),
+            ) + (("fine_archive",) if "fine_archive" in manifest else ()),
             "checkpoint manifest",
         )
         schema_version = _validate_schema_version(manifest["schema_version"])
@@ -715,6 +753,14 @@ class MappingBackendCheckpointStore:
             assets["occupancy"], sha256_encoding="hex"
         )
         cloud_asset = _validate_optional_cloud(assets["cloud"], backend_kind, sha256_encoding="hex")
+        fine_archive = None
+        if "fine_archive" in manifest:
+            fine_sha, fine_relative, fine_size = _validate_payload_reference(manifest["fine_archive"])
+            fine_path = paths.backend / fine_relative
+            fine_archive = _read_regular_file_at(access.objects_fd, fine_path.name, fine_path,
+                maximum_bytes=MAX_FINE_ARCHIVE_BYTES, description="精细地图资产")
+            if len(fine_archive) != fine_size or payload_digest(fine_archive).hex() != fine_sha:
+                raise MappingBackendCheckpointValidationError("精细地图资产长度或摘要与清单不符")
         checkpoint = self._validate_checkpoint(
             MappingBackendCheckpoint(
                 schema_version=schema_version,
@@ -727,6 +773,7 @@ class MappingBackendCheckpointStore:
                 payload=payload,
                 occupancy_receipt=occupancy_receipt,
                 cloud_receipt=cloud_receipt,
+                fine_archive=fine_archive,
             )
         )
         _validate_asset_bindings(checkpoint, occupancy_asset, cloud_asset)
@@ -861,6 +908,8 @@ class MappingBackendCheckpointStore:
         if current is not None:
             referenced_manifests.add(current.manifest_path.name)
             referenced_objects.add(current.object_path.name)
+            if current.checkpoint.fine_archive is not None:
+                referenced_objects.add(f"sha256-{payload_digest(current.checkpoint.fine_archive).hex()}.bin")
 
         removed_temps = _remove_old_matching(
             access.backend_fd,

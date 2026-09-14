@@ -534,7 +534,7 @@ start_nav_stack() {
   local launcher="${REPO_ROOT}/scripts/systemd/start_nav_stack.sh"
   export NUWAX_NAV_STACK_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
   export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
-  echo "starting nuwax-nav-stack profile=${NUWAX_NAV_PROFILE:-simple-2d}"
+  echo "starting nuwax-nav-stack（导航配置由建图执行链确定）"
   (run_with_title "nuwax-nav-stack-launcher" bash "${launcher}") &
   NAV_STACK_PID="$!"
 

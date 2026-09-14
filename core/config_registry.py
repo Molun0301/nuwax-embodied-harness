@@ -254,18 +254,16 @@ _CHOICES: Dict[str, Tuple[str, ...]] = {
     "NUWAX_GEOMETRY_LIO_BACKEND": ("device", "fastlio2", "pointlio"),
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("voxel", "raytracing"),
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("none", "library_pgo", "native_pgo", "relocalization"),
-    "NUWAX_NAV_PROFILE": ("simple-2d", "replanning-astar", "mls-3d"),
     "NUWAX_EXPLORE_ARBITRATION": ("prefer_wavefront",),
 }
 
 
 _CHOICE_LABELS: Dict[str, Tuple[str, ...]] = {
-    "NUWAX_GEOMETRY_PIPELINE": ("三维激光惯性建图", "二维激光建图"),
+    "NUWAX_GEOMETRY_PIPELINE": ("三维建图、探索与地形导航", "二维建图、探索与平面导航"),
     "NUWAX_GEOMETRY_LIO_BACKEND": ("设备里程计", "快速激光惯性定位（FastLIO2）", "逐点激光惯性定位（Point-LIO）"),
     "NUWAX_GEOMETRY_MAPPING_BACKEND": ("体素窗口", "射线追踪"),
     "NUWAX_GEOMETRY_CORRECTION_BACKEND": ("不启用校正", "库内位姿图优化", "原生位姿图优化", "重定位校正"),
     "NUWAX_LOG_LEVEL": ("调试", "信息", "警告", "错误", "严重错误"),
-    "NUWAX_NAV_PROFILE": ("二维路径跟踪", "动态路径重规划", "楼梯与斜坡三维导航"),
     "NUWAX_EXPLORE_ARBITRATION": ("优先波前探索",),
 }
 
@@ -393,7 +391,6 @@ _ZH_NAMES: Dict[str, str] = {
     'NUWAX_NAV_LOOP_CLOSURE_THRESHOLD': '闭环判据计数阈值',
     'NUWAX_NAV_LOOP_CLOSURE_POLL_INTERVAL_SEC': '闭环判据轮询间隔（秒）',
     'NUWAX_NAV_DB_SQLITE_FALLBACK_ENABLED': '启用建图数据库闭环回退',
-    'NUWAX_NAV_PROFILE': '导航规划方案',
     'NUWAX_EXPLORE_ARBITRATION': '探索任务选择策略',
     'NUWAX_REAL_LCM_REQUIRED': '通信不可用时停止启动',
     'NUWAX_GEOMETRY_RUNTIME_BINARY': '几何运行程序路径',

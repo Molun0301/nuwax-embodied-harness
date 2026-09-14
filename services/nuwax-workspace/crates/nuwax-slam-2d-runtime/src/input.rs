@@ -2,6 +2,9 @@
 use nuwax_codec::lcm::planar::PlanarScan;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+#[path = "navigation_rays.rs"]
+mod navigation_rays;
+pub use navigation_rays::{navigation_rays, NavigationRay};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TimedPose {
@@ -347,6 +350,14 @@ mod deskew_tests {
             .unwrap();
         assert!(corrected.motion_compensated);
         assert_eq!(corrected.timestamp_ns, scan.timestamp_ns);
+        let rays = navigation_rays(&scan, Some(&history), [0.22, -0.08, 0.15]).unwrap().unwrap();
+        assert_eq!(rays.len(), scan.beam_count as usize);
+        for ray in &rays {
+            assert!((ray.endpoint_base_m[0] - 4.0).abs() < 1e-5);
+            assert!(ray.trace_free);
+        }
+        assert!(rays.last().unwrap().origin_base_m[0] - rays[0].origin_base_m[0] > 0.9);
+
         let mut uncompensated_error = 0.0f64;
         for index in 0..scan.beam_count as usize {
             let angle = f32::from_le_bytes(

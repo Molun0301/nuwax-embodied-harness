@@ -1,4 +1,5 @@
-//! 二维完整图的有界分块传输。未命名私有文件由描述符拥有，关闭即释放。
+//! 完整图与精细三维资产共用有界分块传输，按真实格式校验后封存。
+//! 未命名私有文件由描述符拥有，关闭即释放。
 use crate::proto::{GraphArtifactRef, GraphArtifactTransferRequest, GraphArtifactTransferResponse};
 use nuwax_slam_2d_runtime::archive;
 use std::{
@@ -194,7 +195,15 @@ impl Store {
                     if archive::hash_reader(&mut e.file)? != (e.size, e.sha) {
                         return Err("二维上传完整摘要不匹配".into());
                     }
-                    archive::verify(&mut e.file)?;
+                    e.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                    let mut magic = [0; 8];
+                    e.file.read_exact(&mut magic).map_err(|e| e.to_string())?;
+                    if &magic == b"NUWAXAR1" {
+                        let mut fine = nuwax_map_chunks::ArchiveReader::open(&mut e.file)?;
+                        for reference in fine.manifest().blocks.clone() { fine.block(&reference)?; }
+                    } else {
+                        archive::verify(&mut e.file)?;
+                    }
                     e.file.sync_all().map_err(|e| e.to_string())?;
                     e.sealed = true;
                 }

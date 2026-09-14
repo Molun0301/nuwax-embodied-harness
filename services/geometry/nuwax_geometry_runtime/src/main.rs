@@ -22,6 +22,7 @@
 pub mod channel_registry;
 mod correction_coordinator;
 mod explore_runtime;
+mod explore_mission;
 mod forbidden_zones;
 mod lcm_runtime;
 mod lio_ingress;
@@ -263,6 +264,7 @@ fn prefer_sticky_runtime_terminal(
 }
 
 struct StartupPreflight {
+    navigation_pipeline: nuwax_nav_stack::ProductionPipeline,
     planar: Option<slam2d_owner::Settings>,
     owner_profile: owner_profile::OwnerProfile,
     mapping_backend: mapping_backend::MappingBackendSpec,
@@ -366,6 +368,8 @@ impl PreparedLioIngress {
 
 impl StartupPreflight {
     fn from_env() -> Result<Self, String> {
+        let navigation_pipeline = nuwax_nav_stack::ProductionPipeline::from_env()
+            .map_err(|error| error.to_string())?;
         let planar = slam2d_owner::Settings::from_env()?;
         let configured_profile = owner_profile::OwnerProfile::from_env()
             .map_err(|error| format!("invalid Geometry owner profile: {error}"))?;
@@ -442,6 +446,7 @@ impl StartupPreflight {
             }
         };
         Ok(Self {
+            navigation_pipeline,
             planar,
             owner_profile,
             mapping_backend,
@@ -1543,6 +1548,7 @@ fn main() -> ExitCode {
 
 async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflight) -> ExitCode {
     let StartupPreflight {
+        navigation_pipeline,
         planar,
         owner_profile,
         mapping_backend,
@@ -1617,7 +1623,10 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     // ----------------------------------------------------------------------
     // LIO -> Mapping -> Correction owner activation
     // ----------------------------------------------------------------------
-    let prepared_runtime = match lcm_runtime::prepare_geometry_runtime(lcm_backend) {
+    let prepared_runtime = match lcm_runtime::prepare_geometry_runtime_for_pipeline(
+        lcm_backend,
+        navigation_pipeline,
+    ) {
         Ok(prepared) => prepared,
         Err(e) => {
             error!("{}", e);
@@ -1808,6 +1817,12 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             return rollback_mapping_and_lio(runtime_owner, ingress_gate, ExitCode::from(4)).await;
         }
     };
+    if matches!(&correction, correction_coordinator::CorrectionOwnerSpec::Relocalization { .. }) {
+        if let Err(error) = correction_applier.bind_relocalization_mapping(&bridge) {
+            error!(%error, "重定位注册地图绑定失败");
+            return rollback_mapping_and_lio(runtime_owner, ingress_gate, ExitCode::from(4)).await;
+        }
+    }
     if matches!(
         &correction,
         correction_coordinator::CorrectionOwnerSpec::LibraryPgo { .. }

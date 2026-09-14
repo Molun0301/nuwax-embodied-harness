@@ -115,7 +115,10 @@ impl CliOptions {
             i += 1;
         }
 
-        let profile = profile.unwrap_or(NavStackProfile::Simple2D);
+        let profile = match profile {
+            Some(profile) => profile,
+            None => crate::ProductionPipeline::from_env()?.navigation_profile(),
+        };
 
         Ok(Self {
             profile,
@@ -183,7 +186,7 @@ fn print_help() {
          Navigation stack orchestration.\n\n\
          USAGE:\n    nuwax-nav-stack [OPTIONS]\n\n\
          OPTIONS:\n\
-         -p, --profile <NAME>   select stack profile (simple-2d | cmu-native | replanning-astar | exploration-native | mls-3d)\n\
+         -p, --profile <NAME>   确认执行链的导航配置（二维simple-2d，三维mls-3d）；其它图仅可dry-run\n\
              --preset <NAME>    apply feature preset (none | simple | cmu | explore | mls | all)\n\
              --dry-run         render module graph and exit (no process spawn)\n\
              --list-features   list available features and exit\n\
@@ -241,6 +244,9 @@ where
             opts.profile.as_str()
         )));
     }
+
+    // 直接运行二进制也必须服从完整链配对，不能绕过启动脚本交叉接线。
+    crate::ProductionPipeline::from_env()?.validate_navigation(opts.profile)?;
 
     let mut runner = builder.build_runner()?;
     if opts.json {
@@ -410,9 +416,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_default_profile_is_simple2d() {
+    fn parse_default_profile_follows_complete_pipeline() {
         let opts = CliOptions::parse(&[]).unwrap();
-        assert_eq!(opts.profile, NavStackProfile::Simple2D);
+        assert_eq!(opts.profile, crate::ProductionPipeline::from_env().unwrap().navigation_profile());
         assert!(!opts.dry_run);
     }
 

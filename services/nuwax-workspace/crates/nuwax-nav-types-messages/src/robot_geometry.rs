@@ -154,6 +154,11 @@ impl RobotGeometry {
 }
 
 impl GridFootprint {
+    /// 生成此轮廓时的机体偏航，单位弧度。
+    pub fn yaw(&self) -> f64 {
+        self.yaw
+    }
+
     /// 保留真实位姿在格内的偏移，不能把机器人吸附到格中心后扩大自体清除。
     pub fn at_position(&self, origin: Point2, position: Point2) -> Result<Self, String> {
         if !position.x.is_finite() || !position.y.is_finite() {
@@ -196,15 +201,22 @@ impl GridFootprint {
             return false;
         }
         let mut stamp = |point: Point2, yaw: f64| {
-            let Ok(footprint) = self
-                .geometry
-                .grid_footprint(self.resolution, yaw, self.map_width, self.map_height)
-                .and_then(|footprint| footprint.at_position(origin, point))
-            else {
-                return false;
-            };
             let x = ((point.x - origin.x) / self.resolution).floor() as i64;
             let y = ((point.y - origin.y) / self.resolution).floor() as i64;
+            // 直接生成真实格内相位轮廓，省去随后被丢弃的格中心轮廓。
+            let phase = [
+                point.x - origin.x - (x as f64 + 0.5) * self.resolution,
+                point.y - origin.y - (y as f64 + 0.5) * self.resolution,
+            ];
+            let Ok(footprint) = self.geometry.grid_footprint_with_phase(
+                self.resolution,
+                yaw,
+                self.map_width,
+                self.map_height,
+                phase,
+            ) else {
+                return false;
+            };
             footprint.offsets.iter().all(|&(dx, dy)| {
                 x.checked_add(dx)
                     .zip(y.checked_add(dy))

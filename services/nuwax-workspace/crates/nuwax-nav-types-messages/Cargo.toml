@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+nuwax-codec = { path = "../nuwax-codec" }
 nuwax-types = { path = "../nuwax-types" }
 nuwax-protocol = { path = "../nuwax-protocol" }
 serde = { workspace = true }

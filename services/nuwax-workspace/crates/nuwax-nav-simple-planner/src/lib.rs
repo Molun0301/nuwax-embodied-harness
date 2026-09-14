@@ -24,6 +24,7 @@ pub mod config;
 pub mod costmap;
 pub mod inflation;
 pub mod planner;
+pub mod oriented;
 pub mod pointcloud;
 pub mod stuck;
 pub mod waypoint;

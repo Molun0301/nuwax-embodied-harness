@@ -16,8 +16,9 @@ extern "C" {
 #endif
 
 #include "nav_msgs_OccupancyGrid.h"
+#include "nuwax_msgs_NavigationMapBlock.h"
 #include "sensor_msgs_PointCloud2.h"
-#define NUWAX_MSGS_NAVIGATIONMAP3D_SCHEMA_VERSION_V1 1
+#define NUWAX_MSGS_NAVIGATIONMAP3D_SCHEMA_VERSION_V2 2
 
 typedef struct _nuwax_msgs_NavigationMap3D nuwax_msgs_NavigationMap3D;
 struct _nuwax_msgs_NavigationMap3D
@@ -62,6 +63,28 @@ struct _nuwax_msgs_NavigationMap3D
      */
     int8_t     has_virtual_obstacles;
     nav_msgs_OccupancyGrid virtual_obstacles;
+
+    /**
+     * 完整根清单加有界变动块；缺片通过原可靠请求通道补取。
+     */
+    int8_t     has_fine_map;
+
+    /**
+     * LCM Type: byte[32]
+     */
+    uint8_t    fine_root_sha256[32];
+    int32_t    fine_manifest_length;
+
+    /**
+     * LCM Type: byte[fine_manifest_length]
+     */
+    uint8_t    *fine_manifest;
+    int32_t    fine_blocks_length;
+
+    /**
+     * LCM Type: nuwax_msgs.NavigationMapBlock[fine_blocks_length]
+     */
+    nuwax_msgs_NavigationMapBlock *fine_blocks;
     sensor_msgs_PointCloud2 cloud;
 };
 

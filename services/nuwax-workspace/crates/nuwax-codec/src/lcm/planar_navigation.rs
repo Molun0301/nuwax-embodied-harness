@@ -3,7 +3,7 @@ use super::schema::{self, OccupancyGrid};
 use crate::{CodecError, CodecResult};
 
 /// 由lcm-gen（类型生成器）生成并经真实通信核对的指纹。
-pub const FINGERPRINT: [u8; 8] = 0xc0fe_7172_5d24_0712_u64.to_be_bytes();
+pub const FINGERPRINT: [u8; 8] = 0x7b8a_d3f2_faf4_fdd4_u64.to_be_bytes();
 /// 二维导航观测的完整协议类型。
 pub const TYPE_NAME: &str = "nuwax_msgs.PlanarNavigationMap";
 /// 与规范栅格通道分离的导航派生通道。
@@ -16,6 +16,8 @@ pub const MAX_SOURCE_AGE_NS: i64 = 500_000_000;
 #[derive(Clone, Debug, PartialEq, Default)]
 /// 配套规范图身份与新鲜扫描证据；清空显式使用撤销标志。
 pub struct PlanarNavigationMap {
+    /// 规范地图坐标代际；不同代际的目标和扫描不能混用。
+    pub map_frame_generation: i64,
     /// 规范地图拥有方运行代际。
     pub runtime_generation: i64,
     /// 已提交建图会话标识。
@@ -44,6 +46,7 @@ impl PlanarNavigationMap {
     /// 校验身份、栅格结构、值域和内外时间一致性。
     pub fn validate(&self) -> CodecResult<()> {
         if self.runtime_generation <= 0
+            || self.map_frame_generation < 0
             || self.session_generation <= 0
             || self.observation_revision <= 0
             || self.session_id.is_empty()
@@ -87,12 +90,13 @@ impl PlanarNavigationMap {
 pub fn encode_body(value: &PlanarNavigationMap) -> CodecResult<Vec<u8>> {
     value.validate()?;
     let mut out = Vec::new();
-    out.extend(1i32.to_be_bytes());
+    out.extend(2i32.to_be_bytes());
     out.extend(value.runtime_generation.to_be_bytes());
     out.extend(((value.session_id.len() + 1) as i32).to_be_bytes());
     out.extend(value.session_id.as_bytes());
     out.push(0);
     out.extend(value.session_generation.to_be_bytes());
+    out.extend(value.map_frame_generation.to_be_bytes());
     out.extend(value.map_revision.to_be_bytes());
     out.extend(value.map_payload_sha256);
     for n in [
@@ -115,7 +119,7 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
         return Err(bad("二维导航观测超限"));
     }
     let mut reader = Reader { input, pos: 0 };
-    if i32::from_be_bytes(reader.take(4)?.try_into().unwrap()) != 1 {
+    if i32::from_be_bytes(reader.take(4)?.try_into().unwrap()) != 2 {
         return Err(bad("二维导航版本不支持"));
     }
     let runtime_generation = reader.i64()?;
@@ -131,6 +135,7 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
         .map_err(|_| bad("二维会话编码非法"))?
         .to_owned();
     let session_generation = reader.i64()?;
+    let map_frame_generation = reader.i64()?;
     let map_revision = reader.i64()?;
     let map_payload_sha256 = reader.take(32)?.try_into().unwrap();
     let observation_revision = reader.i64()?;
@@ -143,6 +148,7 @@ pub fn decode_body(input: &[u8]) -> CodecResult<PlanarNavigationMap> {
     };
     let grid = schema::decode_occupancy_grid_body(&input[reader.pos..])?;
     let value = PlanarNavigationMap {
+        map_frame_generation,
         runtime_generation,
         session_id,
         session_generation,
@@ -180,7 +186,7 @@ impl<'a> Reader<'a> {
 /// 每个实际消费者保存自己的已接纳顺序；来源倒退不刷新任何接收期限。
 #[derive(Default)]
 pub struct Admission {
-    latest: Option<(i64, i64, String, i64, i64)>,
+    latest: Option<(i64, i64, String, i64, i64, i64)>,
 }
 impl Admission {
     /// 接纳严格前进的真实观测；返回是否切换来源域。
@@ -192,14 +198,14 @@ impl Admission {
         {
             return Err("二维导航观测过期或位于未来".into());
         }
-        let domain = (value.runtime_generation, value.session_generation);
+        let domain = (value.runtime_generation, value.session_generation, value.map_frame_generation);
         let changed = self
             .latest
             .as_ref()
-            .is_none_or(|old| (old.0, old.1) != domain);
+            .is_none_or(|old| (old.0, old.1, old.5) != domain);
         if let Some(old) = &self.latest {
-            if domain < (old.0, old.1)
-                || (domain == (old.0, old.1)
+            if domain < (old.0, old.1, old.5)
+                || (domain == (old.0, old.1, old.5)
                     && (old.2 != value.session_id
                         || value.observation_revision <= old.3
                         || !value.cleared && value.source_timestamp_ns <= old.4))
@@ -213,6 +219,7 @@ impl Admission {
             value.session_id.clone(),
             value.observation_revision,
             value.source_timestamp_ns,
+            value.map_frame_generation,
         ));
         Ok(changed)
     }
@@ -223,6 +230,7 @@ mod tests {
     use super::*;
     fn value() -> PlanarNavigationMap {
         PlanarNavigationMap {
+            map_frame_generation: 0,
             runtime_generation: 1,
             session_id: "map-a".into(),
             session_generation: 1,

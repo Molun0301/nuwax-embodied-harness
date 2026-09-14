@@ -1,7 +1,8 @@
 //! 楼梯、斜坡规划与跟随共用的物理参数；机体到支撑面的标定不得猜测。
 
-use nuwax_nav_mls_planner::mls_planner::Config;
+use nuwax_nav_mls_planner::{mls_planner::Config, SurfaceBodyEnvelope};
 use nuwax_nav_runtime::SurfaceFollowerConfig;
+use nuwax_nav_types_messages::{NavigationCapabilities, RobotGeometry};
 
 use crate::{NavStackError, NavStackResult};
 
@@ -10,6 +11,8 @@ use crate::{NavStackError, NavStackResult};
 pub struct SurfaceNavigationConfig {
     /// 支撑面、净空、台阶和坡道约束。
     pub geometry: Config,
+    /// 完整机体包络，缺失表示尚无外形标定。
+    pub body_envelope: Option<SurfaceBodyEnvelope>,
     /// 机体参考位姿与受控速度参数。
     pub follower: SurfaceFollowerConfig,
     /// 实际机器人宽度，单位米。
@@ -35,9 +38,19 @@ impl SurfaceNavigationConfig {
         let max_slope = configured_number("NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG", 18.0)?;
         let tread = configured_number("NUWAX_NAV_MIN_STAIR_TREAD_M", 0.2)?;
         let frame = std::env::var("NUWAX_GEOMETRY_MAP_FRAME").unwrap_or_else(|_| "map".into());
-        Self::new(
+        let mut config = Self::new(
             frame, offset, width, height, voxel, max_step, max_slope, tread,
-        )
+        )?;
+        let capabilities =
+            NavigationCapabilities::from_env().map_err(NavStackError::InvalidConfig)?;
+        let body = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| RobotGeometry::from_runtime_json(&v))
+            .transpose()
+            .map_err(NavStackError::InvalidConfig)?;
+        config.apply_calibration(body, capabilities)?;
+        Ok(config)
     }
 
     /// 显式构造便于部署校验和无硬件回归，不读取或修改进程环境。
@@ -103,9 +116,79 @@ impl SurfaceNavigationConfig {
         }
         Ok(Self {
             geometry,
+            body_envelope: None,
             follower: SurfaceFollowerConfig::new(body_to_support_z_m),
             robot_width_m,
         })
+    }
+    /// 两端用同一已验证标定物化外形和运动约束。
+    pub fn apply_calibration(
+        &mut self,
+        body: Option<RobotGeometry>,
+        capabilities: Option<NavigationCapabilities>,
+    ) -> NavStackResult<()> {
+        if capabilities.is_some() && body.is_none() {return Err(NavStackError::InvalidConfig("三维运动标定需要完整机器人外形".into()));}
+        if let Some(caps) = &capabilities {
+            caps.validate().map_err(NavStackError::InvalidConfig)?;
+            self.follower.motion_limits = Some(caps.motion.clone());
+            self.follower.controller.speed = self
+                .follower
+                .controller
+                .speed
+                .min(caps.motion.max_forward_mps);
+            if let Some(terrain) = &caps.terrain {
+                self.geometry.step_threshold_m = if terrain.stairs_supported {
+                    terrain.max_step_up_m.max(terrain.max_step_down_m) as f32
+                } else {
+                    0.0
+                };
+                self.geometry.max_slope_deg = terrain.max_slope_deg as f32;
+                self.geometry.min_step_tread_depth_m = terrain
+                    .min_tread_depth_m
+                    .max(f64::from(self.geometry.voxel_size) * 2.0)
+                    as f32;
+                self.follower.max_observation_age_sec = Some(terrain.max_observation_age_sec);
+            } else {
+                // 未声明地形执行能力时，不接纳离散阶跃。
+                self.geometry.step_threshold_m = 0.0;
+            }
+        }
+        if let Some(body) = body {
+            body.validate().map_err(NavStackError::InvalidConfig)?;
+            let terrain = capabilities.as_ref().and_then(|c| c.terrain.as_ref());
+            let envelope = SurfaceBodyEnvelope {
+                footprint_xy_m: body.footprint_xy_m,
+                z_bounds_m: [body.z_min_m, body.z_max_m],
+                body_to_support_z_m: self.follower.body_to_support_z_m,
+                max_step_up_m: terrain.map_or(f64::from(self.geometry.step_threshold_m), |t| {
+                    if t.stairs_supported {
+                        t.max_step_up_m
+                    } else {
+                        0.0
+                    }
+                }),
+                max_step_down_m: terrain.map_or(f64::from(self.geometry.step_threshold_m), |t| {
+                    if t.stairs_supported {
+                        t.max_step_down_m
+                    } else {
+                        0.0
+                    }
+                }),
+                max_cross_slope_deg: terrain.map_or(f64::from(self.geometry.max_slope_deg), |t| {
+                    t.max_cross_slope_deg
+                }),
+                support_uncertainty_m: terrain.map_or(0.0, |t| t.support_height_uncertainty_m),
+            };
+            envelope
+                .validate()
+                .map_err(|e| NavStackError::InvalidConfig(e.to_string()))?;
+            self.geometry.robot_height = self
+                .geometry
+                .robot_height
+                .max((envelope.body_to_support_z_m + body.z_max_m) as f32);
+            self.body_envelope = Some(envelope);
+        }
+        Ok(())
     }
 }
 

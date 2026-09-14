@@ -45,3 +45,24 @@ generated/python/nuwax_msgs/*
 
 # 二维扫描与导航绑定共同属于正式跨语言输入契约。
 !generated/python/nuwax_msgs/PlanarScan.py
+
+# 包入口导出的消息与依赖绑定随协议一起入库，保证独立检出后可导入。
+!generated/python/geometry_msgs/PointStamped.py
+!generated/python/geometry_msgs/PoseStamped.py
+!generated/python/geometry_msgs/Transform.py
+!generated/python/geometry_msgs/TransformStamped.py
+!generated/python/nav_msgs/Path.py
+!generated/python/nuwax_msgs/NavigationMapBlock.py
+!generated/python/nuwax_msgs/GoalEnvelope.py
+!generated/python/nuwax_msgs/CancelNavigation.py
+!generated/python/nuwax_msgs/CorrectionCandidate.py
+!generated/python/nuwax_msgs/Frontier.py
+!generated/python/nuwax_msgs/FrontierList.py
+!generated/python/nuwax_msgs/NativePgoRequest.py
+!generated/python/nuwax_msgs/NativePgoResult.py
+!generated/python/nuwax_msgs/NativePgoStatus.py
+!generated/python/nuwax_msgs/NavigationState.py
+!generated/python/nuwax_msgs/PathEnvelope.py
+!generated/python/nuwax_msgs/PersonFollowCommand.py
+!generated/python/nuwax_msgs/PersonFollowTarget.py
+!generated/python/std_msgs/Bool.py

@@ -9,6 +9,9 @@ package nuwax.geometry;
 // ============================================================================
 
 message Empty {}
+// 单个精细块的可靠补取；通过实际内容传递，不共享本地路径。
+message NavigationMapBlockRequest { string sha256_hex = 1; }
+message NavigationMapBlockResponse { string data_hex = 1; }
 message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
 message Pose {
@@ -218,6 +221,7 @@ message MappingBackendCheckpoint {
   CloudMapCheckpoint canonical_cloud_checkpoint = 12;
   GraphArtifactRef graph_artifact = 13;
   string target_kind = 14;
+  GraphArtifactRef fine_map_artifact = 15;
 }
 
 message ActivateMapRequest {
@@ -418,6 +422,9 @@ message NavigationGoal {
   uint64 motion_guard_generation = 9;
   bytes motion_guard_boot_nonce = 10;
   uint64 motion_stop_generation = 11;
+  bool allow_reverse = 12;
+  optional double position_tolerance_m = 13;
+  optional double yaw_tolerance_rad = 14;
 }
 message CancelNavigationRequest {
   string goal_id = 1;
@@ -548,10 +555,21 @@ message ExploreRequest {
   uint64 motion_guard_generation = 11;
   bytes motion_guard_boot_nonce = 12;
   uint64 motion_stop_generation = 13;
+  // 总行程是路径预算，不能换算为未标定电池能耗；缺省保持原探索行为。
+  ExplorationReturnPolicy return_policy = 14;
+  // 只接入已由地图资产拥有方核对、激活并定位的冻结进度；空值表示新任务。
+  string resume_progress_json = 15;
+}
+message ExplorationReturnPolicy {
+  optional double maximum_distance_m = 1;
+  double reserve_distance_m = 2;
+  bool return_on_completion = 3;
 }
 message StopExplorationRequest {
   string request_id = 1;
 }
+message ExplorationProgressRequest { string request_id = 1; }
+message ExplorationProgressResponse { string checkpoint_json = 1; }
 message ExplorationChildLease {
   string session_id = 1;
   NavigationOwnerKind owner_kind = 2;
@@ -630,6 +648,8 @@ message ExplorationState {
   bool rollover_recovery_eligible = 14;
   ExplorationGlobalStopReconciliation global_stop_reconciliation = 15;
   ExplorationOwnershipReconciliationReceipt ownership_reconciliation_receipt = 16;
+  // 只读版本化采样行程、原起点和返航阶段；没有启用策略时为空。
+  string mission_progress_json = 17;
 }
 message ExplorationSourceDiag {
   string source_name = 1;
@@ -781,6 +801,7 @@ service GeometryRuntime {
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
   rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
   rpc GetMappingCloudAuthority(Empty) returns (MappingCloudAuthority);
+  rpc GetNavigationMapBlock(NavigationMapBlockRequest) returns (NavigationMapBlockResponse);
   rpc SubmitMappingCloudGoal(MappingCloudGoalRequest) returns (MappingCloudGoalTerminal);
   rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
   rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
@@ -813,6 +834,7 @@ service GeometryRuntime {
   rpc ReconcileExplorationAfterGlobalStop(ReconcileExplorationAfterGlobalStopRequest) returns (ExplorationState);
   rpc AcknowledgeExplorationOwnershipReconciliation(AcknowledgeExplorationOwnershipReconciliationRequest) returns (AcknowledgeExplorationOwnershipReconciliationResult);
   rpc GetExplorationState(Empty) returns (ExplorationState);
+  rpc GetExplorationProgress(ExplorationProgressRequest) returns (ExplorationProgressResponse);
   rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
 
   // 输入发布兼容

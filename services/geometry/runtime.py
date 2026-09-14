@@ -3767,6 +3767,9 @@ class PlatformGeometryRuntime:
             identity=identity,
         )
         self._map_activation_snapshot = snapshot
+        if installed_bundle is not None:
+            # 静态资产随后进入续建时会退役；选择的工作区仍须保留这次已确认名称。
+            self._workspace_map_name = installed_bundle.map_name
         return self._map_activation_snapshot_read()
 
     def _map_activation_snapshot_still_current_locked(
@@ -4138,12 +4141,19 @@ class PlatformGeometryRuntime:
                 map_name=resolved_map_name,
                 asset_manifest_sha256=resolved_manifest,
             )
-        result = provider.relocalize(
-            activation_state=activation,
-            request_id=request_id,
-            logical_timeout_ms=logical_timeout_ms,
-            **({"planar_seed": planar_seed} if planar_seed is not None else {}),
-        )
+        try:
+            result = provider.relocalize(
+                activation_state=activation,
+                request_id=request_id,
+                logical_timeout_ms=logical_timeout_ms,
+                **({"planar_seed": planar_seed} if planar_seed is not None else {}),
+            )
+        except GeometryRuntimeRpcError as error:
+            # 原生端此精确拒绝发生在拥有方和生命周期锁准入之前，没有未决应用事务。
+            if error.rpc_name == "Relocalize" and error.grpc_code == grpc.StatusCode.FAILED_PRECONDITION and error.grpc_details == "RELOCALIZATION_OWNER_NOT_SELECTED":
+                raise GeometryRuntimeRelocalizationRejected({"success": False, "disposition_name": "target_unavailable",
+                    "detail": "未选择重定位拥有方；当前配置只支持建图，无法恢复检查点定位"}) from error
+            raise
         if not bool(result.get("success")):
             raise GeometryRuntimeRelocalizationRejected(result)
         with self._runtime_state_lock:
@@ -8820,6 +8830,13 @@ class PlatformGeometryRuntime:
                 LOGGER.exception("geometry exploration 状态已提交，但本地 fanout 失败。")
         return committed
 
+    def get_exploration_progress(self, request_id: str) -> str:
+        """从原探索拥有方读取已停稳任务的持久进度。"""
+        remote = self.providers._resolve_remote_exploration_provider()
+        if remote is None:
+            raise RuntimeError("探索进度拥有方尚未连接")
+        return remote.get_exploration_progress(request_id=request_id)
+
     def start_platform_exploration(self, request) -> bool:
         """兼容平台入口；实际启动统一委托 provider bundle。"""
 
@@ -11371,6 +11388,10 @@ class PlatformGeometryProviderBundle(
                 max_navigation_retries=max_navigation_retries,
                 blacklist_radius_m=blacklist_radius_m,
                 motion_admission=motion_admission,
+                **({"resume_progress_json": request.resume_progress_json}
+                   if getattr(request, "resume_progress_json", None) else {}),
+                **({"return_policy": request.return_policy.model_dump(exclude_none=True)}
+                   if getattr(request, "return_policy", None) is not None else {}),
                 **(
                     {"deadline_monotonic": deadline_monotonic}
                     if deadline_monotonic is not None
@@ -12259,6 +12280,7 @@ class PlatformGeometryProviderBundle(
             "rollover_recovery_eligible": bool(
                 state.get("rollover_recovery_eligible", False)
             ),
+            "mission_progress": state.get("mission_progress"),
             "global_stop_reconciliation": state.get(
                 "global_stop_reconciliation"
             ),

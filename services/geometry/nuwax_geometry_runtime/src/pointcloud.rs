@@ -19,6 +19,10 @@ use voxel_index::VoxelIndex;
 mod dynamic_cloud;
 use dynamic_cloud::DynamicCloudFilter;
 
+#[path = "fine_cloud.rs"]
+mod fine_cloud;
+use fine_cloud::FineCloud;
+
 #[path = "ordered_voxel_snapshot.rs"]
 mod ordered_voxel_snapshot;
 use ordered_voxel_snapshot::OrderedVoxelSnapshot;
@@ -157,6 +161,8 @@ pub struct CloudMapShmWriter {
     voxels: VoxelIndex,
     ordered_voxels: OrderedVoxelSnapshot,
     dynamic_filter: DynamicCloudFilter,
+    fine_cloud: Option<FineCloud>,
+    committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
     max_points: usize,
     last_occupancy_receipt: Option<OccupancyCommitReceipt>,
     last_cloud_receipt: Option<CloudCommitReceipt>,
@@ -264,6 +270,20 @@ pub(crate) struct PreparedCloudAccumulator {
     voxel_size: f32,
     dynamic_filter: DynamicCloudFilter,
     ordered_voxels: OrderedVoxelSnapshot,
+    fine_cloud: Option<FineCloud>,
+}
+
+/// 先于激活持锁提交完成读取、逐块校验和私有导入。
+pub(crate) struct PreparedFineCloud { cloud: FineCloud }
+
+pub(crate) fn prepare_fine_cloud_archive(file: std::fs::File, session: &str, generation: u64,
+    cloud_revision: u64, source_timestamp_ns: u64) -> Result<PreparedFineCloud, String> {
+    let (cloud, root) = FineCloud::from_archive(file)?;
+    if root.domain.session != session || root.domain.generation != generation
+        || root.revision != cloud_revision || root.source_timestamp_ns != source_timestamp_ns {
+        return Err("精细地图资产与原占据/点云提交不一致".into());
+    }
+    Ok(PreparedFineCloud { cloud })
 }
 
 pub(crate) struct CorrelatedCloudMapCommit {
@@ -424,6 +444,8 @@ impl CloudMapShmWriter {
             voxels: VoxelIndex::new(),
             ordered_voxels: OrderedVoxelSnapshot::default(),
             dynamic_filter: DynamicCloudFilter::default(),
+            fine_cloud: None,
+            committed_fine_cloud: None,
             max_points: CM_MAX_POINTS,
             last_occupancy_receipt: None,
             last_cloud_receipt: None,
@@ -510,6 +532,16 @@ impl CloudMapShmWriter {
                     .collect();
             }
         }
+        if self.fine_cloud.is_none() {
+            match FineCloud::fresh() {
+                Ok(fine) => self.fine_cloud = Some(fine),
+                Err(error) => { warn!(%error, "精细导航源创建失败"); return false; }
+            }
+        }
+        if let Err(error) = self.fine_cloud.as_mut().unwrap().accumulate(points, sensor_origin_map, source_timestamp_ns) {
+            warn!(%error, "精细导航源拒绝不完整输入");
+            return false;
+        }
         if let Some(origin) = sensor_origin_map {
             let removed = self.dynamic_filter.clear_observed_free_space_with_hits(
                 &mut self.voxels,
@@ -553,6 +585,8 @@ impl CloudMapShmWriter {
         occupancy_receipt: &OccupancyCommitReceipt,
     ) -> Result<Option<CorrelatedCloudMapCommit>, String> {
         self.validate_occupancy_receipt(occupancy_receipt)?;
+        let fine = if occupancy_receipt.source_timestamp_ns == 0 { None }
+            else { self.fine_cloud.as_mut().map(|fine| fine.seal(occupancy_receipt.source_timestamp_ns)).transpose()? };
         if self.commit_accumulated().is_none() {
             return Ok(None);
         }
@@ -569,6 +603,7 @@ impl CloudMapShmWriter {
         };
         self.last_occupancy_receipt = Some(occupancy_receipt.clone());
         self.last_cloud_receipt = Some(receipt.clone());
+        self.committed_fine_cloud = fine;
         Ok(Some(CorrelatedCloudMapCommit { snapshot, receipt }))
     }
 
@@ -645,6 +680,10 @@ impl CloudMapShmWriter {
         self.last_cloud_receipt.clone()
     }
 
+    pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
+        self.committed_fine_cloud.clone()
+    }
+
     /// Fence a newly started mapping session from the prior session's 3D map.
     /// A successful call publishes a new revision with a slot-local point count
     /// of zero. Replaying the same generation is idempotent.
@@ -679,6 +718,7 @@ impl CloudMapShmWriter {
             voxel_size: self.voxel_size,
             dynamic_filter: std::mem::take(&mut self.dynamic_filter),
             ordered_voxels: std::mem::take(&mut self.ordered_voxels),
+            fine_cloud: self.fine_cloud.take(),
         }
     }
 
@@ -699,6 +739,7 @@ impl CloudMapShmWriter {
         self.voxels = prepared.voxels;
         self.dynamic_filter = prepared.dynamic_filter;
         self.ordered_voxels = prepared.ordered_voxels;
+        self.fine_cloud = prepared.fine_cloud;
         self.commit_accumulated_snapshot(receipt)?
             .ok_or_else(|| "PGO点云发布失败".into())
     }
@@ -713,6 +754,13 @@ impl CloudMapShmWriter {
         point_count: u32,
         xyz_f32_le: &[u8],
     ) -> Result<CorrelatedCloudMapCommit, String> {
+        self.install_checkpoint_with_fine(occupancy_receipt, voxel_size, point_count, xyz_f32_le, None)
+    }
+
+    pub(crate) fn install_checkpoint_with_fine(
+        &mut self, occupancy_receipt: &OccupancyCommitReceipt, voxel_size: f32, point_count: u32,
+        xyz_f32_le: &[u8], fine: Option<PreparedFineCloud>,
+    ) -> Result<CorrelatedCloudMapCommit, String> {
         let session_generation = occupancy_receipt.session_generation;
         if session_generation == 0 {
             return Err("cloud-map checkpoint generation must be positive".to_string());
@@ -723,11 +771,26 @@ impl CloudMapShmWriter {
         let voxels =
             decode_checkpoint_voxels(voxel_size, point_count, xyz_f32_le, self.max_points)?;
         self.validate_occupancy_receipt_for_generation(occupancy_receipt, session_generation)?;
+        let fine = match fine {
+            Some(prepared) => prepared.cloud,
+            None => {
+                let mut fine = FineCloud::new(voxel_size)?;
+                let points = xyz_f32_le.chunks_exact(12).map(|bytes| Point3::new(
+                    f32::from_le_bytes(bytes[0..4].try_into().unwrap()) as f64,
+                    f32::from_le_bytes(bytes[4..8].try_into().unwrap()) as f64,
+                    f32::from_le_bytes(bytes[8..12].try_into().unwrap()) as f64,
+                )).collect::<Vec<_>>();
+                // 旧检查点只有历史几何，恢复提交时间不能冒充逐点观察时间。
+                fine.accumulate(&points, None, 0)?;
+                fine
+            }
+        };
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels.into();
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
+        self.fine_cloud = Some(fine);
         self.commit_accumulated_snapshot(occupancy_receipt)?
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
     }
@@ -804,6 +867,8 @@ impl CloudMapShmWriter {
     }
 
     fn reset_accumulator(&mut self, session_generation: u64) {
+        self.fine_cloud = None;
+        self.committed_fine_cloud = None;
         self.voxels.clear();
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
@@ -984,6 +1049,41 @@ fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fine_cloud_survives_display_coarsening_and_seals_the_exact_commit() {
+        let path = test_path("fine-cloud-coarsening");
+        let mut writer = CloudMapShmWriter::new(&path).unwrap();
+        writer.max_points = 4;
+        let points = (0..30).map(|x| Point3::new(f64::from(x) * 0.051, 0.025, 0.175)).collect::<Vec<_>>();
+        assert!(writer.accumulate_mapping_scan(1, &points, None, 100));
+        let first_receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 1 },
+            session_id: "精细源验证".into(), session_generation: 1, occupancy_revision: 1,
+            source_timestamp_ns: 100, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        let display = writer.commit_accumulated_snapshot(&first_receipt).unwrap().unwrap();
+        assert!(display.snapshot.voxel_size > VOXEL_SIZE);
+        assert!(display.snapshot.point_count <= 4);
+        let fine = writer.committed_fine_cloud().unwrap();
+        let domain = nuwax_map_chunks::Domain { session: "精细源验证".into(), generation: 1, frame_generation: 0, producer_generation: 1 };
+        let root = fine.manifest(domain.clone(), 1).unwrap();
+        assert_eq!(root.voxel_size_m, VOXEL_SIZE);
+        assert_eq!(root.points(), 30);
+        let mut reader = nuwax_map_chunks::RegionReader::new(fine.repository.clone(), 4 * 1024 * 1024);
+        let saved = reader.region(&root, [-100; 3], [100; 3], 100).unwrap();
+        assert!(saved.iter().all(|(key, evidence)| key[2] == 3 && evidence.observed_ns == 100));
+        assert!(writer.accumulate_mapping_scan(1, &[Point3::new(-0.1, 0.025, 0.325)], None, 200));
+        assert!(Arc::ptr_eq(&fine, &writer.committed_fine_cloud().unwrap()));
+        assert_eq!(reader.region(&root, [-100; 3], [100; 3], 100).unwrap(), saved);
+        let receipt = OccupancyCommitReceipt { commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 2 },
+            occupancy_revision: 2, source_timestamp_ns: 200, ..first_receipt };
+        writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+        let next = writer.committed_fine_cloud().unwrap();
+        assert_eq!(next.manifest(domain, 2).unwrap().points(), 31);
+        writer.cleanup_product_owned_file().unwrap();
+    }
 
     #[test]
     fn pgo_accumulator_install_preserves_pending_dynamic_evidence() {
@@ -1323,6 +1423,17 @@ mod tests {
         assert_eq!(restored.receipt.cloud_revision, 1);
         assert_eq!(writer.session_generation, 7);
         assert_eq!(read_u32(&writer.mmap, CM_GLOBAL_POINT_COUNT_OFFSET), 2);
+
+        // 激活回执有时间，但没有精细资产的旧点必须保留未知观察时间。
+        let fine = writer.committed_fine_cloud().unwrap();
+        let root = fine.manifest(nuwax_map_chunks::Domain {
+            session: occupancy_receipt.session_id.clone(), generation: 7,
+            frame_generation: 0, producer_generation: 1,
+        }, 1).unwrap();
+        let mut reader = nuwax_map_chunks::RegionReader::new(fine.repository.clone(), 1024 * 1024);
+        let evidence = reader.region(&root, [-100; 3], [100; 3], 10).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|(_, evidence)| evidence.observed_ns == 0 && evidence.hits == 0));
 
         assert!(writer.accumulate_mapping_frame(7, &[Point3::new(2.025, 0.025, 0.025)]));
         let continued = writer.commit_accumulated().expect("continued snapshot");

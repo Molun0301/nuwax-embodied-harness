@@ -171,6 +171,11 @@ message ModeSwitchCommand {
 message ZeroAck {
   string zero_ack_id = 1;
   uint64 applied_monotonic_ns = 2;
+  // 命令被接纳与实际停稳分别记录；旧执行端缺失字段时保持未知。
+  bool stationary_confirmed = 3;
+  string confirmation_kind = 4;
+  uint64 feedback_source_timestamp_ns = 5;
+  uint64 stationary_deadline_monotonic_ns = 6;
 }
 
 message AcquireLeaseRequest {
@@ -297,6 +302,7 @@ message GetGuardStateResponse {
   bool recovery_fence_held = 8;
   bytes recovery_fence_token_sha256 = 9;
   bytes recovery_fence_correlation_sha256 = 10;
+  ZeroAck last_zero_confirmation = 11;
 }
 
 message GetOperationResultResponse {

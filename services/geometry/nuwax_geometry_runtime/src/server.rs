@@ -647,6 +647,39 @@ impl ShutdownListener {
 }
 
 impl GeometryRuntimeService {
+    /// 暂停新计算，让原位后端的既有批次正常提交，再将锁交给重定位准入。
+    async fn drain_mapping_before_relocalization(
+        &self,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Option<MappingCheckpointExportGuard>), Status> {
+        tokio::time::timeout(MAPPING_TRANSITION_TIMEOUT, async {
+            let mut lifecycle = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
+            self.ensure_running_admission("Relocalize").await?;
+            let Some(adapter) = self.bridge.mapping_adapter.as_ref().cloned() else {
+                return Ok((lifecycle, None));
+            };
+            let lease = {
+                let mut mapping = adapter.lock();
+                if !mapping.is_active() {
+                    return Ok((lifecycle, None));
+                }
+                mapping.begin_backend_checkpoint_export().map_err(Status::failed_precondition)?
+            };
+            // 只复用计算排空屏障，不刷新或导出地图资产。
+            let barrier = MappingCheckpointExportGuard::new(adapter.clone(), lease);
+            loop {
+                self.ensure_running_admission("Relocalize").await?;
+                let drained = adapter.lock().backend_checkpoint_client_if_drained(barrier.lease())
+                    .map_err(Status::failed_precondition)?.is_some();
+                if drained {
+                    return Ok((lifecycle, Some(barrier)));
+                }
+                drop(lifecycle);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                lifecycle = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
+            }
+        }).await.map_err(|_| Status::deadline_exceeded("重定位准入前建图计算未能按时排空"))?
+    }
+
     fn start_mapping_cloud_owner(bridge: &GeometryRuntimeHandle) -> Arc<MappingCloudOwner> {
         let owner_epoch = bridge.nav.producer_runtime_generation();
         Arc::new(
@@ -1792,6 +1825,11 @@ fn canonical_backend_sha256(
     canonical_append_cloud_receipt(&mut out, cloud_receipt)?;
     out.extend_from_slice(&canonical_occupancy_sha256(occupancy_checkpoint)?);
     out.extend_from_slice(&canonical_cloud_sha256(&cloud_target)?);
+    if let Some(fine) = &checkpoint.fine_map_artifact {
+        out.extend_from_slice(b"nuwax.geometry.fine-map-archive.v1\0");
+        out.extend_from_slice(&fine.size.to_be_bytes());
+        out.extend_from_slice(&canonical_hash32(&fine.sha256, "fine_map_artifact.sha256")?);
+    }
     Ok(crate::map_checksum::sha256_bytes(&out))
 }
 
@@ -2118,6 +2156,19 @@ async fn activate_map_r1(
         .map(|checkpoint| canonical_backend_sha256(checkpoint, &expected_map_frame_id))
         .transpose()
         .map_err(Status::invalid_argument)?;
+
+    let prepared_fine = if let Some(backend) = mapping_backend_checkpoint.as_ref().filter(|b| b.fine_map_artifact.is_some()) {
+        let file = service.graph_artifacts.lock().open(backend.fine_map_artifact.as_ref().unwrap()).map_err(Status::invalid_argument)?;
+        let source_session = backend.source_session_id.clone();
+        let source_generation = backend.source_session_generation;
+        let receipt = backend.cloud_receipt.as_ref().ok_or_else(|| Status::invalid_argument("精细资产缺少原点云收据"))?.clone();
+        let receiver = service.bridge.register_navigation_map_operation(async move {
+            tokio::task::spawn_blocking(move || crate::pointcloud::prepare_fine_cloud_archive(file, &source_session,
+                source_generation, receipt.cloud_revision, receipt.source_timestamp_ns))
+                .await.map_err(|e| e.to_string()).and_then(|v| v)
+        }).map_err(Status::unavailable)?;
+        Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
+    } else { None };
 
     if let ActivationRequestIdentityClass::Modern {
         asset_manifest_sha256,
@@ -2800,9 +2851,9 @@ async fn activate_map_r1(
 
     let revision_floor = bridge.state.read().await.map.revision;
     let install_result = {
-        adapter
-            .lock()
-            .install_checkpoint(checkpoint, checkpoint_timestamp_ns, revision_floor)
+        let mut mapping = adapter.lock();
+        mapping.checkpoint_localization_required = immutable_target.is_some();
+        mapping.install_checkpoint(checkpoint, checkpoint_timestamp_ns, revision_floor)
     };
     let (map, event) = match install_result {
         Ok(result) => result,
@@ -2858,11 +2909,12 @@ async fn activate_map_r1(
         let installed = {
             let mut writer = bridge.cloud_map_writer.lock();
             match writer.as_mut() {
-                Some(writer) => writer.install_checkpoint(
+                Some(writer) => writer.install_checkpoint_with_fine(
                     &occupancy_receipt,
                     target.voxel_size,
                     target.point_count,
                     &target.xyz_f32_le,
+                    prepared_fine,
                 ),
                 None => Err("cloud-map SHM writer became unavailable".to_owned()),
             }
@@ -3765,6 +3817,7 @@ fn validate_mapping_checkpoint_receipts(
 }
 
 fn validate_planar_checkpoint(checkpoint:&MappingBackendCheckpoint)->Result<(),String> {
+    if checkpoint.fine_map_artifact.is_some() { return Err("二维检查点不能携带三维精细资产".into()); }
     let reference=checkpoint.graph_artifact.as_ref().ok_or("二维图必须通过分块制品引用加载")?;
     if checkpoint.schema_version!=1 || checkpoint.backend_kind!="slam_toolbox" || checkpoint.target_kind!="planar_graph"
         || checkpoint.created_at_ns==0 || checkpoint.source_session_id.is_empty() || checkpoint.source_session_generation==0
@@ -3790,6 +3843,10 @@ fn validate_mapping_backend_checkpoint(
     checkpoint: &MappingBackendCheckpoint,
     expected_backend: crate::mapping_backend::MappingBackendKind,
 ) -> Result<(), String> {
+    if let Some(fine) = &checkpoint.fine_map_artifact {
+        if fine.id.is_empty() || fine.id.len() > 128 || fine.size == 0 || fine.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES
+            || fine.sha256.len() != 32 || fine.sha256.iter().all(|b| *b == 0) { return Err("精细地图制品引用无效".into()); }
+    }
     if expected_backend==crate::mapping_backend::MappingBackendKind::SlamToolbox {return validate_planar_checkpoint(checkpoint);}
     if checkpoint.schema_version
         != crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION
@@ -3972,6 +4029,7 @@ fn exploration_state_from_snapshot(
         rollover_recovery_eligible: snapshot.rollover_recovery_eligible,
         global_stop_reconciliation,
         ownership_reconciliation_receipt,
+        mission_progress_json: snapshot.mission_progress_json,
     }
 }
 
@@ -4038,6 +4096,10 @@ fn explore_config_from_request(
         stop_conditions,
         max_navigation_retries: request.max_navigation_retries,
         blacklist_radius_m: request.blacklist_radius_m,
+        resume_progress_json: request.resume_progress_json.clone(),
+        return_policy: request.return_policy.as_ref().map(|p| nuwax_exploration::mission::ReturnPolicy {
+            maximum_distance_m:p.maximum_distance_m,reserve_distance_m:p.reserve_distance_m,return_on_completion:p.return_on_completion,
+        }).unwrap_or_default(),
     })
 }
 
@@ -5969,7 +6031,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     let shared = bridge.state.read().await;
                     (shared.map.revision, shared.map.timestamp_ns)
                 };
-                let (cloud_snapshot, cloud_receipt) = {
+                let (cloud_snapshot, cloud_receipt, fine_snapshot) = {
                     let writer = bridge.cloud_map_writer.lock();
                     let writer = writer.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
@@ -5986,7 +6048,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                             "mapping backend checkpoint requires a canonical cloud commit",
                         )
                     })?;
-                    (snapshot, receipt)
+                    (snapshot, receipt, writer.committed_fine_cloud())
                 };
                 if !snapshot.active
                     || snapshot.session_id.trim().is_empty()
@@ -6056,6 +6118,20 @@ impl GeometryRuntime for GeometryRuntimeService {
                     .as_nanos();
                 let created_at_ns = u64::try_from(created_at_ns)
                     .map_err(|_| Status::internal("checkpoint creation time exceeds u64"))?;
+                let fine_root = fine_snapshot.as_ref().map(|fine| fine.manifest(nuwax_map_chunks::Domain {
+                    session: snapshot.session_id.clone(), generation: snapshot.session_generation,
+                    frame_generation: adapter.lock().global_frame_generation(),
+                    producer_generation: bridge.nav.producer_runtime_generation(),
+                }, cloud_receipt.cloud_revision)).transpose().map_err(Status::internal)?;
+                // 已拿到同一屏障内的不可变快照，归档不持生命周期锁。
+                drop(lifecycle_guard);
+                let fine_map_artifact = if let (Some(fine), Some(root)) = (fine_snapshot, fine_root) {
+                    let store = owned_service.graph_artifacts.clone();
+                    Some(tokio::task::spawn_blocking(move || {
+                        let (file, size, sha) = nuwax_map_chunks::archive_file(&root, &fine.repository)?;
+                        store.lock().insert(file, size, sha)
+                    }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(Status::internal)?)
+                } else { None };
                 let checkpoint = MappingBackendCheckpoint {
                     schema_version:
                         crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
@@ -6074,6 +6150,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     canonical_cloud_checkpoint: Some(canonical_cloud_checkpoint),
                     graph_artifact: None,
                     target_kind: String::new(),
+                    fine_map_artifact,
                 };
                 validate_mapping_backend_checkpoint(&checkpoint, backend_kind)
                     .map_err(Status::internal)?;
@@ -6124,13 +6201,8 @@ impl GeometryRuntime for GeometryRuntimeService {
             .relocalization_ingress
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        let lifecycle_guard = self
-            .bridge
-            .mapping_lifecycle_lock
-            .clone()
-            .lock_owned()
-            .await;
         if req.get_ref().target_kind=="planar_graph" {
+            let lifecycle_guard = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
             let request=req.into_inner();let task_request=request.clone();let service=self.clone();
             let work:crate::correction_coordinator::PlanarCommandWork=Box::new(move|context|Box::pin(async move {
                 let bridge=service.bridge.clone();
@@ -6146,10 +6218,13 @@ impl GeometryRuntime for GeometryRuntimeService {
             let waiter=ingress.admit_planar(request,lifecycle_guard,work).await.map_err(relocalization_command_status)?;
             return waiter.wait().await.map(Response::new).map_err(relocalization_command_status);
         }
+        let (lifecycle_guard, compute_barrier) = self.drain_mapping_before_relocalization().await?;
         let waiter: crate::correction_coordinator::RelocalizationCommandWaiter = ingress
             .admit_with_lifecycle_guard(req.into_inner(), lifecycle_guard)
             .await
             .map_err(relocalization_command_status)?;
+        // 原准入拥有方已在生命周期锁内切换模式，旧批次已经提交。
+        drop(compute_barrier);
         waiter
             .wait()
             .await
@@ -6469,6 +6544,7 @@ impl GeometryRuntime for GeometryRuntimeService {
         )
         .map_err(Status::invalid_argument)?;
         let input = SetGoalInput {
+            options: nuwax_nav_types_messages::GoalOptions {allow_reverse:ng.allow_reverse,position_tolerance_m:ng.position_tolerance_m.unwrap_or(0.3),yaw_tolerance_rad:ng.yaw_tolerance_rad.unwrap_or(0.3)},
             goal_id: goal_id.clone(),
             owner_kind,
             parent_request_id,
@@ -6496,6 +6572,19 @@ impl GeometryRuntime for GeometryRuntimeService {
         let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
         let _ = self.bridge.nav_state_tx.send(update.clone());
         Ok(Response::new(nav_state_to_proto(update)))
+    }
+
+    async fn get_navigation_map_block(
+        &self, request: Request<NavigationMapBlockRequest>,
+    ) -> Result<Response<NavigationMapBlockResponse>, Status> {
+        self.ensure_running_admission("GetNavigationMapBlock").await?;
+        let hash = crate::pointcloud::decode_checkpoint_sha256(&request.into_inner().sha256_hex)
+            .map_err(Status::invalid_argument)?;
+        let receiver = self.bridge.read_navigation_map_block(hash).map_err(Status::failed_precondition)?;
+        let bytes = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
+        Ok(Response::new(NavigationMapBlockResponse {
+            data_hex: bytes.iter().map(|v| format!("{v:02x}")).collect(),
+        }))
     }
 
     async fn get_mapping_cloud_authority(
@@ -6642,7 +6731,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             self.bridge.committed_map_authority.clone(),
             self.bridge.map_revision_latest_tx.subscribe(),
             Some(sealed.map_name.clone()),
-        );
+        ).with_mapping_adapter(self.bridge.mapping_adapter.clone());
         let active_map = ActiveMapIdentityV1 {
             map_name: request.map_name,
             map_frame_id: request.map_frame_id,
@@ -6718,6 +6807,8 @@ impl GeometryRuntime for GeometryRuntimeService {
                     &admission_io,
                     &self.bridge.nav,
                     schema::GoalIntent {
+                        map_frame_generation: admission_context.map_frame_generation(),
+                        options: Default::default(),
                         producer: "mapping-cloud".to_owned(),
                         producer_epoch: i64::try_from(owner_epoch)
                             .map_err(|_| Status::internal("owner epoch exceeds wire range"))?,
@@ -7146,6 +7237,11 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
 
+    async fn get_exploration_progress(&self,request:Request<ExplorationProgressRequest>)->Result<Response<ExplorationProgressResponse>,Status> {
+        let checkpoint_json=self.bridge.explore.checkpoint_progress(&request.get_ref().request_id).await.map_err(Status::failed_precondition)?;
+        Ok(Response::new(ExplorationProgressResponse {checkpoint_json}))
+    }
+
     async fn stop_exploration(
         &self,
         req: Request<StopExplorationRequest>,
@@ -7249,6 +7345,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             zero: ZeroConfirmation {
                 zero_ack_id: guard.zero_ack_id,
                 applied_monotonic_ns: guard.zero_applied_monotonic_ns,
+                ..Default::default()
             },
             recovery_fence_token,
         };
@@ -7376,6 +7473,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             zero: ZeroConfirmation {
                 zero_ack_id: held.zero_ack_id,
                 applied_monotonic_ns: held.zero_applied_monotonic_ns,
+                ..Default::default()
             },
             recovery_fence_token,
         };
@@ -7641,11 +7739,24 @@ impl GeometryRuntime for GeometryRuntimeService {
                 binding.navigation.capture_odometry(session.session_generation,sample).map_err(Status::failed_precondition)?;
                 return Ok(Response::new(PublishResult{success:true,message:"二维里程计已交付本次重定位候选".into()}));
             }
-            binding
+            let response=binding
                 .execute(nuwax_slam_2d_runtime::protocol::Operation::Odometry { sample:sample.clone() })
                 .await
                 .map_err(Status::unavailable)?;
-            binding.navigation.capture_odometry(session.session_generation,sample).map_err(Status::failed_precondition)?;
+            binding.navigation.capture_odometry(session.session_generation,sample.clone()).map_err(Status::failed_precondition)?;
+            let published=crate::slam2d_owner::publish_device_odometry(&self.bridge,&binding,&session,&sample,&response.status)
+                .await.map_err(Status::failed_precondition)?;
+            let epoch=binding.fence.snapshot().epoch;
+            drop(_lifecycle);
+            // 有效设备位姿下的真实新扫描独立派生；计算/发布仍由根保留任务和原提交锁拥有。
+            if let (true,Some(native_session),Some(estimate))=(published,response.status.session,response.status.last_estimate) {
+                let observer_bridge=self.bridge.clone();let observer_binding=binding.clone();
+                let receiver=self.bridge.register_planar_operation(async move {
+                    crate::planar_navigation::observe_device_latest(&observer_bridge,&observer_binding,&native_session,&estimate,&sample,epoch).await
+                }).map_err(Status::unavailable)?;
+                receiver.await.map_err(|_|Status::unavailable("二维观测保留任务未交付终态"))?
+                    .map_err(Status::unavailable)?;
+            }
             return Ok(Response::new(PublishResult {
                 success: true,
                 message: "二维里程计已接纳".into(),
@@ -10401,6 +10512,8 @@ mod lifecycle_tests {
                 &admission_io,
                 &self.facade.nav,
                 schema::GoalIntent {
+                    map_frame_generation: 0,
+                        options: Default::default(),
                     producer: "wavefront".to_string(),
                     producer_epoch: i64::try_from(producer_epoch).map_err(|_| {
                         ChildNavigationSubmitError::Rejected(
@@ -10975,6 +11088,7 @@ mod lifecycle_tests {
             payload_schema_version: crate::pointcloud::CM_PAYLOAD_SCHEMA_VERSION,
         };
         MappingBackendCheckpoint {
+            fine_map_artifact: None,
             schema_version: crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
             backend_kind: "voxel".to_owned(),
             source_session_generation: 7,
@@ -12869,6 +12983,8 @@ mod lifecycle_tests {
             .published
             .lock()
             .expect("configured-frame published frames");
+        let published: Vec<_> = published.iter()
+            .filter(|frame| frame.msg_type.fqn() == "sensor_msgs.PointCloud2").collect();
         assert_eq!(published.len(), 1);
         let mut encoded = Vec::with_capacity(8 + published[0].payload.len());
         encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
@@ -13434,8 +13550,11 @@ mod lifecycle_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ray_backend_checkpoint_activation_preserves_continuation_and_receipts() {
-        let (source_handle, source_service, source_cloud_path) =
+        let (source_handle, _, source_cloud_path) =
             ray_runtime_with_cloud_writer("source").await;
+        let mut source_owner = crate::lcm_runtime::attach_root_task_owner_for_tests(source_handle);
+        let source_handle = source_owner.handle.clone();
+        let source_service = GeometryRuntimeService::new(source_handle.clone());
         let source_session_id = "ray-checkpoint-source";
         let started =
             start_mapping_session(&source_service, source_session_id, "warehouse-ray").await;
@@ -13460,7 +13579,7 @@ mod lifecycle_tests {
             assert!(committed, "每帧点必须接纳，栅格发布另行判断");
             assert_eq!(source_handle.state.read().await.map.revision > 0, sequence == 3);
         }
-        let source_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
+        let mut source_checkpoint = GeometryRuntime::export_mapping_backend_checkpoint(
             &source_service,
             Request::new(Empty {}),
         )
@@ -13474,8 +13593,37 @@ mod lifecycle_tests {
             .and_then(|receipt| receipt.commit_id.clone())
             .expect("source checkpoint occupancy commit id");
 
-        let (restored_handle, restored_service, restored_cloud_path) =
+        let (restored_handle, _, restored_cloud_path) =
             ray_runtime_with_cloud_writer("restored").await;
+        let mut restored_owner = crate::lcm_runtime::attach_root_task_owner_for_tests(restored_handle);
+        let restored_handle = restored_owner.handle.clone();
+        let restored_service = GeometryRuntimeService::new(restored_handle.clone());
+        if let Some(original) = source_checkpoint.fine_map_artifact.clone() {
+            let copied = GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), ..original.clone() };
+            GeometryRuntime::transfer_graph_artifact(&restored_service, Request::new(GraphArtifactTransferRequest {
+                action: 1, artifact: Some(copied.clone()), offset: 0, data: Vec::new(),
+            })).await.unwrap();
+            let mut offset = 0;
+            while offset < original.size {
+                let chunk = GeometryRuntime::transfer_graph_artifact(&source_service, Request::new(GraphArtifactTransferRequest {
+                    action: 4, artifact: Some(original.clone()), offset, data: Vec::new(),
+                })).await.unwrap().into_inner();
+                assert!(!chunk.data.is_empty());
+                let length = chunk.data.len() as u64;
+                GeometryRuntime::transfer_graph_artifact(&restored_service, Request::new(GraphArtifactTransferRequest {
+                    action: 2, artifact: Some(copied.clone()), offset, data: chunk.data,
+                })).await.unwrap();
+                offset += length;
+            }
+            let sealed = GeometryRuntime::transfer_graph_artifact(&restored_service, Request::new(GraphArtifactTransferRequest {
+                action: 3, artifact: Some(copied.clone()), offset: 0, data: Vec::new(),
+            })).await.unwrap().into_inner();
+            assert!(sealed.sealed);
+            GeometryRuntime::transfer_graph_artifact(&source_service, Request::new(GraphArtifactTransferRequest {
+                action: 5, artifact: Some(original), offset: 0, data: Vec::new(),
+            })).await.unwrap();
+            source_checkpoint.fine_map_artifact = Some(copied);
+        }
         let restored_session_id = "ray-checkpoint-restored";
         let activated = GeometryRuntime::activate_map(
             &restored_service,
@@ -13510,6 +13658,17 @@ mod lifecycle_tests {
             activation_boot_nonce.as_slice(),
             "activation must allocate a fresh occupancy receipt domain"
         );
+
+        {
+            let mut adapter = restored_handle.mapping_adapter.as_ref().unwrap().lock();
+            assert!(adapter.checkpoint_localization_required);
+            // 本测试对照同一坐标系的检查点序列化；显式建立已对齐夹具。
+            // 真实校正事务及重启定位由注册提交测试和完整进程场景覆盖。
+            adapter.feed_pose_in_frame(0.0,0.0,0.0,0.0,"odom").unwrap();
+            let mut aligned = adapter.map_odom_transform_snapshot().unwrap();
+            aligned.correction_revision = 1;
+            adapter.commit_relocalization_registration(aligned);
+        }
 
         let continuation_points = [
             Point3::new(2.5, 0.0, 1.0),
@@ -13674,6 +13833,8 @@ mod lifecycle_tests {
         )
         .await
         .expect("stop restored ray session");
+        assert!(source_owner.task_owner.shutdown().await.producers_settled());
+        assert!(restored_owner.task_owner.shutdown().await.producers_settled());
         let _ = std::fs::remove_file(source_cloud_path);
         let _ = std::fs::remove_file(restored_cloud_path);
     }
@@ -13973,6 +14134,79 @@ mod lifecycle_tests {
         .await
         .expect("stop cancellation ray session");
         let _ = std::fs::remove_file(cloud_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relocalization_drain_commits_in_flight_and_releases_cancelled_barriers() {
+        for ending in ["admitted", "cancelled", "timeout"] {
+            let (handle, service, cloud_path) = ray_runtime_with_cloud_writer(ending).await;
+            start_mapping_session(&service, ending, ending).await;
+            let adapter = handle.mapping_adapter.as_ref().unwrap().clone();
+            let gate = crate::mapping_backend::MappingBackendTestGate::default();
+            adapter.lock().replace_worker_with_test_gate(gate.clone()).unwrap();
+            let handoff = {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    crate::lcm_runtime::handoff_registered_lio_cloud(
+                        &handle, &[Point3::new(1.0, 0.0, 1.0), Point3::new(1.5, 0.5, 1.0)], 12,
+                        1_000_000_000, 1_000_000_000, "map",
+                    ).await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !gate.entered() { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            let drain = {
+                let service = service.clone();
+                tokio::spawn(async move { service.drain_mapping_before_relocalization().await })
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !adapter.lock().checkpoint_export_pending_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert!(!drain.is_finished());
+            // 排空时提交端仍能取得生命周期锁，不能把等待变成死锁。
+            drop(tokio::time::timeout(Duration::from_millis(200), handle.mapping_lifecycle_lock.lock())
+                .await.unwrap());
+            match ending {
+                "cancelled" => {
+                    drain.abort();
+                    assert!(drain.await.err().unwrap().is_cancelled());
+                    assert!(!adapter.lock().checkpoint_export_pending_for_tests());
+                    gate.release();
+                }
+                "timeout" => {
+                    let result = drain.await.unwrap();
+                    assert_eq!(result.err().unwrap().code(), tonic::Code::DeadlineExceeded);
+                    assert!(!adapter.lock().checkpoint_export_pending_for_tests());
+                    gate.release();
+                }
+                _ => {
+                    gate.release();
+                    let (lifecycle, barrier) = drain.await.unwrap().unwrap();
+                    assert!(adapter.lock().backend_checkpoint_client().is_ok());
+                    assert!(handle.mapping_lifecycle_lock.try_lock().is_err());
+                    assert!(adapter.lock().checkpoint_export_pending_for_tests());
+                    // 生产在此将同一锁交给原命令准入，模式切换后释放屏障。
+                    drop(barrier);
+                    drop(lifecycle);
+                }
+            }
+            assert!(handoff.await.unwrap().unwrap());
+            for sequence in 2..=3 {
+                assert!(crate::lcm_runtime::handoff_registered_lio_cloud(
+                    &handle, &[Point3::new(1.0, 0.0, 1.0), Point3::new(1.5, 0.5, 1.0)], 12,
+                    sequence * 1_000_000_000, sequence * 1_000_000_000, "map",
+                ).await.unwrap(), "{ending}: 同一后端必须继续接纳下一批次");
+            }
+            assert_eq!(adapter.lock().latest_occupancy_commit_receipt().unwrap().source_timestamp_ns,
+                3_000_000_000);
+            GeometryRuntime::stop_mapping(&service, Request::new(StopMappingRequest {
+                session_id: ending.into(), reason: "重定位排空验证结束".into(),
+            })).await.unwrap();
+            let _ = std::fs::remove_file(cloud_path);
+        }
     }
 
     #[tokio::test]
@@ -14817,7 +15051,9 @@ mod lifecycle_tests {
                 .published
                 .lock()
                 .expect("checkpoint published frames");
-            assert_eq!(published.len(), 1);
+            let published: Vec<_> = published.iter()
+            .filter(|frame| frame.msg_type.fqn() == "sensor_msgs.PointCloud2").collect();
+        assert_eq!(published.len(), 1);
             let mut encoded = Vec::with_capacity(8 + published[0].payload.len());
             encoded.extend_from_slice(&schema::POINT_CLOUD2_FINGERPRINT);
             encoded.extend_from_slice(&published[0].payload);
@@ -16414,6 +16650,8 @@ mod exploration_contract_tests {
     #[test]
     fn start_request_parses_boundary_and_stop_conditions() {
         let request = ExploreRequest {
+            return_policy: None,
+            resume_progress_json: String::new(),
             strategy: "wavefront".into(),
             arbitration: "prefer_wavefront".into(),
             request_id: "explore-1".into(),
@@ -16508,6 +16746,7 @@ mod exploration_contract_tests {
     fn exploration_state_preserves_child_identity() {
         let proto =
             exploration_state_from_snapshot(crate::explore_runtime::ExploreRuntimeSnapshot {
+                mission_progress_json: String::new(),
                 status: crate::explore_runtime::STATUS_ACTIVE,
                 message: "moving".into(),
                 request_id: "parent".into(),

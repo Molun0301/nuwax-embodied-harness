@@ -8,6 +8,8 @@ authors.workspace = true
 description = "nuwax 序列化编解码(LCM-first;protobuf 仅作 compat 边界)"
 
 [dependencies]
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }
+nuwax-types = { path = "../nuwax-types" }
 # 默认协议层 = LCM（不依赖 nuwax-protocol,以打破 codec ↔ protocol 循环）
 # LCM frame 常量与字节布局在 `lcm` 模块内部直接定义;高层 crate 通过
 # `nuwax-protocol` 暴露的 `LcmFrameHeader` / `RawLcmFrame` 走强类型封装。

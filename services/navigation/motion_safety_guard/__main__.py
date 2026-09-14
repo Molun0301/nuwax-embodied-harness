@@ -46,6 +46,7 @@ def run() -> None:
     }
     lock = SingleInstanceLock(lock_path)
     server: Optional[MotionGuardUnixServer] = None
+    actuator = None
     try:
         lock.acquire()
         epoch_store = EpochStore(
@@ -69,7 +70,14 @@ def run() -> None:
         )
         if not core.startup_configured:
             raise RuntimeError(core.startup_reason)
-        core.initialize_zero_fence()
+        try:
+            core.initialize_zero_fence(cancelled=stop_event.is_set)
+        except ActuatorError as exc:
+            if stop_event.is_set() and exc.code == "LOCOMOTION_MODE_CANCELLED":
+                return
+            raise
+        if stop_event.is_set():
+            return
         socket_gid = os.getegid()
         server = MotionGuardUnixServer(
             socket_path=socket_path,
@@ -80,11 +88,18 @@ def run() -> None:
         while not stop_event.wait(timeout=1.0):
             pass
     finally:
-        if server is not None:
-            server.stop()
-        lock.release()
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        try:
+            if server is not None:
+                server.stop()
+        finally:
+            try:
+                closer = getattr(actuator, "close", None)
+                if callable(closer):
+                    closer()
+            finally:
+                lock.release()
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 def main() -> int:

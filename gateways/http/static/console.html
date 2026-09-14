@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260908-pose-log-stream">
+  <link rel="stylesheet" href="/static/console.css?v=20260914-explore-layout">
 </head>
 <body>
 <div class="app" id="app">
@@ -87,7 +87,7 @@
                     <button id="mapGoalToggle" class="tool" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
                     <button id="mapPublishPointToggle" class="tool" type="button" title="Publish Point：发布 /clicked_point">选点</button>
                   </div>
-                  <label class="map-tool-group glass navigation-height-field" title="目标在地图中的机体高度；留空使用当前定位高度，跨层时填写目标楼层的机体高度。">
+                  <label class="map-tool-group glass navigation-height-field" title="目标在地图中的机体高度；留空使用当前定位高度，三维地形目标按实际机体高度填写。">
                     目标机体高度（米）
                     <input id="mapGoalHeight" type="number" step="any" inputmode="decimal" placeholder="当前高度" aria-label="地图目标机体高度（米）">
                   </label>
@@ -99,7 +99,7 @@
               </div>
               <div id="navigation-container" class="navigation-panel glass" data-role="v2-navigation" hidden>
                 <strong>导航到地图选点</strong>
-                <p class="navigation-hint">在二维地图上单击选点；跨层时填写目标在地图中的机体高度。</p>
+                <p class="navigation-hint">在地图上单击选点；三维地形目标填写实际机体高度。</p>
                 <label class="navigation-height-field">目标机体高度（米）
                   <input data-role="nav-height" type="number" step="any" inputmode="decimal" placeholder="留空使用当前定位高度">
                 </label>
@@ -109,6 +109,50 @@
                 </div>
                 <p data-role="nav-status" aria-live="polite">未选点</p>
                 <pre data-role="nav-detail"></pre>
+                <details class="exploration-mission" data-role="exploration-mission">
+                  <summary>自动探索与恢复</summary>
+                  <p class="navigation-hint">暂停会先停车，再保存地图和探索进度。恢复后会重新定位。</p>
+                  <div class="floor-navigation-fields">
+                    <label>地图名称<input data-role="explore-map" placeholder="留空使用当前地图"></label>
+                    <label>最长运行时间（秒）<input data-role="explore-timeout" type="number" min="1" value="600"></label>
+                    <label>总路程预算（米）<input data-role="explore-distance" type="number" min="0.1" step="0.1" placeholder="不限制"></label>
+                    <label>返航余量（米）<input data-role="explore-reserve" type="number" min="0" step="0.1" value="0"></label>
+                  </div>
+                  <label class="exploration-return"><input data-role="explore-return" type="checkbox"> 探索结束后返回起点</label>
+                  <div class="navigation-actions">
+                    <button data-role="explore-start" type="button">开始探索</button>
+                    <button data-role="explore-pause" type="button" disabled>暂停并保存</button>
+                    <button data-role="explore-stop" type="button" disabled>停止探索</button>
+                  </div>
+                  <label class="navigation-height-field">已保存的探索<select data-role="explore-checkpoint" aria-label="探索检查点"></select></label>
+                  <div class="navigation-actions">
+                    <button data-role="explore-refresh" type="button">刷新检查点</button>
+                    <button data-role="explore-resume" type="button" disabled>继续所选探索</button>
+                  </div>
+                  <p data-role="explore-status" aria-live="polite">等待操作。</p>
+                  <p data-role="explore-progress"></p>
+                </details>
+                <details class="floor-navigation" data-role="floor-navigation" hidden>
+                  <summary>跨楼层导航</summary>
+                  <p class="navigation-hint">通过已登记设施前往目标层，填写目标层地图中的坐标。</p>
+                  <div class="floor-navigation-fields">
+                    <label>建筑<select data-role="floor-building" aria-label="目标建筑"></select></label>
+                    <label>目标楼层<select data-role="floor-target" aria-label="目标楼层"></select></label>
+                    <label>横坐标（米）<input data-role="floor-x" type="number" step="any" required></label>
+                    <label>纵坐标（米）<input data-role="floor-y" type="number" step="any" required></label>
+                    <label>朝向（弧度）<input data-role="floor-yaw" type="number" step="any" value="0"></label>
+                  </div>
+                  <div class="navigation-actions">
+                    <button data-role="floor-submit" type="button">前往目标层</button>
+                    <button data-role="floor-cancel" type="button" disabled>停止任务</button>
+                    <button data-role="floor-resume" type="button" hidden>继续原请求</button>
+                    <button data-role="floor-explore" type="button">逐层探索建筑</button>
+                    <button data-role="floor-resume-explore" type="button" hidden>继续逐层探索</button>
+                    <label class="floor-import">导入楼层配置<input data-role="floor-import" type="file" accept="application/json,.json"></label>
+                  </div>
+                  <p data-role="floor-status" aria-live="polite">正在读取楼层目录。</p>
+                  <pre data-role="floor-detail"></pre>
+                </details>
               </div>
               <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
                 <div class="forbidden-zone-head">
@@ -327,7 +371,9 @@
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
-  <script src="/static/js/navigation.js?v=20260908-nav-height"></script>
+  <script src="/static/js/navigation.js?v=20260914-explore-layout"></script>
+  <script src="/static/js/building-navigation.js?v=20260914-explore-layout"></script>
+  <script src="/static/js/exploration-mission.js?v=20260914-checkpoint-request"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>
   <script>
     // 地图导航工具入口开关：

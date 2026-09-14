@@ -11,9 +11,8 @@
 //!
 //! ## 核心职责
 //!
-//! 1. 读取 `NUWAX_NAV_PROFILE`，默认 `simple-2d`；`replanning-astar` 与
-//!    `mls-3d` 同样使用统一运动守卫。`cmu-native` 和 `exploration-native`
-//!    保留仅检查准入，具体状态由导航配置清单决定。
+//! 1. 捕获两条固定完整链：二维使用`simple-2d`，三维使用`mls-3d`。
+//!    导航配置与建图链冲突时拒绝启动，不回退其它维度。
 //! 2. 用 `nuwax_nav_stack::NavStackBuilder` 构造 `ModuleGraph`,把节点列表
 //!    写入 diagnostics / nav state message 的 `message` 字段(便于 health
 //!    check / 日志 / CI 守门观测)。
@@ -57,8 +56,7 @@ use crate::lcm_runtime::{GeometryRuntimeHandle, NavState, PoseState, SharedState
 use crate::sequence_state::{SequenceStateError, SequenceStateStore};
 use crate::typed_codec;
 
-/// 导航 profile 字符串常量。env `NUWAX_NAV_PROFILE` 直接吃这些字符串,
-/// 解析失败时回退到 `simple-2d`。
+/// 二维完整链的导航配置名。
 pub const PROFILE_SIMPLE_2D: &str = "simple-2d";
 /// `replanning-astar` profile 字符串。
 pub const PROFILE_REPLANNING_ASTAR: &str = "replanning-astar";
@@ -72,14 +70,16 @@ pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
 /// 测试中 `text.contains(p)` 会失败。
 pub const PROFILE_MLS3D: &str = "mls-3d";
 
-/// 默认 profile(env 未设置或非法值时)。
-pub const DEFAULT_PROFILE: &str = PROFILE_SIMPLE_2D;
+/// 未选择执行链时使用三维完整链；非法显式配置不会回退。
+pub const DEFAULT_PROFILE: &str = PROFILE_MLS3D;
 
 static NEXT_NAV_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// 目标准入只需持有地图生命周期 fence、唯一已提交地图权威与只读地图名称投影。
 #[derive(Clone)]
 pub(crate) struct NavAdmissionContext {
+    mapping_adapter: Option<Arc<parking_lot::Mutex<crate::mapping_adapter::MappingAdapter>>>,
+    allow_previous_map_revisions: bool,
     pub(crate) mapping_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) committed_map_authority: Arc<StdMutex<Option<schema::CommittedMapIdentity>>>,
     map_revision_latest_rx:
@@ -120,7 +120,21 @@ impl NavAdmissionContext {
             committed_map_authority,
             map_revision_latest_rx,
             expected_map_name,
+            mapping_adapter: None,
+            allow_previous_map_revisions: false,
         }
+    }
+
+    pub(crate) fn with_mapping_adapter(mut self, adapter: Option<Arc<parking_lot::Mutex<crate::mapping_adapter::MappingAdapter>>>) -> Self {
+        self.mapping_adapter = adapter;
+        self
+    }
+    pub(crate) fn with_previous_map_revisions(mut self, allowed: bool) -> Self {
+        self.allow_previous_map_revisions = allowed;
+        self
+    }
+    pub(crate) fn map_frame_generation(&self) -> i64 {
+        self.mapping_adapter.as_ref().map_or(0, |a| i64::try_from(a.lock().global_frame_generation()).unwrap_or(-1))
     }
 
     fn map_name_unchanged(&self) -> bool {
@@ -600,6 +614,7 @@ impl NavRuntimeState {
     /// 新建 nav runtime:读 env profile、build module graph、把节点 ID
     /// 写入 slot。
     pub fn from_env() -> Self {
+        let profile = resolve_profile_from_env().expect("有效的建图探索导航执行链");
         let producer_runtime_generation = NEXT_NAV_RUNTIME_GENERATION
             .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
                 current
@@ -608,22 +623,36 @@ impl NavRuntimeState {
             })
             .map(|previous| previous + 1)
             .expect("process-local test producer generation exhausted");
-        Self::from_env_with_producer_runtime_generation(producer_runtime_generation)
+        Self::with_profile_and_producer_runtime_generation(profile, producer_runtime_generation)
     }
 
     /// Construct the production runtime only after durably reserving a producer
     /// epoch that remains newer after a geometry process restart.
     pub(crate) fn try_from_sequence_store(
         sequence_store: &SequenceStateStore,
+    ) -> Result<Self, String> {
+        let pipeline = nuwax_nav_stack::ProductionPipeline::from_env()
+            .map_err(|error| error.to_string())?;
+        Self::try_from_sequence_store_for_pipeline(sequence_store, pipeline)
+            .map_err(|error| error.to_string())
+    }
+
+    /// 使用启动时已捕获的固定配对，分配代次后不重读环境。
+    pub(crate) fn try_from_sequence_store_for_pipeline(
+        sequence_store: &SequenceStateStore,
+        pipeline: nuwax_nav_stack::ProductionPipeline,
     ) -> Result<Self, SequenceStateError> {
         let producer_runtime_generation = sequence_store.reserve_producer_runtime_generation()?;
-        Ok(Self::from_env_with_producer_runtime_generation(
+        Ok(Self::with_profile_and_producer_runtime_generation(
+            pipeline.navigation_profile().as_str(),
             producer_runtime_generation,
         ))
     }
 
-    fn from_env_with_producer_runtime_generation(producer_runtime_generation: u64) -> Self {
-        let profile = resolve_profile_from_env();
+    fn with_profile_and_producer_runtime_generation(
+        profile: &'static str,
+        producer_runtime_generation: u64,
+    ) -> Self {
         let module_nodes = match NavStackBuilder::new(profile_enum(profile)).build() {
             Ok(graph) => graph
                 .nodes()
@@ -1738,25 +1767,10 @@ fn reject_stale_generation(current: Option<u64>, received: u64) -> Result<(), Ob
     }
 }
 
-/// 解析 `NUWAX_NAV_PROFILE` env 值,失败时回退到 default。
-pub fn resolve_profile_from_env() -> &'static str {
-    match std::env::var("NUWAX_NAV_PROFILE") {
-        Ok(v) => match v.trim() {
-            PROFILE_SIMPLE_2D => PROFILE_SIMPLE_2D,
-            PROFILE_REPLANNING_ASTAR => PROFILE_REPLANNING_ASTAR,
-            PROFILE_CMU_NATIVE => PROFILE_CMU_NATIVE,
-            PROFILE_EXPLORATION_NATIVE => PROFILE_EXPLORATION_NATIVE,
-            PROFILE_MLS3D => PROFILE_MLS3D,
-            other => {
-                warn!(
-                    "NUWAX_NAV_PROFILE={:?} 不识别,回退 default={}",
-                    other, DEFAULT_PROFILE
-                );
-                DEFAULT_PROFILE
-            }
-        },
-        Err(_) => DEFAULT_PROFILE,
-    }
+/// 解析固定执行链；显式错配或非法值保留错误。
+pub fn resolve_profile_from_env() -> Result<&'static str, nuwax_nav_stack::NavStackError> {
+    nuwax_nav_stack::ProductionPipeline::from_env()
+        .map(|pipeline| pipeline.navigation_profile().as_str())
 }
 
 /// 把 profile 字符串映射到 `NavStackProfile` enum(用于 `NavStackBuilder::new`)。
@@ -1977,7 +1991,7 @@ pub async fn compute_readiness(
     let cmd_vel_sink_ready = observations.motion_sink_fresh && observations.motion_sink_ready;
     let planar_admitted=handle.mapping_adapter.as_ref().is_none_or(|adapter|{
         let a=adapter.lock();
-        a.planar.as_ref().is_none_or(|binding|a.is_active() && a.planar_ready
+        !a.checkpoint_localization_required && a.planar.as_ref().is_none_or(|binding|a.is_active() && a.planar_ready
             && a.planar_error.is_none() && binding.navigation.fresh())
     });
     let planner = profile_supported
@@ -2294,6 +2308,8 @@ pub(crate) const fn test_motion_admission() -> MotionAdmissionProof {
 /// `set_goal` 的输入(已从 gRPC `NavigationGoal` 提取并归一化)。
 #[derive(Clone)]
 pub struct SetGoalInput {
+    /// 已归一化并随目标摘要封存的执行约束。
+    pub options: nuwax_nav_types_messages::GoalOptions,
     /// 目标点 ID(用户传或自动生成)。
     pub goal_id: String,
     /// Lease owner kind; public RPC and exploration bridge use distinct values.
@@ -2311,6 +2327,7 @@ pub struct SetGoalInput {
 }
 
 struct AdmittedGoalInput {
+    map_frame_generation: i64,
     input: SetGoalInput,
     producer: String,
     producer_epoch: i64,
@@ -2322,6 +2339,8 @@ struct AdmittedGoalInput {
 /// Machine-readable reason that allows a navigation admission to be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetGoalRetryReason {
+    /// 普通提交先于候选计算前进，需要重新读取输入，不是目标不可达。
+    MapRevisionAdvanced,
     /// A typed navigation readiness blocker rejected admission.
     NavigationNotReady(NavigationReadinessCode),
 }
@@ -2329,6 +2348,8 @@ pub enum SetGoalRetryReason {
 /// Machine-readable reason for a permanent navigation admission rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetGoalRejectReason {
+    /// 原目标所属的地图域或坐标代际已经撤销。
+    MapFrameChanged,
     /// The active map name no longer matches the name frozen by the caller.
     ActiveMapNameChanged,
 }
@@ -2408,6 +2429,33 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
     }
 }
 
+fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::CommittedMapIdentity,
+    frame_generation: i64, goal_id: &str, source_prevalidated: bool) -> Option<SetGoalOutcome> {
+    if admission.mapping_adapter.as_ref().is_some_and(|a| a.lock().checkpoint_localization_required) {
+        let mut outcome = rejected_goal_intent(goal_id.into(), "已激活地图正在等待真实定位提交");
+        outcome.retry_reason = Some(SetGoalRetryReason::NavigationNotReady(NavigationReadinessCode::PlannerNotReady));
+        return Some(outcome);
+    }
+    let current = admission.committed_map_authority.lock().ok().and_then(|m| m.clone());
+    let Some(current) = current else {
+        let mut outcome = rejected_goal_intent(goal_id.into(), "authoritative committed map is unavailable");
+        outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
+        return Some(outcome);
+    };
+    let same_domain = source.session_id == current.session_id && source.session_generation == current.session_generation && source.frame_id == current.frame_id;
+    if frame_generation < 0 || !same_domain || frame_generation != admission.map_frame_generation() {
+        return Some(rejected_goal_intent_with_reason(goal_id.into(), "map session or coordinate generation changed before admission", SetGoalRejectReason::MapFrameChanged));
+    }
+    if source == &current { return None; }
+    if source.revision < current.revision {
+        if source_prevalidated || (admission.allow_previous_map_revisions && admission.mapping_adapter.is_some()) { return None; }
+        let mut outcome = rejected_goal_intent(goal_id.into(), "committed map revision advanced before admission");
+        outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
+        return Some(outcome);
+    }
+    Some(rejected_goal_intent(goal_id.into(), "committed map revision or hash conflicts with authority"))
+}
+
 fn rejected_goal_intent_with_reason(
     goal_id: String,
     reason: impl Into<String>,
@@ -2424,6 +2472,7 @@ async fn goal_intent_from_set_goal(
     mut input: SetGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
 ) -> Result<schema::GoalIntent, String> {
+    let _map_guard = admission.mapping_lifecycle_lock.lock().await;
     input.goal_id = input.goal_id.trim().to_string();
     input.parent_request_id = input.parent_request_id.trim().to_string();
     input.target.frame_id = input.frame_id.clone();
@@ -2468,7 +2517,7 @@ async fn goal_intent_from_set_goal(
             ],
         },
     };
-    let goal_sha256 = schema::goal_intent_goal_sha256(&goal).map_err(|error| error.to_string())?;
+    let goal_sha256 = schema::goal_intent_action_sha256(&goal, &input.options).map_err(|error| error.to_string())?;
     let (boundary_id, boundary_points, boundary_sha256) = match boundary {
         Some(boundary) => {
             if boundary.frame_id.trim() != committed_map.frame_id.trim() {
@@ -2488,6 +2537,8 @@ async fn goal_intent_from_set_goal(
         None => (String::new(), Vec::new(), [0; 32]),
     };
     Ok(schema::GoalIntent {
+        map_frame_generation: admission.map_frame_generation(),
+        options: input.options,
         producer: producer.to_string(),
         producer_epoch,
         priority,
@@ -2559,7 +2610,7 @@ pub async fn set_goal_with_boundary(
         handle.mapping_lifecycle_lock.clone(),
         handle.committed_map_authority.clone(),
         handle.map_revision_latest_tx.subscribe(),
-    );
+    ).with_mapping_adapter(handle.mapping_adapter.clone());
     let io = NavAdmissionIo::new(
         handle.state.clone(),
         handle.transport.clone(),
@@ -2588,6 +2639,11 @@ pub(crate) async fn admit_goal_intent(
     intent: schema::GoalIntent,
     producer_authority: GoalProducerEpochAuthority,
 ) -> SetGoalOutcome {
+    if intent.options.allow_reverse {
+        let allowed = nuwax_nav_types_messages::NavigationCapabilities::from_env()
+            .ok().flatten().is_some_and(|profile| profile.motion.max_reverse_mps > 0.0);
+        if !allowed { return rejected_goal_intent(intent.session_id.clone(), "reverse motion requires explicit calibrated capability"); }
+    }
     let goal_id = intent.session_id.clone();
     let producer_contract_valid = matches!(
         (intent.producer.as_str(), intent.owner_kind, intent.priority,),
@@ -2634,24 +2690,7 @@ pub(crate) async fn admit_goal_intent(
     if let Err(reason) = validate_committed_map_identity(&intent.committed_map) {
         return rejected_goal_intent(goal_id, reason);
     }
-    let current_map = match admission.committed_map_authority.lock() {
-        Ok(authority) => authority.clone(),
-        Err(_) => {
-            return rejected_goal_intent(
-                goal_id,
-                "authoritative committed map state is unavailable",
-            )
-        }
-    };
-    let Some(current_map) = current_map else {
-        return rejected_goal_intent(goal_id, "authoritative committed map is unavailable");
-    };
-    if intent.committed_map != current_map {
-        return rejected_goal_intent(
-            goal_id,
-            "committed map session, generation, revision, frame, or hash changed before admission",
-        );
-    }
+    if let Some(rejection) = goal_map_rejection(admission, &intent.committed_map, intent.map_frame_generation, &goal_id, false) { return rejection; }
     if intent.goal.header.seq != 0
         || intent.goal.header.frame_id != intent.committed_map.frame_id
         || intent.goal.header.stamp_sec < 0
@@ -2681,7 +2720,7 @@ pub(crate) async fn admit_goal_intent(
     if let Err(reason) = motion_admission.validate() {
         return rejected_goal_intent(goal_id, reason);
     }
-    let expected_goal_sha256 = match schema::goal_intent_goal_sha256(&intent.goal) {
+    let expected_goal_sha256 = match schema::goal_intent_action_sha256(&intent.goal, &intent.options) {
         Ok(hash) => hash,
         Err(error) => return rejected_goal_intent(goal_id, error.to_string()),
     };
@@ -2764,7 +2803,9 @@ pub(crate) async fn admit_goal_intent(
             .saturating_add(intent.goal.header.stamp_nsec as u64)
     };
     let admitted = AdmittedGoalInput {
+        map_frame_generation: intent.map_frame_generation,
         input: SetGoalInput {
+            options: intent.options,
             goal_id: intent.session_id,
             owner_kind: intent.owner_kind,
             parent_request_id: intent.parent_request_id,
@@ -2801,6 +2842,7 @@ async fn admit_goal_input(
     admission: &NavAdmissionContext,
 ) -> SetGoalOutcome {
     let AdmittedGoalInput {
+        map_frame_generation,
         mut input,
         producer,
         producer_epoch,
@@ -2928,8 +2970,14 @@ async fn admit_goal_input(
         state.configured_profile() == PROFILE_MLS3D,
     )
     .await;
+    let configuration_sha256=match nuwax_nav_types_messages::navigation_capabilities::configuration_digest_from_env() {
+        Ok(value)=>value,
+        Err(error)=>return rejected_goal_intent(input.goal_id.clone(),error),
+    };
     let transaction_guard = state.transaction_gate.lock().await;
     let map_goal_guard = admission.mapping_lifecycle_lock.lock().await;
+    // 入口已核验源提交；等就绪期间的普通修订前进不撤销目标，坐标代际仍必须一致。
+    if let Some(rejection) = goal_map_rejection(admission, &committed_map, map_frame_generation, &input.goal_id, true) { return rejection; }
     if !admission.map_name_unchanged() {
         return rejected_goal_intent_with_reason(
             input.goal_id,
@@ -2993,6 +3041,9 @@ async fn admit_goal_input(
         .map(|boundary| (boundary.frame_id.trim().to_string(), boundary.points))
         .unwrap_or_default();
     let mut envelope = schema::GoalEnvelope {
+        map_frame_generation,
+        navigation_configuration_sha256: configuration_sha256,
+        options: input.options,
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: input.goal_id.clone(),
         owner_kind: input.owner_kind,
@@ -3807,13 +3858,17 @@ mod tests {
     static NEXT_SEQUENCE_TEST_PATH: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
-    struct NavProfileEnvRestore(Option<OsString>);
+    struct NavProfileEnvRestore(Option<OsString>, Option<OsString>);
 
     impl Drop for NavProfileEnvRestore {
         fn drop(&mut self) {
             match self.0.take() {
                 Some(value) => std::env::set_var("NUWAX_NAV_PROFILE", value),
                 None => std::env::remove_var("NUWAX_NAV_PROFILE"),
+            }
+            match self.1.take() {
+                Some(value) => std::env::set_var("NUWAX_GEOMETRY_PIPELINE", value),
+                None => std::env::remove_var("NUWAX_GEOMETRY_PIPELINE"),
             }
         }
     }
@@ -3824,7 +3879,9 @@ mod tests {
             Some(value) => std::env::set_var("NUWAX_NAV_PROFILE", value),
             None => std::env::remove_var("NUWAX_NAV_PROFILE"),
         }
-        NavProfileEnvRestore(previous)
+        let previous_pipeline = std::env::var_os("NUWAX_GEOMETRY_PIPELINE");
+        std::env::set_var("NUWAX_GEOMETRY_PIPELINE", if value == Some("simple-2d") { "slam_2d" } else { "lio_3d" });
+        NavProfileEnvRestore(previous, previous_pipeline)
     }
 
     fn sequence_test_path(label: &str) -> std::path::PathBuf {
@@ -3835,6 +3892,25 @@ mod tests {
                 NEXT_SEQUENCE_TEST_PATH.fetch_add(1, AtomicOrdering::Relaxed),
             ))
             .join("sequence_state.json")
+    }
+
+    #[test]
+    fn captured_pipeline_binds_navigation_before_epoch_allocation() {
+        let path = sequence_test_path("captured-pipeline");
+        let store = SequenceStateStore::open(&path).expect("独立序号存储");
+        let mut previous_generation = 0;
+        for pipeline in [
+            nuwax_nav_stack::ProductionPipeline::Slam2D,
+            nuwax_nav_stack::ProductionPipeline::Lio3D,
+        ] {
+            let state = NavRuntimeState::try_from_sequence_store_for_pipeline(&store, pipeline)
+                .expect("使用捕获的完整链");
+            assert_eq!(state.configured_profile(), pipeline.navigation_profile().as_str());
+            assert!(state.producer_runtime_generation() > previous_generation);
+            previous_generation = state.producer_runtime_generation();
+        }
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap()).expect("清理测试序号存储");
     }
 
     #[test]
@@ -3963,6 +4039,43 @@ mod tests {
             .expect("build test handle");
         install_committed_map_fixture(&handle, "map", true).await;
         handle
+    }
+
+    #[tokio::test]
+    async fn unlocalized_asset_blocks_even_prevalidated_goal_and_ready_observations() {
+        let handle = make_handle().await;
+        observe_ready_execution_chain(&handle.nav).await;
+        let context = NavAdmissionContext::new(handle.mapping_lifecycle_lock.clone(),
+            handle.committed_map_authority.clone(),handle.map_revision_latest_tx.subscribe())
+            .with_mapping_adapter(handle.mapping_adapter.clone());
+        let source = handle.committed_map_authority.lock().unwrap().clone().unwrap();
+        let frame = context.map_frame_generation();
+        assert!(compute_readiness(&handle,&handle.nav).await.ready);
+        handle.mapping_adapter.as_ref().unwrap().lock().checkpoint_localization_required = true;
+        assert!(!compute_readiness(&handle,&handle.nav).await.ready);
+        for verified in [false,true] {
+            assert_eq!(goal_map_rejection(&context,&source,frame,"before-localized",verified).unwrap().retry_reason,
+                Some(SetGoalRetryReason::NavigationNotReady(NavigationReadinessCode::PlannerNotReady)));
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_source_revision_can_advance_without_losing_coordinate_fence() {
+        let handle = make_handle().await;
+        let mut current = handle.committed_map_authority.lock().unwrap().clone().unwrap();
+        current.revision = 3;
+        *handle.committed_map_authority.lock().unwrap() = Some(current.clone());
+        let mut source = current.clone(); source.revision = 2; source.payload_sha256 = [7; 32];
+        let context = NavAdmissionContext::new(handle.mapping_lifecycle_lock.clone(), handle.committed_map_authority.clone(), handle.map_revision_latest_tx.subscribe())
+            .with_mapping_adapter(handle.mapping_adapter.clone()).with_previous_map_revisions(true);
+        let frame = context.map_frame_generation();
+        assert!(goal_map_rejection(&context, &source, frame, "old-source", false).is_none());
+        assert_eq!(goal_map_rejection(&context, &source, frame + 1, "wrong-frame", false).unwrap().reject_reason, Some(SetGoalRejectReason::MapFrameChanged));
+        source.revision = current.revision;
+        assert!(goal_map_rejection(&context, &source, frame, "mutated-revision", false).unwrap().retry_reason.is_none());
+        source.revision = 2;
+        let strict = context.with_previous_map_revisions(false);
+        assert_eq!(goal_map_rejection(&strict, &source, frame, "refresh-source", false).unwrap().retry_reason, Some(SetGoalRetryReason::MapRevisionAdvanced));
     }
 
     async fn set_exploration_goal_for_test(
@@ -4116,6 +4229,7 @@ mod tests {
 
     fn test_goal_input(goal_id: &str) -> SetGoalInput {
         SetGoalInput {
+            options: Default::default(),
             goal_id: goal_id.to_string(),
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             parent_request_id: format!("request-{goal_id}"),
@@ -4239,7 +4353,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = set_nav_profile_for_test(None);
-        assert_eq!(resolve_profile_from_env(), PROFILE_SIMPLE_2D);
+        assert_eq!(resolve_profile_from_env().unwrap(), PROFILE_MLS3D);
     }
 
     #[test]
@@ -4247,17 +4361,17 @@ mod tests {
         let _lock = NAV_PROFILE_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = set_nav_profile_for_test(Some("replanning-astar"));
-        assert_eq!(resolve_profile_from_env(), PROFILE_REPLANNING_ASTAR);
+        let _restore = set_nav_profile_for_test(Some("simple-2d"));
+        assert_eq!(resolve_profile_from_env().unwrap(), PROFILE_SIMPLE_2D);
     }
 
     #[test]
-    fn resolve_profile_falls_back_on_unknown() {
+    fn resolve_profile_rejects_unknown() {
         let _lock = NAV_PROFILE_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = set_nav_profile_for_test(Some("hologram"));
-        assert_eq!(resolve_profile_from_env(), DEFAULT_PROFILE);
+        assert!(resolve_profile_from_env().is_err());
     }
 
     #[test]
@@ -4811,6 +4925,7 @@ mod tests {
             &handle,
             &state,
             SetGoalInput {
+            options: Default::default(),
                 target: PoseState {
                     x: 1.0,
                     qw: 1.0,
@@ -6912,6 +7027,7 @@ mod tests {
             &handle,
             &state,
             SetGoalInput {
+            options: Default::default(),
                 frame_id: "odom".into(),
                 target: PoseState {
                     frame_id: "odom".into(),

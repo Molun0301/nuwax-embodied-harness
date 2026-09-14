@@ -32,6 +32,7 @@ enum GeometryRpcMethod {
     StartMapping,
     StopMapping,
     GetMappingState,
+    GetNavigationMapBlock,
     ActivateMap,
     SetNavigationGoal,
     CancelNavigation,
@@ -62,6 +63,7 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::StartMapping,
     GeometryRpcMethod::StopMapping,
     GeometryRpcMethod::GetMappingState,
+    GeometryRpcMethod::GetNavigationMapBlock,
     GeometryRpcMethod::ActivateMap,
     GeometryRpcMethod::SetNavigationGoal,
     GeometryRpcMethod::CancelNavigation,
@@ -94,6 +96,7 @@ impl GeometryRpcMethod {
             Self::StartMapping => "start_mapping",
             Self::StopMapping => "stop_mapping",
             Self::GetMappingState => "get_mapping_state",
+            Self::GetNavigationMapBlock => "get_navigation_map_block",
             Self::ActivateMap => "activate_map",
             Self::SetNavigationGoal => "set_navigation_goal",
             Self::CancelNavigation => "cancel_navigation",
@@ -220,6 +223,9 @@ impl GeometryRpcHandler {
             GeometryRpcMethod::GetMappingState => {
                 call_unary!(Empty, get_mapping_state)
             }
+            GeometryRpcMethod::GetNavigationMapBlock => {
+                call_unary!(NavigationMapBlockRequest, get_navigation_map_block)
+            }
             GeometryRpcMethod::ActivateMap => {
                 call_unary!(ActivateMapRequest, activate_map)
             }
@@ -310,7 +316,7 @@ mod tests {
             .copied()
             .map(GeometryRpcMethod::rpc_name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 26);
+        assert_eq!(names.len(), 27);
         assert!(names.contains(&"GeometryRuntimeService/health_check".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/stop".to_string()));
         assert!(names

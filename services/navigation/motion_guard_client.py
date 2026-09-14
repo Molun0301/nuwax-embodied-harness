@@ -29,6 +29,7 @@ from services.navigation.motion_safety_guard.framing import (
 )
 from services.navigation.motion_safety_guard.wire import seal_request
 from services.navigation.proto_gen import motion_guard_pb2 as pb
+from core.config_values import runtime_value
 
 
 DEFAULT_TIMEOUT_SECONDS = 1.0
@@ -223,12 +224,17 @@ class GuardState:
     recovery_fence_held: bool = False
     recovery_fence_token_sha256: bytes = b""
     recovery_fence_correlation_sha256: bytes = b""
+    last_zero_confirmation: Optional["ZeroConfirmation"] = None
 
 
 @dataclass(frozen=True)
 class ZeroConfirmation:
     zero_ack_id: str
     applied_monotonic_ns: int
+    stationary_confirmed: bool = False
+    confirmation_kind: str = ""
+    feedback_source_timestamp_ns: int = 0
+    stationary_deadline_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -339,6 +345,7 @@ class MotionGuardClient:
             raise MotionGuardUsageError("max_frame_bytes must be positive")
         self.socket_path = os.fspath(socket_path)
         self.timeout_seconds = float(timeout_seconds)
+        self._require_stationary = bool(runtime_value("NUWAX_NAV_CAPABILITIES_JSON", "").strip())
         self.max_frame_bytes = int(max_frame_bytes)
         self._monotonic_ns = monotonic_ns
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
@@ -652,6 +659,7 @@ class MotionGuardClient:
         self._validate_epoch(outcome.generation, boot_nonce)
         return GuardState(
             result=result,
+            last_zero_confirmation=(self._parse_zero_confirmation(outcome.last_zero_confirmation) if outcome.HasField("last_zero_confirmation") else None),
             generation=outcome.generation,
             boot_nonce=boot_nonce,
             last_zero_ack_id=outcome.last_zero_ack_id,
@@ -727,7 +735,7 @@ class MotionGuardClient:
             self._raise_protocol("unresolved operation result is not OUTCOME_UNKNOWN")
         zero = None
         if outcome.HasField("zero_ack"):
-            zero = self._zero_confirmation(outcome.zero_ack)
+            zero = self._parse_zero_confirmation(outcome.zero_ack)
         return OperationStatus(
             result=result,
             operation_id=target,
@@ -938,7 +946,7 @@ class MotionGuardClient:
         return StopAllMotionConfirmation(
             operation_id=operation,
             result=result,
-            zero=self._zero_confirmation(outcome.zero_ack),
+            zero=self._zero_confirmation(outcome.zero_ack, operation_id=operation, source=pb.GUARD_SOURCE_GATEWAY_MANUAL, namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP),
             lease_revoked=lease_revoked,
             motion_stop_generation=outcome.motion_stop_generation,
             recovery_fence_token=token,
@@ -989,13 +997,44 @@ class MotionGuardClient:
             )
         return proof.generation, boot_nonce, stop_generation
 
-    def _zero_confirmation(self, zero_ack: pb.ZeroAck) -> ZeroConfirmation:
+    def _parse_zero_confirmation(self, zero_ack: pb.ZeroAck) -> ZeroConfirmation:
         if not zero_ack.zero_ack_id or zero_ack.applied_monotonic_ns <= 0:
             self._raise_protocol("terminal zero acknowledgement is incomplete")
         return ZeroConfirmation(
             zero_ack_id=zero_ack.zero_ack_id,
             applied_monotonic_ns=zero_ack.applied_monotonic_ns,
+            stationary_confirmed=zero_ack.stationary_confirmed,
+            confirmation_kind=zero_ack.confirmation_kind,
+            feedback_source_timestamp_ns=zero_ack.feedback_source_timestamp_ns,
+            stationary_deadline_monotonic_ns=zero_ack.stationary_deadline_monotonic_ns,
         )
+
+    def _zero_confirmation(self, zero_ack: pb.ZeroAck, *, operation_id: str,
+                           source: int, namespace: int = pb.OPERATION_NAMESPACE_LEASE) -> ZeroConfirmation:
+        return self.wait_for_stationary(source, operation_id, self._parse_zero_confirmation(zero_ack), operation_namespace=namespace)
+
+    def wait_for_stationary(self, source: int, operation_id: str, zero: ZeroConfirmation,
+                            *, operation_namespace: int = pb.OPERATION_NAMESPACE_LEASE) -> ZeroConfirmation:
+        """等待原停止操作的物理终态；恢复丢失回执时也复用原账本。"""
+        namespace = operation_namespace
+        if zero.stationary_deadline_monotonic_ns:
+            deadline = zero.stationary_deadline_monotonic_ns
+            if deadline > self._now() + 32_000_000_000:
+                self._raise_protocol("守卫停稳确认截止超过有界预算")
+            while self._now() <= deadline:
+                status = self.get_operation_result(source, operation_id, operation_namespace=namespace)
+                observed = status.zero
+                if not status.resolved or observed is None or observed.zero_ack_id != zero.zero_ack_id:
+                    raise MotionGuardError("原停止操作的停稳证明已不可用")
+                if observed.stationary_confirmed:
+                    return observed
+                if observed.confirmation_kind == "unconfirmed":
+                    raise MotionGuardError("执行器在保证制动期限内未确认停稳")
+                time.sleep(0.01)
+            raise MotionGuardError("等待执行器实际停稳超时，运动资源继续由守卫隔离")
+        if self._require_stationary and not zero.stationary_confirmed:
+            self._raise_protocol("已标定运动链缺少实际停稳或保证制动证明")
+        return zero
 
 
 class MotionGuardSession:
@@ -1178,7 +1217,7 @@ class MotionGuardSession:
                 raise
             zero = None
             if pb.ACK_CODE_ZEROED in expected_acks:
-                zero = self._client._zero_confirmation(outcome.zero_ack)
+                zero = self._client._zero_confirmation(outcome.zero_ack, operation_id=envelope.operation_id, source=self.source)
             return CommandConfirmation(
                 operation_id=operation,
                 result=result,
@@ -1323,7 +1362,7 @@ class MotionGuardSession:
                 self._failure = exc
                 raise
             zero = (
-                self._client._zero_confirmation(outcome.zero_ack)
+                self._client._zero_confirmation(outcome.zero_ack, operation_id=envelope.operation_id, source=self.source)
                 if action == pb.SPORT_ACTION_STOP_MOVE
                 else None
             )
@@ -1373,7 +1412,7 @@ class MotionGuardSession:
                     expected_outcome="revoke_zero_and_switch_mode",
                     expected_acks={pb.ACK_CODE_RESOURCE_FENCED},
                 )
-                zero = self._client._zero_confirmation(outcome.zero_ack)
+                zero = self._client._zero_confirmation(outcome.zero_ack, operation_id=envelope.operation_id, source=self.source)
             except MotionGuardError as exc:
                 self._failure = exc
                 raise MotionGuardFenceError(
@@ -1431,7 +1470,7 @@ class MotionGuardSession:
                     expected_outcome="revoke_and_zero",
                     expected_acks={pb.ACK_CODE_RESOURCE_FENCED},
                 )
-                zero = self._client._zero_confirmation(outcome.zero_ack)
+                zero = self._client._zero_confirmation(outcome.zero_ack, operation_id=envelope.operation_id, source=self.source)
             except MotionGuardError as exc:
                 self._active = False
                 fence_error = MotionGuardFenceError(

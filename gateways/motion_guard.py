@@ -373,6 +373,10 @@ class GatewayMotionGuard:
                     raise MotionGuardError(
                         "resolved global stop has no valid terminal zero result"
                     )
+                zero = recovery_client.wait_for_stationary(
+                    pb.GUARD_SOURCE_GATEWAY_MANUAL, operation, status.zero,
+                    operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
+                )
                 state = recovery_client.get_guard_state(
                     pb.GUARD_SOURCE_GATEWAY_MANUAL
                 )
@@ -414,7 +418,7 @@ class GatewayMotionGuard:
                 return StopAllMotionConfirmation(
                     operation_id=operation,
                     result=status.result,
-                    zero=status.zero,
+                    zero=zero,
                     lease_revoked=status.target_ack
                     == pb.ACK_CODE_RESOURCE_FENCED,
                     motion_stop_generation=status.motion_stop_generation,

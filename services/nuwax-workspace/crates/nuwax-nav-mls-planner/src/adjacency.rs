@@ -5,13 +5,13 @@
 //!
 //! A slot map: inserts reuse freed slots marked with a tombstone, or grow.
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use rayon::prelude::*;
 
 use crate::voxel::VoxelKey;
 
 /// 以 `(ix, iy)` 为键、以 z 索引列表为值的可通行表面查找表。
-pub type SurfaceLookup = AHashMap<(i32, i32), Vec<i32>>;
+pub type SurfaceLookup = im::HashMap<(i32, i32), Vec<i32>, ahash::RandomState>;
 
 /// 可通行表面体素的唯一 ID(从 0 开始,可达 `u32::MAX`)。
 pub type CellId = u32;
@@ -44,9 +44,9 @@ pub struct Edge {
 /// 可通行表面的 slot map:支持插入/复用 tombstone 槽位/生长。
 #[derive(Clone, Default)]
 pub struct SurfaceCells {
-    coord: Vec<VoxelKey>,
-    edges: Vec<Vec<Edge>>,
-    by_coord: AHashMap<VoxelKey, CellId>,
+    coord: im::Vector<VoxelKey>,
+    edges: im::Vector<Vec<Edge>>,
+    by_coord: im::HashMap<VoxelKey, CellId, ahash::RandomState>,
     free: Vec<CellId>,
 }
 
@@ -88,8 +88,8 @@ impl SurfaceCells {
             free_id
         } else {
             let id = self.coord.len() as CellId;
-            self.coord.push(k);
-            self.edges.push(Vec::new());
+            self.coord.push_back(k);
+            if self.edges.len()<=id as usize {self.edges.push_back(Vec::new());}
             id
         };
         self.by_coord.insert(k, id);
@@ -132,6 +132,11 @@ impl SurfaceCells {
     /// 获取 cell 的邻接边可变切片。
     pub fn edges_mut(&mut self, id: CellId) -> &mut [Edge] {
         &mut self.edges[id as usize]
+    }
+
+    /// 用已重新校验的局部邻接替换一个活单元，供共享表面增量构建使用。
+    pub(crate) fn replace_edges(&mut self, id: CellId, edges: Vec<Edge>) {
+        self.edges[id as usize] = edges;
     }
 
     #[cfg(test)]
@@ -189,7 +194,7 @@ pub fn build_surface_lookup(cells: &[VoxelKey], out: &mut SurfaceLookup) {
     for &(ix, iy, iz) in cells {
         out.entry((ix, iy)).or_default().push(iz);
     }
-    for zs in out.values_mut() {
+    for (_, zs) in out.iter_mut() {
         zs.sort_unstable();
         zs.dedup();
     }
@@ -213,14 +218,12 @@ pub fn build_surface_cells(
     }
 
     let n = cells.coord.len();
-    cells.edges.resize_with(n, Vec::new);
-    let coord: &[VoxelKey] = &cells.coord;
-    let by_coord: &AHashMap<VoxelKey, CellId> = &cells.by_coord;
-    cells
-        .edges
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(src_id, local)| {
+    cells.edges.truncate(n);
+    while cells.edges.len()<n {cells.edges.push_back(Vec::new());}
+    let coord = &cells.coord;
+    let by_coord = &cells.by_coord;
+    let edges: Vec<Vec<Edge>>=(0..n).into_par_iter().map(|src_id| {
+            let mut local=Vec::new();
             let (ix, iy, iz) = coord[src_id];
             for (dx, dy) in NEIGHBORS_4 {
                 let Some(nzs) = surface_lookup.get(&(ix + dx, iy + dy)) else {
@@ -243,7 +246,9 @@ pub fn build_surface_cells(
                     });
                 }
             }
-        });
+            local
+        }).collect();
+    cells.edges=edges.into();
 }
 
 /// Recompute outgoing edges for the seed cells and their surface neighbors.
@@ -256,7 +261,7 @@ pub fn rebuild_edges_around(
     seeds: &[VoxelKey],
     voxel_size: f32,
     step_threshold_cells: i32,
-) {
+) -> AHashSet<CellId> {
     let mut affected: AHashSet<CellId> = AHashSet::new();
     for &(ix, iy, iz) in seeds {
         if let Some(id) = cells.id((ix, iy, iz)) {
@@ -277,7 +282,7 @@ pub fn rebuild_edges_around(
         }
     }
 
-    for id in affected {
+    for &id in &affected {
         let (ix, iy, iz) = cells.coord(id);
         let mut edges: Vec<Edge> = Vec::new();
         for (dx, dy) in NEIGHBORS_4 {
@@ -303,6 +308,7 @@ pub fn rebuild_edges_around(
         }
         cells.edges[id as usize] = edges;
     }
+    affected
 }
 
 #[cfg(test)]
@@ -317,7 +323,7 @@ mod tests {
     }
 
     fn build(cells: &[VoxelKey]) -> (SurfaceLookup, SurfaceCells) {
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(cells, &mut lookup);
         let mut sc = SurfaceCells::default();
         build_surface_cells(&mut sc, &lookup, VOXEL, 2);

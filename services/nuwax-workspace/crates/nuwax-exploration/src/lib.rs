@@ -31,6 +31,9 @@ use thiserror::Error;
 
 pub mod conversions;
 
+/// 单层探索的返航预算与实际行程。
+pub mod mission;
+
 #[cfg(feature = "surface")]
 pub mod surface_adapter;
 
@@ -90,7 +93,7 @@ impl From<ExploreError> for NavResult<()> {
 ///
 /// 方案 §8.2 列出四种。`UserCancelled` 只由 controller / 上层 stop 命令产生,
 /// 不来自单个 source 的 internal stop detection。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ExplorationStopReason {
     /// 连续无信息增益
     NoInformationGain,
@@ -108,6 +111,8 @@ pub enum ExplorationStopReason {
     DurationExceeded,
     /// 已派发目标数达到请求上限
     MaxGoalsReached,
+    /// 实际行程预算不再允许新的探索目标，按策略返航后结束。
+    DistanceBudgetReached,
     /// 被 pin 的地图 revision 在会话中发生变化
     MapRevisionChanged,
 }
@@ -132,7 +137,8 @@ impl ExplorationStopReason {
             | Self::CoverageReached
             | Self::NoFrontierTimeout
             | Self::DurationExceeded
-            | Self::MaxGoalsReached => ExplorationTerminalKind::Succeeded,
+            | Self::MaxGoalsReached
+            | Self::DistanceBudgetReached => ExplorationTerminalKind::Succeeded,
             Self::UserCancelled => ExplorationTerminalKind::Cancelled,
             Self::NoReachableFreeSpace
             | Self::ConsecutiveFailuresExceeded
@@ -144,6 +150,8 @@ impl ExplorationStopReason {
 /// child navigation 对 exploration source 的终态反馈。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorationGoalFeedback {
+    /// 输入短时不可用且子导航已确认停车；等待新输入，不作为几何不可达记录。
+    InputUnavailable(String),
     /// child navigation 已到达。
     Reached,
     /// child navigation 失败，保留原始原因用于诊断和 retry/blacklist。
@@ -461,6 +469,11 @@ pub trait ExplorationGoalSource: Send {
         Vec::new()
     }
 
+    /// 保存已经确认的源历史；无支持的源必须明确拒绝。
+    fn checkpoint(&self)->ExploreResult<String> {Err(ExploreError::SourceError("探索源不支持持久进度".into()))}
+    /// 在新控制器已启动但尚未轮询前恢复历史，当前输入仍须重新核验。
+    fn restore_checkpoint(&mut self,_payload:&str)->ExploreResult<()> {Err(ExploreError::SourceError("探索源不支持恢复进度".into()))}
+
     /// 当前 source diagnostics(只读)
     fn diagnostics(&self) -> ExplorationSourceDiagnostics;
 }
@@ -495,6 +508,26 @@ pub struct ExplorationController {
 }
 
 impl ExplorationController {
+    /// 由原任务在确认停止后取得所有源的版本化进度。
+    pub fn checkpoint(&self)->ExploreResult<Vec<mission::SourceCheckpoint>> {
+        self.sources.iter().map(|source| {
+            let payload=source.checkpoint()?;
+            if payload.len()>1_048_576{return Err(ExploreError::SourceError("探索源进度超过一兆字节".into()));}
+            Ok(mission::SourceCheckpoint {name:source.source_name().into_owned(),payload})
+        }).collect()
+    }
+    /// 只安装到新建控制器；上层失败时丢弃整个候选，防止部分恢复。
+    pub fn restore_checkpoint(&mut self,states:&[mission::SourceCheckpoint])->ExploreResult<()> {
+        if !self.active || states.len()!=self.sources.len() || states.len()>16 {return Err(ExploreError::SourceError("探索恢复源集合不匹配".into()));}
+        let mut seen=std::collections::HashSet::new();
+        for state in states {
+            if state.payload.len()>1_048_576 || !seen.insert(&state.name){return Err(ExploreError::SourceError("探索恢复源重复或载荷过大".into()));}
+            let source=self.sources.iter_mut().find(|s|s.source_name()==state.name).ok_or_else(||ExploreError::SourceError("探索恢复源名称不匹配".into()))?;
+            source.restore_checkpoint(&state.payload)?;
+        }
+        Ok(())
+    }
+
     /// 构造 controller
     #[must_use]
     pub fn new(arbitration: ExplorationArbitrationPolicy) -> Self {
@@ -621,6 +654,15 @@ impl ExplorationController {
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
     ) -> ExploreResult<ExplorationPoll> {
+        self.poll_next_goal_with_deferred_stop(state, false)
+    }
+
+    /// 父任务需要完成返航时保留源和控制器，终态由原父任务明确收尾。
+    pub fn poll_next_goal_with_deferred_stop(
+        &mut self,
+        state: &ExplorationStateSnapshot<'_>,
+        defer_stop: bool,
+    ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
             return Ok(ExplorationPoll::SourceUnavailable(
                 "controller not active".to_string(),
@@ -705,10 +747,12 @@ impl ExplorationController {
                     // Stop 立即结束,不 fallback
                     self.last_selected = Some(source_name.to_string());
                     self.last_stop_reason = Some(reason);
-                    for source in self.sources.iter_mut().rev() {
-                        let _ = source.end();
+                    if !defer_stop {
+                        for source in self.sources.iter_mut().rev() {
+                            let _ = source.end();
+                        }
+                        self.active = false;
                     }
-                    self.active = false;
                     return Ok(ExplorationPoll::Stop(reason));
                 }
             }

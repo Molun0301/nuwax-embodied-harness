@@ -345,6 +345,9 @@ fn adapt_observation(
         motion_guard_generation: admission.motion_guard_generation,
         motion_guard_boot_nonce: nonce.to_vec(),
         motion_stop_generation: admission.motion_stop_generation,
+        allow_reverse: false,
+        position_tolerance_m: None,
+        yaw_tolerance_rad: None,
     })
 }
 

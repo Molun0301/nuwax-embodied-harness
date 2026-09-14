@@ -42,6 +42,7 @@ nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link
 # - 导航接入二维简易、持续重规划和多层表面的统一守卫链。
 # - 探索运行时使用波前会话，按配置选择栅格或三维表面目标源。
 nuwax-mapping = { path = "../../nuwax-workspace/crates/nuwax-mapping" }
+nuwax-map-chunks = { path = "../../nuwax-workspace/crates/nuwax-map-chunks" }
 nuwax-mapping-cloud = { path = "../../nuwax-workspace/crates/nuwax-mapping-cloud", features = ["cloud-enabled"] }
 nuwax-mapping-raytracing = { path = "../../nuwax-workspace/crates/nuwax-mapping-raytracing" }
 nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["foundation", "simple-2d", "replanning-astar", "mls"] }

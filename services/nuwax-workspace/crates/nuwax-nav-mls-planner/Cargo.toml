@@ -18,10 +18,13 @@ name = "mls_planner_native"
 path = "src/bin/mls_planner_native.rs"
 
 [dependencies]
+nuwax-explore-routing = { path = "../nuwax-explore-routing" }
 # 注意:MLS core 不引入 nuwax-nav-types-messages / nuwax-nav-base 以保持独立编译
 # Foundation lane 正在修复类型收敛;本 crate 沿用原 dimos-mls-planner 的纯类型策略
 # 内部使用 (f32,f32,f32) 元组 / Point3 / VoxelKey;不引入 LCM / DDS / pyo3 / numpy
 ahash = "0.8"
+# 不可变地图快照共享未变化的集合页。
+im = { version = "15.1.0", features = ["rayon"] }
 tracing = { workspace = true }
 # validator + validator_derive:`#[validate(...)]` 字段校验宏与 `derive` 提供的 Validate trait
 validator = { workspace = true, features = ["derive"] }

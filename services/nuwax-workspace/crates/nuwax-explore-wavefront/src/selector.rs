@@ -18,6 +18,7 @@ use crate::scoring::{CandidateGeometry, FrontierScorer};
 
 /// 唯一选择器(组合 detector + scorer,管理 id_source 与 session 消费顺序)。
 pub struct WavefrontGoalSelector {
+    observation_model: Option<nuwax_nav_types_messages::ObservationModel>,
     detector: WavefrontDetector,
     scorer: FrontierScorer,
 }
@@ -34,9 +35,27 @@ impl WavefrontGoalSelector {
     #[must_use]
     pub fn new(config: WavefrontConfig) -> Self {
         Self {
+            observation_model: None,
             detector: WavefrontDetector::new(config),
             scorer: FrontierScorer::new(),
         }
+    }
+
+    /// 使用显式传感器视域；没有标定时继续采用几何前沿估算。
+    pub fn set_observation_model(
+        &mut self,
+        model: nuwax_nav_types_messages::ObservationModel,
+    ) -> Result<(), WavefrontError> {
+        model
+            .validate()
+            .map_err(WavefrontError::InvalidObservation)?;
+        if model.kind != nuwax_nav_types_messages::ObservationKind::Planar {
+            return Err(WavefrontError::InvalidObservation(
+                "二维源需要平面扫描".into(),
+            ));
+        }
+        self.observation_model = Some(model);
+        Ok(())
     }
 
     /// 探索源提供本次位姿对应的机体轮廓。
@@ -59,7 +78,7 @@ impl WavefrontGoalSelector {
     /// 1. 记录信息增益；低增益只有在没有未访问的可达替代前沿时才结束探索。
     /// 2. `detector.detect_candidates(...)`
     /// 3. `DetectionOutcome::NoReachableFreeSpace` -> `GoalSelection::Stop(StopReason::NoReachableFreeSpace)`
-    /// 4. `DetectionOutcome::Candidates` -> 打分 + 排序 + 选择 top 1 + 调 `id_source` 生成 id
+    /// 4. 候选打分、区域压缩与访问顺序，最后为本轮选中目标分配标识。
     /// 5. 无候选 -> `GoalSelection::NoFrontier`(允许 facade arbitration fallback)
     pub fn select_goal_at(
         &mut self,
@@ -106,8 +125,9 @@ impl WavefrontGoalSelector {
         // 4. 评分 + 排序
         let mut scored: Vec<(
             crate::FrontierScoreBreakdown,
-            &crate::detector::FrontierCandidate,
+            crate::detector::FrontierCandidate,
         )> = Vec::with_capacity(candidates.len());
+        let mut views = std::collections::BTreeMap::new();
         for cand in &candidates {
             if session.is_blacklisted(cand.goal_position) {
                 continue;
@@ -134,31 +154,82 @@ impl WavefrontGoalSelector {
                 session.exploration_direction(),
                 &cfg,
             );
-            scored.push((breakdown, cand));
+            let mut candidate = cand.clone();
+            if let Some(model) = &self.observation_model {
+                let mut best = None;
+                let turns = if model.horizontal_fov_rad >= std::f64::consts::TAU - 1e-6 {
+                    1
+                } else {
+                    4
+                };
+                for i in 0..turns {
+                    let yaw = cand.goal_yaw + i as f64 * std::f64::consts::FRAC_PI_2;
+                    if !self.detector.goal_rotation_is_clear(
+                        physical_costmap,
+                        cand.goal_position,
+                        yaw,
+                    ) {
+                        continue;
+                    }
+                    let view = nuwax_explore_routing::observation::estimate_planar_view(
+                        model,
+                        physical_costmap,
+                        [cand.goal_position.x, cand.goal_position.y],
+                        yaw,
+                        self.detector.observation_targets(),
+                    )
+                    .map_err(WavefrontError::InvalidObservation)?;
+                    if best.as_ref().is_none_or(
+                        |(_, previous): &(
+                            f64,
+                            nuwax_explore_routing::observation::ViewEstimate,
+                        )| view.cells.len() > previous.cells.len(),
+                    ) {
+                        best = Some((yaw, view));
+                    }
+                }
+                let Some((yaw, view)) = best.filter(|(_, view)| !view.cells.is_empty()) else {
+                    continue;
+                };
+                candidate.goal_yaw = yaw;
+                views.insert(candidate.debug_index, view);
+            }
+            scored.push((breakdown, candidate));
         }
-        scored.sort_by(|a, b| {
-            b.0.total
-                .partial_cmp(&a.0.total)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    a.1.cluster
-                        .centroid
-                        .y
-                        .partial_cmp(&b.1.cluster.centroid.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| {
-                    a.1.cluster
-                        .centroid
-                        .x
-                        .partial_cmp(&b.1.cluster.centroid.x)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.1.cluster.cell_count.cmp(&b.1.cluster.cell_count))
-        });
-
-        // 5. 选 top 1
-        let Some((breakdown, cand)) = scored.first() else {
+        // 区域核心压缩代表并计算访问顺序，避免先对所有候选进行另一遍排序。
+        let routing: Vec<_> = scored
+            .iter()
+            .map(|(score, candidate)| nuwax_explore_routing::Candidate {
+                position: [candidate.goal_position.x, candidate.goal_position.y, 0.0],
+                gain: views.get(&candidate.debug_index).map_or(
+                    candidate.cluster.area_m2 * f64::from(score.total.max(0.001)),
+                    |view| view.cells.len() as f64 * physical_costmap.resolution.powi(2),
+                ),
+                travel_cost: candidate.travel_cost,
+            })
+            .collect();
+        let observed: Vec<_> = scored
+            .iter()
+            .map(|(_, candidate)| {
+                views
+                    .get(&candidate.debug_index)
+                    .map(|view| view.cells.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let selection = session.regional_schedule.select_observed(
+            &routing,
+            self.observation_model.as_ref().map(|_| observed.as_slice()),
+            |source, goals| {
+                let targets: Vec<_> = goals.iter().map(|&i| scored[i].1.goal_position).collect();
+                self.detector
+                    .travel_costs(scored[source].1.goal_position, &targets)
+            },
+        );
+        let Some((breakdown, cand)) = selection
+            .as_ref()
+            .and_then(|selection| scored.get(selection.index))
+        else {
             return Ok(match no_gain_reason {
                 Some(reason) => GoalSelection::Stop(reason),
                 None => GoalSelection::NoFrontier,
@@ -176,8 +247,41 @@ impl WavefrontGoalSelector {
         let id = id_source.next_frontier_goal_id(&seed);
 
         // 7. 构造 goal(crate-private helper)
-        let goal =
+        let mut goal =
             frontier_candidate_to_goal(cand, id, now, breakdown.total, cand.cluster.area_m2 as f32);
+        goal.distance_cost = Some(cand.travel_cost as f32);
+        if let Some(view) = views.get(&cand.debug_index) {
+            goal.information_gain =
+                Some((view.cells.len() as f64 * physical_costmap.resolution.powi(2)) as f32);
+            goal.metadata.insert(
+                "gain_basis".into(),
+                "calibrated_visible_frontier_cells".into(),
+            );
+            goal.metadata
+                .insert("visibility_rays".into(), view.rays.to_string());
+            goal.metadata.insert(
+                "visibility_budget_limited".into(),
+                view.budget_limited.to_string(),
+            );
+        }
+        goal.metadata
+            .insert("selection_method".into(), "regional_route".into());
+        if let Some(selection) = selection {
+            goal.metadata.insert(
+                "region_wait_rounds".into(),
+                selection.priority_wait_rounds.to_string(),
+            );
+            goal.metadata.insert(
+                "route_regions".into(),
+                selection.regional_order.len().to_string(),
+            );
+            goal.metadata.insert(
+                "available_regions".into(),
+                selection.region_count.to_string(),
+            );
+            goal.metadata
+                .insert("route_cost_m".into(), selection.route_cost.to_string());
+        }
         Ok(GoalSelection::Goal(goal))
     }
 }
@@ -244,7 +348,7 @@ pub(crate) fn frontier_candidate_to_goal(
                 y: candidate.goal_position.y,
                 z: 0.0,
             },
-            orientation: Quaternion::IDENTITY,
+            orientation: Quaternion::from_yaw(candidate.goal_yaw),
         },
     };
     let mut metadata = BTreeMap::new();
@@ -259,7 +363,7 @@ pub(crate) fn frontier_candidate_to_goal(
     );
 
     let mut goal = FrontierGoal::new(id, pose, score);
-    goal.information_gain = Some(candidate.cluster.cell_count as f32); // cell count 作为粗略信息量
+    goal.information_gain = Some(area_m2); // 对外契约使用平方米，簇格数仅用于内部归一化评分
     goal.distance_cost = None; // 由 facade conversions 决定是否填
     goal.frontier_area_m2 = Some(area_m2);
     goal.producer = format!("nuwax-explore-wavefront/{}", env!("CARGO_PKG_VERSION"));
@@ -288,6 +392,33 @@ mod tests {
     }
 
     #[test]
+    fn frontier_gain_uses_square_meters_at_different_resolutions() {
+        for area in [0.04_f64, 4.0] {
+            let candidate = crate::detector::FrontierCandidate {
+                cluster: crate::detector::FrontierCluster {
+                    centroid: Point2::new(1.0, 2.0),
+                    cell_count: 4,
+                    perimeter_m: 1.0,
+                    area_m2: area,
+                },
+                goal_position: Point2::new(0.5, 2.0),
+                goal_yaw: 0.0,
+                travel_cost: 3.0,
+                debug_index: 0,
+            };
+            let goal = frontier_candidate_to_goal(
+                &candidate,
+                "area".into(),
+                Timestamp::default(),
+                1.0,
+                area as f32,
+            );
+            assert_eq!(goal.information_gain, Some(area as f32));
+            assert_eq!(goal.frontier_area_m2, goal.information_gain);
+        }
+    }
+
+    #[test]
     fn self_occupancy_view_does_not_count_as_new_sensor_information() {
         let cfg = WavefrontConfig::default();
         let mut observations =
@@ -302,7 +433,7 @@ mod tests {
         let mut session = crate::session::ExplorationSession::new();
         let observed_count = session.information_count(&observations, &cfg);
         let mut selector = WavefrontGoalSelector::new(cfg);
-        let mut ids = crate::test_helpers::TestIdSource::default();
+        let mut ids = SeqIdSrc(Cell::new(0));
         let _ = selector.select_goal_with_observations(
             Point2::new(1.55, 1.55),
             &planning,

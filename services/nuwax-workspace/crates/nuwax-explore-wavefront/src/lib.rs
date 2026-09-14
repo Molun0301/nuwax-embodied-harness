@@ -30,6 +30,7 @@ pub mod selector;
 pub mod classification;
 pub mod config;
 pub mod diagnostics;
+pub mod incremental;
 pub mod frontier_goal;
 pub mod session;
 

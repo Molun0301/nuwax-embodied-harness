@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 
 from contracts.base import MetadataDict, TimestampedContract, utc_now
 from contracts.geometry import Pose
+from contracts.exploration_mission import ExplorationReturnPolicy
 from typing import List, Optional, Tuple
 
 
@@ -94,6 +95,8 @@ class ExploreAreaRequest(TimestampedContract):
     strategy: str = Field(default="frontier", description="探索策略，例如 frontier 或 coverage。")
     max_duration_sec: Optional[float] = Field(default=None, gt=0.0, description="探索最大时长。")
     stop_conditions: MetadataDict = Field(default_factory=dict, description="停止条件。")
+    return_policy: Optional[ExplorationReturnPolicy] = Field(default=None, description="可选行程预算与结束返航策略。")
+    resume_progress_json: Optional[str] = Field(default=None, max_length=2_097_152, exclude=True, repr=False, description="经地图资产拥有方核对的内部恢复载荷。")
     # —— V2 新增（手划探索范围） ——
     boundary_line_segments: List[Tuple[Pose, Pose]] = Field(
         default_factory=list,

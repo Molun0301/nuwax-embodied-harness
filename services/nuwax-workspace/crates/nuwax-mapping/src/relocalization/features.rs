@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use kiddo::KdTree;
+use super::nearest::NearestPointIndex;
 use nalgebra::{linalg::SymmetricEigen, Matrix3, Point3, Vector3};
 
 /// Number of bins in each angular component of an FPFH descriptor.
@@ -125,20 +125,20 @@ pub fn estimate_normals(
         .enumerate()
         .map(|(point_index, point)| {
             let nearest = tree
-                .nearest_n::<kiddo::SquaredEuclidean>(&[point.x, point.y, point.z], query_count);
+                .nearest_n(point, query_count);
             let mut neighbours: Vec<usize> = nearest
                 .iter()
                 .filter(|neighbour| {
-                    neighbour.item as usize != point_index && neighbour.distance <= radius_sq
+                    neighbour.0 != point_index && points[neighbour.0] != *point && neighbour.1 <= radius_sq
                 })
-                .map(|neighbour| neighbour.item as usize)
+                .map(|neighbour| neighbour.0)
                 .collect();
             if neighbours.len() < 2 {
                 neighbours = nearest
                     .iter()
-                    .filter(|neighbour| neighbour.item as usize != point_index)
+                    .filter(|neighbour| neighbour.0 != point_index && points[neighbour.0] != *point)
                     .take(2)
-                    .map(|neighbour| neighbour.item as usize)
+                    .map(|neighbour| neighbour.0)
                     .collect();
             }
 
@@ -181,20 +181,20 @@ pub fn compute_fpfh(
         .enumerate()
         .map(|(point_index, point)| {
             let nearest = tree
-                .nearest_n::<kiddo::SquaredEuclidean>(&[point.x, point.y, point.z], query_count);
+                .nearest_n(point, query_count);
             let mut within: Vec<(usize, f64)> = nearest
                 .iter()
                 .filter(|neighbour| {
-                    neighbour.item as usize != point_index && neighbour.distance <= radius_sq
+                    neighbour.0 != point_index && points[neighbour.0] != *point && neighbour.1 <= radius_sq
                 })
-                .map(|neighbour| (neighbour.item as usize, neighbour.distance.sqrt()))
+                .map(|neighbour| (neighbour.0, neighbour.1.sqrt()))
                 .collect();
             if within.len() < 2 {
                 within = nearest
                     .iter()
-                    .filter(|neighbour| neighbour.item as usize != point_index)
+                    .filter(|neighbour| neighbour.0 != point_index && points[neighbour.0] != *point)
                     .take(2)
-                    .map(|neighbour| (neighbour.item as usize, neighbour.distance.sqrt()))
+                    .map(|neighbour| (neighbour.0, neighbour.1.sqrt()))
                     .collect();
             }
             within
@@ -281,12 +281,8 @@ pub(crate) fn preprocess(points: &[Point3<f64>], config: FeatureConfig) -> Proce
     }
 }
 
-fn point_tree(points: &[Point3<f64>]) -> KdTree<f64, 3> {
-    let mut tree = KdTree::new();
-    for (index, point) in points.iter().enumerate() {
-        tree.add(&[point.x, point.y, point.z], index as u64);
-    }
-    tree
+fn point_tree(points: &[Point3<f64>]) -> NearestPointIndex {
+    NearestPointIndex::new(points)
 }
 
 fn pca_normal(points: &[Point3<f64>]) -> Vector3<f64> {
@@ -495,5 +491,21 @@ fn descriptor_distance(left: &FpfhDescriptor, right: &FpfhDescriptor) -> f64 {
 fn update_nearest(index: usize, distance: f64, best: &mut (usize, f64)) {
     if distance < best.1 || (distance == best.1 && index < best.0) {
         *best = (index, distance);
+    }
+}
+
+#[cfg(test)]
+mod planar_index_tests {
+    use super::*;
+    #[test]
+    fn dense_exact_plane_normals_and_features_do_not_overflow_axis_bucket() {
+        let points:Vec<_>=(0..100).flat_map(|x|(0..100).map(move|y|Point3::new(x as f64*0.03,y as f64*0.03,0.0))).collect();
+        let normals=estimate_normals(&points,0.15,32);
+        assert_eq!(normals.len(),points.len());
+        assert!(normals.iter().all(|n|n.z.abs()>0.999));
+        let features=compute_fpfh(&points,&normals,0.2,32);
+        assert_eq!(features.len(),points.len());
+        let score=super::super::ransac::evaluate_alignment(&points,&points,nalgebra::Isometry3::identity(),0.01);
+        assert_eq!(score.inlier_count,points.len());assert_eq!(score.rmse,0.0);
     }
 }

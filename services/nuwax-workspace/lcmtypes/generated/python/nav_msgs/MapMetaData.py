@@ -7,9 +7,9 @@ DO NOT MODIFY BY HAND!!!!
 from io import BytesIO
 import struct
 
-import geometry_msgs.Pose
+import geometry_msgs
 
-import std_msgs.Time
+import std_msgs
 
 class MapMetaData(object):
 

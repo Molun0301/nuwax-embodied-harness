@@ -5,7 +5,7 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
-from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
+from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, payload_digest, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
 
 from contextlib import contextmanager
@@ -98,6 +98,7 @@ _RELOCALIZE_TERMINAL_PROOF_DOMAIN_V1 = (
     b"nuwax.geometry.relocalize.terminal-proof.v1\0"
 )
 _CORRECTION_CANDIDATE_SCHEMA_VERSION_V1 = 1
+_CORRECTION_CANDIDATE_SCHEMA_VERSION_V2 = 2
 _CORRECTION_CANDIDATE_BACKEND_RELOCALIZATION = 3
 _CORRECTION_TRANSFORM_ABSOLUTE_LEFT_SE3 = 1
 _CORRECTION_IDENTITY_STRING_MAX_BYTES = 255
@@ -368,10 +369,17 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 
 
 def _checkpoint_export_bundle_from_proto(
-    response, payload=None,
+    response, payload=None, fine_payload=None,
 ) -> MappingBackendCheckpointExportBundle:
     if str(response.backend_kind) == "slam_toolbox":
+        if fine_payload is not None:
+            raise ValueError("二维导出不能携带精细三维资产")
         return _planar_checkpoint_export_bundle_from_proto(response, payload)
+    has_fine = getattr(response, "fine_map_artifact", None) is not None and response.HasField("fine_map_artifact")
+    if has_fine != (fine_payload is not None):
+        raise ValueError("精细地图制品引用与下载载荷不一致")
+    if has_fine and (len(fine_payload) != response.fine_map_artifact.size or payload_digest(fine_payload) != bytes(response.fine_map_artifact.sha256)):
+        raise ValueError("精细地图下载载荷与制品摘要不一致")
     occupancy_receipt = _require_proto_message_field(response, "occupancy_receipt")
     cloud_receipt = _require_proto_message_field(response, "cloud_receipt")
     occupancy_checkpoint = _require_proto_message_field(
@@ -423,6 +431,7 @@ def _checkpoint_export_bundle_from_proto(
         payload=bytes(getattr(response, "payload", b"") or b""),
         occupancy_receipt=_occupancy_receipt_dict(occupancy_receipt),
         cloud_receipt=_cloud_receipt_dict(cloud_receipt),
+        fine_archive=fine_payload,
     )
     occupancy_asset = {
         "raw_data_sha256": hashlib.sha256(occupancy_data).digest(),
@@ -473,6 +482,7 @@ def _checkpoint_export_bundle_from_proto(
             validated_checkpoint.occupancy_receipt
         ),
         cloud_receipt=_freeze_checkpoint_value(validated_checkpoint.cloud_receipt),
+        fine_archive=validated_checkpoint.fine_archive,
     )
     return MappingBackendCheckpointExportBundle(
         checkpoint=frozen_checkpoint,
@@ -497,7 +507,7 @@ def _mapping_commit_identity_proto(value: Mapping[str, object]):
 def _mapping_backend_checkpoint_proto(
     stored: StoredMappingBackendCheckpoint,
     occupancy_checkpoint,
-    cloud_checkpoint, graph_artifact=None,
+    cloud_checkpoint, graph_artifact=None, fine_map_artifact=None,
 ):
     checkpoint = stored.checkpoint
     if checkpoint.backend_kind == "slam_toolbox":
@@ -542,6 +552,7 @@ def _mapping_backend_checkpoint_proto(
         ),
         canonical_occupancy_checkpoint=occupancy_checkpoint,
         canonical_cloud_checkpoint=cloud_checkpoint,
+        fine_map_artifact=fine_map_artifact,
     )
 
 
@@ -676,6 +687,10 @@ def _canonical_backend_sha256(checkpoint) -> bytes:
     preimage.extend(struct.pack(">I", int(cloud_receipt.point_count)))
     preimage.extend(_canonical_occupancy_sha256(occupancy_checkpoint))
     preimage.extend(_canonical_cloud_sha256(cloud_checkpoint))
+    if getattr(checkpoint, "fine_map_artifact", None) is not None and checkpoint.HasField("fine_map_artifact"):
+        preimage.extend(b"nuwax.geometry.fine-map-archive.v1\0")
+        preimage.extend(struct.pack(">Q", checkpoint.fine_map_artifact.size))
+        preimage.extend(_require_digest_bytes(checkpoint.fine_map_artifact.sha256, "fine_map_artifact.sha256"))
     return hashlib.sha256(preimage).digest()
 
 
@@ -1011,11 +1026,17 @@ def _parse_relocalize_candidate_payload_preimage_v1(
     transform_bytes = take(56, "transform")
     translation_m = struct.unpack(">3d", transform_bytes[:24])
     rotation_xyzw = struct.unpack(">4d", transform_bytes[24:])
+    trajectory_bytes = b""
+    if schema_version == _CORRECTION_CANDIDATE_SCHEMA_VERSION_V2:
+        # 版本2统一追加优化轨迹；重定位候选只能携带明确的零长度轨迹。
+        trajectory_bytes = take(4, "optimized_trajectory_count")
+        if struct.unpack(">i", trajectory_bytes)[0] != 0:
+            raise ValueError("Relocalize candidate cannot contain optimized trajectory")
 
     if offset != len(preimage):
         raise ValueError("Relocalize candidate payload has trailing bytes")
     if (
-        schema_version != _CORRECTION_CANDIDATE_SCHEMA_VERSION_V1
+        schema_version not in {_CORRECTION_CANDIDATE_SCHEMA_VERSION_V1, _CORRECTION_CANDIDATE_SCHEMA_VERSION_V2}
         or backend != _CORRECTION_CANDIDATE_BACKEND_RELOCALIZATION
         or transform_semantics != _CORRECTION_TRANSFORM_ABSOLUTE_LEFT_SE3
     ):
@@ -1118,6 +1139,7 @@ def _parse_relocalize_candidate_payload_preimage_v1(
     canonical.extend(correction_lease_boot_nonce)
     canonical.extend(struct.pack(">q", correction_lease_generation))
     canonical.extend(transform_bytes)
+    canonical.extend(trajectory_bytes)
     if bytes(canonical) != preimage:
         raise ValueError("Relocalize candidate payload is not canonical")
 
@@ -1488,7 +1510,8 @@ def _parse_relocalize_mode1_evidence_v1(
         or target_xyz_length != target_point_count * 12
         or target_decoded_point_count != target_point_count
         or target_decoded_f64_bytes != target_point_count * 24
-        or publication_cloud_revision != target_source_revision
+        # 资产源修订来自保存时的拥有方；重新激活的发布修订属于新运行实例。
+        or publication_cloud_revision == 0
         or publication_point_count != target_point_count
         or publication_voxel_size != target_voxel_size
         or not any(publication_mapping_commit_boot_nonce)
@@ -3133,6 +3156,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
             "commit_disposition": str(receipt.commit_disposition or ""),
         }
     return {
+        "mission_progress": json.loads(resp.mission_progress_json) if getattr(resp, "mission_progress_json", "") else None,
         "status": resp.status,
         "message": resp.message,
         "request_id": resp.request_id,
@@ -4580,12 +4604,13 @@ class GeometryRuntimeProvider:
         finally:
             self._graph_transfer(5, reference)
 
-    def _upload_graph_artifact(self, checkpoint):
-        reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=checkpoint.payload_size, sha256=checkpoint.content_sha256)
+    def _upload_graph_artifact(self, checkpoint, *, payload=None):
+        payload = checkpoint.payload if payload is None else payload
+        reference = pb2.GraphArtifactRef(id=uuid.uuid4().hex, size=len(payload), sha256=payload_digest(payload))
         try:
             self._graph_transfer(1, reference)
             offset = 0
-            for data in payload_chunks(checkpoint.payload):
+            for data in payload_chunks(payload):
                 response = self._graph_transfer(2, reference, offset=offset, data=data)
                 offset += len(data)
                 if response.offset != offset:
@@ -4616,7 +4641,8 @@ class GeometryRuntimeProvider:
                 exc,
             ) from exc
         payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
-        return _checkpoint_export_bundle_from_proto(response, payload)
+        fine_payload = self._download_graph_artifact(response.fine_map_artifact) if response.HasField("fine_map_artifact") else None
+        return _checkpoint_export_bundle_from_proto(response, payload, fine_payload)
 
     def _selected_mapping_backend_state(self) -> Dict[str, Any]:
         state = self.get_mapping_state()
@@ -4963,14 +4989,17 @@ class GeometryRuntimeProvider:
         if cloud_checkpoint is not None:
             request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
         graph_artifact = None
+        fine_map_artifact = None
         if stored_backend_checkpoint is not None:
             if selected_backend_kind == "slam_toolbox":
                 graph_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint)
+            if stored_backend_checkpoint.checkpoint.fine_archive is not None:
+                fine_map_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint, payload=stored_backend_checkpoint.checkpoint.fine_archive)
             request.mapping_backend_checkpoint.CopyFrom(
                 _mapping_backend_checkpoint_proto(
                     stored_backend_checkpoint,
                     occupancy_checkpoint,
-                    cloud_checkpoint, graph_artifact=graph_artifact,
+                    cloud_checkpoint, graph_artifact=graph_artifact, fine_map_artifact=fine_map_artifact,
                 )
             )
         request.asset_bundle_sha256 = _canonical_asset_bundle_sha256(
@@ -5230,6 +5259,8 @@ class GeometryRuntimeProvider:
             )
         if graph_artifact is not None:
             self._graph_transfer(5, graph_artifact)
+        if fine_map_artifact is not None:
+            self._graph_transfer(5, fine_map_artifact)
         planar_default_seed = None
         if selected_backend_kind == "slam_toolbox":
             graph_payload = stored_backend_checkpoint.checkpoint.payload
@@ -7318,6 +7349,10 @@ class GeometryRuntimeProvider:
                     LOGGER.exception(
                         "SetNavigationGoal 已提交，但通知投递异常。"
                     )
+            if not accepted:
+                submission = getattr(transaction_context, "result", None)
+                if isinstance(submission, tuple) and len(submission) == 3 and submission[0] == request_goal_id:
+                    LOGGER.warning("导航目标未被接纳 goal_id=%s reason=%s", request_goal_id, submission[2])
             if accepted and deadline_monotonic is None:
                 try:
                     self._ensure_nav_state_stream()
@@ -7390,6 +7425,9 @@ class GeometryRuntimeProvider:
             proto_goal = pb2.NavigationGoal(
                 pose=proto_pose,
                 frame_id=target_frame_id,
+                allow_reverse=bool(getattr(goal, "allow_reverse", False)),
+                position_tolerance_m=float(getattr(goal, "tolerance_position_m", 0.3)),
+                yaw_tolerance_rad=float(getattr(goal, "tolerance_yaw_rad", 0.3)),
                 goal_id=request_goal_id,
                 owner_kind=_PUBLIC_NAV_OWNER_KIND,
                 parent_request_id=canonical_parent_request_id,
@@ -8070,6 +8108,8 @@ class GeometryRuntimeProvider:
         stop_conditions: Optional[Dict[str, Any]] = None,
         max_navigation_retries: int = 0,
         blacklist_radius_m: float = 0.0,
+        resume_progress_json: Optional[str] = None,
+        return_policy: Optional[Dict[str, Any]] = None,
         motion_admission: Optional[Dict[str, Any]] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -8118,6 +8158,14 @@ class GeometryRuntimeProvider:
                 motion_guard_boot_nonce=motion_guard_boot_nonce,
                 motion_stop_generation=motion_stop_generation,
             )
+            if resume_progress_json:
+                if len(resume_progress_json.encode("utf-8")) > 2_097_152:
+                    raise ValueError("探索恢复载荷超过两兆字节")
+                req.resume_progress_json = resume_progress_json
+            if return_policy is not None:
+                from contracts.exploration_mission import ExplorationReturnPolicy
+                policy = ExplorationReturnPolicy.model_validate(return_policy)
+                req.return_policy.CopyFrom(pb2.ExplorationReturnPolicy(**policy.model_dump(exclude_none=True)))
             raw_stop_conditions = dict(stop_conditions or {})
             recognized_stop_keys = {
                 "max_coverage_pct",
@@ -8155,6 +8203,17 @@ class GeometryRuntimeProvider:
             return _exploration_state_to_dict(resp)
         except grpc.RpcError as e:
             raise _exploration_rpc_error("StartExploration", e) from e
+
+    def get_exploration_progress(self, *, request_id: str) -> str:
+        """读取已停止原任务的进度；原生端拒绝仍持有子导航的任务。"""
+        self._raise_if_stopping("get_exploration_progress")
+        stub = self._stub
+        if stub is None:
+            raise _missing_exploration_stub_error("GetExplorationProgress")
+        try:
+            return stub.GetExplorationProgress(pb2.ExplorationProgressRequest(request_id=request_id), timeout=5).checkpoint_json
+        except grpc.RpcError as error:
+            raise _exploration_rpc_error("GetExplorationProgress", error) from error
 
     def stop_exploration(
         self,

@@ -76,6 +76,25 @@ class MotionControlActuator:
         except Exception as exc:
             raise ActuatorError("ACTUATOR_COMMAND_FAILED", str(exc)) from exc
 
+    @property
+    def supports_motion_feedback(self) -> bool:
+        return callable(getattr(self._control, "get_motion_execution_feedback", None))
+
+    def get_motion_execution_feedback(self):
+        getter = getattr(self._control, "get_motion_execution_feedback", None)
+        return getter() if callable(getter) else None
+
+    def close(self) -> None:
+        closer = getattr(self._control, "close", None)
+        if callable(closer):
+            closer()
+
+    def set_locomotion_mode(self, mode_id: str) -> None:
+        setter = getattr(self._control, "set_locomotion_mode", None)
+        if not callable(setter):
+            raise ActuatorError("LOCOMOTION_MODE_UNSUPPORTED", "执行器没有标准步态切换接口。")
+        setter(mode_id)
+
     def zero(self) -> None:
         try:
             self._control.stop_motion()

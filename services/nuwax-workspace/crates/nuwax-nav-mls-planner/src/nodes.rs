@@ -487,7 +487,7 @@ mod tests {
     }
 
     fn build_cells(surface: &[VoxelKey], step_cells: i32) -> SurfaceCells {
-        let mut lookup = SurfaceLookup::new();
+        let mut lookup = SurfaceLookup::default();
         build_surface_lookup(surface, &mut lookup);
         let mut sc = SurfaceCells::default();
         build_surface_cells(&mut sc, &lookup, VOXEL, step_cells);

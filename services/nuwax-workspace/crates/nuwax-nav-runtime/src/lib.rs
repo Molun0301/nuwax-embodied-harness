@@ -181,6 +181,8 @@ impl PathExecutionIdentity {
 /// One navigation session and its request-level motion admission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavSession {
+    /// 随封存目标核对的倒车授权与到达容差。
+    pub options: nuwax_nav_types_messages::GoalOptions,
     /// Stable goal/session identifier.
     pub session_id: String,
     /// Complete sealed goal identity expected on every admitted path.
@@ -677,6 +679,9 @@ impl NavMotionPort for ProductionNavMotionPort {
         .await
         .map_err(|_| MotionPortError::new("priority fence exceeded 300 ms hard timeout"))??;
         self.lease_tuple = None;
+        // 租约和指令通道已在原硬期限内隔离；此后等待同一归零标识的物理停稳。
+        let fence=MotionGuardClient::confirm_stationary_after_fence(self.normal_config.clone(),&operation_id,fence)
+            .await.map_err(|e|MotionPortError::new(e.to_string()))?;
         Ok(Self::fence_proof(fence))
     }
 }
@@ -712,6 +717,12 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// 在获取新目标租约前捕获执行选项；默认后端不推定支持倒车。
+    fn configure_goal(&mut self, _goal: &PoseStamped, options: nuwax_nav_types_messages::GoalOptions) -> Result<(), RuntimeError> {
+        options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
+        if options.allow_reverse {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"执行后端未声明倒车能力".into()});}
+        Ok(())
+    }
     /// Replace the active plan after version validation.
     fn replace_path(&mut self, path: Path2D);
     /// 替换路径与可选朝向；不使用朝向的兼容后端仍沿原接口运行。
@@ -788,6 +799,10 @@ impl BasicInProcessLocalBackend {
 }
 
 impl NavPlanner for BasicInProcessLocalBackend {
+    fn configure_goal(&mut self, goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
+        self.0.configure_goal(goal.clone(),options).map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})
+    }
+
     fn replace_path(&mut self, path: Path2D) {
         self.0.start_planning(path);
     }
@@ -809,7 +824,7 @@ impl NavPlanner for BasicInProcessLocalBackend {
         match stop {
             None => PlannerStep::Command(twist),
             Some(StopMessage::Arrived) => PlannerStep::Succeeded,
-            Some(StopMessage::ObstacleFound) => PlannerStep::Failed("obstacle found".into()),
+            Some(StopMessage::ObstacleFound) => PlannerStep::ReplanRequired("局部轨迹受阻，停车等待新路径".into()),
             Some(StopMessage::Error) => PlannerStep::Failed("local planner error".into()),
         }
     }
@@ -835,6 +850,9 @@ fn production_local_backend(
                     reason,
                 })?;
                 backend.0.set_robot_geometry(geometry);
+            }
+            if let Some(capabilities)=nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})? {
+                backend.0.set_motion_limits(capabilities.motion).map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})?;
             }
             Ok(backend)
         }
@@ -1243,6 +1261,7 @@ where
         let motion_admission = session.motion_admission;
         let guard_generation = motion_admission.guard_generation;
         self.planner.stop();
+        self.planner.configure_goal(&session.goal_pose,session.options)?;
         self.session = Some(session);
         self.current_path_revision = 0;
         self.current_payload_hash = None;
@@ -2066,6 +2085,7 @@ fn stale_receipt_reason(
 }
 
 fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
+    session.options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
     validate_map_pose(&session.goal_pose, "goal_pose")?;
     if session.session_id.trim().is_empty() {
         return Err(RuntimeError::InvalidInput {
@@ -2523,6 +2543,7 @@ mod tests {
                     zero_ack: Some(ZeroAck {
                         zero_ack_id: "zero-uds-1".into(),
                         applied_monotonic_ns: 102,
+                        ..Default::default()
                     }),
                 }),
             ),
@@ -2728,6 +2749,7 @@ mod tests {
 
     fn session_for(session_id: &str) -> NavSession {
         NavSession {
+            options: Default::default(),
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, 0),
             local_owner_runtime_generation: 1,
@@ -3012,7 +3034,9 @@ mod tests {
             .update_costmap(costmap_at(1_000_000_000))
             .await
             .expect("覆盖路径的地图");
-        handle.start_session(session()).await.expect("会话");
+        let mut requested=session();
+        requested.goal_pose.pose.orientation=nuwax_nav_types_messages::Quaternion::from_yaw(goal_yaw);
+        handle.start_session(requested).await.expect("会话");
 
         let mut oriented_path = path();
         for invalid_yaws in [vec![0.0], vec![0.0, f64::NAN]] {

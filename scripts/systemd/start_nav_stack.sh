@@ -10,7 +10,7 @@ NUWAX_ROBOT_GEOMETRY_JSON="$("${NUWAX_PYTHON_BIN:-python3}" "${REPO_ROOT}/script
 export NUWAX_ROBOT_GEOMETRY_JSON
 IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
 BINARY="${NUWAX_NAV_STACK_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-nav-stack}"
-PROFILE="${NUWAX_NAV_PROFILE:-simple-2d}"
+PROFILE="${NUWAX_NAV_PROFILE}"
 READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
 INTERNAL_READY_FILE="${READY_FILE}.runtime"
 MOTION_GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
@@ -106,10 +106,10 @@ internal_scheduler_ready() {
 }
 
 case "${PROFILE}" in
-  simple-2d|replanning-astar|mls-3d)
+  simple-2d|mls-3d)
     ;;
   *)
-    fail "unsupported production profile '${PROFILE}'; expected simple-2d, replanning-astar or mls-3d"
+    fail "生产导航配置必须由二维或三维执行链确定：${PROFILE}"
     ;;
 esac
 

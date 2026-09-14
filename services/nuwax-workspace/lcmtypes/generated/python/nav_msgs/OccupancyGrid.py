@@ -7,9 +7,9 @@ DO NOT MODIFY BY HAND!!!!
 from io import BytesIO
 import struct
 
-import std_msgs.Header
+import nav_msgs
 
-import nav_msgs.MapMetaData
+import std_msgs
 
 class OccupancyGrid(object):
 

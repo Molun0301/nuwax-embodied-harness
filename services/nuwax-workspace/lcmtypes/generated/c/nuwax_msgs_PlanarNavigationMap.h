@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +28,7 @@ struct _nuwax_msgs_PlanarNavigationMap
      */
     char*      session_id;
     int64_t    session_generation;
+    int64_t    map_frame_generation;
     int64_t    map_revision;
 
     /**

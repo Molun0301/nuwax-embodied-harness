@@ -82,6 +82,12 @@ mod runtime_owners;
 pub mod topics;
 #[cfg(feature = "mls")]
 pub mod surface_config;
+#[cfg(feature = "mls")]
+pub mod surface_map;
+#[cfg(feature="mls")]
+pub mod surface_oriented;
+#[cfg(feature = "mls")]
+mod surface_chunks;
 
 pub use builder::{NavStackBuilder, NavStackHandle};
 pub use error::{NavStackError, NavStackResult};
@@ -89,6 +95,8 @@ pub use features::{NavFeatureFlags, NavStackPreset};
 pub use graph::{ModuleGraph, ModuleKind, ModuleNode};
 pub use manifest::{CanonicalSlot, ProfileActivation, ProfileManifest};
 pub use profile::NavStackProfile;
+pub mod production_pipeline;
+pub use production_pipeline::ProductionPipeline;
 pub use runner::StackRunner;
 pub use topics::{NavTopicConfig, TopicName};
 

@@ -2626,6 +2626,7 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let (nav_state_tx, _) = broadcast::channel(8);
     let (frontiers_tx, _) = broadcast::channel(4);
     let bridge = Arc::new(ExploreNavigationBridge {
+        mapping_adapter: None,
         state: state.clone(),
         expected_map_frame: Arc::from("map"),
         cloud_map_tx,
@@ -4280,6 +4281,7 @@ fn canary_readiness_handle(nav: &crate::nav_runtime::NavRuntimeState) -> Geometr
     let (map_revision_tx, _) = broadcast::channel(1);
     let (map_revision_latest_tx, _) = watch::channel(None);
     ExploreNavigationBridge {
+        mapping_adapter: None,
         state: Arc::new(RwLock::new(SharedState::default())),
         expected_map_frame: Arc::from("map"),
         cloud_map_tx,

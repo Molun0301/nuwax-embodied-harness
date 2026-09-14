@@ -130,6 +130,23 @@ impl LocalPlannerConfig {
 
 /// 局部规划器（deterministic core）
 pub struct LocalPlanner {
+    motion_limits: Option<nuwax_nav_types_messages::MotionLimits>,
+    last_command: Twist2,
+    observed_velocity: Twist2,
+    allow_reverse: bool,
+    blocked_cycles: usize,
+    expected_goal: Option<PoseStamped>,
+    oriented_path: bool,
+    rotation_stops: Vec<(usize, Point2, f64)>,
+    rotation_cursor: usize,
+    path_cumulative: Vec<f64>,
+    path_progress: f64,
+    progress_credit: f64,
+    tracking_target: Option<(Point2, f64)>,
+    settling_cycles: usize,
+    braking_latch: bool,
+    braking_cycles: usize,
+    observed_velocity_valid: bool,
     config: LocalPlannerConfig,
     controller: PController,
     state: LocalPlannerState,
@@ -180,6 +197,23 @@ impl LocalPlanner {
         let mut controller = PController::new(effective_speed, config.control_frequency);
         controller.set_simulation(config.simulation);
         Self {
+            motion_limits: None,
+            last_command: make_twist2_zero(),
+            observed_velocity: make_twist2_zero(),
+            allow_reverse: false,
+            blocked_cycles: 0,
+            expected_goal: None,
+            oriented_path: false,
+            rotation_stops: Vec::new(),
+            rotation_cursor: 0,
+            path_cumulative: Vec::new(),
+            path_progress: 0.0,
+            progress_credit: 0.0,
+            tracking_target: None,
+            settling_cycles: 0,
+            braking_latch: false,
+            braking_cycles: 0,
+            observed_velocity_valid: false,
             config,
             controller,
             state: LocalPlannerState::Idle,
@@ -198,6 +232,45 @@ impl LocalPlanner {
         }
     }
 
+    /// 原目标和容差与路径分开保存，不能把近似路径终点当作用户目标。
+    pub fn configure_goal(
+        &mut self,
+        goal: PoseStamped,
+        options: nuwax_nav_types_messages::GoalOptions,
+    ) -> Result<(), String> {
+        options.validate()?;
+        if options.allow_reverse
+            && self
+                .motion_limits
+                .as_ref()
+                .is_none_or(|limits| limits.max_reverse_mps <= 0.0)
+        {
+            return Err("倒车请求缺少已标定的倒车能力".into());
+        }
+        self.allow_reverse = options.allow_reverse;
+        self.config.goal_tolerance = options.position_tolerance_m.max(1e-6);
+        self.config.orientation_tolerance = options.yaw_tolerance_rad.max(1e-6);
+        self.expected_goal = Some(goal);
+        Ok(())
+    }
+
+    /// 捕获显式运动/制动标定；该接口不猜测硬件限制。
+    pub fn set_motion_limits(
+        &mut self,
+        limits: nuwax_nav_types_messages::MotionLimits,
+    ) -> Result<(), String> {
+        limits.validate()?;
+        self.motion_limits = Some(limits);
+        self.braking_latch = true;
+        self.braking_cycles = 0;
+        Ok(())
+    }
+
+    /// 倒车必须由当前目标明确允许，并同时满足标定中的倒车速度上限。
+    pub fn set_allow_reverse(&mut self, allowed: bool) {
+        self.allow_reverse = allowed;
+    }
+
     /// 统一机体外形用于前瞻碰撞与当前位置自体区域消除。
     pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
         self.robot_geometry = Some(geometry);
@@ -214,7 +287,14 @@ impl LocalPlanner {
     /// `yaws.len()` 必须等于 `path.points.len()`;长度不一致时回退到段方向。
     /// (审计 H-13 修复)
     pub fn start_planning_with_orientations(&mut self, path: Path2D, yaws: Option<Vec<f64>>) {
+        let expected = self.expected_goal.take();
+        let reverse = self.allow_reverse;
+        let command = self.last_command;
         self.stop_planning();
+        // 换路线不代表底盘已经停下；先前命令仍参与反应延迟和制动包络。
+        self.last_command = command;
+        self.expected_goal = expected;
+        self.allow_reverse = reverse;
         self.last_goal_reached = GoalReached::NotReached;
         self.path = Some(make_path2d(path.points.clone()));
         // 仅当长度与 points 完全匹配时保留;否则回退到段方向
@@ -225,6 +305,7 @@ impl LocalPlanner {
                 None
             }
         });
+        self.initialize_oriented_path();
         self.path_distancer = Some(PathDistancer::new(self.path.as_ref().expect("set"), 0.5));
         self.path_clearance = None;
         self.pose_index = 0;
@@ -257,6 +338,9 @@ impl LocalPlanner {
     }
 
     fn last_segment_yaw_or_last_yaw(&self) -> Option<f64> {
+        if let Some(goal) = self.expected_goal.as_ref() {
+            return Some(goal.pose.orientation.yaw());
+        }
         let path = self.path.as_ref()?;
         if let Some(yaws) = self.path_yaws.as_ref() {
             if let Some(y) = yaws.last() {
@@ -274,6 +358,18 @@ impl LocalPlanner {
 
     /// 停止规划
     pub fn stop_planning(&mut self) {
+        self.last_command = make_twist2_zero();
+        self.blocked_cycles = 0;
+        self.expected_goal = None;
+        self.allow_reverse = false;
+        self.oriented_path = false;
+        self.rotation_stops.clear();
+        self.rotation_cursor = 0;
+        self.path_cumulative.clear();
+        self.path_progress = 0.0;
+        self.progress_credit = 0.0;
+        self.tracking_target = None;
+        self.settling_cycles = 0;
         self.path = None;
         self.path_distancer = None;
         self.path_clearance = None;
@@ -287,6 +383,39 @@ impl LocalPlanner {
 
     /// 更新 odom
     pub fn handle_odom(&mut self, odom: PoseStamped) {
+        if self.oriented_path {
+            let position = pose_to_point2(&odom);
+            let distance = self
+                .current_odom
+                .as_ref()
+                .map(|old| position.distance(pose_to_point2(old)))
+                .or_else(|| {
+                    self.path
+                        .as_ref()
+                        .and_then(|path| path.points.first())
+                        .map(|start| position.distance(*start))
+                })
+                .unwrap_or(0.0);
+            if distance.is_finite() {
+                self.progress_credit += distance;
+            }
+        }
+        if let Some(previous) = self.current_odom.as_ref() {
+            let dt = odom.stamp.nanos.saturating_sub(previous.stamp.nanos) as f64 * 1e-9;
+            if odom.stamp.clock == previous.stamp.clock && dt > 0.005 && dt < 1.0 {
+                let (x, y, yaw) = pose_xy_yaw(previous);
+                let (nx, ny, nyaw) = pose_xy_yaw(&odom);
+                let middle = yaw + angle_diff(nyaw, yaw) * 0.5;
+                self.observed_velocity_valid = true;
+                self.observed_velocity = Twist2 {
+                    linear: Point2::new(
+                        ((nx - x) * middle.cos() + (ny - y) * middle.sin()) / dt,
+                        (-(nx - x) * middle.sin() + (ny - y) * middle.cos()) / dt,
+                    ),
+                    angular_z: angle_diff(nyaw, yaw) / dt,
+                };
+            }
+        }
         self.current_odom = Some(odom);
     }
 
@@ -332,6 +461,74 @@ impl LocalPlanner {
     /// - 若返回 `Some(StopMessage)`，全局规划器应据此触发 arrived / replan / cancel。
     /// - 若返回 `None`，表示继续按当前 twist 运动。
     pub fn step(&mut self, robot_width: f64) -> (Twist2, Option<StopMessage>) {
+        if self.motion_limits.is_some() && self.braking_latch {
+            self.last_command = make_twist2_zero();
+            if self.observed_velocity_valid
+                && self
+                    .observed_velocity
+                    .linear
+                    .x
+                    .hypot(self.observed_velocity.linear.y)
+                    + self.observed_velocity.angular_z.abs()
+                    < 0.02
+            {
+                self.braking_cycles += 1;
+            } else {
+                self.braking_cycles = 0;
+            }
+            let required = (self.motion_limits.as_ref().unwrap().reaction_time_sec
+                * self.config.control_frequency)
+                .ceil() as usize
+                + 2;
+            if self.braking_cycles < required {
+                return (make_twist2_zero(), None);
+            }
+            self.braking_latch = false;
+            self.braking_cycles = 0;
+        }
+        let (preferred, stop) = self.preferred_step(robot_width);
+        if stop.is_some() || self.motion_limits.is_none() {
+            self.last_command = preferred;
+            return (preferred, stop);
+        }
+        let Some(command) = self.choose_bounded_control(preferred, robot_width) else {
+            self.braking_latch = true;
+            self.braking_cycles = 0;
+            self.last_command = make_twist2_zero();
+            return (make_twist2_zero(), Some(StopMessage::ObstacleFound));
+        };
+        if command.linear.x.hypot(command.linear.y) + command.angular_z.abs() < 1e-8
+            && preferred.linear.x.hypot(preferred.linear.y) + preferred.angular_z.abs() > 1e-6
+        {
+            self.blocked_cycles += 1;
+            if self.blocked_cycles as f64 >= (self.config.control_frequency * 0.25).ceil().max(1.0)
+            {
+                self.last_command = make_twist2_zero();
+                return (make_twist2_zero(), Some(StopMessage::ObstacleFound));
+            }
+        } else {
+            self.blocked_cycles = 0;
+        }
+        if command == Twist2::ZERO
+            && (self.last_command.linear.x.hypot(self.last_command.linear.y)
+                + self.last_command.angular_z.abs()
+                > 0.02
+                || self
+                    .observed_velocity
+                    .linear
+                    .x
+                    .hypot(self.observed_velocity.linear.y)
+                    + self.observed_velocity.angular_z.abs()
+                    > 0.02)
+        {
+            self.braking_latch = true;
+            self.braking_cycles = 0;
+        }
+        self.last_command = command;
+        (command, None)
+    }
+
+    fn preferred_step(&mut self, robot_width: f64) -> (Twist2, Option<StopMessage>) {
         // 非法姿态或路径不能进入控制器，避免非数朝向传播成非数运动指令。
         let invalid_pose = self.current_odom.as_ref().is_some_and(|odom| {
             let position = odom.pose.position;
@@ -351,6 +548,31 @@ impl LocalPlanner {
         if invalid_pose || invalid_path {
             self.stop_planning();
             return (make_twist2_zero(), Some(StopMessage::Error));
+        }
+        if let (Some(goal), Some(path), Some(odom)) = (
+            self.expected_goal.as_ref(),
+            self.path.as_ref(),
+            self.current_odom.as_ref(),
+        ) {
+            if let Some(end) = path.points.last() {
+                let position = pose_to_point2(odom);
+                let partial =
+                    end.distance(goal.pose.position.to_2d()) > self.config.goal_tolerance + 1e-9;
+                let at_end = position.distance(*end) <= 0.05
+                    || path.points.iter().rev().nth(1).is_some_and(|previous| {
+                        let dx = end.x - previous.x;
+                        let dy = end.y - previous.y;
+                        (position.x - end.x) * dx + (position.y - end.y) * dy >= 0.0
+                            && ((position.x - end.x) * dy - (position.y - end.y) * dx).abs()
+                                <= 0.05 * dx.hypot(dy)
+                    });
+                if partial && at_end {
+                    return (make_twist2_zero(), Some(StopMessage::ObstacleFound));
+                }
+            }
+        }
+        if self.oriented_path {
+            self.update_oriented_tracking();
         }
         // 初始化：若 path 已设置且状态仍 Idle，进入 InitialRotation（或 PathFollowing / FinalRotation）
         if self.state == LocalPlannerState::Idle
@@ -381,64 +603,76 @@ impl LocalPlanner {
             self.change_state(new_state);
         }
 
-        // 检查 costmap 与 obstacle
-        let path_progress = self
-            .path_distancer
-            .as_ref()
-            .zip(self.current_odom.as_ref())
-            .map(|(path, odom)| path.closest_projection(pose_to_point2(odom)));
-        let rotation_target = self.current_odom.as_ref().and_then(|odom| {
-            let near_goal = self.path_distancer.as_ref().is_some_and(|path| {
-                path.distance_to_goal(pose_to_point2(odom)) < self.config.goal_tolerance
+        if self.motion_limits.is_none() {
+            // 检查 costmap 与 obstacle
+            let path_progress = self
+                .path_distancer
+                .as_ref()
+                .zip(self.current_odom.as_ref())
+                .map(|(path, odom)| path.closest_projection(pose_to_point2(odom)));
+            let rotation_target = self.current_odom.as_ref().and_then(|odom| {
+                let near_goal = self.path_distancer.as_ref().is_some_and(|path| {
+                    path.distance_to_goal(pose_to_point2(odom)) < self.config.goal_tolerance
+                });
+                if let Some(yaw) = self.rotation_target_yaw() {
+                    Some(yaw)
+                } else if near_goal {
+                    self.last_segment_yaw_or_last_yaw()
+                } else if self.state == LocalPlannerState::InitialRotation {
+                    self.first_segment_yaw_or_first_yaw()
+                } else {
+                    None
+                }
             });
-            if near_goal {
-                self.last_segment_yaw_or_last_yaw()
-            } else if self.state == LocalPlannerState::InitialRotation {
-                self.first_segment_yaw_or_first_yaw()
-            } else {
-                None
-            }
-        });
-        let mut obstacle_ahead = false;
-        if let Some(pc) = self.path_clearance.as_mut() {
-            if let Some(cm) = self.costmap.as_ref() {
+            let mut obstacle_ahead = false;
+            if let Some(pc) = self.path_clearance.as_mut() {
+                if let Some(cm) = self.costmap.as_ref() {
+                    pc.update_costmap(cm.clone());
+                }
+                if let Some((index, projected)) = path_progress {
+                    pc.update_path_progress(index, projected);
+                }
+                if let Some(odom) = self.current_odom.as_ref() {
+                    let (x, y, yaw) = pose_xy_yaw(odom);
+                    pc.update_robot_pose(Point2::new(x, y), yaw);
+                }
+                pc.update_rotation_target(rotation_target);
+                obstacle_ahead = pc.is_obstacle_ahead();
+            } else if let (Some(cm), Some(path)) = (self.costmap.as_ref(), self.path.as_ref()) {
+                // 第一次：构造 path_clearance
+                let mut pc = PathClearance::new(path.clone(), robot_width, 3.0);
+                if let Some(geometry) = self.robot_geometry.as_ref() {
+                    pc.set_robot_geometry(geometry.clone());
+                }
+                if let Some(odom) = self.current_odom.as_ref() {
+                    let (x, y, yaw) = pose_xy_yaw(odom);
+                    pc.update_robot_pose(Point2::new(x, y), yaw);
+                }
                 pc.update_costmap(cm.clone());
+                if let Some((index, projected)) = path_progress {
+                    pc.update_path_progress(index, projected);
+                }
+                pc.update_rotation_target(rotation_target);
+                obstacle_ahead = pc.is_obstacle_ahead();
+                self.path_clearance = Some(pc);
             }
-            if let Some((index, projected)) = path_progress {
-                pc.update_path_progress(index, projected);
-            }
-            if let Some(odom) = self.current_odom.as_ref() {
-                let (x, y, yaw) = pose_xy_yaw(odom);
-                pc.update_robot_pose(Point2::new(x, y), yaw);
-            }
-            pc.update_rotation_target(rotation_target);
-            obstacle_ahead = pc.is_obstacle_ahead();
-        } else if let (Some(cm), Some(path)) = (self.costmap.as_ref(), self.path.as_ref()) {
-            // 第一次：构造 path_clearance
-            let mut pc = PathClearance::new(path.clone(), robot_width, 3.0);
-            if let Some(geometry) = self.robot_geometry.as_ref() {
-                pc.set_robot_geometry(geometry.clone());
-            }
-            if let Some(odom) = self.current_odom.as_ref() {
-                let (x, y, yaw) = pose_xy_yaw(odom);
-                pc.update_robot_pose(Point2::new(x, y), yaw);
-            }
-            pc.update_costmap(cm.clone());
-            if let Some((index, projected)) = path_progress {
-                pc.update_path_progress(index, projected);
-            }
-            pc.update_rotation_target(rotation_target);
-            obstacle_ahead = pc.is_obstacle_ahead();
-            self.path_clearance = Some(pc);
-        }
 
-        if obstacle_ahead {
-            return (make_twist2_zero(), Some(StopMessage::ObstacleFound));
+            if obstacle_ahead {
+                return (make_twist2_zero(), Some(StopMessage::ObstacleFound));
+            }
         }
 
         // H-14:navigation_costmap 发布(在订阅者 + interval>0 时按节流发布最近 gradient)
         self.maybe_publish_navigation_costmap();
 
+        if self.oriented_path {
+            if self.state==LocalPlannerState::InitialRotation && self.rotation_target_yaw().is_none() {
+                return self.compute_initial_rotation();
+            }
+            if let Some(command) = self.oriented_preference() {
+                return (command, None);
+            }
+        }
         match self.state {
             LocalPlannerState::Idle => (make_twist2_zero(), None),
             LocalPlannerState::InitialRotation => self.compute_initial_rotation(),
@@ -456,6 +690,18 @@ impl LocalPlanner {
         }
     }
 
+    fn distance_to_expected_goal(&self, position: Point2) -> f64 {
+        self.expected_goal
+            .as_ref()
+            .map(|goal| position.distance(goal.pose.position.to_2d()))
+            .or_else(|| {
+                self.path_distancer
+                    .as_ref()
+                    .map(|path| path.distance_to_goal(position))
+            })
+            .unwrap_or(f64::INFINITY)
+    }
+
     fn compute_initial_rotation(&mut self) -> (Twist2, Option<StopMessage>) {
         let odom = match self.current_odom.as_ref() {
             Some(o) => o,
@@ -470,9 +716,9 @@ impl LocalPlanner {
             return self.compute_path_following();
         }
         // 接近 goal：跳过 path-following，直接 FinalRotation
-        if let Some(pd) = self.path_distancer.as_ref() {
+        if self.path_distancer.is_some() {
             let pos = pose_to_point2(odom);
-            if pd.distance_to_goal(pos) < self.config.goal_tolerance {
+            if self.distance_to_expected_goal(pos) < self.config.goal_tolerance {
                 self.change_state(LocalPlannerState::FinalRotation);
                 return self.compute_final_rotation();
             }
@@ -486,15 +732,27 @@ impl LocalPlanner {
             _ => return (make_twist2_zero(), None),
         };
         let pos = pose_to_point2(odom);
-        if pd.distance_to_goal(pos) < self.config.goal_tolerance {
+        if self.distance_to_expected_goal(pos) < self.config.goal_tolerance {
             self.change_state(LocalPlannerState::FinalRotation);
             return self.compute_final_rotation();
         }
         self.pose_index = pd.closest_projection(pos).0;
         let lookahead = pd.find_lookahead_from_position(pos);
-        let t = self
+        let mut t = self
             .controller
             .advance((lookahead.x, lookahead.y), odom.clone());
+        if let Some(limits) = self.motion_limits.as_ref() {
+            let distance =
+                (self.distance_to_expected_goal(pos) - self.config.goal_tolerance * 0.5).max(0.0);
+            let delay = limits.reaction_time_sec + 1.0 / self.config.control_frequency;
+            let maximum = ((limits.guaranteed_braking_mps2 * delay).powi(2)
+                + 2.0 * limits.guaranteed_braking_mps2 * distance)
+                .sqrt()
+                - limits.guaranteed_braking_mps2 * delay;
+            let ratio = (maximum / t.linear.x.hypot(t.linear.y).max(1e-9)).min(1.0);
+            t.linear.x *= ratio;
+            t.linear.y *= ratio;
+        }
         (t, None)
     }
 
@@ -504,10 +762,10 @@ impl LocalPlanner {
             _ => return (make_twist2_zero(), None),
         };
         // 旋转期间定位可能变化或机器人发生位移，终态须同时满足位置与朝向。
-        let Some(pd) = self.path_distancer.as_ref() else {
+        if self.path_distancer.is_none() {
             return (make_twist2_zero(), Some(StopMessage::Error));
-        };
-        if pd.distance_to_goal(pose_to_point2(odom)) >= self.config.goal_tolerance {
+        }
+        if self.distance_to_expected_goal(pose_to_point2(odom)) >= self.config.goal_tolerance {
             self.change_state(LocalPlannerState::PathFollowing);
             return self.compute_path_following();
         }
@@ -517,6 +775,30 @@ impl LocalPlanner {
         if let Some(goal_yaw) = goal_yaw_opt {
             let yaw_error = angle_diff(goal_yaw, oyaw);
             if yaw_error.abs() < self.config.orientation_tolerance {
+                if self.motion_limits.is_some() {
+                    if self.last_command.linear.x.hypot(self.last_command.linear.y)
+                        + self.last_command.angular_z.abs()
+                        > 0.01
+                        || self
+                            .observed_velocity
+                            .linear
+                            .x
+                            .hypot(self.observed_velocity.linear.y)
+                            + self.observed_velocity.angular_z.abs()
+                            > 0.02
+                    {
+                        self.settling_cycles = 0;
+                        return (make_twist2_zero(), None);
+                    }
+                    self.settling_cycles += 1;
+                    let required = (self.motion_limits.as_ref().unwrap().reaction_time_sec
+                        * self.config.control_frequency)
+                        .ceil() as usize
+                        + 2;
+                    if self.settling_cycles < required {
+                        return (make_twist2_zero(), None);
+                    }
+                }
                 self.change_state(LocalPlannerState::Arrived);
                 // H-20:FinalRotation 阶段进入 Arrived → FinalReached(最终 goal)
                 self.last_goal_reached = GoalReached::FinalReached;
@@ -935,3 +1217,9 @@ mod tests {
         assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
     }
 }
+
+#[path = "local_trajectory.rs"]
+mod local_trajectory;
+
+#[path = "local_oriented.rs"]
+mod local_oriented;

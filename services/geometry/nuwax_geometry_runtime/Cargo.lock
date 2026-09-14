@@ -197,6 +197,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitmaps"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
+dependencies = [
+ "typenum",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -974,6 +983,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "im"
+version = "15.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
+dependencies = [
+ "bitmaps",
+ "rand_core 0.6.4",
+ "rand_xoshiro",
+ "rayon",
+ "sized-chunks",
+ "typenum",
+ "version_check",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1417,6 +1441,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "lz4_flex",
+ "nuwax-map-chunks",
+ "nuwax-types",
  "serde",
  "thiserror 1.0.69",
  "turbojpeg",
@@ -1440,14 +1466,24 @@ dependencies = [
 name = "nuwax-exploration"
 version = "0.1.0"
 dependencies = [
+ "nuwax-explore-routing",
  "nuwax-explore-wavefront",
  "nuwax-nav-base",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuwax-explore-routing"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-types-messages",
+ "serde",
 ]
 
 [[package]]
@@ -1455,6 +1491,7 @@ name = "nuwax-explore-wavefront"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "nuwax-explore-routing",
  "nuwax-nav-base",
  "nuwax-nav-types-messages",
  "rayon",
@@ -1481,6 +1518,7 @@ dependencies = [
  "nuwax-explore-wavefront",
  "nuwax-lcm",
  "nuwax-lio-backends",
+ "nuwax-map-chunks",
  "nuwax-mapping",
  "nuwax-mapping-cloud",
  "nuwax-mapping-raytracing",
@@ -1544,6 +1582,16 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "nuwax-map-chunks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1634,6 +1682,7 @@ dependencies = [
  "nuwax-core",
  "nuwax-mapping",
  "nuwax-nav-base",
+ "nuwax-nav-control",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
  "serde",
@@ -1676,14 +1725,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-control"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-types-messages",
+]
+
+[[package]]
 name = "nuwax-nav-mls-planner"
 version = "0.1.0"
 dependencies = [
  "ahash",
  "futures",
+ "im",
  "image",
  "imageproc",
  "nuwax-codec",
+ "nuwax-explore-routing",
  "nuwax-protocol",
  "nuwax-transport",
  "rayon",
@@ -1745,6 +1803,7 @@ dependencies = [
  "async-trait",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
+ "nuwax-nav-control",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
  "thiserror 1.0.69",
@@ -1756,6 +1815,7 @@ name = "nuwax-nav-simple-planner"
 version = "0.1.0"
 dependencies = [
  "nuwax-nav-base",
+ "nuwax-nav-control",
  "nuwax-nav-types-messages",
  "serde",
  "thiserror 1.0.69",
@@ -1770,21 +1830,25 @@ dependencies = [
  "futures",
  "nuwax-codec",
  "nuwax-core",
+ "nuwax-map-chunks",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-click-goal-bridge",
+ "nuwax-nav-control",
  "nuwax-nav-mls-planner",
  "nuwax-nav-patrolling",
  "nuwax-nav-runtime",
  "nuwax-nav-simple-planner",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
+ "nuwax-rpc",
  "nuwax-transport",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1805,6 +1869,7 @@ dependencies = [
  "approx",
  "indexmap 2.14.0",
  "nalgebra 0.33.3",
+ "nuwax-codec",
  "nuwax-protocol",
  "nuwax-types",
  "serde",
@@ -2348,6 +2413,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xoshiro"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "rawpointer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2666,6 +2740,16 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "sized-chunks"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
+dependencies = [
+ "bitmaps",
+ "typenum",
+]
 
 [[package]]
 name = "slab"

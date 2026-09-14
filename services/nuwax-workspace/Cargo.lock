@@ -218,6 +218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitmaps"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
+dependencies = [
+ "typenum",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,6 +1101,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "im"
+version = "15.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
+dependencies = [
+ "bitmaps",
+ "rand_core 0.6.4",
+ "rand_xoshiro",
+ "rayon",
+ "sized-chunks",
+ "typenum",
+ "version_check",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,7 +1561,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "lz4_flex",
+ "nuwax-map-chunks",
  "nuwax-protocol",
+ "nuwax-types",
  "pretty_assertions",
  "serde",
  "thiserror 1.0.69",
@@ -1563,6 +1589,7 @@ dependencies = [
 name = "nuwax-exploration"
 version = "0.1.0"
 dependencies = [
+ "nuwax-explore-routing",
  "nuwax-explore-tare-bridge",
  "nuwax-explore-terrain-map-bridge",
  "nuwax-explore-wavefront",
@@ -1572,9 +1599,18 @@ dependencies = [
  "nuwax-nav-patrolling",
  "nuwax-nav-types-messages",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuwax-explore-routing"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-types-messages",
+ "serde",
 ]
 
 [[package]]
@@ -1627,6 +1663,7 @@ dependencies = [
  "criterion",
  "ndarray",
  "nuwax-core",
+ "nuwax-explore-routing",
  "nuwax-explore-wavefront",
  "nuwax-mapping",
  "nuwax-nav-base",
@@ -1673,6 +1710,16 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "nuwax-map-chunks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1775,6 +1822,7 @@ dependencies = [
  "nuwax-core",
  "nuwax-mapping",
  "nuwax-nav-base",
+ "nuwax-nav-control",
  "nuwax-nav-types-messages",
  "nuwax-numeric",
  "pretty_assertions",
@@ -1837,6 +1885,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-nav-control"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-types-messages",
+]
+
+[[package]]
 name = "nuwax-nav-far-planner-bridge"
 version = "0.1.0"
 dependencies = [
@@ -1879,9 +1934,11 @@ dependencies = [
  "ahash",
  "approx",
  "futures",
+ "im",
  "image",
  "imageproc",
  "nuwax-codec",
+ "nuwax-explore-routing",
  "nuwax-protocol",
  "nuwax-transport",
  "rayon",
@@ -1978,6 +2035,7 @@ dependencies = [
  "async-trait",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
+ "nuwax-nav-control",
  "nuwax-nav-mls-planner",
  "nuwax-nav-types-messages",
  "prost",
@@ -1990,7 +2048,9 @@ name = "nuwax-nav-simple-planner"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "nuwax-nav-astar",
  "nuwax-nav-base",
+ "nuwax-nav-control",
  "nuwax-nav-types-messages",
  "serde",
  "thiserror 1.0.69",
@@ -2001,6 +2061,7 @@ dependencies = [
 name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bitflags 2.13.0",
  "futures",
  "nuwax-codec",
@@ -2009,11 +2070,13 @@ dependencies = [
  "nuwax-explore-tare-bridge",
  "nuwax-explore-terrain-bridge",
  "nuwax-explore-wavefront",
+ "nuwax-map-chunks",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-basic-path-follower",
  "nuwax-nav-bbox-tracker",
  "nuwax-nav-click-goal-bridge",
+ "nuwax-nav-control",
  "nuwax-nav-far-planner-bridge",
  "nuwax-nav-local-planner-bridge",
  "nuwax-nav-mls-planner",
@@ -2030,6 +2093,7 @@ dependencies = [
  "nuwax-nav-visual-query",
  "nuwax-nav-visual-servoing",
  "nuwax-protocol",
+ "nuwax-rpc",
  "nuwax-transport",
  "pretty_assertions",
  "serde",
@@ -2037,6 +2101,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2076,6 +2141,7 @@ dependencies = [
  "approx",
  "indexmap 2.14.0",
  "nalgebra 0.33.3",
+ "nuwax-codec",
  "nuwax-protocol",
  "nuwax-types",
  "pretty_assertions",
@@ -2768,6 +2834,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xoshiro"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "rawpointer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3120,6 +3195,16 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+
+[[package]]
+name = "sized-chunks"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
+dependencies = [
+ "bitmaps",
+ "typenum",
+]
 
 [[package]]
 name = "slab"

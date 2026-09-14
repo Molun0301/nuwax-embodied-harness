@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
-use nuwax_nav_mls_planner::{SurfaceFrontier, SurfaceSnapshot};
+use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped};
 use nuwax_nav_types_messages::visual::FrontierGoal;
 
@@ -36,6 +36,20 @@ impl SurfaceInputReceiver {
 
     /// 原子交换引用；旧大图的释放放在锁外。
     pub fn replace(&self, snapshot: Option<Arc<SurfaceSnapshot>>) -> ExploreResult<()> {
+        self.replace_inner(snapshot, false)
+    }
+
+    /// 提交已通过来源/修订/时效核对的新观测，允许复用同一几何引用。
+    /// 只读查询或本地缓存重复设置不得调用此入口。
+    pub fn observe(&self, snapshot: Arc<SurfaceSnapshot>) -> ExploreResult<()> {
+        self.replace_inner(Some(snapshot), true)
+    }
+
+    fn replace_inner(
+        &self,
+        snapshot: Option<Arc<SurfaceSnapshot>>,
+        observed: bool,
+    ) -> ExploreResult<()> {
         let previous = {
             let mut current = self.current.write().map_err(|_| input_lock_error())?;
             let unchanged = match (current.as_ref(), snapshot.as_ref()) {
@@ -43,8 +57,8 @@ impl SurfaceInputReceiver {
                 (None, None) => true,
                 _ => false,
             };
-            if !unchanged {
-                // 仅保留引用变化通知，不参与地图/目标身份或来源时效判定。
+            if observed || !unchanged {
+                // 几何变化或真正的新观测通知，不参与地图身份及源时间判定。
                 self.notifications.fetch_add(1, Ordering::Release);
             }
             std::mem::replace(&mut *current, snapshot)
@@ -73,6 +87,8 @@ fn input_lock_error() -> ExploreError {
     ExploreError::SourceError("shared surface input lock is poisoned".into())
 }
 
+#[derive(serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GoalHistory {
     support_xyz: [f64; 3],
     vertical_radius_m: f64,
@@ -95,6 +111,7 @@ impl GoalHistory {
 
 /// 由同一可通行表面查询前沿，导航仍由原探索控制器统一派发。
 pub struct SurfaceGoalSourceAdapter {
+    observation_model: Option<nuwax_nav_types_messages::ObservationModel>,
     name: Cow<'static, str>,
     body_to_support_z_m: f64,
     receiver: SurfaceInputReceiver,
@@ -105,9 +122,11 @@ pub struct SurfaceGoalSourceAdapter {
     next_goal_id: u64,
     selected: Option<SelectedGoal>,
     history: Vec<GoalHistory>,
+    regional_schedule: nuwax_explore_routing::RegionalSchedule,
     last_snapshot: Option<Weak<SurfaceSnapshot>>,
     last_notification: Option<u64>,
     last_query_support: Option<[f64; 3]>,
+    last_query_orientation: Option<[f64; 4]>,
     last_no_frontier: bool,
     retry_support: Option<[f64; 3]>,
     last_frontiers: Vec<FrontierGoal>,
@@ -130,6 +149,7 @@ impl SurfaceGoalSourceAdapter {
             ));
         }
         Ok(Self {
+            observation_model: None,
             name,
             body_to_support_z_m,
             receiver,
@@ -140,14 +160,31 @@ impl SurfaceGoalSourceAdapter {
             next_goal_id: 0,
             selected: None,
             history: Vec::new(),
+            regional_schedule: Default::default(),
             last_snapshot: None,
             last_notification: None,
             last_query_support: None,
+            last_query_orientation: None,
             last_no_frontier: false,
             retry_support: None,
             last_frontiers: Vec::new(),
             last_error: None,
         })
+    }
+
+    /// 接入明确的三维传感器视域，收益计算不替代真实观察或支撑证据。
+    pub fn set_observation_model(
+        &mut self,
+        model: nuwax_nav_types_messages::ObservationModel,
+    ) -> ExploreResult<()> {
+        model.validate().map_err(ExploreError::SourceError)?;
+        if model.kind != nuwax_nav_types_messages::ObservationKind::Volume {
+            return Err(ExploreError::SourceError("三维源要求空间观察标定".into()));
+        }
+        self.observation_model = Some(model);
+        self.last_no_frontier = false;
+        self.last_snapshot = None;
+        Ok(())
     }
 
     /// 边界在候选搜索前生效；历史需同时满足三维距离和可跨台阶的局部高度范围。
@@ -165,6 +202,11 @@ impl SurfaceGoalSourceAdapter {
         self.boundary = boundary;
         self.max_navigation_retries = max_navigation_retries;
         self.blacklist_radius_m = blacklist_radius_m;
+        self.last_snapshot = None;
+        self.last_notification = None;
+        self.last_query_support = None;
+        self.last_query_orientation = None;
+        self.last_no_frontier = false;
         Ok(())
     }
 
@@ -210,6 +252,18 @@ impl SurfaceGoalSourceAdapter {
 }
 
 impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
+    fn checkpoint(&self)->ExploreResult<String> {
+        if self.history.len()>65536{return Err(ExploreError::SourceError("三维探索历史超过持久容量".into()));}
+        serde_json::to_string(&(1_u32,&self.history,&self.regional_schedule)).map_err(|e|ExploreError::SourceError(e.to_string()))
+    }
+    fn restore_checkpoint(&mut self,payload:&str)->ExploreResult<()> {
+        if self.selected.is_some() || payload.len()>1_048_576{return Err(ExploreError::SourceError("三维探索恢复时已有目标或载荷过大".into()));}
+        let (version,history,schedule):(u32,Vec<GoalHistory>,nuwax_explore_routing::RegionalSchedule)=serde_json::from_str(payload).map_err(|e|ExploreError::SourceError(e.to_string()))?;
+        if version!=1 || history.len()>65536 || history.iter().any(|h|h.support_xyz.iter().any(|v|!v.is_finite() || v.abs()>1e9) || !h.vertical_radius_m.is_finite() || !(0.0..=1e6).contains(&h.vertical_radius_m)) {
+            return Err(ExploreError::SourceError("三维探索进度无效或版本不支持".into()));
+        }
+        self.history=history;self.regional_schedule=schedule;self.last_snapshot=None;self.last_notification=None;self.retry_support=None;self.last_frontiers.clear();Ok(())
+    }
     fn source_name(&self) -> Cow<'static, str> {
         self.name.clone()
     }
@@ -218,9 +272,11 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.active = true;
         self.selected = None;
         self.history.clear();
+        self.regional_schedule.reset();
         self.last_snapshot = None;
         self.last_notification = None;
         self.last_query_support = None;
+        self.last_query_orientation = None;
         self.last_no_frontier = false;
         self.retry_support = None;
         self.last_frontiers.clear();
@@ -273,20 +329,20 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 )
             }
         };
-        let new_snapshot = self.last_notification != Some(notification)
-            || self
-                .last_snapshot
-                .as_ref()
-                .is_none_or(|previous| !Weak::ptr_eq(previous, &Arc::downgrade(&snapshot)));
+        let same_geometry = self
+            .last_snapshot
+            .as_ref()
+            .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(&snapshot)));
+        // 边界、距离门限与机体参考转换依赖精确位置和姿态，不能仅比较所在格。
+        let same_query = self.last_query_support == Some(robot.support_xyz)
+            && self.last_query_orientation == Some(quaternion);
+        if same_geometry && same_query && self.last_no_frontier {
+            self.last_notification = Some(notification);
+            self.last_error = None;
+            return Ok(ExplorationPoll::NoFrontier);
+        }
+        let new_snapshot = self.last_notification != Some(notification) || !same_geometry;
         if !new_snapshot && self.retry_support.is_none() {
-            let same_support = self.last_query_support.is_some_and(|previous| {
-                distance(previous, robot.support_xyz)
-                    <= f64::from(snapshot.config().voxel_size) * 0.5
-            });
-            if self.last_no_frontier && same_support {
-                self.last_error = None;
-                return Ok(ExplorationPoll::NoFrontier);
-            }
             return Ok(ExplorationPoll::Pending);
         }
         let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
@@ -296,7 +352,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 .map(|point| [point.x, point.y])
                 .collect()
         });
-        let candidates = match snapshot.reachable_frontiers(robot.support_xyz, &boundary) {
+        let mut candidates = match snapshot.reachable_frontiers(robot.support_xyz, &boundary) {
             Ok(candidates) => candidates,
             Err(error) => {
                 return Ok(
@@ -307,6 +363,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.last_snapshot = Some(Arc::downgrade(&snapshot));
         self.last_notification = Some(notification);
         self.last_query_support = Some(robot.support_xyz);
+        self.last_query_orientation = Some(quaternion);
         self.last_frontiers.clear();
         let minimum_distance = f64::from(
             snapshot
@@ -317,24 +374,103 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         // 默认3米策略半径不能跨越另一楼层；高度只覆盖局部可跨台阶及量化差。
         let vertical_radius =
             f64::from(snapshot.config().step_threshold_m) + f64::from(snapshot.config().voxel_size);
+        let observation_targets = if self.observation_model.is_some() {
+            snapshot
+                .observation_targets(&boundary)
+                .map_err(|error| ExploreError::SourceError(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        // 先用真实路线长度和几何收益缩小昂贵视域查询，后续决策仍重新考虑全部前沿。
+        if self.observation_model.is_some() {
+            candidates.sort_by(|a, b| {
+                (b.gain / (1.0 + b.travel_cost))
+                    .total_cmp(&(a.gain / (1.0 + a.travel_cost)))
+                    .then_with(|| a.cell.cmp(&b.cell))
+            });
+            candidates.truncate(64);
+        }
         let mut admissible = Vec::new();
-        for candidate in candidates {
+        for mut candidate in candidates {
             if self.excluded(candidate.support_xyz, vertical_radius)
                 || distance(robot.support_xyz, candidate.support_xyz) <= minimum_distance
             {
                 continue;
             }
-            let body = snapshot
-                .body_position_from_support(
+            let base_yaw = (candidate.support_xyz[1] - robot.support_xyz[1])
+                .atan2(candidate.support_xyz[0] - robot.support_xyz[0]);
+            let turns = if self
+                .observation_model
+                .as_ref()
+                .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6)
+            {
+                4
+            } else {
+                1
+            };
+            let mut best = None;
+            for i in 0..turns {
+                let yaw = base_yaw + i as f64 * std::f64::consts::FRAC_PI_2;
+                let candidate_quaternion = if snapshot.body_envelope().is_some() {
+                    match snapshot.body_orientation_at(candidate.support_xyz, yaw) {
+                        Ok(q) => q,
+                        Err(_) => continue,
+                    }
+                } else if self.observation_model.is_some() {
+                    [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]
+                } else {
+                    quaternion
+                };
+                let body = match snapshot.body_position_from_support(
                     candidate.support_xyz,
-                    quaternion,
+                    candidate_quaternion,
                     self.body_to_support_z_m,
-                )
-                .map_err(|error| {
-                    ExploreError::SourceError(format!(
-                        "frontier body-reference conversion failed: {error}"
-                    ))
-                })?;
+                ) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if snapshot.body_envelope().is_some()
+                    && snapshot
+                        .validate_body_pose(body, candidate_quaternion)
+                        .is_err()
+                {
+                    continue;
+                }
+                let view = self
+                    .observation_model
+                    .as_ref()
+                    .map(|model| {
+                        snapshot.estimate_observation_view(
+                            model,
+                            body,
+                            candidate_quaternion,
+                            &observation_targets,
+                        )
+                    })
+                    .transpose()
+                    .map_err(ExploreError::SourceError)?;
+                if view.as_ref().is_some_and(|view| view.cells.is_empty()) {
+                    continue;
+                }
+                let count = view.as_ref().map_or(1, |view| view.cells.len());
+                if best.as_ref().is_none_or(
+                    |(_, _, _, old): &(
+                        [f64; 3],
+                        [f64; 4],
+                        Option<nuwax_explore_routing::observation::ViewEstimate>,
+                        usize,
+                    )| count > *old,
+                ) {
+                    best = Some((body, candidate_quaternion, view, count));
+                }
+            }
+            let Some((body, candidate_quaternion, view, _)) = best else {
+                continue;
+            };
+            if let Some(view) = &view {
+                candidate.gain =
+                    view.cells.len() as f64 * f64::from(snapshot.config().voxel_size).powi(2);
+            }
             // 支撑点和完整姿态转换后的机体目标都在候选阶段约束，不能选中后才丢掉。
             if self.boundary.as_ref().is_some_and(|boundary| {
                 !boundary.contains(nuwax_nav_types_messages::geometry::Point2::new(
@@ -343,12 +479,12 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             }) {
                 continue;
             }
-            admissible.push((candidate, body));
+            admissible.push((candidate, (body, candidate_quaternion), view));
         }
         let retry = self.retry_support;
         if !new_snapshot {
             // 旧图只允许重试原视点，不能借失败反馈把其它旧候选算作新增益。
-            admissible.retain(|(candidate, _)| {
+            admissible.retain(|(candidate, _, _)| {
                 retry.is_some_and(|retry| {
                     distance(retry, candidate.support_xyz)
                         <= f64::from(snapshot.config().voxel_size) * 0.25
@@ -359,24 +495,54 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 return Ok(ExplorationPoll::Pending);
             }
         }
-        admissible.sort_by(|(left, _), (right, _)| {
-            let retry_distance =
-                |point| retry.map_or(f64::INFINITY, |retry| distance(retry, point));
-            let left_retry =
-                retry_distance(left.support_xyz) <= f64::from(snapshot.config().voxel_size) * 0.25;
-            let right_retry =
-                retry_distance(right.support_xyz) <= f64::from(snapshot.config().voxel_size) * 0.25;
-            right_retry
-                .cmp(&left_retry)
-                .then_with(|| {
-                    let score = |candidate: &SurfaceFrontier| {
-                        candidate.gain / (1.0 + distance(robot.support_xyz, candidate.support_xyz))
-                    };
-                    score(right).total_cmp(&score(left))
-                })
-                .then(left.cell.cmp(&right.cell))
+        let routing_candidates: Vec<_> = admissible
+            .iter()
+            .map(|(candidate, _, _)| nuwax_explore_routing::Candidate {
+                position: candidate.support_xyz,
+                gain: candidate.gain,
+                travel_cost: candidate.travel_cost,
+            })
+            .collect();
+        let retry_index = retry.and_then(|retry| {
+            admissible.iter().position(|(candidate, _, _)| {
+                distance(retry, candidate.support_xyz)
+                    <= f64::from(snapshot.config().voxel_size) * 0.25
+            })
         });
-        let Some((candidate, body)) = admissible.first() else {
+        let observed: Vec<_> = admissible
+            .iter()
+            .map(|(_, _, view)| {
+                view.as_ref()
+                    .map(|view| view.cells.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let selection = if retry_index.is_none() {
+            self.regional_schedule.select_observed(
+                &routing_candidates,
+                self.observation_model.as_ref().map(|_| observed.as_slice()),
+                |source, goals| {
+                    let targets: Vec<_> = goals
+                        .iter()
+                        .map(|&i| routing_candidates[i].position)
+                        .collect();
+                    snapshot
+                        .frontier_travel_costs(
+                            routing_candidates[source].position,
+                            &targets,
+                            &boundary,
+                        )
+                        .unwrap_or_else(|_| vec![f64::INFINITY; targets.len()])
+                },
+            )
+        } else {
+            None
+        };
+        let selected_index =
+            retry_index.or_else(|| selection.as_ref().map(|selection| selection.index));
+        let Some((candidate, (body, candidate_quaternion), view)) =
+            selected_index.and_then(|index| admissible.get(index))
+        else {
             self.retry_support = None;
             self.last_no_frontier = true;
             self.last_error = None;
@@ -386,7 +552,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.next_goal_id = self.next_goal_id.checked_add(1).ok_or_else(|| {
             ExploreError::SourceError("surface frontier goal identifier exhausted".into())
         })?;
-        let travel = distance([position.x, position.y, position.z], *body);
+        let travel = candidate.travel_cost;
         let mut goal = FrontierGoal::new(
             format!(
                 "{}-surface-{:016x}-{}",
@@ -397,15 +563,57 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 stamp: state.now,
                 pose: Pose3 {
                     position: Point3::new(body[0], body[1], body[2]),
-                    orientation,
+                    orientation: nuwax_nav_types_messages::Quaternion {
+                        x: candidate_quaternion[0],
+                        y: candidate_quaternion[1],
+                        z: candidate_quaternion[2],
+                        w: candidate_quaternion[3],
+                    },
                 },
             },
             (candidate.gain / (1.0 + travel)) as f32,
         );
         goal.information_gain = Some(candidate.gain as f32);
+        if let Some(view) = view {
+            goal.metadata.insert(
+                "gain_basis".into(),
+                "calibrated_visible_support_cells".into(),
+            );
+            goal.metadata
+                .insert("visibility_rays".into(), view.rays.to_string());
+            goal.metadata.insert(
+                "visibility_budget_limited".into(),
+                view.budget_limited.to_string(),
+            );
+        }
         goal.frontier_area_m2 = Some(candidate.gain as f32);
         goal.distance_cost = Some(travel as f32);
         goal.producer = "nuwax-exploration/surface".into();
+        goal.metadata.insert(
+            "selection_method".into(),
+            if retry_index.is_some() {
+                "navigation_retry"
+            } else {
+                "regional_route"
+            }
+            .into(),
+        );
+        if let Some(selection) = selection {
+            goal.metadata.insert(
+                "region_wait_rounds".into(),
+                selection.priority_wait_rounds.to_string(),
+            );
+            goal.metadata.insert(
+                "route_regions".into(),
+                selection.regional_order.len().to_string(),
+            );
+            goal.metadata.insert(
+                "available_regions".into(),
+                selection.region_count.to_string(),
+            );
+            goal.metadata
+                .insert("route_cost_m".into(), selection.route_cost.to_string());
+        }
         goal.stamp = state.now;
         self.last_frontiers = vec![goal.clone()];
         self.selected = Some(SelectedGoal {
@@ -433,7 +641,16 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         let selected = self.selected.take().expect("goal identity was checked");
         self.retry_support = None;
         self.last_no_frontier = false;
+        if !matches!(
+            feedback,
+            ExplorationGoalFeedback::Cancelled | ExplorationGoalFeedback::InputUnavailable(_)
+        ) {
+            self.regional_schedule.record_outcome(selected.support_xyz);
+        }
         match feedback {
+            ExplorationGoalFeedback::InputUnavailable(reason) => {
+                self.last_error = Some(format!("等待导航输入恢复：{reason}"));
+            }
             ExplorationGoalFeedback::Reached => {
                 self.record_feedback(selected.support_xyz, selected.vertical_radius_m, true);
                 self.last_error = None;
@@ -543,6 +760,112 @@ mod tests {
     }
 
     #[test]
+    fn input_interruption_does_not_blacklist_surface_or_advance_region_age() {
+        let receiver = SurfaceInputReceiver::new();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
+        let mut source = source(receiver.clone(), 0);
+        let selected = goal(source.poll_goal(&state(0.4, 1)).unwrap());
+        source
+            .report_goal_feedback(
+                &selected.id,
+                ExplorationGoalFeedback::InputUnavailable("位姿过期，已停车".into()),
+            )
+            .unwrap();
+        assert!(source.history.is_empty());
+        assert_eq!(source.regional_schedule.completed_rounds(), 0);
+        assert_eq!(
+            source.poll_goal(&state(0.4, 2)).unwrap(),
+            ExplorationPoll::Pending
+        );
+        receiver.observe(snapshot).unwrap();
+        assert!(matches!(
+            source.poll_goal(&state(0.4, 3)).unwrap(),
+            ExplorationPoll::Goal(_)
+        ));
+    }
+
+    #[test]
+    fn calibrated_surface_source_reports_visible_information_on_the_correct_level() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.replace(Some(map())).unwrap();
+        let mut source = source(receiver, 1);
+        source
+            .set_observation_model(nuwax_nav_types_messages::ObservationModel {
+                kind: nuwax_nav_types_messages::ObservationKind::Volume,
+                min_range_m: 0.05,
+                max_range_m: 2.0,
+                horizontal_fov_rad: std::f64::consts::TAU,
+                vertical_min_rad: -std::f64::consts::FRAC_PI_2,
+                vertical_max_rad: 0.0,
+                sensor_translation_body_m: [0.0; 3],
+                sensor_rotation_body_xyzw: [0.0, 0.0, 0.0, 1.0],
+                max_rays: 128,
+            })
+            .unwrap();
+        let selected = goal(source.poll_goal(&state(0.4, 1)).unwrap());
+        assert_eq!(
+            selected.metadata.get("gain_basis").map(String::as_str),
+            Some("calibrated_visible_support_cells")
+        );
+        assert!(selected.information_gain.unwrap() > 0.0);
+        assert!(selected.pose.pose.position.z < 1.0);
+    }
+
+    #[test]
+    fn regional_age_only_advances_for_matching_navigation_outcomes() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut adapter = source(receiver.clone(), 1);
+        adapter.begin().unwrap();
+        let selected = goal(adapter.poll_goal(&state(0.3, 1)).unwrap());
+        adapter
+            .report_goal_feedback("late-old-goal", ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert_eq!(adapter.regional_schedule.completed_rounds(), 0);
+        adapter
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        adapter
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        assert_eq!(adapter.regional_schedule.completed_rounds(), 1);
+        adapter.end().unwrap();
+        adapter.begin().unwrap();
+        receiver.observe(map()).unwrap();
+        assert_eq!(adapter.regional_schedule.completed_rounds(), 0);
+        let selected = goal(adapter.poll_goal(&state(0.3, 2)).unwrap());
+        adapter
+            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Cancelled)
+            .unwrap();
+        assert_eq!(adapter.regional_schedule.completed_rounds(), 0);
+    }
+
+    #[test]
+    fn production_surface_source_reports_shared_regional_selection() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver, 1);
+        source.begin().unwrap();
+        let goal = goal(source.poll_goal(&state(0.3, 1)).unwrap());
+        assert_eq!(
+            goal.metadata.get("selection_method").map(String::as_str),
+            Some("regional_route")
+        );
+        assert!(goal
+            .distance_cost
+            .is_some_and(|cost| cost.is_finite() && cost > 0.0));
+        assert!(
+            goal.metadata
+                .get("route_regions")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                <= 8
+        );
+    }
+
+    #[test]
     fn selected_goal_waits_for_exact_feedback_and_a_new_surface_observation() {
         let receiver = SurfaceInputReceiver::new();
         let first_map = map();
@@ -590,6 +913,62 @@ mod tests {
             .unwrap();
         assert!(matches!(
             source.poll_goal(&arrived).unwrap(),
+            ExplorationPoll::SourceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn admitted_observation_can_reuse_geometry_after_exact_goal_feedback() {
+        let receiver = SurfaceInputReceiver::new();
+        let physical = map();
+        receiver.observe(Arc::clone(&physical)).unwrap();
+        let mut source = source(receiver.clone(), 1);
+        let first = goal(source.poll_goal(&state(0.4, 1)).unwrap());
+        source
+            .report_goal_feedback(&first.id, ExplorationGoalFeedback::Reached)
+            .unwrap();
+        let arrived = ExplorationStateSnapshot::new(first.pose.clone(), Timestamp::from_unix(3, 0));
+        receiver.replace(Some(Arc::clone(&physical))).unwrap();
+        receiver.snapshot().unwrap();
+        assert_eq!(
+            source.poll_goal(&arrived).unwrap(),
+            ExplorationPoll::Pending
+        );
+        receiver.observe(Arc::clone(&physical)).unwrap();
+        assert!(Arc::ptr_eq(
+            &receiver.snapshot().unwrap().unwrap(),
+            &physical
+        ));
+        let next = goal(source.poll_goal(&arrived).unwrap());
+        assert_ne!(next.id, first.id);
+        assert!(first.pose.pose.position.distance(next.pose.pose.position) > 0.3);
+    }
+
+    #[test]
+    fn new_observation_after_subcell_boundary_crossing_does_not_reuse_no_frontier() {
+        let receiver = SurfaceInputReceiver::new();
+        let physical = map();
+        receiver.observe(Arc::clone(&physical)).unwrap();
+        let mut source = source(receiver.clone(), 1);
+        let boundary = ExplorationBoundary::from_vertices(vec![
+            Point2::new(0.8, 0.8),
+            Point2::new(1.08, 0.8),
+            Point2::new(1.08, 1.3),
+            Point2::new(0.8, 1.3),
+        ])
+        .unwrap();
+        source
+            .configure_constraints(Some(boundary), 1, 0.3)
+            .unwrap();
+        let mut pose = state(0.4, 1);
+        assert_eq!(
+            source.poll_goal(&pose).unwrap(),
+            ExplorationPoll::NoFrontier
+        );
+        pose.robot_pose.pose.position.x = 1.09;
+        receiver.observe(physical).unwrap();
+        assert!(matches!(
+            source.poll_goal(&pose).unwrap(),
             ExplorationPoll::SourceUnavailable(_)
         ));
     }

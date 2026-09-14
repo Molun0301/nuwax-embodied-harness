@@ -24,6 +24,23 @@ pub fn plan_on_costmap(
     max_expansions: Option<usize>,
     inflation_override: Option<f64>,
 ) -> Result<Option<Vec<Point2>>, NavError> {
+    plan_on_costmap_interruptible(
+        costmap,
+        start,
+        goal,
+        max_expansions,
+        inflation_override,
+        &|| false,
+    )
+}
+fn plan_on_costmap_interruptible(
+    costmap: &Costmap,
+    start: Point2,
+    goal: Point2,
+    max_expansions: Option<usize>,
+    inflation_override: Option<f64>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Option<Vec<Point2>>, NavError> {
     if !start.x.is_finite() || !start.y.is_finite() || !goal.x.is_finite() || !goal.y.is_finite() {
         return Err(NavError::InvalidInput {
             field: "start/goal",
@@ -53,6 +70,9 @@ pub fn plan_on_costmap(
     }
 
     let is_blocked = |ix: i64, iy: i64| -> bool {
+        if cancelled() {
+            return true;
+        }
         if costmap.has_occupancy() {
             return !costmap.has_footprint_clearance(ix, iy, effective_radius);
         }
@@ -89,8 +109,11 @@ pub fn plan_on_costmap(
 ///
 /// 业务线程 / event loop / tokio task 应在自己的 runtime 中驱动 `replan_once` 与
 /// `update_waypoint`；本结构不启动线程（与 Python 原实现的 thread-per-loop 不同）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimplePlanner {
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    goal_options: nuwax_nav_types_messages::GoalOptions,
+    cached_yaws: Option<Vec<f64>>,
     config: SimplePlannerConfig,
     costmap: Costmap,
     /// 机器人平面坐标
@@ -117,6 +140,23 @@ pub struct SimplePlanner {
 }
 
 impl SimplePlanner {
+    /// 在私有规划实例查询完整路线，供行程预算复用生产规划与机体检查。
+    pub fn query_route(mut self, from: Pose3, to: Pose3, options: nuwax_nav_types_messages::GoalOptions) -> Result<Vec<Point2>, NavError> {
+        self.update_odometry(from);
+        self.set_goal_options(options)?;
+        self.set_goal(to.position, 0.0);
+        self.set_goal_yaw(to.orientation.yaw());
+        if self.goal_pose_reached() {
+            let points=vec![Point2::new(from.position.x,from.position.y),Point2::new(to.position.x,to.position.y)];
+            let view=if let Some(geometry)=self.config.robot_geometry.as_ref(){self.costmap.planning_view(points[0],from.orientation.yaw(),geometry)?}else{self.costmap.clone()};
+            if view.path_has_observed_clearance(&points,from.orientation.yaw(),Some(to.orientation.yaw())) {return Ok(points);}
+        } else {
+            self.replan_once(0.0);
+            if let Some(path)=self.cached_path {return Ok(path);}
+        }
+        Err(NavError::InvalidInput {field:"route",reason:"完整机体路线不可达或计算预算耗尽".into()})
+    }
+
     /// 构造。costmap 按 config 默认参数创建。
     /// # Errors
     /// 转发 `Costmap::new` 的 `InvalidInput`。
@@ -127,6 +167,9 @@ impl SimplePlanner {
             config.inflation_radius,
         )?;
         Ok(Self {
+            cancellation: None,
+            goal_options: Default::default(),
+            cached_yaws: None,
             effective_inflation: config.inflation_radius,
             stuck: StuckState {
                 ref_goal_dist: f64::INFINITY,
@@ -150,6 +193,56 @@ impl SimplePlanner {
         })
     }
 
+    /// 到达必须同时满足本目标的位置和朝向容差，供模块与规划核心共同判断。
+    pub(crate) fn goal_pose_reached(&self) -> bool {
+        self.has_odom
+            && self.goal_x.zip(self.goal_y).is_some_and(|(x, y)| {
+                (x - self.robot_x).hypot(y - self.robot_y) <= self.config.goal_reached_threshold
+                    && self.goal_yaw.is_none_or(|yaw| {
+                        (yaw - self.robot_yaw)
+                            .sin()
+                            .atan2((yaw - self.robot_yaw).cos())
+                            .abs()
+                            <= self.goal_options.yaw_tolerance_rad.max(1e-6)
+                    })
+            })
+    }
+    pub(crate) fn needs_replan(&self, now: f64) -> bool {
+        self.has_odom
+            && self.goal_x.is_some()
+            && self.goal_y.is_some()
+            && (self.cached_path.is_none()
+                || now - self.last_plan_time >= self.config.replan_cooldown)
+    }
+    pub(crate) fn set_cancellation(
+        &mut self,
+        token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.cancellation = Some(token);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// 只接纳工作线程的规划结果；地图、位姿和目标继续由输入拥有方持有。
+    pub(crate) fn accept_plan(&mut self, computed: &Self) -> bool {
+        self.cached_path = computed.cached_path.clone();
+        self.cached_yaws = computed.cached_yaws.clone();
+        if self.cached_path.is_some()
+            && self.costmap.has_occupancy()
+            && !self.cached_route_is_clear()
+        {
+            self.cached_path = None;
+            self.cached_yaws = None;
+            self.current_wp = None;
+            return false;
+        }
+        self.last_plan_time = computed.last_plan_time;
+        self.stuck = computed.stuck;
+        true
+    }
+
     /// 直接覆盖 costmap（接收 terrain_map_ext 输入后调用）。
     pub fn replace_costmap(&mut self, mut costmap: Costmap) {
         if costmap.has_occupancy() {
@@ -162,9 +255,99 @@ impl SimplePlanner {
             self.stuck.effective_inflation = self.effective_inflation;
         }
         self.costmap = costmap;
-        // 地图更新可能阻断旧路径，必须在下一次调度重新规划，不能继续冷却缓存。
-        self.cached_path = None;
-        self.current_wp = None;
+        // 新观测仍由执行者逐周期检查；只在剩余完整机体路线失效时撤销缓存。
+        if !self.cached_route_is_clear() {
+            self.cached_path = None;
+            self.cached_yaws = None;
+            self.current_wp = None;
+        }
+    }
+
+    /// 保留同布局占据索引，当前路线仍按完整新图复核。
+    pub fn update_occupancy(&mut self, grid: nuwax_nav_types_messages::OccupancyGrid2D) -> Result<crate::costmap::OccupancyUpdateStats, NavError> {
+        let radius = self.config.inflation_radius.max(self.costmap.minimum_inflation_radius());
+        let stats = self.costmap.replace_occupancy(grid, radius)?;
+        self.effective_inflation = self.costmap.inflation_radius();
+        self.stuck.effective_inflation = self.effective_inflation;
+        if !self.cached_route_is_clear() {
+            self.cached_path = None;
+            self.cached_yaws = None;
+            self.current_wp = None;
+        }
+        Ok(stats)
+    }
+
+    fn cached_route_is_clear(&self) -> bool {
+        use nuwax_nav_control::PlanarPose;
+        let (Some(path), Some(geometry)) = (&self.cached_path, &self.config.robot_geometry) else {
+            return false;
+        };
+        if path.is_empty() || !self.has_odom {
+            return false;
+        }
+        let derived_yaws: Vec<f64>;
+        let yaws = if let Some(yaws) = self.cached_yaws.as_ref() {
+            yaws
+        } else {
+            derived_yaws = path
+                .iter()
+                .enumerate()
+                .map(|(i, point)| {
+                    path.get(i + 1)
+                        .map_or(self.goal_yaw.unwrap_or(self.robot_yaw), |next| {
+                            (next.y - point.y).atan2(next.x - point.x)
+                        })
+                })
+                .collect();
+            &derived_yaws
+        };
+        if yaws.len() != path.len() {
+            return false;
+        }
+        let current = Point2::new(self.robot_x, self.robot_y);
+        let Ok(view) = self
+            .costmap
+            .planning_view(current, self.robot_yaw, geometry)
+        else {
+            return false;
+        };
+        let Some(grid) = view.occupancy_grid() else {
+            return false;
+        };
+        let angle = |a: f64, b: f64| (a - b).sin().atan2((a - b).cos()).abs();
+        let nearest = path
+            .iter()
+            .enumerate()
+            .min_by(|(ia, a), (ib, b)| {
+                a.distance(current)
+                    .total_cmp(&b.distance(current))
+                    .then_with(|| {
+                        angle(yaws[*ia], self.robot_yaw)
+                            .total_cmp(&angle(yaws[*ib], self.robot_yaw))
+                    })
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        if path[nearest].distance(current) > self.config.lookahead_distance.max(0.3) {
+            return false;
+        }
+        let mut from = PlanarPose {
+            x: current.x,
+            y: current.y,
+            yaw: self.robot_yaw,
+        };
+        for i in nearest..path.len() {
+            let to = PlanarPose {
+                x: path[i].x,
+                y: path[i].y,
+                yaw: yaws[i],
+            };
+            if !crate::oriented::motion_is_clear(grid, geometry, from, to) {
+                return false;
+            }
+            from = to;
+        }
+        true
     }
 
     /// 访问当前 costmap。
@@ -208,6 +391,38 @@ impl SimplePlanner {
         dirty
     }
 
+    /// 捕获当前目标行为，旧目标选项不能在新请求中复用。
+    pub fn set_goal_options(
+        &mut self,
+        options: nuwax_nav_types_messages::GoalOptions,
+    ) -> Result<(), NavError> {
+        options
+            .validate()
+            .map_err(|reason| NavError::InvalidInput {
+                field: "goal_options",
+                reason,
+            })?;
+        if options.allow_reverse
+            && self
+                .config
+                .motion_limits
+                .as_ref()
+                .is_none_or(|limits| limits.max_reverse_mps <= 0.0)
+        {
+            return Err(NavError::InvalidInput {
+                field: "allow_reverse",
+                reason: "缺少倒车能力标定".into(),
+            });
+        }
+        self.goal_options = options;
+        self.config.goal_reached_threshold = options.position_tolerance_m.max(1e-6);
+        Ok(())
+    }
+    /// 最近规划的真实机体朝向，和位置路径逐点对应。
+    pub fn cached_yaws(&self) -> Option<&[f64]> {
+        self.cached_yaws.as_deref()
+    }
+
     /// 设置机器人位姿。
     pub fn update_odometry(&mut self, pose: Pose3) {
         self.robot_x = pose.position.x;
@@ -247,6 +462,7 @@ impl SimplePlanner {
             effective_inflation: self.effective_inflation,
         };
         self.cached_path = None;
+        self.cached_yaws = None;
         self.last_plan_time = 0.0;
         self.current_wp = None;
     }
@@ -257,6 +473,7 @@ impl SimplePlanner {
         self.goal_x = None;
         self.goal_y = None;
         self.cached_path = None;
+        self.cached_yaws = None;
         self.current_wp = None;
         if !already_idle {
             tracing::info!("Goal cleared — idle until new goal");
@@ -309,6 +526,7 @@ impl SimplePlanner {
                 Err(error) => {
                     tracing::warn!(%error, "机器人规划外形不可用");
                     self.cached_path = None;
+                    self.cached_yaws = None;
                     self.current_wp = None;
                     return (Some(None), true, false);
                 }
@@ -317,7 +535,7 @@ impl SimplePlanner {
             None
         };
         let goal_dist = ((gx - rx).powi(2) + (gy - ry).powi(2)).sqrt();
-        if goal_dist <= self.config.goal_reached_threshold {
+        if self.goal_pose_reached() {
             let costmap = planning_view.as_ref().unwrap_or(&self.costmap);
             if !costmap.permits_positions(
                 Point2::new(rx, ry),
@@ -325,6 +543,7 @@ impl SimplePlanner {
                 self.effective_inflation,
             ) {
                 self.cached_path = None;
+                self.cached_yaws = None;
                 self.current_wp = None;
                 return (Some(None), true, false);
             }
@@ -366,27 +585,76 @@ impl SimplePlanner {
                 .set_inflation_radius(new_stuck.effective_inflation);
         }
 
-        let path = plan_on_costmap(
+        let mut path = plan_on_costmap_interruptible(
             planning_view.as_ref().unwrap_or(&self.costmap),
             Point2 { x: rx, y: ry },
             Point2 { x: gx, y: gy },
             Some(self.config.max_expansions),
             Some(self.effective_inflation),
+            &|| self.is_cancelled(),
         );
+        if self.is_cancelled() {
+            return (None, false, false);
+        }
+        let mut planned_yaws = None;
+        if let Some(geometry) = self.config.robot_geometry.as_ref() {
+            let view = planning_view.as_ref().unwrap_or(&self.costmap);
+            let needs_oriented = self.goal_options.allow_reverse
+                || self.config.motion_limits.as_ref().is_some_and(|limits| {
+                    limits.model != nuwax_nav_types_messages::MotionModel::Differential
+                        || !limits.can_rotate_in_place
+                })
+                || !matches!(&path,Ok(Some(points)) if view.path_has_observed_clearance(points,self.robot_yaw,self.goal_yaw));
+            if needs_oriented {
+                if let Some(grid) = view.occupancy_grid() {
+                    match crate::oriented::plan_oriented_interruptible(
+                        grid,
+                        geometry,
+                        nuwax_nav_control::PlanarPose {
+                            x: rx,
+                            y: ry,
+                            yaw: self.robot_yaw,
+                        },
+                        nuwax_nav_control::PlanarPose {
+                            x: gx,
+                            y: gy,
+                            yaw: self.goal_yaw.unwrap_or(self.robot_yaw),
+                        },
+                        self.goal_options,
+                        self.config.motion_limits.as_ref(),
+                        self.config.max_expansions,
+                        &|| self.is_cancelled(),
+                    ) {
+                        Ok(Some(poses)) => {
+                            planned_yaws = Some(poses.iter().map(|p| p.yaw).collect());
+                            path = Ok(Some(poses.iter().map(|p| Point2::new(p.x, p.y)).collect()));
+                        }
+                        Ok(None) => path = Ok(None),
+                        Err(error) => path = Err(error),
+                    }
+                }
+            }
+        }
+        if self.is_cancelled() {
+            return (None, false, false);
+        }
         self.last_plan_time = mono_now;
         // 只有本次规划成功才能继续发布路线；失败时旧路线已经失效。
         self.cached_path = None;
+        self.cached_yaws = None;
         self.current_wp = None;
         match path {
             Ok(Some(p)) => {
-                if !planning_view
-                    .as_ref()
-                    .unwrap_or(&self.costmap)
-                    .path_has_observed_clearance(&p, self.robot_yaw, self.goal_yaw)
+                if planned_yaws.is_none()
+                    && !planning_view
+                        .as_ref()
+                        .unwrap_or(&self.costmap)
+                        .path_has_observed_clearance(&p, self.robot_yaw, self.goal_yaw)
                 {
                     tracing::warn!("实际路径朝向会扫过已观测障碍，拒绝发布该路线");
                     return (Some(None), true, escalated);
                 }
+                self.cached_yaws = planned_yaws;
                 self.cached_path = Some(p.clone());
                 (Some(Some(p)), true, escalated)
             }

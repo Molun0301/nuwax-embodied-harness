@@ -12,6 +12,8 @@ pub const FRAME_SENSOR: &str = "sensor";
 /// 简易路径规划器配置。
 #[derive(Debug, Clone)]
 pub struct SimplePlannerConfig {
+    /// 显式运动学标定，缺省不启用倒车或有曲率限制的底盘模型。
+    pub motion_limits: Option<nuwax_nav_types_messages::MotionLimits>,
     /// 世界坐标系
     pub world_frame: String,
     /// 机器人本体坐标系
@@ -57,6 +59,7 @@ pub struct SimplePlannerConfig {
 impl Default for SimplePlannerConfig {
     fn default() -> Self {
         Self {
+            motion_limits: None,
             world_frame: FRAME_MAP.into(),
             body_frame: FRAME_BODY.into(),
             sensor_frame: FRAME_SENSOR.into(),

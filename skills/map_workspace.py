@@ -6,6 +6,7 @@ from datetime import datetime
 from functools import wraps
 import json
 import logging
+import math
 import threading
 import uuid
 
@@ -1926,9 +1927,15 @@ class MapWorkspaceService:
                 reason="receipt_identity_mismatch",
             )
         if any(
-            isinstance(value, bool)
-            or not isinstance(value, (str, int))
-            for value in session_receipt.values()
+            (
+                not isinstance(value, list)
+                or len(value) != 3
+                or canonical.get("target_kind") != "planar_graph"
+                or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) for item in value)
+            ) if field_name == "planar_seed" else (
+                isinstance(value, bool) or not isinstance(value, (str, int))
+            )
+            for field_name, value in session_receipt.items()
         ):
             self._raise_relocalization_session_metadata_invalid(
                 canonical,
@@ -2773,13 +2780,14 @@ class MapWorkspaceService:
                     request_id=resolved_request_id
                 )
                 raise GatewayError(
-                    "重定位请求被 provider 明确拒绝。",
+                    "重定位请求被明确拒绝：%s" % str(result.get("detail") or result.get("message") or disposition),
                     error_code="relocalization_%s" % disposition,
                     http_status=409,
                     jsonrpc_code=-32000,
                     details={
                         "request_id": resolved_request_id,
                         "disposition": disposition,
+                        "provider_detail": result.get("detail") or result.get("message"),
                     },
                 ) from exc
             except Exception as exc:
@@ -3383,7 +3391,7 @@ class MapWorkspaceService:
             or source_kind == "map_asset_bundle"
             or (
                 metadata.get("checkpoint_ready")
-                and metadata.get("map_name")
+                and (getattr(latest_map_snapshot, "map_name", None) or metadata.get("map_name"))
                 and metadata.get("asset_manifest_sha256")
             )
         )

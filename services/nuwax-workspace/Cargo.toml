@@ -17,6 +17,7 @@ members = [
     "crates/nuwax-tf",
     # 建图、点云与激光惯性里程计
     "crates/nuwax-mapping",
+    "crates/nuwax-map-chunks",
     "crates/nuwax-gtsam",
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",
@@ -27,6 +28,7 @@ members = [
     # 导航编排与探索
     "crates/nuwax-nav-stack",
     "crates/nuwax-exploration",
+    "crates/nuwax-explore-routing",
     "crates/nuwax-explore-wavefront",
     "crates/nuwax-explore-tare-bridge",
     "crates/nuwax-explore-terrain-bridge",
@@ -56,6 +58,7 @@ members = [
     "crates/nuwax-nav-mls-planner",
     "crates/nuwax-motion-safety-guard",
     "crates/nuwax-nav-runtime",
+    "crates/nuwax-nav-control",
 ]
 
 [workspace.package]

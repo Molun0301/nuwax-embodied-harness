@@ -93,6 +93,7 @@ from services.geometry.runtime_input_bridge import (
     RuntimeInputBridge,
     build_default_runtime_input_bridge,
 )
+from services.geometry.recording import MappingRecorder
 from services.geometry import (
     PlatformGeometryRuntime,
     PointCloudMapCache,
@@ -1252,6 +1253,17 @@ class GatewayRuntime:
         # The input bridge starts only after the Rust geometry gRPC endpoint is ready.
         self._input_bridge: Optional[RuntimeInputBridge] = None
         self._input_bridge_started = False
+        recording_root = config.runtime_data.mapping_recording_dir or str(
+            Path(config.runtime_data.map_catalog_root or config.gateway.artifact_dir).parent / "mapping_recordings"
+        )
+        self.mapping_recorder = MappingRecorder(
+            Path(recording_root), enabled=config.runtime_data.mapping_recording_enabled,
+            max_bytes=config.runtime_data.mapping_recording_max_bytes,
+        )
+        self._recording_subscription_id = self.stream_bus.subscribe(
+            self.mapping_recorder.record_stream_frame,
+            topics=("localization.pose", "map.frame", "runtime.governance"),
+        )
 
     def _attach_geometry_runtime_on_start(self) -> bool:
         """Attach and probe the systemd-owned geometry sidecar at startup.
@@ -1455,7 +1467,9 @@ class GatewayRuntime:
         relocalization_pending: Dict[str, object] = {}
         with self._lifecycle_lock:
             if not self._started:
-                if not self._closed:
+                recorder = getattr(self, "mapping_recorder", None)
+                recording_pending = recorder is not None and not recorder.status()["closed"]
+                if not self._closed or recording_pending:
                     self.task_manager.shutdown(wait=True)
                     self._join_exploration_finalizers()
                     self._close_dispatch_resources()
@@ -1516,6 +1530,7 @@ class GatewayRuntime:
                 ("geometry runtime", self.platform_geometry_runtime.stop),
                 ("audio service", self.audio_service.stop),
                 ("data frame streams", self._stop_data_frame_stream_sources),
+                ("geometry recording", self._close_mapping_recording),
                 ("perception video runtime", self.perception_video_runtime.stop),
                 ("memory background workers", self.memory_service.disable_memory_library),
                 ("robot", self.robot.stop),
@@ -1580,9 +1595,24 @@ class GatewayRuntime:
             if stop_error is not None:
                 raise stop_error
 
+    def _close_mapping_recording(self) -> None:
+        """所有输入与定位生产者停止后，撤销记录订阅并排空磁盘写入者。"""
+        recorder = getattr(self, "mapping_recorder", None)
+        if recorder is not None:
+            subscription = getattr(self, "_recording_subscription_id", None)
+            if subscription is not None:
+                self.stream_bus.unsubscribe(subscription)
+                self._recording_subscription_id = None
+            recorder.close()
+
     def _close_dispatch_resources(self) -> None:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
 
+        recording_error = None
+        try:
+            self._close_mapping_recording()
+        except Exception as error:
+            recording_error = error
         building_service = getattr(self, "_building_navigation_service", None)
         if building_service is not None:
             for provider in building_service.providers.values():
@@ -1596,6 +1626,8 @@ class GatewayRuntime:
             self.event_bus.shutdown()
         if getattr(self, "_owns_stream_bus", False):
             self.stream_bus.shutdown()
+        if recording_error is not None:
+            raise recording_error
 
     def get_live_map_stream_status(self) -> Dict[str, object]:
         return {
@@ -4478,6 +4510,7 @@ class GatewayRuntime:
             "runtime_input_bridge": input_bridge.get_status() if input_bridge is not None else {
                 "started": False, "ready": False,
             },
+            "mapping_recording": self.mapping_recorder.status() if getattr(self, "mapping_recorder", None) is not None else None,
             "robot_name": self.robot.manifest.robot_name,
             "robot_model": self.robot.manifest.robot_model,
             "assembly_status": self._serialize(self.robot.get_status()),
@@ -10669,6 +10702,25 @@ class GatewayRuntime:
             sensor_sample_provider=sensor_sample_provider,
             **({"sensor_source_owner": source_owner} if source_owner is not None else {}),
         )
+        recorder = getattr(self, "mapping_recorder", None)
+        if recorder is not None:
+            # 在订阅设备之前开始记录，包含原生算法预热；网页连接不参与其生命周期。
+            recorder.start({
+                "geometry": self.config.geometry.build_metadata(),
+                "robot_name": self.robot.manifest.robot_name,
+                "body_from_sensor": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
+                "body_from_imu": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
+                "native_lio_settings": {key: runtime_value(key, "") for key in (
+                    "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
+                    "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
+                    "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS",
+                )},
+            })
+            bridge.recording_sink = recorder
+            recorder.record_event("input_bridge.starting", {
+                "pipeline": getattr(geometry_config, "pipeline", "lio_3d"),
+                "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
+            })
         # 先接管资源引用，完整启动后才提交可复用状态；回滚失败仍保留清理拥有权。
         self._input_bridge = bridge
         self._input_bridge_started = False
@@ -10683,6 +10735,11 @@ class GatewayRuntime:
             if self.platform_geometry_runtime.get_geometry_runtime_provider() is not remote_provider:
                 RUNTIME_LOGGER.warning("RuntimeInputBridge 启动期间 Geometry 提供器已更换，回收旧绑定。")
                 return False
+            if recorder is not None:
+                recorder.record_event("input_bridge.started", {
+                    "pipeline": getattr(geometry_config, "pipeline", "lio_3d"),
+                    "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
+                })
             RUNTIME_LOGGER.info(
                 "RuntimeInputBridge 已接入 gateway lifecycle "
                 "(localization=%s, pointcloud=%s)。",

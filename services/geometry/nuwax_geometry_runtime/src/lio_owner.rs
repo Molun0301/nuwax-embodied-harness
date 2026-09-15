@@ -1215,10 +1215,18 @@ async fn shutdown_native_process(process: &mut Option<NativeProcessOwner>) -> Re
     let Some(process) = process.as_mut() else {
         return Ok(());
     };
-    process
+    let result = process
         .shutdown(NATIVE_LIO_TERM_GRACE, NATIVE_LIO_FORCE_REAP_TIMEOUT)
-        .await
-        .map(|_| ())
+        .await;
+    if result.is_err() {
+        let stdout = process.stdout_tail();
+        let stderr = process.stderr_tail();
+        tracing::error!(event = "lio.native.failure_output",
+            stdout_tail = %String::from_utf8_lossy(&stdout[stdout.len().saturating_sub(8192)..]),
+            stderr_tail = %String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(8192)..]),
+            "原生定位进程失败后的末段输出已保留，核对惯性缺测或通信错误");
+    }
+    result.map(|_| ())
 }
 
 fn poll_owner_terminal(
@@ -1476,6 +1484,8 @@ async fn run_subscription_worker(
     mut shutdown_rx: watch::Receiver<bool>,
     ingress: Arc<dyn LioIngressSink>,
 ) -> Result<(), String> {
+    let mut skipped_clouds = 0_u64;
+    let mut last_skip_report = tokio::time::Instant::now();
     loop {
         if *shutdown_rx.borrow() {
             return unsubscribe_bounded(kind, subscription).await;
@@ -1487,9 +1497,24 @@ async fn run_subscription_worker(
                     return unsubscribe_bounded(kind, subscription).await;
                 }
             }
-            frame = subscription.recv() => {
+            frame = async {
+                // 注册许可只保留少量最新点云；逐个等待旧广播积压会把许可耗尽变成永久落后。
+                // 里程计及原始输入仍按顺序接收，延后启动的精确回执继续经过原身份围栏。
+                if matches!(kind, WorkerKind::PublicCloud) {
+                    subscription.recv_latest().await
+                } else {
+                    subscription.recv().await.map(|frame| (frame, 0))
+                }
+            } => {
                 match frame {
-                    Ok(frame) => {
+                    Ok((frame, skipped)) => {
+                        skipped_clouds = skipped_clouds.saturating_add(skipped);
+                        if skipped_clouds > 0 && last_skip_report.elapsed() >= Duration::from_secs(5) {
+                            info!(event = "lio.cloud.coalesced", skipped_clouds,
+                                "点云消费者跳过已被新扫描替代的积压，继续接纳最新注册输入");
+                            skipped_clouds = 0;
+                            last_skip_report = tokio::time::Instant::now();
+                        }
                         if let Err(error) = kind
                             .accept(ingress.as_ref(), frame, &mut shutdown_rx)
                             .await

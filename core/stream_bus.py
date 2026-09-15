@@ -38,6 +38,9 @@ class StreamReplaySnapshot:
     latest_cursor: int
     topic_oldest_cursors: Dict[str, int]
     topic_evicted_through_cursors: Dict[str, int]
+    # 与游标边界同时捕获的最新状态，即使其事件已被历史窗口淘汰仍可恢复。
+    latest_frames: Tuple[StreamFrame, ...] = ()
+    map_identity_start_cursor: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,7 @@ class StreamBus:
         self._frames: Deque[StreamFrame] = collections.deque(maxlen=self._retention_limit)
         self._subscriptions: Dict[str, StreamSubscription] = {}
         self._latest_by_topic: Dict[str, StreamFrame] = {}
+        self._map_identity_start_cursor: Optional[int] = None
         self._evicted_through_by_topic: Dict[str, int] = {}
         self._dropped_by_topic: DefaultDict[str, int] = defaultdict(int)
         self._next_cursor = 1
@@ -135,6 +139,11 @@ class StreamBus:
             self._next_cursor += 1
             if stored_frame.payload_kind != StreamPayloadKind.BINARY:
                 self._retain_frame_locked(stored_frame)
+                if stored_frame.topic == "map.frame":
+                    previous = self._latest_by_topic.get("map.frame")
+                    identity = self._map_identity_key(stored_frame)
+                    if identity is None or previous is None or self._map_identity_key(previous) != identity:
+                        self._map_identity_start_cursor = stored_frame.cursor
                 self._latest_by_topic[stored_frame.topic] = stored_frame
             # 异步消费者在游标分配锁内接收，保持顺序且不等待无关同步回调。
             # 同步订阅仍沿原有重入/完成等待契约执行。
@@ -169,6 +178,20 @@ class StreamBus:
         elif dispatch_owner_thread_id != publisher_thread_id:
             dispatch_item.completion.wait()
         return stored_frame
+
+    @staticmethod
+    def _map_identity_key(frame: StreamFrame):
+        """内容更新不重置地图来源的游标起点；不读取或复制地图栅格。"""
+        if frame.status == "cleared" or frame.payload is None:
+            return None
+        payload = frame.payload
+        try:
+            key = tuple(payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
+                        for name in ("map_name", "source_name", "source_epoch", "frame_id"))
+            key = (*key[:3], key[3] or frame.frame_id)
+        except Exception:
+            return None
+        return key if all(isinstance(value, str) and value for value in key) else None
 
     def _enqueue_async_locked(self, subscription: StreamSubscription, frame: StreamFrame) -> None:
         """在首次跨线程分发前合并订阅明确声明可替代的状态。"""
@@ -449,6 +472,11 @@ class StreamBus:
             latest_cursor=latest_cursor,
             topic_oldest_cursors=topic_oldest_cursors,
             topic_evicted_through_cursors=topic_evicted_through_cursors,
+            latest_frames=tuple(
+                frame for frame in self._latest_by_topic.values()
+                if topic_filter is None or frame.topic in topic_filter
+            ),
+            map_identity_start_cursor=self._map_identity_start_cursor,
         )
 
     def unsubscribe(self, subscription_id: str) -> None:
@@ -468,6 +496,8 @@ class StreamBus:
         """
 
         with self._lock:
+            if str(topic) == "map.frame":
+                self._map_identity_start_cursor = None
             return self._latest_by_topic.pop(str(topic), None) is not None
 
     def replay(

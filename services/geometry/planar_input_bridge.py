@@ -15,10 +15,11 @@ from providers.sensors import ManagedSensorSource
 
 class PlanarRuntimeInputBridge:
     def __init__(self, *, runtime_provider, sensor_sample_provider=None, localization_provider=None,
-                 sensor_source_owner: Optional[ManagedSensorSource] = None):
+                 sensor_source_owner: Optional[ManagedSensorSource] = None, recording_sink=None):
         self.runtime_provider = runtime_provider
         self.sensor_sample_provider = sensor_sample_provider
         self.localization_provider = localization_provider
+        self.recording_sink = recording_sink
         self._condition = threading.Condition()
         self._lifecycle = threading.RLock()
         self._started = False
@@ -107,6 +108,8 @@ class PlanarRuntimeInputBridge:
             return True
         context = self._capture(generation)
         if context is not None:
+            if self.recording_sink is not None:
+                self.recording_sink.record_sensor(scan)
             self._enqueue("scan", scan, context, generation)
         # 建图会话尚未创建时丢弃实时帧，不让驱动误判通信失败。
         return True
@@ -137,6 +140,11 @@ class PlanarRuntimeInputBridge:
                 self._counters["dropped_count"] += 1
             return
         self._enqueue("odom", (pose, stamp, domain, clock_id), context, generation)
+        if self.recording_sink is not None:
+            self.recording_sink.record_event("sensor.odometry", {
+                "pose": pose.model_dump(mode="json"), "clock_domain": domain, "clock_id": clock_id,
+                "context": context,
+            }, source_ns=stamp)
 
     def _publish_loop(self, generation):
         while True:

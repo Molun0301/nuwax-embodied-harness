@@ -490,6 +490,9 @@ class RuntimeDataConfig:
     observation_history_limit: int = 100
     perception_history_limit: int = 100
     localization_history_limit: int = 100
+    mapping_recording_enabled: bool = True
+    mapping_recording_dir: str = ""
+    mapping_recording_max_bytes: int = 16 * 1024 ** 3
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
     map_catalog_root: str = ""
@@ -1027,6 +1030,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
         observation_history_limit=max(1, _cfg_int("NUWAX_OBSERVATION_HISTORY_LIMIT", 100)),
         perception_history_limit=max(1, _cfg_int("NUWAX_PERCEPTION_HISTORY_LIMIT", 100)),
         localization_history_limit=max(1, _cfg_int("NUWAX_LOCALIZATION_HISTORY_LIMIT", 100)),
+        mapping_recording_enabled=_cfg_bool("NUWAX_MAPPING_RECORDING_ENABLED", True),
+        mapping_recording_dir=_cfg_str("NUWAX_MAPPING_RECORDING_DIR", ""),
+        mapping_recording_max_bytes=max(1048576, _cfg_int("NUWAX_MAPPING_RECORDING_MAX_BYTES", 17179869184)),
         navigation_history_limit=max(1, _cfg_int("NUWAX_NAVIGATION_HISTORY_LIMIT", 100)),
         memory_history_limit=max(1, _cfg_int("NUWAX_MEMORY_HISTORY_LIMIT", 200)),
         map_catalog_root=_cfg_str(

@@ -34,6 +34,8 @@ pub struct LoopClosurePipelineConfig {
     pub keyframe_translation: f64,
     /// Rotation angle required before a frame becomes a keyframe.
     pub keyframe_rotation: f64,
+    /// 已有回环历史时的静止观测间隔，避免首次回程扫描失败后永久停止搜索。
+    pub stationary_probe_interval_secs: f64,
     /// Maximum odometry-space distance for loop candidate search.
     pub loop_search_radius: f64,
     /// Minimum time separation between loop candidates.
@@ -72,6 +74,7 @@ impl Default for LoopClosurePipelineConfig {
             odometry_rotation_sigma_rad: 0.5_f64.to_radians(),
             keyframe_translation: 0.5,
             keyframe_rotation: 10.0_f64.to_radians(),
+            stationary_probe_interval_secs: 2.0,
             loop_search_radius: 2.0,
             min_loop_separation_secs: 20.0,
             min_keyframe_points: 10,
@@ -302,6 +305,19 @@ pub struct LoopClosureCoordinator {
     loops: Vec<LoopClosureRecord>,
     timeline: CorrectionTimeline,
     pending_loop: Option<PendingLoop>,
+    search_diagnostics: LoopSearchDiagnostics,
+    last_search_report_timestamp: Option<f64>,
+}
+
+#[derive(Default)]
+struct LoopSearchDiagnostics {
+    searches: usize,
+    candidates: usize,
+    registration_failed: usize,
+    geometry_rejected: usize,
+    odometry_rejected: usize,
+    best_source_overlap: f64,
+    best_target_overlap: f64,
 }
 
 impl LoopClosureCoordinator {
@@ -315,6 +331,8 @@ impl LoopClosureCoordinator {
             loops: Vec::new(),
             timeline: CorrectionTimeline::default(),
             pending_loop: None,
+            search_diagnostics: LoopSearchDiagnostics::default(),
+            last_search_report_timestamp: None,
         })
     }
 
@@ -344,7 +362,10 @@ impl LoopClosureCoordinator {
             let delta = last.local_pose.inverse() * local_pose;
             let confirmation_due = self.pending_loop.is_some()
                 && timestamp - last.timestamp >= self.config.loop_confirmation_interval_secs;
+            let stationary_probe_due = self.keyframes.len() >= self.config.min_keyframes_for_loop_search
+                && timestamp - last.timestamp >= self.config.stationary_probe_interval_secs;
             if !confirmation_due
+                && !stationary_probe_due
                 && delta.translation.vector.norm() < self.config.keyframe_translation
                 && delta.rotation.angle() < self.config.keyframe_rotation
             {
@@ -425,6 +446,9 @@ impl LoopClosureCoordinator {
             if cost_strictly_improved(initial_cost, final_cost)
                 && has_valid_correction(&self.graph, &optimized_graph)
             {
+                tracing::info!(event = "pgo.loop.confirmed", node_id, historic_id,
+                    constraints = records.len(), initial_cost, final_cost,
+                    "独立回环观测已确认，提交完整优化轨迹供规范地图校正");
                 self.graph = optimized_graph;
                 self.loops.extend(records);
                 ProcessFrameResult::LoopClosed {
@@ -466,9 +490,11 @@ impl LoopClosureCoordinator {
         self.loops.clear();
         self.timeline = CorrectionTimeline::default();
         self.pending_loop = None;
+        self.search_diagnostics = LoopSearchDiagnostics::default();
+        self.last_search_report_timestamp = None;
     }
 
-    fn find_and_measure_loop(&self, current_id: u64) -> Option<LoopClosureRecord> {
+    fn find_and_measure_loop(&mut self, current_id: u64) -> Option<LoopClosureRecord> {
         let current = self.keyframes.get(&current_id)?;
         if self.keyframes.len() < self.config.min_keyframes_for_loop_search {
             return None;
@@ -484,6 +510,9 @@ impl LoopClosureCoordinator {
             return None;
         }
         let candidates = self.loop_candidates(current_id);
+        self.search_diagnostics.searches += 1;
+        self.search_diagnostics.candidates += candidates.len();
+        let mut measurements = Vec::new();
 
         for (historic_id, historic_from_current) in candidates {
             let historic_pose = self.graph.nodes.get(&historic_id)?.pose;
@@ -534,6 +563,7 @@ impl LoopClosureCoordinator {
                         }
                     }
                     Err(error) => {
+                        self.search_diagnostics.registration_failed += 1;
                         tracing::debug!(%error,"回环点到平面匹配失败");
                         continue;
                     }
@@ -546,12 +576,14 @@ impl LoopClosureCoordinator {
                 || registration.mse > self.config.max_loop_mse
                 || !is_finite_pose(&registration.transformation)
             {
+                self.search_diagnostics.registration_failed += 1;
                 continue;
             }
-            // 不能用少量被筛选内点的低误差证明整帧回环；在最终变换上独立核对两帧。
+            // 子图用于稳定法线与求解；独立双向覆盖必须比较当前帧和候选锚帧。
+            // 将多帧子图的全部区域当作单帧视野分母，会随历史增长拒绝真实重访。
             let evidence = evaluate_loop_registration(
                 &seeded_points,
-                &target,
+                &self.keyframes[&historic_id].points,
                 &registration.transformation,
                 if self.config.point_to_plane {
                     self.config.icp.max_correspondence_distance.min(0.3)
@@ -559,11 +591,18 @@ impl LoopClosureCoordinator {
                     self.config.icp.max_correspondence_distance
                 },
             );
+            if evidence.source_overlap.min(evidence.target_overlap)
+                > self.search_diagnostics.best_source_overlap.min(self.search_diagnostics.best_target_overlap)
+            {
+                self.search_diagnostics.best_source_overlap = evidence.source_overlap;
+                self.search_diagnostics.best_target_overlap = evidence.target_overlap;
+            }
             if let Some(reason) = evidence.rejection_reason(
                 self.config.min_keyframe_points,
                 self.config.min_loop_overlap_ratio,
                 self.config.max_loop_mse,
             ) {
+                self.search_diagnostics.geometry_rejected += 1;
                 tracing::debug!(
                     event = "pgo.loop.rejected",
                     reason,
@@ -622,6 +661,7 @@ impl LoopClosureCoordinator {
                 "记录回环配准与里程计一致性依据"
             );
             if record.odometry_innovation > self.config.max_loop_innovation {
+                self.search_diagnostics.odometry_rejected += 1;
                 tracing::info!(
                     event = "pgo.loop.rejected",
                     reason = "odometry_inconsistent",
@@ -632,9 +672,35 @@ impl LoopClosureCoordinator {
                 );
                 continue;
             }
-            return Some(record);
+            measurements.push(record);
         }
-        None
+        // 扩大检索不能把重复房间里的第一个低误差解当作唯一地点。
+        // 同次观测的候选也须沿原里程计协方差相互闭合；歧义时保留原图等待新观察。
+        let ambiguous = measurements.iter().enumerate().any(|(index, first)| {
+            measurements.iter().skip(index + 1).any(|second|
+                self.pair_innovation(first, second) > self.config.max_loop_innovation)
+        });
+        let measured = if ambiguous {
+            tracing::info!(event = "pgo.loop.rejected", reason = "ambiguous_geometry", current_id,
+                candidates = measurements.len(), "多个历史地点的几何匹配相互矛盾，等待新的独立观测");
+            None
+        } else {
+            measurements.into_iter().min_by(|a, b| a.mse.total_cmp(&b.mse))
+        };
+        if measured.is_some() || self.last_search_report_timestamp
+            .is_none_or(|previous| current.timestamp - previous >= 5.0)
+        {
+            let report = std::mem::take(&mut self.search_diagnostics);
+            tracing::info!(event = "pgo.loop.search_summary", current_id,
+                source_timestamp = current.timestamp, source_points = current.points.len(),
+                searches = report.searches, candidates = report.candidates,
+                registration_failed = report.registration_failed,
+                geometry_rejected = report.geometry_rejected, odometry_rejected = report.odometry_rejected,
+                best_source_overlap = report.best_source_overlap, best_target_overlap = report.best_target_overlap,
+                "回环搜索与几何拒绝汇总");
+            self.last_search_report_timestamp = Some(current.timestamp);
+        }
+        measured
     }
 
     /// 每个关键帧最多四次几何配准，描述子只精比六个环键近邻。
@@ -643,26 +709,49 @@ impl LoopClosureCoordinator {
         let current_pose = self.graph.nodes[&current_id].pose;
         let mut spatial = Vec::new();
         let mut descriptors = Vec::new();
-        for (id, historic) in self.keyframes.iter().filter(|(id, historic)| {
-            **id != current_id
-                && (current.timestamp - historic.timestamp).abs()
-                    >= self.config.min_loop_separation_secs
-        }) {
+        let mut tail = (Isometry3::identity(), Matrix6::zeros());
+        let mut next = current;
+        // 从当前节点向前一次累积既有里程计噪声；检索和最终一致性使用同一模型。
+        for (id, historic) in self.keyframes.range(..current_id).rev() {
+            tail = compose_uncertainty(
+                (historic.local_pose.inverse() * next.local_pose, next.odometry_covariance), tail,
+            );
+            next = historic;
+            if current.timestamp - historic.timestamp < self.config.min_loop_separation_secs {
+                continue;
+            }
             let distance = (current_pose.translation.vector
                 - self.graph.nodes[id].pose.translation.vector)
                 .norm();
-            if distance <= self.config.loop_search_radius {
+            let uncertainty_radius = (self.config.max_loop_innovation
+                * tail.1.fixed_view::<3, 3>(0, 0).trace().max(0.0)).sqrt();
+            if distance <= self.config.loop_search_radius.max(uncertainty_radius) {
                 spatial.push((distance, *id));
             }
             descriptors.push((current.context.ring_distance(&historic.context), *id));
         }
         spatial.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         descriptors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let mut candidates: Vec<_> = spatial
-            .iter()
-            .take(2)
-            .map(|(_, id)| (*id, self.graph.nodes[id].pose.inverse() * current_pose))
-            .collect();
+        let spatial_seed = |distance: f64, id: u64| {
+            let mut seed = self.graph.nodes[&id].pose.inverse() * current_pose;
+            if distance > self.config.loop_search_radius {
+                // 累计漂移超过局部配准捕获范围时，用两帧质心提供平移初值。
+                // 里程计保留朝向初值；几何、独立覆盖及一致性检验仍全部执行。
+                let center = |points: &[Point3<f64>]| points.iter()
+                    .fold(nalgebra::Vector3::zeros(), |sum, p| sum + p.coords) / points.len() as f64;
+                seed.translation = Translation3::from(center(&self.keyframes[&id].points)
+                    - seed.rotation * center(&current.points));
+            }
+            (id, seed)
+        };
+        let mut candidates: Vec<_> = spatial.first()
+            .map(|(distance, id)| spatial_seed(*distance, *id)).into_iter().collect();
+        // 同一地点相邻历史帧不能占满预算，保留一个更早的锚点以发现整段累计漂移。
+        if let Some((distance, id)) = spatial.iter().min_by_key(|(_, id)| *id) {
+            if candidates.iter().all(|(existing, _)| existing != id) {
+                candidates.push(spatial_seed(*distance, *id));
+            }
+        }
         let mut matches: Vec<_> = descriptors
             .iter()
             .filter(|_| self.config.scan_context_enabled)
@@ -701,12 +790,12 @@ impl LoopClosureCoordinator {
                 break;
             }
         }
-        for (_, id) in spatial.into_iter().skip(2) {
+        for (distance, id) in spatial {
             if candidates.len() >= 4 {
                 break;
             }
             if candidates.iter().all(|(existing, _)| *existing != id) {
-                candidates.push((id, self.graph.nodes[&id].pose.inverse() * current_pose));
+                candidates.push(spatial_seed(distance, id));
             }
         }
         candidates
@@ -931,6 +1020,9 @@ fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosureP
         return Err(LoopClosurePipelineError::InvalidConfig(
             "keyframe_rotation must be finite and non-negative",
         ));
+    }
+    if !config.stationary_probe_interval_secs.is_finite() || config.stationary_probe_interval_secs <= 0.0 {
+        return Err(LoopClosurePipelineError::InvalidConfig("静止回环观测间隔必须为正有限数"));
     }
     if !config.loop_search_radius.is_finite() || config.loop_search_radius <= 0.0 {
         return Err(LoopClosurePipelineError::InvalidConfig(

@@ -17335,7 +17335,9 @@ mod mapping_feed_tests {
         )
         .await
         .expect("next cadence revision"));
-        assert_eq!(backend.published_count(), 2);
+        // 三维导航表面也会发布到同一传输端；本例只核对占据图节拍。
+        assert_eq!(backend.published.lock().unwrap().iter()
+            .filter(|frame| frame.topic.channel() == "/global_map").count(), 2);
         assert_eq!(handle.state.read().await.cloud_map_revision, 2);
         {
             let writer = handle.cloud_map_writer.lock();

@@ -1,4 +1,7 @@
 {
+  "NUWAX_MAPPING_RECORDING_ENABLED": "在端侧输入订阅前开始持久记录规范雷达、惯性、位姿和地图身份；不依赖电脑或网页连接。关闭该项后重启网关生效。",
+  "NUWAX_MAPPING_RECORDING_DIR": "端侧几何记录目录，留空时使用地图目录同级的mapping_recordings。保存包含预热输入的SQLite记录，每次网关输入生命周期创建独立文件。重启网关生效。",
+  "NUWAX_MAPPING_RECORDING_MAX_BYTES": "全部端侧几何记录的总容量上限，单位字节，默认16GiB。已有记录不自动删除；容量或磁盘空间不足会明确报告记录不完整，算法继续运行。重启网关生效。",
   "GO2_DATA_PLANE_ENABLED": "是否启用 Go2 设备侧数据面",
   "GO2_ROBOT_IP": "Go2 本体 WebRTC 信令 IPv4 地址，不是部署 Jetson 的 SSH 地址；视频推流优先使用此值，留空时回退通用 ROBOT_IP。",
   "GO2_VIDEO_STREAM_ENABLED": "是否启动 Go2 WebRTC 持续视频轨道并将 JPEG 帧送入 Rust 视频中转。",

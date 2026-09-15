@@ -360,4 +360,27 @@ mod tests {
             .await
             .expect("owner-thread acknowledged unsubscribe");
     }
+
+    #[cfg(feature = "real-lcm")]
+    #[tokio::test]
+    async fn latest_owned_cloud_skips_backlog_while_ordered_odometry_keeps_every_frame() {
+        let transport = LcmTransport::new_real("memq://").unwrap();
+        let topic = LcmTopic::new("/owned/backlog").unwrap();
+        let msg_type = LcmMessageType::new("geometry_msgs/PoseStamped").unwrap();
+        let mut cloud = transport.subscribe_owned(topic.clone(), Some(msg_type.clone())).await.unwrap();
+        let mut ordered = transport.subscribe_owned(topic.clone(), Some(msg_type.clone())).await.unwrap();
+        for sequence in 1_u8..=16 {
+            transport.publish(RawLcmFrameBuilder::new(topic.clone(), msg_type.clone()).payload(vec![sequence]).build()).await.unwrap();
+        }
+        // 另一正常订阅读到最后一帧，证明真实LCM拥有方已交付全部回调。
+        for sequence in 1_u8..=16 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ordered.recv()).await.unwrap().unwrap();
+            assert_eq!(frame.payload.as_slice(), &[sequence]);
+        }
+        let (latest, skipped) = cloud.recv_latest().await.unwrap();
+        assert_eq!(latest.payload.as_slice(), &[16]);
+        assert_eq!(skipped, 15);
+        cloud.unsubscribe().await.unwrap();
+        ordered.unsubscribe().await.unwrap();
+    }
 }

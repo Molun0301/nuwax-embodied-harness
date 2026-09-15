@@ -93,6 +93,10 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
         "navigation.state",  # 仅共享判定认可的无目标守卫心跳，业务状态不合并。
     }
 )
+# 连接恢复总要携带当前状态，事件历史仍按游标续传；不在回放完成后另读新快照。
+_REPLAY_SNAPSHOT_TOPICS = _LATEST_ONLY_STREAM_TOPICS | frozenset({
+    "runtime.governance", "pointcloud_map.meta", "exploration.state", "system.metrics",
+})
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {
         "task.succeeded",
@@ -206,7 +210,8 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
     return values
 
 
-def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None) -> Optional[object]:
+def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None,
+                                max_cells: int = _STREAM_JSON_MAX_OCCUPANCY_CELLS) -> Optional[object]:
     """共享已验证的规范栅格；原始字典输入仍在编码边界验证。"""
 
     if frame.topic != "map.frame":
@@ -242,7 +247,7 @@ def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None) -> Optional[o
     cell_count = width * height
     if (
         cell_count <= 0
-        or cell_count > _STREAM_JSON_MAX_OCCUPANCY_CELLS
+        or cell_count > max_cells
         or not isinstance(data, (list, tuple))
         or len(data) != cell_count
     ):
@@ -530,10 +535,15 @@ def _build_replay_batch(
     ):
         gap_reason = "cursor_expired"
 
-    frames = retained_frames
-    if gap_reason and not frames:
-        frames = runtime.stream_bus.latest_frames(topics=topic_filter)
-    frames = _coalesce_latest_topic_frames(frames)
+    latest_states = tuple(
+        frame for frame in snapshot.latest_frames
+        if frame.topic in _REPLAY_SNAPSHOT_TOPICS
+        and (topic_filter is None or frame.topic in topic_filter)
+    )
+    frames = _coalesce_latest_topic_frames(tuple(sorted(
+        {frame.cursor: frame for frame in (*retained_frames, *latest_states)}.values(),
+        key=lambda frame: frame.cursor or 0,
+    )))
 
     frame_limit = max(1, int(limit))
     truncated = len(frames) > frame_limit
@@ -969,6 +979,7 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
 
 _MAP_BINARY_MAGIC = b"NUWAXMAP"
 _MAP_BINARY_VERSION = 2
+_MAP_BINARY_MAX_CELLS = 16 * 1024 * 1024
 _MAP_ENCODE_CACHE_BYTES = 32 * 1024 * 1024
 _MAP_ENCODE_CACHE = collections.OrderedDict()
 _MAP_ENCODE_LOCK = threading.Lock()
@@ -1002,9 +1013,11 @@ def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
 
     # 已发布快照按只读共享；帧头与栅格共享同一份输入。
     occupancy_grid = field_value(frame.payload, "occupancy_grid")
-    data = _complete_map_occupancy_data(frame, grid=occupancy_grid)
+    data = _complete_map_occupancy_data(frame, grid=occupancy_grid, max_cells=_MAP_BINARY_MAX_CELLS)
     if data is None:
         raise ValueError("地图栅格尺寸、数量或取值无效")
+    if len(data) > _MAP_BINARY_MAX_CELLS:
+        raise ValueError("二进制地图超过16MiB栅格容量")
     payload = selected_fields(frame.payload, (
         "map_name", "source_name", "source_epoch", "update_sequence", "content_sha256",
         "frame_id", "timestamp", "metadata",
@@ -1084,7 +1097,8 @@ async def _format_sse_frame(frame: StreamFrame) -> str:
     return _format_sse_payload(frame)
 
 
-def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0) -> Dict[str, object]:
+def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0,
+                          start_cursor: Optional[int] = None) -> Dict[str, object]:
     """只投影既有地图身份，不读取栅格或为传输创建另一套来源代际。"""
     cleared = frame is None or frame.status == "cleared" or frame.payload is None
     identity = selected_fields(frame.payload, (
@@ -1095,6 +1109,8 @@ def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0
     return {
         "type": "stream.map_identity",
         "cursor": _pointcloud_identity_integer(frame.cursor if frame is not None else empty_cursor, "cursor"),
+        "start_cursor": _pointcloud_identity_integer(
+            start_cursor if start_cursor is not None else (frame.cursor if frame is not None else empty_cursor), "start_cursor"),
         **{name: identity.get(name) for name in ("map_name", "source_name", "source_epoch", "frame_id")},
         "cleared": cleared,
     }
@@ -1290,14 +1306,14 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             replay_latest_cursor = replay_status["latest_cursor"]
             if map_identity_only:
                 map_frame = next((frame for frame in replay_frames if frame.topic == "map.frame"), None)
-                barrier_cursor = int(map_frame.cursor or 0) if map_frame is not None else replay_latest_cursor
+                barrier_cursor = int(replay_snapshot.map_identity_start_cursor or map_frame.cursor or 0) if map_frame is not None else replay_latest_cursor
                 # 新地图之后不能重放可能属于旧图的缓存位姿，也不再重放旧地图屏障。
                 replay_frames = tuple(
                     frame for frame in replay_frames
                     if frame.topic == "localization.pose" and int(frame.cursor or 0) > barrier_cursor
                 )
                 replay_status["frame_count"] = len(replay_frames)
-                await _send_ws_json(websocket, _map_identity_message(map_frame, empty_cursor=barrier_cursor))
+                await _send_ws_json(websocket, _map_identity_message(map_frame, empty_cursor=barrier_cursor, start_cursor=barrier_cursor))
             for frame in replay_frames:
                 if getattr(frame, 'payload_kind', None) == StreamPayloadKind.BINARY:
                     continue  # binary 帧不回放

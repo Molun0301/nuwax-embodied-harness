@@ -4899,7 +4899,9 @@
         const current = state.poseMapIdentity;
         if (current && compareCanonicalInteger(cursor, current.cursor) <= 0) return;
         const changed = !current || current.key !== key || current.cleared !== cleared;
-        state.poseMapIdentity = { key, cursor, cleared, startCursor: changed ? cursor : current.startCursor };
+        const startCursor = normalizedStreamCursor(message.start_cursor) || cursor;
+        if (compareCanonicalInteger(startCursor, cursor) > 0) return;
+        state.poseMapIdentity = { key, cursor, cleared, startCursor: changed ? startCursor : current.startCursor };
         if (cleared) state.appliedMapIdentity = null;
         if (changed) {
           state.pendingMapPose = null;
@@ -5028,7 +5030,8 @@
           const grid = payload?.occupancy_grid;
           if (message.type !== "stream.frame" || frame?.topic !== "map.frame" || !grid || typeof payload.map_name !== "string" || !payload.map_name) return null;
           const cells = grid.width * grid.height;
-          if (![grid.width, grid.height, cells].every(Number.isSafeInteger) || grid.width < 1 || grid.height < 1 || cells > 2000000) return null;
+          // 与服务器二进制地图的16MiB载荷预算一致；不得套用JSON展示的200万格限制。
+          if (![grid.width, grid.height, cells].every(Number.isSafeInteger) || grid.width < 1 || grid.height < 1 || cells > 16 * 1024 * 1024) return null;
           if (!Number.isFinite(grid.resolution_m) || grid.resolution_m <= 0 || !grid.frame_id || !grid.origin) return null;
           const origin = grid.origin.position;
           const orientation = grid.origin.orientation;

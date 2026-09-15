@@ -232,6 +232,7 @@ class RuntimeInputBridge:
     localization_provider: Optional[StreamingLocalizationProvider] = None
     point_cloud_provider: Optional[StreamingPointCloudProvider] = None
     sensor_sample_provider: Optional[StreamingSensorSampleProvider] = None
+    recording_sink: Any = None
     max_points_before_downsample: int = MAX_POINTS_BEFORE_DOWNSAMPLE
     max_points_after_downsample: int = MAX_POINTS_AFTER_DOWNSAMPLE
 
@@ -702,6 +703,8 @@ class RuntimeInputBridge:
                     "received_lio_imu_count" if isinstance(sample, CanonicalImuSample)
                     else "received_lio_pointcloud_count"
                 )
+                if self.recording_sink is not None:
+                    self.recording_sink.record_sensor(sample)
                 try:
                     measurement = (
                         self._lio_measurement_assembler.add_imu(sample)
@@ -851,6 +854,8 @@ class RuntimeInputBridge:
                     if not self._lio_callback_is_current(_lio_generation):
                         return
                     self._increment_counter("received_lio_imu_count")
+                    if self.recording_sink is not None:
+                        self.recording_sink.record_sensor(canonical_imu)
                     try:
                         measurement = self._lio_measurement_assembler.add_imu(
                             canonical_imu
@@ -1016,6 +1021,8 @@ class RuntimeInputBridge:
                     )
                     return
                 self._increment_counter("received_lio_pointcloud_count")
+                if self.recording_sink is not None:
+                    self.recording_sink.record_sensor(canonical_lidar)
                 try:
                     measurement = self._lio_measurement_assembler.add_lidar(
                         canonical_lidar
@@ -1830,6 +1837,7 @@ def build_default_runtime_input_bridge(
     point_cloud_provider: Optional[StreamingPointCloudProvider] = None,
     sensor_sample_provider: Optional[StreamingSensorSampleProvider] = None,
     sensor_source_owner=None,
+    recording_sink=None,
 ) -> RuntimeInputBridge:
     """工厂方法，集中默认值，便于测试与生产链路复用。"""
     pipeline_reader = getattr(runtime_provider, "get_geometry_pipeline", None)
@@ -1842,6 +1850,7 @@ def build_default_runtime_input_bridge(
         return PlanarRuntimeInputBridge(
             runtime_provider=runtime_provider, sensor_sample_provider=sensor_sample_provider,
             localization_provider=localization_provider, sensor_source_owner=sensor_source_owner,
+            recording_sink=recording_sink,
         )
     if pipeline != "lio_3d":
         raise ValueError("未知Geometry执行链")
@@ -1850,6 +1859,7 @@ def build_default_runtime_input_bridge(
         localization_provider=localization_provider,
         point_cloud_provider=point_cloud_provider,
         sensor_sample_provider=sensor_sample_provider,
+        recording_sink=recording_sink,
     )
 
 

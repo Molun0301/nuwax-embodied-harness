@@ -119,6 +119,36 @@ impl OwnedLcmSubscription {
         }
     }
 
+    /// 读取已有积压中的最新帧及跳过数量；仅供明确允许合并的状态/点云消费者使用。
+    /// 消费范围在首帧到达后截取，持续生产不能让读取一直等待“队列清空”。
+    pub async fn recv_latest(&mut self) -> TransportResult<(RawLcmFrame, u64)> {
+        let first = self.recv().await?;
+        let subscription = self.subscription.as_mut().ok_or(TransportError::ChannelClosed)?;
+        let queued = subscription.receiver.len();
+        let mut latest = None;
+        let mut skipped = 0_u64;
+        for _ in 0..queued {
+            match subscription.receiver.try_recv() {
+                Ok(message) => {
+                    latest = Some(message);
+                    skipped = skipped.saturating_add(1);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                    skipped = skipped.saturating_add(count);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return Err(TransportError::ChannelClosed);
+                }
+            }
+        }
+        let frame = match latest {
+            Some(message) => decode_subscription_message(message, &self.topic, self.msg_type_filter.as_ref())?,
+            None => first,
+        };
+        Ok((frame, skipped))
+    }
+
     /// Wait until the liblcm owner thread has processed this unsubscribe.
     ///
     /// This consumes the handle so queued callback data cannot be observed by

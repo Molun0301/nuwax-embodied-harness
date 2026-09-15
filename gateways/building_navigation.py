@@ -8,6 +8,7 @@ from typing import Any
 
 from contracts.building_navigation import FloorPose
 from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.navigation import NavigationGoal, NavigationStatus
 from contracts.runtime_views import LocalizationSessionStatus
 from core.errors import GatewayError
@@ -73,7 +74,7 @@ class GatewayBuildingPorts:
             if not self.activate_and_localize(floor,self.state.last_pose):
                 raise GatewayError("恢复层内移动前尚未取得有效定位。",error_code="floor_resume_localization_required")
         goal = NavigationGoal(goal_id=goal_id, map_name=floor.map_name,
-            target_pose=Pose(frame_id="map", position=Vector3(x=pose.x,y=pose.y,z=0.0), orientation=Quaternion(z=math.sin(pose.yaw_rad/2),w=math.cos(pose.yaw_rad/2))),
+            target_pose=Pose(frame_id=DEFAULT_MAP_FRAME, position=Vector3(x=pose.x,y=pose.y,z=0.0), orientation=Quaternion(z=math.sin(pose.yaw_rad/2),w=math.cos(pose.yaw_rad/2))),
             tolerance_position_m=0.1,tolerance_yaw_rad=0.1,
             metadata={"requested_by":self.requested_by or "unknown", "parent_task_id":self.context.task_id,"floor_id":floor.floor_id})
         goal = self.runtime._goal_with_motion_admission(goal,self.admission)

@@ -11,6 +11,7 @@ struct Device {
   std::unique_ptr<sl::IChannel> channel;
   std::unique_ptr<sl::ILidarDriver> driver;
   bool motor_started=false;
+  std::vector<sl_lidar_response_measurement_node_hq_t> nodes;
   ~Device() {
     if(driver){driver->stop();if(motor_started)driver->setMotorSpeed(0);driver->disconnect();}
   }
@@ -52,7 +53,8 @@ int nw_slamtec_read(void* handle,NuwaxSlamtecPoint* output,size_t* count,uint64_
   try {
     if(!handle||!output||!count||!timestamp_us||*count==0||*count>32768)throw std::runtime_error("雷达读取缓冲区无效");
     auto& device=*static_cast<Device*>(handle);
-    std::vector<sl_lidar_response_measurement_node_hq_t> nodes(*count);
+    auto& nodes=device.nodes;
+    nodes.resize(*count);
     sl_u64 stamp=0;size_t n=nodes.size();
     auto result=device.driver->grabScanDataHqWithTimeStamp(nodes.data(),n,stamp,100);
     if(result==SL_RESULT_OPERATION_TIMEOUT){*count=0;return 1;}

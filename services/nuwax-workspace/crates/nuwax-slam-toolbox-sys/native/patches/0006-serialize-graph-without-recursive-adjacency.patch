@@ -1,0 +1,71 @@
+diff --git a/upstream/karto/include/karto_sdk/Mapper.h b/upstream/karto/include/karto_sdk/Mapper.h
+index 568e515..19c69de 100644
+--- a/upstream/karto/include/karto_sdk/Mapper.h
++++ b/upstream/karto/include/karto_sdk/Mapper.h
+@@ -34,6 +34,7 @@
+ #include "Eigen/Core"
+ #include "Karto.h"  // NOLINT
+ #include "nanoflann_adaptors.h"  // NOLINT
++#include <set>
+ 
+ 
+ namespace karto
+@@ -254,6 +255,7 @@ template<typename T>
+ class Vertex
+ {
+   friend class Edge<T>;
++  template<typename U> friend class Graph;
+ 
+ public:
+   /**
+@@ -378,7 +380,8 @@ private:
+   void serialize(Archive & ar, const unsigned int version)
+   {
+     ar & BOOST_SERIALIZATION_NVP(m_pObject);
+-    ar & BOOST_SERIALIZATION_NVP(m_Edges);
++    // 新图由Graph集中保存边，避免沿邻接关系递归遍历整条链。
++    if (version == 0) ar & BOOST_SERIALIZATION_NVP(m_Edges);
+     ar & BOOST_SERIALIZATION_NVP(m_Score);
+   }
+ };    // Vertex<T>
+@@ -688,10 +691,28 @@ protected:
+   template<class Archive>
+   void serialize(Archive & ar, const unsigned int version)
+   {
+-    std::cout << "Graph <- m_Edges; ";
+-    ar & BOOST_SERIALIZATION_NVP(m_Edges);
+-    std::cout << "Graph <- m_Vertices\n";
+-    ar & BOOST_SERIALIZATION_NVP(m_Vertices);
++    if (version == 0) {
++      ar & BOOST_SERIALIZATION_NVP(m_Edges);
++      ar & BOOST_SERIALIZATION_NVP(m_Vertices);
++    } else {
++      // 先登记全部节点身份，随后边只保存节点引用，栈深度不随图增长。
++      ar & BOOST_SERIALIZATION_NVP(m_Vertices);
++      ar & BOOST_SERIALIZATION_NVP(m_Edges);
++      if (Archive::is_loading::value) {
++        std::set<Vertex<T> *> vertices;
++        for (auto & group : m_Vertices) for (auto & entry : group.second) {
++          if (!entry.second || !vertices.insert(entry.second).second)
++            throw std::runtime_error("图节点身份为空或重复");
++          entry.second->m_Edges.clear();
++        }
++        for (auto * edge : m_Edges) {
++          if (!edge || !vertices.count(edge->GetSource()) || !vertices.count(edge->GetTarget()))
++            throw std::runtime_error("图边引用不属于已加载节点");
++          edge->GetSource()->AddEdge(edge);
++          edge->GetTarget()->AddEdge(edge);
++        }
++      }
++    }
+   }
+ };    // Graph<T>
+ 
+@@ -2510,4 +2531,7 @@ public:
+ BOOST_SERIALIZATION_ASSUME_ABSTRACT(Mapper)
+ }  // namespace karto
+ 
++BOOST_CLASS_VERSION(karto::Vertex<karto::LocalizedRangeScan>, 1)
++BOOST_CLASS_VERSION(karto::Graph<karto::LocalizedRangeScan>, 1)
++
+ #endif  // KARTO_SDK__MAPPER_H_

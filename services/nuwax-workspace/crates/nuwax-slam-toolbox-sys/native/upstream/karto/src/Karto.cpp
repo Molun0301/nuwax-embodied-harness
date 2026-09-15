@@ -183,7 +183,7 @@ const PointVectorDouble LaserRangeFinder::GetPointReadings(
   // compute point readings
   kt_int32u beamNum = 0;
   kt_double * pRangeReadings = pLocalizedRangeScan->GetRangeReadings();
-  for (kt_int32u i = 0; i < m_NumberOfRangeReadings; i++, beamNum++) {
+  for (kt_int32u i = 0; i < pLocalizedRangeScan->GetNumberOfRangeReadings(); i++, beamNum++) {
     kt_double rangeReading = pRangeReadings[i];
 
     if (ignoreThresholdPoints) {
@@ -194,7 +194,7 @@ const PointVectorDouble LaserRangeFinder::GetPointReadings(
       rangeReading = math::Clip(rangeReading, GetMinimumRange(), GetRangeThreshold());
     }
 
-    kt_double angle = scanPose.GetHeading() + GetMinimumAngle() + beamNum * GetAngularResolution();
+    kt_double angle = scanPose.GetHeading() + pLocalizedRangeScan->GetBeamAngle(i);
 
     Vector2<kt_double> point;
 
@@ -216,6 +216,12 @@ const PointVectorDouble LaserRangeFinder::GetPointReadings(
 kt_bool LaserRangeFinder::Validate(SensorData * pSensorData)
 {
   LaserRangeScan * pLaserRangeScan = dynamic_cast<LaserRangeScan *>(pSensorData);
+
+  if (pLaserRangeScan == NULL) return false;
+  auto * localized = dynamic_cast<LocalizedRangeScan *>(pSensorData);
+  if (localized != NULL && !localized->GetBeamAngles().empty()) {
+    return localized->GetBeamAngles().size() == pLaserRangeScan->GetNumberOfRangeReadings();
+  }
 
   // verify number of range readings in LaserRangeScan matches the number of expected range readings
   if (pLaserRangeScan->GetNumberOfRangeReadings() != GetNumberOfRangeReadings()) {

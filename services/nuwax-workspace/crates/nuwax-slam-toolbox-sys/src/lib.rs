@@ -94,6 +94,12 @@ unsafe extern "C" {
         error: *mut c_char,
         capacity: usize,
     ) -> i32;
+    pub fn nw_slam_set_scan_input_mode(ctx: *mut c_void, raw_mode: u32, error: *mut c_char, capacity: usize) -> i32;
+    pub fn nw_slam_process_raw(ctx: *mut c_void, scan: *const Scan, angles: *const f64, angle_count: usize,
+        out: *mut Output, error: *mut c_char, capacity: usize) -> i32;
+    pub fn nw_slam_begin_grid(ctx: *mut c_void, revision: u64, error: *mut c_char, capacity: usize) -> i32;
+    pub fn nw_slam_poll_grid(ctx: *mut c_void, output: *mut Grid, ready: *mut u32, error: *mut c_char, capacity: usize) -> i32;
+    pub fn nw_slam_cancel_grid(ctx: *mut c_void, error: *mut c_char, capacity: usize) -> i32;
     pub fn nw_slam_grid(
         ctx: *mut c_void,
         out: *mut Grid,

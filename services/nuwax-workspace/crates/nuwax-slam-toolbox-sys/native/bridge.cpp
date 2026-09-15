@@ -1,6 +1,7 @@
 #include "bridge.h"
 #include "solver.h"
 #include "incremental_grid.h"
+#include "async_grid.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -70,6 +71,21 @@ struct Context {
   int odometry_mode=-1;
   std::vector<int8_t> grid;
   karto::IncrementalOccupancyGrid grid_cache;
+  std::unique_ptr<NuwaxAsyncGrid> async_grid;
+  std::unordered_map<const void*,std::shared_ptr<const NuwaxGridGeometry>> grid_geometry;
+  std::vector<NuwaxGridNode> capture_grid() {
+    auto scans=localization?loaded_graph_scans:mapper->GetAllProcessedScans();
+    std::vector<NuwaxGridNode> nodes;nodes.reserve(scans.size());
+    for(auto* scan:scans){
+      auto& geometry=grid_geometry[scan];
+      if(!geometry){
+        auto data=std::make_shared<NuwaxGridGeometry>();
+        data->ranges=scan->GetRangeReadingsVector();data->angles=scan->GetBeamAngles();geometry=std::move(data);
+      }
+      nodes.push_back({scan,geometry,scan->GetCorrectedPose()});
+    }
+    return nodes;
+  }
   explicit Context(NwSlamConfig c):config(c),threads(tbb::global_control::max_allowed_parallelism,c.solver_threads),solver(c.solver_threads) {
     dataset=std::make_unique<karto::Dataset>();
     mapper=std::make_unique<karto::Mapper>(); configure(*mapper);
@@ -100,6 +116,8 @@ struct Context {
     m.setMinimumScanResponse(config.minimum_response);
   }
   ~Context() {
+    // 构图影子对象仍引用只读雷达配置，先等待其退出再释放传感器。
+    async_grid.reset();
     local_scans.clear(); local_matcher.reset(); local_parameters.reset();
     if(mapper && mapper->GetMapperSensorManager()) mapper->ClearLocalizationBuffer();
     mapper.reset();
@@ -111,14 +129,16 @@ struct Context {
     if(mapper->GetGraph())for(const auto& group:mapper->GetGraph()->GetVertices())count+=group.second.size();
     return count;
   }
-  std::unique_ptr<karto::LocalizedRangeScan> make_scan(const std::vector<double>& ranges,NwSlamPose p,uint64_t stamp) {
+  bool raw_scan_input=false;
+  std::unique_ptr<karto::LocalizedRangeScan> make_scan(const std::vector<double>& ranges,const std::vector<double>& angles,NwSlamPose p,uint64_t stamp) {
     auto scan=std::make_unique<karto::LocalizedRangeScan>(laser->GetName(),ranges);
+    scan->SetBeamAngles(angles);
     scan->SetOdometricPose(pose(p)); scan->SetCorrectedPose(pose(p));
     scan->SetTime(static_cast<double>(stamp)*1e-9); return scan;
   }
-  bool local_odometry(const std::vector<double>& ranges,uint64_t stamp,NwSlamPose& output,double& response) {
+  bool local_odometry(const std::vector<double>& ranges,const std::vector<double>& angles,uint64_t stamp,NwSlamPose& output,double& response) {
     if(!local_matcher)local_matcher.reset(karto::ScanMatcher::Create(local_parameters.get(),config.search_dimension,config.search_resolution,config.search_smear,config.range_threshold));
-    auto scan=make_scan(ranges,local_pose,stamp);
+    auto scan=make_scan(ranges,angles,local_pose,stamp);
     response=-1;
     if(!local_scans.empty()) {
       require(stamp>local_timestamp && (resume_pending || (stamp-local_timestamp)*1e-9<=config.max_scan_gap_s),"激光里程计连续扫描缺测超限，需要重建来源");
@@ -144,21 +164,22 @@ struct Context {
       for(double range:ranges)if(std::isfinite(range)&&range>config.range_min&&range<=config.range_threshold) {squared_range+=range*range;++observed;}
       const double scale=std::sqrt(squared_range/std::max<size_t>(1,observed));
       Eigen::Matrix3d information=Eigen::Matrix3d::Zero();
-      Eigen::Vector2d previous;size_t previous_index=0,segments=0;bool has_previous=false;
+      Eigen::Vector2d previous;double previous_angle=0;size_t segments=0;bool has_previous=false;
       for(size_t index=0;index<ranges.size();++index) {
         const double range=ranges[index];
         if(!std::isfinite(range)||range<=config.range_min||range>config.range_threshold)continue;
-        const double angle=config.angle_min+index*config.angle_increment;
+        const double angle=angles.empty()?config.angle_min+index*config.angle_increment:angles[index];
         const Eigen::Vector2d point(range*std::cos(angle),range*std::sin(angle));
-        if(has_previous && (index-previous_index)*config.angle_increment<=0.25) {
+        const double angular_gap=std::abs(std::remainder(angle-previous_angle,2*M_PI));
+        if(has_previous && angular_gap<=0.25) {
           const Eigen::Vector2d tangent=point-previous;const double length=tangent.norm();
-          if(length>1e-6 && length<std::max(0.5,scale*config.angle_increment*3)) {
+          if(length>1e-6 && length<std::max(0.5,scale*angular_gap*3)) {
             const Eigen::Vector2d normal(-tangent.y()/length,tangent.x()/length),middle=(point+previous)*0.5;
             const Eigen::Vector3d row(normal.x(),normal.y(),(middle.x()*normal.y()-middle.y()*normal.x())/std::max(0.1,scale));
             information+=row*row.transpose();++segments;
           }
         }
-        previous=point;previous_index=index;has_previous=true;
+        previous=point;previous_angle=angle;has_previous=true;
       }
       Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen(information);
       const double information_ratio=eigen.info()==Eigen::Success?eigen.eigenvalues()[0]/std::max(1e-12,eigen.eigenvalues()[2]):0.0;
@@ -212,10 +233,23 @@ extern "C" void nw_slam_destroy(void* ctx) {
   if(!ctx)return;
   delete static_cast<Context*>(ctx); occupied=false;
 }
-extern "C" int nw_slam_process(void* ptr,const NwSlamScan* in,NwSlamResult* out,char* error,size_t capacity) {
+extern "C" int nw_slam_set_scan_input_mode(void* ptr,uint32_t raw_mode,char* error,size_t capacity) {
+  return protect(ptr,error,capacity,[&](Context& c){
+    require(raw_mode<=1&&!c.has_source&&c.nodes()==0,"扫描模式必须在空实例初始化时选择");
+    c.raw_scan_input=raw_mode!=0;
+  });
+}
+static int process_scan(void* ptr,const NwSlamScan* in,const double* input_angles,size_t angle_count,NwSlamResult* out,char* error,size_t capacity) {
   return protect(ptr,error,capacity,[&](Context& c){
     require(in&&out&&in->ranges,"二维扫描为空");
-    require(in->count==c.config.scan_count && in->timestamp_ns>0 && in->use_laser_odometry<=1,"二维扫描尺寸或时间非法");
+    require(in->count>=16&&in->count<=max_beams&&in->timestamp_ns>0&&in->use_laser_odometry<=1,"二维扫描尺寸或时间非法");
+    require(c.raw_scan_input == (input_angles!=nullptr),"输入角度布局与会话模式不一致");
+    require(input_angles?angle_count==in->count:in->count==c.config.scan_count,"角度与距离数量不一致");
+    std::vector<double> angles;
+    if(input_angles) {
+      angles.assign(input_angles,input_angles+angle_count);
+      for(double angle:angles)require(std::isfinite(angle)&&std::abs(angle)<=M_PI*2+1e-5,"原始角度非有限或超出一圈");
+    }
     require(!c.has_source || (in->timestamp_ns>c.timestamp && in->sequence>c.sequence),"二维扫描源时间或序号未递增");
     require(c.odometry_mode<0 || c.odometry_mode==static_cast<int>(in->use_laser_odometry),"运行中不能隐式更换里程计来源");
     require(in->use_laser_odometry || finite(in->odom_from_base),"设备里程计位姿无效");
@@ -238,11 +272,11 @@ extern "C" int nw_slam_process(void* ptr,const NwSlamScan* in,NwSlamResult* out,
       out->edge_count=c.mapper->GetGraph()?c.mapper->GetGraph()->GetEdges().size():0;
       out->optimizations=c.solver.optimizations();
     };
-    if(in->use_laser_odometry && !c.local_odometry(ranges,in->timestamp_ns,odom,out->local_response)) {
+    if(in->use_laser_odometry && !c.local_odometry(ranges,angles,in->timestamp_ns,odom,out->local_response)) {
       odom=c.local_pose;out->disposition=3;fill();return;
     }
     const bool first=c.nodes()==0;
-    auto scan=c.make_scan(ranges,compose(c.reprocessing,odom),in->timestamp_ns);
+    auto scan=c.make_scan(ranges,angles,compose(c.reprocessing,odom),in->timestamp_ns);
     karto::Matrix3 covariance; covariance.SetToIdentity();
     bool accepted;
     if(c.near_seed) {
@@ -264,19 +298,18 @@ extern "C" int nw_slam_process(void* ptr,const NwSlamScan* in,NwSlamResult* out,
     fill();
   });
 }
+extern "C" int nw_slam_process(void* ptr,const NwSlamScan* in,NwSlamResult* out,char* error,size_t capacity) {
+  return process_scan(ptr,in,nullptr,0,out,error,capacity);
+}
+extern "C" int nw_slam_process_raw(void* ptr,const NwSlamScan* in,const double* angles,size_t angle_count,NwSlamResult* out,char* error,size_t capacity) {
+  if(!angles){error_text(error,capacity,"原始角度数组为空");return 1;}
+  return process_scan(ptr,in,angles,angle_count,out,error,capacity);
+}
 extern "C" int nw_slam_grid(void* ptr,NwSlamGrid* out,char* error,size_t capacity) {
   return protect(ptr,error,capacity,[&](Context& c){
     require(out,"栅格输出为空");require(c.nodes()>0,"尚无可构图扫描");
     auto scans=c.localization?c.loaded_graph_scans:c.mapper->GetAllProcessedScans();
-    double min_x=1e30,min_y=1e30,max_x=-1e30,max_y=-1e30;
-    for(auto* scan:scans) {
-      auto p=scan->GetSensorPose();
-      min_x=std::min(min_x,p.GetX());max_x=std::max(max_x,p.GetX());
-      min_y=std::min(min_y,p.GetY());max_y=std::max(max_y,p.GetY());
-    }
-    double w=(max_x-min_x+2*c.config.range_threshold)/c.config.resolution+4;
-    double h=(max_y-min_y+2*c.config.range_threshold)/c.config.resolution+4;
-    require(std::isfinite(w*h)&&w<=8192&&h<=8192&&w*h<=max_grid_cells,"地图范围超过内存预算");
+    // 实际尺寸由同一增量构图器检查，不再按传感器中心外扩重复估算。
     auto* map=c.grid_cache.update(scans,c.config.resolution,2,0.1);
     require(bool(map),"栅格生成失败");
     auto origin=map->GetCoordinateConverter()->GetOffset();
@@ -288,6 +321,25 @@ extern "C" int nw_slam_grid(void* ptr,NwSlamGrid* out,char* error,size_t capacit
       c.grid[size_t(y)*out->width+x]=value==karto::GridStates_Occupied?100:value==karto::GridStates_Free?0:-1;
     }
   });
+}
+extern "C" int nw_slam_begin_grid(void* ptr,uint64_t revision,char* error,size_t capacity) {
+  return protect(ptr,error,capacity,[&](Context& c){
+    require(revision==c.revision&&c.nodes()>0,"异步栅格修订与当前图不一致");
+    if(!c.async_grid)c.async_grid=std::make_unique<NuwaxAsyncGrid>(c.laser->GetName(),c.config.resolution);
+    c.async_grid->submit(revision,c.capture_grid());
+  });
+}
+extern "C" int nw_slam_poll_grid(void* ptr,NwSlamGrid* output,uint32_t* ready,char* error,size_t capacity) {
+  return protect(ptr,error,capacity,[&](Context& c){
+    require(output&&ready,"异步栅格输出为空");*ready=0;
+    if(!c.async_grid)return;
+    auto result=c.async_grid->poll();if(!result)return;
+    if(!result->error.empty())throw std::runtime_error(result->error);
+    *output=result->metadata;c.grid=std::move(result->cells);*ready=1;
+  });
+}
+extern "C" int nw_slam_cancel_grid(void* ptr,char* error,size_t capacity) {
+  return protect(ptr,error,capacity,[](Context& c){if(c.async_grid)c.async_grid->cancel();});
 }
 extern "C" int nw_slam_copy_grid(void* ptr,int8_t* out,size_t count,char* error,size_t capacity) {
   return protect(ptr,error,capacity,[&](Context& c){
@@ -327,6 +379,11 @@ extern "C" int nw_slam_load(void* ptr,const char* prefix,uint32_t localization,N
       throw std::runtime_error("图数据与当前雷达几何或外参不兼容");
     karto::SensorManager::GetInstance()->RegisterSensor(c.laser);
     if(c.loaded_graph_scans.empty()||c.loaded_graph_scans.size()>c.config.max_nodes)throw std::runtime_error("图节点为空或超过容量");
+    for(auto* scan:c.loaded_graph_scans) {
+      const auto count=scan->GetNumberOfRangeReadings();
+      if(count<16||count>max_beams||c.raw_scan_input!=!scan->GetBeamAngles().empty()||!c.laser->Validate(scan))
+        throw std::runtime_error("图扫描角度布局与输入模式不一致");
+    }
     c.configure(*c.mapper);c.mapper->SetScanSolver(&c.solver);
     for(const auto& group:c.mapper->GetGraph()->GetVertices())for(const auto& item:group.second)c.solver.AddNode(item.second);
     for(auto* edge:c.mapper->GetGraph()->GetEdges())c.solver.AddConstraint(edge);

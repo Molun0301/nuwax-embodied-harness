@@ -3,8 +3,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const VERSION: u32 = 4;
-pub const WORKER_CONTRACT: &str = "nuwax-slam-2d-worker-v4";
+pub const VERSION: u32 = 6;
+pub const WORKER_CONTRACT: &str = "nuwax-slam-2d-worker-v6";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -32,6 +32,7 @@ impl Identity {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.to_be_bytes())
         )
     }
+    pub fn status_channel(&self) -> String { format!("{}state#nuwax_msgs.PlanarStatus", self.scan_prefix()) }
     pub fn scan_channel(&self, generation: u64) -> String {
         format!(
             "{}{:016x}#nuwax_msgs.PlanarScan",
@@ -209,6 +210,11 @@ pub struct Estimate {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Status {
+    pub scan_input_mode: String,
+    pub input_beams: u32,
+    pub processed_beams: u32,
+    pub valid_beams: u32,
+    pub processing_ms: f64,
     pub motion_compensation: String,
     pub paused: bool,
     pub localization: bool,
@@ -222,6 +228,10 @@ pub struct Status {
     pub active: bool,
     pub stopping: bool,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusNotice { pub version: u32, pub identity: Identity, pub sequence: u64, pub status: Status }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {

@@ -10,9 +10,18 @@ use std::{
     ptr::NonNull,
 };
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanInputMode {
+    #[default]
+    Uniform,
+    Raw,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub scan_input_mode: ScanInputMode,
     pub scan_count: u32,
     pub angle_min: f64,
     pub angle_increment: f64,
@@ -41,6 +50,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            scan_input_mode: ScanInputMode::Uniform,
             scan_count: 360,
             angle_min: -std::f64::consts::PI,
             angle_increment: std::f64::consts::TAU / 360.0,
@@ -186,11 +196,11 @@ impl Slam {
             code: 2,
             message: "原生创建成功但未返回上下文".into(),
         })?;
-        Ok(Self {
-            handle,
-            config,
-            _thread: PhantomData,
-        })
+        let instance = Self { handle, config, _thread: PhantomData };
+        let code = unsafe { raw::nw_slam_set_scan_input_mode(instance.handle.as_ptr(),
+            u32::from(instance.config.scan_input_mode == ScanInputMode::Raw), error.as_mut_ptr(), error.len()) };
+        check(code, &error)?;
+        Ok(instance)
     }
     pub fn resume_after_pause(&mut self) -> Result<(), Error> {
         let mut error = [0; 1024];
@@ -208,12 +218,25 @@ impl Slam {
         ranges: &[f64],
         odometry: Option<Pose>,
     ) -> Result<Estimate, Error> {
-        if ranges.len() != self.config.scan_count as usize {
+        if self.config.scan_input_mode != ScanInputMode::Uniform || ranges.len() != self.config.scan_count as usize {
             return Err(Error {
                 code: 1,
                 message: "扫描束数与配置不一致".into(),
             });
         }
+        self.process_input(timestamp_ns, sequence, ranges, None, odometry)
+    }
+    /// 原始模式保留每束角度和距离，允许变化束数与相同角度的多次观测。
+    pub fn process_raw(&mut self, timestamp_ns: u64, sequence: u64, ranges: &[f64], angles: &[f64],
+        odometry: Option<Pose>) -> Result<Estimate, Error> {
+        if self.config.scan_input_mode != ScanInputMode::Raw || ranges.len() != angles.len()
+            || !(16..=32768).contains(&ranges.len()) {
+            return Err(Error { code: 1, message: "原始扫描角度、束数或模式不一致".into() });
+        }
+        self.process_input(timestamp_ns, sequence, ranges, Some(angles), odometry)
+    }
+    fn process_input(&mut self, timestamp_ns: u64, sequence: u64, ranges: &[f64], angles: Option<&[f64]>,
+        odometry: Option<Pose>) -> Result<Estimate, Error> {
         let input = raw::Scan {
             timestamp_ns,
             sequence,
@@ -225,13 +248,12 @@ impl Slam {
         let mut output = raw::Output::default();
         let mut error = [0; 1024];
         let code = unsafe {
-            raw::nw_slam_process(
-                self.handle.as_ptr(),
-                &input,
-                &mut output,
-                error.as_mut_ptr(),
-                error.len(),
-            )
+            if let Some(angles) = angles {
+                raw::nw_slam_process_raw(self.handle.as_ptr(), &input, angles.as_ptr(), angles.len(),
+                    &mut output, error.as_mut_ptr(), error.len())
+            } else {
+                raw::nw_slam_process(self.handle.as_ptr(), &input, &mut output, error.as_mut_ptr(), error.len())
+            }
         };
         check(code, &error)?;
         let disposition = match output.disposition {
@@ -251,6 +273,23 @@ impl Slam {
             output,
         })
     }
+    pub fn begin_grid(&mut self, revision: u64) -> Result<(), Error> {
+        let mut error = [0; 1024];
+        let code = unsafe { raw::nw_slam_begin_grid(self.handle.as_ptr(), revision, error.as_mut_ptr(), error.len()) };
+        check(code, &error)
+    }
+    pub fn cancel_grid(&mut self) -> Result<(), Error> {
+        let mut error = [0; 1024];
+        let code = unsafe { raw::nw_slam_cancel_grid(self.handle.as_ptr(), error.as_mut_ptr(), error.len()) };
+        check(code, &error)
+    }
+    pub fn poll_grid(&mut self) -> Result<Option<OccupancyGrid>, Error> {
+        let mut metadata = raw::Grid::default();let mut ready = 0;let mut error = [0; 1024];
+        let code = unsafe { raw::nw_slam_poll_grid(self.handle.as_ptr(), &mut metadata, &mut ready, error.as_mut_ptr(), error.len()) };
+        check(code, &error)?;
+        if ready == 0 { return Ok(None); }
+        self.copy_grid(metadata).map(Some)
+    }
     pub fn occupancy_grid(&mut self) -> Result<OccupancyGrid, Error> {
         let mut metadata = raw::Grid::default();
         let mut error = [0; 1024];
@@ -263,6 +302,10 @@ impl Slam {
             )
         };
         check(code, &error)?;
+        self.copy_grid(metadata)
+    }
+    fn copy_grid(&mut self, metadata: raw::Grid) -> Result<OccupancyGrid, Error> {
+        let mut error = [0; 1024];
         let len = (metadata.width as usize)
             .checked_mul(metadata.height as usize)
             .filter(|n| *n <= 16 * 1024 * 1024)
@@ -591,4 +634,70 @@ mod tests {
         }
         std::fs::remove_dir_all(path).unwrap();
     }
+    fn irregular_scan(config: &Config, base: Pose, count: usize, reverse: bool) -> (Vec<f64>, Vec<f64>) {
+        let mut angles: Vec<f64> = (0..count).map(|i| -std::f64::consts::PI +
+            (i as f64 + 0.19 * (i as f64 * 0.7).sin()) * std::f64::consts::TAU / count as f64).collect();
+        // 相同角度的两束必须分别进入核心，不能被角度格合并。
+        angles[11] = angles[10];
+        if reverse { angles.reverse(); }
+        let ranges = angles.iter().map(|angle| room(&Config { scan_count: 1, angle_min: *angle,
+            ..config.clone() }, base)[0]).collect();
+        (ranges, angles)
+    }
+    #[test]
+    fn raw_angles_variable_beams_roundtrip_and_tracking() {
+        let _guard = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+        let directory = std::env::temp_dir().join(format!("nuwax-raw-angle-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let prefix = directory.join("graph");
+        let config = Config { scan_input_mode: ScanInputMode::Raw, base_from_laser: [0.2, -0.07, 0.13], ..Config::default() };
+        let mut slam = Slam::new(config.clone()).unwrap();
+        let mut final_pose = Pose::default();
+        for i in 0..40u64 {
+            let actual = Pose { x: i as f64 * 0.02, y: 0.0, yaw: i as f64 * 0.002 };
+            let count = 600 + (i as usize * 7) % 137;
+            let (mut ranges, angles) = irregular_scan(&config, actual, count, i % 2 == 1);
+            ranges[5] = f64::NAN;
+            let result = slam.process_raw(1_000_000_000 + i * 100_000_000, i, &ranges, &angles, None).unwrap();
+            assert_ne!(result.disposition, Disposition::MatchRejected, "{result:?}");
+            assert_eq!(result.output.valid_beams as usize, count - 1);
+            final_pose = result.output.map_from_base;
+        }
+        assert!((final_pose.x - 0.78).abs() < 0.1, "{final_pose:?}");
+        assert!((final_pose.yaw - 0.078).abs() < 0.06, "{final_pose:?}");
+        let before = slam.occupancy_grid().unwrap();
+        slam.save(&prefix).unwrap();
+        drop(slam);
+        // 两种模式均恢复相同的实际栅格，再用变化束数继续真实匹配。
+        for localization in [true, false] {
+            let mut restored = Slam::new(config.clone()).unwrap();
+            restored.load(&prefix, localization, final_pose).unwrap();
+            assert_eq!(before.cells, restored.occupancy_grid().unwrap().cells);
+            for i in 0..5u64 {
+                let actual = Pose { x: 0.78 + i as f64 * 0.01, y: 0.0, yaw: 0.078 };
+                let (ranges, angles) = irregular_scan(&config, actual, 3200 + i as usize, true);
+                let output = restored.process_raw(10_000_000_000 + i * 100_000_000, i, &ranges, &angles, Some(actual)).unwrap();
+                assert_ne!(output.disposition, Disposition::MatchRejected, "{output:?}");
+                assert!((output.output.map_from_base.x - actual.x).abs() < 0.1);
+            }
+        }
+        let mut wrong = Slam::new(Config::default()).unwrap();
+        assert!(wrong.load(&prefix, false, Pose::default()).is_err());
+        drop(wrong);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn raw_angles_reject_invalid_layout_before_state_changes() {
+        let _guard = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+        let config = Config { scan_input_mode: ScanInputMode::Raw, ..Config::default() };
+        let (ranges, mut angles) = irregular_scan(&config, Pose::default(), 601, false);
+        let mut slam = Slam::new(config).unwrap();
+        assert!(slam.process_raw(1_000_000_000, 1, &ranges, &angles[..600], None).is_err());
+        let valid = angles[3]; angles[3] = f64::NAN;
+        assert!(slam.process_raw(1_000_000_000, 1, &ranges, &angles, None).is_err());
+        angles[3] = valid;
+        assert!(slam.process_raw(1_000_000_000, 1, &ranges, &angles, None).unwrap().accepted());
+        assert!(slam.process(1_100_000_000, 2, &ranges, None).is_err());
+    }
+
 }

@@ -1129,7 +1129,13 @@ PointVectorDouble ScanMatcher::FindValidPoints(
   LocalizedRangeScan * pScan,
   const Vector2<kt_double> & rViewPoint) const
 {
-  const PointVectorDouble & rPointReadings = pScan->GetPointReadings();
+  const PointVectorDouble & sourcePoints = pScan->GetPointReadings();
+  PointVectorDouble angularPoints;
+  if (!pScan->GetAngularOrder().empty()) {
+    angularPoints.reserve(sourcePoints.size());
+    for (auto index : pScan->GetAngularOrder()) angularPoints.push_back(sourcePoints.at(index));
+  }
+  const PointVectorDouble & rPointReadings = angularPoints.empty() ? sourcePoints : angularPoints;
 
   // points must be at least 10 cm away when making comparisons of inside/outside of viewpoint
   const kt_double minSquareDistance = math::Square(0.1);    // in m^2
@@ -1200,23 +1206,20 @@ kt_double ScanMatcher::GetResponse(kt_int32u angleIndex, kt_int32s gridPositionI
     return response;
   }
 
-  // calculate response
-  kt_int32s * pAngleIndexPointer = pOffsets->GetArrayPointer();
-  for (kt_int32u i = 0; i < nPoints; i++) {
-    // ignore points that fall off the grid
-    // 无效束哨兵不能参与索引相加；宽类型先完成边界校验，避免有符号溢出。
-    if (pAngleIndexPointer[i] == INVALID_SCAN) {
-      continue;
+  // 偏移已排序；整个区间在图内时只检查一次边界，热循环保留整数加权。
+  const auto& offsets = pOffsets->GetWeightedOffsets();
+  const auto dataSize = m_pCorrelationGrid->GetDataSize();
+  kt_int64u sum = 0;
+  if (!offsets.empty() && static_cast<kt_int64s>(gridPositionIndex) + offsets.front().offset >= 0 &&
+      static_cast<kt_int64s>(gridPositionIndex) + offsets.back().offset < dataSize) {
+    for (const auto& entry : offsets) sum += static_cast<kt_int64u>(pByte[entry.offset]) * entry.count;
+  } else {
+    for (const auto& entry : offsets) {
+      const kt_int64s index = static_cast<kt_int64s>(gridPositionIndex) + entry.offset;
+      if (index >= 0 && index < dataSize) sum += static_cast<kt_int64u>(pByte[entry.offset]) * entry.count;
     }
-    const kt_int64s pointGridIndex = static_cast<kt_int64s>(gridPositionIndex) + pAngleIndexPointer[i];
-    if (pointGridIndex < 0 || pointGridIndex >= m_pCorrelationGrid->GetDataSize())
-    {
-      continue;
-    }
-
-    // uses index offsets to efficiently find location of point in the grid
-    response += pByte[pAngleIndexPointer[i]];
   }
+  response = static_cast<kt_double>(sum);
 
   // normalize response
   response /= (nPoints * GridStates_Occupied);
@@ -1543,6 +1546,7 @@ kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSens
       (covariance(1, 1) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()))
     {
       LocalizedRangeScan tmpScan(pScan->GetSensorName(), pScan->GetRangeReadingsVector());
+      tmpScan.SetBeamAngles(pScan->GetBeamAngles());
       tmpScan.SetUniqueId(pScan->GetUniqueId());
       tmpScan.SetTime(pScan->GetTime());
       tmpScan.SetStateId(pScan->GetStateId());

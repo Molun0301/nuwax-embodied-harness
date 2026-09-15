@@ -99,17 +99,17 @@ impl PoseHistory {
     }
 }
 /// 将具备真实逐束时间的扫描补偿到起始雷达坐标；返回空值表示等待真实里程计覆盖。
-pub fn deskew_scan(
-    scan: &PlanarScan,
+pub fn deskew_scan<'a>(
+    scan: &'a PlanarScan,
     history: &PoseHistory,
     base_from_laser: [f64; 3],
-) -> Result<Option<PlanarScan>, String> {
+) -> Result<Option<std::borrow::Cow<'a, PlanarScan>>, String> {
     scan.validate().map_err(|e| e.to_string())?;
     if scan.motion_compensated
         || scan.time_offsets_quality != 1
         || scan.time_offsets_ns_le.is_empty()
     {
-        return Ok(Some(scan.clone()));
+        return Ok(Some(std::borrow::Cow::Borrowed(scan)));
     }
     if scan.timestamp_ns <= 0 || base_from_laser.iter().any(|v| !v.is_finite()) {
         return Err("逐束补偿的源时间或外参非法".into());
@@ -180,7 +180,27 @@ pub fn deskew_scan(
     }
     output.motion_compensated = true;
     output.validate().map_err(|e| e.to_string())?;
-    Ok(Some(output))
+    Ok(Some(std::borrow::Cow::Owned(output)))
+}
+
+/// 保留源顺序、变化束数和重复角度；无效束只改变有效性，不挤掉数组位置。
+pub fn raw_scan(scan: &PlanarScan) -> Result<(Vec<f64>, Vec<f64>), String> {
+    scan.validate().map_err(|e| e.to_string())?;
+    let count = scan.beam_count as usize;
+    let mut ranges = Vec::with_capacity(count);
+    let mut angles = Vec::with_capacity(count);
+    for i in 0..count {
+        let angle = if scan.angular_layout == 1 {
+            scan.angle_min_rad + scan.angle_increment_rad * i as f64
+        } else {
+            f32::from_le_bytes(scan.angles_f32_le[i * 4..i * 4 + 4].try_into().unwrap()) as f64
+        };
+        angles.push(angle);
+        ranges.push(if scan.beam_states_u8[i] == 1 {
+            f32::from_le_bytes(scan.ranges_f32_le[i * 4..i * 4 + 4].try_into().unwrap()) as f64
+        } else { f64::NAN });
+    }
+    Ok((ranges, angles))
 }
 
 pub fn normalize(
@@ -402,4 +422,27 @@ mod deskew_tests {
                 .motion_compensated
         );
     }
+    #[test]
+    fn raw_scan_keeps_float_bits_duplicates_and_invalid_positions() {
+        let mut scan = moving_wall_scan();
+        let count = scan.beam_count as usize;
+        scan.angular_layout = 2;
+        scan.angle_min_rad = 0.0;
+        scan.angle_increment_rad = 0.0;
+        let mut expected: Vec<f32> = (0..count).map(|i| 0.4 - (i as f32 + (i as f32 * 0.7).sin() * 0.1) / count as f32).collect();
+        expected[25] = expected[24];
+        scan.angles_f32_le = expected.iter().flat_map(|v| v.to_le_bytes()).collect();
+        scan.beam_states_u8[50] = 0;
+        let original = scan.clone();
+        let (ranges, angles) = raw_scan(&scan).unwrap();
+        assert_eq!(angles.len(), count);
+        assert_eq!(ranges.len(), count);
+        for i in 0..count {
+            assert_eq!((angles[i] as f32).to_bits(), expected[i].to_bits());
+            if i == 50 { assert!(ranges[i].is_nan()); }
+            else { assert_eq!((ranges[i] as f32).to_le_bytes(), scan.ranges_f32_le[i*4..i*4+4]); }
+        }
+        assert_eq!(scan, original, "转换不得修改来源、时间或原始载荷");
+    }
+
 }

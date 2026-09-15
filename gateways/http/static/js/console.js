@@ -1069,6 +1069,7 @@
         const names = {
           gateway_web: "网页与能力接口", gateway_supervisor: "网关启动与进程守护",
           geometry_runtime: "定位建图与几何计算", geometry_external: "几何服务接口",
+          slam_2d_worker: "二维激光建图", nuwax_slam_2d_worker: "二维激光建图",
           nav_stack: "路径规划与导航执行", static_tf: "固定坐标变换",
           go2_video_streamer: "摄像头采集与视频推流", go2_data_plane: "机器人状态与传感器接入",
           motion_safety_guard: "运动安全守卫", nuwax_motion_safety_guard: "运动安全守卫",
@@ -3686,19 +3687,32 @@
         state.displayedPoseMetrics ||= {};
         const mapKey = state.appliedMapIdentity.key;
         const previous = state.displayedPoseMetrics[kind];
-        if (previous?.pose === pose && previous.mapKey === mapKey) return;
+        if (previous && previous.mapKey === mapKey && previous.pose?.timestamp === pose.timestamp
+            && previous.pose?.frame_id === pose.frame_id) {
+          previous.pose = pose;
+          return;
+        }
         // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
         const sourceTime = typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN;
         const rawAgeMs = displayedAt - sourceTime;
         const estimate = activeStreamClockEstimate();
         const age = rawAgeMs + (estimate?.offsetMs || 0);
-        state.displayedPoseMetrics[kind] = { pose, mapKey, rawAgeMs, calibrated: Boolean(estimate), ageMs: Number.isFinite(sourceTime) && Number.isFinite(age) && age >= 0 ? age : null };
+        // 轮询/轨迹更新可能重建同一位姿对象；以当前地图和真实采样时间关联接收诊断。
+        const receiptKey = JSON.stringify([state.poseMapIdentity?.key, pose.frame_id, pose.timestamp]);
+        const receiptMs = Number(state.poseReceipts?.get(receiptKey)) / 1e6;
+        const softwareMs = displayedAt + (estimate?.offsetMs || 0) - receiptMs;
+        state.displayedPoseMetrics[kind] = { pose, mapKey, rawAgeMs, calibrated: Boolean(estimate),
+          softwareMs: Number.isFinite(receiptMs) && receiptMs > 0 && softwareMs >= 0 ? softwareMs : null,
+          ageMs: Number.isFinite(sourceTime) && Number.isFinite(age) && age >= 0 ? age : null };
+        window.dispatchEvent(new CustomEvent("map:pose-displayed", { detail: { kind, sourceTime,
+          softwareMs: state.displayedPoseMetrics[kind].softwareMs, calibrated: Boolean(estimate) } }));
         updateMapStreamChip();
       }
       function mapPoseLatencyText(kind) {
         const metric = state.displayedPoseMetrics?.[kind];
         if (!metric || !displayedMapPoseAllowed(kind, metric.pose) || metric.mapKey !== state.appliedMapIdentity?.key || metric.ageMs === null) return "--";
-        return `${metric.calibrated ? "≈" : ""}${Math.round(metric.ageMs)} ms`;
+        const age = `${metric.calibrated ? "≈" : ""}${Math.round(metric.ageMs)} ms`;
+        return metric.softwareMs === null ? age : `${age} · 收齐到绘制 ${metric.calibrated ? "≈" : ""}${Math.round(metric.softwareMs)} ms`;
       }
       function mediaMetricText(kind, now = Date.now(), monotonicNow = performance.now()) {
         const metric = state.mediaMetrics?.[kind];
@@ -3722,7 +3736,7 @@
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
         setVisionText(els.mapStreamStatus, mediaMetricText(kind));
-        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
+        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。二维收齐到绘制使用驱动完整扫描返回时刻，包含转换、算法、通信与画布绘制；不含屏幕扫描输出，跨主机受时钟误差影响。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);
@@ -3793,6 +3807,12 @@
         const incomingPose = data.pose || (pointFromPose(data) ? data : null);
         if (pointFromPose(incomingPose)) state.latestPose = incomingPose;
         else if (envelope.type === "localization.pose") state.latestPose = null;
+        if (incomingPose && envelope.metadata?.scan_received_unix_ns) {
+          state.poseReceipts ||= new Map();
+          const key = JSON.stringify([state.poseMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
+          state.poseReceipts.set(key, envelope.metadata.scan_received_unix_ns);
+          if (state.poseReceipts.size > 256) state.poseReceipts.delete(state.poseReceipts.keys().next().value);
+        }
         updateMapPoseHud();
         if (!shouldDisplaySpatialPose()) {
           clearLocalizationDisplay(LOCALIZATION_DISPLAY_IDLE_MESSAGE, "missing");

@@ -2010,7 +2010,7 @@
       "services/geometry/planar_input_bridge.py"
     ],
     "apply_scope": "重启Geometry与网关后生效",
-    "description": "JSON（结构化数据）对象，明确sensor_id、frame_id、map_frame_id、odom_frame_id、body_frame_id、clock_domain、clock_id、calibration_ref、odometry_source及core_config；core_config.base_from_laser必须为真实平面外参。monotonic_ns时clock_id可写local_boot，由拥有方在启动时解析为真实boot_id。"
+    "description": "JSON（结构化数据）对象，明确sensor_id、frame_id、map_frame_id、odom_frame_id、body_frame_id、clock_domain、clock_id、calibration_ref、odometry_source及core_config；core_config.base_from_laser必须为真实平面外参。core_config.scan_input_mode选择uniform（默认等角度归并）或raw（保留每束真实角度和距离，允许变化束数）；uniform的scan_count与angle_increment须成对设置，raw不使用这两项归并扫描。更换输入模式应新建地图。monotonic_ns时clock_id可写local_boot，由拥有方在启动时解析为真实boot_id。"
   },
   "NUWAX_GEOMETRY_SLAM2D_DEVICE": {
     "zh_name": "二维雷达连接配置",

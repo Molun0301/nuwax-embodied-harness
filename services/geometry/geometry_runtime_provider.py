@@ -2705,7 +2705,8 @@ def _exploration_rpc_timeout(
     deadline_monotonic: Optional[float],
     rpc_name: str,
 ) -> float:
-    timeout = _read_deadline_sec()
+    # 续建会恢复完整图，使用重操作预算；任务显式截止时间仍取更早者。
+    timeout = _heavy_deadline_sec() if rpc_name == "StartMapping" else _read_deadline_sec()
     if deadline_monotonic is None:
         return timeout
     remaining = float(deadline_monotonic) - time.monotonic()
@@ -3461,6 +3462,8 @@ class GeometryRuntimeProvider:
         self._last_exploration_signature = None
         self._map_delivery_lock = threading.RLock()
         self._map_state_lock = threading.Lock()
+        self._planar_scan_receipts = {}
+        self._planar_unix_offset_ns = 0
         self._map_delivery_condition = threading.Condition()
         self._map_delivery_tickets: Dict[int, _MapDeliveryTicket] = {}
         self._next_map_delivery_ticket_id = 1
@@ -8728,6 +8731,7 @@ class GeometryRuntimeProvider:
         if not self._stub:
             raise RuntimeError("Geometry尚未连接")
         response = self._stub.HealthCheck(pb2.HealthCheckRequest(), timeout=_read_deadline_sec())
+        self._planar_unix_offset_ns = int(response.planar_unix_offset_ns)
         return {
             "healthy": bool(response.healthy),
             "geometry_pipeline": str(response.geometry_pipeline or "lio_3d"),
@@ -8754,6 +8758,14 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("publish_laser_scan")
         if not self._stub:
             return False
+        if scan.scan_received_unix_ns is not None:
+            stamp = scan.timestamp_ns + (self._planar_unix_offset_ns if scan.clock_domain == "monotonic_ns" else 0)
+            with self._map_state_lock:
+                identity = self._mapping_identity
+                if identity is not None and identity[0] == context["session_id"] and identity[2] == context["session_generation"]:
+                    self._planar_scan_receipts[stamp] = (identity, scan.scan_received_unix_ns)
+                    if len(self._planar_scan_receipts) > 256:
+                        self._planar_scan_receipts.pop(next(iter(self._planar_scan_receipts)))
         payload = encode_planar_scan(scan, int(context["runtime_generation"]))
         response = self._stub.PublishLaserScan(pb2.PublishLaserScanRequest(
             payload=payload, session_id=context["session_id"],
@@ -9003,16 +9015,13 @@ class GeometryRuntimeProvider:
                         if handle.stop_event.is_set():
                             return
                         try:
-                            callback(
-                                pose,
-                                cached_tree,
-                                {
-                                    "sequence": update.sequence,
-                                    "source_timestamp_ns": int(
-                                        getattr(update.pose, "timestamp_ns", 0) or 0
-                                    ),
-                                },
-                            )
+                            metadata = {"sequence": update.sequence,
+                                        "source_timestamp_ns": int(update.pose.timestamp_ns)}
+                            with self._map_state_lock:
+                                receipt = self._planar_scan_receipts.get(metadata["source_timestamp_ns"])
+                                if receipt is not None and receipt[0] == self._mapping_identity:
+                                    metadata["scan_received_unix_ns"] = receipt[1]
+                            callback(pose, cached_tree, metadata)
                         except Exception:
                             LOGGER.exception(
                                 "位姿流消费回调失败，当前订阅继续。"

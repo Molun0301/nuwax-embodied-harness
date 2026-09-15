@@ -45,14 +45,18 @@ class _Point(ctypes.Structure):
 
 
 def sample_from_slamtec(settings: SlamtecConfig, mode: _Mode, points, count: int,
-                        timestamp_us: int, sequence: int, clock_id: str) -> CanonicalLaserScan:
+                        timestamp_us: int, sequence: int, clock_id: str,
+                        scan_received_unix_ns: Optional[int] = None) -> CanonicalLaserScan:
     """保留实际角度和采集顺序，估算的逐束时间不能标成硬件精确时间。"""
     if not 1 <= count <= 32768 or settings.angle_sign not in (-1, 1):
         raise ValueError("思岚扫描束数或角度方向非法")
     if timestamp_us <= 0 or not math.isfinite(mode.sample_period_us) or mode.sample_period_us <= 0:
         raise ValueError("思岚扫描时间或采样周期非法")
-    ranges = np.array([points[i].range_m for i in range(count)], dtype="<f4")
-    angles = np.array([settings.angle_sign * points[i].angle_rad for i in range(count)], dtype="<f4")
+    # 按原生结构体步幅批量读取，避免每束创建Python临时对象。
+    raw = np.frombuffer(points, dtype=np.dtype({"names": ["angle", "range"],
+        "formats": ["<f4", "<f4"], "offsets": [0, 4], "itemsize": ctypes.sizeof(_Point)}), count=count)
+    ranges = raw["range"]
+    angles = settings.angle_sign * raw["angle"]
     angles = np.remainder(angles + np.float32(math.pi), np.float32(2 * math.pi)) - np.float32(math.pi)
     # 部分扫描模式不提供可靠强度，不能用quality字段为零否决有效距离。
     states = (np.isfinite(ranges) & (ranges >= settings.range_min_m) & (ranges <= mode.range_max_m)).astype(np.uint8)
@@ -61,12 +65,13 @@ def sample_from_slamtec(settings: SlamtecConfig, mode: _Mode, points, count: int
         raise ValueError("思岚扫描采集窗口超限")
     offsets = np.arange(count, dtype="<u8") * period_ns
     return CanonicalLaserScan(sensor_id=settings.sensor_id, source_sequence=sequence,
+        scan_received_unix_ns=scan_received_unix_ns,
         timestamp_ns=timestamp_us * 1000, clock_domain="monotonic_ns", clock_id=clock_id,
         frame_id=settings.frame_id, registration_state="sensor", registration_frame_id=settings.frame_id,
         calibration_ref=settings.calibration_ref, beam_count=count, angular_layout="explicit",
-        angles_f32_le=angles.astype("<f4").tobytes(), ranges_f32_le=ranges.tobytes(), beam_states_u8=states.tobytes(),
+        angles_f32_le=angles.astype("<f4", copy=False).tobytes(), ranges_f32_le=ranges.tobytes(), beam_states_u8=states.tobytes(),
         range_min_m=settings.range_min_m, range_max_m=mode.range_max_m, scan_duration_ns=period_ns * count,
-        time_offsets_ns_le=offsets.astype("<u8").tobytes(), timestamp_quality="estimated", time_offsets_quality="estimated")
+        time_offsets_ns_le=offsets.astype("<u8", copy=False).tobytes(), timestamp_quality="estimated", time_offsets_quality="estimated")
 
 
 class SlamtecLidarAdapter(AdapterBase[CanonicalLaserScan, CanonicalLaserScan]):
@@ -140,11 +145,12 @@ class SlamtecLidarAdapter(AdapterBase[CanonicalLaserScan, CanonicalLaserScan]):
             while not self._stop.is_set():
                 count, timestamp = ctypes.c_size_t(32768), ctypes.c_uint64()
                 result = self._library.nw_slamtec_read(self._handle, points, ctypes.byref(count), ctypes.byref(timestamp), error, len(error))
+                received_unix_ns = time.time_ns()
                 if result == 1:
                     continue
                 if result != 0:
                     raise RuntimeError(error.value.decode("utf-8", errors="replace"))
-                sample = sample_from_slamtec(self.settings, self._mode, points, count.value, timestamp.value, self._sequence, self._clock_id)
+                sample = sample_from_slamtec(self.settings, self._mode, points, count.value, timestamp.value, self._sequence, self._clock_id, received_unix_ns)
                 if self._stop.is_set():
                     return
                 if self._publish(sample) is False:

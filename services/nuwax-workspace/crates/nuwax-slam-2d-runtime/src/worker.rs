@@ -1,11 +1,11 @@
 //! 单一原生线程拥有算法。控制回执可重试，扫描只保留最新待处理帧。
 use crate::{
-    input::{compose, deskew_scan, inverse, normalize, PoseHistory, TimedPose},
+    input::{compose, deskew_scan, inverse, normalize, raw_scan, PoseHistory, TimedPose},
     protocol::*,
 };
 use nuwax_codec::lcm::planar::PlanarScan;
 use nuwax_rpc::{RpcHandler, RpcRequest, RpcResponse};
-use nuwax_slam_toolbox::{Config, Disposition, Pose, Slam};
+use nuwax_slam_toolbox::{Config, Disposition, Pose, ScanInputMode, Slam};
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -45,6 +45,7 @@ struct Shared {
     session_generation: AtomicU64,
     stopped: AtomicBool,
     exit: watch::Sender<bool>,
+    updates: watch::Sender<Status>,
 }
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -66,6 +67,7 @@ impl WorkerOwner {
             session_generation: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             exit: watch::channel(false).0,
+            updates: watch::channel(Status::default()).0,
         });
         let handle = WorkerHandle {
             shared: shared.clone(),
@@ -82,6 +84,7 @@ impl WorkerOwner {
     pub fn handle(&self) -> WorkerHandle {
         self.handle.clone()
     }
+    pub fn status_receiver(&self) -> watch::Receiver<Status> { self.handle.shared.updates.subscribe() }
     pub fn exit_receiver(&self) -> watch::Receiver<bool> {
         self.handle.shared.exit.subscribe()
     }
@@ -235,6 +238,7 @@ struct Algorithm {
     highest_session: u64,
     snapshot_counter: u64,
     snapshot: Option<Snapshot>,
+    pending_grid: Option<Estimate>,
     directory: PathBuf,
     artifacts: Vec<FileArtifact>,
     loaded: Option<crate::archive::Metadata>,
@@ -246,6 +250,8 @@ impl Algorithm {
             .is_some_and(|s| s.session_id == id && s.session_generation == generation)
     }
     fn clear_snapshot(&mut self) -> Result<(), String> {
+        self.pending_grid = None;
+        if let Some(slam) = self.slam.as_mut() { slam.cancel_grid().map_err(|e| e.to_string())?; }
         if let Some(snapshot) = self.snapshot.as_ref() {
             match std::fs::remove_file(self.directory.join(&snapshot.file_name)) {
                 Ok(()) => {}
@@ -355,16 +361,15 @@ impl Algorithm {
                         response.snapshot = Some(snapshot.clone());
                         return Ok(());
                     }
-                    let estimate = self
-                        .last_graph_estimate
-                        .clone()
-                        .ok_or("没有已接纳的二维图")?;
-                    let grid = self
-                        .slam
-                        .as_mut()
-                        .ok_or("二维会话已停止")?
-                        .occupancy_grid()
-                        .map_err(|e| e.to_string())?;
+                    if self.pending_grid.is_none() {
+                        let estimate = self.last_graph_estimate.clone().ok_or("没有已接纳的二维图")?;
+                        self.slam.as_mut().ok_or("二维会话已停止")?.begin_grid(estimate.graph_revision).map_err(|e| e.to_string())?;
+                        self.pending_grid = Some(estimate);
+                    }
+                    let Some(grid) = self.slam.as_mut().ok_or("二维会话已停止")?.poll_grid().map_err(|e| e.to_string())? else {
+                        return Ok(());
+                    };
+                    let estimate = self.pending_grid.take().unwrap();
                     if grid.metadata.graph_revision != estimate.graph_revision {
                         return Err("二维图和位姿修订不一致".into());
                     }
@@ -380,11 +385,8 @@ impl Algorithm {
                         .create_new(true)
                         .open(&path)
                         .map_err(|e| e.to_string())?;
-                    let write = (|| -> Result<(), String> {
-                        file.write_all(&bytes).map_err(|e| e.to_string())?;
-                        file.sync_all().map_err(|e| e.to_string())?;
-                        Ok(())
-                    })();
+                    // 与三维共享映射一致：临时候选只保证完整可读，不承担资产断电持久性。
+                    let write = file.write_all(&bytes).map_err(|e| e.to_string());
                     if let Err(error) = write {
                         let _ = std::fs::remove_file(path);
                         return Err(error);
@@ -561,6 +563,7 @@ impl Algorithm {
         response.error = result.err();
         response.status = shared.status.lock().unwrap().clone();
         if request.operation.mutates() {
+            shared.updates.send_replace(response.status.clone());
             self.last_command = request.command_sequence;
             self.commands.push_back((request.clone(), response.clone()));
             while self.commands.len() > 128 {
@@ -704,7 +707,7 @@ impl Algorithm {
                     None => return Ok(None),
                 }
             } else {
-                scan.clone()
+                std::borrow::Cow::Borrowed(scan)
             };
             drop(history);
             shared.status.lock().unwrap().motion_compensation = if scan.motion_compensated {
@@ -715,20 +718,25 @@ impl Algorithm {
                 "rigid_uncompensated"
             }
             .into();
-            let ranges = normalize(
-                &prepared,
-                c.angle_min,
-                c.angle_increment,
-                c.scan_count as usize,
-            )?;
-            let result = slam
-                .process(
-                    scan.timestamp_ns as u64,
-                    scan.source_sequence as u64,
-                    &ranges,
-                    odometry,
-                )
-                .map_err(|e| e.to_string())?;
+            let processing_started = Instant::now();
+            let (result, processed_beams, mode) = if c.scan_input_mode == ScanInputMode::Raw {
+                let (ranges, angles) = raw_scan(&prepared)?;
+                (slam.process_raw(scan.timestamp_ns as u64, scan.source_sequence as u64,
+                    &ranges, &angles, odometry), ranges.len(), "raw")
+            } else {
+                let ranges = normalize(&prepared, c.angle_min, c.angle_increment, c.scan_count as usize)?;
+                (slam.process(scan.timestamp_ns as u64, scan.source_sequence as u64,
+                    &ranges, odometry), ranges.len(), "uniform")
+            };
+            let result = result.map_err(|e| e.to_string())?;
+            {
+                let mut status = shared.status.lock().unwrap();
+                status.scan_input_mode = mode.into();
+                status.input_beams = scan.beam_count as u32;
+                status.processed_beams = processed_beams as u32;
+                status.valid_beams = result.output.valid_beams;
+                status.processing_ms = processing_started.elapsed().as_secs_f64() * 1000.0;
+            }
             let o = result.output;
             let pose = |p: Pose| [p.x, p.y, p.yaw];
             let estimate = Estimate {
@@ -783,6 +791,8 @@ impl Algorithm {
                 status.last_error = Some(error);
             }
         }
+        let state = shared.status.lock().unwrap().clone();
+        shared.updates.send_replace(state);
     }
 }
 struct WorkerExitGuard {
@@ -822,6 +832,7 @@ fn run(shared: Arc<Shared>, directory: PathBuf) {
         highest_session: 0,
         snapshot_counter: 0,
         snapshot: None,
+        pending_grid: None,
         directory,
         artifacts: Vec::new(),
         loaded: None,
@@ -906,7 +917,7 @@ mod odometry_ingress_tests {
             clock_domain:"unix_ns".into(),clock_id:String::new(),calibration_ref:"校验".into(),odometry_source:OdometrySource::Device,core_config:serde_json::json!({})};
         let shared=Arc::new(Shared{identity:identity.clone(),status:Mutex::new(Status{active:true,session:Some(session),..Default::default()}),
             history:Mutex::new(PoseHistory::default()),inbox:Mutex::new(Inbox::default()),wake:Condvar::new(),
-            session_generation:AtomicU64::new(3),stopped:AtomicBool::new(false),exit:watch::channel(false).0});
+            session_generation:AtomicU64::new(3),stopped:AtomicBool::new(false),exit:watch::channel(false).0,updates:watch::channel(Status::default()).0});
         let handle=WorkerHandle{shared:shared.clone()};
         let request=|sample:TimedPose|RpcRequest{name:identity.rpc_name(),id:Some(1.0),args:(vec![serde_json::to_value(Request{version:VERSION,identity:identity.clone(),command_sequence:1,operation:Operation::Odometry{sample}}).unwrap()],Default::default())};
         let sample=TimedPose{timestamp_ns:1_000_000_000,clock_domain:"unix_ns".into(),clock_id:String::new(),odom_frame_id:"odom".into(),body_frame_id:"body".into(),pose:[1.0,2.0,0.1]};

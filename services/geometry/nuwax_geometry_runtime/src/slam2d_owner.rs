@@ -4,7 +4,7 @@ use crate::{
     lcm_runtime::{self, GeometryRuntimeHandle, PoseState},
 };
 use nuwax_slam_2d_runtime::{
-    protocol::{Operation, Session, Snapshot},
+    protocol::{Operation, Session, Snapshot, StatusNotice, VERSION},
     supervisor::{Client, ProcessOwner},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -159,6 +159,8 @@ struct Owners {
     retiring: Vec<ProcessOwner>,
 }
 #[derive(Clone)]
+struct LaserOdometry {session_id:String,generation:u64,epoch:u64,stamp:u64,pose:[f64;3]}
+#[derive(Clone)]
 pub(crate) struct Binding {
     pub client: ClientSlot,
     owners: Arc<parking_lot::Mutex<Owners>>,
@@ -167,6 +169,7 @@ pub(crate) struct Binding {
     pub operation: Arc<tokio::sync::Mutex<()>>,
     relocation: Arc<parking_lot::RwLock<Option<RelocalizationInput>>>,
     status: Arc<parking_lot::RwLock<Option<nuwax_slam_2d_runtime::protocol::Status>>>,
+    latest_laser: Arc<parking_lot::RwLock<Option<LaserOdometry>>>,
     pub settings: Settings,
     pub fence: Arc<RelocalizationModeFence>,
     pub navigation: Arc<crate::planar_navigation::Owner>,
@@ -447,6 +450,9 @@ impl Binding {
             return None;
         }
         Some(serde_json::json!({
+            "scan_input_mode":status.scan_input_mode,"input_beams":status.input_beams,
+            "processed_beams":status.processed_beams,"valid_beams":status.valid_beams,
+            "processing_ms":status.processing_ms,
             "received_scans":status.received_scans,"dropped_scans":status.dropped_scans,
             "rejected_scans":status.rejected_scans,"worker_active":status.active,
             "last_estimate":status.last_estimate,"last_error":status.last_error,"motion_compensation":status.motion_compensation,
@@ -498,6 +504,7 @@ pub(crate) async fn start(
         operation: Arc::new(tokio::sync::Mutex::new(())),
         relocation: Arc::new(parking_lot::RwLock::new(None)),
         status: Arc::new(parking_lot::RwLock::new(None)),
+        latest_laser: Arc::new(parking_lot::RwLock::new(None)),
         settings,
         fence,
         tf_binding,
@@ -531,80 +538,85 @@ async fn supervise(
     bridge: &GeometryRuntimeHandle,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut failures = 0;
-    loop {
-        tokio::select! { biased; _=shutdown.changed()=>return Ok(()), _=tick.tick()=>{} }
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        binding.retire().await?;
-        binding
-            .owners
-            .lock()
-            .current
-            .as_mut()
-            .ok_or("二维当前进程丢失")?
-            .check_alive()?;
-        let adapter = bridge.mapping_adapter.as_ref().ok_or("二维适配器丢失")?;
-        let (session, revision, ready) = {
-            let a = adapter.lock();
-            (a.snapshot(), a.planar_revision, a.planar_ready)
-        };
-        if !session.active || !ready {
-            continue;
-        }
-        let epoch = binding.fence.snapshot();
-        if epoch.active {
-            continue;
-        }
-        if epoch.epoch != adapter.lock().planar_epoch {
-            let Some(_operation) = binding.operation.try_lock().ok() else {
+    let mut notices = binding
+        .context
+        .subscribe("^2/[^/]+/state#nuwax_msgs\\.PlanarStatus$")
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut pending: Option<tokio::sync::oneshot::Receiver<Result<(), String>>> = None;
+    let result=async {
+        let mut notice_identity=binding.client.current().identity().clone();
+        let mut notice_sequence=0_u64;
+        let mut tick=tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut failures=0;
+        let mut refresh_due = true;
+        loop {
+            let mut incoming=None;
+            tokio::select! {biased;
+                _=shutdown.changed()=>return Ok(()),
+                message=notices.receiver.recv()=>match message {
+                    Ok(message)=>{
+                        if let Ok(notice)=serde_json::from_slice::<StatusNotice>(&message.payload) {
+                            let current=binding.client.current().identity().clone();
+                            if current!=notice_identity {notice_identity=current.clone();notice_sequence=0;}
+                            if notice.version==VERSION && notice.identity==current && notice.sequence>notice_sequence {
+                                notice_sequence=notice.sequence;incoming=Some(notice.status);refresh_due=true;
+                            }
+                        }
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{},
+                    Err(e)=>return Err(e.to_string()),
+                },
+                result=async {match &mut pending {Some(receiver)=>Some(receiver.await),None=>std::future::pending().await}}=>{
+                    pending=None;
+                    match result.unwrap().map_err(|_|"二维保留任务未交付终态".to_string())? {
+                        Ok(())=>failures=0,
+                        Err(e)=>{failures+=1;if failures>=3{return Err(e);}}
+                    }
+                },
+                _=tick.tick()=>{refresh_due=true;},
+            }
+            if *shutdown.borrow(){return Ok(());}
+            binding.retire().await?;
+            binding.owners.lock().current.as_mut().ok_or("二维当前进程丢失")?.check_alive()?;
+            let adapter=bridge.mapping_adapter.as_ref().ok_or("二维适配器丢失")?;
+            let (session,revision,ready)={let a=adapter.lock();(a.snapshot(),a.planar_revision,a.planar_ready)};
+            if let Some(status)=incoming {
+                let epoch=binding.fence.snapshot();
+                if status.active && !status.paused && !status.stopping && status.last_error.is_none() && !epoch.active {
+                    if let (Some(current),Some(estimate))=(&status.session,&status.last_estimate) {
+                        if current.session_id==session.session_id && current.session_generation==session.session_generation
+                            && matches!(estimate.disposition.as_str(),"accepted"|"initialized"|"motion_skipped") {
+                            if current.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Laser {
+                                update_pose(bridge,binding,current,estimate,epoch.epoch,status.localization).await?;
+                            }
+                        }
+                    }
+                }
+                *binding.status.write()=Some(status);
+            }
+            if !session.active || !ready || pending.is_some() || !refresh_due {continue;}
+            let epoch=binding.fence.snapshot();if epoch.active{continue;}
+            if epoch.epoch!=adapter.lock().planar_epoch {
+                if let Ok(_operation)=binding.operation.try_lock(){let mut a=adapter.lock();a.planar_ready=false;a.planar_error=Some("二维原生图跨越重定位代际，必须重新建立会话".into());}
                 continue;
-            };
-            let mut a = adapter.lock();
-            a.planar_ready = false;
-            a.planar_error = Some("二维原生图跨越重定位代际，必须重新建立会话".into());
-            continue;
-        }
-        let operation_bridge = bridge.clone();
-        let operation_binding = binding.clone();
-        let operation_session = session.clone();
-        let receiver = match bridge.register_planar_operation(async move {
-            poll_and_commit(
-                &operation_bridge,
-                &operation_binding,
-                &operation_session,
-                revision,
-                epoch.epoch,
-            )
-            .await
-        }) {
-            Ok(receiver) => receiver,
-            Err(error) => {
-                if bridge
-                    .task_control()
-                    .is_some_and(|control| !control.admission_is_open())
-                {
-                    continue;
-                }
-                return Err(error);
             }
-        };
-        match receiver
-            .await
-            .map_err(|_| "二维保留任务未交付终态".to_string())?
-        {
-            Ok(()) => failures = 0,
-            Err(error) => {
-                record_error(bridge, &session, Some(error.clone()));
-                failures += 1;
-                if failures >= 3 {
-                    return Err(error);
-                }
+            refresh_due=false;
+            let owner=bridge.clone();let binding=binding.clone();let current=session.clone();
+            match bridge.register_planar_operation(async move {poll_and_commit(&owner,&binding,&current,revision,epoch.epoch).await}) {
+                Ok(receiver)=>pending=Some(receiver),
+                Err(_) if bridge.task_control().is_some_and(|control|!control.admission_is_open())=>{},
+                Err(error)=>return Err(error),
             }
         }
+    }.await;
+    // 关闭仍等待已保留的地图任务，再由根拥有方回收算法进程。
+    if let Some(receiver) = pending.take() {
+        let _ = receiver.await;
     }
+    let unsubscribed = notices.unsubscribe().await.map_err(|e| e.to_string());
+    result.and(unsubscribed)
 }
 
 async fn poll_and_commit(
@@ -739,11 +751,22 @@ async fn commit(
         return Err("二维候选跨越重定位代际".into());
     }
     let mut state = bridge.state.write().await;
-    let odom=planar_commit_odometry(&binding.navigation,&snapshot.session,estimate,
-        binding.settings.unix_offset_ns,state.pose.timestamp_ns)?;
+    let odom = planar_commit_odometry(
+        &binding.navigation,
+        &snapshot.session,
+        estimate,
+        binding.settings.unix_offset_ns,
+        state.pose.timestamp_ns,
+        binding.latest_laser.read().as_ref(),
+        epoch,
+    )?;
     let observation = lcm_runtime::canonical_mapping_observation_from_isometry(
-        &snapshot.session.map_frame_id,&snapshot.session.odom_frame_id,
-        snapshot.session.session_generation,&effective,&odom,&snapshot.session.body_frame_id,
+        &snapshot.session.map_frame_id,
+        &snapshot.session.odom_frame_id,
+        snapshot.session.session_generation,
+        &effective,
+        &odom,
+        &snapshot.session.body_frame_id,
     )?;
 
     let adapter = bridge.mapping_adapter.as_ref().ok_or("二维适配器不可用")?;
@@ -761,20 +784,55 @@ async fn commit(
 
 /// 新图提交时保留较新的已接纳原始里程计，避免地图计算把公共位姿倒退到旧扫描。
 fn planar_commit_odometry(
-    navigation:&crate::planar_navigation::Owner,session:&Session,
-    estimate:&nuwax_slam_2d_runtime::protocol::Estimate,unix_offset_ns:i128,latest_unix_ns:u64,
-)->Result<PoseState,String> {
-    let mut timestamp=u64::try_from(i128::from(estimate.source_timestamp_ns)+unix_offset_ns)
-        .map_err(|_|"二维提交采样时间越界")?;
-    let mut pose=estimate.odom_from_base;
-    if session.odometry_source==nuwax_slam_2d_runtime::protocol::OdometrySource::Device && latest_unix_ns>timestamp {
-        let native=u64::try_from(i128::from(latest_unix_ns)-unix_offset_ns).map_err(|_|"二维设备时间越界")?;
-        pose=navigation.odometry_at(session.session_generation,native,&session.clock_domain,&session.clock_id)?
+    navigation: &crate::planar_navigation::Owner,
+    session: &Session,
+    estimate: &nuwax_slam_2d_runtime::protocol::Estimate,
+    unix_offset_ns: i128,
+    latest_unix_ns: u64,
+    latest_laser: Option<&LaserOdometry>,
+    epoch: u64,
+) -> Result<PoseState, String> {
+    let mut timestamp = u64::try_from(i128::from(estimate.source_timestamp_ns) + unix_offset_ns)
+        .map_err(|_| "二维提交采样时间越界")?;
+    let mut pose = estimate.odom_from_base;
+    if session.odometry_source == nuwax_slam_2d_runtime::protocol::OdometrySource::Device
+        && latest_unix_ns > timestamp
+    {
+        let native = u64::try_from(i128::from(latest_unix_ns) - unix_offset_ns)
+            .map_err(|_| "二维设备时间越界")?;
+        pose = navigation
+            .odometry_at(
+                session.session_generation,
+                native,
+                &session.clock_domain,
+                &session.clock_id,
+            )?
             .ok_or("新图提交缺少已发布位姿的原始设备采样")?;
-        timestamp=latest_unix_ns;
+        timestamp = latest_unix_ns;
     }
-    Ok(PoseState{x:pose[0],y:pose[1],qz:(pose[2]*0.5).sin(),qw:(pose[2]*0.5).cos(),
-        frame_id:session.odom_frame_id.clone(),timestamp_ns:timestamp,..Default::default()})
+    if session.odometry_source == nuwax_slam_2d_runtime::protocol::OdometrySource::Laser {
+        if let Some(latest) = latest_laser.filter(|p| {
+            p.session_id == session.session_id
+                && p.generation == session.session_generation
+                && p.epoch == epoch
+                && p.stamp > timestamp
+        }) {
+            timestamp = latest.stamp;
+            pose = latest.pose;
+        }
+        if timestamp < latest_unix_ns {
+            return Err("新图提交缺少已发布位姿的原始激光采样".into());
+        }
+    }
+    Ok(PoseState {
+        x: pose[0],
+        y: pose[1],
+        qz: (pose[2] * 0.5).sin(),
+        qw: (pose[2] * 0.5).cos(),
+        frame_id: session.odom_frame_id.clone(),
+        timestamp_ns: timestamp,
+        ..Default::default()
+    })
 }
 
 /// 设备里程计只沿当前已提交有效校正更新位置，不提前使用待提交回环。
@@ -841,7 +899,8 @@ async fn update_pose(
 ) -> Result<(), String> {
     let timestamp = binding.settings.unix_stamp(estimate.source_timestamp_ns)?;
     let _lifecycle = bridge.mapping_lifecycle_lock.lock().await;
-    if binding.fence.snapshot().epoch != epoch {
+    let fence = binding.fence.snapshot();
+    if fence.active || fence.epoch != epoch {
         return Ok(());
     }
     let adapter = bridge.mapping_adapter.as_ref().ok_or("二维适配器不存在")?;
@@ -852,15 +911,20 @@ async fn update_pose(
             || !current.active
             || current.session_id != session.session_id
             || current.session_generation != session.session_generation
-            || a.planar_revision != estimate.graph_revision
+            || a.planar_revision > estimate.graph_revision
         {
             return Ok(());
         }
-        if localization || a.map_odom_transform_snapshot().is_none() {
+        if localization {
+            if a.planar_revision != estimate.graph_revision {
+                return Ok(());
+            }
             a.update_planar_localization(estimate)?
         } else {
-            a.map_odom_transform_snapshot()
-                .ok_or("二维地图尚无有效校正")?
+            let Some(transform) = a.map_odom_transform_snapshot() else {
+                return Ok(());
+            };
+            transform
         }
     };
     let odom = PoseState {
@@ -883,6 +947,16 @@ async fn update_pose(
     let mut state = bridge.state.write().await;
     if timestamp <= state.pose.timestamp_ns {
         return Ok(());
+    }
+    if session.odometry_source == nuwax_slam_2d_runtime::protocol::OdometrySource::Laser {
+        // 与实际位姿发布共用生命周期和单调水位，旧控制状态不能回写缓存。
+        *binding.latest_laser.write() = Some(LaserOdometry {
+            session_id: session.session_id.clone(),
+            generation: session.session_generation,
+            epoch,
+            stamp: timestamp,
+            pose: estimate.odom_from_base,
+        });
     }
     lcm_runtime::apply_canonical_mapping_observation_locked(&mut state, &observation);
     binding.install_sensor_edge(&mut state);
@@ -971,7 +1045,7 @@ mod device_pose_tests {
         let navigation=crate::planar_navigation::Owner::default();
         navigation.capture_odometry(3,sample.clone()).unwrap();
         let session=status.session.as_ref().unwrap();let estimate=status.last_estimate.as_ref().unwrap();
-        let odom=planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns).unwrap();
+        let odom=planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns,None,0).unwrap();
         assert_eq!(odom.timestamp_ns,sample.timestamp_ns);assert_eq!([odom.x,odom.y],sample.pose[..2]);
         let effective=nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(3.0,-2.0,0.0),
             nalgebra::UnitQuaternion::from_euler_angles(0.0,0.0,std::f64::consts::FRAC_PI_2));
@@ -980,9 +1054,17 @@ mod device_pose_tests {
         lcm_runtime::apply_canonical_mapping_observation_locked(&mut state,&observation);
         assert_eq!(state.pose.timestamp_ns,sample.timestamp_ns);
         assert!((state.pose.x-1.0).abs()<1e-9 && (state.pose.y+1.0).abs()<1e-9);
-        assert!(planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns+1).is_err());
+        assert!(planar_commit_odometry(&navigation,session,estimate,0,sample.timestamp_ns+1,None,0).is_err());
+        let mut laser_session=session.clone();laser_session.odometry_source=OdometrySource::Laser;
+        let mut laser=LaserOdometry{session_id:laser_session.session_id.clone(),generation:3,epoch:7,
+            stamp:sample.timestamp_ns,pose:sample.pose};
+        let kept=planar_commit_odometry(&navigation,&laser_session,estimate,0,sample.timestamp_ns,Some(&laser),7).unwrap();
+        assert_eq!(kept.timestamp_ns,sample.timestamp_ns);assert_eq!(kept.x,sample.pose[0]);
+        assert!(planar_commit_odometry(&navigation,&laser_session,estimate,0,sample.timestamp_ns,Some(&laser),8).is_err());
+        laser.generation=4;
+        assert!(planar_commit_odometry(&navigation,&laser_session,estimate,0,sample.timestamp_ns,Some(&laser),7).is_err());
         let mut wrong=session.clone();wrong.session_generation=4;
-        assert!(planar_commit_odometry(&navigation,&wrong,estimate,0,sample.timestamp_ns).is_err());
+        assert!(planar_commit_odometry(&navigation,&wrong,estimate,0,sample.timestamp_ns,None,0).is_err());
         let mut stale=sample.clone();stale.timestamp_ns=1_600_000_000;
         assert!(!device_pose_has_current_basis(&status,"mapping-session",3,2,&stale));
         stale.timestamp_ns=900_000_000;

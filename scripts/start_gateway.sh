@@ -164,6 +164,10 @@ wait_for_person_follow_ready() {
 run_with_title() {
   local process_title="$1"
   shift
+  # Python依靠解释器首参数定位虚拟环境；改名会丢失专属依赖路径。
+  if [[ "$1" == "${PYTHON_BIN}" ]]; then
+    exec "$@"
+  fi
   if [[ -n "${BASH_VERSION:-}" ]]; then
     exec -a "${process_title}" "$@"
   fi

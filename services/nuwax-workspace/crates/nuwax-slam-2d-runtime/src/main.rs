@@ -1,7 +1,7 @@
 use nuwax_lcm::LcmContext;
 use nuwax_rpc::{LcmRpcTransport, RpcBroker, RpcServerConfig};
 use nuwax_slam_2d_runtime::{
-    protocol::{Identity, WORKER_CONTRACT},
+    protocol::{Identity, StatusNotice, VERSION, WORKER_CONTRACT},
     worker::WorkerOwner,
 };
 use std::{path::PathBuf, sync::Arc};
@@ -41,6 +41,8 @@ async fn run() -> Result<(), String> {
     let context = Arc::new(LcmContext::new(&field("--lcm")?).map_err(|e| e.to_string())?);
     let mut owner = WorkerOwner::start(identity.clone(), directory)?;
     let mut algorithm_exit = owner.exit_receiver();
+    let mut status_updates = owner.status_receiver();
+    let mut notice_sequence = 0_u64;
     let broker = RpcBroker::new();
     broker
         .register(identity.rpc_name(), Box::new(owner.handle()))
@@ -72,6 +74,13 @@ async fn run() -> Result<(), String> {
             _=term.recv()=>break,
             _=algorithm_exit.changed()=>return Err("二维算法线程已结束".into()),
             _=interrupt.recv()=>break,
+            changed=status_updates.changed()=>{
+                changed.map_err(|e|e.to_string())?;
+                let status=status_updates.borrow_and_update().clone();
+                notice_sequence += 1;
+                let bytes=serde_json::to_vec(&StatusNotice{version:VERSION,identity:identity.clone(),sequence:notice_sequence,status}).map_err(|e|e.to_string())?;
+                context.publish(&identity.status_channel(),bytes.into()).await.map_err(|e|e.to_string())?;
+            },
             message=scan.receiver.recv()=>match message {
                 Ok(message)=>match nuwax_codec::lcm::planar::decode(&message.payload){Ok(data)=>owner.handle().accept_scan(&message.channel,data),Err(error)=>eprintln!("二维扫描解码拒绝：{error}")},
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{},

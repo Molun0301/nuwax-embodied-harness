@@ -1377,7 +1377,7 @@ class LocalizationService:
         if self._stream_bus is not None:
             # 帧时间由总线记录发布时刻，源采样时间和订阅序号单独保留。
             pose_metadata = {"source_name": source_name}
-            for key in ("source_timestamp_ns", "sequence"):
+            for key in ("source_timestamp_ns", "sequence", "scan_received_unix_ns"):
                 if key in snapshot.metadata:
                     pose_metadata[key] = snapshot.metadata[key]
             # 位姿独立传输时，缺失也必须在同一主题显式撤销旧位置。

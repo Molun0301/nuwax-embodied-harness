@@ -228,6 +228,8 @@ class CanonicalLaserScan(SensorSample):
     time_offsets_quality: Literal["unavailable", "hardware", "estimated"] = "unavailable"
     timing_uncertainty_ns: Optional[int] = Field(default=None, ge=0)
     motion_compensated: bool = False
+    # 诊断用完整帧接收时刻，不参与采样、融合或跨进程物理扫描编码。
+    scan_received_unix_ns: Optional[int] = Field(default=None, gt=0, le=(1 << 63) - 1)
 
     @model_validator(mode="after")
     def _validate_planar_payload(self) -> "CanonicalLaserScan":

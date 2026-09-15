@@ -62,6 +62,7 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("log_query", "日志历史查询", "nuwax-log-query"),
     ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
     ("gateway_supervisor", "网关守护脚本", "nuwax-gateway-supervisor"),
+    ("slam_2d_worker", "二维激光建图", "nuwax-slam-2d-worker"),
     ("geometry_runtime", "Native geometry runtime", "nuwax-geometry-runtime"),
     ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
     ("nav_stack", "Native 导航栈", "nuwax-nav-stack"),

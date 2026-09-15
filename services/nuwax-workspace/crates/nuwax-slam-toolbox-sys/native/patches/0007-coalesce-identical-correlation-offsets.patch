@@ -1,0 +1,73 @@
+--- a/upstream/karto/include/karto_sdk/Karto.h
++++ b/upstream/karto/include/karto_sdk/Karto.h
+@@ -6760,7 +6760,22 @@
+     return m_pArray;
+   }
+ 
++  struct WeightedOffset { kt_int32s offset; kt_int32u count; };
++  const std::vector<WeightedOffset>& GetWeightedOffsets() const {return m_Weighted;}
++  void CompressOffsets() {
++    m_Sorted.assign(m_pArray,m_pArray+m_Size);
++    std::sort(m_Sorted.begin(),m_Sorted.end());
++    m_Weighted.clear();
++    for(auto offset:m_Sorted) {
++      if(offset==INVALID_SCAN)continue;
++      if(!m_Weighted.empty() && m_Weighted.back().offset==offset)++m_Weighted.back().count;
++      else m_Weighted.push_back({offset,1});
++    }
++  }
+ private:
++  // 派生缓存不入档；ComputeOffsets在并行评分开始前重建一次。
++  std::vector<kt_int32s> m_Sorted;
++  std::vector<WeightedOffset> m_Weighted;
+   kt_int32s * m_pArray;
+   kt_int32u m_Capacity;
+   kt_int32u m_Size;
+@@ -6947,6 +6962,7 @@
+ 
+       readingIndex++;
+     }
++    m_ppLookupArray[angleIndex]->CompressOffsets();
+     assert(readingIndex == rLocalPoints.size());
+   }
+ 
+--- a/upstream/karto/src/Mapper.cpp
++++ b/upstream/karto/src/Mapper.cpp
+@@ -1206,23 +1206,20 @@
+     return response;
+   }
+ 
+-  // calculate response
+-  kt_int32s * pAngleIndexPointer = pOffsets->GetArrayPointer();
+-  for (kt_int32u i = 0; i < nPoints; i++) {
+-    // ignore points that fall off the grid
+-    // 无效束哨兵不能参与索引相加；宽类型先完成边界校验，避免有符号溢出。
+-    if (pAngleIndexPointer[i] == INVALID_SCAN) {
+-      continue;
+-    }
+-    const kt_int64s pointGridIndex = static_cast<kt_int64s>(gridPositionIndex) + pAngleIndexPointer[i];
+-    if (pointGridIndex < 0 || pointGridIndex >= m_pCorrelationGrid->GetDataSize())
+-    {
+-      continue;
+-    }
+-
+-    // uses index offsets to efficiently find location of point in the grid
+-    response += pByte[pAngleIndexPointer[i]];
+-  }
++  // 偏移已排序；整个区间在图内时只检查一次边界，热循环保留整数加权。
++  const auto& offsets = pOffsets->GetWeightedOffsets();
++  const auto dataSize = m_pCorrelationGrid->GetDataSize();
++  kt_int64u sum = 0;
++  if (!offsets.empty() && static_cast<kt_int64s>(gridPositionIndex) + offsets.front().offset >= 0 &&
++      static_cast<kt_int64s>(gridPositionIndex) + offsets.back().offset < dataSize) {
++    for (const auto& entry : offsets) sum += static_cast<kt_int64u>(pByte[entry.offset]) * entry.count;
++  } else {
++    for (const auto& entry : offsets) {
++      const kt_int64s index = static_cast<kt_int64s>(gridPositionIndex) + entry.offset;
++      if (index >= 0 && index < dataSize) sum += static_cast<kt_int64u>(pByte[entry.offset]) * entry.count;
++    }
++  }
++  response = static_cast<kt_double>(sum);
+ 
+   // normalize response
+   response /= (nPoints * GridStates_Occupied);

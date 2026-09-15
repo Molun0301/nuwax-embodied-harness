@@ -101,17 +101,16 @@ impl Client {
             return Err("二维拥有方已关闭新操作接纳".into());
         }
         if !operation.mutates() {
-            return self
-                .request(
-                    &Request {
-                        version: VERSION,
-                        identity: self.identity.clone(),
-                        command_sequence: 0,
-                        operation,
-                    },
-                    Duration::from_secs(5),
-                )
-                .await;
+            let wait_for_grid = matches!(operation, Operation::Snapshot { .. });
+            let request = Request { version: VERSION, identity: self.identity.clone(), command_sequence: 0, operation };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {return Err("二维快照准备超过调用预算".into());}
+                let result = self.request(&request, remaining).await?;
+                if !wait_for_grid || result.error.is_some() || result.snapshot.is_some() {return Ok(result);}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
         let mut commands = self.commands.lock().await;
         if let Some(pending) = commands.pending.clone() {

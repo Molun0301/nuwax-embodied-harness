@@ -1,0 +1,174 @@
+diff --git a/upstream/karto/include/karto_sdk/Karto.h b/upstream/karto/include/karto_sdk/Karto.h
+index 86dd0a5..f59443e 100644
+--- a/upstream/karto/include/karto_sdk/Karto.h
++++ b/upstream/karto/include/karto_sdk/Karto.h
+@@ -29,6 +29,7 @@
+ #include <boost/serialization/nvp.hpp>
+ #include <boost/serialization/utility.hpp>
+ #include <boost/serialization/export.hpp>
++#include <boost/serialization/version.hpp>
+ #include <boost/type_traits/is_abstract.hpp>
+ #include <boost/archive/binary_iarchive.hpp>
+ #include <boost/archive/binary_oarchive.hpp>
+@@ -5640,6 +5641,39 @@ public:
+     }
+   }
+ 
++  // 空数组表示沿用雷达的固定角度；非空数组与原始距离逐束对应。
++  inline const std::vector<kt_double> & GetBeamAngles() const { return m_BeamAngles; }
++  inline const std::vector<kt_int32u> & GetAngularOrder() const { return m_AngularOrder; }
++
++  inline void SetBeamAngles(const std::vector<kt_double> & angles)
++  {
++    if (!angles.empty() && angles.size() != GetNumberOfRangeReadings()) {
++      throw std::invalid_argument("逐束角度与距离数量不一致");
++    }
++    for (auto angle : angles) {
++      if (!std::isfinite(angle)) throw std::invalid_argument("逐束角度必须有限");
++    }
++    m_BeamAngles = angles;
++    // 可见性判断需要逆时针邻接关系，索引排序不改变原始束顺序或数量。
++    m_AngularOrder.resize(angles.size());
++    for (kt_int32u i = 0; i < angles.size(); ++i) m_AngularOrder[i] = i;
++    const auto canonical = [](kt_double angle) {
++      kt_double value = std::fmod(angle + M_PI, 2 * M_PI);
++      return value < 0 ? value + 2 * M_PI : value;
++    };
++    std::stable_sort(m_AngularOrder.begin(), m_AngularOrder.end(), [&](kt_int32u a, kt_int32u b) {
++      return canonical(m_BeamAngles[a]) < canonical(m_BeamAngles[b]);
++    });
++    m_IsDirty = true;
++  }
++
++  inline kt_double GetBeamAngle(kt_int32u index) const
++  {
++    if (!m_BeamAngles.empty()) return m_BeamAngles.at(index);
++    auto * laser = GetLaserRangeFinder();
++    return laser->GetMinimumAngle() + index * laser->GetAngularResolution();
++  }
++
+   inline void SetPointReadings(PointVectorDouble & points, kt_bool setFiltered = false)
+   {
+     if (setFiltered) {
+@@ -5663,17 +5697,15 @@ private:
+       m_UnfilteredPointReadings.clear();
+ 
+       kt_double rangeThreshold = pLaserRangeFinder->GetRangeThreshold();
+-      kt_double minimumAngle = pLaserRangeFinder->GetMinimumAngle();
+-      kt_double angularResolution = pLaserRangeFinder->GetAngularResolution();
+       Pose2 scanPose = GetSensorPose();
+ 
+       // compute point readings
+       Vector2<kt_double> rangePointsSum;
+       kt_int32u beamNum = 0;
+-      for (kt_int32u i = 0; i < pLaserRangeFinder->GetNumberOfRangeReadings(); i++, beamNum++) {
++      for (kt_int32u i = 0; i < GetNumberOfRangeReadings(); i++, beamNum++) {
+         kt_double rangeReading = GetRangeReadings()[i];
+         if (!math::InRange(rangeReading, pLaserRangeFinder->GetMinimumRange(), rangeThreshold)) {
+-          kt_double angle = scanPose.GetHeading() + minimumAngle + beamNum * angularResolution;
++          kt_double angle = scanPose.GetHeading() + GetBeamAngle(i);
+ 
+           Vector2<kt_double> point;
+           point.SetX(scanPose.GetX() + (rangeReading * cos(angle)));
+@@ -5683,7 +5715,7 @@ private:
+           continue;
+         }
+ 
+-        kt_double angle = scanPose.GetHeading() + minimumAngle + beamNum * angularResolution;
++        kt_double angle = scanPose.GetHeading() + GetBeamAngle(i);
+ 
+         Vector2<kt_double> point;
+         point.SetX(scanPose.GetX() + (rangeReading * cos(angle)));
+@@ -5731,6 +5763,12 @@ private:
+     ar & BOOST_SERIALIZATION_NVP(m_BoundingBox);
+     ar & BOOST_SERIALIZATION_NVP(m_IsDirty);
+     ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(LaserRangeScan);
++    // 版本0图没有角度数组，继续使用原有等角度几何。
++    if (version >= 1) ar & BOOST_SERIALIZATION_NVP(m_BeamAngles);
++    else if (Archive::is_loading::value) m_BeamAngles.clear();
++    if (Archive::is_loading::value && !m_BeamAngles.empty()) {
++      SetBeamAngles(m_BeamAngles);
++    }
+   }
+ 
+ private:
+@@ -5743,6 +5781,9 @@ private:
+    */
+   Pose2 m_OdometricPose;
+ 
++  std::vector<kt_double> m_BeamAngles;
++  std::vector<kt_int32u> m_AngularOrder;
++
+   /**
+    * Corrected pose of robot calculated by mapper (or localizer)
+    */
+@@ -7032,6 +7073,7 @@ BOOST_CLASS_EXPORT_KEY(karto::Object);
+ BOOST_CLASS_EXPORT_KEY(karto::Sensor);
+ BOOST_CLASS_EXPORT_KEY(karto::Name);
+ BOOST_CLASS_EXPORT_KEY(karto::SensorData);
++BOOST_CLASS_VERSION(karto::LocalizedRangeScan, 1)
+ BOOST_CLASS_EXPORT_KEY(karto::LocalizedRangeScan);
+ BOOST_CLASS_EXPORT_KEY(karto::LaserRangeScan);
+ BOOST_CLASS_EXPORT_KEY(karto::LaserRangeFinder);
+diff --git a/upstream/karto/src/Karto.cpp b/upstream/karto/src/Karto.cpp
+index 7ae4ea4..b6db046 100644
+--- a/upstream/karto/src/Karto.cpp
++++ b/upstream/karto/src/Karto.cpp
+@@ -183,7 +183,7 @@ const PointVectorDouble LaserRangeFinder::GetPointReadings(
+   // compute point readings
+   kt_int32u beamNum = 0;
+   kt_double * pRangeReadings = pLocalizedRangeScan->GetRangeReadings();
+-  for (kt_int32u i = 0; i < m_NumberOfRangeReadings; i++, beamNum++) {
++  for (kt_int32u i = 0; i < pLocalizedRangeScan->GetNumberOfRangeReadings(); i++, beamNum++) {
+     kt_double rangeReading = pRangeReadings[i];
+ 
+     if (ignoreThresholdPoints) {
+@@ -194,7 +194,7 @@ const PointVectorDouble LaserRangeFinder::GetPointReadings(
+       rangeReading = math::Clip(rangeReading, GetMinimumRange(), GetRangeThreshold());
+     }
+ 
+-    kt_double angle = scanPose.GetHeading() + GetMinimumAngle() + beamNum * GetAngularResolution();
++    kt_double angle = scanPose.GetHeading() + pLocalizedRangeScan->GetBeamAngle(i);
+ 
+     Vector2<kt_double> point;
+ 
+@@ -217,6 +217,12 @@ kt_bool LaserRangeFinder::Validate(SensorData * pSensorData)
+ {
+   LaserRangeScan * pLaserRangeScan = dynamic_cast<LaserRangeScan *>(pSensorData);
+ 
++  if (pLaserRangeScan == NULL) return false;
++  auto * localized = dynamic_cast<LocalizedRangeScan *>(pSensorData);
++  if (localized != NULL && !localized->GetBeamAngles().empty()) {
++    return localized->GetBeamAngles().size() == pLaserRangeScan->GetNumberOfRangeReadings();
++  }
++
+   // verify number of range readings in LaserRangeScan matches the number of expected range readings
+   if (pLaserRangeScan->GetNumberOfRangeReadings() != GetNumberOfRangeReadings()) {
+     std::cout << "LaserRangeScan contains " << pLaserRangeScan->GetNumberOfRangeReadings() <<
+diff --git a/upstream/karto/src/Mapper.cpp b/upstream/karto/src/Mapper.cpp
+index 5150511..b8cee7f 100644
+--- a/upstream/karto/src/Mapper.cpp
++++ b/upstream/karto/src/Mapper.cpp
+@@ -1129,7 +1129,13 @@ PointVectorDouble ScanMatcher::FindValidPoints(
+   LocalizedRangeScan * pScan,
+   const Vector2<kt_double> & rViewPoint) const
+ {
+-  const PointVectorDouble & rPointReadings = pScan->GetPointReadings();
++  const PointVectorDouble & sourcePoints = pScan->GetPointReadings();
++  PointVectorDouble angularPoints;
++  if (!pScan->GetAngularOrder().empty()) {
++    angularPoints.reserve(sourcePoints.size());
++    for (auto index : pScan->GetAngularOrder()) angularPoints.push_back(sourcePoints.at(index));
++  }
++  const PointVectorDouble & rPointReadings = angularPoints.empty() ? sourcePoints : angularPoints;
+ 
+   // points must be at least 10 cm away when making comparisons of inside/outside of viewpoint
+   const kt_double minSquareDistance = math::Square(0.1);    // in m^2
+@@ -1543,6 +1549,7 @@ kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSens
+       (covariance(1, 1) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()))
+     {
+       LocalizedRangeScan tmpScan(pScan->GetSensorName(), pScan->GetRangeReadingsVector());
++      tmpScan.SetBeamAngles(pScan->GetBeamAngles());
+       tmpScan.SetUniqueId(pScan->GetUniqueId());
+       tmpScan.SetTime(pScan->GetTime());
+       tmpScan.SetStateId(pScan->GetStateId());

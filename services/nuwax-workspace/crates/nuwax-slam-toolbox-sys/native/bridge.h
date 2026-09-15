@@ -40,7 +40,13 @@ int nw_slam_validate_config(const NwSlamConfig*, char*, size_t);
 int nw_slam_create(const NwSlamConfig*, void**, char*, size_t);
 void nw_slam_destroy(void*);
 int nw_slam_process(void*, const NwSlamScan*, NwSlamResult*, char*, size_t);
+// 原始模式逐束传角度，允许每帧束数变化；原有接口结构保持不变。
+int nw_slam_set_scan_input_mode(void*, uint32_t raw_mode, char*, size_t);
+int nw_slam_process_raw(void*, const NwSlamScan*, const double* angles, size_t angle_count, NwSlamResult*, char*, size_t);
 int nw_slam_grid(void*, NwSlamGrid*, char*, size_t);
+int nw_slam_begin_grid(void*, uint64_t revision, char*, size_t);
+int nw_slam_poll_grid(void*, NwSlamGrid*, uint32_t* ready, char*, size_t);
+int nw_slam_cancel_grid(void*, char*, size_t);
 int nw_slam_copy_grid(void*, int8_t*, size_t, char*, size_t);
 int nw_slam_resume(void*,char*,size_t);
 int nw_slam_save(void*, const char*, char*, size_t);

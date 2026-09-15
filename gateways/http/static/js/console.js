@@ -3711,8 +3711,7 @@
       function mapPoseLatencyText(kind) {
         const metric = state.displayedPoseMetrics?.[kind];
         if (!metric || !displayedMapPoseAllowed(kind, metric.pose) || metric.mapKey !== state.appliedMapIdentity?.key || metric.ageMs === null) return "--";
-        const age = `${metric.calibrated ? "≈" : ""}${Math.round(metric.ageMs)} ms`;
-        return metric.softwareMs === null ? age : `${age} · 收齐到绘制 ${metric.calibrated ? "≈" : ""}${Math.round(metric.softwareMs)} ms`;
+        return `${metric.calibrated ? "≈" : ""}${Math.round(metric.ageMs)} ms`;
       }
       function mediaMetricText(kind, now = Date.now(), monotonicNow = performance.now()) {
         const metric = state.mediaMetrics?.[kind];
@@ -3736,7 +3735,7 @@
         if (!els.mapStreamStatus) return;
         const kind = state.mapViewMode === "3d" ? "map3d" : "map2d";
         setVisionText(els.mapStreamStatus, mediaMetricText(kind));
-        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。二维收齐到绘制使用驱动完整扫描返回时刻，包含转换、算法、通信与画布绘制；不含屏幕扫描输出，跨主机受时钟误差影响。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
+        els.mapStreamStatus.title = "帧率仅统计接受的新地图内容，不是机器人移动或画布重画频率。位姿延迟使用通过当前地图身份校验且实际绘制的位姿自身时间至本次绘制时刻，每个新位姿更新；地图内容时间不参与。缺少有效位姿、源时间或页面隐藏时显示未知；≈表示已估算时钟偏差。" + clockCalibrationHint(state.displayedPoseMetrics?.[kind]?.rawAgeMs);
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);

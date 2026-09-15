@@ -34,7 +34,7 @@
     buttons();
   }
   async function refresh() {
-    const data = await invoke('get_navigation_context');
+    const data = await invoke('get_navigation_snapshot');
     const context = data.exploration_context || {};
     const state = context.exploration_state || {};
     const metadata = state.metadata || {};

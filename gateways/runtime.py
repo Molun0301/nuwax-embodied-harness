@@ -11724,6 +11724,17 @@ class GatewayRuntime:
         request_id: str,
         deadline_monotonic: Optional[float] = None,
     ) -> MotionAdmission:
+        # 在启动导航进程前报告缺失标定，避免服务反复退出后才返回启动超时。
+        geometry = getattr(getattr(self, "config", None), "geometry", None)
+        if _runtime_activation_level(capability_name) == "motion" and getattr(geometry, "pipeline", None) == "lio_3d":
+            from contracts.navigation_pipeline import navigation_support_distance
+            try:
+                navigation_support_distance(runtime_value("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", ""))
+            except ValueError as exc:
+                raise GatewayError(
+                    str(exc), error_code="navigation_calibration_required", http_status=409,
+                    details={"setting_key": "NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "pipeline": "lio_3d"},
+                ) from exc
         self._ensure_geometry_runtime_started(
             capability_name,
             **({"deadline_monotonic": deadline_monotonic} if deadline_monotonic is not None else {}),

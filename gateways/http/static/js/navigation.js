@@ -85,22 +85,43 @@
     return 'x=' + pose.x.toFixed(2) + ' y=' + pose.y.toFixed(2) + ' · 机体高度 ' + height;
   }
 
-  function targetHeight(frameId) {
+  function targetHeight(frameId, selection) {
+    if (state.heightInput?.validity?.badInput) throw new Error('目标机体高度必须是有限数值（米）。');
+    if (selection && Number.isFinite(selection.surface_z) && !String(state.heightInput?.value || '').trim()) {
+      const distance = window.__NUWAX_NAV_SUPPORT_DISTANCE__;
+      if (typeof distance !== 'number' || !Number.isFinite(distance) || distance <= 0) {
+        throw new Error('请先在平台设置中填写机体到支撑面距离，保存并重启服务后刷新页面。');
+      }
+      // 选取的是地面点；目标朝向保持水平，机体目标沿地图正Z轴抬高标定距离。
+      return selection.surface_z + distance;
+    }
     if (typeof window.__nuwaxResolveNavigationHeight !== 'function') {
       throw new Error('定位高度入口不可用，请刷新控制台。');
     }
     return window.__nuwaxResolveNavigationHeight(state.heightInput, frameId);
   }
 
-  function selectMapPoint(x, y, frameId) {
+  function selectMapPoint(x, y, frameId, selection) {
     if (![x, y].every(function (value) { return typeof value === 'number' && Number.isFinite(value); })) return;
-    const pose = { x: x, y: y, z: null, yaw: 0.0, frame_id: frameId || 'map' };
-    try { pose.z = targetHeight(pose.frame_id); } catch (_) { /* 没有真实高度时保留待填，不猜楼层。 */ }
+    const pose = Object.assign({}, selection, { x: x, y: y, z: null, yaw: 0.0, frame_id: frameId || 'map', map_name: window.__nuwaxActiveMapName?.() });
+    try { pose.z = targetHeight(pose.frame_id, pose); } catch (_) { /* 没有真实高度时保留待填，不猜楼层。 */ }
     state.pendingPose = pose;
-    setStatus('已选点：' + selectedPoseLabel(pose), 'pending');
+    window.pointcloud3d?.previewNavigationPoint(pose);
+    const surface = Number.isFinite(pose.surface_z) ? ' · 地面高度 ' + pose.surface_z.toFixed(2) + ' 米' : '';
+    setStatus('已选点：' + selectedPoseLabel(pose) + surface, 'pending');
   }
 
   function captureClickFromMap() {
+    window.addEventListener('pointcloud3d:navigation-pick', function (event) {
+      if (!window.__nuwaxNavigationActive || state.container.hidden) return;
+      const point = event.detail;
+      if (!point) {
+        state.pendingPose = null;
+        window.pointcloud3d?.previewNavigationPoint(null);
+        setStatus('未命中地图点，请放大并点击可见地面；拖动可调整视角', 'warn'); return;
+      }
+      selectMapPoint(point.x, point.y, point.frame_id, point);
+    });
     // 兼容已有世界坐标钩子，同时监听控制台实际使用的地图画布。
     if (typeof window.__nuwaxMapClick === 'function') {
       const original = window.__nuwaxMapClick;
@@ -144,7 +165,12 @@
     }
     let pose;
     try {
-      pose = Object.assign({}, state.pendingPose, { z: targetHeight(state.pendingPose.frame_id) });
+      const pending = state.pendingPose;
+      const mapName = window.__nuwaxActiveMapName?.();
+      if (!mapName || pending.map_name !== mapName || (pending.source_key && !window.pointcloud3d?.navigationPointIsCurrent(pending))) {
+        throw new Error('地图或点云来源已切换，请重新选点。');
+      }
+      pose = Object.assign({}, pending, { z: targetHeight(pending.frame_id, pending) });
     } catch (err) {
       setStatus(err.message, 'warn');
       return;
@@ -153,6 +179,7 @@
     state.submitting = true;
     setStatus('提交导航中：' + selectedPoseLabel(pose), 'pending');
     invokeCapability(NAV_API, {
+      map_name: pose.map_name,
       frame_id: pose.frame_id,
       x: pose.x,
       y: pose.y,
@@ -246,7 +273,11 @@
     state.heightInput = state.container.querySelector('[data-role="nav-height"]');
     if (state.heightInput) state.heightInput.addEventListener('input', function () {
       const pose = state.pendingPose;
-      if (pose) selectMapPoint(pose.x, pose.y, pose.frame_id);
+      if (pose) {
+        try { pose.z = targetHeight(pose.frame_id, pose); } catch (_) { pose.z = null; }
+        window.pointcloud3d?.previewNavigationPoint(pose);
+        setStatus('已选点：' + selectedPoseLabel(pose), 'pending');
+      }
     });
     if (state.btnNav) state.btnNav.addEventListener('click', submitNavigation);
     if (state.btnCancel) state.btnCancel.addEventListener('click', cancelNavigation);
@@ -262,6 +293,13 @@
   }
 
   window.__nuwaxNavigationModule = {
+    setActive: function (active) {
+      state.pendingPose = null;
+      window.pointcloud3d?.previewNavigationPoint(null);
+      if (state.heightInput) state.heightInput.placeholder = window.__nuwaxMapViewMode?.() === '3d'
+        ? '留空使用地面高度＋机体支撑距离' : '留空使用当前定位高度';
+      if (active && !state.inflightRequestId) setStatus('请在地图上点击可通行地面选择目标', 'idle');
+    },
     submit: submitNavigation,
     cancel: cancelNavigation,
     getState: function () { return state; },

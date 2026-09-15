@@ -1786,9 +1786,11 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs",
+      "gateways/runtime.py",
+      "gateways/http/console.py"
     ],
-    "apply_scope": "重启导航栈与几何运行时后生效",
+    "apply_scope": "重启网关、导航栈与几何运行时后生效；网页刷新后更新选点换算",
     "description": "三维导航必需的实际标定距离，沿机体负Z轴；留空时不启用三维运动，不使用机器人净空高度猜测。"
   },
   "NUWAX_NAV_ROBOT_WIDTH_M": {

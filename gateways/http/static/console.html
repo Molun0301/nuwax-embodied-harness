@@ -53,6 +53,7 @@
                     <button id="mapCenterRobot" class="tool" type="button" title="2D 视图居中到机器人" hidden>机器人</button>
                   </div>
                   <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
+                    <button id="map3dNavToggle" class="tool" type="button" title="选择点云中的地面位置并预览导航目标">选点导航</button>
                     <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、三轴平移和缩放">自由视角</button>
                     <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器人">跟随机器人</button>
                     <label class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
@@ -99,12 +100,12 @@
               </div>
               <div id="navigation-container" class="navigation-panel glass" data-role="v2-navigation" hidden>
                 <strong>导航到地图选点</strong>
-                <p class="navigation-hint">在地图上单击选点；三维地形目标填写实际机体高度。</p>
+                <p class="navigation-hint">单击选择目标，点击“开始导航”后执行。三维视图请点击地面；拖动可调整视角。</p>
                 <label class="navigation-height-field">目标机体高度（米）
                   <input data-role="nav-height" type="number" step="any" inputmode="decimal" placeholder="留空使用当前定位高度">
                 </label>
                 <div class="navigation-actions">
-                  <button data-role="nav-submit" type="button">导航到选点</button>
+                  <button data-role="nav-submit" type="button">开始导航</button>
                   <button data-role="nav-cancel" type="button">取消导航</button>
                 </div>
                 <p data-role="nav-status" aria-live="polite">未选点</p>
@@ -343,7 +344,7 @@
                 <div id="semanticMemoryList" class="semantic-memory-list" aria-label="记忆物品列表"></div>
                 <p class="semantic-memory-footnote">地图只显示有空间依据的物体位置。观察记录表示曾在此处见过物品。</p>
               </aside>
-  <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__";</script>
+  <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js"></script>
   <script src="/static/js/console.js?v=20260915-map-reconnect-1"></script>
@@ -367,13 +368,13 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260912-pipeline");
+      await import("/static/js/pointcloud3d.js?v=20260915-navigation-pick");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
-  <script src="/static/js/navigation.js?v=20260914-explore-layout"></script>
+  <script src="/static/js/navigation.js?v=20260915-navigation-pick"></script>
   <script src="/static/js/building-navigation.js?v=20260914-explore-layout"></script>
-  <script src="/static/js/exploration-mission.js?v=20260914-checkpoint-request"></script>
+  <script src="/static/js/exploration-mission.js?v=20260915-navigation-snapshot"></script>
   <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>
   <script>
     // 地图导航工具入口开关：
@@ -385,6 +386,7 @@
       var navContainer = document.getElementById('navigation-container');
       var boundaryContainer = document.getElementById('boundary-draw-container');
       var navBtn = document.getElementById('mapNavToggle');
+      var nav3dBtn = document.getElementById('map3dNavToggle');
       var boundaryBtn = document.getElementById('mapBoundaryToggle');
       function setActive(target) {
         window.__nuwaxNavigationActive = target === 'nav';
@@ -393,6 +395,8 @@
         if (navContainer) navContainer.hidden = (target !== 'nav');
         if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');
         if (navBtn) navBtn.classList.toggle('active', target === 'nav');
+        if (nav3dBtn) nav3dBtn.classList.toggle('active', target === 'nav');
+        window.__nuwaxNavigationModule?.setActive(target === 'nav');
         if (boundaryBtn) boundaryBtn.classList.toggle('active', target === 'boundary');
       }
       if (navBtn) {
@@ -400,6 +404,9 @@
           setActive(navContainer && navContainer.hidden ? 'nav' : null);
         });
       }
+      if (nav3dBtn) nav3dBtn.addEventListener('click', function () {
+        setActive(navContainer && navContainer.hidden ? 'nav' : null);
+      });
       if (boundaryBtn) {
         boundaryBtn.addEventListener('click', function () {
           setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);

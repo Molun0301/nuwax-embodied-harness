@@ -1,6 +1,23 @@
 """建图、探索与导航的两条固定生产链契约。"""
 
+import math
 from typing import Optional
+
+
+def navigation_support_distance(value: object) -> float:
+    """校验三维机体至支撑面的实测正距离，不推断机器人尺寸。"""
+    try:
+        distance = float(str(value).strip())
+    except (TypeError, ValueError):
+        distance = float("nan")
+    # 与原生规划器的单精度正常正数范围一致。
+    if not math.isfinite(distance) or not 1.17549435e-38 <= distance <= 3.4028234e38:
+        raise ValueError(
+            "三维导航缺少有效的机体到支撑面距离。请在平台设置中填写"
+            "“机体到支撑面距离（米）”，使用正常站立时机体坐标原点到地面的实测正距离，"
+            "保存并重启网关、几何与导航服务。"
+        )
+    return distance
 
 
 def resolve_navigation_profile(pipeline: Optional[str], configured_profile: Optional[str] = None) -> str:

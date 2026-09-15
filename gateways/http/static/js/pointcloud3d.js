@@ -524,6 +524,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const x = Number(event.clientX);
       const y = Number(event.clientY);
       if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - start.x, y - start.y) > 6) return;
+      if (window.__nuwaxNavigationActive) {
+        const point = this.pickNavigationPoint(x, y);
+        window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
+        return;
+      }
       this._emitSemanticSelectionAtClientPoint(x, y);
     };
     this._semanticPointerCancelHandler = () => {
@@ -562,6 +567,56 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._requestRender();
       this._emitCameraState();
     });
+  }
+
+  pickNavigationPoint(clientX, clientY) {
+    const mesh = this._pointsMesh;
+    const identity = this._pointCloudMapWatermark;
+    if (!this._visible || !mesh?.visible || !identity || this._renderedCloudSourceKey !== this._cloudSourceKey) return null;
+    const rect = this._renderer.domElement.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const pointer = new THREE.Vector2((clientX - rect.left) / rect.width * 2 - 1, 1 - (clientY - rect.top) / rect.height * 2);
+    this._camera.updateMatrixWorld();
+    mesh.updateMatrixWorld();
+    const ray = new THREE.Raycaster();
+    ray.params.Points.threshold = 0.12;
+    ray.setFromCamera(pointer, this._camera);
+    const position = mesh.geometry.getAttribute('position');
+    let selected = null;
+    let nearestPixels = Infinity;
+    for (const hit of ray.intersectObject(mesh, false)) {
+      // 点云交点是射线上的近似位置；目标必须取命中索引对应的真实地图点。
+      const point = new THREE.Vector3().fromBufferAttribute(position, hit.index).applyMatrix4(mesh.matrixWorld);
+      const projected = point.clone().project(this._camera);
+      if (projected.z < -1 || projected.z > 1) continue;
+      const pixels = Math.hypot((projected.x - pointer.x) * rect.width / 2, (projected.y - pointer.y) * rect.height / 2);
+      if (pixels > 8 || pixels >= nearestPixels - 0.25) continue;
+      // 优先贴近光标；四分之一像素内保留更靠近相机的命中，避免选到重叠层。
+      nearestPixels = pixels;
+      selected = { x: point.x, y: point.y, surface_z: point.z, frame_id: identity.header.frame_id, source_key: this._cloudSourceKey };
+    }
+    return selected;
+  }
+
+  navigationPointIsCurrent(point) {
+    return Boolean(this._pointCloudMapWatermark && point?.source_key === this._cloudSourceKey);
+  }
+
+  previewNavigationPoint(point) {
+    if (this._navigationPickMarker) {
+      this._scene?.remove(this._navigationPickMarker);
+      this._navigationPickMarker.geometry.dispose();
+      this._navigationPickMarker.material.dispose();
+      this._navigationPickMarker = null;
+    }
+    if (point && this._scene && Number.isFinite(point.z)) {
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: COLORS.navGoal, depthTest: false }));
+      marker.position.set(point.x, point.y, point.z);
+      marker.renderOrder = 10;
+      this._navigationPickMarker = marker;
+      this._scene.add(marker);
+    }
+    this._requestRender();
   }
 
   _setupResizeObserver() {
@@ -993,6 +1048,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._floorLevelCache = floor?.levels ?? null;
     }
     this._renderedCloudMapRevision = job.revision;
+    this._renderedCloudSourceKey = this._cloudSourceKey;
     this._renderedPointCloudSourcePoints = job.positions.length / 3;
     this._renderPointCloudPositions(result.positions, result.measurement, floor, result.colors);
     window.dispatchEvent(new CustomEvent('pointcloud3d:diagnostic', {
@@ -1786,6 +1842,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   dispose() {
     this._cloudDisposed = true;
+    this.previewNavigationPoint(null);
     this._cloudLoadToken += 1;
     this._invalidatePointCloudWork();
     this._cloudWorker?.terminate();

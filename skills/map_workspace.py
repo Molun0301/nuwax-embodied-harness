@@ -3299,43 +3299,6 @@ class MapWorkspaceService:
             "pcd": latest_map_snapshot.metadata.get("pcd"),
         }
 
-    def restore_localization_checkpoint_display(self) -> bool:
-        """定位模式下把 Debug 显示层恢复为已加载的 current checkpoint。"""
-
-        workspace = self.get_active_workspace(refresh_localization=False)
-        if (
-            workspace is None
-            or workspace.map_asset is None
-            or not workspace.map_asset.finalized
-            or not workspace.active_map_name
-        ):
-            return False
-        try:
-            bundle = self._require_map_asset_bundle(workspace.active_map_name)
-        except GatewayError:
-            return False
-        latest_snapshot = self._mapping_service.get_latest_snapshot()
-        if latest_snapshot is not None:
-            metadata = dict(getattr(latest_snapshot, "metadata", {}) or {})
-            if (
-                self._checkpoint_map_displayable(latest_snapshot)
-                and str(metadata.get("asset_manifest_sha256") or "")
-                == str(bundle.manifest_sha256 or "")
-            ):
-                return True
-        runtime_snapshot = self._geometry_runtime.get_map_snapshot()
-        runtime_metadata = (
-            dict(runtime_snapshot.metadata or {})
-            if runtime_snapshot is not None
-            else {}
-        )
-        self._ingest_localization_checkpoint_snapshot(
-            bundle=bundle,
-            runtime_snapshot=runtime_snapshot,
-            runtime_metadata=runtime_metadata,
-        )
-        return True
-
     def _ingest_localization_checkpoint_snapshot(
         self,
         *,

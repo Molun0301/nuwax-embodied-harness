@@ -282,9 +282,7 @@ button{font-family:inherit;cursor:pointer}
 
 /* map tool active state (real .active -> mockup .tool.on) */
 .tool.active{background:var(--ink);color:var(--surface);border-color:transparent}
-.tool.pose-tool.active{background:var(--robot);color:#fff}
 /* map canvas interaction cursors (preserve prior affordances) */
-#mapCanvas.goal-pick,#mapCanvas.publish-point,#mapCanvas.initial-pose{cursor:crosshair}
 #mapCanvas.pan-ready{cursor:grab}#mapCanvas.panning{cursor:grabbing}
 
 /* ===== config view (full takeover, real #config-view structure) ===== */

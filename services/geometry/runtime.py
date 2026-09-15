@@ -971,10 +971,6 @@ class PlatformGeometryRuntime:
         self._external_live_pose: Optional[Pose] = None
         self._external_live_pose_at_monotonic = 0.0
         self._external_live_pose_lock = threading.Lock()
-        self._debug_initial_pose_hint: Optional[Pose] = None
-        self._debug_initial_pose_anchor: Optional[Pose] = None
-        self._debug_initial_pose_hint_until = 0.0
-        self._debug_initial_pose_hint_stable_count = 0
         # 正式导航后端由 `_remote_provider`（GeometryRuntimeProvider）持有。
         self._cmd_vel_bridge = None
         self._geometry_runtime_subprocess: Optional[GeometryRuntimeSubprocess] = None
@@ -3554,100 +3550,7 @@ class PlatformGeometryRuntime:
             return None
         if max_age_sec > 0.0 and (time.monotonic() - updated_at) > max_age_sec:
             return None
-        return self._resolve_pose_after_initial_hint(pose.model_copy(deep=True))
-
-    def invalidate_external_live_pose_cache(self) -> None:
-        """清空 /go2/pose_map 缓存，便于 2D Pose 后尽快接受新 TF。"""
-
-        with self._external_live_pose_lock:
-            self._external_live_pose = None
-            self._external_live_pose_at_monotonic = 0.0
-
-    def clear_debug_initial_pose_hint(self) -> None:
-        """清除 debug 2D Pose 的 UI hint，避免与真实 TF 打架。"""
-
-        with self._external_live_pose_lock:
-            self._debug_initial_pose_hint = None
-            self._debug_initial_pose_anchor = None
-            self._debug_initial_pose_hint_until = 0.0
-            self._debug_initial_pose_hint_stable_count = 0
-
-    def _set_debug_initial_pose_hint(self, target_pose: Pose, *, ttl_sec: float = 12.0) -> None:
-        with self._external_live_pose_lock:
-            self._debug_initial_pose_hint = target_pose.model_copy(deep=True)
-            self._debug_initial_pose_anchor = (
-                self._external_live_pose.model_copy(deep=True)
-                if self._external_live_pose is not None
-                else None
-            )
-            self._debug_initial_pose_hint_until = time.monotonic() + max(1.0, float(ttl_sec))
-            self._debug_initial_pose_hint_stable_count = 0
-
-    def _resolve_pose_after_initial_hint(self, pose: Pose) -> Pose:
-        with self._external_live_pose_lock:
-            hint = self._debug_initial_pose_hint
-            anchor = self._debug_initial_pose_anchor
-            expires_at = self._debug_initial_pose_hint_until
-        if hint is None or time.monotonic() > expires_at:
-            with self._external_live_pose_lock:
-                self._debug_initial_pose_hint = None
-                self._debug_initial_pose_anchor = None
-                self._debug_initial_pose_hint_until = 0.0
-            return pose
-        try:
-            hx = float(hint.position.x)
-            hy = float(hint.position.y)
-            nx = float(pose.position.x)
-            ny = float(pose.position.y)
-            dist_to_hint = math.hypot(nx - hx, ny - hy)
-            if anchor is not None:
-                ax = float(anchor.position.x)
-                ay = float(anchor.position.y)
-                dist_anchor_to_hint = math.hypot(ax - hx, ay - hy)
-                if dist_to_hint + 0.35 >= dist_anchor_to_hint:
-                    return hint.model_copy(deep=True)
-            if dist_to_hint <= 0.45:
-                if anchor is not None:
-                    ax = float(anchor.position.x)
-                    ay = float(anchor.position.y)
-                    if math.hypot(nx - ax, ny - ay) <= 0.35:
-                        with self._external_live_pose_lock:
-                            self._debug_initial_pose_hint_stable_count = 0
-                        return hint.model_copy(deep=True)
-                with self._external_live_pose_lock:
-                    self._debug_initial_pose_hint_stable_count += 1
-                    if self._debug_initial_pose_hint_stable_count >= 3:
-                        self._debug_initial_pose_hint = None
-                        self._debug_initial_pose_anchor = None
-                        self._debug_initial_pose_hint_until = 0.0
-                        self._debug_initial_pose_hint_stable_count = 0
-                        return pose
-                return hint.model_copy(deep=True)
-            with self._external_live_pose_lock:
-                self._debug_initial_pose_hint_stable_count = 0
-            return hint.model_copy(deep=True)
-        except (TypeError, ValueError):
-            return pose
-
-    def publish_debug_initial_pose(self, target_pose: Pose) -> Dict[str, object]:
-        """RViz 2D Pose Estimate 入口。
-
-        调用方可通过 debug 面板/外部 debug observer 路径注入初始位姿 hint；
-        本入口仅保留协议签名（HTTP 503 语义：明确告知功能下线），不再默默失败。
-        """
-        # 清掉旧的 hint，让下一次 _resolve_pose_after_initial_hint 走默认路径。
-        self.clear_debug_initial_pose_hint()
-        return {
-            "published": False,
-            "topic": "/initialpose",
-            "message": (
-                "RViz 2D Pose Estimate 当前不可用："
-                "当前 geometry runtime proto 未定义 relocalize/initial-pose RPC，"
-                "因此平台不会伪造已提交结果。"
-            ),
-            "deprecated": True,
-            "unsupported": True,
-        }
+        return pose.model_copy(deep=True)
 
     def _handle_external_debug_pose_update(
         self,
@@ -3657,7 +3560,7 @@ class PlatformGeometryRuntime:
     ) -> None:
         resolved_pose = pose
         if pose is not None and hasattr(pose, "model_copy"):
-            resolved_pose = self._resolve_pose_after_initial_hint(pose.model_copy(deep=True))
+            resolved_pose = pose.model_copy(deep=True)
             with self._external_live_pose_lock:
                 self._external_live_pose = resolved_pose.model_copy(deep=True)
                 self._external_live_pose_at_monotonic = time.monotonic()
@@ -5832,7 +5735,7 @@ class PlatformGeometryRuntime:
             == "mapping_localization"
         ) and bundle.snapshot.occupancy_grid is not None:
             # 定位模式 Debug 固定展示已加载的平台 checkpoint；live /map_obstacles
-            # （含 2D Pose 后零星重发）与已加载资产包栅格不一致，不得替换显示层。
+            # （含零星重发）与已加载资产包栅格不一致，不得替换显示层。
             metadata.update({
                 "event_type": "heartbeat",
                 "suppressed_live_map_update": True,

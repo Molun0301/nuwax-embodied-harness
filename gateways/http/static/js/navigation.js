@@ -122,14 +122,6 @@
       }
       selectMapPoint(point.x, point.y, point.frame_id, point);
     });
-    // 兼容已有世界坐标钩子，同时监听控制台实际使用的地图画布。
-    if (typeof window.__nuwaxMapClick === 'function') {
-      const original = window.__nuwaxMapClick;
-      window.__nuwaxMapClick = function (x, y, frameId) {
-        selectMapPoint(x, y, frameId);
-        return original.apply(this, arguments);
-      };
-    }
     const mapEl = document.getElementById('mapCanvas') || document.getElementById('map') || document.getElementById('map-canvas');
     if (!mapEl) return;
     mapEl.addEventListener('nuwax:map-click', function (ev) {

@@ -84,15 +84,6 @@
                 </div>
                 <div id="map2dActionControls" class="map-tool-row" data-map-view="2d" aria-label="2D 地图交互">
                   <div class="map-tool-group glass">
-                    <button id="mapInitialPoseToggle" class="tool pose-tool" type="button" title="2D Pose Estimate：发布 /initialpose">2D Pose</button>
-                    <button id="mapGoalToggle" class="tool" type="button" title="2D Goal：左键设目标、中/右键平移、滚轮缩放">2D Goal</button>
-                    <button id="mapPublishPointToggle" class="tool" type="button" title="Publish Point：发布 /clicked_point">选点</button>
-                  </div>
-                  <label class="map-tool-group glass navigation-height-field" title="目标在地图中的机体高度；留空使用当前定位高度，三维地形目标按实际机体高度填写。">
-                    目标机体高度（米）
-                    <input id="mapGoalHeight" type="number" step="any" inputmode="decimal" placeholder="当前高度" aria-label="地图目标机体高度（米）">
-                  </label>
-                  <div class="map-tool-group glass">
                     <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
                     <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
                   </div>
@@ -199,7 +190,7 @@
                 <div class="forbidden-zone-hint" data-role="boundary-hint">直线、矩形和圆形用鼠标拖拽；自定义多边形逐点单击后完成。</div>
                 <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
               </div>
-              <span id="mapGoalStatus" class="mchip glass map-goal-chip" hidden></span>
+              <span id="mapInteractionStatus" class="mchip glass map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip" title="地图内容更新帧率与当前显示位姿的源时间至绘制时间">-- FPS · 位姿延迟 --</span>
               <details class="glass legend" id="mapLegend" open>
                 <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
@@ -211,7 +202,7 @@
                   <span class="lg"><span class="sw" style="background:var(--robot)"></span><span id="robotGeometryLegend">机器人</span></span>
                   <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
                   <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
-                  <span id="mapRvizHint" class="lg" hidden>2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放</span>
+                  <span id="mapCameraHint" class="lg" hidden>自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图</span>
                   <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
                 </div>
               </details>
@@ -390,7 +381,7 @@
       var boundaryBtn = document.getElementById('mapBoundaryToggle');
       function setActive(target) {
         window.__nuwaxNavigationActive = target === 'nav';
-        if ((target === 'nav' || target === 'boundary') && typeof window.__nuwaxDisableMapTools === 'function') window.__nuwaxDisableMapTools(true);
+        if ((target === 'nav' || target === 'boundary') && typeof window.__nuwaxResetMapInteraction === 'function') window.__nuwaxResetMapInteraction(true);
         if (target !== 'boundary' && window.__nuwaxBoundaryDrawModule) window.__nuwaxBoundaryDrawModule.setDrawing(false);
         if (navContainer) navContainer.hidden = (target !== 'nav');
         if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');

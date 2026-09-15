@@ -12,12 +12,6 @@
         robotStroke: "#fef3c7",
         goal: "#a78bfa",
         goalStroke: "#ddd6fe",
-        goalPick: "#34d399",
-        goalPickStroke: "#6ee7b7",
-        clickedPoint: "#38bdf8",
-        clickedPointStroke: "#7dd3fc",
-        initialPosePick: "#f97316",
-        initialPosePickStroke: "#fdba74",
         navPath: "#22ff66",
       };
       const overviewNames = ["health", "state", "localization", "map", "navigation", "exploration", "runtime_governance", "pointcloud_map", "pointcloud", "video", "perception_nms", "logs"].filter(name => !PLANAR_PIPELINE || !["pointcloud_map", "pointcloud"].includes(name));
@@ -69,7 +63,6 @@
         pointcloud3dDisplayedPoints: 0,
         pointcloud3dPointCountKnown: false,
         pointcloud3dReady: false,
-        mapRvizView: { center: null, zoom: 1 },
         mapPanDrag: null,
         mapStream: null,
         pose: null,
@@ -77,15 +70,6 @@
         trajectory: [],
         frontiers: [],
         goalPose: null,
-        goalPickMode: false,
-        publishPointMode: false,
-        initialPosePickMode: false,
-        goalPickDrag: null,
-        initialPosePickDrag: null,
-        publishPointClick: null,
-        clickedPoints: [],
-        initialPoses: [],
-        pendingNavGoal: null,
         navigationPath: [],
         logCursor: 0,
         streamSocket: null,
@@ -237,12 +221,8 @@
         map2dCameraToggle: document.getElementById("map2dCameraToggle"),
         mapCenterRobot: document.getElementById("mapCenterRobot"),
         mapZoomValue: document.getElementById("mapZoomValue"),
-        mapRvizHint: document.getElementById("mapRvizHint"),
-        mapInitialPoseToggle: document.getElementById("mapInitialPoseToggle"),
-        mapGoalToggle: document.getElementById("mapGoalToggle"),
-        mapGoalHeight: document.getElementById("mapGoalHeight"),
-        mapPublishPointToggle: document.getElementById("mapPublishPointToggle"),
-        mapGoalStatus: document.getElementById("mapGoalStatus"),
+        mapCameraHint: document.getElementById("mapCameraHint"),
+        mapInteractionStatus: document.getElementById("mapInteractionStatus"),
         mapStreamStatus: document.getElementById("mapStreamStatus"),
         mapStatus: document.getElementById("mapStatus"),
         mapEmpty: document.getElementById("mapEmpty"),
@@ -1416,23 +1396,14 @@
           y: Number(origin.y || 0) + x * sin + y * cos,
         }));
       }
-      function isMapToolActive() {
-        return Boolean(state.goalPickMode || state.publishPointMode || state.initialPosePickMode);
-      }
-      function usesRvizMapView() {
-        return Boolean(
-          state.map2dCameraMode === "free"
-          || isMapToolActive()
-          || state.goalPickDrag
-          || state.initialPosePickDrag
-          || state.mapPanDrag,
-        );
+      function usesFreeMapView() {
+        return state.map2dCameraMode === "free";
       }
       function activeMapWorldView() {
-        return state.map2dCameraMode === "free" ? state.mapFreeView : state.mapRvizView;
+        return state.mapFreeView;
       }
       function mapViewZoom() {
-        return usesRvizMapView() ? (activeMapWorldView().zoom || 1) : state.mapZoom;
+        return usesFreeMapView() ? (activeMapWorldView().zoom || 1) : state.mapZoom;
       }
       function defaultMapViewCenter() {
         const posePoint = pointFromPose(state.pose);
@@ -1441,19 +1412,12 @@
         if (!corners.length) return { x: 0, y: 0 };
         return corners.reduce((acc, item) => ({ x: acc.x + item.x / corners.length, y: acc.y + item.y / corners.length }), { x: 0, y: 0 });
       }
-      function getMapRvizViewCenter() {
+      function getFreeMapViewCenter() {
         const center = activeMapWorldView().center;
         if (center && Number.isFinite(Number(center.x)) && Number.isFinite(Number(center.y))) {
           return { x: Number(center.x), y: Number(center.y) };
         }
         return defaultMapViewCenter();
-      }
-      function resetRvizMapView(focusPose) {
-        const posePoint = focusPose || pointFromPose(state.pose);
-        state.mapRvizView = {
-          center: posePoint ? { x: posePoint.x, y: posePoint.y } : defaultMapViewCenter(),
-          zoom: 1,
-        };
       }
       function resetFreeMapView() {
         const corners = mapCorners(state.mapGrid);
@@ -1462,13 +1426,13 @@
           : defaultMapViewCenter();
         state.mapFreeView = { center, zoom: 1, fitSpan: null };
         if (window.__nuwaxMapFreeze) window.__nuwaxMapFreezeCenter = { ...center };
-        if (state.mapGrid) basePixelsPerMeterRviz();
+        if (state.mapGrid) basePixelsPerMeterFree();
       }
       function syncMap2dCameraControls() {
         const button = els.map2dCameraToggle;
         if (!button) return;
         const free = state.map2dCameraMode === "free";
-        const busy = Boolean(isMapToolActive() || state.mapPanDrag || window.__nuwaxMapToolV2?.active());
+        const busy = Boolean(state.mapPanDrag || window.__nuwaxMapToolV2?.active());
         button.textContent = free ? "自由拖拽" : "机器人跟随";
         button.classList.toggle("active", free);
         button.setAttribute("aria-pressed", free ? "true" : "false");
@@ -1480,13 +1444,13 @@
             : "当前跟随机器人：箭头固定居中朝上，地图随机器人移动和转向；点击切换自由拖拽";
       }
       function setMap2dCameraMode(mode) {
-        if (isMapToolActive() || state.mapPanDrag || window.__nuwaxMapToolV2?.active()) return;
+        if (state.mapPanDrag || window.__nuwaxMapToolV2?.active()) return;
         state.map2dCameraMode = mode === "free" ? "free" : "follow";
         if (state.map2dCameraMode === "free" && !state.mapFreeView.center) resetFreeMapView();
         syncMapToolUi();
         requestMapDraw(false);
       }
-      function centerRvizMapOnRobot() {
+      function centerFreeMapOnRobot() {
         const posePoint = pointFromPose(state.pose);
         if (!posePoint) return;
         activeMapWorldView().center = { x: posePoint.x, y: posePoint.y };
@@ -1509,8 +1473,8 @@
             mapFixed: true,
           };
         }
-        if (usesRvizMapView()) {
-          const center = getMapRvizViewCenter();
+        if (usesFreeMapView()) {
+          const center = getFreeMapViewCenter();
           return { point: { x: center.x, y: center.y, z: 0 }, yaw: 0, locked: false, mapFixed: true };
         }
         const posePoint = pointFromPose(state.pose);
@@ -1518,7 +1482,7 @@
         const fallback = defaultMapViewCenter();
         return { point: { x: fallback.x, y: fallback.y, z: 0 }, yaw: 0, locked: false, mapFixed: false };
       }
-      function basePixelsPerMeterRviz() {
+      function basePixelsPerMeterFree() {
         const canvas = els.mapCanvas;
         const fitSpan = state.map2dCameraMode === "free" && state.mapFreeView.fitSpan;
         if (fitSpan) return Math.max(4, Math.min(canvas.width / fitSpan.x, canvas.height / fitSpan.y));
@@ -1541,7 +1505,7 @@
         return Math.max(4, Math.min(canvas.width / (spanX * 1.12), canvas.height / (spanY * 1.12)));
       }
       function basePixelsPerMeter(anchor) {
-        if (anchor && anchor.mapFixed) return basePixelsPerMeterRviz();
+        if (anchor && anchor.mapFixed) return basePixelsPerMeterFree();
         const canvas = els.mapCanvas;
         const corners = mapCorners(state.mapGrid);
         if (!corners.length) return 60;
@@ -1646,7 +1610,7 @@
           y: (-b * sx + a * sy) / det,
         };
       }
-      function zoomRvizMapAt(pointer, factor) {
+      function zoomFreeMapAt(pointer, factor) {
         const anchor = cameraAnchor();
         const scaleBefore = cameraScale(anchor);
         if (!Number.isFinite(scaleBefore) || scaleBefore <= 0) return;
@@ -1664,88 +1628,6 @@
         if (state.map2dCameraMode === "free" && window.__nuwaxMapFreeze) {
           window.__nuwaxMapFreezeCenter = { ...activeMapWorldView().center };
         }
-      }
-      function formatMapPoint(point) {
-        if (!point) return "--";
-        const height = typeof point.z === "number" && Number.isFinite(point.z) ? `, ${point.z.toFixed(2)}` : "";
-        return `(${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)}${height})`;
-      }
-      function planarDistanceMeters(a, b) {
-        if (!a || !b) return null;
-        const dx = Number(a.x) - Number(b.x);
-        const dy = Number(a.y) - Number(b.y);
-        if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
-        return Math.hypot(dx, dy);
-      }
-      function navGoalMatchesPending(targetPose, pending) {
-        if (!targetPose || !pending) return false;
-        const point = pointFromPose(targetPose);
-        if (!point) return false;
-        const dist = planarDistanceMeters(point, pending);
-        const z = targetPose.position && targetPose.position.z;
-        const frame = String(targetPose.frame_id || "").trim().replace(/^\/+/, "");
-        const pendingFrame = String(pending.frame_id || "").trim().replace(/^\/+/, "");
-        return typeof z === "number" && Number.isFinite(z)
-          && typeof pending.z === "number" && Number.isFinite(pending.z)
-          && frame !== "" && frame === pendingFrame
-          && dist !== null && Math.hypot(dist, z - pending.z) < 0.35;
-      }
-      function syncDebugNavGoalFromStream(navPayload) {
-        const pending = state.pendingNavGoal;
-        if (!pending || pending.status === "sending") return;
-        const navState = getNestedState(navPayload, "navigation_state");
-        if (!navState) return;
-        const status = String(navState.status || "").toLowerCase();
-        const metadata = navState.metadata || {};
-        const targetPose = metadata.target_pose || null;
-        const matches = navGoalMatchesPending(targetPose, pending);
-        if (status === "running" || status === "planning") {
-          if (!matches) return;
-          const remain = navState.remaining_distance_m;
-          const remainLabel = remain === null || remain === undefined ? "" : ` · 剩余 ${Number(remain).toFixed(2)}m`;
-          updateGoalPickStatus(`导航执行中 → ${formatMapPoint(pending)}${remainLabel}`, "ok");
-          pending.status = "accepted";
-          return;
-        }
-        if (status === "succeeded") {
-          if (!matches) return;
-          updateGoalPickStatus(`已到达 ${formatMapPoint(pending)}`, "ok");
-          state.pendingNavGoal = null;
-          requestMapDraw(false);
-          return;
-        }
-        if (status === "failed" || status === "cancelled") {
-          if (!matches) return;
-          const message = navState.message || (status === "cancelled" ? "导航已取消" : "导航失败");
-          const failureReason = String(metadata.failure_reason || "");
-          if (
-            failureReason === "navigation_not_ready"
-            || message.includes("nav_runtime 未 ready")
-            || message.includes("lifecycle 未全部 active")
-            || message.includes("costmap 尚未首帧")
-          ) {
-            return;
-          }
-          pending.status = "error";
-          pending.message = message;
-          updateGoalPickStatus(`${message}（目标 ${formatMapPoint(pending)}）`, "error");
-          requestMapDraw(false);
-        }
-      }
-      function mapGoalUsesOfflineGrid() {
-        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
-        // 定位模式固定 checkpoint 仅作 Debug 底图；导航仍使用已加载静态图。
-        if (shouldPinLocalizationCheckpointDisplay(diagnostics)) return false;
-        if (activeLocalizationSessionReason()) {
-          const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
-          const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
-          if (sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint") {
-            return false;
-          }
-        }
-        const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
-        const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
-        return sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint";
       }
       function canvasPointer(event) {
         const rect = els.mapCanvas.getBoundingClientRect();
@@ -1891,286 +1773,28 @@
         if (!current) throw new Error("当前机体高度不可用或已过期，请填写目标在地图中的机体高度（米）。");
         return current.z;
       }
-      function updateGoalPickStatus(text, tone) {
-        if (!els.mapGoalStatus) return;
+      function updateMapInteractionStatus(text, tone) {
+        if (!els.mapInteractionStatus) return;
         const value = String(text || "").trim();
         if (!value) {
-          els.mapGoalStatus.hidden = true;
-          els.mapGoalStatus.textContent = "";
-          els.mapGoalStatus.className = "map-chip map-goal-chip";
+          els.mapInteractionStatus.hidden = true;
+          els.mapInteractionStatus.textContent = "";
+          els.mapInteractionStatus.className = "map-chip map-goal-chip";
           return;
         }
-        els.mapGoalStatus.hidden = false;
-        els.mapGoalStatus.textContent = value;
-        els.mapGoalStatus.className = `map-chip map-goal-chip${tone ? ` ${tone}` : ""}`;
+        els.mapInteractionStatus.hidden = false;
+        els.mapInteractionStatus.textContent = value;
+        els.mapInteractionStatus.className = `map-chip map-goal-chip${tone ? ` ${tone}` : ""}`;
       }
       function syncMapToolUi() {
-        const goalActive = Boolean(state.goalPickMode);
-        const pointActive = Boolean(state.publishPointMode);
-        const initialPoseActive = Boolean(state.initialPosePickMode);
-        const toolActive = goalActive || pointActive || initialPoseActive;
         const free = state.map2dCameraMode === "free";
         syncMap2dCameraControls();
-        if (els.mapInitialPoseToggle) els.mapInitialPoseToggle.classList.toggle("active", initialPoseActive);
-        if (els.mapGoalToggle) els.mapGoalToggle.classList.toggle("active", goalActive);
-        if (els.mapPublishPointToggle) els.mapPublishPointToggle.classList.toggle("active", pointActive);
         if (els.mapCanvas) {
-          els.mapCanvas.classList.toggle("goal-pick", toolActive);
-          els.mapCanvas.classList.toggle("publish-point", pointActive && !goalActive && !initialPoseActive);
-          els.mapCanvas.classList.toggle("initial-pose", initialPoseActive && !goalActive && !pointActive);
-          els.mapCanvas.classList.toggle("pan-ready", (toolActive || free) && !state.mapPanDrag);
+          els.mapCanvas.classList.toggle("pan-ready", free && !state.mapPanDrag);
           els.mapCanvas.classList.toggle("panning", Boolean(state.mapPanDrag));
         }
-        if (els.mapCenterRobot) els.mapCenterRobot.hidden = !toolActive && !free;
-        if (els.mapRvizHint) {
-          els.mapRvizHint.hidden = !toolActive && !free;
-          if (initialPoseActive) {
-            els.mapRvizHint.textContent = "2D Pose：左键拖拽设初始位姿 · 中/右键平移 · 滚轮缩放";
-          } else if (goalActive) {
-            els.mapRvizHint.textContent = "2D Goal：左键拖拽设目标 · 中/右键平移 · 滚轮缩放";
-          } else if (pointActive) {
-            els.mapRvizHint.textContent = "选点：左键发布 /clicked_point · 中/右键平移 · 滚轮缩放";
-          } else if (free) {
-            els.mapRvizHint.textContent = "自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图";
-          }
-        }
-      }
-      const syncGoalPickUi = syncMapToolUi;
-      function goalPickYawFromDrag(drag) {
-        const pointerDx = drag.pointerCurrent.x - drag.pointerStart.x;
-        const pointerDy = drag.pointerCurrent.y - drag.pointerStart.y;
-        if (Math.hypot(pointerDx, pointerDy) < 8) {
-          return planarYawFromPose(state.pose) || 0;
-        }
-        const mapDx = drag.current.x - drag.start.x;
-        const mapDy = drag.current.y - drag.start.y;
-        return Math.atan2(mapDy, mapDx);
-      }
-      function formatNavGoalError(payload, status) {
-        const code = String((payload && payload.code) || "").trim();
-        const message = String((payload && payload.message) || "").trim();
-        if (code === "localization_unavailable") {
-          return "平台定位会话未就绪（与 go2.sh 模式无关）。mapping / explore / localization 任一模式均可导航，但需先 activate_map，且定位 session 进入 ready。";
-        }
-        if (code === "map_not_activated") {
-          return "未激活地图。请先调用 activate_map 选择地图。";
-        }
-        if (code === "access_denied") {
-          return "当前令牌无权调用 navigate_to_pose。";
-        }
-        if (code === "navigation_not_ready") {
-          const waitingFor = payload && payload.details && payload.details.waiting_for;
-          return waitingFor
-            ? `导航未就绪（等待 ${waitingFor}）。${message || ""}`
-            : (message || "导航未就绪，无法导航。");
-        }
-        if (code === "goal_pose_publish_failed" || code === "goal_pose_publish_unsupported") {
-          return message || "发布 /goal_pose 失败。";
-        }
-        if (code === "initial_pose_publish_failed" || code === "initial_pose_publish_unsupported") {
-          return message || "发布 /initialpose 失败。";
-        }
-        if (code === "runtime_provider_unavailable") {
-          return message || "导航运行时未初始化。";
-        }
-        return message || `HTTP ${status}`;
-      }
-      async function dispatchNavGoal(mapPoint, yawRad) {
-        if (!state.mapGrid) {
-          updateGoalPickStatus("地图未显示，无法下发导航目标", "error");
-          return;
-        }
-        if (!state.pose || !pointFromPose(state.pose)) {
-          updateGoalPickStatus("定位位姿不可用，无法将点击坐标变换到 map 系", "error");
-          return;
-        }
-        if (mapGoalUsesOfflineGrid()) {
-          updateGoalPickStatus("当前为离线/缓存地图，与实时代价地图可能不一致，建议等待实时流后再发目标", "error");
-          return;
-        }
-        if (state.pendingNavGoal && state.pendingNavGoal.status === "sending") {
-          updateGoalPickStatus("上一条导航目标仍在下发，请稍候", "pending");
-          return;
-        }
-        const frameId = navigationFrameId();
-        const mapName = activeMapName();
-        const robotPoint = pointFromPose(state.pose);
-        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
-        let targetHeight;
-        try {
-          targetHeight = resolveNavigationHeight(els.mapGoalHeight, frameId);
-        } catch (error) {
-          updateGoalPickStatus(error.message, "error");
-          return;
-        }
-        const body = {
-          frame_id: frameId,
-          x: Number(mapPoint.x),
-          y: Number(mapPoint.y),
-          z: targetHeight,
-          yaw_rad: Number(yawRad),
-        };
-        if (mapName) body.map_name = mapName;
-        state.pendingNavGoal = {
-          x: body.x,
-          y: body.y,
-          z: body.z,
-          yaw_rad: body.yaw_rad,
-          frame_id: frameId,
-          status: "sending",
-        };
-        const robotLabel = robotPoint ? formatMapPoint(robotPoint) : "--";
-        const distanceLabel = distanceM === null ? "" : ` · 距离 ${distanceM.toFixed(2)}m`;
-        updateGoalPickStatus(`下发 map 目标 ${formatMapPoint(body)} · 机器人 ${robotLabel}${distanceLabel} · 坐标系 ${frameId}`, "pending");
-        requestMapDraw(false);
-        const controller = new AbortController();
-        const requestTimeout = window.setTimeout(() => controller.abort(), 5000);
-        try {
-          const response = await fetch("/api/console/navigation/goal", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
-          const payload = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            throw new Error(formatNavGoalError(payload, response.status));
-          }
-          if (!payload.published) {
-            throw new Error(payload.message || "发布 /goal_pose 失败。");
-          }
-          const apiDistance = payload.distance_m;
-          const distanceSuffix = Number.isFinite(Number(apiDistance))
-            ? ` · 距离 ${Number(apiDistance).toFixed(2)}m`
-            : distanceLabel;
-          state.pendingNavGoal = {
-            x: body.x,
-            y: body.y,
-            z: body.z,
-            yaw_rad: body.yaw_rad,
-            frame_id: frameId,
-            status: "published",
-            topic: payload.topic || "/goal_pose",
-          };
-          const topicLabel = payload.topic ? ` · ${payload.topic}` : "";
-          const goalLabel = `${formatMapPoint(body)}${distanceSuffix} · ${frameId}`;
-          updateGoalPickStatus(`已发布 RViz 目标 ${goalLabel}${topicLabel}`, "ok");
-        } catch (error) {
-          const message = error && error.name === "AbortError"
-            ? "发布 /goal_pose 超时（5s），请确认网关与 go2.sh 已启动。"
-            : (error && error.message ? error.message : String(error));
-          state.pendingNavGoal = {
-            x: body.x,
-            y: body.y,
-            z: body.z,
-            yaw_rad: body.yaw_rad,
-            frame_id: frameId,
-            status: "error",
-            message,
-          };
-          updateGoalPickStatus(`下发失败：${message}`, "error");
-        } finally {
-          window.clearTimeout(requestTimeout);
-        }
-        requestMapDraw(false);
-      }
-      async function dispatchClickedPoint(mapPoint) {
-        if (!state.mapGrid) {
-          updateGoalPickStatus("地图未显示，无法发布选点", "error");
-          return;
-        }
-        if (!state.pose || !pointFromPose(state.pose)) {
-          updateGoalPickStatus("定位位姿不可用，无法将点击坐标变换到 map 系", "error");
-          return;
-        }
-        const frameId = navigationFrameId();
-        const robotPoint = pointFromPose(state.pose);
-        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
-        const body = {
-          frame_id: frameId,
-          x: Number(mapPoint.x),
-          y: Number(mapPoint.y),
-          z: 0,
-        };
-        const distanceLabel = distanceM === null ? "" : ` · 距机器人 ${distanceM.toFixed(2)}m`;
-        updateGoalPickStatus(`发布 /clicked_point ${formatMapPoint(mapPoint)}${distanceLabel} · ${frameId}`, "pending");
-        try {
-          const response = await fetch("/api/console/map/clicked_point", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          });
-          const payload = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            const message = String((payload && payload.message) || `HTTP ${response.status}`);
-            throw new Error(message);
-          }
-          state.clickedPoints = [
-            {
-              x: body.x,
-              y: body.y,
-              z: body.z,
-              frame_id: frameId,
-              at: Date.now(),
-            },
-            ...(state.clickedPoints || []),
-          ].slice(0, 30);
-          const topic = payload.topic || "/clicked_point";
-          updateGoalPickStatus(`已发布 ${topic} ${formatMapPoint(mapPoint)}${distanceLabel} · ${frameId}`, "ok");
-        } catch (error) {
-          const message = error && error.message ? error.message : String(error);
-          updateGoalPickStatus(`选点发布失败：${message}`, "error");
-        }
-        requestMapDraw(false);
-      }
-      async function dispatchInitialPose(mapPoint, yawRad) {
-        if (!state.mapGrid) {
-          updateGoalPickStatus("地图未显示，无法发布初始位姿", "error");
-          return;
-        }
-        const frameId = navigationFrameId();
-        const robotPoint = pointFromPose(state.pose);
-        const distanceM = planarDistanceMeters(mapPoint, robotPoint);
-        const body = {
-          frame_id: frameId,
-          x: Number(mapPoint.x),
-          y: Number(mapPoint.y),
-          z: 0,
-          yaw_rad: Number(yawRad),
-        };
-        const distanceLabel = distanceM === null ? "" : ` · 距当前位姿 ${distanceM.toFixed(2)}m`;
-        updateGoalPickStatus(`发布 /initialpose ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${frameId}`, "pending");
-        try {
-          const response = await fetch("/api/console/map/initial_pose", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          });
-          const payload = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            throw new Error(formatNavGoalError(payload, response.status));
-          }
-          if (!payload.published) {
-            throw new Error(payload.message || "发布 /initialpose 失败。");
-          }
-          state.initialPoses = [
-            {
-              x: body.x,
-              y: body.y,
-              z: body.z,
-              yaw_rad: body.yaw_rad,
-              frame_id: frameId,
-              at: Date.now(),
-            },
-            ...(state.initialPoses || []),
-          ].slice(0, 20);
-          const topic = payload.topic || "/initialpose";
-          updateGoalPickStatus(`已发布 RViz 初始位姿 ${formatMapPoint(mapPoint)} yaw=${(body.yaw_rad * 180 / Math.PI).toFixed(0)}°${distanceLabel} · ${topic} · ${frameId}`, "ok");
-        } catch (error) {
-          const message = error && error.message ? error.message : String(error);
-          updateGoalPickStatus(`初始位姿发布失败：${message}`, "error");
-        }
-        requestMapDraw(false);
+        if (els.mapCenterRobot) els.mapCenterRobot.hidden = !free;
+        if (els.mapCameraHint) els.mapCameraHint.hidden = !free;
       }
       function drawOrientedGoal(ctx, anchor, scale, point, yawRad, colors, pixels) {
         if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
@@ -2253,12 +1877,6 @@
         const data = envelope.data || {};
         return pointFromPose(data.pose || data) ? "localization_pose_stream" : null;
       }
-      function goalInteractionReason() {
-        if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {
-          return "goal_pick";
-        }
-        return null;
-      }
       function activeSpatialTaskReason() {
         for (const task of state.taskActiveById.values()) {
           const capability = String(task.capability_name || task.name || "").trim();
@@ -2296,8 +1914,6 @@
         if (localizationReason) return localizationReason;
         const poseStreamReason = localizationPoseStreamReason();
         if (poseStreamReason) return poseStreamReason;
-        const goalReason = goalInteractionReason();
-        if (goalReason) return goalReason;
         return null;
       }
       function activeLocalizationSessionReason() {
@@ -2402,11 +2018,6 @@
         return count === null || count > 0;
       }
       function shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared) {
-        if (goalInteractionReason()) {
-          if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && grid.width && grid.height) {
-            return { display: true, reason: "goal_pick" };
-          }
-        }
         if (cleared) return { display: false, status: "cleared", message: mapClearedMessage(diagnostics) };
         if (!grid || !(Array.isArray(grid.data) || grid.data instanceof Int8Array) || !grid.width || !grid.height) {
           return { display: false, status: status === "error" ? "error" : "missing", message: errorReason(envelope, "无 occupancy_grid，占据栅格不可用。") };
@@ -2485,11 +2096,6 @@
         return true;
       }
       function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
-        if (state.goalPickMode || state.publishPointMode || state.initialPosePickMode || state.pendingNavGoal) {
-          els.mapEmpty.hidden = false;
-          els.mapEmpty.textContent = message || MAP_DISPLAY_IDLE_MESSAGE;
-          return;
-        }
         state.mapGrid = null;
         state.appliedMapIdentity = null;
         state.mapGridContentKey = "";
@@ -2570,10 +2176,6 @@
         drawTrajectory(ctx, anchor, scale);
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
-        drawGoalPickPreview(ctx, anchor, scale);
-        drawInitialPosePickPreview(ctx, anchor, scale);
-        drawInitialPoses(ctx, anchor, scale);
-        drawClickedPoints(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
         drawSemanticInstances(ctx, anchor, scale);
         drawRobot(ctx, anchor);
@@ -2640,18 +2242,6 @@
         drawWorldPoints(ctx, anchor, scale, state.navigationPath, CANVAS_THEME.navPath, 3);
       }
       function drawGoal(ctx, anchor, scale) {
-        const pending = state.pendingNavGoal;
-        if (pending && pending.status !== "error") {
-          drawOrientedGoal(
-            ctx,
-            anchor,
-            scale,
-            { x: pending.x, y: pending.y },
-            pending.yaw_rad,
-            { fill: CANVAS_THEME.goalPick, stroke: CANVAS_THEME.goalPickStroke },
-            2.8,
-          );
-        }
         const point = pointFromPose(state.goalPose);
         if (!point) return;
         const yaw = yawFromPose(state.goalPose);
@@ -2678,72 +2268,6 @@
         ctx.fill();
         ctx.stroke();
         ctx.restore();
-      }
-      function drawClickedPoints(ctx, anchor, scale) {
-        const points = state.clickedPoints || [];
-        if (!points.length) return;
-        ctx.save();
-        applyCameraTransform(ctx, anchor, scale);
-        ctx.fillStyle = CANVAS_THEME.clickedPoint;
-        ctx.strokeStyle = CANVAS_THEME.clickedPointStroke;
-        for (const point of points) {
-          if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) continue;
-          const radius = Math.max(0.1, 6 / scale);
-          ctx.lineWidth = Math.max(1 / scale, 2 / scale);
-          ctx.beginPath();
-          ctx.arc(Number(point.x), Number(point.y), radius, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
-      function drawGoalPickPreview(ctx, anchor, scale) {
-        const drag = state.goalPickDrag;
-        if (!drag || !drag.start) return;
-        const previewAnchor = drag.anchor || anchor;
-        const previewScale = drag.anchor ? cameraScale(previewAnchor) : scale;
-        const yaw = goalPickYawFromDrag(drag);
-        drawOrientedGoal(
-          ctx,
-          previewAnchor,
-          previewScale,
-          drag.start,
-          yaw,
-          { fill: CANVAS_THEME.goalPick, stroke: CANVAS_THEME.goalPickStroke },
-          3,
-        );
-      }
-      function drawInitialPosePickPreview(ctx, anchor, scale) {
-        const drag = state.initialPosePickDrag;
-        if (!drag || !drag.start) return;
-        const previewAnchor = drag.anchor || anchor;
-        const previewScale = drag.anchor ? cameraScale(previewAnchor) : scale;
-        const yaw = goalPickYawFromDrag(drag);
-        drawOrientedGoal(
-          ctx,
-          previewAnchor,
-          previewScale,
-          drag.start,
-          yaw,
-          { fill: CANVAS_THEME.initialPosePick, stroke: CANVAS_THEME.initialPosePickStroke },
-          3,
-        );
-      }
-      function drawInitialPoses(ctx, anchor, scale) {
-        const poses = state.initialPoses || [];
-        if (!poses.length) return;
-        for (const pose of poses) {
-          if (!pose || !Number.isFinite(Number(pose.x)) || !Number.isFinite(Number(pose.y))) continue;
-          drawOrientedGoal(
-            ctx,
-            anchor,
-            scale,
-            { x: pose.x, y: pose.y },
-            Number(pose.yaw_rad) || 0,
-            { fill: CANVAS_THEME.initialPosePick, stroke: CANVAS_THEME.initialPosePickStroke },
-            2.4,
-          );
-        }
       }
       function drawRobot(ctx, anchor) {
         const posePoint = pointFromPose(state.pose);
@@ -3448,8 +2972,8 @@
       }
       function locateSemanticInstance(inst) {
         if (!semanticScopeMatches(inst) || semanticQuality(inst).key !== "located" || state.semanticError) return;
-        if (isMapToolActive() || window.__nuwaxMapToolV2?.active()) {
-          updateGoalPickStatus("请先结束地图选点或区域绘制，再定位查看物品。", "error");
+        if (window.__nuwaxMapToolV2?.active()) {
+          updateMapInteractionStatus("请先结束地图选点或区域绘制，再定位查看物品。", "error");
           return;
         }
         closeSemanticOverlay();
@@ -3627,10 +3151,6 @@
           || (typeof (diagnostics && (diagnostics.event_type || diagnostics.suppressed_live_map_reason)) === "string"
               && ((diagnostics.event_type || diagnostics.suppressed_live_map_reason) === "catalog_cleared"
                   || (diagnostics.event_type || diagnostics.suppressed_live_map_reason) === "workspace_cleared"));
-        // 地图/工作区切换时清空 2D Pose 历史 marker，避免旧坐标错位被误读为新位姿
-        if (cleared && Array.isArray(state.initialPoses) && state.initialPoses.length) {
-          state.initialPoses = [];
-        }
         return cleared;
       }
       function mapClearedMessage(diagnostics) {
@@ -4087,7 +3607,6 @@
             && String(explorationMetadata.geometry_session_mode).toLowerCase() !== "explore"
           )
         ));
-        syncDebugNavGoalFromStream(data.navigation_context || data);
         if (canonicalInactive) {
           state.goalPose = null;
           state.navigationPath = [];
@@ -4100,9 +3619,6 @@
         ) {
           state.goalPose = null;
           state.navigationPath = [];
-        }
-        if (state.pendingNavGoal && state.pendingNavGoal.status === "accepted" && state.goalPose) {
-          state.pendingNavGoal = null;
         }
         setKv(els.navigationMeta, [
           ["导航", summarizeContext(data.navigation_context, "navigation_state")],
@@ -5767,7 +5283,7 @@
       startVideoStream();
       function setMapZoom(nextZoom) {
         const zoom = Math.min(8, Math.max(0.25, nextZoom));
-        if (usesRvizMapView() || isMapToolActive()) {
+        if (usesFreeMapView()) {
           activeMapWorldView().zoom = zoom;
         } else {
           state.mapZoom = zoom;
@@ -5778,7 +5294,6 @@
       els.mapZoomOut.addEventListener("click", () => setMapZoom(mapViewZoom() / 1.25));
       els.mapZoomReset.addEventListener("click", () => {
         if (state.map2dCameraMode === "free") resetFreeMapView();
-        else if (isMapToolActive()) resetRvizMapView();
         else setMapZoom(1);
         requestMapDraw(false);
       });
@@ -5786,137 +5301,33 @@
         setMap2dCameraMode(state.map2dCameraMode === "free" ? "follow" : "free");
       });
       if (els.mapCenterRobot) {
-        els.mapCenterRobot.addEventListener("click", () => centerRvizMapOnRobot());
+        els.mapCenterRobot.addEventListener("click", () => centerFreeMapOnRobot());
       }
       function isMap3dVisible() {
         const container = document.getElementById("map3dContainer");
         return Boolean(container && container.style.display !== "none");
       }
-      function finishGoalPick(event) {
-        if (!state.goalPickDrag) return;
-        if (state.pendingNavGoal && state.pendingNavGoal.status === "sending") {
-          state.goalPickDrag = null;
-          return;
-        }
-        const drag = state.goalPickDrag;
-        state.goalPickDrag = null;
-        const yaw = goalPickYawFromDrag(drag);
-        void dispatchNavGoal(drag.start, yaw);
-        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
-          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
-        }
-        requestMapDraw(false);
-      }
-      function disableMapTools(clearStatus) {
-        state.goalPickMode = false;
-        state.publishPointMode = false;
-        state.initialPosePickMode = false;
-        state.goalPickDrag = null;
-        state.initialPosePickDrag = null;
-        state.publishPointClick = null;
+      function resetMapInteraction(clearStatus) {
         state.mapPanDrag = null;
         syncMapToolUi();
-        if (clearStatus) updateGoalPickStatus("", "");
+        if (clearStatus) updateMapInteractionStatus("", "");
         requestMapDraw(false);
-      }
-      function finishInitialPosePick(event) {
-        if (!state.initialPosePickDrag) return;
-        const drag = state.initialPosePickDrag;
-        state.initialPosePickDrag = null;
-        const yaw = goalPickYawFromDrag(drag);
-        void dispatchInitialPose(drag.start, yaw);
-        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
-          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
-        }
-        requestMapDraw(false);
-      }
-      if (els.mapInitialPoseToggle) {
-        els.mapInitialPoseToggle.addEventListener("click", () => {
-          const next = !state.initialPosePickMode;
-          disableMapTools(false);
-          state.initialPosePickMode = next;
-          syncMapToolUi();
-          if (state.initialPosePickMode) {
-            if (state.map2dCameraMode !== "free") resetRvizMapView();
-            reevaluateCachedMapDisplay();
-            updateGoalPickStatus(
-              state.mapGrid
-                ? "2D Pose 模式：左键拖拽设初始位姿 · 中/右键平移 · 滚轮缩放"
-                : "2D Pose 已开启，但地图未显示。请先 activate_map 并启动 go2.sh。",
-              state.mapGrid ? "pending" : "error",
-            );
-          } else {
-            updateGoalPickStatus("", "");
-          }
-          requestMapDraw(false);
-        });
-      }
-      if (els.mapGoalToggle) {
-        els.mapGoalToggle.addEventListener("click", () => {
-          const next = !state.goalPickMode;
-          disableMapTools(false);
-          state.goalPickMode = next;
-          syncMapToolUi();
-          if (state.goalPickMode) {
-            if (state.map2dCameraMode !== "free") resetRvizMapView();
-            reevaluateCachedMapDisplay();
-            updateGoalPickStatus(
-              state.mapGrid
-                ? "RViz 模式：左键设目标 · 中/右键平移 · 滚轮缩放"
-                : "2D Goal 已开启，但地图未显示。请先 activate_map 并启动 go2.sh（mapping / explore / localization 均可）。",
-              state.mapGrid ? "pending" : "error",
-            );
-          } else {
-            updateGoalPickStatus("", "");
-          }
-          requestMapDraw(false);
-        });
-      }
-      if (els.mapPublishPointToggle) {
-        els.mapPublishPointToggle.addEventListener("click", () => {
-          const next = !state.publishPointMode;
-          disableMapTools(false);
-          state.publishPointMode = next;
-          syncMapToolUi();
-          if (state.publishPointMode) {
-            if (state.map2dCameraMode !== "free") resetRvizMapView();
-            reevaluateCachedMapDisplay();
-            updateGoalPickStatus(
-              state.mapGrid
-                ? "选点模式：左键发布 /clicked_point（不导航）"
-                : "选点已开启，但地图未显示。请先 activate_map 并启动 go2.sh。",
-              state.mapGrid ? "pending" : "error",
-            );
-          } else {
-            updateGoalPickStatus("", "");
-          }
-          requestMapDraw(false);
-        });
       }
       function finishMapPan(event) {
         if (!state.mapPanDrag) return;
         state.mapPanDrag = null;
-        syncGoalPickUi();
+        syncMapToolUi();
         if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
           try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
         }
-      }
-      function finishPublishPoint(event) {
-        if (!state.publishPointClick) return;
-        const click = state.publishPointClick;
-        state.publishPointClick = null;
-        if (event && event.pointerId !== undefined && els.mapCanvas.releasePointerCapture) {
-          try { els.mapCanvas.releasePointerCapture(event.pointerId); } catch (_) {}
-        }
-        void dispatchClickedPoint(click.mapPoint);
       }
       els.mapCanvas.addEventListener("contextmenu", (event) => {
-        if (isMapToolActive() || state.map2dCameraMode === "free") event.preventDefault();
+        if (state.map2dCameraMode === "free") event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
         // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
-        if (!isMap3dVisible() && event.button === 0 && !isMapToolActive()) {
+        if (!isMap3dVisible() && event.button === 0) {
           const pointer = canvasPointer(event);
           const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
           if (hit) {
@@ -5926,48 +5337,18 @@
             return;
           }
         }
-        if ((!isMapToolActive() && state.map2dCameraMode !== "free") || isMap3dVisible()) return;
+        if ((state.map2dCameraMode !== "free") || isMap3dVisible()) return;
         const pointer = canvasPointer(event);
-        if (event.button === 1 || event.button === 2 || (event.button === 0 && state.map2dCameraMode === "free" && !isMapToolActive())) {
+        if (event.button === 1 || event.button === 2 || (event.button === 0 && state.map2dCameraMode === "free")) {
           event.preventDefault();
           state.mapPanDrag = {
             pointerStart: pointer,
-            centerStart: getMapRvizViewCenter(),
+            centerStart: getFreeMapViewCenter(),
           };
           syncMapToolUi();
           if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
           return;
         }
-        if (event.button !== 0) return;
-        event.preventDefault();
-        const anchor = cameraAnchor();
-        const mapPoint = canvasToMap(pointer.x, pointer.y, anchor);
-        if (state.publishPointMode) {
-          state.publishPointClick = { pointer, anchor, mapPoint };
-          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
-          return;
-        }
-        if (state.initialPosePickMode) {
-          state.initialPosePickDrag = {
-            pointerStart: pointer,
-            pointerCurrent: pointer,
-            anchor,
-            start: mapPoint,
-            current: mapPoint,
-          };
-          if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
-          requestMapDraw(false);
-          return;
-        }
-        state.goalPickDrag = {
-          pointerStart: pointer,
-          pointerCurrent: pointer,
-          anchor,
-          start: mapPoint,
-          current: mapPoint,
-        };
-        if (els.mapCanvas.setPointerCapture) els.mapCanvas.setPointerCapture(event.pointerId);
-        requestMapDraw(false);
       });
       els.mapCanvas.addEventListener("pointermove", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
@@ -5985,18 +5366,6 @@
           requestMapDraw(false);
           return;
         }
-        if (state.initialPosePickDrag) {
-          const pointer = canvasPointer(event);
-          state.initialPosePickDrag.pointerCurrent = pointer;
-          state.initialPosePickDrag.current = canvasToMap(pointer.x, pointer.y, state.initialPosePickDrag.anchor);
-          requestMapDraw(false);
-          return;
-        }
-        if (!state.goalPickDrag) return;
-        const pointer = canvasPointer(event);
-        state.goalPickDrag.pointerCurrent = pointer;
-        state.goalPickDrag.current = canvasToMap(pointer.x, pointer.y, state.goalPickDrag.anchor);
-        requestMapDraw(false);
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
@@ -6004,15 +5373,6 @@
           finishMapPan(event);
           return;
         }
-        if (state.publishPointClick) {
-          finishPublishPoint(event);
-          return;
-        }
-        if (state.initialPosePickDrag) {
-          finishInitialPosePick(event);
-          return;
-        }
-        finishGoalPick(event);
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
@@ -6020,21 +5380,12 @@
           finishMapPan(event);
           return;
         }
-        if (state.publishPointClick) {
-          finishPublishPoint(event);
-          return;
-        }
-        if (state.initialPosePickDrag) {
-          finishInitialPosePick(event);
-          return;
-        }
-        finishGoalPick(event);
       });
       els.mapCanvas.addEventListener("wheel", (event) => {
         event.preventDefault();
-        if (isMapToolActive() || state.map2dCameraMode === "free") {
+        if (state.map2dCameraMode === "free") {
           const pointer = canvasPointer(event);
-          zoomRvizMapAt(pointer, event.deltaY < 0 ? 1.12 : 1 / 1.12);
+          zoomFreeMapAt(pointer, event.deltaY < 0 ? 1.12 : 1 / 1.12);
           requestMapDraw(false);
           return;
         }
@@ -6053,10 +5404,7 @@
         return { x: world.x, y: world.y, frame_id: navigationFrameId() };
       };
       window.__nuwaxResolveNavigationHeight = resolveNavigationHeight;
-      window.__nuwaxDisableMapTools = disableMapTools;
-      // 选点回调：navigation.js 会在启动时 monkey-patch 此函数缓存点击坐标。
-      // 这里默认 no-op；publish-point 走的是 isMapToolActive() 的现有 publishPoint 流程。
-      window.__nuwaxMapClick = window.__nuwaxMapClick || null;
+      window.__nuwaxResetMapInteraction = resetMapInteraction;
       // V2 模块互斥开关：boundary_draw.js / navigation.js 在激活时会置 true，
       // 主循环的 pointerdown/pointermove/pointerup 入口据此提前 return 让事件落到 SVG overlay。
       window.__nuwaxMapToolV2 = {
@@ -6086,7 +5434,7 @@
         };
       };
       // 禁行区使用与 canvas 完全相同的 world -> pixel 投影，包含非零地图中心、
-      // robot-locked 旋转视角、RViz 固定视角和 CSS 缩放。
+      // robot-locked 旋转视角、自由固定视角和 CSS 缩放。
       window.__nuwaxMapProject = function (worldX, worldY) {
         if (!els.mapCanvas) return null;
         const anchor = cameraAnchor();
@@ -6110,7 +5458,7 @@
       window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
       // V2 boundary freeze：boundary_draw.js 在 setDrawing(true) 时调一次取当前 anchor
       // 作冻结中心；setDrawing(false) 时清掉。cameraAnchor() 入口的 __nuwaxMapFreeze
-      // 短路优先于 usesRvizMapView() 与 pose-locked 路径。
+      // 短路优先于 usesFreeMapView() 与 pose-locked 路径。
       window.__nuwaxCameraAnchor = function () {
         return cameraAnchor();
       };
@@ -6168,7 +5516,7 @@
         const nextMode = !PLANAR_PIPELINE && mode === "3d" ? "3d" : "2d";
         state.mapViewMode = nextMode;
         updateMapStreamChip();
-        if (nextMode === "3d") disableMapTools(true);
+        if (nextMode === "3d") resetMapInteraction(true);
         syncMapViewControls();
         window.pointcloud3d?.setVisible(nextMode === "3d");
         if (nextMode === "3d") {

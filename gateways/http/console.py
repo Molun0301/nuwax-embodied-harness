@@ -6,10 +6,9 @@ import json
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from core.errors import GatewayError, as_gateway_error
+from fastapi.responses import HTMLResponse, RedirectResponse
 from core.robot_geometry import RobotGeometryError, resolve_robot_geometry
 from core.config_values import runtime_value
 from contracts.navigation_pipeline import navigation_support_distance
@@ -66,30 +65,5 @@ def build_console_router(runtime: GatewayRuntime) -> APIRouter:
     @router.get("/debug/", include_in_schema=False)
     async def previous_console_address() -> RedirectResponse:
         return RedirectResponse("/console", status_code=308)
-
-    async def dispatch(request: Request, handler) -> JSONResponse:
-        try:
-            payload = await request.json()
-        except ValueError as exc:
-            raise GatewayError("控制参数必须是有效的 JSON 对象。", error_code="invalid_params", http_status=422) from exc
-        if not isinstance(payload, dict):
-            raise GatewayError("控制参数必须是对象。", error_code="invalid_params", http_status=422)
-        try:
-            result = await run_in_threadpool(handler, payload, requested_by="console")
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
-        return JSONResponse(to_jsonable(result))
-
-    @router.post("/api/console/navigation/goal")
-    async def navigation_goal(request: Request) -> JSONResponse:
-        return await dispatch(request, runtime.dispatch_console_navigation_goal)
-
-    @router.post("/api/console/map/clicked_point")
-    async def clicked_point(request: Request) -> JSONResponse:
-        return await dispatch(request, runtime.dispatch_console_clicked_point)
-
-    @router.post("/api/console/map/initial_pose")
-    async def initial_pose(request: Request) -> JSONResponse:
-        return await dispatch(request, runtime.dispatch_console_initial_pose)
 
     return router

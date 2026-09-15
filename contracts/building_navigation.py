@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional, Tuple
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from contracts.base import ContractModel
@@ -73,8 +73,8 @@ class BuildingTopology(ContractModel):
     building_id: str = Field(min_length=1, max_length=128)
     display_name: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
-    floors: tuple[FloorRecord, ...] = Field(min_length=1, max_length=256)
-    connections: tuple[FloorConnection, ...] = Field(default=(), max_length=2048)
+    floors: Tuple[FloorRecord, ...] = Field(min_length=1, max_length=256)
+    connections: Tuple[FloorConnection, ...] = Field(default=(), max_length=2048)
 
     @model_validator(mode="after")
     def _references(self) -> "BuildingTopology":
@@ -139,7 +139,7 @@ class FloorNavigationRequest(ContractModel):
     target_manifest_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     create_target_map: bool = False
     target_pose: FloorPose
-    route: tuple[str, ...] = ()
+    route: Tuple[str, ...] = ()
     timeout_sec: float = Field(default=600.0, gt=0.0, le=7200.0)
 
     @model_validator(mode="after")
@@ -211,7 +211,7 @@ class BuildingExplorationRequest(ContractModel):
     request_id: str
     building_id: str
     topology_revision: int = Field(ge=1)
-    floors: tuple[FloorRecord, ...] = Field(min_length=1, max_length=256)
+    floors: Tuple[FloorRecord, ...] = Field(min_length=1, max_length=256)
     stop_conditions: dict = Field(default_factory=dict)
     per_floor_timeout_sec: float = Field(default=300.0, gt=0.0, le=3600.0)
     timeout_sec: float = Field(default=7200.0, gt=0.0, le=43200.0)
@@ -229,7 +229,7 @@ class BuildingExplorationState(ContractModel):
     request: BuildingExplorationRequest
     topology_revision: int
     next_floor_index: int = 0
-    completed_floors: dict[str, dict] = Field(default_factory=dict)
+    completed_floors: Dict[str, dict] = Field(default_factory=dict)
     stage: str = "accepted"
     attempt: int = 0
     owner_task_id: Optional[str] = None

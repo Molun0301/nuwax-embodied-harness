@@ -34,6 +34,7 @@ GATEWAY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
 VIDEO_STREAMER_UNIT_SOURCE="${REPO_ROOT}/drivers/go2/systemd/nuwax-go2-video-streamer.service"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
 PROVISIONER="${REPO_ROOT}/scripts/provision_motion_guard.py"
+LCM_NETWORK_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-lcm-network.service"
 LCM_PREFLIGHT="${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh"
 PROCESS_IDENTITY_HELPER="${REPO_ROOT}/scripts/systemd/process_identity.sh"
 GEOMETRY_LAUNCHER="${REPO_ROOT}/scripts/systemd/start_geometry_runtime.sh"
@@ -73,6 +74,7 @@ GATEWAY_WRITE_DIRS=(
   /var/log/nuwax/gateway
 )
 DEPLOYMENT_UNITS=(
+  nuwax-lcm-network.service
   nuwax-motion-safety-guard.service
   nuwax-nav-stack.service
   nuwax-geometry-runtime.service
@@ -282,7 +284,7 @@ check_unit_templates() {
   local unit_path=""
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-                "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+                "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
                 "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
                 "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     render_unit_to "${source}" "${rendered_dir}/$(basename "${source}")"
@@ -302,10 +304,10 @@ check_systemd_owned_invariants() {
   local unit=""
   local command=""
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-              "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
               "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
-    if [[ "${unit}" == "${RUNTIME_ACTIVATION_UNIT_SOURCE}" ]]; then
-      # 只有系统服务编排拥有方需要特权，且不能接管普通组件的共享日志目录。
+    if [[ "${unit}" == "${RUNTIME_ACTIVATION_UNIT_SOURCE}" || "${unit}" == "${LCM_NETWORK_UNIT_SOURCE}" ]]; then
+      # 系统服务编排及宿主机网络准备需要特权，不接管普通组件的共享日志目录。
       grep -qx 'User=root' "${unit}" \
         || fail "runtime activator must run as root to manage system services: ${unit}"
       ! grep -q '^LogsDirectory=' "${unit}" \
@@ -328,7 +330,7 @@ check_systemd_owned_invariants() {
     || fail "Gateway unit must expose shared /tmp for CycloneDDS and video IPC"
 
   for unit in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-              "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+              "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
               "${GATEWAY_UNIT_SOURCE}" "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     grep -q '^ExecStart=/usr/bin/env ' "${unit}" \
       || fail "ExecStart does not force systemd-owned invariants: ${unit}"
@@ -483,6 +485,8 @@ check_sources() {
   check_file "${GUARD_MODULE}"
   check_file "${PROVISIONER}"
   check_file "${LCM_PREFLIGHT}"
+  check_file "${LCM_NETWORK_UNIT_SOURCE}"
+  check_file "${REPO_ROOT}/scripts/systemd/prepare_lcm_network.py"
   check_file "${PROCESS_IDENTITY_HELPER}"
   check_file "${GEOMETRY_LAUNCHER}"
   check_file "${GEOMETRY_READY_HELPER}"
@@ -781,7 +785,7 @@ systemd_sources_changed() {
   local unit=""
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
-                "${PERSON_FOLLOW_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
+                "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
                 "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
                 "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     unit="$(basename "${source}")"
@@ -813,6 +817,20 @@ restore_systemd_state() {
   local saved=""
   [[ -f "${SYSTEMD_BACKUP_DIR}/snapshot.complete" ]] \
     || fail "systemd rollback snapshot is missing: ${SYSTEMD_BACKUP_DIR}"
+  local index state restore_lcm=false
+  # 回滚可能跨越尚无网络准备单元的旧版本，先收回当前活动或启动中的消费者。
+  for (( index=${#DEPLOYMENT_UNITS[@]}-1; index>=0; index-- )); do
+    unit="${DEPLOYMENT_UNITS[index]}"
+    state="$(systemctl show -p ActiveState --value "${unit}" 2>/dev/null || true)"
+    case "${state}" in active|activating|reloading|deactivating) systemctl stop "${unit}" ;; esac
+  done
+  while IFS=$'\t' read -r unit enabled active; do
+    if [[ "${active}" == active ]]; then
+      case "${unit}" in
+        nuwax-lcm-network.service|nuwax-host-gateway.service|nuwax-geometry-runtime.service|nuwax-nav-stack.service|nuwax-person-follow.service) restore_lcm=true ;;
+      esac
+    fi
+  done < "${SYSTEMD_BACKUP_DIR}/service-state.tsv"
   for unit in "${DEPLOYMENT_UNITS[@]}"; do
     base="/etc/systemd/system/${unit}"
     saved="${SYSTEMD_BACKUP_DIR}/units/${unit}"
@@ -835,6 +853,10 @@ restore_systemd_state() {
     fi
   done
   systemctl daemon-reload
+  if [[ "${restore_lcm}" == true ]]; then
+    # 使用当前安装器的解析器读取已恢复配置；旧发布可以没有这项新工具。
+    /usr/bin/python3 -I -S "${DEFAULT_REPO_ROOT}/scripts/systemd/prepare_lcm_network.py" --config-dir "${CONFIG_DIR}"
+  fi
   while IFS=$'\t' read -r unit enabled active; do
     case "${enabled}" in
       enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "${unit}" ;;
@@ -968,6 +990,8 @@ verify_installed() {
     --actuator-symbols-file "${INSTALLED_ACTUATOR_SYMBOLS_FILE}"
   check_record "${GUARD_STATE_DIR}/provisioned.json" 400
   check_record "${GUARD_STATE_DIR}/epoch.json" 600
+  require_always_on_unit_file_state nuwax-lcm-network.service
+  systemctl is-active --quiet nuwax-lcm-network.service || fail "本机通信网络准备未完成"
   require_always_on_unit_file_state nuwax-host-gateway.service
   systemctl is-active --quiet nuwax-host-gateway.service \
     || fail "nuwax-host-gateway.service is not active"
@@ -1058,10 +1082,11 @@ install_sources() {
   apply_systemd_tmpfiles /usr/lib/tmpfiles.d/nuwax-motion.conf
   bash "${REPO_ROOT}/scripts/configure_realtime_network.sh"
   secure_runtime_data_permissions
-  bash "${LCM_PREFLIGHT}"
+  /usr/bin/python3 -I -S "${DEFAULT_REPO_ROOT}/scripts/systemd/prepare_lcm_network.py" --config-dir "${CONFIG_DIR}" --print-url
   check_service_access
   if [[ "${sources_changed}" == "true" ]]; then
     remove_legacy_dropins
+    render_unit "${LCM_NETWORK_UNIT_SOURCE}" /etc/systemd/system/nuwax-lcm-network.service
     render_unit "${GUARD_UNIT_SOURCE}" /etc/systemd/system/nuwax-motion-safety-guard.service
     render_unit "${NAV_UNIT_SOURCE}" /etc/systemd/system/nuwax-nav-stack.service
     render_unit "${GEOMETRY_UNIT_SOURCE}" /etc/systemd/system/nuwax-geometry-runtime.service
@@ -1089,6 +1114,7 @@ enable_stack() {
   systemctl disable nuwax-geometry-runtime.service
   systemctl disable nuwax-person-follow.service
   systemctl disable nuwax-runtime-activation.service
+  systemctl enable nuwax-lcm-network.service
   systemctl enable nuwax-runtime-activation.path
   systemctl enable nuwax-host-gateway.service
   systemctl enable nuwax-go2-video-streamer.service
@@ -1107,11 +1133,9 @@ start_stack() {
   check_project_identity system
   check_service_access
 
-  systemctl stop nuwax-go2-video-streamer.service
-  systemctl stop nuwax-person-follow.service
-  systemctl stop nuwax-geometry-runtime.service
-  systemctl stop nuwax-nav-stack.service
-  systemctl stop nuwax-motion-safety-guard.service
+  # 网络选路改变前先沿正常反向顺序收回全部旧通信会话。
+  stop_stack
+  systemctl restart nuwax-lcm-network.service
   rm -f /run/nuwax/gateway/geometry.request /run/nuwax/gateway/geometry.result.json
   systemctl restart nuwax-runtime-activation.path
   systemctl restart nuwax-host-gateway.service
@@ -1129,6 +1153,8 @@ stop_stack() {
   systemctl stop nuwax-geometry-runtime.service
   systemctl stop nuwax-nav-stack.service
   systemctl stop nuwax-motion-safety-guard.service
+  systemctl stop nuwax-lcm-network.service 2>/dev/null \
+    || [[ "$(systemctl show -p LoadState --value nuwax-lcm-network.service 2>/dev/null || true)" == not-found ]]
   echo "stopped stack in reverse dependency order"
 }
 

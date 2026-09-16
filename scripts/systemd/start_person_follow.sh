@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # 先解析共同配置并统一旧通道别名，再物化启动参数。
 source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+# 严格真实通信启动须在启动业务子进程之前确认本机/外部选路条件。
+case "${NUWAX_REAL_LCM_REQUIRED:-false}" in
+  1|true|TRUE|yes|YES|on|ON) bash "${SCRIPT_DIR}/check_lcm_multicast.sh" ;;
+esac
+
 IDENTITY_HELPER="${SCRIPT_DIR}/process_identity.sh"
 BINARY="${NUWAX_PERSON_FOLLOW_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-person-follow}"
 READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-/run/nuwax/person-follow/nuwax_person_follow.ready}"

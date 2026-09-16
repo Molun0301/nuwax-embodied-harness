@@ -56,8 +56,20 @@ class PackedOccupancyCells(Sequence):
 
     @cached_property
     def canonical_json(self):
-        # 仅整数数组采用编译序列化器；格式与原紧凑JSON逐字节一致。
-        return _INTEGER_ARRAY.dump_json(self.to_list())
+        # 整张大图的编译编码会长时间独占解释器，阻塞同进程的惯性采集。
+        # 按固定单元数限制每次展开/编码的工作量；格式和缓存身份仍与原紧凑JSON一致。
+        cells = np.frombuffer(self.raw, dtype=np.int8)
+        chunk_cells = 16384
+        if len(cells) <= chunk_cells:
+            return _INTEGER_ARRAY.dump_json(cells.tolist())
+        parts = [b"["]
+        for start in range(0, len(cells), chunk_cells):
+            if start:
+                parts.append(b",")
+            encoded = _INTEGER_ARRAY.dump_json(cells[start:start + chunk_cells].tolist())
+            parts.append(encoded[1:-1])
+        parts.append(b"]")
+        return b"".join(parts)
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):

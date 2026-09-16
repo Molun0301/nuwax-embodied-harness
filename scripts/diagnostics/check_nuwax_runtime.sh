@@ -217,7 +217,7 @@ else
 fi
 
 bar "9. LCM roundtrip (Phase 8 §12.6 硬约束)"
-LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
 if ! bash "${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh" "${LCM_URL}"; then
   nr "multicast route/interface 未就绪"
 elif ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --modversion lcm >/dev/null 2>&1; then

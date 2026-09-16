@@ -537,7 +537,7 @@ start_nav_stack() {
 
   local launcher="${REPO_ROOT}/scripts/systemd/start_nav_stack.sh"
   export NUWAX_NAV_STACK_READY_FILE="${NUWAX_NAV_STACK_READY_FILE:-${REPO_ROOT}/runtime_data/navigation/nuwax_nav_stack.ready}"
-  export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+  export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
   echo "starting nuwax-nav-stack（导航配置由建图执行链确定）"
   (run_with_title "nuwax-nav-stack-launcher" bash "${launcher}") &
   NAV_STACK_PID="$!"
@@ -578,7 +578,7 @@ start_geometry_runtime() {
     source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
     export NUWAX_GEOMETRY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
     export NUWAX_GEOMETRY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
-    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
     export NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL:-${NUWAX_LCM_CHANNEL_POINTCLOUD:-/go2/lidar/points#sensor_msgs.PointCloud2}}"
     export NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL:-${NUWAX_LCM_CHANNEL_CLOUD_MAP:-/cloud_map#sensor_msgs.PointCloud2}}"
     export NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL="${NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL:-${NUWAX_LCM_CHANNEL_GOAL_POSE:-/nav/goal#nuwax_msgs.GoalEnvelope}}"
@@ -631,7 +631,7 @@ start_person_follow() {
     export NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL="${PERSON_FOLLOW_COMMAND_CHANNEL}"
     export NUWAX_PERSON_FOLLOW_READY_FILE="${NUWAX_PERSON_FOLLOW_READY_FILE:-${REPO_ROOT}/runtime_data/person-follow/nuwax_person_follow.ready}"
     export NUWAX_PERSON_FOLLOW_BINARY="${binary}"
-    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}"
+    export NUWAX_LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
     run_with_title "nuwax-person-follow-launcher" bash "${launcher}"
   ) &
   PERSON_FOLLOW_PID="$!"
@@ -1230,6 +1230,11 @@ esac
 
 if is_truthy "${NUWAX_GEOMETRY_ENABLED:-true}"; then
   source_runtime_script "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+fi
+
+# 非systemd启动也沿同一只读预检，网络准备失败时不创建旧接口上的通信会话。
+if is_truthy "${NUWAX_REAL_LCM_REQUIRED:-false}"; then
+  bash "${REPO_ROOT}/scripts/systemd/check_lcm_multicast.sh"
 fi
 
 export PYTHONUNBUFFERED=1

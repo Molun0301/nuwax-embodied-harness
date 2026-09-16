@@ -7730,7 +7730,7 @@ pub(crate) fn prepare_geometry_runtime_for_pipeline(
     let real_lcm_required = real_lcm_required_from_env();
     let (transport, backend_available): (LcmTransport, bool) = {
         let lcm_url = std::env::var("NUWAX_LCM_URL")
-            .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=1".to_owned());
+            .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".to_owned());
         #[cfg(feature = "real-lcm-bridge")]
         {
             match attempt_real_lcm_startup(real_lcm_required, || LcmTransport::new_real(&lcm_url)) {
@@ -11461,7 +11461,7 @@ pub fn test_lcm_url() -> String {
     let pid = std::process::id() as u64;
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let port = (pid * 10_000 + counter) % 60_000 + 7_667; // [7667, 67666]
-    format!("udpm://239.255.76.67:{}?ttl=1", port)
+    format!("udpm://239.255.76.67:{}?ttl=0", port)
 }
 
 /// 单元测试 helper:构造一个最简 `GeometryRuntimeHandle`。
@@ -19346,7 +19346,7 @@ mod exploration_lcm_smoke_tests {
 
         let provider = test_lcm_url();
         assert!(provider.starts_with("udpm://239.255.76.67:"));
-        assert!(provider.ends_with("?ttl=1"));
+        assert!(provider.ends_with("?ttl=0"));
         let publisher = LcmTransport::new_real(&provider)
             .expect("real LCM publisher context; install liblcm-dev to run this smoke");
         let subscriber =

@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from drivers.registry import ROBOT_DRIVER_REGISTRY
+from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_root_lcm_url
 ROOT_ENV_TEMPLATE = PROJECT_ROOT / ".env.example"
 ROOT_ENV_TARGET = PROJECT_ROOT / ".env"
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_gateway.sh"
@@ -262,7 +263,8 @@ def _read_existing_env(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
     values: Dict[str, str] = {}
-    for raw_line in _read_text(path).splitlines():
+    source = _read_text(path)
+    for raw_line in source.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -270,6 +272,13 @@ def _read_existing_env(path: Path) -> Dict[str, str]:
         key = key.strip()
         if key:
             values[key] = value.strip().strip("\"'")
+    # 地址迁移使用运行时同一语法，避免引号后注释被误当成自定义地址。
+    lcm_url = lcm_url_from_env_text(source)
+    if lcm_url is not None:
+        for key in tuple(values):
+            if key.startswith("export ") and key[7:].strip() == "NUWAX_LCM_URL":
+                del values[key]
+        values["NUWAX_LCM_URL"] = lcm_url
     return values
 
 
@@ -368,7 +377,7 @@ class BootstrapPlanner:
             "NUWAX_GEOMETRY_RUNTIME_BINARY": str(PROJECT_ROOT / "services" / "geometry" / "nuwax_geometry_runtime" / "target" / "release" / "nuwax-geometry-runtime"),
             "NUWAX_GEOMETRY_RUNTIME_PORT": "50051",
             "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(PROJECT_ROOT / "runtime_data" / "geometry" / "nuwax_geometry_runtime.ready"),
-            "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=1",
+            "NUWAX_LCM_URL": migrated_root_lcm_url(self.root_existing.get("NUWAX_LCM_URL")),
             "NUWAX_LCM_BACKEND": "real-lcm",
             "NUWAX_LCM_CHANNEL_ODOM": "/odom",
             "NUWAX_LCM_CHANNEL_TF": "/tf",
@@ -850,7 +859,8 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
         LogsDirectoryMode=0750
         UMask=0007
         Environment=PYTHONUNBUFFERED=1
-        EnvironmentFile=-{PROJECT_ROOT}/.env
+        Environment={json.dumps("NUWAX_BOOTSTRAP_ENV_FILE=" + str(planner.root_target).replace("%", "%%"), ensure_ascii=False)}
+        EnvironmentFile={json.dumps("-" + str(planner.root_target).replace("%", "%%"), ensure_ascii=False)}
         Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock
         Environment=NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true
         Environment=NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready
@@ -874,7 +884,7 @@ def write_systemd_example(planner: BootstrapPlanner) -> Path:
         Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
         Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
         ExecStartPre=/usr/bin/env NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=15 /bin/bash {PROJECT_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh check
-        ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true "NUWAX_LCM_URL=udpm://239.255.76.67:7667?ttl=1" NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" /bin/bash {START_SCRIPT}
+        ExecStart=/usr/bin/env NUWAX_LCM_BACKEND=real-lcm NUWAX_REAL_LCM_REQUIRED=true NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_NAV_STACK_READY_FILE=/run/nuwax/navigation/nuwax_nav_stack.ready NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_READY_FILE=/run/nuwax/geometry/nuwax_geometry_runtime.ready NUWAX_GEOMETRY_RUNTIME_PORT=50051 NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT=30 NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_LCM_CHANNEL_GOAL_POSE=/nav/goal#nuwax_msgs.GoalEnvelope" "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL=/nav/path#nuwax_msgs.PathEnvelope" "NUWAX_LCM_CHANNEL_NAV_PATH=/nav/path#nuwax_msgs.PathEnvelope" /bin/bash {START_SCRIPT}
         Restart=on-failure
         RestartSec=3
         TimeoutStopSec=20

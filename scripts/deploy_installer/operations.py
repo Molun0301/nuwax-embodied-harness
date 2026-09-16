@@ -20,6 +20,7 @@ from typing import Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, TYPE_CHE
 from .config import atomic_write, fsync_directory, render_env
 from .profile import profile_sha256
 from .runner import resolve_build_account, source_user_command, source_user_environment
+from scripts.systemd.prepare_lcm_network import lcm_url_from_env_text, migrated_root_lcm_url
 
 if TYPE_CHECKING:
     from .engine import ExecutionContext
@@ -3536,6 +3537,7 @@ def write_configuration(context: "ExecutionContext") -> None:
         _migrate_legacy_runtime_data(context, root_source)
     managed = {
         "NUWAX_ACTIVE_ROBOT": context.profile.robot,
+        "NUWAX_LCM_URL": migrated_root_lcm_url(lcm_url_from_env_text(root_source)),
         "NUWAX_PYTHON_BIN": str(options.current_link / ".venv" / "bin" / "python"),
         "NUWAX_GATEWAY_HOST": options.gateway_host,
         "NUWAX_NUWAX_WORKSPACE_DIR": str(options.current_link / "services" / "nuwax-workspace"),
@@ -3845,6 +3847,26 @@ def verify_deployment(context: "ExecutionContext") -> None:
             env=_deployment_env(context, active_release=True),
             timeout=600,
         )
+    # 父进程有权限读取运行配置，探针只接收已校验的最终地址。
+    resolver_path = active_release / "scripts" / "systemd" / "prepare_lcm_network.py"
+    if not resolver_path.exists() and not resolver_path.is_symlink():
+        # 正式回滚可选择尚未带此工具的旧发布，沿当前安装器的同一配置解析规则验证。
+        resolver_path = Path(__file__).resolve().parents[1] / "systemd" / "prepare_lcm_network.py"
+    resolver = _require_file(
+        resolver_path,
+        "active release LCM configuration resolver",
+    )
+    resolved_url = subprocess.run(
+        ("/usr/bin/python3", "-I", "-S", str(resolver),
+         "--config-dir", str(context.options.config_dir), "--print-url"),
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    if resolved_url.returncode != 0:
+        raise DeploymentError("实际LCM配置解析或校验失败：" + resolved_url.stderr.strip())
+    lcm_url = resolved_url.stdout.strip()
+    if not lcm_url.startswith("udpm://") or any(char.isspace() for char in lcm_url):
+        raise DeploymentError("LCM配置解析器未返回唯一地址")
     context.runner.run(
         (
             str(context.options.current_link / ".venv" / "bin" / "python"),
@@ -3854,7 +3876,7 @@ def verify_deployment(context: "ExecutionContext") -> None:
         cwd=context.options.current_link,
         env={
             **_build_user_env(context),
-            "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=1",
+            "NUWAX_LCM_URL": lcm_url,
         },
         as_build_user=True,
         timeout=30,

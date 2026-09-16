@@ -88,7 +88,7 @@ impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
             provider_url: std::env::var("NUWAX_LCM_URL")
-                .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=1".into()),
+                .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into()),
             topics: WorkerTopics::default(),
             backend_id: std::env::var("NUWAX_MLS_BACKEND_ID").unwrap_or_else(|_| "mls3d".into()),
             backend_generation: 1,

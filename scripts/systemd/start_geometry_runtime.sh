@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # 先解析共同配置并统一旧通道别名，再物化启动参数。
 source "${REPO_ROOT}/services/geometry/source_runtime_env.sh"
+# 严格真实通信启动须在启动业务子进程之前确认本机/外部选路条件。
+case "${NUWAX_REAL_LCM_REQUIRED:-false}" in
+  1|true|TRUE|yes|YES|on|ON) bash "${SCRIPT_DIR}/check_lcm_multicast.sh" ;;
+esac
+
 # 模型/手填设置只在启动时解析，两个进程消费同一机体坐标外形。
 NUWAX_ROBOT_GEOMETRY_JSON="$("${NUWAX_PYTHON_BIN:-python3}" "${REPO_ROOT}/scripts/resolve_robot_geometry.py")"
 export NUWAX_ROBOT_GEOMETRY_JSON

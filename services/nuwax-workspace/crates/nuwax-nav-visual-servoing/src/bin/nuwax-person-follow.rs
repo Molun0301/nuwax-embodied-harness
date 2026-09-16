@@ -9,7 +9,7 @@ use nuwax_nav_visual_servoing::lcm_owner::{
 };
 use nuwax_transport::LcmTransport;
 
-const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
+const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
 const INTERNAL_READY_FILE_ENV: &str = "NUWAX_PERSON_FOLLOW_INTERNAL_READY_FILE";
 
 struct InternalReadyMarker {

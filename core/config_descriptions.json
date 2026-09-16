@@ -39,7 +39,7 @@
   "NUWAX_PERCEPTION_YOLO_WORLD_ALIASES": "检测类别的别名列表，使用逗号分隔；留空表示不增加别名。",
   "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": "模型文件后缀即推理链路：.pt → PyTorch(YOLOWorld 开放词汇)；.engine → TensorRT(YOLO，类别固化)",
   "NUWAX_LCM_BACKEND": "LCM 后端选择（只接受 real-lcm；其它非空值会在配置加载时直接报错）",
-  "NUWAX_LCM_URL": "LCM·多播 URL（必须 udpm:// 协议,默认 udpm://239.255.76.67:7667?ttl=1,settings.py:build_default_lcm_url）",
+  "NUWAX_LCM_URL": "LCM·多播 URL（必须 udpm:// 协议,默认 udpm://239.255.76.67:7667?ttl=0,settings.py:build_default_lcm_url）",
   "NUWAX_REAL_LCM_REQUIRED": "是否强制要求 real-lcm backend；true 时 liblcm 或 multicast 不可用会令进程启动失败。",
   "NUWAX_LCM_CHANNEL_POSE_STAMPED": "位姿消息通道，可使用“/话题#消息类型”形式。",
   "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV": "声明几何运行时是否提供导航能力。",

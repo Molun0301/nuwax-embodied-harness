@@ -216,7 +216,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
-            provider_url: "udpm://239.255.76.67:7667?ttl=1".into(),
+            provider_url: "udpm://239.255.76.67:7667?ttl=0".into(),
             topics: WorkerTopics::default(),
             planner: FarCoreConfig::default(),
             plan_timeout: Duration::from_secs(2),

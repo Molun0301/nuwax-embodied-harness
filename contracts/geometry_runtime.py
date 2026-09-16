@@ -45,7 +45,7 @@ def build_default_geometry_runtime_port() -> int:
 def build_default_lcm_url() -> str:
     """返回默认 LCM UDP multicast URL（real-lcm backend 启用时生效）。"""
 
-    return "udpm://239.255.76.67:7667?ttl=1"
+    return "udpm://239.255.76.67:7667?ttl=0"
 
 
 def build_default_nuwax_workspace_dir() -> str:

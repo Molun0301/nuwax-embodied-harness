@@ -83,7 +83,7 @@ use crate::error::{NavStackError, NavStackResult};
 use crate::graph::ModuleNode;
 use crate::runner::InProcessNode;
 
-const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=1";
+const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 static FAR_READY_GENERATION: AtomicI64 = AtomicI64::new(0);

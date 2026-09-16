@@ -37,7 +37,7 @@ impl SurfaceMapCache {
             fine_observed_root: None,
             observations: None,
             lcm_url: std::env::var("NUWAX_LCM_URL")
-                .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=1".into()),
+                .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into()),
         }
     }
 

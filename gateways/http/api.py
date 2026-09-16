@@ -8,7 +8,7 @@ from typing import Dict, Optional, Any
 from fastapi import APIRouter, Query
 from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,7 +20,7 @@ from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary
 from gateways.runtime import GatewayRuntime
-from gateways.serialization import to_jsonable
+from gateways.serialization import to_jsonable, to_map_json_bytes
 from core import config_io
 from skills.handlers import localization_skills
 from skills.handlers import memory_skills
@@ -680,40 +680,38 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return await run_in_threadpool(submit)
 
 
-    @router.get("/api/maps/catalog")
-    def api_maps_catalog(request: Request) -> Dict[str, Any]:
-        return {
-            "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
-            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-        }
+    @router.get("/api/maps/catalog", response_model=Dict[str, Any])
+    def api_maps_catalog(request: Request) -> Response:
+        return Response(to_map_json_bytes({
+            "maps": runtime.map_workspace_service.list_maps(),
+            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
+        }), media_type="application/json")
 
-    @router.post("/api/maps/catalog")
-    async def api_maps_catalog_create(request: Request) -> Dict[str, Any]:
+    @router.post("/api/maps/catalog", response_model=Dict[str, Any])
+    async def api_maps_catalog_create(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
         map_name = str(payload.get("map_name", "")).strip()
         def submit():
-            return {
-                "map_asset": to_jsonable(
-                    runtime.map_workspace_service.create_map(
-                        map_name=map_name,
-                        metadata={"requested_by": "http_api"},
-                    )
+            return Response(to_map_json_bytes({
+                "map_asset": runtime.map_workspace_service.create_map(
+                    map_name=map_name,
+                    metadata={"requested_by": "http_api"},
                 ),
-                "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
-                "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-            }
+                "maps": runtime.map_workspace_service.list_maps(),
+                "active_workspace": runtime.map_workspace_service.get_active_workspace(),
+            }), media_type="application/json")
 
         return await run_in_threadpool(submit)
 
 
-    @router.delete("/api/maps/catalog/{map_name}")
+    @router.delete("/api/maps/catalog/{map_name}", response_model=Dict[str, Any])
     def api_maps_catalog_delete(
         map_name: str,
         request: Request,
         delete_memory_library: Optional[bool] = None,
-    ) -> Dict[str, Any]:
+    ) -> Response:
         delete_result = runtime.map_workspace_service.delete_map(
             map_name=map_name,
             delete_memory_library=(
@@ -724,14 +722,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         )
         if bool(delete_result.get("was_active")):
             runtime._sync_perception_runtime_for_memory_state(enabled=False)
-        return {
-            "delete_result": to_jsonable(delete_result),
-            "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
-            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-        }
+        return Response(to_map_json_bytes({
+            "delete_result": delete_result,
+            "maps": runtime.map_workspace_service.list_maps(),
+            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
+        }), media_type="application/json")
 
-    @router.post("/api/maps/activate")
-    async def api_maps_activate(request: Request) -> Dict[str, Any]:
+    @router.post("/api/maps/activate", response_model=Dict[str, Any])
+    async def api_maps_activate(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
@@ -745,37 +743,38 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                 metadata={"requested_by": "http_api"},
             )
             runtime._sync_perception_runtime_for_memory_state(enabled=True)
-            return {
-                "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace() or active_workspace),
-                "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
-                "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
-            }
+            return Response(to_map_json_bytes({
+                "active_workspace": runtime.map_workspace_service.get_active_workspace() or active_workspace,
+                "maps": runtime.map_workspace_service.list_maps(),
+                "memory_summary": runtime.memory_service.get_summary(),
+            }), media_type="application/json")
 
         return await run_in_threadpool(submit)
 
 
-    @router.get("/api/maps/active")
-    async def api_maps_active(request: Request) -> Dict[str, Any]:
-        return await run_in_threadpool(lambda: {
-            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-        })
+    @router.get("/api/maps/active", response_model=Dict[str, Any])
+    async def api_maps_active(request: Request) -> Response:
+        return await run_in_threadpool(lambda: Response(to_map_json_bytes({
+            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
+        }), media_type="application/json"))
 
-    @router.post("/api/maps/finalize")
-    async def api_maps_finalize(request: Request) -> Dict[str, Any]:
+    @router.post("/api/maps/finalize", response_model=Dict[str, Any])
+    async def api_maps_finalize(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        result = await run_in_threadpool(
-            lambda: localization_skills.handle_finalize_active_map(
+        def submit():
+            result = localization_skills.handle_finalize_active_map(
                 runtime._skill_ctx,
                 payload,
                 requested_by="http_api",
             )
-        )
-        return {
-            "map_asset_bundle": to_jsonable(result["map_asset_bundle"]),
-            "active_workspace": to_jsonable(result["active_workspace"]),
-        }
+            return Response(to_map_json_bytes({
+                "map_asset_bundle": result["map_asset_bundle"],
+                "active_workspace": result["active_workspace"],
+            }), media_type="application/json")
+
+        return await run_in_threadpool(submit)
 
 
     @router.get("/api/navigation/forbidden-zones")
@@ -1012,21 +1011,21 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         return await run_in_threadpool(submit)
 
 
-    @router.delete("/api/memory/libraries/{library_name}")
-    def api_delete_memory_library(library_name: str, request: Request) -> Dict[str, Any]:
+    @router.delete("/api/memory/libraries/{library_name}", response_model=Dict[str, Any])
+    def api_delete_memory_library(library_name: str, request: Request) -> Response:
         active_workspace = runtime.map_workspace_service.get_active_workspace()
         delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
         if active_workspace is not None and active_workspace.active_map_name == library_name:
             runtime.map_workspace_service.clear_active_map(disable_memory_library=False)
         if bool(delete_result.get("was_active")):
             runtime._sync_perception_runtime_for_memory_state(enabled=False)
-        return {
-            "delete_result": to_jsonable(delete_result),
-            "maps": to_jsonable(runtime.map_workspace_service.list_maps()),
-            "active_workspace": to_jsonable(runtime.map_workspace_service.get_active_workspace()),
-            "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
-            "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
-        }
+        return Response(to_map_json_bytes({
+            "delete_result": delete_result,
+            "maps": runtime.map_workspace_service.list_maps(),
+            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
+            "libraries": runtime.memory_service.list_memory_libraries(),
+            "memory_summary": runtime.memory_service.get_summary(),
+        }), media_type="application/json")
 
     @router.get("/api/memory/locations")
     def api_memory_locations(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:

@@ -425,7 +425,7 @@ impl StartupPreflight {
                 provider
             }
             Ok(_) => return Err("CORRECTION_PREFLIGHT_FAILED invalid LCM provider".to_owned()),
-            Err(std::env::VarError::NotPresent) => "udpm://239.255.76.67:7667?ttl=1".to_owned(),
+            Err(std::env::VarError::NotPresent) => "udpm://239.255.76.67:7667?ttl=0".to_owned(),
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err("CORRECTION_PREFLIGHT_FAILED LCM provider is not Unicode".to_owned());
             }

@@ -12,7 +12,7 @@ def main() -> int:
     except ImportError as exc:
         print(f"LCM probe cannot import lcm: {exc}", file=sys.stderr)
         return 2
-    url = os.environ.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=1")
+    url = os.environ.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0")
     channel = f"NUWAX_INSTALL_PROBE_{os.getpid()}_{secrets.token_hex(4)}"
     payload = secrets.token_bytes(32)
     received = []

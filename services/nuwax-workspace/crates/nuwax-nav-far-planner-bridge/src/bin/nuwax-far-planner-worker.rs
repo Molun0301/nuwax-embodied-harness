@@ -42,7 +42,7 @@ async fn run() -> Result<(), String> {
     let samples_per_obstacle = optional_env_usize("NUWAX_FAR_SAMPLES_PER_OBSTACLE")?
         .unwrap_or(FarCoreConfig::default().samples_per_obstacle);
     let provider_url = std::env::var("LCM_DEFAULT_URL")
-        .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=1".into());
+        .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into());
     let backend_id =
         std::env::var("NUWAX_FAR_BACKEND_ID").unwrap_or_else(|_| "far-visibility-graph".into());
 

@@ -4,6 +4,7 @@
 
 pub mod mid360_pcap;
 pub mod native;
+pub mod pointlio_options;
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};

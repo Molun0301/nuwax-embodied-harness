@@ -10444,7 +10444,7 @@ class GatewayRuntime:
                 "native_lio_settings": {key: runtime_value(key, "") for key in (
                     "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
                     "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
-                    "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS",
+                    "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS", "NUWAX_GEOMETRY_POINTLIO_OPTIONS",
                 )},
             })
             bridge.recording_sink = recorder

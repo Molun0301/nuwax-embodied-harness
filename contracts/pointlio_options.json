@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "parameters": {
+    "use_imu_as_input": {
+      "type": "bool"
+    },
+    "prop_at_freq_of_imu": {
+      "type": "bool"
+    },
+    "check_satu": {
+      "type": "bool"
+    },
+    "space_down_sample": {
+      "type": "bool"
+    },
+    "imu_en": {
+      "type": "bool"
+    },
+    "start_in_aggressive_motion": {
+      "type": "bool"
+    },
+    "extrinsic_est_en": {
+      "type": "bool"
+    },
+    "gravity_align": {
+      "type": "bool"
+    },
+    "publish_odometry_without_downsample": {
+      "type": "bool"
+    },
+    "point_filter_num": {
+      "type": "int",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "init_map_size": {
+      "type": "int",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "blind": {
+      "type": "number",
+      "minimum": 0
+    },
+    "det_range": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "satu_acc": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "satu_gyro": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "acc_norm": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "plane_thr": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "ivox_grid_resolution": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "imu_time_inte": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "lidar_meas_cov": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "imu_meas_acc_cov": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "imu_meas_omg_cov": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "match_s": {
+      "type": "number",
+      "exclusive_minimum": 0
+    },
+    "acc_cov_input": {
+      "type": "number",
+      "minimum": 0
+    },
+    "gyr_cov_input": {
+      "type": "number",
+      "minimum": 0
+    },
+    "acc_cov_output": {
+      "type": "number",
+      "minimum": 0
+    },
+    "gyr_cov_output": {
+      "type": "number",
+      "minimum": 0
+    },
+    "vel_cov": {
+      "type": "number",
+      "minimum": 0
+    },
+    "b_acc_cov": {
+      "type": "number",
+      "minimum": 0
+    },
+    "b_gyr_cov": {
+      "type": "number",
+      "minimum": 0
+    },
+    "gravity": {
+      "type": "vector3"
+    },
+    "gravity_init": {
+      "type": "vector3"
+    },
+    "ivox_nearby_type": {
+      "type": "enum",
+      "choices": [
+        "center",
+        "nearby6",
+        "nearby18",
+        "nearby26"
+      ]
+    }
+  },
+  "unsupported": {
+    "time_lag_imu_to_lidar": "规范输入在进入测量组装器前必须完成时钟标定，当前不支持在内核再偏移时间",
+    "con_frame": "规范输入的扫描边界由来源声明，当前不提供内核合帧设置",
+    "con_frame_num": "同con_frame",
+    "cut_frame": "规范输入当前按完整扫描配对，不提供内核切帧设置",
+    "cut_frame_time_interval": "同cut_frame",
+    "lidar_type": "当前采用规范XYZ及纳秒点时间入口，不通过雷达类型选择消息格式",
+    "timestamp_unit": "规范offset_ns固定为纳秒",
+    "scan_line": "规范输入未提供真实雷达线号",
+    "scan_rate": "真实逐点时间已明确，不按扫描频率生成时间",
+    "cube_side_length": "当前Point地图无此立方裁剪实现",
+    "fov_degree": "当前Point地图无此视场裁剪实现",
+    "msr_freq": "当前Point内核没有此计时器",
+    "odom_only": "当前Point内核无此独立模式",
+    "filter_size_surf": "使用NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M",
+    "filter_size_map": "使用NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
+    "initial_map_frames": "使用NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES",
+    "extrinsic_t": "使用NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR",
+    "extrinsic_r": "使用NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR"
+  }
+}

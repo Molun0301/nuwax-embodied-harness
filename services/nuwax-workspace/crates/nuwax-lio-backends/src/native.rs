@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
+use crate::pointlio_options::PointLioOptions;
 
 pub const LIDAR_TOPIC: &str = "/lidar#sensor_msgs.PointCloud2";
 pub const ODOMETRY_TOPIC: &str = "/odometry#nav_msgs.Odometry";
@@ -104,6 +105,12 @@ pub struct NativeLioConfig {
     /// 初图最少有效扫描数；Point仍同时遵守原有点数门及静止初始化前提。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_map_frames: Option<u32>,
+    /// Point专用参数，已在共享契约中校验，不能任意注入启动参数。
+    #[serde(default, skip_serializing_if = "PointLioOptions::is_empty")]
+    pub pointlio_options: PointLioOptions,
+    /// 惯性测量原点在机体坐标中的位置；仅Point当前接口消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu_origin_in_body_m: Option<[f64; 3]>,
 }
 
 impl NativeLioConfig {
@@ -128,10 +135,20 @@ impl NativeLioConfig {
             scan_voxel_size_m: None,
             map_voxel_size_m: None,
             initial_map_frames: None,
+            pointlio_options: PointLioOptions::default(),
+            imu_origin_in_body_m: None,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.pointlio_options.validate()?;
+        if self.backend != NativeBackend::PointLio
+            && (!self.pointlio_options.is_empty() || self.imu_origin_in_body_m.is_some()) {
+            return Err("Point专用参数不能传给其他后端".into());
+        }
+        if self.imu_origin_in_body_m.is_some_and(|p| !p.iter().all(|v| v.is_finite())) {
+            return Err("惯性原点必须为有限三维坐标".into());
+        }
         validate_typed_topic(&self.lidar_topic, "sensor_msgs.PointCloud2", "lidar_topic")?;
         validate_typed_topic(&self.odometry_topic, "nav_msgs.Odometry", "odometry_topic")?;
         if let Some(topic) = &self.input_lidar_topic {
@@ -223,6 +240,10 @@ impl NativeLioConfig {
         }
         if let Some(value) = self.initial_map_frames {
             args.extend(["--initial_map_frames".to_owned(), value.to_string()]);
+        }
+        args.extend(self.pointlio_options.render_args()?);
+        if let Some(origin) = self.imu_origin_in_body_m {
+            args.extend(["--imu_origin_in_body".to_owned(), render_numbers(&origin)]);
         }
         if let (Some(input_lidar), Some(input_imu)) =
             (&self.input_lidar_topic, &self.input_imu_topic)

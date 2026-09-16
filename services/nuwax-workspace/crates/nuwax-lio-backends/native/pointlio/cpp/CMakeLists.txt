@@ -76,9 +76,10 @@ set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-initial-map-frames.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-static-bias-initialization.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-scan-output-deskew.patch"
-  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-voxel-membership.patch")
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-voxel-membership.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-parameter-wiring.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
-foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp)
+foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp parameters.cpp)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
     "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
@@ -179,7 +180,7 @@ add_executable(pointlio_native
   main.cpp
   ${FASTLIO_SOURCE_DIR}/src/preprocess.cpp
   ${POINTLIO_PATCHED_DIR}/src/Estimator.cpp
-  ${FASTLIO_SOURCE_DIR}/src/parameters.cpp
+  ${POINTLIO_PATCHED_DIR}/src/parameters.cpp
 )
 
 

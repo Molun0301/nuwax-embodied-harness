@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use nalgebra::{Matrix3, Point3, Vector3};
 use nuwax_codec::lcm::lio::{LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO};
 use nuwax_lio_backends::native::{NativeBackend, NativeLioConfig, NativeRuntimeSpec};
+use nuwax_lio_backends::pointlio_options::{PointLioOptions, POINTLIO_OPTIONS_ENV};
 use nuwax_protocol::{LcmMessageType, LcmTopic};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -30,6 +31,7 @@ pub(crate) const PAIR_MAX_SKEW_MS_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MA
 const SCAN_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M";
 const MAP_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M";
 const INITIAL_MAP_FRAMES_ENV: &str = "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES";
+const BODY_FROM_IMU_ENV: &str = "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU";
 
 const LCM_URL_ENV: &str = "NUWAX_LCM_URL";
 const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
@@ -201,6 +203,16 @@ impl NativeLioPreflight {
         native_config.scan_voxel_size_m = optional_number_env(SCAN_VOXEL_SIZE_M_ENV)?;
         native_config.map_voxel_size_m = optional_number_env(MAP_VOXEL_SIZE_M_ENV)?;
         native_config.initial_map_frames = optional_number_env(INITIAL_MAP_FRAMES_ENV)?;
+        if backend == NativeBackend::PointLio {
+            native_config.pointlio_options = PointLioOptions::from_json(
+                &env::var(POINTLIO_OPTIONS_ENV).unwrap_or_default(),
+            )?;
+            // 原点必须来自与数据面同一份显式标定，不能把雷达平移当作惯性平移。
+            let imu = BodyFromSensorTransform::from_json_for_env(
+                &required_env(BODY_FROM_IMU_ENV)?, BODY_FROM_IMU_ENV,
+            )?;
+            native_config.imu_origin_in_body_m = Some(imu.translation_m());
+        }
         native_config.validate().map_err(|error| {
             format!("NATIVE_LIO_PREFLIGHT_FAILED invalid native sampling config: {error}")
         })?;
@@ -320,7 +332,7 @@ fn validate_native_backend_identity(
 
     let expected = match backend {
         NativeBackend::FastLio2 => "nuwax-native-lio-v1:fastlio2",
-        NativeBackend::PointLio => "nuwax-native-lio-v1:pointlio",
+        NativeBackend::PointLio => "nuwax-native-lio-v2:pointlio",
     };
     let failure = |reason: String| format!(
         "NATIVE_LIO_PREFLIGHT_FAILED backend_identity path={} expected={expected} {reason}; rebuild the selected native backend or correct {NATIVE_EXECUTABLE_ENV}",
@@ -1102,7 +1114,8 @@ mod tests {
                 NativeBackend::FastLio2 => "fastlio2",
                 NativeBackend::PointLio => "pointlio",
             };
-            Self::new(&format!("[ \"$1\" = --nuwax-lio-contract ] || exit 9\nprintf 'nuwax-native-lio-v1:{tag}\\n'"))
+            let version = if backend == NativeBackend::PointLio { 2 } else { 1 };
+            Self::new(&format!("[ \"$1\" = --nuwax-lio-contract ] || exit 9\nprintf 'nuwax-native-lio-v{version}:{tag}\\n'"))
         }
     }
 
@@ -1119,6 +1132,8 @@ mod tests {
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, Some(shell)),
             (BODY_FROM_SENSOR_ENV, Some(rotated_json())),
+            (BODY_FROM_IMU_ENV, Some(identity_json())),
+            (POINTLIO_OPTIONS_ENV, None),
             (LCM_URL_ENV, Some("memq://native-lio-test")),
             (PRIVATE_PREFIX_ENV, Some("/g13")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1234")),
@@ -1145,10 +1160,47 @@ mod tests {
     }
 
     #[test]
+    fn point_options_and_imu_origin_are_captured_before_binding() {
+        let probe = ProbeExecutable::for_backend(NativeBackend::PointLio);
+        let imu = r#"{"translation_m":[0.1,-0.2,0.3],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#;
+        let (_lock, _env) = EnvRestore::set(&[
+            (NATIVE_EXECUTABLE_ENV, probe.0.to_str()),
+            (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+            (BODY_FROM_IMU_ENV, Some(imu)),
+            (POINTLIO_OPTIONS_ENV, Some(r#"{"point_filter_num":1,"lidar_meas_cov":0.001,"publish_odometry_without_downsample":true}"#)),
+            (LCM_URL_ENV, Some("memq://point-options")),
+            (PRIVATE_PREFIX_ENV, Some("/point")),
+        ]);
+        let captured = NativeLioPreflight::from_env(NativeBackend::PointLio).unwrap();
+        env::set_var(POINTLIO_OPTIONS_ENV, r#"{"point_filter_num":7}"#);
+        env::set_var(BODY_FROM_IMU_ENV, identity_json());
+        let bound = captured.bind(8, "sensor", "body", "odom").unwrap();
+        for expected in [["--point_filter_num", "1"], ["--imu_origin_in_body", "0.1,-0.2,0.3"],
+                ["--publish_odometry_without_downsample", "true"]] {
+            assert!(bound.runtime.args.windows(2).any(|x| x == expected));
+        }
+        env::set_var(POINTLIO_OPTIONS_ENV, r#"{"det_range":0}"#);
+        assert!(NativeLioPreflight::from_env(NativeBackend::PointLio).is_err());
+        env::set_var(POINTLIO_OPTIONS_ENV, "{}");
+        env::remove_var(BODY_FROM_IMU_ENV);
+        assert!(NativeLioPreflight::from_env(NativeBackend::PointLio).is_err());
+    }
+
+    #[test]
+    #[ignore = "由保存配置和本机真实程序驱动，输出实际生产bind的命令行"]
+    fn export_saved_point_configuration_for_replay() {
+        let bound = NativeLioPreflight::from_env(NativeBackend::PointLio).unwrap()
+            .bind(1, "utlidar_lidar", "base_link", "odom").unwrap();
+        println!("POINT_RUNTIME_ARGS {}", serde_json::to_string(&bound.runtime.args).unwrap());
+    }
+
+    #[test]
     fn executable_artifact_validation_fails_closed() {
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, Some("relative/native-lio")),
             (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
         ]);
         let error = NativeLioPreflight::from_env(NativeBackend::FastLio2)
             .expect_err("relative artifact must fail");
@@ -1188,6 +1240,8 @@ mod tests {
             let (_lock, _env) = EnvRestore::set(&[
                 (NATIVE_EXECUTABLE_ENV, Some(shell)),
                 (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
                 (PRIVATE_PREFIX_ENV, Some("/12345678901234")),
             ]);
             let error = NativeLioPreflight::from_env(NativeBackend::FastLio2)
@@ -1246,6 +1300,8 @@ mod tests {
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, shell.to_str()),
             (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
             (LCM_URL_ENV, Some("memq://native-sampling-test")),
             (PRIVATE_PREFIX_ENV, Some("/sample")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
@@ -1280,6 +1336,8 @@ mod tests {
             let (_lock, _env) = EnvRestore::set(&[
                 (NATIVE_EXECUTABLE_ENV, shell.to_str()),
                 (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
                 (LCM_URL_ENV, Some("memq://native-sampling-test")),
                 (PRIVATE_PREFIX_ENV, Some("/sample")),
                 (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
@@ -1302,6 +1360,8 @@ mod tests {
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, shell.to_str()),
             (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
             (LCM_URL_ENV, Some("memq://native-sampling-test")),
             (PRIVATE_PREFIX_ENV, Some("/sample")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),
@@ -1330,6 +1390,8 @@ mod tests {
         let (_lock, _env) = EnvRestore::set(&[
             (NATIVE_EXECUTABLE_ENV, shell.to_str()),
             (BODY_FROM_SENSOR_ENV, Some(identity_json())),
+                (BODY_FROM_IMU_ENV, Some(identity_json())),
+                (POINTLIO_OPTIONS_ENV, None),
             (LCM_URL_ENV, Some("memq://saved-native-config")),
             (PRIVATE_PREFIX_ENV, Some("/saved")),
             (FIRST_PAIR_TIMEOUT_MS_ENV, Some("1000")),

@@ -215,7 +215,7 @@ function buildConfigRow(f) {
     input.type = "number";
     if (f.type === "float") input.step = "any";
     input.value = f.value == null ? "" : f.value;
-  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE"].includes(f.key)) && !f.sensitive) {
+  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_POINTLIO_OPTIONS"].includes(f.key)) && !f.sensitive) {
     input = document.createElement("textarea");
     input.rows = 3;
     input.value = f.value == null ? "" : f.value;

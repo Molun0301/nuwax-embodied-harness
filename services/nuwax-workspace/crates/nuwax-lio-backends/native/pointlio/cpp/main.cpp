@@ -36,6 +36,9 @@
 #include "scan_imu_buffer.hpp"
 #include "native_input_subscription.hpp"
 #include "native_lio_arguments.hpp"
+#include "native_imu_reference.hpp"
+#include "pointlio_options.hpp"
+#include "ordered_odometry_output.hpp"
 
 #include "dimos_native_module.hpp"
 
@@ -59,18 +62,25 @@ static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_typed_input_failed{false};
 static lcm::LCM* g_lcm = nullptr;
 static PointLio* g_point_lio = nullptr;
+static nuwax_lio::NativeImuReference g_imu_reference;
 
 // Parse a comma-separated list of doubles (CLI vector args); empty on bad input.
 static std::vector<double> parse_doubles(const std::string& csv) {
     std::vector<double> out;
+    if (!csv.empty() && csv.back() == ',') throw std::invalid_argument("向量参数不能以逗号结束");
     size_t i = 0;
     while (i < csv.size()) {
         size_t j = csv.find(',', i);
         if (j == std::string::npos) { j = csv.size(); }
         try {
-            out.push_back(std::stod(csv.substr(i, j - i)));
+            const std::string item = csv.substr(i, j - i);
+            std::size_t consumed = 0;
+            const double value = std::stod(item, &consumed);
+            if (consumed != item.size() || !std::isfinite(value))
+                throw std::invalid_argument("向量参数包含非法数值");
+            out.push_back(value);
         } catch (...) {
-            return {};
+            throw std::invalid_argument("向量参数必须为逗号分隔的有限数值");
         }
         i = j + 1;
     }
@@ -234,6 +244,10 @@ static nav_msgs::Odometry make_odometry_message(
     msg.twist.twist.angular.y = odom.twist.twist.angular.y;
     msg.twist.twist.angular.z = odom.twist.twist.angular.z;
     std::memset(msg.twist.covariance, 0, sizeof(msg.twist.covariance));
+
+    // 内核参考惯性测量点，对外仍按配置声明的机体原点发布。
+    g_imu_reference.shift_world_velocity_to_body(msg.pose.pose, msg.twist.twist);
+    g_imu_reference.shift_pose_to_body(msg.pose.pose);
 
     return msg;
 }
@@ -556,13 +570,14 @@ static void signal_handler(int /*sig*/) {
     g_running.store(false);
 }
 
-int main(int argc, char** argv) {
+static int run_pointlio(int argc, char** argv) {
     // 身份查询在通信和算法构造前结束；允许部署路径或文件名独立于后端名称。
     if (argc == 2 && std::strcmp(argv[1], "--nuwax-lio-contract") == 0) {
-        std::puts("nuwax-native-lio-v1:pointlio");
+        std::puts("nuwax-native-lio-v2:pointlio");
         return 0;
     }
     dimos::NativeModule mod(argc, argv);
+    mod.enable_strict_arguments();
 
     g_lidar_topic = mod.has("lidar") ? mod.topic("lidar") : "";
     g_odometry_topic = mod.has("odometry") ? mod.topic("odometry") : "";
@@ -663,6 +678,10 @@ int main(int argc, char** argv) {
     g_input_lidar_topic = mod.arg("input_lidar", "");
     g_input_imu_topic = mod.arg("input_imu", "");
     g_external_input = !g_input_lidar_topic.empty() || !g_input_imu_topic.empty();
+    if (g_external_input && !mod.has("imu_origin_in_body"))
+        throw std::invalid_argument("规范Point输入必须声明imu_origin_in_body");
+    g_imu_reference.configure(mod.arg("imu_origin_in_body", "0,0,0"));
+    params.extrinsic_T = g_imu_reference.lidar_translation_at_imu(params.extrinsic_T);
     if (g_external_input) {
         if (params.extrinsic_R.size() != g_body_from_sensor_rotation.size()) {
             fprintf(stderr, "Error: typed IMU requires a 3x3 body-from-sensor rotation\n");
@@ -695,6 +714,11 @@ int main(int argc, char** argv) {
     ports.host_imu_data   = mod.arg_int("host_imu_data_port", port_defaults.host_imu_data);
     ports.host_log_data   = mod.arg_int("host_log_data_port", port_defaults.host_log_data);
 
+    nuwax_lio::validate_pointlio_options(params, mod);
+    for (double rate : {double(g_frequency), double(pointcloud_freq), double(odom_freq), main_freq})
+        if (!std::isfinite(rate) || rate <= 0) throw std::invalid_argument("原生频率必须为有限正数");
+    mod.require_all_arguments_consumed();
+
     if (debug) {
         printf("[pointlio] Starting Point-LIO + Livox Mid-360 native module\n");
         printf("[pointlio] lidar topic: %s\n", g_lidar_topic.empty() ? "(disabled)" : g_lidar_topic.c_str());
@@ -715,8 +739,32 @@ int main(int argc, char** argv) {
     g_lcm = &lcm;
 
     if (debug) { printf("[pointlio] Initializing Point-LIO...\n"); }
+    std::unique_ptr<nuwax_lio::OrderedOdometryOutput<nav_msgs::Odometry>> point_output;
     PointLio point_lio(params, msr_freq, main_freq, 10.0, initial_map_frames);
     g_point_lio = &point_lio;
+    std::optional<nav_msgs::Odometry> pending_point_odometry;
+    uint64_t pending_point_stamp = 0, last_stream_stamp = 0;
+    bool has_stream_stamp = false;
+    if (params.publish_odometry_without_downsample && !g_odometry_topic.empty()) {
+        point_output = std::make_unique<nuwax_lio::OrderedOdometryOutput<nav_msgs::Odometry>>(
+            [](const nav_msgs::Odometry& message) {
+                if (!g_lcm || g_lcm->publish(g_odometry_topic, &message) != 0)
+                    throw std::runtime_error("逐点里程计发布失败");
+            });
+        point_lio.set_odometry_callback([&](const custom_messages::Odometry& result) {
+            uint64_t timestamp = 0;
+            if (!next_source_timestamp(result, last_stream_stamp, has_stream_stamp, timestamp)) return;
+            if (pending_point_odometry && timestamp < pending_point_stamp) return;
+            // epoch双精度可能把邻近时间压成同一个纳秒值，保留该时刻最后一次更新。
+            if (pending_point_odometry && timestamp > pending_point_stamp) {
+                point_output->submit(std::move(*pending_point_odometry));
+                last_stream_stamp = pending_point_stamp;
+                has_stream_stamp = true;
+            }
+            pending_point_odometry = make_odometry_message(result, timestamp);
+            pending_point_stamp = timestamp;
+        });
+    }
     if (debug) { printf("[pointlio] Point-LIO initialized.\n"); }
 
     // Main-loop state. Body lives in `run_main_iter`, driven by the wall-paced
@@ -818,9 +866,25 @@ int main(int argc, char** argv) {
         last_output_source_timestamp_ns = source_timestamp_ns;
         has_last_output_source_timestamp = true;
 
+        if (point_output) {
+            if (pending_point_odometry) {
+                point_output->submit(std::move(*pending_point_odometry));
+                last_stream_stamp = pending_point_stamp;
+                has_stream_stamp = true;
+                pending_point_odometry.reset();
+            }
+            if (!has_stream_stamp || source_timestamp_ns > last_stream_stamp) {
+                point_output->submit(odometry);
+                last_stream_stamp = source_timestamp_ns;
+                has_stream_stamp = true;
+            }
+            // 锁外等待，保证扫描点云之前已经发出它对应的末态位姿。
+            point_output->flush();
+        }
+
         // Publish odometry first whenever a cloud is emitted so the two private
         // channels carry an exact, source-timestamped pair for bounded reordering.
-        if (!g_odometry_topic.empty() && (odometry_due || cloud_due)) {
+        if (!point_output && !g_odometry_topic.empty() && (odometry_due || cloud_due)) {
             publish_odometry(odometry);
             last_odom_publish = now;
             if (pointlio_debug) {
@@ -839,6 +903,10 @@ int main(int argc, char** argv) {
     };
 
     bool sdk_started = false;
+    struct SdkLifetime {
+        bool& started;
+        ~SdkLifetime() { if (started) LivoxLidarSdkUninit(); g_point_lio = nullptr; }
+    } sdk_lifetime{sdk_started};
     if (g_external_input) {
         auto* lidar_subscription = lcm.subscribeFunction(
             g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
@@ -892,10 +960,20 @@ int main(int argc, char** argv) {
     }
 
     if (debug) { printf("[pointlio] Shutting down...\n"); }
-    if (sdk_started) LivoxLidarSdkUninit();
+    if (sdk_started) { LivoxLidarSdkUninit(); sdk_started = false; }
+    if (point_output) { point_output->flush(); point_output->close(); }
     g_point_lio = nullptr;
     g_lcm = nullptr;
 
     if (debug) { printf("[pointlio] Done.\n"); }
     return g_typed_input_failed.load() ? 2 : 0;
+}
+
+int main(int argc, char** argv) {
+    try { return run_pointlio(argc, argv); }
+    catch (const std::exception& error) {
+        g_lcm = nullptr;
+        std::fprintf(stderr, "[pointlio] 配置或输出失败：%s\n", error.what());
+        return 2;
+    }
 }

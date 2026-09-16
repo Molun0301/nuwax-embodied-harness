@@ -719,7 +719,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        println!("nuwax-native-lio-v1:{}", backend_name(backend));
+        let version = if backend == NativeBackend::PointLio { 2 } else { 1 };
+        println!("nuwax-native-lio-v{version}:{}", backend_name(backend));
         return ExitCode::SUCCESS;
     }
     let runtime = match tokio::runtime::Runtime::new() {

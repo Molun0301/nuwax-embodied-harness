@@ -416,7 +416,7 @@
     "description": ""
   },
   "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS": {
-    "zh_name": "原生定位点云与惯性最大时间差（毫秒）",
+    "zh_name": "原生定位输出位姿与点云配对时间差（毫秒）",
     "type": "int",
     "default": 100,
     "section_id": "geometry_runtime",
@@ -425,7 +425,7 @@
       "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "description": ""
+    "description": "约束原生输出位姿与点云的关联；不是输入IMU与雷达的时间偏移，也不改变惯性积分。"
   },
   "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M": {
     "zh_name": "原生定位扫描体素边长（米）",
@@ -491,7 +491,7 @@
       "drivers/go2/data_plane.py"
     ],
     "apply_scope": "重启机器人数据面及几何运行时后生效；停止建图或数据断线重连不会重载",
-    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将惯性传感器坐标转换到机体，来自实际标定。Go2数据面与雷达外参共同捕获，留空沿用模型默认；加速度和角速度只应用旋转，平移不作用于向量。"
+    "description": "仅对FastLIO2（快速激光惯性定位）和PointLIO（逐点激光惯性定位）生效，设备自带建图不使用此覆盖。单行 JSON（结构化文本），必须完整包含 translation_m（三维平移，米）和 rotation_row_major（按行排列的九个正交旋转矩阵元素），将惯性传感器坐标转换到机体，来自实际标定。Go2数据面与雷达外参共同捕获，留空沿用模型默认；加速度和角速度只应用旋转，平移不作用于向量。 Point原生后端要求显式提供此标定：平移用于估计参考原点及机体位姿/速度换算，不能以雷达安装位置代替。"
   },
   "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": {
     "zh_name": "原生定位后端程序",
@@ -2083,5 +2083,18 @@
     ],
     "apply_scope": "重启网关后生效",
     "description": "填写提供器标识到标准设施HTTP（超文本传输协议）桥接配置的映射。每项包含type=http、base_url及可选authorization_env（认证环境变量名）。空对象表示没有设施控制能力；楼层和入口出口通过建筑目录登记。"
+  },
+  "NUWAX_GEOMETRY_POINTLIO_OPTIONS": {
+    "zh_name": "PointLIO参数覆盖（JSON）",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
+      "services/nuwax-workspace/crates/nuwax-lio-backends/src/pointlio_options.rs"
+    ],
+    "apply_scope": "重启几何运行时及Point原生进程后生效；停止建图不会重载",
+    "description": "填写参数对象，例如 {\"point_filter_num\":1,\"lidar_meas_cov\":0.001,\"use_imu_as_input\":true,\"publish_odometry_without_downsample\":true}。支持惯性模式、噪声、盲区/量程、抽点、索引、初始化及逐点输出；字段和类型严格校验，未知或当前不支持的键会拒绝。扫描/地图体素、初图扫描数和外参仍使用各自设置，避免重复来源。留空沿用程序缺省值。"
   }
 }

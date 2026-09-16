@@ -1,0 +1,86 @@
+参数过滤接线与逐点结果回调；不改变滤波预测或观测计算。
+
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -1,3 +1,4 @@
++#include <functional>
+ #include <omp.h>
+ #include <mutex>
+ #include <cmath>
+@@ -33,6 +34,9 @@
+                  double rotation_gap_threshold_deg_s = 10.0,
+                  int initial_map_frames = 1);
+     void setup(const PointLioParams& params);
++    void set_odometry_callback(std::function<void(const custom_messages::Odometry&)> callback) {
++        odometry_callback_ = std::move(callback);
++    }
+     bool run_once(custom_messages::Odometry& odom_out);
+     void imu_cbk(const ImuConstPtr& msg_in);
+     void livox_pcl_cbk(const CstMsgConstPtr& msg);
+@@ -60,6 +64,7 @@
+     std::size_t initial_map_frame_count_ = 0;
+     // 与最近一次成功发布的位姿共同冻结，空转或初始化不能覆盖输出点云。
+     nuwax_lio::PointLioScanOutput scan_output_;
++    std::function<void(const custom_messages::Odometry&)> odometry_callback_;
+     void record_output_pose(double timestamp);
+     bool finish_output_scan(const custom_messages::Odometry& odometry);
+ };
+@@ -468,9 +473,9 @@
+         out.linear.x = kf_input.x_.vel(0);
+         out.linear.y = kf_input.x_.vel(1);
+         out.linear.z = kf_input.x_.vel(2);
+-        out.angular.x = imu_last.angular_velocity.x;
+-        out.angular.y = imu_last.angular_velocity.y;
+-        out.angular.z = imu_last.angular_velocity.z;
++        out.angular.x = input_in.gyro[0] - kf_input.x_.bg[0];
++        out.angular.y = input_in.gyro[1] - kf_input.x_.bg[1];
++        out.angular.z = input_in.gyro[2] - kf_input.x_.bg[2];
+     }
+ }
+ 
+@@ -995,9 +1000,8 @@
+             }
+ 
+             /******* Publish odometry downsample *******/
+-            if (!publish_odometry_without_downsample) {
+-                publish_odometry();
+-            }
++            // 每帧末态始终与最终点云对应，包括末尾只有预测而没有有效匹配的情况。
++            publish_odometry();
+ 
+             /*** add the feature points to the iVox map ***/
+             t3 = omp_get_wtime();
+@@ -1091,6 +1095,10 @@
+         const auto& state = kf_output.x_;
+         append(state, state.omg, state.rot * state.acc + state.gravity);
+     }
++    if (publish_odometry_without_downsample && odometry_callback_) {
++        publish_odometry();
++        odometry_callback_(odomAftMapped);
++    }
+ }
+ 
+ bool LaserMapping::finish_output_scan(const custom_messages::Odometry& odometry) {
+--- a/src/pointlio.hpp
++++ b/src/pointlio.hpp
+@@ -21,6 +21,9 @@
+ 
+     void feed_imu(const ImuConstPtr &imu_data)   { laser_mapping->imu_cbk(imu_data); }
+     void feed_lidar(const CstMsgConstPtr &lidar) { laser_mapping->livox_pcl_cbk(lidar); }
++    void set_odometry_callback(std::function<void(const custom_messages::Odometry&)> callback) {
++        laser_mapping->set_odometry_callback(std::move(callback));
++    }
+     void process()                               { laser_mapping->run(odom_result); }
+ 
+     std::vector<double> get_pose() {
+--- a/src/parameters.cpp
++++ b/src/parameters.cpp
+@@ -85,6 +85,8 @@
+     imu_meas_acc_cov      = params.imu_meas_acc_cov;
+     imu_meas_omg_cov      = params.imu_meas_omg_cov;
+     p_pre->blind          = params.blind;
++    // 最大距离必须传入真正执行距离过滤的对象。
++    p_pre->det_range      = params.det_range;
+     lidar_type            = params.lidar_type;
+     p_pre->N_SCANS        = params.scan_line;
+     p_pre->SCAN_RATE      = params.scan_rate;

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260914-explore-layout">
+  <link rel="stylesheet" href="/static/console.css?v=20260917-full-pointcloud">
 </head>
 <body>
 <div class="app" id="app">
@@ -60,6 +60,7 @@
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
                         <option value="height" selected>高度</option>
+                        <option value="full" title="显示收到的全部点，保留原坐标，不受点云间隔和显示精度影响">完整点云</option>
                         <option value="singleFloor">单层</option>
                         <option value="ground">地面</option>
                         <option value="structure">结构</option>
@@ -359,7 +360,7 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260915-navigation-pick");
+      await import("/static/js/pointcloud3d.js?v=20260917-full-pointcloud");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->

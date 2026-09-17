@@ -1,6 +1,6 @@
 import * as THREE from './three.module.min.js';
 import { OrbitControls } from './OrbitControls.js';
-import { PointCloudProcessor } from './pointcloud-processing.js?v=20260911-background-preprocess';
+import { PointCloudProcessor } from './pointcloud-processing.js?v=20260917-full-pointcloud';
 
 const COLORS = {
   robot: 0xfbbf24,
@@ -90,6 +90,13 @@ const POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(
   typeof window === 'undefined' ? null : window.__NUWAX_POINTCLOUD3D_CONFIG__,
 );
 const POINT_STYLE_PRESETS = Object.freeze({
+  full: Object.freeze({
+    label: '完整点云',
+    preserveSource: true,
+    size: POINTCLOUD3D_CONFIG.size,
+    sizeAttenuation: false,
+    colorMode: 'height',
+  }),
   height: Object.freeze({
     label: '高度',
     sampleStride: 2,
@@ -966,7 +973,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _ensurePointCloudWorker() {
     if (this._cloudWorker || this._cloudWorkerFailed) return this._cloudWorker;
     try {
-      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260911-background-preprocess', import.meta.url), {
+      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260917-full-pointcloud', import.meta.url), {
         type: 'module', name: 'nuwax-pointcloud-preprocess',
       });
       this._cloudWorker = worker;

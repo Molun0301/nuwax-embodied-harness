@@ -14,7 +14,7 @@
   "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS": "3D 点云高度渐变颜色，从低到高填写 5 个 #RRGGBB，逗号分隔。",
   "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR": "3D 点云结构视图中低矮物体的颜色，使用 #RRGGBB。",
   "NUWAX_GATEWAY_POINTCLOUD3D_SIZE": "Three.js 点云基础点大小；各显示样式按既有比例应用。",
-  "NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M": "实时累计点云的基础空间采样间隔（米）；越小越密，允许范围 0.01-2.0。",
+  "NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M": "高度、单层、地面和结构样式的实时点云空间采样间隔（米）；越小越密，允许范围 0.01-2.0。完整点云样式保留收到的全部原坐标，不应用此间隔。",
   "NUWAX_GATEWAY_POINTCLOUD3D_STRUCTURE_COLOR": "3D 点云结构视图中垂直结构的颜色，使用 #RRGGBB。",
   "NUWAX_GATEWAY_TELEMETRY_ENABLED": "性能监控（CPU/内存/进程）采集，平台侧用 psutil，通用不绑定机器人型号。",
   "NUWAX_GATEWAY_TELEMETRY_INCLUDE_PROCESS_TREE": "是否额外纳入网关本进程树（自身 + 子孙进程）。",

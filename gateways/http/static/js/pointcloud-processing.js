@@ -292,6 +292,10 @@ export class PointCloudProcessor {
       : src;
     const measurement = visibleSource.length ? this._measurePointCloud(visibleSource) : null;
     this._activeFloorZ = floorContext?.floorZ ?? null;
+    // 完整显示保留收到的每个点及原坐标，不应用显示间隔或细节级别抽样。
+    if (preset.preserveSource) {
+      return this._preparedResult(visibleSource, measurement, floorContext);
+    }
     if (this._isLiveCloudMapSnapshot) {
       const positions = preset.liveSpacingM
         ? this._spatiallySamplePointCloud(visibleSource, preset.liveSpacingM)

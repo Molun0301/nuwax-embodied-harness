@@ -31,6 +31,7 @@ mod preflight_only_contract {
     use nuwax_mapping::loop_closure::{
         LoopClosureCoordinator, LoopClosurePipelineConfig, ProcessFrameResult,
     };
+    use nuwax_mapping::loop_closure::options::{PgoOptions, PGO_OPTIONS_ENV};
     use nuwax_mapping::relocalization::{
         relocation_pipeline_with_config, RelocalizationConfig, RelocalizationResult,
     };
@@ -48,7 +49,7 @@ mod preflight_only_contract {
     use crate::lcm_runtime::ValidatedFrameBindings;
     use crate::map_checksum::sha256_bytes;
     use crate::mapping_commit::MappingCommitId;
-    use crate::owner_profile::CorrectionBackend;
+    use crate::owner_profile::{CorrectionBackend, LioBackend};
 
     const CORRECTION_SCHEMA_VERSION_V2: i32 = 2;
     const CORRECTION_BACKEND_LIBRARY_PGO: i32 = 1;
@@ -1145,14 +1146,32 @@ mod preflight_only_contract {
     impl CorrectionOwnerSpec {
         pub(crate) fn preflight(
             backend: CorrectionBackend,
+            lio_backend: LioBackend,
             frames: &ValidatedFrameBindings,
         ) -> Result<Self, String> {
             let (map_frame_id, odom_frame_id, body_frame_id) = frames.as_parts();
-            Self::preflight_for_frames(backend, map_frame_id, odom_frame_id, body_frame_id)
+            let mut spec = Self::preflight_for_frames(
+                backend, lio_backend, map_frame_id, odom_frame_id, body_frame_id,
+            )?;
+            if let Self::LibraryPgo { pipeline, .. } = &mut spec {
+                // 共同启动脚本已合并配置文件；只在预检捕获，运行中的图不热改参数。
+                let raw = match std::env::var(PGO_OPTIONS_ENV) {
+                    Ok(raw) => raw,
+                    Err(std::env::VarError::NotPresent) => String::new(),
+                    Err(error) => return Err(format!("CORRECTION_PREFLIGHT_FAILED {PGO_OPTIONS_ENV}: {error}")),
+                };
+                *pipeline = PgoOptions::from_json(&raw)
+                    .and_then(|options| options.apply_to(*pipeline))
+                    .map_err(|error| format!("CORRECTION_PREFLIGHT_FAILED {PGO_OPTIONS_ENV}: {error}"))?;
+                tracing::info!(event = "pgo.config.loaded", lio_backend = ?lio_backend,
+                    effective_config = ?pipeline, "已捕获库内PGO启动参数，修改配置后重启生效");
+            }
+            Ok(spec)
         }
 
         fn preflight_for_frames(
             backend: CorrectionBackend,
+            lio_backend: LioBackend,
             map_frame_id: &str,
             odom_frame_id: &str,
             body_frame_id: &str,
@@ -1174,7 +1193,10 @@ mod preflight_only_contract {
             match backend {
                 CorrectionBackend::None => Ok(Self::None),
                 CorrectionBackend::LibraryPgo => {
-                    let pipeline = LoopClosurePipelineConfig::default();
+                    let pipeline = match lio_backend {
+                        LioBackend::PointLio => LoopClosurePipelineConfig::for_point_lio(),
+                        _ => LoopClosurePipelineConfig::default(),
+                    };
                     LoopClosureCoordinator::new(pipeline).map_err(|error| {
                         format!("CORRECTION_PREFLIGHT_FAILED library_pgo config: {error}")
                     })?;
@@ -16123,6 +16145,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(matches!(
                 CorrectionOwnerSpec::preflight_for_frames(
                     CorrectionBackend::None,
+                    LioBackend::FastLio2,
                     "map",
                     "odom",
                     "base_link"
@@ -16132,6 +16155,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(matches!(
                 CorrectionOwnerSpec::preflight_for_frames(
                     CorrectionBackend::LibraryPgo,
+                    LioBackend::FastLio2,
                     "map",
                     "odom",
                     "base_link"
@@ -16141,6 +16165,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             assert!(matches!(
                 CorrectionOwnerSpec::preflight_for_frames(
                     CorrectionBackend::NativePgo,
+                    LioBackend::FastLio2,
                     "map",
                     "odom",
                     "base_link"
@@ -16149,11 +16174,93 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             ));
             assert!(CorrectionOwnerSpec::preflight_for_frames(
                 CorrectionBackend::LibraryPgo,
+                LioBackend::FastLio2,
                 " map",
                 "odom",
                 "base_link"
             )
             .is_err());
+        }
+
+        #[test]
+        fn pgo_environment_preflight_probe() {
+            let Ok(expected) = std::env::var("NUWAX_PGO_PREFLIGHT_EXPECTED") else {
+                return;
+            };
+            let frames = ValidatedFrameBindings::from_env().unwrap();
+            let result = CorrectionOwnerSpec::preflight(
+                CorrectionBackend::LibraryPgo, LioBackend::PointLio, &frames,
+            );
+            if expected == "rejected" {
+                let message = result.unwrap_err();
+                assert!(message.contains(PGO_OPTIONS_ENV), "{message}");
+                return;
+            }
+            let CorrectionOwnerSpec::LibraryPgo { pipeline, .. } = result.unwrap() else {
+                panic!("必须选择库内PGO");
+            };
+            assert_eq!(pipeline.icp.max_correspondence_distance, expected.parse::<f64>().unwrap());
+            assert_eq!(pipeline.min_loop_overlap_ratio, 0.7, "未覆盖字段保留Point默认");
+            println!("PGO读取成功：{}", pipeline.icp.max_correspondence_distance);
+        }
+
+        #[test]
+        fn same_program_reads_changed_pgo_settings_on_each_start() {
+            // 每组单独进程，避免通过全局环境污染并行用例；同一程序只换参数。
+            for (raw, expected) in [
+                (r#"{"max_correspondence_distance":0.22}"#, "0.22"),
+                (r#"{"max_correspondence_distance":0.45}"#, "0.45"),
+                ("{}", "0.3"),
+                (r#"{"max_correspondence_distance":0}"#, "rejected"),
+                (r#"{"not_wired":1}"#, "rejected"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "correction_coordinator::preflight_only_contract::tests::pgo_environment_preflight_probe", "--nocapture"])
+                    .env(PGO_OPTIONS_ENV, raw)
+                    .env("NUWAX_PGO_PREFLIGHT_EXPECTED", expected)
+                    .env("NUWAX_GEOMETRY_MAP_FRAME", "map")
+                    .env("NUWAX_GEOMETRY_ODOM_FRAME", "odom")
+                    .env("NUWAX_BASE_FRAME", "base_link")
+                    .output().unwrap();
+                assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+        }
+
+        #[test]
+        fn preflight_selects_point_lio_registration_profile_only_for_point_lio() {
+            for backend in [LioBackend::PointLio, LioBackend::FastLio2] {
+                let CorrectionOwnerSpec::LibraryPgo { pipeline, .. } =
+                    CorrectionOwnerSpec::preflight_for_frames(
+                        CorrectionBackend::LibraryPgo,
+                        backend,
+                        "map",
+                        "odom",
+                        "base_link",
+                    )
+                    .unwrap()
+                else {
+                    panic!("必须选择库内回环");
+                };
+                let expected = if backend == LioBackend::PointLio {
+                    LoopClosurePipelineConfig::for_point_lio()
+                } else {
+                    LoopClosurePipelineConfig::default()
+                };
+                assert_eq!(pipeline.max_loop_mse, expected.max_loop_mse);
+                assert_eq!(
+                    pipeline.min_loop_overlap_ratio,
+                    expected.min_loop_overlap_ratio
+                );
+                assert_eq!(
+                    pipeline.loop_confirmation_frames,
+                    expected.loop_confirmation_frames
+                );
+                assert_eq!(pipeline.min_loop_interval_secs, expected.min_loop_interval_secs);
+                assert_eq!(
+                    pipeline.icp.max_correspondence_distance,
+                    expected.icp.max_correspondence_distance
+                );
+            }
         }
 
         #[test]
@@ -18394,6 +18501,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let mut none = CorrectionOwnerHandle::start(
                 CorrectionOwnerSpec::preflight_for_frames(
                     CorrectionBackend::None,
+                    LioBackend::FastLio2,
                     "map",
                     "odom",
                     "base_link",

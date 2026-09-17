@@ -7,6 +7,7 @@
 pub mod coordinator;
 pub mod eval;
 pub mod optimizer;
+pub mod options;
 pub mod pgo;
 pub mod pgo_auto;
 mod registration;

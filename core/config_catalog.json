@@ -2096,5 +2096,18 @@
     ],
     "apply_scope": "重启几何运行时及Point原生进程后生效；停止建图不会重载",
     "description": "填写参数对象，例如 {\"point_filter_num\":1,\"lidar_meas_cov\":0.001,\"use_imu_as_input\":true,\"publish_odometry_without_downsample\":true}。支持惯性模式、噪声、盲区/量程、抽点、索引、初始化及逐点输出；字段和类型严格校验，未知或当前不支持的键会拒绝。扫描/地图体素、初图扫描数和外参仍使用各自设置，避免重复来源。留空沿用程序缺省值。"
+  },
+  "NUWAX_GEOMETRY_PGO_OPTIONS": {
+    "zh_name": "库内PGO参数覆盖（JSON）",
+    "type": "str",
+    "default": "",
+    "section_id": "geometry_runtime",
+    "target_file": "core_env",
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs",
+      "services/nuwax-workspace/crates/nuwax-mapping/src/loop_closure/options.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效，无需重新构建；停止建图不会重载",
+    "description": "仅library_pgo使用，按所选前端默认值叠加覆盖。留空或{}恢复默认。示例：{\"max_correspondence_distance\":0.3,\"max_loop_mse\":0.01,\"min_loop_overlap_ratio\":0.7,\"loop_confirmation_frames\":3,\"loop_confirmation_interval_secs\":2,\"min_loop_separation_secs\":60,\"min_loop_interval_secs\":60,\"stationary_probe_interval_secs\":5}。距离单位米，均方误差平方米，覆盖率0到1，间隔秒。还支持关键帧平移/旋转（keyframe_translation/keyframe_rotation，米/弧度）、搜索半径loop_search_radius、最低支持点数min_keyframe_points、子图体素submap_resolution_m、子图半宽loop_submap_half_range、搜索最低关键帧数min_keyframes_for_loop_search、配准迭代数icp_max_iterations和优化迭代数optimizer_max_iterations。字段、类型及范围严格校验。"
   }
 }

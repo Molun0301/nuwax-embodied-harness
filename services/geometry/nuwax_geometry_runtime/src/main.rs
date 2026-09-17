@@ -414,6 +414,7 @@ impl StartupPreflight {
         }
         let correction = correction_coordinator::CorrectionOwnerSpec::preflight(
             owner_profile.correction(),
+            owner_profile.lio(),
             &frame_bindings,
         )?;
         let correction_provider = match std::env::var("NUWAX_LCM_URL") {

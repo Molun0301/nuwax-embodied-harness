@@ -94,6 +94,28 @@ impl Default for LoopClosurePipelineConfig {
     }
 }
 
+impl LoopClosurePipelineConfig {
+    /// 已校准Point-LIO的回环参数：优先保留低漂移里程计，只接纳充分确认的局部配准。
+    /// 其它前端继续使用各自配置，不能将这组实录调参当作通用噪声标定。
+    #[must_use]
+    pub fn for_point_lio() -> Self {
+        Self {
+            max_loop_mse: 0.01,
+            min_loop_overlap_ratio: 0.7,
+            loop_confirmation_frames: 3,
+            loop_confirmation_interval_secs: 2.0,
+            min_loop_separation_secs: 60.0,
+            min_loop_interval_secs: 60.0,
+            stationary_probe_interval_secs: 5.0,
+            icp: IcpConfig {
+                max_correspondence_distance: 0.3,
+                ..IcpConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+}
+
 /// One immutable keyframe used to interpolate drift correction.
 #[derive(Debug, Clone)]
 pub struct CorrectionKeyframe {
@@ -1106,6 +1128,52 @@ fn has_valid_correction(before: &PoseGraph, after: &PoseGraph) -> bool {
 mod tests {
     use super::*;
     use nalgebra::UnitQuaternion;
+
+    #[test]
+    fn point_lio_profile_preserves_accurate_room_and_corrects_supported_drift() {
+        // 三个不同法向的合成墙面提供完整几何约束；分别验证准确前端与已知缓慢漂移。
+        let world: Vec<_> = (-20..=20)
+            .flat_map(|a| {
+                (-10..=20).flat_map(move |b| {
+                    let u = a as f64 * 0.1;
+                    let v = b as f64 * 0.1;
+                    [
+                        Point3::new(4.0, u, v),
+                        Point3::new(u + 1.0, 3.0, v),
+                        Point3::new(u + 1.0, v, -1.0),
+                    ]
+                })
+            })
+            .collect();
+        for drift in [0.0, 0.2] {
+            let mut owner =
+                LoopClosureCoordinator::new(LoopClosurePipelineConfig::for_point_lio()).unwrap();
+            let mut raw = Isometry3::identity();
+            for step in 0..=24 {
+                let x = if step <= 10 {
+                    step as f64 * 0.5
+                } else {
+                    (20 - step.min(20)) as f64 * 0.5
+                };
+                let truth = Isometry3::translation(x, 0.0, 0.0);
+                raw = Isometry3::translation(x + drift * step as f64 / 24.0, 0.0, 0.0);
+                let points: Vec<_> = world.iter().map(|p| truth.inverse() * p).collect();
+                owner
+                    .process_frame(step as f64 * 10.0, raw, &points)
+                    .unwrap();
+            }
+            let corrected = owner.corrections().correct_pose(240.0, &raw).unwrap();
+            // 准确输入保持厘米内，已知漂移至少减半；末段新增漂移仍可能等待下一轮回环。
+            let error_limit = if drift == 0.0 { 0.01 } else { drift * 0.5 };
+            assert!(
+                corrected.translation.vector.norm() < error_limit,
+                "漂移={drift}，校正={corrected:?}"
+            );
+            if drift > 0.0 {
+                assert!(owner.loops().len() >= 3, "真实配准必须形成足够的回环约束");
+            }
+        }
+    }
 
     fn consistency_fixture() -> LoopClosureCoordinator {
         let mut owner = LoopClosureCoordinator::new(LoopClosurePipelineConfig {

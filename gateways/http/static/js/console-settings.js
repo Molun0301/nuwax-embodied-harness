@@ -146,7 +146,7 @@ function syncGeometryPipelineFields() {
   for (const row of document.querySelectorAll("#configSections [data-key]")) {
     const key = row.dataset.key;
     const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
-      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
+      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_GEOMETRY_PGO_OPTIONS", "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
       "NUWAX_NAV_ROBOT_HEIGHT_M", "NUWAX_NAV_SURFACE_VOXEL_SIZE_M",
       "NUWAX_NAV_MIN_STAIR_TREAD_M", "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M",
       "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
@@ -215,7 +215,7 @@ function buildConfigRow(f) {
     input.type = "number";
     if (f.type === "float") input.step = "any";
     input.value = f.value == null ? "" : f.value;
-  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_POINTLIO_OPTIONS"].includes(f.key)) && !f.sensitive) {
+  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_POINTLIO_OPTIONS", "NUWAX_GEOMETRY_PGO_OPTIONS"].includes(f.key)) && !f.sensitive) {
     input = document.createElement("textarea");
     input.rows = 3;
     input.value = f.value == null ? "" : f.value;

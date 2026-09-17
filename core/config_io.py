@@ -578,6 +578,12 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key == "NUWAX_GEOMETRY_PGO_OPTIONS":
+        try:
+            from contracts.pgo_options import normalize_pgo_options
+            return normalize_pgo_options(v)
+        except (ValueError, TypeError, OverflowError):
+            return None
     if key == "NUWAX_GEOMETRY_POINTLIO_OPTIONS":
         try:
             from contracts.pointlio_options import normalize_pointlio_options
@@ -767,6 +773,12 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
         normalized = _validate(key, raw, field.type)
         if normalized is None:
             rejected[key] = f"值不符合类型 {field.type}"
+            if key == "NUWAX_GEOMETRY_PGO_OPTIONS":
+                try:
+                    from contracts.pgo_options import normalize_pgo_options
+                    normalize_pgo_options(raw)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    rejected[key] = str(exc)
             if key in ROBOT_GEOMETRY_SETTING_KEYS:
                 try:
                     normalize_robot_geometry_setting(key, raw)

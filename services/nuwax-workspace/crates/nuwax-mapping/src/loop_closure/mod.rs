@@ -23,6 +23,7 @@ pub use eval::EvalLoopClosure;
 pub use optimizer::{GaussNewtonOptimizer, LevenbergMarquardt, OptimizerConfig};
 pub use pgo::{PoseEdge, PoseGraph, PoseNode};
 pub use pgo_auto::{AutoLoopDetector, LoopConstraint};
+pub use scan_context::ScanContextConfig;
 
 /// 生产位姿图优化门面，使用GTSAM阻尼求解完整SE(3)因子图。
 /// 数学诊断用的旧Gauss-Newton接口保留，生产路径不再使用其稠密求解器。

@@ -69,6 +69,18 @@ impl PgoOptions {
             macro_rules! number { ($field:ident) => { config.$field = value.as_f64().ok_or("参数必须为数值")? }; }
             macro_rules! count { ($field:ident) => { config.$field = value.as_u64().ok_or("参数必须为整数")? as usize }; }
             match name.as_str() {
+                "scan_context_radius_m" => config.scan_context.radius_m = value.as_f64().ok_or("描述半径必须为数值")?,
+                "scan_context_min_sectors" => config.scan_context.min_sectors = value.as_u64().ok_or("扇区数必须为整数")? as usize,
+                "scan_context_max_distance" => config.scan_context.max_distance = value.as_f64().ok_or("描述距离必须为数值")?,
+                "scan_context_ambiguity_margin" => config.scan_context.ambiguity_margin = value.as_f64().ok_or("航向歧义差必须为数值")?,
+                "scan_context_candidate_count" => config.scan_context.candidate_count = value.as_u64().ok_or("候选数必须为整数")? as usize,
+                "loop_candidate_count" => count!(loop_candidate_count),
+                "max_loop_innovation" => number!(max_loop_innovation),
+                "odometry_translation_sigma_m" => number!(odometry_translation_sigma_m),
+                "odometry_rotation_sigma_rad" => number!(odometry_rotation_sigma_rad),
+                "gravity_prior_sigma_rad" => config.gravity_prior_sigma_rad = Some(value.as_f64().ok_or("重力标准差必须为数值")?),
+                "loop_translation_sigma_floor_m" => number!(loop_translation_sigma_floor_m),
+                "loop_rotation_sigma_floor_rad" => number!(loop_rotation_sigma_floor_rad),
                 "max_correspondence_distance" => config.icp.max_correspondence_distance = value.as_f64().ok_or("对应距离必须为数值")?,
                 "icp_max_iterations" => config.icp.max_iterations = value.as_u64().ok_or("配准迭代数必须为整数")? as usize,
                 "optimizer_max_iterations" => config.optimizer.max_iterations = value.as_u64().ok_or("优化迭代数必须为整数")? as usize,
@@ -122,6 +134,35 @@ mod tests {
             r#"{"loop_confirmation_frames":2.5}"#, r#"{"loop_confirmation_frames":9}"#,
             r#"{"loop_confirmation_interval_secs":11}"#, r#"{"max_correspondence_distance":0}"#,
             r#"{"min_loop_overlap_ratio":1.1}"#, r#"{"icp_max_iterations":301}"#] {
+            assert!(PgoOptions::from_json(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn retrieval_and_graph_noise_overrides_reach_the_selected_config() {
+        let raw = r#"{"scan_context_radius_m":12,"scan_context_min_sectors":8,
+            "scan_context_max_distance":0.2,"scan_context_ambiguity_margin":0.005,
+            "scan_context_candidate_count":18,"loop_candidate_count":8,
+            "max_loop_innovation":20,"odometry_translation_sigma_m":0.03,
+            "odometry_rotation_sigma_rad":0.002,"gravity_prior_sigma_rad":0.04,
+            "loop_translation_sigma_floor_m":0.05,"loop_rotation_sigma_floor_rad":0.02}"#;
+        let config = PgoOptions::from_json(raw).unwrap()
+            .apply_to(LoopClosurePipelineConfig::for_point_lio()).unwrap();
+        assert_eq!(config.scan_context.radius_m, 12.0);
+        assert_eq!(config.scan_context.min_sectors, 8);
+        assert_eq!(config.scan_context.max_distance, 0.2);
+        assert_eq!(config.scan_context.ambiguity_margin, 0.005);
+        assert_eq!(config.scan_context.candidate_count, 18);
+        assert_eq!(config.loop_candidate_count, 8);
+        assert_eq!(config.max_loop_innovation, 20.0);
+        assert_eq!(config.odometry_translation_sigma_m, 0.03);
+        assert_eq!(config.odometry_rotation_sigma_rad, 0.002);
+        assert_eq!(config.gravity_prior_sigma_rad, Some(0.04));
+        assert_eq!(config.loop_translation_sigma_floor_m, 0.05);
+        assert_eq!(config.loop_rotation_sigma_floor_rad, 0.02);
+        for invalid in [r#"{"scan_context_radius_m":0.5}"#, r#"{"scan_context_min_sectors":61}"#,
+            r#"{"scan_context_ambiguity_margin":0}"#, r#"{"loop_candidate_count":0}"#,
+            r#"{"gravity_prior_sigma_rad":0}"#, r#"{"loop_rotation_sigma_floor_rad":-1}"#] {
             assert!(PgoOptions::from_json(invalid).is_err(), "{invalid}");
         }
     }

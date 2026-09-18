@@ -8,7 +8,7 @@ use thiserror::Error;
 use super::optimizer::{cost_strictly_improved, graph_cost, OptimizerConfig};
 use super::pgo::{PoseEdge, PoseGraph};
 use super::registration::evaluate_loop_registration;
-use super::scan_context::ScanContext;
+use super::scan_context::{ScanContext, ScanContextConfig};
 use super::se3::{se3_adjoint, se3_log_to_vector6};
 use super::PgoOptimizer;
 use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
@@ -18,6 +18,10 @@ use crate::relocalization::{voxel_downsample, IcpConfig, IcpResult, IcpSolver};
 pub struct LoopClosurePipelineConfig {
     /// 启用与里程计距离无关的地点检索；几何门验证可单独关闭它以隔离候选来源。
     pub scan_context_enabled: bool,
+    /// 扫描上下文的范围、相似度及航向歧义门限。
+    pub scan_context: ScanContextConfig,
+    /// 每个关键帧最多尝试的空间与描述子配准初值总数。
+    pub loop_candidate_count: usize,
     /// 对比里程计路径及候选之间的带协方差闭合误差，数值为马氏距离平方上限。
     pub max_loop_innovation: f64,
     /// 至少由多少次分离的观测确认同一回环，单次匹配不能直接改写整图。
@@ -30,6 +34,10 @@ pub struct LoopClosurePipelineConfig {
     pub odometry_translation_sigma_m: f64,
     /// 里程计增量旋转的基础标准差，单位弧度。
     pub odometry_rotation_sigma_rad: f64,
+    /// 回环平移置信度下限，同时参与图权重和一致性检查。
+    pub loop_translation_sigma_floor_m: f64,
+    /// 回环旋转置信度下限，单位弧度。
+    pub loop_rotation_sigma_floor_rad: f64,
     /// Translation required before a frame becomes a keyframe.
     pub keyframe_translation: f64,
     /// Rotation angle required before a frame becomes a keyframe.
@@ -66,12 +74,16 @@ impl Default for LoopClosurePipelineConfig {
     fn default() -> Self {
         Self {
             scan_context_enabled: true,
+            scan_context: ScanContextConfig::default(),
+            loop_candidate_count: 4,
             max_loop_innovation: 30.0,
             loop_confirmation_frames: 2,
             loop_confirmation_interval_secs: 1.0,
             gravity_prior_sigma_rad: Some(1.0_f64.to_radians()),
             odometry_translation_sigma_m: 0.02,
             odometry_rotation_sigma_rad: 0.5_f64.to_radians(),
+            loop_translation_sigma_floor_m: 0.02,
+            loop_rotation_sigma_floor_rad: 0.5_f64.to_radians(),
             keyframe_translation: 0.5,
             keyframe_rotation: 10.0_f64.to_radians(),
             stationary_probe_interval_secs: 2.0,
@@ -444,7 +456,7 @@ impl LoopClosureCoordinator {
                 timestamp,
                 local_pose,
                 points: voxel_downsample(points, self.config.submap_resolution_m),
-                context: ScanContext::new(points, local_pose.rotation),
+                context: ScanContext::new(points, local_pose.rotation, self.config.scan_context),
                 odometry_covariance,
             },
         );
@@ -599,6 +611,11 @@ impl LoopClosureCoordinator {
                 || !is_finite_pose(&registration.transformation)
             {
                 self.search_diagnostics.registration_failed += 1;
+                tracing::debug!(event = "pgo.registration.rejected", current_id, historic_id,
+                    source_timestamp = current.timestamp,
+                    converged = registration.converged, mse = registration.mse,
+                    iterations = registration.iterations, max_mse = self.config.max_loop_mse,
+                    "回环求解未收敛或求解残差超限");
                 continue;
             }
             // 子图用于稳定法线与求解；独立双向覆盖必须比较当前帧和候选锚帧。
@@ -639,15 +656,16 @@ impl LoopClosureCoordinator {
                 );
                 continue;
             }
-            // 对应点相关，最多按64个独立支撑计权；保留2厘米与0.5度方差下限。
+            // 对应点相关，最多按64个独立支撑计权；置信度受配置下限约束。
             // 用几何力臂把米平方换成弧度平方，不直接将匹配误差充作角度方差。
             let support = evidence
                 .source_inliers
                 .min(evidence.unique_target_inliers)
                 .min(64) as f64;
-            let position_variance = (evidence.mse / support).max(0.02_f64.powi(2));
+            let position_variance = (evidence.mse / support)
+                .max(self.config.loop_translation_sigma_floor_m.powi(2));
             let rotation_variance = (position_variance / evidence.lever_arm_m2.max(0.25))
-                .max(0.5_f64.to_radians().powi(2));
+                .max(self.config.loop_rotation_sigma_floor_rad.powi(2));
             let information = Matrix6::from_diagonal(&nalgebra::Vector6::new(
                 position_variance.recip(),
                 position_variance.recip(),
@@ -725,7 +743,7 @@ impl LoopClosureCoordinator {
         measured
     }
 
-    /// 每个关键帧最多四次几何配准，描述子只精比六个环键近邻。
+    /// 在配置预算内合并空间和描述子初值，保留近邻及较早锚点。
     fn loop_candidates(&self, current_id: u64) -> Vec<(u64, Isometry3<f64>)> {
         let current = &self.keyframes[&current_id];
         let current_pose = self.graph.nodes[&current_id].pose;
@@ -770,23 +788,37 @@ impl LoopClosureCoordinator {
             .map(|(distance, id)| spatial_seed(*distance, *id)).into_iter().collect();
         // 同一地点相邻历史帧不能占满预算，保留一个更早的锚点以发现整段累计漂移。
         if let Some((distance, id)) = spatial.iter().min_by_key(|(_, id)| *id) {
-            if candidates.iter().all(|(existing, _)| existing != id) {
+            if candidates.len() < self.config.loop_candidate_count
+                && candidates.iter().all(|(existing, _)| existing != id) {
                 candidates.push(spatial_seed(*distance, *id));
             }
         }
+        let spatial_count = candidates.len();
+        let mut descriptor_checked = 0;
         let mut matches: Vec<_> = descriptors
             .iter()
             .filter(|_| self.config.scan_context_enabled)
-            .take(6)
+            .take(self.config.scan_context.candidate_count)
             .filter_map(|(_, id)| {
-                current
+                descriptor_checked += 1;
+                let alignment = current
                     .context
-                    .align_to(&self.keyframes[id].context)
-                    .map(|(score, yaw)| (score, *id, yaw))
+                    .align_to(&self.keyframes[id].context, self.config.scan_context);
+                tracing::debug!(event = "pgo.sc.alignment", current_id, historic_id = *id,
+                    source_timestamp = current.timestamp,
+                    historic_timestamp = self.keyframes[id].timestamp,
+                    accepted = alignment.is_ok(), reason = alignment.as_ref().err().copied().unwrap_or("accepted"),
+                    score = alignment.as_ref().map(|value| value.0).ok(),
+                    "扫描上下文航向检索结果");
+                alignment.ok().map(|(score, yaw)| (score, *id, yaw))
             })
             .collect();
+        let descriptor_accepted = matches.len();
         matches.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         for (_, id, yaw) in matches {
+            if candidates.len() >= self.config.loop_candidate_count {
+                break;
+            }
             let historic = &self.keyframes[&id];
             let rotation = historic.context.level_from_body.inverse()
                 * nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw)
@@ -808,18 +840,25 @@ impl LoopClosureCoordinator {
                 continue;
             }
             candidates.push((id, seed));
-            if candidates.len() == 4 {
+            if candidates.len() == self.config.loop_candidate_count {
                 break;
             }
         }
+        let descriptor_selected = candidates.len() - spatial_count;
+        let spatial_available = spatial.len();
         for (distance, id) in spatial {
-            if candidates.len() >= 4 {
+            if candidates.len() >= self.config.loop_candidate_count {
                 break;
             }
             if candidates.iter().all(|(existing, _)| *existing != id) {
                 candidates.push(spatial_seed(distance, id));
             }
         }
+        tracing::debug!(event = "pgo.loop.retrieval", current_id,
+            source_timestamp = current.timestamp, spatial_available,
+            descriptor_available = descriptors.len(), descriptor_checked, descriptor_accepted,
+            descriptor_selected, candidates = candidates.len(),
+            "记录空间与扫描上下文检索预算及召回");
         candidates
     }
 
@@ -1003,6 +1042,9 @@ fn gravity_cost(graph: &PoseGraph, priors: &[(u64, nuwax_gtsam::GravityPrior)]) 
 }
 
 fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosurePipelineError> {
+    if !config.scan_context.is_valid() || !(1..=64).contains(&config.loop_candidate_count) {
+        return Err(LoopClosurePipelineError::InvalidConfig("扫描上下文或配准候选预算无效"));
+    }
     if config.loop_confirmation_frames == 0
         || config.loop_confirmation_frames > 8
         || !config.max_loop_innovation.is_finite()
@@ -1016,6 +1058,10 @@ fn validate_config(config: LoopClosurePipelineConfig) -> Result<(), LoopClosureP
         || config.odometry_translation_sigma_m <= 0.0
         || !config.odometry_rotation_sigma_rad.is_finite()
         || config.odometry_rotation_sigma_rad <= 0.0
+        || !config.loop_translation_sigma_floor_m.is_finite()
+        || config.loop_translation_sigma_floor_m <= 0.0
+        || !config.loop_rotation_sigma_floor_rad.is_finite()
+        || config.loop_rotation_sigma_floor_rad <= 0.0
     {
         return Err(LoopClosurePipelineError::InvalidConfig(
             "invalid loop consistency or gravity configuration",
@@ -1403,6 +1449,12 @@ mod tests {
         assert_eq!(coordinator.graph.nodes[&0].pose, Isometry3::identity());
         let current_id = *coordinator.keyframes.last_key_value().unwrap().0;
         assert!(coordinator.loop_candidates(current_id).len() <= 4);
+        for budget in [1, 2, 8] {
+            coordinator.config.loop_candidate_count = budget;
+            let candidates = coordinator.loop_candidates(current_id);
+            assert!(!candidates.is_empty());
+            assert!(candidates.len() <= budget);
+        }
     }
 
     #[test]

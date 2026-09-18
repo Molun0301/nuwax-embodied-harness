@@ -30,8 +30,8 @@ Lifecycle
 ========
 
 - odom: 直发，不节流；calling thread 同步走 gRPC。
-- 原生 LiDAR/IMU：回调组装后只保留最新待发扫描，由独立单拥有方线程顺序发布；
-  队列满时承接旧帧惯性，停止取消未领取帧，不占用传感器读取线程等待发布。
+- 原生 LiDAR/IMU：有界顺序交付，不替换扫描；Point等待原生处理确认，Fast保留传输回执；
+  超过容量、等待预算或处理失败时锁定本代，停止取消未领取帧。
 - pointcloud:
 
     * 默认阈值 ``MAX_POINTS_BEFORE_DOWNSAMPLE = 100_000``；
@@ -58,9 +58,9 @@ from typing import Any, Deque, Dict, Optional, Tuple
 import numpy as np
 
 from adapters.sensors.lio_measurement import (
-    DEFAULT_MAX_IMU_SAMPLES,
     LioMeasurementAssembler,
     LioMeasurementAssemblerError,
+    LioMeasurementOverflow,
 )
 from contracts.geometry import FrameTree, Pose
 from contracts.pointcloud import PointCloudFrame
@@ -89,8 +89,10 @@ _LIO_BACKEND_ENV = "NUWAX_GEOMETRY_LIO_BACKEND"
 _DEVICE_LIO_BACKEND = "device"
 _LIO_SENSOR_FRAME_ENV = "NUWAX_GEOMETRY_LIDAR_FRAME"
 _DEFAULT_LIO_SENSOR_FRAME = "utlidar_lidar"
-# 一组在途之外只保留最新待发扫描，旧扫描的必要惯性由原承接逻辑保留。
-_MAX_LIO_PUBLISH_QUEUE_SIZE = 1
+# 两个相邻配组批次各最多16帧；同时限制载荷与等待时间，不能靠替换旧帧续算。
+_MAX_LIO_PUBLISH_QUEUE_SIZE = 32
+_MAX_LIO_PUBLISH_QUEUE_BYTES = 8 * 1024 * 1024
+_MAX_LIO_PUBLISH_QUEUE_WAIT_SEC = 1.0
 _APPLIED_TRANSFORM_PROVENANCE_PREFIX = "calibration_applied:"
 _INPUT_ERROR_LOG_INTERVAL_SEC = 5.0
 # 仅汇总已知逐样本重复诊断，固定键集合不会随任意异常正文增长。
@@ -239,7 +241,7 @@ class RuntimeInputBridge:
     counters: BridgeCounters = field(default_factory=BridgeCounters)
     _error_log_limiter: LogRateLimiter = field(default_factory=LogRateLimiter, init=False, repr=False)
     _lio_measurement_assembler: LioMeasurementAssembler = field(
-        default_factory=LioMeasurementAssembler,
+        default_factory=lambda: LioMeasurementAssembler(fail_on_overflow=True),
         init=False,
         repr=False,
     )
@@ -248,11 +250,13 @@ class RuntimeInputBridge:
         init=False,
         repr=False,
     )
-    _lio_publish_queue: Deque[Tuple[int, CanonicalLioMeasurement]] = field(
+    _lio_publish_queue: Deque[Tuple[int, CanonicalLioMeasurement, float, int]] = field(
         default_factory=deque,
         init=False,
         repr=False,
     )
+    _lio_queue_bytes: int = field(default=0, init=False)
+    _native_input_failure: Optional[Dict[str, Any]] = field(default=None, init=False)
     _lio_generation: int = field(default=0, init=False)
     _lio_accepting: bool = field(default=False, init=False)
     _lio_sensor_frame: str = field(
@@ -263,6 +267,7 @@ class RuntimeInputBridge:
     _lio_publish_owner_thread_id: Optional[int] = field(default=None, init=False)
     _lio_publisher_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _native_lio_enabled: bool = field(default=False, init=False)
+    _native_lio_backend: str = field(default=_DEVICE_LIO_BACKEND, init=False)
     _lio_in_flight_count: int = field(default=0, init=False)
     _callback_in_flight_count: int = field(default=0, init=False)
     _callback_in_flight_by_thread: Dict[int, int] = field(
@@ -390,6 +395,10 @@ class RuntimeInputBridge:
     def _start_new_generation_locked(self) -> bool:
         """在 lifecycle operation lock 内启动一个新的 bridge generation。"""
 
+        with self._lio_condition:
+            if self._native_input_failure is not None:
+                self._record_error("原生输入已经失败，需重启几何拥有方后重新创建输入桥")
+                return False
         selected_lio_backend = os.environ.get(
             _LIO_BACKEND_ENV, _DEVICE_LIO_BACKEND
         )
@@ -426,11 +435,13 @@ class RuntimeInputBridge:
             self._lio_reset_pending_generation = None
             self._lio_publish_owner_thread_id = None
             self._native_lio_enabled = selected_lio_backend != _DEVICE_LIO_BACKEND
+            self._native_lio_backend = selected_lio_backend
             self._lio_sensor_frame = os.environ.get(
                 _LIO_SENSOR_FRAME_ENV,
                 _DEFAULT_LIO_SENSOR_FRAME,
             ).strip()
             self._lio_publish_queue.clear()
+            self._lio_queue_bytes = 0
             self._lio_measurement_assembler.reset()
 
         if self._native_lio_enabled:
@@ -540,6 +551,7 @@ class RuntimeInputBridge:
                         self._lio_generation
                     )
                     self._lio_publish_queue.clear()
+                    self._lio_queue_bytes = 0
                     self._lio_condition.notify_all()
 
                 if sensor_id is not None and self.sensor_sample_provider is not None:
@@ -652,17 +664,15 @@ class RuntimeInputBridge:
             return self._started
 
     def is_ready(self) -> bool:
-        """输入桥就绪：运行时已连接且至少有一条有效输入订阅。"""
+        """输入桥订阅可用且本代输入连续性没有失败。"""
         with self._lock:
-            if not self._started:
-                return False
-            if self._runtime_unavailable:
-                return False
-            return any(subscription is not None for subscription in (
-                self._localization_subscription_id,
-                self._point_cloud_subscription_id,
-                self._sensor_sample_subscription_id,
-            ))
+            ready = self._started and not self._runtime_unavailable and any(
+                subscription is not None for subscription in (
+                    self._localization_subscription_id, self._point_cloud_subscription_id,
+                    self._sensor_sample_subscription_id,
+                ))
+        with self._lio_condition:
+            return ready and self._native_input_failure is None
 
     # ------------------------------------------------------------------
     # subscription helpers
@@ -1338,88 +1348,48 @@ class RuntimeInputBridge:
             return None
 
     def _enqueue_ready_lio_measurements(
-        self,
-        measurement: Optional[CanonicalLioMeasurement],
-        generation: int,
+        self, measurement: Optional[CanonicalLioMeasurement], generation: int,
     ) -> None:
-        """在条件锁内组装到既有有界队列，唤醒独立发布拥有方。"""
-
-        while measurement is not None:
+        """保持扫描顺序；短时突发进入有界队列，无法保全时锁定失败。"""
+        while measurement is not None and self._lio_callback_is_current(generation):
             prepared = self._prepare_native_lio_measurement(measurement)
-            if prepared is not None:
-                self._lio_publish_queue.append((generation, prepared))
-                if len(self._lio_publish_queue) > _MAX_LIO_PUBLISH_QUEUE_SIZE:
-                    dropped_generation, dropped = self._lio_publish_queue.popleft()
-                    self._increment_counter("dropped_pointcloud_count")
-                    self._record_error(
-                        "native LIO 待发槽已替换，丢弃旧点云并承接其 IMU"
-                    )
-                    self._carry_dropped_lio_imu(dropped.imu_samples, dropped_generation)
+            if prepared is None:
+                self._fail_native_input_locked("规范扫描准备失败", measurement.scan_begin_timestamp_ns)
+                return
+            size = sum(len(getattr(prepared.lidar, name) or b"") for name in (
+                "xyz_f32_le", "intensity_f32_le", "time_offset_ns_le", "ring_u16_le",
+            )) + len(prepared.imu_samples) * 80
+            if len(self._lio_publish_queue) >= _MAX_LIO_PUBLISH_QUEUE_SIZE or self._lio_queue_bytes + size > _MAX_LIO_PUBLISH_QUEUE_BYTES:
+                self._increment_counter("dropped_pointcloud_count")
+                self._fail_native_input_locked("原生待发队列容量耗尽，禁止替换扫描", prepared.scan_begin_timestamp_ns)
+                return
+            self._lio_publish_queue.append((generation, prepared, time.monotonic(), size))
+            self._lio_queue_bytes += size
             measurement = self._lio_measurement_assembler.pop_ready()
-        if self._lio_publish_queue:
-            self._lio_condition.notify_all()
+        self._lio_condition.notify_all()
 
-    def _carry_dropped_lio_imu(
-        self, samples: Tuple[CanonicalImuSample, ...], generation: int
-    ) -> None:
-        """在既有发布锁内把被丢点云的惯性历史交给下一保留帧。"""
-
-        while self._lio_publish_queue:
-            next_generation, measurement = self._lio_publish_queue[0]
-            if next_generation != generation:
-                self._increment_counter("dropped_lio_imu_count", len(samples))
-                self._increment_counter("lio_not_ready_count")
-                self._record_error("拒绝跨代际承接 %d 条 LIO IMU" % len(samples))
-                return
-            by_timestamp = {sample.timestamp_ns: sample for sample in samples}
-            conflicting_samples = 0
-            for sample in measurement.imu_samples:
-                previous = by_timestamp.setdefault(sample.timestamp_ns, sample)
-                if previous != sample:
-                    conflicting_samples += 1
-            if conflicting_samples:
-                # 同时刻不同内容说明源身份已失真，不能任意挑选一个值继续积分。
-                self._lio_publish_queue.popleft()
-                self._increment_counter("dropped_pointcloud_count")
-                dropped_samples = len(by_timestamp) + conflicting_samples
-                self._increment_counter("dropped_lio_imu_count", dropped_samples)
-                self._increment_counter("lio_not_ready_count")
-                self._record_error(
-                    "LIO IMU 同时间戳内容冲突，拒绝承接并丢弃 %d 条样本"
-                    % dropped_samples
-                )
-                return
-            samples = tuple(by_timestamp[stamp] for stamp in sorted(by_timestamp))
-            excess = len(samples) - DEFAULT_MAX_IMU_SAMPLES
-            if excess > 0:
-                samples = samples[excess:]
-                self._increment_counter("dropped_lio_imu_count", excess)
-                self._increment_counter("lio_not_ready_count")
-                self._record_error(
-                    "LIO IMU 承接超过 %d 条上限，丢弃最旧 %d 条待发样本，连续区间无法保证"
-                    % (DEFAULT_MAX_IMU_SAMPLES, excess)
-                )
-            if samples[0].timestamp_ns > measurement.scan_begin_timestamp_ns:
-                self._lio_publish_queue.popleft()
-                self._increment_counter("dropped_pointcloud_count")
-                self._increment_counter("lio_not_ready_count")
-                self._record_error("LIO IMU 承接溢出后不覆盖扫描开始，拒绝该点云")
-                continue
-            self._lio_publish_queue[0] = (
-                generation,
-                CanonicalLioMeasurement(
-                    lidar=measurement.lidar,
-                    imu_samples=samples,
-                    scan_begin_timestamp_ns=measurement.scan_begin_timestamp_ns,
-                    scan_end_timestamp_ns=measurement.scan_end_timestamp_ns,
-                ),
-            )
+    def _fail_native_input_locked(self, reason: str, source_timestamp_ns: int) -> None:
+        """在条件锁内封存首个缺口；远程故障通知由发布线程在锁外完成。"""
+        if self._native_input_failure is not None:
             return
-        self._increment_counter("dropped_lio_imu_count", len(samples))
-        self._record_error("LIO IMU 承接后没有可覆盖点云，丢弃 %d 条样本" % len(samples))
+        if self._lio_publish_queue:
+            source_timestamp_ns = min(source_timestamp_ns, self._lio_publish_queue[0][1].scan_begin_timestamp_ns)
+        self._native_input_failure = {
+            "reason": reason, "first_missing_source_timestamp_ns": source_timestamp_ns,
+            "generation": self._lio_generation, "reported_to_runtime": False,
+            "pending_measurement_count": len(self._lio_publish_queue),
+            "pending_payload_bytes": self._lio_queue_bytes,
+            "oldest_pending_wait_ms": ((time.monotonic() - self._lio_publish_queue[0][2]) * 1000.0) if self._lio_publish_queue else 0.0,
+        }
+        self._increment_counter("dropped_pointcloud_count", len(self._lio_publish_queue))
+        self._lio_publish_queue.clear()
+        self._lio_queue_bytes = 0
+        self._lio_accepting = False
+        self._record_error(reason)
+        self._lio_condition.notify_all()
 
     def _drain_native_lio_measurements(self, generation: int) -> None:
-        """当前代际独立线程在条件锁外顺序发布，空闲等待，停止后退出。"""
+        """当前代际顺序交付，收到处理确认后领取下一帧；失败不再续算。"""
         with self._lio_condition:
             self._lio_publish_owner_thread_id = threading.get_ident()
         try:
@@ -1428,24 +1398,49 @@ class RuntimeInputBridge:
                     while self._lio_callback_is_current(generation) and not self._lio_publish_queue:
                         self._lio_condition.wait()
                     if not self._lio_callback_is_current(generation):
-                        return
-                    queued_generation, measurement = self._lio_publish_queue.popleft()
+                        break
+                    queued_generation, measurement, enqueued_at, size = self._lio_publish_queue.popleft()
+                    self._lio_queue_bytes -= size
                     if queued_generation != generation:
                         continue
+                    if time.monotonic() - enqueued_at > _MAX_LIO_PUBLISH_QUEUE_WAIT_SEC:
+                        self._increment_counter("dropped_pointcloud_count")
+                        self._fail_native_input_locked("原生扫描待发超过1秒，禁止以旧输入继续估计", measurement.scan_begin_timestamp_ns)
+                        break
                     self._lio_in_flight_count += 1
                 try:
-                    self._publish_native_lio_measurement(measurement)
+                    if not self._publish_native_lio_measurement(measurement, generation=generation):
+                        with self._counter_lock:
+                            reason = self.counters.last_error or "原生输入发布未确认"
+                        with self._lio_condition:
+                            if self._lio_callback_is_current(generation):
+                                self._fail_native_input_locked(reason, measurement.scan_begin_timestamp_ns)
                 except Exception as exc:
                     self._increment_counter("dropped_pointcloud_count")
-                    self._record_error("publish canonical LIO measurement 未处理异常：%s" % exc)
+                    with self._lio_condition:
+                        if self._lio_callback_is_current(generation):
+                            self._fail_native_input_locked("原生输入发布异常：%s" % exc, measurement.scan_begin_timestamp_ns)
                 finally:
                     with self._lio_condition:
                         self._lio_in_flight_count -= 1
                         self._lio_condition.notify_all()
         except Exception as exc:
-            self._record_error("原生输入发布线程异常退出：%s" % exc)
-            self.stop()
+            with self._lio_condition:
+                self._fail_native_input_locked("原生输入发布线程异常：%s" % exc, 0)
         finally:
+            with self._lio_condition:
+                failure = dict(self._native_input_failure) if self._native_input_failure else None
+            if failure is not None:
+                try:
+                    notify = getattr(self.runtime_provider, "report_native_input_failure", None)
+                    reported = bool(notify(failure["reason"], failure["first_missing_source_timestamp_ns"])) if callable(notify) else False
+                    with self._lio_condition:
+                        self._native_input_failure["reported_to_runtime"] = reported
+                    if self.recording_sink is not None:
+                        self.recording_sink.record_event("native_input.failed", dict(self._native_input_failure))
+                except Exception as exc:
+                    LOGGER.error("原生输入故障通知失败，输入桥保持停止：%s", exc)
+                self.stop(_wait_for_drain=False)
             with self._lio_condition:
                 self._lio_publish_owner_active = False
                 self._lio_publish_owner_thread_id = None
@@ -1464,23 +1459,26 @@ class RuntimeInputBridge:
 
         self._increment_counter("lio_not_ready_count")
         self._record_error("%s: %s" % (error.code.value, str(error)))
+        if isinstance(error, LioMeasurementOverflow):
+            with self._lio_condition:
+                self._fail_native_input_locked(str(error), error.source_timestamp_ns)
 
     def _publish_native_lio_measurement(
-        self, measurement: CanonicalLioMeasurement
-    ) -> None:
+        self, measurement: CanonicalLioMeasurement, *, generation: Optional[int] = None
+    ) -> bool:
         """仅发布扫描末端已被 IMU 覆盖的 canonical measurement。"""
 
         publisher = getattr(self.runtime_provider, "publish_point_cloud", None)
         if not callable(publisher):
             self._increment_counter("dropped_pointcloud_count")
             self._record_error("runtime_provider.publish_point_cloud 不存在")
-            return
+            return False
         bytes_payload = self._encode_canonical_lidar_bytes(measurement.lidar)
         if bytes_payload is None:
             self._increment_counter("dropped_pointcloud_count")
             self._increment_counter("lio_not_ready_count")
             self._record_error("lio_not_ready: canonical LiDAR payload 编码失败")
-            return
+            return False
         registration_frame = measurement.lidar.registration_frame_id
         imu_samples = tuple(
             LioImuSample(
@@ -1509,11 +1507,11 @@ class RuntimeInputBridge:
         except Exception as exc:
             self._increment_counter("dropped_pointcloud_count")
             self._record_error("publish canonical LIO measurement 抛异常：%s" % exc)
-            return
+            return False
         if not bool(result):
             self._increment_counter("dropped_pointcloud_count")
             self._record_error("publish canonical LIO measurement 返回 False")
-            return
+            return False
         self._increment_counter("published_pointcloud_count")
         self._increment_counter("emitted_lio_measurement_count")
         self._update_counters(
@@ -1522,6 +1520,18 @@ class RuntimeInputBridge:
             last_published_point_step=point_step,
             last_publish_at_monotonic=time.monotonic(),
         )
+
+        if self.recording_sink is not None:
+            try:
+                self.recording_sink.record_event("native_input.processed" if self._native_lio_backend == "pointlio" else "native_input.published", {
+                    "source_sequence": measurement.lidar.source_sequence,
+                    "scan_begin_timestamp_ns": measurement.scan_begin_timestamp_ns,
+                    "scan_end_timestamp_ns": measurement.scan_end_timestamp_ns,
+                    "bridge_generation": generation if generation is not None else self._lio_generation,
+                })
+            except Exception:
+                LOGGER.exception("原生处理回执记录失败")
+        return True
 
     @staticmethod
     def _encode_canonical_lidar_bytes(
@@ -1783,10 +1793,15 @@ class RuntimeInputBridge:
             counters = self.counters.as_dict()
         with self._lio_condition:
             oldest = self._lio_publish_queue[0][1] if self._lio_publish_queue else None
+            ready = ready and self._native_input_failure is None
             native_input = {
                 "generation": self._lio_generation,
                 "pending_measurement_count": len(self._lio_publish_queue),
                 "max_pending_measurement_count": _MAX_LIO_PUBLISH_QUEUE_SIZE,
+                "pending_payload_bytes": self._lio_queue_bytes,
+                "max_pending_payload_bytes": _MAX_LIO_PUBLISH_QUEUE_BYTES,
+                "failure": dict(self._native_input_failure) if self._native_input_failure else None,
+                "delivery_confirmation": "native_processed" if self._native_lio_backend == "pointlio" else "transport_publish",
                 "in_flight_measurement_count": self._lio_in_flight_count,
                 "oldest_pending_source_timestamp_ns": oldest.scan_begin_timestamp_ns if oldest else 0,
                 "oldest_pending_clock_domain": oldest.lidar.clock_domain.value if oldest else None,

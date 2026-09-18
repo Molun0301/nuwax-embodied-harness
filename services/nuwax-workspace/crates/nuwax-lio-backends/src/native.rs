@@ -82,6 +82,12 @@ pub struct NativeLioConfig {
     /// to typed PointCloud2/Imu channels and does not open Livox callbacks.
     pub input_lidar_topic: Option<String>,
     pub input_imu_topic: Option<String>,
+    /// Point私有扫描处理回执，未配置时仅供直接离线工具使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ack_topic: Option<String>,
+    /// 与回执配对的完整测量消息通道。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_frame_topic: Option<String>,
     pub frame_id: String,
     pub child_frame_id: String,
     pub sensor_frame_id: String,
@@ -121,6 +127,8 @@ impl NativeLioConfig {
             odometry_topic: ODOMETRY_TOPIC.into(),
             input_lidar_topic: None,
             input_imu_topic: None,
+            input_ack_topic: None,
+            input_frame_topic: None,
             frame_id: ODOM_FRAME.into(),
             child_frame_id: BODY_FRAME.into(),
             sensor_frame_id: SENSOR_FRAME.into(),
@@ -160,6 +168,18 @@ impl NativeLioConfig {
         if self.input_imu_topic.is_some() != self.input_lidar_topic.is_some() {
             return Err("input_lidar_topic and input_imu_topic must be configured together".into());
         }
+        if let Some(topic) = &self.input_ack_topic {
+            if self.backend != NativeBackend::PointLio || self.input_frame_topic.is_none() {
+                return Err("处理回执需要Point规范输入".into());
+            }
+            validate_typed_topic(topic, "nuwax_msgs.LioInputAck", "input_ack_topic")?;
+        }
+        if self.input_frame_topic.is_some() != self.input_ack_topic.is_some() {
+            return Err("完整测量与回执必须同时配置".into());
+        }
+        if let Some(topic) = &self.input_frame_topic {
+            validate_typed_topic(topic, "nuwax_msgs.LioInputFrame", "input_frame_topic")?;
+        }
         validate_frame(&self.frame_id, "frame_id")?;
         validate_frame(&self.child_frame_id, "child_frame_id")?;
         validate_frame(&self.sensor_frame_id, "sensor_frame_id")?;
@@ -172,7 +192,7 @@ impl NativeLioConfig {
         validate_extrinsic_translation(&self.extrinsic_translation_m)?;
         validate_extrinsic_rotation(&self.extrinsic_rotation_row_major)?;
 
-        if self.input_lidar_topic.is_none() {
+        if self.input_lidar_topic.is_none() && self.input_frame_topic.is_none() {
             let host_ip = validate_ipv4(&self.host_ip, "host_ip")?;
             let lidar_ip = validate_ipv4(&self.lidar_ip, "lidar_ip")?;
             if host_ip == lidar_ip {
@@ -245,7 +265,9 @@ impl NativeLioConfig {
         if let Some(origin) = self.imu_origin_in_body_m {
             args.extend(["--imu_origin_in_body".to_owned(), render_numbers(&origin)]);
         }
-        if let (Some(input_lidar), Some(input_imu)) =
+        if let Some(frame) = &self.input_frame_topic {
+            args.extend(["--input_frame".into(), frame.clone()]);
+        } else if let (Some(input_lidar), Some(input_imu)) =
             (&self.input_lidar_topic, &self.input_imu_topic)
         {
             args.extend([
@@ -260,6 +282,9 @@ impl NativeLioConfig {
                 "--host_ip".into(), self.host_ip.clone(),
                 "--lidar_ip".into(), self.lidar_ip.clone(),
             ]);
+        }
+        if let Some(topic) = &self.input_ack_topic {
+            args.extend(["--input_ack".into(), topic.clone()]);
         }
         Ok(args)
     }

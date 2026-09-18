@@ -2058,6 +2058,8 @@ mod tests {
                     &format!("{channel_root}/input_imu"),
                     "sensor_msgs.Imu",
                 ),
+                input_ack: None,
+                input_frame: None,
             },
             runtime: Box::new(NativeRuntimeSpec {
                 backend: NativeBackend::FastLio2,

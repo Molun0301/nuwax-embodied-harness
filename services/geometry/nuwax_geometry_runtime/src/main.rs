@@ -28,6 +28,7 @@ mod lcm_runtime;
 mod lio_ingress;
 mod lio_owner;
 mod native_lio_owner;
+mod native_input_delivery;
 // W41 (Bug #2 fix): `map_checksum` 模块是 W37 (RALPLAN §Phase M #3) 新增
 // 的 SHA-256 helper,供 `mapping_adapter::build_and_publish` 算 checksum
 // 并通过 `MapRevisionEvent.checksum` 广播;untracked 状态下 main.rs 漏
@@ -1652,6 +1653,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
     };
     let relocalization_mode_fence =
         Arc::new(correction_coordinator::RelocalizationModeFence::default());
+    let mut rpc_native_ack_binding = None;
     let (lio_spec, pending_ingress, rpc_point_cloud_binding, rpc_native_raw_input_binding): (
         lio_owner::LioOwnerSpec,
         PendingLioIngress,
@@ -1700,6 +1702,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
                     return ExitCode::from(4);
                 }
             };
+            rpc_native_ack_binding = native_runtime.channels.input_ack.clone().zip(native_runtime.channels.input_frame.clone());
             let ingress_spec = match lio_ingress::DeviceLioIngressSpec::new_for_backend(
                 native_runtime.backend_code,
                 runtime_generation,
@@ -1966,6 +1969,7 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         shutdown.clone(),
         rpc_point_cloud_binding,
         rpc_native_raw_input_binding,
+        rpc_native_ack_binding,
         Some(lio_bindings.sensor_frame.clone()),
         relocalization_ingress,
     );

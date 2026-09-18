@@ -111,6 +111,8 @@ mod tests {
             ("nuwax_msgs.LioOdometryEnvelope", 0x742d_9b06_c0c7_a223),
             ("nuwax_msgs.LioCloudEnvelope", 0xdcd4_ae0f_83a9_a81b),
             ("nuwax_msgs.LioStatus", 0x6d7a_e636_d8ba_41b2),
+            ("nuwax_msgs.LioInputAck", 0x76c9_3e45_543d_ab19),
+            ("nuwax_msgs.LioInputFrame", 0xc323_3f5a_145a_8a6a),
             ("nuwax_msgs.CorrectionCandidate", 0x05057b4c757c80f3),
             ("nuwax_msgs.NativePgoRequest", 0xa714e98d60d0b620),
             ("nuwax_msgs.NativePgoResult", 0xadd11e19aa0ec18b),

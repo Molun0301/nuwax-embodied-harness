@@ -28,17 +28,27 @@ class LioMeasurementAssemblerError(ValueError):
         self.code = code
 
 
+class LioMeasurementOverflow(LioMeasurementAssemblerError):
+    """有界配组容量耗尽，生产者必须终止当前连续输入。"""
+
+    def __init__(self, message: str, source_timestamp_ns: int) -> None:
+        super().__init__(SensorErrorCode.LIO_NOT_READY, message)
+        self.source_timestamp_ns = source_timestamp_ns
+
+
 class LioMeasurementAssembler:
     """以有界队列组装扫描开始和结束均被 IMU 覆盖的测量组。"""
 
     def __init__(
-        self, max_lidar_frames: int = DEFAULT_MAX_LIDAR_FRAMES, max_imu_samples: int = DEFAULT_MAX_IMU_SAMPLES
+        self, max_lidar_frames: int = DEFAULT_MAX_LIDAR_FRAMES, max_imu_samples: int = DEFAULT_MAX_IMU_SAMPLES,
+        *, fail_on_overflow: bool = False
     ) -> None:
         if max_lidar_frames <= 0 or max_imu_samples <= 0:
             raise ValueError("LiDAR 与 IMU 队列上限必须为正数")
         self._lock = RLock()
         self._max_lidar_frames = max_lidar_frames
         self._max_imu_samples = max_imu_samples
+        self._fail_on_overflow = fail_on_overflow
         self._lidar_frames: Deque[CanonicalLidarFrame] = deque()
         self._imu_samples: Deque[CanonicalImuSample] = deque()
         self._clock_key: Optional[Tuple[object, Optional[str]]] = None
@@ -80,6 +90,9 @@ class LioMeasurementAssembler:
             self._last_lidar_identity = self._admit_monotonic(
                 "LiDAR", self._last_lidar_identity, frame.source_sequence, frame.timestamp_ns
             )
+            if self._fail_on_overflow and len(self._lidar_frames) >= self._max_lidar_frames:
+                self.dropped_lidar_count += 1
+                raise LioMeasurementOverflow("雷达等待惯性期间配组容量耗尽", self._lidar_frames[0].timestamp_ns)
             self._lidar_frames.append(frame)
             if len(self._lidar_frames) > self._max_lidar_frames:
                 self._lidar_frames.popleft()
@@ -105,6 +118,9 @@ class LioMeasurementAssembler:
             self._last_imu_identity = self._admit_monotonic(
                 "IMU", self._last_imu_identity, sample.source_sequence, sample.timestamp_ns
             )
+            if self._fail_on_overflow and len(self._imu_samples) >= self._max_imu_samples:
+                self.dropped_imu_count += 1
+                raise LioMeasurementOverflow("惯性配组容量耗尽", sample.timestamp_ns)
             self._imu_samples.append(sample)
             if len(self._imu_samples) > self._max_imu_samples:
                 self._imu_samples.popleft()

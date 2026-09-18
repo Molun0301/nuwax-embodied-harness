@@ -23,3 +23,6 @@ from .NavigationState import NavigationState as NavigationState
 from .PathEnvelope import PathEnvelope as PathEnvelope
 from .PersonFollowCommand import PersonFollowCommand as PersonFollowCommand
 from .PersonFollowTarget import PersonFollowTarget as PersonFollowTarget
+
+from .LioInputAck import LioInputAck
+from .LioInputFrame import LioInputFrame

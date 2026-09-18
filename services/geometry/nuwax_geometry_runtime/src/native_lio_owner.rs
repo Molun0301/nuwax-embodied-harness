@@ -138,6 +138,8 @@ pub(crate) struct NativePrivateChannels {
     /// Generation-private canonical raw sensor ingress consumed by the native child.
     pub(crate) input_cloud: (LcmTopic, LcmMessageType),
     pub(crate) input_imu: (LcmTopic, LcmMessageType),
+    pub(crate) input_ack: Option<(LcmTopic, LcmMessageType)>,
+    pub(crate) input_frame: Option<(LcmTopic, LcmMessageType)>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +252,12 @@ impl NativeLioPreflight {
             source_cloud: typed_binding(&format!("{channel_root}/c"), "sensor_msgs.PointCloud2")?,
             input_cloud: typed_binding(&format!("{channel_root}/ic"), "sensor_msgs.PointCloud2")?,
             input_imu: typed_binding(&format!("{channel_root}/ii"), "sensor_msgs.Imu")?,
+            input_frame: if self.backend == NativeBackend::PointLio {
+                Some(typed_binding(&format!("{channel_root}/m"), "nuwax_msgs.LioInputFrame")?)
+            } else { None },
+            input_ack: if self.backend == NativeBackend::PointLio {
+                Some(typed_binding(&format!("{channel_root}/ia"), "nuwax_msgs.LioInputAck")?)
+            } else { None },
         };
 
         let odometry_pattern = typed_pattern(&channels.source_odometry);
@@ -277,6 +285,20 @@ impl NativeLioPreflight {
         let input_imu_pattern = typed_pattern(&channels.input_imu);
         config.input_lidar_topic = Some(input_cloud_pattern);
         config.input_imu_topic = Some(input_imu_pattern);
+        if let Some(ack) = &channels.input_ack {
+            let pattern = typed_pattern(ack);
+            if pattern.len() > LCM_MAX_CHANNEL_NAME_BYTES {
+                return Err("原生处理回执通道超过通信库长度限制".into());
+            }
+            config.input_ack_topic = Some(pattern);
+        }
+        if let Some(frame) = &channels.input_frame {
+            let pattern = typed_pattern(frame);
+            if pattern.len() > LCM_MAX_CHANNEL_NAME_BYTES {
+                return Err("完整测量通道超过通信库长度限制".into());
+            }
+            config.input_frame_topic = Some(pattern);
+        }
         config.sensor_frame_id = sensor_frame.into();
         config.child_frame_id = body_frame.into();
         config.frame_id = odom_frame.into();
@@ -332,7 +354,7 @@ fn validate_native_backend_identity(
 
     let expected = match backend {
         NativeBackend::FastLio2 => "nuwax-native-lio-v1:fastlio2",
-        NativeBackend::PointLio => "nuwax-native-lio-v2:pointlio",
+        NativeBackend::PointLio => "nuwax-native-lio-v3:pointlio",
     };
     let failure = |reason: String| format!(
         "NATIVE_LIO_PREFLIGHT_FAILED backend_identity path={} expected={expected} {reason}; rebuild the selected native backend or correct {NATIVE_EXECUTABLE_ENV}",
@@ -1114,7 +1136,7 @@ mod tests {
                 NativeBackend::FastLio2 => "fastlio2",
                 NativeBackend::PointLio => "pointlio",
             };
-            let version = if backend == NativeBackend::PointLio { 2 } else { 1 };
+            let version = if backend == NativeBackend::PointLio { 3 } else { 1 };
             Self::new(&format!("[ \"$1\" = --nuwax-lio-contract ] || exit 9\nprintf 'nuwax-native-lio-v{version}:{tag}\\n'"))
         }
     }

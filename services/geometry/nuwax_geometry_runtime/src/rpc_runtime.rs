@@ -48,6 +48,7 @@ enum GeometryRpcMethod {
     PublishLaserScan,
     PublishOdom,
     PublishPointCloud,
+    ReportNativeInputFailure,
 }
 
 const RPC_METHODS: &[GeometryRpcMethod] = &[
@@ -79,6 +80,7 @@ const RPC_METHODS: &[GeometryRpcMethod] = &[
     GeometryRpcMethod::PublishLaserScan,
     GeometryRpcMethod::PublishOdom,
     GeometryRpcMethod::PublishPointCloud,
+    GeometryRpcMethod::ReportNativeInputFailure,
 ];
 
 impl GeometryRpcMethod {
@@ -112,6 +114,7 @@ impl GeometryRpcMethod {
             Self::PublishLaserScan => "publish_laser_scan",
             Self::PublishOdom => "publish_odom",
             Self::PublishPointCloud => "publish_point_cloud",
+            Self::ReportNativeInputFailure => "report_native_input_failure",
         }
     }
 
@@ -262,6 +265,9 @@ impl GeometryRpcHandler {
             }
             GeometryRpcMethod::PublishLaserScan => call_unary!(PublishLaserScanRequest, publish_laser_scan),
             GeometryRpcMethod::PublishOdom => call_unary!(PublishOdomRequest, publish_odom),
+            GeometryRpcMethod::ReportNativeInputFailure => {
+                call_unary!(NativeInputFailureRequest, report_native_input_failure)
+            }
             GeometryRpcMethod::PublishPointCloud => {
                 call_unary!(PublishPointCloudRequest, publish_point_cloud)
             }
@@ -316,7 +322,8 @@ mod tests {
             .copied()
             .map(GeometryRpcMethod::rpc_name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 29);
+        assert!(names.contains(&"GeometryRuntimeService/report_native_input_failure".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/health_check".to_string()));
         assert!(names.contains(&"GeometryRuntimeService/stop".to_string()));
         assert!(names

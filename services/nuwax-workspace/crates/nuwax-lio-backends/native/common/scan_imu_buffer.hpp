@@ -22,7 +22,8 @@ void feed_scan_imu_and_retain_boundary(
     std::vector<Sample>& samples,
     uint64_t scan_end_ns,
     std::optional<uint64_t>& last_fed_timestamp_ns,
-    Feed&& feed
+    Feed&& feed,
+    std::optional<uint64_t> next_scan_lower_bound_ns = std::nullopt
 ) {
     const auto first_after_end = std::upper_bound(
         samples.begin(), samples.end(), scan_end_ns,
@@ -38,7 +39,12 @@ void feed_scan_imu_and_retain_boundary(
         feed(sample->message);
         last_fed_timestamp_ns = sample->timestamp_ns;
     }
-    auto retain_from = first_after_end;
+    // 相邻完整扫描允许时间窗口轻微重叠。保留当前扫描开始的左界，
+    // 下个开始时间严格递增；已喂入去重水位仍避免重复积分。
+    auto retain_from = next_scan_lower_bound_ns
+        ? std::upper_bound(samples.begin(), samples.end(), *next_scan_lower_bound_ns,
+            [](uint64_t stamp, const Sample& sample) { return stamp < sample.timestamp_ns; })
+        : first_after_end;
     if (retain_from != samples.begin()) { --retain_from; }
     samples.erase(samples.begin(), retain_from);
 }

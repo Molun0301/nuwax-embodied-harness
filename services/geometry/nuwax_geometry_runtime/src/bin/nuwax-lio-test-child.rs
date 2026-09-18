@@ -71,6 +71,12 @@ impl NativeChildArgs {
                 "--lidar" => config.lidar_topic = value.to_owned(),
                 "--input_lidar" => config.input_lidar_topic = Some(value.to_owned()),
                 "--input_imu" => config.input_imu_topic = Some(value.to_owned()),
+                "--input_ack" => config.input_ack_topic = Some(value.to_owned()),
+                "--input_frame" => config.input_frame_topic = Some(value.to_owned()),
+                "--imu_origin_in_body" => config.imu_origin_in_body_m = Some(parse_numbers(flag, value)?),
+                "--filter_size_surf" => config.scan_voxel_size_m = Some(parse_number(flag, value)?),
+                "--filter_size_map" => config.map_voxel_size_m = Some(parse_number(flag, value)?),
+                "--initial_map_frames" => config.initial_map_frames = Some(value.parse::<u32>().map_err(|e| e.to_string())?),
                 "--odometry" => config.odometry_topic = value.to_owned(),
                 "--frame_id" => config.frame_id = value.to_owned(),
                 "--child_frame_id" => config.child_frame_id = value.to_owned(),
@@ -118,7 +124,13 @@ impl NativeChildArgs {
             + usize::from(config.input_imu_topic.is_some());
         let network_flags = usize::from(seen.contains("--host_ip"))
             + usize::from(seen.contains("--lidar_ip"));
-        if seen.len() != expected_flags.len() + input_flags + network_flags
+        let optional_flags = usize::from(config.input_ack_topic.is_some())
+            + usize::from(config.input_frame_topic.is_some())
+            + usize::from(config.imu_origin_in_body_m.is_some())
+            + usize::from(config.scan_voxel_size_m.is_some())
+            + usize::from(config.map_voxel_size_m.is_some())
+            + usize::from(config.initial_map_frames.is_some());
+        if seen.len() != expected_flags.len() + input_flags + network_flags + optional_flags
             || expected_flags.iter().any(|flag| !seen.contains(*flag))
         {
             return Err(format!("native argv is incomplete: flags={seen:?}"));
@@ -547,7 +559,7 @@ async fn run_native_lio_test_child() -> Result<(), String> {
     let transport = LcmTransport::new_real(&lcm_url)
         .map_err(|error| format!("create real LCM transport failed: {error}"))?;
 
-    if args.config.input_lidar_topic.is_some() && playback.is_none()
+    if (args.config.input_lidar_topic.is_some() || args.config.input_frame_topic.is_some()) && playback.is_none()
         && publish_permit_file.is_none()
     {
         return run_raw_input_test_child(&transport, &args, &lcm_url, &contract_path).await;
@@ -642,6 +654,9 @@ async fn run_raw_input_test_child(
     contract_path: &Path,
 ) -> Result<(), String> {
     use nuwax_codec::lcm::schema;
+    if args.config.input_frame_topic.is_some() {
+        return run_atomic_input_test_child(transport, args, lcm_url, contract_path).await;
+    }
     let cloud_binding = typed_binding(
         args.config.input_lidar_topic.as_deref().ok_or("missing input cloud")?,
         POINT_CLOUD_TYPE,
@@ -683,6 +698,12 @@ async fn run_raw_input_test_child(
                 bytes.extend_from_slice(&frame.payload);
                 let mut cloud = schema::decode_point_cloud2(&bytes)
                     .map_err(|error| error.to_string())?;
+                let input_sequence = cloud.header.seq;
+                let input_begin = cloud.header.stamp_sec as u64 * 1_000_000_000 + cloud.header.stamp_nsec as u64;
+                let time_offset = cloud.fields.iter().find(|field| field.name == "offset_ns").map(|field| field.offset as usize);
+                let input_end = input_begin + time_offset.map(|offset| cloud.data.chunks_exact(cloud.point_step as usize)
+                    .map(|point| u32::from_le_bytes(point[offset..offset + 4].try_into().unwrap()) as u64)
+                    .max().unwrap_or(0)).unwrap_or(0);
                 count += 1;
                 cloud.header.seq = count as i32;
                 cloud.header.frame_id = args.config.sensor_frame_id.clone();
@@ -696,6 +717,16 @@ async fn run_raw_input_test_child(
                     cloud: encode_point_cloud2_body(&cloud).map_err(|error| error.to_string())?,
                 };
                 publish_pair(transport, args, count, &pair).await?;
+                if let Some(topic) = args.config.input_ack_topic.as_deref() {
+                    let (topic, kind) = typed_binding(topic, "nuwax_msgs.LioInputAck")?;
+                    let ack = nuwax_codec::lcm::input_ack::LioInputAck {
+                        sequence: input_sequence, scan_begin_timestamp_ns: input_begin,
+                        scan_end_timestamp_ns: input_end, success: true, message: "processed".into(),
+                    };
+                    transport.publish(RawLcmFrameBuilder::new(topic, kind)
+                        .payload(nuwax_codec::lcm::input_ack::encode_body(&ack).map_err(|e| e.to_string())?)
+                        .build()).await.map_err(|e| e.to_string())?;
+                }
                 report["published_pair_count"] = json!(count);
                 report["raw_imu_count"] = json!(imu_count);
                 write_contract_atomic(contract_path, &report)?;
@@ -705,6 +736,59 @@ async fn run_raw_input_test_child(
     clouds.unsubscribe().await.map_err(|error| error.to_string())?;
     imus.unsubscribe().await.map_err(|error| error.to_string())?;
     result
+}
+
+async fn run_atomic_input_test_child(
+    transport: &LcmTransport, args: &NativeChildArgs, lcm_url: &str, contract_path: &Path,
+) -> Result<(), String> {
+    use nuwax_codec::lcm::{input_frame, input_ack};
+    let input = typed_binding(args.config.input_frame_topic.as_deref().unwrap(), "nuwax_msgs.LioInputFrame")?;
+    let ack_binding = typed_binding(args.config.input_ack_topic.as_deref().unwrap(), "nuwax_msgs.LioInputAck")?;
+    let mut frames = transport.subscribe_owned(input.0, Some(input.1)).await.map_err(|e| e.to_string())?;
+    write_marker(PID_FILE_ENV, std::process::id().to_string())?;
+    let mut count = 0_u32;
+    let mut report = contract_value(args, lcm_url, None, None, None, count, count);
+    report["raw_subscriptions_ready"] = json!(true);
+    write_contract_atomic(contract_path, &report)?;
+    let mut cached: Option<(Vec<u8>, input_ack::LioInputAck)> = None;
+    let termination = wait_for_test_termination(); tokio::pin!(termination);
+    loop {
+        tokio::select! {
+            marker = &mut termination => { write_marker(TERM_FILE_ENV, marker?)?; break; }
+            frame = frames.recv() => {
+                let frame = frame.map_err(|e| e.to_string())?;
+                let input = input_frame::decode_body(&frame.payload).map_err(|e| e.to_string())?;
+                let cloud = input.cloud;
+                let sequence = cloud.header.seq;
+                let ack = if let Some((bytes, ack)) = cached.as_ref().filter(|(_, ack)| ack.sequence == sequence) {
+                    if bytes != &frame.payload { return Err("同序列重试内容变化".into()); }
+                    ack.clone()
+                } else {
+                    if sequence != (count + 1) as i32 || input.imu_samples.is_empty() { return Err("整组输入身份或惯性缺失".into()); }
+                    let begin = cloud.header.stamp_sec as u64 * 1_000_000_000 + cloud.header.stamp_nsec as u64;
+                    let offset = cloud.fields.iter().find(|f| f.name == "offset_ns").ok_or("no point time")?.offset as usize;
+                    let end = begin + cloud.data.chunks_exact(cloud.point_step as usize)
+                        .map(|point| u32::from_le_bytes(point[offset..offset + 4].try_into().unwrap()) as u64).max().unwrap_or(0);
+                    let mut odometry = Odometry::default(); odometry.header = cloud.header.clone();
+                    odometry.header.frame_id = args.config.frame_id.clone(); odometry.child_frame_id = args.config.child_frame_id.clone();
+                    odometry.pose.orientation_xyzw[3] = 1.0;
+                    let pair = EncodedPair { odometry: encode_odometry_body(&odometry).map_err(|e| e.to_string())?,
+                        cloud: encode_point_cloud2_body(&cloud).map_err(|e| e.to_string())? };
+                    count += 1; publish_pair(transport, args, count, &pair).await?;
+                    let ack = input_ack::LioInputAck { sequence, scan_begin_timestamp_ns: begin, scan_end_timestamp_ns: end,
+                        success: true, message: "processed".into() };
+                    cached = Some((frame.payload, ack.clone()));
+                    report["published_pair_count"] = json!(count); report["raw_imu_count"] = json!(input.imu_samples.len());
+                    write_contract_atomic(contract_path, &report)?;
+                    ack
+                };
+                transport.publish(RawLcmFrameBuilder::new(ack_binding.0.clone(), ack_binding.1.clone())
+                    .payload(input_ack::encode_body(&ack).map_err(|e| e.to_string())?).build()).await.map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    frames.unsubscribe().await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -719,7 +803,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let version = if backend == NativeBackend::PointLio { 2 } else { 1 };
+        let version = if backend == NativeBackend::PointLio { 3 } else { 1 };
         println!("nuwax-native-lio-v{version}:{}", backend_name(backend));
         return ExitCode::SUCCESS;
     }

@@ -334,6 +334,8 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
     ("nuwax_msgs.LioOdometryEnvelope", 0xba16_cd83_6063_d111_u64),
     ("nuwax_msgs.LioCloudEnvelope", 0xee6a_5707_c1d4_d40d_u64),
     ("nuwax_msgs.LioStatus", 0x36bd_731b_6c5d_20d9_u64),
+    ("nuwax_msgs.LioInputAck", 0xbb64_9f22_aa1e_d58c_u64),
+    ("nuwax_msgs.LioInputFrame", 0x6191_9fad_0a2d_4535_u64),
     ("nuwax_msgs.CorrectionCandidate", 0x8282bda63abe4079u64),
     ("nuwax_msgs.NativePgoRequest", 0x538a74c6b0685b10u64),
     ("nuwax_msgs.NativePgoResult", 0xd6e88f0cd50760c5u64),

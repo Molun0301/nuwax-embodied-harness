@@ -8812,6 +8812,20 @@ class GeometryRuntimeProvider:
             _log_rpc_error("PublishOdom", e)
             return False
 
+    def report_native_input_failure(self, reason: str, first_missing_source_timestamp_ns: int) -> bool:
+        """将生产者连续性故障锁定到当前原生代际，不能靠新建输入桥绕过。"""
+        self._native_input_failure_reason = str(reason)
+        self._raise_if_stopping("report_native_input_failure")
+        if self._stub is None:
+            return False
+        response = self._stub.ReportNativeInputFailure(
+            pb2.NativeInputFailureRequest(
+                reason=str(reason).encode("utf-8")[:1000].decode("utf-8", errors="ignore"),
+                first_missing_source_timestamp_ns=max(0, int(first_missing_source_timestamp_ns)),
+            ), timeout=3.0,
+        )
+        return bool(response.success)
+
     def publish_point_cloud(
         self,
         payload: bytes,
@@ -8832,6 +8846,8 @@ class GeometryRuntimeProvider:
         are rejected before any RPC instead of being repaired to a legacy frame.
         """
         self._raise_if_stopping("publish_point_cloud")
+        if imu_samples and getattr(self, "_native_input_failure_reason", None):
+            raise RuntimeError("原生输入连续性已失败，需重启拥有方：%s" % self._native_input_failure_reason)
         raw_frame_id = str(frame_id or "")
         normalized_frame_id = raw_frame_id.strip()
         if not normalized_frame_id or normalized_frame_id != raw_frame_id:
@@ -8884,9 +8900,13 @@ class GeometryRuntimeProvider:
                 request,
                 timeout=_heavy_deadline_sec(),
             )
+            if imu_samples and not bool(getattr(response, "success", False)):
+                raise RuntimeError("原生输入未确认：%s" % getattr(response, "message", "未知原因"))
             return bool(getattr(response, "success", False))
         except grpc.RpcError as e:
             _log_rpc_error("PublishPointCloud", e)
+            if imu_samples:
+                raise RuntimeError("原生输入RPC失败：%s %s" % (e.code(), e.details())) from e
             return False
 
     def get_status(

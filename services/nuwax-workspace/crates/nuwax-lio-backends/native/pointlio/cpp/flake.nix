@@ -90,6 +90,7 @@
             "-DFETCHCONTENT_SOURCE_DIR_DIMOS_LCM=${dimos-lcm}"
             "-DFASTLIO_DIR=${fast-lio}"
             "-DLIVOX_COMMON_DIR=${livox-common}"
+            "-DNUWAX_NATIVE_ACK_SCHEMA=${../../../../../lcmtypes/nuwax_msgs}/LioInputAck.lcm"
           ];
         };
       in {

@@ -1,4 +1,6 @@
-# 原生定位只依赖这些标准消息。使用当前通信库配套生成器，避免直接复用另一版本的C++头文件。
+# 原生定位消息使用当前通信库配套生成器，避免混用不同版本的C++头文件。
+set(NUWAX_NATIVE_ACK_SCHEMA "${CMAKE_CURRENT_LIST_DIR}/../../../../lcmtypes/nuwax_msgs/LioInputAck.lcm"
+    CACHE FILEPATH "原生扫描处理回执的权威消息定义")
 function(nuwax_generate_native_lcm_types schema_root)
   find_program(NUWAX_LCM_GEN_EXECUTABLE NAMES lcm-gen)
   if(NOT NUWAX_LCM_GEN_EXECUTABLE)
@@ -18,6 +20,8 @@ function(nuwax_generate_native_lcm_types schema_root)
     endif()
     list(APPEND schemas "${schema}")
   endforeach()
+  get_filename_component(native_schema_directory "${NUWAX_NATIVE_ACK_SCHEMA}" DIRECTORY)
+  list(APPEND schemas "${NUWAX_NATIVE_ACK_SCHEMA}" "${native_schema_directory}/LioInputFrame.lcm")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${schemas})
   set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/nuwax-lcm-types")
   file(MAKE_DIRECTORY "${output_dir}")

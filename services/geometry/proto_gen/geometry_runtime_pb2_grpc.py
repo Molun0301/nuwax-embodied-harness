@@ -256,6 +256,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.PublishPointCloudRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.PublishResult.FromString,
                 _registered_method=True)
+        self.ReportNativeInputFailure = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/ReportNativeInputFailure',
+                request_serializer=geometry__runtime__pb2.NativeInputFailureRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.PublishResult.FromString,
+                _registered_method=True)
 
 
 class GeometryRuntimeServicer(object):
@@ -548,6 +553,12 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReportNativeInputFailure(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GeometryRuntimeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -769,6 +780,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
             'PublishPointCloud': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishPointCloud,
                     request_deserializer=geometry__runtime__pb2.PublishPointCloudRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.PublishResult.SerializeToString,
+            ),
+            'ReportNativeInputFailure': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportNativeInputFailure,
+                    request_deserializer=geometry__runtime__pb2.NativeInputFailureRequest.FromString,
                     response_serializer=geometry__runtime__pb2.PublishResult.SerializeToString,
             ),
     }
@@ -1962,6 +1978,33 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.GeometryRuntime/PublishPointCloud',
             geometry__runtime__pb2.PublishPointCloudRequest.SerializeToString,
+            geometry__runtime__pb2.PublishResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportNativeInputFailure(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/ReportNativeInputFailure',
+            geometry__runtime__pb2.NativeInputFailureRequest.SerializeToString,
             geometry__runtime__pb2.PublishResult.FromString,
             options,
             channel_credentials,

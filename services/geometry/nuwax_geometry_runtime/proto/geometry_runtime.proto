@@ -715,6 +715,11 @@ message PublishPointCloudRequest {
   repeated LioImuSample imu_samples = 8;
 }
 message PublishResult { bool success = 1; string message = 2; }
+// 生产者报告已经破坏本代输入连续性；几何重启前禁止接纳更晚扫描。
+message NativeInputFailureRequest {
+  string reason = 1;
+  uint64 first_missing_source_timestamp_ns = 2;
+}
 
 message MappingCloudAuthority {
   string map_name = 1;
@@ -841,4 +846,5 @@ service GeometryRuntime {
   rpc PublishLaserScan(PublishLaserScanRequest) returns (PublishResult);
   rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
   rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
+  rpc ReportNativeInputFailure(NativeInputFailureRequest) returns (PublishResult);
 }

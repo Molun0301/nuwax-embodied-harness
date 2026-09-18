@@ -2140,6 +2140,13 @@ fn decode_imu_from(cursor: &mut Cursor<'_>) -> CodecResult<Imu> {
     })
 }
 
+/// 解码嵌套惯性前缀，复用同一布局并返回实际消耗字节数。
+pub(crate) fn decode_imu_prefix(encoded: &[u8]) -> CodecResult<(Imu, usize)> {
+    let mut cursor = Cursor::new(encoded);
+    let sample = decode_imu_from(&mut cursor)?;
+    Ok((sample, encoded.len() - cursor.remaining()))
+}
+
 /// Encode a top-level `geometry_msgs.Transform` message.
 pub fn encode_geometry_transform(message: &Transform) -> Vec<u8> {
     with_fingerprint(

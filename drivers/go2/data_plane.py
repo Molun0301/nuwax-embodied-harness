@@ -62,15 +62,20 @@ class _HistoryChannelSubscriber:
     def __init__(
         self, modules, topic, message_type, qos, *,
         read_batch_size: int = 1, latest_sample_key: Optional[Callable[[object], int]] = None,
+        ordered_sample_key: Optional[Callable[[object], int]] = None,
     ) -> None:
         self._modules = modules
         self._topic_name = topic
         self._message_type = message_type
         self._qos = qos
-        self._read_batch_size = int(read_batch_size) if latest_sample_key is not None else 1
+        self._read_batch_size = int(read_batch_size) if latest_sample_key is not None or ordered_sample_key is not None else 1
         if self._read_batch_size <= 0:
             raise ValueError("Go2 DDS 读取批次大小必须为正")
+        if latest_sample_key is not None and ordered_sample_key is not None:
+            raise ValueError("读取器不能同时选择最新帧和完整顺序交付")
         self._latest_sample_key = latest_sample_key
+        self._ordered_sample_key = ordered_sample_key
+        self._pending_samples = deque()
         self._dropped_sample_count = 0
         self._lock = threading.RLock()
         self._initialized = False
@@ -133,9 +138,18 @@ class _HistoryChannelSubscriber:
                 with self._lock:
                     if self._closed:
                         return None
+                    if self._pending_samples:
+                        return self._pending_samples.popleft()
                 samples = reader.take(self._read_batch_size, condition=condition)
                 if samples:
-                    # 点云是可替代扫描：在昂贵解析/分发之前丢弃当前批次的旧云。
+                    if self._ordered_sample_key is not None:
+                        ordered = sorted(samples, key=self._ordered_sample_key)
+                        with self._lock:
+                            if self._closed:
+                                return None
+                            self._pending_samples.extend(ordered)
+                            return self._pending_samples.popleft()
+                    # 兼容的最新帧读取路径：在昂贵解析/分发之前丢弃当前批次的旧云。
                     # 惯性读取器仍每次只取一条，源时间及完整惯性历史不变。
                     selected = (
                         max(samples, key=self._latest_sample_key)
@@ -185,6 +199,7 @@ class _HistoryChannelSubscriber:
                     except Exception:
                         LOGGER.debug("分离 Go2 DDS 读取条件失败。", exc_info=True)
         # Python 绑定由拥有引用析构实体，不调用SDK私有成员或删除执行中的读取器。
+        self._pending_samples.clear()
         self._waitset = None
         self._read_condition = None
         self._guard_condition = None
@@ -941,7 +956,8 @@ class Go2DirectDdsBridge:
                 return _HistoryChannelSubscriber(
                     modules, topic, message_type, qos,
                     read_batch_size=history_depth,
-                    latest_sample_key=_point_cloud_source_time_key if latest_cloud else None,
+                    latest_sample_key=_point_cloud_source_time_key if latest_cloud and self.config.lio_backend != "pointlio" else None,
+                    ordered_sample_key=_point_cloud_source_time_key if latest_cloud and self.config.lio_backend == "pointlio" else None,
                 )
 
             pose_subscriber = make_subscriber(

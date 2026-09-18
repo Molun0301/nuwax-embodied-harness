@@ -69,6 +69,8 @@ pub struct GeometryRuntimeService {
     /// Native mode publishes raw cloud and IMU to generation-private channels.
     native_raw_input_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
     native_raw_sensor_frame: Option<String>,
+    native_input_failure: Arc<parking_lot::Mutex<Option<String>>>,
+    native_input_delivery: Option<Arc<crate::native_input_delivery::NativeInputDelivery>>,
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
     graph_artifacts: Arc<parking_lot::Mutex<crate::planar_artifacts::Store>>,
@@ -731,6 +733,8 @@ impl GeometryRuntimeService {
             point_cloud_binding: Some(point_cloud_binding),
             native_raw_input_binding: None,
             native_raw_sensor_frame: None,
+            native_input_failure: Arc::new(parking_lot::Mutex::new(None)),
+            native_input_delivery: None,
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
@@ -777,6 +781,7 @@ impl GeometryRuntimeService {
         shutdown: ShutdownCoordinator,
         point_cloud_binding: Option<(LcmTopic, LcmMessageType)>,
         native_raw_input_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
+        native_ack_binding: Option<((LcmTopic, LcmMessageType), (LcmTopic, LcmMessageType))>,
         native_raw_sensor_frame: Option<String>,
         relocalization_ingress: Option<crate::correction_coordinator::RelocalizationCommandIngress>,
     ) -> Self {
@@ -797,6 +802,8 @@ impl GeometryRuntimeService {
             point_cloud_binding,
             native_raw_input_binding,
             native_raw_sensor_frame,
+            native_input_failure: Arc::new(parking_lot::Mutex::new(None)),
+            native_input_delivery: native_ack_binding.map(|(ack, frame)| Arc::new(crate::native_input_delivery::NativeInputDelivery::new(ack, frame).with_shutdown(shutdown.request_tx.subscribe()))),
             mapping_transition: shutdown.mapping_transition.clone(),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
             deferred_replay: shutdown.deferred_replay.clone(),
@@ -4512,7 +4519,7 @@ fn encode_native_imu_payload(sample: &LioImuSample) -> CodecResult<Vec<u8>> {
 /// 因而必须先发完本次 measurement 的全部 IMU，再发 cloud。LCM 没有跨消息
 /// 事务；中途失败时保留已经成功发布的 IMU 前缀，但绝不提前发布 cloud。
 /// 整帧只向原通信线程提交一次并等待一次确认，避免逐样本累计空队列等待。
-async fn publish_native_raw_pair(
+pub(crate) async fn publish_native_raw_pair(
     transport: &nuwax_transport::LcmTransport,
     cloud_binding: &(LcmTopic, LcmMessageType),
     imu_binding: &(LcmTopic, LcmMessageType),
@@ -4541,6 +4548,10 @@ async fn publish_native_raw_pair(
 }
 
 fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> CodecResult<Vec<u8>> {
+    encode_pointcloud_request_payload_with_sequence(request, 0)
+}
+
+pub(crate) fn encode_pointcloud_request_payload_with_sequence(request: &PublishPointCloudRequest, sequence: i32) -> CodecResult<Vec<u8>> {
     if request.frame_id.is_empty() || request.frame_id.trim() != request.frame_id {
         return Err(CodecError::LcmEncode(
             "point cloud frame_id must be non-empty without surrounding whitespace".into(),
@@ -4592,7 +4603,7 @@ fn encode_pointcloud_request_payload(request: &PublishPointCloudRequest) -> Code
         .map_err(|_| CodecError::LcmEncode("point cloud timestamp seconds exceed int32".into()))?;
     schema::encode_point_cloud2_body(&schema::PointCloud2 {
         header: schema::Header {
-            seq: 0,
+            seq: sequence,
             stamp_sec,
             stamp_nsec: (request.timestamp_ns % 1_000_000_000) as i32,
             frame_id: request.frame_id.clone(),
@@ -7805,6 +7816,23 @@ impl GeometryRuntime for GeometryRuntimeService {
         }
     }
 
+    async fn report_native_input_failure(
+        &self, req: Request<NativeInputFailureRequest>,
+    ) -> Result<Response<PublishResult>, Status> {
+        if self.native_raw_input_binding.is_none() {
+            return Err(Status::failed_precondition("当前不是原生传感器输入"));
+        }
+        let request = req.into_inner();
+        if request.reason.trim().is_empty() || request.reason.len() > 1024 {
+            return Err(Status::invalid_argument("输入故障原因不能为空或超过1024字节"));
+        }
+        let reason = format!("source_ns={} {}", request.first_missing_source_timestamp_ns, request.reason);
+        let mut failure = self.native_input_failure.lock();
+        let first = failure.get_or_insert(reason);
+        tracing::error!(reason = %first, "原生输入连续性失败，锁定本代后续扫描");
+        Ok(Response::new(PublishResult { success: true, message: first.clone() }))
+    }
+
     async fn publish_point_cloud(
         &self,
         req: Request<PublishPointCloudRequest>,
@@ -7822,6 +7850,9 @@ impl GeometryRuntime for GeometryRuntimeService {
         let pcr = req.get_ref();
         let lcm_transport = self.bridge.transport.clone();
         if let Some((cloud_binding, imu_binding)) = self.native_raw_input_binding.clone() {
+            if let Some(reason) = self.native_input_failure.lock().as_ref() {
+                return Err(Status::failed_precondition(format!("原生输入已锁定失败，需重启几何运行时：{reason}")));
+            }
             if pcr.imu_samples.is_empty() {
                 return Ok(Response::new(PublishResult {
                     success: false,
@@ -7843,9 +7874,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             validate_native_raw_pointcloud_fields(pcr).map_err(|error| {
                 Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
             })?;
-            let cloud_payload = encode_pointcloud_request_payload(pcr).map_err(|error| {
-                Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
-            })?;
             let imu_payloads = pcr
                 .imu_samples
                 .iter()
@@ -7854,6 +7882,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                 .map_err(|error| {
                     Status::invalid_argument(format!("native raw IMU rejected: {error}"))
                 })?;
+            if let Some(delivery) = &self.native_input_delivery {
+                let sequence = delivery.publish(&lcm_transport, pcr, imu_payloads).await?;
+                return Ok(Response::new(PublishResult { success: true,
+                    message: format!("原生扫描已处理 sequence={sequence} source_ns={}", pcr.timestamp_ns) }));
+            }
+            let cloud_payload = encode_pointcloud_request_payload(pcr).map_err(|error| {
+                Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
+            })?;
             publish_native_raw_pair(
                 &lcm_transport,
                 &cloud_binding,
@@ -8259,6 +8295,23 @@ mod pointcloud_request_tests {
                 LcmMessageType::new("sensor_msgs.Imu").expect("IMU type"),
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn producer_input_failure_is_shared_and_keeps_first_gap() {
+        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        let mut service = GeometryRuntimeService::new(handle);
+        service.native_raw_input_binding = Some(native_raw_bindings());
+        let other = service.clone();
+        for (reason, stamp) in [("队列溢出", 123), ("后续故障", 456)] {
+            let result = service.report_native_input_failure(Request::new(NativeInputFailureRequest {
+                reason: reason.into(), first_missing_source_timestamp_ns: stamp,
+            })).await.unwrap().into_inner();
+            assert!(result.success && result.message.contains("123") && result.message.contains("队列溢出"));
+        }
+        let error = other.publish_point_cloud(Request::new(request())).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("123"));
     }
 
     #[tokio::test]
@@ -17110,6 +17163,7 @@ mod relocalization_terminal_query_tests {
         GeometryRuntimeService::new_with_shutdown_and_point_cloud_binding(
             handle,
             shutdown,
+            None,
             None,
             None,
             None,

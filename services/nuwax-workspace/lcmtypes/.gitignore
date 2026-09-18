@@ -40,6 +40,8 @@ generated/python/nuwax_msgs/*
 !generated/python/nuwax_msgs/LioOdometryEnvelope.py
 !generated/python/nuwax_msgs/LioCloudEnvelope.py
 !generated/python/nuwax_msgs/LioStatus.py
+!generated/python/nuwax_msgs/LioInputAck.py
+!generated/python/nuwax_msgs/LioInputFrame.py
 !generated/python/nuwax_msgs/NavigationMap3D.py
 !generated/python/nuwax_msgs/PlanarNavigationMap.py
 

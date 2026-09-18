@@ -35,6 +35,7 @@
 #include "imu_frame_transform.hpp"
 #include "scan_imu_buffer.hpp"
 #include "native_input_subscription.hpp"
+#include "native_input_receipt.hpp"
 #include "native_lio_arguments.hpp"
 #include "native_imu_reference.hpp"
 #include "pointlio_options.hpp"
@@ -48,6 +49,7 @@
 #include "sensor_msgs/Imu.hpp"
 #include "sensor_msgs/PointCloud2.hpp"
 #include "sensor_msgs/PointField.hpp"
+#include "nuwax_msgs/LioInputFrame.hpp"
 
 // Point-LIO (header-only core, compiled sources linked via CMake)
 #include "pointlio.hpp"
@@ -62,6 +64,7 @@ static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_typed_input_failed{false};
 static lcm::LCM* g_lcm = nullptr;
 static PointLio* g_point_lio = nullptr;
+static nuwax_lio::NativeInputReceipt* g_input_receipt = nullptr;
 static nuwax_lio::NativeImuReference g_imu_reference;
 
 // Parse a comma-separated list of doubles (CLI vector args); empty on bad input.
@@ -314,14 +317,27 @@ static bool typed_imu_covers_scan(uint64_t scan_start_ns, uint64_t scan_end_ns) 
 
 static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const sensor_msgs::PointCloud2* msg, void*) {
     if (!g_running.load() || !g_external_input || !msg) { return; }
+    // 拒绝必须有回执并终止本代，不能静默跳过后继续融合更晚扫描。
+    const auto reject = [&](const char* reason) {
+        if (g_input_receipt && g_input_receipt->enabled()) {
+            const uint64_t begin = msg->header.stamp.sec >= 0 && msg->header.stamp.nsec >= 0
+                ? static_cast<uint64_t>(msg->header.stamp.sec) * NANOS_PER_SECOND
+                    + static_cast<uint64_t>(msg->header.stamp.nsec) : 0;
+            g_input_receipt->reject(msg->header.seq, begin, begin, reason);
+            g_typed_input_failed.store(true);
+            g_running.store(false);
+        }
+    };
     if (msg->header.frame_id.empty() || msg->header.frame_id != g_sensor_frame_id ||
         msg->header.stamp.sec < 0 || msg->header.stamp.nsec < 0 ||
         msg->header.stamp.nsec >= static_cast<int32_t>(NANOS_PER_SECOND) || msg->is_bigendian) {
         fprintf(stderr, "[pointlio] reject typed cloud: invalid frame, timestamp, or endianness\\n");
+        reject("[pointlio] reject typed cloud: invalid frame, timestamp, or endianness\\n");
         return;
     }
     if (msg->width <= 0 || msg->height <= 0 || msg->point_step < 12 || msg->row_step < 0) {
         fprintf(stderr, "[pointlio] reject typed cloud: invalid dimensions\\n");
+        reject("[pointlio] reject typed cloud: invalid dimensions\\n");
         return;
     }
     const auto* x_field = find_typed_field(msg, "x");
@@ -333,6 +349,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
         !typed_field_fits(z_field, msg->point_step, 4) || z_field->datatype != 7 ||
         !typed_field_fits(time_field, msg->point_step, 4) || time_field->datatype != 6) {
         fprintf(stderr, "[pointlio] reject typed cloud: require float32 xyz and uint32 offset_ns\\n");
+        reject("[pointlio] reject typed cloud: require float32 xyz and uint32 offset_ns\\n");
         return;
     }
     const size_t width = static_cast<size_t>(msg->width);
@@ -343,6 +360,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
         height > SIZE_MAX / row_step || msg->data.size() < height * row_step ||
         height > SIZE_MAX / width || width * height > 2'000'000) {
         fprintf(stderr, "[pointlio] reject typed cloud: row/data bounds invalid\\n");
+        reject("[pointlio] reject typed cloud: row/data bounds invalid\\n");
         return;
     }
     const uint64_t stamp_ns = static_cast<uint64_t>(msg->header.stamp.sec) * NANOS_PER_SECOND +
@@ -358,6 +376,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
             if (!read_float32_field(msg, x_field, base, x) || !read_float32_field(msg, y_field, base, y) ||
                 !read_float32_field(msg, z_field, base, z) || !read_offset_ns(msg, time_field, base, offset_ns)) {
                 fprintf(stderr, "[pointlio] reject typed cloud: non-finite or malformed point\\n");
+                reject("[pointlio] reject typed cloud: non-finite or malformed point\\n");
                 return;
             }
             max_offset_ns = std::max(max_offset_ns, offset_ns);
@@ -371,6 +390,7 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
     if (stamp_ns > UINT64_MAX - max_offset_ns ||
         !typed_imu_covers_scan(stamp_ns, stamp_ns + max_offset_ns)) {
         fprintf(stderr, "[pointlio] reject typed cloud: IMU does not cover scan window\n");
+        reject("[pointlio] reject typed cloud: IMU does not cover scan window\n");
         return;
     }
     // 原载荷保留设备顺序；内核计算副本按真实时间排列，整点移动以保持坐标对应。
@@ -381,11 +401,17 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
     if (!std::is_sorted(accepted_points.begin(), accepted_points.end(), earlier_point)) {
         std::stable_sort(accepted_points.begin(), accepted_points.end(), earlier_point);
     }
-    // A PointCloud2 message is one scan. Replace the pending frame atomically;
-    // never append a later scan to the prior scan's timebase.
+    // 主循环在本回调返回后立即处理当前扫描；序列回执防止跨帧静默继续。
     std::lock_guard<std::mutex> lock(g_pc_mutex);
     if (g_has_last_typed_cloud_stamp && stamp_ns <= g_last_typed_cloud_stamp_ns) {
         fprintf(stderr, "[pointlio] reject typed cloud: source timestamp must increase\n");
+        reject("[pointlio] reject typed cloud: source timestamp must increase\n");
+        return;
+    }
+    if (g_input_receipt && !g_input_receipt->accept(
+            msg->header.seq, stamp_ns, stamp_ns + max_offset_ns)) {
+        g_typed_input_failed.store(true);
+        g_running.store(false);
         return;
     }
     g_last_typed_cloud_stamp_ns = stamp_ns;
@@ -455,6 +481,49 @@ static void on_typed_imu(const lcm::ReceiveBuffer*, const std::string&, const se
         g_last_typed_imu_stamp_ns = timestamp_ns;
         g_has_last_typed_imu_stamp = true;
     }
+}
+
+// LCM只在整组消息完成重组后调用此入口；部分惯性丢失时不会单独交付点云。
+static void on_input_frame(const lcm::ReceiveBuffer*, const std::string&,
+                           const nuwax_msgs::LioInputFrame* frame, void*) {
+    if (!g_running.load() || !frame || !g_input_receipt) return;
+    const auto& cloud = frame->cloud;
+    const uint64_t begin = cloud.header.stamp.sec >= 0 && cloud.header.stamp.nsec >= 0
+        ? static_cast<uint64_t>(cloud.header.stamp.sec) * NANOS_PER_SECOND + cloud.header.stamp.nsec : 0;
+    const auto fail = [&](const char* reason) {
+        g_input_receipt->reject(cloud.header.seq, begin, begin, reason);
+        g_typed_input_failed.store(true);
+        g_running.store(false);
+    };
+    const int size = frame->getEncodedSize();
+    if (frame->imu_count <= 0 || frame->imu_count > 4096
+        || frame->imu_samples.size() != static_cast<size_t>(frame->imu_count)
+        || size <= 0 || size > 8 * 1024 * 1024 + 8) {
+        fail("整组输入数量或长度不合法"); return;
+    }
+    std::vector<uint8_t> packet(static_cast<size_t>(size));
+    if (frame->encode(packet.data(), 0, size) != size) { fail("整组输入无法编码核对"); return; }
+    if (!g_input_receipt->stage_packet(cloud.header.seq, begin, std::move(packet))) {
+        if (g_input_receipt->failed()) { g_typed_input_failed.store(true); g_running.store(false); }
+        return;
+    }
+    std::optional<uint64_t> previous;
+    for (const auto& imu : frame->imu_samples) {
+        if (imu.header.stamp.sec < 0 || imu.header.stamp.nsec < 0
+            || imu.header.stamp.nsec >= static_cast<int32_t>(NANOS_PER_SECOND)) {
+            fail("整组惯性时间不合法"); return;
+        }
+        const uint64_t stamp = static_cast<uint64_t>(imu.header.stamp.sec) * NANOS_PER_SECOND + imu.header.stamp.nsec;
+        if (previous && stamp <= *previous) { fail("整组惯性时间必须递增"); return; }
+        previous = stamp;
+        // 相邻窗口共享边界，已经完整接收的历史样本无需再次积分。
+        if (g_has_last_typed_imu_stamp && stamp <= g_last_typed_imu_stamp_ns) continue;
+        on_typed_imu(nullptr, "", &imu, nullptr);
+        if (!g_running.load() || !g_has_last_typed_imu_stamp || g_last_typed_imu_stamp_ns != stamp) {
+            fail("整组惯性准入失败"); return;
+        }
+    }
+    on_typed_cloud(nullptr, "", &cloud, nullptr);
 }
 
 static void on_point_cloud(const uint32_t /*handle*/, const uint8_t /*dev_type*/, LivoxLidarEthernetPacket* data, void* /*client_data*/) {
@@ -573,7 +642,7 @@ static void signal_handler(int /*sig*/) {
 static int run_pointlio(int argc, char** argv) {
     // 身份查询在通信和算法构造前结束；允许部署路径或文件名独立于后端名称。
     if (argc == 2 && std::strcmp(argv[1], "--nuwax-lio-contract") == 0) {
-        std::puts("nuwax-native-lio-v2:pointlio");
+        std::puts("nuwax-native-lio-v3:pointlio");
         return 0;
     }
     dimos::NativeModule mod(argc, argv);
@@ -677,9 +746,15 @@ static int run_pointlio(int argc, char** argv) {
     g_sensor_frame_id = mod.arg_required("sensor_frame_id");
     g_input_lidar_topic = mod.arg("input_lidar", "");
     g_input_imu_topic = mod.arg("input_imu", "");
-    g_external_input = !g_input_lidar_topic.empty() || !g_input_imu_topic.empty();
+    const auto input_ack_topic = mod.arg("input_ack", "");
+    const auto input_frame_topic = mod.arg("input_frame", "");
+    g_external_input = !g_input_lidar_topic.empty() || !g_input_imu_topic.empty() || !input_frame_topic.empty();
     if (g_external_input && !mod.has("imu_origin_in_body"))
         throw std::invalid_argument("规范Point输入必须声明imu_origin_in_body");
+    if (input_ack_topic.empty() != input_frame_topic.empty())
+        throw std::invalid_argument("整组输入与处理回执必须同时配置");
+    if (!input_ack_topic.empty() && !g_external_input)
+        throw std::invalid_argument("扫描回执只能用于规范输入");
     g_imu_reference.configure(mod.arg("imu_origin_in_body", "0,0,0"));
     params.extrinsic_T = g_imu_reference.lidar_translation_at_imu(params.extrinsic_T);
     if (g_external_input) {
@@ -689,7 +764,7 @@ static int run_pointlio(int argc, char** argv) {
         }
         std::copy(params.extrinsic_R.begin(), params.extrinsic_R.end(), g_body_from_sensor_rotation.begin());
     }
-    if (g_external_input && (g_input_lidar_topic.empty() || g_input_imu_topic.empty())) {
+    if (g_external_input && input_frame_topic.empty() && (g_input_lidar_topic.empty() || g_input_imu_topic.empty())) {
         fprintf(stderr, "Error: --input_lidar and --input_imu must be supplied together\\n");
         return 1;
     }
@@ -737,6 +812,8 @@ static int run_pointlio(int argc, char** argv) {
         return 1;
     }
     g_lcm = &lcm;
+    nuwax_lio::NativeInputReceipt input_receipt(lcm, input_ack_topic);
+    g_input_receipt = &input_receipt;
 
     if (debug) { printf("[pointlio] Initializing Point-LIO...\n"); }
     std::unique_ptr<nuwax_lio::OrderedOdometryOutput<nav_msgs::Odometry>> point_output;
@@ -822,7 +899,7 @@ static int run_pointlio(int argc, char** argv) {
                 const uint64_t scan_end_ns = frame_start + static_cast<uint64_t>(points.back().offset_time);
                 nuwax_lio::feed_scan_imu_and_retain_boundary(
                     g_typed_imu_samples, scan_end_ns, g_last_fed_typed_imu_stamp_ns,
-                    [&point_lio](const auto& sample) { point_lio.feed_imu(sample); });
+                    [&point_lio](const auto& sample) { point_lio.feed_imu(sample); }, frame_start);
             }
 
             if (!points.empty()) {
@@ -905,9 +982,13 @@ static int run_pointlio(int argc, char** argv) {
     bool sdk_started = false;
     struct SdkLifetime {
         bool& started;
-        ~SdkLifetime() { if (started) LivoxLidarSdkUninit(); g_point_lio = nullptr; }
+        ~SdkLifetime() { if (started) LivoxLidarSdkUninit(); g_point_lio = nullptr; g_input_receipt = nullptr; }
     } sdk_lifetime{sdk_started};
-    if (g_external_input) {
+    if (g_external_input && !input_frame_topic.empty()) {
+        auto* subscription = lcm.subscribeFunction(input_frame_topic, on_input_frame, static_cast<void*>(nullptr));
+        if (!nuwax_lio::configure_native_input_subscription(subscription,
+                nuwax_lio::kNativeInputCloudQueueCapacity, "pointlio", input_frame_topic)) return 1;
+    } else if (g_external_input) {
         auto* lidar_subscription = lcm.subscribeFunction(
             g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
         if (!nuwax_lio::configure_native_input_subscription(
@@ -948,6 +1029,7 @@ static int run_pointlio(int argc, char** argv) {
             if (!g_running.load()) break;
         }
         run_main_iter(std::chrono::steady_clock::now());
+        if (g_external_input) input_receipt.complete();
 
         if (!g_external_input) lcm.handleTimeout(0);
 
@@ -973,6 +1055,7 @@ int main(int argc, char** argv) {
     try { return run_pointlio(argc, argv); }
     catch (const std::exception& error) {
         g_lcm = nullptr;
+        g_input_receipt = nullptr;
         std::fprintf(stderr, "[pointlio] 配置或输出失败：%s\n", error.what());
         return 2;
     }

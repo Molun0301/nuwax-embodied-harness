@@ -1837,6 +1837,11 @@ fn canonical_backend_sha256(
         out.extend_from_slice(&fine.size.to_be_bytes());
         out.extend_from_slice(&canonical_hash32(&fine.sha256, "fine_map_artifact.sha256")?);
     }
+    if let Some(dense) = &checkpoint.dense_cloud_artifact {
+        out.extend_from_slice(b"nuwax.geometry.dense-cloud-archive.v1\0");
+        out.extend_from_slice(&dense.size.to_be_bytes());
+        out.extend_from_slice(&canonical_hash32(&dense.sha256, "dense_cloud_artifact.sha256")?);
+    }
     Ok(crate::map_checksum::sha256_bytes(&out))
 }
 
@@ -2172,6 +2177,21 @@ async fn activate_map_r1(
         let receiver = service.bridge.register_navigation_map_operation(async move {
             tokio::task::spawn_blocking(move || crate::pointcloud::prepare_fine_cloud_archive(file, &source_session,
                 source_generation, receipt.cloud_revision, receipt.source_timestamp_ns))
+                .await.map_err(|e| e.to_string()).and_then(|v| v)
+        }).map_err(Status::unavailable)?;
+        Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
+    } else { None };
+
+    let prepared_dense = if let Some(backend) = mapping_backend_checkpoint.as_ref().filter(|b| b.dense_cloud_artifact.is_some()) {
+        let file = service.graph_artifacts.lock().open(backend.dense_cloud_artifact.as_ref().unwrap()).map_err(Status::invalid_argument)?;
+        let receipt = backend.cloud_receipt.as_ref().ok_or_else(|| Status::invalid_argument("完整点云缺少原提交收据"))?;
+        let expected = crate::dense_cloud::Metadata {
+            version: 1, session_id: backend.source_session_id.clone(), session_generation: backend.source_session_generation,
+            cloud_revision: receipt.cloud_revision, source_timestamp_ns: receipt.source_timestamp_ns,
+            frame_id: expected_map_frame_id.clone(), point_count: 0, bounds_min: [0.; 3], bounds_max: [0.; 3],
+        };
+        let receiver = service.bridge.register_navigation_map_operation(async move {
+            tokio::task::spawn_blocking(move || crate::dense_cloud::DenseCloud::from_archive(file, &expected))
                 .await.map_err(|e| e.to_string()).and_then(|v| v)
         }).map_err(Status::unavailable)?;
         Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
@@ -2916,12 +2936,13 @@ async fn activate_map_r1(
         let installed = {
             let mut writer = bridge.cloud_map_writer.lock();
             match writer.as_mut() {
-                Some(writer) => writer.install_checkpoint_with_fine(
+                Some(writer) => writer.install_checkpoint_with_sources(
                     &occupancy_receipt,
                     target.voxel_size,
                     target.point_count,
                     &target.xyz_f32_le,
                     prepared_fine,
+                    prepared_dense,
                 ),
                 None => Err("cloud-map SHM writer became unavailable".to_owned()),
             }
@@ -3824,6 +3845,7 @@ fn validate_mapping_checkpoint_receipts(
 }
 
 fn validate_planar_checkpoint(checkpoint:&MappingBackendCheckpoint)->Result<(),String> {
+    if checkpoint.dense_cloud_artifact.is_some() { return Err("二维检查点不能携带完整三维点云".into()); }
     if checkpoint.fine_map_artifact.is_some() { return Err("二维检查点不能携带三维精细资产".into()); }
     let reference=checkpoint.graph_artifact.as_ref().ok_or("二维图必须通过分块制品引用加载")?;
     if checkpoint.schema_version!=1 || checkpoint.backend_kind!="slam_toolbox" || checkpoint.target_kind!="planar_graph"
@@ -3850,6 +3872,10 @@ fn validate_mapping_backend_checkpoint(
     checkpoint: &MappingBackendCheckpoint,
     expected_backend: crate::mapping_backend::MappingBackendKind,
 ) -> Result<(), String> {
+    if let Some(dense) = &checkpoint.dense_cloud_artifact {
+        if dense.id.is_empty() || dense.id.len() > 128 || dense.size == 0 || dense.size > crate::dense_cloud::MAX_ARCHIVE_BYTES
+            || dense.sha256.len() != 32 || dense.sha256.iter().all(|b| *b == 0) { return Err("完整点云制品引用无效".into()); }
+    }
     if let Some(fine) = &checkpoint.fine_map_artifact {
         if fine.id.is_empty() || fine.id.len() > 128 || fine.size == 0 || fine.size > nuwax_map_chunks::MAX_ARCHIVE_BYTES
             || fine.sha256.len() != 32 || fine.sha256.iter().all(|b| *b == 0) { return Err("精细地图制品引用无效".into()); }
@@ -6042,7 +6068,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     let shared = bridge.state.read().await;
                     (shared.map.revision, shared.map.timestamp_ns)
                 };
-                let (cloud_snapshot, cloud_receipt, fine_snapshot) = {
+                let (cloud_snapshot, cloud_receipt, fine_snapshot, dense_snapshot) = {
                     let writer = bridge.cloud_map_writer.lock();
                     let writer = writer.as_ref().ok_or_else(|| {
                         Status::failed_precondition(
@@ -6059,7 +6085,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                             "mapping backend checkpoint requires a canonical cloud commit",
                         )
                     })?;
-                    (snapshot, receipt, writer.committed_fine_cloud())
+                    (snapshot, receipt, writer.committed_fine_cloud(), writer.committed_dense_cloud().map_err(Status::failed_precondition)?)
                 };
                 if !snapshot.active
                     || snapshot.session_id.trim().is_empty()
@@ -6136,6 +6162,14 @@ impl GeometryRuntime for GeometryRuntimeService {
                 }, cloud_receipt.cloud_revision)).transpose().map_err(Status::internal)?;
                 // 已拿到同一屏障内的不可变快照，归档不持生命周期锁。
                 drop(lifecycle_guard);
+                let dense_cloud_artifact = if let Some(dense) = dense_snapshot {
+                    let store = owned_service.graph_artifacts.clone();
+                    let frame_id = raw_map.frame_id.clone();
+                    Some(tokio::task::spawn_blocking(move || {
+                        let (file, size, sha) = dense.archive(&frame_id)?;
+                        store.lock().insert(file, size, sha)
+                    }).await.map_err(|e| Status::internal(e.to_string()))?.map_err(Status::internal)?)
+                } else { None };
                 let fine_map_artifact = if let (Some(fine), Some(root)) = (fine_snapshot, fine_root) {
                     let store = owned_service.graph_artifacts.clone();
                     Some(tokio::task::spawn_blocking(move || {
@@ -6162,6 +6196,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     graph_artifact: None,
                     target_kind: String::new(),
                     fine_map_artifact,
+                    dense_cloud_artifact,
                 };
                 validate_mapping_backend_checkpoint(&checkpoint, backend_kind)
                     .map_err(Status::internal)?;
@@ -6595,6 +6630,49 @@ impl GeometryRuntime for GeometryRuntimeService {
         let bytes = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::not_found)?;
         Ok(Response::new(NavigationMapBlockResponse {
             data_hex: bytes.iter().map(|v| format!("{v:02x}")).collect(),
+        }))
+    }
+
+    async fn get_dense_cloud_chunk(
+        &self, request: Request<DenseCloudChunkRequest>,
+    ) -> Result<Response<DenseCloudChunk>, Status> {
+        self.ensure_running_admission("GetDenseCloudChunk").await?;
+        let request = request.into_inner();
+        if request.max_points == 0 || request.max_points > crate::dense_cloud::CHUNK_POINTS
+            || request.expected_epoch.len() > 128 || (request.expected_epoch.is_empty() && request.offset_points != 0) {
+            return Err(Status::invalid_argument("完整点云分块请求非法"));
+        }
+        let (snapshot, frame_id) = {
+            let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
+            self.ensure_running_admission("GetDenseCloudChunk").await?;
+            let frame_id = self.bridge.state.read().await.map.frame_id.clone();
+            let snapshot = self.bridge.cloud_map_writer.lock().as_ref()
+                .ok_or_else(|| Status::failed_precondition("三维点云拥有方未就绪"))?
+                .committed_dense_cloud().map_err(Status::failed_precondition)?
+                .ok_or_else(|| Status::not_found("当前地图没有完整扫描数据；旧体素地图无法还原全部扫描点"))?;
+            (snapshot, frame_id)
+        };
+        if !request.expected_epoch.is_empty() && request.expected_epoch != snapshot.epoch {
+            return Err(Status::failed_precondition("DENSE_CLOUD_SOURCE_CHANGED"));
+        }
+        let read_snapshot = snapshot.clone();
+        let receiver = self.bridge.register_navigation_map_operation(async move {
+            tokio::task::spawn_blocking(move || read_snapshot.read(request.offset_points, request.max_points))
+                .await.map_err(|e| e.to_string()).and_then(|v| v)
+        }).map_err(Status::unavailable)?;
+        let data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?;
+        self.ensure_running_admission("GetDenseCloudChunk").await?;
+        let current_epoch = self.bridge.cloud_map_writer.lock().as_ref()
+            .and_then(|writer| writer.committed_dense_cloud().ok().flatten()).map(|cloud| cloud.epoch);
+        if current_epoch.as_ref() != Some(&snapshot.epoch) {
+            return Err(Status::failed_precondition("DENSE_CLOUD_SOURCE_CHANGED"));
+        }
+        Ok(Response::new(DenseCloudChunk {
+            epoch: snapshot.epoch, revision: snapshot.receipt.cloud_revision,
+            source_timestamp_ns: snapshot.receipt.source_timestamp_ns, frame_id,
+            session_id: snapshot.session_id, session_generation: snapshot.receipt.session_generation,
+            total_points: snapshot.point_count, offset_points: request.offset_points, xyz_f32_le: data,
+            bounds_min: snapshot.bounds_min.to_vec(), bounds_max: snapshot.bounds_max.to_vec(),
         }))
     }
 
@@ -11142,6 +11220,7 @@ mod lifecycle_tests {
         };
         MappingBackendCheckpoint {
             fine_map_artifact: None,
+            dense_cloud_artifact: None,
             schema_version: crate::mapping_backend::MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION,
             backend_kind: "voxel".to_owned(),
             source_session_generation: 7,
@@ -13651,7 +13730,8 @@ mod lifecycle_tests {
         let mut restored_owner = crate::lcm_runtime::attach_root_task_owner_for_tests(restored_handle);
         let restored_handle = restored_owner.handle.clone();
         let restored_service = GeometryRuntimeService::new(restored_handle.clone());
-        if let Some(original) = source_checkpoint.fine_map_artifact.clone() {
+        for (is_dense, original) in [(false, source_checkpoint.fine_map_artifact.clone()), (true, source_checkpoint.dense_cloud_artifact.clone())] {
+            let Some(original) = original else { continue; };
             let copied = GraphArtifactRef { id: uuid::Uuid::new_v4().simple().to_string(), ..original.clone() };
             GeometryRuntime::transfer_graph_artifact(&restored_service, Request::new(GraphArtifactTransferRequest {
                 action: 1, artifact: Some(copied.clone()), offset: 0, data: Vec::new(),
@@ -13675,7 +13755,8 @@ mod lifecycle_tests {
             GeometryRuntime::transfer_graph_artifact(&source_service, Request::new(GraphArtifactTransferRequest {
                 action: 5, artifact: Some(original), offset: 0, data: Vec::new(),
             })).await.unwrap();
-            source_checkpoint.fine_map_artifact = Some(copied);
+            if is_dense { source_checkpoint.dense_cloud_artifact = Some(copied); }
+            else { source_checkpoint.fine_map_artifact = Some(copied); }
         }
         let restored_session_id = "ray-checkpoint-restored";
         let activated = GeometryRuntime::activate_map(
@@ -13785,6 +13866,18 @@ mod lifecycle_tests {
             .expect("restored continued cloud snapshot");
         assert_eq!(restored_cloud.point_count, source_cloud.point_count);
         assert_eq!(restored_cloud.xyz_f32_le, source_cloud.xyz_f32_le);
+
+        let request = || Request::new(DenseCloudChunkRequest { expected_epoch: String::new(), offset_points: 0, max_points: 65536 });
+        let source_dense = GeometryRuntime::get_dense_cloud_chunk(&source_service, request()).await.unwrap().into_inner();
+        let restored_dense = GeometryRuntime::get_dense_cloud_chunk(&restored_service, request()).await.unwrap().into_inner();
+        assert_ne!(source_dense.epoch, restored_dense.epoch);
+        assert_eq!(source_dense.total_points, 12, "四帧扫描的重复观测均须保留");
+        assert_eq!(source_dense.xyz_f32_le, restored_dense.xyz_f32_le);
+        assert_eq!(restored_dense.total_points, 12);
+        let error = GeometryRuntime::get_dense_cloud_chunk(&restored_service, Request::new(DenseCloudChunkRequest {
+            expected_epoch: source_dense.epoch, offset_points: 9, max_points: 65536,
+        })).await.unwrap_err();
+        assert!(error.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
 
         let continued_occupancy_receipt = restored_handle
             .mapping_adapter

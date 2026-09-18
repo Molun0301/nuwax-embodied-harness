@@ -274,6 +274,7 @@ export class PointCloudProcessor {
 
   _preparePointCloud() {
     const preset = this._processingConfig.stylePresets[this._pointStyle] || this._processingConfig.stylePresets[DEFAULT_POINT_STYLE];
+    if (preset.denseSource) throw new Error('完整点云必须读取完整扫描来源，不能使用体素预览');
     const src = this._allPositions;
     if (this._floorLevelSource && this._floorLevelSource !== src) {
       this._floorLevelSource = null;

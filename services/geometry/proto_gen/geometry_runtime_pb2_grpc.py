@@ -101,6 +101,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.CloudMapShmRef.FromString,
                 _registered_method=True)
+        self.GetDenseCloudChunk = channel.unary_unary(
+                '/nuwax.geometry.GeometryRuntime/GetDenseCloudChunk',
+                request_serializer=geometry__runtime__pb2.DenseCloudChunkRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.DenseCloudChunk.FromString,
+                _registered_method=True)
         self.StartMapping = channel.unary_unary(
                 '/nuwax.geometry.GeometryRuntime/StartMapping',
                 request_serializer=geometry__runtime__pb2.StartMappingRequest.SerializeToString,
@@ -348,6 +353,12 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def SubscribeCloudMapUpdates(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetDenseCloudChunk(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -626,6 +637,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
                     servicer.SubscribeCloudMapUpdates,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
                     response_serializer=geometry__runtime__pb2.CloudMapShmRef.SerializeToString,
+            ),
+            'GetDenseCloudChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetDenseCloudChunk,
+                    request_deserializer=geometry__runtime__pb2.DenseCloudChunkRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.DenseCloudChunk.SerializeToString,
             ),
             'StartMapping': grpc.unary_unary_rpc_method_handler(
                     servicer.StartMapping,
@@ -1142,6 +1158,33 @@ class GeometryRuntime(object):
             '/nuwax.geometry.GeometryRuntime/SubscribeCloudMapUpdates',
             geometry__runtime__pb2.Empty.SerializeToString,
             geometry__runtime__pb2.CloudMapShmRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetDenseCloudChunk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.GeometryRuntime/GetDenseCloudChunk',
+            geometry__runtime__pb2.DenseCloudChunkRequest.SerializeToString,
+            geometry__runtime__pb2.DenseCloudChunk.FromString,
             options,
             channel_credentials,
             insecure,

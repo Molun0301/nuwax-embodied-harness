@@ -1,6 +1,7 @@
 import * as THREE from './three.module.min.js';
 import { OrbitControls } from './OrbitControls.js';
-import { PointCloudProcessor } from './pointcloud-processing.js?v=20260917-full-pointcloud';
+import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
+import { DensePointCloudLayer } from './dense-pointcloud.js?v=20260918-dense-pointcloud';
 
 const COLORS = {
   robot: 0xfbbf24,
@@ -92,17 +93,14 @@ const POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(
 const POINT_STYLE_PRESETS = Object.freeze({
   full: Object.freeze({
     label: '完整点云',
-    preserveSource: true,
-    size: POINTCLOUD3D_CONFIG.size,
+    denseSource: true,
+    size: POINTCLOUD3D_CONFIG.size * (1.25 / 1.35),
     sizeAttenuation: false,
     colorMode: 'height',
   }),
   height: Object.freeze({
     label: '高度',
-    sampleStride: 2,
-    liveSpacingM: POINTCLOUD3D_CONFIG.spacingM,
-    heightGradientScale: 2,
-    blueBandHeightM: 0.4,
+    preserveSource: true,
     size: POINTCLOUD3D_CONFIG.size,
     sizeAttenuation: false,
     colorMode: 'height',
@@ -392,6 +390,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._camera = null;
     this._controls = null;
     this._pointsMesh = null;
+    this._denseCloud = null;
     this._robotMesh = null;
     this._robotGeometryCenter = null;
     this._frontierGroup = null;
@@ -577,9 +576,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   pickNavigationPoint(clientX, clientY) {
-    const mesh = this._pointsMesh;
+    const mesh = this._pointStyle === 'full' ? this._denseCloud?.group : this._pointsMesh;
     const identity = this._pointCloudMapWatermark;
-    if (!this._visible || !mesh?.visible || !identity || this._renderedCloudSourceKey !== this._cloudSourceKey) return null;
+    if (!this._visible || !mesh?.visible || !identity || this._renderedCloudSourceKey !== this._cloudSourceKey
+        || (this._pointStyle === 'full' && !this._denseCloud?.metadata)) return null;
     const rect = this._renderer.domElement.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
     const pointer = new THREE.Vector2((clientX - rect.left) / rect.width * 2 - 1, 1 - (clientY - rect.top) / rect.height * 2);
@@ -588,25 +588,27 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const ray = new THREE.Raycaster();
     ray.params.Points.threshold = 0.12;
     ray.setFromCamera(pointer, this._camera);
-    const position = mesh.geometry.getAttribute('position');
     let selected = null;
     let nearestPixels = Infinity;
-    for (const hit of ray.intersectObject(mesh, false)) {
+    for (const hit of ray.intersectObject(mesh, true)) {
       // 点云交点是射线上的近似位置；目标必须取命中索引对应的真实地图点。
-      const point = new THREE.Vector3().fromBufferAttribute(position, hit.index).applyMatrix4(mesh.matrixWorld);
+      const position = hit.object.geometry.getAttribute('position');
+      const point = new THREE.Vector3().fromBufferAttribute(position, hit.index).applyMatrix4(hit.object.matrixWorld);
       const projected = point.clone().project(this._camera);
       if (projected.z < -1 || projected.z > 1) continue;
       const pixels = Math.hypot((projected.x - pointer.x) * rect.width / 2, (projected.y - pointer.y) * rect.height / 2);
       if (pixels > 8 || pixels >= nearestPixels - 0.25) continue;
       // 优先贴近光标；四分之一像素内保留更靠近相机的命中，避免选到重叠层。
       nearestPixels = pixels;
-      selected = { x: point.x, y: point.y, surface_z: point.z, frame_id: identity.header.frame_id, source_key: this._cloudSourceKey };
+      selected = { x: point.x, y: point.y, surface_z: point.z, frame_id: identity.header.frame_id,
+        source_key: this._cloudSourceKey, dense_epoch: this._pointStyle === 'full' ? this._denseCloud.epoch : null };
     }
     return selected;
   }
 
   navigationPointIsCurrent(point) {
-    return Boolean(this._pointCloudMapWatermark && point?.source_key === this._cloudSourceKey);
+    return Boolean(this._pointCloudMapWatermark && point?.source_key === this._cloudSourceKey
+      && (!point.dense_epoch || (this._pointStyle === 'full' && point.dense_epoch === this._denseCloud?.epoch)));
   }
 
   previewNavigationPoint(point) {
@@ -700,11 +702,13 @@ class PointCloud3DViewer extends PointCloudProcessor {
   setVisible(visible) {
     this._visible = Boolean(visible);
     if (!this._visible) {
+      this._denseCloud?.stop();
       this._lastPoseDrawnSource = null;
       if (this._rafId) cancelAnimationFrame(this._rafId);
       this._rafId = null;
       return;
     }
+    if (this._pointStyle === 'full') this._rebuildPointCloud();
     this.resize();
     this._requestRender();
   }
@@ -832,8 +836,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const center = this._pointCloudBounds.center;
     const radius = Math.max(0.5, this._pointCloudBounds.radius);
     const halfFov = THREE.MathUtils.degToRad(this._camera.fov * 0.5);
+    const fitHalfFov = this._pointStyle === 'full'
+      ? Math.atan(Math.tan(halfFov) * Math.min(1, this._camera.aspect)) : halfFov;
     const distance = THREE.MathUtils.clamp(
-      radius / Math.max(Math.sin(halfFov), 0.2) * 1.15,
+      radius / Math.max(Math.sin(fitHalfFov), 0.05) * 1.15,
       CAMERA_MIN_DISTANCE,
       CAMERA_MAX_DISTANCE,
     );
@@ -973,7 +979,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _ensurePointCloudWorker() {
     if (this._cloudWorker || this._cloudWorkerFailed) return this._cloudWorker;
     try {
-      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260917-full-pointcloud', import.meta.url), {
+      const worker = new Worker(new URL('./pointcloud-worker.js?v=20260918-dense-pointcloud', import.meta.url), {
         type: 'module', name: 'nuwax-pointcloud-preprocess',
       });
       this._cloudWorker = worker;
@@ -1070,6 +1076,20 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _rebuildPointCloud() {
     if (this._cloudDisposed) return;
+    if (this._pointStyle === 'full') {
+      this._invalidatePointCloudWork();
+      if (this._pointsMesh) this._pointsMesh.visible = false;
+      if (!this._scene) return;
+      if (!this._denseCloud) {
+        this._denseCloud = new DensePointCloudLayer({
+          size: POINT_STYLE_PRESETS.full.size,
+          onChange: state => this._applyDenseCloudState(state),
+        });
+        this._scene.add(this._denseCloud.group);
+      }
+      if (this._visible) this._denseCloud.start();
+      return;
+    }
     const src = this._allPositions;
     if (src.byteLength > MAX_BUFFER_BYTES || src.length % 3 !== 0) {
       this._invalidatePointCloudWork();
@@ -1104,6 +1124,19 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._cloudPending = job;
       this._startNextPointCloudWork();
     }
+  }
+
+  _applyDenseCloudState(state) {
+    if (this._cloudDisposed || this._pointStyle !== 'full') return;
+    this._displayedPointCount = state.count;
+    this._renderedPointCloudSourcePoints = state.total;
+    this._renderedCloudMapRevision = state.metadata?.revision ?? null;
+    this._renderedCloudSourceKey = this._cloudSourceKey;
+    this._pointCloudBounds = state.bounds?.clone() || null;
+    this._emitPointCount();
+    window.dispatchEvent(new CustomEvent('pointcloud3d:dense-state', { detail: { ...state, bounds: undefined, enabled: true } }));
+    if (this._pointCloudBounds && !this._hasFramedPointCloud && !this._hasUserCameraInput && this._cameraMode === 'free') this._framePointCloud();
+    this._requestRender();
   }
 
   async loadPointCloud(url, lod = 'preview') {
@@ -1154,8 +1187,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _replaceCloudMapBuffer(xyzArray, identity) {
     if (this._cloudDisposed) return;
     this._cloudLoadToken += 1;
+    const previousSourceKey = this._cloudSourceKey;
     this._cloudSourceKey = JSON.stringify([identity.header.source, identity.header.source_epoch,
       identity.header.frame_id, String(identity.streamGeneration ?? '')]);
+    if (previousSourceKey !== this._cloudSourceKey || xyzArray.length === 0) this._denseCloud?.reset();
     this._lastCloudMapRevision = identity.header.revision;
     this._pointCloudMapWatermark = identity;
     this._hasPointCloudSnapshot = true;
@@ -1811,7 +1846,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   _applyCachedSceneState() {
-    if (this._hasPointCloudSnapshot) this._rebuildPointCloud();
+    if (this._hasPointCloudSnapshot || this._pointStyle === 'full') this._rebuildPointCloud();
     if (this._robotPose) {
       const { x, y, z, yaw, quaternion } = this._robotPose;
       this.setRobotPose(x, y, z, yaw, quaternion);
@@ -1834,7 +1869,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
     if (!Object.prototype.hasOwnProperty.call(POINT_STYLE_PRESETS, style)) return false;
     const changed = this._pointStyle !== style;
     this._pointStyle = style;
-    if (changed && this._hasPointCloudSnapshot) this._rebuildPointCloud();
+    if (style !== 'full') {
+      this._denseCloud?.stop();
+      window.dispatchEvent(new CustomEvent('pointcloud3d:dense-state', { detail: { enabled: false } }));
+    }
+    if (changed) this._rebuildPointCloud();
     const preset = POINT_STYLE_PRESETS[style];
     window.dispatchEvent(new CustomEvent('pointcloud3d:style-state', {
       detail: {
@@ -1849,6 +1888,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   dispose() {
     this._cloudDisposed = true;
+    this._denseCloud?.dispose();
+    this._denseCloud = null;
     this.previewNavigationPoint(null);
     this._cloudLoadToken += 1;
     this._invalidatePointCloudWork();
@@ -2207,6 +2248,7 @@ window.addEventListener('stream:pointcloud_map.reset', () => {
   window.pointcloud3d._invalidatePointCloudWork();
   window.pointcloud3d._cloudLoadToken += 1;
   window.pointcloud3d._pointCloudMapWatermark = null;
+  window.pointcloud3d._denseCloud?.reset();
 });
 
 // 二进制消费者已注册与三维画布已初始化是两个不同阶段。

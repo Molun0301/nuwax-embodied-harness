@@ -34,6 +34,7 @@ from contracts.navigation import NavigationGoal, NavigationState, NavigationStat
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
+from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, DENSE_CHUNK_POINTS, dense_chunk_payload
 from services.geometry.mapping_backend_checkpoint_store import (
     MappingBackendCheckpoint,
     MappingBackendCheckpointNotFoundError,
@@ -369,10 +370,10 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
 
 
 def _checkpoint_export_bundle_from_proto(
-    response, payload=None, fine_payload=None,
+    response, payload=None, fine_payload=None, dense_payload=None,
 ) -> MappingBackendCheckpointExportBundle:
     if str(response.backend_kind) == "slam_toolbox":
-        if fine_payload is not None:
+        if fine_payload is not None or dense_payload is not None:
             raise ValueError("二维导出不能携带精细三维资产")
         return _planar_checkpoint_export_bundle_from_proto(response, payload)
     has_fine = getattr(response, "fine_map_artifact", None) is not None and response.HasField("fine_map_artifact")
@@ -380,6 +381,11 @@ def _checkpoint_export_bundle_from_proto(
         raise ValueError("精细地图制品引用与下载载荷不一致")
     if has_fine and (len(fine_payload) != response.fine_map_artifact.size or payload_digest(fine_payload) != bytes(response.fine_map_artifact.sha256)):
         raise ValueError("精细地图下载载荷与制品摘要不一致")
+    has_dense = response.HasField("dense_cloud_artifact")
+    if has_dense != (dense_payload is not None):
+        raise ValueError("完整点云制品引用与下载载荷不一致")
+    if has_dense and (len(dense_payload) != response.dense_cloud_artifact.size or payload_digest(dense_payload) != bytes(response.dense_cloud_artifact.sha256)):
+        raise ValueError("完整点云下载载荷与制品摘要不一致")
     occupancy_receipt = _require_proto_message_field(response, "occupancy_receipt")
     cloud_receipt = _require_proto_message_field(response, "cloud_receipt")
     occupancy_checkpoint = _require_proto_message_field(
@@ -432,6 +438,7 @@ def _checkpoint_export_bundle_from_proto(
         occupancy_receipt=_occupancy_receipt_dict(occupancy_receipt),
         cloud_receipt=_cloud_receipt_dict(cloud_receipt),
         fine_archive=fine_payload,
+        dense_archive=dense_payload,
     )
     occupancy_asset = {
         "raw_data_sha256": hashlib.sha256(occupancy_data).digest(),
@@ -483,6 +490,7 @@ def _checkpoint_export_bundle_from_proto(
         ),
         cloud_receipt=_freeze_checkpoint_value(validated_checkpoint.cloud_receipt),
         fine_archive=validated_checkpoint.fine_archive,
+        dense_archive=validated_checkpoint.dense_archive,
     )
     return MappingBackendCheckpointExportBundle(
         checkpoint=frozen_checkpoint,
@@ -507,7 +515,7 @@ def _mapping_commit_identity_proto(value: Mapping[str, object]):
 def _mapping_backend_checkpoint_proto(
     stored: StoredMappingBackendCheckpoint,
     occupancy_checkpoint,
-    cloud_checkpoint, graph_artifact=None, fine_map_artifact=None,
+    cloud_checkpoint, graph_artifact=None, fine_map_artifact=None, dense_cloud_artifact=None,
 ):
     checkpoint = stored.checkpoint
     if checkpoint.backend_kind == "slam_toolbox":
@@ -553,6 +561,7 @@ def _mapping_backend_checkpoint_proto(
         canonical_occupancy_checkpoint=occupancy_checkpoint,
         canonical_cloud_checkpoint=cloud_checkpoint,
         fine_map_artifact=fine_map_artifact,
+        dense_cloud_artifact=dense_cloud_artifact,
     )
 
 
@@ -691,6 +700,10 @@ def _canonical_backend_sha256(checkpoint) -> bytes:
         preimage.extend(b"nuwax.geometry.fine-map-archive.v1\0")
         preimage.extend(struct.pack(">Q", checkpoint.fine_map_artifact.size))
         preimage.extend(_require_digest_bytes(checkpoint.fine_map_artifact.sha256, "fine_map_artifact.sha256"))
+    if checkpoint.HasField("dense_cloud_artifact"):
+        preimage.extend(b"nuwax.geometry.dense-cloud-archive.v1\0")
+        preimage.extend(struct.pack(">Q", checkpoint.dense_cloud_artifact.size))
+        preimage.extend(_require_digest_bytes(checkpoint.dense_cloud_artifact.sha256, "dense_cloud_artifact.sha256"))
     return hashlib.sha256(preimage).digest()
 
 
@@ -4587,8 +4600,8 @@ class GeometryRuntimeProvider:
             raise RuntimeError("二维图传输回执身份冲突")
         return response
 
-    def _download_graph_artifact(self, reference):
-        if reference.size <= 0 or reference.size > MAX_PLANAR_ARCHIVE_BYTES or len(reference.sha256) != 32:
+    def _download_graph_artifact(self, reference, maximum_bytes=MAX_PLANAR_ARCHIVE_BYTES):
+        if reference.size <= 0 or reference.size > maximum_bytes or len(reference.sha256) != 32:
             raise ValueError("二维图传输引用非法")
         def chunks():
             offset = 0
@@ -4600,7 +4613,7 @@ class GeometryRuntimeProvider:
                 offset += len(data)
                 yield data
         try:
-            payload = FrozenPayload(chunks())
+            payload = FrozenPayload(chunks(), maximum_bytes=maximum_bytes)
             if len(payload) != reference.size or payload._digest != bytes(reference.sha256):
                 raise ValueError("二维图下载摘要不一致")
             return payload
@@ -4645,7 +4658,28 @@ class GeometryRuntimeProvider:
             ) from exc
         payload = self._download_graph_artifact(_require_proto_message_field(response, "graph_artifact")) if response.backend_kind == "slam_toolbox" else None
         fine_payload = self._download_graph_artifact(response.fine_map_artifact) if response.HasField("fine_map_artifact") else None
-        return _checkpoint_export_bundle_from_proto(response, payload, fine_payload)
+        dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
+        return _checkpoint_export_bundle_from_proto(response, payload, fine_payload, dense_payload)
+
+    def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0):
+        """读取当前规范提交中的完整扫描前缀，不触发启动或建图。"""
+        self._raise_if_stopping("get_dense_cloud_chunk")
+        if not self._connected or not self._stub:
+            raise RuntimeError("Geometry运行时未连接")
+        with self._map_delivery_condition:
+            if self._mapping_transition_inflight:
+                raise RuntimeError("地图正在切换，完整点云暂不可用")
+            token = self._map_delivery_token_locked()
+        try:
+            response = self._stub.GetDenseCloudChunk(pb2.DenseCloudChunkRequest(
+                expected_epoch=expected_epoch, offset_points=offset_points, max_points=DENSE_CHUNK_POINTS,
+            ), timeout=5.0)
+        except grpc.RpcError as error:
+            raise GeometryRuntimeRpcError.from_rpc_error("GetDenseCloudChunk", error) from error
+        with self._map_delivery_condition:
+            if token != self._map_delivery_token_locked() or self._mapping_transition_inflight:
+                raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        return dense_chunk_payload(response, expected_epoch=expected_epoch, offset_points=offset_points)
 
     def _selected_mapping_backend_state(self) -> Dict[str, Any]:
         state = self.get_mapping_state()
@@ -4993,16 +5027,20 @@ class GeometryRuntimeProvider:
             request.cloud_checkpoint.CopyFrom(cloud_checkpoint)
         graph_artifact = None
         fine_map_artifact = None
+        dense_cloud_artifact = None
         if stored_backend_checkpoint is not None:
             if selected_backend_kind == "slam_toolbox":
                 graph_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint)
             if stored_backend_checkpoint.checkpoint.fine_archive is not None:
                 fine_map_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint, payload=stored_backend_checkpoint.checkpoint.fine_archive)
+            if stored_backend_checkpoint.checkpoint.dense_archive is not None:
+                dense_cloud_artifact = self._upload_graph_artifact(stored_backend_checkpoint.checkpoint, payload=stored_backend_checkpoint.checkpoint.dense_archive)
             request.mapping_backend_checkpoint.CopyFrom(
                 _mapping_backend_checkpoint_proto(
                     stored_backend_checkpoint,
                     occupancy_checkpoint,
                     cloud_checkpoint, graph_artifact=graph_artifact, fine_map_artifact=fine_map_artifact,
+                    dense_cloud_artifact=dense_cloud_artifact,
                 )
             )
         request.asset_bundle_sha256 = _canonical_asset_bundle_sha256(
@@ -5264,6 +5302,8 @@ class GeometryRuntimeProvider:
             self._graph_transfer(5, graph_artifact)
         if fine_map_artifact is not None:
             self._graph_transfer(5, fine_map_artifact)
+        if dense_cloud_artifact is not None:
+            self._graph_transfer(5, dense_cloud_artifact)
         planar_default_seed = None
         if selected_backend_kind == "slam_toolbox":
             graph_payload = stored_backend_checkpoint.checkpoint.payload

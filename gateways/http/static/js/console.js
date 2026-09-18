@@ -206,6 +206,7 @@
         mapModeToggle: document.getElementById("mapModeToggle"),
         map2dCameraControls: document.getElementById("map2dCameraControls"),
         map3dCameraControls: document.getElementById("map3dCameraControls"),
+        map3dDenseStatusRow: document.getElementById("map3dDenseStatusRow"),
         map2dActionControls: document.getElementById("map2dActionControls"),
         map3dFreeView: document.getElementById("map3dFreeView"),
         map3dFollowView: document.getElementById("map3dFollowView"),
@@ -5469,6 +5470,7 @@
         if (els.map2dCameraControls) els.map2dCameraControls.hidden = is3d;
         if (els.map2dActionControls) els.map2dActionControls.hidden = is3d;
         if (els.map3dCameraControls) els.map3dCameraControls.hidden = !is3d;
+        if (els.map3dDenseStatusRow) els.map3dDenseStatusRow.hidden = !is3d;
         if (els.mapModeToggle) {
           els.mapModeToggle.hidden = PLANAR_PIPELINE;
           els.mapModeToggle.disabled = PLANAR_PIPELINE;
@@ -5589,6 +5591,16 @@
         state.pointcloud3dPointCountKnown = hasDisplayedPoints || hasSourcePoints;
         recordPointcloudDiagnostic({ pointcloudDisplayedPoints: state.pointcloud3dDisplayedPoints, pointcloudSourcePoints: state.pointcloud3dSourcePoints });
         renderMapSummary();
+      });
+      window.addEventListener("pointcloud3d:dense-state", (event) => {
+        const status = document.getElementById("map3dDenseStatus");
+        if (!status) return;
+        const detail = event.detail || {};
+        status.hidden = detail.enabled !== true;
+        status.dataset.error = detail.error ? "true" : "false";
+        const loaded = Number(detail.count || 0).toLocaleString("zh-CN");
+        const total = Number(detail.total || 0).toLocaleString("zh-CN");
+        status.textContent = detail.error || (detail.loading ? `完整点云加载中 ${loaded} / ${total} 点` : `完整点云 ${loaded} 点`);
       });
       if (els.showSemanticInstances) {
         els.showSemanticInstances.addEventListener("change", () => {

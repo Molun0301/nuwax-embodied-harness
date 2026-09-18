@@ -471,6 +471,29 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
         return await run_in_threadpool(config_io.build_schema)
 
+    @router.get("/api/pointcloud/dense")
+    async def api_dense_pointcloud(
+        request: Request,
+        epoch: str = Query(default="", max_length=128),
+        offset: int = Query(default=0, ge=0, le=2 ** 53 - 1),
+    ) -> Response:
+        try:
+            metadata, data = await run_in_threadpool(
+                lambda: runtime.get_dense_cloud_chunk(expected_epoch=epoch, offset_points=offset),
+            )
+        except Exception as error:
+            changed = "DENSE_CLOUD_SOURCE_CHANGED" in str(error)
+            message = getattr(error, "grpc_details", None) or str(error)
+            raise GatewayError(
+                "完整点云来源已变化" if changed else message,
+                error_code="dense_cloud_source_changed" if changed else "dense_cloud_unavailable",
+                http_status=409 if changed else 503,
+            ) from error
+        return Response(data, media_type="application/octet-stream", headers={
+            "Cache-Control": "no-store",
+            "X-Nuwax-Pointcloud": json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        })
+
     @router.post("/api/config/save")
     async def api_config_save(request: Request) -> Dict[str, Any]:
         """批量写回配置项到对应 env 文件（原子写 + 备份）。重启后生效。"""

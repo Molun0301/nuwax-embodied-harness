@@ -106,7 +106,6 @@ from services.geometry.geometry_runtime_provider import (
     resolve_direct_static_calibration_edge,
 )
 from services.geometry.pointcloud_map import (
-    WEB_POINTCLOUD_MAX_POINTS,
     CloudMapMmapReader,
     LivePointCloudMapSource,
     PointCloudMapSnapshot,
@@ -1211,6 +1210,8 @@ class GatewayRuntime:
         self._navigation_status_refresh_stop = threading.Event()
         self._navigation_status_refresh_thread: Optional[threading.Thread] = None
         self._pointcloud_map_cache = PointCloudMapCache()
+        from services.geometry.dense_cloud import SavedDenseCloudCache
+        self._saved_dense_cloud_cache = SavedDenseCloudCache()
         self._last_pointcloud_map_chunk_key: Optional[Tuple[str, str]] = None
         self._cloud_map_shm_path = runtime_value(
             "NUWAX_CLOUDMAP_SHM_PATH",
@@ -1608,6 +1609,9 @@ class GatewayRuntime:
     def _close_dispatch_resources(self) -> None:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
 
+        dense_cache = getattr(self, "_saved_dense_cloud_cache", None)
+        if dense_cache is not None:
+            dense_cache.close()
         recording_error = None
         try:
             self._close_mapping_recording()
@@ -1883,6 +1887,34 @@ class GatewayRuntime:
     _POINTCLOUD_MAP_ERROR_BACKOFF_MAX_SEC = 2.0
     _POINTCLOUD_MAP_STOP_JOIN_TIMEOUT_SEC = 5.0
 
+    def get_dense_cloud_chunk(self, *, expected_epoch: str = "", offset_points: int = 0):
+        """按当前显示来源读取完整点云，换图后的旧请求不能继续交付。"""
+        if self._closed:
+            raise RuntimeError("网关已关闭")
+        platform = self.platform_geometry_runtime
+        if platform.is_map_asset_activation_recovery_pending():
+            raise RuntimeError("地图正在激活，完整点云暂不可用")
+
+        def source_identity():
+            with self._lock:
+                snapshot = self._pointcloud_map_current_snapshot
+                return (snapshot.source, snapshot.source_epoch, snapshot.stream_generation) if snapshot is not None else None
+
+        before = source_identity()
+        provider = platform.get_geometry_runtime_provider()
+        if provider is not None and (before is None or before[0] == "live"):
+            result = provider.get_dense_cloud_chunk(expected_epoch=expected_epoch, offset_points=offset_points)
+        else:
+            source = platform.get_saved_dense_cloud_source()
+            if source is None:
+                raise RuntimeError("当前地图没有可读取的完整扫描数据")
+            result = self._saved_dense_cloud_cache.read(source, expected_epoch=expected_epoch, offset_points=offset_points)
+            if source != platform.get_saved_dense_cloud_source():
+                raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        if self._closed or before != source_identity() or platform.is_map_asset_activation_recovery_pending():
+            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
+        return result
+
     def _observe_pointcloud_map_source_error(self, exc: PointCloudMapSourceError) -> None:
         with self._lock:
             self._pointcloud_map_pending_source_error = exc
@@ -1896,7 +1928,6 @@ class GatewayRuntime:
             LivePointCloudMapSource(
                 CloudMapMmapReader(self._cloud_map_shm_path),
                 frame_id=self.config.geometry.frames.map_frame,
-                max_points=WEB_POINTCLOUD_MAX_POINTS,
             ),
             self._observe_pointcloud_map_source_error,
         )

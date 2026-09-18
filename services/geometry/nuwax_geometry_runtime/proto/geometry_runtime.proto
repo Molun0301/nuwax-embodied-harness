@@ -222,6 +222,7 @@ message MappingBackendCheckpoint {
   GraphArtifactRef graph_artifact = 13;
   string target_kind = 14;
   GraphArtifactRef fine_map_artifact = 15;
+  GraphArtifactRef dense_cloud_artifact = 16;
 }
 
 message ActivateMapRequest {
@@ -401,6 +402,26 @@ message CloudMapShmRef {
   ShmRef shm_ref = 1;
   uint32 point_count = 2;
   float voxel_size = 3;
+}
+
+// 全部有效扫描点按原坐标分块读取；epoch变化时旧偏移不可续传。
+message DenseCloudChunkRequest {
+  string expected_epoch = 1;
+  uint64 offset_points = 2;
+  uint32 max_points = 3;
+}
+message DenseCloudChunk {
+  string epoch = 1;
+  uint64 revision = 2;
+  uint64 source_timestamp_ns = 3;
+  string frame_id = 4;
+  string session_id = 5;
+  uint64 session_generation = 6;
+  uint64 total_points = 7;
+  uint64 offset_points = 8;
+  bytes xyz_f32_le = 9;
+  repeated float bounds_min = 10;
+  repeated float bounds_max = 11;
 }
 
 // === 导航兼容 ===
@@ -794,6 +815,7 @@ service GeometryRuntime {
   rpc GetOccupancyGridShm(Empty) returns (ShmRef);
   rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
   rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
+  rpc GetDenseCloudChunk(DenseCloudChunkRequest) returns (DenseCloudChunk);
   rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
   rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
   rpc GetMappingState(Empty) returns (MappingSessionState);

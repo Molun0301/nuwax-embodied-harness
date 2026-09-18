@@ -1,6 +1,7 @@
 """点云资产的有界顺序读取；完整读取与网页抽样共用格式校验。"""
 
 from contextlib import contextmanager
+from itertools import chain
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -207,13 +208,16 @@ def read_all_xyz(path: Path, *, format_hint: str):
         return header, points
 
 
-def read_preview_xyz(path: Path, max_points: int, *, should_cancel=None):
+def read_preview_xyz(path: Path, max_points: Optional[int], *, should_cancel=None):
     """全量校验与统计，均匀选择文件位置；保留点数与资产总点数分开返回。"""
 
     with open_pointcloud_chunks(path, should_cancel=should_cancel) as (header, chunks):
-        selected_count = min(header.points, max_points)
+        first = next(chunks)
+        selected_count = header.points if max_points is None else min(header.points, max_points)
         # 整数等间距索引包含两端，不受块边界影响，也不分配与原始点数等长的索引。
-        if selected_count == 1:
+        if selected_count == header.points:
+            indices = None
+        elif selected_count == 1:
             indices = np.zeros(1, dtype=np.int64)
         else:
             indices = (np.arange(selected_count, dtype=np.int64)
@@ -223,7 +227,7 @@ def read_preview_xyz(path: Path, max_points: int, *, should_cancel=None):
         upper = np.full(3, -np.inf)
         offset = kept = total = 0
         first_finite = None
-        for chunk in chunks:
+        for chunk in chain((first,), chunks):
             mask = finite_xyz_mask(chunk)
             valid = chunk if bool(mask.all()) else chunk[mask]
             total += len(valid)
@@ -233,11 +237,15 @@ def read_preview_xyz(path: Path, max_points: int, *, should_cancel=None):
                 chunk_lower, chunk_upper = xyz_bounds(valid)
                 lower = np.minimum(lower, chunk_lower)
                 upper = np.maximum(upper, chunk_upper)
-            begin, end = np.searchsorted(indices, [offset, offset + len(chunk)])
-            local = indices[begin:end] - offset
-            local = local[mask[local]]
-            selected[kept:kept + len(local)] = chunk[local]
-            kept += len(local)
+            if indices is None:
+                selected[kept:kept + len(valid)] = valid
+                kept += len(valid)
+            else:
+                begin, end = np.searchsorted(indices, [offset, offset + len(chunk)])
+                local = indices[begin:end] - offset
+                local = local[mask[local]]
+                selected[kept:kept + len(local)] = chunk[local]
+                kept += len(local)
             offset += len(chunk)
         if not total:
             raise PointCloudMapError("点云地图没有可用有限点。")

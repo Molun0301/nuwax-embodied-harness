@@ -7372,6 +7372,23 @@ class PlatformGeometryRuntime:
             "process_running": process.is_running() if process is not None else False,
         }
 
+    def get_saved_dense_cloud_source(self) -> Optional[Dict[str, object]]:
+        """只返回当前活动资产的权威检查点身份，不打开完整点云文件。"""
+        if self.is_map_asset_activation_recovery_pending():
+            return None
+        snapshot = self._map_activation_snapshot_read()
+        bundle = snapshot.bundle
+        if bundle is None or bundle.geometry_asset is None or snapshot.bundle_root is None:
+            return None
+        reference = bundle.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
+        if not reference.get("present") or not reference.get("manifest_sha256"):
+            return None
+        return {
+            "bundle_root": snapshot.bundle_root, "backend_kind": reference["backend_kind"],
+            "manifest_sha256": reference["manifest_sha256"], "frame_id": bundle.geometry_asset.frame_id or bundle.frame_id,
+            "activation_generation": snapshot.generation,
+        }
+
     def get_live_pointcloud_map_asset_summary(self) -> Dict[str, object]:
         """返回当前累计点云地图 PCD 资产候选，不读取扫描帧。"""
 

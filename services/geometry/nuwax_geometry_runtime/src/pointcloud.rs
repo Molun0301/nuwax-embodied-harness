@@ -10,6 +10,7 @@ use nalgebra::Point3;
 use tracing::{info, warn};
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
+use crate::dense_cloud::{DenseCloud, DenseSnapshot};
 
 #[path = "voxel_index.rs"]
 mod voxel_index;
@@ -163,6 +164,10 @@ pub struct CloudMapShmWriter {
     dynamic_filter: DynamicCloudFilter,
     fine_cloud: Option<FineCloud>,
     committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
+    dense_cloud: Option<DenseCloud>,
+    committed_dense_cloud: Option<DenseSnapshot>,
+    dense_error: Option<String>,
+    dense_history_missing: bool,
     max_points: usize,
     last_occupancy_receipt: Option<OccupancyCommitReceipt>,
     last_cloud_receipt: Option<CloudCommitReceipt>,
@@ -271,6 +276,9 @@ pub(crate) struct PreparedCloudAccumulator {
     dynamic_filter: DynamicCloudFilter,
     ordered_voxels: OrderedVoxelSnapshot,
     fine_cloud: Option<FineCloud>,
+    dense_cloud: Option<DenseCloud>,
+    dense_error: Option<String>,
+    dense_history_missing: bool,
 }
 
 /// 先于激活持锁提交完成读取、逐块校验和私有导入。
@@ -446,6 +454,10 @@ impl CloudMapShmWriter {
             dynamic_filter: DynamicCloudFilter::default(),
             fine_cloud: None,
             committed_fine_cloud: None,
+            dense_cloud: None,
+            committed_dense_cloud: None,
+            dense_error: None,
+            dense_history_missing: false,
             max_points: CM_MAX_POINTS,
             last_occupancy_receipt: None,
             last_cloud_receipt: None,
@@ -542,6 +554,19 @@ impl CloudMapShmWriter {
             warn!(%error, "精细导航源拒绝不完整输入");
             return false;
         }
+        // 完整显示记录每个已接纳扫描点，动态体素清理不删除扫描历史。
+        // 故障锁存并撤销完整源，不能继续发布缺帧历史或影响原导航地图。
+        if !self.dense_history_missing && self.dense_error.is_none() {
+            let result = (|| {
+                if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::new()?); }
+                self.dense_cloud.as_mut().unwrap().append(points)
+            })();
+            if let Err(error) = result {
+                warn!(%error, "完整扫描归档失败，完整点云不可用");
+                self.dense_error = Some(error);
+                self.committed_dense_cloud = None;
+            }
+        }
         if let Some(origin) = sensor_origin_map {
             let removed = self.dynamic_filter.clear_observed_free_space_with_hits(
                 &mut self.voxels,
@@ -604,7 +629,15 @@ impl CloudMapShmWriter {
         self.last_occupancy_receipt = Some(occupancy_receipt.clone());
         self.last_cloud_receipt = Some(receipt.clone());
         self.committed_fine_cloud = fine;
+        self.committed_dense_cloud = if self.dense_error.is_none() && receipt.source_timestamp_ns > 0 {
+            self.dense_cloud.as_ref().and_then(|cloud| cloud.snapshot(&receipt, &occupancy_receipt.session_id))
+        } else { None };
         Ok(Some(CorrelatedCloudMapCommit { snapshot, receipt }))
+    }
+
+    pub(crate) fn committed_dense_cloud(&self) -> Result<Option<DenseSnapshot>, String> {
+        if let Some(error) = &self.dense_error { return Err(format!("完整扫描归档失败：{error}")); }
+        Ok(self.committed_dense_cloud.clone())
     }
 
     /// Read the exact active SHM payload without advancing its revision.
@@ -719,6 +752,9 @@ impl CloudMapShmWriter {
             dynamic_filter: std::mem::take(&mut self.dynamic_filter),
             ordered_voxels: std::mem::take(&mut self.ordered_voxels),
             fine_cloud: self.fine_cloud.take(),
+            dense_cloud: self.dense_cloud.take(),
+            dense_error: self.dense_error.take(),
+            dense_history_missing: self.dense_history_missing,
         }
     }
 
@@ -740,6 +776,9 @@ impl CloudMapShmWriter {
         self.dynamic_filter = prepared.dynamic_filter;
         self.ordered_voxels = prepared.ordered_voxels;
         self.fine_cloud = prepared.fine_cloud;
+        self.dense_cloud = prepared.dense_cloud;
+        self.dense_error = prepared.dense_error;
+        self.dense_history_missing = prepared.dense_history_missing;
         self.commit_accumulated_snapshot(receipt)?
             .ok_or_else(|| "PGO点云发布失败".into())
     }
@@ -760,6 +799,13 @@ impl CloudMapShmWriter {
     pub(crate) fn install_checkpoint_with_fine(
         &mut self, occupancy_receipt: &OccupancyCommitReceipt, voxel_size: f32, point_count: u32,
         xyz_f32_le: &[u8], fine: Option<PreparedFineCloud>,
+    ) -> Result<CorrelatedCloudMapCommit, String> {
+        self.install_checkpoint_with_sources(occupancy_receipt, voxel_size, point_count, xyz_f32_le, fine, None)
+    }
+
+    pub(crate) fn install_checkpoint_with_sources(
+        &mut self, occupancy_receipt: &OccupancyCommitReceipt, voxel_size: f32, point_count: u32,
+        xyz_f32_le: &[u8], fine: Option<PreparedFineCloud>, dense: Option<DenseCloud>,
     ) -> Result<CorrelatedCloudMapCommit, String> {
         let session_generation = occupancy_receipt.session_generation;
         if session_generation == 0 {
@@ -791,6 +837,10 @@ impl CloudMapShmWriter {
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
         self.fine_cloud = Some(fine);
+        self.dense_history_missing = dense.is_none();
+        self.dense_cloud = dense;
+        self.dense_error = None;
+        self.committed_dense_cloud = None;
         self.commit_accumulated_snapshot(occupancy_receipt)?
             .ok_or_else(|| "cloud-map checkpoint publication failed".to_string())
     }
@@ -869,6 +919,10 @@ impl CloudMapShmWriter {
     fn reset_accumulator(&mut self, session_generation: u64) {
         self.fine_cloud = None;
         self.committed_fine_cloud = None;
+        self.dense_cloud = None;
+        self.committed_dense_cloud = None;
+        self.dense_error = None;
+        self.dense_history_missing = false;
         self.voxels.clear();
         self.ordered_voxels.invalidate();
         self.dynamic_filter = DynamicCloudFilter::default();
@@ -1049,6 +1103,47 @@ fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_cloud_follows_commits_rebuilds_and_checkpoint_availability() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let points = vec![Point3::new(0.011, 0.012, 0.013), Point3::new(0.014, 0.012, 0.013)];
+        let receipt = OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 1 },
+            session_id: "完整扫描".into(), session_generation: 1, occupancy_revision: 1,
+            source_timestamp_ns: 100, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        assert!(writer.accumulate_mapping_scan(1, &points, None, 100));
+        assert!(writer.committed_dense_cloud().unwrap().is_none());
+        let commit = writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+        assert_eq!(commit.snapshot.point_count, 1);
+        let dense = writer.committed_dense_cloud().unwrap().unwrap();
+        assert_eq!(dense.point_count, 2);
+        assert!(writer.accumulate_mapping_scan(1, &points, None, 200));
+        assert_eq!(writer.committed_dense_cloud().unwrap().unwrap().point_count, 2);
+
+        let mut rebuilt = CloudMapShmWriter::new_private().unwrap();
+        let corrected = points.iter().map(|p| p + nalgebra::Vector3::new(1., 0., 0.)).collect::<Vec<_>>();
+        assert!(rebuilt.accumulate_mapping_scan(1, &corrected, None, 200));
+        let receipt2 = OccupancyCommitReceipt { commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 17, sequence: 2 },
+            occupancy_revision: 2, source_timestamp_ns: 200, ..receipt.clone() };
+        writer.install_prepared_accumulator(&receipt2, rebuilt.take_prepared_accumulator()).unwrap();
+        let current = writer.committed_dense_cloud().unwrap().unwrap();
+        assert_ne!(current.epoch, dense.epoch);
+        assert_eq!(current.point_count, 2);
+        assert_eq!(f32::from_le_bytes(current.read(0, 2).unwrap()[..4].try_into().unwrap()), 1.011_f32);
+        assert_eq!(f32::from_le_bytes(dense.read(0, 2).unwrap()[..4].try_into().unwrap()), 0.011_f32);
+
+        let mut legacy = CloudMapShmWriter::new_private().unwrap();
+        legacy.install_checkpoint(&receipt, commit.snapshot.voxel_size, commit.snapshot.point_count, &commit.snapshot.xyz_f32_le).unwrap();
+        assert!(legacy.accumulate_mapping_scan(1, &points, None, 200));
+        legacy.commit_accumulated_snapshot(&receipt2).unwrap().unwrap();
+        assert!(legacy.committed_dense_cloud().unwrap().is_none(), "旧资产不能以新扫描后缀冒充完整历史");
+
+        assert!(writer.accumulate_mapping_scan(2, &points, None, 300));
+        assert!(writer.committed_dense_cloud().unwrap().is_none(), "换会话不能泄漏旧地图");
+    }
 
     #[test]
     fn fine_cloud_survives_display_coarsening_and_seals_the_exact_commit() {

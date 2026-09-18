@@ -38,7 +38,6 @@ _LOD_LIMITS = {
     "medium": 180000,
     "full": None,
 }
-WEB_POINTCLOUD_MAX_POINTS = 1_000_000
 
 
 class PointCloudMapError(RuntimeError):
@@ -254,10 +253,10 @@ class PointCloudMapCache:
 
     def load_preview(
         self, path: Path, *, frame_id: str = DEFAULT_MAP_FRAME,
-        source_kind: str = "map_asset", max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        source_kind: str = "map_asset", max_points: Optional[int] = None,
         should_cancel=None,
     ) -> PointCloudMap:
-        """大资产按块校验和抽样，缓存只保留有界网页工作集。"""
+        """分块读取资产；默认保留全部点，仅显式预览请求才抽样。"""
         from services.geometry.pointcloud_asset_stream import check_cancelled, read_preview_xyz
 
         resolved = path.expanduser().resolve(strict=False)
@@ -265,9 +264,10 @@ class PointCloudMapCache:
         identity = _file_identity(resolved)
         if identity is None:
             raise PointCloudMapError("点云地图不存在：%s" % resolved)
-        max_points = int(max_points)
-        if max_points <= 0 or max_points > WEB_POINTCLOUD_MAX_POINTS:
-            raise ValueError("网页点云预算必须在1到%d之间。" % WEB_POINTCLOUD_MAX_POINTS)
+        if max_points is not None:
+            max_points = int(max_points)
+            if max_points <= 0:
+                raise ValueError("显式预览点数必须为正数。")
         key = (str(resolved), identity, frame_id, source_kind, max_points)
         cached = self._cached(key)
         if cached is not None:
@@ -721,7 +721,7 @@ class CloudMapMmapReader:
 
     def read_stable_snapshot(
         self,
-        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        max_points: Optional[int] = None,
     ) -> Optional[CloudMapMmapSnapshot]:
         """读取包含完整 v2 身份与时间字段的稳定点云快照。"""
 
@@ -762,7 +762,7 @@ class CloudMapMmapReader:
             max_buffer_points = self.SINGLE_BUFFER_SIZE // (3 * 4)
             if point_count > max_buffer_points:
                 return None
-            selected_max_points = min(max(1, int(max_points)), max_buffer_points)
+            selected_max_points = max_buffer_points if max_points is None else min(max(1, int(max_points)), max_buffer_points)
             buf_offset = self.HEADER_SIZE + read_buf * self.SINGLE_BUFFER_SIZE
             if point_count == 0:
                 actual_count = 0
@@ -816,7 +816,7 @@ class CloudMapMmapReader:
 
     def read_stable(
         self,
-        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        max_points: Optional[int] = None,
     ) -> Optional[Tuple[int, int, bytes]]:
         """兼容旧调用方，返回完整 u64 revision、点数与 XYZ 字节。"""
 
@@ -827,7 +827,7 @@ class CloudMapMmapReader:
 
     def build_binary_frame(
         self,
-        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        max_points: Optional[int] = None,
     ) -> Optional[bytes]:
         """构建 Wire Format binary 帧: revision(u32) + point_count(u32) + XYZ data。"""
         result = self.read_stable(max_points)
@@ -849,11 +849,11 @@ class LivePointCloudMapSource(PointCloudMapSource):
         reader: CloudMapMmapReader,
         *,
         frame_id: str = DEFAULT_MAP_FRAME,
-        max_points: int = WEB_POINTCLOUD_MAX_POINTS,
+        max_points: Optional[int] = None,
     ) -> None:
         self._reader = reader
         self._frame_id = str(frame_id or DEFAULT_MAP_FRAME)
-        self._max_points = max(1, int(max_points))
+        self._max_points = None if max_points is None else max(1, int(max_points))
         self._opened = False
         self._cancelled = False
         self._closed = False
@@ -1104,7 +1104,7 @@ class SavedPointCloudMapSource(PointCloudMapSource):
                 "finite_point_count": pointcloud_map.source_point_count,
                 "display_point_count": pointcloud_map.point_count,
                 "display_sampled": pointcloud_map.point_count < pointcloud_map.header.points,
-                "display_sampling": "uniform-file-index",
+                "display_sampling": "none",
                 "bounds_min": pointcloud_map.bounds_min,
                 "bounds_max": pointcloud_map.bounds_max,
             },

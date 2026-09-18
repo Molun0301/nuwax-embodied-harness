@@ -36,7 +36,7 @@ impl Store {
         if reference.id.is_empty()
             || reference.id.len() > 128
             || reference.size == 0
-            || reference.size > archive::MAX_ARCHIVE
+            || reference.size > crate::dense_cloud::MAX_ARCHIVE_BYTES
             || sha == [0; 32]
         {
             return Err("二维制品身份或大小非法".into());
@@ -60,7 +60,7 @@ impl Store {
         };
         Self::identity(&reference)?;
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        if archive::hash_reader(&mut file)? != (size, sha) {
+        if crate::dense_cloud::hash_reader(&mut file)? != (size, sha) {
             return Err("二维制品导入摘要变化".into());
         }
         self.entries.insert(
@@ -192,13 +192,15 @@ impl Store {
                 }
                 if !e.sealed {
                     e.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                    if archive::hash_reader(&mut e.file)? != (e.size, e.sha) {
+                    if crate::dense_cloud::hash_reader(&mut e.file)? != (e.size, e.sha) {
                         return Err("二维上传完整摘要不匹配".into());
                     }
                     e.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                     let mut magic = [0; 8];
                     e.file.read_exact(&mut magic).map_err(|e| e.to_string())?;
-                    if &magic == b"NUWAXAR1" {
+                    if &magic == b"NUWAXDC1" {
+                        crate::dense_cloud::validate_archive(&mut e.file)?;
+                    } else if &magic == b"NUWAXAR1" {
                         let mut fine = nuwax_map_chunks::ArchiveReader::open(&mut e.file)?;
                         for reference in fine.manifest().blocks.clone() { fine.block(&reference)?; }
                     } else {

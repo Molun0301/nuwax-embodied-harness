@@ -46,6 +46,7 @@ mod owner_profile;
 mod persistent_occupancy;
 mod pgo_map;
 mod pointcloud;
+mod dense_cloud;
 mod rpc_runtime;
 mod runtime_diagnostics;
 mod sequence_state;

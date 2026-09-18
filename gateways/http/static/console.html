@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260917-full-pointcloud">
+  <link rel="stylesheet" href="/static/console.css?v=20260918-dense-pointcloud">
 </head>
 <body>
 <div class="app" id="app">
@@ -60,7 +60,7 @@
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
                         <option value="height" selected>高度</option>
-                        <option value="full" title="显示收到的全部点，保留原坐标，不受点云间隔和显示精度影响">完整点云</option>
+                        <option value="full" title="分块加载全部有效扫描点，保留原坐标，不受点云间隔和显示精度影响">完整点云</option>
                         <option value="singleFloor">单层</option>
                         <option value="ground">地面</option>
                         <option value="structure">结构</option>
@@ -82,6 +82,9 @@
                     <button id="semanticMemoryToggle" class="tool" type="button" aria-expanded="false" aria-controls="semanticMemoryPanel">空间记忆 <span id="semanticMemoryCount">—</span></button>
                     <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
                   </div>
+                </div>
+                <div id="map3dDenseStatusRow" class="map-tool-row" data-map-view="3d" hidden>
+                  <span id="map3dDenseStatus" class="dense-cloud-status glass" role="status" hidden></span>
                 </div>
                 <div id="map2dActionControls" class="map-tool-row" data-map-view="2d" aria-label="2D 地图交互">
                   <div class="map-tool-group glass">
@@ -339,7 +342,7 @@
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260915-map-reconnect-1"></script>
+  <script src="/static/js/console.js?v=20260918-dense-pointcloud"></script>
   <script>
     window.__NUWAX_ROBOT_GEOMETRY__ = "__ROBOT_GEOMETRY__";
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
@@ -360,7 +363,7 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260917-full-pointcloud");
+      await import("/static/js/pointcloud3d.js?v=20260918-dense-pointcloud");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->

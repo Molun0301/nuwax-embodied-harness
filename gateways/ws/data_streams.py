@@ -90,6 +90,7 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
         "localization.frame_tree",  # 坐标树只需要最新帧
         "localization.trajectory",  # 轨迹只需要最新帧
         "map.heartbeat",  # 地图心跳只需要最新帧
+        "memory.instances",  # 物品完整视图可替代，慢连接不积压逐次观察。
         "navigation.state",  # 仅共享判定认可的无目标守卫心跳，业务状态不合并。
     }
 )

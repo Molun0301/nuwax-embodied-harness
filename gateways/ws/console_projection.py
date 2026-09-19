@@ -63,5 +63,5 @@ def console_payload(topic, payload):
     result["detections_2d"] = overlays
     result["overlay_count"] = len(overlays)
     result["detections_truncated"] = bool(field_value(payload, "detections_truncated", False)) or len(overlays) != len(detections)
-    result.update(selected_fields(payload, ("stage_status", "stage_duration_ms", "nms_stats", "pipeline_lock_wait_ms")))
+    result.update(selected_fields(payload, ("stage_status", "stage_duration_ms", "nms_stats", "pipeline_lock_wait_ms", "output_validation")))
     return result

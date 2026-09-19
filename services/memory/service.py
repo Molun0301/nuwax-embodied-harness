@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import logging
 import math
+import heapq
 import queue
 import re
 import threading
@@ -72,6 +73,7 @@ from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
+from services.memory.instance_stream import SemanticInstancePublisher
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.repository import MemoryRepository
 from services.memory.scene_space_sampler import SceneSpaceSampler
@@ -194,6 +196,7 @@ class MemoryService:
         deferred_projection_config: Optional[Any] = None,
         accumulated_cloud_provider: Optional[Any] = None,
         live_pose_provider: Optional[Any] = None,
+        stream_bus=None,
     ) -> None:
         self._localization_service = localization_service
         self._mapping_service = mapping_service
@@ -304,6 +307,13 @@ class MemoryService:
         self._instances_lock = threading.RLock()
         # 只限定当前关键帧结构提交；向量任务在释放结构锁后再执行。
         self._observation_write_state = threading.local()
+        self._instance_publisher = SemanticInstancePublisher(stream_bus, self.get_semantic_instances_snapshot)
+
+    def start_instance_stream(self) -> None:
+        self._instance_publisher.start()
+
+    def stop_instance_stream(self) -> None:
+        self._instance_publisher.stop()
 
     def is_enabled(self) -> bool:
         """返回记忆库当前是否已启用。"""
@@ -390,6 +400,7 @@ class MemoryService:
             self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
+        self._instance_publisher.notify()
         self._start_vectorization_worker()
         self._start_deferred_refine_worker()
         summary = self.get_summary()
@@ -461,6 +472,7 @@ class MemoryService:
             self._clear_active_memory_state()
             self._memory_enabled = False
             self._active_library_name = None
+        self._instance_publisher.notify()
         summary = self.get_summary()
         if previous_name:
             self._publish_memory_event(
@@ -602,9 +614,11 @@ class MemoryService:
 
         was_active = resolved_name == self._active_library_name
         if was_active:
-            self._clear_active_memory_state()
-            self._memory_enabled = False
-            self._active_library_name = None
+            with self._instances_lock:
+                self._clear_active_memory_state()
+                self._memory_enabled = False
+                self._active_library_name = None
+            self._instance_publisher.notify()
 
         deleted_counts = self._delete_memory_library_records(resolved_name)
         deleted_directory = self._repository.delete_memory_library(resolved_name)
@@ -2832,15 +2846,49 @@ class MemoryService:
         if not target_library:
             return []
         resolved_now = utc_now()
-        instances = sorted(
-            self._repository.load_semantic_instances(library_name=target_library),
-            key=lambda item: (
-                item.last_seen_ts if item.last_seen_ts.tzinfo is not None
-                else item.last_seen_ts.replace(tzinfo=resolved_now.tzinfo),
-                item.instance_id,
-            ),
-            reverse=True,
-        )
+        stored = self._repository.load_semantic_instances(library_name=target_library)
+        by_id = {item.instance_id: item for item in stored}
+        # 当前库连续感知的坐标比关键帧持久记录更新，不能让磁盘快照遮蔽它。
+        with self._instances_lock:
+            if target_library == self._active_library_name:
+                by_id.update({key: item for key, item in self._semantic_instances_by_id.items()
+                              if self._record_library_name(item) == target_library})
+        instances = sorted(by_id.values(), key=self._instance_view_order, reverse=True)
+        return self._semantic_instance_rows(instances, target_library, resolved_now, label=label)
+
+    @staticmethod
+    def _instance_view_order(item):
+        timestamp = item.last_seen_ts
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=utc_now().tzinfo)
+        return timestamp, item.instance_id
+
+    def get_semantic_instances_snapshot(self, *, limit: int = 500) -> Dict[str, object]:
+        """实时视图只读取当前库内存；限量后才投影轻量字段，不读取数据库。"""
+        limit = max(1, min(1000, int(limit)))
+        now = utc_now()
+        with self._instances_lock:
+            library = self._active_library_name if self._memory_enabled else None
+            instances = tuple(item for item in self._semantic_instances_by_id.values()
+                              if library and self._record_library_name(item) == library)
+        selected = heapq.nlargest(limit, instances, key=self._instance_view_order)
+        rows = self._semantic_instance_rows(selected, library or "", now)
+        # 无新观察时只在下一个生命周期边界唤醒一次，避免定频扫库。
+        deadlines = []
+        policy = self._instance_association_service
+        for item in selected:
+            timestamp = self._instance_view_order(item)[0].timestamp()
+            for durations in (policy._UNCERTAIN_AFTER_SEC, policy._STALE_AFTER_SEC, policy._REMOVED_AFTER_SEC):
+                deadline = timestamp + durations[item.movability]
+                if deadline > now.timestamp():
+                    deadlines.append(deadline)
+        return {
+            "instances": rows, "library_name": library, "active_library_name": library,
+            "total": len(instances), "limit": limit, "truncated": len(instances) > limit,
+            "_next_update_at": min(deadlines) if deadlines else None,
+        }
+
+    def _semantic_instance_rows(self, instances, target_library, resolved_now, *, label=None):
         label_lower = str(label).lower().strip() if label else None
         lifecycle_order = {
             InstanceLifecycleState.ACTIVE: 0,
@@ -4871,10 +4919,9 @@ class MemoryService:
             return
         if cloud_xyz is None or getattr(cloud_xyz, "shape", (0,))[0] == 0:
             return
-        # 同一轮目标共享一份规范化数组，避免每个 project_cone 调用重复做
-        # float64 转换；不改变点顺序、点数或筛选参数。
+        # 同轮共享原始数组；投影内部按块转换，避免整图扩大为双精度副本。
         try:
-            cloud_xyz = np.asarray(cloud_xyz, dtype=np.float64)
+            cloud_xyz = np.asarray(cloud_xyz)
         except (TypeError, ValueError):
             return
         if cloud_xyz.ndim != 2 or cloud_xyz.shape[1] != 3 or cloud_xyz.shape[0] == 0:
@@ -4920,7 +4967,7 @@ class MemoryService:
         if result is None:
             self._record_deferred_refine_failure(instance_id, in_cone_count=count)
             return
-        self._apply_deferred_refine_success(instance_id, result=result)
+        self._apply_deferred_refine_success(instance_id, result=result, expected_instance=instance)
 
     def _record_deferred_refine_failure(self, instance_id: str, *, in_cone_count: int) -> None:
         """记录一次 fast-fail：retry 计数 +1，超限标 exhausted。"""
@@ -4940,12 +4987,16 @@ class MemoryService:
             updated = instance.model_copy(update={"metadata": metadata}, deep=True)
             self._semantic_instances_by_id[instance_id] = updated
 
-    def _apply_deferred_refine_success(self, instance_id: str, *, result) -> None:
+    def _apply_deferred_refine_success(self, instance_id: str, *, result, expected_instance=None) -> None:
         """精化成功：覆盖坐标、清 pending、恢复 navigable；triangulation_first 做 cross-validation。"""
 
         with self._instances_lock:
             instance = self._semantic_instances_by_id.get(instance_id)
             if instance is None:
+                return
+            if expected_instance is not None and instance is not expected_instance:
+                return
+            if self._record_library_name(instance) != self._active_library_name or not self._memory_enabled:
                 return
             metadata = dict(instance.metadata or {})
             centroid = result.centroid
@@ -4972,8 +5023,10 @@ class MemoryService:
                     else:
                         xval_meta["deferred_pc_xval_agreement"] = True
             metadata.pop("pending_localization", None)
-            metadata["navigable"] = True
-            metadata.pop("non_navigable_reason", None)
+            metadata["observation_only"] = False
+            metadata["pose_quality_level"] = "high"
+            metadata["projection_degradation_reason"] = ""
+            metadata["position_observation_count"] = max(1, int(metadata.get("position_observation_count") or 0))
             metadata["projection_method"] = projection_method
             metadata["projection_confidence"] = float(confidence)
             metadata["support_point_count"] = int(result.point_count)
@@ -4984,6 +5037,15 @@ class MemoryService:
             lifecycle = instance.lifecycle_state
             if lifecycle == InstanceLifecycleState.UNCERTAIN:
                 lifecycle = InstanceLifecycleState.ACTIVE
+            if xval_meta.get("deferred_pc_xval_agreement") is False:
+                lifecycle = InstanceLifecycleState.UNCERTAIN
+            metadata.update(self._evaluate_navigation_metadata(
+                metadata, backend_name=str(metadata.get("backend") or "memory_service.semantic_instance"),
+                map_name=instance.map_name, localization_session_id=instance.localization_session_id,
+            ))
+            if lifecycle != InstanceLifecycleState.ACTIVE or not self._is_long_term_static_instance(instance):
+                metadata["navigable"] = False
+                metadata["non_navigable_reason"] = "instance_not_active_or_static"
             updated = instance.model_copy(
                 update={"pose": pc_pose, "metadata": metadata, "lifecycle_state": lifecycle},
                 deep=True,
@@ -6405,10 +6467,15 @@ class MemoryService:
                 },
                 deep=True,
             )
-            # P0-3：与延迟精化 worker 共享 _instances_lock，单点写回必须在锁内，
-            # 与 worker 的 get→copy→set 串行；I/O 留在锁外（沿用本类既有模式）。
+            # 关联后生成元数据期间可能已有精化或切库；旧结果不能覆盖新位置或复活旧库。
             with self._instances_lock:
-                self._semantic_instances_by_id[instance.instance_id] = instance
+                current = self._semantic_instances_by_id.get(instance.instance_id)
+                if current is None:
+                    continue
+                if current is not outcome.instance:
+                    instance = current
+                else:
+                    self._semantic_instances_by_id[instance.instance_id] = instance
             linked_instance_ids.append(instance.instance_id)
             self._semantic_instance_history.append(instance)
             self._write_semantic_instance_state(instance)
@@ -6983,6 +7050,7 @@ class MemoryService:
             source="memory_service",
             metadata={"kind": "semantic_instance"},
         )
+        self._instance_publisher.notify()
 
     def _write_observation_event_state(self, event: ObservationEvent) -> None:
         self._state_store.write(

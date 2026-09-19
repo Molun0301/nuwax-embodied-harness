@@ -18,7 +18,7 @@
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "tasks.state", "system.metrics"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "tasks.state", "system.metrics"];
       const POSE_STREAM_TOPICS = ["localization.pose", "map.frame"];
       const LOG_STREAM_TOPICS = ["logs.entry"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
@@ -179,7 +179,7 @@
         highlightTarget: null,
         clusterAnim: null,
         _prevClusters: null,
-        _semanticPollTimer: null,
+        semanticStreamVersion: 0,
         _zoomDebounceTimer: null,
       };
       const els = {
@@ -2309,6 +2309,7 @@
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 8000);
         const requestedMap = activeMapName();
+        const streamVersion = state.semanticStreamVersion;
         if (els.semanticInstancesRefresh) {
           els.semanticInstancesRefresh.disabled = true;
           els.semanticInstancesRefresh.setAttribute("aria-busy", "true");
@@ -2321,29 +2322,11 @@
             const src = Array.isArray(body?.instances) ? body : body?.result;
             if (!Array.isArray(src?.instances)) throw new Error("记忆接口返回格式异常");
             if (requestedMap && requestedMap !== activeMapName()) throw new Error("地图已切换，正在刷新当前记忆库");
-            const seen = new Set();
-            const list = src.instances.filter((inst) => {
-              if (!inst || typeof inst !== "object" || !inst.instance_id || seen.has(inst.instance_id)) return false;
-              seen.add(inst.instance_id);
-              return true;
-            });
-            const snapshotKey = JSON.stringify([src.library_name, src.map_name, list]);
-            const wasError = Boolean(state.semanticError);
-            state.semanticError = "";
-            state.semanticFetchedAt = Date.now();
-            const previousLibrary = state.semanticMeta.library_name;
-            state.semanticMeta = src;
-            if (snapshotKey !== state.semanticSnapshotKey || wasError) {
-              state.semanticSnapshotKey = snapshotKey;
-              state.semanticInstances = list;
-              if (!list.some((inst) => inst.instance_id === state.semanticSelectedId)) state.semanticSelectedId = null;
-              reconcileSemanticOverlay(previousLibrary);
-              publishSemanticMapInstances();
-              requestMapDraw(false);
-              renderSemanticMemoryList();
-            }
+            if (streamVersion !== state.semanticStreamVersion) return;
+            applySemanticInstances(src);
           })
           .catch((error) => {
+            if (streamVersion !== state.semanticStreamVersion) return;
             state.semanticError = error.name === "AbortError" ? "读取超时" : String(error.message || error);
             reconcileSemanticOverlay(state.semanticMeta.library_name);
             // 失败时保留可查阅记录，但撤下地图标记，避免缓存被当作当前位置。
@@ -2363,6 +2346,37 @@
           });
         renderSemanticMemoryStatus();
         return state.semanticLoadPromise;
+      }
+      function applySemanticInstances(src) {
+        if (!Array.isArray(src?.instances)) {
+          state.semanticError = src?.message || "空间记忆实时数据不可用";
+          publishSemanticMapInstances();
+          requestMapDraw(false);
+          renderSemanticMemoryStatus();
+          return;
+        }
+        const seen = new Set();
+        const list = src.instances.filter((inst) => {
+          if (!inst || typeof inst !== "object" || !inst.instance_id || seen.has(inst.instance_id)) return false;
+          seen.add(inst.instance_id);
+          return true;
+        });
+        const snapshotKey = JSON.stringify([src.library_name, src.map_name, list]);
+        const wasError = Boolean(state.semanticError);
+        state.semanticError = "";
+        state.semanticFetchedAt = Date.now();
+        const previousLibrary = state.semanticMeta.library_name;
+        state.semanticMeta = src;
+        if (snapshotKey !== state.semanticSnapshotKey || wasError) {
+          state.semanticSnapshotKey = snapshotKey;
+          state.semanticInstances = list;
+          if (!list.some((inst) => inst.instance_id === state.semanticSelectedId)) state.semanticSelectedId = null;
+          reconcileSemanticOverlay(previousLibrary);
+          publishSemanticMapInstances();
+          requestMapDraw(false);
+          renderSemanticMemoryList();
+        }
+        renderSemanticMemoryStatus();
       }
       function semanticObservationOnly(inst) {
         return inst.observation_only === true || inst.projection_method === "current_pose_fallback";
@@ -2411,7 +2425,7 @@
           ? `刷新失败：${state.semanticError}。${count ? "正在查看上次缓存，地图标记已隐藏。" : "请重试。"}`
           : state.semanticLoadPromise ? "正在读取当前记忆库…"
           : !library && !count ? "未启用记忆库，请先激活地图。"
-          : `${library ? `记忆库：${library}` : "当前记忆库"}${suffix}${mismatch ? " · 与当前地图不匹配，标记已隐藏" : ""}`;
+          : `${library ? `记忆库：${library}` : "当前记忆库"} · 实时更新${suffix}${mismatch ? " · 与当前地图不匹配，标记已隐藏" : ""}`;
         if (els.semanticMemoryStatus) {
           els.semanticMemoryStatus.textContent = status;
           els.semanticMemoryStatus.dataset.state = state.semanticError ? "error" : mismatch ? "stale" : "ready";
@@ -2467,7 +2481,7 @@
         if (open) {
           renderSemanticMemoryList();
           renderSemanticMemoryStatus();
-          if (!state.semanticFetchedAt || Date.now() - state.semanticFetchedAt >= 30000) loadSemanticInstances();
+          if (!state.semanticFetchedAt) loadSemanticInstances();
           els.semanticMemorySearch?.focus();
         }
       }
@@ -4165,6 +4179,12 @@
         scheduleVideoDetectionDraw();
       }
       // vis-three-fixes 任务 1.7 / AC3.4：用 video.detections 流里的 nms_stats 填充感知 NMS 卡片。
+      function formatDetectionScore(score) {
+        if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1) return "分数无效";
+        if (score === 1) return "100%";
+        if (score >= 0.999) return "≥99.9%";
+        return `${(score * 100).toFixed(1)}%`;
+      }
       function updatePerceptionNmsCard(data, envelope) {
         const section = document.getElementById("overview-perception_nms");
         if (!section) return;
@@ -4239,7 +4259,7 @@
           if (!(right > left && bottom > top)) continue;
           const x = geometry.x + left * geometry.scale, y = geometry.y + top * geometry.scale;
           const boxWidth = (right - left) * geometry.scale, boxHeight = (bottom - top) * geometry.scale;
-          const label = `${detection.label} ${Math.round(detection.score * 100)}%`;
+          const label = `${detection.label} ${formatDetectionScore(detection.score)}`;
           const labelMaxWidth = Math.max(20, Math.min(240, width - x - 10));
           const fitted = fitSemanticMarkerLabel(context, label, labelMaxWidth);
           const labelWidth = Math.min(width - x, context.measureText(fitted).width + 10);
@@ -4274,6 +4294,7 @@
         "pointcloud_map.snapshot",
         "video.frame",
         "video.detections",
+        "memory.instances",
         "tasks.state",
         "system.metrics"
       ].filter(topic => !PLANAR_PIPELINE || !topic.startsWith("pointcloud"));
@@ -4762,6 +4783,9 @@
           acceptsMessages = false;
           if (stream === state) {
             state.connectionProbe = null;
+            state.semanticStreamVersion += 1;
+            delete state.pendingStreamFrames["memory.instances"];
+            applySemanticInstances({ message: "实时连接已断开，正在重连" });
             setText(els.lastReceive, "--");
             resetPointCloudMapBinaryConsumer("disconnect");
             resetExplorationOverlayConsumer("disconnect");
@@ -4785,6 +4809,7 @@
       function recoverStreamGap(message) {
         const topics = Array.isArray(message?.topics) && message.topics.length ? new Set(message.topics) : null;
         if (!topics || topics.has("tasks.state")) void loadInitialTasks();
+        if (!topics || topics.has("memory.instances")) void loadSemanticInstances();
         if (!topics || topics.has("logs.entry")) {
           const logs = window.nuwaxConsoleLogs;
           if (typeof logs?.recoverGap === "function") void logs.recoverGap();
@@ -4970,6 +4995,10 @@
           scheduleVideoUpdate(envelopeFromFrame(frame));
         } else if (frame.topic === "video.detections") {
           updateVideoDetections(frame.payload || {}, envelopeFromFrame(frame));
+        } else if (frame.topic === "memory.instances") {
+          state.semanticStreamVersion += 1;
+          applySemanticInstances(frame.payload || {});
+          updateOverviewForFrame = false;
         } else if (frame.topic === "logs.entry") {
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
@@ -5621,18 +5650,11 @@
       });
       els.semanticMemorySearch?.addEventListener("input", renderSemanticMemoryList);
       els.semanticMemoryFilter?.addEventListener("change", renderSemanticMemoryList);
-      state._semanticPollTimer = window.setInterval(() => {
-        if (!document.hidden && (state.showSemanticInstances || els.semanticMemoryPanel?.hidden === false)) loadSemanticInstances();
-      }, 30000);
-      document.addEventListener("visibilitychange", () => {
-        if (!document.hidden && Date.now() - state.semanticFetchedAt >= 30000) loadSemanticInstances();
-      });
       window.addEventListener("stream:map.frame", () => {
         const mapName = activeMapName();
         if (state.semanticLastMapName !== mapName) {
           state.semanticLastMapName = mapName;
           reconcileSemanticOverlay(state.semanticMeta.library_name);
-          if (!document.hidden) loadSemanticInstances();
         }
         publishSemanticMapInstances();
         renderSemanticMemoryStatus();

@@ -416,6 +416,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._navigationPath = [];
     this._navigationGoal = null;
     this._semanticInstances = [];
+    this._semanticRenderKey = null;
     this._semanticInstancesVisible = true;
     this._semanticOwnedResources = [];
     this._semanticMarkerGeometry = null;
@@ -1354,6 +1355,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticGroup?.clear();
     for (const resource of this._semanticOwnedResources) resource.dispose?.();
     this._semanticOwnedResources = [];
+    this._semanticRenderKey = null;
   }
 
   _syncSemanticGroupVisibility(distance = this._cameraDistance()) {
@@ -1480,15 +1482,27 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _rebuildSemanticInstances() {
     if (!this._semanticGroup) return;
+    const renderKey = JSON.stringify(this._semanticInstances.map(instance => [
+      instance.instance_id, instance.pose, instance.display_name, instance.label,
+      instance.frame_id, instance.is_fallback, instance.observation_only, instance.projection_method,
+    ]));
+    if (renderKey === this._semanticRenderKey) {
+      // 观察次数、时间及置信度更新只替换选择数据，复用几何和标签纹理。
+      const byId = new Map(this._semanticInstances.map(instance => [instance.instance_id, instance]));
+      for (const child of this._semanticGroup.children) {
+        if (child.userData.semanticInstance) child.userData.semanticInstance = byId.get(child.userData.semanticInstance.instance_id);
+      }
+      return;
+    }
     this._clearSemanticInstances();
+    this._semanticRenderKey = renderKey;
     this._syncSemanticGroupVisibility();
     for (const instance of this._semanticInstances) {
       const pose = instance?.pose;
-      const x = Number(pose?.x);
-      const y = Number(pose?.y);
-      const zValue = Number(pose?.z || 0);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-      const z = Number.isFinite(zValue) ? zValue : 0;
+      // 坐标必须来自完整地图位置，空值不能经 Number(null) 变成原点。
+      if (!pose || ![pose.x, pose.y, pose.z].every(value => typeof value === 'number' && Number.isFinite(value))) continue;
+      const { x, y, z } = pose;
+      if (instance.observation_only || instance.projection_method === 'current_pose_fallback') continue;
       const fallback = Boolean(instance.is_fallback) || String(instance.frame_id || 'map') !== 'map';
       const marker = new THREE.Mesh(
         this._semanticMarkerGeometry,

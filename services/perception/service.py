@@ -1128,6 +1128,7 @@ class PerceptionService:
             "overlay_phase": overlay_phase,
             "publish_interval_ms": publish_interval_ms,
             "nms_stats": nms_stats,
+            "output_validation": dict(detection_metadata.get("output_validation") or {}),
             "pipeline_lock_wait_ms": context.metadata.get("pipeline_lock_wait_ms"),
             "source_timestamp_ns": context.metadata.get("source_timestamp_ns"),
         }

@@ -60,43 +60,51 @@ def project_cone(
 
     if points_xyz is None:
         return None, 0
-    points = np.asarray(points_xyz, dtype=np.float64)
+    points = np.asarray(points_xyz)
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
         return None, 0
-
     origin_arr = np.asarray(origin, dtype=np.float64)
     dir_arr = np.asarray(direction, dtype=np.float64)
+    if origin_arr.shape != (3,) or dir_arr.shape != (3,):
+        return None, 0
+    if not np.isfinite(origin_arr).all() or not np.isfinite(dir_arr).all():
+        return None, 0
     dir_norm = float(np.linalg.norm(dir_arr))
-    if dir_norm < 1e-9:
+    if not math.isfinite(dir_norm) or dir_norm < 1e-9:
         return None, 0
     dir_arr = dir_arr / dir_norm
-
-    half_angle = float(max(1e-4, half_angle_rad))
-    cos_half = math.cos(half_angle)
-
-    # 各点相对锥顶的向量与距离
-    rel = points - origin_arr
-    ranges = np.linalg.norm(rel, axis=1)
-    valid_range = (ranges >= float(min_range_m)) & (ranges <= float(max_range_m))
-    if not bool(np.any(valid_range)):
+    half_angle = float(half_angle_rad)
+    if not math.isfinite(half_angle) or not 0.0 <= half_angle < math.pi / 2:
         return None, 0
-
-    # 余弦判据：点向量与轴向夹角 ≤ half_angle ⟺ cos(angle) ≥ cos(half_angle)
-    safe_ranges = np.where(ranges > 1e-9, ranges, 1.0)
-    cos_angles = (rel @ dir_arr) / safe_ranges
-    in_cone = valid_range & (cos_angles >= cos_half)
-    count = int(np.count_nonzero(in_cone))
+    if not (math.isfinite(min_range_m) and math.isfinite(max_range_m)
+            and 0.0 <= min_range_m < max_range_m):
+        return None, 0
+    cos_squared = math.cos(max(1e-4, half_angle)) ** 2
+    count = 0
+    point_sum = np.zeros(3, dtype=np.float64)
+    range_sum = 0.0
+    # 分块限定临时内存；平方距离筛选避免对整图开方和多线程矩阵调度。
+    for start in range(0, len(points), 65536):
+        block = np.asarray(points[start:start + 65536], dtype=np.float64)
+        rel = block - origin_arr
+        squared_ranges = np.einsum("ij,ij->i", rel, rel)
+        forward = np.einsum("ij,j->i", rel, dir_arr)
+        in_cone = (np.isfinite(squared_ranges) & (squared_ranges >= min_range_m ** 2)
+                   & (squared_ranges <= max_range_m ** 2) & (forward > 0.0)
+                   & (forward * forward >= cos_squared * squared_ranges))
+        selected_count = int(np.count_nonzero(in_cone))
+        if selected_count:
+            count += selected_count
+            point_sum += block[in_cone].sum(axis=0)
+            range_sum += float(np.sqrt(squared_ranges[in_cone]).sum())
     if count < max(1, int(min_points)):
         return None, count
-
-    selected = points[in_cone]
-    centroid = selected.mean(axis=0)
-    mean_range = float(np.mean(ranges[in_cone]))
+    centroid = point_sum / count
     return (
         ConeProjectionResult(
             centroid=(float(centroid[0]), float(centroid[1]), float(centroid[2])),
             point_count=count,
-            mean_range_m=mean_range,
+            mean_range_m=range_sum / count,
         ),
         count,
     )

@@ -148,7 +148,8 @@ def _clamp_score(value: object) -> float:
         score = float(value)
     except (TypeError, ValueError):
         score = 0.0
-    return max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
+    # 后端合同已是概率，越界值不能被夹成“100%”或猜测为百分数/原始分数。
+    return score if math.isfinite(score) and 0.0 <= score <= 1.0 else 0.0
 
 
 def _normalize_label(value: object) -> str:
@@ -380,6 +381,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         self._last_worker_inference_ms = None
         self._last_inference_execution = "not_run"
         self._worker_fallback_reason = ""
+        self._last_output_validation = {}
         provider_metadata = resolve_detection_provider_spec(
             backend_name=name,
             backend_kind="yolo_world",
@@ -559,6 +561,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
         result: Optional[Any],
         image_frame: ImageFrame,
     ) -> Tuple[Detection2D, ...]:
+        self._last_output_validation = {"invalid_score_count": 0, "score_kind": "detection_confidence"}
         if result is None:
             return ()
         boxes = getattr(result, "boxes", None)
@@ -585,7 +588,12 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 raw_class_id = float(class_items[index])
             except (TypeError, ValueError):
                 continue
-            if not math.isfinite(score) or not math.isfinite(raw_class_id) or raw_class_id < 0.0 or not raw_class_id.is_integer():
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                self._last_output_validation["invalid_score_count"] += 1
+                continue
+            if score < self._confidence_threshold:
+                continue
+            if not math.isfinite(raw_class_id) or raw_class_id < 0.0 or not raw_class_id.is_integer():
                 continue
             try:
                 bbox = _clamp_bbox(
@@ -605,6 +613,7 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 "model_name": self._resolved_model_source or self._weights,
                 "class_id": class_id,
                 "grounding_score": _clamp_score(score),
+                "score_kind": "detection_confidence",
                 "relative_area": round((width * height) / float(image_frame.width_px * image_frame.height_px), 6),
                 "center_x_ratio": round(((x1 + x2) * 0.5) / float(image_frame.width_px), 6),
                 "center_y_ratio": round(((y1 + y2) * 0.5) / float(image_frame.height_px), 6),
@@ -867,7 +876,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
             max_detections=max_detections,
             use_worker_process=use_worker_process,
         )
-        self._configured_class_names = self._normalize_class_names(class_names) or ("object",)
+        self._configured_class_names = self._normalize_class_names(class_names) or (() if self._use_tensorrt else ("object",))
         self._dynamic_class_metadata_keys = tuple(
             str(item).strip()
             for item in dynamic_class_metadata_keys
@@ -977,6 +986,7 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                         }
                     )
             first_result = results[0] if results else None
+            requested_classes = class_names
             if self._use_tensorrt:
                 # 固定引擎无法应用动态请求词表，只报告模型实际返回的类别表。
                 names = getattr(first_result, "names", None)
@@ -993,14 +1003,27 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                 camera_info=camera_info,
                 class_names=class_names,
             )
+            if self._use_tensorrt:
+                # 固定引擎无法新增类别，但仍须按本次请求筛选已有类别，不能忽略用户词表。
+                allowed = set(requested_classes)
+                selected = tuple(item for item in detections_2d if not allowed or item.label in allowed)
+                base_metadata["requested_class_filter_applied"] = bool(allowed)
+                base_metadata["unrequested_detection_count"] = len(detections_2d) - len(selected)
+                base_metadata["unsupported_requested_classes"] = sorted(allowed - set(class_names))
+                detections_2d = selected
+            invalid_output = bool(self._last_output_validation.get("invalid_score_count")) and not detections_2d
+            unsupported_request = self._use_tensorrt and bool(requested_classes) and not set(requested_classes).intersection(class_names)
+            unavailable_reason = "invalid_model_scores" if invalid_output else "unsupported_engine_classes" if unsupported_request else ""
             return DetectionBundle(
                 detections_2d=detections_2d,
                 detections_3d=(),
                 metadata={
                     **base_metadata,
                     "raw_detection_count": len(detections_2d),
-                    "stage_status": "completed",
-                    "availability": "available",
+                    "output_validation": dict(self._last_output_validation),
+                    "stage_status": "not_ready" if unavailable_reason else "completed",
+                    "availability": "unavailable" if unavailable_reason else "available",
+                    "reason": unavailable_reason,
                     "model_loaded": self._model is not None or self._last_inference_execution == "worker_process",
                     "model_source": self._resolved_model_source or self._weights,
                     "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,

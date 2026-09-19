@@ -1094,6 +1094,7 @@ class GatewayRuntime:
             event_bus=self.event_bus,
         )
         self.memory_service = MemoryService(
+            stream_bus=self.stream_bus,
             localization_service=self.localization_service,
             mapping_service=self.mapping_service,
             observation_service=self.observation_service,
@@ -1534,6 +1535,7 @@ class GatewayRuntime:
                 ("geometry recording", self._close_mapping_recording),
                 ("perception video runtime", self.perception_video_runtime.stop),
                 ("memory background workers", self.memory_service.disable_memory_library),
+                ("memory instance stream", self.memory_service.stop_instance_stream),
                 ("robot", self.robot.stop),
             )
             for component_name, cleanup in cleanup_steps:
@@ -1735,6 +1737,7 @@ class GatewayRuntime:
     def _start_data_frame_stream_sources(self) -> None:
         providers = getattr(self.robot, "providers", None)
 
+        self.memory_service.start_instance_stream()
         self._publish_runtime_governance_stream_frame()
         self._start_pointcloud_map_stream()
         self._start_navigation_status_refresh_stream()

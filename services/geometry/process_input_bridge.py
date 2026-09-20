@@ -63,7 +63,7 @@ class ProcessInputBridge:
     def start(self):
         if self._started:
             return self.is_ready()
-        if not self.runtime_provider.is_connected():
+        if not self.runtime_provider.is_connected:
             return False
         spec = {"target": self.runtime_provider._bridge.grpc_target,
                 "recording": self.recording_sink is not None}

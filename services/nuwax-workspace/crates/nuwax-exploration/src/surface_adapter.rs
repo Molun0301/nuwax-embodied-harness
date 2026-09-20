@@ -125,7 +125,7 @@ pub struct SurfaceGoalSourceAdapter {
     regional_schedule: nuwax_explore_routing::RegionalSchedule,
     last_snapshot: Option<Weak<SurfaceSnapshot>>,
     last_notification: Option<u64>,
-    last_query_support: Option<[f64; 3]>,
+    last_query_body: Option<[f64; 3]>,
     last_query_orientation: Option<[f64; 4]>,
     last_no_frontier: bool,
     retry_support: Option<[f64; 3]>,
@@ -163,7 +163,7 @@ impl SurfaceGoalSourceAdapter {
             regional_schedule: Default::default(),
             last_snapshot: None,
             last_notification: None,
-            last_query_support: None,
+            last_query_body: None,
             last_query_orientation: None,
             last_no_frontier: false,
             retry_support: None,
@@ -204,7 +204,7 @@ impl SurfaceGoalSourceAdapter {
         self.blacklist_radius_m = blacklist_radius_m;
         self.last_snapshot = None;
         self.last_notification = None;
-        self.last_query_support = None;
+        self.last_query_body = None;
         self.last_query_orientation = None;
         self.last_no_frontier = false;
         Ok(())
@@ -275,7 +275,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.regional_schedule.reset();
         self.last_snapshot = None;
         self.last_notification = None;
-        self.last_query_support = None;
+        self.last_query_body = None;
         self.last_query_orientation = None;
         self.last_no_frontier = false;
         self.retry_support = None;
@@ -291,7 +291,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.retry_support = None;
         self.last_snapshot = None;
         self.last_notification = None;
-        self.last_query_support = None;
+        self.last_query_body = None;
         self.last_frontiers.clear();
         Ok(())
     }
@@ -317,6 +317,13 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         let position = state.robot_pose.pose.position;
         let orientation = state.robot_pose.pose.orientation;
         let quaternion = [orientation.x, orientation.y, orientation.z, orientation.w];
+        let source_snapshot = Arc::clone(&snapshot);
+        let snapshot = match snapshot.with_current_body_support(
+            [position.x, position.y, position.z], quaternion,
+        ) {
+            Ok(view) => Arc::new(view),
+            Err(error) => return Ok(self.unavailable(format!("current body support evidence: {error}"))),
+        };
         let robot = match snapshot.locate_support_from_body(
             [position.x, position.y, position.z],
             quaternion,
@@ -332,9 +339,10 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         let same_geometry = self
             .last_snapshot
             .as_ref()
-            .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(&snapshot)));
-        // 边界、距离门限与机体参考转换依赖精确位置和姿态，不能仅比较所在格。
-        let same_query = self.last_query_support == Some(robot.support_xyz)
+            .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(&source_snapshot)));
+        // 当前占据区依赖实际机体高度；层内接触可能关联同一层顶，缓存不能
+        // 因此合并不同的真实位置、姿态或仅比较所在格。
+        let same_query = self.last_query_body == Some([position.x, position.y, position.z])
             && self.last_query_orientation == Some(quaternion);
         if same_geometry && same_query && self.last_no_frontier {
             self.last_notification = Some(notification);
@@ -360,9 +368,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 )
             }
         };
-        self.last_snapshot = Some(Arc::downgrade(&snapshot));
+        self.last_snapshot = Some(Arc::downgrade(&source_snapshot));
         self.last_notification = Some(notification);
-        self.last_query_support = Some(robot.support_xyz);
+        self.last_query_body = Some([position.x, position.y, position.z]);
         self.last_query_orientation = Some(quaternion);
         self.last_frontiers.clear();
         let minimum_distance = f64::from(

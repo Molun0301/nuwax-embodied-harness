@@ -86,12 +86,26 @@ impl SurfaceFollower {
         }
         // 逐点保留转向停留；曲线点只在到达或沿已确认小段越过时消耗。
         let tolerance = (f64::from(map.config().voxel_size) * 0.7).min(0.07);
+        let actual_support = map.locate_support_from_body(
+            body(pose).0, body(pose).1, self.config.body_to_support_z_m,
+        ).ok();
         while self.path_index < path.poses.len() {
             let target = &path.poses[self.path_index];
             let previous = &path.poses[self.path_index - 1];
             let rotation = target.pose.position.distance(previous.pose.position) < 1e-5;
             let error = angle_diff(target.pose.orientation.yaw(), yaw);
-            let distance = position.distance(target.pose.position);
+            let same_support = actual_support.zip(map.locate_support_from_body(
+                body(target).0, body(target).1, self.config.body_to_support_z_m,
+            ).ok()).is_some_and(|(a,b)| {
+                (a.surface_xyz[2]-b.surface_xyz[2]).abs()
+                    <= f64::from(map.source_voxel_size_m())+1e-6
+            });
+            // 地面厚层允许实际足端参考位于层内。已通过完整机体检查且关联
+            // 同一高度层时，按水平进度消耗路径点；平面速度无法补偿层顶偏差。
+            // 最终到达仍使用上方完整三维距离，不跨楼层或扩大用户容差。
+            let distance = if same_support {
+                (position.x-target.pose.position.x).hypot(position.y-target.pose.position.y)
+            } else {position.distance(target.pose.position)};
             let passed = if rotation {
                 false
             } else {
@@ -100,7 +114,10 @@ impl SurfaceFollower {
                 let dot = (position.x - b.x) * (b.x - a.x) + (position.y - b.y) * (b.y - a.y);
                 dot >= 0.0 && distance < tolerance * 2.0
             };
-            if distance < tolerance && (!rotation || error.abs() < 0.05) || passed {
+            let goal_position = (target.pose.position.x-goal.pose.position.x)
+                .hypot(target.pose.position.y-goal.pose.position.y) < 1e-5;
+            let reached_position = !goal_position || final_distance < self.config.controller.goal_tolerance;
+            if reached_position && (distance < tolerance && (!rotation || error.abs() < 0.05) || passed) {
                 self.progress_m = self.cumulative[self.path_index];
                 self.path_index += 1;
             } else {
@@ -290,7 +307,8 @@ impl SurfaceFollower {
             },
         );
         match result {
-            Some(choice) if choice.command != Twist2::ZERO => {
+            Some(choice) if choice.command.linear.x.hypot(choice.command.linear.y) > 1e-9
+                || choice.command.angular_z.abs() > 1e-9 => {
                 self.last_command = choice.command;
                 PlannerStep::Command(choice.command)
             }

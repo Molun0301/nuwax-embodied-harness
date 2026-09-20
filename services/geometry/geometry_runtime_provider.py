@@ -2441,6 +2441,57 @@ def _cancel_stream_call(call, *, context: str) -> bool:
         return False
 
 
+def _latest_pose_updates(call, stop_event):
+    """持续排空远程位姿，只向回调线程保留最新一项；订阅拥有并回收读线程。"""
+    condition = threading.Condition()
+    latest = None
+    finished = False
+    failure = None
+
+    def receive():
+        nonlocal latest, finished, failure
+        try:
+            for update in call:
+                with condition:
+                    if stop_event.is_set():
+                        break
+                    latest = update
+                    condition.notify()
+        except Exception as exc:
+            with condition:
+                failure = exc
+        finally:
+            with condition:
+                finished = True
+                condition.notify()
+
+    reader = threading.Thread(
+        target=receive, name="geometry_runtime_pose_receive", daemon=True
+    )
+    reader.start()
+    try:
+        while not stop_event.is_set():
+            with condition:
+                condition.wait_for(
+                    lambda: latest is not None or finished or stop_event.is_set(),
+                    timeout=0.1,
+                )
+                if stop_event.is_set():
+                    return
+                update, latest = latest, None
+                if update is None:
+                    if failure is not None:
+                        raise failure
+                    if finished:
+                        return
+                    continue
+            yield update
+    finally:
+        # 回调线程退出前先停止真实读取；未回收时原订阅句柄仍保持存活。
+        _cancel_stream_call(call, context="位姿接收")
+        reader.join()
+
+
 class _CancellableStreamHandle:
     """Own one reconnecting streaming worker and its current gRPC call."""
 
@@ -9045,6 +9096,7 @@ class GeometryRuntimeProvider:
                 cached_tree: Optional[FrameTree] = None
                 next_tree_refresh_at = 0.0
                 tree_call = None
+                updates = None
                 call = None
                 call_failed = False
                 try:
@@ -9054,7 +9106,8 @@ class GeometryRuntimeProvider:
                     call = stub.SubscribePose(pb2.PoseRequest())
                     if not handle.bind_call(call):
                         return
-                    for update in call:
+                    updates = _latest_pose_updates(call, handle.stop_event)
+                    for update in updates:
                         if handle.stop_event.is_set():
                             return
                         pose = _build_pose(update.pose)
@@ -9109,6 +9162,8 @@ class GeometryRuntimeProvider:
                             "SubscribePose 非 gRPC 异常，准备重连。"
                         )
                 finally:
+                    if updates is not None:
+                        updates.close()
                     if tree_call is not None:
                         _cancel_stream_call(tree_call, context="位姿订阅坐标树")
                     if call is not None:

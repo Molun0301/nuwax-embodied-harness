@@ -1,70 +1,82 @@
 //! 墙代价只在配置缓冲距离内传播；局部重算包含完整来源外圈，不借旧边界值续接。
 use super::*;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-
-#[derive(Clone, Copy)]
-struct Queue(f32, CellId);
-impl PartialEq for Queue {
-    fn eq(&self, b: &Self) -> bool {
-        self.0.to_bits() == b.0.to_bits() && self.1 == b.1
-    }
-}
-impl Eq for Queue {}
-impl PartialOrd for Queue {
-    fn partial_cmp(&self, b: &Self) -> Option<Ordering> {
-        Some(self.cmp(b))
-    }
-}
-impl Ord for Queue {
-    fn cmp(&self, b: &Self) -> Ordering {
-        b.0.total_cmp(&self.0).then_with(|| b.1.cmp(&self.1))
-    }
-}
+use std::collections::VecDeque;
 
 fn limit(config: &Config) -> f32 {
     (config.wall_clearance_m + config.wall_buffer_m).max(config.voxel_size)
 }
-fn wall_adjacent(cells: &SurfaceCells, id: CellId) -> bool {
-    let c = cells.coord(id);
-    let mut mask = 0;
-    for e in cells.neighbors(id) {
-        let n = cells.coord(e.dest);
-        mask |= match (n.0 - c.0, n.1 - c.1) {
-            (-1, 0) => 1,
-            (1, 0) => 2,
-            (0, -1) => 4,
-            (0, 1) => 8,
-            _ => 0,
-        };
-    }
-    mask != 15
-}
-fn distances(cells: &SurfaceCells, domain: &AHashSet<CellId>, cap: f32) -> AHashMap<CellId, f32> {
-    let mut heap = BinaryHeap::new();
-    let mut distances = AHashMap::new();
-    for &id in domain {
-        if wall_adjacent(cells, id) {
-            distances.insert(id, 0.0);
-            heap.push(Queue(0.0, id));
-        }
-    }
-    while let Some(Queue(cost, id)) = heap.pop() {
-        if cost > *distances.get(&id).unwrap_or(&cap) {
-            continue;
-        }
-        for edge in cells.neighbors(id) {
-            let next = cost + edge.base_cost;
-            if next < cap
-                && domain.contains(&edge.dest)
-                && next < *distances.get(&edge.dest).unwrap_or(&cap)
-            {
-                distances.insert(edge.dest, next);
-                heap.push(Queue(next, edge.dest));
+
+/// 以单元真实边界为障碍位置，计算水平欧氏距离；不把边界格中心当成墙。
+fn distances(
+    graph: &PlannerGraph,
+    domain: &AHashSet<CellId>,
+    config: &Config,
+) -> AHashMap<CellId, f32> {
+    let cells = &graph.cells;
+    let size = config.voxel_size;
+    let cap = limit(config);
+    let ramp_jump = config.max_slope_deg.to_radians().tan() * size + size;
+    let height_cells = (config.step_threshold_m.max(ramp_jump) / size).ceil() as i32;
+    let mut result = AHashMap::with_capacity(domain.len());
+    let mut queue = VecDeque::new();
+    let mut seen = AHashSet::new();
+    for &origin in domain {
+        let centre = cells.coord(origin);
+        let mut nearest = cap;
+        queue.clear();
+        seen.clear();
+        queue.push_back(origin);
+        seen.insert(origin);
+        while let Some(id) = queue.pop_front() {
+            let cell = cells.coord(id);
+            let mut directions = [false; 4];
+            // 坡阶不可达与墙/未知空间是两种约束。避墙距离读取真实邻列，不能
+            // 将剖面不足或方向性运动限制再次按机器人宽度向内膨胀。
+            for (index, &(sx, sy)) in DIRECTIONS.iter().enumerate() {
+                for &z in graph
+                    .surface_lookup
+                    .get(&(cell.0 + sx, cell.1 + sy))
+                    .into_iter()
+                    .flatten()
+                {
+                    if (z - cell.2).abs() > height_cells {
+                        continue;
+                    }
+                    let next = (cell.0 + sx, cell.1 + sy, z);
+                    let Some(next_id) = cells.id(next) else {
+                        continue;
+                    };
+                    directions[index] = true;
+                    let dx = (next.0 - centre.0) as f32;
+                    let dy = (next.1 - centre.1) as f32;
+                    if dx.hypot(dy) * size <= cap + size
+                        && domain.contains(&next_id)
+                        && seen.insert(next_id)
+                    {
+                        queue.push_back(next_id);
+                    }
+                }
+            }
+            for (index, &(dx, dy)) in DIRECTIONS.iter().enumerate() {
+                if directions[index] {
+                    continue;
+                }
+                let x = (cell.0 - centre.0) as f32;
+                let y = (cell.1 - centre.1) as f32;
+                let distance = if dx != 0 {
+                    (x + dx as f32 * 0.5).hypot((y.abs() - 0.5).max(0.0))
+                } else {
+                    (y + dy as f32 * 0.5).hypot((x.abs() - 0.5).max(0.0))
+                } * size;
+                nearest = nearest.min(distance);
+            }
+            if nearest <= size * 0.5 {
+                break;
             }
         }
+        result.insert(origin, nearest);
     }
-    distances
+    result
 }
 fn scale(graph: &mut PlannerGraph, config: &Config, ids: impl IntoIterator<Item = CellId>) {
     for id in ids {
@@ -89,7 +101,7 @@ fn scale(graph: &mut PlannerGraph, config: &Config, ids: impl IntoIterator<Item 
 pub(super) fn full(graph: &mut PlannerGraph, config: &Config) {
     let cap = limit(config);
     let domain = graph.cells.ids().collect::<AHashSet<_>>();
-    let distances = distances(&graph.cells, &domain, cap);
+    let distances = distances(graph, &domain, config);
     graph.wall_state.dist = vec![cap; graph.cells.slot_capacity()];
     for (id, distance) in distances {
         graph.wall_state.dist[id as usize] = distance;
@@ -143,7 +155,7 @@ pub(super) fn update(
     let inner = expand(changed, radius);
     let outer = expand(changed, radius * 2);
     let domain = ids(graph, &outer);
-    let distances = distances(&graph.cells, &domain, cap);
+    let distances = distances(graph, &domain, config);
     graph
         .wall_state
         .dist

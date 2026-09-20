@@ -471,6 +471,79 @@ mod tests {
             .all(|p| (p.0[0] - 0.05).hypot(p.0[1] - 0.05) < 1e-5));
     }
     #[test]
+    fn observed_ground_band_height_error_does_not_stall_before_final_rotation() {
+        let base = scene(false);
+        let points: Vec<_> = (-20..20)
+            .flat_map(|x| {
+                (-15..15).flat_map(move |y| {
+                    [0.025, 0.075, 0.125]
+                        .into_iter()
+                        .map(move |z| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z))
+                })
+            })
+            .collect();
+        let map = Arc::new(
+            SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
+                .unwrap()
+                .with_body_envelope(base.body_envelope().unwrap().clone())
+                .unwrap(),
+        );
+        let start = ([-0.55, 0.05, 0.46], [0.0, 0.0, 0.0, 1.0]);
+        let goal = ([0.55, 0.05, 0.55], [0.0, 0.0, 0.3_f64.sin(), 0.3_f64.cos()]);
+        let options = GoalOptions {
+            allow_reverse: false,
+            position_tolerance_m: 0.1,
+            yaw_tolerance_rad: 0.08,
+        };
+        let motion = limits();
+        let path = plan(&map, start, goal, options, Some(&motion), &[], 3000).unwrap();
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.motion_limits = Some(motion);
+        config.controller.control_frequency = 20.0;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower
+            .update_execution_map(ExecutionMap::Surface(map))
+            .unwrap();
+        let mut current = start;
+        let mut nanos = 1_000_000_000;
+        follower.update_odometry(stamped(current, nanos));
+        follower
+            .configure_goal(&stamped(goal, nanos), options)
+            .unwrap();
+        follower
+            .replace_execution_path(
+                ExecutionPath::Surface(Path3D {
+                    poses: path.into_iter().map(|p| stamped(p, nanos)).collect(),
+                }),
+                None,
+                stamped(goal, nanos),
+            )
+            .unwrap();
+        let mut reached = false;
+        for _ in 0..1200 {
+            let command = match follower.step(0.24) {
+                PlannerStep::Command(v) => v,
+                PlannerStep::Succeeded => {
+                    reached = true;
+                    break;
+                }
+                other => panic!("{other:?} at {current:?}"),
+            };
+            let next = integrate(planar(current), command, 0.05);
+            // 独立平面模型保持真实高度，不让规划高度成为模拟反馈。
+            current = (
+                [next.x, next.y, start.0[2]],
+                [0.0, 0.0, (next.yaw * 0.5).sin(), (next.yaw * 0.5).cos()],
+            );
+            nanos += 50_000_000;
+            follower.update_odometry(stamped(current, nanos));
+        }
+        assert!(reached, "同一支撑层高度偏差导致停止推进: {current:?}");
+        assert!((current.0[0] - goal.0[0]).abs() < 0.05);
+        assert!(angle(planar(current).yaw - planar(goal).yaw).abs() < 0.08);
+    }
+
+    #[test]
     fn shared_surface_control_reaches_forward_reverse_and_final_yaw() {
         for reverse in [false, true] {
             let map = Arc::new(scene(false));

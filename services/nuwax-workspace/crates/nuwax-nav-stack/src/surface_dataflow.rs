@@ -312,6 +312,9 @@ fn body_path(
     ];
     if surface.body_envelope().is_some() {
         let p=start.pose.position;
+        let current_view=surface.with_current_body_support([p.x,p.y,p.z],start_quat)
+            .map_err(|e|module_error("surface current body",e.to_string()))?;
+        let surface=&current_view;
         let boundary:Vec<_>=goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect();
         let options=goal.options;
         let route=crate::surface_oriented::plan(surface,([p.x,p.y,p.z],start_quat),(goal.goal.pose.position,goal.goal.pose.orientation_xyzw),options,config.follower.motion_limits.as_ref(),&boundary,30_000).map_err(|e|module_error("surface body planning",e))?;

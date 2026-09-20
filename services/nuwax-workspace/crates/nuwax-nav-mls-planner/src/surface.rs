@@ -276,6 +276,10 @@ impl SurfaceSnapshot {
         let mask = Arc::new(VirtualObstacleMask::new(
             origin, resolution, width, height, blocked,
         )?);
+        self.with_virtual_mask(mask)
+    }
+
+    fn with_virtual_mask(&self, mask: Arc<VirtualObstacleMask>) -> Result<Self, SurfaceError> {
         let physical = Arc::clone(&self.data.physical_graph);
         let mut graph = physical.as_ref().clone();
         let excluded: AHashSet<_> = graph
@@ -947,21 +951,22 @@ fn side_profile(
     max_step: i32,
     bounds: &HeightBounds,
     size: f32,
-) -> Option<Vec<f32>> {
+) -> Vec<f32> {
     let mut cell = start;
     let value=|cell:VoxelKey| bounds.get(&cell).map_or((cell.2 as f32+1.0)*size,|bounds|bounds[1])/size;
     let mut heights = vec![value(cell)];
     for _ in 0..count {
-        cell = nearest_z(
+        let Some(next) = nearest_z(
             lookup,
             cell.0 + direction.0,
             cell.1 + direction.1,
             cell.2,
             max_step,
-        )?;
+        ) else {break;};
+        cell = next;
         heights.push(value(cell));
     }
-    Some(heights)
+    heights
 }
 
 fn classify_transition(
@@ -984,18 +989,28 @@ fn classify_transition(
     if dz.abs() < 1e-5 {
         return Some(SurfaceTransition::Level);
     }
+    // 小于半个源体素且实测局部坡度已合格的连续变化不属于离散台阶。
+    // 否则墙外或窗口另一端的地形会反向切断当前平缓表面内的邻接。
+    if dz.abs() <= quantum * 0.5 + 1e-5
+        && dz.abs() <= config.max_slope_deg.to_radians().tan() + 1e-5
+    {
+        return Some(SurfaceTransition::Ramp);
+    }
     let before = side_profile(
         lookup,
         from,
         (-dx, -dy),
         profile_cells,
         candidate_step_cells, bounds, config.voxel_size,
-    )?;
-    let after = side_profile(lookup, to, (dx, dy), profile_cells, candidate_step_cells, bounds, config.voxel_size)?;
+    );
+    let after = side_profile(lookup, to, (dx, dy), profile_cells, candidate_step_cells, bounds, config.voxel_size);
     let heights: Vec<_> = before.iter().rev().chain(after.iter()).copied().collect();
     let max_gradient = config.max_slope_deg.to_radians().tan();
     let flat = |side: &[f32]| side.iter().copied().fold(f32::NEG_INFINITY,f32::max)-side.iter().copied().fold(f32::INFINITY,f32::min) <= quantum*0.5+1e-5;
-    let has_treads = flat(&before) && flat(&after);
+    // 踏面须有完整实测深度；连续地面则按实际可见剖面检查，不能把墙外
+    // 缺失的样本反向侵蚀已观测的狭窄通道。
+    let has_treads = before.len() > profile_cells as usize && after.len() > profile_cells as usize
+        && flat(&before) && flat(&after);
     // 明确的多体素台阶不能借较大的坡度上限绕过台阶高度限制。
     if has_treads {
         return (dz.abs() * config.voxel_size <= config.step_threshold_m + 1e-5).then_some(

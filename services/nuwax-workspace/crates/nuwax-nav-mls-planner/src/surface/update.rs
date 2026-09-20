@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_wall_updates_match_unbounded_reference_after_obstacle_removal() {
+    fn bounded_wall_updates_match_physical_rectangles_after_obstacle_removal() {
         let mut cells = scene();
         let mut builder = SurfaceMapBuilder::new(config());
         for (key, add) in [
@@ -846,32 +846,30 @@ mod tests {
             }
             let snapshot = builder.build(&points(&cells), SIZE).unwrap().snapshot;
             let graph = &snapshot.data.graph;
-            let mut reference = (**graph).clone();
-            crate::nodes::place_nodes(
-                &mut reference.cells,
-                SIZE,
-                0.3,
-                0.1,
-                0.3,
-                2.0,
-                1.0,
-                &mut reference.wall_state,
-                &mut reference.nodes,
-            );
+            // 用场景的真实矩形边界作为独立真值，不再与旧的边界格中心距离对账。
+            let expected = |id: CellId| {
+                let (x,y,z)=graph.cells.coord(id);
+                let px=(x as f32+0.5)*SIZE;
+                let py=(y as f32+0.5)*SIZE;
+                if z==4 {return SIZE*0.5;}
+                let mut distance=px.min(6.0-px).min(py).min(3.2-py).min(0.4);
+                if z==0 {
+                    for (bx,by) in [(25,16),(26,16),(31,16)] {
+                        if cells.contains(&(bx,by,0)) && !cells.contains(&(bx,by,4)) {continue;}
+                        let dx=(bx as f32*SIZE-px).max(px-(bx+1) as f32*SIZE).max(0.0);
+                        let dy=(by as f32*SIZE-py).max(py-(by+1) as f32*SIZE).max(0.0);
+                        distance=distance.min(dx.hypot(dy));
+                    }
+                }
+                distance
+            };
             for id in graph.cells.ids() {
-                assert!(
-                    (graph.wall_state.dist[id as usize]
-                        - reference.wall_state.dist[id as usize].min(0.4))
-                    .abs()
-                        < 1e-5
-                );
-                for (a, b) in graph
-                    .cells
-                    .neighbors(id)
-                    .iter()
-                    .zip(reference.cells.neighbors(id))
-                {
-                    assert!(a.cost == b.cost || (a.cost - b.cost).abs() < 1e-5);
+                assert!((graph.wall_state.dist[id as usize]-expected(id)).abs()<1e-5,
+                    "墙距不符合物理边界: {:?}",graph.cells.coord(id));
+                let penalty=|id| penalty_of(expected(id),0.1,0.3,2.0);
+                for edge in graph.cells.neighbors(id) {
+                    let expected_cost=edge.base_cost*(penalty(id)+penalty(edge.dest))/2.0+edge.rise;
+                    assert!(edge.cost==expected_cost || (edge.cost-expected_cost).abs()<1e-5);
                 }
             }
         }
@@ -1181,5 +1179,24 @@ mod replay_diagnostics {
                 );
             }
         }
+    }
+}
+
+impl SurfaceSnapshot {
+    /// 当前占据区的列派生沿原增量构建，不写回环境图或刷新观测时间。
+    pub(super) fn with_current_body_columns(
+        &self,
+        columns: &[SurfaceColumnUpdate],
+    ) -> Result<Self, SurfaceError> {
+        let mut builder =
+            SurfaceMapBuilder::configured(self.config().clone(), self.body_envelope().cloned());
+        builder.current = Some(Arc::new(self.clone()));
+        let built = builder.build_column_updates(columns, self.source_voxel_size_m(), false, 0)?;
+        let mut view = built.snapshot.as_ref().clone();
+        if let Some(mask) = &self.data.virtual_obstacles {
+            view = view.with_virtual_mask(Arc::clone(mask))?;
+        }
+        view.observations = self.observations.clone();
+        Ok(view)
     }
 }

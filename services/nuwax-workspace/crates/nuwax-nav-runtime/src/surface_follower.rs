@@ -83,6 +83,7 @@ pub struct SurfaceFollower {
     config: SurfaceFollowerConfig,
     controller: PController,
     map: Option<Arc<SurfaceSnapshot>>,
+    source_map: Option<Arc<SurfaceSnapshot>>,
     odometry: Option<PoseStamped>,
     path: Option<Path3D>,
     goal: Option<PoseStamped>,
@@ -110,6 +111,7 @@ impl SurfaceFollower {
             config,
             controller,
             map: None,
+            source_map: None,
             odometry: None,
             path: None,
             goal: None,
@@ -131,6 +133,18 @@ impl SurfaceFollower {
     #[must_use]
     pub fn progress_m(&self) -> f64 {
         self.progress_m
+    }
+
+    fn refresh_current_body_view(&mut self) {
+        self.map = self.source_map.clone();
+        if let (Some(map), Some(pose)) = (self.source_map.as_ref(), self.odometry.as_ref()) {
+            let p = pose.pose.position;
+            let q = pose.pose.orientation;
+            // 每次从环境快照派生；旧足迹清除不能随实际运动累积到未知区域。
+            if let Ok(view) = map.with_current_body_support([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]) {
+                self.map = Some(Arc::new(view));
+            }
+        }
     }
 
     fn support(map: &SurfaceSnapshot, pose: &PoseStamped, offset: f64) -> Result<[f64; 3], String> {
@@ -492,10 +506,12 @@ impl NavPlanner for SurfaceFollower {
     fn update_odometry(&mut self, odometry: PoseStamped) {
         self.observe_body_velocity(&odometry);
         self.odometry = Some(odometry);
+        self.refresh_current_body_view();
     }
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
         self.map = None;
+        self.source_map = None;
         self.invalid_input = Some("三维后端拒绝二维占据图".into());
     }
 
@@ -505,7 +521,8 @@ impl NavPlanner for SurfaceFollower {
                 if map.config().world_frame != "map" {
                     return Err(rejected("三维表面快照必须使用当前机体路径的map坐标系"));
                 }
-                self.map = Some(map);
+                self.source_map = Some(map);
+                self.refresh_current_body_view();
                 Ok(())
             }
             ExecutionMap::Planar(_) => Err(rejected("三维后端不能用二维占据图恢复就绪")),
@@ -515,6 +532,7 @@ impl NavPlanner for SurfaceFollower {
     fn invalidate_execution_map(&mut self) {
         self.stop();
         self.map = None;
+        self.source_map = None;
     }
 
     fn step(&mut self, robot_width_m: f64) -> PlannerStep {
@@ -702,6 +720,33 @@ pub(crate) fn test_snapshot(slope: f64, blocked_strip: bool) -> Arc<SurfaceSnaps
 mod tests {
     use super::*;
     use nuwax_nav_types_messages::{NavFrameId, Pose3, Timestamp};
+
+    #[test]
+    fn moving_current_body_view_does_not_accumulate_old_footprint_clearing() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        let mut points: Vec<_> = (0..40).flat_map(|x| (0..20).map(move |y|
+            ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))).collect();
+        points.extend([(0.55,0.55,0.45),(2.55,0.55,0.45)]);
+        let source=Arc::new(SurfaceSnapshot::from_points(
+            &points,test_snapshot(0.0,false).config().clone(),0.1,
+        ).unwrap().with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m:vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],
+            z_bounds_m:[-0.05,0.2],body_to_support_z_m:0.3,
+            max_step_up_m:0.15,max_step_down_m:0.15,max_cross_slope_deg:15.0,
+            support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
+        let first=[0.55,0.55,0.4];let next=[2.55,0.55,0.4];let q=[0.0,0.0,0.0,1.0];
+        follower.update_odometry(body_pose(first,Quaternion::IDENTITY,1));
+        follower.map.as_ref().unwrap().validate_body_pose(first,q).unwrap();
+        follower.update_odometry(body_pose(next,Quaternion::IDENTITY,2));
+        let view=follower.map.as_ref().unwrap();
+        view.validate_body_pose(next,q).unwrap();
+        assert!(view.validate_body_pose(first,q).is_err(),"旧足迹外障碍必须恢复");
+        assert!(source.validate_body_pose(first,q).is_err(),"原始环境不能被改写");
+        assert!(Arc::ptr_eq(follower.source_map.as_ref().unwrap(),&source));
+    }
 
     #[test]
     fn near_field_evidence_covers_the_emergency_braking_tail() {

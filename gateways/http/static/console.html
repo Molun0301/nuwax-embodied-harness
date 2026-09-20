@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260920-robot-settings">
+  <link rel="stylesheet" href="/static/console.css?v=20260920-settings-style">
 </head>
 <body>
 <div class="app" id="app">
@@ -315,7 +315,7 @@
             <label>机器人 <select id="configRobotSelect" class="field" aria-label="配置所属机器人"></select></label>
             <label>配置方案 <select id="configProfileSelect" class="field" aria-label="机器人配置方案"></select></label>
             <button id="configProfileApply" class="btn" type="button">应用所选方案</button>
-            <input id="configProfileName" class="field" maxlength="64" placeholder="新方案名称" aria-label="新配置方案名称">
+            <label>另存为 <input id="configProfileName" class="field" maxlength="64" placeholder="新方案名称" aria-label="新配置方案名称"></label>
             <button id="configProfileSaveAs" class="btn" type="button">另存方案</button>
             <button id="configRestartPending" class="btn" type="button">重启待生效项</button>
           </div>
@@ -351,8 +351,8 @@
               </aside>
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
-  <script src="/static/js/console-settings.js?v=20260920-robot-settings"></script>
-  <script src="/static/js/console.js?v=20260920-robot-settings"></script>
+  <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
+  <script src="/static/js/console.js?v=20260920-settings-style"></script>
   <script>
     window.__NUWAX_ROBOT_GEOMETRY__ = "__ROBOT_GEOMETRY__";
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
@@ -373,14 +373,14 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260920-robot-settings");
+      await import("/static/js/pointcloud3d.js?v=20260920-settings-style");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
   <script src="/static/js/navigation.js?v=20260915-navigation-pick"></script>
   <script src="/static/js/building-navigation.js?v=20260914-explore-layout"></script>
   <script src="/static/js/exploration-mission.js?v=20260915-navigation-snapshot"></script>
-  <script src="/static/js/boundary_draw.js?v=20260920-robot-settings"></script>
+  <script src="/static/js/boundary_draw.js?v=20260920-settings-style"></script>
   <script>
     // 地图导航工具入口开关：
     // map-toolbar 上的"导航"按钮 → 显示 navigation-container

@@ -11,5 +11,6 @@ WorkingDirectory=@NUWAX_REPO_ROOT@
 Environment=NUWAX_CONFIG_DIR=@NUWAX_CONFIG_DIR@
 Environment=NUWAX_BIN_DIR=@NUWAX_BIN_DIR@
 Environment=NUWAX_PYTHON_BIN=@NUWAX_PYTHON_BIN@
+Environment=NUWAX_GO2_SDK_PATH=@NUWAX_GO2_SDK_PATH@
 ExecStart=/usr/bin/python3 -I -S @NUWAX_REPO_ROOT@/scripts/apply_settings.py --systemd
 TimeoutStartSec=180

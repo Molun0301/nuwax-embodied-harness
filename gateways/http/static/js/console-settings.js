@@ -74,6 +74,26 @@ function renderProfileControls(schema) {
   document.getElementById('configRestartPending').disabled = !schema.application?.restart_available;
   document.getElementById('configRestartPending').title = schema.application?.restart_unavailable_reason || '';
 }
+function configDisclosure(title, count) {
+  const section = document.createElement('details');
+  section.className = 'config-disclosure';
+  const summary = document.createElement('summary');
+  const label = document.createElement('span');
+  label.className = 'config-disclosure-title';
+  label.textContent = title;
+  summary.appendChild(label);
+  if (count !== undefined) {
+    const badge = document.createElement('span');
+    badge.className = 'config-badge'; badge.textContent = count;
+    summary.appendChild(badge);
+  }
+  const action = document.createElement('span');
+  action.className = 'config-disclosure-action';
+  action.setAttribute('aria-hidden', 'true');
+  summary.appendChild(action);
+  section.appendChild(summary);
+  return section;
+}
 function buildOptionsEditor(field, rawInput, changed) {
   const host = document.createElement('div');
   host.className = 'config-options-editor';
@@ -82,13 +102,12 @@ function buildOptionsEditor(field, rawInput, changed) {
   for (const [name, spec] of Object.entries(field.options_schema)) {
     const groupName = field.key === 'NUWAX_GEOMETRY_PGO_OPTIONS'
       ? (name.startsWith('scan_context_') ? '扫描上下文：地点检索' : /^(odometry_|gravity_|loop_.*sigma_|optimizer_)/.test(name)
-        ? '位姿图：约束权重与优化' : '回环：配准、确认与关键帧') : '算法高级参数';
+        ? '位姿图：约束权重与优化' : '回环：配准、确认与关键帧') : '参数明细';
     if (!groups.has(groupName)) {
-      const section = document.createElement('details');
-      section.className = 'config-options-group';
-      const title = document.createElement('summary'); title.textContent = groupName;
+      const section = configDisclosure(groupName);
+      section.classList.add('config-options-group');
       const grid = document.createElement('div'); grid.className = 'config-options-grid';
-      section.append(title, grid); host.append(section); groups.set(groupName, { section, grid });
+      section.appendChild(grid); host.append(section); groups.set(groupName, { section, grid });
       const query = document.getElementById('configSearch').value.trim().toLowerCase();
       section.open = Boolean(query) || groupName.startsWith('扫描上下文');
     }
@@ -295,19 +314,14 @@ function renderConfigSchema(schema) {
       block.appendChild(grid);
     }
     if (advanced.length) {
-      // 高级项：默认隐藏，勾选「展开高级项」或搜索命中时展开（带高度动画）。
-      const wrap = document.createElement("div");
-      wrap.className = "config-adv" + (query ? " open" : "");
-      const bar = document.createElement("div");
-      bar.className = "config-adv-bar";
-      bar.innerHTML = '<span>高级项</span><span class="config-badge">' + advanced.length + "</span>";
-      const inner = document.createElement("div");
-      inner.className = "config-adv-inner";
+      // 高级设置只有这一层入口，与参数分组共用折叠控件。
+      const wrap = configDisclosure('高级项', advanced.length);
+      wrap.classList.add('config-adv');
+      wrap.open = forceAdvanced || Boolean(query);
       const grid = document.createElement("div");
       grid.className = "config-grid";
       for (const f of advanced) { grid.appendChild(buildConfigRow(f)); }
-      inner.appendChild(grid);
-      wrap.append(bar, inner);
+      wrap.appendChild(grid);
       block.appendChild(wrap);
     }
     host.appendChild(block);
@@ -452,10 +466,11 @@ function buildConfigRow(f) {
   if (f.options_schema) {
     row.classList.add('config-options-row');
     const editor = buildOptionsEditor(f, input, handleTextInput);
-    const raw = document.createElement('details');
-    const summary = document.createElement('summary');
-    summary.textContent = '原始结构化配置';
-    raw.append(summary, input);
+    const raw = configDisclosure('原始结构化配置');
+    raw.classList.add('config-raw-editor');
+    const content = document.createElement('div');
+    content.className = 'config-raw-content';
+    content.appendChild(input); raw.appendChild(content);
     try { JSON.parse(input.value || '{}'); } catch (_) { raw.open = true; }
     cell.prepend(editor, raw);
   }
@@ -627,10 +642,13 @@ async function saveConfig() {
   document.getElementById('configRestartNow')?.addEventListener('click', restartConfiguration);
   document.getElementById('configRestartLater')?.addEventListener('click', () => document.getElementById('configApplyDialog').close());
   if (search) search.addEventListener("input", rerender);
-  // 勾选直接切 class 触发高度动画，不重渲染（重渲染会打断过渡）。
+  // 只切换高级分组状态，保留正在编辑的输入。
   if (adv) adv.addEventListener("change", () => {
     const host = document.getElementById("configSections");
-    if (host) host.classList.toggle("show-adv", adv.checked);
+    if (host) {
+      host.classList.toggle("show-adv", adv.checked);
+      for (const group of host.querySelectorAll(".config-adv")) group.open = adv.checked;
+    }
   });
 })();
 window.nuwaxConsoleSettings = {

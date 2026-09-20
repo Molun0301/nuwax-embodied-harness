@@ -392,8 +392,8 @@ button{font-family:inherit;cursor:pointer}
 .navigation-height-field{display:flex;align-items:center;gap:7px;color:var(--strong);font-size:11px;padding:4px 8px}
 .navigation-height-field input{min-width:0;width:108px;height:27px;padding:3px 6px;border:1px solid var(--line);
   border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit}
-.navigation-panel{position:absolute;left:14px;top:140px;z-index:7;width:min(350px,calc(100% - 28px));
-  max-height:calc(100% - 210px);overflow:auto;padding:12px;border:1px solid var(--line);border-radius:var(--r);font-size:12px}
+.navigation-panel{position:absolute;left:14px;top:var(--map-tools-bottom,140px);z-index:7;width:min(350px,calc(100% - 28px));
+  max-height:calc(100% - var(--map-tools-bottom,140px) - 14px);overflow:auto;padding:12px;border:1px solid var(--line);border-radius:var(--r);font-size:12px}
 .navigation-panel[hidden]{display:none!important}
 .navigation-panel .navigation-height-field{display:grid;padding:0}
 .navigation-panel input{width:100%}
@@ -431,7 +431,7 @@ button{font-family:inherit;cursor:pointer}
 .map-pose-title{margin-bottom:4px;color:var(--muted);font-size:9.5px;font-weight:700;text-transform:uppercase}
 .map-pose-meta{grid-template-columns:auto minmax(72px,auto);gap:2px 10px;font-size:10.5px;line-height:1.35}
 #mapStatus{position:absolute;right:14px;bottom:115px;z-index:5}
-.forbidden-zone-panel{position:absolute;left:14px;top:104px;z-index:7;width:min(390px,calc(100% - 28px));
+.forbidden-zone-panel{position:absolute;left:14px;top:var(--map-tools-bottom,104px);z-index:7;width:min(390px,calc(100% - 28px));
   max-height:min(430px,calc(100% - 180px));overflow:auto;padding:10px;pointer-events:auto;border:1px solid var(--line)}
 .forbidden-zone-panel[hidden]{display:none!important}
 .forbidden-zone-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
@@ -460,7 +460,7 @@ button{font-family:inherit;cursor:pointer}
 .map-info-grid{display:none}
 .workspace.swapped .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
 .workspace.swapped .map-tool-row{gap:5px}
-.workspace.swapped #map3dCameraControls{flex-wrap:wrap;max-width:252px}
+.workspace.swapped #mapCameraControls{flex-wrap:wrap;max-width:252px}
 .workspace.swapped .legend{left:10px;bottom:10px;max-width:calc(100% - 200px);padding:5px 8px;gap:4px 8px;font-size:9.5px}
 
 @media(max-width:760px){
@@ -484,7 +484,7 @@ button{font-family:inherit;cursor:pointer}
   .legend{left:10px;bottom:10px;max-width:48%}
   .map-pose-hud{right:10px;bottom:10px;min-width:154px;padding:7px 9px}
   #mapStatus{right:10px;bottom:109px}
-  .forbidden-zone-panel{left:10px;top:135px;width:calc(100% - 20px);max-height:calc(100% - 210px)}
+  .forbidden-zone-panel{left:10px;top:var(--map-tools-bottom,135px);width:calc(100% - 20px);max-height:calc(100% - 210px)}
 }
 
 /* media-swap buttons */
@@ -716,3 +716,6 @@ button{font-family:inherit;cursor:pointer}
 .floor-import input{display:none}
 
 .exploration-return input{width:auto}
+
+/* 面板跟随工具栏实际换行高度，二维和三维共用同一位置。 */
+.navigation-panel,.forbidden-zone-panel{max-height:calc(100% - var(--map-tools-bottom,140px) - 14px)}

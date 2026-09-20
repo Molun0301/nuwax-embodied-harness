@@ -607,6 +607,36 @@ class PointCloud3DViewer extends PointCloudProcessor {
     return selected;
   }
 
+  // 禁区仍按地图平面坐标保存；首点高度仅用于三维编辑平面的投影。
+  boundaryPointAt(clientX, clientY, anchor) {
+    if (!anchor) return this.pickNavigationPoint(clientX, clientY);
+    if (!this.navigationPointIsCurrent(anchor) || !this._camera || !this._visible) return null;
+    const rect = this._renderer.domElement.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const pointer = new THREE.Vector2((clientX - rect.left) / rect.width * 2 - 1, 1 - (clientY - rect.top) / rect.height * 2);
+    this._camera.updateMatrixWorld();
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(pointer, this._camera);
+    const point = ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -anchor.surface_z), new THREE.Vector3());
+    return point ? { ...anchor, x: point.x, y: point.y } : null;
+  }
+
+  projectBoundaryPoint(x, y, height = 0) {
+    if (!this._camera || !this._renderer || !this._visible) return null;
+    const rect = this._renderer.domElement.getBoundingClientRect();
+    this._camera.updateMatrixWorld();
+    const point = new THREE.Vector3(x, y, height).project(this._camera);
+    if (point.z < -1 || point.z > 1) return null;
+    return { x: (point.x + 1) * rect.width / 2, y: (1 - point.y) * rect.height / 2,
+      pixelWidth: rect.width, pixelHeight: rect.height, scale: 1 };
+  }
+
+  setBoundaryEditing(active) {
+    this._boundaryEditing = Boolean(active);
+    if (this._boundaryEditing) this._settleControlsMotion();
+    if (this._controls) this._controls.enabled = !this._boundaryEditing;
+  }
+
   navigationPointIsCurrent(point) {
     return Boolean(this._pointCloudMapWatermark && point?.source_key === this._cloudSourceKey
       && (!point.dense_epoch || (this._pointStyle === 'full' && point.dense_epoch === this._denseCloud?.epoch)));
@@ -1313,7 +1343,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._robotMesh.quaternion.copy(pose.quaternion);
     }
 
-    if (this._cameraMode === 'follow' && this._camera && this._controls) {
+    if (!this._boundaryEditing && this._cameraMode === 'follow' && this._camera && this._controls) {
       const nextTarget = this._robotTarget(pose);
       if (previousFollowTarget) {
         this._camera.position.add(nextTarget.clone().sub(previousFollowTarget));

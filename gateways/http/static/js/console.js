@@ -52,10 +52,10 @@
         mapGrid: null,
         mapViewport: null,
         mapZoom: 1,
-        map2dCameraMode: "follow",
+        map2dCameraMode: "free",
         mapFreeView: { center: null, zoom: 1, fitSpan: null },
         mapFreeViewIdentity: "",
-        mapViewMode: "2d",
+        mapViewMode: PLANAR_PIPELINE ? "2d" : "3d",
         pointcloud3dCameraMode: "free",
         pointcloud3dDistance: null,
         pointcloud3dZoomPercent: 100,
@@ -204,22 +204,14 @@
         mapCanvas: document.getElementById("mapCanvas"),
         map3dContainer: document.getElementById("map3dContainer"),
         mapModeToggle: document.getElementById("mapModeToggle"),
-        map2dCameraControls: document.getElementById("map2dCameraControls"),
-        map3dCameraControls: document.getElementById("map3dCameraControls"),
         map3dDenseStatusRow: document.getElementById("map3dDenseStatusRow"),
-        map2dActionControls: document.getElementById("map2dActionControls"),
-        map3dFreeView: document.getElementById("map3dFreeView"),
-        map3dFollowView: document.getElementById("map3dFollowView"),
+        mapFreeView: document.getElementById("mapFreeView"),
+        mapFollowView: document.getElementById("mapFollowView"),
+        mapPointStyleControl: document.getElementById("mapPointStyleGroup"),
         map3dPointStyle: document.getElementById("map3dPointStyle"),
-        map3dZoomOut: document.getElementById("map3dZoomOut"),
-        map3dZoomValue: document.getElementById("map3dZoomValue"),
-        map3dZoomIn: document.getElementById("map3dZoomIn"),
-        map3dResetView: document.getElementById("map3dResetView"),
-        map3dCenterRobot: document.getElementById("map3dCenterRobot"),
         mapZoomIn: document.getElementById("mapZoomIn"),
         mapZoomOut: document.getElementById("mapZoomOut"),
         mapZoomReset: document.getElementById("mapZoomReset"),
-        map2dCameraToggle: document.getElementById("map2dCameraToggle"),
         mapCenterRobot: document.getElementById("mapCenterRobot"),
         mapZoomValue: document.getElementById("mapZoomValue"),
         mapCameraHint: document.getElementById("mapCameraHint"),
@@ -1430,22 +1422,35 @@
         if (state.mapGrid) basePixelsPerMeterFree();
       }
       function syncMap2dCameraControls() {
-        const button = els.map2dCameraToggle;
-        if (!button) return;
-        const free = state.map2dCameraMode === "free";
-        const busy = Boolean(state.mapPanDrag || window.__nuwaxMapToolV2?.active());
-        button.textContent = free ? "自由拖拽" : "机器人跟随";
-        button.classList.toggle("active", free);
-        button.setAttribute("aria-pressed", free ? "true" : "false");
-        button.disabled = busy;
-        button.title = busy
-          ? "结束选点、绘制或拖拽后可切换二维视角"
-          : free
-            ? "当前自由视角：拖拽平移、滚轮缩放；点击切回机器人居中朝上的跟随视角"
-            : "当前跟随机器人：箭头固定居中朝上，地图随机器人移动和转向；点击切换自由拖拽";
+        syncMapCameraControls();
+      }
+      function syncMapCameraControls() {
+        const is3d = state.mapViewMode === "3d";
+        const mode = is3d ? state.pointcloud3dCameraMode : state.map2dCameraMode;
+        const robotAvailable = Boolean(pointFromPose(is3d ? state.latestPose : state.pose));
+        const busy = Boolean(state.mapPanDrag || window.__nuwaxBoundaryActive);
+        for (const [button, selected] of [[els.mapFreeView, mode === "free"], [els.mapFollowView, mode === "follow"]]) {
+          if (!button) continue;
+          button.classList.toggle("active", selected);
+          button.setAttribute("aria-pressed", String(selected));
+          button.disabled = busy || (button === els.mapFollowView && !robotAvailable);
+        }
+        if (els.mapCenterRobot) els.mapCenterRobot.disabled = busy || !robotAvailable;
+        for (const button of [els.mapZoomIn, els.mapZoomOut, els.mapZoomReset]) {
+          if (button) button.disabled = Boolean(window.__nuwaxBoundaryActive);
+        }
+        if (els.mapCameraHint) els.mapCameraHint.hidden = is3d || mode !== "free";
+        if (els.mapZoomValue) els.mapZoomValue.textContent = `${Math.round(is3d ? state.pointcloud3dZoomPercent : mapViewZoom() * 100)}%`;
+      }
+      function setMapCameraMode(mode) {
+        if (window.__nuwaxBoundaryActive || state.mapPanDrag) return;
+        state.pointcloud3dCameraMode = mode;
+        setMap2dCameraMode(mode);
+        window.pointcloud3d?.setCameraMode(mode);
+        syncMapCameraControls();
       }
       function setMap2dCameraMode(mode) {
-        if (state.mapPanDrag || window.__nuwaxMapToolV2?.active()) return;
+        if (state.mapPanDrag || window.__nuwaxBoundaryActive) return;
         state.map2dCameraMode = mode === "free" ? "free" : "follow";
         if (state.map2dCameraMode === "free" && !state.mapFreeView.center) resetFreeMapView();
         syncMapToolUi();
@@ -1794,8 +1799,7 @@
           els.mapCanvas.classList.toggle("pan-ready", free && !state.mapPanDrag);
           els.mapCanvas.classList.toggle("panning", Boolean(state.mapPanDrag));
         }
-        if (els.mapCenterRobot) els.mapCenterRobot.hidden = !free;
-        if (els.mapCameraHint) els.mapCameraHint.hidden = !free;
+        if (els.mapCameraHint) els.mapCameraHint.hidden = !free || state.mapViewMode === "3d";
       }
       function drawOrientedGoal(ctx, anchor, scale, point, yawRad, colors, pixels) {
         if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
@@ -5320,18 +5324,16 @@
         }
         requestMapDraw(false);
       }
-      els.mapZoomIn.addEventListener("click", () => setMapZoom(mapViewZoom() * 1.25));
-      els.mapZoomOut.addEventListener("click", () => setMapZoom(mapViewZoom() / 1.25));
+      els.mapZoomIn.addEventListener("click", () => isMap3dVisible() ? window.pointcloud3d?.zoomBy(0.8) : setMapZoom(mapViewZoom() * 1.25));
+      els.mapZoomOut.addEventListener("click", () => isMap3dVisible() ? window.pointcloud3d?.zoomBy(1.25) : setMapZoom(mapViewZoom() / 1.25));
       els.mapZoomReset.addEventListener("click", () => {
+        if (isMap3dVisible()) { window.pointcloud3d?.resetView(); return; }
         if (state.map2dCameraMode === "free") resetFreeMapView();
         else setMapZoom(1);
         requestMapDraw(false);
       });
-      els.map2dCameraToggle?.addEventListener("click", () => {
-        setMap2dCameraMode(state.map2dCameraMode === "free" ? "follow" : "free");
-      });
       if (els.mapCenterRobot) {
-        els.mapCenterRobot.addEventListener("click", () => centerFreeMapOnRobot());
+        els.mapCenterRobot.addEventListener("click", () => isMap3dVisible() ? window.pointcloud3d?.centerOnRobot() : centerFreeMapOnRobot());
       }
       function isMap3dVisible() {
         const container = document.getElementById("map3dContainer");
@@ -5496,9 +5498,8 @@
         const is3d = state.mapViewMode === "3d";
         if (els.mapCanvas) els.mapCanvas.style.display = is3d ? "none" : "";
         if (els.map3dContainer) els.map3dContainer.style.display = is3d ? "" : "none";
-        if (els.map2dCameraControls) els.map2dCameraControls.hidden = is3d;
-        if (els.map2dActionControls) els.map2dActionControls.hidden = is3d;
-        if (els.map3dCameraControls) els.map3dCameraControls.hidden = !is3d;
+        if (els.mapPointStyleControl) els.mapPointStyleControl.hidden = !is3d;
+        syncMapCameraControls();
         if (els.map3dDenseStatusRow) els.map3dDenseStatusRow.hidden = !is3d;
         if (els.mapModeToggle) {
           els.mapModeToggle.hidden = PLANAR_PIPELINE;
@@ -5513,7 +5514,6 @@
       function updatePointcloud3dCameraControls(detail) {
         const cameraState = detail || {};
         const mode = cameraState.mode === "follow" ? "follow" : "free";
-        const robotAvailable = cameraState.robotAvailable === true || Boolean(pointFromPose(state.latestPose));
         const distance = Number(cameraState.distance);
         const zoomPercent = Number(cameraState.zoomPercent);
         state.pointcloud3dCameraMode = mode;
@@ -5521,31 +5521,13 @@
         if (Number.isFinite(zoomPercent) && zoomPercent > 0) {
           state.pointcloud3dZoomPercent = zoomPercent;
         }
-        if (els.map3dFreeView) {
-          els.map3dFreeView.classList.toggle("active", mode === "free");
-          els.map3dFreeView.setAttribute("aria-pressed", mode === "free" ? "true" : "false");
-        }
-        if (els.map3dFollowView) {
-          els.map3dFollowView.classList.toggle("active", mode === "follow");
-          els.map3dFollowView.setAttribute("aria-pressed", mode === "follow" ? "true" : "false");
-          els.map3dFollowView.disabled = !robotAvailable;
-          els.map3dFollowView.title = robotAvailable
-            ? "相机轨道中心跟随机器人"
-            : "等待定位位姿后可跟随机器人";
-        }
-        if (els.map3dCenterRobot) {
-          els.map3dCenterRobot.disabled = !robotAvailable;
-          els.map3dCenterRobot.title = robotAvailable
-            ? "将 3D 视角定位到机器人"
-            : "等待定位位姿后可定位机器人";
-        }
-        if (els.map3dZoomValue) {
-          els.map3dZoomValue.textContent = `${Math.max(1, Math.round(state.pointcloud3dZoomPercent))}%`;
-        }
+        syncMapCameraControls();
       }
       function setMapViewMode(mode) {
         const nextMode = !PLANAR_PIPELINE && mode === "3d" ? "3d" : "2d";
+        if (state.mapViewMode !== nextMode) window.__nuwaxBoundaryDrawModule?.setDrawing(false);
         state.mapViewMode = nextMode;
+        window.dispatchEvent(new CustomEvent("map:view-changed", { detail: { mode: nextMode } }));
         updateMapStreamChip();
         if (nextMode === "3d") resetMapInteraction(true);
         syncMapViewControls();
@@ -5575,6 +5557,7 @@
       });
       window.addEventListener("pointcloud3d:consumer-ready", () => {
         recordPointcloudDiagnostic({ pointcloudConsumerReady: true });
+        setMapViewMode(state.mapViewMode);
       });
       window.addEventListener("pointcloud3d:diagnostic", (event) => {
         recordPointcloudDiagnostic(event.detail || {});
@@ -5666,24 +5649,20 @@
       els.mapModeToggle?.addEventListener("click", () => {
         setMapViewMode(state.mapViewMode === "3d" ? "2d" : "3d");
       });
-      els.map3dFreeView?.addEventListener("click", () => {
-        state.pointcloud3dCameraMode = "free";
-        window.pointcloud3d?.setCameraMode("free");
-      });
-      els.map3dFollowView?.addEventListener("click", () => {
-        if (els.map3dFollowView.disabled) return;
-        state.pointcloud3dCameraMode = "follow";
-        window.pointcloud3d?.setCameraMode("follow");
-      });
+      els.mapFreeView?.addEventListener("click", () => setMapCameraMode("free"));
+      els.mapFollowView?.addEventListener("click", () => setMapCameraMode("follow"));
+      window.addEventListener("map:editing-changed", syncMapCameraControls);
       els.map3dPointStyle?.addEventListener("change", () => {
         const style = els.map3dPointStyle.value;
         els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
         window.pointcloud3d?.setPointStyle(style);
       });
-      els.map3dZoomOut?.addEventListener("click", () => window.pointcloud3d?.zoomBy(1.25));
-      els.map3dZoomIn?.addEventListener("click", () => window.pointcloud3d?.zoomBy(0.8));
-      els.map3dResetView?.addEventListener("click", () => window.pointcloud3d?.resetView());
-      els.map3dCenterRobot?.addEventListener("click", () => window.pointcloud3d?.centerOnRobot());
+      const mapToolbar = document.querySelector(".map-toolbar");
+      if (mapToolbar && typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(() => {
+          mapToolbar.parentElement.style.setProperty("--map-tools-bottom", `${mapToolbar.offsetTop + mapToolbar.offsetHeight + 10}px`);
+        }).observe(mapToolbar);
+      }
       syncMapViewControls();
       syncMap2dCameraControls();
       updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.latestPose)) });

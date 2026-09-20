@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260918-dense-pointcloud">
+  <link rel="stylesheet" href="/static/console.css?v=20260920-map-controls">
 </head>
 <body>
 <div class="app" id="app">
@@ -44,19 +44,31 @@
                     <button id="mapModeToggle" class="tool" type="button" data-map-view="2d" aria-pressed="false" title="切换 2D / 3D 地图">切换 3D</button>
                     <button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
                   </div>
-                  <div id="map2dCameraControls" class="map-tool-group glass" data-map-view="2d" aria-label="2D 地图视角">
-                    <button id="map2dCameraToggle" class="tool" type="button" aria-pressed="false" title="当前跟随机器人：箭头固定居中朝上，地图随机器人移动和转向；点击切换自由拖拽">机器人跟随</button>
-                    <button id="mapZoomOut" class="tool" type="button" title="缩小 2D 地图">–</button>
+                  <div id="mapCameraControls" class="map-tool-group glass" aria-label="地图视角">
+                    <button id="mapFreeView" class="tool active" type="button" aria-pressed="true" title="自由调整地图视角">自由视角</button>
+                    <button id="mapFollowView" class="tool" type="button" aria-pressed="false" title="视角跟随机器人">跟随机器人</button>
+                    <button id="mapZoomOut" class="tool" type="button" title="缩小地图">–</button>
                     <span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span>
-                    <button id="mapZoomIn" class="tool" type="button" title="放大 2D 地图">+</button>
-                    <button id="mapZoomReset" class="tool" type="button" title="复位 2D 地图视角">复位</button>
-                    <button id="mapCenterRobot" class="tool" type="button" title="2D 视图居中到机器人" hidden>机器人</button>
+                    <button id="mapZoomIn" class="tool" type="button" title="放大地图">+</button>
+                    <button id="mapZoomReset" class="tool" type="button" title="复位当前地图视角">复位视角</button>
+                    <button id="mapCenterRobot" class="tool" type="button" title="将视角定位到机器人" disabled>定位机器人</button>
                   </div>
-                  <div id="map3dCameraControls" class="map-tool-group glass" data-map-view="3d" aria-label="3D 地图视角" hidden>
-                    <button id="map3dNavToggle" class="tool" type="button" title="选择点云中的地面位置并预览导航目标">选点导航</button>
-                    <button id="map3dFreeView" class="tool active" type="button" aria-pressed="true" title="自由旋转、三轴平移和缩放">自由视角</button>
-                    <button id="map3dFollowView" class="tool" type="button" aria-pressed="false" title="相机轨道中心跟随机器人">跟随机器人</button>
-                    <label class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
+                </div>
+                <div id="mapActionControls" class="map-tool-row" aria-label="地图交互">
+                  <div class="map-tool-group glass">
+                    <button id="mapNavToggle" class="tool" type="button" title="在地图上选择目标，确认后开始导航">导航</button>
+                    <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
+                  </div>
+                  <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
+                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品；3D 远距缩小时自动隐藏">
+                      <input id="showSemanticInstances" type="checkbox" checked>
+                      <span class="sw" style="background:#f59e0b"></span>物品
+                    </label>
+                    <button id="semanticMemoryToggle" class="tool" type="button" aria-expanded="false" aria-controls="semanticMemoryPanel">空间记忆 <span id="semanticMemoryCount">—</span></button>
+                    <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
+                  </div>
+                  <div id="mapPointStyleGroup" class="map-tool-group glass" hidden>
+                    <label id="mapPointStyleControl" class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
                         <option value="height" selected>高度</option>
@@ -67,30 +79,10 @@
                         <option value="mono">单色</option>
                       </select>
                     </label>
-                    <span class="map-tool-separator" aria-hidden="true"></span>
-                    <button id="map3dZoomOut" class="tool" type="button" title="缩小 3D 地图">–</button>
-                    <span id="map3dZoomValue" class="tool" aria-live="polite">100%</span>
-                    <button id="map3dZoomIn" class="tool" type="button" title="放大 3D 地图">+</button>
-                    <button id="map3dResetView" class="tool" type="button" title="复位当前 3D 视角">复位视角</button>
-                    <button id="map3dCenterRobot" class="tool" type="button" title="将 3D 视角定位到机器人" disabled>定位机器人</button>
-                  </div>
-                  <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
-                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品；3D 远距缩小时自动隐藏">
-                      <input id="showSemanticInstances" type="checkbox" checked>
-                      <span class="sw" style="background:#f59e0b"></span>物品
-                    </label>
-                    <button id="semanticMemoryToggle" class="tool" type="button" aria-expanded="false" aria-controls="semanticMemoryPanel">空间记忆 <span id="semanticMemoryCount">—</span></button>
-                    <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
                   </div>
                 </div>
                 <div id="map3dDenseStatusRow" class="map-tool-row" data-map-view="3d" hidden>
                   <span id="map3dDenseStatus" class="dense-cloud-status glass" role="status" hidden></span>
-                </div>
-                <div id="map2dActionControls" class="map-tool-row" data-map-view="2d" aria-label="2D 地图交互">
-                  <div class="map-tool-group glass">
-                    <button id="mapNavToggle" class="tool" type="button" title="进入导航模式：在地图上左键选点后提交 navigate_to_pose">导航</button>
-                    <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
-                  </div>
                 </div>
               </div>
               <div id="navigation-container" class="navigation-panel glass" data-role="v2-navigation" hidden>
@@ -342,7 +334,7 @@
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js"></script>
-  <script src="/static/js/console.js?v=20260919-memory-stream"></script>
+  <script src="/static/js/console.js?v=20260920-map-controls"></script>
   <script>
     window.__NUWAX_ROBOT_GEOMETRY__ = "__ROBOT_GEOMETRY__";
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
@@ -363,14 +355,14 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260919-memory-stream");
+      await import("/static/js/pointcloud3d.js?v=20260920-map-controls");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
   <script src="/static/js/navigation.js?v=20260915-navigation-pick"></script>
   <script src="/static/js/building-navigation.js?v=20260914-explore-layout"></script>
   <script src="/static/js/exploration-mission.js?v=20260915-navigation-snapshot"></script>
-  <script src="/static/js/boundary_draw.js?v=20260720-map-bound-zones"></script>
+  <script src="/static/js/boundary_draw.js?v=20260920-map-controls"></script>
   <script>
     // 地图导航工具入口开关：
     // map-toolbar 上的"导航"按钮 → 显示 navigation-container
@@ -381,7 +373,6 @@
       var navContainer = document.getElementById('navigation-container');
       var boundaryContainer = document.getElementById('boundary-draw-container');
       var navBtn = document.getElementById('mapNavToggle');
-      var nav3dBtn = document.getElementById('map3dNavToggle');
       var boundaryBtn = document.getElementById('mapBoundaryToggle');
       function setActive(target) {
         window.__nuwaxNavigationActive = target === 'nav';
@@ -390,7 +381,6 @@
         if (navContainer) navContainer.hidden = (target !== 'nav');
         if (boundaryContainer) boundaryContainer.hidden = (target !== 'boundary');
         if (navBtn) navBtn.classList.toggle('active', target === 'nav');
-        if (nav3dBtn) nav3dBtn.classList.toggle('active', target === 'nav');
         window.__nuwaxNavigationModule?.setActive(target === 'nav');
         if (boundaryBtn) boundaryBtn.classList.toggle('active', target === 'boundary');
       }
@@ -399,18 +389,11 @@
           setActive(navContainer && navContainer.hidden ? 'nav' : null);
         });
       }
-      if (nav3dBtn) nav3dBtn.addEventListener('click', function () {
-        setActive(navContainer && navContainer.hidden ? 'nav' : null);
-      });
       if (boundaryBtn) {
         boundaryBtn.addEventListener('click', function () {
           setActive(boundaryContainer && boundaryContainer.hidden ? 'boundary' : null);
         });
       }
-      ['mapGoalToggle', 'mapInitialPoseToggle', 'mapPublishPointToggle', 'mapModeToggle'].forEach(function (id) {
-        var button = document.getElementById(id);
-        if (button) button.addEventListener('click', function () { setActive(null); });
-      });
     })();
   </script>
 </body>

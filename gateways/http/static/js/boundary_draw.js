@@ -1,6 +1,4 @@
-// Navigation forbidden-zone editor and persistent 2D overlay.
-// The backend owns the canonical document; this module only replaces the zone
-// list for the active map through /api/navigation/forbidden-zones.
+// 二维与三维共用禁行区编辑器；通过正式接口替换当前地图的禁区列表。
 
 (function () {
   'use strict';
@@ -41,6 +39,7 @@
     overlayHeight: 0,
     overlayScale: 1,
     editing: false,
+    draftAnchor: null,
     busy: false,
     activePointerId: null,
     dragStart: null,
@@ -428,13 +427,25 @@
   }
 
   function worldFromEvent(event) {
+    if (!is2dMapVisible()) {
+      if (!state.draftAnchor && event.type !== 'pointerdown') return null;
+      const point = window.pointcloud3d?.boundaryPointAt(event.clientX, event.clientY, state.draftAnchor);
+      if (!point) {
+        if (event.type === 'pointerdown') setStatus('请在可见点云地面上开始绘制，空白处无法确定位置。', 'warning');
+        return null;
+      }
+      if (!state.draftAnchor) state.draftAnchor = point;
+      return normalizedPoint(point);
+    }
     if (typeof window.__nuwaxMapUnproject !== 'function') return null;
     return normalizedPoint(window.__nuwaxMapUnproject(event.clientX, event.clientY));
   }
 
   function projectPoint(point) {
     if (!point || typeof window.__nuwaxMapProject !== 'function') return null;
-    const projected = window.__nuwaxMapProject(point.x, point.y);
+    const projected = is2dMapVisible()
+      ? window.__nuwaxMapProject(point.x, point.y)
+      : window.pointcloud3d?.projectBoundaryPoint(point.x, point.y, state.draftAnchor?.surface_z ?? 0);
     if (!projected || !Number.isFinite(Number(projected.x)) || !Number.isFinite(Number(projected.y))) return null;
     if (Number.isFinite(Number(projected.scale)) && Number(projected.scale) > 0) state.overlayScale = Number(projected.scale);
     if (Number.isFinite(Number(projected.pixelWidth))) state.overlayWidth = Number(projected.pixelWidth);
@@ -577,6 +588,14 @@
   }
 
   function syncOverlayMetrics() {
+    if (!is2dMapVisible()) {
+      const rect = findOverlayHost()?.getBoundingClientRect();
+      state.overlayWidth = rect?.width || 1;
+      state.overlayHeight = rect?.height || 1;
+      state.overlayScale = 1;
+      state.overlaySvg?.setAttribute('viewBox', '0 0 ' + state.overlayWidth + ' ' + state.overlayHeight);
+      return;
+    }
     const projected = typeof window.__nuwaxMapProject === 'function'
       ? window.__nuwaxMapProject(0, 0)
       : null;
@@ -591,8 +610,11 @@
     if (!state.overlaySvg) return;
     syncOverlayMetrics();
     clearOverlay();
-    for (const zone of state.zones.filter((item) => item.mode === 'outside')) appendZoneToOverlay(zone);
-    for (const zone of state.zones.filter((item) => item.mode !== 'outside')) appendZoneToOverlay(zone);
+    // 已保存禁区由三维场景绘制，覆盖层只承担三维草稿与指针输入。
+    if (is2dMapVisible()) {
+      for (const zone of state.zones.filter((item) => item.mode === 'outside')) appendZoneToOverlay(zone);
+      for (const zone of state.zones.filter((item) => item.mode !== 'outside')) appendZoneToOverlay(zone);
+    }
     const preview = draftPreview();
     if (preview) appendZoneToOverlay(preview, { draft: true, vertices: true });
   }
@@ -748,6 +770,7 @@
   }
 
   function clearDraft() {
+    state.draftAnchor = null;
     state.activePointerId = null;
     state.dragStart = null;
     state.dragCurrent = null;
@@ -802,7 +825,7 @@
   }
 
   function setEditing(active) {
-    const next = Boolean(active) && is2dMapVisible();
+    const next = Boolean(active);
     const overlay = ensureOverlay();
     if (next && !overlay) {
       setStatus('找不到地图容器 .canvas-wrap', 'error');
@@ -814,7 +837,9 @@
       state.overlaySvg.style.cursor = next ? 'crosshair' : 'default';
     }
     setV2ActiveFlag(next);
-    if (next) {
+    window.pointcloud3d?.setBoundaryEditing(next && !is2dMapVisible());
+    window.dispatchEvent(new CustomEvent('map:editing-changed'));
+    if (next && is2dMapVisible()) {
       const anchor = typeof window.__nuwaxCameraAnchor === 'function' ? window.__nuwaxCameraAnchor() : null;
       const point = anchor && anchor.point ? anchor.point : { x: 0, y: 0 };
       window.__nuwaxMapFreezeCenter = { x: Number(point.x) || 0, y: Number(point.y) || 0 };
@@ -838,6 +863,7 @@
     if (!state.editing || (event.pointerType === 'mouse' && event.button !== 0)) return;
     event.preventDefault();
     event.stopPropagation();
+    if (selectedShape() !== 'polygon' || !state.customVertices.length) state.draftAnchor = null;
     const point = worldFromEvent(event);
     if (!point) return;
     if (selectedShape() === 'polygon') {
@@ -964,6 +990,12 @@
   }
 
   async function saveDraft() {
+    if (state.draftAnchor && !window.pointcloud3d?.navigationPointIsCurrent(state.draftAnchor)) {
+      clearDraft();
+      setEditing(false);
+      setStatus('点云来源已变化，请重新绘制禁行区。', 'error');
+      return;
+    }
     const zone = draftAsZone();
     if (!zone) {
       if (!state.draft) setStatus('请先在地图上绘制禁行区', 'error');
@@ -999,15 +1031,8 @@
   }
 
   function syncMapView() {
-    const is2d = is2dMapVisible();
-    if (state.overlaySvg) state.overlaySvg.style.display = is2d ? 'block' : 'none';
-    if (!is2d) {
-      setEditing(false);
-      if (state.container) state.container.hidden = true;
-      document.getElementById('mapBoundaryToggle')?.classList.remove('active');
-    } else {
-      redrawOverlay();
-    }
+    if (state.overlaySvg) state.overlaySvg.style.display = 'block';
+    redrawOverlay();
   }
 
   function onDrawTick() {
@@ -1071,14 +1096,23 @@
 
     const boundaryButton = document.getElementById('mapBoundaryToggle');
     const navigationButton = document.getElementById('mapNavToggle');
-    const mapModeButton = document.getElementById('mapModeToggle');
     boundaryButton?.addEventListener('click', function () {
       queueMicrotask(function () { if (state.container.hidden) setEditing(false); });
     });
     navigationButton?.addEventListener('click', function () {
       queueMicrotask(function () { if (state.container.hidden) setEditing(false); });
     });
-    mapModeButton?.addEventListener('click', function () { queueMicrotask(syncMapView); });
+    window.addEventListener('map:view-changed', syncMapView);
+    window.addEventListener('pointcloud3d:camera-state', function () {
+      if (!is2dMapVisible()) redrawOverlay();
+    });
+    window.addEventListener('pointcloud3d:map-frame', function () {
+      if (state.draftAnchor && !window.pointcloud3d?.navigationPointIsCurrent(state.draftAnchor)) {
+        clearDraft();
+        setEditing(false);
+        setStatus('点云来源已变化，请重新绘制禁行区。', 'warning');
+      }
+    });
 
     state.previousDrawTick = window.__nuwaxMapDrawTick;
     window.__nuwaxMapDrawTick = function () {

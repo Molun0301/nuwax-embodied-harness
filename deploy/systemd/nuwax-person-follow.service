@@ -46,6 +46,10 @@ Environment=NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC=15
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
+# 活动方案最后加载；物化的业务值可由共同加载器和热加载入口更新。
+Environment=NUWAX_ROBOT_PROFILE_MODE=1
+Environment=NUWAX_CONFIG_FROM_SYSTEMD_FILES=1
+EnvironmentFile=-@NUWAX_REPO_ROOT@/runtime_data/settings/active.env
 # Channels stay unsuffixed here; nuwax-transport appends the declared LCM type.
 ExecStartPre=/usr/bin/env /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/check_lcm_multicast.sh
 ExecStartPre=/usr/bin/env /bin/bash @NUWAX_REPO_ROOT@/scripts/systemd/wait_for_motion_guard_socket.sh check nuwax nuwax

@@ -1826,6 +1826,21 @@ class GatewayRuntime:
                 continue
             self._publish_navigation_bootstrap_stream_frames()
 
+    def apply_telemetry_settings(self, config) -> None:
+        """停止并回收原采集线程后替换采集器，网关和机器人业务保持运行。"""
+        self._stop_system_telemetry_stream()
+        thread = self._system_telemetry_thread
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("性能采集线程尚未退出，未应用新设置")
+        self._system_metrics_collector = SystemMetricsCollector(
+            keywords=config.telemetry_process_keywords or None,
+            include_process_tree=config.telemetry_include_process_tree,
+            sample_interval_sec=config.telemetry_interval_sec,
+        )
+        self.config.gateway.telemetry_enabled = config.telemetry_enabled
+        if config.telemetry_enabled:
+            self._start_system_telemetry_stream()
+
     def _start_system_telemetry_stream(self) -> None:
         """启动性能监控采集线程（daemon），失败不影响其它流源启动。"""
 
@@ -1849,6 +1864,8 @@ class GatewayRuntime:
         self._system_telemetry_stop.set()
         if thread.is_alive():
             thread.join(timeout=self._system_metrics_collector.sample_interval_sec + 1.0)
+        if thread.is_alive():
+            return
         self._system_telemetry_thread = None
 
     def _run_system_telemetry_stream(self) -> None:

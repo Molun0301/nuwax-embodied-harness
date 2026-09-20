@@ -5,8 +5,8 @@
 nuwax_robot_bridge 统一配置解析层。
 
 说明：
-1. 用户编辑项目根目录的 `.env` 文件，或显式指定配置文件。
-2. 为兼容旧部署，也会回退读取 `.config`。
+1. 用户配置保存在 drivers/<机器人>/configs/，活动方案由共同解析器读取。
+2. 首次保存迁移旧配置；显式部署文件入口仍可兼容。
 3. 同名环境变量优先级高于文件配置。
 4. 这里仅负责把配置解析成结构化对象，业务逻辑不要直接散落读取环境变量。
 """
@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from core.config_values import config_value, raw_value, read_env_values, record_value, user_config_values
+from core.config_values import config_value, raw_value, read_env_values, record_value, user_config_values, configuration_values
 from core.robot_geometry import RobotGeometryConfig
 from core.logging_utils import (
     CorrelationContextFilter,
@@ -72,12 +72,7 @@ DEFAULT_GEOMETRY_STACK_NAME = "nuwax_geometry_runtime"
 
 
 def _load_file_values() -> Dict[str, str]:
-    configured = os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", "").strip()
-    env_file = Path(configured).expanduser() if configured else ENV_FILE
-    values = read_env_values(LEGACY_CONFIG_FILE)
-    values.update(read_env_values(env_file))
-    values.update(user_config_values())
-    return values
+    return configuration_values(root=ENV_FILE.parent)
 
 
 _FILE_VALUES = _load_file_values()

@@ -87,10 +87,10 @@ function normalizePointCloud3DConfig(rawConfig) {
   });
 }
 
-const POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(
+let POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(
   typeof window === 'undefined' ? null : window.__NUWAX_POINTCLOUD3D_CONFIG__,
 );
-const POINT_STYLE_PRESETS = Object.freeze({
+function buildPointStylePresets() { return Object.freeze({
   full: Object.freeze({
     label: '完整点云',
     denseSource: true,
@@ -139,11 +139,12 @@ const POINT_STYLE_PRESETS = Object.freeze({
     sizeAttenuation: false,
     colorMode: 'mono',
   }),
-});
-const HEIGHT_COLOR_STOPS = Object.freeze(
+}); }
+let POINT_STYLE_PRESETS = buildPointStylePresets();
+let HEIGHT_COLOR_STOPS = Object.freeze(
   POINTCLOUD3D_CONFIG.heightColors.map((color) => Object.freeze(pointCloudHexToRgb(color))),
 );
-const FLOOR_COLORS = Object.freeze({
+let FLOOR_COLORS = Object.freeze({
   ground: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.groundColor)),
   context: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.color)),
   structure: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor)),
@@ -1909,6 +1910,26 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._rebuildPointCloud();
   }
 
+  applyDisplayConfig(value) {
+    POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(value);
+    POINT_STYLE_PRESETS = buildPointStylePresets();
+    HEIGHT_COLOR_STOPS = POINTCLOUD3D_CONFIG.heightColors.map(pointCloudHexToRgb);
+    FLOOR_COLORS = {
+      ground: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.groundColor),
+      context: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.color),
+      structure: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor),
+      object: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.objectColor),
+    };
+    this._displayConfig = POINTCLOUD3D_CONFIG;
+    this._processingConfig = { stylePresets: POINT_STYLE_PRESETS, heightColorStops: HEIGHT_COLOR_STOPS, floorColors: FLOOR_COLORS };
+    // 旧工作线程结果不能覆盖新样式，保留点云和相机，只重新计算显示数据。
+    this._invalidatePointCloudWork();
+    this._cloudContextKey = null;
+    if (this._denseCloud) this._denseCloud.material.size = POINT_STYLE_PRESETS.full.size;
+    this._rebuildPointCloud();
+    this._requestRender();
+  }
+
   setPointStyle(style) {
     if (!Object.prototype.hasOwnProperty.call(POINT_STYLE_PRESETS, style)) return false;
     const changed = this._pointStyle !== style;
@@ -2297,3 +2318,8 @@ window.addEventListener('stream:pointcloud_map.reset', () => {
 
 // 二进制消费者已注册与三维画布已初始化是两个不同阶段。
 window.dispatchEvent(new CustomEvent('pointcloud3d:consumer-ready'));
+
+window.addEventListener('settings:display', event => {
+  window.__NUWAX_POINTCLOUD3D_CONFIG__ = event.detail;
+  window.pointcloud3d.applyDisplayConfig(event.detail);
+});

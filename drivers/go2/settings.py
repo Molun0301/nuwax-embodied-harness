@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from core.config_values import config_value, raw_value, read_env_values, user_config_values
+from core.config_values import config_value, raw_value, read_env_values, user_config_values, configuration_values
 from contracts.geometry_runtime import PlatformGeometryConfig
 from drivers.go2.defaults import GO2_DEFAULT_FRAME_IDS
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -14,13 +14,7 @@ _GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
 
 
 def _load_file_values() -> Dict[str, str]:
-    configured = os.environ.get("GO2_DATA_PLANE_ENV_FILE", "").strip()
-    path = Path(configured).expanduser() if configured else _GO2_ENV_FILE
-    values = read_env_values(path)
-    core_path = os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", str(_PROJECT_ROOT / ".env"))
-    values.update(read_env_values(Path(core_path).expanduser()))
-    values.update(user_config_values())
-    return values
+    return configuration_values()
 
 
 _FILE_VALUES = _load_file_values()

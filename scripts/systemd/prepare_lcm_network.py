@@ -118,13 +118,17 @@ def resolve_lcm_url(
     """按网关服务文件顺序解析地址，每次新读，不执行文件内容或继承业务环境。"""
     values_module = _configuration_parser()
     value = DEFAULT_LCM_URL
-    for path in (
-        config_dir / "nuwax.env",
-        go2_env if go2_env is not None else config_dir / "go2-data-plane.env",
-        geometry_env,
-        pointcloud_env,
-        user_env,
-    ):
+    active = REPO_ROOT / "runtime_data/settings/active.env"
+    if active.is_symlink():
+        location = values_module.configuration_location(root=REPO_ROOT, environment={})
+        if location is None or not location["path"].is_file():
+            raise ValueError("活动配置方案不存在")
+        paths = (location["path"],)
+    else:
+        paths = (config_dir / "nuwax.env",
+                 go2_env if go2_env is not None else config_dir / "go2-data-plane.env",
+                 geometry_env, pointcloud_env, user_env)
+    for path in paths:
         values = values_module.read_env_values(Path(path))
         if "NUWAX_LCM_URL" in values:
             value = values["NUWAX_LCM_URL"].strip() or DEFAULT_LCM_URL

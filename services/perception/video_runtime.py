@@ -173,6 +173,20 @@ class PerceptionVideoRuntime:
                 pass
         return False
 
+    def apply_tuning(self, config) -> None:
+        """在两帧之间更新采样和关键帧阈值，保留任务、模型与历史基准。"""
+        with self._run_lock, self._lock:
+            self._interval_sec = config.interval_sec
+            self._failure_backoff_sec = config.failure_backoff_sec
+            self._remember_keyframes = config.remember_keyframes
+            self._burst_frame_count = config.burst_frame_count
+            self._burst_interval_sec = config.burst_interval_sec
+            self._keyframe_selector.update_thresholds(
+                min_interval_sec=config.keyframe_min_interval_sec,
+                translation_threshold_m=config.keyframe_translation_threshold_m,
+                yaw_threshold_deg=config.keyframe_yaw_threshold_deg,
+            )
+
     def bind_memory_service(self, memory_service) -> None:
         """显式注入 memory_service，避免外部直接赋值私有字段。"""
 

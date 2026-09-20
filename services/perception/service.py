@@ -101,6 +101,16 @@ class PerceptionService:
     def set_video_frame_source(self, video_frame_source: Optional[VideoFrameSource]) -> None:
         self._video_frame_source = video_frame_source
 
+    def update_detector_thresholds(self, config) -> None:
+        """等待正在执行的检测完成后更新已注册后端，不创建第二个模型。"""
+        with self._pipeline_lock:
+            for spec in self._detector_pipeline.list_backends():
+                backend = self._detector_pipeline.get_backend(spec.name)
+                update = getattr(backend, "update_thresholds", None)
+                if callable(update):
+                    update(confidence_threshold=config.confidence_threshold,
+                           iou_threshold=config.iou_threshold, max_detections=config.max_detections)
+
     @property
     def detector_pipeline(self) -> DetectorPipeline:
         """返回检测管线。"""

@@ -156,6 +156,9 @@ def _all_raw_keys() -> Dict[str, _RawKey]:
 SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("robot", "机器人与运行入口"),
     ("gateway", "网关与服务"),
+    ("display", "网页与点云显示"),
+    ("localization", "定位与建图算法"),
+    ("loop_closure", "扫描上下文、回环与位姿图"),
     ("telemetry", "性能监控（遥测）"),
     ("logging", "日志"),
     ("geometry_runtime", "几何引擎·运行时与通信"),
@@ -180,6 +183,7 @@ _SECTION_TITLES = dict(SECTIONS)
 
 # 分类规则：(section_id, 前缀元组)。按列表顺序匹配，**首个命中**生效，故更具体的前缀在前。
 _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("display", ("NUWAX_GATEWAY_POINTCLOUD3D_",)),
     ("telemetry", ("NUWAX_GATEWAY_TELEMETRY",)),
     ("gateway", ("NUWAX_GATEWAY",)),
     ("relay", ("NUWAX_RELAY",)),
@@ -603,7 +607,7 @@ def build_registry() -> Tuple[ConfigField, ...]:
             type=rk.type,
             section_id=section_id,
             section_title=_SECTION_TITLES.get(section_id, "其它"),
-            advanced=key not in _REGULAR_KEYS,
+            advanced=entry.get("advanced", key not in _REGULAR_KEYS),
             sensitive=key in _SENSITIVE_KEYS,
             target_file=rk.target_file,
             default_repr=rk.default_repr,
@@ -623,11 +627,23 @@ def all_keys() -> Tuple[str, ...]:
     return tuple(f.key for f in build_registry())
 
 
+@lru_cache(maxsize=1)
+def _field_index():
+    return {field.key: field for field in build_registry()}
+
+
 def get_field(key: str) -> Optional[ConfigField]:
-    for f in build_registry():
-        if f.key == key:
-            return f
-    return None
+    return _field_index().get(key)
+
+
+@lru_cache(maxsize=1)
+def structured_options() -> Dict[str, dict]:
+    """页面与实际算法预检复用同一参数定义，不建立另一套参数键。"""
+    result = {}
+    for key, name in (("NUWAX_GEOMETRY_PGO_OPTIONS", "pgo_options"),
+                      ("NUWAX_GEOMETRY_POINTLIO_OPTIONS", "pointlio_options")):
+        result[key] = json.loads((_REPO_ROOT / "contracts" / (name + ".json")).read_text(encoding="utf-8"))["parameters"]
+    return result
 
 
 def sensitive_keys() -> frozenset:

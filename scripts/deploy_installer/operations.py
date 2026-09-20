@@ -2690,6 +2690,7 @@ def _copy_ignore(_directory: str, names: Sequence[str]):
         name
         for name in names
         if name in ignored
+        or (name == "configs" and Path(_directory).parent.name == "drivers")
         or name == ".env"
         or name.startswith(".env.")
         or name == "data_plane.env"
@@ -2759,6 +2760,8 @@ def _copy_release_source(source_root: Path, release_dir: Path) -> None:
             relative = Path(os.fsdecode(raw_relative))
             if relative.is_absolute() or ".." in relative.parts:
                 raise DeploymentError(f"tracked source path is unsafe: {relative}")
+            if len(relative.parts) >= 3 and relative.parts[0] == "drivers" and relative.parts[2] == "configs":
+                continue
             source = source_root / relative
             if source.is_symlink():
                 raise DeploymentError(f"release source must not contain symlinks: {relative}")
@@ -2869,6 +2872,11 @@ def _release_source_digest(release_dir: Path) -> str:
     digest = hashlib.sha256()
     excluded_dirs = {".venv", "bin", "models", "vendor", "__pycache__"}
     for root, directories, files in os.walk(release_dir):
+        relative_root = Path(root).relative_to(release_dir)
+        if len(relative_root.parts) == 2 and relative_root.parts[0] == "drivers":
+            directories[:] = [name for name in directories if name != "configs"]
+        if relative_root.as_posix() == "runtime_data":
+            directories[:] = [name for name in directories if name != "settings"]
         directories[:] = sorted(name for name in directories if name not in excluded_dirs)
         root_path = Path(root)
         for name in sorted(files):
@@ -3765,6 +3773,56 @@ def enable_and_start(context: "ExecutionContext") -> None:
     context.runner.run(("bash", str(script), "start"), env=env, timeout=600)
 
 
+def _migrate_robot_profiles(source: Path, destination: Path) -> None:
+    """升级时迁移现场方案；只复制配置数据，不把秘密打包进源码制品。"""
+    if source.resolve() == destination.resolve():
+        return
+    drivers = source / "drivers"
+    if not drivers.is_dir():
+        return
+    for robot in drivers.iterdir():
+        configs = robot / "configs"
+        if not configs.exists():
+            continue
+        if robot.is_symlink() or configs.is_symlink() or not (destination / "drivers" / robot.name / "manifest.py").is_file():
+            raise DeploymentError("机器人配置目录无法迁移：" + str(configs))
+        target_dir = destination / "drivers" / robot.name / "configs"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        metadata = configs.stat()
+        os.chown(target_dir, metadata.st_uid, metadata.st_gid)
+        os.chmod(target_dir, stat.S_IMODE(metadata.st_mode))
+        for path in configs.iterdir():
+            if path.name != ".active" and path.suffix != ".env":
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise DeploymentError("机器人配置文件无法迁移：" + str(path))
+            target = target_dir / path.name
+            atomic_write(target, path.read_text(encoding="utf-8"), mode=0o600)
+            metadata = path.stat()
+            os.chown(target, metadata.st_uid, metadata.st_gid)
+    active = source / "runtime_data/settings/active.env"
+    if active.is_symlink():
+        try:
+            relative = active.resolve().relative_to(source.resolve())
+        except ValueError as error:
+            raise DeploymentError("活动方案指向项目目录之外") from error
+        if len(relative.parts) != 4 or relative.parts[0] != "drivers" or relative.parts[2] != "configs":
+            raise DeploymentError("活动方案路径无效")
+        target = destination / relative
+        if not target.is_file():
+            raise DeploymentError("活动配置方案迁移不完整")
+        link = destination / "runtime_data/settings/active.env"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        temporary = link.with_name(".active-migration")
+        try:
+            temporary.symlink_to(os.path.relpath(target, link.parent))
+            os.replace(temporary, link)
+            fsync_directory(link.parent)
+        finally:
+            if temporary.is_symlink():
+                temporary.unlink()
+
+
 def activate_release(context: "ExecutionContext") -> None:
     release_dir = context.options.release_dir
     manifest = _require_file(release_dir / "release-manifest.json", "candidate release manifest")
@@ -3774,6 +3832,15 @@ def activate_release(context: "ExecutionContext") -> None:
         raise DeploymentError(f"candidate release manifest is invalid: {manifest}") from exc
     if payload.get("fingerprint") != context.plan.fingerprint:
         raise DeploymentError("candidate release fingerprint changed before activation")
+    current = context.options.current_link
+    if current.is_symlink() and current.resolve() != release_dir.resolve():
+        previous = _validate_managed_release(context, current.resolve(), "configuration migration source")
+        if (previous / "drivers").is_dir():
+            # 先沿原拥有方停机，再迁移最后保存的配置，避免切换窗口继续写旧目录。
+            if not context.options.no_systemd:
+                context.runner.run(("bash", str(previous / "scripts/install_motion_guard_deployment.sh"), "stop"),
+                                   env=_deployment_env(context, active_release=True), timeout=300)
+            _migrate_robot_profiles(previous, release_dir)
     _switch_current(context, release_dir)
 
 

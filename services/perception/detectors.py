@@ -427,6 +427,19 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
                 },
             )
 
+    def update_thresholds(self, *, confidence_threshold, iou_threshold, max_detections) -> None:
+        """与正式检测共用锁；工作进程下一帧携带新阈值，不重载模型。"""
+        with self._detection_lock:
+            self._confidence_threshold = float(confidence_threshold)
+            self._iou_threshold = float(iou_threshold)
+            self._max_detections = int(max_detections)
+            with self._inference_worker_lock:
+                if self._inference_worker is not None:
+                    self._inference_worker.update_thresholds(
+                        confidence_threshold=self._confidence_threshold,
+                        iou_threshold=self._iou_threshold, max_detections=self._max_detections,
+                    )
+
     def _predict(self, image_bgr) -> List[Any]:
         # 优先使用独立进程推理（释放主线程 GIL）
         self._last_worker_inference_ms = None

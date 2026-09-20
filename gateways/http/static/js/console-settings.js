@@ -1,7 +1,19 @@
 /* 平台设置：来源、生效状态与未保存编辑独立维护。 */
 (() => {
 "use strict";
-const configState = { loaded: false, loading: false, saving: false, dirty: new Map(), errors: new Map(), lastSchema: null };
+const configState = { loaded: false, loading: false, saving: false, dirty: new Map(), errors: new Map(), lastSchema: null, robot: null, profile: null };
+function profileIdentity() {
+  const context = configState.lastSchema?.profile_context;
+  return context ? { robot: context.robot, profile: context.profile, revision: context.revision } : {};
+}
+async function configRequest(url, payload) {
+  const response = await fetch(url, payload === undefined ? undefined : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || result.error || result.detail || ('请求失败：' + response.status));
+  return result;
+}
 function setConfigStatus(state, text) {
   const status = document.getElementById("configStatus");
   status.className = "pill " + state;
@@ -37,11 +49,179 @@ function createConfigColorPicker(value, label) {
   picker.title = label;
   return picker;
 }
+function renderProfileControls(schema) {
+  const context = schema.profile_context;
+  const robotSelect = document.getElementById('configRobotSelect');
+  const profileSelect = document.getElementById('configProfileSelect');
+  if (!robotSelect || !profileSelect) return;
+  for (const [select, options, selected] of [[robotSelect, context?.robots || [], context?.robot],
+    [profileSelect, context?.profiles || [], context?.profile]]) {
+    select.replaceChildren(...options.map(value => Object.assign(document.createElement('option'), { value, textContent: value })));
+    if (selected) select.value = selected;
+    select.disabled = !context;
+  }
+  if (context) {
+    configState.robot = context.robot;
+    configState.profile = context.profile;
+  }
+  document.getElementById('configProfileStatus').textContent = context
+    ? ('当前编辑：' + context.robot + ' / ' + context.profile + '。' + (context.is_active ? '这是已选择的方案。' : '应用此方案后才改变运行设置。')
+      + (context.migration_required ? '首次保存会迁移该机器人的旧配置。' : '')
+      + (context.running_robot ? ' 启动时：' + context.running_robot + ' / ' + (context.running_profile || '旧配置入口') : ''))
+    : '当前使用显式配置文件入口。';
+  document.getElementById('configProfileApply').disabled = !context;
+  document.getElementById('configProfileSaveAs').disabled = !context;
+  document.getElementById('configRestartPending').disabled = !schema.application?.restart_available;
+  document.getElementById('configRestartPending').title = schema.application?.restart_unavailable_reason || '';
+}
+function buildOptionsEditor(field, rawInput, changed) {
+  const host = document.createElement('div');
+  host.className = 'config-options-editor';
+  const groups = new Map();
+  const controls = new Map();
+  for (const [name, spec] of Object.entries(field.options_schema)) {
+    const groupName = field.key === 'NUWAX_GEOMETRY_PGO_OPTIONS'
+      ? (name.startsWith('scan_context_') ? '扫描上下文：地点检索' : /^(odometry_|gravity_|loop_.*sigma_|optimizer_)/.test(name)
+        ? '位姿图：约束权重与优化' : '回环：配准、确认与关键帧') : '算法高级参数';
+    if (!groups.has(groupName)) {
+      const section = document.createElement('details');
+      section.className = 'config-options-group';
+      const title = document.createElement('summary'); title.textContent = groupName;
+      const grid = document.createElement('div'); grid.className = 'config-options-grid';
+      section.append(title, grid); host.append(section); groups.set(groupName, { section, grid });
+      const query = document.getElementById('configSearch').value.trim().toLowerCase();
+      section.open = Boolean(query) || groupName.startsWith('扫描上下文');
+    }
+    const label = document.createElement('label');
+    label.className = 'config-option-field';
+    const title = document.createElement('span'); title.textContent = spec.description || name;
+    const key = document.createElement('code'); key.textContent = name;
+    const input = document.createElement(['bool', 'enum'].includes(spec.type) ? 'select' : 'input');
+    input.className = 'field';
+    input.setAttribute('aria-label', spec.description || name);
+    input.dataset.option = name;
+    if (spec.type === 'bool') {
+      input.replaceChildren(...[['', '使用算法默认'], ['true', '是'], ['false', '否']].map(([value, textContent]) =>
+        Object.assign(document.createElement('option'), { value, textContent })));
+    } else if (spec.type === 'enum') {
+      input.replaceChildren(...['', ...(spec.choices || [])].map(value =>
+        Object.assign(document.createElement('option'), { value, textContent: value || '使用算法默认' })));
+    } else if (['int', 'number'].includes(spec.type)) {
+      input.type = 'number'; input.step = spec.type === 'int' ? '1' : 'any';
+      if (spec.minimum !== undefined) input.min = spec.minimum;
+      if (spec.maximum !== undefined) input.max = spec.maximum;
+      input.placeholder = '使用算法默认';
+    } else {
+      input.type = 'text'; input.placeholder = '留空使用默认；数组按结构化格式填写';
+    }
+    input.addEventListener('change', () => {
+      let value;
+      try { value = JSON.parse(rawInput.value || '{}'); }
+      catch (_) { setConfigStatus('error', '请先修正原始配置格式'); return; }
+      if (!value || Array.isArray(value) || typeof value !== 'object') {
+        setConfigStatus('error', '原始配置必须是对象'); return;
+      }
+      if (!input.value.trim()) delete value[name];
+      else if (spec.type === 'bool') value[name] = input.value === 'true';
+      else if (spec.type === 'enum') value[name] = input.value;
+      else if (['int', 'number'].includes(spec.type)) {
+        const parsed = Number(input.value);
+        if (!Number.isFinite(parsed) || (spec.type === 'int' && !Number.isInteger(parsed))) return;
+        value[name] = parsed;
+      } else {
+        try { value[name] = JSON.parse(input.value); }
+        catch (_) { setConfigStatus('error', '数组格式无效，输入已保留'); return; }
+      }
+      rawInput.value = JSON.stringify(value);
+      changed();
+    });
+    label.append(title, key, input); groups.get(groupName).grid.append(label); controls.set(name, input);
+  }
+  const sync = () => {
+    let value;
+    try { value = JSON.parse(rawInput.value || '{}'); }
+    catch (_) { return; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    for (const [name, input] of controls) input.value = value[name] == null ? ''
+      : typeof value[name] === 'object' ? JSON.stringify(value[name]) : String(value[name]);
+  };
+  rawInput.addEventListener('input', sync); sync();
+  return host;
+}
+function showRestartChoice(result = {}) {
+  const application = configState.lastSchema?.application || {};
+  document.getElementById('configApplyMessage').textContent = (result.effect_note || '已保存的参数可在下次启动时生效。')
+    + ' 重启范围：' + (application.restart_scope || '相关运行组件') + '。'
+    + (application.restart_unavailable_reason || '');
+  document.getElementById('configRestartNow').disabled = !application.restart_available;
+  document.getElementById('configApplyDialog').showModal();
+}
+async function restartConfiguration() {
+  document.getElementById('configRestartNow').disabled = true;
+  try {
+    await configRequest('/api/config/restart', profileIdentity());
+    document.getElementById('configApplyDialog').close();
+    setConfigStatus('stale', '正在重启');
+    document.getElementById('configDirty').textContent = '已安排重启，连接会短暂断开；新网关返回后更新状态。';
+    const deadline = Date.now() + 180000;
+    const check = async () => {
+      try {
+        const status = await configRequest('/api/config/status');
+        if (status.restart?.state === 'restarted') {
+          await loadConfigSchema();
+          document.getElementById('configDirty').textContent = status.restart.message;
+          return;
+        }
+        if (status.restart?.state === 'failed') throw Object.assign(new Error(status.restart.message), { terminal: true });
+      } catch (error) {
+        if (error.terminal) { setConfigStatus('error', '重启失败'); document.getElementById('configDirty').textContent = error.message; return; }
+      }
+      if (Date.now() < deadline) window.setTimeout(check, 1500);
+      else { setConfigStatus('error', '尚未恢复连接'); document.getElementById('configDirty').textContent = '请检查启动日志；若修改了网关地址，请使用新地址访问。'; }
+    };
+    window.setTimeout(check, 1500);
+  } catch (error) {
+    setConfigStatus('error', '无法重启'); document.getElementById('configApplyMessage').textContent = error.message;
+  }
+}
+async function profileAction(action) {
+  if (configState.saving || configState.loading) return;
+  if (configState.dirty.size) {
+    document.getElementById('configDirty').textContent = '请先保存当前编辑，再选择或另存方案。'; return;
+  }
+  configState.saving = true;
+  try {
+    const identity = profileIdentity();
+    if (action === 'create') {
+      const name = document.getElementById('configProfileName').value.trim();
+      if (!name) throw new Error('请填写新方案名称');
+      const result = await configRequest('/api/config/profiles', { ...identity, name });
+      configState.profile = result.profile;
+      document.getElementById('configProfileName').value = '';
+      await loadConfigSchema();
+    } else {
+      const result = await configRequest('/api/config/activate', identity);
+      await loadConfigSchema();
+      const failures = Object.entries(result.apply_errors || {});
+      if (failures.length) {
+        setConfigStatus('error', '已保存，部分热加载失败');
+        document.getElementById('configDirty').textContent = failures.map(([key, message]) => key + '：' + message).join('；');
+      }
+      if (result.restart_required) showRestartChoice(result);
+      else if (!failures.length) document.getElementById('configDirty').textContent = result.effect_note;
+    }
+  } catch (error) {
+    setConfigStatus('error', '操作失败'); document.getElementById('configDirty').textContent = error.message;
+  } finally { configState.saving = false; }
+}
 async function loadConfigSchema() {
   if (configState.loading) return;
   configState.loading = true;
   try {
-    const resp = await fetch("/api/config/schema");
+    const query = new URLSearchParams();
+    if (configState.robot) query.set('robot', configState.robot);
+    if (configState.profile) query.set('profile', configState.profile);
+    const resp = await fetch("/api/config/schema?" + query);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const schema = await resp.json();
     // 刷新来源信息时保留尚未保存或被拒绝的输入。
@@ -54,6 +234,7 @@ async function loadConfigSchema() {
       }
     }
     configState.lastSchema = schema;
+    renderProfileControls(schema);
     renderConfigSchema(schema);
     configState.loaded = true;
     setConfigStatus(configState.errors.size ? "error" : "available", configState.errors.size ? "部分未保存" : "已加载");
@@ -78,7 +259,8 @@ function renderConfigSchema(schema) {
   const navLinks = [];
   const forceAdvanced = document.getElementById("configShowAdvanced").checked;
   const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
-  const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query) || (f.description || "").toLowerCase().includes(query);
+  const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query) || (f.description || "").toLowerCase().includes(query)
+    || Object.entries(f.options_schema || {}).some(([key, spec]) => (key + ' ' + (spec.description || '')).toLowerCase().includes(query));
   let sectionIndex = 0;
   for (const section of schema.sections || []) {
     const fields = (section.fields || []).filter(match);
@@ -152,7 +334,7 @@ function syncGeometryPipelineFields() {
       "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
       || key.startsWith("NUWAX_GATEWAY_POINTCLOUD3D_");
     const disabled = planar && spatial;
-    for (const input of row.querySelectorAll("input,select,textarea")) input.disabled = disabled;
+    for (const input of row.querySelectorAll("input,select,textarea")) input.disabled = disabled || input.dataset.readonly === 'true';
     row.style.opacity = disabled ? "0.5" : "";
     if (spatial) row.title = disabled ? "该设置仅用于三维执行链" : "";
   }
@@ -228,6 +410,7 @@ function buildConfigRow(f) {
   }
   input.id = "cfg__" + f.key;
   input.className = "field";
+  if (f.readonly) { input.disabled = true; input.dataset.readonly = 'true'; }
   if (f.description) input.title = f.description;
   input.dataset.original = (f.sensitive && f.is_set) ? "" : (f.value == null ? "" : String(f.value));
   if (configState.dirty.has(f.key)) {
@@ -266,6 +449,16 @@ function buildConfigRow(f) {
   };
   input.addEventListener("input", handleTextInput);
   input.addEventListener("change", handleTextInput);
+  if (f.options_schema) {
+    row.classList.add('config-options-row');
+    const editor = buildOptionsEditor(f, input, handleTextInput);
+    const raw = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = '原始结构化配置';
+    raw.append(summary, input);
+    try { JSON.parse(input.value || '{}'); } catch (_) { raw.open = true; }
+    cell.prepend(editor, raw);
+  }
   if (singleColorPicker) {
     const applySingleColor = () => {
       input.value = singleColorPicker.value.toLowerCase();
@@ -369,10 +562,10 @@ async function saveConfig() {
     const resp = await fetch("/api/config/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates }),
+      body: JSON.stringify({ updates, ...profileIdentity() }),
     });
     const result = await resp.json();
-    if (!resp.ok) throw new Error(typeof result.detail === "string" ? result.detail : "HTTP " + resp.status);
+    if (!resp.ok) throw new Error(result.error?.message || result.error || result.detail || "请求失败：" + resp.status);
     const rejected = result.rejected || {};
     // 只移除本次成功保存且没有继续编辑的值，不丢失失败项或保存期间的新输入。
     for (const [key, submitted] of Object.entries(updates)) {
@@ -389,7 +582,13 @@ async function saveConfig() {
       setConfigStatus("available", "已保存");
       document.getElementById("configDirty").textContent = configState.dirty.size
         ? "本次改动已保存；仍有 " + configState.dirty.size + " 项新编辑待保存。"
-        : "改动已保存。请按各项说明重启对应服务。";
+        : (result.hot_applied?.length ? result.hot_applied.length + ' 项已热加载。' : '') + (result.effect_note || '改动已保存。');
+      const failures = Object.entries(result.apply_errors || {});
+      if (failures.length) {
+        setConfigStatus('error', '已保存，部分热加载失败');
+        document.getElementById('configDirty').textContent = failures.map(([key, message]) => key + '：' + message).join('；');
+      }
+      if (result.restart_required) showRestartChoice(result);
     }
   } catch (err) {
     setConfigStatus("error", "保存失败");
@@ -406,7 +605,27 @@ async function saveConfig() {
   const adv = document.getElementById("configShowAdvanced");
   if (reload) reload.addEventListener("click", loadConfigSchema);
   if (save) save.addEventListener("click", saveConfig);
-  const rerender = () => { if (configState.loaded && configState.lastSchema) renderConfigSchema(configState.lastSchema); };
+  let searchTimer;
+  const rerender = () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { if (configState.loaded && configState.lastSchema) renderConfigSchema(configState.lastSchema); }, 120);
+  };
+  for (const id of ['configRobotSelect', 'configProfileSelect']) document.getElementById(id)?.addEventListener('change', async event => {
+    if (configState.dirty.size || configState.saving || configState.loading) {
+      renderProfileControls(configState.lastSchema);
+      document.getElementById('configDirty').textContent = '请先完成并保存当前编辑，再切换方案。'; return;
+    }
+    configState.robot = document.getElementById('configRobotSelect').value;
+    configState.profile = id === 'configRobotSelect' ? null : event.target.value;
+    if (!await loadConfigSchema()) {
+      renderProfileControls(configState.lastSchema);
+    }
+  });
+  document.getElementById('configProfileSaveAs')?.addEventListener('click', () => profileAction('create'));
+  document.getElementById('configProfileApply')?.addEventListener('click', () => profileAction('activate'));
+  document.getElementById('configRestartPending')?.addEventListener('click', () => showRestartChoice());
+  document.getElementById('configRestartNow')?.addEventListener('click', restartConfiguration);
+  document.getElementById('configRestartLater')?.addEventListener('click', () => document.getElementById('configApplyDialog').close());
   if (search) search.addEventListener("input", rerender);
   // 勾选直接切 class 触发高度动画，不重渲染（重渲染会打断过渡）。
   if (adv) adv.addEventListener("change", () => {

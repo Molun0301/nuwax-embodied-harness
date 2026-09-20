@@ -173,3 +173,11 @@ htmlcov/
 
 # 原生定位本机构建产物；源代码与公共转换头文件仍进入仓库。
 services/nuwax-workspace/crates/nuwax-lio-backends/native/*/cpp/result/
+
+# 机器人现场配置与活动选择包含私有参数，不随源码发布。
+drivers/*/configs/
+drivers/*/.active_config
+drivers/.active_robot
+drivers/.settings.lock
+drivers/*/.active_config.lock
+drivers/.active_robot.lock

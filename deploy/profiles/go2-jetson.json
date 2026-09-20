@@ -142,7 +142,9 @@
     "nuwax-runtime-activation.service",
     "nuwax-runtime-activation.path",
     "nuwax-host-gateway.service",
-    "nuwax-go2-video-streamer.service"
+    "nuwax-go2-video-streamer.service",
+    "nuwax-settings-apply.service",
+    "nuwax-settings-apply.path"
   ],
   "models": {
     "prepare_yolo": true,
@@ -157,14 +159,16 @@
     "always_on_services": [
       "nuwax-runtime-activation.path",
       "nuwax-host-gateway.service",
-      "nuwax-go2-video-streamer.service"
+      "nuwax-go2-video-streamer.service",
+      "nuwax-settings-apply.path"
     ],
     "on_demand_services": [
       "nuwax-motion-safety-guard.service",
       "nuwax-nav-stack.service",
       "nuwax-geometry-runtime.service",
       "nuwax-person-follow.service",
-      "nuwax-runtime-activation.service"
+      "nuwax-runtime-activation.service",
+      "nuwax-settings-apply.service"
     ],
     "minimum_free_gb": 40,
     "required_dds_interface": "eth0",

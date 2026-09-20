@@ -67,6 +67,8 @@ def read_current(home: Path) -> dict:
 
 
 def existing_config(root: Path, current: Mapping) -> dict:
+    if (root / "runtime_data/settings/active.env").is_file():
+        return read_existing(root)
     if not current:
         return read_existing(root)
     return read_settings(Path(current["prefix"]) / "settings.env")

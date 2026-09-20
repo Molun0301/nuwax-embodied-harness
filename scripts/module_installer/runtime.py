@@ -61,6 +61,9 @@ def read_settings(path: Path) -> dict[str, str]:
 def read_existing(root: Path) -> dict[str, str]:
     """只读真实用户配置；示例不作为设备身份或已安装功能的证据。"""
     root = root.resolve()
+    active = root / "runtime_data/settings/active.env"
+    if active.is_file():
+        return _VALUES.configuration_values(root=root, environment={})
     values: dict[str, str] = {}
     for path in (
         root / "drivers/go2/data_plane.env",
@@ -159,6 +162,8 @@ def write_runtime(
     # 这些是安装产物与入口身份，不能继承旧安装或调用环境里的位置。
     fixed = {key: str(settings_path) for key in _CONFIG_PATH_KEYS}
     fixed.update({
+        "NUWAX_ROBOT_PROFILE_MODE": "1",
+        "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
         "NUWAX_ACTIVE_ROBOT": robot,
         "NUWAX_GATEWAY_LOCK_FILE": str(root / "runtime_data/gateway/start_gateway.lock"),
         "NUWAX_GATEWAY_PID_FILE": str(root / "runtime_data/gateway/gateway.pid"),
@@ -193,6 +198,8 @@ def write_runtime(
                 device["library_path"] = str(prefix / "lib/libnuwax_slamtec.so.1")
                 values["NUWAX_GEOMETRY_SLAM2D_DEVICE"] = json.dumps(device, ensure_ascii=False, separators=(",", ":"))
     values.update(fixed)
+    # 机器人选择属于方案；安装器只固定模块与程序身份。
+    fixed.pop("NUWAX_ACTIVE_ROBOT", None)
     enabled = {
         "NUWAX_GEOMETRY_ENABLED": geometry,
         "NUWAX_GEOMETRY_EXTERNAL_ENABLED": geometry,
@@ -235,7 +242,7 @@ def write_runtime(
     prefix.mkdir(parents=True, exist_ok=True)
     # 先完整序列化再写入；配置含设备凭据，只允许当前用户读取。
     lines = [
-        "# 模块化安装的专属设置；控制台保存也写入本文件。",
+        "# 模块化安装的初始设置；控制台首次保存迁入机器人独立方案。",
         "# 修改模块请重新运行安装器；地图、模型和其它用户数据保留原位置。",
         "# 未安装模块由启动入口强制禁用，已安装模块的业务参数仍支持显式环境覆盖。",
     ]

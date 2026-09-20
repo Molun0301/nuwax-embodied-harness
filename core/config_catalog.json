@@ -431,7 +431,7 @@
     "zh_name": "原生定位扫描体素边长（米）",
     "type": "float",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
@@ -444,7 +444,7 @@
     "zh_name": "原生定位地图插入体素边长（米）",
     "type": "float",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
@@ -457,7 +457,7 @@
     "zh_name": "原生定位初图最少有效扫描数（帧）",
     "type": "int",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
@@ -1093,7 +1093,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1121,7 +1121,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1149,7 +1149,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1177,7 +1177,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1205,7 +1205,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1233,7 +1233,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1261,7 +1261,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1289,7 +1289,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1317,7 +1317,7 @@
       "ERROR",
       "CRITICAL"
     ],
-    "description": "空值继承全局日志级别；重启网关后生效。",
+    "description": "空值继承全局日志级别；保存后在网关内热加载。",
     "choice_labels": [
       "继承全局设置",
       "调试",
@@ -1988,7 +1988,7 @@
     "zh_name": "建图、探索与导航执行链",
     "type": "str",
     "default": "lio_3d",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "contracts/navigation_pipeline.py",
@@ -2003,7 +2003,7 @@
     "zh_name": "二维扫描与算法配置",
     "type": "str",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs",
@@ -2016,7 +2016,7 @@
     "zh_name": "二维雷达连接配置",
     "type": "str",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "gateways/runtime.py",
@@ -2085,29 +2085,31 @@
     "description": "填写提供器标识到标准设施HTTP（超文本传输协议）桥接配置的映射。每项包含type=http、base_url及可选authorization_env（认证环境变量名）。空对象表示没有设施控制能力；楼层和入口出口通过建筑目录登记。"
   },
   "NUWAX_GEOMETRY_POINTLIO_OPTIONS": {
-    "zh_name": "PointLIO参数覆盖（JSON）",
+    "zh_name": "逐点激光惯性定位参数",
     "type": "str",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "localization",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
       "services/nuwax-workspace/crates/nuwax-lio-backends/src/pointlio_options.rs"
     ],
     "apply_scope": "重启几何运行时及Point原生进程后生效；停止建图不会重载",
-    "description": "填写参数对象，例如 {\"point_filter_num\":1,\"lidar_meas_cov\":0.001,\"use_imu_as_input\":true,\"publish_odometry_without_downsample\":true}。支持惯性模式、噪声、盲区/量程、抽点、索引、初始化及逐点输出；字段和类型严格校验，未知或当前不支持的键会拒绝。扫描/地图体素、初图扫描数和外参仍使用各自设置，避免重复来源。留空沿用程序缺省值。"
+    "description": "填写参数对象，例如 {\"point_filter_num\":1,\"lidar_meas_cov\":0.001,\"use_imu_as_input\":true,\"publish_odometry_without_downsample\":true}。支持惯性模式、噪声、盲区/量程、抽点、索引、初始化及逐点输出；字段和类型严格校验，未知或当前不支持的键会拒绝。扫描/地图体素、初图扫描数和外参仍使用各自设置，避免重复来源。留空沿用程序缺省值。",
+    "advanced": false
   },
   "NUWAX_GEOMETRY_PGO_OPTIONS": {
-    "zh_name": "库内PGO参数覆盖（JSON）",
+    "zh_name": "扫描上下文、回环与位姿图参数",
     "type": "str",
     "default": "",
-    "section_id": "geometry_runtime",
+    "section_id": "loop_closure",
     "target_file": "core_env",
     "consumers": [
       "services/geometry/nuwax_geometry_runtime/src/correction_coordinator.rs",
       "services/nuwax-workspace/crates/nuwax-mapping/src/loop_closure/options.rs"
     ],
     "apply_scope": "重启几何运行时后生效，无需重新构建；停止建图不会重载",
-    "description": "仅library_pgo使用，按所选前端默认值叠加覆盖。留空或{}恢复默认。示例：{\"max_correspondence_distance\":0.3,\"max_loop_mse\":0.01,\"min_loop_overlap_ratio\":0.7,\"loop_confirmation_frames\":3,\"loop_confirmation_interval_secs\":2,\"min_loop_separation_secs\":60,\"min_loop_interval_secs\":60,\"stationary_probe_interval_secs\":5}。距离单位米，均方误差平方米，覆盖率0到1，间隔秒。还支持关键帧平移/旋转（keyframe_translation/keyframe_rotation，米/弧度）、搜索半径loop_search_radius、最低支持点数min_keyframe_points、子图体素submap_resolution_m、子图半宽loop_submap_half_range、搜索最低关键帧数min_keyframes_for_loop_search、配准迭代数icp_max_iterations和优化迭代数optimizer_max_iterations。字段、类型及范围严格校验。"
+    "description": "按参数覆盖扫描上下文检索、回环配准与确认、图约束和优化预算；空白项使用所选定位后端默认。修改后重启几何运行时，无需重新构建。",
+    "advanced": false
   }
 }

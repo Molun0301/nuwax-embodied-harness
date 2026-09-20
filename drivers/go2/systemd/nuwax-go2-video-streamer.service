@@ -25,6 +25,10 @@ EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
+# 活动方案最后加载；物化的业务值可由共同加载器和热加载入口更新。
+Environment=NUWAX_ROBOT_PROFILE_MODE=1
+Environment=NUWAX_CONFIG_FROM_SYSTEMD_FILES=1
+EnvironmentFile=-@NUWAX_REPO_ROOT@/runtime_data/settings/active.env
 # 视频发送器不依赖 GO2_DATA_PLANE_ENABLED；它只依赖锁定的 WebRTC 包、
 # Go2 IP/key 配置和 geometry runtime 提供的 UDS 中转。
 ExecStart=/usr/bin/env PYTHONUNBUFFERED=1 PYTHONPATH=@NUWAX_REPO_ROOT@ @NUWAX_PYTHON_BIN@ -m drivers.go2.video_streamer

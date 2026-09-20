@@ -1,7 +1,7 @@
 """设置读取、展示与原子保存。
 
 编辑值、当前进程已读取值、来源和默认值分别返回；预览使用隔离上下文。
-生产新写入统一用户文件，本地继续写项目配置；修改按服务范围重启生效。
+新保存统一写机器人方案；显式旧入口兼容，热加载与重启由网关应用层协调。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,8 @@ except ImportError:  # pragma: no cover
 from core import config_registry as R
 from contracts.navigation_pipeline import resolve_navigation_profile
 from core.config_values import RUNTIME_VALUES, config_snapshot, read_env_values, parse_env_line, env_assignment
+from core.config_values import configuration_location, configuration_sources, configuration_file_values
+from core.config_effects import apply_mode, apply_scope
 from core.robot_geometry import (
     ROBOT_GEOMETRY_SETTING_KEYS, RobotGeometryConfig, RobotGeometryError,
     normalize_robot_geometry_setting, resolve_robot_geometry,
@@ -39,6 +42,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CORE_ENV = _REPO_ROOT / ".env"
 _GO2_ENV = _REPO_ROOT / "drivers" / "go2" / "data_plane.env"
 _USER_SETTINGS_TARGET = "user_settings_env"
+_ROBOT_PROFILE_TARGET = "robot_profile_env"
+_PROFILE_LOCATION = ContextVar("settings_profile_location", default=None)
 _POINTCLOUD3D_KEY_PREFIX = "NUWAX_GATEWAY_POINTCLOUD3D_"
 _POINTCLOUD3D_TARGET = "gateway_pointcloud3d_env"
 _POINTCLOUD3D_ENV_FILENAME = "pointcloud3d.env"
@@ -284,6 +289,8 @@ def _pointcloud3d_env_path() -> Path:
 
 
 def _target_path(target_file: str) -> Path:
+    if target_file == _ROBOT_PROFILE_TARGET:
+        return _PROFILE_LOCATION.get()["path"]
     if target_file == _USER_SETTINGS_TARGET:
         return Path(os.environ["NUWAX_USER_CONFIG_ENV_FILE"]).expanduser()
     if target_file == _POINTCLOUD3D_TARGET:
@@ -294,6 +301,8 @@ def _target_path(target_file: str) -> Path:
 
 
 def _save_target(key: str, registry_target: str) -> str:
+    if _PROFILE_LOCATION.get() is not None:
+        return _ROBOT_PROFILE_TARGET
     if os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", "").strip():
         return _USER_SETTINGS_TARGET
     # 本地旧部署可能把设备设置放在根文件；更新真正生效的已有来源。
@@ -329,6 +338,12 @@ def _schema_file_snapshot():
 def _current_value(key: str) -> str:
     """当前值：专用覆盖文件优先，其次进程环境、core .env 和 go2 env。"""
 
+    location = _PROFILE_LOCATION.get()
+    if location:
+        values = {}
+        for path in configuration_sources(root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]):
+            values.update(configuration_file_values(path, reader=_read_env_values))
+        return values.get(key, "")
     user_path = os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", "").strip()
     if user_path:
         values = _read_env_values(Path(user_path).expanduser())
@@ -366,7 +381,7 @@ def _format_config_value(value: Any, typ: str) -> str:
     return str(value)
 
 
-def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str], *, defaults: bool = False) -> Dict[str, str]:
+def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str], *, defaults: bool = False, environment=None) -> Dict[str, str]:
     """独立上下文解析配置，不修改正在运行的模块或进程环境。"""
     values = {}
     for item in R.build_registry():
@@ -377,7 +392,7 @@ def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str
         values[item.key] = _format_config_value(value, item.type)
     try:
         from core import settings
-        with config_snapshot({} if defaults else core_vals, {} if defaults else None) as recorded:
+        with config_snapshot({} if defaults else core_vals, {} if defaults else environment) as recorded:
             settings.load_config()
         for key, value in recorded.items():
             item = R.get_field(key)
@@ -389,10 +404,16 @@ def _collect_effective_values(core_vals: Dict[str, str], go2_vals: Dict[str, str
     return values
 
 
+@lru_cache(maxsize=1)
+def _default_values():
+    """默认解析不依赖用户文件，进程内只构建一次；不缓存含秘密的设置响应。"""
+    return _collect_effective_values({}, {}, defaults=True)
+
+
 def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
     """只在设置查询中解析一次外形；这是下次启动输入的预览，不是进程生效证明。"""
     keys = ROBOT_GEOMETRY_SETTING_KEYS | {"NUWAX_ACTIVE_ROBOT", "NUWAX_NAV_ROBOT_WIDTH_M"}
-    values = {key: os.environ.get(key, file_values.get(key, "")) for key in keys}
+    values = {key: file_values.get(key, "") if _PROFILE_LOCATION.get() else os.environ.get(key, file_values.get(key, "")) for key in keys}
     base = {"configuration_source": "saved_files_plus_environment", "effective_confirmed": False}
     try:
         geometry = resolve_robot_geometry(
@@ -423,27 +444,45 @@ def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
 
 
 @_schema_file_snapshot()
-def build_schema() -> Dict[str, object]:
+def build_schema(robot=None, profile=None) -> Dict[str, object]:
+    location = configuration_location(root=_CORE_ENV.parent, robot=robot, profile=profile)
+    token = _PROFILE_LOCATION.set(location)
+    try:
+        if location:
+            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"):
+                return _build_schema(location)
+        return _build_schema(location)
+    finally:
+        _PROFILE_LOCATION.reset(token)
+
+
+def _build_schema(location) -> Dict[str, object]:
     """构建前端 schema：按板块分组，含当前值（敏感脱敏）、默认值、常规/高级标记。"""
 
     from core import settings
-    legacy_vals = _read_env_values(settings.LEGACY_CONFIG_FILE)
-    core_file_vals = _read_env_values(_core_env_path())
+    legacy_vals = {} if location else _read_env_values(settings.LEGACY_CONFIG_FILE)
+    core_file_vals = {} if location else _read_env_values(_core_env_path())
     core_vals = dict(legacy_vals)
     core_vals.update(core_file_vals)
-    go2_vals = _read_env_values(_go2_env_path())
-    geometry_owner_vals = _read_env_values(_geometry_owner_env_path())
-    pointcloud3d_vals = _read_env_values(_pointcloud3d_env_path())
+    go2_vals = {} if location else _read_env_values(_go2_env_path())
+    geometry_owner_vals = {} if location else _read_env_values(_geometry_owner_env_path())
+    pointcloud3d_vals = {} if location else _read_env_values(_pointcloud3d_env_path())
     user_path = os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", "").strip()
     user_vals = _read_env_values(Path(user_path).expanduser()) if user_path else {}
+    if location:
+        user_vals = {}
+        for path in configuration_sources(root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]):
+            user_vals.update(configuration_file_values(path, reader=_read_env_values))
+        user_vals["NUWAX_ACTIVE_ROBOT"] = location["robot"]
+        user_path = str(location["path"])
     effective_core_vals = dict(core_vals)
     effective_core_vals.update(geometry_owner_vals)
     effective_core_vals.update(pointcloud3d_vals)
     effective_core_vals.update(user_vals)
     robot_geometry_preview = _robot_geometry_preview(effective_core_vals)
-    effective_vals = _collect_effective_values(effective_core_vals, go2_vals)
+    effective_vals = _collect_effective_values(effective_core_vals, go2_vals, environment={} if location else None)
 
-    default_vals = _collect_effective_values({}, {}, defaults=True)
+    default_vals = _default_values()
 
     def saved_value(field: R.ConfigField):
         candidates = [(user_vals, user_path, "user_file")]
@@ -466,7 +505,7 @@ def build_schema() -> Dict[str, object]:
         return None, "", "default"
 
     source_labels = {
-        "user_file": "统一用户设置文件", "file": "配置文件",
+        "user_file": "机器人配置方案" if location else "统一用户设置文件", "file": "配置文件",
         "environment": "进程环境", "default": "程序默认值",
         "legacy_file": "旧版配置", "legacy_environment": "旧版环境别名",
     }
@@ -478,11 +517,13 @@ def build_schema() -> Dict[str, object]:
         sections[sid] = {"section_id": sid, "section_title": title, "fields": []}
 
     for f in R.build_registry():
+        if location and location["robot"] != "go2" and f.key.startswith("GO2_"):
+            continue
         saved, source_path, source = saved_value(f)
         raw_value = saved
-        if raw_value is None and f.key in os.environ:
+        if raw_value is None and f.key in os.environ and not location:
             raw_value, source = os.environ[f.key], "environment"
-        if raw_value is None:
+        if raw_value is None and not location:
             for alias in f.aliases:
                 if alias in os.environ:
                     raw_value, source = os.environ[alias], "legacy_environment"
@@ -490,7 +531,14 @@ def build_schema() -> Dict[str, object]:
         edit_value = raw_value if raw_value is not None else effective_vals.get(f.key, default_vals.get(f.key, ""))
         known = f.key in RUNTIME_VALUES
         effective_value = _format_config_value(RUNTIME_VALUES[f.key], f.type) if known else os.environ.get(f.key, edit_value)
-        pending = f.key in _SAVED_SINCE_START or (raw_value is not None and str(edit_value) != str(effective_value))
+        pending = f.key in _SAVED_SINCE_START or (known and str(edit_value) != str(effective_value))
+        if location:
+            startup = effective_value if known else os.environ.get(f.key, settings._FILE_VALUES.get(f.key, default_vals.get(f.key, "")))
+            normalized_saved = _validate(f.key, str(edit_value), f.type)
+            normalized_startup = _validate(f.key, str(startup), f.type)
+            pending = normalized_saved != normalized_startup
+            if apply_mode(f.key) == "hot_and_restart" and (str(location["path"]), f.key) in _SAVED_SINCE_START:
+                pending = True
         def masked(value):
             return _SENSITIVE_MASK if f.sensitive and value else value
         display_value = masked(edit_value)
@@ -520,7 +568,10 @@ def build_schema() -> Dict[str, object]:
             "effective_value_known": known,
             "default_value": masked(default_vals.get(f.key, "")),
             "pending_restart": pending,
-            "apply_scope": f.apply_scope,
+            "apply_scope": apply_scope(f.key, f.apply_scope),
+            "apply_mode": apply_mode(f.key),
+            "options_schema": R.structured_options().get(f.key),
+            "readonly": bool(location and f.key == "NUWAX_ACTIVE_ROBOT"),
             "target_path": str(_target_path(_save_target(f.key, f.target_file))),
             "source_path": source_path,
             "consumers": list(f.consumers),
@@ -529,13 +580,16 @@ def build_schema() -> Dict[str, object]:
         })
 
     ordered = [sections[sid] for sid, _t in R.SECTIONS if sections[sid]["fields"]]
+    from core.config_profiles import profile_catalog
     return {
         "sections": ordered,
-        "field_count": len(R.build_registry()),
-        "effect_note": "保存后按各项生效范围重启服务；编辑值来自文件，当前进程已读取值单独显示。外部进程未回报的值不标为已确认生效。",
+        "field_count": sum(len(section["fields"]) for section in ordered),
+        "effect_note": "显示、监控及支持在线调整的参数保存后热加载；算法状态、设备和通信设置按提示重启。已保存值与进程读取值分别展示。",
         "geometry_backend_structure_matrix": [status.as_dict() for status in geometry_statuses],
         "geometry_backend_matrix": [status.as_dict() for status in geometry_statuses if status.enabled],
         "robot_geometry_preview": robot_geometry_preview,
+        "profile_context": profile_catalog(
+            root=_CORE_ENV.parent, robot=location["robot"], profile=location["profile"]) if location else None,
     }
 
 
@@ -578,6 +632,20 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    from core.config_effects import HOT_FIELDS
+    if key.startswith("NUWAX_LOG_LEVEL_") and v.upper() not in {"", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        return None
+    if key in HOT_FIELDS and typ in {"float", "int"}:
+        try:
+            number = float(v)
+        except ValueError:
+            return None
+        if not math.isfinite(number) or number < 0:
+            return None
+        if key in {"NUWAX_PERCEPTION_YOLO_WORLD_CONFIDENCE", "NUWAX_PERCEPTION_YOLO_WORLD_IOU"} and number > 1:
+            return None
+        if typ == "int" and number < 1:
+            return None
     if key == "NUWAX_GEOMETRY_PGO_OPTIONS":
         try:
             from contracts.pgo_options import normalize_pgo_options
@@ -716,22 +784,15 @@ def _target_lock(path: Path):
 
 
 def _atomic_write(path: Path, content: str) -> str:
-    """原子写并保持目标文件 owner/group/mode，只保留一个固定备份。"""
+    """原子写并保持目标文件权限；不为每次设置保存制造重复备份。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.stat() if path.exists() else None
     target_uid = existing.st_uid if existing is not None else os.geteuid()
     target_gid = existing.st_gid if existing is not None else path.parent.stat().st_gid
-    target_mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o640
+    target_mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o600
 
     backup = ""
-    if existing is not None:
-        backup = str(path) + ".bak"
-        backup_path = Path(backup)
-        backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-        os.chmod(str(backup_path), target_mode)
-        os.chown(str(backup_path), target_uid, target_gid)
-
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg_", suffix=".tmp")
     try:
         os.fchmod(fd, target_mode)
@@ -741,19 +802,38 @@ def _atomic_write(path: Path, content: str) -> str:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
     return backup
 
 
-def save_values(updates: Dict[str, str]) -> SaveResult:
+def save_values(updates: Dict[str, str], *, robot=None, profile=None, expected_revision=None) -> SaveResult:
+    location = configuration_location(root=_CORE_ENV.parent, robot=robot, profile=profile)
+    token = _PROFILE_LOCATION.set(location)
+    try:
+        if location:
+            from core.config_profiles import check_revision
+            with _target_lock(_CORE_ENV.parent / "runtime_data" / "settings" / "transaction"):
+                check_revision(location, expected_revision, root=_CORE_ENV.parent)
+                return _save_values(updates)
+        return _save_values(updates)
+    finally:
+        _PROFILE_LOCATION.reset(token)
+
+
+def _save_values(updates: Dict[str, str]) -> SaveResult:
     """校验并写回一批配置项。
 
     规则：
     - 未知键 / 类型非法 → rejected，不写。
     - 敏感键值等于脱敏掩码或为空串（未改动）→ skipped，不覆盖原密钥。
-    - 点云显示项写入网关可写覆盖文件；其余按 registry target_file 原子写回。
+    - 机器人方案统一写回；显式旧入口按真实目标文件保存。
     """
 
     written: Dict[str, List[str]] = {}
@@ -762,6 +842,10 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
     per_target: Dict[str, Dict[str, str]] = {}
 
     for key, raw in updates.items():
+        location = _PROFILE_LOCATION.get()
+        if key == "NUWAX_ACTIVE_ROBOT" and location and raw.strip() != location["robot"]:
+            rejected[key] = "请在机器人配置选择框中切换机器人，不能改写方案的所属机器人"
+            continue
         field = R.get_field(key)
         if field is None:
             rejected[key] = "未知配置键"
@@ -798,9 +882,13 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
             kv["NUWAX_NAV_PROFILE"] = resolve_navigation_profile(kv["NUWAX_GEOMETRY_PIPELINE"])
         path = _target_path(target_file)
         with _target_lock(path):
+            existed = path.exists()
             original = path.read_text(encoding="utf-8") if path.exists() else ""
+            if not path.exists() and target_file == _ROBOT_PROFILE_TARGET:
+                from core.config_profiles import read_profile, render_values
+                original = render_values(read_profile(_PROFILE_LOCATION.get(), root=_CORE_ENV.parent))
             new_text = _apply_updates_to_text(original, kv)
-            if new_text == original:
+            if new_text == original and path.exists():
                 backups[target_file] = ""
                 readback = _read_env_values(path)
             else:
@@ -808,9 +896,10 @@ def save_values(updates: Dict[str, str]) -> SaveResult:
                 # 回读校验（仍在锁内，避免并发写者插入）
                 readback = _read_env_values(path)
         confirmed = [k for k, v in kv.items() if readback.get(k) == v]
-        if new_text != original:
-            _SAVED_SINCE_START.update(confirmed)
-        if backups.get(target_file) or new_text != original:
+        changed = new_text != original or not existed
+        if changed:
+            _SAVED_SINCE_START.update((str(path), key) if target_file == _ROBOT_PROFILE_TARGET else key for key in confirmed)
+        if changed:
             written[target_file] = sorted(confirmed)
         missing = set(kv) - set(confirmed)
         if missing:

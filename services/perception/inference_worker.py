@@ -75,14 +75,14 @@ def _worker_loop(
         if msg is None:  # 关闭信号
             break
 
-        shm_name, shape, dtype_str, req_id = msg
+        shm_name, shape, dtype_str, req_id, thresholds = msg
         shm: Optional[shared_memory.SharedMemory] = None
         try:
             shm = shared_memory.SharedMemory(name=shm_name)
             image_bgr = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=shm.buf)
 
             # 当前协议只返回首个结果，直接消费迭代器，避免为后续结果建立列表。
-            result = next(iter(model.predict(image_bgr, **predict_kwargs)), None)
+            result = next(iter(model.predict(image_bgr, **dict(predict_kwargs, **thresholds))), None)
 
             # 提取原始检测结果为可序列化格式
             xyxy_np: Optional[np.ndarray] = None
@@ -341,6 +341,12 @@ class YoloInferenceWorker:
             self.stop()
         return False
 
+    def update_thresholds(self, *, confidence_threshold, iou_threshold, max_detections) -> None:
+        """下一帧请求携带阈值快照；不终止正在使用的推理进程。"""
+        with self._predict_lock:
+            self._predict_kwargs.update(conf=float(confidence_threshold), iou=float(iou_threshold),
+                                        max_det=int(max_detections))
+
     def predict(
         self,
         image_bgr: np.ndarray,
@@ -379,7 +385,8 @@ class YoloInferenceWorker:
                 if remaining <= 0.0:
                     raise TimeoutError("worker_request_timeout")
                 request_queue.put(
-                    (self._shm.name, image_bgr.shape, str(image_bgr.dtype), req_id),
+                    (self._shm.name, image_bgr.shape, str(image_bgr.dtype), req_id,
+                     {key: self._predict_kwargs[key] for key in ("conf", "iou", "max_det")}),
                     timeout=remaining,
                 )
                 while True:

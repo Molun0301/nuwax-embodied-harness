@@ -30,6 +30,8 @@ GEOMETRY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service
 PERSON_FOLLOW_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-person-follow.service"
 RUNTIME_ACTIVATION_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.service"
 RUNTIME_ACTIVATION_PATH_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.path"
+SETTINGS_APPLY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-settings-apply.service"
+SETTINGS_APPLY_PATH_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-settings-apply.path"
 GATEWAY_UNIT_SOURCE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
 VIDEO_STREAMER_UNIT_SOURCE="${REPO_ROOT}/drivers/go2/systemd/nuwax-go2-video-streamer.service"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
@@ -81,6 +83,8 @@ DEPLOYMENT_UNITS=(
   nuwax-person-follow.service
   nuwax-runtime-activation.service
   nuwax-runtime-activation.path
+  nuwax-settings-apply.service
+  nuwax-settings-apply.path
   nuwax-host-gateway.service
   nuwax-go2-video-streamer.service
 )
@@ -285,7 +289,7 @@ check_unit_templates() {
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
                 "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
-                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${SETTINGS_APPLY_UNIT_SOURCE}" "${SETTINGS_APPLY_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
                 "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     render_unit_to "${source}" "${rendered_dir}/$(basename "${source}")"
   done
@@ -786,7 +790,7 @@ systemd_sources_changed() {
   rendered_dir="$(mktemp -d)"
   for source in "${GUARD_UNIT_SOURCE}" "${NAV_UNIT_SOURCE}" "${GEOMETRY_UNIT_SOURCE}" \
                 "${PERSON_FOLLOW_UNIT_SOURCE}" "${LCM_NETWORK_UNIT_SOURCE}" "${RUNTIME_ACTIVATION_UNIT_SOURCE}" \
-                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
+                "${RUNTIME_ACTIVATION_PATH_SOURCE}" "${SETTINGS_APPLY_UNIT_SOURCE}" "${SETTINGS_APPLY_PATH_SOURCE}" "${GATEWAY_UNIT_SOURCE}" \
                 "${VIDEO_STREAMER_UNIT_SOURCE}"; do
     unit="$(basename "${source}")"
     render_unit_to "${source}" "${rendered_dir}/${unit}"
@@ -1093,6 +1097,8 @@ install_sources() {
     render_unit "${PERSON_FOLLOW_UNIT_SOURCE}" /etc/systemd/system/nuwax-person-follow.service
     render_unit "${RUNTIME_ACTIVATION_UNIT_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.service
     render_unit "${RUNTIME_ACTIVATION_PATH_SOURCE}" /etc/systemd/system/nuwax-runtime-activation.path
+    render_unit "${SETTINGS_APPLY_UNIT_SOURCE}" /etc/systemd/system/nuwax-settings-apply.service
+    render_unit "${SETTINGS_APPLY_PATH_SOURCE}" /etc/systemd/system/nuwax-settings-apply.path
     render_unit "${GATEWAY_UNIT_SOURCE}" /etc/systemd/system/nuwax-host-gateway.service
     render_unit "${VIDEO_STREAMER_UNIT_SOURCE}" /etc/systemd/system/nuwax-go2-video-streamer.service
     systemctl daemon-reload
@@ -1100,6 +1106,11 @@ install_sources() {
   else
     rm -f "${SYSTEMD_BACKUP_DIR}/sources.changed"
   fi
+  install -d -o "${PROJECT_USER}" -g "${PROJECT_GROUP}" -m 2770 "${REPO_ROOT}/runtime_data/settings"
+  local robot_directory=""
+  for robot_directory in go2 g1 customrobot raspi_lidar_robot; do
+    install -d -o "${PROJECT_USER}" -g "${PROJECT_GROUP}" -m 2770 "${REPO_ROOT}/drivers/${robot_directory}/configs"
+  done
   echo "deployment files installed; provision durable records before enabling the stack"
 }
 
@@ -1116,6 +1127,7 @@ enable_stack() {
   systemctl disable nuwax-runtime-activation.service
   systemctl enable nuwax-lcm-network.service
   systemctl enable nuwax-runtime-activation.path
+  systemctl enable nuwax-settings-apply.path
   systemctl enable nuwax-host-gateway.service
   systemctl enable nuwax-go2-video-streamer.service
   echo "enabled base services: Gateway + Go2 video + runtime activation watcher; motion components start on demand"
@@ -1138,6 +1150,7 @@ start_stack() {
   systemctl restart nuwax-lcm-network.service
   rm -f /run/nuwax/gateway/geometry.request /run/nuwax/gateway/geometry.result.json
   systemctl restart nuwax-runtime-activation.path
+  systemctl start nuwax-settings-apply.path
   systemctl restart nuwax-host-gateway.service
   systemctl restart nuwax-go2-video-streamer.service
   echo "started base services: Gateway + Go2 video + runtime activation watcher; motion components remain idle"

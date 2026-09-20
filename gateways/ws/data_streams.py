@@ -96,7 +96,7 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
 )
 # 连接恢复总要携带当前状态，事件历史仍按游标续传；不在回放完成后另读新快照。
 _REPLAY_SNAPSHOT_TOPICS = _LATEST_ONLY_STREAM_TOPICS | frozenset({
-    "runtime.governance", "pointcloud_map.meta", "exploration.state", "system.metrics",
+    "runtime.governance", "pointcloud_map.meta", "exploration.state", "system.metrics", "settings.display",
 })
 _TERMINAL_TASK_EVENT_TYPES = frozenset(
     {

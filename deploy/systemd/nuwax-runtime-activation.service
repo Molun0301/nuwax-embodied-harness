@@ -15,6 +15,10 @@ Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
+# 活动方案最后加载；物化的业务值可由共同加载器和热加载入口更新。
+Environment=NUWAX_ROBOT_PROFILE_MODE=1
+Environment=NUWAX_CONFIG_FROM_SYSTEMD_FILES=1
+EnvironmentFile=-@NUWAX_REPO_ROOT@/runtime_data/settings/active.env
 Environment=NUWAX_RUNTIME_ACTIVATION_REQUEST=/run/nuwax/gateway/geometry.request
 Environment=NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.json
 Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock

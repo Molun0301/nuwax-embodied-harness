@@ -1169,20 +1169,8 @@ stop_gateway() {
 }
 
 
-GO2_DATA_PLANE_ENV_FILE="${GO2_DATA_PLANE_ENV_FILE:-${REPO_ROOT}/drivers/go2/data_plane.env}"
-load_env_file "${GO2_DATA_PLANE_ENV_FILE}"
-load_env_file "${REPO_ROOT}/.config"
-load_env_file "${ENV_FILE}"
-GATEWAY_WEB_CONFIG_ENV_FILE="${NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE:-$(default_gateway_web_config_env_file)}"
-export NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE="${GATEWAY_WEB_CONFIG_ENV_FILE}"
-if [[ -f "${GATEWAY_WEB_CONFIG_ENV_FILE}" ]]; then
-  # Web 覆盖文件只能影响无安全敏感性的点云显示项。
-  load_env_file "${GATEWAY_WEB_CONFIG_ENV_FILE}" "NUWAX_GATEWAY_POINTCLOUD3D_"
-fi
-
-if [[ -n "${NUWAX_USER_CONFIG_ENV_FILE:-}" ]]; then
-  load_env_file "${NUWAX_USER_CONFIG_ENV_FILE}"
-fi
+load_platform_config
+export NUWAX_SETTINGS_LAUNCHER="${NUWAX_SETTINGS_LAUNCHER:-${REPO_ROOT}/scripts/start_gateway.sh}"
 RESTART_POLICY="${NUWAX_GATEWAY_RESTART:-on-failure}"
 RESTART_SEC="${NUWAX_GATEWAY_RESTART_SEC:-3}"
 RESTART_MAX_ATTEMPTS="${NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS:-0}"

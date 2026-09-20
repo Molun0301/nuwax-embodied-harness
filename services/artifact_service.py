@@ -19,6 +19,10 @@ class ArtifactService:
         self._store = store
         self._retention_policy = retention_policy
 
+    def update_retention_policy(self, policy: ArtifactRetentionPolicy) -> None:
+        """替换完整策略，下一次正常清理使用新值；保存设置不主动清理数据。"""
+        self._retention_policy = policy
+
     def save_image_frame(
         self,
         image_frame: ImageFrame,

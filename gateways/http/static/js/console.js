@@ -18,7 +18,7 @@
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "tasks.state", "system.metrics"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "tasks.state", "system.metrics", "settings.display"];
       const POSE_STREAM_TOPICS = ["localization.pose", "map.frame"];
       const LOG_STREAM_TOPICS = ["logs.entry"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
@@ -4300,7 +4300,8 @@
         "video.detections",
         "memory.instances",
         "tasks.state",
-        "system.metrics"
+        "system.metrics",
+        "settings.display"
       ].filter(topic => !PLANAR_PIPELINE || !topic.startsWith("pointcloud"));
       const POINTCLOUD3D_STREAM_TOPICS = new Set([
         "map.frame",
@@ -5007,6 +5008,10 @@
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
           updateTaskFrame(frame);
+        } else if (frame.topic === "settings.display") {
+          window.__NUWAX_POINTCLOUD3D_CONFIG__ = frame.payload;
+          window.dispatchEvent(new CustomEvent("settings:display", { detail: frame.payload }));
+          updateOverviewForFrame = false;
         } else if (frame.topic === "system.metrics") {
           updateSystemMetrics(frame.payload);
           updateOverviewForFrame = false;

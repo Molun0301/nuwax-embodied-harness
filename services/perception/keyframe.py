@@ -45,6 +45,12 @@ class PerceptionKeyframeSelector:
         self._last_keyframe_at = None
         self._last_keyframe_pose = None
 
+    def update_thresholds(self, *, min_interval_sec, translation_threshold_m, yaw_threshold_deg) -> None:
+        """由感知运行锁保护，保留上一关键帧及位姿基准。"""
+        self._min_interval_sec = max(0.05, float(min_interval_sec))
+        self._translation_threshold_m = max(0.0, float(translation_threshold_m))
+        self._yaw_threshold_rad = math.radians(max(0.0, float(yaw_threshold_deg)))
+
     def decide(
         self,
         *,

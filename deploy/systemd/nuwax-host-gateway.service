@@ -55,11 +55,15 @@ Environment=NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock
 Environment=NUWAX_LOG_DIR=/var/log/nuwax/gateway
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/nuwax.env
 EnvironmentFile=-@NUWAX_CONFIG_DIR@/go2-data-plane.env
-# Web 仅写共享状态目录中的三项 Geometry owner 选择；后置加载覆盖只读基础配置。
+# 旧几何选择仅作迁移兼容；活动机器人方案在文件链末尾加载。
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/geometry-owner.env
 Environment=NUWAX_USER_CONFIG_ENV_FILE=/var/lib/nuwax_robot_bridge/settings.env
 EnvironmentFile=-/var/lib/nuwax/gateway/pointcloud3d.env
 EnvironmentFile=-/var/lib/nuwax_robot_bridge/settings.env
+# 活动方案最后加载；物化的业务值可由共同加载器和热加载入口更新。
+Environment=NUWAX_ROBOT_PROFILE_MODE=1
+Environment=NUWAX_CONFIG_FROM_SYSTEMD_FILES=1
+EnvironmentFile=-@NUWAX_REPO_ROOT@/runtime_data/settings/active.env
 # 统一启动入口会按 .env 中的 NUWAX_ACTIVE_ROBOT 与 NUWAX_GEOMETRY_ENABLED 加载运行环境。
 # 平台文件日志路径由 .env 中的 NUWAX_LOG_* 控制。
 ExecStart=/usr/bin/env NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD=true NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD=true NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD=true NUWAX_RUNTIME_ACTIVATION_REQUEST=/run/nuwax/gateway/geometry.request NUWAX_RUNTIME_ACTIVATION_RESULT=/run/nuwax/gateway/geometry.result.json NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY=false NUWAX_GATEWAY_PID_FILE=/run/nuwax/gateway/gateway.pid NUWAX_GATEWAY_LOCK_FILE=/run/nuwax/gateway/start_gateway.lock /bin/bash @NUWAX_REPO_ROOT@/scripts/start_gateway.sh
@@ -71,5 +75,6 @@ SuccessExitStatus=0
 # 建议通过宿主机目录持久化日志和制品
 ReadWritePaths=/run/nuwax/gateway /var/log/nuwax/gateway /var/lib/nuwax/gateway /var/lib/nuwax_robot_bridge /tmp
 
+ReadWritePaths=@NUWAX_REPO_ROOT@/runtime_data/settings @NUWAX_REPO_ROOT@/drivers/go2/configs @NUWAX_REPO_ROOT@/drivers/g1/configs @NUWAX_REPO_ROOT@/drivers/customrobot/configs @NUWAX_REPO_ROOT@/drivers/raspi_lidar_robot/configs
 [Install]
 WantedBy=multi-user.target

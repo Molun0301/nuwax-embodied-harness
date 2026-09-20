@@ -157,6 +157,11 @@ class Go2ProviderBundle(
 
         return self.subscribe_localization(publish_latest)
 
+    def get_sensor_input_executor(self):
+        """暴露独立输入执行器，由平台装配交付逻辑。"""
+        getter = getattr(self.assembly.data_plane, "get_sensor_input_executor", None)
+        return getter() if callable(getter) else None
+
     def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
         subscriber = getattr(self.assembly.data_plane, "subscribe_sensor_sample", None)
         return subscriber(callback) if callable(subscriber) else None

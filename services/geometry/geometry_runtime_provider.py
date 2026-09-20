@@ -4661,7 +4661,7 @@ class GeometryRuntimeProvider:
         dense_payload = self._download_graph_artifact(response.dense_cloud_artifact, MAX_DENSE_ARCHIVE_BYTES) if response.HasField("dense_cloud_artifact") else None
         return _checkpoint_export_bundle_from_proto(response, payload, fine_payload, dense_payload)
 
-    def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0):
+    def get_dense_cloud_chunk(self, *, expected_epoch="", offset_points=0, allow_delta=False):
         """读取当前规范提交中的完整扫描前缀，不触发启动或建图。"""
         self._raise_if_stopping("get_dense_cloud_chunk")
         if not self._connected or not self._stub:
@@ -4672,14 +4672,14 @@ class GeometryRuntimeProvider:
             token = self._map_delivery_token_locked()
         try:
             response = self._stub.GetDenseCloudChunk(pb2.DenseCloudChunkRequest(
-                expected_epoch=expected_epoch, offset_points=offset_points, max_points=DENSE_CHUNK_POINTS,
+                expected_epoch=expected_epoch, offset_points=offset_points, max_points=DENSE_CHUNK_POINTS, allow_delta=allow_delta,
             ), timeout=5.0)
         except grpc.RpcError as error:
             raise GeometryRuntimeRpcError.from_rpc_error("GetDenseCloudChunk", error) from error
         with self._map_delivery_condition:
             if token != self._map_delivery_token_locked() or self._mapping_transition_inflight:
                 raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
-        return dense_chunk_payload(response, expected_epoch=expected_epoch, offset_points=offset_points)
+        return dense_chunk_payload(response, expected_epoch=expected_epoch, offset_points=offset_points, allow_delta=allow_delta)
 
     def _selected_mapping_backend_state(self) -> Dict[str, Any]:
         state = self.get_mapping_state()
@@ -7407,6 +7407,15 @@ class GeometryRuntimeProvider:
         finally:
             transaction_context.notification = None
             transaction_context.active = False
+
+    def take_goal_submission_result(self, goal_id: str):
+        """领取本线程本次提交的结果；不读取可能已被另一目标覆盖的全局状态。"""
+        context = self._nav_set_transaction_context
+        result = getattr(context, "result", None)
+        context.result = None
+        if isinstance(result, tuple) and len(result) == 3 and result[0] == goal_id:
+            return {"goal_id": result[0], "accepted": result[1], "message": result[2]}
+        return None
 
     def _set_goal_transaction(
         self,

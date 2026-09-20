@@ -19,6 +19,14 @@ from contracts.naming import validate_frame_id
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 
+class SensorStreamFailure(ContractModel):
+    """来源停止完整交付的终态通知，不属于可用于估计的传感器样本。"""
+
+    model_config = ConfigDict(frozen=True)
+    reason: str = Field(min_length=1)
+    source_timestamp_ns: int = Field(default=0, ge=0)
+
+
 class SensorKind(StrEnum):
     """传感器类别。"""
 

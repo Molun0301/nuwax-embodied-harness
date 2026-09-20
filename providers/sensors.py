@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Protocol, runtime_checkable
 
-from contracts.sensors import SensorDescriptor, SensorSample
+from contracts.sensors import SensorDescriptor, SensorSample, SensorStreamFailure
 from providers.base import BaseProvider
 
 
@@ -24,7 +24,7 @@ class StreamingSensorSampleProvider(BaseProvider, Protocol):
     单传感器的描述查询仍由独立的 SensorDescriptorProvider 提供。
     """
 
-    def subscribe_sensor_sample(self, callback: Callable[[SensorSample], None]) -> Optional[int]:
+    def subscribe_sensor_sample(self, callback: Callable[[SensorSample | SensorStreamFailure], None]) -> Optional[int]:
         """订阅规范化传感器样本。"""
 
     def unsubscribe_sensor_sample(self, subscription_id: Optional[int]) -> None:

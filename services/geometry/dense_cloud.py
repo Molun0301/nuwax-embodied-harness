@@ -73,14 +73,31 @@ def validate_dense_archive(payload, *, session=None, generation=None, cloud_revi
     return metadata
 
 
-def dense_chunk_payload(response, *, expected_epoch="", offset_points=0):
+def dense_chunk_payload(response, *, expected_epoch="", offset_points=0, allow_delta=False):
     """检查远端有界分块，整数身份以字符串交给浏览器。"""
     data = bytes(response.xyz_f32_le)
-    if not response.epoch or len(response.epoch) > 128 or (expected_epoch and response.epoch != expected_epoch):
+    ranges = list(response.removed_ranges)
+    base_epoch = response.base_epoch
+    removed_count = 0
+    previous_end = 0
+    if base_epoch:
+        if not allow_delta or not expected_epoch or base_epoch != expected_epoch or response.base_offset_points != offset_points:
+            raise ValueError("完整点云增量基准不一致")
+        if len(ranges) % 2 or len(ranges) > 8192:
+            raise ValueError("完整点云删除区间非法")
+        for start, count in zip(ranges[::2], ranges[1::2]):
+            if count == 0 or start < previous_end or start + count > offset_points:
+                raise ValueError("完整点云删除区间越界或重叠")
+            previous_end = start + count
+            removed_count += count
+    elif ranges:
+        raise ValueError("完整点云删除缺少基准")
+    actual_offset = offset_points - removed_count
+    if not response.epoch or len(response.epoch) > 128 or (expected_epoch and response.epoch != expected_epoch and not base_epoch):
         raise ValueError("完整点云分块来源不一致")
-    if response.offset_points != offset_points or len(data) % 12 or len(data) > DENSE_CHUNK_POINTS * 12:
+    if response.offset_points != actual_offset or len(data) % 12 or len(data) > DENSE_CHUNK_POINTS * 12:
         raise ValueError("完整点云分块位置或长度不符")
-    if response.total_points < offset_points + len(data) // 12 or (not data and offset_points != response.total_points):
+    if response.total_points < actual_offset + len(data) // 12 or (not data and actual_offset != response.total_points):
         raise ValueError("完整点云分块点数不符")
     if not response.frame_id or not response.session_id or response.revision == 0 or response.session_generation == 0:
         raise ValueError("完整点云分块缺少地图身份")
@@ -89,13 +106,18 @@ def dense_chunk_payload(response, *, expected_epoch="", offset_points=0):
         for low, high in zip(response.bounds_min, response.bounds_max)
     ) or not np.isfinite(np.frombuffer(data, dtype="<f4")).all():
         raise ValueError("完整点云分块坐标或边界非法")
-    return {
+    metadata = {
         "epoch": response.epoch, "frame_id": response.frame_id, "session_id": response.session_id,
         "session_generation": str(response.session_generation), "revision": str(response.revision),
         "source_timestamp_ns": str(response.source_timestamp_ns), "total_points": str(response.total_points),
         "offset_points": str(response.offset_points), "point_count": len(data) // 12,
         "bounds_min": list(response.bounds_min), "bounds_max": list(response.bounds_max),
-    }, data
+    }
+    if base_epoch:
+        metadata.update(base_epoch=base_epoch, base_offset_points=str(offset_points), removed_range_bytes=len(ranges) * 8)
+        # 删除区间置于二进制体，避免大响应头超过代理限制。
+        data = struct.pack("<%dQ" % len(ranges), *ranges) + data
+    return metadata, data
 
 
 class SavedDenseCloudCache:

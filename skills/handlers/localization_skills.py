@@ -20,12 +20,28 @@ import logging
 from typing import Any, Dict, Optional
 
 from contracts.map_workspace import MapGeoreferenceV1
+from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
 from core.errors import GatewayError
 from skills.common import params
 from skills.common.context import SkillContext
 
 _LOGGER = logging.getLogger("nuwax_robot_bridge.skills.localization")
 _FINALIZE_ACTIVE_MAP_ARGUMENTS = frozenset({"map_name", "reason", "georeference"})
+
+
+def handle_list_forbidden_zones(ctx: SkillContext, payload: Dict[str, Any], *, requested_by=None):
+    """读取同一导航服务持有的禁行区。"""
+    return ctx.navigation_service.list_forbidden_zones(map_name=params.optional_str(payload, "map_name"))
+
+
+def handle_replace_forbidden_zones(ctx: SkillContext, payload: Dict[str, Any], *, requested_by=None):
+    """两类调用方共同执行结构校验、版本检查及运行时应用。"""
+    request = ReplaceForbiddenZonesRequest.model_validate(payload)
+    return ctx.navigation_service.replace_forbidden_zones(
+        map_name=request.map_name,
+        zones=request.zones,
+        expected_generation=request.expected_generation,
+    )
 
 
 def _parse_map_georeference(payload: Dict[str, Any]) -> Optional[MapGeoreferenceV1]:

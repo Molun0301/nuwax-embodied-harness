@@ -672,6 +672,13 @@ impl CloudMapShmWriter {
         self.dense_cloud.as_mut().ok_or("完整点云拥有方已退役")?.pin_read(latest, epoch, offset).map(Some)
     }
 
+    pub(crate) fn dense_cloud_update_for_read(&mut self, epoch: &str, offset: u64)
+        -> Result<Option<(DenseSnapshot, Option<DenseSnapshot>)>, String> {
+        let Some(latest) = self.committed_dense_cloud()? else { return Ok(None); };
+        self.dense_cloud.as_mut().ok_or("完整点云拥有方已退役")?
+            .pin_update(latest, epoch, offset).map(Some)
+    }
+
     pub(crate) fn dense_read_epoch_available(&self, epoch: &str) -> bool {
         self.dense_error.is_none() && self.dense_cloud.as_ref().is_some_and(|cloud| cloud.read_epoch_available(epoch))
     }

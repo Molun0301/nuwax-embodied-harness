@@ -35,6 +35,7 @@ from contracts.capabilities import (
 from contracts.base import MetadataDict, utc_now
 from contracts.events import RuntimeEventCategory, RuntimeEventSeverity
 from contracts.frame_semantics import frame_ids_semantically_equal
+from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.map_workspace import (
@@ -373,6 +374,11 @@ class _PendingExplorationAdmission:
     motion_stop_generation: int
 
 
+@dataclass(frozen=True)
+class _PendingNavigationAdmission(_PendingExplorationAdmission):
+    """选点任务受理身份；后台准备完成后才申请实际运动许可。"""
+
+
 class _RuntimeActivationEvent(threading.Event):
     """只在一次在途启动内共享结果，后续独立请求仍可重新尝试。"""
 
@@ -474,6 +480,7 @@ _MOTION_STACK_CAPABILITY_NAMES = frozenset(
         "resume_building_exploration",
         "resume_exploration",
         "navigate_to_pose",
+        "navigate_to_place",
         "navigate_to_named_location",
         "find_target",
         "explore_area",
@@ -1907,7 +1914,7 @@ class GatewayRuntime:
     _POINTCLOUD_MAP_ERROR_BACKOFF_MAX_SEC = 2.0
     _POINTCLOUD_MAP_STOP_JOIN_TIMEOUT_SEC = 5.0
 
-    def get_dense_cloud_chunk(self, *, expected_epoch: str = "", offset_points: int = 0):
+    def get_dense_cloud_chunk(self, *, expected_epoch: str = "", offset_points: int = 0, allow_delta: bool = False):
         """按当前显示来源读取完整点云，换图后的旧请求不能继续交付。"""
         if self._closed:
             raise RuntimeError("网关已关闭")
@@ -1923,7 +1930,7 @@ class GatewayRuntime:
         before = source_identity()
         provider = platform.get_geometry_runtime_provider()
         if provider is not None and (before is None or before[0] == "live"):
-            result = provider.get_dense_cloud_chunk(expected_epoch=expected_epoch, offset_points=offset_points)
+            result = provider.get_dense_cloud_chunk(expected_epoch=expected_epoch, offset_points=offset_points, **({"allow_delta": True} if allow_delta else {}))
         else:
             source = platform.get_saved_dense_cloud_source()
             if source is None:
@@ -3245,6 +3252,7 @@ class GatewayRuntime:
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
+                        "goal_id": {"type": "string", "minLength": 1, "description": "可选客户端目标标识；省略时由平台生成。"},
                         "map_name": {"type": "string"},
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
@@ -3262,6 +3270,37 @@ class GatewayRuntime:
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
                 timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
                 cancel_supported=True,
+            ),
+            _descriptor(
+                "navigate_to_place",
+                "导航到地图地点",
+                "查询已完成地图中的地点并向原地图导航拥有方提交目标，返回目标受理回执。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object({
+                    "query_text": {"type": "string", "minLength": 1},
+                    "query_request_id": {"type": "string", "minLength": 1},
+                }, required=("query_text",)),
+                output_schema={"type": "object"},
+                required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
+            ),
+            _descriptor(
+                "list_forbidden_zones",
+                "读取地图禁行区",
+                "读取指定地图的禁行区；省略地图名时使用当前地图。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"map_name": {"type": "string"}}),
+                output_schema={"type": "object"},
+            ),
+            _descriptor(
+                "replace_forbidden_zones",
+                "替换地图禁行区",
+                "按地图和预期版本替换禁行区，沿导航服务完成必要停车、持久化与运行时确认。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=ReplaceForbiddenZonesRequest.model_json_schema(),
+                output_schema={"type": "object"},
             ),
             _descriptor(
                 "cancel_navigation",
@@ -3629,6 +3668,9 @@ class GatewayRuntime:
             "navigate_to_floor": self._handle_navigate_to_floor,
             "resume_floor_navigation": self._handle_resume_floor_navigation,
             "navigate_to_pose": self._handle_navigate_to_pose,
+            "navigate_to_place": self._handle_navigate_to_place,
+            "list_forbidden_zones": partial(localization_skills.handle_list_forbidden_zones, self._skill_ctx),
+            "replace_forbidden_zones": partial(localization_skills.handle_replace_forbidden_zones, self._skill_ctx),
             "navigate_to_named_location": self._handle_navigate_to_named_location,
             "cancel_navigation": self._handle_cancel_navigation,
             "get_navigation_state": self._handle_get_navigation_state,
@@ -4102,6 +4144,16 @@ class GatewayRuntime:
                 capability_name="follow_target",
             ),
         )
+        skills += tuple(
+            SkillDescriptor(
+                name=name,
+                display_name=self.capability_registry.get_descriptor(name).display_name,
+                description=self.capability_registry.get_descriptor(name).description,
+                category=SkillCategory.TASK if name == "navigate_to_place" else SkillCategory.SYSTEM,
+                capability_name=name,
+            )
+            for name in ("navigate_to_place", "list_forbidden_zones", "replace_forbidden_zones")
+        )
         private_skills = tuple(
             SkillDescriptor(
                 name=spec.name,
@@ -4276,7 +4328,7 @@ class GatewayRuntime:
 
         registration = self.capability_registry.get_registration(capability_name)
         descriptor = registration.descriptor
-        self._refresh_dynamic_capability_matrix()
+        self._refresh_dynamic_capability_matrix(capability_names=(capability_name,))
         self.capability_registry.assert_supported(
             capability_name,
             robot_model=self.robot.manifest.robot_model,
@@ -4313,6 +4365,12 @@ class GatewayRuntime:
                         request_id=str(context.get("request_id") or ""),
                         motion_stop_generation=self.safety_guard.begin_motion_admission(),
                     )
+                )
+            elif descriptor.name == "navigate_to_pose":
+                payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = _PendingNavigationAdmission(
+                    capability_name=descriptor.name,
+                    request_id=str(context.get("request_id") or ""),
+                    motion_stop_generation=self.safety_guard.begin_motion_admission(),
                 )
             elif self._requires_motion_admission(descriptor):
                 payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = (
@@ -6621,24 +6679,38 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "navigate_to_pose",
-        )
-        map_name, workspace = self._resolve_map_workspace_for_request(
-            arguments,
-            capability_name="navigate_to_pose",
-            requested_by=requested_by,
-            create_if_missing=False,
-        )
-        self._refresh_workspace_snapshots()
-        self._ensure_localization_for_navigation(
-            capability_name="navigate_to_pose",
-            map_name=map_name,
-            workspace=workspace,
-            requested_by=requested_by,
-            arguments=arguments,
-        )
+        motion_admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
+        pending = isinstance(motion_admission, _PendingNavigationAdmission)
+        if pending and motion_admission.capability_name != "navigate_to_pose":
+            raise RuntimeError("导航准备请求的能力身份不匹配")
+        if not pending:
+            motion_admission = self._require_motion_admission(arguments, "navigate_to_pose")
+        map_name = str(arguments.get("map_name") or "").strip()
+        workspace = None
+        if pending:
+            map_name = map_name or self.map_workspace_service.get_active_map_name()
+            if not map_name:
+                raise GatewayError("请先选择地图。", error_code="map_not_activated")
+
+        def prepare_navigation():
+            nonlocal map_name, workspace, current_localization_session_id
+            map_name, workspace = self._resolve_map_workspace_for_request(
+                {**arguments, **({"map_name": map_name} if map_name else {})},
+                capability_name="navigate_to_pose", requested_by=requested_by, create_if_missing=False,
+            )
+            self._refresh_workspace_snapshots()
+            self._ensure_localization_for_navigation(
+                capability_name="navigate_to_pose", map_name=map_name, workspace=workspace,
+                requested_by=requested_by, arguments=arguments,
+            )
+            current_localization_session_id = (
+                workspace.active_localization_session.session_id
+                if workspace is not None and workspace.active_localization_session is not None else None
+            )
+
+        current_localization_session_id = None
+        if not pending:
+            prepare_navigation()
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
         # 导航强制执行只使用 `force_runtime_goal` 单一 key。
@@ -6648,7 +6720,7 @@ class GatewayRuntime:
         if force_runtime_goal:
             goal_metadata["force_runtime_goal"] = True
         goal = NavigationGoal(
-            goal_id=self._build_runtime_request_id("nav_pose"),
+            goal_id=str(arguments.get("goal_id") or "").strip() or self._build_runtime_request_id("nav_pose"),
             map_name=map_name,
             target_pose=pose,
             tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
@@ -6661,11 +6733,6 @@ class GatewayRuntime:
         verify_on_arrival = bool(arguments.get("verify_on_arrival", False))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
         target_name_hint = str(arguments.get("target_name") or goal.target_name or "navigate_to_pose").strip()
-        current_localization_session_id = (
-            workspace.active_localization_session.session_id
-            if workspace is not None and workspace.active_localization_session is not None
-            else None
-        )
         return self._submit_navigation_task(
             capability_name="navigate_to_pose",
             goal=goal,
@@ -6674,6 +6741,7 @@ class GatewayRuntime:
             timeout_sec=timeout_sec,
             requested_by=requested_by,
             request_context=request_context,
+            **({"prepare_callback": prepare_navigation} if pending else {}),
             completion_callback=(
                 (
                     lambda _navigation_context: self._build_navigation_arrival_result(
@@ -6691,6 +6759,30 @@ class GatewayRuntime:
                 )
                 if verify_on_arrival
                 else None
+            ),
+        )
+
+    def _handle_navigate_to_place(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """人和智能体复用同一地图查询、运动准入与目标拥有方。"""
+        del requested_by
+        query_text = self._require_str(arguments, "query_text")
+        query_request_id = str(arguments.get("query_request_id") or "").strip() or self._build_runtime_request_id("place")
+        admission = self._require_motion_admission(arguments, "navigate_to_place")
+        return self._run_with_motion_admission(
+            admission,
+            lambda: self.map_workspace_service.submit_mapping_cloud_goal(
+                query_request_id=query_request_id,
+                query_text=query_text,
+                motion_admission={
+                    "guard_generation": admission.generation,
+                    "guard_boot_nonce": admission.boot_nonce,
+                    "motion_stop_generation": admission.guard_motion_stop_generation,
+                },
             ),
         )
 
@@ -11834,13 +11926,28 @@ class GatewayRuntime:
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
         completion_callback=None,
+        prepare_callback=None,
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
-        goal = self._goal_with_motion_admission(goal, motion_admission)
+        if not isinstance(motion_admission, _PendingNavigationAdmission):
+            goal = self._goal_with_motion_admission(goal, motion_admission)
         poll_interval_sec = max(0.02, poll_interval_sec)
 
-        def runner(context) -> Dict[str, Any]:
+        def runner(context, goal=goal, motion_admission=motion_admission) -> Dict[str, Any]:
             parent_deadline = context.timeout_deadline_monotonic()
+            if isinstance(motion_admission, _PendingNavigationAdmission):
+                pending = motion_admission
+                context.ensure_active()
+                context.update(progress=0.01, stage="prepare_navigation", message="导航请求已受理，正在准备运行时。")
+                self._run_with_motion_admission(pending, lambda: None)
+                motion_admission = self._admit_motion_request(capability_name,
+                    request_id=pending.request_id, deadline_monotonic=parent_deadline)
+                self._run_with_motion_admission(pending, lambda: None)
+                context.ensure_active()
+                if prepare_callback is not None:
+                    prepare_callback()
+                context.ensure_active()
+                goal = self._goal_with_motion_admission(goal, motion_admission)
             self._ensure_motion_runtime_for_backend_call(
                 capability_name,
                 motion_admission,
@@ -11859,10 +11966,27 @@ class GatewayRuntime:
                 )
                 return last_context, generation_snapshot
 
-            last_context, generation_snapshot = self._run_with_motion_admission(
-                motion_admission,
-                submit_goal,
-            )
+            def wait_and_submit():
+                # 等待只占本任务线程；每次实际提交仍复核原全局停车代次。
+                while True:
+                    context.ensure_active()
+                    try:
+                        return self._run_with_motion_admission(motion_admission, submit_goal)
+                    except GatewayError as error:
+                        if error.error_code != "navigation_goal_rejected" or error.details.get("backend_code") not in {
+                            "PLANNER_NOT_READY", "PLANNER_INPUT_UNOBSERVED", "PLANNER_INPUT_STALE",
+                            "TF_UNOBSERVED", "TF_STALE", "TF_INCOMPLETE",
+                        }:
+                            raise
+                        context.update(progress=0.02, stage="waiting_navigation_inputs",
+                            message="目标已保留，等待导航输入恢复：" + error.message,
+                            payload={"goal_id": goal.goal_id, "backend_code": error.details.get("backend_code")})
+                        remaining = context.timeout_remaining_sec()
+                        if remaining is not None and remaining <= 0:
+                            context.ensure_active()
+                        time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
+
+            last_context, generation_snapshot = wait_and_submit()
             self._record_task_generation_snapshot(context, generation_snapshot)
             finalized = False
             context.update(
@@ -11936,6 +12060,14 @@ class GatewayRuntime:
                                 "target_name": goal.target_name,
                             },
                         )
+                    if status == NavigationStatus.FAILED and str(last_context.navigation_state.message or "").startswith("SafetyFailed cause=StaleInput:"):
+                        proof = self._navigation_terminal_proof(last_context, goal_id=goal.goal_id,
+                            allowed_statuses={NavigationStatus.FAILED.value})
+                        if proof:
+                            context.update(stage="waiting_navigation_inputs", message="输入暂时失鲜，已确认停车；保留目标等待恢复。")
+                            last_context, generation_snapshot = wait_and_submit()
+                            self._record_task_generation_snapshot(context, generation_snapshot)
+                            continue
                     if status == NavigationStatus.FAILED:
                         raise GatewayError(
                             last_context.navigation_state.message or "导航执行失败。",
@@ -13418,15 +13550,19 @@ class GatewayRuntime:
                 details={"camera_frame": camera_frame, "reason": str(exc)},
             ) from exc
 
-    def _refresh_dynamic_capability_matrix(self) -> None:
+    def _refresh_dynamic_capability_matrix(self, *, capability_names: Optional[Tuple[str, ...]] = None) -> None:
         if not self._gateway_capability_names:
             return
         base_matrix = self._base_capability_matrix
-        merged_capabilities = {item.name: item for item in base_matrix.capabilities}
-        for capability_name in self._gateway_capability_names:
+        base_capabilities = {item.name: item for item in base_matrix.capabilities}
+        merged_capabilities = dict(base_capabilities) if capability_names is None else {}
+        names = self._gateway_capability_names if capability_names is None else (
+            name for name in capability_names if name in self._gateway_capability_names
+        )
+        for capability_name in names:
             merged_capabilities[capability_name] = self._build_gateway_capability_availability(
                 capability_name,
-                fallback=merged_capabilities.get(capability_name),
+                fallback=base_capabilities.get(capability_name),
             )
         self.capability_registry.bind_robot_capability_matrix(
             CapabilityMatrix(
@@ -13436,7 +13572,8 @@ class GatewayRuntime:
                     **dict(base_matrix.metadata),
                     "runtime_gateway": "enabled",
                 },
-            )
+            ),
+            merge=capability_names is not None,
         )
 
     def _sync_perception_runtime_for_memory_state(self, *, enabled: bool) -> None:
@@ -14525,6 +14662,10 @@ class GatewayRuntime:
                 None,
             ),
             "navigate_to_pose": (
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
+            ),
+            "navigate_to_place": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),

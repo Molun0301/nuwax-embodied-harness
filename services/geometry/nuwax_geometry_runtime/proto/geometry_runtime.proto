@@ -409,6 +409,7 @@ message DenseCloudChunkRequest {
   string expected_epoch = 1;
   uint64 offset_points = 2;
   uint32 max_points = 3;
+  bool allow_delta = 4;
 }
 message DenseCloudChunk {
   string epoch = 1;
@@ -422,6 +423,10 @@ message DenseCloudChunk {
   bytes xyz_f32_le = 9;
   repeated float bounds_min = 10;
   repeated float bounds_max = 11;
+  // 增量基于请求已安装前缀；删除区间为旧前缀中的起点和长度。
+  string base_epoch = 12;
+  uint64 base_offset_points = 13;
+  repeated uint64 removed_ranges = 14;
 }
 
 // === 导航兼容 ===

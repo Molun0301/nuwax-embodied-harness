@@ -124,6 +124,17 @@ class MappingRecorder:
             self._condition.notify_all()
             return True
 
+    def record_transport_loss(self, count: int) -> None:
+        """记录跨进程通道未能保留的证据数量，不反向阻塞控制输入。"""
+        with self._condition:
+            if count > 0:
+                self._dropped += count
+                now = time.time_ns()
+                if self._first_dropped_ns is None:
+                    self._first_dropped_ns = now
+                self._last_dropped_ns = now
+                self._condition.notify_all()
+
     def record_sensor(self, sample) -> bool:
         """在配组、丢弃和降采样之前保存原规范输入，保留每束时间及惯性值。"""
         if not isinstance(sample, tuple(SENSOR_TYPES.values())):

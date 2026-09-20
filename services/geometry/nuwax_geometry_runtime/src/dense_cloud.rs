@@ -360,6 +360,19 @@ impl DenseCloud {
         Ok(snapshot)
     }
 
+    /// 捕获删除前缀的基准和最新快照；差异计算在拥有方锁外执行。
+    pub fn pin_update(
+        &mut self, latest: DenseSnapshot, epoch: &str, offset: u64,
+    ) -> Result<(DenseSnapshot, Option<DenseSnapshot>), String> {
+        self.readers.retain(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
+        let base = if !epoch.is_empty() && epoch != latest.epoch {
+            Some(self.readers.iter().find(|(_, old)| old.epoch == epoch && offset <= old.point_count)
+                .map(|(_, old)| old.clone()).ok_or("DENSE_CLOUD_SOURCE_CHANGED")?)
+        } else { None };
+        let latest = self.pin_read(latest, "", 0)?;
+        Ok((latest, base))
+    }
+
     pub fn read_epoch_available(&self, epoch: &str) -> bool {
         self.epoch == epoch
             || self.readers.iter().any(|(at, snapshot)| {
@@ -411,6 +424,44 @@ impl DenseCloud {
 }
 
 impl DenseSnapshot {
+    /// 只返回已安装旧前缀中消失的区间，保留全部幸存点的顺序和坐标。
+    pub fn removed_prefix_ranges(&self, old: &Self, offset: u64) -> Result<Vec<u64>, String> {
+        if !Arc::ptr_eq(&self.file, &old.file) || self.session_id != old.session_id
+            || self.receipt.session_generation != old.receipt.session_generation || offset > old.point_count {
+            return Err("DENSE_CLOUD_SOURCE_CHANGED".into());
+        }
+        let mut ranges: Vec<u64> = Vec::new();
+        let mut logical = 0_u64;
+        for (index, page) in old.pages.iter().enumerate() {
+            if logical >= offset { break; }
+            let current = self.pages.get(index).ok_or("DENSE_CLOUD_SOURCE_CHANGED")?;
+            if Arc::ptr_eq(page, current) {
+                logical += page.count.min(offset - logical);
+                continue;
+            }
+            for (word_index, &bits) in page.visible.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 && logical < offset {
+                    let bit = bits.trailing_zeros();
+                    if current.visible[word_index] & (1_u64 << bit) == 0 {
+                        let n = ranges.len();
+                        if n >= 2 && ranges[n - 2] + ranges[n - 1] == logical {
+                            ranges[n - 1] += 1;
+                        } else {
+                            // 差异过大时显式重新领取，避免无界响应。
+                            if n >= 8192 { return Err("DENSE_CLOUD_SOURCE_CHANGED".into()); }
+                            ranges.extend_from_slice(&[logical, 1]);
+                        }
+                    }
+                    logical += 1;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        if logical != offset { return Err("DENSE_CLOUD_SOURCE_CHANGED".into()); }
+        Ok(ranges)
+    }
+
     pub fn read(&self, offset: u64, count: u32) -> Result<Vec<u8>, String> {
         if count == 0 || count > CHUNK_POINTS || offset > self.point_count {
             return Err("完整点云分块位置或大小非法".into());
@@ -669,6 +720,31 @@ mod tests {
         assert_eq!(after.read(0, 12_000).unwrap(), expected);
         assert_eq!(cloud.remove_voxels(&[(40, 0, 20)], 0.05).unwrap(), 1);
         assert_eq!(cloud.snapshot(&receipt(5), "预算回退").unwrap().read(0, 12_000).unwrap(), expected);
+    }
+
+    #[test]
+    fn delta_keeps_surviving_prefix_and_unread_points_through_multiple_removals() {
+        let mut cloud = DenseCloud::new().unwrap();
+        let points = (0..10_000).map(|i| Point3::new(i as f64 * 0.1 + 0.025, 0.025, 1.025)).collect::<Vec<_>>();
+        cloud.append(&points).unwrap();
+        let old = cloud.snapshot(&receipt(1), "增量").unwrap();
+        cloud.pin_update(old.clone(), "", 0).unwrap();
+        cloud.remove_voxels(&[(4, 0, 20), (8000, 0, 20), (18000, 0, 20)], 0.05).unwrap();
+        cloud.append(&[Point3::new(9999.025, 0.025, 1.025)]).unwrap();
+        let current = cloud.snapshot(&receipt(2), "增量").unwrap();
+        let ranges = current.removed_prefix_ranges(&old, 5000).unwrap();
+        assert_eq!(ranges, vec![2, 1, 4000, 1]);
+        let old_bytes = old.read(0, 5000).unwrap();
+        let mut installed = Vec::new();
+        for (i, point) in old_bytes.chunks_exact(12).enumerate() {
+            if i != 2 && i != 4000 { installed.extend_from_slice(point); }
+        }
+        installed.extend_from_slice(&current.read(4998, CHUNK_POINTS).unwrap());
+        assert_eq!(installed, current.read(0, CHUNK_POINTS).unwrap());
+        let (_, base) = cloud.pin_update(current.clone(), &old.epoch, 5000).unwrap();
+        assert!(base.is_some());
+        let replacement = DenseCloud::new().unwrap();
+        assert!(!replacement.read_epoch_available(&old.epoch));
     }
 
     #[test]

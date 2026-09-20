@@ -177,7 +177,6 @@
       y: pose.y,
       z: pose.z,
       yaw_rad: pose.yaw,
-      timeout_sec: 60,
     }).then(function (resp) {
       const taskId = resp && resp.task_id;
       if (!taskId) throw new Error('网关响应缺少导航任务标识，无法确认受理。');

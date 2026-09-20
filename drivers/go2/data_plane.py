@@ -413,8 +413,12 @@ def _load_go2_official_sdk_modules(
 class Go2DirectDdsBridge:
     """Go2 官方 DDS 原始输入桥（直连 unitree_sdk2py，绕开 ROS2 中间层）。"""
 
-    def __init__(self, config: "Go2DataPlaneConfig") -> None:
+    def __init__(self, config: "Go2DataPlaneConfig", *, isolate_native_input: bool = False) -> None:
         self.config = config
+        self._isolate_native_input = isolate_native_input
+        self._sensor_process = None
+        self._sensor_process_status = {}
+        self._sensor_process_failure = None
         # 原生定位两类样本共用创建时标定；设备自带模式不消费或验证定位覆盖。
         self._calibration_profile = (
             go2_calibration_profile_from_config(config.lio_body_from_sensor, config.lio_body_from_imu)
@@ -571,7 +575,10 @@ class Go2DirectDdsBridge:
         with self._lock:
             callback_id = self._next_subscription_id()
             self._sensor_sample_callbacks[callback_id] = callback
-            return callback_id
+            failure = self._sensor_process_failure
+        if failure is not None:
+            callback(failure)
+        return callback_id
 
     def unsubscribe_sensor_sample(self, callback_id: int) -> None:
         with self._lock:
@@ -686,7 +693,8 @@ class Go2DirectDdsBridge:
                 "direct_dds_started": self._direct_dds_started and active_generation is not None,
                 "lifecycle_generation": self._lifecycle_generation,
                 "active_generation": active_generation,
-                "input_timing": self._input_timing_snapshot_locked(),
+                "input_timing": self._sensor_process_status.get("input_timing", {}) if self._sensor_process is not None else self._input_timing_snapshot_locked(),
+                "sensor_process_pid": getattr(self._sensor_process, "pid", None),
                 "dds_pose_ready": pose_active,
                 "dds_imu_ready": imu_active,
                 "dds_cloud_ready": point_cloud_active,
@@ -900,6 +908,19 @@ class Go2DirectDdsBridge:
         if not getattr(self.config, "direct_dds", None) or not self.config.direct_dds.enabled:
             self._record_point_cloud_bridge_error("Go2 DirectDDS 后端未启用")
             return
+        if self._isolate_native_input and self.config.lio_backend in {"fastlio2", "pointlio"}:
+            from drivers.go2.sensor_process import Go2SensorProcess
+            worker = Go2SensorProcess(self.config,
+                forward_samples=False,
+                on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
+                on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),
+                on_error=lambda message, stamp: self._fail_sensor_process(message, stamp, generation))
+            self._sensor_process = worker
+            self._sensor_process_failure = None
+            with self._lock:
+                self._direct_dds_started = True
+            worker.start()
+            return
         modules = _load_go2_official_sdk_modules(self.config, include_dds_topics=True)
         if modules is None:
             message = "Go2 DirectDDS SDK 模块加载失败"
@@ -1046,6 +1067,10 @@ class Go2DirectDdsBridge:
             raise RuntimeError(f"DirectDDS 读取线程启动失败：{exc}") from exc
 
     def _stop_direct_dds_backend(self) -> None:
+        worker = self._sensor_process
+        if worker is not None:
+            worker.close()
+            self._sensor_process = None
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
@@ -1080,6 +1105,62 @@ class Go2DirectDdsBridge:
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
+
+    def _fail_sensor_process(self, message: str, stamp: int, generation: int) -> None:
+        from contracts.sensors import SensorStreamFailure
+        failure = SensorStreamFailure(reason=message, source_timestamp_ns=stamp)
+        with self._lock:
+            if not self._is_generation_active_locked(generation):
+                return
+            self._sensor_process_failure = failure
+        self._publish_sensor_sample(failure, generation)
+        with self._lock:
+            if self._active_generation == generation:
+                self._direct_dds_started = False
+                self._invalidate_observations_locked(message)
+        LOGGER.error("Go2独立采集停止：%s", message)
+
+    def _install_process_snapshot(self, snapshot, generation: int) -> None:
+        pose, imu, cloud = snapshot["pose"], snapshot["imu"], snapshot["cloud"]
+        with self._lock:
+            if not self._is_generation_active_locked(generation) or self._sensor_process_failure is not None:
+                return
+            self._sensor_process_status = snapshot["status"]
+            if pose is not None:
+                self._latest_pose_from_dds = pose
+                self._latest_imu_state_from_dds = imu
+                self._latest_pose_generation = self._latest_imu_generation = generation
+                self._direct_pose_ready, self._direct_imu_ready = True, imu is not None
+                self._latest_pose_source = snapshot["status"].get("pose_source", "")
+                self._latest_imu_source_topic = snapshot["status"].get("imu_source_topic", "")
+                self._latest_imu_source_timestamp_ns = int(imu.timestamp.timestamp() * 1_000_000_000) if imu is not None else None
+            if cloud is not None:
+                self._latest_local_point_cloud = cloud
+                self._latest_point_cloud_generation = generation
+                self._direct_point_cloud_ready = True
+                self._last_accepted_point_cloud_source_timestamp_ns = cloud.metadata.get("source_timestamp_ns")
+                self._latest_point_cloud_source_topic = cloud.metadata.get("source_topic", "")
+                self._point_cloud_bridge_last_error = None
+            pose_callbacks = tuple(self._localization_callbacks.values()) if pose is not None else ()
+            cloud_callbacks = tuple(self._point_cloud_callbacks.values()) if cloud is not None else ()
+        for callback in pose_callbacks:
+            with self._lock:
+                if not self._is_generation_active_locked(generation):
+                    return
+            try:
+                callback(pose.model_copy(deep=False), FrameTree(root_frame_id=pose.frame_id),
+                         {**snapshot.get("pose_metadata", {}), "source_topic": self._latest_pose_source,
+                          "source_generation": generation, "dds_pose_ready": True, "dds_imu_ready": imu is not None})
+            except Exception:
+                LOGGER.debug("Go2进程显示位姿回调失败", exc_info=True)
+        for callback in cloud_callbacks:
+            with self._lock:
+                if not self._is_generation_active_locked(generation):
+                    return
+            try:
+                callback(cloud.model_copy(deep=False))
+            except Exception:
+                LOGGER.debug("Go2进程显示点云回调失败", exc_info=True)
 
     def _direct_pose_reader_loop(
         self,
@@ -1788,7 +1869,7 @@ class Go2DataPlaneRuntime:
     bridge: Optional[Go2DirectDdsBridge] = None
 
     def __post_init__(self) -> None:
-        self.bridge = self.bridge or Go2DirectDdsBridge(self.config)
+        self.bridge = self.bridge or Go2DirectDdsBridge(self.config, isolate_native_input=True)
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_condition = threading.Condition(self._lifecycle_lock)
@@ -2146,6 +2227,10 @@ class Go2DeviceDataPlane:
     """装配层使用的 Go2 窄设备数据面。"""
 
     runtime: Go2DataPlaneRuntime
+
+    def get_sensor_input_executor(self):
+        """仅返回当前代际已启动的采集进程。"""
+        return getattr(self.runtime.bridge, "_sensor_process", None)
 
     def start(self) -> None:
         self.runtime.start()

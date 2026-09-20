@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 
+from gateways.arguments import validate_closed_schema as _validate_closed_schema
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import (
@@ -290,10 +291,13 @@ def _build_collection_catalogs(
     refresh_availability: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     catalogs: Dict[str, Dict[str, Dict[str, Any]]] = {name: {} for name in _MCP_COLLECTIONS}
+    descriptors = runtime.skill_registry.list_descriptors()
     refresh = getattr(runtime, "_refresh_dynamic_capability_matrix", None)
     if refresh_availability and callable(refresh):
-        refresh()
-    descriptors = runtime.skill_registry.list_descriptors()
+        if tool_names is None:
+            refresh()
+        else:
+            refresh(capability_names=tuple(descriptor.capability_name for descriptor in descriptors if descriptor.name in tool_names))
     get_availability = getattr(runtime.capability_registry, "get_availability", None)
     robot_model = getattr(
         getattr(getattr(runtime, "robot", None), "manifest", None),
@@ -456,48 +460,6 @@ def _resolve_tool_invocation(
         details={"tool_name": tool_name},
     )
 
-
-def _validate_closed_schema(value: Any, schema: Dict[str, Any], *, path: str) -> None:
-    """Enforce the closed-object boundary advertised by MCP input schemas."""
-
-    if not isinstance(schema, dict):
-        return
-    schema_type = schema.get("type")
-    if schema_type == "object" or "properties" in schema:
-        if not isinstance(value, dict):
-            return
-        properties = schema.get("properties")
-        properties = properties if isinstance(properties, dict) else {}
-        if schema.get("additionalProperties") is False:
-            unexpected = sorted(str(key) for key in value if key not in properties)
-            if unexpected:
-                raise GatewayError(
-                    f"{path} 包含 schema 未声明的字段: {', '.join(unexpected)}。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                    details={
-                        "path": path,
-                        "unexpected_properties": unexpected,
-                    },
-                )
-        for key, child_schema in properties.items():
-            if key in value:
-                _validate_closed_schema(
-                    value[key],
-                    child_schema,
-                    path=f"{path}.{key}",
-                )
-        return
-    if schema_type == "array" and isinstance(value, list):
-        item_schema = schema.get("items")
-        if isinstance(item_schema, dict):
-            for index, item in enumerate(value):
-                _validate_closed_schema(
-                    item,
-                    item_schema,
-                    path=f"{path}[{index}]",
-                )
 
 
 def _negotiate_protocol_version(params: Dict[str, Any]) -> str:

@@ -10527,6 +10527,7 @@ class PlatformGeometryProviderBundle(
     runtime: PlatformGeometryRuntime
     provider_name: str = "platform_geometry_runtime"
     provider_version: str = "0.3.0"
+    _goal_submission_context: Any = field(default_factory=threading.local, init=False, repr=False)
 
     def is_available(self) -> bool:
         return self.runtime.is_available()
@@ -10806,6 +10807,7 @@ class PlatformGeometryProviderBundle(
         *,
         deadline_monotonic: Optional[float] = None,
     ):
+        self._goal_submission_context.result = None
         _exploration_deadline_remaining(deadline_monotonic, "SetNavigationGoal")
         if (
             not self._is_geometry_profile_enabled()
@@ -10827,11 +10829,22 @@ class PlatformGeometryProviderBundle(
                 target_pose.frame_id,
             )
         if deadline_monotonic is None:
-            return self._call_navigation_backend(backend, "set_goal", goal)
-        setter = getattr(backend, "set_goal", None)
-        if not callable(setter):
-            return False
-        return setter(goal, deadline_monotonic=deadline_monotonic)
+            accepted = self._call_navigation_backend(backend, "set_goal", goal)
+        else:
+            setter = getattr(backend, "set_goal", None)
+            if not callable(setter):
+                return False
+            accepted = setter(goal, deadline_monotonic=deadline_monotonic)
+        take_result = getattr(backend, "take_goal_submission_result", None)
+        if callable(take_result):
+            # 捕获实际提交的后端回执，之后即使挂接更换也不重新解析提供器。
+            self._goal_submission_context.result = take_result(goal.goal_id)
+        return accepted
+
+    def take_goal_submission_result(self, goal_id: str):
+        result = getattr(self._goal_submission_context, "result", None)
+        self._goal_submission_context.result = None
+        return result if isinstance(result, dict) and result.get("goal_id") == goal_id else None
 
     def cancel_goal(
         self,

@@ -603,7 +603,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
       // 优先贴近光标；四分之一像素内保留更靠近相机的命中，避免选到重叠层。
       nearestPixels = pixels;
       selected = { x: point.x, y: point.y, surface_z: point.z, frame_id: identity.header.frame_id,
-        source_key: this._cloudSourceKey, dense_epoch: this._pointStyle === 'full' ? this._denseCloud.epoch : null };
+        source_key: this._cloudSourceKey, dense_source: this._pointStyle === 'full' ? {
+          frame_id: this._denseCloud.metadata.frame_id,
+          session_id: this._denseCloud.metadata.session_id,
+          session_generation: this._denseCloud.metadata.session_generation,
+        } : null };
     }
     return selected;
   }
@@ -639,8 +643,12 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   navigationPointIsCurrent(point) {
+    const source = point?.dense_source;
+    const current = this._denseCloud?.metadata;
+    // 增量修订只更新地图内容，已经选定的地图坐标不依赖显示加载进度。
     return Boolean(this._pointCloudMapWatermark && point?.source_key === this._cloudSourceKey
-      && (!point.dense_epoch || (this._pointStyle === 'full' && point.dense_epoch === this._denseCloud?.epoch)));
+      && (!source || (current && source.frame_id === current.frame_id
+        && source.session_id === current.session_id && source.session_generation === current.session_generation)));
   }
 
   previewNavigationPoint(point) {

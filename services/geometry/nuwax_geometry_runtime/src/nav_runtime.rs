@@ -2040,10 +2040,12 @@ pub async fn compute_readiness(
     } else if !observations.planner_fresh {
         blockers.push(NavigationReadinessCode::PlannerInputStale);
     } else {
-        if !observations.planner_frame_matches {
+        if !observations.map_frame.trim().is_empty()
+            && !observations.pose_frame.trim().is_empty()
+            && !observations.planner_frame_matches {
             blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
         }
-        if !observations.planner_ready {
+        if !observations.planner_ready || !observations.planner_frame_matches {
             blockers.push(NavigationReadinessCode::PlannerNotReady);
         }
     }
@@ -2147,10 +2149,12 @@ fn compute_admission_readiness<'a>(
         } else if !observations.planner_fresh {
             blockers.push(NavigationReadinessCode::PlannerInputStale);
         } else {
-            if !observations.planner_frame_matches {
+            if !observations.map_frame.trim().is_empty()
+            && !observations.pose_frame.trim().is_empty()
+            && !observations.planner_frame_matches {
                 blockers.push(NavigationReadinessCode::PlannerFrameMismatch);
             }
-            if !observations.planner_ready {
+            if !observations.planner_ready || !observations.planner_frame_matches {
                 blockers.push(NavigationReadinessCode::PlannerNotReady);
             }
         }
@@ -7132,6 +7136,28 @@ mod tests {
         assert_eq!(after.tf_generation, 1);
         assert_eq!(after.planner_generation, 7);
         assert_eq!(after.motion_sink_generation, 11);
+    }
+
+    #[tokio::test]
+    async fn absent_planner_frames_report_unready_instead_of_frame_mismatch() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        observe_healthy_stack(&state).await;
+        let before = compute_readiness(&handle, &state).await;
+        assert!(before.blockers.contains(&NavigationReadinessCode::PlannerInputUnobserved));
+        for (map, pose) in [("", ""), ("map", ""), ("", "map")] {
+            state.observe_planner_input(PlannerInputObservation {
+                generation: 1, map_revision: 1, map_frame: map.into(), pose_frame: pose.into(), ready: false,
+            }).unwrap();
+            let detail = compute_readiness(&handle, &state).await;
+            assert!(!detail.ready);
+            assert!(detail.blockers.contains(&NavigationReadinessCode::PlannerNotReady));
+            assert!(!detail.blockers.contains(&NavigationReadinessCode::PlannerFrameMismatch));
+            let io = NavAdmissionIo::new(handle.state.clone(), handle.transport.clone(), handle.transport_backend_name, handle.lcm_backend_available);
+            let admission = compute_admission_readiness(&io, &state).await;
+            assert!(admission.blockers.contains(&NavigationReadinessCode::PlannerNotReady));
+            assert!(!admission.blockers.contains(&NavigationReadinessCode::PlannerFrameMismatch));
+        }
     }
 
     #[tokio::test]

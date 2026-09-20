@@ -1531,24 +1531,26 @@ class NavigationService:
                 goal,
                 deadline_monotonic=deadline_monotonic,
             )
+        take_result = getattr(provider, "take_goal_submission_result", None)
+        submission = take_result(goal.goal_id) if callable(take_result) else None
         if not accepted:
-            default_message = "导航后端拒绝目标 %s。" % goal.goal_id
-            message = (
-                self._navigation_provider_error_message(
-                    provider,
-                    default=default_message,
-                )
-                if deadline_monotonic is None
-                else default_message
-            )
+            message = "导航后端拒绝目标 %s。" % goal.goal_id
+            details = {"goal_id": goal.goal_id}
+            if submission and submission.get("goal_id") == goal.goal_id and not submission.get("accepted"):
+                message = submission.get("message") or message
+                details["backend_message"] = message
+                # 只解析本次事务回执中的机器代码，不从共享的最后状态猜测。
+                import re
+                match = re.search(r"SET_GOAL_REJECTED\[([A-Z0-9_]+)\]", message)
+                if match:
+                    details["backend_code"] = match.group(1)
             with _exploration_deadline_lock(
-                self._lock,
-                deadline_monotonic,
-                "SetNavigationGoal",
+                self._lock, deadline_monotonic, "SetNavigationGoal",
             ):
-                self._current_goal = None
-                self._state_machine.fail(message)
-            raise GatewayError(message)
+                if self._current_goal is goal:
+                    self._current_goal = None
+                    self._state_machine.fail(message)
+            raise GatewayError(message, error_code="navigation_goal_rejected", details=details)
         LOGGER.info("导航服务目标已被后端接收 goal_id=%s provider=%s", goal.goal_id, provider.provider_name)
         if deadline_monotonic is None:
             context = self.refresh_navigation()

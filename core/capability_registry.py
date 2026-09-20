@@ -37,6 +37,9 @@ PLATFORM_GEOMETRY_CAPABILITIES = frozenset(
         "get_active_map",
         "finalize_active_map",
         "navigate_to_pose",
+        "navigate_to_place",
+        "list_forbidden_zones",
+        "replace_forbidden_zones",
         "navigate_to_named_location",
         "explore_area",
         "explore_area_v2",
@@ -162,10 +165,19 @@ class CapabilityRegistry:
             self._registrations[descriptor.name] = registration
             return registration
 
-    def bind_robot_capability_matrix(self, matrix: CapabilityMatrix) -> None:
+    def bind_robot_capability_matrix(self, matrix: CapabilityMatrix, *, merge: bool = False) -> None:
         """绑定机器人能力矩阵。"""
 
         with self._lock:
+            previous = self._robot_matrices.get(matrix.robot_model)
+            if merge and previous is not None:
+                # 在同一锁内合并局部刷新，避免并发调用覆盖另一能力刚更新的结果。
+                capabilities = {item.name: item for item in previous.capabilities}
+                capabilities.update({item.name: item for item in matrix.capabilities})
+                matrix = matrix.model_copy(update={
+                    "capabilities": list(capabilities.values()),
+                    "metadata": {**dict(previous.metadata), **dict(matrix.metadata)},
+                })
             self._robot_matrices[matrix.robot_model] = matrix
 
     def list_names(self) -> Tuple[str, ...]:

@@ -12,14 +12,37 @@ function countValue(value) {
 
 export function decodeDenseChunk(metadata, buffer, epoch, offset) {
   if (!metadata || typeof metadata !== 'object') throw new Error('完整点云缺少分块元数据');
+  const ranges = [];
+  let removed = 0;
+  let rangeBytes = 0;
+  if (metadata.base_epoch !== undefined) {
+    rangeBytes = metadata.removed_range_bytes;
+    if (!epoch || metadata.base_epoch !== epoch || countValue(metadata.base_offset_points) !== offset
+        || !Number.isInteger(rangeBytes) || rangeBytes < 0 || rangeBytes > 65536 || rangeBytes % 16
+        || !(buffer instanceof ArrayBuffer) || rangeBytes > buffer.byteLength) {
+      throw new Error('完整点云增量基准非法');
+    }
+    const view = new DataView(buffer);
+    let end = 0;
+    for (let at = 0; at < rangeBytes; at += 16) {
+      const start = Number(view.getBigUint64(at, true));
+      const count = Number(view.getBigUint64(at + 8, true));
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(count) || count <= 0 || start < end || start + count > offset) {
+        throw new Error('完整点云删除区间非法');
+      }
+      ranges.push([start, count]);
+      end = start + count;
+      removed += count;
+    }
+  }
   const total = countValue(metadata.total_points);
   const start = countValue(metadata.offset_points);
   if (!metadata.epoch || typeof metadata.epoch !== 'string' || metadata.epoch.length > 128
-      || (epoch && metadata.epoch !== epoch) || start !== offset
+      || (epoch && metadata.epoch !== epoch && metadata.base_epoch !== epoch) || start !== offset - removed
       || !metadata.frame_id || !metadata.session_id || !/^[1-9][0-9]*$/.test(metadata.session_generation)
       || !/^[1-9][0-9]*$/.test(metadata.revision) || !/^[0-9]+$/.test(metadata.source_timestamp_ns)
-      || !(buffer instanceof ArrayBuffer) || buffer.byteLength % 12 || buffer.byteLength > CHUNK_POINTS * 12
-      || metadata.point_count !== buffer.byteLength / 12 || total < start + metadata.point_count
+      || !(buffer instanceof ArrayBuffer) || (buffer.byteLength - rangeBytes) % 12 || buffer.byteLength - rangeBytes > CHUNK_POINTS * 12
+      || metadata.point_count !== (buffer.byteLength - rangeBytes) / 12 || total < start + metadata.point_count
       || (metadata.point_count === 0 && start !== total)) {
     throw new Error('完整点云分块身份、位置或点数不符');
   }
@@ -28,9 +51,9 @@ export function decodeDenseChunk(metadata, buffer, epoch, offset) {
       || metadata.bounds_min.some((value, axis) => value > metadata.bounds_max[axis])) {
     throw new Error('完整点云范围非法');
   }
-  const positions = new Float32Array(buffer);
+  const positions = new Float32Array(rangeBytes ? buffer.slice(rangeBytes) : buffer);
   for (const value of positions) if (!Number.isFinite(value)) throw new Error('完整点云包含无效坐标');
-  return { positions, total, metadata };
+  return { positions, total, metadata, ranges };
 }
 
 function createMaterial(size) {
@@ -70,14 +93,16 @@ export class DensePointCloudLayer {
     this._abort = null;
   }
 
-  append({ positions, total, metadata }) {
-    if (this.epoch && (metadata.epoch !== this.epoch || total < this.total
+  append({ positions, total, metadata, ranges = [] }) {
+    const delta = this.epoch && metadata.base_epoch === this.epoch && countValue(metadata.base_offset_points) === this.count;
+    if (this.epoch && ((!delta && (metadata.epoch !== this.epoch || total < this.total))
         || metadata.frame_id !== this.metadata.frame_id || metadata.session_id !== this.metadata.session_id
         || metadata.session_generation !== this.metadata.session_generation
         || BigInt(metadata.revision) < BigInt(this.metadata.revision))) {
       throw new Error('完整点云来源发生变化，不能继续追加');
     }
-    if (!positions.length && this.metadata?.revision === metadata.revision && total === this.total) return;
+    if (delta) this._removeRanges(ranges);
+    if (!delta && !positions.length && this.metadata?.revision === metadata.revision && total === this.total) return;
     let offset = 0;
     while (offset < positions.length) {
       let mesh = this.group.children.at(-1);
@@ -109,6 +134,38 @@ export class DensePointCloudLayer {
     this.bounds = new THREE.Box3(new THREE.Vector3(...metadata.bounds_min), new THREE.Vector3(...metadata.bounds_max))
       .getBoundingSphere(new THREE.Sphere());
     this.onChange({ count: this.count, total, metadata, bounds: this.bounds, loading: this.count < total });
+  }
+
+  _removeRanges(ranges) {
+    if (!ranges.length) return;
+    const meshes = this.group.children;
+    let read = 0, write = 0;
+    const copyUntil = end => {
+      while (read < end) {
+        const sourceIndex = Math.floor(read / GEOMETRY_POINTS), targetIndex = Math.floor(write / GEOMETRY_POINTS);
+        const sourceStart = read % GEOMETRY_POINTS, targetStart = write % GEOMETRY_POINTS;
+        const count = Math.min(end - read, GEOMETRY_POINTS - sourceStart, GEOMETRY_POINTS - targetStart);
+        if (read !== write) {
+          const source = meshes[sourceIndex].geometry.getAttribute('position').array;
+          meshes[targetIndex].geometry.getAttribute('position').array.set(source.subarray(sourceStart * 3, (sourceStart + count) * 3), targetStart * 3);
+        }
+        read += count; write += count;
+      }
+    };
+    for (const [start, count] of ranges) { copyUntil(start); read += count; }
+    copyUntil(this.count);
+    this.count = write;
+    const firstChanged = Math.floor(ranges[0][0] / GEOMETRY_POINTS);
+    for (let index = meshes.length - 1; index >= firstChanged; index--) {
+      const mesh = meshes[index], geometry = mesh.geometry;
+      const count = Math.max(0, Math.min(GEOMETRY_POINTS, write - index * GEOMETRY_POINTS));
+      if (!count) { geometry.dispose(); this.group.remove(mesh); continue; }
+      const attribute = geometry.getAttribute('position');
+      geometry.setDrawRange(0, count);
+      attribute.clearUpdateRanges(); attribute.addUpdateRange(0, count * 3); attribute.needsUpdate = true;
+      geometry.boundingBox.setFromArray(attribute.array.subarray(0, count * 3));
+      geometry.boundingSphere = geometry.boundingBox.getBoundingSphere(new THREE.Sphere());
+    }
   }
 
   clear() {
@@ -151,7 +208,7 @@ export class DensePointCloudLayer {
     const timeout = setTimeout(() => controller.abort(), 15000);
     let delay = 500;
     try {
-      const query = new URLSearchParams({ epoch: this.epoch || '', offset: String(this.count) });
+      const query = new URLSearchParams({ epoch: this.epoch || '', offset: String(this.count), delta: '1' });
       const response = await this.fetchChunk(`/api/pointcloud/dense?${query}`, { signal: controller.signal, cache: 'no-store' });
       if (!this._active || serial !== this._serial) return;
       if (response.status === 409) {
@@ -160,6 +217,7 @@ export class DensePointCloudLayer {
         delay = 0;
       } else if (!response.ok) {
         const body = await response.json().catch(() => ({}));
+        this.clear();
         throw new Error(body.error?.message || body.message || `完整点云读取失败（${response.status}）`);
       } else {
         const metadata = JSON.parse(response.headers.get('X-Nuwax-Pointcloud') || 'null');
@@ -170,8 +228,7 @@ export class DensePointCloudLayer {
       }
     } catch (error) {
       if (!this._active || serial !== this._serial) return;
-      this.clear();
-      this.onChange({ count: 0, total: 0, error: error.name === 'AbortError' ? '完整点云读取超时' : String(error.message || error) });
+      this.onChange({ count: this.count, total: this.total, error: error.name === 'AbortError' ? '完整点云读取超时' : String(error.message || error) });
       delay = 2000;
     } finally {
       clearTimeout(timeout);

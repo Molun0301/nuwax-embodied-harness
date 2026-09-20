@@ -68,7 +68,6 @@ const DEFAULT_SCHEDULER_PERIOD: Duration = Duration::from_millis(200);
 const DEFAULT_POSE_RECEIPT_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_COSTMAP_RECEIPT_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_NO_FRONTIER_STABILITY: Duration = Duration::from_secs(5);
-const DEFAULT_POSE_UNAVAILABLE_GRACE: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const SCHEDULER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -4789,20 +4788,6 @@ impl ExploreSchedulerHandle {
         pose_provider: Arc<dyn ExplorePoseProvider>,
         period: Duration,
     ) -> Self {
-        Self::spawn_with_pose_grace(
-            runtime,
-            pose_provider,
-            period,
-            DEFAULT_POSE_UNAVAILABLE_GRACE,
-        )
-    }
-
-    fn spawn_with_pose_grace(
-        runtime: ExploreRuntimeHandle,
-        pose_provider: Arc<dyn ExplorePoseProvider>,
-        period: Duration,
-        pose_unavailable_grace: Duration,
-    ) -> Self {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         #[cfg(test)]
         let topology_control = crate::lcm_runtime::topology_test_control();
@@ -4816,43 +4801,36 @@ impl ExploreSchedulerHandle {
             crate::lcm_runtime::wait_for_topology_scheduler_release(topology_control);
             let mut interval = tokio::time::interval(period);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut pose_unavailable_since = None;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         if !runtime.is_active().await {
-                            pose_unavailable_since = None;
                             continue;
                         }
                         match pose_provider.current_pose().await {
                             Ok(pose) => {
-                                pose_unavailable_since = None;
                                 let _ = runtime.tick_with_pose(pose).await;
                             }
                             Err(error) => {
-                                if runtime.is_active().await {
-                                    let first_unavailable = *pose_unavailable_since
-                                        .get_or_insert_with(Instant::now);
-                                    let snapshot = runtime.snapshot();
-                                    if !snapshot.child_task_id.is_empty()
-                                        || first_unavailable.elapsed() >= pose_unavailable_grace
-                                    {
-                                        let _ = runtime
-                                            .finish_session(
-                                                None,
-                                                ExplorationStopReason::ConsecutiveFailuresExceeded,
-                                                format!("pose source unavailable: {error}"),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                    let mut snapshot = runtime.snapshot();
-                                    snapshot.status = STATUS_PENDING;
-                                    snapshot.message = format!(
-                                        "pose source unavailable within bounded grace: {error}"
-                                    );
-                                    runtime.store_snapshot(snapshot);
+                                // 决策层允许低频输入。活动子导航由执行守卫按源时效停车，
+                                // 探索保留任务并等待其具名终态，不能抢先终止整个父任务。
+                                let mut guard = runtime.inner.lock().await;
+                                if !guard.controller.is_active() || guard.pending_child_cancellation.is_some() {
+                                    continue;
                                 }
+                                guard.no_frontier_since = None;
+                                guard.last_poll = Some(ExplorationPoll::SourceUnavailable(error.clone()));
+                                let expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
+                                    .is_some_and(|limit| now_unix_nanos().saturating_sub(guard.started_at_ns) >= limit.saturating_mul(1_000_000));
+                                if expired {
+                                    drop(guard);
+                                    let _ = runtime.finish_session(None, ExplorationStopReason::NoReachableFreeSpace,
+                                        format!("任务期限内位姿输入未恢复：{error}")).await;
+                                    continue;
+                                }
+                                let status = if guard.active_child.is_some() { STATUS_ACTIVE } else { STATUS_PENDING };
+                                let snapshot = guard.snapshot(status, format!("等待位姿输入恢复，目标决策已保留：{error}"));
+                                runtime.store_snapshot(snapshot);
                             }
                         }
                     }
@@ -8156,72 +8134,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_pose_with_active_child_enters_cancel_pending_immediately() {
+    async fn stale_pose_preserves_active_child_until_execution_terminal_or_user_stop() {
         let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
         handle.start("req-stale-active", "prefer_wavefront").await;
         let active = handle.tick((2.0, 2.0)).await;
-        let scheduler = ExploreSchedulerHandle::spawn_with_pose_grace(
-            handle.clone(),
-            Arc::new(MissingPoseProvider),
-            Duration::from_millis(5),
-            Duration::from_secs(1),
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if handle.snapshot().status == STATUS_STOPPING {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("active child stale pose must request cancellation");
+        let scheduler = ExploreSchedulerHandle::spawn(handle.clone(), Arc::new(MissingPoseProvider), Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handle.is_active().await);
         assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        handle.stop("req-stale-active").await;
         assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        scheduler
-            .shutdown()
-            .await
-            .expect("scheduler graceful shutdown");
+        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn stale_pose_without_child_has_bounded_grace_then_fails() {
+    async fn stale_pose_without_child_waits_for_request_deadline_not_two_second_grace() {
         let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
         handle.start("req-stale-idle", "prefer_wavefront").await;
-        let scheduler = ExploreSchedulerHandle::spawn_with_pose_grace(
-            handle.clone(),
-            Arc::new(MissingPoseProvider),
-            Duration::from_millis(5),
-            Duration::from_millis(25),
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if handle.snapshot().status == STATUS_FAILED {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("idle stale pose must fail after bounded grace");
-        assert!(handle
-            .snapshot()
-            .message
-            .contains("pose source unavailable"));
+        let scheduler = ExploreSchedulerHandle::spawn(handle.clone(), Arc::new(MissingPoseProvider), Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(handle.snapshot().status, STATUS_PENDING);
+        assert!(handle.is_active().await);
+        handle.stop("req-stale-idle").await;
         assert!(!handle.is_active().await);
-        assert!(!handle.blocks_mapping_mutation().await);
-        scheduler
-            .shutdown()
-            .await
-            .expect("scheduler graceful shutdown");
+        scheduler.shutdown().await.unwrap();
     }
 
     #[tokio::test]

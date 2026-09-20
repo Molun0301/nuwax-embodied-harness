@@ -70,6 +70,7 @@ from contracts.sensors import (
     CanonicalLioMeasurement,
     RegistrationState,
     SensorClockDomain,
+    SensorStreamFailure,
 )
 from core.logging_utils import LogRateLimiter
 from providers.localization import StreamingLocalizationProvider
@@ -701,6 +702,11 @@ class RuntimeInputBridge:
         return True
 
     def _on_sensor_sample(self, sample: Any, generation: int) -> None:
+        if isinstance(sample, SensorStreamFailure):
+            with self._lio_condition:
+                if self._lio_callback_is_current(generation):
+                    self._fail_native_input_locked(sample.reason, sample.source_timestamp_ns)
+            return
         if not isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame)):
             return
         if not self._admit_bridge_callback(generation):
@@ -1869,6 +1875,11 @@ def build_default_runtime_input_bridge(
         )
     if pipeline != "lio_3d":
         raise ValueError("未知Geometry执行链")
+    executor_getter = getattr(sensor_sample_provider, "get_sensor_input_executor", None)
+    executor = executor_getter() if callable(executor_getter) else None
+    if executor is not None:
+        from services.geometry.process_input_bridge import ProcessInputBridge
+        return ProcessInputBridge(runtime_provider, executor, recording_sink)
     return RuntimeInputBridge(
         runtime_provider=runtime_provider,
         localization_provider=localization_provider,

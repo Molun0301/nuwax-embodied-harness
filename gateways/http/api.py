@@ -16,14 +16,14 @@ from pydantic import BaseModel, Field
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
 from contracts.navigation import NavigationGoal
+from gateways.arguments import validate_closed_schema
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary
 from gateways.runtime import GatewayRuntime
 from gateways.serialization import to_jsonable, to_map_json_bytes
+from gateways.ws.client_queue import ClientQueue
 from core import config_io
-from skills.handlers import localization_skills
-from skills.handlers import memory_skills
 
 
 class CapabilityInvokeRequest(BaseModel):
@@ -489,10 +489,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         epoch: str = Query(default="", max_length=128),
         offset: int = Query(default=0, ge=0, le=2 ** 53 - 1),
+        delta: bool = False,
     ) -> Response:
         try:
             metadata, data = await run_in_threadpool(
-                lambda: runtime.get_dense_cloud_chunk(expected_epoch=epoch, offset_points=offset),
+                lambda: runtime.get_dense_cloud_chunk(expected_epoch=epoch, offset_points=offset, **({"allow_delta": True} if delta else {})),
             )
         except Exception as error:
             changed = "DENSE_CLOUD_SOURCE_CHANGED" in str(error)
@@ -605,14 +606,18 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         )
         return context
 
-    @router.post("/api/capabilities/{capability_name}/invoke")
-    async def api_invoke_capability(
-        capability_name: str,
-        body: CapabilityInvokeRequest,
+    def _invoke_capability(
         request: Request,
-    ) -> Dict[str, Any]:
+        capability_name: str,
+        arguments: Dict[str, Any],
+        *,
+        unwrap: bool = False,
+        map_response: bool = False,
+    ):
+        """网页只适配传输和展示；执行、任务与取消均由公共能力拥有。"""
         descriptor = runtime.capability_registry.get_descriptor(capability_name)
         access_manager.authorize_capability(descriptor)
+        validate_closed_schema(arguments, descriptor.input_schema, path="arguments")
         requested_by = "local"
         request_context = _build_capability_request_context(
             request,
@@ -620,21 +625,33 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             requested_by=requested_by,
         )
         try:
-            result = await run_in_threadpool(
-                lambda: runtime.invoke_capability(
-                    capability_name,
-                    body.arguments,
-                    requested_by=requested_by,
-                    request_context=request_context,
-                )
+            result = runtime.invoke_capability(
+                capability_name,
+                arguments,
+                requested_by=requested_by,
+                request_context=request_context,
+                project_result=not unwrap,
             )
         except Exception as exc:
             raise as_gateway_error(exc) from exc
+        # 异步操作必须保留受理信封，不能由网页请求等待任务结束。
+        if unwrap and "result" in result and not result.get("task_id"):
+            result = result["result"]
+        if map_response:
+            return Response(to_map_json_bytes(result), media_type="application/json")
         response = to_jsonable(result)
         request_id = getattr(request.state, "request_id", None)
         if isinstance(response, dict) and request_id:
             response["request_id"] = request_id
         return response
+
+    @router.post("/api/capabilities/{capability_name}/invoke")
+    async def api_invoke_capability(
+        capability_name: str,
+        body: CapabilityInvokeRequest,
+        request: Request,
+    ) -> Dict[str, Any]:
+        return await run_in_threadpool(_invoke_capability, request, capability_name, body.arguments)
 
     @router.get("/api/tasks")
     def api_tasks(
@@ -683,15 +700,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/tasks/{task_id}/cancel")
     def api_cancel_task(task_id: str, request: Request) -> Dict[str, Any]:
-        try:
-            return to_jsonable(
-                runtime._handle_cancel_task(
-                    {"task_id": task_id},
-                    requested_by="local",
-                )
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+        return _invoke_capability(request, "cancel_task", {"task_id": task_id}, unwrap=True)
 
 
 
@@ -706,74 +715,39 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/perception/runtime")
     def api_perception_runtime(request: Request) -> Dict[str, Any]:
-        return {"perception_runtime": to_jsonable(runtime.perception_video_runtime.get_status())}
+        return _invoke_capability(request, "get_perception_runtime_status", {}, unwrap=True)
 
     @router.post("/api/perception/runtime/start")
     def api_perception_runtime_start(request: Request) -> Dict[str, Any]:
-        return {"perception_runtime": to_jsonable(runtime._manual_perception_start())}
+        return _invoke_capability(request, "start_perception_runtime", {}, unwrap=True)
 
     @router.post("/api/perception/runtime/stop")
     def api_perception_runtime_stop(request: Request) -> Dict[str, Any]:
-        return {"perception_runtime": to_jsonable(runtime._manual_perception_stop())}
+        return _invoke_capability(request, "stop_perception_runtime", {}, unwrap=True)
 
 
     @router.get("/api/localization/session")
     def api_localization_session(request: Request) -> Dict[str, Any]:
-        try:
-            return to_jsonable(
-                localization_skills.handle_get_localization_session(
-                    runtime._skill_ctx,
-                    {},
-                    requested_by="http_api",
-                )
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+        return _invoke_capability(request, "get_localization_session", {}, unwrap=True)
 
     @router.post("/api/localization/relocalize")
     async def api_localization_relocalize(request: Request) -> Dict[str, Any]:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        def submit():
-            try:
-                return to_jsonable(
-                    localization_skills.handle_relocalize_active_map(
-                        runtime._skill_ctx,
-                        payload,
-                        requested_by="http_api",
-                    )
-                )
-            except Exception as exc:
-                raise as_gateway_error(exc) from exc
-
-        return await run_in_threadpool(submit)
+        return await run_in_threadpool(_invoke_capability, request, "relocalize_active_map", payload, unwrap=True)
 
 
     @router.get("/api/maps/catalog", response_model=Dict[str, Any])
     def api_maps_catalog(request: Request) -> Response:
-        return Response(to_map_json_bytes({
-            "maps": runtime.map_workspace_service.list_maps(),
-            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
-        }), media_type="application/json")
+        return _invoke_capability(request, "list_maps", {}, unwrap=True, map_response=True)
 
     @router.post("/api/maps/catalog", response_model=Dict[str, Any])
     async def api_maps_catalog_create(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        map_name = str(payload.get("map_name", "")).strip()
-        def submit():
-            return Response(to_map_json_bytes({
-                "map_asset": runtime.map_workspace_service.create_map(
-                    map_name=map_name,
-                    metadata={"requested_by": "http_api"},
-                ),
-                "maps": runtime.map_workspace_service.list_maps(),
-                "active_workspace": runtime.map_workspace_service.get_active_workspace(),
-            }), media_type="application/json")
-
-        return await run_in_threadpool(submit)
+        return await run_in_threadpool(_invoke_capability, request, "create_map", payload, unwrap=True, map_response=True)
 
 
     @router.delete("/api/maps/catalog/{map_name}", response_model=Dict[str, Any])
@@ -782,69 +756,29 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         delete_memory_library: Optional[bool] = None,
     ) -> Response:
-        delete_result = runtime.map_workspace_service.delete_map(
-            map_name=map_name,
-            delete_memory_library=(
-                delete_memory_library
-                if delete_memory_library is not None
-                else runtime.config.runtime_data.map_delete_also_delete_library
-            ),
-        )
-        if bool(delete_result.get("was_active")):
-            runtime._sync_perception_runtime_for_memory_state(enabled=False)
-        return Response(to_map_json_bytes({
-            "delete_result": delete_result,
-            "maps": runtime.map_workspace_service.list_maps(),
-            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
-        }), media_type="application/json")
+        arguments = {"map_name": map_name}
+        if delete_memory_library is not None:
+            arguments["delete_memory_library"] = delete_memory_library
+        return _invoke_capability(request, "delete_map", arguments, unwrap=True, map_response=True)
 
     @router.post("/api/maps/activate", response_model=Dict[str, Any])
     async def api_maps_activate(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        map_name = str(payload.get("map_name", "")).strip()
-        def submit():
-            active_workspace = runtime.map_workspace_service.activate_map(
-                map_name=map_name,
-                create_if_missing=False,
-                load_memory_history=bool(payload.get("load_memory_history", True)),
-                reset_memory_library=bool(payload.get("reset_memory_library", False)),
-                metadata={"requested_by": "http_api"},
-            )
-            runtime._sync_perception_runtime_for_memory_state(enabled=True)
-            return Response(to_map_json_bytes({
-                "active_workspace": runtime.map_workspace_service.get_active_workspace() or active_workspace,
-                "maps": runtime.map_workspace_service.list_maps(),
-                "memory_summary": runtime.memory_service.get_summary(),
-            }), media_type="application/json")
-
-        return await run_in_threadpool(submit)
+        return await run_in_threadpool(_invoke_capability, request, "activate_map", payload, unwrap=True, map_response=True)
 
 
     @router.get("/api/maps/active", response_model=Dict[str, Any])
     async def api_maps_active(request: Request) -> Response:
-        return await run_in_threadpool(lambda: Response(to_map_json_bytes({
-            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
-        }), media_type="application/json"))
+        return await run_in_threadpool(_invoke_capability, request, "get_active_map", {}, unwrap=True, map_response=True)
 
     @router.post("/api/maps/finalize", response_model=Dict[str, Any])
     async def api_maps_finalize(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        def submit():
-            result = localization_skills.handle_finalize_active_map(
-                runtime._skill_ctx,
-                payload,
-                requested_by="http_api",
-            )
-            return Response(to_map_json_bytes({
-                "map_asset_bundle": result["map_asset_bundle"],
-                "active_workspace": result["active_workspace"],
-            }), media_type="application/json")
-
-        return await run_in_threadpool(submit)
+        return await run_in_threadpool(_invoke_capability, request, "finalize_active_map", payload, unwrap=True, map_response=True)
 
 
     @router.get("/api/navigation/forbidden-zones")
@@ -852,93 +786,50 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         request: Request,
         map_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        try:
-            envelope = await run_in_threadpool(
-                runtime.navigation_service.list_forbidden_zones,
-                map_name=map_name,
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
-        return to_jsonable(envelope)
+        arguments = {"map_name": map_name} if map_name is not None else {}
+        return await run_in_threadpool(_invoke_capability, request, "list_forbidden_zones", arguments, unwrap=True)
 
     @router.put("/api/navigation/forbidden-zones")
     async def api_navigation_forbidden_zones_put(
         request: Request,
         body: ReplaceForbiddenZonesRequest,
     ) -> Dict[str, Any]:
-        try:
-            envelope = await run_in_threadpool(
-                runtime.navigation_service.replace_forbidden_zones,
-                map_name=body.map_name,
-                zones=body.zones,
-                expected_generation=body.expected_generation,
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
-        return to_jsonable(envelope)
+        return await run_in_threadpool(_invoke_capability, request, "replace_forbidden_zones", body.model_dump(mode="json"), unwrap=True)
 
     @router.post("/api/navigation/goal")
     async def api_navigation_goal(request: Request, goal: NavigationGoalRequest) -> Dict[str, Any]:
-        """Submit a goal through the singleton production navigation service."""
-
+        """兼容旧坐标请求，返回统一导航任务的受理结果。"""
         try:
             navigation_goal = _build_navigation_goal(goal)
-
-            def submit_goal():
-                admission = runtime._admit_motion_request(
-                    "navigate_to_pose",
-                    request_id=goal.goal_id,
-                )
-                admitted_goal = runtime._goal_with_motion_admission(
-                    navigation_goal,
-                    admission,
-                )
-                return runtime._run_with_motion_admission(
-                    admission,
-                    lambda: runtime.navigation_service.set_goal(admitted_goal),
-                )
-
-            context = await run_in_threadpool(submit_goal)
+            pose = navigation_goal.target_pose
+            orientation = pose.orientation
+            if abs(orientation.x) > 1e-8 or abs(orientation.y) > 1e-8:
+                raise ValueError("导航目标只接受位置与偏航角，不能指定俯仰或横滚。")
+            arguments = {
+                "goal_id": goal.goal_id,
+                "frame_id": pose.frame_id,
+                "x": pose.position.x, "y": pose.position.y, "z": pose.position.z,
+                "yaw_rad": 2.0 * math.atan2(orientation.z, orientation.w),
+            }
+            return await run_in_threadpool(_invoke_capability, request, "navigate_to_pose", arguments)
         except Exception as exc:
             raise as_gateway_error(exc) from exc
-        return _navigation_state_payload(context, fallback_goal_id=goal.goal_id)
 
     @router.post("/api/navigation/place-goal")
     async def api_navigation_place_goal(request: Request) -> Dict[str, Any]:
-        """将地点文本查询接入唯一 mapping-cloud owner 与 GoalLease。"""
-
+        """地点文本与智能体共用地图地点导航能力。"""
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        query_text = str(payload.get("query_text") or "").strip()
-        query_request_id = str(
-            payload.get("query_request_id") or "place-{}".format(uuid.uuid4().hex)
-        ).strip()
-        if not query_text:
-            raise as_gateway_error(ValueError("query_text 不能为空。"))
-        try:
-            def submit_goal():
-                admission = runtime._admit_motion_request(
-                    "navigate_to_pose",
-                    request_id=query_request_id,
-                )
-                motion_admission = {
-                    "guard_generation": admission.generation,
-                    "guard_boot_nonce": admission.boot_nonce,
-                    "motion_stop_generation": admission.guard_motion_stop_generation,
-                }
-                return runtime._run_with_motion_admission(
-                    admission,
-                    lambda: runtime.map_workspace_service.submit_mapping_cloud_goal(
-                        query_request_id=query_request_id,
-                        query_text=query_text,
-                        motion_admission=motion_admission,
-                    ),
-                )
+        return await run_in_threadpool(_invoke_capability, request, "navigate_to_place", payload, unwrap=True)
 
-            return to_jsonable(await run_in_threadpool(submit_goal))
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
+    @router.get("/api/navigation/snapshot")
+    def api_navigation_snapshot(request: Request) -> Dict[str, Any]:
+        """控制台读取已有导航和探索状态；不触发运动或按需启动。"""
+        return {
+            "navigation_context": to_jsonable(runtime.navigation_service.get_latest_navigation_context()),
+            "exploration_context": to_jsonable(runtime.navigation_service.get_latest_exploration_context()),
+        }
 
     @router.get("/api/navigation/state")
     async def api_navigation_state(request: Request) -> StreamingResponse:
@@ -953,21 +844,10 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
         async def _event_generator():
             loop = asyncio.get_running_loop()
-            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=64)
-
-            def _enqueue(frame: Any) -> None:
-                def _push() -> None:
-                    if queue.full():
-                        try:
-                            queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
-                    queue.put_nowait(frame)
-
-                loop.call_soon_threadsafe(_push)
+            queue = ClientQueue(loop, maxsize=1)
 
             subscription_id = runtime.stream_bus.subscribe(
-                _enqueue,
+                queue.put,
                 topics=("navigation.state",),
             )
             try:
@@ -986,6 +866,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
                     payload = _navigation_state_payload(frame)
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             finally:
+                queue.close()
                 runtime.stream_bus.unsubscribe(subscription_id)
 
         return StreamingResponse(_event_generator(), media_type="text/event-stream")
@@ -1008,51 +889,9 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_navigation_cancel(
         request: Request, body: NavigationCancelRequest
     ) -> Dict[str, Any]:
-        """Request cancellation without claiming terminal before actuator zero ack."""
-
-        try:
-            current_context = await run_in_threadpool(
-                runtime.navigation_service.refresh_navigation
-            )
-            current = _navigation_state_payload(current_context)
-            current_goal_id = current.get("goal_id")
-            if not current_goal_id:
-                raise GatewayError(
-                    "导航后端未提供活动 goal_id，无法安全执行定向取消。",
-                    error_code="navigation_goal_identity_unavailable",
-                    http_status=503,
-                    details={"requested_goal_id": body.goal_id},
-                )
-            if current_goal_id != body.goal_id:
-                raise GatewayError(
-                    "当前活动导航目标与取消请求不匹配。",
-                    error_code="navigation_goal_mismatch",
-                    http_status=409,
-                    details={
-                        "requested_goal_id": body.goal_id,
-                        "active_goal_id": current_goal_id,
-                    },
-                )
-            if str(current.get("status") or "").lower() not in {
-                "accepted",
-                "planning",
-                "running",
-                "cancelling",
-                "cancel_requested",
-            }:
-                raise GatewayError(
-                    "当前没有可取消的活动导航目标。",
-                    error_code="navigation_goal_not_active",
-                    http_status=409,
-                    details={"goal_id": body.goal_id, "state": current.get("state")},
-                )
-            context = await run_in_threadpool(
-                runtime.navigation_service.cancel_goal,
-                request_id=body.goal_id,
-            )
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
-        return _navigation_state_payload(context, fallback_goal_id=body.goal_id)
+        """定向取消沿公共能力执行，受理与完成由同一后端证明。"""
+        result = await run_in_threadpool(_invoke_capability, request, "cancel_navigation", {"request_id": body.goal_id}, unwrap=True)
+        return _navigation_state_payload(result, fallback_goal_id=body.goal_id)
 
     @router.get("/api/memory/summary")
     def api_memory_summary(request: Request) -> Dict[str, Any]:
@@ -1060,42 +899,19 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.get("/api/memory/libraries")
     def api_memory_libraries(request: Request) -> Dict[str, Any]:
-        return {
-            "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
-            "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
-        }
+        return _invoke_capability(request, "list_memory_libraries", {}, unwrap=True)
 
     @router.post("/api/memory/libraries")
     async def api_create_memory_library(request: Request) -> Dict[str, Any]:
         payload = await request.json()
         if not isinstance(payload, dict):
             payload = {}
-        library_name = str(payload.get("library_name", "")).strip()
-        def submit():
-            return {
-                "create_result": to_jsonable(runtime.memory_service.create_memory_library(library_name=library_name)),
-                "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
-                "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
-            }
-
-        return await run_in_threadpool(submit)
+        return await run_in_threadpool(_invoke_capability, request, "create_memory_library", payload, unwrap=True)
 
 
     @router.delete("/api/memory/libraries/{library_name}", response_model=Dict[str, Any])
     def api_delete_memory_library(library_name: str, request: Request) -> Response:
-        active_workspace = runtime.map_workspace_service.get_active_workspace()
-        delete_result = runtime.memory_service.delete_memory_library(library_name=library_name)
-        if active_workspace is not None and active_workspace.active_map_name == library_name:
-            runtime.map_workspace_service.clear_active_map(disable_memory_library=False)
-        if bool(delete_result.get("was_active")):
-            runtime._sync_perception_runtime_for_memory_state(enabled=False)
-        return Response(to_map_json_bytes({
-            "delete_result": delete_result,
-            "maps": runtime.map_workspace_service.list_maps(),
-            "active_workspace": runtime.map_workspace_service.get_active_workspace(),
-            "libraries": runtime.memory_service.list_memory_libraries(),
-            "memory_summary": runtime.memory_service.get_summary(),
-        }), media_type="application/json")
+        return _invoke_capability(request, "delete_memory_library", {"library_name": library_name}, unwrap=True, map_response=True)
 
     @router.get("/api/memory/locations")
     def api_memory_locations(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:
@@ -1132,14 +948,12 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         # 同步路由由网关线程池执行，读取和序列化均不占用异步事件循环。
         active_library = runtime.memory_service.get_active_library_name()
         target_library = library_name.strip() if library_name is not None else active_library
-        result = runtime.invoke_capability(
+        payload = _invoke_capability(
+            request,
             "list_semantic_instances",
             {"library_name": target_library or "", "label": label},
-            requested_by="http_api",
+            unwrap=True,
         )
-        payload = to_jsonable(result)
-        if isinstance(payload, dict) and "instances" not in payload and isinstance(payload.get("result"), dict):
-            payload = payload["result"]
         if runtime.memory_service.get_active_library_name() != active_library:
             raise GatewayError("查询期间记忆库已切换，请刷新。", error_code="memory_library_changed", http_status=409)
         if isinstance(payload, dict) and isinstance(payload.get("instances"), list):
@@ -1173,7 +987,7 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         }.items():
             if value is not None:
                 arguments[key] = value
-        return to_jsonable(memory_skills.handle_list_scene_spaces(runtime._skill_ctx, arguments, requested_by="http_api"))
+        return _invoke_capability(request, "list_scene_spaces", arguments, unwrap=True)
 
     @router.get("/api/memory/scene_spaces/query")
     def api_memory_scene_spaces_query(
@@ -1199,17 +1013,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         }.items():
             if value is not None:
                 arguments[key] = value
-        return to_jsonable(memory_skills.handle_query_scene_spaces(runtime._skill_ctx, arguments, requested_by="http_api"))
+        return _invoke_capability(request, "query_scene_spaces", arguments, unwrap=True)
 
     @router.get("/api/memory/scene_spaces/{scene_space_id}")
     def api_memory_scene_space(scene_space_id: str, request: Request) -> Dict[str, Any]:
-        return to_jsonable(
-            memory_skills.handle_get_scene_space(
-                runtime._skill_ctx,
-                {"scene_space_id": scene_space_id},
-                requested_by="http_api",
-            )
-        )
+        return _invoke_capability(request, "get_scene_space", {"scene_space_id": scene_space_id}, unwrap=True)
 
     @router.get("/artifacts/{artifact_id}/meta")
     def api_artifact_meta(artifact_id: str, request: Request) -> Dict[str, Any]:

@@ -6644,25 +6644,37 @@ impl GeometryRuntime for GeometryRuntimeService {
             || request.expected_epoch.len() > 128 || (request.expected_epoch.is_empty() && request.offset_points != 0) {
             return Err(Status::invalid_argument("完整点云分块请求非法"));
         }
-        let (snapshot, frame_id) = {
+        let (snapshot, base, frame_id) = {
             let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
             self.ensure_running_admission("GetDenseCloudChunk").await?;
             let frame_id = self.bridge.state.read().await.map.frame_id.clone();
-            let snapshot = self.bridge.cloud_map_writer.lock().as_mut()
-                .ok_or_else(|| Status::failed_precondition("三维点云拥有方未就绪"))?
-                .dense_cloud_for_read(&request.expected_epoch, request.offset_points).map_err(Status::failed_precondition)?
+            let mut writer = self.bridge.cloud_map_writer.lock();
+            let writer = writer.as_mut().ok_or_else(|| Status::failed_precondition("三维点云拥有方未就绪"))?;
+            let captured = if request.allow_delta {
+                writer.dense_cloud_update_for_read(&request.expected_epoch, request.offset_points)
+            } else {
+                writer.dense_cloud_for_read(&request.expected_epoch, request.offset_points)
+                    .map(|value| value.map(|snapshot| (snapshot, None)))
+            }.map_err(Status::failed_precondition)?
                 .ok_or_else(|| Status::not_found("当前地图没有完整扫描数据；旧体素地图无法还原全部扫描点"))?;
-            (snapshot, frame_id)
+            (captured.0, captured.1, frame_id)
         };
-        if !request.expected_epoch.is_empty() && request.expected_epoch != snapshot.epoch {
-            return Err(Status::failed_precondition("DENSE_CLOUD_SOURCE_CHANGED"));
-        }
+        let base_epoch = base.as_ref().map(|old| old.epoch.clone()).unwrap_or_default();
         let read_snapshot = snapshot.clone();
         let receiver = self.bridge.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || read_snapshot.read(request.offset_points, request.max_points))
-                .await.map_err(|e| e.to_string()).and_then(|v| v)
+            tokio::task::spawn_blocking(move || {
+                let removed = match base {
+                    Some(old) => read_snapshot.removed_prefix_ranges(&old, request.offset_points)?,
+                    None => Vec::new(),
+                };
+                let removed_count: u64 = removed.chunks_exact(2).map(|range| range[1]).sum();
+                let offset = request.offset_points - removed_count;
+                let data = read_snapshot.read(offset, request.max_points)?;
+                Ok((data, removed, offset))
+            }).await.map_err(|e| e.to_string()).and_then(|v| v)
         }).map_err(Status::unavailable)?;
-        let data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?;
+        let (data, removed_ranges, offset) = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?
+            .map_err(Status::invalid_argument)?;
         self.ensure_running_admission("GetDenseCloudChunk").await?;
         let readable = self.bridge.cloud_map_writer.lock().as_ref()
             .is_some_and(|writer| writer.dense_read_epoch_available(&snapshot.epoch));
@@ -6673,7 +6685,8 @@ impl GeometryRuntime for GeometryRuntimeService {
             epoch: snapshot.epoch, revision: snapshot.receipt.cloud_revision,
             source_timestamp_ns: snapshot.receipt.source_timestamp_ns, frame_id,
             session_id: snapshot.session_id, session_generation: snapshot.receipt.session_generation,
-            total_points: snapshot.point_count, offset_points: request.offset_points, xyz_f32_le: data,
+            total_points: snapshot.point_count, offset_points: offset, xyz_f32_le: data,
+            base_epoch, base_offset_points: request.offset_points, removed_ranges,
             bounds_min: snapshot.bounds_min.to_vec(), bounds_max: snapshot.bounds_max.to_vec(),
         }))
     }
@@ -13713,29 +13726,41 @@ mod lifecycle_tests {
                 }
             }
             if frame == 10 {
-                pinned = Some(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+                pinned = Some(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
                     expected_epoch: String::new(), offset_points: 0, max_points: 10,
                 })).await.unwrap().into_inner());
             }
         }
         let pinned = pinned.unwrap();
-        let tail = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+        let tail = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: pinned.epoch.clone(), offset_points: 10, max_points: 100,
         })).await.unwrap().into_inner();
         assert_eq!(tail.epoch, pinned.epoch);
         assert_eq!(tail.total_points, pinned.total_points);
         assert_eq!(tail.xyz_f32_le, expected_tail);
-        let exhausted = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+        let exhausted = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: pinned.epoch.clone(), offset_points: pinned.total_points, max_points: 10,
         })).await.unwrap_err();
         assert!(exhausted.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
-        let latest = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+        let latest = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: String::new(), offset_points: 0, max_points: 10,
         })).await.unwrap().into_inner();
         assert_ne!(latest.epoch, pinned.epoch);
+        let delta = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+            allow_delta: true, expected_epoch: pinned.epoch.clone(), offset_points: pinned.total_points, max_points: 100,
+        })).await.unwrap().into_inner();
+        assert_eq!(delta.base_epoch, pinned.epoch);
+        assert_eq!(delta.epoch, latest.epoch);
+        assert_eq!(delta.base_offset_points, pinned.total_points);
+        assert!(!delta.removed_ranges.is_empty());
+        let removed: u64 = delta.removed_ranges.chunks_exact(2).map(|range| range[1]).sum();
+        assert_eq!(delta.offset_points, pinned.total_points - removed);
+        let expected = handle.cloud_map_writer.lock().as_ref().unwrap().committed_dense_cloud().unwrap().unwrap()
+            .read(delta.offset_points, 100).unwrap();
+        assert_eq!(delta.xyz_f32_le, expected);
         // 替换拥有方后不能用其前任的分块代际继续读取。
         *handle.cloud_map_writer.lock() = Some(CloudMapShmWriter::new_private().unwrap());
-        assert!(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+        assert!(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: pinned.epoch, offset_points: 10, max_points: 100,
         })).await.is_err());
         assert!(owner.task_owner.shutdown().await.producers_settled());
@@ -13929,14 +13954,14 @@ mod lifecycle_tests {
         assert_eq!(restored_cloud.point_count, source_cloud.point_count);
         assert_eq!(restored_cloud.xyz_f32_le, source_cloud.xyz_f32_le);
 
-        let request = || Request::new(DenseCloudChunkRequest { expected_epoch: String::new(), offset_points: 0, max_points: 65536 });
+        let request = || Request::new(DenseCloudChunkRequest { allow_delta: false, expected_epoch: String::new(), offset_points: 0, max_points: 65536 });
         let source_dense = GeometryRuntime::get_dense_cloud_chunk(&source_service, request()).await.unwrap().into_inner();
         let restored_dense = GeometryRuntime::get_dense_cloud_chunk(&restored_service, request()).await.unwrap().into_inner();
         assert_ne!(source_dense.epoch, restored_dense.epoch);
         assert_eq!(source_dense.total_points, 12, "四帧扫描的重复观测均须保留");
         assert_eq!(source_dense.xyz_f32_le, restored_dense.xyz_f32_le);
         assert_eq!(restored_dense.total_points, 12);
-        let error = GeometryRuntime::get_dense_cloud_chunk(&restored_service, Request::new(DenseCloudChunkRequest {
+        let error = GeometryRuntime::get_dense_cloud_chunk(&restored_service, Request::new(DenseCloudChunkRequest { allow_delta: false,
             expected_epoch: source_dense.epoch, offset_points: 9, max_points: 65536,
         })).await.unwrap_err();
         assert!(error.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));

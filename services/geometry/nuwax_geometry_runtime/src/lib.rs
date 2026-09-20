@@ -1,5 +1,7 @@
 //! Geometry 可复用库入口。
 
+mod dynamic_scene;
+
 #[doc(hidden)]
 pub mod mapping_backend;
 mod mapping_commit;

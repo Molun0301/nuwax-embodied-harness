@@ -68,6 +68,8 @@ pub(crate) struct ScanHistory {
     scans: BTreeMap<u64, ArchivedScan>,
     point_count: usize,
     incomplete: bool,
+    dynamic_scene: crate::dynamic_scene::DynamicScene,
+    latest_static_scan: Option<(u64, [u8; 32], usize, Arc<[u32]>)>,
 }
 
 impl ScanHistory {
@@ -75,6 +77,8 @@ impl ScanHistory {
         self.scans.clear();
         self.point_count = 0;
         self.incomplete = false;
+        self.dynamic_scene = Default::default();
+        self.latest_static_scan = None;
     }
 
     pub fn record(
@@ -84,36 +88,45 @@ impl ScanHistory {
         binding: &RegistrationBinding,
         points: &[Point3<f64>],
     ) -> Result<(), String> {
-        if self.incomplete {
-            return Ok(());
-        }
         if let Some(existing) = self.scans.get(&source_timestamp_ns) {
-            return if existing.envelope_sha256 == binding.envelope_sha256 {
-                Ok(())
-            } else {
-                Err("PGO历史扫描来源冲突".into())
-            };
+            return if existing.envelope_sha256 == binding.envelope_sha256 { Ok(()) }
+                else { Err("PGO历史扫描来源冲突".into()) };
         }
+        if let Some((stamp, digest, _, _)) = &self.latest_static_scan {
+            if source_timestamp_ns <= *stamp {
+                return if source_timestamp_ns == *stamp && *digest == binding.envelope_sha256 {
+                    Ok(())
+                } else {
+                    Err("PGO扫描来源倒序或冲突".into())
+                };
+            }
+        }
+        let body_from_map =
+            (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
+        let body_points: Vec<_> = points.iter().map(|point| body_from_map * point).collect();
+        let sensor_origin = binding.sensor_origin_map.map(|p| body_from_map * Point3::from(p));
+        self.dynamic_scene.clear_frame();
+        if let Some(origin) = sensor_origin {
+            // 用未受回环跳变影响的里程计坐标积累运动证据；每个已接纳扫描都参与。
+            let odom_points = body_points.iter().map(|point| binding.frozen_odom_from_body * point).collect::<Vec<_>>();
+            let odom_origin = binding.frozen_odom_from_body * origin;
+            self.dynamic_scene.observe(&odom_points, odom_origin.coords.into(), source_timestamp_ns);
+        }
+        let static_indices = body_points.iter().enumerate().filter_map(|(index, point)| {
+            let p = binding.frozen_odom_from_body * point;
+            (!self.dynamic_scene.is_dynamic([p.x, p.y, p.z])).then_some(index as u32)
+        }).collect::<Vec<_>>();
+        self.latest_static_scan = Some((source_timestamp_ns, binding.envelope_sha256, points.len(), static_indices.into()));
+        if self.incomplete { return Ok(()); }
         if self.point_count.saturating_add(points.len()) > MAX_ARCHIVED_POINTS {
-            tracing::warn!(
-                event = "pgo.history.exhausted",
-                archived_points = self.point_count,
-                incoming_points = points.len(),
-                "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续"
-            );
-            // 已有公共地图仍然有效；锁存历史不完整，不能保留后缀并冒充完整历史。
+            tracing::warn!(event = "pgo.history.exhausted", archived_points = self.point_count,
+                incoming_points = points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
             self.scans.clear();
             self.point_count = 0;
             self.incomplete = true;
             return Ok(());
         }
-        let body_from_map =
-            (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
-        let body_points: Vec<_> = points.iter().map(|point| body_from_map * point).collect();
-        let sensor_origin_body = binding
-            .sensor_origin_map
-            .map(|p| body_from_map * Point3::from(p))
-            .unwrap_or_else(Point3::origin);
+        let sensor_origin_body = sensor_origin.unwrap_or_else(Point3::origin);
         self.point_count += body_points.len();
         self.scans.insert(
             source_timestamp_ns,
@@ -127,6 +140,15 @@ impl ScanHistory {
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn static_point_indices(&self, timestamp_ns: u64, digest: [u8; 32], count: usize) -> Result<Arc<[u32]>, String> {
+        let (stamp, source_digest, source_count, indices) = self.latest_static_scan.as_ref()
+            .ok_or("PGO静态扫描尚未准备")?;
+        if (*stamp, *source_digest, *source_count) != (timestamp_ns, digest, count) {
+            return Err("PGO静态扫描与当前来源不一致".into());
+        }
+        Ok(Arc::clone(indices))
     }
 
     pub fn latest_timestamp_ns(&self) -> Option<u64> {

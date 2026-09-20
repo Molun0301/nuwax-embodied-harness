@@ -10,6 +10,15 @@ import time
 LOGGER = logging.getLogger(__name__)
 
 
+def _snapshot_frame_id(payload):
+    # 实例可携带不同坐标系；只有整份快照明确同系时才声明共同坐标身份。
+    frames = {row.get("frame_id") for row in payload.get("instances", ())}
+    if len(frames) != 1:
+        return None
+    frame = next(iter(frames))
+    return frame if isinstance(frame, str) and frame.strip() else None
+
+
 class SemanticInstancePublisher:
     def __init__(self, stream_bus, snapshot_reader) -> None:
         self._stream_bus = stream_bus
@@ -69,9 +78,11 @@ class SemanticInstancePublisher:
                 if self._stopping:
                     return
                 self._dirty = False
+            frame_id = None
             try:
                 payload = self._snapshot_reader()
                 next_update_at = payload.pop("_next_update_at", None)
+                frame_id = _snapshot_frame_id(payload)
                 status = "available"
             except Exception:
                 LOGGER.exception("读取空间记忆实时快照失败。")
@@ -83,6 +94,6 @@ class SemanticInstancePublisher:
                     return
             self._stream_bus.publish(
                 "memory.instances", source="memory_service", payload=payload,
-                frame_id="map", status=status,
+                frame_id=frame_id, status=status,
             )
             next_publish_at = time.monotonic() + 0.1

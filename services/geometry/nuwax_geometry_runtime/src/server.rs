@@ -2183,6 +2183,8 @@ async fn activate_map_r1(
     } else { None };
 
     let prepared_dense = if let Some(backend) = mapping_backend_checkpoint.as_ref().filter(|b| b.dense_cloud_artifact.is_some()) {
+        let dense_voxel_size = prepared_fine.as_ref().map(|fine| fine.voxel_size()).or_else(|| immutable_target.as_ref().map(|target| target.voxel_size))
+            .ok_or_else(|| Status::invalid_argument("完整点云缺少匹配的体素地图"))?;
         let file = service.graph_artifacts.lock().open(backend.dense_cloud_artifact.as_ref().unwrap()).map_err(Status::invalid_argument)?;
         let receipt = backend.cloud_receipt.as_ref().ok_or_else(|| Status::invalid_argument("完整点云缺少原提交收据"))?;
         let expected = crate::dense_cloud::Metadata {
@@ -2191,7 +2193,7 @@ async fn activate_map_r1(
             frame_id: expected_map_frame_id.clone(), point_count: 0, bounds_min: [0.; 3], bounds_max: [0.; 3],
         };
         let receiver = service.bridge.register_navigation_map_operation(async move {
-            tokio::task::spawn_blocking(move || crate::dense_cloud::DenseCloud::from_archive(file, &expected))
+            tokio::task::spawn_blocking(move || crate::dense_cloud::DenseCloud::from_archive_with_voxel_size(file, &expected, dense_voxel_size))
                 .await.map_err(|e| e.to_string()).and_then(|v| v)
         }).map_err(Status::unavailable)?;
         Some(receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?)
@@ -6646,9 +6648,9 @@ impl GeometryRuntime for GeometryRuntimeService {
             let _lifecycle = self.bridge.mapping_lifecycle_lock.lock().await;
             self.ensure_running_admission("GetDenseCloudChunk").await?;
             let frame_id = self.bridge.state.read().await.map.frame_id.clone();
-            let snapshot = self.bridge.cloud_map_writer.lock().as_ref()
+            let snapshot = self.bridge.cloud_map_writer.lock().as_mut()
                 .ok_or_else(|| Status::failed_precondition("三维点云拥有方未就绪"))?
-                .committed_dense_cloud().map_err(Status::failed_precondition)?
+                .dense_cloud_for_read(&request.expected_epoch, request.offset_points).map_err(Status::failed_precondition)?
                 .ok_or_else(|| Status::not_found("当前地图没有完整扫描数据；旧体素地图无法还原全部扫描点"))?;
             (snapshot, frame_id)
         };
@@ -6662,9 +6664,9 @@ impl GeometryRuntime for GeometryRuntimeService {
         }).map_err(Status::unavailable)?;
         let data = receiver.await.map_err(|e| Status::unavailable(e.to_string()))?.map_err(Status::invalid_argument)?;
         self.ensure_running_admission("GetDenseCloudChunk").await?;
-        let current_epoch = self.bridge.cloud_map_writer.lock().as_ref()
-            .and_then(|writer| writer.committed_dense_cloud().ok().flatten()).map(|cloud| cloud.epoch);
-        if current_epoch.as_ref() != Some(&snapshot.epoch) {
+        let readable = self.bridge.cloud_map_writer.lock().as_ref()
+            .is_some_and(|writer| writer.dense_read_epoch_available(&snapshot.epoch));
+        if !readable {
             return Err(Status::failed_precondition("DENSE_CLOUD_SOURCE_CHANGED"));
         }
         Ok(Response::new(DenseCloudChunk {
@@ -13678,6 +13680,66 @@ mod lifecycle_tests {
         drop(service);
         drop(handle);
         let _ = std::fs::remove_file(cloud_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dense_chunk_finishes_pinned_version_during_dynamic_removal_and_rejects_new_owner() {
+        use crate::dynamic_scene::tests::{corridor, ORIGIN};
+        use crate::mapping_commit::{MappingCommitId, OccupancyCommitReceipt};
+        let (handle, _, path) = ray_runtime_with_cloud_writer("动态分块").await;
+        let mut owner = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+        let handle = owner.handle.clone();
+        let service = GeometryRuntimeService::new(handle.clone());
+        assert!(start_mapping_session(&service, "动态分块", "动态分块").await.active);
+        let mut pinned: Option<DenseCloudChunk> = None;
+        let mut expected_tail = Vec::new();
+        for frame in 1..=22 {
+            let person = (7..=16).contains(&frame).then(|| -0.5 + (frame - 7) as f64 * 0.12);
+            let (points, _) = corridor(person, (frame % 3) as f64);
+            {
+                let mut guard = handle.cloud_map_writer.lock();
+                let writer = guard.as_mut().unwrap();
+                assert!(writer.accumulate_mapping_scan(1, &points, Some(ORIGIN), frame * 100_000_000));
+                let receipt = OccupancyCommitReceipt {
+                    commit_id: MappingCommitId { boot_nonce: 800, sequence: frame },
+                    session_id: "动态分块".into(), session_generation: 1, occupancy_revision: frame,
+                    source_timestamp_ns: frame * 100_000_000,
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Raytracing,
+                    backend_generation: 1,
+                };
+                writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+                if frame == 10 {
+                    expected_tail = writer.committed_dense_cloud().unwrap().unwrap().read(10, 100).unwrap();
+                }
+            }
+            if frame == 10 {
+                pinned = Some(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+                    expected_epoch: String::new(), offset_points: 0, max_points: 10,
+                })).await.unwrap().into_inner());
+            }
+        }
+        let pinned = pinned.unwrap();
+        let tail = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+            expected_epoch: pinned.epoch.clone(), offset_points: 10, max_points: 100,
+        })).await.unwrap().into_inner();
+        assert_eq!(tail.epoch, pinned.epoch);
+        assert_eq!(tail.total_points, pinned.total_points);
+        assert_eq!(tail.xyz_f32_le, expected_tail);
+        let exhausted = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+            expected_epoch: pinned.epoch.clone(), offset_points: pinned.total_points, max_points: 10,
+        })).await.unwrap_err();
+        assert!(exhausted.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
+        let latest = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+            expected_epoch: String::new(), offset_points: 0, max_points: 10,
+        })).await.unwrap().into_inner();
+        assert_ne!(latest.epoch, pinned.epoch);
+        // 替换拥有方后不能用其前任的分块代际继续读取。
+        *handle.cloud_map_writer.lock() = Some(CloudMapShmWriter::new_private().unwrap());
+        assert!(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
+            expected_epoch: pinned.epoch, offset_points: 10, max_points: 100,
+        })).await.is_err());
+        assert!(owner.task_owner.shutdown().await.producers_settled());
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

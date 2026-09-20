@@ -27,6 +27,13 @@ impl FineCloud {
             dynamic: DynamicCloudFilter::default(), failure: None, recent: VecDeque::new(), readers: Vec::new(), commits: 0 })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
+    #[cfg(test)]
+    pub(super) fn use_legacy_filter(&mut self) { self.dynamic.legacy_only = true; }
+    pub(super) fn removed_keys(&self) -> &[(i32, i32, i32)] { self.dynamic.removed_keys() }
+    pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
+    pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
+        self.dynamic.is_dynamic([point.x, point.y, point.z])
+    }
     pub(super) fn accumulate(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<(), String> {
         if let Some(error) = &self.failure { return Err(error.clone()); }
         let result = self.accumulate_inner(points, origin, timestamp_ns);
@@ -35,6 +42,7 @@ impl FineCloud {
         result
     }
     fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<(), String> {
+        self.dynamic.clear_frame();
         let size = self.writer.voxel_size_m();
         let hits = points.iter().map(|p| voxel_key([p.x, p.y, p.z], size).ok_or("精细输入坐标无效"))
             .collect::<Result<AHashSet<_>, _>>()?;

@@ -17,6 +17,9 @@ const MAX_RAY_STEPS: usize = 2048;
 
 #[derive(Default)]
 pub(super) struct DynamicCloudFilter {
+    scene: crate::dynamic_scene::DynamicScene,
+    #[cfg(test)]
+    pub(super) legacy_only: bool,
     misses: HashMap<VoxelKey, (u8, u64)>,
     last_timestamp_ns: u64,
     sampling_phase: usize,
@@ -24,6 +27,14 @@ pub(super) struct DynamicCloudFilter {
 }
 
 impl DynamicCloudFilter {
+    pub(super) fn clear_frame(&mut self) {
+        self.removed_keys.clear();
+        self.scene.clear_frame();
+    }
+
+    pub(super) fn is_dynamic(&self, point: [f64; 3]) -> bool {
+        self.scene.is_dynamic(point)
+    }
     /// 当前扫描实际移除的体素，供确定性快照同步撤销；下一次扫描清空。
     pub(super) fn removed_keys(&self) -> &[VoxelKey] {
         &self.removed_keys
@@ -64,6 +75,11 @@ impl DynamicCloudFilter {
         hits: &HashSet<VoxelKey>,
     ) -> usize {
         self.removed_keys.clear();
+        #[cfg(test)]
+        let enabled = !self.legacy_only;
+        #[cfg(not(test))]
+        let enabled = true;
+        if enabled { self.scene.observe(points, origin, timestamp_ns); }
         if timestamp_ns == 0
             || timestamp_ns <= self.last_timestamp_ns
             || points.is_empty()
@@ -72,6 +88,15 @@ impl DynamicCloudFilter {
             return 0;
         }
         self.last_timestamp_ns = timestamp_ns;
+        if self.scene.has_clears() {
+            let removed = voxels.iter().copied().filter(|key|
+                self.scene.clears(voxel_center_f64(*key, voxel_size))).collect::<Vec<_>>();
+            for key in removed {
+                voxels.remove(&key);
+                self.misses.remove(&key);
+                self.removed_keys.push(key);
+            }
+        }
         // 当前命中及相邻体素优先；恢复观测立即撤销此前反证。
         self.misses.retain(|key, (_, last)| {
             timestamp_ns.saturating_sub(*last) <= EVIDENCE_WINDOW_NS
@@ -84,7 +109,7 @@ impl DynamicCloudFilter {
         // 全部历史体素都被当前回波或其邻格保护时，不可能产生删除反证。
         // 先证明这一条件，可省去整帧在空空间里的重复射线遍历；采样相位仍正常推进。
         if voxels.iter().all(|key| has_nearby_hit(hits, *key)) {
-            return 0;
+            return self.removed_keys.len();
         }
         let coarse_hits = voxels.coarse_enabled().then(|| {
             hits.iter()
@@ -103,7 +128,7 @@ impl DynamicCloudFilter {
                 &mut free,
             );
         }
-        let mut removed = 0;
+        let mut removed = self.removed_keys.len();
         for key in free {
             let evidence = self.misses.entry(key).or_insert((0, timestamp_ns));
             evidence.0 = evidence.0.saturating_add(1);
@@ -315,6 +340,37 @@ fn trace_free_voxels_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passing_person_trails_are_removed_more_completely_than_sampled_rays() {
+        use crate::dynamic_scene::tests::{corridor, ORIGIN};
+        let mut improved = DynamicCloudFilter::default();
+        let mut legacy = DynamicCloudFilter { legacy_only: true, ..Default::default() };
+        let mut new_map = VoxelIndex::new();
+        let mut old_map = VoxelIndex::new();
+        let mut people = HashSet::new();
+        let mut structures = HashSet::new();
+        for frame in 1..=28 {
+            let person = (7..=22).contains(&frame).then(|| -0.9 + (frame - 7) as f64 * 0.12);
+            let (points, labels) = corridor(person, (frame % 3) as f64);
+            let keys: HashSet<_> = points.iter().map(|p| voxel_key([p.x, p.y, p.z], 0.05).unwrap()).collect();
+            for (point, dynamic) in points.iter().zip(labels) {
+                let key = voxel_key([point.x, point.y, point.z], 0.05).unwrap();
+                if dynamic { people.insert(key); } else { structures.insert(key); }
+            }
+            improved.clear_observed_free_space_with_hits(&mut new_map, 0.05, ORIGIN, frame * 100_000_000, &points, &keys);
+            legacy.clear_observed_free_space_with_hits(&mut old_map, 0.05, ORIGIN, frame * 100_000_000, &points, &keys);
+            new_map.extend(keys.iter().copied());
+            old_map.extend(keys.iter().copied());
+        }
+        let old_residual = people.iter().filter(|key| old_map.contains(key)).count();
+        let new_residual = people.iter().filter(|key| new_map.contains(key)).count();
+        let old_static = structures.iter().filter(|key| old_map.contains(key)).count();
+        let new_static = structures.iter().filter(|key| new_map.contains(key)).count();
+        eprintln!("移动人体体素={} 旧残留={old_residual} 新残留={new_residual} 静态体素={} 旧保留={old_static} 新保留={new_static}", people.len(), structures.len());
+        assert!(new_residual * 2 < old_residual, "相同回波下残留至少减少一半");
+        assert!(new_static as f64 / structures.len() as f64 > 0.995, "静态结构保留率");
+    }
 
     #[test]
     fn coarse_empty_blocks_match_original_ray_walk_exactly() {

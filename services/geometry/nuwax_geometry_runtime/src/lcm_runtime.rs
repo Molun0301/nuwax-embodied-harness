@@ -10581,6 +10581,8 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
         committed_map,
         committed_map_occupancy: Arc::clone(&event.data),
         points_frame_id: body_frame.to_owned(),
+        static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
+            .pgo_static_point_indices(source_timestamp_ns, binding.envelope_sha256, body_points.len())?,
         body_points,
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
@@ -10944,6 +10946,8 @@ async fn registered_lio_correction_input(
         committed_map,
         committed_map_occupancy: Arc::clone(&event.data),
         points_frame_id: body_frame.to_owned(),
+        static_point_indices: handle.mapping_adapter.as_ref().ok_or("建图拥有方未就绪")?.lock()
+            .pgo_static_point_indices(source_timestamp_ns, binding.envelope_sha256, body_points.len())?,
         body_points,
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: frame_capture_epoch,
@@ -11087,6 +11091,7 @@ async fn registered_lio_read_only_correction_frame(
         committed_map_occupancy,
         points_frame_id: body_frame.to_owned(),
         body_points,
+        static_point_indices: None,
         base_anchor_map_from_odom: binding.base_anchor_map_from_odom,
         frame_capture_relocalization_epoch: mode_epoch,
         relocalization_mode_epoch: Some(mode_epoch),
@@ -12655,7 +12660,21 @@ mod mapping_feed_tests {
             Some(live.committed_map),
             *fixture.context.committed_map_authority.lock().unwrap()
         );
-        assert_eq!(live.cloud.data, committed.xyz_f32_le);
+        // 当前导航走精细块协议；核对实际块内容，不能把空的旧内联字段当作点云丢失。
+        let fine = live.fine.as_ref().expect("精细导航输入");
+        let root = nuwax_map_chunks::Manifest::decode(&fine.root, fine.root_sha256).unwrap();
+        assert_eq!(root.source_timestamp_ns, committed.receipt.source_timestamp_ns);
+        let mut keys = std::collections::BTreeSet::new();
+        for block in &root.blocks {
+            let bytes = fine.included.get(&block.sha256).expect("小场景包含全部块");
+            assert_eq!(nuwax_map_chunks::digest(bytes), block.sha256);
+            for (local, _) in nuwax_map_chunks::decode_block(bytes).unwrap() {
+                keys.insert(nuwax_map_chunks::global_key(block.key, local).unwrap());
+            }
+        }
+        let fine_xyz = keys.into_iter().flat_map(|key| key.into_iter().flat_map(|v|
+            (((v as f64 + 0.5) * f64::from(root.voxel_size_m)) as f32).to_le_bytes())).collect::<Vec<_>>();
+        assert_eq!(fine_xyz, committed.xyz_f32_le);
         assert_eq!(
             frames[3].msg_type.fingerprint(),
             schema::NAVIGATION_MAP_3D_FINGERPRINT
@@ -15601,6 +15620,7 @@ mod mapping_feed_tests {
             .clone();
         let (mapping_snapshot, map_frame_generation, base_anchor_map_from_odom) = {
             let mut adapter = mapping.lock();
+            adapter.enable_pgo_history();
             adapter
                 .start_session("correction-receipt-session", "correction-receipt-map")
                 .expect("active mapping session");
@@ -15739,6 +15759,7 @@ mod mapping_feed_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(frame.body_points, expected_body_points);
+        assert_eq!(frame.static_point_indices.as_deref(), Some([0, 1, 2].as_slice()));
         assert_eq!(
             frame.registered_cloud.body_points_sha256,
             crate::correction_coordinator::body_points_sha256(&expected_body_points)
@@ -15765,6 +15786,8 @@ mod mapping_feed_tests {
         )
         .await
         .expect("live cloud is accepted during publication cadence"));
+        assert_eq!(mapping.lock().pgo_static_point_indices(source_timestamp_ns + 1,
+            throttled_binding.envelope_sha256, map_points.len()).unwrap().as_deref(), Some([0, 1, 2].as_slice()));
         assert!(revision_rx.try_recv().is_err());
         assert_eq!(sink.staged.lock().await.len(), 1);
         assert_eq!(handle.state.read().await.map.revision, before_revision);

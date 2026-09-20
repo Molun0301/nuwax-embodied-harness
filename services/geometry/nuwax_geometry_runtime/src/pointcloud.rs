@@ -153,6 +153,8 @@ pub(crate) fn cloud_map_active_slot(revision: u64) -> Option<u32> {
 }
 
 pub struct CloudMapShmWriter {
+    #[cfg(test)]
+    last_stage_ms: [f64; 3],
     mmap: MmapMut,
     shm_path: std::path::PathBuf,
     shm_identity: Option<ProductOwnedMmapIdentity>,
@@ -283,6 +285,10 @@ pub(crate) struct PreparedCloudAccumulator {
 
 /// 先于激活持锁提交完成读取、逐块校验和私有导入。
 pub(crate) struct PreparedFineCloud { cloud: FineCloud }
+
+impl PreparedFineCloud {
+    pub(crate) fn voxel_size(&self) -> f32 { self.cloud.voxel_size() }
+}
 
 pub(crate) fn prepare_fine_cloud_archive(file: std::fs::File, session: &str, generation: u64,
     cloud_revision: u64, source_timestamp_ns: u64) -> Result<PreparedFineCloud, String> {
@@ -452,6 +458,8 @@ impl CloudMapShmWriter {
             voxels: VoxelIndex::new(),
             ordered_voxels: OrderedVoxelSnapshot::default(),
             dynamic_filter: DynamicCloudFilter::default(),
+            #[cfg(test)]
+            last_stage_ms: [0.0; 3],
             fine_cloud: None,
             committed_fine_cloud: None,
             dense_cloud: None,
@@ -550,16 +558,28 @@ impl CloudMapShmWriter {
                 Err(error) => { warn!(%error, "精细导航源创建失败"); return false; }
             }
         }
+        #[cfg(test)]
+        let phase_started = std::time::Instant::now();
         if let Err(error) = self.fine_cloud.as_mut().unwrap().accumulate(points, sensor_origin_map, source_timestamp_ns) {
             warn!(%error, "精细导航源拒绝不完整输入");
             return false;
         }
-        // 完整显示记录每个已接纳扫描点，动态体素清理不删除扫描历史。
+        #[cfg(test)]
+        { self.last_stage_ms[0] = phase_started.elapsed().as_secs_f64() * 1000.0; }
+        #[cfg(test)]
+        let phase_started = std::time::Instant::now();
+        // 完整显示保留静态扫描原坐标和重复观测，同步撤销动态历史。
         // 故障锁存并撤销完整源，不能继续发布缺帧历史或影响原导航地图。
         if !self.dense_history_missing && self.dense_error.is_none() {
             let result = (|| {
-                if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::new()?); }
-                self.dense_cloud.as_mut().unwrap().append(points)
+                let fine = self.fine_cloud.as_ref().unwrap();
+                if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::with_voxel_size(fine.voxel_size())?); }
+                let dense = self.dense_cloud.as_mut().unwrap();
+                #[cfg(test)]
+                if self.dynamic_filter.legacy_only { return dense.append(points); }
+                dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?;
+                let static_points = points.iter().filter(|point| !fine.is_dynamic(point)).copied().collect::<Vec<_>>();
+                dense.append(&static_points)
             })();
             if let Err(error) = result {
                 warn!(%error, "完整扫描归档失败，完整点云不可用");
@@ -567,6 +587,10 @@ impl CloudMapShmWriter {
                 self.committed_dense_cloud = None;
             }
         }
+        #[cfg(test)]
+        { self.last_stage_ms[1] = phase_started.elapsed().as_secs_f64() * 1000.0; }
+        #[cfg(test)]
+        let phase_started = std::time::Instant::now();
         if let Some(origin) = sensor_origin_map {
             let removed = self.dynamic_filter.clear_observed_free_space_with_hits(
                 &mut self.voxels,
@@ -592,7 +616,10 @@ impl CloudMapShmWriter {
                 self.ordered_voxels.inserted(key, self.max_points);
             }
         }
-        self.coarsen_to_fit()
+        let result = self.coarsen_to_fit();
+        #[cfg(test)]
+        { self.last_stage_ms[2] = phase_started.elapsed().as_secs_f64() * 1000.0; }
+        result
     }
 
     /// Serialize the current voxel centroids into the double-buffered SHM.
@@ -638,6 +665,15 @@ impl CloudMapShmWriter {
     pub(crate) fn committed_dense_cloud(&self) -> Result<Option<DenseSnapshot>, String> {
         if let Some(error) = &self.dense_error { return Err(format!("完整扫描归档失败：{error}")); }
         Ok(self.committed_dense_cloud.clone())
+    }
+
+    pub(crate) fn dense_cloud_for_read(&mut self, epoch: &str, offset: u64) -> Result<Option<DenseSnapshot>, String> {
+        let Some(latest) = self.committed_dense_cloud()? else { return Ok(None); };
+        self.dense_cloud.as_mut().ok_or("完整点云拥有方已退役")?.pin_read(latest, epoch, offset).map(Some)
+    }
+
+    pub(crate) fn dense_read_epoch_available(&self, epoch: &str) -> bool {
+        self.dense_error.is_none() && self.dense_cloud.as_ref().is_some_and(|cloud| cloud.read_epoch_available(epoch))
     }
 
     /// Read the exact active SHM payload without advancing its revision.
@@ -1083,7 +1119,7 @@ fn voxel_center_f32(key: VoxelKey, voxel_size: f32) -> [f32; 3] {
     [point[0] as f32, point[1] as f32, point[2] as f32]
 }
 
-fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
+pub(crate) fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
     if !voxel_size.is_finite() || voxel_size <= 0.0 || point.iter().any(|value| !value.is_finite())
     {
         return None;
@@ -1103,6 +1139,116 @@ fn voxel_key(point: [f64; 3], voxel_size: f32) -> Option<VoxelKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "需要显式提供已冻结位姿的记录，仅用于同源性能测量"]
+    fn dynamic_recorded_scan_benchmark() {
+        use std::io::Read;
+        let path = std::env::var("NUWAX_DYNAMIC_RECORDED_SCANS").expect("指定配对扫描文件");
+        let limit = std::env::var("NUWAX_DYNAMIC_BENCHMARK_FRAMES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(300);
+        let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_DYNAMIC_SENSOR_ORIGIN_BODY").expect("指定真实雷达机体原点")).unwrap();
+        let mut file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let legacy = std::env::var_os("NUWAX_DYNAMIC_BENCHMARK_LEGACY").is_some();
+        if legacy {
+            writer.reset_accumulator(1);
+            writer.dynamic_filter.legacy_only = true;
+            let mut fine = FineCloud::fresh().unwrap();
+            fine.use_legacy_filter();
+            writer.fine_cloud = Some(fine);
+        }
+        let mut durations = Vec::new();
+        let mut stages = [0.0; 3];
+        let mut count = 0;
+        for _ in 0..limit {
+            let mut header = [0; 68];
+            match file.read_exact(&mut header) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("读取扫描失败：{error}"),
+            }
+            let stamp = u64::from_le_bytes(header[..8].try_into().unwrap());
+            let pose: [f64; 7] = std::array::from_fn(|i| f64::from_le_bytes(header[8 + i * 8..16 + i * 8].try_into().unwrap()));
+            let transform = nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(pose[0], pose[1], pose[2]),
+                nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(pose[6], pose[3], pose[4], pose[5])));
+            let size = u32::from_le_bytes(header[64..68].try_into().unwrap()) as usize;
+            assert!(size <= POINTCLOUD_MAX_FRAME_POINTS);
+            let mut bytes = vec![0; size * 12];
+            file.read_exact(&mut bytes).unwrap();
+            let points = bytes.chunks_exact(12).map(|b| transform * Point3::new(
+                f32::from_le_bytes(b[..4].try_into().unwrap()) as f64,
+                f32::from_le_bytes(b[4..8].try_into().unwrap()) as f64,
+                f32::from_le_bytes(b[8..12].try_into().unwrap()) as f64)).collect::<Vec<_>>();
+            let origin = (transform * Point3::from(origin)).coords.into();
+            let start = std::time::Instant::now();
+            assert!(writer.accumulate_mapping_scan(1, &points, Some(origin), stamp));
+            durations.push(start.elapsed().as_secs_f64() * 1000.0);
+            for i in 0..3 { stages[i] += writer.last_stage_ms[i]; }
+            count += size;
+        }
+        durations.sort_by(f64::total_cmp);
+        assert!(!durations.is_empty());
+        eprintln!("{}", serde_json::json!({"frames": durations.len(), "source_points": count,
+            "map_voxels": writer.voxels.len(), "stage_mean_ms": stages.map(|v| v / durations.len() as f64), "mean_ms": durations.iter().sum::<f64>() / durations.len() as f64,
+            "p50_ms": durations[durations.len()/2], "p95_ms": durations[durations.len()*95/100],
+            "max_ms": durations.last().unwrap(), "labeled_humans": false}));
+    }
+
+    #[test]
+    fn passing_person_is_live_obstacle_but_not_dense_history_and_survives_save_restore() {
+        use crate::dynamic_scene::tests::{corridor, ORIGIN};
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let mut static_total = 0_u64;
+        let mut people_total = 0_u64;
+        let mut last_receipt = None;
+        for frame in 1..=22 {
+            let person = (7..=16).contains(&frame).then(|| -0.5 + (frame - 7) as f64 * 0.12);
+            let (points, labels) = corridor(person, (frame % 3) as f64);
+            people_total += labels.iter().filter(|label| **label).count() as u64;
+            static_total += labels.iter().filter(|label| !**label).count() as u64;
+            assert!(writer.accumulate_mapping_scan(1, &points, Some(ORIGIN), frame * 100_000_000));
+            // 过滤后的导航源仍包含本帧所有人体回波，不能让静态显示需求抹除避障依据。
+            for point in points.iter().zip(&labels).filter(|(_, label)| **label).map(|(point, _)| point) {
+                assert!(writer.voxels.contains(&voxel_key([point.x, point.y, point.z], writer.voxel_size).unwrap()));
+            }
+            let receipt = OccupancyCommitReceipt {
+                commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 80, sequence: frame },
+                session_id: "人员经过".into(), session_generation: 1, occupancy_revision: frame,
+                source_timestamp_ns: frame * 100_000_000, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                backend_generation: 1,
+            };
+            writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
+            last_receipt = Some(receipt);
+        }
+        let snapshot = writer.committed_dense_cloud().unwrap().unwrap();
+        let mut offset = 0;
+        let mut remaining_person = 0;
+        let mut remaining_static = 0;
+        while offset < snapshot.point_count {
+            let bytes = snapshot.read(offset, crate::dense_cloud::CHUNK_POINTS).unwrap();
+            offset += bytes.len() as u64 / 12;
+            for bytes in bytes.chunks_exact(12) {
+                let xyz: [f32; 3] = std::array::from_fn(|axis| f32::from_le_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap()));
+                if xyz[0] > 2.7 && xyz[0] < 3.3 && xyz[2] > 0.1 && xyz[2] < 1.9 { remaining_person += 1; }
+                else { remaining_static += 1; }
+            }
+        }
+        eprintln!("完整扫描人体原始={people_total} 剩余={remaining_person} 静态原始={static_total} 保留={remaining_static}");
+        assert!(remaining_person * 5 < people_total);
+        assert_eq!(remaining_static, static_total);
+        let (mut archive, _, _) = snapshot.archive("map").unwrap();
+        crate::dense_cloud::validate_archive(&mut archive).unwrap();
+        let restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
+        let restored = restored.snapshot(&snapshot.receipt, "人员经过").unwrap();
+        assert_eq!(restored.point_count, snapshot.point_count);
+        assert_eq!(restored.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap(), snapshot.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap());
+        let receipt = last_receipt.unwrap();
+        let mut next = CloudMapShmWriter::new_private().unwrap();
+        next.install_prepared_accumulator(&receipt, writer.take_prepared_accumulator()).unwrap();
+        assert_eq!(next.committed_dense_cloud().unwrap().unwrap().point_count, snapshot.point_count);
+        assert!(next.accumulate_mapping_scan(2, &corridor(Some(0.0), 0.0).0, Some(ORIGIN), 1));
+        assert!(next.fine_cloud.as_ref().unwrap().removed_keys().is_empty(), "换图不复用旧动态证据");
+    }
 
     #[test]
     fn dense_cloud_follows_commits_rebuilds_and_checkpoint_availability() {

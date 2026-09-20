@@ -2448,6 +2448,10 @@ impl MappingAdapter {
         )
     }
 
+    pub(crate) fn pgo_static_point_indices(&self, timestamp_ns: u64, digest: [u8; 32], count: usize) -> Result<Option<Arc<[u32]>>, String> {
+        self.pgo_history.as_ref().map(|history| history.static_point_indices(timestamp_ns, digest, count)).transpose()
+    }
+
     pub(crate) fn pgo_rebuild_input(
         &self,
     ) -> Result<

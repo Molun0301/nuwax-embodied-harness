@@ -1397,6 +1397,8 @@ mod preflight_only_contract {
         pub(crate) committed_map_occupancy: Arc<[u8]>,
         pub(crate) points_frame_id: String,
         pub(crate) body_points: Vec<Point3<f64>>,
+        /// 同一接纳扫描的静态子集；原始点与来源证明保留，回环算法只消费该子集。
+        pub(crate) static_point_indices: Option<Arc<[u32]>>,
         /// Immutable canonical anchor captured before this frame was committed.
         pub(crate) base_anchor_map_from_odom: Isometry3<f64>,
         /// Fence epoch observed when this source frame crossed the LIO
@@ -1407,6 +1409,19 @@ mod preflight_only_contract {
         /// carry the active epoch; ordinary correction backends leave this
         /// unset.
         pub(crate) relocalization_mode_epoch: Option<u64>,
+    }
+
+    impl CorrectionFrameInput {
+        fn pgo_points(&self) -> Result<std::borrow::Cow<'_, [Point3<f64>]>, CorrectionOwnerError> {
+            let Some(indices) = &self.static_point_indices else {
+                return Ok(std::borrow::Cow::Borrowed(&self.body_points));
+            };
+            if indices.windows(2).any(|pair| pair[0] >= pair[1])
+                || indices.last().is_some_and(|index| *index as usize >= self.body_points.len()) {
+                return Err(CorrectionOwnerError::InvalidRegisteredCloudProof);
+            }
+            Ok(std::borrow::Cow::Owned(indices.iter().map(|index| self.body_points[*index as usize]).collect()))
+        }
     }
 
     pub(crate) struct LibraryPgoOwner {
@@ -1520,6 +1535,7 @@ mod preflight_only_contract {
             input: CorrectionFrameInput,
         ) -> Result<Option<CorrectionCandidate>, CorrectionOwnerError> {
             let session_transition = validate_frame_input(&input, self)?;
+            let static_points = input.pgo_points()?;
             if session_transition {
                 self.coordinator = LoopClosureCoordinator::new(self.pipeline)
                     .map_err(|error| CorrectionOwnerError::Pipeline(error.to_string()))?;
@@ -1551,7 +1567,7 @@ mod preflight_only_contract {
                 .process_frame(
                     relative_timestamp,
                     input.correlated_odom.odom_from_body,
-                    &input.body_points,
+                    &static_points,
                 )
                 .map_err(|error| CorrectionOwnerError::Pipeline(error.to_string()))?;
             if matches!(
@@ -1565,7 +1581,8 @@ mod preflight_only_contract {
                     source_timestamp_ns = input.registered_cloud.source_timestamp_ns,
                     session_generation = input.mapping_session_generation,
                     keyframe_id = self.keyframe_source_timestamps_ns.len() - 1,
-                    point_count = input.body_points.len(),
+                    point_count = static_points.len(),
+                    source_point_count = input.body_points.len(),
                     odom_translation_m = ?input.correlated_odom.odom_from_body.translation.vector,
                     odom_rotation_xyzw = ?input.correlated_odom.odom_from_body.rotation.coords,
                     "记录回环关键帧的原始里程计依据"
@@ -4746,6 +4763,13 @@ mod preflight_only_contract {
             input: CorrectionFrameInput,
             cancellation: &CorrectionRequestCancellation,
         ) -> Result<CandidateProduction, CorrectionRuntimeError> {
+            if input.static_point_indices.as_ref().is_some_and(|indices| indices.is_empty()) {
+                if input.registered_cloud.point_count != input.body_points.len() as u64
+                    || input.registered_cloud.body_points_sha256 != body_points_sha256(&input.body_points)? {
+                    return Err(CorrectionOwnerError::InvalidRegisteredCloudProof.into());
+                }
+                return Ok(CandidateProduction::NoCandidate);
+            }
             let request = native_pgo_request(
                 &self.identity,
                 &self.map_frame_id,
@@ -4831,9 +4855,12 @@ mod preflight_only_contract {
             i64::try_from(value)
                 .map_err(|_| CorrectionRuntimeError::NativePgo(format!("{label} exceeds i64")))
         };
-        let coordinate_count = input
-            .body_points
-            .len()
+        if input.registered_cloud.point_count != input.body_points.len() as u64
+            || input.registered_cloud.body_points_sha256 != body_points_sha256(&input.body_points)? {
+            return Err(CorrectionOwnerError::InvalidRegisteredCloudProof.into());
+        }
+        let static_points = input.pgo_points()?;
+        let coordinate_count = static_points.len()
             .checked_mul(3)
             .and_then(|count| i32::try_from(count).ok())
             .ok_or_else(|| {
@@ -4844,8 +4871,8 @@ mod preflight_only_contract {
         let map_cell_count = i32::try_from(input.committed_map_occupancy.len()).map_err(|_| {
             CorrectionRuntimeError::NativePgo("committed map cell count exceeds i32".to_owned())
         })?;
-        let mut registered_body_points_xyz = Vec::with_capacity(input.body_points.len() * 3);
-        for point in &input.body_points {
+        let mut registered_body_points_xyz = Vec::with_capacity(static_points.len() * 3);
+        for point in static_points.iter() {
             registered_body_points_xyz.extend_from_slice(&[point.x, point.y, point.z]);
         }
         let odom = CorrectionTransform::from_isometry(&input.correlated_odom.odom_from_body);
@@ -4885,10 +4912,10 @@ mod preflight_only_contract {
                     )?,
                     point_count: checked_i64(
                         "registered cloud point count",
-                        input.registered_cloud.point_count,
+                        static_points.len() as u64,
                     )?,
                     envelope_sha256: input.registered_cloud.envelope_sha256,
-                    body_points_sha256: input.registered_cloud.body_points_sha256,
+                    body_points_sha256: body_points_sha256(&static_points)?,
                 },
                 correlated_odom: native_pgo_codec::NativePgoCorrelatedOdomProof {
                     source_sequence: checked_i64(
@@ -12383,6 +12410,7 @@ mod preflight_only_contract {
                     committed_map_occupancy: Arc::from(Vec::<u8>::new()),
                     points_frame_id: "base".to_owned(),
                     body_points: Vec::new(),
+                    static_point_indices: None,
                     base_anchor_map_from_odom: boundary_base_anchor,
                     frame_capture_relocalization_epoch: 1,
                     relocalization_mode_epoch: Some(1),
@@ -16567,6 +16595,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 committed_map_occupancy,
                 points_frame_id: "robot_body".into(),
                 body_points,
+                static_point_indices: None,
                 base_anchor_map_from_odom: Isometry3::identity(),
                 frame_capture_relocalization_epoch: 0,
                 relocalization_mode_epoch: None,
@@ -16588,6 +16617,104 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             input.frame_capture_relocalization_epoch = mode.epoch;
             input.relocalization_mode_epoch = Some(mode.epoch);
             input
+        }
+
+        #[test]
+        fn accepted_static_scan_reaches_library_and_native_before_keyframes_and_loop_processing() {
+            use crate::dynamic_scene::tests::{corridor, ORIGIN};
+            let (people_scan, labels) = corridor(Some(0.0), 0.0);
+            let people = labels.iter().filter(|label| **label).count();
+            let threshold = people_scan.len() - people / 2;
+            let pipeline = LoopClosurePipelineConfig {
+                min_keyframe_points: threshold,
+                min_keyframes_for_loop_search: 100,
+                keyframe_translation: 0.001,
+                ..LoopClosurePipelineConfig::default()
+            };
+            let mut library = CorrectionOwnerHandle::start(CorrectionOwnerSpec::LibraryPgo {
+                map_frame_id: "robot_map".into(), odom_frame_id: "robot_odom".into(),
+                body_frame_id: "robot_body".into(), pipeline,
+            }, owner_identity()).unwrap();
+            let mut history = crate::pgo_map::ScanHistory::default();
+            let mut static_input = None;
+            for sequence in 1..=7 {
+                let world_points = if sequence == 7 { people_scan.clone() } else { corridor(None, 0.0).0 };
+                let mut input = frame(sequence, sequence * 100_000_000, sequence as f64 * 0.1);
+                // 故意改变已提交地图校正，运动证据仍须留在同一原始里程计坐标。
+                let anchor = Isometry3::translation(sequence as f64 * 2.0, -1.0, 0.3);
+                let map_points = world_points.iter().map(|point| anchor * point).collect::<Vec<_>>();
+                let origin_map = anchor * Point3::from(ORIGIN);
+                let binding = crate::lio_ingress::RegistrationBinding {
+                    runtime_generation: 1, cloud_source_sequence: sequence as i64,
+                    correlated_odometry: crate::lio_ingress::CorrelatedOdometry {
+                        source_sequence: sequence as i64, source_timestamp_ns: (sequence * 100_000_000) as i64,
+                    },
+                    mapping_session_id: input.mapping_session_id.clone(),
+                    mapping_session_generation: input.mapping_session_generation,
+                    map_frame_generation: input.map_frame_generation,
+                    envelope_sha256: input.registered_cloud.envelope_sha256,
+                    frozen_odom_from_body: input.correlated_odom.odom_from_body,
+                    base_anchor_map_from_odom: Isometry3::identity(),
+                    registration_map_from_odom: anchor,
+                    registration_correction_revision: sequence,
+                    sensor_origin_map: Some(origin_map.coords.into()), frame_capture_relocalization_epoch: Some(0),
+                };
+                history.record(sequence * 100_000_000, sequence * 100_000_000, &binding, &map_points).unwrap();
+                let body_from_map = (anchor * binding.frozen_odom_from_body).inverse();
+                input.body_points = map_points.iter().map(|point| body_from_map * point).collect();
+                input.registered_cloud.point_count = input.body_points.len() as u64;
+                input.registered_cloud.body_points_sha256 = body_points_sha256(&input.body_points).unwrap();
+                input.static_point_indices = Some(history.static_point_indices(sequence * 100_000_000,
+                    binding.envelope_sha256, input.body_points.len()).unwrap());
+                if sequence == 7 {
+                    let indices = input.static_point_indices.as_ref().unwrap();
+                    let retained_people = indices.iter().filter(|i| labels[**i as usize]).count();
+                    let retained_static = indices.len() - retained_people;
+                    assert!(retained_people * 5 < people);
+                    assert_eq!(retained_static, people_scan.len() - people);
+                    assert!(indices.len() < threshold && input.body_points.len() > threshold);
+                    let raw_digest = input.registered_cloud.body_points_sha256;
+                    let mut request = native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).unwrap();
+                    request.identity.request_sequence = 1;
+                    let request = native_pgo_codec::seal_native_pgo_request(request).unwrap();
+                    let wire = native_pgo_codec::encode_native_pgo_request_wire(&request).unwrap();
+                    let decoded = native_pgo_codec::decode_native_pgo_request_wire(&wire).unwrap();
+                    assert_eq!(decoded.identity.registered_cloud.point_count as usize, indices.len());
+                    assert_eq!(decoded.registered_body_points_xyz,
+                        input.pgo_points().unwrap().iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>());
+                    assert_ne!(decoded.identity.registered_cloud.body_points_sha256, raw_digest);
+                    assert_eq!(input.registered_cloud.body_points_sha256, raw_digest);
+                    static_input = Some((indices.clone(), raw_digest));
+                }
+                assert!(library.submit_frame(input).unwrap().is_none());
+            }
+            let CorrectionOwnerHandle::LibraryPgo { owner, .. } = &library else { unreachable!() };
+            // 前六帧已真实建关键帧；人体扫描过滤后低于准入点数，证明过滤发生在协调器之前。
+            assert_eq!(owner.coordinator.graph().nodes.len(), 6);
+            assert!(static_input.is_some());
+            assert!(history.static_point_indices(700_000_000, [0; 32], people_scan.len()).is_err());
+            history.clear();
+            assert!(history.static_point_indices(700_000_000, [7; 32], people_scan.len()).is_err());
+        }
+
+        #[test]
+        fn static_selection_rejects_invalid_source_and_indices_before_resetting_owner() {
+            let mut library = CorrectionOwnerHandle::start(transport_library_spec(), owner_identity()).unwrap();
+            library.submit_frame(frame(1, 1_000_000_000, 0.0)).unwrap();
+            for indices in [vec![1, 1], vec![u32::MAX], vec![2, 1]] {
+                let mut input = frame(2, 2_000_000_000, 1.0);
+                input.mapping_session_generation += 1;
+                input.map_frame_generation += 1;
+                input.static_point_indices = Some(indices.into());
+                assert!(native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).is_err());
+                assert_eq!(library.submit_frame(input), Err(CorrectionOwnerError::InvalidRegisteredCloudProof));
+                let CorrectionOwnerHandle::LibraryPgo { owner, .. } = &library else { unreachable!() };
+                assert_eq!(owner.session.as_ref().unwrap().mapping_session_generation, 23);
+                assert_eq!(owner.coordinator.graph().nodes.len(), 1);
+            }
+            let mut input = frame(2, 2_000_000_000, 1.0);
+            input.registered_cloud.point_count += 1;
+            assert!(native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).is_err());
         }
 
         #[test]

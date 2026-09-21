@@ -3,7 +3,7 @@
 use crate::{
     lio_ingress::RegistrationBinding,
     mapping_backend::{
-        self, MappingBackendComputeConfig, MappingBackendInput, MappingBackendKind,
+        self, MappingBackendComputeConfig, MappingBackendInput,
         MappingBackendSpec, MappingComputeToken,
     },
     persistent_occupancy::PersistentOccupancyGrid,
@@ -13,7 +13,6 @@ use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion};
 use nuwax_codec::lcm::native_pgo::{validate_optimized_keyframes, OptimizedKeyframe};
 use nuwax_mapping::{
     loop_closure::{CorrectionKeyframe, CorrectionTimeline},
-    OccupancyGrid,
 };
 use std::{
     collections::BTreeMap,
@@ -176,7 +175,7 @@ impl ScanHistory {
 }
 
 pub(crate) struct RebuiltMap {
-    pub occupancy: OccupancyGrid,
+    pub persistent: PersistentOccupancyGrid,
     pub cloud: CommittedCloudMapSnapshot,
     pub backend_checkpoint: Vec<u8>,
     pub accumulator: crate::pointcloud::PreparedCloudAccumulator,
@@ -217,7 +216,7 @@ pub(crate) struct ReplayBuilder {
 }
 
 pub(crate) struct PreparedReplay {
-    occupancy: OccupancyGrid,
+    persistent: PersistentOccupancyGrid,
     cloud: CommittedCloudMapSnapshot,
     backend_checkpoint: Vec<u8>,
     pub source_timestamp_ns: u64,
@@ -417,7 +416,6 @@ impl ReplayBuilder {
                     &mut self.persistent,
                     &input,
                     self.config,
-                    self.background,
                 )?;
                 self.kernel_time += phase.elapsed();
                 self.check(cancelled)?;
@@ -450,13 +448,12 @@ impl ReplayBuilder {
         }
         self.cloud_worker.as_mut().unwrap().submit(input.clone())?;
         let started = Instant::now();
-        // 禁止两阶段并行中再启动高度投影线程，最多两路计算。
+        // 地图与点云各自推进，最多两路计算。
         let kernel_result = append_kernel_stage(
             &mut self.kernel,
             &mut self.persistent,
             input,
             self.config,
-            false,
         );
         self.kernel_time += started.elapsed();
         let was_cancelled = cancelled();
@@ -511,28 +508,14 @@ impl ReplayBuilder {
         };
         // 物化候选不能改变继续追赶的节拍或持久栅格；否则分批边界会改变同输入结果。
         let mut output_kernel = self.kernel.clone();
-        let occupancy = if let Some(candidate) =
+        let persistent = if let Some(candidate) =
             mapping_backend::flush_candidate(&mut output_kernel, input, &token, self.config)?
         {
-            match candidate.backend_kind {
-                MappingBackendKind::SlamToolbox => {
-                    return Err("二维算法不得进入三维回环重建".into())
-                }
-                MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
-                    self.persistent.as_ref(),
-                    &candidate.live_window_occupancy,
-                    &candidate.latest_frame_occupancy,
-                )?,
-                MappingBackendKind::Raytracing => {
-                    PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy)?
-                }
-            }
-            .grid
+            PersistentOccupancyGrid::stage_observation(self.persistent.as_ref(), &candidate.latest_frame_occupancy)?
         } else {
             self.persistent
                 .as_ref()
                 .ok_or("PGO重建没有占据地图")?
-                .grid
                 .clone()
         };
         self.check(cancelled)?;
@@ -557,7 +540,7 @@ impl ReplayBuilder {
             )
         };
         let prepared = PreparedReplay {
-            occupancy,
+            persistent,
             cloud: self
                 .cloud
                 .as_ref()
@@ -585,7 +568,7 @@ impl ReplayBuilder {
             return Err("PGO点云线程尚未在后台回收".into());
         }
         let result = RebuiltMap {
-            occupancy: prepared.occupancy,
+            persistent: prepared.persistent,
             cloud: prepared.cloud,
             backend_checkpoint: prepared.backend_checkpoint,
             accumulator: self
@@ -715,33 +698,17 @@ fn append_kernel_stage(
     persistent: &mut Option<PersistentOccupancyGrid>,
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
-    parallel_projection: bool,
 ) -> Result<(), RebuildError> {
     if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
         kernel,
         input,
         config,
-        mapping_backend::REPLAY_CANDIDATE_INTERVAL_NS,
-        parallel_projection,
+        0,
     )? {
-        match candidate.backend_kind {
-            MappingBackendKind::SlamToolbox => return Err("二维算法不得进入三维回环重建".into()),
-            MappingBackendKind::Voxel => {
-                if persistent.is_none() {
-                    *persistent = Some(PersistentOccupancyGrid::from_grid(
-                        candidate.live_window_occupancy.clone(),
-                    )?);
-                }
-                persistent.as_mut().unwrap().merge(
-                    &candidate.live_window_occupancy,
-                    &candidate.latest_frame_occupancy,
-                )?;
-            }
-            MappingBackendKind::Raytracing => {
-                *persistent = Some(PersistentOccupancyGrid::stage_authoritative(
-                    &candidate.live_window_occupancy,
-                )?);
-            }
+        if let Some(grid) = persistent.as_mut() {
+            grid.merge_observation(&candidate.latest_frame_occupancy)?;
+        } else {
+            *persistent = Some(PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy)?);
         }
     }
     Ok(())
@@ -831,6 +798,34 @@ pub(crate) fn rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planar_scan_replay_observes_each_frame_and_materialization_does_not_vote_again() {
+        let config = MappingBackendComputeConfig {
+            resolution:0.05,
+            initial_safe_radius_meters:0.0, window_capacity:1000,
+        };
+        for spec in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
+            let mut kernel = spec.into_kernel(config.window_capacity);
+            let mut persistent = None;
+            let mut input = MappingBackendInput {
+                session_id:"planar-replay".into(),session_generation:1,backend_generation:1,
+                frame_sequence:1,source_timestamp_ns:1_000_000_000,received_at_ns:1_000_000_000,
+                registered_frame_id:"map".into(),sensor_origin_map:[0.025,0.025,0.0],
+                registered_points_map:vec![Point3::new(2.025,0.025,0.0)],
+            };
+            append_kernel_stage(&mut kernel,&mut persistent,&input,config).unwrap();
+            assert!(!persistent.as_ref().unwrap().grid.data.contains(&100));
+            input.frame_sequence += 1;
+            input.source_timestamp_ns += 50_000_000;
+            input.received_at_ns += 50_000_000;
+            append_kernel_stage(&mut kernel,&mut persistent,&input,config).unwrap();
+            let grid = &persistent.as_ref().unwrap().grid;
+            assert!(grid.data.contains(&100), "重放必须累积小于250毫秒间隔的真实扫描");
+            let again = PersistentOccupancyGrid::stage_observation(persistent.as_ref(),grid).unwrap();
+            assert_eq!(again.grid.data,grid.data);
+        }
+    }
 
     #[test]
     fn archive_capacity_disables_only_complete_history_and_resets_with_session() {
@@ -958,7 +953,6 @@ mod tests {
         });
         let config = MappingBackendComputeConfig {
             resolution: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 10_000,
         };
@@ -1001,8 +995,8 @@ mod tests {
                 actual.source_timestamp_ns,
                 scans.last().unwrap().source_timestamp_ns
             );
-            let a = &actual.occupancy;
-            let b = &expected.occupancy;
+            let a = &actual.persistent.grid;
+            let b = &expected.persistent.grid;
             assert_eq!(
                 (
                     a.width,
@@ -1048,7 +1042,6 @@ mod tests {
             MappingBackendSpec::Voxel,
             MappingBackendComputeConfig {
                 resolution: 0.05,
-                occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
                 initial_safe_radius_meters: 0.0,
                 window_capacity: 100_000,
             },
@@ -1063,7 +1056,6 @@ mod tests {
         let (scans, trajectory) = scale_input(48);
         let config = MappingBackendComputeConfig {
             resolution: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 10_000,
         };
@@ -1116,7 +1108,7 @@ mod tests {
             assert!(slices >= 3);
             let (builder, prepared) = builder.advance(&[], &|| false).unwrap();
             let actual = builder.finish(prepared, &|| false).unwrap();
-            assert_eq!(actual.occupancy.data, expected.occupancy.data);
+            assert_eq!(actual.persistent.grid.data, expected.persistent.grid.data);
             assert_eq!(actual.cloud.xyz_f32_le, expected.cloud.xyz_f32_le);
             assert_eq!(actual.source_timestamp_ns, expected.source_timestamp_ns);
             assert!(actual.prepared_backend.is_some());
@@ -1152,7 +1144,6 @@ mod tests {
         let scans: Arc<[ArchivedScan]> = scans.into();
         let config = MappingBackendComputeConfig {
             resolution: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 1_000_000,
         };
@@ -1198,11 +1189,11 @@ mod tests {
             eprintln!("固定扰动 parallel={parallel} elapsed_ms={:.3} kernel_ms={kernel_ms:.3} cloud_ms={cloud_ms:.3} points={}",
                 started.elapsed().as_secs_f64()*1000.0, output.cloud.point_count);
             if let Some(reference) = &reference {
-                assert_eq!(output.occupancy.data, reference.occupancy.data);
-                assert_eq!(output.occupancy.origin, reference.occupancy.origin);
+                assert_eq!(output.persistent.grid.data, reference.persistent.grid.data);
+                assert_eq!(output.persistent.grid.origin, reference.persistent.grid.origin);
                 assert_eq!(
-                    (output.occupancy.width, output.occupancy.height),
-                    (reference.occupancy.width, reference.occupancy.height)
+                    (output.persistent.grid.width, output.persistent.grid.height),
+                    (reference.persistent.grid.width, reference.persistent.grid.height)
                 );
                 assert_eq!(output.cloud.xyz_f32_le, reference.cloud.xyz_f32_le);
                 assert_eq!(output.source_timestamp_ns, reference.source_timestamp_ns);
@@ -1220,7 +1211,6 @@ mod tests {
         let started = Instant::now();
         let config = MappingBackendComputeConfig {
             resolution: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 100_000,
         };

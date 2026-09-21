@@ -107,18 +107,6 @@
     "apply_scope": "重启几何运行时后生效",
     "description": ""
   },
-  "NUWAX_MAPPING_OCCUPANCY_ALGO": {
-    "zh_name": "占据栅格算法",
-    "type": "str",
-    "default": "height_cost",
-    "section_id": "mapping",
-    "target_file": "core_env",
-    "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/mapping_adapter.rs"
-    ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": ""
-  },
   "NUWAX_MAPPING_ORIGIN_X": {
     "zh_name": "栅格原点 X（米）",
     "type": "float",

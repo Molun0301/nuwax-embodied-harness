@@ -18,8 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use nalgebra::Point3;
-use nuwax_mapping::cost_mapper::{CostAlgoSelector, CostMapper, OccupancyConfig, PointCloud2Like};
-use nuwax_mapping::pointclouds::occupancy::PointCloudOccConfig;
+use nuwax_mapping::cost_mapper::{CostMapper, OccupancyConfig, PointCloud2Like};
 use nuwax_mapping::OccupancyGrid;
 use nuwax_mapping_raytracing::voxel_ray_tracer::{
     append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config, iter_global_points,
@@ -35,9 +34,8 @@ const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 const PREINSTALL_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
-// 在线最多30次/秒，仍只消费真实新输入；历史回放保持原有计算节拍。
+// 在线最多30次/秒，仍只消费真实新输入；历史回放逐帧累积水平观测。
 pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 33_333_333;
-pub(crate) const REPLAY_CANDIDATE_INTERVAL_NS: u64 = 250_000_000;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAPPING_BACKEND_CHECKPOINT_MAGIC: [u8; 8] = *b"NWMBCKP\0";
@@ -319,7 +317,6 @@ pub(crate) struct MappingBackendCandidate {
 #[doc(hidden)]
 pub struct MappingBackendComputeConfig {
     pub resolution: f64,
-    pub occupancy_algo: CostAlgoSelector,
     pub initial_safe_radius_meters: f32,
     pub window_capacity: usize,
 }
@@ -862,8 +859,6 @@ impl MappingBackendWorker {
                                             == compute_config.window_capacity
                                         && prepared.config.resolution.to_bits()
                                             == compute_config.resolution.to_bits()
-                                        && prepared.config.occupancy_algo
-                                            == compute_config.occupancy_algo
                                         && prepared.config.initial_safe_radius_meters.to_bits()
                                             == compute_config.initial_safe_radius_meters.to_bits()
                                     {
@@ -1251,8 +1246,6 @@ impl MappingBackendSpec {
                 last_candidate_received_at_ns: 0,
                 dirty_since_candidate: false,
                 dynamic_scene: Default::default(),
-                live_height_cache: Default::default(),
-                latest_height_cache: Default::default(),
             }),
             Self::Raytracing(spec) => MappingKernel::Raytracing(RaytracingKernel {
                 config: spec.config(),
@@ -1347,9 +1340,6 @@ impl MappingKernel {
 #[derive(Clone)]
 pub(crate) struct VoxelKernel {
     current_window: VecDeque<Point3<f64>>,
-    // 派生结果不进入检查点；原始窗口与输入仍是可恢复真值。
-    live_height_cache: nuwax_mapping::pointclouds::occupancy::HeightCostCache,
-    latest_height_cache: nuwax_mapping::pointclouds::occupancy::HeightCostCache,
     capacity: usize,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1974,8 +1964,6 @@ fn restore_mapping_kernel_checkpoint(
                 last_candidate_received_at_ns,
                 dirty_since_candidate: false,
                 dynamic_scene: Default::default(),
-                live_height_cache: Default::default(),
-                latest_height_cache: Default::default(),
             }))
         }
         MappingBackendSpec::Raytracing(ray_spec) => {
@@ -2095,8 +2083,6 @@ fn validate_kernel_checkpoint_occupancy(occupancy: &OccupancyGrid) -> Result<(),
 
 fn occupancy_config(config: MappingBackendComputeConfig) -> OccupancyConfig {
     OccupancyConfig {
-        algo: config.occupancy_algo,
-        pointcloud: PointCloudOccConfig::default(),
         initial_safe_radius_meters: config.initial_safe_radius_meters,
     }
 }
@@ -2127,22 +2113,12 @@ impl PointCloud2Like for BorrowedBackendCloud<'_> {
 }
 
 fn build_occupancy(
-    points: &[Point3<f64>],
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<OccupancyGrid, String> {
-    build_occupancy_with_cache(points, input, config, None, false)
-}
-
-fn build_occupancy_with_cache(
-    points: &[Point3<f64>],
-    input: &MappingBackendInput,
-    config: MappingBackendComputeConfig,
-    cache: Option<&mut nuwax_mapping::pointclouds::occupancy::HeightCostCache>,
-    parallel_projection: bool,
-) -> Result<OccupancyGrid, String> {
+    // 水平扫描必须与本帧雷达原点配对，不能从当前原点向历史点云发射射线。
     let cloud = BorrowedBackendCloud {
-        points,
+        points: &input.registered_points_map,
         sensor_origin: nalgebra::point![
             input.sensor_origin_map[0],
             input.sensor_origin_map[1],
@@ -2151,23 +2127,9 @@ fn build_occupancy_with_cache(
         frame_id: &input.registered_frame_id,
         timestamp: input.source_timestamp_ns as f64 / 1_000_000_000.0,
     };
-    match cache {
-        Some(cache) => CostMapper::occupancy_from_pointcloud_auto_cached(
-            &cloud, &occupancy_config(config), config.resolution, cache, parallel_projection),
-        None => CostMapper::occupancy_from_pointcloud_auto(
-            &cloud, &occupancy_config(config), config.resolution),
-    }.map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))
-}
-
-fn cleared_previous_occupancy(
-    previous: &OccupancyGrid,
-    input: &MappingBackendInput,
-) -> OccupancyGrid {
-    let mut cleared = previous.clone();
-    cleared.data.fill(0);
-    cleared.frame_id = input.registered_frame_id.clone();
-    cleared.ts = input.source_timestamp_ns as f64 / 1_000_000_000.0;
-    cleared
+    CostMapper::occupancy_from_pointcloud_auto(
+        &cloud, &occupancy_config(config), config.resolution)
+        .map_err(|error| format!("MAPPING_BACKEND_COMPUTE_REJECTED: {error}"))
 }
 
 fn candidate_due(last_received_at_ns: u64, received_at_ns: u64, interval_ns: u64) -> bool {
@@ -2198,12 +2160,11 @@ pub(crate) fn flush_candidate(
                 voxel.dirty_since_candidate = false;
                 return Ok(None);
             }
-            let live = build_occupancy_with_cache(voxel.current_window.make_contiguous(), input, config, Some(&mut voxel.live_height_cache), false)?;
-            let latest = build_occupancy_with_cache(&input.registered_points_map, input, config, Some(&mut voxel.latest_height_cache), false)?;
+            let latest = build_occupancy(input, config)?;
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = voxel.current_window.len();
             voxel.dirty_since_candidate = false;
-            (MappingBackendKind::Voxel, live, latest)
+            (MappingBackendKind::Voxel, latest.clone(), latest)
         }
         MappingKernel::Raytracing(ray) => {
             if !ray.dirty_since_candidate {
@@ -2211,28 +2172,13 @@ pub(crate) fn flush_candidate(
                 return Ok(None);
             }
             ray.refresh_stable_points();
-            if ray.stable_points.is_empty() {
-                let Some(previous) = ray.last_occupancy.as_ref() else {
-                    ray.dirty_since_candidate = false;
-                    ray.validate_checkpoint_budget()?;
-                    return Ok(None);
-                };
-                let cleared = cleared_previous_occupancy(previous, input);
-                ray.last_occupancy = Some(cleared.clone());
-                ray.last_candidate_received_at_ns = input.received_at_ns;
-                ray.last_candidate_point_count = 0;
-                ray.dirty_since_candidate = false;
-                ray.validate_checkpoint_budget()?;
-                (MappingBackendKind::Raytracing, cleared.clone(), cleared)
-            } else {
-                let live = build_occupancy(&ray.stable_points, input, config)?;
+                let live = build_occupancy(input, config)?;
                 ray.last_occupancy = Some(live.clone());
                 ray.last_candidate_received_at_ns = input.received_at_ns;
                 ray.last_candidate_point_count = ray.stable_points.len();
                 ray.dirty_since_candidate = false;
                 ray.validate_checkpoint_budget()?;
                 (MappingBackendKind::Raytracing, live.clone(), live)
-            }
         }
     };
     Ok(Some(MappingBackendCandidate {
@@ -2299,7 +2245,7 @@ pub(crate) fn compute_candidate_in_place(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    compute_candidate_with_parallelism(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS, true, false)
+    compute_candidate_with_parallelism(kernel, input, config, MAPPING_CANDIDATE_INTERVAL_NS, true)
 }
 
 /// 历史回放自行选择构图节拍；点云接纳与累积仍逐帧执行。
@@ -2308,9 +2254,8 @@ pub(crate) fn compute_candidate_in_place_with_interval(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
     candidate_interval_ns: u64,
-    parallel_projection: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    compute_candidate_with_parallelism(kernel, input, config, candidate_interval_ns, false, parallel_projection)
+    compute_candidate_with_parallelism(kernel, input, config, candidate_interval_ns, false)
 }
 
 fn compute_candidate_with_parallelism(
@@ -2319,7 +2264,6 @@ fn compute_candidate_with_parallelism(
     config: MappingBackendComputeConfig,
     candidate_interval_ns: u64,
     parallel: bool,
-    parallel_projection: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
     if input.registered_points_map.is_empty() {
         return Ok(None);
@@ -2376,34 +2320,12 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            let live_points = voxel.current_window.make_contiguous();
-            let result = (
-                build_occupancy_with_cache(live_points, input, config, Some(&mut voxel.live_height_cache), parallel_projection)?,
-                build_occupancy_with_cache(&input.registered_points_map, input, config, Some(&mut voxel.latest_height_cache), false)?,
-            );
+            let latest = build_occupancy(input, config)?;
+            let result = (latest.clone(), latest);
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = point_count;
             voxel.dirty_since_candidate = false;
             result
-        }
-        MappingKernel::Raytracing(ray) if ray.stable_points.is_empty() => {
-            let Some(previous) = ray.last_occupancy.as_ref() else {
-                return Ok(None);
-            };
-            if !candidate_due(
-                ray.last_candidate_received_at_ns,
-                input.received_at_ns,
-                candidate_interval_ns,
-            ) {
-                return Ok(None);
-            }
-            let cleared = cleared_previous_occupancy(previous, input);
-            ray.last_occupancy = Some(cleared.clone());
-            ray.last_candidate_received_at_ns = input.received_at_ns;
-            ray.last_candidate_point_count = 0;
-            ray.dirty_since_candidate = false;
-            ray.validate_checkpoint_budget()?;
-            (cleared.clone(), cleared)
         }
         MappingKernel::Raytracing(ray) => {
             let point_count = ray.stable_points.len();
@@ -2414,7 +2336,7 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            let live = build_occupancy(&ray.stable_points, input, config)?;
+            let live = build_occupancy(input, config)?;
             ray.last_occupancy = Some(live.clone());
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = point_count;
@@ -2447,7 +2369,7 @@ mod tests {
     fn both_mapping_kernels_clear_passing_person_history_and_keep_current_obstacles() {
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
         for spec in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
-            let config = MappingBackendComputeConfig { window_capacity: 1_000_000, occupancy_algo: CostAlgoSelector::General, ..compute_config() };
+            let config = MappingBackendComputeConfig { window_capacity: 1_000_000, ..compute_config() };
             let mut kernel = spec.into_kernel(config.window_capacity);
             let mut people_count = 0;
             let mut persistent: Option<crate::persistent_occupancy::PersistentOccupancyGrid> = None;
@@ -2464,13 +2386,7 @@ mod tests {
                     sensor_origin_map: ORIGIN, registered_points_map: points,
                 };
                 if let Some(candidate) = compute_candidate_in_place(&mut kernel, &input, config).unwrap() {
-                    if spec.kind() == MappingBackendKind::Raytracing {
-                        persistent = Some(crate::persistent_occupancy::PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy).unwrap());
-                    } else if let Some(grid) = persistent.as_mut() {
-                        grid.merge(&candidate.live_window_occupancy, &candidate.latest_frame_occupancy).unwrap();
-                    } else {
-                        persistent = Some(crate::persistent_occupancy::PersistentOccupancyGrid::from_grid(candidate.live_window_occupancy).unwrap());
-                    }
+                    persistent = Some(crate::persistent_occupancy::PersistentOccupancyGrid::stage_observation(persistent.as_ref(), &candidate.latest_frame_occupancy).unwrap());
                 }
                 if person.is_some() {
                     match &kernel {
@@ -2573,7 +2489,6 @@ mod tests {
     fn compute_config() -> MappingBackendComputeConfig {
         MappingBackendComputeConfig {
             resolution: 0.1,
-            occupancy_algo: CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 1024,
         }
@@ -2604,6 +2519,38 @@ mod tests {
             registered_frame_id: "map".to_owned(),
             sensor_origin_map: [0.0; 3],
             registered_points_map: vec![Point3::new(1.0, 0.0, 1.0)],
+        }
+    }
+
+    #[test]
+    fn planar_scan_backends_use_current_frame_origin_and_survive_restore() {
+        let config = MappingBackendComputeConfig { ..compute_config() };
+        for spec in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
+            let mut kernel = spec.into_kernel(config.window_capacity);
+            let mut first = input(1);
+            first.registered_points_map = vec![Point3::new(2.05,0.05,0.0)];
+            compute_candidate(&mut kernel, &first, config).unwrap().unwrap();
+            let mut next = input(2);
+            next.sensor_origin_map = [10.05,0.05,0.0];
+            next.registered_points_map = vec![Point3::new(12.05,0.05,0.0)];
+            let candidate = compute_candidate(&mut kernel,&next,config).unwrap().unwrap();
+            assert!(candidate.live_window_occupancy.origin[0] >= 9.0);
+            assert_eq!(candidate.live_window_occupancy.data,candidate.latest_frame_occupancy.data);
+            assert!(candidate.latest_frame_occupancy.data.contains(&100));
+            let checkpoint = export_mapping_kernel_checkpoint(&kernel).unwrap();
+            let mut restored = restore_mapping_kernel_checkpoint(spec,config,&checkpoint).unwrap();
+            next.frame_sequence = 3;
+            next.source_timestamp_ns += 1_000_000_000;
+            next.received_at_ns += 1_000_000_000;
+            let expected = compute_candidate(&mut kernel,&next,config).unwrap().unwrap();
+            let actual = compute_candidate(&mut restored,&next,config).unwrap().unwrap();
+            assert_eq!(actual.live_window_occupancy.data,expected.live_window_occupancy.data);
+            next.frame_sequence = 4;
+            next.source_timestamp_ns += 1_000_000_000;
+            next.received_at_ns += 1_000_000_000;
+            next.registered_points_map = vec![Point3::new(12.05,0.05,-0.4)];
+            let missing = compute_candidate(&mut restored,&next,config).unwrap().unwrap();
+            assert!(missing.latest_frame_occupancy.data.iter().all(|&v|v<0));
         }
     }
 
@@ -3045,8 +2992,6 @@ mod tests {
             last_candidate_received_at_ns: 7,
             dirty_since_candidate: false,
                 dynamic_scene: Default::default(),
-                live_height_cache: Default::default(),
-                latest_height_cache: Default::default(),
         });
         let mut non_finite =
             export_mapping_kernel_checkpoint(&one_point).expect("encode one point");

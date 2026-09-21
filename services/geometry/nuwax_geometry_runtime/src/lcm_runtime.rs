@@ -4733,7 +4733,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     .mapping
                     .lock()
                     .prepare_pgo_install(
-                        map.occupancy.clone(),
+                        map.persistent.clone(),
                         map.source_timestamp_ns,
                         transaction.absolute_left_correction,
                         transaction.correction_revision,
@@ -7896,10 +7896,9 @@ pub async fn spawn_geometry_runtime(
         let cfg = MappingAdapterConfig::from_env();
         let forbidden_zones_path = crate::forbidden_zones::path_from_env();
         info!(
-            "mapping_adapter 已构造且等待 StartMapping: backend={} resolution={}m auto_bounds_padding=1m occupancy_algo={} forbidden_zones_path={}",
+            "mapping_adapter 已构造且等待 StartMapping: backend={} resolution={}m auto_bounds_padding=1m projection=planar_scan forbidden_zones_path={}",
             mapping_backend.stable_name(),
             cfg.resolution,
-            cfg.occupancy_algo.as_dimos_str(),
             forbidden_zones_path.display()
         );
         Some(Arc::new(parking_lot::Mutex::new(
@@ -8454,10 +8453,10 @@ fn ingest_mapping_points(
             source_timestamp_ns,
         });
     }
-    let accepted_map_points = adapter.take_latest_accepted_map_points();
     let session_generation = adapter.snapshot().session_generation;
     let mut revision_rx = map_revision_tx.subscribe();
     let occupancy_committed = adapter.build_and_publish(state, Some(map_revision_tx));
+    let accepted_map_points = adapter.take_latest_accepted_map_points();
     let occupancy_event = occupancy_committed
         .then(|| revision_rx.try_recv().ok())
         .flatten();
@@ -12351,7 +12350,6 @@ mod mapping_feed_tests {
             height_cells: 20,
             origin_xy: (-5.0, -5.0),
             voxel_size: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::General,
             initial_safe_radius_meters: 0.0,
         }
     }

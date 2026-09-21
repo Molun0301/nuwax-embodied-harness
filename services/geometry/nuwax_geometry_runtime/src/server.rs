@@ -11132,7 +11132,6 @@ mod lifecycle_tests {
                 height_cells: 20,
                 origin_xy: (-1.0, -1.0),
                 voxel_size: 0.1,
-                occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
                 initial_safe_radius_meters: 0.0,
             },
             crate::mapping_backend::MappingBackendSpec::raytracing_defaults(),

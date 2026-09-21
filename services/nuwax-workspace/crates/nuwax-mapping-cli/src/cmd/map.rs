@@ -1,13 +1,10 @@
 //! Build and durably publish an immutable offline map asset bundle.
 
 use clap::Args;
-use nalgebra::{point, Point3};
-use nuwax_mapping::cost_mapper::{
-    CostAlgoSelector, CostMapper, CostMapperConfig, OccupancyConfig, SimplePointCloud2,
-};
+use nuwax_mapping::cost_mapper::{CostMapper, CostMapperConfig};
 use nuwax_mapping::occupancy::types::OccupancyGrid;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -216,48 +213,11 @@ fn costmap_from_occupancy_record(
 }
 
 fn costmap_from_point_records(
-    records: &[crate::dataset::DatasetRecord],
-    resolution: f64,
-    required_frame: &str,
+    _records: &[crate::dataset::DatasetRecord],
+    _resolution: f64,
+    _required_frame: &str,
 ) -> anyhow::Result<nuwax_mapping::Costmap> {
-    let frames: BTreeSet<&str> = records
-        .iter()
-        .filter_map(|record| match &record.payload {
-            RecordPayload::PointCloud { frame_id, .. } => Some(frame_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    if frames.len() != 1 || frames.iter().next().copied() != Some(required_frame) {
-        anyhow::bail!(
-            "point-cloud frame set {frames:?} does not exactly match --frame-id {required_frame:?}"
-        );
-    }
-    let points: Vec<Point3<f64>> = records
-        .iter()
-        .filter_map(|record| match &record.payload {
-            RecordPayload::PointCloud { points, .. } => Some(points.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .map(|value| point![value[0], value[1], value[2]])
-        .collect();
-    if points.is_empty() {
-        anyhow::bail!("dataset contains neither occupancy-grid nor point-cloud records");
-    }
-    let timestamp = records
-        .iter()
-        .filter(|record| matches!(record.payload, RecordPayload::PointCloud { .. }))
-        .map(|record| record.timestamp)
-        .max_by(f64::total_cmp)
-        .unwrap_or(0.0);
-    let cloud =
-        SimplePointCloud2::with_metadata(points, point![0.0, 0.0, 0.0], required_frame, timestamp);
-    let config = OccupancyConfig {
-        algo: CostAlgoSelector::Simple,
-        ..OccupancyConfig::default()
-    };
-    let (_, _, costmap) = CostMapper::from_pointcloud_auto(&cloud, &config, resolution)?;
-    Ok(costmap)
+    anyhow::bail!("点云记录缺少逐帧配对雷达原点；请使用几何离线重放生成占据图后再导出地图")
 }
 
 fn producer_metadata(

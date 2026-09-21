@@ -558,17 +558,8 @@ impl GeometryOfflineReplayOwner {
         timestamp: u64,
     ) -> Result<PersistentOccupancyGrid, String> {
         self.validate_candidate_identity(candidate, sequence, timestamp)?;
-        match candidate.backend_kind {
-            MappingBackendKind::SlamToolbox => Err("二维算法不得进入三维离线回放".into()),
-            MappingBackendKind::Voxel => PersistentOccupancyGrid::stage_voxel(
-                self.canonical_occupancy.as_ref(),
-                &candidate.live_window_occupancy,
-                &candidate.latest_frame_occupancy,
-            ),
-            MappingBackendKind::Raytracing => {
-                PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy)
-            }
-        }
+        PersistentOccupancyGrid::stage_observation(
+            self.canonical_occupancy.as_ref(), &candidate.latest_frame_occupancy)
     }
 
     fn fail<T>(&mut self, error: String) -> Result<T, String> {
@@ -747,7 +738,6 @@ fn backend_config(
             MappingBackendSpec::Voxel,
             MappingBackendComputeConfig {
                 resolution: config.resolution_m,
-                occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
                 initial_safe_radius_meters: config.initial_safe_radius_m as f32,
                 window_capacity: config.window_capacity,
             },
@@ -766,7 +756,6 @@ fn backend_config(
             ),
             MappingBackendComputeConfig {
                 resolution: config.resolution_m,
-                occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::HeightCost,
                 initial_safe_radius_meters: 0.0,
                 window_capacity: 1,
             },
@@ -789,4 +778,59 @@ fn transform_frame(frame: &ValidatedOfflineReplayFrameV1) -> ([f64; 3], Vec<Poin
             .map(|point| rotation.transform_point(&Point3::new(point.x, point.y, point.z)) + offset)
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::offline_replay::{OfflinePointXyzV1, OfflinePoseV1, OfflineReplayConfigV1, OfflineVoxelConfigV1, OfflineRaytracingConfigV1};
+
+    #[tokio::test]
+    async fn offline_owner_accumulates_horizontal_observations_and_keeps_full_cloud() {
+        for backend in [
+            OfflineBackendConfigV1::Voxel(OfflineVoxelConfigV1 {
+                resolution_m:0.05, voxel_size_m:0.05, initial_safe_radius_m:0.0, window_capacity:100,
+            }),
+            OfflineBackendConfigV1::Raytracing(OfflineRaytracingConfigV1 {
+                resolution_m:0.05, voxel_size_m:0.05, max_range_m:30.0, ray_subsample:1,
+                shadow_depth_m:0.2, grace_depth_m:0.2, min_health:1, max_health:10,
+                graze_cos:0.0, recency_window:10,
+            }),
+        ] {
+            let kind = match &backend { OfflineBackendConfigV1::Voxel(_) => OfflineBackendKind::Voxel,
+                OfflineBackendConfigV1::Raytracing(_) => OfflineBackendKind::Raytracing };
+            let mut owner = GeometryOfflineReplayOwner::start(OfflineReplayRequestV1 {
+                map_name:"horizontal-test".into(), source_id:"paired-scans".into(),
+                config:OfflineReplayConfigV1 {
+                    map_frame_id:"map".into(), backend_kind:kind, backend,
+                    georeference:OfflineGeoreferenceV1 {
+                        schema_version:1, map_name:"horizontal-test".into(), map_frame_id:"map".into(),
+                        source_crs:"EPSG:4326".into(), projected_crs:"EPSG:3857".into(),
+                        axis_convention:"projected_x_east_y_north_z_up".into(),
+                        altitude_policy:"map_plane_constant".into(), anchor_lat_deg:0.0, anchor_lng_deg:0.0,
+                        anchor_easting_m:0.0, anchor_northing_m:0.0, map_origin_x_m:0.0, map_origin_y_m:0.0,
+                        map_from_projected_yaw_rad:0.0, map_plane_z_m:0.0,
+                    },
+                },
+            }).unwrap();
+            for sequence in 1..=2 {
+                owner.submit_frame(OfflineReplayFrameV1 {
+                    source_sequence:sequence, source_timestamp_ns:sequence as i64 * 100_000_000,
+                    sensor_frame_id:"lidar".into(), map_frame_id:"map".into(),
+                    pose_t_map_sensor:OfflinePoseV1 { translation_xyz_m:[10.025,0.025,2.0], rotation_xyzw:[0.0,0.0,0.0,1.0] },
+                    points_xyz:vec![OfflinePointXyzV1{x:2.0,y:0.0,z:0.0}, OfflinePointXyzV1{x:1.0,y:0.0,z:-0.4}, OfflinePointXyzV1{x:1.0,y:0.0,z:2.0}],
+                }).await.unwrap();
+                assert_eq!(owner.canonical_occupancy.as_ref().unwrap().grid.data.contains(&100), sequence == 2);
+            }
+            let snapshot = owner.finish_v2().await.unwrap();
+            assert_eq!(snapshot.processing_receipt.committed_frame_count,2);
+            assert!(snapshot.canonical_raw_occupancy.data.contains(&0));
+            assert!(snapshot.canonical_raw_occupancy.data.contains(&100));
+            assert!(snapshot.canonical_raw_occupancy.origin[0] >= 9.0);
+            assert!(snapshot.committed_transformed_accepted_cloud.iter().any(|point|point.z < 1.7));
+            assert!(snapshot.committed_transformed_accepted_cloud.iter().any(|point|point.z > 3.9));
+            let checkpoint = &snapshot.canonical_checkpoint_projection;
+            assert_eq!(checkpoint.occupancy_receipt.commit_id,checkpoint.cloud_receipt.commit_id);
+        }
+    }
 }

@@ -1,13 +1,11 @@
-//! MAP-500 基线：直接测量三种公开占据栅格 kernel。
+//! MAP-500 基线：测量水平扫描投影。
 //!
 //! 运行：
 //! `cargo bench --manifest-path services/nuwax-workspace/Cargo.toml -p nuwax-mapping --bench occupancy_algorithms`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use nalgebra::Point3;
-use nuwax_mapping::pointclouds::occupancy::{
-    PointCloudOccAlgo, PointCloudOccConfig, PointCloudOccupancyBuilder,
-};
+use nuwax_mapping::pointclouds::occupancy::PointCloudOccupancyBuilder;
 
 const GRID_SIZE: u32 = 500;
 const RESOLUTION: f64 = 0.05;
@@ -34,23 +32,13 @@ fn bench_map_500(c: &mut Criterion) {
         (-12.5, -12.5),
     );
 
-    for (name, algo) in [
-        ("general", PointCloudOccAlgo::General),
-        ("simple", PointCloudOccAlgo::Simple),
-        ("height_cost", PointCloudOccAlgo::HeightCost),
-    ] {
-        let config = PointCloudOccConfig {
-            algo,
-            ..PointCloudOccConfig::default()
-        };
-        c.bench_function(&format!("map_500x500_{name}"), |bencher| {
-            bencher.iter(|| {
-                let grid = builder.build_with_config(black_box(&points), black_box(&config));
-                black_box((grid.width, grid.height, grid.data.len()));
-                grid
-            });
+    c.bench_function("map_500x500_planar_scan", |bencher| {
+        bencher.iter(|| {
+            let grid = builder.build(black_box(&points));
+            black_box((grid.width, grid.height, grid.data.len()));
+            grid
         });
-    }
+    });
 }
 
 criterion_group!(benches, bench_map_500);

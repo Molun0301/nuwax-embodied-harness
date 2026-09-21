@@ -19,26 +19,74 @@ pub(crate) struct PersistentOccupancyGrid {
     pub(crate) grid: OccupancyGrid,
     pending_values: Vec<i8>,
     pending_counts: Vec<u8>,
+    last_observation_timestamp: Option<f64>,
 }
 
 impl PersistentOccupancyGrid {
-    #[allow(dead_code)]
-    pub(crate) fn stage_voxel(
-        current: Option<&Self>,
-        accumulated: &OccupancyGrid,
-        latest: &OccupancyGrid,
-    ) -> Result<Self, String> {
+    /// 水平扫描只提供本帧真实射线，持久图在原拥有方内累积。
+    pub(crate) fn stage_observation(current: Option<&Self>, latest: &OccupancyGrid) -> Result<Self, String> {
         let mut staged = match current {
             Some(current) => current.clone(),
-            None => Self::from_grid(accumulated.clone())?,
+            None => {
+                let mut unknown = latest.clone();
+                unknown.data.fill(-1);
+                Self::from_grid(unknown)?
+            }
         };
-        staged.merge(accumulated, latest)?;
+        staged.merge_observation(latest)?;
         Ok(staged)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn stage_authoritative(grid: &OccupancyGrid) -> Result<Self, String> {
-        Self::from_grid(grid.clone())
+    /// 缺测不投票；同一源帧的再次物化也不能重复确认障碍或清除。
+    pub(crate) fn merge_observation(&mut self, latest: &OccupancyGrid) -> Result<bool, String> {
+        self.validate_compatible(latest)?;
+        if !latest.ts.is_finite() {
+            return Err("observation timestamp must be finite".into());
+        }
+        if self.last_observation_timestamp.is_some_and(|timestamp| latest.ts <= timestamp) {
+            return Ok(false);
+        }
+        if latest.data.iter().all(|value| *value < 0) {
+            self.grid.ts = latest.ts;
+            self.last_observation_timestamp = Some(latest.ts);
+            return Ok(false);
+        }
+        let mut changed = self.expand_to_include(latest)?;
+        let projection = GridProjection::new(&self.grid, latest);
+        for row in 0..latest.height {
+            for col in 0..latest.width {
+                let incoming = latest.data[latest.index(row, col)];
+                if incoming < 0 { continue; }
+                let target = projection.project(row, col)?;
+                let existing = self.grid.data[target];
+                let occupied = occupancy_class(incoming) != 0;
+                if (existing < 0 && !occupied)
+                    || (existing >= 0 && occupancy_class(existing) == occupancy_class(incoming)) {
+                    changed |= existing != incoming;
+                    self.grid.data[target] = incoming;
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    continue;
+                }
+                // 障碍需两次真实命中，清除需三次真实穿越；中间缺测不充当反证。
+                let count = if self.pending_counts[target] > 0
+                    && occupancy_class(self.pending_values[target]) == occupancy_class(incoming) {
+                    self.pending_counts[target].saturating_add(1)
+                } else { 1 };
+                self.pending_values[target] = incoming;
+                self.pending_counts[target] = count;
+                let required = if occupied { 2 } else { OCCUPANCY_CHANGE_CONFIRMATIONS };
+                if count >= required {
+                    self.grid.data[target] = incoming;
+                    self.pending_values[target] = -1;
+                    self.pending_counts[target] = 0;
+                    changed = true;
+                }
+            }
+        }
+        self.grid.ts = latest.ts;
+        self.last_observation_timestamp = Some(latest.ts);
+        Ok(changed)
     }
 
     pub(crate) fn from_grid(grid: OccupancyGrid) -> Result<Self, String> {
@@ -48,101 +96,9 @@ impl PersistentOccupancyGrid {
             grid,
             pending_values: vec![-1; cell_count],
             pending_counts: vec![0; cell_count],
+            // 保存资产的源时间属于旧会话，不能作为新来源的去重水位。
+            last_observation_timestamp: None,
         })
-    }
-
-    /// Merge a rolling-window view and a latest-frame view.
-    ///
-    /// The rolling view can only add cells that were previously unknown.  A
-    /// latest-frame observation is allowed to change a known cell, but only
-    /// after several consecutive observations disagree with its current
-    /// traversability class.  Unknown cells never erase accumulated state.
-    pub(crate) fn merge(
-        &mut self,
-        accumulated: &OccupancyGrid,
-        latest: &OccupancyGrid,
-    ) -> Result<bool, String> {
-        self.validate_compatible(accumulated)?;
-        self.validate_compatible(latest)?;
-
-        let mut changed = self.expand_to_include(accumulated)?;
-        // Latest-frame bounds are normally contained in the accumulated view,
-        // but expanding for both keeps this helper correct for direct callers.
-        changed |= self.expand_to_include(latest)?;
-
-        // 列投影与行号无关、行投影与列号无关；按原浮点公式各计算一次。
-        let accumulated_projection = GridProjection::new(&self.grid, accumulated);
-        let latest_projection = GridProjection::new(&self.grid, latest);
-
-        for row in 0..accumulated.height {
-            for col in 0..accumulated.width {
-                let incoming = accumulated.data[accumulated.index(row, col)];
-                if incoming < 0 {
-                    continue;
-                }
-                let target = accumulated_projection.project(row, col)?;
-                if self.grid.data[target] < 0 {
-                    self.grid.data[target] = incoming;
-                    self.pending_values[target] = -1;
-                    self.pending_counts[target] = 0;
-                    changed = true;
-                }
-            }
-        }
-
-        // A pending contradiction is valid only while the corresponding cell
-        // is observed in every latest frame.  The mask also prevents a stale
-        // pending clear from surviving an occlusion or a missed scan.
-        let mut observed = vec![false; self.grid.data.len()];
-        for row in 0..latest.height {
-            for col in 0..latest.width {
-                let incoming = latest.data[latest.index(row, col)];
-                if incoming < 0 {
-                    continue;
-                }
-                let target = latest_projection.project(row, col)?;
-                observed[target] = true;
-                let existing = self.grid.data[target];
-                if existing < 0 {
-                    self.grid.data[target] = incoming;
-                    self.pending_values[target] = -1;
-                    self.pending_counts[target] = 0;
-                    changed = true;
-                    continue;
-                }
-
-                if occupancy_class(existing) == occupancy_class(incoming) {
-                    self.pending_values[target] = -1;
-                    self.pending_counts[target] = 0;
-                    continue;
-                }
-
-                let count = if self.pending_counts[target] > 0
-                    && occupancy_class(self.pending_values[target]) == occupancy_class(incoming)
-                {
-                    self.pending_counts[target].saturating_add(1)
-                } else {
-                    1
-                };
-                self.pending_values[target] = incoming;
-                self.pending_counts[target] = count;
-                if count >= OCCUPANCY_CHANGE_CONFIRMATIONS {
-                    self.grid.data[target] = incoming;
-                    self.pending_values[target] = -1;
-                    self.pending_counts[target] = 0;
-                    changed = true;
-                }
-            }
-        }
-
-        for (index, is_observed) in observed.iter().enumerate() {
-            if !*is_observed {
-                self.pending_values[index] = -1;
-                self.pending_counts[index] = 0;
-            }
-        }
-        self.grid.ts = self.grid.ts.max(accumulated.ts).max(latest.ts);
-        Ok(changed)
     }
 
     fn validate_compatible(&self, incoming: &OccupancyGrid) -> Result<(), String> {
@@ -385,6 +341,72 @@ pub(crate) fn validate_checkpoint_grid(
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    #[test]
+    fn planar_observations_confirm_hits_and_clears_without_reusing_timestamps() {
+        let mut scan = OccupancyGrid::with_frame(3, 1, 0.05, "map");
+        scan.data = vec![0, 100, -1];
+        scan.ts = 1.0;
+        let mut map = PersistentOccupancyGrid::stage_observation(None, &scan).unwrap();
+        assert_eq!(map.grid.data, [0, -1, -1]);
+        map.merge_observation(&scan).unwrap();
+        assert_eq!(map.grid.data[1], -1);
+        scan.ts = 2.0;
+        map.merge_observation(&scan).unwrap();
+        assert_eq!(map.grid.data, [0, 100, -1]);
+        scan.data[1] = 0;
+        for ts in [3.0, 4.0] {
+            scan.ts = ts;
+            map.merge_observation(&scan).unwrap();
+            assert_eq!(map.grid.data[1], 100);
+        }
+        scan.ts = 3.5;
+        map.merge_observation(&scan).unwrap();
+        assert_eq!(map.grid.data[1], 100);
+        scan.ts = 5.0;
+        scan.data.fill(-1);
+        map.merge_observation(&scan).unwrap();
+        assert_eq!(map.grid.data[1], 100);
+        scan.ts = 6.0;
+        scan.data[1] = 0;
+        map.merge_observation(&scan).unwrap();
+        assert_eq!(map.grid.data, [0, 0, -1]);
+        let restored = PersistentOccupancyGrid::from_grid(map.grid.clone()).unwrap();
+        assert_eq!(restored.grid.data, map.grid.data);
+    }
+
+    #[test]
+    fn planar_restored_map_accepts_new_source_clock_without_reusing_pending_votes() {
+        let mut saved = OccupancyGrid::with_frame(2,1,0.05,"map");
+        saved.data = vec![100,-1];
+        saved.ts = 10000.0;
+        let mut restored = PersistentOccupancyGrid::from_grid(saved.clone()).unwrap();
+        let mut observation = saved;
+        observation.data = vec![0,100];
+        for timestamp in [1.0,2.0] {
+            observation.ts = timestamp;
+            restored.merge_observation(&observation).unwrap();
+        }
+        assert_eq!(restored.grid.data,[100,100]);
+        observation.ts = 3.0;
+        restored.merge_observation(&observation).unwrap();
+        assert_eq!(restored.grid.data,[0,100]);
+    }
+
+    #[test]
+    fn planar_missing_returns_do_not_expand_or_erase_history() {
+        let mut old = OccupancyGrid::with_frame(2, 1, 0.05, "map");
+        old.origin[0] = 100.0;
+        old.data = vec![0, 100];
+        old.ts = 1.0;
+        let mut map = PersistentOccupancyGrid::from_grid(old.clone()).unwrap();
+        let mut absent = OccupancyGrid::with_frame(1, 1, 0.05, "map");
+        absent.ts = 2.0;
+        map.merge_observation(&absent).unwrap();
+        assert_eq!(map.grid.origin,old.origin);
+        assert_eq!(map.grid.data,old.data);
+        assert_eq!(map.grid.ts,2.0);
+    }
 
     #[test]
     fn long_thin_grid_keeps_projection_memory_bounded() {

@@ -1,24 +1,9 @@
-//! CostMapper
-//!
-//! SSOT：`/home/ml/Deeprob/dimos/dimos/mapping/costmapper.py`（Config: algo + OccupancyConfig）
-//!
-//! 修复要点（见 docs/.../20_rework20_全仓审计_对dimos原始.md §2.1 H-5/H-6）：
-//! - 原 Rust `CostMapperConfig` 是 Nav2 cost layer 数值常量（lethal_cost=254 等），
-//!   **不在 dimos Python 协议中**——Python `CostMapper.config.algo` 是 selector
-//!   字符串（如 `"height_cost"`），`OccupancyConfig` 是对应算法参数。
-//! - 数值常量（lethal=254 / inscribed=253 / no_info=255）属 Nav2 costmap_2d
-//!   协议，不属于 mapping 接口；本期保留为 `Nav2CostLayer`（独立类型）以避免
-//!   误用，但 CostMapperConfig 改为 selector 风格。
-//!
-//! Point-cloud inputs dispatch to the original `height_cost`, `general`, and
-//! `simple` occupancy kernels through [`PointCloudOccConfig`].
+//! 水平扫描占据图与导航代价图转换。
+//! 点云必须与同帧雷达原点配对，不能从一个原点投射混合历史点云。
 
 use crate::models::{Costmap, MapMeta};
 use crate::occupancy::types::{MapMetaData, OccupancyGrid, OccupancyValue};
-use crate::pointclouds::occupancy::{
-    build_occupancy_auto, build_occupancy_auto_cached, HeightCostCache, MappingError,
-    PointCloudOccAlgo, PointCloudOccConfig,
-};
+use crate::pointclouds::occupancy::{build_occupancy_auto, MappingError};
 use crate::pointclouds::PointCloudOccupancyBuilder;
 use nalgebra::{Isometry3, Point3};
 use serde::{Deserialize, Serialize};
@@ -26,32 +11,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::occupancy::types::Pose;
 
-/// 算法 selector（Python `Config.algo` 取值）
-///
-/// 对应 `dimos.mapping.pointclouds.occupancy.OCCUPANCY_ALGOS` 的 key。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub enum CostAlgoSelector {
-    /// 高度切片成本（Python `HeightCostConfig`，默认）
-    #[default]
-    HeightCost,
-    /// 原版通用 obstacle/ground occupancy。
-    General,
-    /// 原版 morphology-closing simple occupancy。
-    Simple,
-    /// 旧配置别名；运行时映射到 [`Self::General`]。
-    Probability,
-    /// 旧配置别名；运行时映射到 [`Self::Simple`]。
-    Probabilistic,
-}
-
-/// CostMapper selector, exact point-cloud kernel parameters, and safe radius.
+/// 占据图的初始安全范围；点云投影固定使用水平扫描。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OccupancyConfig {
-    /// 选中算法
-    pub algo: CostAlgoSelector,
-    /// Original algorithm-specific point-cloud parameters.
-    #[serde(default)]
-    pub pointcloud: PointCloudOccConfig,
     /// 初始安全半径（m），对应 Python `initial_safe_radius_meters`
     pub initial_safe_radius_meters: f32,
 }
@@ -59,8 +21,6 @@ pub struct OccupancyConfig {
 impl Default for OccupancyConfig {
     fn default() -> Self {
         Self {
-            algo: CostAlgoSelector::default(),
-            pointcloud: PointCloudOccConfig::default(),
             initial_safe_radius_meters: 0.0,
         }
     }
@@ -69,7 +29,7 @@ impl Default for OccupancyConfig {
 /// CostMapper 配置（Python `CostMapper.config` 直映射）
 #[derive(Debug, Clone)]
 pub struct CostMapperConfig {
-    /// 算法 selector + 参数
+    /// 占据图参数
     pub config: OccupancyConfig,
 }
 
@@ -107,7 +67,7 @@ impl Nav2CostLayer {
 }
 
 impl CostMapperConfig {
-    /// Python 默认（HeightCost 算法）
+    /// 项目默认占据配置。
     #[must_use]
     pub fn dimos_default() -> Self {
         Self {
@@ -234,16 +194,6 @@ impl PointCloud2Like for SimplePointCloud2 {
     }
 }
 
-fn selected_pointcloud_config(occupancy_cfg: &OccupancyConfig) -> PointCloudOccConfig {
-    let mut pointcloud_config = occupancy_cfg.pointcloud;
-    pointcloud_config.algo = match occupancy_cfg.algo {
-        CostAlgoSelector::HeightCost => PointCloudOccAlgo::HeightCost,
-        CostAlgoSelector::General | CostAlgoSelector::Probability => PointCloudOccAlgo::General,
-        CostAlgoSelector::Simple | CostAlgoSelector::Probabilistic => PointCloudOccAlgo::Simple,
-    };
-    pointcloud_config
-}
-
 fn apply_initial_safe_radius(grid: &mut OccupancyGrid, radius_meters: f32) {
     let radius_m = f64::from(radius_meters.max(0.0));
     if radius_m <= 0.0 || grid.data.is_empty() {
@@ -263,15 +213,7 @@ fn apply_initial_safe_radius(grid: &mut OccupancyGrid, radius_meters: f32) {
 }
 
 impl CostMapper {
-    /// 从 PointCloud2 + OccupancyConfig 构造 CostMapper（完整 pipeline）
-    ///
-    /// 流程：
-    /// 1. `PointCloudOccupancyBuilder` projects points into an `OccupancyGrid`;
-    /// 2. 依据 `OccupancyConfig.algo` 分派 HeightCost / General / Simple；
-    /// 3. 按原版 CostMapper 语义，把机器人世界原点附近的 cell 清成 FREE。
-    ///
-    /// 返回：(CostMapper, Costmap) —— caller 同时拿到 CostMapper 实例
-    /// （便于后续 in-place 更新）和最终 Costmap。
+    /// 将单帧水平扫描投影到固定范围，并转换为代价图。
     #[must_use]
     pub fn from_pointcloud<P: PointCloud2Like>(
         cloud: &P,
@@ -289,15 +231,12 @@ impl CostMapper {
             height,
             origin_xy,
         );
-        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
-        let mut grid = builder.build_with_config(cloud.points(), &pointcloud_config);
+        let mut grid = builder.build(cloud.points());
         apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
 
         // 阶段 4：OccGrid → Costmap（走现有 convert）
-        let mut normalized_config = occupancy_cfg.clone();
-        normalized_config.pointcloud = pointcloud_config;
         let mapper = Self::new(CostMapperConfig {
-            config: normalized_config,
+            config: occupancy_cfg.clone(),
         });
         let costmap = mapper.convert(&grid);
         (mapper, costmap)
@@ -319,10 +258,8 @@ impl CostMapper {
     ) -> Result<(Self, OccupancyGrid, Costmap), MappingError> {
         let grid = Self::occupancy_from_pointcloud_auto(cloud, occupancy_cfg, resolution)?;
 
-        let mut normalized_config = occupancy_cfg.clone();
-        normalized_config.pointcloud = selected_pointcloud_config(occupancy_cfg);
         let mapper = Self::new(CostMapperConfig {
-            config: normalized_config,
+            config: occupancy_cfg.clone(),
         });
         let costmap = mapper.convert(&grid);
         Ok((mapper, grid, costmap))
@@ -337,61 +274,9 @@ impl CostMapper {
         occupancy_cfg: &OccupancyConfig,
         resolution: f64,
     ) -> Result<OccupancyGrid, MappingError> {
-        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
-        let mut grid = build_occupancy_auto(cloud, resolution, &pointcloud_config)?;
+        let mut grid = build_occupancy_auto(cloud, resolution)?;
         apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
         Ok(grid)
-    }
-
-    /// 复用相同高度剖面的派生代价，当前安全半径、帧和时间仍逐次计算。
-    ///
-    /// # Errors
-    /// 与无缓存占据栅格入口使用相同配置及边界校验。
-    pub fn occupancy_from_pointcloud_auto_cached<P: PointCloud2Like + ?Sized>(
-        cloud: &P,
-        occupancy_cfg: &OccupancyConfig,
-        resolution: f64,
-        cache: &mut HeightCostCache,
-        parallel_projection: bool,
-    ) -> Result<OccupancyGrid, MappingError> {
-        let pointcloud_config = selected_pointcloud_config(occupancy_cfg);
-        let mut grid = build_occupancy_auto_cached(
-            cloud,
-            resolution,
-            &pointcloud_config,
-            cache,
-            parallel_projection,
-        )?;
-        apply_initial_safe_radius(&mut grid, occupancy_cfg.initial_safe_radius_meters);
-        Ok(grid)
-    }
-}
-
-/// 从 OccupancyConfig 推断的算法名（dimos Python `Config.algo`）
-impl CostAlgoSelector {
-    /// dimos Python 字符串（如 `"height_cost"`）
-    #[must_use]
-    pub fn as_dimos_str(&self) -> &'static str {
-        match self {
-            Self::HeightCost => "height_cost",
-            Self::General => "general",
-            Self::Simple => "simple",
-            Self::Probability => "probability",
-            Self::Probabilistic => "probabilistic",
-        }
-    }
-
-    /// 从 dimos 字符串解析（未知值 fallback 到 HeightCost）
-    #[must_use]
-    pub fn from_dimos_str(s: &str) -> Self {
-        match s {
-            "height_cost" => Self::HeightCost,
-            "general" => Self::General,
-            "simple" => Self::Simple,
-            "probability" => Self::Probability,
-            "probabilistic" => Self::Probabilistic,
-            _ => Self::HeightCost,
-        }
     }
 }
 
@@ -428,9 +313,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dimos_selector_default_is_height_cost() {
+    fn default_does_not_invent_initial_free_space() {
         let cfg = CostMapperConfig::dimos_default();
-        assert_eq!(cfg.config.algo, CostAlgoSelector::HeightCost);
         assert!((cfg.config.initial_safe_radius_meters - 0.0).abs() < f32::EPSILON);
     }
 

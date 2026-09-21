@@ -1152,7 +1152,8 @@ fn encode_compute_config(
     config: MappingBackendComputeConfig,
 ) -> Result<(), String> {
     encoder.f64(config.resolution);
-    encoder.u8(cost_algo_tag(config.occupancy_algo));
+    // 固定水平扫描标签；旧进程不能将此配置误解为已移除的投影。
+    encoder.u8(5);
     encoder.f32(config.initial_safe_radius_meters);
     encoder.u64(
         u64::try_from(config.window_capacity).map_err(|_| {
@@ -1166,7 +1167,10 @@ fn decode_compute_config(
     decoder: &mut WireDecoder<'_>,
 ) -> Result<MappingBackendComputeConfig, String> {
     let resolution = decoder.f64()?;
-    let occupancy_algo = decode_cost_algo(decoder.u8()?)?;
+    let projection = decoder.u8()?;
+    if projection != 5 {
+        return Err("MAPPING_BACKEND_SIDECAR_PROTOCOL: obsolete occupancy projection".into());
+    }
     let initial_safe_radius_meters = decoder.f32()?;
     let window_capacity = usize::try_from(decoder.u64()?).map_err(|_| {
         "MAPPING_BACKEND_SIDECAR_PROTOCOL: window capacity exceeds usize".to_owned()
@@ -1181,33 +1185,9 @@ fn decode_compute_config(
     }
     Ok(MappingBackendComputeConfig {
         resolution,
-        occupancy_algo,
         initial_safe_radius_meters,
         window_capacity,
     })
-}
-
-fn cost_algo_tag(algo: CostAlgoSelector) -> u8 {
-    match algo {
-        CostAlgoSelector::HeightCost => 0,
-        CostAlgoSelector::General => 1,
-        CostAlgoSelector::Simple => 2,
-        CostAlgoSelector::Probability => 3,
-        CostAlgoSelector::Probabilistic => 4,
-    }
-}
-
-fn decode_cost_algo(tag: u8) -> Result<CostAlgoSelector, String> {
-    match tag {
-        0 => Ok(CostAlgoSelector::HeightCost),
-        1 => Ok(CostAlgoSelector::General),
-        2 => Ok(CostAlgoSelector::Simple),
-        3 => Ok(CostAlgoSelector::Probability),
-        4 => Ok(CostAlgoSelector::Probabilistic),
-        _ => Err(format!(
-            "MAPPING_BACKEND_SIDECAR_PROTOCOL: unknown occupancy algorithm {tag}"
-        )),
-    }
 }
 
 fn encode_token(encoder: &mut WireEncoder, token: &MappingComputeToken) -> Result<(), String> {
@@ -1874,7 +1854,6 @@ mod tests {
     fn sample_compute_config() -> MappingBackendComputeConfig {
         MappingBackendComputeConfig {
             resolution: 0.1,
-            occupancy_algo: CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
             window_capacity: 1_024,
         }
@@ -2066,6 +2045,18 @@ mod tests {
         assert!(!requires_supervision(
             MappingBackendSpec::raytracing_defaults()
         ));
+    }
+
+    #[test]
+    fn planar_scan_selection_survives_sidecar_wire_format() {
+        let mut encoder = WireEncoder { frame: Vec::new() };
+        encode_compute_config(&mut encoder, sample_compute_config()).unwrap();
+        let mut encoded = encoder.frame;
+        assert_eq!(encoded[8], 5);
+        for obsolete in 0..5 {
+            encoded[8] = obsolete;
+            assert!(decode_compute_config(&mut WireDecoder::new(&encoded)).is_err());
+        }
     }
 
     #[test]

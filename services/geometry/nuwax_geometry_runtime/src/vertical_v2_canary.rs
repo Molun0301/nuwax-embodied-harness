@@ -267,7 +267,6 @@ fn canary_mapping() -> MappingAdapter {
             height_cells: 20,
             origin_xy: (-5.0, -5.0),
             voxel_size: 0.05,
-            occupancy_algo: nuwax_mapping::cost_mapper::CostAlgoSelector::General,
             initial_safe_radius_meters: 2.0,
         },
         "map",

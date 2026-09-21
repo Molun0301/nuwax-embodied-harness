@@ -38,11 +38,10 @@ use nalgebra::Point3;
 #[cfg(test)]
 use nuwax_mapping::cost_mapper::SimplePointCloud2;
 use nuwax_mapping::cost_mapper::{
-    CostAlgoSelector, CostMapperConfig, OccupancyConfig, PointCloud2Like,
+    CostMapperConfig, OccupancyConfig, PointCloud2Like,
 };
 #[cfg(test)]
 use nuwax_mapping::pointclouds::occupancy::MappingError;
-use nuwax_mapping::pointclouds::occupancy::PointCloudOccConfig;
 use nuwax_mapping::{CostMapper, MappingSession, OccupancyGrid, PointCloudAccumulator};
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
@@ -235,7 +234,6 @@ impl PointCloud2Like for BorrowedPointCloud<'_> {
 /// - `width_cells` / `height_cells` —— 栅格尺寸;默认 200×200 (10m × 10m)
 /// - `voxel_size` —— 体素降采样边长;默认 0.05,与 `pointcloud.rs::VOXEL_SIZE` 对齐
 /// - `origin_xy` —— 旧 fixed-bounds 兼容配置;production 使用点云四周 1 m auto bounds
-/// - `occupancy_algo` —— 原版 HeightCost / General / Simple kernel selector
 #[derive(Debug, Clone, Copy)]
 pub struct MappingAdapterConfig {
     pub resolution: f64,
@@ -243,7 +241,6 @@ pub struct MappingAdapterConfig {
     pub height_cells: u32,
     pub origin_xy: (f64, f64),
     pub voxel_size: f64,
-    pub occupancy_algo: CostAlgoSelector,
     pub initial_safe_radius_meters: f32,
 }
 
@@ -255,7 +252,6 @@ impl MappingAdapterConfig {
     /// - `NUWAX_MAPPING_HEIGHT_CELLS` (默认 200)
     /// - `NUWAX_MAPPING_VOXEL_SIZE` (默认 0.05)
     /// - `NUWAX_MAPPING_ORIGIN_X` / `NUWAX_MAPPING_ORIGIN_Y` (默认 -5 / -5)
-    /// - `NUWAX_MAPPING_OCCUPANCY_ALGO` (默认 height_cost)
     /// - `NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS` (默认 0)
     pub fn from_env() -> Self {
         Self {
@@ -267,30 +263,10 @@ impl MappingAdapterConfig {
                 parse_env_f64("NUWAX_MAPPING_ORIGIN_Y", -5.0),
             ),
             voxel_size: parse_env_f64("NUWAX_MAPPING_VOXEL_SIZE", 0.05),
-            occupancy_algo: parse_env_occupancy_algo(),
             initial_safe_radius_meters: parse_env_nonnegative_f32(
                 "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS",
                 0.0,
             ),
-        }
-    }
-}
-
-fn parse_env_occupancy_algo() -> CostAlgoSelector {
-    let Some(value) = std::env::var("NUWAX_MAPPING_OCCUPANCY_ALGO")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-    else {
-        return CostAlgoSelector::HeightCost;
-    };
-    match value.as_str() {
-        "height_cost" | "height-cost" => CostAlgoSelector::HeightCost,
-        "general" | "probability" => CostAlgoSelector::General,
-        "simple" | "probabilistic" => CostAlgoSelector::Simple,
-        other => {
-            warn!("NUWAX_MAPPING_OCCUPANCY_ALGO={other:?} 无效;回退到原版默认 height_cost");
-            CostAlgoSelector::HeightCost
         }
     }
 }
@@ -582,12 +558,8 @@ impl MappingCommitPreparation {
         let Some(candidate) = self.completion.result.as_ref().ok().and_then(|value| value.as_ref()) else {
             return Ok(None);
         };
-        let persistent = if candidate.backend_kind == MappingBackendKind::Raytracing {
-            PersistentOccupancyGrid::stage_authoritative(&candidate.live_window_occupancy)?
-        } else {
-            PersistentOccupancyGrid::stage_voxel(self.persistent.as_deref(),
-                &candidate.live_window_occupancy, &candidate.latest_frame_occupancy)?
-        };
+        let persistent = PersistentOccupancyGrid::stage_observation(
+            self.persistent.as_deref(), &candidate.latest_frame_occupancy)?;
         let grid = &persistent.grid;
         let floor = self.completion.token.base_occupancy_revision;
         let revision = match &self.sequence_store {
@@ -1382,8 +1354,6 @@ impl MappingAdapter {
     ) -> Self {
         let cost_mapper = CostMapper::new(CostMapperConfig {
             config: OccupancyConfig {
-                algo: config.occupancy_algo,
-                pointcloud: PointCloudOccConfig::default(),
                 initial_safe_radius_meters: config.initial_safe_radius_meters,
             },
         });
@@ -1929,7 +1899,6 @@ impl MappingAdapter {
     fn backend_compute_config(&self) -> MappingBackendComputeConfig {
         MappingBackendComputeConfig {
             resolution: self.config.resolution,
-            occupancy_algo: self.config.occupancy_algo,
             initial_safe_radius_meters: self.config.initial_safe_radius_meters,
             window_capacity: self.session.capacity(),
         }
@@ -2508,7 +2477,7 @@ impl MappingAdapter {
 
     pub(crate) fn prepare_pgo_install(
         &mut self,
-        grid: OccupancyGrid,
+        persistent: PersistentOccupancyGrid,
         source_timestamp_ns: u64,
         correction: nalgebra::Isometry3<f64>,
         correction_revision: u64,
@@ -2517,7 +2486,8 @@ impl MappingAdapter {
         if self.checkpoint_export.is_some() {
             return Err("PGO地图提交与检查点导出冲突".into());
         }
-        validate_checkpoint_grid(&grid, &self.map_frame_id)?;
+        let grid = &persistent.grid;
+        validate_checkpoint_grid(grid, &self.map_frame_id)?;
         let mut transform = self
             .map_odom_transform
             .clone()
@@ -2564,7 +2534,7 @@ impl MappingAdapter {
             event,
             receipt,
             raw_map,
-            persistent: PersistentOccupancyGrid::from_grid(grid)?,
+            persistent,
             transform,
             expected_session,
             expected_revision,
@@ -3033,6 +3003,8 @@ impl MappingAdapter {
                 return;
             }
             self.latest_accepted_point_count = stats.accepted;
+            self.latest_accepted_map_points.clear();
+            self.latest_accepted_map_points.extend_from_slice(accepted_points);
             self.pointcloud_count = self.pointcloud_count.saturating_add(1);
             self.has_data = true;
             self.latest_pointcloud_source_frame_id = self.map_frame_id.clone();
@@ -3525,8 +3497,7 @@ impl MappingAdapter {
 
     #[cfg(test)]
     fn build_maps(&self) -> Result<(CostMapper, OccupancyGrid), MappingError> {
-        let voxel_points = self.session.clone_points();
-        let points = self.mapping_kernel.accumulated_points(&voxel_points);
+        let points = &self.latest_accepted_map_points;
         let origin = self.last_sensor_origin;
         let cloud = SimplePointCloud2::with_metadata(
             points.to_vec(),
@@ -3551,9 +3522,7 @@ impl MappingAdapter {
         let timestamp = self.latest_pointcloud_timestamp_ns as f64 / 1_000_000_000.0;
         let occupancy_config = self.cost_mapper.config().config.clone();
         let resolution = self.config.resolution;
-        let latest_count = self.latest_accepted_point_count;
-        let voxel_points = self.session.make_contiguous_points();
-        let points = self.mapping_kernel.accumulated_points(voxel_points);
+        let points = &self.latest_accepted_map_points;
         let cloud = BorrowedPointCloud {
             points,
             sensor_origin: nalgebra::point![origin[0], origin[1], origin[2]],
@@ -3562,25 +3531,7 @@ impl MappingAdapter {
         };
         let (mapper, occupancy, _costmap) =
             CostMapper::from_pointcloud_auto(&cloud, &occupancy_config, resolution)?;
-        let latest_count = latest_count.min(points.len());
-        let latest_grid = if self.mapping_kernel.is_raytracing() {
-            occupancy.clone()
-        } else if latest_count == 0 {
-            let mut unknown = occupancy.clone();
-            unknown.data.fill(-1);
-            unknown
-        } else {
-            let latest_start = points.len() - latest_count;
-            let latest_cloud = BorrowedPointCloud {
-                points: &points[latest_start..],
-                sensor_origin: nalgebra::point![origin[0], origin[1], origin[2]],
-                frame_id: &frame_id,
-                timestamp,
-            };
-            let (_latest_mapper, latest_grid, _latest_costmap) =
-                CostMapper::from_pointcloud_auto(&latest_cloud, &occupancy_config, resolution)?;
-            latest_grid
-        };
+        let latest_grid = occupancy.clone();
         Ok((mapper, occupancy, latest_grid))
     }
 
@@ -3637,7 +3588,7 @@ impl MappingAdapter {
         let built_generation = self.session.generation();
         let built_point_count = self.session.current_size();
         let built_received_at_ns = self.latest_pointcloud_received_at_ns;
-        let (mapper, live_grid, latest_grid) = match self.build_maps_zero_copy() {
+        let (mapper, _live_grid, latest_grid) = match self.build_maps_zero_copy() {
             Ok(result) => result,
             Err(error) => {
                 warn!("mapping_adapter: auto-bounds occupancy 构建失败: {error}");
@@ -3645,35 +3596,13 @@ impl MappingAdapter {
             }
         };
         self.cost_mapper = mapper;
-        let raytracing_backend = self.mapping_kernel.is_raytracing();
-        let mut next_persistent = if raytracing_backend {
-            match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
-                Ok(persistent) => persistent,
-                Err(error) => {
-                    warn!("mapping_adapter: persistent occupancy initialization failed: {error}");
-                    return false;
-                }
-            }
-        } else {
-            match self.persistent_grid.as_deref() {
-                Some(persistent) => persistent.clone(),
-                None => match PersistentOccupancyGrid::from_grid(live_grid.clone()) {
-                    Ok(persistent) => persistent,
-                    Err(error) => {
-                        warn!(
-                            "mapping_adapter: persistent occupancy initialization failed: {error}"
-                        );
-                        return false;
-                    }
-                },
-            }
-        };
-        if !raytracing_backend {
-            if let Err(error) = next_persistent.merge(&live_grid, &latest_grid) {
-                warn!("mapping_adapter: persistent/live occupancy merge failed: {error}");
+        let next_persistent = match PersistentOccupancyGrid::stage_observation(self.persistent_grid.as_deref(), &latest_grid) {
+            Ok(grid) => grid,
+            Err(error) => {
+                warn!("mapping_adapter: 水平观测累积失败: {error}");
                 return false;
             }
-        }
+        };
         let grid = next_persistent.grid.clone();
         if let Ok(mut s) = state.try_write() {
             let revision_floor = s.map.revision.max(self.revision).max(self.global_revision);
@@ -4141,19 +4070,11 @@ fn map_cost_to_i8(v: u8) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nuwax_mapping::cost_mapper::CostAlgoSelector;
     use nuwax_mapping::occupancy::types::OccupancyValue;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_SEQUENCE_TEST_PATH: AtomicU64 = AtomicU64::new(0);
-
-    const GENERAL_GOLDEN: &[i8] = &[
-        -1, -1, -1, -1, -1, -1, -1, // row 0
-        -1, -1, -1, 0, -1, -1, -1, // row 1
-        -1, -1, 100, 0, 100, -1, -1, // row 2
-        -1, -1, -1, 0, -1, -1, -1, // row 3
-    ];
 
     fn sample_config() -> MappingAdapterConfig {
         MappingAdapterConfig {
@@ -4162,7 +4083,6 @@ mod tests {
             height_cells: 20,
             origin_xy: (-1.0, -1.0),
             voxel_size: 0.1,
-            occupancy_algo: CostAlgoSelector::HeightCost,
             initial_safe_radius_meters: 0.0,
         }
     }
@@ -4299,78 +4219,14 @@ mod tests {
         let mut persistent =
             PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
         let accumulated = observed_grid((1.0, 0.0), 2, 1, 0);
-        let latest = accumulated.clone();
-
         assert!(persistent
-            .merge(&accumulated, &latest)
+            .merge_observation(&accumulated)
             .expect("merge extending live grid"));
 
         assert_eq!(persistent.grid.origin, [0.0, 0.0, 0.0]);
         assert_eq!((persistent.grid.width, persistent.grid.height), (3, 1));
         assert_eq!(grid_cell_at_world(&persistent.grid, 0.5, 0.5), 100);
         assert_eq!(grid_cell_at_world(&persistent.grid, 2.5, 0.5), 0);
-    }
-
-    #[test]
-    fn persistent_grid_confirms_changes_across_navigation_cost_threshold() {
-        for (old, new) in [(50, 49), (56, 0), (49, 50)] {
-            let seed = observed_grid((0.0, 0.0), 1, 1, old);
-            let unknown = observed_grid((0.0, 0.0), 1, 1, -1);
-            let observation = observed_grid((0.0, 0.0), 1, 1, new);
-            let mut persistent = PersistentOccupancyGrid::from_grid(seed).unwrap();
-            for _ in 0..2 {
-                assert!(!persistent.merge(&unknown, &observation).unwrap());
-                assert_eq!(persistent.grid.data, vec![old]);
-            }
-            // 未观测必须打断反证累计，不能把间断的观测凑成连续证据。
-            persistent.merge(&unknown, &unknown).unwrap();
-            for _ in 0..2 {
-                assert!(!persistent.merge(&unknown, &observation).unwrap());
-            }
-            assert!(persistent.merge(&unknown, &observation).unwrap());
-            assert_eq!(persistent.grid.data, vec![new]);
-        }
-    }
-
-    #[test]
-    fn persistent_grid_ignores_unknown_and_single_frame_contradictions() {
-        let seed = observed_grid((0.0, 0.0), 1, 1, 100);
-        let mut persistent =
-            PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
-        let unknown = observed_grid((0.0, 0.0), 1, 1, -1);
-        let free = observed_grid((0.0, 0.0), 1, 1, 0);
-
-        assert!(!persistent
-            .merge(&unknown, &unknown)
-            .expect("unknown does not erase known cell"));
-        assert_eq!(persistent.grid.data, vec![100]);
-        assert!(!persistent
-            .merge(&free, &free)
-            .expect("first contradiction is pending"));
-        assert_eq!(persistent.grid.data, vec![100]);
-        assert!(!persistent
-            .merge(&free, &free)
-            .expect("second contradiction is pending"));
-        assert_eq!(persistent.grid.data, vec![100]);
-    }
-
-    #[test]
-    fn persistent_grid_clears_moving_obstacle_after_confirmed_free_observations() {
-        let seed = observed_grid((0.0, 0.0), 1, 1, 100);
-        let mut persistent =
-            PersistentOccupancyGrid::from_grid(seed).expect("valid persistent seed");
-        let free = observed_grid((0.0, 0.0), 1, 1, 0);
-
-        for _ in 1..OCCUPANCY_CHANGE_CONFIRMATIONS {
-            assert!(!persistent
-                .merge(&free, &free)
-                .expect("contradictory observation stays pending"));
-            assert_eq!(persistent.grid.data, vec![100]);
-        }
-        assert!(persistent
-            .merge(&free, &free)
-            .expect("confirmed free observation clears obstacle"));
-        assert_eq!(persistent.grid.data, vec![0]);
     }
 
     #[test]
@@ -4428,10 +4284,9 @@ mod tests {
     #[test]
     fn build_occupancy_produces_grid() {
         let mut a = active_adapter(sample_config());
-        // 默认 HeightCost 语义下,z > 1.5m 才是 Occupied；z=0 属于 Unknown。
-        a.feed_pointcloud(&[Point3::new(0.0, 0.0, 2.0), Point3::new(0.1, 0.0, 2.0)]);
+        a.feed_pointcloud(&[Point3::new(1.0, 0.0, 0.0)]);
         let grid = a.build_occupancy().expect("valid auto-bounds occupancy");
-        assert_eq!(grid.width, 21);
+        assert_eq!(grid.width, 30);
         assert_eq!(grid.height, 20);
         // 至少有一个 occupied cell
         let mut has_occupied = false;
@@ -4447,10 +4302,9 @@ mod tests {
     }
 
     #[test]
-    fn production_mapping_uses_auto_bounds_selected_kernel_and_source_metadata() {
+    fn production_mapping_uses_horizontal_rays_and_source_metadata() {
         let mut config = sample_config();
         config.resolution = 0.5;
-        config.occupancy_algo = CostAlgoSelector::General;
         let mut adapter = active_adapter(config);
         let points = vec![
             Point3::new(0.00, 0.00, 0.00),
@@ -4474,27 +4328,29 @@ mod tests {
         let occupancy = adapter
             .build_occupancy()
             .expect("selected production occupancy");
-        assert_eq!((occupancy.width, occupancy.height), (7, 4));
+        assert_eq!((occupancy.width, occupancy.height), (6, 4));
         assert_eq!(occupancy.origin, [-1.0, -1.0, 0.0]);
         assert_eq!(occupancy.frame_id, "map");
         assert_eq!(occupancy.ts, 123.25);
-        assert_eq!(occupancy.data, GENERAL_GOLDEN);
+        assert_eq!(grid_cell_at_world(&occupancy, 0.25, 0.25), 0);
+        assert_eq!(grid_cell_at_world(&occupancy, 0.75, 0.25), 100);
+        assert_eq!(grid_cell_at_world(&occupancy, 1.25, 0.25), -1);
 
         let state = Arc::new(RwLock::new(SharedState::default()));
         assert!(adapter.build_and_publish(&state, None));
         let state = state.try_read().expect("committed map state");
-        assert_eq!((state.map.width, state.map.height), (7, 4));
+        assert_eq!((state.map.width, state.map.height), (6, 4));
         assert_eq!((state.map.origin_x, state.map.origin_y), (-1.0, -1.0));
         assert_eq!(state.map.frame_id, "map");
         assert_eq!(state.map.timestamp_ns, source_timestamp_ns);
-        assert_eq!(state.map.data, GENERAL_GOLDEN);
+        assert_eq!(map_cell_at_world(&state.map, 0.25, 0.25), 0);
+        assert_eq!(map_cell_at_world(&state.map, 0.75, 0.25), -1, "首帧命中尚未确认");
     }
 
     #[test]
     fn published_grid_survives_window_eviction_expands_and_clears_after_confirmation() {
         let mut config = sample_config();
         config.resolution = 1.0;
-        config.occupancy_algo = CostAlgoSelector::General;
         let mut adapter = active_adapter(config);
         adapter.session = MappingSession::with_capacity(1);
         let state = Arc::new(RwLock::new(SharedState::default()));
@@ -4511,28 +4367,29 @@ mod tests {
                 .expect("accepted mapping frame");
         };
 
-        feed(&mut adapter, Point3::new(0.0, 0.0, 0.5), 1_000_000_000);
-        assert!(adapter.build_and_publish(&state, None));
+        for timestamp in [1_000_000_000, 1_100_000_000] {
+            feed(&mut adapter, Point3::new(1.5, 0.0, 0.0), timestamp);
+            assert!(adapter.build_and_publish(&state, None));
+        }
         assert_eq!(
-            map_cell_at_world(&state.try_read().expect("first map").map, 0.5, 0.5),
+            map_cell_at_world(&state.try_read().expect("first map").map, 1.5, 0.5),
             100
         );
 
-        // Capacity one evicts the obstacle point.  Its published cell must
-        // remain while a newly explored world region is appended.
-        feed(&mut adapter, Point3::new(3.0, 0.0, 0.0), 2_100_000_000);
+        // 新方向观测淘汰旧点，但不构成旧障碍的清除证据。
+        feed(&mut adapter, Point3::new(0.0, 3.5, 0.0), 2_100_000_000);
         assert!(adapter.build_and_publish(&state, None));
         {
             let shared = state.try_read().expect("expanded map");
-            assert_eq!(map_cell_at_world(&shared.map, 0.5, 0.5), 100);
-            assert_eq!(map_cell_at_world(&shared.map, 3.5, 0.5), 0);
+            assert_eq!(map_cell_at_world(&shared.map, 1.5, 0.5), 100);
+            assert_eq!(map_cell_at_world(&shared.map, 0.5, 2.5), 0);
         }
 
         for observation in 0..OCCUPANCY_CHANGE_CONFIRMATIONS {
             let timestamp_ns = 3_200_000_000 + u64::from(observation) * 1_100_000_000;
-            feed(&mut adapter, Point3::new(0.0, 0.0, 0.0), timestamp_ns);
+            feed(&mut adapter, Point3::new(3.5, 0.0, 0.0), timestamp_ns);
             assert!(adapter.build_and_publish(&state, None));
-            let value = map_cell_at_world(&state.try_read().expect("confirmed map").map, 0.5, 0.5);
+            let value = map_cell_at_world(&state.try_read().expect("confirmed map").map, 1.5, 0.5);
             if observation + 1 < OCCUPANCY_CHANGE_CONFIRMATIONS {
                 assert_eq!(value, 100, "single-frame clears must be suppressed");
             } else {
@@ -4565,12 +4422,12 @@ mod tests {
     fn build_and_publish_writes_shared_state() {
         let state = Arc::new(RwLock::new(SharedState::default()));
         let mut a = active_adapter(sample_config());
-        a.feed_pointcloud(&[Point3::new(0.0, 0.0, 0.0)]);
+        a.feed_pointcloud(&[Point3::new(1.0, 0.0, 0.0)]);
         // 测试路径不接 broadcast Sender,传 None — 保持 Phase 5 后向兼容。
         assert!(a.build_and_publish(&state, None));
         let s = state.try_read().expect("read");
         assert!(s.map.revision >= 1);
-        assert_eq!(s.map.width, 20);
+        assert_eq!(s.map.width, 30);
         assert_eq!(s.map.height, 20);
     }
 
@@ -5701,6 +5558,31 @@ mod tests {
         assert_eq!(shared.try_read().unwrap().pose.timestamp_ns, 2_000_000_000);
         adapter.resolve_backend_completion(&committed.token, committed.resolution, true).unwrap();
         std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn planar_scan_canonical_commits_accumulate_and_keep_full_3d_returns() {
+        let config = MappingAdapterConfig { ..sample_config() };
+        for spec in [MappingBackendSpec::Voxel,MappingBackendSpec::raytracing_defaults()] {
+            let mut adapter = MappingAdapter::new_with_frames_and_optional_sequence_store(config,spec,"map","odom",None);
+            adapter.start_session("planar-scan-session","planar-scan-map").unwrap();
+            let points = [Point3::new(2.025,0.025,0.0), Point3::new(1.025,0.025,-0.4), Point3::new(1.025,0.025,2.0)];
+            let mut shared = SharedState::default();
+            for sequence in 1..=2 {
+                let stamp = sequence * 1_000_000_000;
+                let prepared = adapter.prepare_backend_compute(&points,(0.0,0.0),12,stamp,"map",stamp,false).unwrap().unwrap();
+                let completion = prepared.worker.submit(prepared.token,prepared.input).unwrap().blocking_recv().unwrap();
+                assert_eq!(completion.accepted_points_map.len(),points.len());
+                let committed = adapter.commit_backend_completion(completion,&mut shared).unwrap().unwrap();
+                assert_eq!(committed.event.as_ref().unwrap().revision,sequence);
+                assert_eq!(shared.map.data.contains(&100),sequence==2);
+                adapter.resolve_backend_completion(&committed.token,committed.resolution,true).unwrap();
+            }
+            let saved = adapter.persistent_grid.as_ref().unwrap().grid.clone();
+            assert!(saved.data.contains(&100));
+            let restored = PersistentOccupancyGrid::from_grid(saved.clone()).unwrap();
+            assert_eq!(restored.grid.data,saved.data);
+        }
     }
 
     #[test]

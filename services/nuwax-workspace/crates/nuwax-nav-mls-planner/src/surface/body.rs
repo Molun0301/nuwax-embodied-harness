@@ -4,6 +4,39 @@ use std::collections::VecDeque;
 pub(super) type CacheSlot =
     std::sync::Mutex<AHashMap<(VoxelKey, u64), Arc<AHashMap<(i32, i32), VoxelKey>>>>;
 
+/// 当前占据只证明精确足迹内的支撑，原始快照用于下一次位姿重新派生。
+pub(super) struct CurrentBodySupport {
+    pub(super) source: SurfaceSnapshot,
+    pub(super) body: [f64; 3],
+    pub(super) quaternion: [f64; 4],
+    pub(super) polygon: Vec<[f64; 2]>,
+    pub(super) cells: AHashSet<VoxelKey>,
+}
+
+impl CurrentBodySupport {
+    fn permits_overlap(&self, polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
+        // 将候选足迹裁到当前列，逐顶点核对其仍在原凸足迹中；相交格不能
+        // 把列内未占据的半格也变成可通行支撑。
+        let mut clipped = polygon.to_vec();
+        for (axis, limit, sign) in [(0, f64::from(x)*size, 1.0),
+            (0, f64::from(x+1)*size, -1.0), (1, f64::from(y)*size, 1.0),
+            (1, f64::from(y+1)*size, -1.0)] {
+            let mut next = Vec::with_capacity(clipped.len()+1);
+            for (&a, &b) in clipped.iter().zip(clipped.iter().cycle().skip(1)) {
+                let da = (a[axis]-limit)*sign;
+                let db = (b[axis]-limit)*sign;
+                if da >= 0.0 { next.push(a); }
+                if (da >= 0.0) != (db >= 0.0) {
+                    let t = da / (da-db);
+                    next.push([a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1])]);
+                }
+            }
+            clipped = next;
+        }
+        clipped.into_iter().all(|p| inside_boundary(p, &self.polygon))
+    }
+}
+
 /// 数学核心使用的机体和地形参数；外层从唯一标定契约转换。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceBodyEnvelope {
@@ -265,6 +298,10 @@ impl SurfaceSnapshot {
         body: [f64; 3],
         quaternion: [f64; 4],
     ) -> Result<Self, SurfaceError> {
+        if let Some(current) = &self.current_body_support {
+            return current.source.with_observations(self.observations.clone())
+                .with_current_body_support(body, quaternion);
+        }
         let Some(model) = self.body_envelope() else {
             return Ok(self.clone());
         };
@@ -379,21 +416,21 @@ impl SurfaceSnapshot {
                         })
                     })
                 {
+                    tracing::debug!(x, y, ground=z, "当前占据区存在已观测下方落差");
                     return Err(SurfaceError::MissingSupport);
                 }
-                // 相交格可能同时含有贴身环境障碍；没有亚格证据时只处理
-                // 完全位于当前投影内的列，不能多清除半格环境。
-                if [x,x+1].into_iter().all(|ix| [y,y+1].into_iter().all(|iy|
-                    inside_boundary([f64::from(ix)*size,f64::from(iy)*size],&polygon))) {
-                    footprint.push((x, y, z));
-                }
+                // 支撑接触和完整机体检查使用同一相交格集合；自体占据清除
+                // 仍由 covered 单独核对整体素，边缘格中的外部障碍不能清除。
+                footprint.push((x, y, z));
             }
         }
         let evidence_hull = hull(evidence);
         if evidence_hull.len() < 3 || polygon.iter().any(|&p| !inside_boundary(p, &evidence_hull)) {
+            tracing::debug!(?polygon, ?evidence_hull, "当前占据区缺少周边地面包围证据");
             return Err(SurfaceError::MissingSupport);
         }
         let mut updates = Vec::with_capacity(footprint.len());
+        let mut inferred = AHashSet::new();
         for (x, y, z) in footprint {
             let top = z + (model.body_to_support_z_m + model.z_bounds_m[1]) / r[2][2];
             // 已观测到的合法足下层顶继续保留，避免清除自体时把厚地面挖成
@@ -412,9 +449,10 @@ impl SurfaceSnapshot {
                 .filter(|&&iz| self.observed_support_lower_bound((x, y, iz)) <= z + quantum)
                 .map(|&iz| self.cell_position((x, y, iz))[2])
                 .filter(|&height| {
-                    height >= z && height <= maximum_ground.min(z + model.max_step_up_m)
+                    height >= z - quantum && height <= maximum_ground.min(z + model.max_step_up_m)
                 })
-                .fold(z, f64::max);
+                .max_by(f64::total_cmp)
+                .unwrap_or(z);
             let mut cells = std::collections::BTreeMap::new();
             for &iz in self
                 .data
@@ -430,13 +468,21 @@ impl SurfaceSnapshot {
                 }
             }
             let iz = ((z - quantum * 0.5) / size).floor() as i32;
+            if !self.data.physical_graph.surface_lookup.get(&(x, y)).is_some_and(|zs| {
+                zs.iter().any(|&old| (self.cell_position((x, y, old))[2]-z).abs() <= 1e-6)
+            }) {
+                inferred.insert((x, y, iz));
+            }
             cells.insert(iz, [(z - quantum) as f32, z as f32]);
             updates.push(SurfaceColumnUpdate {
                 column: [x, y],
                 cells: cells.into_iter().collect(),
             });
         }
-        let view=self.with_current_body_columns(&updates)?;
+        let mut view=self.with_current_body_columns(&updates)?;
+        view.current_body_support = Some(Arc::new(CurrentBodySupport {
+            source: self.clone(), body, quaternion, polygon, cells: inferred,
+        }));
         view.validate_body_pose(body,quaternion)?;
         Ok(view)
     }
@@ -467,6 +513,10 @@ impl SurfaceSnapshot {
 
     /// 装配同一不可变几何上的完整机体包络；上下阶方向直接进入实际邻接。
     pub fn with_body_envelope(&self, model: SurfaceBodyEnvelope) -> Result<Self, SurfaceError> {
+        if let Some(current) = &self.current_body_support {
+            return current.source.with_observations(self.observations.clone())
+                .with_body_envelope(model)?.with_current_body_support(current.body, current.quaternion);
+        }
         model.validate()?;
         let mut physical=(*self.data.physical_graph).clone();
         let ids=physical.cells.ids().collect::<Vec<_>>();
@@ -481,6 +531,7 @@ impl SurfaceSnapshot {
         let regions=Arc::new(regions::RegionGraph::full(&graph,self.config().voxel_size));
         Ok(Self {
             observations: self.observations.clone(),
+            current_body_support: None,
             data: Arc::new(SurfaceData {
                 graph: Arc::new(graph),
                 regions,
@@ -708,6 +759,12 @@ impl SurfaceSnapshot {
                     tracing::debug!(?body,x,y,centre=?centre.cell,"机体包络下缺少连通地面");
                     SurfaceError::MissingSupport
                 })?;
+                if self.current_body_support.as_ref().is_some_and(|current| {
+                    current.cells.contains(&ground) && !current.permits_overlap(&polygon, x, y, size)
+                }) {
+                    tracing::debug!(?body, x, y, "候选机体进入当前足迹外的缺测支撑");
+                    return Err(SurfaceError::MissingSupport);
+                }
                 if self
                     .data
                     .virtual_obstacles
@@ -1449,6 +1506,76 @@ mod tests {
         assert!(base.validate_body_pose(pose.0,pose.1).is_err());
         assert!(base.with_current_body_support(pose.0,pose.1).is_err(),
             "足迹右端为0.55米，不能清除同一体素中0.575米处的环境障碍");
+    }
+
+    #[test]
+    fn current_body_blind_footprint_can_depart_into_observed_ground() {
+        let mut config = scene(&[], false).config().clone();
+        config.wall_clearance_m = 0.15;
+        let mut envelope = model();
+        envelope.footprint_xy_m = vec![[-0.24, -0.164], [0.34, -0.164],
+            [0.34, 0.164], [-0.24, 0.164]];
+        envelope.z_bounds_m = [-0.448, 0.057];
+        for (yaw, pitch) in [(0.0_f64, 0.0_f64), (0.37, 0.0), (1.1, 0.0), (0.0, 0.0072)] {
+            let pose = ([0.027, 0.013, 0.451], [-(yaw/2.0).sin()*(pitch/2.0).sin(),
+                (yaw/2.0).cos()*(pitch/2.0).sin(), (yaw/2.0).sin()*(pitch/2.0).cos(),
+                (yaw/2.0).cos()*(pitch/2.0).cos()]);
+            let polygon: Vec<_> = envelope.footprint_xy_m.iter().map(|p| {
+                [pose.0[0] + p[0] * yaw.cos() - p[1] * yaw.sin(),
+                 pose.0[1] + p[0] * yaw.sin() + p[1] * yaw.cos()]
+            }).collect();
+            let points: Vec<_> = (-40..40).flat_map(|x| (-40..40).map(move |y|
+                ((x as f32 + 0.5) * 0.05, (y as f32 + 0.5) * 0.05, 0.025)))
+                .filter(|&(x,y,_)| !inside_boundary([f64::from(x),f64::from(y)], &polygon)).collect();
+            let base = SurfaceSnapshot::from_points(&points, config.clone(), 0.05).unwrap()
+                .with_body_envelope(envelope.clone()).unwrap();
+            assert!(base.validate_body_pose(pose.0, pose.1).is_err());
+            let view = base.with_current_body_support(pose.0, pose.1)
+                .unwrap_or_else(|error| panic!("当前足迹盲区不能阻止起步，朝向{yaw}: {error}"));
+            view.validate_body_pose(pose.0, pose.1).unwrap();
+            let target = ([pose.0[0] + yaw.cos() * 0.8, pose.0[1] + yaw.sin() * 0.8, pose.0[2]], pose.1);
+            view.validate_body_motion(pose, target, &[]).unwrap();
+            assert!(base.validate_body_pose(pose.0, pose.1).is_err(), "原图仍保留真实盲区");
+        }
+    }
+
+    #[test]
+    fn current_body_blind_support_keeps_real_observations_and_does_not_accumulate() {
+        let points: Vec<_> = (-30..30).flat_map(|x| (-30..30).filter_map(move |y| {
+            (!(x >= -5 && x <= 4 && y == 0)).then_some(
+                ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))
+        })).collect();
+        let observations = observation_grid(|cells| {
+            cells.retain(|key,_| !(key[0] >= -5 && key[0] <= 4 && key[1] == 0));
+        });
+        let base = SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.1)
+            .unwrap().with_body_envelope(model()).unwrap().with_observations(Some(observations.clone()));
+        let start = ([0.0,0.0,0.5],[0.0,0.0,0.0,1.0]);
+        let target = ([0.8,0.0,0.5],start.1);
+        let view = base.with_current_body_support(start.0,start.1).unwrap();
+        assert!(Arc::ptr_eq(view.observations.as_ref().unwrap(), &observations));
+        let occupied = view.body_observation_footprint(start).unwrap();
+        view.validate_observed_body_motion(start,target,&occupied,10_100_000_000,1_000_000_000).unwrap();
+        assert!(view.validate_observed_body_motion(start,target,&occupied,12_000_000_000,1_000_000_000).is_err());
+        let advanced = view.with_current_body_support(target.0,target.1).unwrap();
+        assert!(advanced.validate_body_pose(start.0,start.1).is_err(), "新查询不能保留旧足迹的补足");
+        assert!(base.validate_body_pose(start.0,start.1).is_err());
+        assert!(observations.get([0,0,0]).is_none(), "不能伪造盲区的观察时间");
+    }
+
+    #[test]
+    fn current_body_blind_edge_does_not_authorize_unknown_outside_its_polygon() {
+        let points: Vec<_> = (-30..30).flat_map(|x| (-30..30).filter_map(move |y| {
+            (x != 5 || y != 0).then_some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.025))
+        })).collect();
+        let base=SurfaceSnapshot::from_points(&points,scene(&[],false).config().clone(),0.1)
+            .unwrap().with_body_envelope(model()).unwrap();
+        let pose=([0.0,0.0,0.5],[0.0,0.0,0.0,1.0]);
+        let view=base.with_current_body_support(pose.0,pose.1).unwrap();
+        view.validate_body_pose(pose.0,pose.1).unwrap();
+        view.validate_body_motion(pose,([-0.3,0.0,0.5],pose.1),&[]).unwrap();
+        assert!(view.validate_body_motion(pose,([0.025,0.0,0.5],pose.1),&[]).is_err(),
+            "当前足迹止于0.55米，不能借相交格走进0.575米的未知区域");
     }
 
     #[test]

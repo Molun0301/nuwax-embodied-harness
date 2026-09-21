@@ -71,6 +71,7 @@ impl SurfaceSnapshot {
         Self {
             data: Arc::clone(&self.data),
             observations,
+            current_body_support: self.current_body_support.clone(),
         }
     }
 

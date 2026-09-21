@@ -471,6 +471,54 @@ mod tests {
             .all(|p| (p.0[0] - 0.05).hypot(p.0[1] - 0.05) < 1e-5));
     }
     #[test]
+    fn blind_start_planning_and_following_reach_observed_ground() {
+        let base = scene(false);
+        let start = pose(0.027, 0.013, 0.0);
+        let goal = pose(0.827, 0.013, 0.0);
+        let points: Vec<_> = (-40..40).flat_map(|x| (-30..30).map(move |y|
+            ((x as f32 + 0.5) * 0.05, (y as f32 + 0.5) * 0.05, 0.075)))
+            .filter(|&(x, y, _)| (f64::from(x)-start.0[0]).abs() > 0.3
+                || (f64::from(y)-start.0[1]).abs() > 0.12).collect();
+        let map = Arc::new(SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
+            .unwrap().with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+        assert!(map.validate_body_pose(start.0, start.1).is_err());
+        let view = map.with_current_body_support(start.0, start.1).unwrap();
+        let motion = limits();
+        let options = GoalOptions { allow_reverse: false, position_tolerance_m: 0.08,
+            yaw_tolerance_rad: 0.08 };
+        let path = plan(&view, start, goal, options, Some(&motion), &[], 2000).unwrap();
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.motion_limits = Some(motion);
+        config.controller.control_frequency = 20.0;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+        let mut current = start;
+        let mut nanos = 1_000_000_000;
+        follower.update_odometry(stamped(current, nanos));
+        follower.configure_goal(&stamped(goal, nanos), options).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: path.into_iter().map(|p| stamped(p, nanos)).collect(),
+        }), None, stamped(goal, nanos)).unwrap();
+        let mut reached = false;
+        for _ in 0..1000 {
+            let command = match follower.step(0.24) {
+                PlannerStep::Command(v) => v,
+                PlannerStep::Succeeded => { reached = true; break; }
+                other => panic!("盲区起步执行失败: {other:?} at {current:?}"),
+            };
+            let next = integrate(planar(current), command, 0.05);
+            // 反馈来自独立平面运动积分，真实高度保持不变。
+            current = ([next.x, next.y, start.0[2]],
+                [0.0, 0.0, (next.yaw*0.5).sin(), (next.yaw*0.5).cos()]);
+            nanos += 50_000_000;
+            follower.update_odometry(stamped(current, nanos));
+        }
+        assert!(reached, "盲区起步未到达目标: {current:?}");
+        assert!((current.0[0]-goal.0[0]).abs() < 0.08);
+        assert!(map.validate_body_pose(start.0, start.1).is_err(), "执行不能补写原始盲区");
+    }
+
+    #[test]
     fn observed_ground_band_height_error_does_not_stall_before_final_rotation() {
         let base = scene(false);
         let points: Vec<_> = (-20..20)

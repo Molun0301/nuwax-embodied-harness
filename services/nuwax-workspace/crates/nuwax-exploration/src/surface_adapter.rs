@@ -768,6 +768,30 @@ mod tests {
     }
 
     #[test]
+    fn blind_start_selects_a_goal_on_observed_ground() {
+        let points: Vec<_> = (0..40).flat_map(|x| (0..40).map(move |y|
+            ((x as f32+0.5)*0.05, (y as f32+0.5)*0.05, 0.075)))
+            .filter(|&(x,y,_)| (f64::from(x)-1.05).abs() > 0.3
+                || (f64::from(y)-1.05).abs() > 0.12).collect();
+        let snapshot = Arc::new(SurfaceSnapshot::from_points(&points,map().config().clone(),0.05)
+            .unwrap().with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+                footprint_xy_m: vec![[-0.3,-0.12],[0.3,-0.12],[0.3,0.12],[-0.3,0.12]],
+                z_bounds_m: [-0.05,0.2], body_to_support_z_m: 0.3,
+                max_step_up_m: 0.2, max_step_down_m: 0.2, max_cross_slope_deg: 15.0,
+                support_uncertainty_m: 0.0,
+            }).unwrap());
+        let current = state(0.4,1);
+        assert!(snapshot.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]).is_err());
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(Arc::clone(&snapshot)).unwrap();
+        let selected = goal(source(receiver,1).poll_goal(&current).unwrap());
+        let p = selected.pose.pose.position;
+        let q = selected.pose.pose.orientation;
+        snapshot.validate_body_pose([p.x,p.y,p.z],[q.x,q.y,q.z,q.w]).unwrap();
+        assert!(snapshot.validate_body_pose([1.05,1.05,0.4],[0.0,0.0,0.0,1.0]).is_err());
+    }
+
+    #[test]
     fn input_interruption_does_not_blacklist_surface_or_advance_region_age() {
         let receiver = SurfaceInputReceiver::new();
         let snapshot = map();

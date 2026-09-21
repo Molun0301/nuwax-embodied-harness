@@ -479,6 +479,7 @@ pub(super) fn from_columns(
     let occupied_voxels = columns.values().map(Vec::len).sum();
     Ok(SurfaceSnapshot {
         observations: None,
+        current_body_support: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),
@@ -674,6 +675,7 @@ fn update_columns(
     };
     let snapshot = SurfaceSnapshot {
         observations: None,
+        current_body_support: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),

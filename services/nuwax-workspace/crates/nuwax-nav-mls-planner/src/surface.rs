@@ -237,6 +237,7 @@ impl VirtualObstacleMask {
 pub struct SurfaceSnapshot {
     data: Arc<SurfaceData>,
     observations: Option<Arc<SurfaceObservations>>,
+    current_body_support: Option<Arc<body::CurrentBodySupport>>,
 }
 
 impl std::fmt::Debug for SurfaceSnapshot {
@@ -280,6 +281,10 @@ impl SurfaceSnapshot {
     }
 
     fn with_virtual_mask(&self, mask: Arc<VirtualObstacleMask>) -> Result<Self, SurfaceError> {
+        if let Some(current) = &self.current_body_support {
+            return current.source.with_observations(self.observations.clone())
+                .with_virtual_mask(mask)?.with_current_body_support(current.body, current.quaternion);
+        }
         let physical = Arc::clone(&self.data.physical_graph);
         let mut graph = physical.as_ref().clone();
         let excluded: AHashSet<_> = graph
@@ -299,6 +304,7 @@ impl SurfaceSnapshot {
         let regions=Arc::new(regions::RegionGraph::full(&graph,self.config().voxel_size));
         let result=Self {
             observations: self.observations.clone(),
+            current_body_support: None,
             data: Arc::new(SurfaceData {
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),
@@ -750,6 +756,12 @@ impl SurfaceSnapshot {
         let cell = self
             .nearest_column_cell(ix, iy, support_xyz[2], tolerance)
             .ok_or(SurfaceError::MissingSupport)?;
+        if self.current_body_support.as_ref().is_some_and(|current| {
+            current.cells.contains(&cell)
+                && !inside_boundary([support_xyz[0], support_xyz[1]], &current.polygon)
+        }) {
+            return Err(SurfaceError::MissingSupport);
+        }
         if self
             .data
             .graph

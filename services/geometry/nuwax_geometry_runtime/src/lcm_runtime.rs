@@ -8753,171 +8753,127 @@ async fn ingest_mapping_points_with_backend_owned(
             });
         }
     };
-    let commit_result: Result<
-        MappingIngestCommit,
-        (
-            String,
-            String,
-            Option<crate::mapping_adapter::MappingBackendRetirement>,
-        ),
-    > = {
-        let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        let mut shared_guard = Some(state.write().await);
+    let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
+    let lifecycle_guard = lifecycle_lock.lock().await;
+    let committed_result = {
+        let mut shared = state.write().await;
         let mut adapter = mapping.lock();
-        let target_frame_id = adapter.configured_map_frame_id().to_owned();
-        let mut completion = Some(prepared_completion);
         let fence_violation = match (expected_relocalization_epoch, relocalization_mode.as_ref()) {
-            (Some(expected_epoch), Some(mode)) => {
-                let snapshot = mode.snapshot();
-                snapshot.active || snapshot.epoch != expected_epoch
+            (Some(epoch), Some(mode)) => {
+                let current = mode.snapshot();
+                current.active || current.epoch != epoch
             }
             _ => false,
         };
-        let fence_commit = if fence_violation {
-            drop(shared_guard.take());
-            let completion = completion
-                .take()
-                .expect("mapping completion is present before relocalization fence");
-            let token = completion.completion.token.clone();
-            let resolution = completion.completion.resolution;
-            match resolution.abort() {
-                Err(error) => Some(Err((
-                    target_frame_id.clone(),
-                    format!("mapping completion abort failed across relocalization fence: {error}"),
-                    None,
-                ))),
-                Ok(()) if !adapter.fail_backend_compute(&token) => Some(Err((
-                    target_frame_id.clone(),
-                    "mapping completion became stale while aborting across relocalization fence"
-                        .to_owned(),
-                    None,
-                ))),
-                Ok(()) => {
-                    let session_generation = adapter.snapshot().session_generation;
-                    Some(Ok(MappingIngestCommit {
-                        outcome: MappingIngestOutcome {
-                            sensor_origin_map: None,
-                            accepted_map_points: Vec::new(),
-                            occupancy_event: None,
-                            occupancy_receipt: None,
-                            #[cfg(test)]
-                            occupancy_committed: false,
-                            session_generation,
-                            source_timestamp_ns,
-                        },
-                        cloud_commit: None,
-                    }))
-                }
+        if fence_violation {
+            let completion = prepared_completion.completion;
+            match completion.resolution.abort() {
+                Err(error) => Err(format!("mapping completion abort failed across relocalization fence: {error}")),
+                Ok(()) if !adapter.fail_backend_compute(&completion.token) =>
+                    Err("mapping completion became stale while aborting across relocalization fence".into()),
+                Ok(()) => Ok(None),
             }
         } else {
-            None
-        };
-        let mut commit_result = if let Some(fence_commit) = fence_commit {
-            fence_commit
-        } else {
-            let completion_result = adapter.commit_prepared_backend_completion(
-                completion.expect("mapping completion is present without a relocalization fence"),
-                &mut *shared_guard
-                    .as_mut()
-                    .expect("shared state guard is present before mapping commit"),
-            );
-            drop(shared_guard.take());
-            match completion_result {
-                Ok(Some(committed)) => {
-                    let crate::mapping_adapter::CommittedMappingCandidate {
-                        token: committed_token,
-                        resolution,
-                        accepted_map_points,
-                        event,
-                        session_generation,
-                        source_timestamp_ns: committed_timestamp_ns,
-                        occupancy_receipt,
-                        ..
-                    } = committed;
-                    let outcome = MappingIngestOutcome {
-                        sensor_origin_map,
-                        accepted_map_points,
-                        #[cfg(test)]
-                        occupancy_committed: event.is_some(),
-                        occupancy_event: event,
-                        occupancy_receipt,
-                        session_generation,
-                        source_timestamp_ns: committed_timestamp_ns,
-                    };
-                    let current_session = adapter.snapshot();
-                    drop(adapter);
-                    let cloud_acceptance = update_mapping_cloud_map_with_acceptance(
-                        &outcome,
-                        &current_session,
-                        cloud_map_writer,
-                    );
-                    let accepted = cloud_acceptance.accepted;
-                    let mut adapter = mapping.lock();
-                    let resolution_result =
-                        adapter.resolve_backend_completion(&committed_token, resolution, accepted);
-                    if !accepted || resolution_result.is_err() {
-                        let reason = if !accepted {
-                            "canonical cloud-map acceptance failed".to_owned()
-                        } else {
-                            format!(
-                                "mapping backend completion resolution failed: {}",
-                                resolution_result.expect_err("resolution failure checked above")
-                            )
-                        };
-                        let retirement = adapter
-                            .stop_session_detached(&token.session_id)
-                            .ok()
-                            .and_then(|transition| transition.retirement);
-                        Err((target_frame_id, reason, retirement))
-                    } else {
-                        Ok(MappingIngestCommit {
-                            outcome,
-                            cloud_commit: cloud_acceptance.cloud_commit,
-                        })
+            adapter.commit_prepared_backend_completion(prepared_completion, &mut shared)
+        }
+    };
+    let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
+    // P继续串行化规范地图变更；L只保护短提交，位姿接纳不等待点云文件与计算。
+    let commit_result = match committed_result {
+        Ok(Some(committed)) => {
+            let crate::mapping_adapter::CommittedMappingCandidate {
+                token: committed_token, resolution, accepted_map_points, event,
+                session_generation, source_timestamp_ns: committed_timestamp_ns,
+                occupancy_receipt, ..
+            } = committed;
+            let outcome = MappingIngestOutcome {
+                sensor_origin_map, accepted_map_points,
+                #[cfg(test)]
+                occupancy_committed: event.is_some(),
+                occupancy_event: event, occupancy_receipt, session_generation,
+                source_timestamp_ns: committed_timestamp_ns,
+            };
+            let current_session = mapping.lock().snapshot();
+            let preparation = {
+                let mut writer = cloud_map_writer.lock();
+                writer.as_mut().map(CloudMapShmWriter::prepare_scan_work).transpose()
+            };
+            drop(lifecycle_guard);
+            let prepared = match preparation {
+                Ok(Some((ticket, work))) => {
+                    let session = current_session.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let writer = Arc::new(parking_lot::Mutex::new(Some(work)));
+                        let acceptance = update_mapping_cloud_map_with_acceptance(&outcome, &session, &writer);
+                        let work = writer.lock().take().unwrap();
+                        (outcome, Some((ticket, work)), acceptance)
+                    }).await.map_err(|error| format!("point-cloud preparation failed: {error}"))
+                }
+                Ok(None) => Ok((outcome, None, MappingCloudMapAcceptance { cloud_commit: None, accepted: true })),
+                Err(error) => Err(error),
+            };
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let mut adapter = mapping.lock();
+            let current = adapter.snapshot();
+            let still_current = current.active && current.session_id == current_session.session_id
+                && current.session_generation == current_session.session_generation
+                && match (expected_relocalization_epoch, relocalization_mode.as_ref()) {
+                    (Some(epoch), Some(mode)) => { let value = mode.snapshot(); !value.active && value.epoch == epoch }
+                    _ => true,
+                };
+            let (outcome, acceptance, preparation_error) = match prepared {
+                Ok((outcome, work, mut acceptance)) => {
+                    acceptance.accepted &= still_current;
+                    if let Some((ticket, work)) = work {
+                        acceptance.accepted &= cloud_map_writer.lock().as_mut()
+                            .is_some_and(|writer| still_current && writer.install_scan_work(ticket, work));
                     }
+                    (Some(outcome), acceptance, None)
                 }
-                Ok(None) => {
-                    let session_generation = adapter.snapshot().session_generation;
-                    Ok(MappingIngestCommit {
-                        outcome: MappingIngestOutcome {
-                            sensor_origin_map: None,
-                            accepted_map_points: Vec::new(),
-                            occupancy_event: None,
-                            occupancy_receipt: None,
-                            #[cfg(test)]
-                            occupancy_committed: false,
-                            session_generation,
-                            source_timestamp_ns,
-                        },
-                        cloud_commit: None,
-                    })
-                }
-                Err(reason) => {
-                    let retirement = adapter
-                        .stop_session_detached(&token.session_id)
-                        .ok()
-                        .and_then(|transition| transition.retirement);
-                    Err((target_frame_id, reason, retirement))
-                }
-            }
-        };
-        if commit_result
-            .as_ref()
-            .is_err_and(|(_, _, retirement)| retirement.is_some())
-        {
-            projection_guard.pending_latest = None;
-            if let Err(error) = GeometryRuntimeHandle::revoke_committed_map_projection_parts_locked(
-                committed_map_authority,
-                map_revision_latest_tx,
-            ) {
-                if let Err((_, reason, _)) = &mut commit_result {
-                    *reason = format!("{reason}; authority revoke failed: {error}");
-                }
+                Err(error) => (None, MappingCloudMapAcceptance { cloud_commit: None, accepted: false }, Some(error)),
+            };
+            let resolved = adapter.resolve_backend_completion(&committed_token, resolution, acceptance.accepted);
+            if acceptance.accepted && resolved.is_ok() {
+                Ok(MappingIngestCommit { outcome: outcome.unwrap(), cloud_commit: acceptance.cloud_commit })
+            } else {
+                let reason = preparation_error.unwrap_or_else(|| match resolved {
+                    Err(error) => format!("mapping backend completion resolution failed: {error}"),
+                    Ok(()) => "canonical cloud-map acceptance failed".to_owned(),
+                });
+                let retirement = adapter.stop_session_detached(&token.session_id).ok().and_then(|v| v.retirement);
+                Err((target_frame_id, reason, retirement))
             }
         }
-        commit_result
+        Ok(None) => {
+            let session_generation = mapping.lock().snapshot().session_generation;
+            drop(lifecycle_guard);
+            Ok(MappingIngestCommit {
+                outcome: MappingIngestOutcome {
+                    sensor_origin_map: None, accepted_map_points: Vec::new(), occupancy_event: None,
+                    occupancy_receipt: None,
+                    #[cfg(test)]
+                    occupancy_committed: false,
+                    session_generation, source_timestamp_ns,
+                }, cloud_commit: None,
+            })
+        }
+        Err(reason) => {
+            let retirement = mapping.lock().stop_session_detached(&token.session_id).ok().and_then(|v| v.retirement);
+            drop(lifecycle_guard);
+            Err((target_frame_id, reason, retirement))
+        }
     };
+    let mut commit_result = commit_result;
+    if commit_result.as_ref().is_err_and(|(_, _, retirement)| retirement.is_some()) {
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        projection_guard.pending_latest = None;
+        if let Err(error) = GeometryRuntimeHandle::revoke_committed_map_projection_parts_locked(
+            committed_map_authority, map_revision_latest_tx,
+        ) {
+            if let Err((_, reason, _)) = &mut commit_result { *reason = format!("{reason}; authority revoke failed: {error}"); }
+        }
+    }
+    drop(projection_guard);
     match commit_result {
         Ok(commit) => Ok(commit),
         Err((target_frame_id, reason, retirement)) => {

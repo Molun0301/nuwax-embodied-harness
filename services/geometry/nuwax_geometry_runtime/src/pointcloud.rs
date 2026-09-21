@@ -10,7 +10,7 @@ use nalgebra::Point3;
 use tracing::{info, warn};
 
 use crate::mapping_commit::{CloudCommitReceipt, OccupancyCommitReceipt};
-use crate::dense_cloud::{DenseCloud, DenseSnapshot};
+use crate::dense_cloud::{DenseCloud, DenseCloudReaders, DenseSnapshot};
 
 #[path = "voxel_index.rs"]
 mod voxel_index;
@@ -168,6 +168,8 @@ pub struct CloudMapShmWriter {
     committed_fine_cloud: Option<Arc<nuwax_map_chunks::SealedMap>>,
     dense_cloud: Option<DenseCloud>,
     committed_dense_cloud: Option<DenseSnapshot>,
+    pending_dense_readers: Option<DenseCloudReaders>,
+    scan_preparation: Option<uuid::Uuid>,
     dense_error: Option<String>,
     dense_history_missing: bool,
     max_points: usize,
@@ -464,6 +466,8 @@ impl CloudMapShmWriter {
             committed_fine_cloud: None,
             dense_cloud: None,
             committed_dense_cloud: None,
+            pending_dense_readers: None,
+            scan_preparation: None,
             dense_error: None,
             dense_history_missing: false,
             max_points: CM_MAX_POINTS,
@@ -667,20 +671,89 @@ impl CloudMapShmWriter {
         Ok(self.committed_dense_cloud.clone())
     }
 
+    fn dense_readers(&self) -> Option<DenseCloudReaders> {
+        self.dense_cloud.as_ref().map(DenseCloud::readers).or_else(|| self.pending_dense_readers.clone())
+    }
+
     pub(crate) fn dense_cloud_for_read(&mut self, epoch: &str, offset: u64) -> Result<Option<DenseSnapshot>, String> {
         let Some(latest) = self.committed_dense_cloud()? else { return Ok(None); };
-        self.dense_cloud.as_mut().ok_or("完整点云拥有方已退役")?.pin_read(latest, epoch, offset).map(Some)
+        self.dense_readers().ok_or("完整点云拥有方已退役")?.pin_read(latest, epoch, offset).map(Some)
     }
 
     pub(crate) fn dense_cloud_update_for_read(&mut self, epoch: &str, offset: u64)
         -> Result<Option<(DenseSnapshot, Option<DenseSnapshot>)>, String> {
         let Some(latest) = self.committed_dense_cloud()? else { return Ok(None); };
-        self.dense_cloud.as_mut().ok_or("完整点云拥有方已退役")?
-            .pin_update(latest, epoch, offset).map(Some)
+        self.dense_readers().ok_or("完整点云拥有方已退役")?.pin_update(latest, epoch, offset).map(Some)
     }
 
     pub(crate) fn dense_read_epoch_available(&self, epoch: &str) -> bool {
-        self.dense_error.is_none() && self.dense_cloud.as_ref().is_some_and(|cloud| cloud.read_epoch_available(epoch))
+        self.dense_error.is_none() && self.committed_dense_cloud.as_ref().is_some_and(|latest|
+            self.dense_readers().is_some_and(|readers| readers.read_epoch_available(&latest.epoch, epoch)))
+    }
+
+    /// 移交可变累积状态，公开读者继续使用原提交；计算结果只凭本次票据安装。
+    pub(crate) fn prepare_scan_work(&mut self) -> Result<(uuid::Uuid, Self), String> {
+        if self.scan_preparation.is_some() { return Err("点云已有在途准备".into()); }
+        let mut work = Self::new_private().map_err(|e| e.to_string())?;
+        let ticket = uuid::Uuid::new_v4();
+        self.pending_dense_readers = self.dense_cloud.as_ref().map(DenseCloud::readers);
+        work.replace_accumulator(self.take_prepared_accumulator());
+        work.revision = self.revision;
+        work.session_generation = self.session_generation;
+        work.max_points = self.max_points;
+        work.last_occupancy_receipt = self.last_occupancy_receipt.clone();
+        work.last_cloud_receipt = self.last_cloud_receipt.clone();
+        work.committed_fine_cloud = self.committed_fine_cloud.clone();
+        work.committed_dense_cloud = self.committed_dense_cloud.clone();
+        self.scan_preparation = Some(ticket);
+        Ok((ticket, work))
+    }
+
+    pub(crate) fn install_scan_work(&mut self, ticket: uuid::Uuid, mut work: Self) -> bool {
+        if self.scan_preparation != Some(ticket) || self.session_generation != work.session_generation {
+            return false;
+        }
+        if work.revision != self.revision {
+            if self.revision.checked_add(1) != Some(work.revision) { return false; }
+            let slot = cloud_map_active_slot(work.revision).unwrap() as usize;
+            let (revision_offset, count_offset) = slot_metadata_offsets(slot).unwrap();
+            let count = u32::from_le_bytes(work.mmap[count_offset..count_offset + 4].try_into().unwrap()) as usize;
+            let start = CM_HEADER_SIZE + slot * CM_SINGLE_BUFFER_SIZE;
+            let end = start + count * CM_POINT_SIZE_BYTES;
+            self.mmap[revision_offset..revision_offset + 8].fill(0);
+            fence(Ordering::SeqCst);
+            self.mmap[start..end].copy_from_slice(&work.mmap[start..end]);
+            self.mmap[count_offset..count_offset + 4].copy_from_slice(&work.mmap[count_offset..count_offset + 4]);
+            fence(Ordering::Release);
+            self.mmap[revision_offset..revision_offset + 8].copy_from_slice(&work.revision.to_le_bytes());
+            // 全局修订最后发布，不能让读者把旧身份与新字节配对。
+            self.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_GLOBAL_REVISION_OFFSET]
+                .copy_from_slice(&work.mmap[CM_ACTIVE_BUFFER_OFFSET..CM_GLOBAL_REVISION_OFFSET]);
+            self.mmap[CM_GLOBAL_REVISION_OFFSET + 8..CM_SLOT0_REVISION_OFFSET]
+                .copy_from_slice(&work.mmap[CM_GLOBAL_REVISION_OFFSET + 8..CM_SLOT0_REVISION_OFFSET]);
+            fence(Ordering::Release);
+            self.mmap[CM_GLOBAL_REVISION_OFFSET..CM_GLOBAL_REVISION_OFFSET + 8].copy_from_slice(&work.revision.to_le_bytes());
+            self.revision = work.revision;
+        }
+        self.replace_accumulator(work.take_prepared_accumulator());
+        self.last_occupancy_receipt = work.last_occupancy_receipt.take();
+        self.last_cloud_receipt = work.last_cloud_receipt.take();
+        self.committed_fine_cloud = work.committed_fine_cloud.take();
+        self.committed_dense_cloud = work.committed_dense_cloud.take();
+        self.pending_dense_readers = None;
+        self.scan_preparation = None;
+        true
+    }
+
+    fn replace_accumulator(&mut self, prepared: PreparedCloudAccumulator) {
+        self.voxels = prepared.voxels;
+        self.voxel_size = prepared.voxel_size;
+        self.dynamic_filter = prepared.dynamic_filter;
+        self.ordered_voxels = prepared.ordered_voxels;
+        self.fine_cloud = prepared.fine_cloud;
+        self.dense_cloud = prepared.dense_cloud;
+        self.dense_error = prepared.dense_error;
+        self.dense_history_missing = prepared.dense_history_missing;
     }
 
     /// Read the exact active SHM payload without advancing its revision.
@@ -813,6 +886,8 @@ impl CloudMapShmWriter {
         if prepared.voxels.is_empty() || prepared.voxels.len() > self.max_points {
             return Err("PGO点云状态超过容量".into());
         }
+        self.scan_preparation = None;
+        self.pending_dense_readers = None;
         self.session_generation = receipt.session_generation;
         self.voxel_size = prepared.voxel_size;
         self.voxels = prepared.voxels;
@@ -874,6 +949,8 @@ impl CloudMapShmWriter {
                 fine
             }
         };
+        self.scan_preparation = None;
+        self.pending_dense_readers = None;
         self.session_generation = session_generation;
         self.voxel_size = voxel_size;
         self.voxels = voxels.into();
@@ -960,6 +1037,8 @@ impl CloudMapShmWriter {
     }
 
     fn reset_accumulator(&mut self, session_generation: u64) {
+        self.scan_preparation = None;
+        self.pending_dense_readers = None;
         self.fine_cloud = None;
         self.committed_fine_cloud = None;
         self.dense_cloud = None;
@@ -1255,6 +1334,30 @@ mod tests {
         assert_eq!(next.committed_dense_cloud().unwrap().unwrap().point_count, snapshot.point_count);
         assert!(next.accumulate_mapping_scan(2, &corridor(Some(0.0), 0.0).0, Some(ORIGIN), 1));
         assert!(next.fine_cloud.as_ref().unwrap().removed_keys().is_empty(), "换图不复用旧动态证据");
+    }
+
+    #[test]
+    fn prepared_scan_keeps_previous_dense_reader_until_install() {
+        let mut writer = CloudMapShmWriter::new_private().unwrap();
+        let first = vec![Point3::new(1.0, 0.0, 0.5), Point3::new(1.2, 0.0, 0.5)];
+        assert!(writer.accumulate_mapping_scan(1, &first, None, 100));
+        let receipt = |sequence, timestamp| OccupancyCommitReceipt {
+            commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 91, sequence },
+            session_id: "准备读者".into(), session_generation: 1, occupancy_revision: sequence,
+            source_timestamp_ns: timestamp, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+            backend_generation: 1,
+        };
+        writer.commit_accumulated_snapshot(&receipt(1, 100)).unwrap().unwrap();
+        let old = writer.committed_dense_cloud().unwrap().unwrap();
+        let (ticket, mut work) = writer.prepare_scan_work().unwrap();
+        let second = vec![Point3::new(2.0, 0.0, 0.5)];
+        assert!(work.accumulate_mapping_scan(1, &second, None, 200));
+        work.commit_accumulated_snapshot(&receipt(2, 200)).unwrap().unwrap();
+        let reader = writer.dense_readers().unwrap();
+        let pinned = reader.pin_read(old.clone(), &old.epoch, 0).unwrap();
+        assert_eq!(pinned.point_count, old.point_count);
+        assert!(writer.install_scan_work(ticket, work));
+        assert!(writer.committed_dense_cloud().unwrap().unwrap().point_count > old.point_count);
     }
 
     #[test]

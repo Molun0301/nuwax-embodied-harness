@@ -6162,7 +6162,13 @@ class GeometryRuntimeProvider:
                 ):
                     return None
                 cached = self._last_occupancy_grid
-                return cached.model_copy(deep=True) if cached is not None else None
+            # 整图复制随地图增长，不能占用实时位姿也需要的来源状态锁。
+            result = cached.model_copy(deep=True) if cached is not None else None
+            with self._map_state_lock:
+                if (self._stopping or self._mapping_transition_inflight
+                        or self._map_delivery_token_locked() != request_token):
+                    return None
+            return result
         try:
             grid = self._occupancy_grid_from_components(
                 map_name=request_identity[1],
@@ -6178,6 +6184,7 @@ class GeometryRuntimeProvider:
         except (KeyError, TypeError, ValueError):
             LOGGER.exception("GetOccupancyGridData 返回了无效栅格。")
             return None
+        cached_grid = grid.model_copy(deep=True)
         with self._map_state_lock:
             if (
                 self._stopping
@@ -6190,7 +6197,7 @@ class GeometryRuntimeProvider:
                 )
                 return None
             if request_identity is not None:
-                self._last_occupancy_grid = grid.model_copy(deep=True)
+                self._last_occupancy_grid = cached_grid
                 self._last_occupancy_grid_identity = request_identity
                 self._last_occupancy_grid_revision = int(payload["revision"])
         return grid
@@ -6208,7 +6215,7 @@ class GeometryRuntimeProvider:
         self,
         occupancy_grid: Optional[OccupancyGrid] = None,
     ) -> Optional[Dict[str, Any]]:
-        """在现有缓存锁内一并读取栅格的真实修订和所属会话。"""
+        """捕获同一来源的栅格与修订，整图比较在状态锁外完成。"""
 
         with self._map_state_lock:
             identity = self._mapping_identity
@@ -6219,12 +6226,21 @@ class GeometryRuntimeProvider:
                 or identity is None
                 or self._last_occupancy_grid_identity != identity
                 or cached is None
-                or (occupancy_grid is not None and occupancy_grid != cached)
             ):
+                return None
+            token = self._map_delivery_token_locked()
+            revision = int(self._last_occupancy_grid_revision)
+        if occupancy_grid is not None and occupancy_grid != cached:
+            return None
+        with self._map_state_lock:
+            if (self._stopping or self._mapping_transition_inflight
+                    or self._map_delivery_token_locked() != token
+                    or self._last_occupancy_grid is not cached
+                    or self._last_occupancy_grid_revision != revision):
                 return None
             return {
                 "mapping_identity": identity,
-                "revision": int(self._last_occupancy_grid_revision),
+                "revision": revision,
             }
 
     def get_mapping_stream_status(self) -> Dict[str, Any]:

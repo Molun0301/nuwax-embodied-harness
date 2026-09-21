@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from collections import OrderedDict
+import copy
 import math
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -638,30 +639,31 @@ class InstanceAssociationService:
         merged_lifecycle = InstanceLifecycleState.ACTIVE
         if was_pending and self._is_fallback_observation(observation):
             merged_lifecycle = InstanceLifecycleState.UNCERTAIN
-        return current.model_copy(
-            update={
-                "pose": blended_pose,
-                "map_name": map_name or current.map_name,
-                "localization_session_id": localization_session_id or current.localization_session_id,
-                "topo_node_id": observation.topo_node_id or current.topo_node_id,
-                "semantic_region_id": observation.semantic_region_id or current.semantic_region_id,
-                "confidence": max(float(current.confidence), float(observation.score)),
-                "observation_count": updated_count,
-                "last_seen_ts": now,
-                "artifact_ids": artifact_ids,
-                "semantic_labels": semantic_labels,
-                "visual_labels": visual_labels,
-                "vision_tags": self._merge_strings(current.vision_tags, observation.semantic_labels),
-                "inspection_poses": inspection_poses,
-                "dynamic_state": dynamic_state,
-                "observation_window": observation_window,
-                "deferred_projection_cache": deferred_cache,
-                "lifecycle_state": merged_lifecycle,
-                "metadata": metadata,
-                "supporting_observation_event_ids": supporting_event_ids,
-            },
-            deep=True,
-        )
+        updates = {
+            "pose": blended_pose,
+            "map_name": map_name or current.map_name,
+            "localization_session_id": localization_session_id or current.localization_session_id,
+            "topo_node_id": observation.topo_node_id or current.topo_node_id,
+            "semantic_region_id": observation.semantic_region_id or current.semantic_region_id,
+            "confidence": max(float(current.confidence), float(observation.score)),
+            "observation_count": updated_count,
+            "last_seen_ts": now,
+            "artifact_ids": artifact_ids,
+            "semantic_labels": semantic_labels,
+            "visual_labels": visual_labels,
+            "vision_tags": self._merge_strings(current.vision_tags, observation.semantic_labels),
+            "inspection_poses": inspection_poses,
+            "dynamic_state": dynamic_state,
+            "observation_window": observation_window,
+            "deferred_projection_cache": deferred_cache,
+            "lifecycle_state": merged_lifecycle,
+            "metadata": metadata,
+            "attributes": copy.deepcopy(current.attributes),
+            "supporting_observation_event_ids": supporting_event_ids,
+        }
+        # 只复制本次生成的可变字段，避免每帧复制实例保留的完整射线历史。
+        isolated_updates = {key: copy.deepcopy(value) for key, value in updates.items()}
+        return current.model_copy(update=isolated_updates)
 
     def _create_instance(
         self,

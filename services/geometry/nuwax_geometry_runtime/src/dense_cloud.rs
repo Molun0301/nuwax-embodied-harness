@@ -61,10 +61,14 @@ pub(crate) struct DenseCloud {
     block_pages: Option<HashMap<Key, HashSet<usize>>>,
     block_entries: usize,
     live_keys: Option<HashSet<Key>>,
-    readers: std::collections::VecDeque<(std::time::Instant, DenseSnapshot)>,
+    readers: DenseCloudReaders,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
 }
+
+/// 读者只拥有已提交的不可变快照，独立于正在计算的归档写入器。
+#[derive(Clone, Default)]
+pub(crate) struct DenseCloudReaders(Arc<parking_lot::Mutex<std::collections::VecDeque<(std::time::Instant, DenseSnapshot)>>>);
 
 #[derive(Clone)]
 pub(crate) struct DenseSnapshot {
@@ -331,53 +335,21 @@ impl DenseCloud {
         })
     }
 
-    /// 删除期间允许读者完成已经领取的不可变版本；读到尾部后再切换最新版本。
-    pub fn pin_read(
-        &mut self,
-        latest: DenseSnapshot,
-        expected_epoch: &str,
-        offset: u64,
-    ) -> Result<DenseSnapshot, String> {
-        self.readers
-            .retain(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
-        let snapshot = if expected_epoch.is_empty() || expected_epoch == latest.epoch {
-            latest
-        } else {
-            self.readers
-                .iter()
-                .find(|(_, snapshot)| {
-                    snapshot.epoch == expected_epoch && offset < snapshot.point_count
-                })
-                .map(|(_, snapshot)| snapshot.clone())
-                .ok_or("DENSE_CLOUD_SOURCE_CHANGED")?
-        };
-        self.readers.retain(|(_, old)| old.epoch != snapshot.epoch);
-        self.readers
-            .push_back((std::time::Instant::now(), snapshot.clone()));
-        while self.readers.len() > 8 {
-            self.readers.pop_front();
-        }
-        Ok(snapshot)
+    pub(crate) fn readers(&self) -> DenseCloudReaders { self.readers.clone() }
+
+    #[cfg(test)]
+    pub fn pin_read(&mut self, latest: DenseSnapshot, epoch: &str, offset: u64) -> Result<DenseSnapshot, String> {
+        self.readers.pin_read(latest, epoch, offset)
     }
 
-    /// 捕获删除前缀的基准和最新快照；差异计算在拥有方锁外执行。
-    pub fn pin_update(
-        &mut self, latest: DenseSnapshot, epoch: &str, offset: u64,
-    ) -> Result<(DenseSnapshot, Option<DenseSnapshot>), String> {
-        self.readers.retain(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
-        let base = if !epoch.is_empty() && epoch != latest.epoch {
-            Some(self.readers.iter().find(|(_, old)| old.epoch == epoch && offset <= old.point_count)
-                .map(|(_, old)| old.clone()).ok_or("DENSE_CLOUD_SOURCE_CHANGED")?)
-        } else { None };
-        let latest = self.pin_read(latest, "", 0)?;
-        Ok((latest, base))
+    #[cfg(test)]
+    pub fn pin_update(&mut self, latest: DenseSnapshot, epoch: &str, offset: u64) -> Result<(DenseSnapshot, Option<DenseSnapshot>), String> {
+        self.readers.pin_update(latest, epoch, offset)
     }
 
+    #[cfg(test)]
     pub fn read_epoch_available(&self, epoch: &str) -> bool {
-        self.epoch == epoch
-            || self.readers.iter().any(|(at, snapshot)| {
-                at.elapsed() < std::time::Duration::from_secs(30) && snapshot.epoch == epoch
-            })
+        self.readers.read_epoch_available(&self.epoch, epoch)
     }
 
     #[cfg(test)]
@@ -805,4 +777,60 @@ mod tests {
         file.write_all_at(&f32::NAN.to_le_bytes(), offset).unwrap();
         assert!(validate_archive(&mut file).is_err());
     }
+}
+
+impl DenseCloudReaders {
+    /// 删除期间允许读者完成已经领取的不可变版本；读到尾部后再切换最新版本。
+    pub fn pin_read(
+        &self,
+        latest: DenseSnapshot,
+        expected_epoch: &str,
+        offset: u64,
+    ) -> Result<DenseSnapshot, String> {
+        let mut readers = self.0.lock();
+        readers
+            .retain(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
+        let snapshot = if expected_epoch.is_empty() || expected_epoch == latest.epoch {
+            latest
+        } else {
+            readers
+                .iter()
+                .find(|(_, snapshot)| {
+                    snapshot.epoch == expected_epoch && offset < snapshot.point_count
+                })
+                .map(|(_, snapshot)| snapshot.clone())
+                .ok_or("DENSE_CLOUD_SOURCE_CHANGED")?
+        };
+        readers.retain(|(_, old)| old.epoch != snapshot.epoch);
+        readers
+            .push_back((std::time::Instant::now(), snapshot.clone()));
+        while readers.len() > 8 {
+            readers.pop_front();
+        }
+        Ok(snapshot)
+    }
+
+    /// 捕获删除前缀的基准和最新快照；差异计算在拥有方锁外执行。
+    pub fn pin_update(
+        &self, latest: DenseSnapshot, epoch: &str, offset: u64,
+    ) -> Result<(DenseSnapshot, Option<DenseSnapshot>), String> {
+        let mut readers = self.0.lock();
+        readers.retain(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
+        let base = if !epoch.is_empty() && epoch != latest.epoch {
+            Some(readers.iter().find(|(_, old)| old.epoch == epoch && offset <= old.point_count)
+                .map(|(_, old)| old.clone()).ok_or("DENSE_CLOUD_SOURCE_CHANGED")?)
+        } else { None };
+        readers.retain(|(_, old)| old.epoch != latest.epoch);
+        readers.push_back((std::time::Instant::now(), latest.clone()));
+        while readers.len() > 8 { readers.pop_front(); }
+        Ok((latest, base))
+    }
+
+    pub fn read_epoch_available(&self, latest_epoch: &str, epoch: &str) -> bool {
+        latest_epoch == epoch
+            || self.0.lock().iter().any(|(at, snapshot)| {
+                at.elapsed() < std::time::Duration::from_secs(30) && snapshot.epoch == epoch
+            })
+    }
+
 }

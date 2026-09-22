@@ -18,7 +18,7 @@
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "tasks.state", "system.metrics", "settings.display"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "memory.scene_spaces", "tasks.state", "system.metrics", "settings.display"];
       const POSE_STREAM_TOPICS = ["localization.pose", "map.frame"];
       const LOG_STREAM_TOPICS = ["logs.entry"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
@@ -203,7 +203,7 @@
         overviewGrid: document.getElementById("overviewGrid"),
         mapCanvas: document.getElementById("mapCanvas"),
         map3dContainer: document.getElementById("map3dContainer"),
-        mapModeToggle: document.getElementById("mapModeToggle"),
+        mapViewButtons: Array.from(document.querySelectorAll("[data-map-mode]")),
         map3dDenseStatusRow: document.getElementById("map3dDenseStatusRow"),
         mapFreeView: document.getElementById("mapFreeView"),
         mapFollowView: document.getElementById("mapFollowView"),
@@ -1690,6 +1690,20 @@
         );
       }
       window.__nuwaxActiveMapName = activeMapName;
+      window.__nuwaxMapBinding = function () {
+        const data = state.lastMapEnvelope?.data || {};
+        const source = data.map_snapshot || data;
+        const diagnostics = source.metadata || data.diagnostics || {};
+        return {
+          map_name: source.map_name || activeMapName(),
+          source_name: source.source_name || diagnostics.source_name || null,
+          source_epoch: source.source_epoch || diagnostics.source_epoch || null,
+          content_sha256: source.content_sha256 || diagnostics.content_sha256 || null,
+          update_sequence: source.update_sequence || diagnostics.update_sequence || null,
+          frame_id: state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id || null,
+          available: Boolean(state.mapGrid),
+        };
+      };
       function formatPoseMetric(value) {
         const number = Number(value);
         return Number.isFinite(number) ? `${number.toFixed(2)} m` : "--";
@@ -1740,7 +1754,8 @@
           if (detail.displayStatus) rows.push(["显示状态", detail.displayStatus]);
           if (detail.message) rows.push(["原因", detail.message]);
         }
-        if (els.mapSummaryMode) els.mapSummaryMode.textContent = is3d ? "3D 点云" : "2D 栅格";
+        if (state.mapViewMode === "semantic") rows.push(["语义区域", window.nuwaxSemanticMap?.count?.() ?? "—"]);
+        if (els.mapSummaryMode) els.mapSummaryMode.textContent = is3d ? "3D 点云" : state.mapViewMode === "semantic" ? "语义地图" : "2D 栅格";
         setKv(els.mapMeta, rows);
       }
       function navigationFrameId() {
@@ -1928,16 +1943,16 @@
         if (!status || !ACTIVE_LOCALIZATION_STATUSES.has(status)) return null;
         return "localization";
       }
-      function loadedMapAssetShouldDisplay(diagnostics) {
+      function loadedMapAssetShouldDisplay(diagnostics, canonicalMapName) {
         if (!diagnostics) return false;
-        const mapName = String(diagnostics.active_map_name || diagnostics.map_name || "").trim();
+        const mapName = String(canonicalMapName || diagnostics.active_map_name || diagnostics.map_name || "").trim();
         if (!mapName) return false;
         const manifestSha256 = String(diagnostics.asset_manifest_sha256 || "").trim();
         const snapshotKind = String(diagnostics.map_snapshot_kind || "").toLowerCase();
         const sourceKind = String(diagnostics.source_kind || "").toLowerCase();
         return Boolean(
           manifestSha256 ||
-          snapshotKind === "offline_checkpoint" ||
+          snapshotKind === "offline_checkpoint" || snapshotKind === "offline_recording" ||
           sourceKind === "map_asset_bundle" ||
           diagnostics.checkpoint_ready === true ||
           diagnostics.geometry_ready === true
@@ -1980,7 +1995,7 @@
       function mapSnapshotIsOffline(diagnostics) {
         const sourceKind = String(diagnostics && diagnostics.source_kind || "").toLowerCase();
         const snapshotKind = String(diagnostics && diagnostics.map_snapshot_kind || "").toLowerCase();
-        return sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint";
+        return sourceKind === "map_asset_bundle" || snapshotKind === "offline_checkpoint" || snapshotKind === "offline_recording";
       }
       function shouldPinLocalizationCheckpointDisplay(diagnostics) {
         if (!diagnostics) return false;
@@ -2029,7 +2044,7 @@
         }
         const activeReason = activeSpatialContextReason();
         if (activeReason) return { display: true, reason: activeReason };
-        if (status === "available" && loadedMapAssetShouldDisplay(diagnostics)) {
+        if (status === "available" && loadedMapAssetShouldDisplay(diagnostics, (envelope.data?.map_snapshot || envelope.data)?.map_name)) {
           return { display: true, reason: "loaded_map_asset" };
         }
         if (status !== "available") {
@@ -2102,6 +2117,7 @@
       }
       function clearMapDisplay(message, status, diagnostics, streamBridge, envelope, grid) {
         state.mapGrid = null;
+        window.dispatchEvent?.(new CustomEvent("map:context-changed", { detail: { available: false } }));
         state.appliedMapIdentity = null;
         state.mapGridContentKey = "";
         state.mapBaseCache = null;
@@ -2157,7 +2173,9 @@
         const ctx = canvas.getContext("2d");
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = CANVAS_THEME.mapBackground;
+        ctx.fillStyle = state.mapViewMode === "semantic"
+          ? getComputedStyle(document.documentElement).getPropertyValue("--grid-bg").trim()
+          : CANVAS_THEME.mapBackground;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         const grid = state.mapGrid;
         const anchor = cameraAnchor();
@@ -2176,8 +2194,11 @@
         ctx.rotate(originYaw(grid));
         ctx.scale(resolution, -resolution);
         ctx.imageSmoothingEnabled = false;
+        if (state.mapViewMode === "semantic") ctx.globalAlpha = 0.2;
         ctx.drawImage(offscreen, 0, -height, width, height);
         ctx.restore();
+        window.nuwaxSemanticMap?.draw2d(ctx, (point) => mapToCanvas(point, anchor, scale), state.mapViewMode);
+        window.nuwaxSceneGraph?.draw2d(ctx, (point) => mapToCanvas(point, anchor, scale));
         drawTrajectory(ctx, anchor, scale);
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
@@ -2480,6 +2501,7 @@
       }
       function toggleSemanticMemoryPanel(open) {
         if (!els.semanticMemoryPanel) return;
+        if (open) window.nuwaxMapPanels?.activate("semanticMemoryPanel");
         els.semanticMemoryPanel.hidden = !open;
         els.semanticMemoryToggle?.setAttribute("aria-expanded", String(open));
         if (open) {
@@ -3161,6 +3183,7 @@
           els.mapEmpty.textContent = "";
           requestMapDraw(false);
         }
+        window.dispatchEvent?.(new CustomEvent("map:context-changed", { detail: window.__nuwaxMapBinding?.() }));
         renderMapSummary({ grid, diagnostics, envelope });
         updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
         releasePendingMapPose();
@@ -4299,6 +4322,7 @@
         "video.frame",
         "video.detections",
         "memory.instances",
+        "memory.scene_spaces",
         "tasks.state",
         "system.metrics",
         "settings.display"
@@ -5004,6 +5028,9 @@
           state.semanticStreamVersion += 1;
           applySemanticInstances(frame.payload || {});
           updateOverviewForFrame = false;
+        } else if (frame.topic === "memory.scene_spaces") {
+          window.dispatchEvent(new CustomEvent("stream:memory.scene_spaces", { detail: frame.payload }));
+          updateOverviewForFrame = false;
         } else if (frame.topic === "logs.entry") {
           updateLogFrame(frame);
         } else if (frame.topic === "tasks.state") {
@@ -5364,10 +5391,12 @@
       els.mapCanvas.addEventListener("pointerdown", (event) => {
         // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        state.semanticRegionPointerDown = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
         if (!isMap3dVisible() && event.button === 0) {
           const pointer = canvasPointer(event);
           const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
           if (hit) {
+            state.semanticRegionPointerDown = null;
             event.preventDefault();
             if (hit.type === "cluster") showSemanticClusterList(hit.cluster);
             else showSemanticInstanceDetail(hit.instance);
@@ -5406,9 +5435,12 @@
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
         if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
-        if (state.mapPanDrag) {
-          finishMapPan(event);
-          return;
+        if (state.mapPanDrag) finishMapPan(event);
+        const start = state.semanticRegionPointerDown;
+        state.semanticRegionPointerDown = null;
+        if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) <= 6) {
+          const point = canvasPointer(event);
+          window.nuwaxSemanticMap?.selectAt(point.x, point.y);
         }
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
@@ -5490,6 +5522,23 @@
       };
       window.__nuwaxMapViewMode = function () { return state.mapViewMode; };
       window.__nuwaxMapRequestDraw = function () { requestMapDraw(false); };
+      window.__nuwaxMapFocusRegion = function (space) {
+        if (state.mapViewMode === "3d") { window.pointcloud3d?.focusSemanticRegion(space.scene_space_id, space.boundary); return; }
+        const points = space.boundary?.polygon_points;
+        if (!points?.length || window.__nuwaxMapToolV2?.active()) return;
+        const xs = points.map(p => p.x), ys = points.map(p => p.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+        state.map2dCameraMode = "free";
+        const regionPanel = document.getElementById("semanticRegionPanel");
+        const pixelRatio = els.mapCanvas.width / Math.max(els.mapCanvas.clientWidth, 1);
+        const coveredWidth = regionPanel && !regionPanel.hidden ? Math.min(regionPanel.offsetWidth + 24, els.mapCanvas.clientWidth * .6) * pixelRatio : 0;
+        state.mapFreeView = { center: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 }, zoom: 1,
+          fitSpan: { x: Math.max(maxX - minX, 3) * 1.25 * els.mapCanvas.width / Math.max(els.mapCanvas.width - coveredWidth, 1),
+                     y: Math.max(maxY - minY, 3) * 1.25 } };
+        if (coveredWidth) state.mapFreeView.center.x += coveredWidth / (2 * cameraScale(cameraAnchor()));
+        requestMapDraw(false);
+      };
+      window.addEventListener("map:semantic-panel-opened", () => toggleSemanticMemoryPanel(false));
       // V2 boundary tick：drawMap() 每帧末尾调用，boundary_draw.js 注册回调同步 viewBox。
       // 解耦：boundary 模块自己挂回调，不在主循环 import boundary 模块。
       window.__nuwaxMapDrawTick = window.__nuwaxMapDrawTick || null;
@@ -5506,12 +5555,12 @@
         if (els.mapPointStyleControl) els.mapPointStyleControl.hidden = !is3d;
         syncMapCameraControls();
         if (els.map3dDenseStatusRow) els.map3dDenseStatusRow.hidden = !is3d;
-        if (els.mapModeToggle) {
-          els.mapModeToggle.hidden = PLANAR_PIPELINE;
-          els.mapModeToggle.disabled = PLANAR_PIPELINE;
-          els.mapModeToggle.textContent = is3d ? "切换 2D" : "切换 3D";
-          els.mapModeToggle.dataset.mapView = is3d ? "3d" : "2d";
-          els.mapModeToggle.setAttribute("aria-pressed", is3d ? "true" : "false");
+        for (const button of els.mapViewButtons || []) {
+          const selected = button.dataset.mapMode === state.mapViewMode;
+          button.classList.toggle("active", selected);
+          button.setAttribute("aria-pressed", String(selected));
+          button.disabled = PLANAR_PIPELINE && button.dataset.mapMode === "3d";
+          if (button.disabled) button.title = "当前为二维建图链，没有三维点云";
         }
         if (els.mapEmpty && is3d) els.mapEmpty.hidden = true;
         renderMapSummary();
@@ -5529,7 +5578,7 @@
         syncMapCameraControls();
       }
       function setMapViewMode(mode) {
-        const nextMode = !PLANAR_PIPELINE && mode === "3d" ? "3d" : "2d";
+        const nextMode = mode === "semantic" ? "semantic" : !PLANAR_PIPELINE && mode === "3d" ? "3d" : "2d";
         if (state.mapViewMode !== nextMode) window.__nuwaxBoundaryDrawModule?.setDrawing(false);
         state.mapViewMode = nextMode;
         window.dispatchEvent(new CustomEvent("map:view-changed", { detail: { mode: nextMode } }));
@@ -5631,8 +5680,9 @@
       if (els.semanticInstancesRefresh) {
         els.semanticInstancesRefresh.addEventListener("click", () => loadSemanticInstances());
       }
+      window.nuwaxMapPanels?.register("semanticMemoryPanel", () => toggleSemanticMemoryPanel(false));
       els.semanticMemoryToggle?.addEventListener("click", () => toggleSemanticMemoryPanel(els.semanticMemoryPanel?.hidden));
-      els.semanticMemoryClose?.addEventListener("click", () => toggleSemanticMemoryPanel(false));
+      els.semanticMemoryClose?.addEventListener("click", () => window.nuwaxMapPanels.close("semanticMemoryPanel", true));
       document.querySelectorAll('[data-view-target]:not([data-view-target="monitor-view"])').forEach((button) => {
         button.addEventListener("click", () => toggleSemanticMemoryPanel(false));
       });
@@ -5651,9 +5701,10 @@
       connectStreams();
       connectStreams(state.poseStream);
       connectStreams(state.logStream);
-      els.mapModeToggle?.addEventListener("click", () => {
-        setMapViewMode(state.mapViewMode === "3d" ? "2d" : "3d");
-      });
+      for (const button of els.mapViewButtons || []) {
+        button.addEventListener("click", () => setMapViewMode(button.dataset.mapMode));
+      }
+      window.__nuwaxSetMapViewMode = setMapViewMode;
       els.mapFreeView?.addEventListener("click", () => setMapCameraMode("free"));
       els.mapFollowView?.addEventListener("click", () => setMapCameraMode("follow"));
       window.addEventListener("map:editing-changed", syncMapCameraControls);
@@ -5662,12 +5713,6 @@
         els.map3dPointStyle.closest(".map-point-style")?.setAttribute("data-point-style", style);
         window.pointcloud3d?.setPointStyle(style);
       });
-      const mapToolbar = document.querySelector(".map-toolbar");
-      if (mapToolbar && typeof ResizeObserver !== "undefined") {
-        new ResizeObserver(() => {
-          mapToolbar.parentElement.style.setProperty("--map-tools-bottom", `${mapToolbar.offsetTop + mapToolbar.offsetHeight + 10}px`);
-        }).observe(mapToolbar);
-      }
       syncMapViewControls();
       syncMap2dCameraControls();
       updatePointcloud3dCameraControls({ mode: "free", robotAvailable: Boolean(pointFromPose(state.latestPose)) });

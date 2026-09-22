@@ -2099,5 +2099,288 @@
     "apply_scope": "重启几何运行时后生效，无需重新构建；停止建图不会重载",
     "description": "按参数覆盖扫描上下文检索、回环配准与确认、图约束和优化预算；空白项使用所选定位后端默认。修改后重启几何运行时，无需重新构建。",
     "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_ENABLED": {
+    "zh_name": "启用语义地图",
+    "type": "bool",
+    "default": false,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "启用语义地图能力；保存配置不启动模型服务。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_AUTO_START": {
+    "zh_name": "自动启动语义处理",
+    "type": "bool",
+    "default": false,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "网关启动后自动开始语义处理；须同时启用语义地图。",
+    "advanced": true
+  },
+  "NUWAX_SCENE_MAPPING_BACKEND": {
+    "zh_name": "语义决策后端",
+    "type": "str",
+    "default": "openjev_http",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "选择本地OpenJev服务或Jev远程接口。",
+    "advanced": false,
+    "choices": [
+      "openjev_http",
+      "jev_api"
+    ],
+    "choice_labels": [
+      "本地OpenJev服务",
+      "Jev远程接口"
+    ]
+  },
+  "NUWAX_SCENE_MAPPING_BASE_URL": {
+    "zh_name": "语义决策服务地址",
+    "type": "str",
+    "default": "http://127.0.0.1:8791",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "留空或未配置时按后端取默认值：本地http://127.0.0.1:8791，Jev为https://api.typesafe.ai/v1。填写服务根地址或/v1，不填写完整决策端点。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_MODEL": {
+    "zh_name": "语义决策模型",
+    "type": "str",
+    "default": "AlexWortega/openjev:qwen3.5-4b-nli-v2",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "留空或未配置时本地使用AlexWortega/openjev:qwen3.5-4b-nli-v2，Jev使用jev-1.13.0；显式值优先。",
+    "advanced": false
+  },
+  "NUWAX_SCENE_MAPPING_API_KEY": {
+    "zh_name": "语义决策服务密钥",
+    "type": "str",
+    "default": "",
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "Jev远程接口的访问密钥；查询脱敏，留空保存保留原值。",
+    "advanced": false,
+    "sensitive": true
+  },
+  "NUWAX_SCENE_MAPPING_TIMEOUT_SEC": {
+    "zh_name": "语义请求超时（秒）",
+    "type": "float",
+    "default": 30.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "单次模型请求的最长等待时间。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 600.0
+  },
+  "NUWAX_SCENE_MAPPING_INTERVAL_SEC": {
+    "zh_name": "语义处理间隔（秒）",
+    "type": "float",
+    "default": 10.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "后台语义处理两轮之间的等待时间。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 3600.0
+  },
+  "NUWAX_SCENE_MAPPING_MIN_AREA_M2": {
+    "zh_name": "房间最小面积（平方米）",
+    "type": "float",
+    "default": 2.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "过滤小于该面积的几何房间候选。",
+    "advanced": true,
+    "minimum": 0.01,
+    "maximum": 1000000.0
+  },
+  "NUWAX_SCENE_MAPPING_DOORWAY_WIDTH_M": {
+    "zh_name": "门口分割宽度（米）",
+    "type": "float",
+    "default": 1.2,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "房间分割识别狭窄通道的几何宽度。",
+    "advanced": true,
+    "minimum": 0.05,
+    "maximum": 20.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_CELLS": {
+    "zh_name": "语义分割最大栅格数",
+    "type": "int",
+    "default": 2000000,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "限制单次房间分割的地图栅格总量。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 16000000
+  },
+  "NUWAX_SCENE_MAPPING_MIN_EVIDENCE_VIEWS": {
+    "zh_name": "标注最少证据视角数",
+    "type": "int",
+    "default": 2,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "自动采纳候选标签所需的最少有效视角。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 100
+  },
+  "NUWAX_SCENE_MAPPING_MIN_LABEL_SCORE": {
+    "zh_name": "标注最低支持分数",
+    "type": "float",
+    "default": 0.85,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "候选标签采纳策略的最低支持分数；未经现场概率校准。",
+    "advanced": true,
+    "minimum": 0.0,
+    "maximum": 1.0
+  },
+  "NUWAX_SCENE_MAPPING_MIN_LABEL_MARGIN": {
+    "zh_name": "标注最低分数差",
+    "type": "float",
+    "default": 0.15,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "首选与次选标签的最低分数差；不是概率或精度保证。",
+    "advanced": true,
+    "minimum": 0.0,
+    "maximum": 1.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_REGIONS_PER_CYCLE": {
+    "zh_name": "每轮最多分析区域数",
+    "type": "int",
+    "default": 4,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "限制单轮模型请求区域数。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 100
+  },
+  "NUWAX_SCENE_MAPPING_MAX_EVIDENCE_AGE_SEC": {
+    "zh_name": "证据最长年龄（秒）",
+    "type": "float",
+    "default": 300.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "超龄证据不参与当前语义决策。",
+    "advanced": true,
+    "minimum": 0.1,
+    "maximum": 86400.0
+  },
+  "NUWAX_SCENE_MAPPING_MAX_IMAGES": {
+    "zh_name": "单次决策最多图片数",
+    "type": "int",
+    "default": 3,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "单次模型请求最多传入三张有效证据图片。",
+    "advanced": true,
+    "minimum": 1,
+    "maximum": 3
+  },
+  "NUWAX_SCENE_MAPPING_AUTO_APPLY": {
+    "zh_name": "自动采纳语义标签",
+    "type": "bool",
+    "default": false,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/scene_mapping.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "默认仅记录候选；启用后仍须满足证据视角、分数、来源和修订校验。",
+    "advanced": false
   }
 }

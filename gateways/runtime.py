@@ -1122,6 +1122,13 @@ class GatewayRuntime:
             deferred_projection_config=config.perception.deferred_projection,
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
+        from core.settings import SceneMappingConfig
+        from services.memory.scene_mapping import SceneMappingService
+        self.scene_mapping_service = SceneMappingService(
+            memory_service=self.memory_service,
+            config=getattr(config, "scene_mapping", SceneMappingConfig()),
+            stream_bus=self.stream_bus,
+        )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
         # 构造只登记检测器，首次感知再加载模型，基础接口不占用推理资源。
         self._prewarm_done = False
@@ -1541,6 +1548,7 @@ class GatewayRuntime:
                 ("data frame streams", self._stop_data_frame_stream_sources),
                 ("geometry recording", self._close_mapping_recording),
                 ("perception video runtime", self.perception_video_runtime.stop),
+                ("semantic mapping", self.scene_mapping_service.close),
                 ("memory background workers", self.memory_service.disable_memory_library),
                 ("memory instance stream", self.memory_service.stop_instance_stream),
                 ("robot", self.robot.stop),
@@ -1618,6 +1626,9 @@ class GatewayRuntime:
     def _close_dispatch_resources(self) -> None:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
 
+        scene_mapping = getattr(self, "scene_mapping_service", None)
+        if scene_mapping is not None:
+            scene_mapping.close()
         dense_cache = getattr(self, "_saved_dense_cloud_cache", None)
         if dense_cache is not None:
             dense_cache.close()
@@ -1745,6 +1756,11 @@ class GatewayRuntime:
         providers = getattr(self.robot, "providers", None)
 
         self.memory_service.start_instance_stream()
+        if self.scene_mapping_service.config.enabled and self.scene_mapping_service.config.auto_start:
+            try:
+                self.scene_mapping_service.start()
+            except GatewayError as exc:
+                RUNTIME_LOGGER.warning("语义后台暂未就绪，网关继续启动：%s", exc.error_code)
         self._publish_runtime_governance_stream_frame()
         self._start_pointcloud_map_stream()
         self._start_navigation_status_refresh_stream()
@@ -3707,7 +3723,9 @@ class GatewayRuntime:
                 metadata={"capability_layer": self._resolve_gateway_capability_layer(descriptor.name, active_private_names)},
                 overwrite=True,
             )
-        self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities)
+        from gateways.scene_mapping import register_scene_mapping_capabilities
+        scene_capability_names = register_scene_mapping_capabilities(self)
+        self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities) + scene_capability_names
         self._refresh_dynamic_capability_matrix()
 
     def register_default_skills(self) -> None:
@@ -4174,6 +4192,8 @@ class GatewayRuntime:
 
         for descriptor in skills:
             self.skill_registry.register(descriptor, overwrite=True)
+        from gateways.scene_mapping import register_scene_mapping_skills
+        register_scene_mapping_skills(self)
 
     def _decorate_gateway_descriptor(
         self,

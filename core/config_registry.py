@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -608,7 +609,7 @@ def build_registry() -> Tuple[ConfigField, ...]:
             section_id=section_id,
             section_title=_SECTION_TITLES.get(section_id, "其它"),
             advanced=entry.get("advanced", key not in _REGULAR_KEYS),
-            sensitive=key in _SENSITIVE_KEYS,
+            sensitive=key in sensitive_keys(),
             target_file=rk.target_file,
             default_repr=rk.default_repr,
             alias_of=rk.alias_of,
@@ -647,4 +648,20 @@ def structured_options() -> Dict[str, dict]:
 
 
 def sensitive_keys() -> frozenset:
-    return _SENSITIVE_KEYS
+    return _SENSITIVE_KEYS | frozenset(
+        key for key, entry in runtime_catalog().items() if entry.get("sensitive", False)
+    )
+
+
+def catalog_number_in_range(key: str, value) -> bool:
+    """只有目录声明上下界的数值应用范围约束，启动与保存共用。"""
+    entry = runtime_catalog().get(key, {})
+    if "minimum" not in entry and "maximum" not in entry:
+        return True
+    try:
+        number = float(value)
+        return (math.isfinite(number)
+                and ("minimum" not in entry or number >= entry["minimum"])
+                and ("maximum" not in entry or number <= entry["maximum"]))
+    except (ValueError, TypeError, OverflowError):
+        return False

@@ -13,7 +13,7 @@ nuwax_robot_bridge 统一配置解析层。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -509,6 +509,78 @@ class RuntimeDataConfig:
 
 
 @dataclass
+class SceneMappingConfig:
+    """语义地图决策配置；分数阈值是采纳策略，不表示校准后的概率。"""
+
+    enabled: bool = False
+    auto_start: bool = False
+    backend: str = "openjev_http"
+    base_url: str = "http://127.0.0.1:8791"
+    model: str = "AlexWortega/openjev:qwen3.5-4b-nli-v2"
+    api_key: str = field(default="", repr=False)
+    timeout_sec: float = 30.0
+    interval_sec: float = 10.0
+    min_area_m2: float = 2.0
+    doorway_width_m: float = 1.2
+    max_cells: int = 2000000
+    min_evidence_views: int = 2
+    min_label_score: float = 0.85
+    min_label_margin: float = 0.15
+    max_regions_per_cycle: int = 4
+    max_evidence_age_sec: float = 300.0
+    max_images: int = 3
+    auto_apply: bool = False
+
+    def __post_init__(self) -> None:
+        from core.config_registry import catalog_number_in_range, runtime_catalog
+
+        for item in fields(self):
+            key = "NUWAX_SCENE_MAPPING_" + item.name.upper()
+            entry = runtime_catalog()[key]
+            value = getattr(self, item.name)
+            kind = entry["type"]
+            valid_type = (
+                (kind == "bool" and isinstance(value, bool))
+                or (kind == "str" and isinstance(value, str))
+                or (kind == "int" and type(value) is int)
+                or (kind == "float" and type(value) in (int, float))
+            )
+            if not valid_type or not catalog_number_in_range(key, value):
+                raise ValueError(key + " 类型或数值范围无效")
+            if entry.get("choices") and value not in entry["choices"]:
+                raise ValueError(key + " 不支持该后端")
+
+
+def _load_scene_mapping_config() -> SceneMappingConfig:
+    """从共同配置入口捕获配置；选择后端后再确定未填写的模型和地址。"""
+    defaults = SceneMappingConfig()
+    backend = _cfg_str("NUWAX_SCENE_MAPPING_BACKEND", defaults.backend)
+    remote = backend == "jev_api"
+    values = {"backend": backend}
+    for item in fields(defaults):
+        if item.name == "backend":
+            continue
+        key = "NUWAX_SCENE_MAPPING_" + item.name.upper()
+        default = getattr(defaults, item.name)
+        if remote and item.name == "base_url":
+            default = "https://api.typesafe.ai/v1"
+        elif remote and item.name == "model":
+            default = "jev-1.13.0"
+        if isinstance(default, bool):
+            raw = _raw_value(key, "").strip().lower()
+            if raw and raw not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(key + " 必须是布尔值")
+            values[item.name] = _cfg_bool(key, default)
+        elif isinstance(default, int):
+            values[item.name] = _cfg_int(key, default)
+        elif isinstance(default, float):
+            values[item.name] = _cfg_float(key, default)
+        else:
+            values[item.name] = _cfg_str(key, default)
+    return SceneMappingConfig(**values)
+
+
+@dataclass
 class NuwaxRobotBridgeConfig:
     """项目总配置。"""
 
@@ -523,6 +595,7 @@ class NuwaxRobotBridgeConfig:
     low_level: LowLevelControlConfig
     volume: VolumeControlConfig
     perception: PerceptionConfig
+    scene_mapping: SceneMappingConfig = field(default_factory=SceneMappingConfig)
 
 
 @dataclass
@@ -1112,6 +1185,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         low_level=low_level,
         volume=volume,
         perception=perception,
+        scene_mapping=_load_scene_mapping_config(),
     )
 
 

@@ -1,4 +1,6 @@
 import * as THREE from './three.module.min.js';
+import { SemanticRegionLayer } from './semantic-regions3d.js?v=20260922-semantic-map';
+import { SceneGraphLayer } from './scene-graph3d.js?v=20260922-scene-graph';
 import { OrbitControls } from './OrbitControls.js';
 import { PointCloudProcessor } from './pointcloud-processing.js?v=20260918-dense-pointcloud';
 import { DensePointCloudLayer } from './dense-pointcloud.js?v=20260918-dense-pointcloud';
@@ -397,6 +399,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._frontierGroup = null;
     this._forbiddenZoneGroup = null;
     this._semanticGroup = null;
+    this._semanticRegionLayer = null;
+    this._semanticRegionData = null;
+    this._sceneGraphLayer = null;
+    this._sceneGraphData = null;
     this._trajectoryLine = null;
     this._navPathLine = null;
     this._navGoalMesh = null;
@@ -449,6 +455,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._cloudSourceKey = null;
     this._cloudDisposed = false;
     this._cloudLoadToken = 0;
+    this._assetCloudUrl = null;
+    this._assetCloudSourceKey = null;
+    this._assetCloudLoadingUrl = null;
   }
 
   init(container) {
@@ -510,6 +519,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       opacity: 0.62,
       wireframe: true,
     });
+    this._semanticRegionLayer = new SemanticRegionLayer(this._scene);
+    this._sceneGraphLayer = new SceneGraphLayer(this._scene);
     this._setupSemanticInteraction();
   }
 
@@ -537,7 +548,12 @@ class PointCloud3DViewer extends PointCloudProcessor {
         window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
         return;
       }
-      this._emitSemanticSelectionAtClientPoint(x, y);
+      if (this._emitSemanticSelectionAtClientPoint(x, y)) return;
+      if (window.__nuwaxBoundaryActive) return;
+      const graphNodeId = this._sceneGraphLayer?.pick(x,y,this._camera,canvas);
+      if (graphNodeId) { window.dispatchEvent(new CustomEvent('pointcloud3d:scene-graph-select',{detail:{node_id:graphNodeId}})); return; }
+      const regionId = this._semanticRegionLayer?.pick(x,y,this._camera,canvas);
+      if (regionId) window.dispatchEvent(new CustomEvent('pointcloud3d:semantic-region-select', { detail: { scene_space_id: regionId } }));
     };
     this._semanticPointerCancelHandler = () => {
       this._semanticPointerDown = null;
@@ -714,6 +730,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const controlsChanged = Boolean(this._controls?.update());
     this._removeLegacySceneHelpers();
     this._syncSemanticGroupVisibility();
+    this._semanticRegionLayer?.updateLabels(this._camera,this._container);
+    this._sceneGraphLayer?.updateForCamera(this._camera,this._container);
     this._renderer.render(this._scene, this._camera);
     if (this._robotMesh?.visible && this._robotPoseSource && this._lastPoseDrawnSource !== this._robotPoseSource) {
       this._lastPoseDrawnSource = this._robotPoseSource;
@@ -1181,6 +1199,15 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   async loadPointCloud(url, lod = 'preview') {
     if (this._cloudDisposed) return;
+    // 制品标识对应不可变内容，视图切换重放同一元数据时复用已有点云。
+    if (String(url).includes('/artifacts/') && this._assetCloudUrl === url && this._hasPointCloudSnapshot
+        && this._cloudSourceKey === this._assetCloudSourceKey) {
+      if (this._lod !== lod) this.setLOD(lod);
+      this._requestRender();
+      return;
+    }
+    if (this._assetCloudLoadingUrl === url) return;
+    this._assetCloudLoadingUrl = url;
     const token = ++this._cloudLoadToken;
     this._invalidatePointCloudWork();
     this._lod = lod;
@@ -1193,6 +1220,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._cloudSourceKey = JSON.stringify(['asset', url, token]);
       this._lastCloudMapRevision = null;
       this._allPositions = new Float32Array(buf);
+      this._assetCloudUrl = url;
+      this._assetCloudSourceKey = this._cloudSourceKey;
       this._hasPointCloudSnapshot = true;
       this._isLiveCloudMapSnapshot = false;
       this._pointCloudSourcePoints = Math.floor(this._allPositions.length / 3);
@@ -1203,6 +1232,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     } catch (e) {
       if (this._cloudDisposed || token !== this._cloudLoadToken) return;
       window.dispatchEvent(new CustomEvent('pointcloud3d:status', { detail: { state: 'error', message: e.message } }));
+    } finally {
+      if (this._assetCloudLoadingUrl === url) this._assetCloudLoadingUrl = null;
     }
   }
 
@@ -1225,6 +1256,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   _replaceCloudMapBuffer(xyzArray, identity) {
+    this._assetCloudUrl = null;
     if (this._cloudDisposed) return;
     this._cloudLoadToken += 1;
     const previousSourceKey = this._cloudSourceKey;
@@ -1910,6 +1942,43 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._rebuildForbiddenZones();
     this._rebuildSemanticInstances();
     this.setSemanticInstancesVisible(this._semanticInstancesVisible);
+    if (this._semanticRegionData) this.updateSemanticRegions(this._semanticRegionData);
+    if (this._sceneGraphData) this.updateSceneGraph(this._sceneGraphData);
+  }
+
+  updateSceneGraph(detail) {
+    this._sceneGraphData = detail;
+    this._sceneGraphLayer?.update(detail);
+    if (this._container) {
+      this._container.dataset.sceneGraphNodeCount = String(this._sceneGraphLayer?.nodes.length || 0);
+      this._container.dataset.sceneGraphVisible = String(detail?.visible === true);
+    }
+    this._requestRender();
+  }
+
+  updateSemanticRegions(detail) {
+    this._semanticRegionData = detail;
+    this._semanticRegionLayer?.update(detail);
+    if (this._container) {
+      this._container.dataset.semanticRegionCount = String(this._semanticRegionLayer?.entries.length || 0);
+      this._container.dataset.semanticRegionsVisible = String(detail?.visible === true);
+    }
+    this._requestRender();
+  }
+
+  focusSemanticRegion(id, boundary = null) {
+    let box=this._semanticRegionLayer?.bounds(id);
+    const points=boundary?.polygon_points;
+    if(!box && points?.length && points.every(p=>[p.x,p.y,p.z].every(Number.isFinite))) {
+      box=new THREE.Box3().setFromPoints(points.map(p=>new THREE.Vector3(p.x,p.y,p.z)));
+    }
+    if (!box || !this._camera || !this._controls) return;
+    const center=box.getCenter(new THREE.Vector3());
+    const size=box.getSize(new THREE.Vector3());
+    const distance=Math.max(5,Math.max(size.x,size.y)*1.3);
+    const direction=this._camera.position.clone().sub(this._controls.target).normalize();
+    this._controls.target.copy(center);this._camera.position.copy(center).addScaledVector(direction,distance);
+    this._hasUserCameraInput=true;this._cameraMode='free';this._controls.update();this._emitCameraState();this._requestRender();
   }
 
   setLOD(level) {
@@ -1960,6 +2029,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   dispose() {
+    this._assetCloudUrl = null;
+    this._assetCloudSourceKey = null;
+    this._assetCloudLoadingUrl = null;
     this._cloudDisposed = true;
     this._denseCloud?.dispose();
     this._denseCloud = null;
@@ -1979,6 +2051,12 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._disposePointsMesh();
     this._clearForbiddenZones();
     this._clearSemanticInstances();
+    this._semanticRegionLayer?.dispose();
+    this._semanticRegionLayer = null;
+    this._semanticRegionData = null;
+    this._sceneGraphLayer?.dispose();
+    this._sceneGraphLayer = null;
+    this._sceneGraphData = null;
     this._semanticMarkerGeometry?.dispose();
     this._semanticPreciseMaterial?.dispose();
     this._semanticFallbackMaterial?.dispose();
@@ -2243,6 +2321,14 @@ window.addEventListener('pointcloud3d:semantic-instances', (e) => {
   const detail = e.detail;
   const instances = Array.isArray(detail) ? detail : detail?.instances;
   window.pointcloud3d.updateSemanticInstances(instances || []);
+});
+
+window.addEventListener('pointcloud3d:semantic-regions', (event) => {
+  window.pointcloud3d.updateSemanticRegions(event.detail || {});
+});
+
+window.addEventListener('pointcloud3d:scene-graph', (event) => {
+  window.pointcloud3d.updateSceneGraph(event.detail || {});
 });
 
 window.addEventListener('pointcloud3d:semantic-visibility', (e) => {

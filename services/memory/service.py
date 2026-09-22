@@ -74,6 +74,7 @@ from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
 from services.memory.instance_stream import SemanticInstancePublisher
+from services.memory.scene_mapping_state import MANAGED_KEY, SceneMappingMemoryMixin
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.repository import MemoryRepository
 from services.memory.scene_space_sampler import SceneSpaceSampler
@@ -156,7 +157,7 @@ class _MemoryLibraryStats:
     last_updated_at: Optional[datetime] = None
 
 
-class MemoryService:
+class MemoryService(SceneMappingMemoryMixin):
     """统一地点记忆、语义记忆与多模态向量检索服务。"""
 
     _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
@@ -865,6 +866,7 @@ class MemoryService:
         return self._active_library_name
 
     def _clear_active_memory_state(self) -> None:
+        self._scene_scope_generation = getattr(self, "_scene_scope_generation", 0) + 1
         self._tagged_locations_by_id.clear()
         self._semantic_entries_by_id.clear()
         self._semantic_instances_by_id.clear()
@@ -2629,12 +2631,14 @@ class MemoryService:
             localization_session_id = active_session.session_id
             localization_ready = bool(active_session.pose_available)
         dynamic_anchors = self._build_dynamic_instance_anchors()
+        managed_spaces = self.current_managed_scene_spaces(map_snapshot)
+        current_scene_spaces = [*map_context.scene_spaces, *managed_spaces]
         context = NavigationSemanticContext(
             map_name=resolved_map_name,
             localization_session_id=localization_session_id,
             localization_ready=localization_ready,
             semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
-            scene_spaces=[item.model_copy(deep=True) for item in map_context.scene_spaces],
+            scene_spaces=[item.model_copy(deep=True) for item in current_scene_spaces],
             topology_nodes=self._build_topology_node_summaries(map_context),
             anchors=[
                 *[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
@@ -2644,9 +2648,9 @@ class MemoryService:
                 "active_library_name": self._active_library_name,
                 "frame_id": map_context.frame_id,
                 "semantic_region_count": len(map_context.semantic_regions),
-                "scene_space_count": len(map_context.scene_spaces),
-                "scene_space_candidates": [self._scene_space_context_summary(item) for item in map_context.scene_spaces[:12]],
-                "scene_space_evidence_summary": self._summarize_scene_space_evidence(map_context.scene_spaces),
+                "scene_space_count": len(current_scene_spaces),
+                "scene_space_candidates": [self._scene_space_context_summary(item) for item in current_scene_spaces[:12]],
+                "scene_space_evidence_summary": self._summarize_scene_space_evidence(current_scene_spaces),
                 "topology_node_count": len(map_context.topology_nodes_by_id),
                 "anchor_count": len(map_context.anchors_by_id) + len(dynamic_anchors),
                 "localization_session_status": active_session.status.value if active_session is not None else None,
@@ -2711,6 +2715,10 @@ class MemoryService:
         )
         return {
             "map_name": resolved_map_name,
+            "map_source_name": getattr(map_snapshot, "source_name", None),
+            "map_source_epoch": getattr(map_snapshot, "source_epoch", None),
+            "map_update_sequence": getattr(map_snapshot, "update_sequence", None),
+            "map_content_sha256": getattr(map_snapshot, "content_sha256", None),
             "localization_session_id": active_session.session_id if session_matches_map else None,
             "localization_session_status": active_session.status.value if session_matches_map else None,
             "localization_source_name": (
@@ -3133,6 +3141,8 @@ class MemoryService:
                 ) from exc
         if attributes is not None:
             updates["attributes"] = {**dict(current.attributes), **dict(attributes)}
+        if current.metadata.get(MANAGED_KEY) and (primary_label is not None or human_aliases is not None):
+            updates["metadata"].update({"label_locked": True, "label_source": "explicit_review"})
         return self._upsert_scene_space(current.model_copy(update=updates, deep=True))
 
     def delete_scene_spaces(self, scene_space_ids: List[str]) -> int:
@@ -3285,6 +3295,13 @@ class MemoryService:
             else str(merged_metadata.get("map_name") or "").strip() or None
         )
         merged_metadata["map_name"] = resolved_map_name
+        # 观察来源以捕获快照为准，调用方注释不能伪造跨地图证据。
+        merged_metadata.update({
+            "map_source_name": getattr(map_snapshot, "source_name", None),
+            "map_source_epoch": getattr(map_snapshot, "source_epoch", None),
+            "map_update_sequence": getattr(map_snapshot, "update_sequence", None),
+            "map_content_sha256": getattr(map_snapshot, "content_sha256", None),
+        })
 
         entry = SemanticMemoryEntry(
             memory_id=build_memory_id("scene"),
@@ -5189,6 +5206,12 @@ class MemoryService:
                 not self.is_enabled() or self._active_library_name != expected_library
             ):
                 return
+            if "scene_revision" in task:
+                current = self._scene_spaces_by_id.get(str(task["point_id"]))
+                if (current is None
+                    or getattr(self, "_scene_scope_generation", 0) != task.get("scene_scope_generation")
+                    or int(current.metadata.get("scene_revision", 0)) != task["scene_revision"]):
+                    return
             self._vector_store.upsert_point(
                 point_id=str(task["point_id"]), collection_name=str(task["collection_name"]),
                 record_kind=str(task["record_kind"]), payload=task["payload"],
@@ -5500,6 +5523,8 @@ class MemoryService:
         }
 
     def _scene_space_navigation_pose(self, scene_space: SceneSpace) -> Optional[Pose]:
+        if scene_space.metadata.get(MANAGED_KEY) and not scene_space.metadata.get("navigable", False):
+            return None
         if scene_space.inspection_poses:
             return scene_space.inspection_poses[0]
         if scene_space.entry_poses:
@@ -5815,6 +5840,8 @@ class MemoryService:
     def _build_scene_memory_metadata(self, perception_context) -> Dict[str, object]:
         scene_summary = perception_context.scene_summary
         return {
+            "frame_timestamp": perception_context.metadata.get("frame_timestamp"),
+            "frame_timestamp_source": perception_context.metadata.get("frame_timestamp_source"),
             "visual_labels": self._collect_scene_visual_labels(scene_summary),
             "vision_tags": self._collect_scene_vision_tags(scene_summary),
             "semantic_relations": self._normalize_aliases(scene_summary.metadata.get("semantic_relations")),
@@ -6343,6 +6370,11 @@ class MemoryService:
         )
 
     def _upsert_scene_space(self, scene_space: SceneSpace, *, publish_event: bool = True) -> SceneSpace:
+        if scene_space.metadata.get(MANAGED_KEY):
+            with self._instances_lock:
+                return self._persist_managed_scene_space(
+                    scene_space, expected_revision=int(scene_space.metadata.get("scene_revision", 0))
+                )
         metadata = self._attach_library_metadata(dict(scene_space.metadata))
         if scene_space.localization_session_id and not metadata.get("localization_session_id"):
             metadata["localization_session_id"] = scene_space.localization_session_id

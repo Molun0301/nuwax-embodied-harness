@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nuwax 机器人控制台</title>
-  <link rel="stylesheet" href="/static/console.css?v=20260920-settings-style">
+  <link rel="stylesheet" href="/static/console.css?v=20260922-map-glass-unified">
 </head>
 <body>
 <div class="app" id="app">
@@ -35,39 +35,36 @@
       <div class="mission-layout"><div class="mission-content">
         <div class="workspace">
           <section id="live-map" class="map-panel hero card rise">
+
+            <header class="map-header map-toolbar" aria-label="地图视图与交互控制">
+              <div id="mapViewControls" class="map-tool-group map-mode-switch" aria-label="地图视图">
+                <button id="mapMode2d" class="tool" type="button" data-map-mode="2d" aria-pressed="false">2D</button>
+                <button id="mapMode3d" class="tool" type="button" data-map-mode="3d" aria-pressed="false">3D</button>
+                <button id="mapModeSemantic" class="tool" type="button" data-map-mode="semantic" aria-pressed="false">语义地图</button>
+              </div>
+            <nav id="mapActionControls" class="map-tool-actions" aria-label="地图工具"><button id="mapLayersToggle" class="tool map-action-button" type="button" aria-label="图层" title="图层" aria-expanded="false" aria-controls="mapLayersPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg><span>图层</span></button>
+<button id="semanticRegionPanelToggle" class="tool map-action-button" type="button" aria-label="区域" title="区域" aria-expanded="false" aria-controls="semanticRegionPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg><span>区域</span><span id="semanticRegionCount" class="map-action-count">—</span></button>
+<button id="sceneGraphToggle" class="tool map-action-button" type="button" aria-label="关系图" title="关系图" aria-expanded="false" aria-controls="sceneGraphPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="8" r="3"/><circle cx="10" cy="19" r="3"/><path d="m9 6 6 1M7 9l2 7m7-5-4 5"/></svg><span>关系图</span></button>
+<button id="semanticMemoryToggle" class="tool map-action-button" type="button" aria-label="物品" title="物品" aria-expanded="false" aria-controls="semanticMemoryPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4v10l-8 4-8-4V7l8-4Zm0 9v9M4 7l8 5 8-5m-12-7 8 5"/></svg><span>物品</span><span id="semanticMemoryCount" class="map-action-count">—</span></button>
+<span class="map-actions-divider"></span>
+<button id="mapNavToggle" class="tool map-action-button" type="button" aria-label="导航" title="导航" aria-expanded="false" aria-controls="navigation-container"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 11 16-7-7 16-2-7-7-2Z"/></svg><span>导航</span></button>
+<button id="mapBoundaryToggle" class="tool map-action-button" type="button" aria-label="禁行区" title="禁行区" aria-expanded="false" aria-controls="boundary-draw-container"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="m6 18 12-12"/></svg><span>禁行区</span></button></nav>
+              <div class="map-header-actions"><span id="mapStatus" class="pill missing">缺失</span><button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ <span>视频</span></button></div>
+            </header>
+
             <div class="canvas-wrap">
               <canvas id="mapCanvas" width="1400" height="900"></canvas>
               <div id="map3dContainer" data-pointcloud-consumer-ready="false" data-binary-received-count="0" data-pointcloud-routed-count="0" data-pointcloud-parse-error="" data-pointcloud-accepted-points="0" data-pointcloud-displayed-points="0" data-pointcloud-drawn-points="0" style="display:none;"></div>
-              <div class="hud map-toolbar" aria-label="地图视图与交互控制">
-                <div class="map-tool-row">
-                  <div id="mapViewControls" class="map-tool-group glass" aria-label="地图视图">
-                    <button id="mapModeToggle" class="tool" type="button" data-map-view="2d" aria-pressed="false" title="切换 2D / 3D 地图">切换 3D</button>
-                    <button id="mediaSwapBtn" class="tool media-swap" type="button" title="地图 / 视频 互换位置与大小（遥控时放大视频）">⇄ 视频</button>
-                  </div>
-                  <div id="mapCameraControls" class="map-tool-group glass" aria-label="地图视角">
-                    <button id="mapFreeView" class="tool active" type="button" aria-pressed="true" title="自由调整地图视角">自由视角</button>
-                    <button id="mapFollowView" class="tool" type="button" aria-pressed="false" title="视角跟随机器人">跟随机器人</button>
-                    <button id="mapZoomOut" class="tool" type="button" title="缩小地图">–</button>
-                    <span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span>
-                    <button id="mapZoomIn" class="tool" type="button" title="放大地图">+</button>
-                    <button id="mapZoomReset" class="tool" type="button" title="复位当前地图视角">复位视角</button>
-                    <button id="mapCenterRobot" class="tool" type="button" title="将视角定位到机器人" disabled>定位机器人</button>
-                  </div>
+              <aside id="mapLayersPanel" class="map-drawer map-options-panel" aria-label="地图图层" hidden>
+                <div class="map-drawer-head"><strong>地图图层</strong><button class="tool" type="button" data-map-panel-close="mapLayersPanel" aria-label="关闭图层"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
+                <p class="map-panel-description">选择要在当前地图中显示的内容。</p>
+                <div id="mapLayerControls" class="map-layer-options">
+                  <label id="semanticRegionLayerControl" class="map-layer-toggle"><span><strong>语义标注</strong><small>区域边界与名称</small></span><input id="showSemanticRegions" type="checkbox"></label>
+                  <label class="map-layer-toggle"><span><strong>区域连接</strong><small>区域之间的连接关系</small></span><input id="showSceneConnections" type="checkbox"></label>
+                  <label class="map-layer-toggle"><span><strong>记忆物品</strong><small>有位置依据的物品标记</small></span><input id="showSemanticInstances" type="checkbox" checked></label>
                 </div>
-                <div id="mapActionControls" class="map-tool-row" aria-label="地图交互">
-                  <div class="map-tool-group glass">
-                    <button id="mapNavToggle" class="tool" type="button" title="在地图上选择目标，确认后开始导航">导航</button>
-                    <button id="mapBoundaryToggle" class="tool" type="button" title="创建并管理会参与导航规划的禁行区">禁行区</button>
-                  </div>
-                  <div id="mapLayerControls" class="map-tool-group glass" aria-label="地图图层">
-                    <label class="map-layer-toggle" title="在 2D 与 3D 地图显示当前记忆库物品；3D 远距缩小时自动隐藏">
-                      <input id="showSemanticInstances" type="checkbox" checked>
-                      <span class="sw" style="background:#f59e0b"></span>物品
-                    </label>
-                    <button id="semanticMemoryToggle" class="tool" type="button" aria-expanded="false" aria-controls="semanticMemoryPanel">空间记忆 <span id="semanticMemoryCount">—</span></button>
-                    <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
-                  </div>
-                  <div id="mapPointStyleGroup" class="map-tool-group glass" hidden>
+                <div class="map-point-section"><span class="map-option-label">三维点云样式</span>                  <div id="mapPointStyleGroup" class="map-tool-group glass" hidden>
                     <label id="mapPointStyleControl" class="map-point-style" data-point-style="height" title="切换 3D 点云显示样式">
                       <span class="sw" aria-hidden="true"></span>
                       <select id="map3dPointStyle" aria-label="3D 点云显示样式">
@@ -80,13 +77,74 @@
                       </select>
                     </label>
                   </div>
+</div>
                 </div>
-                <div id="map3dDenseStatusRow" class="map-tool-row" data-map-view="3d" hidden>
-                  <span id="map3dDenseStatus" class="dense-cloud-status glass" role="status" hidden></span>
+              </aside>
+              <aside id="mapCameraPanel" class="map-drawer map-options-panel" aria-label="地图视角设置" hidden>
+                <div class="map-drawer-head"><strong>地图视角</strong><button class="tool" type="button" data-map-panel-close="mapCameraPanel" aria-label="关闭视角设置"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
+                <div id="mapCameraControls" class="map-tool-group map-camera-modes" aria-label="地图视角">
+                  <button id="mapFreeView" class="tool active" type="button" aria-pressed="true">自由视角</button>
+                  <button id="mapFollowView" class="tool" type="button" aria-pressed="false">跟随机器人</button>
                 </div>
+                <button id="mapCenterRobot" class="tool map-locate-button" type="button" disabled>定位机器人</button>
+                <p class="map-panel-description">拖拽调整视角，滚轮缩放。机器人定位可用时，可以开启跟随。</p>
+                <div id="mapPoseHud" class="map-pose-hud" aria-live="polite"><div class="map-pose-title">机器人位姿</div><div id="mapPoseMeta" class="kv map-pose-meta"></div></div>
+                </div>
+              </aside>
+              <div class="map-camera-dock glass map-tool-group" aria-label="地图缩放">
+                <button id="mapZoomOut" class="tool" type="button" title="缩小地图" aria-label="缩小地图">−</button><span id="mapZoomValue" class="tool zoomv" aria-live="polite">100%</span><button id="mapZoomIn" class="tool" type="button" title="放大地图" aria-label="放大地图">+</button>
+                <span class="map-tool-separator" aria-hidden="true"></span><button id="mapZoomReset" class="tool" type="button" title="复位当前地图视角">复位</button><button id="mapCameraToggle" class="tool" type="button" aria-expanded="false" aria-controls="mapCameraPanel">视角</button>
               </div>
-              <div id="navigation-container" class="navigation-panel glass" data-role="v2-navigation" hidden>
-                <strong>导航到地图选点</strong>
+              <div id="map3dDenseStatusRow" class="map-dense-progress" data-map-view="3d" hidden><span id="map3dDenseStatus" class="dense-cloud-status glass" role="status" hidden></span></div>
+              <aside id="semanticMemoryPanel" class="semantic-memory-panel map-drawer" aria-label="空间记忆" hidden>
+                <div class="semantic-memory-head"><strong>空间记忆</strong><button id="semanticMemoryClose" class="tool" type="button" aria-label="关闭空间记忆"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
+                <p id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</p>
+                <div class="semantic-memory-filters">
+                  <input id="semanticMemorySearch" class="field" type="search" placeholder="搜索物品名称或标签" aria-label="搜索空间记忆">
+                  <select id="semanticMemoryFilter" class="field" aria-label="按空间证据筛选"><option value="all">全部记录</option><option value="located">有物体位置</option><option value="observation">仅观察记录</option><option value="uncertain">位置待确认</option></select>
+                </div>
+                <button id="semanticInstancesRefresh" class="tool" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
+                <p id="semanticMemorySummary" class="semantic-memory-summary"></p>
+                <div id="semanticMemoryList" class="semantic-memory-list" aria-label="记忆物品列表"></div>
+                <p class="semantic-memory-footnote">地图只显示有空间依据的物体位置。观察记录表示曾在此处见过物品。</p>
+                </div>
+              </aside>
+              <aside id="semanticRegionPanel" class="map-semantic-panel map-drawer" aria-label="语义区域详情" hidden>
+                <div class="map-semantic-head"><strong>语义区域</strong><button id="semanticRegionClose" class="tool" type="button" aria-label="关闭语义详情"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
+                <p id="semanticRegionStatus" class="map-semantic-status" role="status">点选区域查看名称与证据。</p>
+                <details class="map-recognition-options"><summary>区域识别</summary>
+                <div class="map-semantic-actions"><button id="semanticRegionRefresh" class="tool" type="button">识别当前地图</button><button id="semanticRegionStart" class="tool" type="button">持续识别</button><button id="semanticRegionStop" class="tool" type="button" hidden>停止识别</button></div>
+                <label class="map-layer-toggle"><input id="semanticRegionApply" type="checkbox">本次识别采用符合门槛的标签</label>
+                </details>
+                <input id="semanticRegionSearch" class="field" type="search" aria-label="搜索区域" placeholder="搜索区域名称">
+                <div id="semanticRegionList" class="map-semantic-list" aria-label="语义区域列表"></div>
+                <div id="semanticRegionDetail" class="map-semantic-detail"><p class="muted">选择地图中的区域。</p></div>
+                <p class="map-semantic-footnote">区域用于空间理解；通行状态以导航检查为准。</p>
+                </div>
+              </aside>
+              <section id="sceneGraphPanel" class="map-scene-graph map-drawer" aria-label="空间语义关系图" hidden>
+                <div class="map-scene-graph-head"><strong>空间关系</strong><span id="sceneGraphSummary" class="muted"></span><button id="sceneGraphClose" class="tool" type="button" aria-label="关闭关系图"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
+                <div class="map-scene-graph-tools">
+                  <input id="sceneGraphSearch" class="field" type="search" placeholder="搜索区域或物品" aria-label="搜索关系图">
+                  <select id="sceneGraphLayout" class="tool" aria-label="关系图布局"><option value="relations">关系布局</option><option value="spatial">地图位置</option></select>
+                  <button id="sceneGraphFit" class="tool" type="button">适配全图</button>
+                  <button id="sceneGraphImage" class="tool" type="button">导出地图图像</button>
+                </div>
+                <p id="sceneGraphStatus" class="map-semantic-status" role="status">正在读取区域与连接…</p>
+                <div class="map-scene-graph-body">
+                  <div class="map-scene-graph-stage"><svg id="sceneGraphCanvas" role="group" aria-label="区域、连接口与物品关系，可拖拽和缩放"></svg><span class="map-scene-graph-legend">● 区域　◆ 连接口　○ 物品 · 拖拽平移，滚轮缩放</span></div>
+                  <aside id="sceneGraphDetail" class="map-scene-graph-detail" aria-label="节点详情"><p class="muted">选择节点查看位置、连接和观察证据。</p></aside>
+                </div>
+                <p class="map-semantic-footnote">连接线表示空间关系，路径仍需导航检查。</p>
+                </div>
+              </section>
+              <div id="navigation-container" class="navigation-panel map-drawer" data-role="v2-navigation" hidden>
+                <div class="map-drawer-head"><strong>选点导航</strong><button class="tool" type="button" data-map-panel-close="navigation-container" aria-label="关闭导航面板"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>
+                <div class="map-drawer-body">
                 <p class="navigation-hint">单击选择目标，点击“开始导航”后执行。三维视图请点击地面；拖动可调整视角。</p>
                 <label class="navigation-height-field">目标机体高度（米）
                   <input data-role="nav-height" type="number" step="any" inputmode="decimal" placeholder="留空使用当前定位高度">
@@ -141,12 +199,14 @@
                   <p data-role="floor-status" aria-live="polite">正在读取楼层目录。</p>
                   <pre data-role="floor-detail"></pre>
                 </details>
+                </div>
               </div>
-              <div id="boundary-draw-container" class="forbidden-zone-panel glass" data-role="v2-boundary" hidden>
+              <div id="boundary-draw-container" class="forbidden-zone-panel map-drawer" data-role="v2-boundary" hidden>
                 <div class="forbidden-zone-head">
-                  <span class="forbidden-zone-title">导航禁行区</span>
+                  <span class="forbidden-zone-title">导航禁行区</span><button class="tool" type="button" data-map-panel-close="boundary-draw-container" aria-label="关闭禁行区面板"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                   <span class="forbidden-zone-status" data-role="boundary-status">等待地图</span>
                 </div>
+                <div class="map-drawer-body">
                 <div class="forbidden-zone-grid">
                   <label class="forbidden-zone-field wide">名称
                     <input data-role="boundary-name" type="text" maxlength="80" value="禁行区 1" autocomplete="off">
@@ -185,12 +245,14 @@
                 </div>
                 <div class="forbidden-zone-hint" data-role="boundary-hint">直线、矩形和圆形用鼠标拖拽；自定义多边形逐点单击后完成。</div>
                 <ul class="forbidden-zone-list" data-role="boundary-list"></ul>
+                </div>
               </div>
               <span id="mapInteractionStatus" class="mchip glass map-goal-chip" hidden></span>
               <span id="mapStreamStatus" class="mchip glass map-overlay-panel map-stream-chip" title="地图内容更新帧率与当前显示位姿的源时间至绘制时间">-- FPS · 位姿延迟 --</span>
-              <details class="glass legend" id="mapLegend" open>
+              <details class="glass legend" id="mapLegend">
                 <summary class="legend-toggle" title="收纳或展开地图图例"><span class="legend-arrow" aria-hidden="true">‹</span><span>图例</span></summary>
                 <div class="lgnd legend-items">
+                  <span id="semanticRegionLegend" class="lg" hidden><span class="sw" style="background:var(--info)"></span>语义区域 · 编号对应列表</span>
                   <span class="lg"><span class="sw" style="background:var(--grid-free)"></span>可通行</span>
                   <span class="lg"><span class="sw" style="background:var(--grid-occ)"></span>占据</span>
                   <span class="lg"><span class="sw" style="background:var(--traj)"></span>轨迹</span>
@@ -202,11 +264,6 @@
                   <span class="lg"><span class="sw" style="background:#f59e0b"></span>物品</span>
                 </div>
               </details>
-              <div id="mapPoseHud" class="map-pose-hud glass map-overlay-panel" aria-live="polite">
-                <div class="map-pose-title">位姿</div>
-                <div id="mapPoseMeta" class="kv map-pose-meta"></div>
-              </div>
-              <div id="mapStatus" class="pill missing map-status-chip">缺失</div>
               <div id="mapEmpty" class="empty">等待地图数据。</div>
             </div>
           </section>
@@ -338,21 +395,14 @@
     </div>
   </div>
 </div>
-              <aside id="semanticMemoryPanel" class="semantic-memory-panel glass" aria-label="空间记忆" hidden>
-                <div class="semantic-memory-head"><strong>空间记忆</strong><button id="semanticMemoryClose" class="tool" type="button" aria-label="关闭空间记忆">×</button></div>
-                <p id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</p>
-                <div class="semantic-memory-filters">
-                  <input id="semanticMemorySearch" class="field" type="search" placeholder="搜索物品名称或标签" aria-label="搜索空间记忆">
-                  <select id="semanticMemoryFilter" class="field" aria-label="按空间证据筛选"><option value="all">全部记录</option><option value="located">有物体位置</option><option value="observation">仅观察记录</option><option value="uncertain">位置待确认</option></select>
-                </div>
-                <p id="semanticMemorySummary" class="semantic-memory-summary"></p>
-                <div id="semanticMemoryList" class="semantic-memory-list" aria-label="记忆物品列表"></div>
-                <p class="semantic-memory-footnote">地图只显示有空间依据的物体位置。观察记录表示曾在此处见过物品。</p>
-              </aside>
+
   <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__"; window.__NUWAX_NAV_SUPPORT_DISTANCE__ = "__NAV_SUPPORT_DISTANCE__";</script>
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
-  <script src="/static/js/console.js?v=20260920-settings-style"></script>
+  <script src="/static/js/map-workspace.js?v=20260922-map-workspace"></script>
+  <script src="/static/js/console.js?v=20260922-map-workspace"></script>
+  <script src="/static/js/semantic-map.js?v=20260922-map-workspace"></script>
+  <script src="/static/js/scene-graph.js?v=20260922-map-workspace"></script>
   <script>
     window.__NUWAX_ROBOT_GEOMETRY__ = "__ROBOT_GEOMETRY__";
     window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
@@ -373,7 +423,7 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260920-shared-capabilities");
+      await import("/static/js/pointcloud3d.js?v=20260922-scene-graph");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
@@ -393,6 +443,7 @@
       var navBtn = document.getElementById('mapNavToggle');
       var boundaryBtn = document.getElementById('mapBoundaryToggle');
       function setActive(target) {
+        if (target) window.nuwaxMapPanels?.activate(target === 'nav' ? 'navigation-container' : 'boundary-draw-container');
         window.__nuwaxNavigationActive = target === 'nav';
         if ((target === 'nav' || target === 'boundary') && typeof window.__nuwaxResetMapInteraction === 'function') window.__nuwaxResetMapInteraction(true);
         if (target !== 'boundary' && window.__nuwaxBoundaryDrawModule) window.__nuwaxBoundaryDrawModule.setDrawing(false);
@@ -402,6 +453,8 @@
         window.__nuwaxNavigationModule?.setActive(target === 'nav');
         if (boundaryBtn) boundaryBtn.classList.toggle('active', target === 'boundary');
       }
+      window.nuwaxMapPanels?.register('navigation-container', () => setActive(null));
+      window.nuwaxMapPanels?.register('boundary-draw-container', () => setActive(null));
       if (navBtn) {
         navBtn.addEventListener('click', function () {
           setActive(navContainer && navContainer.hidden ? 'nav' : null);

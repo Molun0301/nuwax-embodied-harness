@@ -632,6 +632,8 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if not R.catalog_number_in_range(key, v):
+        return None
     from core.config_effects import HOT_FIELDS
     if key.startswith("NUWAX_LOG_LEVEL_") and v.upper() not in {"", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         return None

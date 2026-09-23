@@ -92,7 +92,7 @@
       if (typeof distance !== 'number' || !Number.isFinite(distance) || distance <= 0) {
         throw new Error('请先在平台设置中填写机体到支撑面距离，保存并重启服务后刷新页面。');
       }
-      // 选取的是地面点；目标朝向保持水平，机体目标沿地图正Z轴抬高标定距离。
+      // 选取的是地面点；机体目标沿地图正Z轴抬高标定距离，最终朝向不作要求。
       return selection.surface_z + distance;
     }
     if (typeof window.__nuwaxResolveNavigationHeight !== 'function') {
@@ -103,7 +103,7 @@
 
   function selectMapPoint(x, y, frameId, selection) {
     if (![x, y].every(function (value) { return typeof value === 'number' && Number.isFinite(value); })) return;
-    const pose = Object.assign({}, selection, { x: x, y: y, z: null, yaw: 0.0, frame_id: frameId || 'map', map_name: window.__nuwaxActiveMapName?.() });
+    const pose = Object.assign({}, selection, { x: x, y: y, z: null, frame_id: frameId || 'map', map_name: window.__nuwaxActiveMapName?.() });
     try { pose.z = targetHeight(pose.frame_id, pose); } catch (_) { /* 没有真实高度时保留待填，不猜楼层。 */ }
     state.pendingPose = pose;
     window.pointcloud3d?.previewNavigationPoint(pose);
@@ -176,7 +176,6 @@
       x: pose.x,
       y: pose.y,
       z: pose.z,
-      yaw_rad: pose.yaw,
     }).then(function (resp) {
       const taskId = resp && resp.task_id;
       if (!taskId) throw new Error('网关响应缺少导航任务标识，无法确认受理。');

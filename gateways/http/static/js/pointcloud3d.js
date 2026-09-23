@@ -1686,6 +1686,14 @@ class PointCloud3DViewer extends PointCloudProcessor {
   }
 
   updateNavigationPath(path, goalPose) {
+    const samePath = !Array.isArray(path) || (path.length === this._navigationPath.length && path.every((p, i) => {
+      const old = this._navigationPath[i]; return p.x === old.x && p.y === old.y && p.z === old.z;
+    }));
+    const previousGoal = this._navigationGoal;
+    const sameGoal = goalPose === undefined || (!goalPose && !previousGoal)
+      || (goalPose && previousGoal && ['x', 'y', 'z', 'yaw'].every(key => goalPose[key] === previousGoal[key]));
+    if (samePath && sameGoal && this._scene && (this._navPathLine || this._navigationPath.length < 2)
+      && (this._navigationGoal ? this._navGoalMesh : !this._navGoalMesh)) return;
     if (Array.isArray(path)) this._navigationPath = path.slice();
     if (goalPose !== undefined) this._navigationGoal = goalPose || null;
     if (!this._scene) return;
@@ -1705,18 +1713,25 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const pts = this._navigationPath.map(p => new THREE.Vector3(
         Number(p.x || 0),
         Number(p.y || 0),
-        Number(p.z || 0.08),
+        Number.isFinite(p.z) ? p.z : 0.08,
       ));
-      const geo = new THREE.BufferGeometry().setFromPoints(pts);
-      const mat = new THREE.LineDashedMaterial({ color: COLORS.navPath, dashSize: 0.3, gapSize: 0.15 });
-      this._navPathLine = new THREE.Line(geo, mat);
-      this._navPathLine.computeLineDistances();
+      const curve = new THREE.CurvePath();
+      for (let i = 1; i < pts.length; i++) if (pts[i].distanceToSquared(pts[i - 1]) > 1e-12) {
+        curve.add(new THREE.LineCurve3(pts[i - 1], pts[i]));
+      }
+      // 实线带宽以地图米为单位；独立显示层避免被密集点云遮没。
+      const geo = curve.curves.length ? new THREE.TubeGeometry(curve, Math.min(4096, Math.max(8, pts.length * 4)), 0.025, 6, false)
+        : new THREE.BufferGeometry();
+      const mat = new THREE.MeshBasicMaterial({ color: COLORS.navPath, depthTest: false });
+      this._navPathLine = new THREE.Mesh(geo, mat);
+      this._navPathLine.renderOrder = 10;
       this._scene.add(this._navPathLine);
     }
     if (this._navigationGoal) {
       const goal = this._navigationGoal;
-      const geo = new THREE.ConeGeometry(0.25, 0.6, 8);
-      geo.rotateZ(-Math.PI / 2);
+      const oriented = Number.isFinite(goal.yaw);
+      const geo = oriented ? new THREE.ConeGeometry(0.25, 0.6, 8) : new THREE.SphereGeometry(0.12, 16, 12);
+      if (oriented) geo.rotateZ(-Math.PI / 2);
       const mat = new THREE.MeshBasicMaterial({ color: COLORS.navGoal });
       this._navGoalMesh = new THREE.Mesh(geo, mat);
       this._navGoalMesh.position.set(Number(goal.x || 0), Number(goal.y || 0), Number(goal.z || 0.3));
@@ -2145,7 +2160,7 @@ function yawFromValue(value) {
   const pose = value?.target_pose ?? value?.pose ?? value;
   if (pose?.yaw !== undefined) return Number(pose.yaw || 0);
   const q = pose?.orientation;
-  if (!q) return 0;
+  if (!q || value?.require_goal_orientation === false) return undefined;
   const siny = 2 * ((Number(q.w) || 0) * (Number(q.z) || 0) + (Number(q.x) || 0) * (Number(q.y) || 0));
   const cosy = 1 - 2 * ((Number(q.y) || 0) * (Number(q.y) || 0) + (Number(q.z) || 0) * (Number(q.z) || 0));
   return Math.atan2(siny, cosy);
@@ -2184,7 +2199,7 @@ window.addEventListener('stream:exploration.frontier', (e) => {
   window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(data);
   if (window.pointcloud3d._explorationOverlayInactive || data?.frontier_count === 0) {
     window.pointcloud3d.updateFrontiers([]);
-    window.pointcloud3d.updateNavigationPath([], null);
+    if (data?.navigation_is_public !== true) window.pointcloud3d.updateNavigationPath([], null);
     return;
   }
   const rawFrontiers = Array.isArray(data) ? data
@@ -2249,6 +2264,7 @@ window.addEventListener('stream:localization.trajectory', (e) => {
 
 function updateNavigationOverlayFromEvent(e) {
   const d = e.detail;
+  const publicNavigation = d?.navigation_is_public === true;
   let explorationIdentity = window.pointcloud3d._explorationOverlayWatermark;
   if (e.type === 'stream:exploration.state') {
     let identity;
@@ -2272,29 +2288,29 @@ function updateNavigationOverlayFromEvent(e) {
       window.pointcloud3d._explorationOverlayInactive = explorationOverlayIsInactive(d);
       if (window.pointcloud3d._explorationOverlayInactive) {
         window.pointcloud3d.updateFrontiers([]);
-        window.pointcloud3d.updateNavigationPath([], null);
-        return;
+        if (!publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
+        if (!publicNavigation) return;
       }
       if (d?.frontier_count === 0) {
         window.pointcloud3d.updateFrontiers([]);
-        window.pointcloud3d.updateNavigationPath([], null);
-        return;
+        if (!publicNavigation) window.pointcloud3d.updateNavigationPath([], null);
+        if (!publicNavigation) return;
       }
     }
   } else {
     if (
-      explorationIdentity
+      !publicNavigation && explorationIdentity
       && !navigationEventMatchesExploration(d, explorationIdentity)
     ) return;
     if (
-      window.pointcloud3d._explorationOverlayRequiresCanonical
-      || window.pointcloud3d._explorationOverlayInactive
+      !publicNavigation && (window.pointcloud3d._explorationOverlayRequiresCanonical
+      || window.pointcloud3d._explorationOverlayInactive)
     ) {
       window.pointcloud3d.updateNavigationPath([], null);
       return;
     }
   }
-  const navigationCorrelated = !explorationIdentity
+  const navigationCorrelated = publicNavigation || !explorationIdentity
     || navigationEventMatchesExploration(d, explorationIdentity);
   const rawPath = navigationCorrelated
     ? firstDefinedValue(d?.planned_path, d?.nav_path, d?.path)

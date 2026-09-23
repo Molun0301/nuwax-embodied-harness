@@ -485,6 +485,8 @@ message NavigationState {
   bytes goal_payload_sha256 = 22;
   bytes path_payload_sha256 = 23;
   uint64 producer_runtime_generation = 25;
+  // 当前目标已计算路径；终态为空，点采用planner_map_frame坐标。
+  repeated Vec3 planned_path = 26;
 }
 message NavigationReadiness {
   reserved 10;

@@ -96,6 +96,7 @@ pub struct SurfaceFollower {
     last_command: Twist2,
     braking_deadline: Option<std::time::Instant>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
+    body_view_dirty: bool,
 }
 
 impl SurfaceFollower {
@@ -122,6 +123,7 @@ impl SurfaceFollower {
             last_command:Twist2::ZERO,
             braking_deadline:None,
             control_target:None,
+            body_view_dirty: true,
         })
     }
 
@@ -132,6 +134,8 @@ impl SurfaceFollower {
     }
 
     fn refresh_current_body_view(&mut self) {
+        if !self.body_view_dirty { return; }
+        self.body_view_dirty = false;
         self.map = self.source_map.clone();
         if let (Some(map), Some(pose)) = (self.source_map.as_ref(), self.odometry.as_ref()) {
             let p = pose.pose.position;
@@ -151,6 +155,7 @@ impl SurfaceFollower {
     }
 
     fn admit_path(&mut self, path: Path3D, goal: PoseStamped) -> Result<(), RuntimeError> {
+        self.refresh_current_body_view();
         if path.poses.is_empty() {
             return Err(rejected("三维路径为空"));
         }
@@ -286,7 +291,7 @@ impl SurfaceFollower {
             }
             let yaw_error =
                 angle_diff(goal.pose.orientation.yaw(), odometry.pose.orientation.yaw());
-            if yaw_error.abs() < self.config.controller.orientation_tolerance {
+            if !self.options.requires_orientation() || yaw_error.abs() < self.config.controller.orientation_tolerance {
                 return PlannerStep::Succeeded;
             }
             let twist = self.controller.rotate(yaw_error);
@@ -504,7 +509,7 @@ impl NavPlanner for SurfaceFollower {
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
         self.odometry = Some(odometry);
-        self.refresh_current_body_view();
+        self.body_view_dirty = true;
     }
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {
@@ -519,8 +524,9 @@ impl NavPlanner for SurfaceFollower {
                 if map.config().world_frame != "map" {
                     return Err(rejected("三维表面快照必须使用当前机体路径的map坐标系"));
                 }
+                self.map = Some(Arc::clone(&map));
                 self.source_map = Some(map);
-                self.refresh_current_body_view();
+                self.body_view_dirty = true;
                 Ok(())
             }
             ExecutionMap::Planar(_) => Err(rejected("三维后端不能用二维占据图恢复就绪")),
@@ -533,7 +539,12 @@ impl NavPlanner for SurfaceFollower {
         self.source_map = None;
     }
 
+    fn observe_applied_command(&mut self, command:Twist2) {
+        self.last_command=command;
+    }
+
     fn step(&mut self, robot_width_m: f64) -> PlannerStep {
+        self.refresh_current_body_view();
         self.follow_step(robot_width_m)
     }
 
@@ -736,8 +747,10 @@ mod tests {
         follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&source))).unwrap();
         let first=[0.55,0.55,0.4];let next=[2.55,0.55,0.4];let q=[0.0,0.0,0.0,1.0];
         follower.update_odometry(body_pose(first,Quaternion::IDENTITY,1));
+        follower.step(0.3);
         follower.map.as_ref().unwrap().validate_body_pose(first,q).unwrap();
         follower.update_odometry(body_pose(next,Quaternion::IDENTITY,2));
+        follower.step(0.3);
         let view=follower.map.as_ref().unwrap();
         view.validate_body_pose(next,q).unwrap();
         assert!(view.validate_body_pose(first,q).is_err(),"旧足迹外障碍必须恢复");

@@ -311,6 +311,8 @@ pub struct NavRuntimeSlot {
     path_candidate_goal: Option<GoalLease>,
     /// Published planner paths awaiting scheduler confirmation.
     path_candidates: VecDeque<(u64, [u8; 32])>,
+    /// 最近同目标的计算路径，仅用于展示，不能替代执行回执。
+    display_path: Option<(GoalLease, Vec<[f64; 3]>)>,
     /// Highest goal generation ever reserved by this runtime.
     pub last_goal_generation: u64,
     /// module graph 模块节点 ID 列表(diagnostics 暴露)。
@@ -328,6 +330,7 @@ impl NavRuntimeSlot {
             goal: None,
             path_candidate_goal: None,
             path_candidates: VecDeque::new(),
+            display_path: None,
             last_goal_generation: 0,
             module_nodes: Vec::new(),
             profile,
@@ -950,7 +953,19 @@ impl NavRuntimeState {
         }
         slot.path_candidates
             .push_back((path_revision, path.path_payload_sha256));
+        slot.display_path = Some((observed.clone(), path.path.poses.iter().map(|p| p.pose.position).collect()));
         Ok(observed)
+    }
+
+    /// 仅返回仍属于本次目标代次的已计算路线；终态由调用者清空。
+    pub async fn display_path_for(&self, lease: &GoalLease, include_confirmed:bool) -> Vec<[f64; 3]> {
+        let slot = self.inner.read().await;
+        slot.display_path.as_ref().filter(|(owner, _)|
+            owner.identity_matches(lease)
+            && (include_confirmed || owner.path_revision>lease.path_revision)
+            && owner.producer_runtime_generation == lease.producer_runtime_generation
+            && owner.goal_payload_sha256 == lease.goal_payload_sha256
+        ).map(|(_, points)| points.clone()).unwrap_or_default()
     }
 
     /// Correlate a typed NavigationState with either the active or retained
@@ -5613,6 +5628,9 @@ mod tests {
             .observe_path_envelope(&first)
             .await
             .expect("first path");
+        assert_eq!(state.display_path_for(&lease,true).await,first.path.poses.iter().map(|p|p.pose.position).collect::<Vec<_>>());
+        assert!(state.display_path_for(&test_lease("other-goal",6),true).await.is_empty());
+        assert!(state.display_path_for(&accepted,false).await.is_empty(),"等待重规划时不能继续显示已失效的旧路径");
         assert_eq!(accepted.path_revision, 1);
         assert_eq!(accepted.path_payload_sha256, first.path_payload_sha256);
         assert_eq!(

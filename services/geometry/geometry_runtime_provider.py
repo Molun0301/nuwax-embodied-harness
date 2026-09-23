@@ -2949,6 +2949,9 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
     """Project typed NavigationState fields without parsing message text."""
 
     return {
+        "planned_path": [{"x": float(p.x), "y": float(p.y), "z": float(p.z)}
+                         for p in getattr(update, "planned_path", ())],
+        "path_revision": int(getattr(update, "path_revision", 0) or 0),
         "raw_status": str(getattr(update, "status", "") or ""),
         "observed_goal_id": str(getattr(update, "goal_id", "") or ""),
         "owner_kind": int(getattr(update, "owner_kind", 0) or 0),
@@ -7546,7 +7549,8 @@ class GeometryRuntimeProvider:
                 frame_id=target_frame_id,
                 allow_reverse=bool(getattr(goal, "allow_reverse", False)),
                 position_tolerance_m=float(getattr(goal, "tolerance_position_m", 0.3)),
-                yaw_tolerance_rad=float(getattr(goal, "tolerance_yaw_rad", 0.3)),
+                yaw_tolerance_rad=(float(getattr(goal, "tolerance_yaw_rad", 0.3))
+                    if getattr(goal, "require_goal_orientation", True) else math.pi),
                 goal_id=request_goal_id,
                 owner_kind=_PUBLIC_NAV_OWNER_KIND,
                 parent_request_id=canonical_parent_request_id,

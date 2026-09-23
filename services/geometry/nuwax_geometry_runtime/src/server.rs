@@ -4685,6 +4685,7 @@ fn nav_state_to_proto(update: NavigationUpdate) -> NavigationState {
         goal_payload_sha256: feedback.goal_payload_sha256.to_vec(),
         path_payload_sha256: feedback.path_payload_sha256.to_vec(),
         producer_runtime_generation,
+        planned_path: feedback.planned_path.into_iter().map(|p| Vec3 { x:p[0], y:p[1], z:p[2] }).collect(),
     }
 }
 
@@ -17065,6 +17066,7 @@ mod navigation_feedback_contract_tests {
             },
             producer_runtime_generation: 41,
             feedback: NavigationFeedback {
+                planned_path: vec![[1.0,2.0,0.4],[2.0,2.0,0.4]],
                 cancel_phase: "ZEROED".into(),
                 cancel_generation: 3,
                 actuator_zeroed: true,
@@ -17106,6 +17108,8 @@ mod navigation_feedback_contract_tests {
         assert_eq!(proto.goal_payload_sha256, vec![7; 32]);
         assert_eq!(proto.path_payload_sha256, vec![8; 32]);
         assert_eq!(proto.producer_runtime_generation, 41);
+        assert_eq!(proto.planned_path.len(),2);
+        assert_eq!(proto.planned_path[1].z,0.4);
     }
 
     #[tokio::test]

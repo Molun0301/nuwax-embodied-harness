@@ -134,6 +134,7 @@ pub struct LocalPlanner {
     last_command: Twist2,
     observed_velocity: Twist2,
     allow_reverse: bool,
+    require_goal_orientation: bool,
     blocked_cycles: usize,
     expected_goal: Option<PoseStamped>,
     oriented_path: bool,
@@ -201,6 +202,7 @@ impl LocalPlanner {
             last_command: make_twist2_zero(),
             observed_velocity: make_twist2_zero(),
             allow_reverse: false,
+            require_goal_orientation: true,
             blocked_cycles: 0,
             expected_goal: None,
             oriented_path: false,
@@ -249,7 +251,9 @@ impl LocalPlanner {
         }
         self.allow_reverse = options.allow_reverse;
         self.config.goal_tolerance = options.position_tolerance_m.max(1e-6);
-        self.config.orientation_tolerance = options.yaw_tolerance_rad.max(1e-6);
+        self.require_goal_orientation=options.requires_orientation();
+        self.config.orientation_tolerance = if self.require_goal_orientation {options.yaw_tolerance_rad.max(1e-6)}
+            else {LocalPlannerConfig::default_config().orientation_tolerance};
         self.expected_goal = Some(goal);
         Ok(())
     }
@@ -774,7 +778,7 @@ impl LocalPlanner {
         let goal_yaw_opt = self.last_segment_yaw_or_last_yaw();
         if let Some(goal_yaw) = goal_yaw_opt {
             let yaw_error = angle_diff(goal_yaw, oyaw);
-            if yaw_error.abs() < self.config.orientation_tolerance {
+            if !self.require_goal_orientation || yaw_error.abs() < self.config.orientation_tolerance {
                 if self.motion_limits.is_some() {
                     if self.last_command.linear.x.hypot(self.last_command.linear.y)
                         + self.last_command.angular_z.abs()
@@ -858,6 +862,22 @@ mod tests {
     use super::*;
     use crate::helpers::{make_path2d, make_pose_stamped, Point2};
     use crate::navigation_map::CostMap2D;
+
+    #[test]
+    fn position_only_goal_skips_final_yaw_without_disabling_initial_turn() {
+        let mut planner=LocalPlanner::new(0.3,20.0,0.12);
+        let goal=make_pose_stamped("map",1.5,0.5,std::f64::consts::PI);
+        planner.configure_goal(goal,nuwax_nav_types_messages::GoalOptions {
+            position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()
+        }).unwrap();
+        planner.update_costmap(CostMap2D::new_all_free("map",40,40,0.1));
+        planner.handle_odom(make_pose_stamped("map",0.5,0.5,1.0));
+        planner.start_planning_with_orientations(make_path2d(vec![Point2::new(0.5,0.5),Point2::new(1.5,0.5)]),Some(vec![0.0,0.0]));
+        let (turn,stop)=planner.step(0.3);assert!(turn.angular_z.abs()>0.0 && stop.is_none());
+        planner.handle_odom(make_pose_stamped("map",1.5,0.5,0.0));
+        let (command,stop)=planner.step(0.3);
+        assert_eq!(command,Twist2::ZERO);assert_eq!(stop,Some(StopMessage::Arrived));
+    }
 
     #[test]
     fn final_rotation_checks_actual_goal_yaw_against_external_obstacle() {

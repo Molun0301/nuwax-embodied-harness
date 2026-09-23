@@ -64,7 +64,7 @@ impl SurfaceFollower {
         } else { position.distance(goal.pose.position) };
         let final_yaw = angle_diff(goal.pose.orientation.yaw(), yaw);
         if final_distance < self.config.controller.goal_tolerance
-            && final_yaw.abs() < self.config.controller.orientation_tolerance
+            && (!self.options.requires_orientation() || final_yaw.abs() < self.config.controller.orientation_tolerance)
         {
             // 这里只确认到达规划终点；调度器随后撤租归零，等待守卫的物理
             // 停稳证明后才发布成功，避免地图噪声形成第二道停车门槛。

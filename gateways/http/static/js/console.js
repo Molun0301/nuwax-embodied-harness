@@ -1296,7 +1296,11 @@
           setKv(els.localizationMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "navigation") {
           setPill(els.navigationStatus, "error");
-          setKv(els.navigationMeta, [["错误", message], ["前端接收", nowText()]]);
+          const navigationStatus = String(data.navigation_context?.navigation_state?.status || "").toLowerCase();
+        if (["idle", "succeeded", "failed", "cancelled"].includes(navigationStatus)) {
+          state.goalPose = null; state.navigationPath = [];
+        }
+        setKv(els.navigationMeta, [["错误", message], ["前端接收", nowText()]]);
         } else if (kind === "video") {
           setPill(els.videoStatus, "error");
           els.videoEmpty.hidden = false;
@@ -2528,6 +2532,7 @@
             frontiers: state.frontiers || [],
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationExplorationValidated,
             ...currentExplorationOverlayDetail(),
           },
@@ -2536,6 +2541,7 @@
           detail: {
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationExplorationValidated,
             ...currentExplorationOverlayDetail(),
           },
@@ -2544,6 +2550,7 @@
           detail: {
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationExplorationValidated,
             ...currentExplorationOverlayDetail(),
           },
@@ -3428,11 +3435,16 @@
         if (value.x !== undefined && value.y !== undefined) return { x: Number(value.x), y: Number(value.y), z: Number(value.z || 0) };
         return pointFromFrontier(value);
       }
+      function navigationContextIsPublic(context) {
+        const nav = context && context.navigation_state || {};
+        return Number(nav.metadata && nav.metadata.owner_kind) === 1;
+      }
       function goalPoseFromValue(value) {
         if (!value) return null;
         const pose = value.target_pose || value.goal_pose || value.pose || value;
         const point = pointFromPose(pose) || pathPointFromValue(value);
         if (!point) return null;
+        if (value.require_goal_orientation === false) return { position: point };
         if (pose.orientation) return pose;
         const yaw = firstFiniteNumber(pose.yaw, pose.yaw_rad, value.yaw, value.yaw_rad);
         if (yaw === null) return { position: point };
@@ -3450,6 +3462,7 @@
         const metadata = context && context.metadata ? context.metadata : {};
         const stateObj = context && context.navigation_state ? context.navigation_state : {};
         const stateMetadata = stateObj && stateObj.metadata ? stateObj.metadata : {};
+        if (Array.isArray(stateMetadata.planned_path)) return stateMetadata.planned_path.map(pathPointFromValue).filter(Boolean);
         const explorationMetadata = explorationStateMetadata(explorationContext);
         const raw = firstArrayValue(
           context && context.planned_path,
@@ -3477,6 +3490,7 @@
         const metadata = context && context.metadata ? context.metadata : {};
         const navigationState = context && context.navigation_state ? context.navigation_state : {};
         const navigationMetadata = navigationState && navigationState.metadata ? navigationState.metadata : {};
+        if (navigationContextIsPublic(context)) return goalPoseFromValue(context.current_goal || navigationState.current_goal || metadata.current_goal || navigationMetadata.current_goal);
         const explorationMetadata = explorationStateMetadata(explorationContext);
         for (const candidate of [
           context && context.current_goal,
@@ -3598,6 +3612,7 @@
         const latestExplorationIdentity = state.latestExplorationOverlayIdentity;
         if (
           data.navigation_update_frame === true
+          && !navigationContextIsPublic(data.navigation_context)
           && latestExplorationIdentity
           && !navigationGoalMatchesExploration(
             data.navigation_context,
@@ -3623,11 +3638,11 @@
         const frontiers = Array.isArray(data.frontiers) ? data.frontiers : null;
         state.frontiers = frontiers || [];
         state.goalPose = extractNavigationGoal(data.navigation_context, explorationContext)
-          || goalPoseFromValue(data.current_goal)
+          || (!navigationContextIsPublic(data.navigation_context) ? (goalPoseFromValue(data.current_goal)
           || goalPoseFromValue(data.current_frontier)
-          || goalPoseFromValue(data.selected_frontier);
+          || goalPoseFromValue(data.selected_frontier)) : null);
         state.navigationPath = extractNavigationPath(data.navigation_context, explorationContext);
-        if (!state.navigationPath.length && Array.isArray(data.planned_path)) {
+        if (!navigationContextIsPublic(data.navigation_context) && !state.navigationPath.length && Array.isArray(data.planned_path)) {
           state.navigationPath = data.planned_path.map(pathPointFromValue).filter(Boolean);
         }
         const canonicalExploration = String(explorationMetadata.state_source || "").toLowerCase() === "geometry_runtime_grpc"
@@ -3649,11 +3664,12 @@
             && String(explorationMetadata.geometry_session_mode).toLowerCase() !== "explore"
           )
         ));
-        if (canonicalInactive) {
+        if (!navigationContextIsPublic(data.navigation_context) && canonicalInactive) {
           state.goalPose = null;
           state.navigationPath = [];
         } else if (
-          latestExplorationIdentity
+          !navigationContextIsPublic(data.navigation_context)
+          && latestExplorationIdentity
           && !navigationGoalMatchesExploration(
             data.navigation_context,
             latestExplorationIdentity
@@ -3661,6 +3677,10 @@
         ) {
           state.goalPose = null;
           state.navigationPath = [];
+        }
+        const navigationStatus = String(data.navigation_context?.navigation_state?.status || "").toLowerCase();
+        if (["idle", "succeeded", "failed", "cancelled"].includes(navigationStatus)) {
+          state.goalPose = null; state.navigationPath = [];
         }
         setKv(els.navigationMeta, [
           ["导航", summarizeContext(data.navigation_context, "navigation_state")],
@@ -4368,6 +4388,7 @@
           return {
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationGoalMatchesExploration(
               frame.payload,
               state.latestExplorationOverlayIdentity
@@ -4380,6 +4401,7 @@
           return {
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationGoalMatchesExploration(
               navigationFrame && navigationFrame.payload,
               state.latestExplorationOverlayIdentity
@@ -4393,6 +4415,7 @@
             frontiers: state.frontiers || [],
             planned_path: state.navigationPath || [],
             current_goal: state.goalPose || null,
+            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
             navigation_exploration_validated: navigationGoalMatchesExploration(
               navigationFrame && navigationFrame.payload,
               state.latestExplorationOverlayIdentity
@@ -4988,13 +5011,13 @@
           const navStatus = String((navCtx.status && (navCtx.status.value || navCtx.status)) || "").toLowerCase();
           const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(navStatus);
           const explorationIdentity = state.latestExplorationOverlayIdentity;
-          const canonicalGoalAllowed = !explorationIdentity
+          const canonicalGoalAllowed = navigationContextIsPublic(navCtx) || !explorationIdentity
             || navigationGoalMatchesExploration(navCtx, explorationIdentity);
           if (goal && !terminal && canonicalGoalAllowed) {
             state.highlightTarget = {
               record_id: goal.metadata && goal.metadata.record_id || null,
               record_kind: goal.metadata && goal.metadata.record_kind || null,
-              target_pose: goal.target_pose || null,
+              target_pose: goalPoseFromValue(goal),
               target_name: goal.target_name || null,
             };
           } else if (!explorationIdentity && terminal) {
@@ -5006,7 +5029,8 @@
           updateNavigation(envelopeFromFrame(frame, { navigation_context: navigationContext, exploration_context: frame.payload }));
           const explorationIdentity = state.latestExplorationOverlayIdentity;
           if (
-            explorationIdentity
+            !navigationContextIsPublic(navigationContext)
+            && explorationIdentity
             && (
               explorationIdentity.terminal
               || explorationIdentity.status === "idle"

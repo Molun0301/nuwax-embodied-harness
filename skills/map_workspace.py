@@ -873,6 +873,28 @@ class MapWorkspaceService:
         current_asset = self._repository.get_map_asset(current_name) if current_name else None
         if current_name == resolved_name and current_asset is not None and current_asset.finalized:
             return self.get_active_workspace()
+        if (current_name == resolved_name and current_asset is not None
+                and not reset_memory_library
+                and self._memory_service.get_active_library_name() == resolved_name):
+            # 同名实时导航只需复核已绑定来源；不要再加载记忆历史和重挂工作区。
+            snapshot = self._mapping_service.get_latest_snapshot()
+            reader = getattr(self._geometry_runtime, "get_authoritative_mapping_session_state", None)
+            if snapshot is not None and snapshot.map_name == resolved_name and callable(reader):
+                observed = reader()
+                source = snapshot.metadata or {}
+                try:
+                    generation = int(observed.get("session_generation") or 0)
+                    same_source = (generation > 0 and generation == int(source.get("session_generation") or 0)
+                        and bool(observed.get("session_id"))
+                        and observed.get("session_id") == source.get("mapping_session_id"))
+                except (ValueError, TypeError):
+                    same_source = False
+                if (observed.get("success") is True and observed.get("active") is True
+                        and str(observed.get("phase") or "").upper() == "ACTIVE"
+                        and observed.get("map_name") == resolved_name and same_source):
+                    workspace = self.get_active_workspace(refresh_localization=False)
+                    if workspace is not None and workspace.active_map_name == resolved_name:
+                        return workspace
         return self.activate_map(
             map_name=map_name,
             create_if_missing=create_if_missing,

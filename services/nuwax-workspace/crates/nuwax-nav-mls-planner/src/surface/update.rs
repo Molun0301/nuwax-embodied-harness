@@ -480,6 +480,7 @@ pub(super) fn from_columns(
     Ok(SurfaceSnapshot {
         observations: None,
         current_body_support: None,
+        body_pose_cache: Default::default(),
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),
@@ -676,6 +677,7 @@ fn update_columns(
     let snapshot = SurfaceSnapshot {
         observations: None,
         current_body_support: None,
+        body_pose_cache: Default::default(),
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),

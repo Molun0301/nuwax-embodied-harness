@@ -88,7 +88,9 @@ fn straight_connection(
     omni: bool,
     reverse: bool,
     limits: Option<&MotionLimits>,
+    require_orientation: bool,
 ) -> Option<Vec<PlanarPose>> {
+    let goal = if require_orientation { goal } else { PlanarPose { yaw: from.yaw, ..goal } };
     let distance = (goal.x - from.x).hypot(goal.y - from.y);
     if distance < 1e-9 {
         return ((rotate || angle(goal.yaw - from.yaw).abs() < 1e-6)
@@ -106,6 +108,7 @@ fn straight_connection(
     let mut best = None;
     let mut best_cost = f64::INFINITY;
     for movement_yaw in headings {
+        let goal = if require_orientation { goal } else { PlanarPose { yaw: movement_yaw, ..goal } };
         let relative = angle(heading - movement_yaw);
         let forward = relative.cos();
         let lateral = relative.sin();
@@ -241,12 +244,12 @@ pub(crate) fn plan_oriented_interruptible(
         limits.model == MotionModel::Omnidirectional && limits.max_lateral_mps > 0.0
     });
     if !motion_is_clear(grid, geometry, start, start)
-        || !motion_is_clear(grid, geometry, goal, goal)
+        || (options.requires_orientation() && !motion_is_clear(grid, geometry, goal, goal))
     {
         return Ok(None);
     }
     if let Some(direct) =
-        straight_connection(grid, geometry, start, goal, rotate, omni, reverse, limits)
+        straight_connection(grid, geometry, start, goal, rotate, omni, reverse, limits, options.requires_orientation())
     {
         return Ok(Some(direct));
     }
@@ -302,13 +305,13 @@ pub(crate) fn plan_oriented_interruptible(
             return Ok(None);
         }
         let distance = (here.x - goal.x).hypot(here.y - goal.y);
-        let close = distance <= options.position_tolerance_m.min(grid.resolution).max(1e-6)
-            && angle(here.yaw - goal.yaw).abs()
-                <= options.yaw_tolerance_rad.min(yaw_step).max(1e-6);
+        let close = distance <= options.position_tolerance_m.max(1e-6)
+            && (!options.requires_orientation() || angle(here.yaw - goal.yaw).abs()
+                <= options.yaw_tolerance_rad.min(yaw_step).max(1e-6));
         let connection = if close {
             Some(vec![here])
         } else if expanded % 64 == 0 || distance < length * 3.0 {
-            straight_connection(grid, geometry, here, goal, rotate, omni, reverse, limits)
+            straight_connection(grid, geometry, here, goal, rotate, omni, reverse, limits, options.requires_orientation())
         } else {
             None
         };

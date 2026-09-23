@@ -6,6 +6,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 type BodyPose = ([f64; 3], [f64; 4]);
+// 优先较快取得可执行路线；加权启发式不承诺最短路径，碰撞/支撑检查不变。
+const SEARCH_HEURISTIC_WEIGHT: f64 = 10.0;
 fn angle(v: f64) -> f64 {
     (v + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
 }
@@ -83,6 +85,7 @@ fn connect(
     rotate: bool,
     reverse: bool,
     omni: bool,
+    require_orientation: bool,
 ) -> Option<Vec<BodyPose>> {
     let a = planar(from);
     let b = planar(to);
@@ -100,6 +103,13 @@ fn connect(
             .total_cmp(&(angle(*y - a.yaw).abs() + angle(b.yaw - *y).abs()))
     });
     for heading in headings {
+        // 位置目标的终点方向沿本段运动自然生成，不强制回到占位四元数。
+        let to = if require_orientation { to } else {
+            let model = map.body_envelope()?;
+            let support = map.locate_goal_support_from_body(to.0, to.1, model.body_to_support_z_m).ok()?;
+            map.body_pose_on_surface([b.x, b.y], heading, support.surface_xyz).ok()?
+        };
+        let b = planar(to);
         if !rotate && (angle(heading - a.yaw).abs() > 1e-5 || angle(b.yaw - heading).abs() > 1e-5) {
             continue;
         }
@@ -126,6 +136,7 @@ fn connect(
                 ),
                 angular_z: 0.0,
             };
+            if velocity.linear.x < -1e-8 && !reverse { return None; }
             if distance > 1e-9 {
                 out.extend(action(map, aligned, velocity, 1.0, boundary)?);
             }
@@ -185,6 +196,7 @@ pub(crate) fn plan_cancellable(
     if let Some(limits) = limits {
         limits.validate()?;
     }
+    if !options.requires_orientation() { goal.1 = start.1; }
     map.validate_body_pose(start.0, start.1)
         .map_err(|e| format!("起点机体包络: {e}"))?;
     let model = map.body_envelope().ok_or("三维完整机体标定缺失")?;
@@ -194,12 +206,18 @@ pub(crate) fn plan_cancellable(
         // 的固定高度/倾角。投影到该真实支撑面后仍执行完整碰撞和扫掠检查。
         let support = map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m)
             .map_err(|e| format!("目标支撑层: {e}"))?;
-        goal = map.body_pose_on_surface([goal.0[0], goal.0[1]], planar(goal).yaw, support.surface_xyz)
-            .map_err(|e| format!("目标支撑面投影: {e}"))?;
+        let projected=map.body_pose_on_surface([goal.0[0],goal.0[1]],planar(goal).yaw,support.surface_xyz);
+        goal = if options.requires_orientation() { projected } else {
+            projected.or_else(|error| (0..32).find_map(|index|
+                map.body_pose_on_surface([goal.0[0],goal.0[1]],f64::from(index)*std::f64::consts::TAU/32.0,support.surface_xyz).ok()
+            ).ok_or(error))
+        }.map_err(|e|format!("目标支撑面投影: {e}"))?;
     }
     // 起终点与沿途扫掠共用同一当前占据视图；局部补足的足迹边界仍由内核检查。
-    map.validate_body_pose(goal.0, goal.1)
-        .map_err(|e| format!("目标机体包络: {e}"))?;
+    if options.requires_orientation() {
+        map.validate_body_pose(goal.0, goal.1)
+            .map_err(|e| format!("目标机体包络: {e}"))?;
+    }
     let rotate = limits.is_none_or(|m| m.can_rotate_in_place);
     let reverse = options.allow_reverse && limits.is_some_and(|m| m.max_reverse_mps > 0.0);
     if options.allow_reverse && !reverse {
@@ -207,8 +225,55 @@ pub(crate) fn plan_cancellable(
     }
     let omni =
         limits.is_some_and(|m| m.model == MotionModel::Omnidirectional && m.max_lateral_mps > 0.0);
-    if let Some(path) = connect(map, start, goal, boundary, rotate, reverse, omni) {
+    if !options.requires_orientation() {
+        let support = map.locate_goal_support_from_body(goal.0,goal.1,model.body_to_support_z_m)
+            .map_err(|e|format!("目标支撑层: {e}"))?;
+        let feasible = (0..32).any(|index| map.body_pose_on_surface([goal.0[0],goal.0[1]],
+            f64::from(index)*std::f64::consts::TAU/32.0,support.surface_xyz).is_ok());
+        if !feasible { return Err("目标位置没有满足完整机体包络的进场方向".into()); }
+    }
+    if let Some(path) = connect(map, start, goal, boundary, rotate, reverse, omni, options.requires_orientation()) {
         return Ok(path);
+    }
+    // 起步盲区/近墙常使原地转向不可行。先尝试沿当前可执行方向
+    // 连续驶出一个机身长度，再连接目标，避免细角度搜索反复试同一转弯。
+    let probe_step = (model.radius()*0.5).max(f64::from(map.config().voxel_size)*2.0);
+    for sign in [1.0,-1.0] {
+        if sign<0.0 && !reverse {continue;}
+        for step in 1..=5 {
+            if cancelled() {return Err("三维规划已取消".into());}
+            let Some(prefix)=action(map,start,Twist2 {linear:Point2::new(sign,0.0),angular_z:0.0},
+                probe_step*f64::from(step),boundary) else {break;};
+            let from=*prefix.last().expect("前进基元");
+            if let Some(tail)=connect(map,from,goal,boundary,rotate,reverse,omni,options.requires_orientation()) {
+                let mut path=vec![start];path.extend(prefix);path.extend(tail.into_iter().skip(1));return Ok(path);
+            }
+        }
+    }
+    // 先利用已维护的支撑图生成引导线，再逐段核对真实机体及转向。
+    // 开阔地和普通绕行无需展开完整的32方向状态空间；引导线不通过
+    // 机体扫掠时仍进入下方完整搜索，不把点可达当作机体可达。
+    if let (Ok(a), Ok(b)) = (
+        map.locate_support_from_body(start.0, start.1, model.body_to_support_z_m),
+        map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m),
+    ) {
+        if let Ok(guide) = map.plan_in_boundary(a.support_xyz, b.support_xyz, boundary) {
+            let mut path = vec![start];
+            let mut valid = true;
+            for (index, support) in guide.iter().enumerate().skip(1) {
+                if cancelled() { return Err("三维规划已取消".into()); }
+                let last = *path.last().expect("起点");
+                let final_segment = index + 1 == guide.len();
+                let yaw = if final_segment && options.requires_orientation() { planar(goal).yaw }
+                    else { (support[1]-last.0[1]).atan2(support[0]-last.0[0]) };
+                let Ok(target) = map.body_pose_on_surface([support[0],support[1]],yaw,*support) else { valid=false;break; };
+                if let Some(segment) = connect(map,last,target,boundary,rotate,reverse,omni,
+                    final_segment && options.requires_orientation()) {
+                    path.extend(segment.into_iter().skip(1));
+                } else { valid=false;break; }
+            }
+            if valid && path.len()>1 { return Ok(path); }
+        }
     }
     let resolution = f64::from(map.config().voxel_size);
     let yaw_step = std::f64::consts::TAU / 32.0;
@@ -231,6 +296,15 @@ pub(crate) fn plan_cancellable(
             .hypot(p.0[1] - goal.0[1])
             .hypot(p.0[2] - goal.0[2])
     };
+    // 只看直线距离会反复扩展朝目标背面行走的状态；把必要转向纳入
+    // 同一米制代价。全向运动保留横移能力，不人为增加转向要求。
+    let estimate = |p:BodyPose| {
+        let d=distance(p);
+        let heading=(goal.0[1]-p.0[1]).atan2(goal.0[0]-p.0[0]);
+        let forward=angle(heading-planar(p).yaw).abs();
+        let turn=if omni {0.0} else if reverse {forward.min(angle(heading+std::f64::consts::PI-planar(p).yaw).abs())} else {forward};
+        d + 2.0*model.radius()*turn*(d/options.position_tolerance_m.max(0.1)).min(1.0)
+    };
     let mut nodes = vec![Node {
         pose: start,
         cost: 0.0,
@@ -238,7 +312,7 @@ pub(crate) fn plan_cancellable(
         samples: vec![],
     }];
     let mut best = HashMap::from([(key(start).ok_or("起点支撑缺失")?, (0.0, 0))]);
-    let mut queue = BinaryHeap::from([Queue(distance(start), 0)]);
+    let mut queue = BinaryHeap::from([Queue(estimate(start)*SEARCH_HEURISTIC_WEIGHT, 0)]);
     let mut expanded = 0;
     while let Some(Queue(_, index)) = queue.pop() {
         if cancelled() { return Err("三维规划已取消".into()); }
@@ -254,13 +328,13 @@ pub(crate) fn plan_cancellable(
         if expanded > budget || nodes.len() > budget * 4 {
             return Err("三维朝向搜索预算耗尽".into());
         }
-        let close = distance(here) <= options.position_tolerance_m.min(resolution).max(1e-6)
-            && angle(planar(here).yaw - planar(goal).yaw).abs()
-                <= options.yaw_tolerance_rad.min(yaw_step).max(1e-6);
+        let close = distance(here) <= options.position_tolerance_m.max(1e-6)
+            && (!options.requires_orientation() || angle(planar(here).yaw - planar(goal).yaw).abs()
+                <= options.yaw_tolerance_rad.min(yaw_step).max(1e-6));
         let tail = if close {
             Some(vec![here])
-        } else if distance(here) < length * 3.0 || expanded % 64 == 0 {
-            connect(map, here, goal, boundary, rotate, reverse, omni)
+        } else if distance(here) < length * 3.0 || expanded % 8 == 0 {
+            connect(map, here, goal, boundary, rotate, reverse, omni, options.requires_orientation())
         } else {
             None
         };
@@ -277,6 +351,7 @@ pub(crate) fn plan_cancellable(
                 path.extend_from_slice(&nodes[i].samples);
             }
             path.extend(tail.into_iter().skip(1));
+            #[cfg(test)] eprintln!("完整机体搜索：展开{expanded}个状态，生成{}个节点",nodes.len());
             return Ok(path);
         }
         let mut actions = vec![];
@@ -322,7 +397,7 @@ pub(crate) fn plan_cancellable(
         }
         if distance(here) < radius + length * 3.0 {
             let delta = angle(planar(goal).yaw - planar(here).yaw).clamp(-yaw_step, yaw_step);
-            if delta.abs() > 1e-4 {
+            if options.requires_orientation() && delta.abs() > 1e-4 {
                 actions.push((
                     Twist2 {
                         linear: Point2::new(1.0, 0.0),
@@ -354,7 +429,7 @@ pub(crate) fn plan_cancellable(
             }
             let next = cost
                 + velocity.linear.x.hypot(velocity.linear.y) * duration
-                + model.radius() * velocity.angular_z.abs() * duration * 0.2
+                + model.radius() * velocity.angular_z.abs() * duration
                 + 0.001;
             if best.get(&k).is_some_and(|&(old, _)| old <= next) {
                 continue;
@@ -367,7 +442,7 @@ pub(crate) fn plan_cancellable(
                 samples,
             });
             best.insert(k, (next, id));
-            queue.push(Queue(next + distance(end), id));
+            queue.push(Queue(next + estimate(end) * SEARCH_HEURISTIC_WEIGHT, id));
         }
     }
     Err("不存在满足完整机体与运动约束的三维路线".into())
@@ -462,6 +537,56 @@ mod tests {
             can_rotate_in_place: true,
         }
     }
+    #[test]
+    fn inserted_obstacle_replans_around_it_and_continues_to_original_position() {
+        let clear=Arc::new(scene(false));let blocked=Arc::new(scene(true));
+        let mut current=pose(-1.55,0.05,0.0);let goal=pose(1.55,0.05,2.0);
+        let options=GoalOptions {position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        let motion=limits();let mut config=SurfaceFollowerConfig::new(0.4);
+        config.motion_limits=Some(motion.clone());config.controller.control_frequency=20.0;
+        let mut follower=SurfaceFollower::new(config).unwrap();
+        let mut now=1_000_000_000;let mut map=clear;
+        follower.configure_goal(&stamped(goal,now),options).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
+        follower.update_odometry(stamped(current,now));
+        let initial=plan(&map,current,goal,options,Some(&motion),&[],8000).unwrap();
+        assert!(initial.iter().all(|p|(p.0[1]-0.05).abs()<0.01));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:initial.iter().map(|p|stamped(*p,now)).collect()}),None,stamped(goal,now)).unwrap();
+        let mut inserted=false;let mut reached=false;let mut maximum_lateral=0.0_f64;let mut replans=0;
+        for _ in 0..2500 {
+            if !inserted && current.0[0]>-1.2 {
+                inserted=true;map=blocked.clone();
+                follower.update_execution_map(ExecutionMap::Surface(map.clone())).unwrap();
+                let started=std::time::Instant::now();
+                let detour=plan(&map,current,goal,options,Some(&motion),&[],8000).unwrap();
+                eprintln!("动态障碍：重新规划耗时 {:?}，路径{}点",started.elapsed(),detour.len());
+                assert!(detour.iter().any(|p|p.0[1].abs()>0.3));
+                follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:detour.into_iter().map(|p|stamped(p,now)).collect()}),None,stamped(goal,now)).unwrap();
+            }
+            match follower.step(0.24) {
+                PlannerStep::Command(command)=>{
+                    let next=integrate(planar(current),command,0.05);
+                    let to=pose(next.x,next.y,next.yaw);
+                    map.validate_body_motion(current,to,&[]).expect("动态障碍闭环不能穿过障碍");
+                    current=to;maximum_lateral=maximum_lateral.max(current.0[1].abs());
+                }
+                PlannerStep::Succeeded=>{reached=true;break;}
+                PlannerStep::ReplanRequired(reason)=>{
+                    replans+=1;assert!(replans<=8,"局部重规划不能无限循环: {reason}, pose={current:?}");
+                    // 按生产拥有方顺序：停止旧意图，经过已标定制动窗口，再从
+                    // 实际位置提交新路径；测试的运动学模型在零速后保持位置。
+                    follower.stop();std::thread::sleep(std::time::Duration::from_secs_f64(motion.maximum_stopping_time_sec()));
+                    let detour=plan(&map,current,goal,options,Some(&motion),&[],8000).unwrap();
+                    follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:detour.into_iter().map(|p|stamped(p,now)).collect()}),None,stamped(goal,now)).unwrap();
+                }
+                other=>panic!("动态障碍后执行中断: {other:?}, pose={current:?}"),
+            }
+            now+=50_000_000;follower.update_odometry(stamped(current,now));
+        }
+        assert!(inserted && reached && maximum_lateral>0.3,"必须绕行并到达原目标位置");
+        eprintln!("动态障碍到达：局部接续{replans}次，最大侧移{maximum_lateral}米");
+    }
+
     #[test]
     fn complete_body_search_detours_and_preserves_rotation() {
         let map = scene(true);
@@ -560,6 +685,23 @@ mod tests {
             yaw_tolerance_rad: 0.08 };
         plan(&view, start, start, options, Some(&limits()), &[], 2000)
             .expect("当前占据区内的目标不能重新用未处理自体的原图拒绝");
+    }
+
+    #[test]
+    fn position_only_goal_does_not_append_a_default_final_rotation() {
+        let map=scene(false);
+        let start=([-0.55,0.05,0.5],[0.0,0.0,0.0,1.0]);
+        let goal=([0.55,0.05,0.5],[0.0,0.0,1.0,0.0]);
+        let options=GoalOptions {yaw_tolerance_rad:std::f64::consts::PI,..Default::default()};
+        let path=plan(&map,start,goal,options,Some(&limits()),&[],2000).unwrap();
+        assert!(planar(*path.last().unwrap()).yaw.abs()<0.01);
+        let mut follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.4)).unwrap();
+        follower.configure_goal(&stamped(goal,1),options).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(Arc::new(map))).unwrap();
+        follower.update_odometry(stamped(start,1));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:path.iter().map(|p|stamped(*p,1)).collect()}),None,stamped(goal,1)).unwrap();
+        follower.update_odometry(stamped((goal.0,start.1),2));
+        assert_eq!(follower.step(0.3),PlannerStep::Succeeded);
     }
 
     #[test]

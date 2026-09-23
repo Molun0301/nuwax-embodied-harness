@@ -3275,7 +3275,7 @@ class GatewayRuntime:
                         "x": {"type": "number"},
                         "y": {"type": "number"},
                         "z": {"type": "number", "default": 0.0, "description": "地图坐标中的目标机体高度（米）；三维导航须填写实际高度。"},
-                        "yaw_rad": {"type": "number", "default": 0.0},
+                        "yaw_rad": {"type": "number", "description": "可选最终朝向（弧度）；省略时仅要求到达位置。"},
                         "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.3},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
                         "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.1},
@@ -6715,15 +6715,21 @@ class GatewayRuntime:
 
         def prepare_navigation():
             nonlocal map_name, workspace, current_localization_session_id
+            started = time.monotonic()
             map_name, workspace = self._resolve_map_workspace_for_request(
                 {**arguments, **({"map_name": map_name} if map_name else {})},
                 capability_name="navigate_to_pose", requested_by=requested_by, create_if_missing=False,
             )
+            RUNTIME_LOGGER.info("导航工作区已准备 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
+            started = time.monotonic()
             self._refresh_workspace_snapshots()
+            RUNTIME_LOGGER.info("导航工作区状态已同步 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
+            started = time.monotonic()
             self._ensure_localization_for_navigation(
                 capability_name="navigate_to_pose", map_name=map_name, workspace=workspace,
                 requested_by=requested_by, arguments=arguments,
             )
+            RUNTIME_LOGGER.info("导航定位检查已完成 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
             current_localization_session_id = (
                 workspace.active_localization_session.session_id
                 if workspace is not None and workspace.active_localization_session is not None else None
@@ -6746,6 +6752,7 @@ class GatewayRuntime:
             target_pose=pose,
             tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
             tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
+            require_goal_orientation="yaw_rad" in arguments,
             metadata=goal_metadata,
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
@@ -11978,8 +11985,10 @@ class GatewayRuntime:
                 context.ensure_active()
                 context.update(progress=0.01, stage="prepare_navigation", message="导航请求已受理，正在准备运行时。")
                 self._run_with_motion_admission(pending, lambda: None)
+                activation_started=time.monotonic()
                 motion_admission = self._admit_motion_request(capability_name,
                     request_id=pending.request_id, deadline_monotonic=parent_deadline)
+                RUNTIME_LOGGER.info("导航组件准入已完成 goal_id=%s duration_ms=%.3f", goal.goal_id, (time.monotonic()-activation_started)*1000)
                 self._run_with_motion_admission(pending, lambda: None)
                 context.ensure_active()
                 if prepare_callback is not None:

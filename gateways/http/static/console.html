@@ -400,7 +400,7 @@
   <script src="/static/js/console-logs.js?v=20260908-pose-log-stream"></script>
   <script src="/static/js/console-settings.js?v=20260920-settings-style"></script>
   <script src="/static/js/map-workspace.js?v=20260922-map-workspace"></script>
-  <script src="/static/js/console.js?v=20260922-map-workspace"></script>
+  <script src="/static/js/console.js?v=20260923-navigation-path"></script>
   <script src="/static/js/semantic-map.js?v=20260922-map-workspace"></script>
   <script src="/static/js/scene-graph.js?v=20260922-map-workspace"></script>
   <script>
@@ -423,11 +423,11 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20260922-scene-graph");
+      await import("/static/js/pointcloud3d.js?v=20260923-navigation-path");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->
-  <script src="/static/js/navigation.js?v=20260920-shared-capabilities"></script>
+  <script src="/static/js/navigation.js?v=20260923-position-only"></script>
   <script src="/static/js/building-navigation.js?v=20260914-explore-layout"></script>
   <script src="/static/js/exploration-mission.js?v=20260915-navigation-snapshot"></script>
   <script src="/static/js/boundary_draw.js?v=20260920-settings-style"></script>

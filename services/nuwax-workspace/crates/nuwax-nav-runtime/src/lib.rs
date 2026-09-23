@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
@@ -797,6 +798,8 @@ pub trait NavPlanner: Send + 'static {
     fn invalidate_execution_map(&mut self) {
         self.stop();
     }
+    /// 接收唯一运动端已确认的指令；后台计算不能把未执行候选当作当前速度。
+    fn observe_applied_command(&mut self, _command: Twist2) {}
     /// Produce one controller step.
     fn step(&mut self, robot_width_m: f64) -> PlannerStep;
     /// Clear planner state after a terminal fence.
@@ -1006,6 +1009,7 @@ where
                     .await;
             }
 
+            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling);
             tokio::select! {
                 biased;
 
@@ -1048,17 +1052,19 @@ where
                     }
                 }
 
-                command = input_rx.recv(), if input_open => {
-                    match command {
-                        Some(command) => self.handle_input(&status_tx, command).await,
-                        None => input_open = false,
+                event = async {
+                    // 普通输入与控制公平轮换；取消和续租仍由外层优先选择。
+                    tokio::select! {
+                        command=input_rx.recv(), if input_open=>SchedulerEvent::Input(command),
+                        _=tick.tick(), if controlling=>SchedulerEvent::Tick,
+                        else=>std::future::pending().await,
                     }
-                }
-
-                _ = tick.tick(), if matches!(
-                    self.status.phase,
-                    SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
-                ) => {
+                } => match event {
+                    SchedulerEvent::Input(command)=>match command {
+                        Some(command)=>self.handle_input(&status_tx,command).await,
+                        None=>input_open=false,
+                    },
+                    SchedulerEvent::Tick=>{
                     match await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
@@ -1079,6 +1085,7 @@ where
                                 SchedulerPhase::Idle,
                             ).await;
                         }
+                    }
                     }
                 }
             }
@@ -1152,6 +1159,13 @@ where
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
+            InputKind::PlanningDiagnostic(goal_id, hash, message) => {
+                if self.status.phase == SchedulerPhase::AwaitingPath && self.session.as_ref().is_some_and(|session|
+                    session.session_id == goal_id && session.execution_identity.goal_payload_sha256 == hash) {
+                    self.status.message = message; self.publish_status(status_tx);
+                }
+                Ok(())
+            }
         };
         let _ = command.reply.send(result);
     }
@@ -1186,7 +1200,7 @@ where
         });
         self.pose_valid_until = valid_until;
         self.refresh_input_status(Instant::now());
-        if self.status.last_terminal.is_none() {
+        if self.status.last_terminal.is_none() && self.session.is_none() {
             self.status.message = "fresh map pose consumed".into();
         }
         self.publish_status(status_tx);
@@ -1224,7 +1238,7 @@ where
             received_at,
         });
         self.refresh_input_status(Instant::now());
-        if self.status.last_terminal.is_none() {
+        if self.status.last_terminal.is_none() && self.session.is_none() {
             self.status.message = "fresh occupancy costmap consumed".into();
         }
         self.publish_status(status_tx);
@@ -1566,6 +1580,7 @@ where
         }
         self.status.applied_commands = self.status.applied_commands.saturating_add(1);
         self.status.last_applied_twist = Some(twist);
+        self.planner.observe_applied_command(twist);
         self.status.message = "twist APPLIED".into();
         self.publish_status(status_tx);
         Ok(())
@@ -1934,6 +1949,11 @@ impl NavSchedulerHandle {
         result.await.map_err(|_| RuntimeError::SchedulerStopped)?
     }
 
+    /// 规划诊断按目标摘要关联，仅更新等待路径阶段，不能覆盖执行或终态。
+    pub async fn report_planning_diagnostic(&self,goal_id:String,hash:[u8;32],message:String)->Result<(),RuntimeError> {
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,hash,message)).await
+    }
+
     /// Read the latest scheduler status.
     #[must_use]
     pub fn status(&self) -> SchedulerStatus {
@@ -2015,12 +2035,15 @@ pub async fn spawn_production_surface_scheduler(
     surface_config: SurfaceFollowerConfig,
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     validate_config(config)?;
-    let backend = SurfaceFollower::new(surface_config)?;
+    let reverse_supported=surface_config.motion_limits.as_ref().is_some_and(|limits|limits.max_reverse_mps>0.0);
+    let backend = planner_worker::PlannerWorker::new(SurfaceFollower::new(surface_config)?)?.with_reverse_support(reverse_supported);
     let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.message))?;
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
 }
+
+enum SchedulerEvent { Input(Option<InputCommand>), Tick }
 
 struct InputCommand {
     kind: InputKind,
@@ -2032,6 +2055,7 @@ enum InputKind {
     SubmitPath(VersionedPath),
     UpdateOdometry(PoseStamped, Option<Instant>),
     UpdateCostmap(CostmapObservation, Instant),
+    PlanningDiagnostic(String, [u8;32], String),
 }
 
 enum UrgentCommand {
@@ -2752,6 +2776,56 @@ mod tests {
         )
         .expect("test scheduler");
         spawn_scheduler(scheduler)
+    }
+
+    #[tokio::test]
+    async fn planning_reason_survives_pose_updates_and_rejects_old_goal_reports() {
+        let motion=FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
+        let (handle,task)=spawn_scheduler(NavScheduler::new(motion,FakePlanner::commanding(),SchedulerConfig::default()).unwrap());
+        handle.update_odometry(map_pose()).await.unwrap();handle.update_costmap(costmap_at(1)).await.unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),[4;32],"等待路径：起点支撑不足".into()).await.unwrap();
+        handle.update_odometry(map_pose_at(2)).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),[9;32],"旧目标的错误".into()).await.unwrap();
+        assert_eq!(handle.status().message,"等待路径：起点支撑不足");
+        handle.cancel("goal-1").await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),[4;32],"晚到报告".into()).await.unwrap();
+        assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
+        handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_geometry_keeps_renewing_and_cancellation_does_not_wait_for_compute() {
+        struct Slow {entered:Arc<std::sync::atomic::AtomicBool>}
+        impl NavPlanner for Slow {
+            fn replace_path(&mut self,_:Path2D) {}
+            fn update_odometry(&mut self,_:PoseStamped) {}
+            fn update_costmap(&mut self,_:CostMap2D) {}
+            fn step(&mut self,_:f64)->PlannerStep {
+                self.entered.store(true,Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(700));
+                PlannerStep::Command(Twist2 {linear:Point2::new(0.2,0.0),angular_z:0.0})
+            }
+            fn stop(&mut self) {}
+        }
+        let entered=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let motion=FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
+        let calls=motion.0.clone();
+        let worker=planner_worker::PlannerWorker::new(Slow {entered:entered.clone()}).unwrap();
+        let (handle,task)=spawn_scheduler(NavScheduler::new(motion,worker,SchedulerConfig::default()).unwrap());
+        handle.update_odometry(map_pose()).await.unwrap();
+        handle.update_costmap(costmap_at(1)).await.unwrap();
+        handle.start_session(session()).await.unwrap();handle.submit_path(path()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while !entered.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(520)).await;
+        assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("renew:")).count()>=2);
+        tokio::time::timeout(Duration::from_millis(100),handle.cancel("goal-1")).await
+            .expect("取消不能等待700毫秒局部计算").unwrap();
+        assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
+        assert_ne!(handle.status().last_applied_twist.map(|t|t.linear.x),Some(0.2));
+        handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
@@ -3614,7 +3688,7 @@ mod tests {
         local_config.controller.goal_tolerance = 0.12;
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-            SurfaceFollower::new(local_config).unwrap(),
+            planner_worker::PlannerWorker::new(SurfaceFollower::new(local_config).unwrap()).unwrap(),
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 pose_ttl: Duration::from_secs(1),
@@ -3647,7 +3721,7 @@ mod tests {
         first_path.path = ExecutionPath::Surface(surface_path.clone());
         handle.submit_path(first_path).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.status().applied_commands == 0 {
+            while !handle.status().last_applied_twist.is_some_and(|command|command.linear.x>0.0) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
@@ -3676,7 +3750,7 @@ mod tests {
         replacement.path = ExecutionPath::Surface(surface_path);
         handle.submit_path(replacement).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.status().applied_commands <= stopped_count {
+            while handle.status().applied_commands <= stopped_count || !handle.status().last_applied_twist.is_some_and(|command|command.linear.x>0.0) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })

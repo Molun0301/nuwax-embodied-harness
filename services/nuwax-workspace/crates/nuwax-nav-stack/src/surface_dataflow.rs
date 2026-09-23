@@ -25,6 +25,7 @@ pub(super) struct PreparedSurfaceMap {
 struct SurfaceMapHub {
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
+    planning: tokio::sync::watch::Sender<Option<(String,[u8;32],String)>>,
 }
 
 impl SurfaceMapHub {
@@ -32,6 +33,7 @@ impl SurfaceMapHub {
         Self {
             latest: Arc::new(Mutex::new(None)),
             events: tokio::sync::broadcast::channel(32).0,
+            planning: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -180,8 +182,19 @@ where
         .await
         .map_err(|error| module_error("surface scheduler connect", error))?;
     let status = scheduler.subscribe_status();
+    let mut planning=hub.planning.subscribe();
+    let diagnostic_loop=async {
+        loop {
+            planning.changed().await.map_err(|error|module_error("planning diagnostics",error))?;
+            let update=planning.borrow_and_update().clone();
+            if let Some((id,hash,message))=update {
+                scheduler.report_planning_diagnostic(id,hash,message).await.map_err(|error|module_error("planning diagnostics",error))?;
+            }
+        }
+        #[allow(unreachable_code)] Ok::<(),NavStackError>(())
+    };
     signal_ready(ready)?;
-    let loop_future = run_guarded_nav_loop(
+    let execution_loop = run_guarded_nav_loop(
         &node,
         &transport,
         &scheduler,
@@ -195,6 +208,10 @@ where
         None,
         false,
     );
+    let loop_future=async {tokio::select! {
+        result=execution_loop=>result,
+        result=diagnostic_loop=>result,
+    }};
     let task_future = async move {
         task.await
             .map_err(|error| module_error("surface scheduler join", error))?
@@ -546,7 +563,7 @@ async fn run_surface_planner_with_computer(
     let mut needs_plan = false;
     let mut execution_admitted = false;
     let mut diagnostics = InputDiagnosticLimiter::default();
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     signal_ready(ready)?;
     let terminal: NavStackResult<()> = async {
@@ -571,7 +588,6 @@ async fn run_surface_planner_with_computer(
             }
         }
         tokio::select! {
-            biased;
             _ = &mut shutdown => break,
             frame = cancels.next() => {
                 let frame = required_frame(frame, "surface planner cancellation")?;
@@ -630,7 +646,11 @@ async fn run_surface_planner_with_computer(
                         last_path = Some(path); path_surface = Some(Arc::downgrade(&surface)); needs_plan = false;
                     }
                     Ok(None) => { path_surface = Some(Arc::downgrade(&surface)); }
-                    Err(error) => { diagnostics.reject("surface planning", &error.to_string()); last_path = None; }
+                    Err(error) => {
+                        diagnostics.reject("surface planning", &error.to_string()); last_path = None;
+                        hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.payload_sha256,
+                            format!("等待可通行路径：{error}"))));
+                    }
                 }
             }
             frame = maps.next() => {
@@ -679,6 +699,7 @@ async fn run_surface_planner_with_computer(
                     Err(error) => { diagnostics.reject("surface goal", &error.to_string()); continue; }
                 };
                 if retired_goals.contains(&incoming.payload_sha256) { continue; }
+                if goal.as_ref().is_some_and(|active|active == &incoming) { continue; }
                 if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
                 newest_goal = Some(incoming.clone()); goal = Some(incoming);
@@ -709,11 +730,16 @@ async fn run_surface_planner_with_computer(
                 config.planning_cancelled = Some(Arc::clone(&cancelled));
                 path_cancellation = Some((epoch, planned_goal.payload_sha256, cancelled));
                 let computer = Arc::clone(&computer);
+                hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.payload_sha256,
+                    "正在计算三维路径".into())));
                 // 搜索及整条路径复核都可能超过地图续收周期，不能占据接收循环。
+                let queued=Instant::now();
                 path_computations.spawn_blocking(move || {
+                    let started = Instant::now();
                     let result = if previous_path.as_ref().is_some_and(|path| body_path_remains_traversable(&surface,path,&pose,&config)) {
                         Ok(None)
                     } else { computer(&surface,&pose,&planned_goal,&config).map(Some) };
+                    tracing::info!(goal_id=%planned_goal.session_id, queue_ms=started.duration_since(queued).as_secs_f64()*1000.0, elapsed_ms=started.elapsed().as_secs_f64()*1000.0, points=result.as_ref().ok().and_then(|p|p.as_ref()).map(|p|p.poses.len()), error=?result.as_ref().err(), "三维路径计算完成");
                     (epoch, planned_goal, surface, result)
                 });
             }
@@ -766,7 +792,8 @@ mod tests {
         let server = broker.serve(transport, method).await.unwrap();
         let bytes = std::fs::read(directory.join("navigation-map.lcm")).unwrap();
         let message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("pose.json")).unwrap()).unwrap();
+        let pose_file = std::env::var("NUWAX_NAV_DIAGNOSTIC_POSE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_|directory.join("pose.json"));
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(pose_file).unwrap()).unwrap();
         let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
         let quaternion: [f64; 4] = serde_json::from_value(value["quaternion"].clone()).unwrap();
         let mut config = SurfaceNavigationConfig::from_env().unwrap();
@@ -812,6 +839,15 @@ mod tests {
             let mut goal = goal_for(&message, (index+2) as i64,
                 [position[0]+radius*angle.cos(), position[1]+radius*angle.sin(), position[2]]);
             goal.goal.pose.orientation_xyzw = quaternion;
+            if let Ok(target) = std::env::var("NUWAX_NAV_DIAGNOSTIC_TARGET") {
+                goal.goal.pose.position=serde_json::from_str(&target).unwrap();
+            }
+            if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_POSITION_ONLY").is_some() {
+                goal.options.yaw_tolerance_rad=std::f64::consts::PI;
+            }
+            if let Ok(tolerance)=std::env::var("NUWAX_NAV_DIAGNOSTIC_POSITION_TOLERANCE") {
+                goal.options.position_tolerance_m=tolerance.parse().unwrap();
+            }
             let before = Instant::now();
             let result = body_path(&map, &pose, &goal, &config);
             successful += usize::from(result.is_ok());
@@ -1335,6 +1371,10 @@ mod tests {
         }
 
         async fn start_with_computer(computer: SurfacePathComputer) -> Self {
+            Self::start_with_rate(computer,Duration::from_millis(25)).await
+        }
+
+        async fn start_with_rate(computer:SurfacePathComputer,feed_period:Duration)->Self {
             use crate::topics::{NavTopicConfig, TopicName};
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -1438,7 +1478,7 @@ mod tests {
             let feed_node = planner_node.clone();
             let control = scheduler.clone();
             let feeder = tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_millis(25));
+                let mut ticker = tokio::time::interval(feed_period);
                 let mut count = 0;
                 loop {
                     ticker.tick().await;
@@ -1661,6 +1701,19 @@ mod tests {
                 let _ = owner.shutdown();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn continuous_inputs_do_not_starve_path_generation() {
+        let mut harness=Harness::start_with_rate(Arc::new(body_path),Duration::from_micros(100)).await;
+        harness.wait_ready().await;
+        let goal=goal_for(&harness.feed.lock().unwrap().map,1,[1.55,1.55,2.5]);
+        let started=Instant::now();harness.goal(&goal).await;
+        tokio::time::timeout(Duration::from_millis(500),harness.path_for(&goal)).await
+            .expect("连续输入不能阻止路径生成");
+        eprintln!("持续输入到路径交付 {:?}",started.elapsed());
+        harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
+        harness.shutdown().await;
     }
 
     #[tokio::test]

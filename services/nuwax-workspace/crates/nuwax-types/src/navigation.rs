@@ -16,6 +16,9 @@ impl Default for GoalOptions {
     fn default()->Self {Self {allow_reverse:false,position_tolerance_m:0.2,yaw_tolerance_rad:0.35}}
 }
 impl GoalOptions {
+    /// 容差覆盖整个圆周时，不约束最终朝向；仍保留沿途机体方向。
+    pub fn requires_orientation(&self) -> bool { self.yaw_tolerance_rad < std::f64::consts::PI }
+
     /// 校验数值；零容差仅保留数值精度边界，不替换为默认容差。
     pub fn validate(&self)->Result<(),String> {
         if !self.position_tolerance_m.is_finite() || self.position_tolerance_m < 0.0

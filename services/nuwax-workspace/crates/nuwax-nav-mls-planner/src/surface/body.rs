@@ -178,99 +178,63 @@ fn hull(mut points: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     lower.extend(upper);
     lower
 }
-fn polygon_intersects_cell(polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
-    let square = [
-        [x as f64 * size, y as f64 * size],
-        [(x + 1) as f64 * size, y as f64 * size],
-        [(x + 1) as f64 * size, (y + 1) as f64 * size],
-        [x as f64 * size, (y + 1) as f64 * size],
-    ];
-    let axes = polygon
-        .iter()
-        .zip(polygon.iter().cycle().skip(1))
-        .map(|(a, b)| [b[1] - a[1], a[0] - b[0]])
-        .chain([[1.0, 0.0], [0.0, 1.0]]);
-    for axis in axes {
-        let project = |p: &[f64; 2]| p[0] * axis[0] + p[1] * axis[1];
-        let (a, b) = polygon
-            .iter()
-            .map(project)
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
-                (a.min(v), b.max(v))
-            });
-        let (c, d) = square
-            .iter()
-            .map(project)
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
-                (a.min(v), b.max(v))
-            });
-        if b < c - 1e-10 || d < a - 1e-10 {
-            return false;
-        }
+/// 每个位姿只投影一次凸包；同一足迹下的粗细格共用精确分离轴区间。
+struct PolygonQuery(Vec<([f64;2],f64,f64)>);
+impl PolygonQuery {
+    fn new(polygon:&[[f64;2]])->Self {
+        Self(polygon.iter().zip(polygon.iter().cycle().skip(1))
+            .map(|(a,b)|[b[1]-a[1],a[0]-b[0]]).chain([[1.0,0.0],[0.0,1.0]])
+            .map(|axis| {
+                let (low,high)=polygon.iter().map(|p|p[0]*axis[0]+p[1]*axis[1])
+                    .fold((f64::INFINITY,f64::NEG_INFINITY),|(a,b),v|(a.min(v),b.max(v)));
+                (axis,low,high)
+            }).collect())
     }
-    true
-}
-fn prism_intersects_voxel(
-    model: &SurfaceBodyEnvelope,
-    r: [[f64; 3]; 3],
-    origin: [f64; 3],
-    min: [f64; 3],
-    max: [f64; 3],
-) -> bool {
-    let body: Vec<_> = model
-        .footprint_xy_m
-        .iter()
-        .flat_map(|p| model.z_bounds_m.map(|z| [p[0], p[1], z]))
-        .collect();
-    let voxel: Vec<_> = [min[0], max[0]]
-        .into_iter()
-        .flat_map(|x| {
-            [min[1], max[1]].into_iter().flat_map(move |y| {
-                [min[2], max[2]].into_iter().map(move |z| {
-                    let p = [x - origin[0], y - origin[1], z - origin[2]];
-                    [dot(r[0], p), dot(r[1], p), dot(r[2], p)]
-                })
-            })
+    fn intersects(&self,x:i32,y:i32,size:f64)->bool {
+        let centre=[(f64::from(x)+0.5)*size,(f64::from(y)+0.5)*size];
+        self.0.iter().all(|&(axis,low,high)| {
+            let c=centre[0]*axis[0]+centre[1]*axis[1];
+            let radius=(axis[0].abs()+axis[1].abs())*size*0.5;
+            high>=c-radius-1e-10 && c+radius>=low-1e-10
         })
-        .collect();
-    let voxel_axes: [[f64; 3]; 3] = std::array::from_fn(|i| [r[0][i], r[1][i], r[2][i]]);
-    let mut axes = vec![[0.0, 0.0, 1.0]];
-    axes.extend(voxel_axes);
-    for (a, b) in model
-        .footprint_xy_m
-        .iter()
-        .zip(model.footprint_xy_m.iter().cycle().skip(1))
-    {
-        let edge = [b[0] - a[0], b[1] - a[1], 0.0];
-        axes.push([edge[1], -edge[0], 0.0]);
-        for axis in voxel_axes {
-            axes.push(cross(edge, axis));
-        }
     }
-    for axis in voxel_axes {
-        axes.push(cross([0.0, 0.0, 1.0], axis));
-    }
-    for axis in axes {
-        if dot(axis, axis) < 1e-18 {
-            continue;
+}
+fn polygon_intersects_cell(polygon:&[[f64;2]],x:i32,y:i32,size:f64)->bool {
+    PolygonQuery::new(polygon).intersects(x,y,size)
+}
+
+/// 凸柱与轴对齐体素的精确分离轴检查。机体区间预计算，体素用中心和半宽投影。
+struct PrismQuery {origin:[f64;3], axes:Vec<([f64;3],f64,f64)>}
+impl PrismQuery {
+    fn new(model:&SurfaceBodyEnvelope,r:[[f64;3];3],origin:[f64;3])->Self {
+        let body:Vec<_>=model.footprint_xy_m.iter()
+            .flat_map(|p|model.z_bounds_m.map(|z|[p[0],p[1],z])).collect();
+        let voxel_axes:[[f64;3];3]=std::array::from_fn(|i|[r[0][i],r[1][i],r[2][i]]);
+        let mut axes=vec![[0.0,0.0,1.0]];axes.extend(voxel_axes);
+        for (a,b) in model.footprint_xy_m.iter().zip(model.footprint_xy_m.iter().cycle().skip(1)) {
+            let edge=[b[0]-a[0],b[1]-a[1],0.0];axes.push([edge[1],-edge[0],0.0]);
+            for axis in voxel_axes {axes.push(cross(edge,axis));}
         }
-        let (a, b) = body
-            .iter()
-            .map(|p| dot(axis, *p))
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
-                (a.min(v), b.max(v))
-            });
-        let (c, d) = voxel
-            .iter()
-            .map(|p| dot(axis, *p))
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
-                (a.min(v), b.max(v))
-            });
-        if b < c - 1e-10 || d < a - 1e-10 {
-            return false;
-        }
+        for axis in voxel_axes {axes.push(cross([0.0,0.0,1.0],axis));}
+        let axes=axes.into_iter().filter(|a|dot(*a,*a)>=1e-18).map(|axis| {
+            let (low,high)=body.iter().map(|p|dot(axis,*p))
+                .fold((f64::INFINITY,f64::NEG_INFINITY),|(a,b),v|(a.min(v),b.max(v)));
+            let world=std::array::from_fn(|i|axis[0]*r[0][i]+axis[1]*r[1][i]+axis[2]*r[2][i]);
+            (world,low,high)
+        }).collect();
+        Self {origin,axes}
     }
-    true
+    fn intersects(&self,min:[f64;3],max:[f64;3])->bool {
+        let centre=std::array::from_fn(|i|(min[i]+max[i])*0.5-self.origin[i]);
+        let half:[f64;3]=std::array::from_fn(|i|(max[i]-min[i])*0.5);
+        self.axes.iter().all(|&(axis,low,high)| {
+            let c=dot(axis,centre);let radius=dot(axis.map(f64::abs),half);
+            high>=c-radius-1e-10 && c+radius>=low-1e-10
+        })
+    }
+}
+fn prism_intersects_voxel(model:&SurfaceBodyEnvelope,r:[[f64;3];3],origin:[f64;3],min:[f64;3],max:[f64;3])->bool {
+    PrismQuery::new(model,r,origin).intersects(min,max)
 }
 
 /// 重算选定单元的能力代价；从本次物理墙距重建基础值，允许显式换模型重新开放方向。
@@ -346,6 +310,7 @@ impl SurfaceSnapshot {
             return Err(SurfaceError::InvalidPose);
         }
         let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let polygon_query=PolygonQuery::new(&polygon);
         let low: [i32; 2] = std::array::from_fn(|i| {
             (polygon.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min) / size).floor() as i32
         });
@@ -405,7 +370,7 @@ impl SurfaceSnapshot {
                 if supports {
                     evidence.push([(f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size]);
                 }
-                if !polygon_intersects_cell(&polygon, x, y, size) {
+                if !polygon_query.intersects(x,y,size) {
                     continue;
                 }
                 let iz = ((z - quantum * 0.5) / size).floor() as i32;
@@ -528,6 +493,7 @@ impl SurfaceSnapshot {
             });
         }
         let mut view=self.with_current_body_columns(&updates)?;
+        view.body_pose_cache = Default::default();
         view.current_body_support = Some(Arc::new(CurrentBodySupport {
             source: self.clone(), body, quaternion, polygon, cells: inferred, cleared_voxels,
         }));
@@ -597,6 +563,7 @@ impl SurfaceSnapshot {
         Ok(Self {
             observations: self.observations.clone(),
             current_body_support: None,
+            body_pose_cache: Default::default(),
             data: Arc::new(SurfaceData {
                 graph: Arc::new(graph),
                 regions,
@@ -630,13 +597,16 @@ impl SurfaceSnapshot {
         let polygon:Vec<_>=model.footprint_xy_m.iter().map(|p| {
             let v=world(r,body,[p[0],p[1],0.0]);[v[0],v[1]]
         }).collect();
-        let patch=self.ground_patch(candidate,model.radius()+distance+size*2.0);
+        let polygon_query=PolygonQuery::new(&polygon);
+        let radius=((polygon.iter().map(|p|(p[0]-candidate.surface_xyz[0]).hypot(p[1]-candidate.surface_xyz[1]))
+            .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
+        let patch=self.ground_patch(candidate,radius);
         let lower:[i32;2]=std::array::from_fn(|i|(polygon.iter().map(|p|p[i]).fold(f64::INFINITY,f64::min)/size).floor() as i32);
         let upper:[i32;2]=std::array::from_fn(|i|(polygon.iter().map(|p|p[i]).fold(f64::NEG_INFINITY,f64::max)/size).floor() as i32);
         if (i64::from(upper[0])-i64::from(lower[0])+1)*(i64::from(upper[1])-i64::from(lower[1])+1)>16_384 {return Err(SurfaceError::MissingSupport);}
         let mut contact=std::collections::BTreeSet::new();let mut min=f64::INFINITY;let mut max=f64::NEG_INFINITY;
         for x in lower[0]..=upper[0] {for y in lower[1]..=upper[1] {
-            if !polygon_intersects_cell(&polygon,x,y,size) {continue;}
+            if !polygon_query.intersects(x,y,size) {continue;}
             let cell=*patch.get(&(x,y)).ok_or_else(|| {
                 tracing::debug!(?body, x, y, centre=?candidate.cell, "机体足迹缺少连通支撑");
                 SurfaceError::MissingSupport
@@ -649,7 +619,10 @@ impl SurfaceSnapshot {
         }}
         let graph = &self.data.physical_graph;
         let contact_neighbors = |cell: VoxelKey| self.contact_neighbors(cell);
-        let legal_step=contact.iter().any(|&cell|contact_neighbors(cell).into_iter().any(|next|
+        let observed_contact = reference[2] >= self.observed_support_lower_bound(candidate.cell)-quantum
+            && reference[2] <= candidate.surface_xyz[2]+quantum;
+        // 地面厚层已提供接触证据时，不重复计算每条阶跃剖面。
+        let legal_step=!observed_contact && contact.iter().any(|&cell|contact_neighbors(cell).into_iter().any(|next|
             contact.contains(&next)&&matches!(classify_transition(&graph.surface_lookup,cell,next,self.config(),
                 &self.data.height_bounds,self.source_voxel_size_m(),self.data.profile_cells,self.data.candidate_step_cells),
                 Some(SurfaceTransition::StepUp|SurfaceTransition::StepDown))));
@@ -662,8 +635,7 @@ impl SurfaceSnapshot {
         }
         // 多次观测会把地面表示成连续占据层。实测接触落在该层内部时，不把层顶
         // 当成唯一真实地面；候选仍受原有腿部跨阶范围、完整足迹及连通性约束。
-        let observed_contact = reference[2] >= self.observed_support_lower_bound(candidate.cell)-quantum
-            && reference[2] <= candidate.surface_xyz[2]+quantum;
+
         if (!legal_step && !observed_contact) || !contact.is_subset(&connected)
             || (!observed_contact && reference[2]<min-quantum) || reference[2]>max+quantum {
                 tracing::debug!(?body, ?reference, legal_step, observed_contact, min, max,
@@ -774,6 +746,19 @@ impl SurfaceSnapshot {
         body: [f64; 3],
         quaternion: [f64; 4],
     ) -> Result<(), SurfaceError> {
+        let key = [body[0].to_bits(),body[1].to_bits(),body[2].to_bits(),
+            quaternion[0].to_bits(),quaternion[1].to_bits(),quaternion[2].to_bits(),quaternion[3].to_bits()];
+        if let Some(result)=self.body_pose_cache.lock().unwrap_or_else(|e|e.into_inner()).get(&key).cloned() {
+            return result;
+        }
+        let result=self.check_body_pose(body,quaternion);
+        let mut cache=self.body_pose_cache.lock().unwrap_or_else(|e|e.into_inner());
+        if cache.len()>=8192 {cache.clear();}
+        cache.insert(key,result.clone());
+        result
+    }
+
+    fn check_body_pose(&self,body:[f64;3],quaternion:[f64;4])->Result<(),SurfaceError> {
         let model = self
             .body_envelope()
             .ok_or_else(|| SurfaceError::InvalidConfig("body envelope is unavailable".into()))?;
@@ -788,6 +773,8 @@ impl SurfaceSnapshot {
             .flat_map(|p| model.z_bounds_m.map(|z| world(r, body, [p[0], p[1], z])))
             .collect();
         let polygon = hull(vertices.iter().map(|p| [p[0], p[1]]).collect());
+        let polygon_query=PolygonQuery::new(&polygon);
+        let prism_query=PrismQuery::new(model,r,body);
         let (min, max) = vertices.iter().fold(
             ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
             |(mut min, mut max), p| {
@@ -808,16 +795,17 @@ impl SurfaceSnapshot {
                 "body footprint query exceeds budget".into(),
             ));
         }
-        let radius = model.radius()
-            + model.z_bounds_m[0].abs().max(model.z_bounds_m[1].abs())
-            + model.body_to_support_z_m
-            + size * 2.0;
+        // 查询半径取实际投影足迹到支撑格中心的最远距离；高度和支撑
+        // 距离已经包含在旋转后的顶点里，不能再各加一次扩大地面遍历。
+        // 向上对齐体素以复用同一格的邻域，并保留两格接触连接余量。
+        let radius = ((vertices.iter().map(|p|(p[0]-centre.surface_xyz[0]).hypot(p[1]-centre.surface_xyz[1]))
+            .fold(0.0,f64::max)+size*2.0)/size).ceil()*size;
         let patch = self.ground_patch(centre, radius);
         let uncertainty = f64::from(self.source_voxel_size_m()) + model.support_uncertainty_m;
         let mut ground_points = Vec::new();
         for x in x0..=x1 {
             for y in y0..=y1 {
-                if !polygon_intersects_cell(&polygon, x, y, size) {
+                if !polygon_query.intersects(x,y,size) {
                     continue;
                 }
                 let ground = *patch.get(&(x, y)).ok_or_else(|| {
@@ -862,7 +850,7 @@ impl SurfaceSnapshot {
                     let mut height = f64::NEG_INFINITY;
                     for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
                         for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
-                            if !polygon_intersects_cell(&polygon, ix, iy, fine) { continue; }
+                            if !polygon_query.intersects(ix,iy,fine) { continue; }
                             for iz in (lower/fine+1e-5).floor() as i32..(ground_height/fine-1e-5).ceil() as i32 {
                                 if observations.supports_obstacle([ix,iy,iz]) && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
                                     let top = f64::from(iz + 1) * fine;
@@ -870,7 +858,7 @@ impl SurfaceSnapshot {
                                     // 超过足端接触范围的侧面回波，必须实际与三维包络
                                     // 相交才会抬高本次地面检查；原始占据仍完整保留。
                                     if top <= support_plane + contact + 1e-6
-                                        || prism_intersects_voxel(model, r, body,
+                                        || prism_query.intersects(
                                             [f64::from(ix)*fine, f64::from(iy)*fine, f64::from(iz)*fine],
                                             [f64::from(ix+1)*fine, f64::from(iy+1)*fine, top]) {
                                         height = height.max(top);
@@ -900,8 +888,7 @@ impl SurfaceSnapshot {
                         {
                             continue;
                         }
-                        let coarse_intersects = || prism_intersects_voxel(
-                            model, r, body,
+                        let coarse_intersects = || prism_query.intersects(
                             [x as f64 * size, y as f64 * size, f64::from(bounds[0])],
                             [(x + 1) as f64 * size, (y + 1) as f64 * size, f64::from(bounds[1])],
                         );
@@ -917,7 +904,7 @@ impl SurfaceSnapshot {
                                         if !observations.supports_obstacle([ix,iy,iz]) {continue;}
                                         if f64::from(iz+1)*fine <= ground_height+1e-6
                                             || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
-                                        intersects |= prism_intersects_voxel(model,r,body,
+                                        intersects |= prism_query.intersects(
                                             [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
                                             [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine]);
                                     }
@@ -1899,4 +1886,127 @@ mod tests {
         assert!(map.validate_body_motion(([1.0,0.2,0.45],q),([1.0,0.2,0.45],turn),&[]).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod projection_equivalence {
+    use super::*;
+fn reference_polygon_intersects_cell(polygon: &[[f64; 2]], x: i32, y: i32, size: f64) -> bool {
+    let square = [
+        [x as f64 * size, y as f64 * size],
+        [(x + 1) as f64 * size, y as f64 * size],
+        [(x + 1) as f64 * size, (y + 1) as f64 * size],
+        [x as f64 * size, (y + 1) as f64 * size],
+    ];
+    let axes = polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .map(|(a, b)| [b[1] - a[1], a[0] - b[0]])
+        .chain([[1.0, 0.0], [0.0, 1.0]]);
+    for axis in axes {
+        let project = |p: &[f64; 2]| p[0] * axis[0] + p[1] * axis[1];
+        let (a, b) = polygon
+            .iter()
+            .map(project)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                (a.min(v), b.max(v))
+            });
+        let (c, d) = square
+            .iter()
+            .map(project)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                (a.min(v), b.max(v))
+            });
+        if b < c - 1e-10 || d < a - 1e-10 {
+            return false;
+        }
+    }
+    true
+}
+fn reference_prism_intersects_voxel(
+    model: &SurfaceBodyEnvelope,
+    r: [[f64; 3]; 3],
+    origin: [f64; 3],
+    min: [f64; 3],
+    max: [f64; 3],
+) -> bool {
+    let body: Vec<_> = model
+        .footprint_xy_m
+        .iter()
+        .flat_map(|p| model.z_bounds_m.map(|z| [p[0], p[1], z]))
+        .collect();
+    let voxel: Vec<_> = [min[0], max[0]]
+        .into_iter()
+        .flat_map(|x| {
+            [min[1], max[1]].into_iter().flat_map(move |y| {
+                [min[2], max[2]].into_iter().map(move |z| {
+                    let p = [x - origin[0], y - origin[1], z - origin[2]];
+                    [dot(r[0], p), dot(r[1], p), dot(r[2], p)]
+                })
+            })
+        })
+        .collect();
+    let voxel_axes: [[f64; 3]; 3] = std::array::from_fn(|i| [r[0][i], r[1][i], r[2][i]]);
+    let mut axes = vec![[0.0, 0.0, 1.0]];
+    axes.extend(voxel_axes);
+    for (a, b) in model
+        .footprint_xy_m
+        .iter()
+        .zip(model.footprint_xy_m.iter().cycle().skip(1))
+    {
+        let edge = [b[0] - a[0], b[1] - a[1], 0.0];
+        axes.push([edge[1], -edge[0], 0.0]);
+        for axis in voxel_axes {
+            axes.push(cross(edge, axis));
+        }
+    }
+    for axis in voxel_axes {
+        axes.push(cross([0.0, 0.0, 1.0], axis));
+    }
+    for axis in axes {
+        if dot(axis, axis) < 1e-18 {
+            continue;
+        }
+        let (a, b) = body
+            .iter()
+            .map(|p| dot(axis, *p))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                (a.min(v), b.max(v))
+            });
+        let (c, d) = voxel
+            .iter()
+            .map(|p| dot(axis, *p))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                (a.min(v), b.max(v))
+            });
+        if b < c - 1e-10 || d < a - 1e-10 {
+            return false;
+        }
+    }
+    true
+}
+
+    #[test]
+    fn precomputed_projection_matches_vertex_reference_for_tilted_convex_bodies() {
+        let model=SurfaceBodyEnvelope {
+            footprint_xy_m:(0..24).map(|i| {let a=f64::from(i)*std::f64::consts::TAU/24.0;[0.3*a.cos(),0.16*a.sin()]}).collect(),
+            z_bounds_m:[-0.4,0.06],body_to_support_z_m:0.4,max_step_up_m:0.15,max_step_down_m:0.15,
+            max_cross_slope_deg:18.0,support_uncertainty_m:0.0,
+        };
+        let mut seed=7_u64;
+        let mut random=|| {seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1);(seed>>32) as f64/u32::MAX as f64*2.0-1.0};
+        for _ in 0..80 {
+            let q=[random(),random(),random(),random()];let r=rotation(q).unwrap();
+            let origin=[random(),random(),random()];let query=PrismQuery::new(&model,r,origin);
+            let polygon=hull(model.footprint_xy_m.iter().map(|p|{let w=world(r,origin,[p[0],p[1],0.0]);[w[0],w[1]]}).collect());
+            let projected=PolygonQuery::new(&polygon);
+            for _ in 0..80 {
+                let min=[origin[0]+random()*0.5,origin[1]+random()*0.5,origin[2]+random()*0.5];
+                let max=min.map(|v|v+0.05);
+                assert_eq!(query.intersects(min,max),reference_prism_intersects_voxel(&model,r,origin,min,max));
+                let x=(min[0]/0.05).floor() as i32;let y=(min[1]/0.05).floor() as i32;
+                assert_eq!(projected.intersects(x,y,0.05),reference_polygon_intersects_cell(&polygon,x,y,0.05));
+            }
+        }
+    }
 }

@@ -162,6 +162,8 @@ pub struct NavState {
 
 #[derive(Clone, Debug, Default)]
 pub struct NavigationFeedback {
+    /// 当前目标已经计算的地图坐标路径点。
+    pub planned_path: Vec<[f64; 3]>,
     pub cancel_phase: String,
     pub cancel_generation: u64,
     pub actuator_zeroed: bool,
@@ -6000,6 +6002,11 @@ async fn apply_typed_navigation_feedback(
         update.feedback.actuator_zeroed = current.phase == crate::nav_runtime::CancelPhase::Zeroed;
         update.feedback.reason_code =
             navigation_reason_code(&update.state, update.feedback.cancel_phase.as_str());
+    }
+    if matches!(update.state.status.as_str(), "RUNNING" | "PLANNING" | "ACCEPTED") {
+        if let Some(lease) = correlated_lease.as_ref() {
+            update.feedback.planned_path = nav.display_path_for(lease,update.state.status=="RUNNING").await;
+        }
     }
     Some(update)
 }

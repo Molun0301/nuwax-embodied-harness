@@ -472,9 +472,7 @@ struct InputDiagnosticLimiter {
 impl InputDiagnosticLimiter {
     fn reject(&mut self, component: &str, reason: &str) {
         if let Some(suppressed) = self.record_at(Instant::now()) {
-            eprintln!(
-                "[nuwax-nav-stack] {component}: rejected external input: {reason} (suppressed={suppressed})"
-            );
+            tracing::warn!(input=component, reason, suppressed, "导航输入被拒绝");
         }
     }
 

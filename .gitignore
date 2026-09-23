@@ -56,7 +56,14 @@ scripts/ci/release_gates/*
 **/goldens/
 **/recordings/
 *.md
-# 对外建图说明随代码维护，开发文档仍由上方目录规则排除。
+# 公开使用文档随代码维护，开发文档仍由上方目录规则排除。
+!/docs/公开文档/阅读指南.md
+!/docs/公开文档/快速上手.md
+!/docs/公开文档/功能列表.md
+!/docs/公开文档/部署文档.md
+!/docs/公开文档/智能体接入.md
+!/docs/公开文档/架构与机器人接入.md
+!/docs/公开文档/Go2提示词示例.md
 !/docs/公开文档/双LIO建图与回环纠偏.md
 services/geometry/nuwax_geometry_runtime/src/bin/nuwax-lio-test-child.rs
 
@@ -67,7 +74,7 @@ services/nuwax-workspace/crates/nuwax-mapping-cli/FORMAT.md
 .pytest_cache
 .playwright-mcp
 drivers/go2/ros2_ws/
-功能列表.md
+/功能列表.md
 AGENTS.md
 CLAUDE.md
 services/geometry/nuwax_ros_bridge/Cargo.lock

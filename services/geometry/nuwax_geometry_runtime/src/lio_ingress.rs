@@ -239,6 +239,7 @@ pub(crate) struct CommonLioIngressSnapshot {
 pub(crate) struct CommonLioIngress {
     spec: DeviceLioIngressSpec,
     sensor_origin_body: Option<Point3<f64>>,
+    self_cloud_filter: Result<Option<crate::self_cloud::RobotSelfFilter>, String>,
     state: Mutex<CommonLioIngressState>,
     runtime: Option<CommonLioRuntime>,
     odometry_admission: Notify,
@@ -737,6 +738,7 @@ impl CommonLioIngress {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
             sensor_origin_body: None,
+            self_cloud_filter: crate::self_cloud::RobotSelfFilter::from_env(),
             runtime: None,
             odometry_admission: Notify::new(),
             relocalization_mode_fence: OnceLock::new(),
@@ -754,6 +756,7 @@ impl CommonLioIngress {
             spec,
             state: Mutex::new(CommonLioIngressState::default()),
             sensor_origin_body: None,
+            self_cloud_filter: crate::self_cloud::RobotSelfFilter::from_env(),
             runtime: Some(CommonLioRuntime {
                 handle,
                 public_odometry,
@@ -1186,6 +1189,19 @@ impl CommonLioIngress {
                 .cloned()
                 .ok_or(LioIngressError::MissingFrozenOdometry)?,
         };
+        // 自体筛选使用本次配对位姿，早于规范编码、扫描归档和所有地图累积。
+        let mut odom_points = odom_points;
+        if let Some(filter) = self.self_cloud_filter.as_ref().map_err(|error| {
+            LioIngressError::Registration(error.clone())
+        })? {
+            filter.retain_external(&mut odom_points, &frozen_odom_from_body);
+        }
+        if odom_points.is_empty() {
+            return Err(LioIngressError::InvalidPointBudget {
+                source_count: source_point_count_i64,
+                emitted_count: 0,
+            });
+        }
         let registered = adapter
             .register_odom_cloud_to_map(&odom_points, &self.spec.odom_frame_id)
             .map_err(|error| LioIngressError::Registration(error.to_string()))?;
@@ -1569,9 +1585,16 @@ impl NativeLioIngress {
         pair: NativeSourcePair,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<(), String> {
-        let odom_points = transform_native_pair(&pair, &self.body_from_sensor)?;
+        let mut odom_points = transform_native_pair(&pair, &self.body_from_sensor)?;
         let frozen_odom_from_body =
             odometry_pose_isometry(&pair.odometry.odometry).map_err(|error| error.to_string())?;
+        // 启动保留帧也冻结过滤后的点数和摘要，延后注册不能改变其证明。
+        if let Some(filter) = self.common.self_cloud_filter.as_ref().map_err(Clone::clone)? {
+            filter.retain_external(&mut odom_points, &frozen_odom_from_body);
+        }
+        if odom_points.is_empty() {
+            return Err("本帧自体过滤后没有外部点云".into());
+        }
         let odometry = LioOdometryEnvelope {
             schema_version: LIO_SCHEMA_VERSION_V1,
             backend: pair.odometry.identity.backend,
@@ -6223,6 +6246,47 @@ mod tests {
     }
 
     #[test]
+    fn self_cloud_registration_uses_frozen_pose_and_keeps_source_counts() {
+        for backend in [LIO_BACKEND_DEVICE, LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO] {
+            let mut ingress = CommonLioIngress::new(DeviceLioIngressSpec::new_for_backend(
+                backend, 7, "lidar", "base_link", "odom", "map",
+            ).unwrap());
+            ingress.self_cloud_filter = Ok(Some(crate::self_cloud::tests::filter()));
+            let mut source = identity(1, 100);
+            source.backend = backend;
+            let adapter = active_adapter("map");
+            let pose = Isometry3::from_parts(Translation3::new(1.2, 2.1, 0.3), UnitQuaternion::from_euler_angles(0.1, -0.15, 1.1));
+            let mut odom = valid_odometry();
+            odom.pose.position = pose.translation.vector.into();
+            let q = pose.rotation.quaternion();
+            odom.pose.orientation_xyzw = [q.i, q.j, q.k, q.w];
+            ingress.accept_odometry_for_test(source, 10, odom).unwrap();
+            let external: Vec<_> = [[0.0, 0.0, -0.425], [0.0, -0.3, -0.175], [0.5, 0.0, -0.2]]
+                .into_iter().map(|p| pose * Point3::from(p)).collect();
+            let mut points = external.clone();
+            points.push(pose * Point3::new(0.0, 0.0, -0.2));
+            // 较晚的机体位置不能替换扫描配对的冻结位姿。
+            let mut later = source;
+            later.source_sequence = 2;
+            later.source_timestamp_ns = 102;
+            ingress.accept_odometry_for_test(later, 11, valid_odometry()).unwrap();
+            let prepared = ingress.register_odom_points(source, CorrelatedOdometry {
+                source_sequence: 1, source_timestamp_ns: 100,
+            }, 12, 4, points, &adapter).unwrap();
+            assert_eq!(prepared.envelope.source_point_count, 4);
+            assert_eq!(prepared.envelope.emitted_point_count, 3);
+            let encoded = encode_lio_cloud_envelope(&prepared.envelope).unwrap();
+            let accepted = ingress.accept_public_cloud(prepared.envelope, &encoded, 13).unwrap();
+            assert_eq!(accepted.binding.frozen_odom_from_body, pose);
+            assert_eq!(accepted.map_points.len(), 3);
+            let expected = adapter.register_odom_cloud_to_map(&external, "odom").unwrap();
+            for (actual, expected) in accepted.map_points.iter().zip(expected.points) {
+                assert!((actual - expected).norm() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn registered_cloud_freezes_exact_correlated_odometry_pose_across_later_race() {
         let ingress = CommonLioIngress::new(spec());
         let adapter = active_adapter("map");
@@ -7276,6 +7340,8 @@ mod tests {
                 std::env::temp_dir().join(format!("nuwax-dynamic-{}.mmap", uuid::Uuid::new_v4()));
             *handle.cloud_map_writer.lock() =
                 Some(crate::pointcloud::CloudMapShmWriter::new(&path).unwrap());
+            handle.cloud_map_writer.lock().as_mut().unwrap()
+                .begin_session(mapping.lock().snapshot().session_generation).unwrap();
             let native_spec = DeviceLioIngressSpec::new_for_backend(
                 backend_id,
                 7,
@@ -7293,7 +7359,7 @@ mod tests {
                 r#"{"translation_m":[0.025,0.025,0.025],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#
             })
             .unwrap();
-            let ingress = NativeLioIngress::with_runtime(
+            let mut ingress = NativeLioIngress::with_runtime(
                 native_spec,
                 handle.clone(),
                 binding("/test/dynamic/odom", "nuwax_msgs.LioOdometryEnvelope"),
@@ -7303,6 +7369,7 @@ mod tests {
                 Duration::from_millis(1),
             )
             .unwrap();
+            ingress.common.self_cloud_filter = Ok(Some(crate::self_cloud::tests::filter()));
             let ingress = Arc::new(ingress);
             let (correction_owner, correction_wrapper) = if with_correction {
                 let identity = crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
@@ -7369,6 +7436,9 @@ mod tests {
                     Point3::new(if sequence == 1 { 2.0 } else { 4.0 }, 0.0, 0.0),
                     Point3::new(4.0, 1.0, 0.0),
                     Point3::new(4.0, -1.0, 0.0),
+                    // 同帧自体被剔除，近场地面继续进入规范图。
+                    Point3::new(0.0, 0.0, -0.2),
+                    Point3::new(0.0, 0.0, -0.45),
                 ];
                 let pair = NativeSourcePair {
                     odometry: NativeOdometrySample {
@@ -7399,6 +7469,8 @@ mod tests {
                         Some(odometry_pose_isometry(&pair.odometry.odometry).unwrap()),
                     )
                     .unwrap();
+                assert_eq!(prepared.envelope.source_point_count, 5);
+                assert_eq!(prepared.envelope.emitted_point_count, 4);
                 let origin = ingress.common.state.lock().pending_registrations[&(7, sequence)]
                     .binding
                     .sensor_origin_map
@@ -7438,8 +7510,12 @@ mod tests {
                 );
                 assert_eq!(
                     snapshot.point_count,
-                    if sequence == 2 || sequence == 3 { 4 } else { 3 }
+                    if sequence == 2 || sequence == 3 { 5 } else { 4 }
                 );
+                let heights: Vec<_> = snapshot.xyz_f32_le.chunks_exact(12)
+                    .map(|p| f32::from_le_bytes(p[8..12].try_into().unwrap())).collect();
+                assert!(heights.iter().any(|z| (*z + 0.425).abs() < 0.03));
+                assert!(!heights.iter().any(|z| (*z + 0.175).abs() < 0.03));
                 assert_eq!(
                     snapshot.revision,
                     handle.state.read().await.cloud_map_revision
@@ -7927,7 +8003,8 @@ mod tests {
             NativeOdometrySample { identity, odometry }
         }
 
-        let exact_probe = probe();
+        let mut exact_probe = probe();
+        exact_probe.common.self_cloud_filter = Ok(Some(crate::self_cloud::tests::filter()));
         let exact_identity = SourceIdentity {
             backend: LIO_BACKEND_FASTLIO2,
             runtime_generation: 7,
@@ -7940,8 +8017,8 @@ mod tests {
         let exact_pair = exact_probe
             .insert_cloud(NativeCloudSample {
                 identity: exact_identity,
-                source_point_count: 2,
-                sensor_points: vec![Point3::new(1.0, 2.0, 3.0), Point3::new(-1.0, 0.0, 0.5)],
+                source_point_count: 3,
+                sensor_points: vec![Point3::new(1.0, 2.0, 3.0), Point3::new(-1.0, 0.0, 0.5), Point3::new(0.0, 0.0, -0.2)],
                 registration_mode_token: RegistrationModeToken::default(),
             })
             .expect("exact timestamp pair");
@@ -7964,8 +8041,17 @@ mod tests {
             exact.registered_odom_points.as_ref(),
             &[Point3::new(4.0, 0.0, 3.5), Point3::new(2.0, -2.0, 1.0)]
         );
-        assert_eq!(exact.source_point_count, 2);
+        assert_eq!(exact.source_point_count, 3);
         assert_eq!(exact.emitted_point_count, 2);
+        let registered = exact_probe.common.register_odom_points_with_mode_token(
+            exact.cloud_identity,
+            CorrelatedOdometry { source_sequence: exact.odometry_identity.source_sequence, source_timestamp_ns: exact.odometry_identity.source_timestamp_ns },
+            0, exact.source_point_count, exact.registered_odom_points.to_vec(), &active_adapter("map"),
+            RegistrationModeToken::default(), Some(exact.frozen_odom_from_body),
+        ).unwrap();
+        assert_eq!(registered.envelope.emitted_point_count as usize, exact.emitted_point_count);
+        assert_eq!(registered.envelope.source_point_count as usize, exact.source_point_count);
+
         assert!(exact_probe.take_validated_startup_pair().is_err());
 
         let fallback_probe = probe();

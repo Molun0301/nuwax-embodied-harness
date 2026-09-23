@@ -120,6 +120,11 @@ pub struct NativeLioConfig {
 }
 
 impl NativeLioConfig {
+    /// 原生预处理的实际近距下界；未覆盖时明确传给进程，避免上游默认漂移。
+    pub fn minimum_observation_range_m(&self) -> f64 {
+        f64::from(self.pointlio_options.0.get("blind").and_then(serde_json::Value::as_f64).unwrap_or(0.5) as f32)
+    }
+
     pub fn for_backend(backend: NativeBackend) -> Self {
         Self {
             backend,
@@ -260,6 +265,9 @@ impl NativeLioConfig {
         }
         if let Some(value) = self.initial_map_frames {
             args.extend(["--initial_map_frames".to_owned(), value.to_string()]);
+        }
+        if !self.pointlio_options.0.contains_key("blind") {
+            args.extend(["--blind".to_owned(), render_number(self.minimum_observation_range_m())]);
         }
         args.extend(self.pointlio_options.render_args()?);
         if let Some(origin) = self.imu_origin_in_body_m {
@@ -619,6 +627,21 @@ mod tests {
             Some(expected),
             "unexpected value for native option {option}"
         );
+    }
+
+    #[test]
+    fn native_blind_range_matches_the_explicit_preprocessor_argument() {
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let config = NativeLioConfig::for_backend(backend);
+            assert_eq!(config.minimum_observation_range_m(), 0.5);
+            assert_arg_value(&config.render_args().unwrap(), "--blind", "0.5");
+        }
+        let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
+        config.pointlio_options = crate::pointlio_options::PointLioOptions::from_json(r#"{"blind":0.05}"#).unwrap();
+        assert_eq!(config.minimum_observation_range_m(), f64::from(0.05_f32));
+        let args = config.render_args().unwrap();
+        assert_eq!(args.iter().filter(|arg| *arg == "--blind").count(), 1);
+        assert_arg_value(&args, "--blind", "0.05");
     }
 
     #[test]

@@ -290,7 +290,7 @@ fn prepare_surface_map(
         cache.build(&message)
     };
     PreparedSurfaceMap {
-        awaiting_build: false,
+        awaiting_build: !message.cleared && snapshot.is_err(),
         authority,
         source_timestamp_ns,
         received_at,
@@ -485,13 +485,28 @@ fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<[
 }
 
 /// 联验可注入真实但隔离的LCM连接，生产包装仍执行同一循环。
+type SurfacePathComputer = Arc<dyn Fn(&SurfaceSnapshot, &PoseStamped, &schema::GoalEnvelope,
+    &SurfaceNavigationConfig) -> NavStackResult<Path3D> + Send + Sync>;
+
 async fn run_surface_planner_with_transport(
+    node: ModuleNode,
+    hub: SurfaceMapHub,
+    config: SurfaceNavigationConfig,
+    transport: LcmTransport,
+    shutdown: oneshot::Receiver<()>,
+    ready: ReadySender,
+) -> NavStackResult<()> {
+    run_surface_planner_with_computer(node,hub,config,transport,shutdown,ready,Arc::new(body_path)).await
+}
+
+async fn run_surface_planner_with_computer(
     node: ModuleNode,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
     transport: LcmTransport,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
+    computer: SurfacePathComputer,
 ) -> NavStackResult<()> {
     let source_max_age = configured_pose_source_max_age()?;
     let mut maps = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationMap3D").await?;
@@ -504,6 +519,7 @@ async fn run_surface_planner_with_transport(
     let mut order = SurfaceMapOrder::default();
     let cache = Arc::new(std::sync::Mutex::new(SurfaceGeometryCache::configured(&config)));
     let mut computations = tokio::task::JoinSet::new();
+    let mut path_computations = tokio::task::JoinSet::new();
     let mut pending_map: Option<(schema::NavigationMap3D, Instant, u64)> = None;
     let mut accepted_domain: Option<GuardedMapAuthority> = None;
     let mut map_epoch = 0_u64;
@@ -573,11 +589,31 @@ async fn run_surface_planner_with_transport(
                 if epoch != map_epoch || latest_map.as_ref().is_some_and(|old| old.authority.same_domain(&update.authority)
                     && (old.authority.cloud_revision > update.authority.cloud_revision || (old.authority.cloud_revision == update.authority.cloud_revision && old.snapshot.is_ok()))) { continue; }
                 if update.snapshot.is_err() {
-                    retire_goal(&mut goal, &mut retired_goals);
-                    pose = None; last_path = None; execution_admitted = false;
+                    // 构建失败会撤销执行地图；尚未取得租约的目标仍归原拥有方，
+                    // 待同域新图恢复或定向取消，不能只在规划端丢弃身份。
+                    last_path = None; execution_admitted = false;
                 }
                 hub.publish(update.clone()); latest_map = Some(update);
                 needs_plan = goal.is_some() && (needs_plan || last_path.is_none());
+            }
+            computed = path_computations.join_next(), if !path_computations.is_empty() => {
+                let (epoch, planned_goal, surface, result): (u64, schema::GoalEnvelope, Arc<SurfaceSnapshot>, NavStackResult<Option<Path3D>>) =
+                    computed.expect("已有路径任务").map_err(|error| module_error("surface planning join",error))?;
+                // 计算期间继续处理地图、位姿及取消；退休目标不能被迟到路径复活。
+                if epoch != map_epoch || !execution_admitted
+                    || goal.as_ref().is_none_or(|active| active.payload_sha256 != planned_goal.payload_sha256)
+                    || latest_map.as_ref().is_none_or(|current| !current.authority.permits_goal(&planned_goal) || current.snapshot.is_err()) {
+                    continue;
+                }
+                match result {
+                    Ok(Some(path)) => {
+                        path_revision = path_revision.checked_add(1).ok_or_else(|| NavStackError::Internal("surface path revision exhausted".into()))?;
+                        publish_surface_path(&transport, &node.outputs[0], &planned_goal, generation, path_revision, &path).await?;
+                        last_path = Some(path); path_surface = Some(Arc::downgrade(&surface)); needs_plan = false;
+                    }
+                    Ok(None) => { path_surface = Some(Arc::downgrade(&surface)); }
+                    Err(error) => { diagnostics.reject("surface planning", &error.to_string()); last_path = None; }
+                }
             }
             frame = maps.next() => {
                 let frame = required_frame(frame, "surface planner map")?;
@@ -643,30 +679,30 @@ async fn run_surface_planner_with_transport(
                 }
             }
             _ = ticker.tick() => {
+                if !path_computations.is_empty() { continue; }
                 let (Some(map), Some((pose, pose_received_at, pose_valid_until)), Some(active_goal)) = (latest_map.as_ref(), pose.as_ref(), goal.as_ref()) else { continue; };
                 if !execution_admitted || !map.authority.permits_goal(active_goal)
                     || map.received_at.elapsed() > nuwax_nav_runtime::DEFAULT_COSTMAP_TTL
                     || pose_received_at.elapsed() > nuwax_nav_runtime::DEFAULT_POSE_TTL
                     || tokio::time::Instant::now() >= *pose_valid_until { continue; }
                 let Ok(surface) = map.snapshot.as_ref() else { continue; };
-                if !needs_plan {
-                    if let Some(path) = last_path.as_ref() {
-                        let unchanged = path_surface.as_ref().and_then(std::sync::Weak::upgrade)
-                            .is_some_and(|previous| previous.same_geometry(surface));
-                        if unchanged || body_path_remains_traversable(surface, path, &config) {
-                            path_surface = Some(Arc::downgrade(surface));
-                            continue;
-                        }
-                    }
-                }
-                match body_path(surface, pose, active_goal, &config) {
-                    Ok(path) => {
-                        path_revision = path_revision.checked_add(1).ok_or_else(|| NavStackError::Internal("surface path revision exhausted".into()))?;
-                        publish_surface_path(&transport, &node.outputs[0], active_goal, generation, path_revision, &path).await?;
-                        last_path = Some(path); path_surface = Some(Arc::downgrade(surface)); needs_plan = false;
-                    }
-                    Err(error) => { diagnostics.reject("surface planning", &error.to_string()); last_path = None; }
-                }
+                let unchanged = path_surface.as_ref().and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|previous| previous.same_geometry(surface));
+                if !needs_plan && last_path.is_some() && unchanged { continue; }
+                let surface = Arc::clone(surface);
+                let pose = pose.clone();
+                let planned_goal = active_goal.clone();
+                let previous_path = if needs_plan { None } else { last_path.clone() };
+                let config = config.clone();
+                let epoch = map_epoch;
+                let computer = Arc::clone(&computer);
+                // 搜索及整条路径复核都可能超过地图续收周期，不能占据接收循环。
+                path_computations.spawn_blocking(move || {
+                    let result = if previous_path.as_ref().is_some_and(|path| body_path_remains_traversable(&surface,path,&config)) {
+                        Ok(None)
+                    } else { computer(&surface,&pose,&planned_goal,&config).map(Some) };
+                    (epoch, planned_goal, surface, result)
+                });
             }
         }
     }
@@ -679,6 +715,11 @@ async fn run_surface_planner_with_transport(
             if terminal.is_ok() { return Err(NavStackError::Internal(error.to_string())); }
         }
     }
+    while let Some(joined) = path_computations.join_next().await {
+        if let Err(error) = joined {
+            if terminal.is_ok() { return Err(module_error("surface planning shutdown",error)); }
+        }
+    }
     terminal
 }
 
@@ -687,6 +728,123 @@ mod tests {
     use super::super::guarded_tests::RecordingMotion;
     use super::*;
     use nuwax_nav_runtime::{NavSchedulerHandle, SchedulerPhase, TerminalOutcome};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要本轮冻结的实机规范地图、机体位姿及实机配置"]
+    async fn recorded_live_surface_navigation_diagnostic() {
+        nuwax_core::logging::init_component_logging("navigation-diagnostic", "nuwax_nav_mls_planner=debug");
+        struct Blocks(std::path::PathBuf);
+        #[async_trait::async_trait]
+        impl nuwax_rpc::RpcHandler for Blocks {
+            async fn handle(&self, request: nuwax_rpc::RpcRequest) -> nuwax_rpc::RpcResponse {
+                let hash = request.args.0[0]["sha256_hex"].as_str().unwrap();
+                let bytes = std::fs::read(self.0.join(hash)).unwrap();
+                nuwax_rpc::RpcResponse::ok(request.id, serde_json::json!({"data_hex": bytes.iter().map(|v|format!("{v:02x}")).collect::<String>()}))
+            }
+        }
+        let directory = std::path::PathBuf::from(std::env::var("NUWAX_NAV_DIAGNOSTIC_INPUT").unwrap());
+        let broker = nuwax_rpc::RpcBroker::new();
+        let method = "GeometryRuntimeService/get_navigation_map_block";
+        broker.register(method, Box::new(Blocks(directory.join("blocks")))).await.unwrap();
+        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&std::env::var("NUWAX_LCM_URL").unwrap()).unwrap());
+        let server = broker.serve(transport, method).await.unwrap();
+        let bytes = std::fs::read(directory.join("navigation-map.lcm")).unwrap();
+        let message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("pose.json")).unwrap()).unwrap();
+        let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
+        let quaternion: [f64; 4] = serde_json::from_value(value["quaternion"].clone()).unwrap();
+        let mut config = SurfaceNavigationConfig::from_env().unwrap();
+        if let Ok(clearance) = std::env::var("NUWAX_NAV_DIAGNOSTIC_CLEARANCE") {
+            config.geometry.wall_clearance_m = clearance.parse().unwrap();
+        }
+        let mut cache = SurfaceGeometryCache::configured(&config);
+        let start = Instant::now();
+        let captured_message = message.clone();
+        let map = tokio::task::spawn_blocking(move || cache.build(&captured_message)).await.unwrap().unwrap();
+        eprintln!("实机表面构建耗时 {:?}，机体 {:?}，模型 {:?}", start.elapsed(), position, map.body_envelope());
+        eprintln!("原图机体检查 {:?}", map.validate_body_pose(position, quaternion));
+        let view = map.with_current_body_support(position, quaternion);
+        eprintln!("当前足迹派生结果 {:?}", view.as_ref().map(|_| ()));
+        let view = view.unwrap();
+        view.validate_body_pose(position, quaternion).unwrap();
+        if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_EDGES").is_some() {
+            let mut printed=std::collections::BTreeSet::new();
+            for x in -1..=1 { for y in -1..=1 { for z in -11..=-4 {
+                if let Ok(location)=view.locate_support([(f64::from(x)+0.5)*0.1,(f64::from(y)+0.5)*0.1,f64::from(z)*0.05]) {
+                    if printed.insert(location.cell) { eprintln!("近场支撑 {:?} 邻接 {:?}",location,view.neighbors(location.cell)); }
+                }
+            }}}
+        }
+        let pose = PoseStamped {
+            frame_id: nuwax_nav_types_messages::NavFrameId::Map, stamp: nuwax_nav_types_messages::Timestamp { nanos: value["timestamp_ns"].as_i64().unwrap(), clock: nuwax_nav_types_messages::ClockKind::Unix },
+            pose: Pose3 { position: Point3::new(position[0], position[1], position[2]),
+                orientation: Quaternion { x: quaternion[0], y: quaternion[1], z: quaternion[2], w: quaternion[3] } },
+        };
+        let mut current = goal_for(&message, 1, position);
+        current.goal.pose.orientation_xyzw = quaternion;
+        body_path(&map, &pose, &current, &config).expect("实录当前占据目标必须可以规划");
+        let mut successful = 0;
+        for (index, (radius, direction)) in [0.2, 0.5, 0.8].into_iter()
+            .flat_map(|radius| (0..8).map(move |direction| (radius, direction))).enumerate() {
+            let angle = f64::from(direction) * std::f64::consts::FRAC_PI_4;
+            let mut goal = goal_for(&message, (index+2) as i64,
+                [position[0]+radius*angle.cos(), position[1]+radius*angle.sin(), position[2]]);
+            goal.goal.pose.orientation_xyzw = quaternion;
+            let before = Instant::now();
+            let result = body_path(&map, &pose, &goal, &config);
+            successful += usize::from(result.is_ok());
+            eprintln!("半径{radius}米方向{direction}规划 {:?}，耗时 {:?}",
+                result.as_ref().map(|path|path.poses.len()), before.elapsed());
+        }
+        eprintln!("实录周边24个候选中，可规划{successful}个");
+        if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_CONTROL").is_some() {
+            use nuwax_nav_runtime::{NavPlanner,ExecutionMap,ExecutionPath,PlannerStep,SurfaceFollower};
+            let mut follower=SurfaceFollower::new(config.follower.clone()).unwrap();
+            follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
+            let mut actual=pose.clone();
+            for (index, distance) in [0.2,0.4].into_iter().enumerate() {
+                let mut goal=goal_for(&message,100+index as i64,[position[0]+distance,position[1],position[2]]);
+                goal.goal.pose.orientation_xyzw=quaternion;
+                goal.options.position_tolerance_m=0.04;
+                goal.options.yaw_tolerance_rad=0.15;
+                let target=pose_from_schema(&goal.goal).unwrap();
+                follower.stop();
+                follower.configure_goal(&target,goal.options).unwrap();
+                follower.update_odometry(actual.clone());
+                let path=body_path(&map,&actual,&goal,&config).expect("实录闭环目标可规划");
+                follower.replace_execution_path(ExecutionPath::Surface(path),None,target.clone()).unwrap();
+                let mut completed=false;
+                let mut nonzero=0;
+                for tick in 0..800 {
+                    actual.stamp.nanos+=50_000_000;
+                    follower.update_odometry(actual.clone());
+                    match follower.step(config.robot_width_m) {
+                        PlannerStep::Succeeded => { completed=true;break; }
+                        PlannerStep::Command(twist) => {
+                            nonzero+=usize::from(twist!=Twist2::ZERO);
+                            let before=actual.pose.position;
+                            let q=actual.pose.orientation;
+                            let yaw=q.yaw();
+                            let next=nuwax_nav_control::integrate(nuwax_nav_control::PlanarPose{x:before.x,y:before.y,yaw},twist,0.05);
+                            // 此份现场已确认是平地；独立运动学保持实测高度和
+                            // 横滚/俯仰，不拿待测几何投影反过来生成位姿真值。
+                            let half=(next.yaw-yaw)*0.5;
+                            let (s,c)=half.sin_cos();
+                            actual.pose.position=Point3::new(next.x,next.y,before.z);
+                            actual.pose.orientation=Quaternion{x:c*q.x-s*q.y,y:s*q.x+c*q.y,
+                                z:c*q.z+s*q.w,w:c*q.w-s*q.z};
+                        }
+                        other=>panic!("实录闭环中断 tick={tick}, pose={actual:?}, result={other:?}"),
+                    }
+                }
+                let error=(actual.pose.position.x-target.pose.position.x).hypot(actual.pose.position.y-target.pose.position.y);
+                eprintln!("实录运动学闭环：目标{distance}米，非零指令{nonzero}，最终位置{:?}，水平误差{error}",actual.pose.position);
+                assert!(completed && nonzero>0 && error<0.04,"实录闭环不能停留在路径受理或零速循环");
+                follower.stop();
+            }
+        }
+        server.stop().await.unwrap();
+    }
 
     #[test]
     fn old_source_revision_is_usable_but_a_goal_from_old_coordinates_is_not() {
@@ -1148,6 +1306,10 @@ mod tests {
 
     impl Harness {
         async fn start() -> Self {
+            Self::start_with_computer(Arc::new(body_path)).await
+        }
+
+        async fn start_with_computer(computer: SurfacePathComputer) -> Self {
             use crate::topics::{NavTopicConfig, TopicName};
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -1195,13 +1357,14 @@ mod tests {
             let mut planner = boxed_owner(
                 "surface-real-lcm-test-planner",
                 Box::new(move |shutdown, ready| {
-                    Box::pin(run_surface_planner_with_transport(
+                    Box::pin(run_surface_planner_with_computer(
                         planner_spec,
                         planner_hub,
                         config(),
                         planner_transport,
                         shutdown,
                         ready,
+                        computer,
                     ))
                 }),
             );
@@ -1476,6 +1639,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_planning_keeps_inputs_fresh_and_cancellation_retires_late_result() {
+        use std::sync::atomic::{AtomicBool,Ordering as AtomicOrdering};
+        let entered=Arc::new(AtomicBool::new(false));
+        let release=Arc::new(AtomicBool::new(false));
+        let started=Arc::clone(&entered);let resume=Arc::clone(&release);
+        let computer:SurfacePathComputer=Arc::new(move |map,pose,goal,config| {
+            if !started.swap(true,AtomicOrdering::SeqCst) {
+                let deadline=std::time::Instant::now()+Duration::from_secs(2);
+                while !resume.load(AtomicOrdering::SeqCst) && std::time::Instant::now()<deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            body_path(map,pose,goal,config)
+        });
+        let mut harness=Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let first=goal_for(&harness.feed.lock().unwrap().map,1,[1.55,1.55,2.5]);
+        harness.goal(&first).await;
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while !entered.load(AtomicOrdering::SeqCst) { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.expect("路径计算未启动");
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(harness.scheduler.status().planner_inputs_fresh,"长计算不能令持续输入的地图超时");
+        harness.cancel(&first).await;
+        tokio::time::timeout(Duration::from_millis(300),harness.terminal(TerminalOutcome::Cancelled))
+            .await.expect("取消被长计算阻塞");
+        release.store(true,AtomicOrdering::SeqCst);
+        assert!(tokio::time::timeout(Duration::from_millis(150),harness.paths.next()).await.is_err(),
+            "被取消目标的迟到路径不能发布");
+        let second=goal_for(&harness.feed.lock().unwrap().map,2,[1.55,1.55,2.5]);
+        harness.goal(&second).await;
+        harness.path_for(&second).await;
+        harness.wait_controlling().await;
+        harness.cancel(&second).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn real_lcm_surface_chain_preserves_height_replans_and_retires_completed_goals() {
         let mut harness = Harness::start().await;
         let mut states = typed_stream(
@@ -1546,6 +1748,53 @@ mod tests {
             .iter()
             .any(|call| call.starts_with("zero:")));
         harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_surface_goal_remains_cancellable_after_map_build_failure() {
+        for awaiting_build in [true, false] {
+        let mut harness = Harness::start().await;
+        harness.wait_ready().await;
+        let mut future_map = harness.freeze_map().await;
+        future_map.committed_map.revision += 100;
+        future_map.cloud_revision += 100;
+        let goal = goal_for(&future_map, 1, [1.55, 1.55, 2.5]);
+        harness.goal(&goal).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(harness.calls.lock().unwrap().is_empty());
+        // 精细地图补取失败不能删除已经受理、尚未取得运动租约的目标身份。
+        harness.hub.publish(PreparedSurfaceMap {
+            authority: map_authority(&future_map),
+            source_timestamp_ns: future_map.source_timestamp_ns,
+            received_at: Instant::now(),
+            awaiting_build,
+            snapshot: Err("模拟精细地图补取失败".into()),
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        {
+            let mut feed = harness.feed.lock().unwrap();
+            feed.map = future_map;
+            feed.map_enabled = true;
+        }
+        harness.wait_ready().await;
+        if awaiting_build {
+            harness.wait_controlling().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(harness.calls.lock().unwrap().is_empty(), "已撤销目标不能随有效地图恢复执行");
+        }
+        harness.cancel(&goal).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("zero:")));
+        harness.feed.lock().unwrap().map_enabled = true;
+        harness.wait_ready().await;
+        let next = goal_for(&harness.feed.lock().unwrap().map, 2, [1.55, 1.55, 2.5]);
+        harness.goal(&next).await;
+        harness.path_for(&next).await;
+        harness.cancel(&next).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        harness.shutdown().await;
+        }
     }
 
     #[tokio::test]

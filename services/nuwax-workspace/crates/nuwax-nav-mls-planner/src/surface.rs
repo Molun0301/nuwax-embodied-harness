@@ -356,6 +356,20 @@ impl SurfaceSnapshot {
         }
     }
 
+    /// 导航目标高度用于选择支撑层，不作为平面底盘的可控自由度。
+    pub fn locate_goal_support_from_body(
+        &self,
+        body_xyz: [f64; 3],
+        body_xyzw: [f64; 4],
+        body_to_support_z_m: f64,
+    ) -> Result<SurfaceLocation, SurfaceError> {
+        let support = self.support_position_from_body(body_xyz, body_xyzw, body_to_support_z_m)?;
+        let tolerance = self.body_envelope().map_or(0.0, |model|
+            model.max_step_up_m.max(model.max_step_down_m) + model.support_uncertainty_m)
+            + f64::from(self.source_voxel_size_m());
+        self.locate_near_support(support, tolerance)
+    }
+
     /// 只按标定转换参考点，不宣称该处已被观测；用于远端路径的前瞻方向参考。
     pub fn support_position_from_body(
         &self,
@@ -1001,6 +1015,24 @@ fn classify_transition(
     if dz.abs() < 1e-5 {
         return Some(SurfaceTransition::Level);
     }
+    // 同一地面重复观测会形成跨粗格的连续厚层。层顶的一格抖动不能
+    // 因窗口远端的台阶而切断眼前平地；必须有真实重叠带，不能补空隙。
+    if dz.abs() <= quantum + 1e-5
+        && dz.abs() * config.voxel_size <= config.step_threshold_m + 1e-5 {
+        let lower = |cell: VoxelKey| {
+            let mut low = bounds.get(&cell).map_or(cell.2 as f32 * config.voxel_size, |b| b[0]);
+            for step in 1..=candidate_step_cells.max(1) + 2 {
+                let Some(z) = cell.2.checked_sub(step) else { break; };
+                let Some(b) = bounds.get(&(cell.0, cell.1, z)) else { break; };
+                if low - b[1] > source_size + 1e-5 { break; }
+                low = low.min(b[0]);
+            }
+            low
+        };
+        if height(from).min(height(to)) - lower(from).max(lower(to)) >= source_size - 1e-5 {
+            return Some(SurfaceTransition::Ramp);
+        }
+    }
     // 小于半个源体素且实测局部坡度已合格的连续变化不属于离散台阶。
     // 否则墙外或窗口另一端的地形会反向切断当前平缓表面内的邻接。
     if dz.abs() <= quantum * 0.5 + 1e-5
@@ -1211,6 +1243,28 @@ fn plane_from(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_ground_band_keeps_local_connection_without_bridging_a_separated_step() {
+        let mut cfg = config();
+        cfg.voxel_size = 0.1;
+        cfg.step_threshold_m = 0.15;
+        cfg.max_slope_deg = 18.0;
+        let mut lookup = SurfaceLookup::default();
+        let mut bounds = HeightBounds::default();
+        for (y,z,low,high) in [(-2,-5,-0.5,-0.4),(-1,-5,-0.5,-0.4),(0,-5,-0.5,-0.4),
+            (1,-4,-0.4,-0.35),(2,-3,-0.3,-0.25),(3,-2,-0.2,-0.15)] {
+            lookup.insert((0,y),vec![z]);bounds.insert((0,y,z),[low,high]);
+        }
+        let from=(0,0,-5);let to=(0,1,-4);
+        assert_eq!(classify_transition(&lookup,from,to,&cfg,&bounds,0.05,2,2),None,
+            "没有共同高度证据不能跨越分离层");
+        bounds.insert((0,1,-5),[-0.5,-0.4]);
+        assert_eq!(classify_transition(&lookup,from,to,&cfg,&bounds,0.05,2,2),Some(SurfaceTransition::Ramp));
+        cfg.step_threshold_m=0.0;
+        assert_ne!(classify_transition(&lookup,from,to,&cfg,&bounds,0.05,2,2),Some(SurfaceTransition::Ramp),
+            "不得突破明确的零越阶能力");
+    }
 
     const SIZE: f32 = 0.05;
 

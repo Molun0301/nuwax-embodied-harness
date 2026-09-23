@@ -5,12 +5,16 @@ from core.config_values import runtime_value
 from dataclasses import dataclass
 import hashlib
 import importlib
+import json
 import math
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Any, Callable, List, Optional, Protocol
 
+from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 from .constants import MAX_PRODUCTION_SDK_TIMEOUT_SECONDS
@@ -45,6 +49,8 @@ class Go2Factories:
     sport_client: Callable[[], Any]
     obstacle_client: Callable[[], Any]
     low_level_controller: Callable[[Optional[str]], Any]
+    motion_state_subscriber: Optional[Callable[[Callable[[Any], None]], Any]] = None
+    motion_controller_reader: Optional[Callable[[], Optional[str]]] = None
 
 
 _ONE_SHOT_SPORT_METHODS = {
@@ -78,7 +84,9 @@ _TOGGLE_SPORT_METHODS = {
     pb.SPORT_ACTION_CLASSIC_WALK: "ClassicWalk",
 }
 
-_ROBOT_NOT_STANDING_MESSAGE = "当前已进入阻尼状态或已趴下,请恢复到站立姿态"
+_STOP_NOT_ACCEPTED_MESSAGE = "执行器未接受停车命令（返回码 -1）"
+# 宇树运动状态：空闲、趴下、关节锁定、阻尼、坐下，均不属于行走模式。
+_NONWALKING_MODES = frozenset({0, 5, 6, 7, 10})
 
 
 def _prepend_sdk_path(path_value: str) -> Path:
@@ -105,16 +113,46 @@ def _load_sdk_factories(sdk_path: str) -> Go2Factories:
         low_level_module = importlib.import_module(
             "drivers.go2.control.low_level_controller"
         )
+        state_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
+        rpc_module = importlib.import_module("unitree_sdk2py.rpc.client")
     except (ImportError, AttributeError) as exc:
         raise ActuatorError(
             "SDK_IMPORT_FAILED",
             f"cannot import the official Go2 motion SDK: {exc}",
         ) from exc
+    def subscribe_motion_state(callback):
+        # 只读运动状态，与原写入端共用已经初始化的DDS域；仅保留最新消息。
+        subscriber = channel_module.ChannelSubscriber(
+            runtime_value("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),
+            state_module.SportModeState_,
+        )
+        try:
+            subscriber.Init(callback, 1)
+        except Exception:
+            subscriber.Close()
+            raise
+        return subscriber
+
+    def read_motion_controller():
+        # 兼容未打包MotionSwitcher封装的旧SDK，只调用公开只读查询。
+        client = rpc_module.Client("motion_switcher", False)
+        client.SetTimeout(2.0)
+        client._SetApiVerson("1.0.0.1")
+        client._RegistApi(1001, 0)
+        try:
+            code, data = client._Call(1001, "{}")
+            value = json.loads(data) if code == 0 else {}
+            return value.get("name") if isinstance(value, dict) else None
+        except (ValueError, TypeError, RuntimeError):
+            return None
+
     return Go2Factories(
         channel_initialize=channel_module.ChannelFactoryInitialize,
         sport_client=sport_module.SportClient,
         obstacle_client=obstacle_module.ObstaclesAvoidClient,
         low_level_controller=low_level_module.LowLevelController,
+        motion_state_subscriber=subscribe_motion_state,
+        motion_controller_reader=read_motion_controller,
     )
 
 
@@ -148,7 +186,7 @@ def _require_success(code: object, operation: str) -> None:
 
 def _require_zero_success(code: object, operation: str) -> None:
     if code == -1:
-        raise ActuatorError("ACTUATOR_COMMAND_FAILED", _ROBOT_NOT_STANDING_MESSAGE)
+        raise ActuatorError("STOP_REJECTED", _STOP_NOT_ACCEPTED_MESSAGE)
     _require_success(code, operation)
 
 
@@ -209,27 +247,105 @@ class Go2Actuator:
             factories.channel_initialize(0, self._dds_iface)
         else:
             factories.channel_initialize(0)
-        self._sport = factories.sport_client()
-        self._obstacle = factories.obstacle_client()
-        self._emergency_sport = factories.sport_client()
-        self._emergency_obstacle = factories.obstacle_client()
-        clients = (
-            ("SportClient", self._sport),
-            ("ObstaclesAvoidClient", self._obstacle),
-            ("EmergencySportClient", self._emergency_sport),
-            ("EmergencyObstaclesAvoidClient", self._emergency_obstacle),
+        self._feedback_lock = threading.Lock()
+        self._motion_feedback = None
+        self._feedback_source_ns = 0
+        self._feedback_mode = None
+        self._feedback_closed = False
+        self._feedback_supported = factories.motion_state_subscriber is not None
+        self._motion_controller = None
+        self._feedback_frame = runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link"
+        self._motion_state_subscriber = (
+            factories.motion_state_subscriber(self._observe_motion_state)
+            if factories.motion_state_subscriber is not None else None
         )
-        for name, client in clients:
-            try:
-                client.SetTimeout(timeout_seconds)
-                _require_success(client.Init(), f"{name}.Init")
-            except ActuatorError:
-                raise
-            except Exception as exc:
-                raise ActuatorError(
-                    "ACTUATOR_INIT_FAILED",
-                    f"{name} initialization failed: {exc}",
-                ) from exc
+        try:
+            self._sport = factories.sport_client()
+            self._obstacle = factories.obstacle_client()
+            self._emergency_sport = factories.sport_client()
+            self._emergency_obstacle = factories.obstacle_client()
+            clients = (
+                ("SportClient", self._sport),
+                ("ObstaclesAvoidClient", self._obstacle),
+                ("EmergencySportClient", self._emergency_sport),
+                ("EmergencyObstaclesAvoidClient", self._emergency_obstacle),
+            )
+            for name, client in clients:
+                try:
+                    client.SetTimeout(timeout_seconds)
+                    _require_success(client.Init(), f"{name}.Init")
+                except ActuatorError:
+                    raise
+                except Exception as exc:
+                    raise ActuatorError(
+                        "ACTUATOR_INIT_FAILED",
+                        f"{name} initialization failed: {exc}",
+                    ) from exc
+            if factories.motion_controller_reader is not None:
+                self._motion_controller = factories.motion_controller_reader()
+                # mcf模式可真实行走，但传统运动状态的速度/足端字段仍为零。
+                # 仅已知提供有效速度的控制器使用测量停车，未知模式不作此声明。
+                self._feedback_supported = self._feedback_supported and self._motion_controller in {"normal", "advanced"}
+        except BaseException:
+            self.close()
+            raise
+
+    def _observe_motion_state(self, message: Any) -> None:
+        """使用设备采样时间；里程计速度经姿态旋转到受控机体坐标。"""
+        received_monotonic_ns = time.monotonic_ns()
+        try:
+            sec, nanos = int(message.stamp.sec), int(message.stamp.nanosec)
+            stamp = sec * 1_000_000_000 + nanos
+            velocity = [float(v) for v in message.velocity]
+            quaternion = [float(v) for v in message.imu_state.quaternion]
+            gyro = [float(v) for v in message.imu_state.gyroscope]
+            if (sec < 0 or not 0 <= nanos < 1_000_000_000 or stamp <= 0
+                    or stamp > time.time_ns() + 50_000_000
+                    or len(velocity) != 3 or len(quaternion) != 4 or len(gyro) != 3
+                    or not all(math.isfinite(v) for v in velocity + quaternion + gyro)):
+                raise ValueError("运动反馈时间或数值无效")
+            norm = math.sqrt(sum(v * v for v in quaternion))
+            if not 0.9 <= norm <= 1.1:
+                raise ValueError("运动反馈姿态不是有效单位四元数")
+            w, x, y, z = [v / norm for v in quaternion]
+            vx, vy, vz = velocity
+            feedback = MotionExecutionFeedback(
+                source_timestamp_ns=stamp, frame_id=self._feedback_frame,
+                received_monotonic_ns=received_monotonic_ns,
+                linear_x_mps=(1-2*(y*y+z*z))*vx + 2*(x*y+w*z)*vy + 2*(x*z-w*y)*vz,
+                linear_y_mps=2*(x*y-w*z)*vx + (1-2*(x*x+z*z))*vy + 2*(y*z+w*x)*vz,
+                angular_z_rps=gyro[2],
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            with self._feedback_lock:
+                self._motion_feedback = None
+            return
+        with self._feedback_lock:
+            if self._feedback_closed:
+                return
+            if feedback.source_timestamp_ns > self._feedback_source_ns:
+                self._feedback_source_ns = feedback.source_timestamp_ns
+                self._motion_feedback = feedback
+                self._feedback_mode = getattr(message, "mode", None)
+
+    @property
+    def supports_motion_feedback(self) -> bool:
+        return self._feedback_supported
+
+    def get_motion_execution_feedback(self):
+        with self._feedback_lock:
+            return self._motion_feedback
+
+    def close(self) -> None:
+        # 守卫拥有方完成停车和退出后才关闭订阅；失败时保留句柄供再次回收。
+        with self._feedback_lock:
+            self._feedback_closed = True
+            self._motion_feedback = None
+            subscriber = self._motion_state_subscriber
+        if subscriber is not None:
+            subscriber.Close()
+            with self._feedback_lock:
+                self._motion_state_subscriber = None
 
     @classmethod
     def from_environment(cls) -> "Go2Actuator":
@@ -420,14 +536,23 @@ class Go2Actuator:
         raise ActuatorError("INVALID_ARGUMENT", "sport action is unspecified or unsupported")
 
     def zero(self) -> None:
-        errors: List[str] = []
+        if (self._motion_controller == "mcf" and self._low_level_controller is None
+                and not self._obstacle_policy_enabled and not self._obstacle_remote_enabled):
+            # 当前控制器使用Move零速；传统StopMove在此模式返回-1。
+            # 这里只确认归零写入，确认器按真实反馈能力决定是否有物理证明。
+            try:
+                _require_zero_success(self._emergency_sport.Move(0.0, 0.0, 0.0), "EmergencySportClient.Move(zero)")
+            except Exception as exc:
+                raise ActuatorError("ZERO_FAILED", str(exc)) from exc
+            return
+        errors: List[Exception] = []
         try:
             _require_zero_success(
                 self._emergency_obstacle.Move(0.0, 0.0, 0.0),
                 "EmergencyObstaclesAvoidClient.Move(zero)",
             )
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(exc)
         if self._obstacle_remote_enabled:
             try:
                 _require_zero_success(
@@ -436,21 +561,21 @@ class Go2Actuator:
                 )
                 self._obstacle_remote_enabled = False
             except Exception as exc:
-                errors.append(str(exc))
+                errors.append(exc)
         try:
             _require_zero_success(
                 self._emergency_sport.Move(0.0, 0.0, 0.0),
                 "EmergencySportClient.Move(zero)",
             )
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(exc)
         try:
             _require_zero_success(
                 self._emergency_sport.StopMove(),
                 "EmergencySportClient.StopMove",
             )
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(exc)
         if self._low_level_controller is not None:
             try:
                 stop_motion = getattr(self._low_level_controller, "stop_motion", None)
@@ -460,9 +585,20 @@ class Go2Actuator:
                     result = self._low_level_controller.stop()
                 _require_zero_success(result, "LowLevelController.stop")
             except Exception as exc:
-                errors.append(str(exc))
+                errors.append(exc)
         if errors:
-            raise ActuatorError("ZERO_FAILED", "; ".join(dict.fromkeys(errors)))
+            # 未处于行走模式时固件可以拒绝StopMove。用新鲜设备模式判定
+            # 控制器未行走，静止速度仍交给原确认器连续验证，不能伪造命令回执。
+            with self._feedback_lock:
+                feedback = self._motion_feedback
+                inactive = (self._feedback_mode in _NONWALKING_MODES and feedback is not None
+                    and feedback.received_monotonic_ns is not None
+                    and 0 <= time.monotonic_ns()-feedback.received_monotonic_ns <= 250_000_000)
+            if (inactive and self.supports_motion_feedback and self._low_level_controller is None
+                    and not self._obstacle_remote_enabled
+                    and all(isinstance(error, ActuatorError) and error.code == "STOP_REJECTED" for error in errors)):
+                return
+            raise ActuatorError("ZERO_FAILED", "; ".join(dict.fromkeys(str(error) for error in errors)))
 
     def switch_mode(self, command: pb.ModeSwitchCommand) -> int:
         target = command.target_mode

@@ -10,6 +10,8 @@ class MotionExecutionFeedback(ContractModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False, strict=True)
     source_timestamp_ns: int = Field(gt=0)
+    # 同一受控主机接收样本的单调时刻；保留设备时间，不能在读取缓存时刷新。
+    received_monotonic_ns: Optional[int] = Field(default=None, gt=0)
     frame_id: str = Field(min_length=1)
     linear_x_mps: float
     linear_y_mps: float

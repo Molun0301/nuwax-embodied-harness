@@ -371,6 +371,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_geometry_preserves_exact_calibration_float_bits() {
+        // 摘要跨独立可执行程序核对，不能依赖上层偶然开启的浮点解析特性。
+        let geometry = RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.23940000000115902,-0.1640000000011588],[0.3295072838592236,-0.1640000000011588],[0.3295072838592236,0.1640000000011588],[-0.23940000000115902,0.1640000000011588]],"z_min_m":-0.448,"z_max_m":0.056999999999999995}"#).unwrap();
+        assert_eq!(geometry.footprint_xy_m[0][0].to_bits(), (-0.23940000000115902_f64).to_bits());
+        assert_eq!(geometry.footprint_xy_m[1][0].to_bits(), 0.3295072838592236_f64.to_bits());
+        assert_eq!(geometry.footprint_xy_m[0][1].to_bits(), (-0.1640000000011588_f64).to_bits());
+        assert_eq!(geometry.z_max_m.to_bits(), 0.056999999999999995_f64.to_bits());
+    }
+
+    #[test]
     fn malformed_body_geometry_is_rejected() {
         let mut geometry = body();
         geometry.footprint_xy_m.reverse();

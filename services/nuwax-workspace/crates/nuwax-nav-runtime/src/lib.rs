@@ -365,6 +365,9 @@ pub enum RuntimeError {
     /// Motion port failure. The result may be ambiguous.
     #[error("motion guard operation failed: {0}")]
     Motion(String),
+    /// 停止命令已隔离租约，原操作尚未取得物理停稳确认，可继续查询。
+    #[error("navigation stop confirmation pending: {0}")]
+    StopUnconfirmed(String),
     /// Planner reported a terminal failure.
     #[error("planner failed: {0}")]
     Planner(String),
@@ -393,6 +396,8 @@ pub struct MotionPortError {
     pub message: String,
     /// Whether an ambiguous result may have created or retained a lease.
     pub lease_may_be_active: bool,
+    /// 已有精确停止票据，允许保留会话等待后续确认。
+    pub stop_unconfirmed: bool,
 }
 
 impl MotionPortError {
@@ -402,6 +407,7 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: true,
+            stop_unconfirmed: false,
         }
     }
 
@@ -411,7 +417,12 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: false,
+            stop_unconfirmed: false,
         }
+    }
+
+    fn stop_unconfirmed(message: impl Into<String>) -> Self {
+        Self { message: message.into(), lease_may_be_active: true, stop_unconfirmed: true }
     }
 }
 
@@ -572,6 +583,7 @@ struct ProductionNavMotionPort {
     normal_config: ClientConfig,
     priority_config: ClientConfig,
     lease_tuple: Option<LeaseTuple>,
+    pending_fence: Option<(String, nuwax_motion_safety_guard::ZeroConfirmation)>,
 }
 
 impl ProductionNavMotionPort {
@@ -586,6 +598,7 @@ impl ProductionNavMotionPort {
             normal_config: config,
             priority_config,
             lease_tuple: None,
+            pending_fence: None,
         })
     }
 
@@ -605,6 +618,19 @@ impl ProductionNavMotionPort {
             applied_monotonic_ns: confirmation.applied_monotonic_ns,
             lease: FenceLeaseState::Idle,
         }
+    }
+
+    async fn confirm_pending_fence(&mut self) -> Result<FenceProof, MotionPortError> {
+        let (operation, zero) = self.pending_fence.as_ref().expect("已有停车票据").clone();
+        let confirmed = MotionGuardClient::confirm_stationary_after_fence(
+            self.normal_config.clone(), &operation, zero).await.map_err(|error| {
+                if matches!(&error, MotionGuardClientError::Remote { code, .. } if code == "MOTION_STOP_UNCONFIRMED") {
+                    MotionPortError::stop_unconfirmed(error.to_string())
+                } else { MotionPortError::new(error.to_string()) }
+            })?;
+        self.pending_fence = None;
+        self.lease_tuple = None;
+        Ok(Self::fence_proof(confirmed))
     }
 }
 
@@ -647,6 +673,9 @@ impl NavMotionPort for ProductionNavMotionPort {
         &mut self,
         operation_id: &str,
     ) -> Result<FenceProof, MotionPortError> {
+        if self.pending_fence.is_some() {
+            return self.confirm_pending_fence().await;
+        }
         // Closing the ordinary stream cancels a delayed write/read without
         // waiting for its 250 ms request timeout.
         self.normal.take();
@@ -678,11 +707,9 @@ impl NavMotionPort for ProductionNavMotionPort {
         })
         .await
         .map_err(|_| MotionPortError::new("priority fence exceeded 300 ms hard timeout"))??;
-        self.lease_tuple = None;
         // 租约和指令通道已在原硬期限内隔离；此后等待同一归零标识的物理停稳。
-        let fence=MotionGuardClient::confirm_stationary_after_fence(self.normal_config.clone(),&operation_id,fence)
-            .await.map_err(|e|MotionPortError::new(e.to_string()))?;
-        Ok(Self::fence_proof(fence))
+        self.pending_fence = Some((operation_id, fence));
+        self.confirm_pending_fence().await
     }
 }
 
@@ -998,6 +1025,7 @@ where
                             let error = self.fail_closed(&status_tx, error).await;
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
+                            if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
                             return Err(error);
                         }
                         Interruptible::Urgent(Some(command)) => {
@@ -1034,6 +1062,7 @@ where
                         Interruptible::Completed(Err(error)) => {
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
+                            if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
                             return Err(error);
                         }
                         Interruptible::Urgent(Some(command)) => {
@@ -1388,6 +1417,7 @@ where
                 ),
             };
             let qualified_cause = format!("SafetyFailed cause=PathMutation: {error}");
+            self.status.message = qualified_cause.clone();
             self.finish_terminal(
                 status_tx,
                 TerminalOutcome::SafetyFailed,
@@ -1452,7 +1482,7 @@ where
     ) -> Result<(), RuntimeError> {
         if let Some(reason) = self.stale_input_reason(Instant::now()) {
             let qualified_cause = format!("SafetyFailed cause=StaleInput: {reason}");
-            self.status.message = format!("planner input stale: {reason}; fencing");
+            self.status.message = qualified_cause.clone();
             self.publish_status(status_tx);
             self.finish_terminal(
                 status_tx,
@@ -1492,7 +1522,7 @@ where
             }
             LocalExecutionPayload::Failed(reason) => {
                 let qualified_cause = format!("PlannerFailed cause=LocalPlanner: {reason}");
-                self.status.message = format!("planner failed: {reason}; fencing");
+                self.status.message = qualified_cause.clone();
                 self.publish_status(status_tx);
                 self.finish_terminal(
                     status_tx,
@@ -1602,6 +1632,7 @@ where
         }
         if self.current_path_revision > 0 {
             if let Some(reason) = self.stale_input_reason(Instant::now()) {
+                self.status.message = format!("SafetyFailed cause=StaleInput: {reason}");
                 self.finish_terminal(
                     status_tx,
                     TerminalOutcome::SafetyFailed,
@@ -1652,6 +1683,7 @@ where
             RuntimeError::PathRejected { .. } => "PathRejected",
             RuntimeError::PathMutation { .. } => "PathMutation",
             RuntimeError::Motion(_) => "Motion",
+            RuntimeError::StopUnconfirmed(_) => "StopUnconfirmed",
             RuntimeError::Planner(_) => "Planner",
             RuntimeError::StaleInput(_) => "StaleInput",
             RuntimeError::InvalidApplied(_) => "InvalidApplied",
@@ -1660,6 +1692,7 @@ where
             RuntimeError::SequenceExhausted => "SequenceExhausted",
         };
         let qualified_cause = format!("SafetyFailed cause={cause_kind}: {original}");
+        self.status.message = qualified_cause.clone();
         match self
             .finish_terminal(
                 status_tx,
@@ -1673,6 +1706,7 @@ where
                 self.publish_status(status_tx);
                 original
             }
+            Err(RuntimeError::StopUnconfirmed(reason)) => RuntimeError::StopUnconfirmed(format!("{original}; {reason}")),
             Err(fence_error) => RuntimeError::Motion(format!(
                 "{original}; explicit fence also failed: {fence_error}"
             )),
@@ -1685,6 +1719,9 @@ where
         terminal: TerminalOutcome,
         phase_after: SchedulerPhase,
     ) -> Result<(), RuntimeError> {
+        // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
+        let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
+            .then(|| self.status.message.clone());
         self.current_execution_identity = None;
         self.local_intent_sequence = 0;
         self.planner.stop();
@@ -1701,6 +1738,9 @@ where
                 Ok(proof) => proof,
                 Err(error) => {
                     self.fail_status(status_tx, &error.message);
+                    if error.stop_unconfirmed {
+                        return Err(RuntimeError::StopUnconfirmed(error.message));
+                    }
                     return Err(RuntimeError::Motion(error.message));
                 }
             };
@@ -1730,12 +1770,16 @@ where
         self.status.path_revision = 0;
         self.status.last_terminal = Some(terminal);
         if let Some(proof) = verified_fence {
+            self.status.motion_sink_ready = terminal != TerminalOutcome::Shutdown;
             self.status.last_zero_ack_id = Some(proof.zero_ack_id);
             self.status.last_fence_monotonic_ns = proof.applied_monotonic_ns;
             self.status.last_applied_twist = Some(Twist2::ZERO);
             self.status.message = format!("{terminal:?} after verified fence");
         } else {
             self.status.message = format!("{terminal:?} with no active lease");
+        }
+        if let Some(reason) = failure_reason {
+            self.status.message = format!("{reason}; {}", self.status.message);
         }
         if terminal == TerminalOutcome::Shutdown {
             self.status.motion_sink_ready = false;
@@ -2563,6 +2607,7 @@ mod tests {
     struct FakeMotionState {
         calls: Vec<String>,
         fail_twist: bool,
+        unconfirmed_fences: usize,
     }
 
     #[derive(Clone)]
@@ -2615,11 +2660,12 @@ mod tests {
             &mut self,
             operation_id: &str,
         ) -> Result<FenceProof, MotionPortError> {
-            self.0
-                .lock()
-                .expect("fake motion state")
-                .calls
-                .push(format!("fence:{operation_id}"));
+            let mut state = self.0.lock().expect("fake motion state");
+            state.calls.push(format!("fence:{operation_id}"));
+            if state.unconfirmed_fences > 0 {
+                state.unconfirmed_fences -= 1;
+                return Err(MotionPortError::stop_unconfirmed("等待实际停稳"));
+            }
             Ok(FenceProof {
                 zero_ack_id: "zero-ack".into(),
                 applied_monotonic_ns: 100,
@@ -3954,6 +4000,55 @@ mod tests {
             .any(|call| call.starts_with("fence:")));
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
+    }
+
+    #[tokio::test]
+    async fn first_failure_terminal_keeps_the_reason_after_fencing() {
+        for terminal in [TerminalOutcome::PlannerFailed,TerminalOutcome::SafetyFailed] {
+            let mut scheduler = NavScheduler::new(
+                FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+                FakePlanner::commanding(),SchedulerConfig::default()).unwrap();
+            scheduler.session=Some(session());
+            scheduler.lease_active=true;
+            scheduler.status.message="原始失败原因：目标前方没有可行支撑".into();
+            let (sender, observed)=watch::channel(scheduler.status.clone());
+            scheduler.finish_terminal(&sender,terminal,SchedulerPhase::Failed).await.unwrap();
+            let status=observed.borrow();
+            assert_eq!(status.last_terminal,Some(terminal));
+            assert!(status.last_zero_ack_id.is_some());
+            assert!(status.message.contains("目标前方没有可行支撑"),"首次终态丢失原因: {}",status.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_unconfirmed_keeps_scheduler_and_goal_until_cancel_retries() {
+        let motion = Arc::new(Mutex::new(FakeMotionState {
+            unconfirmed_fences: 1, ..Default::default()
+        }));
+        let planner = FakePlanner::commanding();
+        planner.state.lock().unwrap().step = PlannerStep::Succeeded;
+        let (handle, task) = test_scheduler(FakeMotion(motion), planner);
+        wait_for_sink(&handle).await;
+        handle.update_costmap(costmap_at(1_000_000_000)).await.unwrap();
+        handle.update_odometry(map_pose()).await.unwrap();
+        let original = session();
+        handle.start_session(original.clone()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status().phase != SchedulerPhase::Failed {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert!(!task.is_finished(), "暂时缺少停稳确认不能结束调度器");
+        assert_eq!(handle.status().session_id.as_deref(), Some(original.session_id.as_str()));
+        assert!(handle.status().last_terminal.is_none());
+        handle.cancel(&original.session_id).await.unwrap();
+        assert_eq!(handle.status().last_terminal, Some(TerminalOutcome::Cancelled));
+        assert!(handle.status().motion_sink_ready);
+        handle.start_session(session()).await.unwrap();
+        handle.cancel(&original.session_id).await.unwrap();
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

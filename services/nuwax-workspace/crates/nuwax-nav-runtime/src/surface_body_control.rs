@@ -14,47 +14,26 @@ fn planar(p: &PoseStamped) -> PlanarPose {
     }
 }
 impl SurfaceFollower {
-    pub(super) fn observe_body_velocity(&mut self, next: &PoseStamped) {
-        if let Some(previous) = &self.odometry {
-            let dt = (next.stamp.nanos - previous.stamp.nanos) as f64 * 1e-9;
-            if dt > 1e-5 && dt <= crate::DEFAULT_POSE_TTL.as_secs_f64() {
-                let dx = (next.pose.position.x - previous.pose.position.x) / dt;
-                let dy = (next.pose.position.y - previous.pose.position.y) / dt;
-                let yaw = previous.pose.orientation.yaw();
-                self.observed_velocity = Twist2 {
-                    linear: Point2::new(
-                        dx * yaw.cos() + dy * yaw.sin(),
-                        -dx * yaw.sin() + dy * yaw.cos(),
-                    ),
-                    angular_z: angle_diff(next.pose.orientation.yaw(), yaw) / dt,
-                };
-                if self
-                    .observed_velocity
-                    .linear
-                    .x
-                    .hypot(self.observed_velocity.linear.y)
-                    < 0.02
-                    && self.observed_velocity.angular_z.abs() < 0.04
-                {
-                    self.settled_samples += 1;
-                } else {
-                    self.settled_samples = 0;
-                }
-            } else if dt > 0.0 {
-                self.settled_samples = 0;
+    pub(super) fn begin_braking(&mut self) {
+        // 地图位姿包含定位校正，不能差分成真实速度或另一份静止证明。
+        // 仅在实际生成过非零控制时保留标定制动上界；重复零速不延长等待。
+        if self.last_command != Twist2::ZERO {
+            if let Some(limits) = &self.config.motion_limits {
+                self.braking_deadline = Some(std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(limits.maximum_stopping_time_sec()));
             }
         }
+        self.last_command = Twist2::ZERO;
     }
     pub(super) fn follow_body_step(&mut self, robot_width: f64) -> PlannerStep {
         if let Some(error) = &self.invalid_input {
             return PlannerStep::Failed(error.clone());
         }
-        if self.braking {
-            self.last_command = Twist2::ZERO;
-            if self.settled_samples >= 2 {
-                self.braking = false;
+        if let Some(deadline) = self.braking_deadline {
+            if std::time::Instant::now() < deadline {
+                return PlannerStep::Command(Twist2::ZERO);
             }
-            return PlannerStep::Command(Twist2::ZERO);
+            self.braking_deadline = None;
         }
         let (Some(map), Some(pose), Some(path), Some(goal)) = (
             self.map.as_ref(),
@@ -72,23 +51,27 @@ impl SurfaceFollower {
         }
         let position = pose.pose.position;
         let yaw = pose.pose.orientation.yaw();
-        let final_distance = position.distance(goal.pose.position);
+        let actual_support = map.locate_support_from_body(
+            body(pose).0, body(pose).1, self.config.body_to_support_z_m,
+        ).ok();
+        let goal_support = map.locate_goal_support_from_body(
+            body(goal).0, body(goal).1, self.config.body_to_support_z_m,
+        ).ok();
+        let same_goal_surface = actual_support.zip(goal_support).is_some_and(|(a,b)|
+            (a.surface_xyz[2]-b.surface_xyz[2]).abs() <= f64::from(map.source_voxel_size_m())+1e-6);
+        let final_distance = if same_goal_surface {
+            (position.x-goal.pose.position.x).hypot(position.y-goal.pose.position.y)
+        } else { position.distance(goal.pose.position) };
         let final_yaw = angle_diff(goal.pose.orientation.yaw(), yaw);
         if final_distance < self.config.controller.goal_tolerance
             && final_yaw.abs() < self.config.controller.orientation_tolerance
         {
-            if self.settled_samples < 2 || self.last_command != Twist2::ZERO {
-                self.braking = true;
-                self.last_command = Twist2::ZERO;
-                return PlannerStep::Command(Twist2::ZERO);
-            }
+            // 这里只确认到达规划终点；调度器随后撤租归零，等待守卫的物理
+            // 停稳证明后才发布成功，避免地图噪声形成第二道停车门槛。
             return PlannerStep::Succeeded;
         }
         // 逐点保留转向停留；曲线点只在到达或沿已确认小段越过时消耗。
         let tolerance = (f64::from(map.config().voxel_size) * 0.7).min(0.07);
-        let actual_support = map.locate_support_from_body(
-            body(pose).0, body(pose).1, self.config.body_to_support_z_m,
-        ).ok();
         while self.path_index < path.poses.len() {
             let target = &path.poses[self.path_index];
             let previous = &path.poses[self.path_index - 1];
@@ -234,17 +217,9 @@ impl SurfaceFollower {
             return PlannerStep::ReplanRequired("缺少机体包络".into());
         };
         let target = self.control_target.unwrap_or_else(|| planar(pose));
-        let bound = |a: f64, b: f64| if b.abs() > a.abs() { b } else { a };
-        let current = Twist2 {
-            linear: Point2::new(
-                bound(self.last_command.linear.x, self.observed_velocity.linear.x),
-                bound(self.last_command.linear.y, self.observed_velocity.linear.y),
-            ),
-            angular_z: bound(
-                self.last_command.angular_z,
-                self.observed_velocity.angular_z,
-            ),
-        };
+        // 用已下发控制及标定动态界预测制动扫掠；map位姿仍用于实际
+        // 位置、障碍和偏离检查，其坐标校正不充当执行器速度。
+        let current = self.last_command;
         let Ok(initial) =
             map.locate_support_from_body(body(pose).0, body(pose).1, model.body_to_support_z_m).map(|s|s.support_xyz)
         else {
@@ -313,9 +288,7 @@ impl SurfaceFollower {
                 PlannerStep::Command(choice.command)
             }
             _ => {
-                self.last_command = Twist2::ZERO;
-                self.braking = true;
-                self.settled_samples = 0;
+                self.begin_braking();
                 PlannerStep::ReplanRequired(format!("三维制动扫掠受阻，停车后重新接续{}",
                     last_failure.map(|error|format!(": {error}")).unwrap_or_default()))
             }

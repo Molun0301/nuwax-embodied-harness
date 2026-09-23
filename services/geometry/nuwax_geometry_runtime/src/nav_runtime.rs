@@ -1568,15 +1568,24 @@ impl NavRuntimeState {
                 message: "CANCEL_STATE_UNAVAILABLE".to_string(),
             };
         };
-        if cancel.phase == CancelPhase::Pending {
-            if cancel.lease.as_ref() == Some(&lease) {
-                return CancelStart::ExistingPending {
-                    lease,
-                    generation: cancel.generation,
-                    goal_id,
-                    message: cancel.message.clone(),
-                };
+        if matches!(cancel.phase, CancelPhase::Pending | CancelPhase::Failed | CancelPhase::TimedOut)
+            && cancel.lease.as_ref() == Some(&lease)
+        {
+            // 重试同一次停车沿用原票据，避免已持有的全局恢复围栏因代次
+            // 改变而失去对账对象。每次重试仍使用原有的有限确认期限。
+            if cancel.phase != CancelPhase::Pending {
+                cancel.phase = CancelPhase::Pending;
+                cancel.requested_at = Some(Instant::now());
+                cancel.message = "CANCEL_PENDING_ZERO_ACK".to_string();
             }
+            return CancelStart::ExistingPending {
+                lease,
+                generation: cancel.generation,
+                goal_id,
+                message: cancel.message.clone(),
+            };
+        }
+        if cancel.phase == CancelPhase::Pending {
             return CancelStart::Rejected {
                 goal_id,
                 message: "CANCEL_REJECTED[CANCEL_IN_FLIGHT_CONFLICT]".to_string(),
@@ -6350,6 +6359,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_cancel_retry_keeps_recovery_fence_identity() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("cancel-recovery-identity", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        cancel(&handle, &state, cancel_input(&lease)).await;
+        let generation = state.cancel_snapshot().generation;
+        for _ in 0..3 {
+            state.expire_cancel_for_test();
+            state.poll_cancel_timeout().await.expect("停车确认应超时");
+            let retry = cancel(&handle, &state, cancel_input(&lease)).await;
+            assert_eq!(retry.state.status, "PENDING");
+            assert_eq!(state.cancel_snapshot().generation, generation,
+                "同一次停车重试不能改变全局恢复围栏身份");
+        }
+        let zero = state.observe_cancel_ack(cancel_ack(
+            &lease, generation, MotionSinkCancelAckStatus::Zeroed,
+        )).await;
+        assert_eq!(zero.state.status, "CANCELLED");
+    }
+
+    #[tokio::test]
     async fn exact_zero_recovers_failed_and_timed_out_cancel_without_weakening_identity() {
         for recover_from_failure in [true, false] {
             let handle = make_handle().await;
@@ -6493,7 +6528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_generation_rejects_the_old_zero_ack() {
+    async fn retry_preserves_identity_and_rejects_foreign_zero_ack() {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
         let lease = test_lease("retry-old-zero", 1);
@@ -6515,12 +6550,12 @@ mod tests {
             "PENDING"
         );
         let retry = state.cancel_snapshot();
-        assert!(retry.generation > first.generation);
+        assert_eq!(retry.generation, first.generation);
 
         let stale = state
             .observe_cancel_ack(cancel_ack(
                 &lease,
-                first.generation,
+                first.generation + 1,
                 MotionSinkCancelAckStatus::Zeroed,
             ))
             .await;

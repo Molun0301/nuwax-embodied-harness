@@ -924,7 +924,20 @@ class MotionGuardClient:
                 operation_id=operation,
                 outcome_unknown=True,
             ) from exc
-        if state.motion_stop_generation != outcome.motion_stop_generation:
+        if state.motion_stop_generation > outcome.motion_stop_generation:
+            # 操作回执保持幂等，当前状态可能已被后续全局停车推进。
+            # 这属于旧结果失效，不能把正常连接永久标为协议损坏。
+            raise StaleStopGenerationError(
+                operation="stop_all_motion",
+                operation_id=operation,
+                result=GuardResultSnapshot(
+                    ack=pb.ACK_CODE_UNSPECIFIED,
+                    lease=state.result.lease,
+                    error_code="STALE_STOP_GENERATION",
+                    error_message="global stop result was superseded by a later stop",
+                ),
+            )
+        if state.motion_stop_generation < outcome.motion_stop_generation:
             self._raise_protocol(
                 "global stop and guard-state stop generations do not correlate"
             )

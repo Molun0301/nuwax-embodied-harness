@@ -372,7 +372,8 @@ impl MotionGuardClient {
             return Ok(zero);
         }
         if deadline>monotonic_ns()?.saturating_add(32_000_000_000) {return self.protocol_error("停稳确认截止超出有界预算");}
-        while monotonic_ns()?<=deadline {
+        loop {
+            // 原等待期限结束后仍查询一次：同一停车操作可能已在后台取得迟到确认。
             let request=MotionGuardRequest {api_version:API_VERSION,request_id:new_request_id(),operation:Some(motion_guard_request::Operation::GetOperationResult(GetOperationResultRequest {
                 source:source as i32,operation_id:operation_id.into(),operation_namespace:namespace as i32,
             }))};
@@ -383,6 +384,7 @@ impl MotionGuardClient {
             if observed.zero_ack_id!=zero.zero_ack_id {return self.protocol_error("停稳查询更换了原归零标识");}
             if observed.stationary_confirmed {return Ok(observed);}
             if observed.confirmation_kind=="unconfirmed" {break;}
+            if monotonic_ns()?>deadline {break;}
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Err(MotionGuardClientError::Remote{code:"MOTION_STOP_UNCONFIRMED".into(),message:"执行器未在保证制动期限内确认停稳".into(),retryable:false,operation_id:operation_id.into()})

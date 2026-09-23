@@ -1,6 +1,7 @@
 """原运动守卫内的停稳确认；先发停止，再等待真实反馈或标定的保证制动上界。"""
 from __future__ import annotations
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 import math
 import time
 from typing import Optional
@@ -28,6 +29,7 @@ class StopProgress:
     first_settled: Optional[float] = None
     previous_source: int = 0
     count: int = 0
+    samples: deque = field(default_factory=lambda: deque(maxlen=64))
     last_error: str = "执行器在保证制动期限内未确认停稳。"
 
 
@@ -82,8 +84,17 @@ class StopConfirmation:
         now = self._unix_ns()
         if feedback.frame_id != self.frame_id:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器速度未使用受控机体坐标。")
-        if feedback.source_timestamp_ns > now + 50_000_000 or now - feedback.source_timestamp_ns > 250_000_000:
+        if feedback.source_timestamp_ns > now + 50_000_000:
             raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈过期或位于未来。")
+        if feedback.received_monotonic_ns is None:
+            stale = now - feedback.source_timestamp_ns > 250_000_000
+        else:
+            # 接收新鲜度不依赖设备与主机的固定时钟差；设备原始时间仍由
+            # 停车窗口要求晚于停止请求，并严格递增，旧缓存不能补成新证明。
+            age = round(self._monotonic() * 1_000_000_000) - feedback.received_monotonic_ns
+            stale = age < 0 or age > 250_000_000
+        if stale:
+            raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈接收已过期。")
         return feedback
 
     def start(self, actuator, started):
@@ -113,7 +124,19 @@ class StopConfirmation:
             fresh = value.source_timestamp_ns >= progress.issued_ns and value.source_timestamp_ns > progress.previous_source
             if fresh:
                 progress.previous_source = value.source_timestamp_ns
-                stopped = math.hypot(value.linear_x_mps, value.linear_y_mps) <= 0.01 and abs(value.angular_z_rps) <= 0.02
+                # 对速度大小求短窗均值，抑制静止测量抖动；正反运动不会相互抵消。
+                samples = progress.samples
+                now_ns = round(now * 1_000_000_000)
+                samples.append((now_ns, math.hypot(value.linear_x_mps, value.linear_y_mps), abs(value.angular_z_rps)))
+                while len(samples) > 1 and samples[1][0] <= now_ns - 100_000_000:
+                    samples.popleft()
+                linear = sum(sample[1] for sample in samples) / len(samples)
+                angular = sum(sample[2] for sample in samples) / len(samples)
+                window_ready = len(samples) >= 3 and now_ns - samples[0][0] >= 100_000_000
+                stopped = window_ready and linear <= 0.01 and angular <= 0.02
+                progress.last_error = (
+                    "停稳反馈窗口%.3f秒，速度均值%.4f米/秒、角速度均值%.4f弧度/秒，尚未满足连续停稳条件。"
+                    % ((now_ns - samples[0][0]) / 1_000_000_000, linear, angular))
                 if now >= progress.earliest and stopped:
                     progress.first_settled = now if progress.first_settled is None else progress.first_settled
                     progress.count += 1
@@ -123,6 +146,7 @@ class StopConfirmation:
                     progress.first_settled, progress.count = None, 0
         except ActuatorError as exc:
             progress.first_settled, progress.count = None, 0
+            progress.samples.clear()
             progress.last_error = exc.message
         return None
 

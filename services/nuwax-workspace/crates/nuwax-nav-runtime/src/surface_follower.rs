@@ -94,9 +94,7 @@ pub struct SurfaceFollower {
     path_index: usize,
     options: nuwax_nav_types_messages::GoalOptions,
     last_command: Twist2,
-    observed_velocity: Twist2,
-    braking: bool,
-    settled_samples: usize,
+    braking_deadline: Option<std::time::Instant>,
     control_target: Option<nuwax_nav_control::PlanarPose>,
 }
 
@@ -122,9 +120,7 @@ impl SurfaceFollower {
             path_index: 1,
             options:Default::default(),
             last_command:Twist2::ZERO,
-            observed_velocity:Twist2::ZERO,
-            braking:false,
-            settled_samples:0,
+            braking_deadline:None,
             control_target:None,
         })
     }
@@ -478,6 +474,9 @@ impl NavPlanner for SurfaceFollower {
     fn configure_goal(&mut self, _goal:&PoseStamped, options:nuwax_nav_types_messages::GoalOptions)->Result<(),RuntimeError> {
         options.validate().map_err(|reason|RuntimeError::InvalidInput {field:"goal_options",reason})?;
         if options.allow_reverse && self.config.motion_limits.as_ref().is_none_or(|m|m.max_reverse_mps<=0.0) {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"三维执行未提供倒车标定".into()});}
+        // 新目标执行仍须取得守卫准入；旧规划器内部状态不能代替该证明。
+        self.braking_deadline = None;
+        self.last_command = Twist2::ZERO;
         self.options=options;
         self.config.controller.goal_tolerance=options.position_tolerance_m.max(1e-6);
         self.config.controller.orientation_tolerance=options.yaw_tolerance_rad.max(1e-6);
@@ -504,7 +503,6 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn update_odometry(&mut self, odometry: PoseStamped) {
-        self.observe_body_velocity(&odometry);
         self.odometry = Some(odometry);
         self.refresh_current_body_view();
     }
@@ -540,8 +538,7 @@ impl NavPlanner for SurfaceFollower {
     }
 
     fn stop(&mut self) {
-        self.last_command=Twist2::ZERO;
-        if self.observed_velocity.linear.x.hypot(self.observed_velocity.linear.y)>0.02 || self.observed_velocity.angular_z.abs()>0.04 {self.braking=true;self.settled_samples=0;}
+        self.begin_braking();
         self.path = None;
         self.goal = None;
         self.cumulative.clear();
@@ -749,6 +746,37 @@ mod tests {
     }
 
     #[test]
+    fn localization_jitter_does_not_create_a_second_stop_gate() {
+        use nuwax_nav_mls_planner::SurfaceBodyEnvelope;
+        let map = Arc::new(test_snapshot(0.0, false).with_body_envelope(SurfaceBodyEnvelope {
+            footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
+            z_bounds_m: [-0.05,0.2], body_to_support_z_m:0.3,
+            max_step_up_m:0.0, max_step_down_m:0.0, max_cross_slope_deg:10.0,
+            support_uncertainty_m:0.0,
+        }).unwrap());
+        let mut config = SurfaceFollowerConfig::new(0.3);
+        config.controller.speed = 0.15;
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        // 没有发过运动命令；定位微小校正的差分却远大于旧静止阈值。
+        for tick in 0..20 {
+            follower.update_odometry(body_pose([1.0 + if tick%2==0 {0.004} else {-0.004},0.55,0.4],
+                Quaternion::from_yaw(if tick%2==0 {0.01} else {-0.01}),tick));
+        }
+        follower.stop();
+        let start = follower.odometry.clone().unwrap();
+        let goal = body_pose([1.5,0.55,0.4],Quaternion::IDENTITY,20);
+        let options = nuwax_nav_types_messages::GoalOptions {position_tolerance_m:0.04,..Default::default()};
+        follower.configure_goal(&goal,options).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,goal.clone()]}),None,goal.clone()).unwrap();
+        assert!(matches!(follower.step(0.3),PlannerStep::Command(v) if v.linear.x>0.0),
+            "未运动时的地图校正不能把起步锁在零速");
+        follower.update_odometry(goal);
+        assert!(matches!(follower.step(0.3),PlannerStep::Succeeded),
+            "到达只交给调度器发起停车，物理终态由运动守卫确认");
+    }
+
+    #[test]
     fn near_field_evidence_covers_the_emergency_braking_tail() {
         use nuwax_nav_mls_planner::{SurfaceBodyEnvelope, SurfaceObservation, SurfaceObservations};
         use nuwax_nav_types_messages::{MotionLimits, MotionModel};
@@ -784,7 +812,6 @@ mod tests {
             follower.update_odometry(body_pose([1.0, 0.55, 0.4], Quaternion::IDENTITY, 0));
             let speed = Twist2 { linear: Point2::new(0.5, 0.0), angular_z: 0.0 };
             follower.last_command = speed;
-            follower.observed_velocity = speed;
             follower.control_target = Some(nuwax_nav_control::PlanarPose { x: 2.0, y: 0.55, yaw: 0.0 });
             let result = follower.bounded_command(speed);
             if fresh { assert!(matches!(result, PlannerStep::Command(v) if v.linear.x > 0.0), "{result:?}"); }
@@ -792,6 +819,12 @@ mod tests {
                 // 初始机体及第一个50毫秒段仍在新鲜区域，停车尾段会越过1.2米。
                 assert!(matches!(result, PlannerStep::ReplanRequired(_)), "{result:?}");
                 assert_eq!(follower.last_command, Twist2::ZERO);
+                let deadline = follower.braking_deadline.expect("已运动后须保留制动上界");
+                follower.stop();
+                assert_eq!(follower.braking_deadline,Some(deadline),"重复停止不能延长等待");
+                assert!(matches!(follower.follow_body_step(0.3),PlannerStep::Command(v) if v==Twist2::ZERO));
+                follower.braking_deadline=Some(std::time::Instant::now()-std::time::Duration::from_millis(1));
+                assert!(!matches!(follower.follow_body_step(0.3),PlannerStep::Command(_)),"期限结束须回到输入/路径检查");
             }
         }
     }

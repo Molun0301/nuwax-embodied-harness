@@ -212,12 +212,8 @@ class GatewayMotionGuard:
         return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE, proof)
 
     def stop_and_fence(self, session: MotionGuardSession) -> ZeroConfirmation:
-        try:
-            session.stop()
-        except Exception:
-            # 在原异常处理上下文中围栏，使归零也失败时仍保留首次停止错误。
-            session.close()
-            raise
+        # 终结会话直接使用原子撤租归零；先Stop并等待会持锁阻断续租，
+        # 还会在租约已过期后重复停车。close自身核对物理停止回执。
         return session.close()
 
     def execute_sport(

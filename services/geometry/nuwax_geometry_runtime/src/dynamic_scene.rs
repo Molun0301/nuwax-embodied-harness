@@ -9,7 +9,6 @@ use nalgebra::Point3;
 pub(crate) type Cell = (i32, i32, i32);
 pub(crate) const CELL_SIZE: f64 = 0.2;
 const RANGE: f64 = 30.0;
-const MIN_RANGE: f64 = 0.5;
 const SURFACE_MARGIN: f64 = 0.3;
 const FREE_OBSERVATIONS: u8 = 3;
 const EVIDENCE_GAP_NS: u64 = 2_000_000_000;
@@ -29,12 +28,48 @@ struct Evidence {
     known_free: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct DynamicScene {
+    minimum_range_m: f64,
     evidence: HashMap<Cell, Evidence>,
     last_timestamp_ns: u64,
     clear_cells: HashSet<Cell>,
     dynamic_cells: HashSet<Cell>,
+}
+
+/// 与已选原生参数及已有观察标定取同一有效近距；设备未声明时保留原保守范围。
+fn observation_minimum_range(backend: &str, options: &str, observation_min: Option<f64>) -> Result<f64, String> {
+    use nuwax_lio_backends::{native::{NativeBackend, NativeLioConfig}, pointlio_options::PointLioOptions};
+    let native = match backend.trim() {
+        "pointlio" => {
+            let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
+            config.pointlio_options = PointLioOptions::from_json(options)?;
+            Some(config.minimum_observation_range_m())
+        }
+        "fastlio2" => Some(NativeLioConfig::for_backend(NativeBackend::FastLio2).minimum_observation_range_m()),
+        "" | "device" => None,
+        _ => return Err("动态点云观察范围对应的LIO后端无效".into()),
+    };
+    Ok(match (native, observation_min) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => 0.5,
+    })
+}
+
+impl Default for DynamicScene {
+    fn default() -> Self {
+        let minimum = (|| {
+            let capabilities = nuwax_nav_types_messages::NavigationCapabilities::from_env()?;
+            observation_minimum_range(
+                &std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").unwrap_or_default(),
+                &std::env::var(nuwax_lio_backends::pointlio_options::POINTLIO_OPTIONS_ENV).unwrap_or_default(),
+                capabilities.and_then(|value| value.observation.map(|model| model.min_range_m)),
+            )
+        })();
+        // 原拥有方预检负责报告错误；无效配置不能偷偷放宽地图删除范围。
+        Self::with_minimum_range(minimum.unwrap_or(f64::INFINITY))
+    }
 }
 
 pub(crate) fn cell(point: [f64; 3]) -> Option<Cell> {
@@ -52,6 +87,13 @@ fn neighbors(key: Cell) -> impl Iterator<Item = Cell> {
 }
 
 impl DynamicScene {
+    pub(crate) fn with_minimum_range(minimum_range_m: f64) -> Self {
+        Self { minimum_range_m, evidence: HashMap::new(), last_timestamp_ns: 0,
+            clear_cells: HashSet::new(), dynamic_cells: HashSet::new() }
+    }
+
+    pub(crate) fn minimum_range_m(&self) -> f64 { self.minimum_range_m }
+
     pub(crate) fn clear_frame(&mut self) {
         self.clear_cells.clear();
         self.dynamic_cells.clear();
@@ -76,7 +118,7 @@ impl DynamicScene {
             };
             hits.insert(key);
             let range = (point.coords - nalgebra::Vector3::from(origin)).norm();
-            if range <= MIN_RANGE + SURFACE_MARGIN {
+            if range <= self.minimum_range_m + SURFACE_MARGIN {
                 continue;
             }
             // 同一个回波格仅用最近的真实端点发射射线，全部命中格仍参与遮挡。
@@ -90,7 +132,7 @@ impl DynamicScene {
         }
         let mut free = HashSet::new();
         for (point, range) in endpoints.values() {
-            trace(origin, point, *range, &hits, &mut free);
+            trace(origin, point, *range, self.minimum_range_m, &hits, &mut free);
             // 容量不足时整帧不提供新自由证据，不能让任意散列顺序决定删除区域。
             if free.len() > MAX_CELLS {
                 return;
@@ -204,11 +246,12 @@ fn trace(
     origin: [f64; 3],
     point: &Point3<f64>,
     range: f64,
+    minimum_range_m: f64,
     hits: &HashSet<Cell>,
     free: &mut HashSet<Cell>,
 ) {
     let end = (range - SURFACE_MARGIN).min(RANGE);
-    if end <= MIN_RANGE {
+    if end <= minimum_range_m {
         return;
     }
     let direction = [
@@ -245,7 +288,7 @@ fn trace(
         };
         let exit = next[axis].min(end);
         // 不记录只擦过角点的零长度格；近场与回波端点留保护带。
-        if distance >= MIN_RANGE && exit - distance > CELL_SIZE * 0.05 {
+        if distance >= minimum_range_m && exit - distance > CELL_SIZE * 0.05 {
             free.insert(current);
         }
         if next[axis] >= end {
@@ -311,6 +354,17 @@ pub(crate) mod tests {
             }
         }
         (points, labels)
+    }
+
+    #[test]
+    fn calibrated_range_follows_selected_native_blind_and_observation_model() {
+        assert_eq!(observation_minimum_range("pointlio", r#"{"blind":0.05}"#, None).unwrap(),f64::from(0.05_f32));
+        assert_eq!(observation_minimum_range("pointlio", "{}", None).unwrap(),0.5);
+        assert_eq!(observation_minimum_range("fastlio2", "ignored", None).unwrap(),0.5);
+        assert_eq!(observation_minimum_range("pointlio", r#"{"blind":0.05}"#, Some(0.12)).unwrap(),0.12);
+        assert_eq!(observation_minimum_range("device", "ignored", Some(0.1)).unwrap(),0.1);
+        assert_eq!(observation_minimum_range("device", "ignored", None).unwrap(),0.5);
+        assert!(observation_minimum_range("pointlio", r#"{"blind":-1}"#, None).is_err());
     }
 
     #[test]

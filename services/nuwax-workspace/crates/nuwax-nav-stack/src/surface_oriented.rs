@@ -158,7 +158,7 @@ fn connect(
 pub fn plan(
     map: &SurfaceSnapshot,
     start: BodyPose,
-    goal: BodyPose,
+    mut goal: BodyPose,
     options: GoalOptions,
     limits: Option<&MotionLimits>,
     boundary: &[[f64; 2]],
@@ -171,9 +171,16 @@ pub fn plan(
     }
     map.validate_body_pose(start.0, start.1)
         .map_err(|e| format!("起点机体包络: {e}"))?;
+    let model = map.body_envelope().ok_or("三维完整机体标定缺失")?;
+    if map.locate_support_from_body(goal.0, goal.1, model.body_to_support_z_m).is_err() {
+        let support = map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m)
+            .map_err(|e| format!("目标支撑层: {e}"))?;
+        goal = map.body_pose_on_surface([goal.0[0], goal.0[1]], planar(goal).yaw, support.surface_xyz)
+            .map_err(|e| format!("目标支撑面投影: {e}"))?;
+    }
+    // 起终点与沿途扫掠共用同一当前占据视图；局部补足的足迹边界仍由内核检查。
     map.validate_body_pose(goal.0, goal.1)
         .map_err(|e| format!("目标机体包络: {e}"))?;
-    let model = map.body_envelope().ok_or("三维完整机体标定缺失")?;
     let rotate = limits.is_none_or(|m| m.can_rotate_in_place);
     let reverse = options.allow_reverse && limits.is_some_and(|m| m.max_reverse_mps > 0.0);
     if options.allow_reverse && !reverse {
@@ -519,6 +526,24 @@ mod tests {
     }
 
     #[test]
+    fn current_occupied_goal_uses_the_same_view_as_start_and_path() {
+        let base = scene(false);
+        let start = pose(0.027, 0.013, 0.0);
+        let points: Vec<_> = (-40..40).flat_map(|x| (-30..30).map(move |y|
+            ((x as f32 + 0.5) * 0.05, (y as f32 + 0.5) * 0.05, 0.075)))
+            .filter(|&(x, y, _)| (f64::from(x)-start.0[0]).abs() > 0.3
+                || (f64::from(y)-start.0[1]).abs() > 0.12).collect();
+        let map = SurfaceSnapshot::from_points(&points, base.config().clone(), 0.05)
+            .unwrap().with_body_envelope(base.body_envelope().unwrap().clone()).unwrap();
+        let view = map.with_current_body_support(start.0, start.1).unwrap();
+        assert!(map.validate_body_pose(start.0, start.1).is_err());
+        let options = GoalOptions { allow_reverse: false, position_tolerance_m: 0.08,
+            yaw_tolerance_rad: 0.08 };
+        plan(&view, start, start, options, Some(&limits()), &[], 2000)
+            .expect("当前占据区内的目标不能重新用未处理自体的原图拒绝");
+    }
+
+    #[test]
     fn observed_ground_band_height_error_does_not_stall_before_final_rotation() {
         let base = scene(false);
         let points: Vec<_> = (-20..20)
@@ -537,7 +562,7 @@ mod tests {
                 .unwrap(),
         );
         let start = ([-0.55, 0.05, 0.46], [0.0, 0.0, 0.0, 1.0]);
-        let goal = ([0.55, 0.05, 0.55], [0.0, 0.0, 0.3_f64.sin(), 0.3_f64.cos()]);
+        let goal = ([0.55, 0.05, 0.70], [0.0, 0.0, 0.3_f64.sin(), 0.3_f64.cos()]);
         let options = GoalOptions {
             allow_reverse: false,
             position_tolerance_m: 0.1,
@@ -587,8 +612,40 @@ mod tests {
             follower.update_odometry(stamped(current, nanos));
         }
         assert!(reached, "同一支撑层高度偏差导致停止推进: {current:?}");
-        assert!((current.0[0] - goal.0[0]).abs() < 0.05);
+        assert!((current.0[0] - goal.0[0]).hypot(current.0[1] - goal.0[1])
+            < options.position_tolerance_m);
         assert!(angle(planar(current).yaw - planar(goal).yaw).abs() < 0.08);
+    }
+
+    #[test]
+    fn same_xy_on_another_observed_floor_never_completes_body_goal() {
+        let base = scene(false);
+        let points: Vec<_> = (-20..20).flat_map(|x| (-15..15).flat_map(move |y|
+            [0.025, 3.025].map(|z| ((x as f32 + 0.5) * 0.1,
+                (y as f32 + 0.5) * 0.1, z)))).collect();
+        let map = Arc::new(SurfaceSnapshot::from_points(&points, base.config().clone(), 0.1)
+            .unwrap().with_body_envelope(base.body_envelope().unwrap().clone()).unwrap());
+        let start = pose(0.05, 0.05, 0.0);
+        let mut goal = start;
+        goal.0[2] += 3.0;
+        map.validate_body_pose(start.0, start.1).unwrap();
+        map.validate_body_pose(goal.0, goal.1).unwrap();
+        let mut config = SurfaceFollowerConfig::new(0.4);
+        config.motion_limits = Some(limits());
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(map)).unwrap();
+        follower.update_odometry(stamped(start, 1_000_000_000));
+        follower.configure_goal(&stamped(goal, 1_000_000_000), GoalOptions {
+            allow_reverse: false, position_tolerance_m: 0.1, yaw_tolerance_rad: 0.08,
+        }).unwrap();
+        // 当前层的短路径不能借水平距离为零而宣称到达另一层。
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: vec![stamped(start, 1_000_000_000), stamped(start, 1_000_000_000)],
+        }), None, stamped(goal, 1_000_000_000)).unwrap();
+        for index in 1..=4 {
+            follower.update_odometry(stamped(start, 1_000_000_000 + index * 50_000_000));
+            assert!(!matches!(follower.step(0.24), PlannerStep::Succeeded));
+        }
     }
 
     #[test]

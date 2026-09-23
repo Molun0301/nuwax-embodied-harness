@@ -779,7 +779,13 @@ class MotionGuardCore:
                         ),
                         "recovery_fence_correlation_sha256": correlation_sha256,
                     }
-                elif body.mode == pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE:
+                elif body.mode in {
+                    pb.GLOBAL_STOP_MODE_ORDINARY,
+                    pb.GLOBAL_STOP_MODE_RELEASE_RECOVERY_FENCE,
+                }:
+                    # 新的显式全局停车以新停止代次撤销全部旧准入；取得归零
+                    # 回执后也结束旧业务恢复围栏，避免原拥有方退出后永久锁死。
+                    # 归零或持久化失败不会提交解除，停稳等待仍由原确认器负责。
                     recovery_updates = {
                         "recovery_fence_token_hex": "",
                         "recovery_fence_correlation_sha256": "",
@@ -1117,6 +1123,8 @@ class MotionGuardCore:
         self._actuator.zero()
         started = self._stop_confirmation.begin()
         if self._pending_stop is None:
+            retained_zero_id = (self._last_zero_confirmation.zero_ack_id
+                                if self._pending_zero_records and self._last_zero_confirmation is not None else None)
             progress = self._stop_confirmation.start(self._actuator, started)
             if isinstance(progress, StopEvidence):
                 if progress.stationary_confirmed and self._last_zero_confirmation is not None:
@@ -1124,10 +1132,12 @@ class MotionGuardCore:
                 self._last_zero_confirmation = self._new_zero_ack(self._monotonic_ns(), progress)
             else:
                 self._pending_stop = progress
-                self._pending_zero_records = []
                 self._startup_zero_confirmed = False
                 self._last_zero_confirmation = self._new_zero_ack(
                     self._monotonic_ns(), StopEvidence(False, "awaiting_feedback" if progress.has_feedback else "awaiting_braking_bound"))
+                if retained_zero_id:
+                    # 停稳超时后的自动重试仍属于同一次未完成停车，保留原操作关联。
+                    self._last_zero_confirmation.zero_ack_id = retained_zero_id
                 self._last_zero_confirmation.stationary_deadline_monotonic_ns = self._monotonic_ns() + int(self._stop_confirmation.remaining_seconds(progress) * 1_000_000_000)
         if wait and self._pending_stop is not None:
             try:
@@ -1161,7 +1171,8 @@ class MotionGuardCore:
             updated = replace(record, stationary_zero_ack_bytes=encoded)
             target[key] = updated
             self._operation_index[operation_id] = [updated if item is record else item for item in self._operation_index.get(operation_id, ())]
-        self._pending_zero_records = []
+        if self._last_zero_confirmation.stationary_confirmed:
+            self._pending_zero_records = []
 
     @staticmethod
     def _new_zero_ack(now_ns: int, evidence: Optional[StopEvidence] = None) -> pb.ZeroAck:

@@ -44,7 +44,8 @@ impl SurfaceMapCache {
     /// 使用启动时捕获的同一完整模型构建消费者缓存。
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
-        cache.observation_enabled = config.follower.max_observation_age_sec.is_some();
+        cache.observation_enabled = config.body_envelope.is_some()
+            || config.follower.max_observation_age_sec.is_some();
         cache.builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
         cache

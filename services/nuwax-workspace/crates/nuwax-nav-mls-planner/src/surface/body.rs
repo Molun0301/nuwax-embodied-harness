@@ -11,6 +11,7 @@ pub(super) struct CurrentBodySupport {
     pub(super) quaternion: [f64; 4],
     pub(super) polygon: Vec<[f64; 2]>,
     pub(super) cells: AHashSet<VoxelKey>,
+    cleared_voxels: AHashSet<[i32; 3]>,
 }
 
 impl CurrentBodySupport {
@@ -142,6 +143,14 @@ fn rotation(q: [f64; 4]) -> Result<[[f64; 3]; 3], SurfaceError> {
 }
 fn world(r: [[f64; 3]; 3], origin: [f64; 3], v: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| origin[i] + r[0][i] * v[0] + r[1][i] * v[1] + r[2][i] * v[2])
+}
+fn projected_voxel_radius(r: [[f64; 3]; 3], size: f64) -> f64 {
+    let mut radius = 0.0_f64;
+    for x in [-0.5, 0.5] { for y in [-0.5, 0.5] { for z in [-0.5, 0.5] {
+        let corner = [x*size,y*size,z*size];
+        radius = radius.max(dot(r[0],corner).hypot(dot(r[1],corner)));
+    }}}
+    radius
 }
 fn hull(mut points: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     points.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
@@ -431,6 +440,7 @@ impl SurfaceSnapshot {
         }
         let mut updates = Vec::with_capacity(footprint.len());
         let mut inferred = AHashSet::new();
+        let mut cleared_voxels = AHashSet::new();
         for (x, y, z) in footprint {
             let top = z + (model.body_to_support_z_m + model.z_bounds_m[1]) / r[2][2];
             // 已观测到的合法足下层顶继续保留，避免清除自体时把厚地面挖成
@@ -462,6 +472,44 @@ impl SurfaceSnapshot {
                 .flatten()
             {
                 let b = bounds(x, y, iz);
+                if let Some(observations) = &self.observations {
+                    let fine = f64::from(observations.size_m);
+                    let quantization_radius = projected_voxel_radius(r,fine);
+                    let mut residual: Option<[f32;2]> = None;
+                    let mut found = false;
+                    for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
+                        for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
+                            for kz in (f64::from(b[0])/fine+1e-5).floor() as i32..(f64::from(b[1])/fine-1e-5).ceil() as i32 {
+                                if observations.get([ix,iy,kz]).is_none() {continue;}
+                                found = true;
+                                let v=[(f64::from(ix)+0.5)*fine-body[0],(f64::from(iy)+0.5)*fine-body[1],(f64::from(kz)+0.5)*fine-body[2]];
+                                let local=[dot(r[0],v),dot(r[1],v),dot(r[2],v)];
+                                let point=[local[0],local[1]];
+                                // 回波到体素中心的水平偏差取旋转立方体的投影界，
+                                // 不能把半边长误作半径；支撑授权仍裁在真实足迹内。
+                                let at_edge=model.footprint_xy_m.iter().zip(model.footprint_xy_m.iter().cycle().skip(1)).any(|(a,b)| {
+                                    let dx=b[0]-a[0];let dy=b[1]-a[1];
+                                    let t=(((point[0]-a[0])*dx+(point[1]-a[1])*dy)/(dx*dx+dy*dy)).clamp(0.0,1.0);
+                                    (point[0]-a[0]-t*dx).hypot(point[1]-a[1]-t*dy)<quantization_radius-1e-6
+                                });
+                                let is_self=(inside_boundary(point,&model.footprint_xy_m) || at_edge)
+                                    && f64::from(kz)*fine > ground(x,y)+quantum
+                                    && local[2]>=model.z_bounds_m[0].min(-model.body_to_support_z_m)
+                                    && local[2]<=model.z_bounds_m[1];
+                                if !is_self {
+                                    let fine_bounds=[(f64::from(kz)*fine) as f32,(f64::from(kz+1)*fine) as f32];
+                                    residual=Some(residual.map_or(fine_bounds,|old|[old[0].min(fine_bounds[0]),old[1].max(fine_bounds[1])]));
+                                } else {
+                                    cleared_voxels.insert([ix,iy,kz]);
+                                }
+                            }
+                        }
+                    }
+                    if found {
+                        if let Some(b)=residual {cells.insert(iz,b);}
+                        continue;
+                    }
+                }
                 if f64::from(b[1]) < z - quantum || f64::from(b[0]) > top + quantum
                     || !covered(x,y,b) {
                     cells.insert(iz, b);
@@ -470,7 +518,7 @@ impl SurfaceSnapshot {
             let iz = ((z - quantum * 0.5) / size).floor() as i32;
             if !self.data.physical_graph.surface_lookup.get(&(x, y)).is_some_and(|zs| {
                 zs.iter().any(|&old| (self.cell_position((x, y, old))[2]-z).abs() <= 1e-6)
-            }) {
+            }) && !self.observed_ground_column(x, y, z) {
                 inferred.insert((x, y, iz));
             }
             cells.insert(iz, [(z - quantum) as f32, z as f32]);
@@ -481,10 +529,27 @@ impl SurfaceSnapshot {
         }
         let mut view=self.with_current_body_columns(&updates)?;
         view.current_body_support = Some(Arc::new(CurrentBodySupport {
-            source: self.clone(), body, quaternion, polygon, cells: inferred,
+            source: self.clone(), body, quaternion, polygon, cells: inferred, cleared_voxels,
         }));
         view.validate_body_pose(body,quaternion)?;
         Ok(view)
+    }
+
+    /// 自体把粗列的层顶抬高时，核对整列是否仍有真实精细地面。
+    /// 只有每个细列都有同高度证据，才可沿用整格支撑；缺测仍裁到当前足迹。
+    fn observed_ground_column(&self, x: i32, y: i32, height: f64) -> bool {
+        let Some(observations) = &self.observations else { return false; };
+        let size = f64::from(self.config().voxel_size);
+        let fine = f64::from(observations.size_m);
+        let x0 = (f64::from(x) * size / fine).round() as i32;
+        let x1 = (f64::from(x + 1) * size / fine).round() as i32;
+        let y0 = (f64::from(y) * size / fine).round() as i32;
+        let y1 = (f64::from(y + 1) * size / fine).round() as i32;
+        x0 < x1 && y0 < y1 && (x0..x1).all(|ix| (y0..y1).all(|iy| {
+            ((height / fine).floor() as i32 - 2..=(height / fine).ceil() as i32)
+                .any(|iz| (f64::from(iz + 1) * fine - height).abs() <= fine + 1e-6
+                    && observations.get([ix, iy, iz]).is_some())
+        }))
     }
 
     /// 沿真实相邻占据高度读取支撑层下界，不跨越未观测的竖直空隙。
@@ -773,17 +838,53 @@ impl SurfaceSnapshot {
                 {
                     return Err(SurfaceError::VirtualObstacle);
                 }
-                let ground_height = self.cell_position(ground)[2];
+                let mut ground_height = self.cell_position(ground)[2];
                 let px = (x as f64 + 0.5) * size;
                 let py = (y as f64 + 0.5) * size;
-                let plane =
-                    body[2] - ((px - body[0]) * r[2][0] + (py - body[1]) * r[2][1]) / r[2][2];
+                let plane = body[2]
+                    - ((px - body[0]) * r[2][0] + (py - body[1]) * r[2][1]) / r[2][2];
                 let lower = plane + model.z_bounds_m[0] / r[2][2];
                 let contact = model.max_step_up_m.max(model.max_step_down_m) + uncertainty;
+                let support_plane = plane - model.body_to_support_z_m / r[2][2];
+                // 粗列边缘可能只与机体相交一小部分；地面高度必须来自
+                // 实际相交的精细列，不能借用格外最高回波抬高整片支撑。
+                if let Some(observations) = self.observations.as_ref().filter(|_| {
+                    !self.current_body_support.as_ref().is_some_and(|current| current.cells.contains(&ground))
+                }) {
+                    let fine = f64::from(observations.size_m);
+                    let mut lower = self.observed_support_lower_bound(ground);
+                    if let Some(current) = &self.current_body_support {
+                        if polygon_intersects_cell(&current.polygon,x,y,size) {
+                            let support=self.support_position_from_body(current.body,current.quaternion,model.body_to_support_z_m)?;
+                            lower=lower.min(support[2]-fine);
+                        }
+                    }
+                    let mut height = f64::NEG_INFINITY;
+                    for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
+                        for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
+                            if !polygon_intersects_cell(&polygon, ix, iy, fine) { continue; }
+                            for iz in (lower/fine+1e-5).floor() as i32..(ground_height/fine-1e-5).ceil() as i32 {
+                                if observations.get([ix,iy,iz]).is_some() && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
+                                    let top = f64::from(iz + 1) * fine;
+                                    // 倾斜机体的二维投影包含并未被机体占据的空间。
+                                    // 超过足端接触范围的侧面回波，必须实际与三维包络
+                                    // 相交才会抬高本次地面检查；原始占据仍完整保留。
+                                    if top <= support_plane + contact + 1e-6
+                                        || prism_intersects_voxel(model, r, body,
+                                            [f64::from(ix)*fine, f64::from(iy)*fine, f64::from(iz)*fine],
+                                            [f64::from(ix+1)*fine, f64::from(iy+1)*fine, top]) {
+                                        height = height.max(top);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if height.is_finite() { ground_height = ground_height.min(height); }
+                }
                 // 外形最低点包含足端行程，跨阶高度以标定支撑平面为基准；
                 // 否则足端低于名义支撑的部分会再次扣减可跨阶高度。
-                let support_plane = plane - model.body_to_support_z_m / r[2][2];
                 if lower.max(support_plane) + contact + 1e-6 < ground_height || plane < ground_height - uncertainty {
+                    tracing::debug!(?body, x, y, ground_height, support_plane, contact, "机体与地面高度不兼容");
                     return Err(SurfaceError::InsufficientClearance);
                 }
                 ground_points.push([px, py, ground_height]);
@@ -799,17 +900,33 @@ impl SurfaceSnapshot {
                         {
                             continue;
                         }
-                        if prism_intersects_voxel(
-                            model,
-                            r,
-                            body,
+                        let coarse_intersects = || prism_intersects_voxel(
+                            model, r, body,
                             [x as f64 * size, y as f64 * size, f64::from(bounds[0])],
-                            [
-                                (x + 1) as f64 * size,
-                                (y + 1) as f64 * size,
-                                f64::from(bounds[1]),
-                            ],
-                        ) {
+                            [(x + 1) as f64 * size, (y + 1) as f64 * size, f64::from(bounds[1])],
+                        );
+                        let intersects = if let Some(observations) = &self.observations {
+                            let fine = f64::from(observations.size_m);
+                            let mut intersects = false;
+                            let mut found = false;
+                            for ix in (f64::from(x)*size/fine).round() as i32..(f64::from(x+1)*size/fine).round() as i32 {
+                                for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
+                                    for iz in (f64::from(bounds[0])/fine+1e-5).floor() as i32..(f64::from(bounds[1])/fine-1e-5).ceil() as i32 {
+                                        if observations.get([ix,iy,iz]).is_none() { continue; }
+                                        found = true;
+                                        if f64::from(iz+1)*fine <= ground_height+1e-6
+                                            || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
+                                        intersects |= prism_intersects_voxel(model,r,body,
+                                            [f64::from(ix)*fine,f64::from(iy)*fine,f64::from(iz)*fine],
+                                            [f64::from(ix+1)*fine,f64::from(iy+1)*fine,f64::from(iz+1)*fine]);
+                                    }
+                                }
+                            }
+                            // 缺少该占据格的精细依据时保留粗格障碍，不把缺测当作自由。
+                            if found { intersects } else { coarse_intersects() }
+                        } else { coarse_intersects() };
+                        if intersects {
+                            tracing::debug!(?body, x, y, z, ?bounds, ground_height, "机体与占据单元相交");
                             return Err(SurfaceError::InsufficientClearance);
                         }
                     }
@@ -1090,6 +1207,17 @@ fn quaternion_from_columns(r: [[f64; 3]; 3]) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voxel_projection_accounts_for_corners_and_attitude_without_yaw_inflation() {
+        let size=0.05;
+        for yaw in [0.0_f64,0.3,0.8,1.5] {
+            let r=rotation([0.0,0.0,(yaw/2.0).sin(),(yaw/2.0).cos()]).unwrap();
+            assert!((projected_voxel_radius(r,size)-size/std::f64::consts::SQRT_2).abs()<1e-12);
+        }
+        let half=std::f64::consts::FRAC_PI_8;
+        let r=rotation([half.sin(),0.0,0.0,half.cos()]).unwrap();
+        assert!((projected_voxel_radius(r,size)-size*3.0_f64.sqrt()/2.0).abs()<1e-12);
+    }
     #[test]
     fn observed_ground_band_does_not_consume_leg_travel_twice_or_accept_floating_ground() {
         let base = scene(&[], false);
@@ -1497,6 +1625,115 @@ mod tests {
                 .is_err(),
             "不能为悬空位姿虚构地面"
         );
+    }
+
+    #[test]
+    fn missing_fine_observations_do_not_erase_known_body_obstacles() {
+        let base = scene(&[(0.25, 0.05, 0.65)], false);
+        let position = [0.05, 0.05, 0.5];
+        let orientation = [0.0, 0.0, 0.0, 1.0];
+        assert!(base.validate_body_pose(position, orientation).is_err());
+        let empty = Arc::new(SurfaceObservations::new(0.05, 32).unwrap());
+        assert!(base.with_observations(Some(empty))
+            .validate_body_pose(position, orientation).is_err());
+    }
+
+    #[test]
+    fn fine_current_body_clearing_preserves_same_coarse_cell_external_obstacle() {
+        // 相同粗列同时容纳自体回波和外部障碍；整体高度平移不能改变结论。
+        for (offset, obstacle) in [-200, 0, 200].into_iter()
+            .flat_map(|offset| [false, true].map(move |obstacle| (offset, obstacle))) {
+            let mut values = std::collections::BTreeMap::<[i32; 3], SurfaceObservation>::new();
+            for x in -40..40 { for y in -30..30 {
+                values.insert([x, y, offset], SurfaceObservation { observed_ns: 10, hits: 2 });
+            }}
+            for z in 2..=6 {
+                values.insert([10, 0, offset + z], SurfaceObservation { observed_ns: 10, hits: 2 });
+            }
+            if obstacle {
+                values.insert([11, 0, offset + 8], SurfaceObservation { observed_ns: 10, hits: 2 });
+            }
+            let size = 0.05_f32;
+            let points: Vec<_> = values.keys().map(|k| (
+                (k[0] as f32 + 0.5) * size, (k[1] as f32 + 0.5) * size,
+                (k[2] as f32 + 0.5) * size,
+            )).collect();
+            let mut blocks = std::collections::BTreeMap::<_, std::collections::BTreeMap<_, _>>::new();
+            for (key, value) in values {
+                blocks.entry(key.map(|v| v.div_euclid(32))).or_default().insert(key, value);
+            }
+            let mut observations = SurfaceObservations::new(size, 32).unwrap();
+            for (key, values) in blocks { observations.replace_block(key, values).unwrap(); }
+            let observations = Arc::new(observations);
+            let mut envelope = model();
+            envelope.footprint_xy_m = vec![[-0.53, -0.14], [0.53, -0.14],
+                [0.53, 0.14], [-0.53, 0.14]];
+            envelope.z_bounds_m = [-0.448, 0.057];
+            let base = SurfaceSnapshot::from_points(&points, scene(&[], false).config().clone(), size)
+                .unwrap().with_body_envelope(envelope).unwrap()
+                .with_observations(Some(Arc::clone(&observations)));
+            let position = [0.0, 0.0, f64::from(offset) * f64::from(size) + 0.44];
+            let orientation = [0.0, 0.0, 0.0, 1.0];
+            assert!(base.validate_body_pose(position, orientation).is_err());
+            let view = base.with_current_body_support(position, orientation).unwrap();
+            view.validate_body_pose(position, orientation).unwrap();
+            let target = [0.15, position[1], position[2]];
+            if obstacle {
+                assert!(view.validate_body_pose(target, orientation).is_err(),
+                    "不能清除同一粗列中的外部障碍");
+            } else {
+                view.validate_body_motion((position, orientation), (target, orientation), &[])
+                    .expect("自体下面真实完整地面不能被误作只允许原地的盲区补足");
+            }
+            assert!(base.validate_body_pose(position, orientation).is_err(), "原环境不能被清除");
+            assert!(Arc::ptr_eq(view.observations().unwrap(), &observations));
+            assert_eq!(observations.get([10, 0, offset + 6]).unwrap().observed_ns, 10);
+        }
+    }
+
+    #[test]
+    fn tilted_body_shadow_does_not_turn_external_echoes_into_high_ground() {
+        for offset in [-100, 0, 100] {
+            for inside in [false, true] {
+                let mut values = std::collections::BTreeMap::<[i32; 3], SurfaceObservation>::new();
+                for x in -30..30 { for y in -30..30 {
+                    values.insert([x, y, offset], SurfaceObservation { observed_ns: 10, hits: 2 });
+                    values.insert([x, y, offset + 1], SurfaceObservation { observed_ns: 10, hits: 2 });
+                }}
+                for z in 2..=5 {
+                    values.insert([-1, if inside { -4 } else { -5 }, offset + z],
+                        SurfaceObservation { observed_ns: 10, hits: 2 });
+                }
+                let fine = 0.05_f32;
+                let points: Vec<_> = values.keys().map(|k| (
+                    (k[0] as f32 + 0.5)*fine, (k[1] as f32 + 0.5)*fine,
+                    (k[2] as f32 + 0.5)*fine)).collect();
+                let mut blocks = std::collections::BTreeMap::<_, std::collections::BTreeMap<_, _>>::new();
+                for (key, value) in values {
+                    blocks.entry(key.map(|v|v.div_euclid(32))).or_default().insert(key, value);
+                }
+                let mut observations = SurfaceObservations::new(fine, 32).unwrap();
+                for (key, values) in blocks { observations.replace_block(key, values).unwrap(); }
+                let mut envelope = model();
+                envelope.footprint_xy_m = vec![[-0.24,-0.164],[0.34,-0.164],[0.34,0.164],[-0.24,0.164]];
+                envelope.z_bounds_m = [-0.448,0.057];
+                envelope.max_step_up_m = 0.15;
+                envelope.max_step_down_m = 0.15;
+                envelope.max_cross_slope_deg = 18.0;
+                let map = SurfaceSnapshot::from_points(&points, scene(&[],false).config().clone(), fine)
+                    .unwrap().with_body_envelope(envelope).unwrap()
+                    .with_observations(Some(Arc::new(observations)));
+                let position = [0.027,-0.019,0.4534 + f64::from(offset)*f64::from(fine)];
+                let orientation = [-0.0188553,0.0069169,0.0021580,0.9997960];
+                let result = if inside {
+                    map.validate_body_pose(position,orientation)
+                } else {
+                    map.with_current_body_support(position,orientation)
+                        .and_then(|view|view.validate_body_pose(position,orientation))
+                };
+                assert_eq!(result.is_err(), inside, "倾斜投影与真实三维相交必须区分: {offset}, {inside}, {result:?}");
+            }
+        }
     }
 
     #[test]

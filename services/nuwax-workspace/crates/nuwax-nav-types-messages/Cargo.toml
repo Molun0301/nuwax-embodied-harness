@@ -12,7 +12,8 @@ nuwax-codec = { path = "../nuwax-codec" }
 nuwax-types = { path = "../nuwax-types" }
 nuwax-protocol = { path = "../nuwax-protocol" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# 配置摘要跨独立进程使用；长小数须得到相同的二进制浮点值。
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 indexmap = { workspace = true }
 uuid = { workspace = true }

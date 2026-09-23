@@ -71,6 +71,7 @@ pub struct GeometryRuntimeService {
     native_raw_sensor_frame: Option<String>,
     native_input_failure: Arc<parking_lot::Mutex<Option<String>>>,
     native_input_delivery: Option<Arc<crate::native_input_delivery::NativeInputDelivery>>,
+    native_self_filter: Arc<Result<Option<crate::self_cloud::NativeSelfFilter>, String>>,
     shutdown: Option<ShutdownCoordinator>,
     mapping_transition: Arc<tokio::sync::Mutex<()>>,
     graph_artifacts: Arc<parking_lot::Mutex<crate::planar_artifacts::Store>>,
@@ -735,6 +736,7 @@ impl GeometryRuntimeService {
             native_raw_sensor_frame: None,
             native_input_failure: Arc::new(parking_lot::Mutex::new(None)),
             native_input_delivery: None,
+            native_self_filter: Arc::new(Ok(None)),
             shutdown: None,
             mapping_transition: Arc::new(tokio::sync::Mutex::new(())),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
@@ -804,6 +806,7 @@ impl GeometryRuntimeService {
             native_raw_sensor_frame,
             native_input_failure: Arc::new(parking_lot::Mutex::new(None)),
             native_input_delivery: native_ack_binding.map(|(ack, frame)| Arc::new(crate::native_input_delivery::NativeInputDelivery::new(ack, frame).with_shutdown(shutdown.request_tx.subscribe()))),
+            native_self_filter: Arc::new(crate::self_cloud::NativeSelfFilter::from_env()),
             mapping_transition: shutdown.mapping_transition.clone(),
             graph_artifacts: Arc::new(parking_lot::Mutex::new(crate::planar_artifacts::Store::default())),
             deferred_replay: shutdown.deferred_replay.clone(),
@@ -7967,6 +7970,11 @@ impl GeometryRuntime for GeometryRuntimeService {
             validate_native_raw_pointcloud_fields(pcr).map_err(|error| {
                 Status::invalid_argument(format!("native raw PointCloud2 rejected: {error}"))
             })?;
+            let masked = self.native_self_filter.as_ref().as_ref()
+                .map_err(|error| Status::failed_precondition(error.clone()))?
+                .as_ref().map(|filter| filter.mask_request(pcr)).transpose()
+                .map_err(Status::invalid_argument)?;
+            let pcr = masked.as_ref().unwrap_or(pcr);
             let imu_payloads = pcr
                 .imu_samples
                 .iter()
@@ -8405,6 +8413,36 @@ mod pointcloud_request_tests {
         let error = other.publish_point_cloud(Request::new(request())).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("123"));
+    }
+
+    #[tokio::test]
+    async fn self_cloud_raw_publication_reaches_native_preprocessing_field() {
+        let backend = NativeRawPublishBackend::new(None);
+        let mut handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+        handle.transport = nuwax_transport::LcmTransport::new(Arc::new(backend.clone()));
+        let mut service = GeometryRuntimeService::new(handle);
+        service.native_raw_input_binding = Some(native_raw_bindings());
+        service.native_self_filter = Arc::new(Ok(Some(crate::self_cloud::tests::native_filter())));
+        let mut input = request();
+        input.point_step = 16;
+        input.fields.push(PointCloudField { name: "offset_ns".into(), offset: 12, datatype: 6, count: 1 });
+        input.points.clear();
+        for xyz in [[0_f32, 0.1, -0.425], [0.0, 0.1, -0.2]] {
+            for value in xyz { input.points.extend_from_slice(&value.to_le_bytes()); }
+            input.points.extend_from_slice(&10_u32.to_le_bytes());
+        }
+        input.imu_samples.push(LioImuSample { frame_id: input.frame_id.clone(),
+            timestamp_ns: input.timestamp_ns, accel_mps2_z: 9.81, ..Default::default() });
+        assert!(service.publish_point_cloud(Request::new(input)).await.unwrap().into_inner().success);
+        let frames = backend.frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        let mut wire = schema::POINT_CLOUD2_FINGERPRINT.to_vec();
+        wire.extend_from_slice(&frames[1].payload);
+        let cloud = schema::decode_point_cloud2(&wire).unwrap();
+        assert_eq!(cloud.point_step, 17);
+        assert_eq!(cloud.width, 2);
+        assert_eq!(cloud.data[16], 0);
+        assert_eq!(cloud.data[33], 1);
     }
 
     #[tokio::test]

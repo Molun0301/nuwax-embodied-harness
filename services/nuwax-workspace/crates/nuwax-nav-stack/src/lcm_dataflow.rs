@@ -1761,7 +1761,7 @@ where
                                 goal_buffer.costmap_observed=false;
                                 goal_buffer.active_goal_sha256=None;
                                 if value.cleared || !goal_buffer.pending_goal.as_ref().is_some_and(|goal|authority.permits_goal(goal)) {
-                                    goal_buffer.pending_goal=None;
+                                    goal_buffer.pending_invalidated = true;
                                 }
                                 let snapshot=scheduler.status();
                                 publish_guarded_nav_observation(transport,node,snapshot.clone(),&telemetry,
@@ -1795,13 +1795,13 @@ where
                                 .map_err(|error| module_error("surface map invalidation", error))?;
                             goal_buffer.costmap_observed = false;
                             goal_buffer.active_goal_sha256 = None;
+                            // 精细源失败或换域时仍保留待执行目标；否则之后的取消
+                            // 找不到原目标，几何拥有方会永久等待无法关联的停车回执。
                             if (update.snapshot.is_err() && !update.awaiting_build)
-                                || !goal_buffer
-                                    .pending_goal
-                                    .as_ref()
-                                    .is_some_and(|pending| update.authority.permits_goal(pending))
+                                || (changed_domain && !goal_buffer.pending_goal.as_ref()
+                                    .is_some_and(|pending| update.authority.permits_goal(pending)))
                             {
-                                goal_buffer.pending_goal = None;
+                                goal_buffer.pending_invalidated = true;
                             }
                             let snapshot = scheduler.status();
                             publish_guarded_nav_observation(
@@ -1903,11 +1903,27 @@ where
                 let goal_envelope = match decode_configured_goal_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
+                        // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
+                        // 的取消身份，避免上层已受理后永远得不到对应的归零回执。
+                        let mut rejected_telemetry = telemetry.clone();
+                        if active_session.is_none() {
+                            if let Ok(goal) = schema::decode_goal_envelope_body(&frame.payload) {
+                                if pose_from_schema(&goal.goal)
+                                    .and_then(|pose| require_map_pose(&pose, "rejected goal")).is_ok()
+                                    && !matches!(goal_buffer.observe_goal(goal.clone()), PlannerGoalIngress::Rejected(_))
+                                {
+                                    goal_buffer.pending_goal = Some(goal.clone());
+                                    goal_buffer.pending_invalidated = true;
+                                    last_cancel_terminal = None;
+                                    rejected_telemetry = guarded_buffered_cancel_telemetry(&telemetry, &goal, 0);
+                                }
+                            }
+                        }
                         publish_guarded_rejection(
                             transport,
                             &node.outputs[1],
                             scheduler.status(),
-                            &telemetry,
+                            &rejected_telemetry,
                             "goal",
                             &format!("GoalEnvelope rejected: {error}"),
                         )
@@ -3044,7 +3060,7 @@ fn build_guarded_navigation_state(
             _ => 0,
         }
     };
-    let message = if !has_public_session {
+    let message = if !has_public_session && !status.message.starts_with("REJECTED ") {
         "IDLE: guard client heartbeat".to_string()
     } else {
         match status.last_terminal {
@@ -3112,6 +3128,7 @@ async fn publish_guarded_rejection(
     input: &str,
     reason: &str,
 ) -> NavStackResult<()> {
+    tracing::warn!(input, reason, session_id = %telemetry.public_session_id, "导航输入被拒绝");
     let status = guarded_rejection_status(status, input, reason);
     publish_guarded_nav_state(transport, channel, status, telemetry, None).await
 }
@@ -3861,6 +3878,7 @@ enum PlannerGoalIngress {
 #[derive(Default)]
 struct PlannerGoalBuffer {
     costmap_observed: bool,
+    pending_invalidated: bool,
     pending_goal: Option<schema::GoalEnvelope>,
     newest_goal: Option<schema::GoalEnvelope>,
     active_goal_sha256: Option<[u8; 32]>,
@@ -3879,6 +3897,7 @@ impl PlannerGoalBuffer {
             }
         }
         self.active_goal_sha256 = None;
+        self.pending_invalidated = false;
         self.newest_goal = Some(goal.clone());
         if self.costmap_observed {
             self.pending_goal = None;
@@ -3894,7 +3913,7 @@ impl PlannerGoalBuffer {
         // Occupancy header.seq is compatibility telemetry, not a planner
         // synchronization primitive. Timestamp validation and receipt TTL own
         // freshness; any valid costmap can release the newest pending lease.
-        self.pending_goal.take().map(Box::new)
+        self.take_ready_goal()
     }
 
     fn mark_applied(&mut self, goal: &schema::GoalEnvelope) -> bool {
@@ -3931,7 +3950,7 @@ impl PlannerGoalBuffer {
     }
 
     fn take_ready_goal(&mut self) -> Option<Box<schema::GoalEnvelope>> {
-        if self.costmap_observed {
+        if self.costmap_observed && !self.pending_invalidated {
             self.pending_goal.take().map(Box::new)
         } else {
             None
@@ -8968,6 +8987,33 @@ mod guarded_tests {
         send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,body);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!harness.scheduler.status().planner_inputs_fresh);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn configuration_rejected_goal_stays_cancellable_and_cannot_reactivate() {
+        let mut harness = GuardedLoopHarness::spawn().await;
+        let mut goal = sealed_goal("configuration-rejected");
+        goal.navigation_configuration_sha256 = [0x7d; 32];
+        schema::seal_goal_envelope(&mut goal).unwrap();
+        harness.send_goal_and_wait_dequeued(&goal).await;
+        harness.assert_no_session().await;
+        harness.send_pose(1);
+        harness.wait_for_pose(1).await;
+        harness.send_costmap(11);
+        harness.wait_for_costmap(11).await;
+        harness.assert_no_session().await;
+        assert_eq!(harness.motion_call_count("acquire:"), 0);
+        harness.send_cancel(&goal, 1);
+        harness.wait_for_correlated_zero(&goal, 1).await;
+        assert_eq!(harness.motion_call_count("zero:"), 1);
+        let mut next = sealed_goal("configuration-recovered");
+        next.goal_generation = goal.goal_generation + 1;
+        schema::seal_goal_envelope(&mut next).unwrap();
+        harness.send_goal_and_wait_dequeued(&next).await;
+        harness.wait_for_session(&next.session_id).await;
+        harness.send_cancel(&next, 1);
+        harness.wait_for_correlated_zero(&next, 1).await;
         harness.shutdown().await;
     }
 

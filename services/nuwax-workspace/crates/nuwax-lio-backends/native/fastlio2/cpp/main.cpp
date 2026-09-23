@@ -315,6 +315,11 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
     const auto* y_field = find_typed_field(msg, "y");
     const auto* z_field = find_typed_field(msg, "z");
     const auto* time_field = find_typed_field(msg, "offset_ns");
+    const auto* self_field = find_typed_field(msg, "nuwax_self_mask");
+    if (self_field && (!typed_field_fits(self_field, msg->point_step, 1) || self_field->datatype != 2)) {
+        fprintf(stderr, "[fastlio2] reject typed cloud: invalid self mask field\n");
+        return;
+    }
     if (!typed_field_fits(x_field, msg->point_step, 4) || x_field->datatype != 7 ||
         !typed_field_fits(y_field, msg->point_step, 4) || y_field->datatype != 7 ||
         !typed_field_fits(z_field, msg->point_step, 4) || z_field->datatype != 7 ||
@@ -350,7 +355,13 @@ static void on_typed_cloud(const lcm::ReceiveBuffer*, const std::string&, const 
             max_offset_ns = std::max(max_offset_ns, offset_ns);
             custom_messages::CustomPoint point;
             point.x = x; point.y = y; point.z = z;
-            point.reflectivity = 0; point.tag = 0; point.line = 0;
+            // 自体仅沿上游无效回波语义排除匹配，原坐标、采样数和末端时间保持。
+            const uint8_t self_mask = self_field ? static_cast<uint8_t>(msg->data[base + self_field->offset]) : 0;
+            if (self_mask > 1) {
+                fprintf(stderr, "[fastlio2] reject typed cloud: invalid self mask value\n");
+                return;
+            }
+            point.reflectivity = 0; point.tag = self_mask ? 0x20 : 0; point.line = 0;
             point.offset_time = static_cast<uli>(offset_ns);
             accepted_points.push_back(point);
         }

@@ -71,6 +71,7 @@ from gateways.errors import GatewayError
 from gateways.motion_guard import (
     GatewayMotionGuard,
     GatewayMotionGuardError,
+    GatewayMotionGuardUnavailable,
     MotionAdmission,
 )
 from gateways.person_follow import (
@@ -11491,7 +11492,17 @@ class GatewayRuntime:
                             "exploration stop transaction capacity exhausted"
                         )
                     del ledger[completed_id]
-                self.motion_guard.start()
+                try:
+                    self.motion_guard.start()
+                except GatewayMotionGuardUnavailable:
+                    # 已连接的停车走原紧急通道；仅冷启动缺少守卫时沿既有
+                    # 服务激活入口启动守卫，不等待导航/定位，也不要求运动准入。
+                    if getattr(self, "_closed", False) or not os.environ.get(
+                        "NUWAX_RUNTIME_ACTIVATION_REQUEST", ""
+                    ).strip():
+                        raise
+                    self._request_geometry_runtime_activation("stop_all_motion", "guard")
+                    self.motion_guard.start()
                 transaction = _ExplorationStopTransaction(
                     operation_id=operation_id,
                     stop_reason=stop_reason,
@@ -11572,6 +11583,11 @@ class GatewayRuntime:
                     transaction=transaction,
                 )
             except Exception:
+                RUNTIME_LOGGER.exception(
+                    "全局停车后探索资源对账失败：operation_id=%s phase=%s",
+                    operation_id,
+                    transaction.phase.name,
+                )
                 reconciliation = {
                     "attempted": True,
                     "pending": True,

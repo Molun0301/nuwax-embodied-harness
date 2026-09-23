@@ -258,6 +258,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_cloud_all_masked_scan_keeps_original_processing_ack_window() {
+        let transport = LcmTransport::new_real("memq://").unwrap();
+        let cloud = binding("/self-mask/cloud", "nuwax_msgs.LioInputFrame");
+        let ack = binding("/self-mask/ack", "nuwax_msgs.LioInputAck");
+        let mut input = transport.subscribe_owned(cloud.0.clone(), Some(cloud.1.clone())).await.unwrap();
+        let delivery = NativeInputDelivery::new(ack.clone(), cloud);
+        let mut raw = request(100);
+        for (offset, value) in [(0,0_f32),(4,0.1),(8,-0.2)] {
+            raw.points[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+        }
+        let masked = crate::self_cloud::tests::native_filter().mask_request(&raw).unwrap();
+        assert_eq!(scan_end(&masked).unwrap(), scan_end(&raw).unwrap());
+        let responder_transport = transport.clone();
+        let responder = tokio::spawn(async move {
+            let packet = input.recv().await.unwrap();
+            let frame = input_frame::decode_body(&packet.payload).unwrap();
+            assert_eq!(frame.cloud.width, 1);
+            assert_eq!(frame.cloud.data.last(), Some(&1));
+            acknowledge(&responder_transport, &ack, LioInputAck {
+                sequence: 1, scan_begin_timestamp_ns: 100, scan_end_timestamp_ns: 105,
+                success: true, message: "processed_without_external_returns".into(),
+            }).await;
+        });
+        assert_eq!(delivery.publish(&transport, &masked, Vec::new()).await.unwrap(), 1);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_delivery_waits_for_processing_and_sequences_concurrent_requests() {
         let transport = LcmTransport::new_real("memq://").unwrap();
         let cloud = binding("/delivery/cloud", "nuwax_msgs.LioInputFrame");

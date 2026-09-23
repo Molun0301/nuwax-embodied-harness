@@ -240,6 +240,7 @@ class Go2Actuator:
         self._max_body_pose_rad = max_body_pose_rad
         self._obstacle_remote_enabled = False
         self._obstacle_policy_enabled = False
+        self._motion_route_ready = False
         self._low_level_controller: Optional[Any] = None
         self._active_mode = pb.CONTROL_MODE_HIGH_LEVEL
 
@@ -463,6 +464,25 @@ class Go2Actuator:
                 values[1],
                 0.0 if abs(values[2]) <= self._yaw_rate_deadband_rps else values[2],
             )
+            if not self._motion_route_ready:
+                # 设备重启或遥控器可改变避障开关，不能用进程默认值选择通道。
+                # 每次归零后的首条速度重新查询；连续速度不增加同步查询负载。
+                try:
+                    code, enabled = self._obstacle.SwitchGet()
+                    _require_success(code, "ObstaclesAvoidClient.SwitchGet")
+                    if not isinstance(enabled, bool):
+                        raise ValueError("避障开关不是布尔值")
+                except Exception as exc:
+                    raise ActuatorError("OBSTACLE_POLICY_UNAVAILABLE", str(exc)) from exc
+                self._obstacle_policy_enabled = enabled
+                if enabled:
+                    # 请求超时也可能已经获得控制权，收尾仍须尝试释放。
+                    self._obstacle_remote_enabled = True
+                    _require_success(
+                        self._obstacle.UseRemoteCommandFromApi(True),
+                        "ObstaclesAvoidClient.UseRemoteCommandFromApi(true)",
+                    )
+                self._motion_route_ready = True
             client = self._obstacle if self._obstacle_policy_enabled else self._sport
             _require_success(
                 client.Move(*move_values),
@@ -509,6 +529,7 @@ class Go2Actuator:
             )
             self._obstacle_policy_enabled = enabled
             self._obstacle_remote_enabled = enabled
+            self._motion_route_ready = False
             return
         raise ActuatorError("INVALID_ARGUMENT", "motion command oneof is missing")
 
@@ -536,6 +557,7 @@ class Go2Actuator:
         raise ActuatorError("INVALID_ARGUMENT", "sport action is unspecified or unsupported")
 
     def zero(self) -> None:
+        self._motion_route_ready = False
         if (self._motion_controller == "mcf" and self._low_level_controller is None
                 and not self._obstacle_policy_enabled and not self._obstacle_remote_enabled):
             # 当前控制器使用Move零速；传统StopMove在此模式返回-1。
@@ -569,13 +591,14 @@ class Go2Actuator:
             )
         except Exception as exc:
             errors.append(exc)
-        try:
-            _require_zero_success(
-                self._emergency_sport.StopMove(),
-                "EmergencySportClient.StopMove",
-            )
-        except Exception as exc:
-            errors.append(exc)
+        if self._motion_controller != "mcf":
+            try:
+                _require_zero_success(
+                    self._emergency_sport.StopMove(),
+                    "EmergencySportClient.StopMove",
+                )
+            except Exception as exc:
+                errors.append(exc)
         if self._low_level_controller is not None:
             try:
                 stop_motion = getattr(self._low_level_controller, "stop_motion", None)

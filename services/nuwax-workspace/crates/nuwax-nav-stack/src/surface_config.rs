@@ -17,6 +17,8 @@ pub struct SurfaceNavigationConfig {
     pub follower: SurfaceFollowerConfig,
     /// 实际机器人宽度，单位米。
     pub robot_width_m: f64,
+    /// 当前后台搜索的取消信号；不进入机器人标定或地图身份。
+    pub(crate) planning_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SurfaceNavigationConfig {
@@ -119,6 +121,7 @@ impl SurfaceNavigationConfig {
             body_envelope: None,
             follower: SurfaceFollowerConfig::new(body_to_support_z_m),
             robot_width_m,
+            planning_cancelled: None,
         })
     }
     /// 两端用同一已验证标定物化外形和运动约束。
@@ -182,10 +185,10 @@ impl SurfaceNavigationConfig {
             envelope
                 .validate()
                 .map_err(|e| NavStackError::InvalidConfig(e.to_string()))?;
-            self.geometry.robot_height = self
-                .geometry
-                .robot_height
-                .max((envelope.body_to_support_z_m + body.z_max_m) as f32);
+            // 完整机体在每个位姿和扫掠段执行碰撞检查。支撑图不再先按
+            // 通用宽度膨胀一次，否则逐列机体检查会重复扣除通道净空。
+            self.geometry.wall_clearance_m = 0.0;
+            self.geometry.robot_height = (envelope.body_to_support_z_m + body.z_max_m) as f32;
             self.body_envelope = Some(envelope);
         }
         Ok(())

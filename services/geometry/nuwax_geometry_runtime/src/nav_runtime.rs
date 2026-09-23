@@ -363,8 +363,8 @@ struct StackObservation {
 }
 
 const DEFAULT_STACK_STATE_TTL: Duration = Duration::from_secs(2);
-const DEFAULT_TF_TTL: Duration = Duration::from_secs(2);
-const DEFAULT_PLANNER_INPUT_TTL: Duration = Duration::from_secs(2);
+const DEFAULT_TF_TTL: Duration = Duration::ZERO;
+const DEFAULT_PLANNER_INPUT_TTL: Duration = Duration::ZERO;
 const DEFAULT_MOTION_SINK_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_PATH_CANDIDATES: usize = 4096;
@@ -1757,7 +1757,7 @@ fn duration_from_env(name: &str, default: Duration) -> Duration {
 }
 
 fn observation_is_fresh(observed_at: Option<Instant>, ttl: Duration) -> bool {
-    observed_at.is_some_and(|observed_at| observed_at.elapsed() <= ttl)
+    observed_at.is_some_and(|observed_at| ttl.is_zero() || observed_at.elapsed() <= ttl)
 }
 
 fn validate_generation(generation: u64) -> Result<(), ObservationError> {
@@ -7171,6 +7171,20 @@ mod tests {
         assert_eq!(after.tf_generation, 1);
         assert_eq!(after.planner_generation, 7);
         assert_eq!(after.motion_sink_generation, 11);
+        {
+            let mut observations = state.runtime_observations.lock().unwrap();
+            let earlier = Instant::now() - Duration::from_secs(10);
+            observations.tf.observed_at = Some(earlier);
+            observations.planner.observed_at = Some(earlier);
+        }
+        assert!(compute_readiness(&handle, &state).await.ready,
+            "有效输入不能因旧两秒门槛阻断导航");
+        state.observe_planner_input(PlannerInputObservation {
+            generation: 7, map_revision: 42, map_frame: "map".into(),
+            pose_frame: "map".into(), ready: false,
+        }).unwrap();
+        assert!(!compute_readiness(&handle, &state).await.ready,
+            "明确失效的规划输入仍须撤销准入");
     }
 
     #[tokio::test]

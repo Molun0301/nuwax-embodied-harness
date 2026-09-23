@@ -63,12 +63,14 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_RENEW_INTERVAL: Duration = Duration::from_millis(250);
 /// Qualified upper bound for one production NAV guard exchange.
 pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
-/// Default maximum receipt age for a map-frame pose used by the controller.
-pub const DEFAULT_POSE_TTL: Duration = Duration::from_millis(200);
-/// Default maximum receipt age for the planner-consumed occupancy costmap.
-pub const DEFAULT_COSTMAP_TTL: Duration = Duration::from_millis(500);
-/// 租约会话等待首次路径或失效后替换路径的最大时间。
-pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 零表示不按固定接收年龄终止导航，来源失效仍由拥有方显式撤销。
+pub const DEFAULT_POSE_TTL: Duration = Duration::ZERO;
+/// 地图在同一来源内持续有效，直到更新、清空或来源失效。
+pub const DEFAULT_COSTMAP_TTL: Duration = Duration::ZERO;
+/// 零表示持续等待路径，用户取消和任务显式期限仍有效。
+pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::ZERO;
+/// 局部运动预测长度，与输入过期门槛独立。
+pub const DEFAULT_CONTROL_HORIZON: Duration = Duration::from_millis(250);
 /// Hard upper bound from cancel admission to a terminal fence attempt.
 pub const MAX_CANCEL_FENCE_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -313,13 +315,13 @@ pub struct SchedulerConfig {
     pub tick_interval: Duration,
     /// Idle/awaiting-path lease renewal interval.
     pub renew_interval: Duration,
-    /// Maximum time from lease acquisition to the first correlated path.
+    /// 等待路径期限；零表示等待至路径就绪或取消。
     pub path_wait_timeout: Duration,
     /// Collision footprint width passed to the local planner.
     pub robot_width_m: f64,
-    /// Maximum monotonic receipt age for map-frame pose input.
+    /// 位姿接收期限；零表示不以固定接收年龄终止。
     pub pose_ttl: Duration,
-    /// Maximum monotonic receipt age for occupancy costmap input.
+    /// 地图接收期限；零表示保持至来源显式失效。
     pub costmap_ttl: Duration,
 }
 
@@ -1240,10 +1242,10 @@ where
         self.status.costmap_receipt_age_ms = receipt_age_ms(self.costmap_receipt, now);
         self.status.planner_inputs_fresh = self
             .pose_receipt
-            .is_some_and(|receipt| now.duration_since(receipt.received_at) <= self.config.pose_ttl)
+            .is_some_and(|receipt| self.config.pose_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.pose_ttl)
             && self.pose_valid_until.is_none_or(|deadline| now < deadline)
             && self.costmap_receipt.is_some_and(|receipt| {
-                now.duration_since(receipt.received_at) <= self.config.costmap_ttl
+                self.config.costmap_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.costmap_ttl
             });
     }
 
@@ -1648,7 +1650,8 @@ where
             let error = RuntimeError::Planner("awaiting path without a deadline".into());
             return Err(self.fail_closed(status_tx, error).await);
         };
-        if Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
+        if self.config.path_wait_timeout.is_zero()
+            || Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
             return Ok(());
         }
         self.status.message = format!(
@@ -2059,22 +2062,10 @@ fn validate_config(config: SchedulerConfig) -> Result<(), RuntimeError> {
             reason: format!("must be in 1..={}ms", MAX_RENEW_INTERVAL.as_millis()),
         });
     }
-    if config.path_wait_timeout.is_zero() {
-        return Err(RuntimeError::InvalidInput {
-            field: "path_wait_timeout",
-            reason: "must be positive".into(),
-        });
-    }
     if !config.robot_width_m.is_finite() || config.robot_width_m <= 0.0 {
         return Err(RuntimeError::InvalidInput {
             field: "robot_width_m",
             reason: "must be finite and positive".into(),
-        });
-    }
-    if config.pose_ttl.is_zero() || config.costmap_ttl.is_zero() {
-        return Err(RuntimeError::InvalidInput {
-            field: "planner_input_ttl",
-            reason: "pose and costmap TTL must be positive".into(),
         });
     }
     Ok(())
@@ -2118,7 +2109,7 @@ fn stale_receipt_reason(
         return Some(format!("{label} has no consumed observation"));
     };
     let age = now.duration_since(receipt.received_at);
-    (age > ttl).then(|| {
+    (!ttl.is_zero() && age > ttl).then(|| {
         format!(
             "{label} receipt age={}ms exceeds TTL={}ms (source_timestamp_ns={})",
             age.as_millis(),
@@ -3814,6 +3805,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_session_waits_beyond_five_seconds_then_controls_and_cancels() {
+        let motion = FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
+        let scheduler = NavScheduler::new(motion, FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
+        let (handle, task) = spawn_scheduler(scheduler);
+        wait_for_sink(&handle).await;
+        handle.update_odometry(map_pose_at(1)).await.unwrap();
+        handle.update_costmap(costmap_at(1_000_000_000)).await.unwrap();
+        handle.start_session(session_for("persistent-path")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(handle.status().phase, SchedulerPhase::AwaitingPath);
+        assert!(handle.status().last_terminal.is_none());
+        handle.submit_path(path_for("persistent-path", 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(handle.status().phase, SchedulerPhase::Controlling);
+        assert!(handle.status().last_applied_twist.is_some_and(|twist|twist != Twist2::ZERO));
+        handle.cancel("persistent-path").await.unwrap();
+        wait_for_terminal(&handle, TerminalOutcome::Cancelled).await;
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn missing_first_path_fences_and_allows_the_next_session() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
@@ -3917,7 +3930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_map_receipt_budget_accepts_real_cadence_and_expires_after_input_stops() {
+    async fn default_map_receipt_keeps_observed_map_without_age_expiry() {
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
             FakePlanner::commanding(),
@@ -3947,9 +3960,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let expired = handle.status();
-        assert!(!expired.planner_inputs_fresh);
+        assert!(expired.planner_inputs_fresh);
         assert_eq!(expired.costmap_source_timestamp_ns, latest_map_source);
-        assert!(expired.costmap_receipt_age_ms > DEFAULT_COSTMAP_TTL.as_millis() as u64);
+        assert!(expired.costmap_receipt_age_ms > 500);
         assert!(
             matches!(
                 handle.update_costmap(costmap_at(latest_map_source)).await,
@@ -3957,7 +3970,7 @@ mod tests {
             ),
             "旧缓存不能通过相同源时间重放续期"
         );
-        assert!(!handle.status().planner_inputs_fresh);
+        assert!(handle.status().planner_inputs_fresh);
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }

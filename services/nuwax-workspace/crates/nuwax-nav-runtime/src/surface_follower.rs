@@ -237,7 +237,7 @@ impl SurfaceFollower {
             .map_or(0.0, |previous| previous.pose.position.distance(position));
         if let Some(previous) = self.last_tracked_pose.as_ref() {
             let elapsed = ((odometry.stamp.nanos - previous.stamp.nanos).max(0) as f64 * 1e-9)
-                .min(crate::DEFAULT_POSE_TTL.as_secs_f64());
+                .min(crate::DEFAULT_CONTROL_HORIZON.as_secs_f64());
             let plausible =
                 self.config.controller.speed * elapsed + self.config.controller.goal_tolerance;
             if displacement > plausible {
@@ -393,7 +393,7 @@ impl SurfaceFollower {
             return false;
         };
         let yaw = pose.pose.orientation.yaw();
-        let horizon = (crate::DEFAULT_POSE_TTL + crate::DEFAULT_TICK_INTERVAL).as_secs_f64();
+        let horizon = crate::DEFAULT_CONTROL_HORIZON.as_secs_f64();
         let offset = [
             initial_support[0] - pose.pose.position.x,
             initial_support[1] - pose.pose.position.y,

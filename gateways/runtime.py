@@ -3285,7 +3285,7 @@ class GatewayRuntime:
                 ),
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
-                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
+                timeout_sec=None,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -6749,7 +6749,9 @@ class GatewayRuntime:
             metadata=goal_metadata,
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
-        timeout_sec = self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
+        # 选点导航持续执行到到达或取消；仅调用者显式提供期限时才启用任务超时。
+        timeout_sec = (self._resolve_async_timeout("navigate_to_pose", arguments, minimum_sec=0.1)
+                       if "timeout_sec" in arguments else None)
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         verify_on_arrival = bool(arguments.get("verify_on_arrival", False))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
@@ -11958,7 +11960,7 @@ class GatewayRuntime:
         goal: NavigationGoal,
         motion_admission: MotionAdmission,
         poll_interval_sec: float,
-        timeout_sec: float,
+        timeout_sec: Optional[float],
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
         completion_callback=None,

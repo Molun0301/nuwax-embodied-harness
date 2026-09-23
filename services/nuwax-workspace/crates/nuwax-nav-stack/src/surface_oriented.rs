@@ -158,13 +158,29 @@ fn connect(
 pub fn plan(
     map: &SurfaceSnapshot,
     start: BodyPose,
-    mut goal: BodyPose,
+    goal: BodyPose,
     options: GoalOptions,
     limits: Option<&MotionLimits>,
     boundary: &[[f64; 2]],
     budget: usize,
 ) -> Result<Vec<BodyPose>, String> {
-    let began=std::time::Instant::now();
+    plan_cancellable(map, start, goal, options, limits, boundary, budget, None)
+}
+
+/// 后台规划按明确取消退出，不用墙钟截止替代任务生命周期。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_cancellable(
+    map: &SurfaceSnapshot,
+    start: BodyPose,
+    mut goal: BodyPose,
+    options: GoalOptions,
+    limits: Option<&MotionLimits>,
+    boundary: &[[f64; 2]],
+    budget: usize,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<BodyPose>, String> {
+    let cancelled = || cancelled.is_some_and(|flag|flag.load(std::sync::atomic::Ordering::Relaxed));
+    if cancelled() { return Err("三维规划已取消".into()); }
     options.validate()?;
     if let Some(limits) = limits {
         limits.validate()?;
@@ -172,7 +188,10 @@ pub fn plan(
     map.validate_body_pose(start.0, start.1)
         .map_err(|e| format!("起点机体包络: {e}"))?;
     let model = map.body_envelope().ok_or("三维完整机体标定缺失")?;
-    if map.locate_support_from_body(goal.0, goal.1, model.body_to_support_z_m).is_err() {
+    if map.locate_support_from_body(goal.0, goal.1, model.body_to_support_z_m).is_err()
+        || map.validate_body_pose(goal.0, goal.1).is_err() {
+        // 选点给出的高度用于选择支撑层；水平速度不能强制四足保持点击时
+        // 的固定高度/倾角。投影到该真实支撑面后仍执行完整碰撞和扫掠检查。
         let support = map.locate_goal_support_from_body(goal.0, goal.1, model.body_to_support_z_m)
             .map_err(|e| format!("目标支撑层: {e}"))?;
         goal = map.body_pose_on_surface([goal.0[0], goal.0[1]], planar(goal).yaw, support.surface_xyz)
@@ -222,6 +241,7 @@ pub fn plan(
     let mut queue = BinaryHeap::from([Queue(distance(start), 0)]);
     let mut expanded = 0;
     while let Some(Queue(_, index)) = queue.pop() {
+        if cancelled() { return Err("三维规划已取消".into()); }
         let here = nodes[index].pose;
         let cost = nodes[index].cost;
         if best
@@ -231,7 +251,6 @@ pub fn plan(
             continue;
         }
         expanded += 1;
-        if began.elapsed()>std::time::Duration::from_secs(2) {return Err("三维朝向搜索超过两秒计算预算".into());}
         if expanded > budget || nodes.len() > budget * 4 {
             return Err("三维朝向搜索预算耗尽".into());
         }

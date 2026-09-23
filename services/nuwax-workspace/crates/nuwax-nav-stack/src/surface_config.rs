@@ -52,6 +52,13 @@ impl SurfaceNavigationConfig {
             .transpose()
             .map_err(NavStackError::InvalidConfig)?;
         config.apply_calibration(body, capabilities)?;
+        if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS") {
+            if !value.trim().is_empty() {
+                let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS", &value)?;
+                if limit <= 0.0 {return Err(NavStackError::InvalidConfig("执行器线速度上限必须为正".into()));}
+                config.follower.controller.speed = config.follower.controller.speed.min(limit);
+            }
+        }
         Ok(config)
     }
 

@@ -15,6 +15,7 @@ pub struct SurfaceObservation {
 #[derive(Clone, Debug)]
 pub struct SurfaceObservations {
     pub(super) size_m: f32,
+    source_timestamp_ns: u64,
     block_edge: i32,
     blocks: im::OrdMap<[i32; 3], Arc<BTreeMap<[i32; 3], SurfaceObservation>>>,
 }
@@ -26,6 +27,7 @@ impl SurfaceObservations {
         }
         Ok(Self {
             size_m,
+            source_timestamp_ns: 0,
             block_edge,
             blocks: Default::default(),
         })
@@ -58,6 +60,59 @@ impl SurfaceObservations {
             .get(&key.map(|v| v.div_euclid(self.block_edge)))?
             .get(&key)
             .copied()
+    }
+
+    /// 当前完整提交的源采样；零表示旧输入没有可用的帧身份。
+    pub fn set_source_timestamp_ns(&mut self, timestamp_ns: u64) {
+        self.source_timestamp_ns = timestamp_ns;
+    }
+
+    /// 本帧障碍立即保留；历史碰撞须有重复命中或连片空间证据。
+    /// 只影响导航派生判断，不删除原始地图或把未知证据当作自由。
+    pub(super) fn supports_obstacle(&self, key: [i32; 3]) -> bool {
+        let Some(value) = self.get(key) else { return false; };
+        if self.source_timestamp_ns == 0 || value.observed_ns == 0 || value.hits == 0
+            || value.observed_ns >= self.source_timestamp_ns || value.hits >= 3 {
+            return true;
+        }
+        let mut neighbours = 0;
+        for x in -1..=1 { for y in -1..=1 { for z in -1..=1 {
+            if x == 0 && y == 0 && z == 0 { continue; }
+            let (Some(x),Some(y),Some(z)) = (key[0].checked_add(x),key[1].checked_add(y),key[2].checked_add(z)) else {continue;};
+            if let Some(other) = self.get([x,y,z]) {
+                if other.hits >= 3 || other.observed_ns == 0 { return true; }
+                neighbours += 1;
+                if neighbours >= 2 { return true; }
+            }
+        }}}
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolated_history_does_not_replace_current_or_confirmed_obstacles() {
+        let mut grid = SurfaceObservations::new(0.05, 32).unwrap();
+        let values = [
+            ([1,1,1], SurfaceObservation { observed_ns: 100, hits: 1 }),
+            ([5,5,5], SurfaceObservation { observed_ns: 1, hits: 3 }),
+            ([10,10,10], SurfaceObservation { observed_ns: 1, hits: 1 }),
+            ([15,15,15], SurfaceObservation { observed_ns: 1, hits: 1 }),
+            ([16,15,15], SurfaceObservation { observed_ns: 1, hits: 1 }),
+            ([15,16,15], SurfaceObservation { observed_ns: 1, hits: 1 }),
+            ([20,20,20], SurfaceObservation { observed_ns: 0, hits: 0 }),
+        ].into_iter().collect();
+        grid.replace_block([0,0,0], values).unwrap();
+        assert!(grid.supports_obstacle([10,10,10]), "旧格式没有帧证据时保留占据");
+        grid.set_source_timestamp_ns(100);
+        for key in [[1,1,1],[5,5,5],[15,15,15],[20,20,20]] {
+            assert!(grid.supports_obstacle(key), "本帧、稳定及连片障碍不能被过滤");
+        }
+        assert!(!grid.supports_obstacle([10,10,10]), "历史孤立单次回波不作实体墙");
+        assert!(grid.get([10,10,10]).is_some(), "原始观察保留");
     }
 }
 impl SurfaceSnapshot {

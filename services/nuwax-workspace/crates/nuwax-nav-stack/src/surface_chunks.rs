@@ -44,6 +44,7 @@ impl FineMapReader {
             }
             grid.replace_block(reference.key, values).map_err(|e| e.to_string())?;
         }
+        grid.set_source_timestamp_ns(root.source_timestamp_ns);
         Ok(Arc::new(grid))
     }
 

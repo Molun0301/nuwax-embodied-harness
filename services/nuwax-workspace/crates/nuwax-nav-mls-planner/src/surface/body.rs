@@ -864,7 +864,7 @@ impl SurfaceSnapshot {
                         for iy in (f64::from(y)*size/fine).round() as i32..(f64::from(y+1)*size/fine).round() as i32 {
                             if !polygon_intersects_cell(&polygon, ix, iy, fine) { continue; }
                             for iz in (lower/fine+1e-5).floor() as i32..(ground_height/fine-1e-5).ceil() as i32 {
-                                if observations.get([ix,iy,iz]).is_some() && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
+                                if observations.supports_obstacle([ix,iy,iz]) && !self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {
                                     let top = f64::from(iz + 1) * fine;
                                     // 倾斜机体的二维投影包含并未被机体占据的空间。
                                     // 超过足端接触范围的侧面回波，必须实际与三维包络
@@ -914,6 +914,7 @@ impl SurfaceSnapshot {
                                     for iz in (f64::from(bounds[0])/fine+1e-5).floor() as i32..(f64::from(bounds[1])/fine-1e-5).ceil() as i32 {
                                         if observations.get([ix,iy,iz]).is_none() { continue; }
                                         found = true;
+                                        if !observations.supports_obstacle([ix,iy,iz]) {continue;}
                                         if f64::from(iz+1)*fine <= ground_height+1e-6
                                             || self.current_body_support.as_ref().is_some_and(|current|current.cleared_voxels.contains(&[ix,iy,iz])) {continue;}
                                         intersects |= prism_intersects_voxel(model,r,body,
@@ -1301,6 +1302,30 @@ mod tests {
         for (key, values) in blocks { grid.replace_block(key, values).unwrap(); }
         Arc::new(grid)
     }
+    #[test]
+    fn body_collision_retains_live_and_supported_obstacles_but_ignores_isolated_history() {
+        for kind in 0..5 {
+            let mut extra = vec![(0.45,0.05,0.65)];
+            if kind == 4 {extra.extend([(0.55,0.05,0.65),(0.45,0.15,0.65)]);}
+            let base = scene(&extra,false);
+            let mut observations = observation_grid(|values| {
+                values.insert([4,0,6],SurfaceObservation {
+                    observed_ns:if kind == 2 {10_000_000_000} else {1},
+                    hits:if kind == 3 {3} else {1},
+                });
+                if kind == 4 {
+                    for key in [[5,0,6],[4,1,6]] {
+                        values.insert(key,SurfaceObservation {observed_ns:1,hits:1});
+                    }
+                }
+            }).as_ref().clone();
+            if kind != 0 {observations.set_source_timestamp_ns(10_000_000_000);}
+            let map = base.with_observations(Some(Arc::new(observations)));
+            assert_eq!(map.validate_body_pose([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]).is_ok(),kind == 1,
+                "仅历史孤立低命中回波可不作实体障碍，场景{kind}");
+        }
+    }
+
     #[test]
     fn observed_body_motion_checks_fresh_top_support_and_independent_hits() {
         let base = scene(&[], false);

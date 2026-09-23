@@ -192,10 +192,10 @@ impl SurfaceNavigationConfig {
             envelope
                 .validate()
                 .map_err(|e| NavStackError::InvalidConfig(e.to_string()))?;
-            // 完整机体在每个位姿和扫掠段执行碰撞检查。支撑图不再先按
-            // 通用宽度膨胀一次，否则逐列机体检查会重复扣除通道净空。
+            // 支撑图提取独立地面层，只要求一个体素的空隙。完整宽高由
+            // 每个位姿和扫掠的机体检查承担，避免侧面/高处回波抹掉整列地面。
             self.geometry.wall_clearance_m = 0.0;
-            self.geometry.robot_height = (envelope.body_to_support_z_m + body.z_max_m) as f32;
+            self.geometry.robot_height = self.geometry.voxel_size;
             self.body_envelope = Some(envelope);
         }
         Ok(())

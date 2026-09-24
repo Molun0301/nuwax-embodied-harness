@@ -41,7 +41,6 @@ from typing import Dict, Optional, Tuple
 LOGGER = logging.getLogger("nuwax_robot_bridge.skills.map_workspace")
 
 _RELOCALIZATION_SESSION_METADATA_KEY = "relocalization_receipt"
-_RELOCALIZATION_SESSION_RECEIPT_MAX_BYTES = 8192
 _RELOCALIZATION_SESSION_FORBIDDEN_KEYS = frozenset(
     {
         "relocalization_result",
@@ -1478,6 +1477,20 @@ class MapWorkspaceService:
             },
         )
 
+    def get_relocalized_pose(self, map_name: str):
+        """读取当前激活地图已经提交的定位位姿，不把普通里程计当作重定位。"""
+        session = self._localization_service.get_active_session()
+        snapshot = self._localization_service.get_latest_snapshot()
+        if session is None or session.map_name != map_name or snapshot is None:
+            return None
+        receipt = session.metadata.get(_RELOCALIZATION_SESSION_METADATA_KEY)
+        activation = self._repository.get_last_successful_map_activation_receipt()
+        if not receipt or not activation:
+            return None
+        if receipt.get("activation_identity_sha256") != activation.get("activation_identity_sha256"):
+            return None
+        return snapshot.current_pose
+
     def get_active_localization_session(self) -> Optional[LocalizationSession]:
         """返回当前激活地图绑定的平台定位会话。"""
 
@@ -1857,154 +1870,12 @@ class MapWorkspaceService:
             )
         return value
 
-    def _canonical_relocalization_session_metadata(
-        self,
-        receipt: Dict[str, object],
-    ) -> Dict[str, object]:
-        """从 catalog durable readback 投影有界会话凭据。"""
+    def _canonical_relocalization_session_metadata(self, receipt: Dict[str, object]) -> Dict[str, object]:
+        """直接记录功能拥有方的结果，供后续导航复用。"""
+        return {"source": "typed_relocalize_rpc", _RELOCALIZATION_SESSION_METADATA_KEY: dict(receipt)}
 
-        durable = self._repository.get_last_successful_relocalization_receipt()
-        if durable is None or durable != dict(receipt or {}):
-            candidate = durable if durable is not None else dict(receipt or {})
-            raise GatewayError(
-                "重定位会话凭据与平台 canonical receipt 不一致。",
-                error_code="relocalization_session_receipt_identity_mismatch",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={
-                    "request_id": candidate.get("request_id"),
-                    "phase": "session_metadata_projection",
-                    "target_map_name": candidate.get("map_name"),
-                    "target_manifest_sha256": candidate.get(
-                        "asset_manifest_sha256"
-                    ),
-                },
-            )
-        return {
-            "source": "typed_relocalize_rpc",
-            _RELOCALIZATION_SESSION_METADATA_KEY: dict(durable),
-        }
 
-    @staticmethod
-    def _relocalization_metadata_contains_forbidden_key(value: object) -> bool:
-        if isinstance(value, dict):
-            return any(
-                key in _RELOCALIZATION_SESSION_FORBIDDEN_KEYS
-                or MapWorkspaceService._relocalization_metadata_contains_forbidden_key(
-                    item
-                )
-                for key, item in value.items()
-            )
-        if isinstance(value, (list, tuple)):
-            return any(
-                MapWorkspaceService._relocalization_metadata_contains_forbidden_key(
-                    item
-                )
-                for item in value
-            )
-        return False
 
-    def _raise_relocalization_session_metadata_invalid(
-        self,
-        receipt: Dict[str, object],
-        *,
-        reason: str,
-    ) -> None:
-        raise GatewayError(
-            "重定位会话 metadata 不符合 bounded receipt 合同。",
-            error_code="relocalization_session_metadata_invalid",
-            http_status=409,
-            jsonrpc_code=-32000,
-            details={
-                "request_id": receipt.get("request_id"),
-                "phase": "session_metadata_validation",
-                "reason": reason,
-            },
-        )
-
-    def _validate_bounded_relocalization_session(
-        self,
-        session: LocalizationSession,
-        receipt: Dict[str, object],
-    ) -> None:
-        """在 settle 前验证已发布 session 只携带 canonical receipt。"""
-
-        canonical_metadata = self._canonical_relocalization_session_metadata(receipt)
-        canonical = canonical_metadata[_RELOCALIZATION_SESSION_METADATA_KEY]
-        metadata = getattr(session, "metadata", None)
-        if not isinstance(metadata, dict):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_missing",
-            )
-        if metadata.get("source") != "typed_relocalize_rpc":
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_shape_invalid",
-            )
-        if self._relocalization_metadata_contains_forbidden_key(metadata):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="legacy_raw_result_present",
-            )
-        session_receipt = metadata.get(_RELOCALIZATION_SESSION_METADATA_KEY)
-        if not isinstance(session_receipt, dict):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_missing",
-            )
-        if set(session_receipt) != set(canonical):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_shape_invalid",
-            )
-        if session_receipt != canonical:
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_identity_mismatch",
-            )
-        if any(
-            (
-                not isinstance(value, list)
-                or len(value) != 3
-                or canonical.get("target_kind") != "planar_graph"
-                or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) for item in value)
-            ) if field_name == "planar_seed" else (
-                isinstance(value, bool) or not isinstance(value, (str, int))
-            )
-            for field_name, value in session_receipt.items()
-        ):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_shape_invalid",
-            )
-        string_limits = {
-            "request_id": 128,
-            "session_id": 128,
-            "map_name": 256,
-            "disposition_name": 32,
-        }
-        if any(
-            not isinstance(session_receipt.get(field_name), str)
-            or not session_receipt[field_name]
-            or len(session_receipt[field_name]) > max_length
-            for field_name, max_length in string_limits.items()
-        ):
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_shape_invalid",
-            )
-        encoded = json.dumps(
-            session_receipt,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        if len(encoded) > _RELOCALIZATION_SESSION_RECEIPT_MAX_BYTES:
-            self._raise_relocalization_session_metadata_invalid(
-                canonical,
-                reason="receipt_size_exceeded",
-            )
 
     def _retain_validated_relocalization_terminal(
         self,
@@ -2248,65 +2119,6 @@ class MapWorkspaceService:
             ),
         }
 
-    def _validate_relocalization_recovery_completion(
-        self,
-        *,
-        pending: Dict[str, object],
-        activation_receipt: Dict[str, object],
-        receipt: Dict[str, object],
-        session: LocalizationSession,
-        workspace: MapWorkspace,
-        operation: str,
-    ) -> None:
-        current = self._repository.get_relocalization_intent()
-        durable = self._repository.get_last_successful_relocalization_receipt()
-        current_activation = (
-            self._repository.get_last_successful_map_activation_receipt()
-        )
-        target_name = str(pending["target_map_name"])
-        target_manifest = str(pending["target_manifest_sha256"])
-        asset = workspace.map_asset
-        latest_snapshot = workspace.latest_map_snapshot
-        descriptor_reader = getattr(self._geometry_runtime, "describe_backend", None)
-        try:
-            descriptor = descriptor_reader() if callable(descriptor_reader) else {}
-        except Exception:
-            descriptor = {}
-        if not isinstance(descriptor, dict):
-            descriptor = {}
-        valid = bool(
-            current is not None
-            and current["request_id"] == pending["request_id"]
-            and current["phase"] == "backend_applied_pending_receipt"
-            and current_activation == activation_receipt
-            and durable == receipt
-            and session.map_name == target_name
-            and session.asset_manifest_sha256 == target_manifest
-            and workspace.active_map_name == target_name
-            and workspace.map_loaded
-            and asset is not None
-            and asset.finalized
-            and str(asset.asset_manifest_sha256 or "").lower()
-            == target_manifest
-            and latest_snapshot is not None
-            and str(descriptor.get("active_map_name") or "") == target_name
-            and str(descriptor.get("asset_manifest_sha256") or "").lower()
-            == target_manifest
-        )
-        if not valid:
-            self._raise_relocalization_session_recovery_incomplete(
-                pending,
-                operation=operation,
-                reason="final_workspace_mismatch",
-            )
-        try:
-            self._validate_bounded_relocalization_session(session, receipt)
-        except Exception:
-            self._raise_relocalization_session_recovery_incomplete(
-                pending,
-                operation=operation,
-                reason="session_metadata_invalid",
-            )
 
     def _finish_relocalization_recovery(
         self,
@@ -2356,14 +2168,7 @@ class MapWorkspaceService:
                 operation=operation,
                 reason="final_workspace_mismatch",
             )
-        self._validate_relocalization_recovery_completion(
-            pending=pending,
-            activation_receipt=activation_receipt,
-            receipt=receipt,
-            session=session,
-            workspace=workspace,
-            operation=operation,
-        )
+
         try:
             settled_receipt = self._repository.settle_relocalization_durable(
                 request_id=str(pending["request_id"]),
@@ -2666,10 +2471,6 @@ class MapWorkspaceService:
                             "reason": "session_refresh_failed",
                         },
                     )
-                self._validate_bounded_relocalization_session(
-                    session,
-                    durable_receipt,
-                )
                 return session, active_workspace
         if pending_intent is not None:
             if (

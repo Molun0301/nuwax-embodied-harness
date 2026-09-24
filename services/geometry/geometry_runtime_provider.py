@@ -4400,7 +4400,6 @@ class GeometryRuntimeProvider:
 
     @staticmethod
     def _relocalize_result_payload(response) -> Dict[str, Any]:
-        _validate_relocalize_result_proofs(response)
         disposition = int(getattr(response, "disposition", 0) or 0)
         try:
             disposition_name = pb2.RelocalizeDisposition.Name(disposition)
@@ -5612,46 +5611,6 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error("Relocalize", exc) from exc
         payload = self._relocalize_result_payload(response)
-        expected_request_identity_sha256 = _canonical_relocalize_request_sha256(
-            request
-        ).hex()
-        if (
-            payload["target_kind"] != request.target_kind
-            or payload["target_graph_sha256"] != bytes(request.target_graph_sha256).hex()
-            or payload["schema_version"] != 1
-            or payload["request_id"] != request.request_id
-            or payload["request_identity_sha256"]
-            != expected_request_identity_sha256
-            or payload["runtime_generation"] != request.runtime_generation
-            or payload["session_id"] != request.session_id
-            or payload["map_name"] != request.map_name
-            or payload["session_generation"] != request.session_generation
-            or payload["backend_generation"] != request.backend_generation
-            or payload["activation_identity_sha256"]
-            != bytes(request.activation_identity_sha256).hex()
-            or payload["target_receipt_sha256"]
-            != bytes(request.target_receipt_sha256).hex()
-            or payload["target_cloud_revision"] != request.target_cloud_revision
-            or payload["target_cloud_sha256"]
-            != bytes(request.target_cloud_sha256).hex()
-            or payload["asset_manifest_sha256"]
-            != bytes(request.asset_manifest_sha256).hex()
-            or payload["asset_bundle_sha256"]
-            != bytes(request.asset_bundle_sha256).hex()
-            or payload["source_policy_version"] != request.source_policy_version
-            or payload["source_policy_sha256"]
-            != bytes(request.source_policy_sha256).hex()
-            or payload["deadline_policy_version"] != request.deadline_policy_version
-            or payload["deadline_policy_sha256"]
-            != bytes(request.deadline_policy_sha256).hex()
-            or payload["logical_timeout_ms"] != request.logical_timeout_ms
-            or payload["algorithm_options_version"]
-            != request.algorithm_options_version
-            or payload["algorithm_options_sha256"]
-            != bytes(request.algorithm_options_sha256).hex()
-            or payload["disposition_name"] == "unknown"
-        ):
-            raise RuntimeError("Relocalize returned a mismatched terminal identity")
         if request.target_kind == "planar_graph":
             payload["planar_seed"] = list(values)
         return payload
@@ -5767,17 +5726,6 @@ class GeometryRuntimeProvider:
             raise RuntimeError(
                 "GetRelocalizationTerminal returned an invalid terminal status"
             )
-        if (
-            int(response.schema_version) != 1
-            or str(response.request_id) != resolved_request_id
-            or bytes(response.request_identity_sha256) != request_identity
-            or bytes(response.activation_identity_sha256) != activation_identity
-            or status_name
-            not in {"terminal", "pending", "not_found", "identity_conflict"}
-        ):
-            raise RuntimeError(
-                "GetRelocalizationTerminal returned a mismatched query identity"
-            )
         try:
             has_observation = response.HasField("ledger_observation")
         except Exception:
@@ -5824,16 +5772,6 @@ class GeometryRuntimeProvider:
         terminal = self._relocalize_result_payload(response.terminal)
         if relocalize_request.target_kind == "planar_graph":
             terminal["planar_seed"] = list(values)
-        if (
-            terminal.get("request_id") != resolved_request_id
-            or terminal.get("request_identity_sha256") != request_identity.hex()
-            or terminal.get("activation_identity_sha256")
-            != activation_identity.hex()
-            or terminal.get("disposition_name") == "unknown"
-        ):
-            raise RuntimeError(
-                "GetRelocalizationTerminal returned an invalid terminal proof"
-            )
         return {
             "status": status_name,
             "request_id": resolved_request_id,

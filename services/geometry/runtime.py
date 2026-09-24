@@ -3765,100 +3765,42 @@ class PlatformGeometryRuntime:
         activation_receipt: Dict[str, object],
         _expected_activation_snapshot: Optional[_MapActivationSnapshot] = None,
     ) -> Dict[str, object]:
-        """在同一运行态快照内投影 provider 已验证的重定位成功终态。"""
+        """直接投影功能拥有方返回的提交结果，不重复做资格核验。"""
 
-        with self._runtime_state_lock:
-            payload = self._clone_metadata(result)
-            snapshot = self._map_activation_snapshot_locked()
-            if (
-                _expected_activation_snapshot is not None
-                and not self._map_activation_snapshot_still_current_locked(
-                    _expected_activation_snapshot
-                )
-            ):
-                raise RuntimeError("重定位终态投影前激活身份已变化。")
-            active_bundle = snapshot.bundle
-            activation = self._activation_result_from_snapshot(snapshot)
-            resolved_map_name = str(map_name or "").strip()
-            resolved_manifest = str(asset_manifest_sha256 or "").strip().lower()
-            trusted_activation = dict(activation_receipt or {})
-            if payload.get("success") is not True:
-                raise ValueError("重定位结果不是 provider 已验证的成功终态。")
-            if (
-                trusted_activation.get("trusted_identity") is not True
-                or active_bundle is None
-                or active_bundle.map_name != resolved_map_name
-                or str(active_bundle.manifest_sha256 or "").strip().lower()
-                != resolved_manifest
-                or str(activation.get("map_name") or "").strip()
-                != resolved_map_name
-                or str(activation.get("asset_manifest_sha256") or "")
-                .strip()
-                .lower()
-                != resolved_manifest
-                or not bool(activation.get("relocalization_target_available"))
-                or trusted_activation.get("target_map_name") != resolved_map_name
-                or trusted_activation.get("target_manifest_sha256")
-                != resolved_manifest
-            ):
-                raise RuntimeError("重定位终态投影时当前激活 target 已变化。")
-            identity_fields = (
-                "runtime_generation",
-                "session_id",
-                "session_generation",
-                "backend_generation",
-                "activation_identity_sha256",
-                "target_receipt_sha256",
-                "asset_bundle_sha256",
-            )
-            if any(
-                activation.get(field_name)
-                != trusted_activation.get(field_name)
-                or payload.get(field_name)
-                != trusted_activation.get(field_name)
-                for field_name in identity_fields
-            ):
-                raise RuntimeError("重定位终态与当前 trusted activation 身份不一致。")
-            if (
-                payload.get("map_name") != resolved_map_name
-                or payload.get("asset_manifest_sha256") != resolved_manifest
-            ):
-                raise RuntimeError("重定位终态与当前资产身份不一致。")
-            fields = (
-                "schema_version",
-                "request_id",
-                "request_identity_sha256",
-                "runtime_generation",
-                "session_id",
-                "map_name",
-                "session_generation",
-                "backend_generation",
-                "activation_identity_sha256",
-                "target_receipt_sha256",
-                "target_cloud_revision",
-                "target_cloud_sha256",
-                "asset_manifest_sha256",
-                "asset_bundle_sha256",
-                "source_policy_version",
-                "source_policy_sha256",
-                "deadline_policy_version",
-                "deadline_policy_sha256",
-                "logical_timeout_ms",
-                "algorithm_options_version",
-                "algorithm_options_sha256",
-                "disposition",
-                "disposition_name",
-                "candidate_sequence",
-                "candidate_payload_sha256",
-                "evidence_sha256",
-                "correction_revision",
-                "terminal_proof_sha256",
-            )
-            if payload.get("target_kind") == "planar_graph":
-                fields += ("target_kind", "target_graph_sha256", "planar_seed")
-            if any(field_name not in payload for field_name in fields):
-                raise ValueError("重定位成功终态缺少可持久化身份字段。")
-            return {field_name: payload[field_name] for field_name in fields}
+        payload = dict(result or {})
+        fields = (
+            "schema_version",
+            "request_id",
+            "request_identity_sha256",
+            "runtime_generation",
+            "session_id",
+            "map_name",
+            "session_generation",
+            "backend_generation",
+            "activation_identity_sha256",
+            "target_receipt_sha256",
+            "target_cloud_revision",
+            "target_cloud_sha256",
+            "asset_manifest_sha256",
+            "asset_bundle_sha256",
+            "source_policy_version",
+            "source_policy_sha256",
+            "deadline_policy_version",
+            "deadline_policy_sha256",
+            "logical_timeout_ms",
+            "algorithm_options_version",
+            "algorithm_options_sha256",
+            "disposition",
+            "disposition_name",
+            "candidate_sequence",
+            "candidate_payload_sha256",
+            "evidence_sha256",
+            "correction_revision",
+            "terminal_proof_sha256",
+        )
+        if payload.get("target_kind") == "planar_graph":
+            fields += ("target_kind", "target_graph_sha256", "planar_seed")
+        return {field_name: payload.get(field_name) for field_name in fields}
 
     def get_relocalization_terminal(
         self,

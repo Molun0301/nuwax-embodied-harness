@@ -33,7 +33,8 @@ mod preflight_only_contract {
     };
     use nuwax_mapping::loop_closure::options::{PgoOptions, PGO_OPTIONS_ENV};
     use nuwax_mapping::relocalization::{
-        relocation_pipeline_with_config, RelocalizationConfig, RelocalizationResult,
+        evaluate_alignment, relocation_pipeline_with_config, IcpConfig, IcpResult, IcpSolver,
+        RelocalizationConfig, RelocalizationResult,
     };
     use nuwax_nav_pgo_bridge::{
         OnlinePgoConfig, OnlinePgoIngress, OnlinePgoOwner, OnlinePgoStopCause,
@@ -145,9 +146,9 @@ mod preflight_only_contract {
         * RELOCALIZATION_MAX_COMMAND_RECORDS
         * RELOCALIZATION_MAX_DISCLOSURE_BYTES_PER_COMMAND_RECORD;
     pub(crate) const ACTIVATION_RECEIPT_SCHEMA_VERSION_V1: u32 = 1;
-    pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION: u32 = 2;
+    pub(crate) const RELOCALIZATION_SOURCE_POLICY_VERSION: u32 = 3;
     pub(crate) const RELOCALIZATION_DEADLINE_POLICY_VERSION_V1: u32 = 1;
-    pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1: u32 = 1;
+    pub(crate) const RELOCALIZATION_ALGORITHM_OPTIONS_VERSION: u32 = 2;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum CorrectionCandidateBackend {
@@ -3287,9 +3288,8 @@ mod preflight_only_contract {
             out.extend_from_slice(&value.to_be_bytes());
         }
         for value in [
-            50_000_u64, 100_000, 2_400_000, 4_096, 25_600_000, 250_000, 6_000_000, 250_000,
-            6_000_000, RELOCALIZATION_MIN_SOURCE_POINTS as u64, 100_000,
-            (RELOCALIZATION_MIN_SOURCE_POINTS * 24) as u64, 2_400_000, 2_000,
+            0_u64, 100_000, 2_400_000, 4_096, 25_600_000, 250_000, 6_000_000, 250_000,
+            6_000_000, 0, 100_000, 0, 2_400_000, 2_000,
         ] {
             out.extend_from_slice(&value.to_be_bytes());
         }
@@ -3312,7 +3312,7 @@ mod preflight_only_contract {
 
     pub(crate) fn relocalization_algorithm_options_preimage_v1() -> Vec<u8> {
         let mut out = b"nuwax.geometry.relocalize.algorithm-options.v1\0".to_vec();
-        out.extend_from_slice(&1_u32.to_be_bytes());
+        out.extend_from_slice(&RELOCALIZATION_ALGORITHM_OPTIONS_VERSION.to_be_bytes());
         canonical_push_string(&mut out, "nuwax_mapping::relocation_pipeline_with_config");
         out.extend_from_slice(&1_u32.to_be_bytes());
         out.extend_from_slice(&3_u32.to_be_bytes());
@@ -3330,6 +3330,8 @@ mod preflight_only_contract {
         out.extend_from_slice(&1.0e-6_f64.to_be_bytes());
         out.extend_from_slice(&(0.1_f64 * 1.5).to_be_bytes());
         out.extend_from_slice(&10.0_f64.to_be_bytes());
+        canonical_push_string(&mut out, "current-anchor-local-icp-then-global;submit-functional-estimate");
+        out.extend_from_slice(&0.8_f64.to_be_bytes());
         out
     }
 
@@ -4233,7 +4235,7 @@ mod preflight_only_contract {
             state.source_policy_sha256 = relocalization_source_policy_sha256_v1().to_vec();
             state.deadline_policy_version = RELOCALIZATION_DEADLINE_POLICY_VERSION_V1;
             state.deadline_policy_sha256 = relocalization_deadline_policy_sha256_v1().to_vec();
-            state.algorithm_options_version = RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1;
+            state.algorithm_options_version = RELOCALIZATION_ALGORITHM_OPTIONS_VERSION;
             state.algorithm_options_sha256 = relocalization_algorithm_options_sha256_v1().to_vec();
         }
 
@@ -5921,7 +5923,7 @@ mod preflight_only_contract {
             || source_policy_sha256 != if request.target_kind=="planar_graph" {planar_source_policy_sha256()}else{relocalization_source_policy_sha256_v1()}
             || request.deadline_policy_version != RELOCALIZATION_DEADLINE_POLICY_VERSION_V1
             || deadline_policy_sha256 != relocalization_deadline_policy_sha256_v1()
-            || request.algorithm_options_version != RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1
+            || request.algorithm_options_version != RELOCALIZATION_ALGORITHM_OPTIONS_VERSION
             || algorithm_options_sha256 != if request.target_kind=="planar_graph" {planar_algorithm_policy_sha256()}else{relocalization_algorithm_options_sha256_v1()}
         {
             return Err("RELOCALIZATION_POLICY_IDENTITY_MISMATCH".to_owned());
@@ -8078,42 +8080,8 @@ mod preflight_only_contract {
                 input: request.input.clone(),
             });
 
-            let minimum_reached = aggregate_input_points >= RELOCALIZATION_MIN_AGGREGATE_POINTS;
-            let fresh_boundary = request.lease.has_lifecycle_guard();
-            let maximum_reached = aggregate_input_points == RELOCALIZATION_MAX_AGGREGATE_POINTS;
-            if maximum_reached && !fresh_boundary {
-                self.settle_active(
-                    crate::proto::RelocalizeDisposition::InsufficientSource,
-                    "RELOCALIZATION_MAXIMUM_AGGREGATE_FRESH_BOUNDARY_UNAVAILABLE",
-                )?;
-                Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
-                return Ok(());
-            }
-            let cutoff_reason = if maximum_reached {
-                Some(RelocalizationCutoffReasonV1::MaximumAggregateReached)
-            } else if fresh_boundary && minimum_reached {
-                Some(RelocalizationCutoffReasonV1::MinimumAggregateReached)
-            } else if fresh_boundary
-                && accumulation.accepted.len() >= RELOCALIZATION_MAX_FRAMES
-                && aggregate_input_points >= RELOCALIZATION_MIN_SOURCE_POINTS
-            {
-                // 低密度雷达的完整窗口也交给原算法评估，不能为凑点拒绝真实扫描。
-                Some(RelocalizationCutoffReasonV1::MaximumFramesReached)
-            } else {
-                None
-            };
-            if cutoff_reason.is_none() && accumulation.accepted.len() >= RELOCALIZATION_MAX_FRAMES {
-                self.settle_active(
-                    crate::proto::RelocalizeDisposition::InsufficientSource,
-                    if minimum_reached {
-                        "RELOCALIZATION_FRESH_BOUNDARY_UNAVAILABLE"
-                    } else {
-                        "RELOCALIZATION_INSUFFICIENT_SOURCE_MAX_FRAMES"
-                    },
-                )?;
-                Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
-                return Ok(());
-            }
+            let cutoff_reason = request.lease.has_lifecycle_guard()
+                .then_some(RelocalizationCutoffReasonV1::MinimumAggregateReached);
             let Some(cutoff_reason) = cutoff_reason else {
                 self.execution = Some(RelocalizationExecution::Accumulating(accumulation));
                 Self::reply_frame(request.response, CorrectionSubmitDisposition::NoCandidate);
@@ -8298,39 +8266,6 @@ mod preflight_only_contract {
             Ok(())
         }
 
-        fn current_target_matches(
-            runtime: &RelocalizationRuntimeContext,
-            computed: &RelocalizationComputedCommand,
-        ) -> bool {
-            runtime
-                .phase_a
-                .activated_target_receipts()
-                .current_sealed_target_snapshot()
-                .is_some_and(|snapshot| same_sealed_target(&snapshot, &computed.source.snapshot))
-        }
-
-        fn schedule_staged_discard(
-            computed: &RelocalizationComputedCommand,
-            runtime: &RelocalizationRuntimeContext,
-            tasks: &mut tokio::task::JoinSet<RelocalizationTaskEvent>,
-        ) {
-            let cleanup = runtime.cleanup.clone();
-            let input = computed.source.boundary_input.clone();
-            tasks.spawn(async move {
-                RelocalizationTaskEvent::DiscardScheduled(schedule_discard(&cleanup, input).await)
-            });
-        }
-
-        fn preclaim_is_valid(
-            runtime: &RelocalizationRuntimeContext,
-            computed: &RelocalizationComputedCommand,
-        ) -> bool {
-            runtime.phase_a.is_open()
-                && Instant::now() < computed.logical_deadline
-                && computed.source.boundary_lease.has_lifecycle_guard()
-                && Self::current_target_matches(runtime, computed)
-        }
-
         fn handle_task_event(
             &mut self,
             event: RelocalizationTaskEvent,
@@ -8384,22 +8319,6 @@ mod preflight_only_contract {
                         )?;
                         return Ok(());
                     }
-                    if !Self::preclaim_is_valid(runtime, &computed) {
-                        self.settle_completed(
-                            &computed,
-                            if Instant::now() >= computed.logical_deadline {
-                                crate::proto::RelocalizeDisposition::DeadlineExceeded
-                            } else if !runtime.phase_a.is_open() {
-                                crate::proto::RelocalizeDisposition::OwnerStopped
-                            } else {
-                                crate::proto::RelocalizeDisposition::TargetInvalidated
-                            },
-                            None,
-                            0,
-                            "RELOCALIZATION_PRECLAIM_REVALIDATION_FAILED",
-                        )?;
-                        return Ok(());
-                    }
                     let sender = runtime.finalizer.sender.clone();
                     tasks.spawn(async move {
                         RelocalizationTaskEvent::PermitReserved(
@@ -8442,16 +8361,6 @@ mod preflight_only_contract {
                         .terminal(&computed.request.request.request_id)
                         .is_some()
                     {
-                        return Ok(());
-                    }
-                    if !Self::preclaim_is_valid(runtime, &computed) {
-                        self.settle_completed(
-                            &computed,
-                            crate::proto::RelocalizeDisposition::TargetInvalidated,
-                            None,
-                            0,
-                            "RELOCALIZATION_PRESTAGE_REVALIDATION_FAILED",
-                        )?;
                         return Ok(());
                     }
                     let sink = Arc::clone(&runtime.sink);
@@ -8497,39 +8406,13 @@ mod preflight_only_contract {
                         .ledger
                         .terminal(&computed.request.request.request_id)
                         .is_some()
-                        || !Self::preclaim_is_valid(runtime, &computed)
                     {
-                        if self
-                            .ledger
-                            .terminal(&computed.request.request.request_id)
-                            .is_none()
-                        {
-                            self.settle_completed(
-                                &computed,
-                                crate::proto::RelocalizeDisposition::TargetInvalidated,
-                                None,
-                                0,
-                                "RELOCALIZATION_CLAIM_REVALIDATION_FAILED",
-                            )?;
-                        }
                         Self::schedule_staged_discard(&computed, runtime, tasks);
                         return Ok(());
                     }
 
                     let claim_fence = runtime.phase_a.command_claim_fence();
                     let _claim_guard = claim_fence.lock();
-                    if !Self::preclaim_is_valid(runtime, &computed) {
-                        drop(_claim_guard);
-                        self.settle_completed(
-                            &computed,
-                            crate::proto::RelocalizeDisposition::TargetInvalidated,
-                            None,
-                            0,
-                            "RELOCALIZATION_CLAIM_FENCE_REVALIDATION_FAILED",
-                        )?;
-                        Self::schedule_staged_discard(&computed, runtime, tasks);
-                        return Ok(());
-                    }
                     let candidate_sequence =
                         self.next_candidate_sequence.checked_add(1).ok_or_else(|| {
                             CorrectionRuntimeError::Apply(
@@ -8844,7 +8727,11 @@ mod preflight_only_contract {
             if shutting_down && actor.execution.is_none() && tasks.is_empty() {
                 return Ok(());
             }
-            let logical_deadline = actor.ledger.active_identity().map(|active| active.3);
+            // 采集等待使用原请求期限；已交给功能层的计算不被提交层再次超时否决。
+            let logical_deadline = match actor.execution.as_ref() {
+                Some(RelocalizationExecution::Accumulating(_)) => actor.ledger.active_identity().map(|active| active.3),
+                _ => None,
+            };
             let accumulation_deadline = match actor.execution.as_ref() {
                 Some(RelocalizationExecution::Accumulating(accumulation)) => {
                     Some(accumulation.accumulation_deadline)
@@ -10000,8 +9887,7 @@ mod preflight_only_contract {
     fn stable_stratified_source(
         ordered: Vec<Point3<f64>>,
     ) -> Result<StableRelocalizationSource, String> {
-        if ordered.len() < RELOCALIZATION_MIN_SOURCE_POINTS
-            || ordered.len() > RELOCALIZATION_MAX_AGGREGATE_POINTS
+        if ordered.len() > RELOCALIZATION_MAX_AGGREGATE_POINTS
         {
             return Err("RELOCALIZATION_SOURCE_POINT_COUNT_INVALID".to_owned());
         }
@@ -10024,7 +9910,7 @@ mod preflight_only_contract {
             .len()
             .checked_mul(24)
             .ok_or_else(|| "RELOCALIZATION_SOURCE_BYTES_OVERFLOW".to_owned())?;
-        if !(RELOCALIZATION_MIN_SOURCE_POINTS * 24..=2_400_000).contains(&canonical_bytes_len) {
+        if canonical_bytes_len > 2_400_000 {
             return Err("RELOCALIZATION_EMITTED_SOURCE_BYTES_INVALID".to_owned());
         }
         let mut canonical = Vec::with_capacity(8 + canonical_bytes_len);
@@ -10048,13 +9934,29 @@ mod preflight_only_contract {
         target: &[Point3<f64>],
         base_anchor_map_from_odom: Isometry3<f64>,
     ) -> RelocalizationComputeOutput {
-        let result =
-            relocation_pipeline_with_config(source, target, RelocalizationConfig::default());
-        let accepted = result.registration.converged
-            && result.fitness >= RelocalizationConfig::default().min_final_fitness
-            && result.registration.mse.is_finite()
-            && is_finite_isometry(&result.registration.transformation);
-        let correction = accepted
+        let config = RelocalizationConfig::default();
+        // 当前位姿已有初值时先完成局部对齐，避免每次必须从全图重新找位置。
+        let seeded: Vec<_> = source.iter().map(|point| base_anchor_map_from_odom * point).collect();
+        let local = IcpSolver::new(IcpConfig {
+            max_correspondence_distance: config.voxel_sizes.into_iter().fold(0.0, f64::max),
+            ..config.icp
+        }).align(&seeded, target);
+        // 求解器用无限误差表示没有求得估计；已有估计直接提交，分数只作诊断。
+        if local.mse.is_finite() {
+            let transform = local.transformation * base_anchor_map_from_odom;
+            let score = evaluate_alignment(source, target, transform, config.fine_correspondence_distance);
+            return RelocalizationComputeOutput {
+                result: RelocalizationResult {
+                    registration: IcpResult { transformation: transform, ..local },
+                    feature_matches: 0,
+                    ransac_inliers: score.inlier_count,
+                    fitness: score.fitness,
+                },
+                correction: Some(base_anchor_map_from_odom.inverse() * transform),
+            };
+        }
+        let result = relocation_pipeline_with_config(source, target, config);
+        let correction = result.registration.converged
             .then(|| base_anchor_map_from_odom.inverse() * result.registration.transformation);
         RelocalizationComputeOutput { result, correction }
     }
@@ -12620,7 +12522,7 @@ mod preflight_only_contract {
                 deadline_policy_version: RELOCALIZATION_DEADLINE_POLICY_VERSION_V1,
                 deadline_policy_sha256: relocalization_deadline_policy_sha256_v1().to_vec(),
                 logical_timeout_ms: 1_000,
-                algorithm_options_version: RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1,
+                algorithm_options_version: RELOCALIZATION_ALGORITHM_OPTIONS_VERSION,
                 algorithm_options_sha256: relocalization_algorithm_options_sha256_v1().to_vec(),
             }
         }
@@ -19869,7 +19771,7 @@ pub(crate) use preflight_only_contract::{
     GeometryCorrectionSink, RegisteredCloudProof, RelocalizationCommandError,
     PlanarCommandWork, PlanarCommandContext, PlanarCommandOutcome, planar_source_policy_sha256, planar_algorithm_policy_sha256,
     RelocalizationCommandIngress, RelocalizationCommandWaiter, RelocalizationModeFence,
-    RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1,
+    RelocalizationTerminalSnapshot, RELOCALIZATION_ALGORITHM_OPTIONS_VERSION,
     RELOCALIZATION_DEADLINE_POLICY_VERSION_V1, RELOCALIZATION_SOURCE_POLICY_VERSION,
 };
 

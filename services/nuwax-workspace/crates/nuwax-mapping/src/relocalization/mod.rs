@@ -15,7 +15,7 @@ pub use features::{
     FpfhDescriptor, FPFH_BINS, FPFH_DIM,
 };
 pub use module::RelocalizationModule;
-pub use ransac::{ransac_align, RansacConfig, RansacResult};
+pub use ransac::{evaluate_alignment, ransac_align, AlignmentScore, RansacConfig, RansacResult};
 pub use relocalize::{
     compute_fpfh_stub, filter_upright, gravity_tilt_deg, is_upright, multiscale_icp,
     ransac_align_stub, relocation_pipeline, relocation_pipeline_with_config, wall_subset_mask,

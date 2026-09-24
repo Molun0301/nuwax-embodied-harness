@@ -1933,7 +1933,7 @@ fn canonical_activation_identity_preimage(
         &crate::correction_coordinator::relocalization_deadline_policy_sha256_v1(),
     );
     out.extend_from_slice(
-        &crate::correction_coordinator::RELOCALIZATION_ALGORITHM_OPTIONS_VERSION_V1.to_be_bytes(),
+        &crate::correction_coordinator::RELOCALIZATION_ALGORITHM_OPTIONS_VERSION.to_be_bytes(),
     );
     out.extend_from_slice(
         &if backend_kind=="slam_toolbox" {crate::correction_coordinator::planar_algorithm_policy_sha256()}else{crate::correction_coordinator::relocalization_algorithm_options_sha256_v1()},

@@ -6730,7 +6730,7 @@ class GatewayRuntime:
             if not map_name:
                 raise GatewayError("请先选择地图。", error_code="map_not_activated")
 
-        def prepare_navigation():
+        def prepare_navigation(context=None):
             nonlocal map_name, workspace, current_localization_session_id
             started = time.monotonic()
             map_name, workspace = self._resolve_map_workspace_for_request(
@@ -6742,8 +6742,9 @@ class GatewayRuntime:
             self._ensure_localization_for_navigation(
                 capability_name="navigate_to_pose", map_name=map_name, workspace=workspace,
                 requested_by=requested_by, arguments=arguments,
+                on_relocalize=(lambda: context.update(progress=0.02, stage="navigation_relocalizing", message="正在重定位当前地图，完成后继续导航。")) if context is not None else None,
             )
-            RUNTIME_LOGGER.info("导航定位检查已完成 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
+            RUNTIME_LOGGER.info("导航定位准备已完成 map_name=%s duration_ms=%.3f", map_name, (time.monotonic()-started)*1000)
             current_localization_session_id = (
                 workspace.active_localization_session.session_id
                 if workspace is not None and workspace.active_localization_session is not None else None
@@ -7026,10 +7027,10 @@ class GatewayRuntime:
             create_if_missing=False,
         )
         self._refresh_workspace_snapshots()
-        self._ensure_localization_ready(
+        self._ensure_localization_for_navigation(
             capability_name="navigate_to_named_location",
             map_name=map_name,
-            workspace=workspace,
+            workspace=workspace, requested_by=requested_by, arguments=arguments,
         )
         workspace = self.map_workspace_service.get_active_workspace() or workspace
         target_name = self._require_str(arguments, "target_name")
@@ -8784,158 +8785,30 @@ class GatewayRuntime:
             },
         )
 
-    def _ensure_live_navigation_ready(
-        self,
-        *,
-        capability_name: str,
-        map_name: str,
-        force_runtime_goal: bool = False,
-    ):
-        """在实时位姿与 nuwax-geometry-runtime 可用时直接下发导航目标。"""
-
-        localization_snapshot = self.localization_service.get_latest_snapshot()
-        if localization_snapshot is None or localization_snapshot.current_pose is None:
-            raise GatewayError(
-                "当前没有可用实时位姿，无法执行 %s。" % capability_name,
-                error_code="localization_unavailable",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={"map_name": map_name, "capability_name": capability_name},
-            )
-        runtime_provider = getattr(self.platform_geometry_runtime, "_remote_provider", None)
-        if runtime_provider is not None and force_runtime_goal:
-            readiness = runtime_provider.get_navigation_readiness()
-            if readiness is not None:
-                if bool(readiness.get("ready")):
-                    RUNTIME_LOGGER.info(
-                        "trust_live_navigation: nuwax-geometry-runtime ready + live pose, bypass session gate for %s map=%s force=%s",
-                        capability_name,
-                        map_name,
-                        force_runtime_goal,
-                    )
-                    return localization_snapshot
-                raise GatewayError(
-                    readiness.get("message") or "nuwax-geometry-runtime 未就绪，无法执行 %s。" % capability_name,
-                    error_code="runtime_not_ready",
-                    http_status=409,
-                    jsonrpc_code=-32000,
-                    details={
-                        "map_name": map_name,
-                        "capability_name": capability_name,
-                        "waiting_for": readiness.get("waiting_for", []),
-                        "force_runtime_goal": force_runtime_goal,
-                    },
-                )
-        navigation_status = self.platform_geometry_runtime._build_navigation_status()
-        if not bool(navigation_status.get("ready")):
-            raise GatewayError(
-                str(navigation_status.get("message") or "nuwax-geometry-runtime 导航未就绪，无法执行 %s。" % capability_name),
-                error_code="navigation_not_ready",
-                http_status=409,
-                jsonrpc_code=-32000,
-                details={
-                    "map_name": map_name,
-                    "capability_name": capability_name,
-                    "waiting_for": navigation_status.get("waiting_for"),
-                    "navigation_status": navigation_status,
-                },
-            )
-        RUNTIME_LOGGER.info(
-            "trust_live_navigation: nuwax-geometry-runtime ready + live pose, bypass session gate for %s map=%s",
-            capability_name,
-            map_name,
-        )
-        return localization_snapshot
 
     def _ensure_localization_for_navigation(
-        self,
-        *,
-        capability_name: str,
-        map_name: str,
-        workspace,
-        requested_by: Optional[str],
-        arguments: Dict[str, Any],
+        self, *, capability_name: str, map_name: str, workspace,
+        requested_by: Optional[str], arguments: Dict[str, Any], on_relocalize=None,
     ):
-        force_runtime_goal = bool(arguments.get("force_runtime_goal", False))
-        trust_live_navigation = bool(arguments.get("trust_live_navigation", False))
-        # 导航强制执行只使用 `force_runtime_goal` 单一 key。
-        effective_force = force_runtime_goal
-        if trust_live_navigation or effective_force:
-            try:
-                return self._ensure_localization_ready(
-                    capability_name=capability_name,
+        asset = getattr(workspace, "map_asset", None)
+        if asset is not None and asset.finalized:
+            if self.map_workspace_service.get_relocalized_pose(map_name) is None:
+                if on_relocalize is not None:
+                    on_relocalize()
+                self.map_workspace_service.relocalize_active_map(
                     map_name=map_name,
-                    workspace=workspace,
-                )
-            except GatewayError as exc:
-                if exc.error_code != "localization_unavailable":
-                    raise
-                return self._ensure_live_navigation_ready(
-                    capability_name=capability_name,
-                    map_name=map_name,
-                    force_runtime_goal=effective_force,
-                )
-        if bool(arguments.get("sync_localization_session", False)):
-            try:
-                self.map_workspace_service.sync_active_localization_session(
-                    refresh=True,
                     metadata={"requested_by": requested_by or "unknown", "source": capability_name},
                 )
-            except Exception:
-                RUNTIME_LOGGER.debug("sync_active_localization_session failed", exc_info=True)
-        try:
-            return self._ensure_localization_ready(
-                capability_name=capability_name,
-                map_name=map_name,
-                workspace=workspace,
-            )
-        except GatewayError as exc:
-            if exc.error_code != "localization_unavailable":
-                raise
-            if bool(arguments.get("auto_relocalize", False)):
-                return self._ensure_localization_ready_or_relocalize(
-                    capability_name=capability_name,
-                    map_name=map_name,
-                    workspace=workspace,
-                    requested_by=requested_by,
-                )
-            if trust_live_navigation or effective_force:
-                return self._ensure_live_navigation_ready(
-                    capability_name=capability_name,
-                    map_name=map_name,
-                    force_runtime_goal=effective_force,
-                )
-            raise
+        # 定位功能提交后直接继续原目标；位姿消费由导航执行方完成。
+        return self.localization_service.get_latest_snapshot()
 
     def _ensure_localization_ready_or_relocalize(
-        self,
-        *,
-        capability_name: str,
-        map_name: str,
-        workspace,
+        self, *, capability_name: str, map_name: str, workspace,
         requested_by: Optional[str],
     ):
-        try:
-            return self._ensure_localization_ready(
-                capability_name=capability_name,
-                map_name=map_name,
-                workspace=workspace,
-            )
-        except GatewayError as exc:
-            if exc.error_code != "localization_unavailable":
-                raise
-        _session, refreshed_workspace = self.map_workspace_service.relocalize_active_map(
-            map_name=map_name,
-            metadata={
-                "requested_by": requested_by or "unknown",
-                "source": capability_name,
-                "logical_timeout_ms": 10_000,
-            },
-        )
-        return self._ensure_localization_ready(
-            capability_name=capability_name,
-            map_name=map_name,
-            workspace=refreshed_workspace,
+        return self._ensure_localization_for_navigation(
+            capability_name=capability_name, map_name=map_name, workspace=workspace,
+            requested_by=requested_by, arguments={},
         )
 
     def _build_navigation_arrival_result(
@@ -12068,7 +11941,7 @@ class GatewayRuntime:
                     self._run_with_motion_admission(pending, lambda: None)
                     context.ensure_active()
                     if prepare_callback is not None:
-                        prepare_callback()
+                        prepare_callback(context)
                     context.ensure_active()
                     goal = self._goal_with_motion_admission(goal, motion_admission)
                 self._ensure_motion_runtime_for_backend_call(

@@ -12,7 +12,8 @@
     task: null, taskTimer: null, statusTimer: null, reloadTimer: null, disposed: false, busy: false, error: '', renderKey: '', detailKey: '' };
   const controllers = new Set();
   const mode = () => window.__nuwaxMapViewMode?.() || '2d';
-  const visible = () => mode() === 'semantic' || state.overlays[mode()] === true;
+  // 区域工具打开期间始终显示区域，便于点选与核对；图层开关只决定常态显示。
+  const visible = () => mode() === 'semantic' || state.overlays[mode()] === true || !panel.hidden;
   const interested = () => visible() || !panel.hidden;
   const node = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (cls) n.className = cls; return n; };
   const bindingKey = b => JSON.stringify([b?.map_name, b?.source_name, b?.source_epoch, b?.frame_id, b?.content_sha256]);
@@ -48,6 +49,8 @@
     const semantic = mode() === 'semantic';
     if ($('semanticRegionLegend')) $('semanticRegionLegend').hidden = !visible();
     panel.classList.toggle('has-selection', Boolean(state.selected));
+    // 区域详情以检查卡显示在地图右上角，仅在区域工具打开且已选中区域时出现。
+    $('semanticRegionInspector').hidden = panel.hidden || !regions().some(r => r.scene_space_id === state.selected);
     $('semanticRegionLayerControl').hidden = false;
     $('showSemanticRegions').checked = semantic || state.overlays[mode()] === true;
     $('showSemanticRegions').disabled = semantic;
@@ -66,7 +69,7 @@
     state.paths = [];
     const list = visible() ? drawable().map(region => ({ ...region, display_color: color(region), display_index: regions().indexOf(region) + 1 })) : [];
     window.dispatchEvent(new CustomEvent('pointcloud3d:semantic-regions', { detail: {
-      regions: list, binding: state.data?.map_binding || null, visible: mode() === '3d' && state.overlays['3d'], selectedId: state.selected,
+      regions: list, binding: state.data?.map_binding || null, visible: mode() === '3d' && visible(), selectedId: state.selected,
       theme: {surface:getComputedStyle(document.documentElement).getPropertyValue('--surface').trim(),ink:getComputedStyle(document.documentElement).getPropertyValue('--ink').trim()}
     }}));
     window.__nuwaxMapRequestDraw?.();
@@ -74,7 +77,7 @@
   function openPanel(open) {
     if (open) window.nuwaxMapPanels?.activate('semanticRegionPanel');
     panel.hidden = !open;
-    ui();
+    ui(); emitLayer();
     if (open) { window.dispatchEvent(new CustomEvent('map:semantic-panel-opened')); load(); }
   }
   function select(id) {
@@ -82,6 +85,7 @@
     state.selected = id;
     if (panel.hidden) openPanel(true);
     renderList(); renderDetail(); ui(); emitLayer();
+    $('semanticRegionList').querySelector('[aria-pressed="true"]')?.scrollIntoView({block:'nearest',inline:'nearest'});
   }
   function renderList() {
     const list = $('semanticRegionList'), query = $('semanticRegionSearch').value.trim().toLowerCase();
@@ -236,6 +240,7 @@
   },3000);}
   window.nuwaxMapPanels?.register('semanticRegionPanel',()=>openPanel(false));
   $('semanticRegionPanelToggle').addEventListener('click',()=>openPanel(panel.hidden));
+  $('semanticRegionDeselect').addEventListener('click',()=>{state.selected=null;renderList();renderDetail();ui();emitLayer();$('semanticRegionSearch').focus({preventScroll:true});});
   $('semanticRegionClose').addEventListener('click',()=>window.nuwaxMapPanels.close('semanticRegionPanel',true));
   $('showSemanticRegions').addEventListener('change',()=>{state.overlays[mode()]=$('showSemanticRegions').checked;ui();emitLayer();if(visible())load();});
   $('semanticRegionSearch').addEventListener('input',renderList);

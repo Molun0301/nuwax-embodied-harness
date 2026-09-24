@@ -365,12 +365,8 @@ button{font-family:inherit;cursor:pointer}
 .rail-sub+.rail-sub{margin-top:12px;padding-top:12px;border-top:1px solid var(--line-2)}
 
 /* hero map HUD positioning (real ids inside .map-panel) */
-.canvas-wrap{position:absolute;inset:0;border-radius:var(--r-xl);overflow:hidden;background:var(--grid-bg)}
 #mapCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
 #map3dContainer{position:absolute;inset:0;border-radius:var(--r-xl)}
-.map-toolbar{position:absolute;left:14px;top:14px;z-index:5;display:grid;gap:7px;
-  max-width:min(980px,calc(100% - 230px));pointer-events:none}
-.map-tool-row{display:flex;gap:7px;flex-wrap:wrap;align-items:center;pointer-events:none}
 .dense-cloud-status{max-width:min(480px,100%);padding:5px 9px;border-radius:6px;color:var(--strong);font-size:11px;overflow-wrap:anywhere}
 .dense-cloud-status[hidden]{display:none!important}
 .dense-cloud-status[data-error="true"]{color:var(--bad)}
@@ -382,26 +378,6 @@ button{font-family:inherit;cursor:pointer}
 .map-tool-group .tool.active,.map-tool-group .tool[aria-pressed="true"]{background:var(--ink);color:var(--surface)}
 .map-tool-group .tool:disabled{cursor:not-allowed;opacity:.42;background:transparent;color:var(--faint)}
 .map-tool-separator{width:1px;height:20px;background:var(--line);margin:0 2px}
-.navigation-height-field{display:flex;align-items:center;gap:7px;color:var(--strong);font-size:11px;padding:4px 8px}
-.navigation-height-field input{min-width:0;width:108px;height:27px;padding:3px 6px;border:1px solid var(--line);
-  border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit}
-.navigation-panel{position:absolute;left:14px;top:var(--map-tools-bottom,140px);z-index:7;width:min(350px,calc(100% - 28px));
-  max-height:calc(100% - var(--map-tools-bottom,140px) - 14px);overflow:auto;padding:12px;border:1px solid var(--line);border-radius:var(--r);font-size:12px}
-.navigation-panel[hidden]{display:none!important}
-.navigation-panel .navigation-height-field{display:grid;padding:0}
-.navigation-panel input{width:100%}
-.navigation-hint{color:var(--muted);line-height:1.5;margin:8px 0}
-.navigation-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-.navigation-actions button{min-height:29px;padding:5px 9px;border:1px solid var(--line);border-radius:var(--r-sm);
-  background:var(--inset);color:var(--strong);font:inherit;cursor:pointer}
-.navigation-actions [data-role="nav-submit"]{background:var(--ink);color:var(--surface);border-color:transparent}
-.navigation-panel [data-role="nav-status"]{overflow-wrap:anywhere;line-height:1.5;margin:8px 0 0}
-.navigation-panel [data-role="nav-status"][data-level="warn"],.navigation-panel [data-role="nav-status"][data-level="error"]{color:var(--bad)}
-.navigation-panel pre{white-space:pre-wrap;margin:6px 0 0;font-size:11px}
-.map-layer-toggle{min-height:29px;padding:5px 8px;border-radius:var(--r-sm);display:inline-flex;gap:6px;align-items:center;
-  color:var(--strong);font-size:11.5px;font-weight:620;cursor:pointer}
-.map-layer-toggle:hover{background:var(--inset)}
-.map-layer-toggle input{margin:0;accent-color:var(--robot)}
 .map-point-style{min-height:29px;padding:4px 7px;border-radius:var(--r-sm);display:inline-flex;align-items:center;gap:5px;
   color:var(--strong);font-size:11.5px;font-weight:620}
 .map-point-style:hover{background:var(--inset)}
@@ -412,49 +388,10 @@ button{font-family:inherit;cursor:pointer}
 .map-point-style[data-point-style="ground"] .sw{background:var(--pointcloud3d-ground-color,#0ea5a4)}
 .map-point-style[data-point-style="structure"] .sw{background:var(--pointcloud3d-structure-color,#fbbf24)}
 .map-point-style[data-point-style="mono"] .sw{background:var(--pointcloud3d-color,#e2e8f0)}
-.map-overlay-panel{border-radius:var(--r)}
-.forbidden-zone-panel{border-radius:var(--r)}
-.map-stream-chip{position:absolute;right:14px;top:14px;z-index:5;max-width:min(46%,280px);white-space:pre-line;overflow-wrap:anywhere}
-.map-goal-chip{position:absolute;left:14px;top:94px;z-index:5}
-.legend{position:absolute;left:14px;bottom:14px;z-index:5;max-width:52%}
 #mapZoomValue{min-width:48px;justify-content:center;font-family:var(--mono);font-size:11px}
 #map3dZoomValue{min-width:52px;justify-content:center;font-family:var(--mono);font-size:11px}
 #mapEmpty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;max-width:70%}
-.map-pose-hud{position:absolute;right:14px;bottom:14px;z-index:5;min-width:174px;padding:8px 10px;pointer-events:none}
-.map-pose-title{margin-bottom:4px;color:var(--muted);font-size:9.5px;font-weight:700;text-transform:uppercase}
-.map-pose-meta{grid-template-columns:auto minmax(72px,auto);gap:2px 10px;font-size:10.5px;line-height:1.35}
-#mapStatus{position:absolute;right:14px;bottom:115px;z-index:5}
-.forbidden-zone-panel{position:absolute;left:14px;top:var(--map-tools-bottom,104px);z-index:7;width:min(390px,calc(100% - 28px));
-  max-height:min(430px,calc(100% - 180px));overflow:auto;padding:10px;pointer-events:auto;border:1px solid var(--line)}
-.forbidden-zone-panel[hidden]{display:none!important}
-.forbidden-zone-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-.forbidden-zone-title{font-size:12px;font-weight:700;color:var(--strong)}
-.forbidden-zone-status{font-size:9.5px;color:var(--muted);font-family:var(--mono);text-align:right}
-.forbidden-zone-status[data-state="error"]{color:var(--bad)}
-.forbidden-zone-status[data-state="busy"]{color:var(--warn)}
-.forbidden-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
-.forbidden-zone-field{display:grid;gap:3px;min-width:0;color:var(--muted);font-size:9.5px}
-.forbidden-zone-field.wide{grid-column:1/-1}
-.forbidden-zone-field input,.forbidden-zone-field select{min-width:0;width:100%;height:29px;padding:4px 7px;
-  border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit;font-size:11px}
-.forbidden-zone-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}
-.forbidden-zone-actions button,.forbidden-zone-list button{min-height:27px;padding:4px 8px;border:1px solid var(--line);
-  border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font-size:10.5px;font-weight:620}
-.forbidden-zone-actions button.primary{background:var(--ink);border-color:transparent;color:var(--surface)}
-.forbidden-zone-actions button:disabled,.forbidden-zone-list button:disabled{opacity:.45;cursor:not-allowed}
-.forbidden-zone-hint{margin-top:7px;color:var(--muted);font-size:10px;line-height:1.4}
-.forbidden-zone-list{display:grid;gap:5px;margin:8px 0 0;padding:8px 0 0;border-top:1px solid var(--line);list-style:none}
-.forbidden-zone-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center;padding:6px 7px;
-  border-radius:var(--r-sm);background:var(--inset)}
-.forbidden-zone-item-main{min-width:0}
-.forbidden-zone-item-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--strong);font-size:10.5px;font-weight:650}
-.forbidden-zone-item-meta{display:block;color:var(--muted);font-size:9.5px;font-family:var(--mono)}
-.forbidden-zone-empty{padding:5px 2px;color:var(--muted);font-size:10px}
 .map-info-grid{display:none}
-.workspace.swapped .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
-.workspace.swapped .map-tool-row{gap:5px}
-.workspace.swapped #mapCameraControls{flex-wrap:wrap;max-width:252px}
-.workspace.swapped .legend{left:10px;bottom:10px;max-width:calc(100% - 200px);padding:5px 8px;gap:4px 8px;font-size:9.5px}
 
 @media(max-width:760px){
   body{padding:8px;overflow-x:hidden}
@@ -469,15 +406,6 @@ button{font-family:inherit;cursor:pointer}
   .dock.card{grid-template-columns:minmax(0,1fr);height:auto;overflow:visible}
   .dcol{border-left:0;border-top:1px solid var(--line)}
   .dcol:first-child{border-top:0}
-  .map-toolbar{left:10px;right:10px;top:10px;max-width:none}
-  .map-tool-row{gap:5px}
-  .map-tool-group{max-width:100%;flex-wrap:wrap}
-  .map-stream-chip{top:auto;right:10px;bottom:154px;max-width:58%}
-  .map-goal-chip{left:10px;top:auto;bottom:188px;max-width:calc(100% - 20px)}
-  .legend{left:10px;bottom:10px;max-width:48%}
-  .map-pose-hud{right:10px;bottom:10px;min-width:154px;padding:7px 9px}
-  #mapStatus{right:10px;bottom:109px}
-  .forbidden-zone-panel{left:10px;top:var(--map-tools-bottom,135px);width:calc(100% - 20px);max-height:calc(100% - 210px)}
 }
 
 /* media-swap buttons */
@@ -580,24 +508,8 @@ button{font-family:inherit;cursor:pointer}
 .console-log-context{display:block;margin-top:5px;font:10.5px/1.5 var(--mono);color:var(--muted);overflow-wrap:anywhere}
 
 /* 空间记忆：与地图共享证据表达，亮暗主题复用控制台颜色。 */
-.semantic-memory-panel{position:fixed;right:24px;top:92px;bottom:24px;z-index:12;width:min(360px,calc(100% - 48px));max-height:calc(100dvh - 116px);display:flex;flex-direction:column;padding:14px;border-radius:var(--r);font-size:12px;box-shadow:var(--sh-sm)}
-.semantic-memory-panel[hidden]{display:none!important}
-.semantic-memory-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.semantic-memory-head strong{font-size:14px;min-width:0;overflow-wrap:anywhere}
-.semantic-memory-head .tool{font-size:18px;line-height:1;padding:4px 8px;background:var(--inset);color:var(--ink)}
-.semantic-memory-status,.semantic-memory-summary,.semantic-memory-footnote{font-size:11px;line-height:1.6;color:var(--muted);margin:8px 0;overflow-wrap:anywhere}
-.semantic-memory-status[data-state="error"],.semantic-memory-status[data-state="stale"]{color:var(--bad)}
-.semantic-memory-filters{display:grid;grid-template-columns:minmax(0,1fr) 112px;gap:6px;margin:4px 0}
-.semantic-memory-filters .field{width:100%;min-width:0}
-.semantic-memory-list{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;display:grid;gap:5px}
-.semantic-memory-row{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 8px;text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:10px;color:var(--ink);font:inherit;cursor:pointer}
-.semantic-memory-row:hover,.semantic-memory-row[aria-pressed="true"]{background:var(--inset);border-color:var(--ring)}
-.semantic-memory-row strong{font-size:12px;overflow-wrap:anywhere}
-.semantic-memory-row small{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.5}
 .semantic-memory-badge{align-self:start;border-radius:var(--pill);padding:2px 7px;background:var(--inset);color:var(--muted);font-size:10px;white-space:nowrap}
 .semantic-memory-badge[data-quality="located"]{background:rgba(245,158,11,.13);color:var(--strong)}
-.semantic-memory-empty{padding:20px 6px;color:var(--muted);text-align:center;line-height:1.7}
-.semantic-memory-footnote{border-top:1px solid var(--line);padding-top:8px;margin-bottom:0}
 .semantic-overlay{width:min(420px,calc(100vw - 32px));max-height:calc(100dvh - 48px);overflow:auto;background:var(--surface);color:var(--ink);border:1px solid var(--ring);border-radius:var(--r-lg);padding:20px;box-shadow:0 18px 65px rgba(0,0,0,.25)}
 .semantic-overlay::backdrop{background:rgba(0,0,0,.3);backdrop-filter:blur(3px)}
 .semantic-detail-note{line-height:1.65;font-size:12px;padding:10px;border-radius:var(--r-sm);background:var(--inset);color:var(--strong);margin:12px 0}
@@ -607,7 +519,6 @@ button{font-family:inherit;cursor:pointer}
 .semantic-detail-actions{display:flex;flex-wrap:wrap;gap:8px;border-top:1px solid var(--line);padding-top:14px}
 .semantic-detail-actions .btn{flex:1;min-height:34px}
 .semantic-detail-actions .btn:disabled{opacity:.5;cursor:not-allowed}
-@media(max-width:700px){.semantic-memory-panel{right:12px;top:82px;bottom:12px;width:calc(100% - 24px);max-height:calc(100dvh - 94px)}.semantic-memory-filters{grid-template-columns:1fr}.semantic-overlay{padding:16px}}
 
 /* 中屏保持信息分组，小屏按阅读顺序排列；各视图独立滚动。 */
 @media(max-width:1200px){
@@ -690,28 +601,6 @@ button{font-family:inherit;cursor:pointer}
 .legend:not([open]) .legend-items{display:none}
 .workspace.swapped .legend{padding:0}
 
-.floor-navigation{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
-.floor-navigation[hidden]{display:none!important}
-.floor-navigation summary{cursor:pointer;font-weight:650;color:var(--strong)}
-.floor-navigation-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.floor-navigation-fields label{display:grid;gap:4px;color:var(--muted);font-size:11px}
-.floor-navigation-fields input,.floor-navigation-fields select{width:100%;min-width:0;min-height:29px;padding:4px 6px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit}
-.floor-navigation [data-role="floor-status"]{line-height:1.5;overflow-wrap:anywhere}
-.floor-navigation [data-role="floor-status"][data-level="error"]{color:var(--bad)}
-.exploration-mission{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
-.exploration-mission summary{cursor:pointer;font-weight:650;color:var(--strong)}
-.exploration-mission select{width:100%;min-width:0;min-height:29px;padding:4px 6px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--strong);font:inherit}
-.exploration-return{display:flex;align-items:center;gap:6px;margin:10px 0;color:var(--strong)}
-.exploration-mission [data-role="explore-status"]{line-height:1.5;overflow-wrap:anywhere}
-.exploration-mission [data-role="explore-status"][data-level="error"]{color:var(--bad)}
-.exploration-mission [data-role="explore-progress"]{color:var(--muted);font-size:11px}
-.floor-import{display:inline-flex;align-items:center;padding:5px 8px;border:1px solid var(--line);border-radius:var(--r-sm);cursor:pointer}
-.floor-import input{display:none}
-
-.exploration-return input{width:auto}
-
-/* 面板跟随工具栏实际换行高度，二维和三维共用同一位置。 */
-.navigation-panel,.forbidden-zone-panel{max-height:calc(100% - var(--map-tools-bottom,140px) - 14px)}
 
 /* 设置控件沿用控制台颜色、圆角、字号及内容边距。 */
 .config-profile-toolbar{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;padding:0}
@@ -752,24 +641,13 @@ button{font-family:inherit;cursor:pointer}
 }
 
 /* 语义区域复用地图工具栏与主题，详情停留在当前地图内。 */
-.map-semantic-panel{position:absolute;right:14px;top:var(--map-tools-bottom,140px);bottom:auto;z-index:7;
-  width:min(320px,calc(100% - 28px));max-height:calc(100% - var(--map-tools-bottom,140px) - 14px);
-  border-radius:var(--r);padding:12px;display:flex;flex-direction:column;gap:8px;overflow:hidden;font-size:12px}
-.map-semantic-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0}
-.map-semantic-head strong{font-size:13px}
-.map-semantic-head .tool{min-height:26px;padding:2px 8px;font-size:18px;background:transparent;border:0}
 .map-semantic-status,.map-semantic-footnote{font-size:11px;line-height:1.5;color:var(--muted);margin:0;overflow-wrap:anywhere}
 .map-semantic-status[data-error="true"]{color:var(--bad)}
-.map-semantic-actions{display:flex;flex-wrap:wrap;gap:5px;flex-shrink:0}
-.map-semantic-actions .tool{min-height:29px;padding:4px 8px;font-size:11px;background:var(--inset)}
-.map-semantic-panel .map-drawer-body>.field{min-height:29px;height:29px;flex-shrink:0;width:100%}
-.map-semantic-list{min-height:42px;max-height:140px;overflow:auto;display:grid;gap:4px;flex-shrink:0}
 .map-semantic-row{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;text-align:left;
   background:transparent;border:1px solid var(--line);border-radius:var(--r-sm);padding:6px 8px;color:var(--strong);font:inherit}
 .map-semantic-row[aria-pressed="true"]{border-color:var(--info);background:var(--info-w);color:var(--ink)}
 .map-semantic-row .label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .map-semantic-row .tag{flex-shrink:0}
-.map-semantic-detail{min-height:0;max-height:350px;overflow:auto;flex:1;border-top:1px solid var(--line);padding-top:8px;overflow-wrap:anywhere}
 .map-semantic-detail h3{font-size:13px;margin:0 0 7px}
 .map-semantic-detail h4{font-size:11.5px;margin:12px 0 5px}
 .map-semantic-detail dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 10px;font-size:11px}
@@ -784,28 +662,8 @@ button{font-family:inherit;cursor:pointer}
 .map-semantic-detail pre{font-size:10.5px;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--inset);border-radius:var(--r-sm);padding:7px}
 .map-semantic-evidence{display:grid;gap:3px;border-top:1px solid var(--line);padding:7px 0;font-size:11px}
 #semanticRegionLayerControl[hidden]{display:none}
-@media(max-width:720px){
-  .map-semantic-panel{right:10px;bottom:auto;width:min(300px,calc(100% - 20px));padding:10px;overflow:auto}
-  .map-semantic-panel .map-semantic-list{max-height:100px}
-  .map-semantic-detail{flex:none;max-height:none;overflow:visible}
-  .map-semantic-footnote{display:none}
-}
-
-.map-semantic-panel:not(.has-selection) .map-semantic-list{max-height:300px}
-.map-semantic-panel:not(.has-selection) .map-semantic-detail{flex:0 0 auto}
 
 /* 关系图在原地图内展开，图与详情分别滚动，沿用控制台主题。 */
-.map-scene-graph{position:absolute;z-index:8;left:14px;right:14px;top:var(--map-tools-bottom,140px);bottom:14px;
-  display:flex;flex-direction:column;gap:8px;padding:14px;border-radius:var(--r);min-height:0;overflow:hidden}
-.map-scene-graph[hidden]{display:none}
-.map-scene-graph-head{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.map-scene-graph-head strong{font-size:14px}.map-scene-graph-head .muted{font-size:11px;flex:1}
-.map-scene-graph-head .tool{margin-left:auto;font-size:18px;min-height:26px;padding:2px 8px}
-.map-scene-graph-tools{display:flex;align-items:center;flex-wrap:wrap;gap:6px;flex-shrink:0}
-.map-scene-graph-tools .field{width:min(210px,100%);height:29px;min-height:29px}
-.map-scene-graph .tool{font-size:11px;min-height:29px;padding:4px 8px}
-.map-scene-graph-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,260px);min-height:0;flex:1;gap:12px}
-.map-scene-graph-stage{min-height:160px;position:relative;background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden}
 #sceneGraphCanvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
 #sceneGraphCanvas:active{cursor:grabbing}
 #sceneGraphCanvas .scene-graph-edge{stroke:var(--muted);stroke-width:1.3;opacity:.5;vector-effect:non-scaling-stroke}
@@ -826,144 +684,227 @@ button{font-family:inherit;cursor:pointer}
 .map-scene-graph-detail .graph-detail-actions{display:flex;gap:5px;flex-wrap:wrap}
 .map-scene-graph-detail a{color:var(--info);display:block;margin:5px 0}
 .map-scene-graph-detail pre{font-size:10px;white-space:pre-wrap;overflow-wrap:anywhere}
-@media(max-width:720px){
-  .map-scene-graph{left:10px;right:10px;padding:10px;overflow:auto}
-  .map-scene-graph-head{flex-wrap:wrap}.map-scene-graph-head .muted{flex-basis:50%}
-  .map-scene-graph-body{display:flex;flex-direction:column;flex:none}
-  .map-scene-graph-stage{height:260px;flex:none}
-  .map-scene-graph-detail{max-height:none;overflow:visible;border-left:0;border-top:1px solid var(--line);padding:10px 0 0}
-}
 
-/* 地图工作区：固定视图栏与工具栏，画布只承担空间内容。 */
-#live-map{--map-glass-bg:color-mix(in srgb,var(--surface) 88%,transparent);container-type:inline-size;--map-tools-bottom:12px;--map-header-height:56px}
-#live-map>.canvas-wrap{inset:var(--map-header-height) 0 0;border-radius:0 0 var(--r-xl) var(--r-xl)}
-#live-map .map-header{inset:0 0 auto;max-width:none;height:var(--map-header-height);display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface);pointer-events:auto}
+/* ===== 地图工作区：工具栏 → 二级栏 → 画布，纵向排列，二级栏展开时画布让出高度而不被遮挡。 ===== */
+#live-map{--map-glass-bg:color-mix(in srgb,var(--surface) 88%,transparent);--map-header-pad:10px;
+  container-type:inline-size;display:flex;flex-direction:column}
+#live-map>.canvas-wrap{position:relative;flex:1 1 auto;min-height:0;overflow:hidden;background:var(--grid-bg);
+  border-radius:0 0 var(--r-xl) var(--r-xl)}
+#live-map .map-header{position:relative;z-index:6;flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  min-height:56px;padding:var(--map-header-pad) 14px;border-bottom:1px solid var(--line);background:var(--surface)}
 .map-mode-switch{background:var(--inset);padding:3px;gap:3px;border-radius:9px}
 .map-mode-switch .tool{min-width:46px;justify-content:center;text-align:center}
 #live-map .map-mode-switch .tool.active{background:var(--surface);color:var(--ink);box-shadow:var(--sh-sm)}
 .map-header-actions{display:flex;align-items:center;gap:10px;min-width:0}
-#live-map #mapStatus{position:static;font-size:10px;white-space:nowrap}
+#live-map #mapStatus{font-size:10px;white-space:nowrap}
 #live-map .map-header .media-swap{border:1px solid var(--line);background:var(--surface);padding:6px 9px;border-radius:8px;color:var(--muted);min-height:30px;white-space:nowrap}
 .map-tool-actions{display:flex;align-items:center;gap:3px;flex:1;min-width:0;padding-left:10px;border-left:1px solid var(--line)}
-#live-map .map-action-button{position:relative;flex:none;min-height:32px;display:inline-flex;align-items:center;justify-content:center;gap:5px;border:0;border-radius:8px;padding:6px 8px;background:transparent;color:var(--muted);font-size:11px;font-weight:550;line-height:1.15;box-shadow:none;white-space:nowrap}
+#live-map .map-action-button{position:relative;flex:none;min-height:32px;display:inline-flex;align-items:center;justify-content:center;gap:5px;
+  border:0;border-radius:8px;padding:6px 9px;background:transparent;color:var(--muted);font-size:11.5px;font-weight:560;line-height:1.15;box-shadow:none;white-space:nowrap}
 #live-map .map-action-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.55;stroke-linecap:round;stroke-linejoin:round}
 #live-map .map-action-button:hover{background:var(--inset);color:var(--ink);transform:none}
 #live-map .map-action-button.active{background:var(--info-w);color:var(--info)}
-#live-map .map-action-count{font-size:9px;color:var(--faint);font-variant-numeric:tabular-nums}
+/* 当前工具的下划线压在工具栏底边上，表明下方二级栏属于它。 */
+#live-map .map-action-button.active::after{content:"";position:absolute;left:9px;right:9px;bottom:calc(-1 * var(--map-header-pad) - 1px);
+  height:2px;border-radius:2px;background:var(--info)}
+#live-map .map-action-count{font-size:9.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+#live-map .map-action-button.active .map-action-count{color:inherit;opacity:.7}
 .map-actions-divider{width:1px;height:18px;background:var(--line);margin:0 3px;flex:none}
-#live-map .tool:focus-visible,#live-map summary:focus-visible,#live-map input:focus-visible,#live-map select:focus-visible{outline:2px solid var(--info);outline-offset:2px}
-/* 所有工作面板使用同一边距、背景、层级与滚动边界。 */
-#live-map .map-drawer{--map-panel-padding:16px;position:absolute;inset:12px 12px auto auto;width:min(344px,calc(100% - 24px));max-height:calc(100% - 72px);min-height:0;z-index:9;padding:16px;background:var(--map-glass-bg);color:var(--ink);border:1px solid var(--line);border-radius:12px;box-shadow:var(--sh);display:flex;flex-direction:column;gap:12px;overflow:hidden;overscroll-behavior:contain;font-size:12px;scrollbar-width:thin}
-#live-map .map-drawer[hidden]{display:none!important}
-.map-drawer-head,.map-semantic-head,.semantic-memory-head,.forbidden-zone-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-shrink:0}
-#live-map :is(.map-drawer-head,.map-semantic-head,.semantic-memory-head,.map-scene-graph-head,.forbidden-zone-head) strong{font-size:14px;line-height:1.5}
-#live-map :is(.map-drawer-head,.map-semantic-head,.semantic-memory-head,.map-scene-graph-head,.forbidden-zone-head)>.tool{width:30px;height:30px;min-height:30px;flex-shrink:0;justify-content:center;align-items:center;padding:0;border:0;background:var(--inset);color:var(--muted);font-size:20px;border-radius:8px;line-height:1}
-.map-panel-description{font-size:12px;color:var(--muted);line-height:1.7;margin:12px 0}
-#live-map .map-options-panel{bottom:auto;max-height:calc(100% - 72px)}
-.map-layer-options{display:grid;gap:2px}
-#live-map .map-layer-options .map-layer-toggle{display:flex;justify-content:space-between;gap:14px;padding:12px 10px;border:1px solid transparent;border-radius:var(--r-sm)}
-.map-layer-options strong,.map-layer-options small{display:block}
-.map-layer-options strong{font-size:12px;font-weight:600}.map-layer-options small{font-size:11px;color:var(--muted);font-weight:400;margin-top:4px}
-#live-map .map-layer-toggle input{accent-color:var(--info);width:15px;height:15px;flex-shrink:0}
-.map-point-section{padding-top:16px;display:grid;gap:8px}
-.map-point-section:has(#mapPointStyleGroup[hidden]){display:none}
-.map-option-label{font-size:11px;color:var(--muted)}
-#live-map #mapPointStyleGroup{display:flex;background:var(--inset);box-shadow:none;border:1px solid var(--line);border-radius:8px}
-#live-map .map-point-style{width:100%;padding:8px}.map-point-style select{flex:1}
-#live-map .map-camera-modes{display:flex;max-width:none;width:100%;background:var(--inset);margin-top:14px}
-#live-map .map-camera-modes .tool{flex:1}
-#live-map .map-locate-button{display:block;width:100%;margin-top:8px;min-height:34px;background:var(--inset)}
-#live-map .map-pose-hud{position:static;padding:14px 0 0;margin-top:14px;border-top:1px solid var(--line);min-width:0;pointer-events:auto}
-#live-map .map-pose-title{font-size:11px;margin-bottom:10px}
-#live-map .map-pose-meta{font-size:12px;gap:8px}
-#live-map .map-camera-dock{position:absolute;left:12px;bottom:12px;z-index:6;flex-wrap:nowrap;max-width:calc(100% - 24px);border:1px solid var(--line);background:var(--map-glass-bg);box-shadow:var(--sh-sm);gap:0;padding:3px}
-#live-map .map-camera-dock .tool{min-height:30px;padding:5px 9px;font-size:11px}
-#live-map #mapZoomValue{min-width:44px;padding:5px 2px}
-#live-map .map-stream-chip{inset:auto 12px 17px auto;max-width:calc(100% - 260px);background:var(--map-glass-bg);font-size:10px;padding:6px 8px;white-space:nowrap;pointer-events:none}
-#live-map .legend{left:12px;bottom:60px;max-width:calc(100% - 24px);background:var(--surface);border:1px solid var(--line);box-shadow:var(--sh-sm)}
-#live-map .legend[open]{max-width:min(430px,calc(100% - 24px));align-items:flex-start}
-#live-map .legend-items{flex-wrap:wrap;gap:8px 12px}
-#live-map .map-goal-chip{left:12px;top:12px;bottom:auto;max-width:calc(100% - 24px)}
-.map-dense-progress{position:absolute;top:12px;left:12px;max-width:calc(100% - 24px);z-index:5;pointer-events:none}
-#live-map[data-map-panel]:not([data-map-panel=""]) .legend,#live-map[data-map-panel="sceneGraphPanel"] .map-camera-dock,#live-map[data-map-panel="sceneGraphPanel"] .map-stream-chip{visibility:hidden}
-/* 区域列表与详情分配可用高度，展开识别设置仍可滚动到全部操作。 */
-#live-map .map-semantic-panel{display:flex;flex-direction:column;gap:12px}
-#live-map .map-semantic-panel>*{flex-shrink:0}
-.map-recognition-options{border:1px solid var(--line);border-radius:8px;background:var(--surface-2);padding:10px}
-.map-recognition-options summary{font-size:12px;cursor:pointer;color:var(--strong)}
-.map-recognition-options[open] summary{margin-bottom:10px}
-.map-recognition-options .map-layer-toggle{font-size:10px;padding:8px 0 0;line-height:1.5}
-#live-map .map-semantic-panel .map-semantic-list{max-height:150px;min-height:0;gap:5px}
-#live-map .map-semantic-panel:not(.has-selection) .map-semantic-list{max-height:420px;flex:1;min-height:120px}
-#live-map .map-semantic-panel .map-semantic-detail{max-height:none;overflow:visible;flex:none;padding-top:12px}
-#live-map .map-semantic-row{min-height:36px;cursor:pointer}
-#live-map .map-semantic-row:hover{background:var(--inset)}
-#live-map .map-semantic-footnote{font-size:10px;display:block}
-#live-map .semantic-memory-panel{gap:6px}
-#live-map .semantic-memory-filters{grid-template-columns:minmax(0,1fr)}
-#live-map .semantic-memory-list{display:flex;flex-direction:column;min-height:100px}
-#live-map .forbidden-zone-head{flex-wrap:wrap}
-#live-map .forbidden-zone-head .forbidden-zone-status{order:3;flex-basis:100%;text-align:left;margin-bottom:4px}
-#live-map .forbidden-zone-head .tool{margin-left:auto}
-/* 关系图使用整个画布工作区，不叠加第二套工具栏。 */
-#live-map .map-scene-graph{--map-panel-padding:18px;inset:0;width:auto;max-height:none;border:0;border-radius:0;box-shadow:none;padding:18px;display:flex;flex-direction:column;gap:12px;overflow:hidden}
-#live-map .map-scene-graph-body{grid-template-columns:minmax(0,1fr) minmax(180px,250px)}
-#live-map .map-scene-graph-head{flex-wrap:wrap}
-#live-map .map-scene-graph-tools .field{flex:1;min-width:130px}
-#live-map .map-scene-graph-head .muted{font-size:11px}
-#live-map .map-scene-graph .tool{min-height:32px}
-@container (max-width:660px){
-  #live-map .map-stream-chip{top:12px;bottom:auto;max-width:calc(100% - 24px);font-size:9px}
-  #live-map[data-map-panel]:not([data-map-panel=""]) .map-stream-chip{visibility:hidden}
-  #live-map .map-scene-graph{--map-panel-padding:12px;overflow:hidden;padding:12px}
-  #live-map .map-scene-graph-body{display:flex;flex-direction:column;flex:none}
-  #live-map .map-scene-graph-stage{height:260px;flex:none}
-  #live-map .map-scene-graph-detail{border-left:0;border-top:1px solid var(--line);padding:12px 0 0;overflow:visible}
-  #live-map .map-scene-graph-head .muted{order:3;flex-basis:100%}
-  #live-map .map-scene-graph-head .tool{margin-left:auto}
-}
-@container (max-width:420px){
-  #live-map .map-header{padding:8px;gap:6px}
-  #live-map .map-header-actions{gap:5px}
-  #live-map .map-header .media-swap{padding:5px 7px}
-  #live-map .map-mode-switch .tool{min-width:36px;padding:5px 8px}
-  #live-map .map-drawer{--map-panel-padding:12px;padding:12px;inset:8px 8px auto auto;max-height:calc(100% - 68px);width:calc(100% - 16px)}
-  #live-map .map-options-panel{bottom:auto;max-height:calc(100% - 68px)}
-  #live-map .map-scene-graph{inset:0;width:auto;max-height:none}
-  #live-map .map-drawer-head strong{font-size:13px}
-  #live-map .map-semantic-panel .map-semantic-list{max-height:115px}
-  #live-map .map-scene-graph-tools .field{flex-basis:100%;width:100%}
-}
+#live-map :is(.tool,summary,input,select,button):focus-visible{outline:2px solid var(--info);outline-offset:2px}
 
-#live-map .map-drawer>:is(.map-drawer-head,.map-semantic-head,.semantic-memory-head,.forbidden-zone-head,.map-scene-graph-head){position:relative;flex-shrink:0;background:transparent;margin:calc(-1 * var(--map-panel-padding)) calc(-1 * var(--map-panel-padding)) 0;padding:12px var(--map-panel-padding);border-bottom:1px solid var(--line)}
+/* 二级栏：紧贴工具栏的磨砂浮层，覆盖在地图顶部，不改变画布尺寸；所有工具共用同一行高、控件、按钮、标签条和状态行。 */
+#live-map .map-subbar{position:absolute;top:0;left:0;right:0;z-index:9;background:var(--map-glass-bg);border-bottom:1px solid var(--line);
+  box-shadow:0 10px 24px -18px rgba(16,20,28,.45);backdrop-filter:blur(18px) saturate(1.25);-webkit-backdrop-filter:blur(18px) saturate(1.25);
+  padding:8px 10px 8px 14px;font-size:12px;animation:mapSubbarIn .16s ease-out}
+#live-map .map-subbar:not(:has(>.map-subpanel:not([hidden]))){display:none}
+@keyframes mapSubbarIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+#live-map .map-subpanel{display:flex;align-items:flex-start;gap:10px;min-width:0}
+#live-map .map-subpanel[hidden]{display:none!important}
+.msb-body{flex:1;min-width:0}
+.msb-body>*+*,.msb-pane>*+*{margin-top:6px}
+.msb-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;min-height:32px;min-width:0}
+.msb-lead{flex:none;color:var(--muted);font-size:11px;font-weight:600;white-space:nowrap}
+.msb-sep{flex:none;width:1px;height:18px;background:var(--line)}
+.msb-group{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px}
+.msb-field{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:11px;font-weight:560;white-space:nowrap}
+#live-map .msb-input{height:30px;min-width:0;padding:0 9px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);
+  color:var(--ink);font:inherit;font-size:12px;font-weight:450;outline:none;transition:border-color .15s,background .15s}
+#live-map .msb-input:focus{border-color:var(--ring);background:var(--surface)}
+#live-map select.msb-input{padding-right:4px;cursor:pointer}
+#live-map .msb-input:not(select){width:150px}
+#live-map .msb-input.msb-search{width:180px}
+#live-map .msb-input.msb-num{width:78px}
+.msb-btn{height:30px;display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:0 11px;border:1px solid var(--line);
+  border-radius:var(--r-sm);background:var(--surface);color:var(--strong);font:inherit;font-size:11.5px;font-weight:600;white-space:nowrap;cursor:pointer;
+  transition:background .15s,border-color .15s,color .15s}
+.msb-btn:hover:not(:disabled){background:var(--inset);border-color:var(--ring);color:var(--ink)}
+.msb-btn.primary{background:var(--ink);border-color:transparent;color:var(--surface)}
+.msb-btn.primary:hover:not(:disabled){background:var(--ink);color:var(--surface);opacity:.86}
+.msb-btn.danger:hover:not(:disabled){background:var(--bad-w);border-color:transparent;color:var(--bad)}
+.msb-btn:disabled{opacity:.45;cursor:not-allowed}
+.msb-check{display:inline-flex;align-items:center;gap:6px;color:var(--strong);font-size:11.5px;white-space:nowrap;cursor:pointer}
+.msb-check input,.msb-toggle input{margin:0;width:14px;height:14px;accent-color:var(--info)}
+.msb-toggles{display:inline-flex;flex-wrap:wrap;gap:6px}
+.msb-toggle{height:30px;display:inline-flex;align-items:center;gap:7px;padding:0 12px 0 10px;border:1px solid var(--line);border-radius:var(--pill);
+  background:var(--surface);color:var(--strong);font-size:11.5px;font-weight:560;white-space:nowrap;cursor:pointer;transition:.15s}
+.msb-toggle:hover{border-color:var(--ring)}
+.msb-toggle:has(input:checked){background:var(--info-w);border-color:color-mix(in srgb,var(--info) 35%,transparent);color:var(--ink)}
+.msb-toggle:has(input:disabled){cursor:default;opacity:.75}
+#live-map .map-point-section{display:inline-flex;align-items:center;gap:10px}
+#live-map .map-point-section:has(#mapPointStyleGroup[hidden]){display:none}
+#live-map #mapPointStyleGroup{padding:0;background:transparent;border:0;box-shadow:none}
+#live-map .map-point-style{height:30px;min-height:30px;padding:0 4px 0 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);font-size:12px;font-weight:450}
+#live-map .map-point-style select{height:28px;padding:0 4px}
+.map-point-style .sw{width:10px;height:10px;border-radius:3px}
+/* 标签条：列表横向单行滚动，选中项与地图高亮一致。 */
+#live-map .msb-chips{flex:1 1 240px;min-width:0;display:flex;align-items:center;gap:6px;margin:0;padding:1px 0;list-style:none;
+  overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;scrollbar-width:thin}
+#live-map .msb-chips>:is(button,li){flex:none;height:30px;max-width:240px;display:inline-flex;align-items:center;gap:7px;margin:0;padding:0 11px;
+  border:1px solid var(--line);border-radius:var(--pill);background:var(--surface);color:var(--strong);font:inherit;font-size:11.5px;
+  white-space:nowrap;cursor:pointer;text-align:left;transition:border-color .15s,background .15s}
+#live-map .msb-chips>button:hover{border-color:var(--ring);background:var(--surface)}
+#live-map .msb-chips>button[aria-pressed="true"]{border-color:var(--info);background:var(--info-w);color:var(--ink)}
+#live-map .msb-chips>:is(p,li.forbidden-zone-empty){flex:none;height:auto;margin:0;padding:0 2px;border:0;background:none;color:var(--muted);font-size:11.5px;cursor:default}
+#live-map .msb-chips .label,#live-map .msb-chips strong{min-width:0;overflow:hidden;text-overflow:ellipsis;font-weight:560}
+#live-map .msb-chips .tag{color:var(--faint);font-size:10px}
+#live-map .msb-chips .semantic-memory-row small{display:none}
+#live-map .msb-chips .semantic-memory-badge{padding:1px 6px;font-size:9.5px}
+#live-map .forbidden-zone-item{cursor:default;padding-right:4px}
+#live-map .forbidden-zone-item-main{display:inline-flex;align-items:baseline;gap:6px;min-width:0}
+#live-map .forbidden-zone-item-name{font-weight:600;overflow:hidden;text-overflow:ellipsis}
+#live-map .forbidden-zone-item-meta{color:var(--muted);font-size:10px}
+#live-map .forbidden-zone-item button{height:22px;padding:0 8px;border:0;border-radius:var(--pill);background:var(--inset);color:var(--muted);font:inherit;font-size:10.5px;cursor:pointer}
+#live-map .forbidden-zone-item button:hover:not(:disabled){background:var(--bad-w);color:var(--bad)}
+/* 状态行：当前结果在前，说明文字随后；空项不占位。 */
+.msb-status{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 14px;margin:0;color:var(--strong);font-size:11px;line-height:1.55;min-width:0}
+.msb-status>*{min-width:0;overflow-wrap:anywhere}
+.msb-status>:empty{display:none}
+.msb-meta{color:var(--muted);font-variant-numeric:tabular-nums}
+.msb-note{color:var(--faint)}
+.msb-status [data-level="warn"],.msb-status [data-state="busy"]{color:var(--warn)}
+.msb-status :is([data-level="error"],[data-error="true"],[data-state="error"],[data-state="stale"]){color:var(--bad)}
+.msb-status [data-level="success"]{color:var(--good)}
+.msb-status [data-level="active"]{color:var(--info)}
+.msb-detail{margin:0;max-height:72px;overflow:auto;color:var(--muted);font:10.5px/1.5 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.msb-detail:empty{display:none}
+.msb-close{flex:none;width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:var(--r-sm);
+  background:transparent;color:var(--muted);cursor:pointer}
+.msb-close:hover{background:var(--inset);color:var(--ink)}
+/* 导航内分页：与视图切换同款分段按钮。 */
+.msb-tabbed{display:flex;flex-wrap:wrap;align-items:flex-start;gap:6px 12px}
+.msb-tabbed>*+*{margin-top:0}
+.msb-seg{flex:none;display:inline-flex;gap:2px;padding:2px;background:var(--inset);border-radius:9px}
+.msb-seg button{height:28px;padding:0 12px;border:0;border-radius:7px;background:transparent;color:var(--muted);font:inherit;font-size:11.5px;font-weight:600;white-space:nowrap;cursor:pointer}
+.msb-seg button:hover{color:var(--ink)}
+.msb-seg button[aria-selected="true"]{background:var(--surface);color:var(--ink);box-shadow:var(--sh-sm)}
+.msb-pane{flex:1 1 420px;min-width:0}
+.msb-pane:not(.is-active){display:none}
+details.msb-pane>summary{display:none}
+.floor-import{cursor:pointer}
+.floor-import input{display:none}
+
+/* 画布浮层：左上交互提示、右上检查卡、左下镜头、右下位姿。 */
+.map-overlay-top{position:absolute;left:12px;top:calc(12px + var(--map-subbar-h,0px));right:12px;z-index:5;display:flex;flex-direction:column;align-items:flex-start;gap:6px;pointer-events:none}
+.map-overlay-top>*{max-width:100%}
+.map-dense-progress{max-width:100%}
+#live-map .map-goal-chip{max-width:100%}
+#live-map .map-inspector{position:absolute;top:calc(12px + var(--map-subbar-h,0px));right:12px;z-index:7;width:min(320px,calc(100% - 24px));max-height:calc(100% - 80px - var(--map-subbar-h,0px));
+  overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:14px 14px 12px;background:var(--map-glass-bg);border:1px solid var(--line);
+  border-radius:12px;box-shadow:var(--sh);font-size:12px}
+#live-map .map-inspector[hidden]{display:none!important}
+#live-map .map-inspector>.msb-close{position:absolute;top:8px;right:8px}
+#live-map .map-inspector h3{font-size:14px;margin:0 36px 8px 0;color:var(--ink)}
+.map-semantic-detail form{display:flex;gap:6px;margin:10px 0 8px}
+#live-map .map-semantic-detail input{height:30px}
+#live-map .map-semantic-detail .tool{min-height:30px;padding:0 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface);font-size:11.5px}
+#live-map .map-semantic-detail .tool:hover{background:var(--inset);transform:none;box-shadow:none}
+#live-map .map-semantic-detail>.tool{margin:0 6px 6px 0}
+.map-bottom-bar{position:absolute;left:12px;right:12px;bottom:12px;z-index:6;display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;pointer-events:none}
+.map-bottom-bar>*{pointer-events:auto}
+/* 镜头条位于工具栏右侧：缩放、复位、自由/跟随与定位，与视图切换同款分段样式。 */
+#live-map .map-camera-dock{flex:none;flex-wrap:nowrap;gap:0;padding:0 10px 0 0;margin-right:0;border:0;border-right:1px solid var(--line);border-radius:0;background:none;box-shadow:none}
+#live-map .map-camera-dock .tool{min-height:30px;padding:0 8px;font-size:11.5px}
+#live-map #mapZoomValue{min-width:44px;padding:0 2px;justify-content:center;font-family:var(--mono);font-size:11px}
+#live-map .map-camera-dock .map-tool-separator{height:18px;margin:0 3px}
+#live-map .map-camera-modes{display:inline-flex;gap:2px;padding:2px;background:var(--inset);border-radius:9px}
+#live-map .map-camera-modes .tool{min-height:26px;padding:0 10px;border-radius:7px}
+#live-map .map-camera-modes .tool:is(.active,[aria-pressed="true"]){background:var(--surface);color:var(--ink);box-shadow:var(--sh-sm)}
+#live-map .map-locate-button{width:32px;margin-left:3px;padding:0!important;justify-content:center}
+#live-map .map-locate-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}
+#live-map .map-pose-hud{min-width:0;min-height:38px;display:flex;align-items:center;gap:10px;padding:4px 12px;border:1px solid var(--line);
+  border-radius:var(--r);box-shadow:var(--sh-sm);font-size:11px;white-space:nowrap}
+.map-pose-state{display:inline-flex;align-items:center;gap:6px;color:var(--faint);font-weight:620}
+.map-pose-state::before{content:"";width:7px;height:7px;border-radius:99px;background:currentColor}
+.map-pose-state[data-state="good"]{color:var(--good)}
+.map-pose-state:is([data-state="stale"],[data-state="warn"]){color:var(--warn)}
+.map-pose-meta{display:inline-flex;align-items:baseline;gap:12px}
+.map-pose-meta>span{display:inline-flex;align-items:baseline;gap:4px}
+.map-pose-meta .k{color:var(--muted);font-size:10px;font-weight:600}
+.map-pose-meta .v{min-width:44px;color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:11.5px}
+#live-map .map-pose-hud .map-tool-separator{height:18px;margin:0}
+#live-map .map-stream-chip{position:static;color:var(--muted);font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis}
+#live-map .legend{position:absolute;left:12px;bottom:12px;z-index:5;max-width:calc(100% - 24px);border:1px solid var(--line);box-shadow:var(--sh-sm)}
+#live-map .legend[open]{max-width:min(430px,calc(100% - 24px))}
+#live-map .legend-items{display:flex;flex-wrap:wrap;gap:6px 12px}
+#live-map :is(.map-inspector,.map-pose-hud,.legend){background:var(--map-glass-bg);backdrop-filter:blur(18px) saturate(1.25);-webkit-backdrop-filter:blur(18px) saturate(1.25)}
+#live-map .map-close-icon{display:block;width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.semantic-memory-status[data-state="error"],.semantic-memory-status[data-state="stale"]{color:var(--bad)}
+.forbidden-zone-status[data-state="error"]{color:var(--bad)}
+.forbidden-zone-status[data-state="busy"]{color:var(--warn)}
+
+/* 关系图打开时占用整个画布，工具在二级栏；镜头与位姿层暂时收起。 */
+#live-map .map-scene-graph-workspace{position:absolute;inset:var(--map-subbar-h,0px) 0 0;z-index:8;display:none;padding:12px;background:var(--surface)}
+#live-map[data-map-panel="sceneGraphPanel"] .map-scene-graph-workspace{display:flex}
+#live-map[data-map-panel="sceneGraphPanel"] :is(.legend,.map-bottom-bar,.map-inspector,.map-overlay-top,.map-camera-dock){visibility:hidden}
+#live-map .map-scene-graph-body{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,260px);gap:12px}
+.map-scene-graph-stage{min-height:160px;position:relative;background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden}
 
 @container (max-width:800px){
-  #live-map .map-header{height:100px;flex-wrap:wrap;gap:4px 8px;padding:8px 12px}
-  #live-map>.canvas-wrap{top:100px}
+  #live-map{--map-header-pad:8px}
+  #live-map .map-header{flex-wrap:wrap;gap:6px 8px;padding:var(--map-header-pad) 12px}
   #live-map .map-tool-actions{order:3;flex:1 0 100%;border-left:0;border-top:1px solid var(--line-2);padding:4px 0 0;overflow-x:auto;scrollbar-width:thin}
   #live-map .map-header-actions{margin-left:auto}
-  #live-map .map-action-button{flex:1 0 auto;padding:6px;gap:4px}
+  #live-map .map-action-button{flex:1 0 auto;padding:6px}
+  #live-map .map-subbar{padding:8px 8px 8px 12px}
+  #live-map .msb-chips{flex-basis:100%;order:5}
+  #live-map .msb-input.msb-search{flex:1 1 140px;width:auto}
+}
+@container (max-width:660px){
+  .map-bottom-bar{flex-direction:column-reverse;align-items:flex-start}
+  #live-map .legend{bottom:60px}
+  #live-map .map-pose-hud{max-width:100%;overflow-x:auto;scrollbar-width:none}
+  #live-map .map-pose-hud>.map-tool-separator,#live-map .map-stream-chip{display:none}
+  #live-map .map-scene-graph-body{display:flex;flex-direction:column;overflow:auto}
+  #live-map .map-scene-graph-stage{height:260px;flex:none}
+  #live-map .map-scene-graph-detail{border-left:0;border-top:1px solid var(--line);padding:12px 0 0;overflow:visible}
 }
 @container (max-width:420px){
-  #live-map .map-header{padding:8px}
-  #live-map .map-action-button{font-size:10px;padding:6px 5px;gap:3px}
+  #live-map .map-mode-switch .tool{min-width:36px;padding:5px 8px}
+  #live-map .map-header .media-swap{padding:5px 7px}
+  #live-map .map-action-button{font-size:10.5px;padding:6px 5px;gap:3px}
   #live-map .map-action-button svg{width:14px;height:14px}
   #live-map .map-action-count{display:none}
-  #live-map .map-tool-actions{gap:1px}
-  #live-map .map-actions-divider{margin:0 1px}
+  #live-map .msb-field{flex:1 1 calc(50% - 5px);flex-direction:column;align-items:stretch;gap:3px;min-width:0}
+  #live-map .msb-field .msb-input{width:100%!important}
+  #live-map .map-pose-meta{gap:8px}
+  #live-map .map-pose-meta .v{min-width:36px}
 }
-
-/* 地图浮层统一轻磨砂材质，文字本身保持不透明。 */
-#live-map :is(.map-drawer,.map-camera-dock,.map-stream-chip){backdrop-filter:blur(18px) saturate(1.25);-webkit-backdrop-filter:blur(18px) saturate(1.25)}
-#live-map .map-close-icon{display:block;width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
-
-/* 标题与正文共用外层磨砂底板；只滚动正文，避免标题二次叠色。 */
-#live-map .map-drawer>.map-drawer-body{min-height:0;flex:0 1 auto;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;margin:0 calc(-1 * var(--map-panel-padding)) calc(-1 * var(--map-panel-padding));padding:0 var(--map-panel-padding) var(--map-panel-padding)}
-#live-map .map-semantic-panel>.map-drawer-body{display:flex;flex-direction:column;gap:12px}
-#live-map .map-semantic-panel>.map-drawer-body>*{flex-shrink:0}
-#live-map .map-scene-graph>.map-drawer-body{display:flex;flex-direction:column;gap:12px;flex:1;overflow:hidden}
-#live-map .map-scene-graph>.map-drawer-body>:not(.map-scene-graph-body){flex-shrink:0}
-#live-map .map-layer-options .map-layer-toggle:is(:hover,:focus-within){background:color-mix(in srgb,var(--inset) 70%,transparent);border-color:var(--line)}
+.msb-status>.map-semantic-status:not([data-error="true"]){color:inherit}
+#live-map .msb-chips>*{width:auto}
+#live-map [data-nav-pane="goal"] .msb-input{width:236px}
+/* 二级栏最多覆盖地图一半高度，超出滚动，地图始终可见。 */
+#live-map .map-subbar{max-height:52%;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
 @container (max-width:660px){
-  #live-map .map-scene-graph>.map-drawer-body{overflow:auto}
+  #live-map .map-inspector{max-height:calc(100% - 120px - var(--map-subbar-h,0px))}
+}
+@container (max-width:420px){
+  /* 小窗展开工具时让出位姿栏，只保留镜头条；收起工具后位姿恢复常驻。 */
+  #live-map[data-map-panel]:not([data-map-panel=""]) .map-pose-hud{display:none}
+}
+@container (max-width:660px){
+  /* 窄容器：第一行视图与状态，第二行镜头条，第三行功能按钮（紧挨二级栏）。 */
+  #live-map .map-header-actions{display:contents}
+  #live-map #mapStatus{margin-left:auto}
+  #live-map .map-camera-dock{order:2;flex:1 0 100%;padding:4px 0 0;border-right:0;border-top:1px solid var(--line-2)}
+  #live-map .map-tool-actions{order:3}
 }

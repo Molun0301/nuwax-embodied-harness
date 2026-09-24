@@ -57,7 +57,8 @@
     if (payload.failure && payload.failure.code) {
       lines.push('错误: [' + payload.failure.code + '] ' + (payload.failure.message || ''));
     }
-    state.detailEl.textContent = lines.join('\n');
+    // 详情与状态同处二级栏的一行说明中，用分隔符代替换行，避免栏高随导航反馈跳动。
+    state.detailEl.textContent = lines.join(' · ');
   }
 
   function invokeCapability(url, args) {

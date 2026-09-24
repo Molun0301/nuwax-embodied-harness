@@ -220,6 +220,7 @@
         mapStatus: document.getElementById("mapStatus"),
         mapEmpty: document.getElementById("mapEmpty"),
         mapPoseMeta: document.getElementById("mapPoseMeta"),
+        mapPoseState: document.getElementById("mapPoseState"),
         mapMeta: document.getElementById("mapMeta"),
         mapSummaryMode: document.getElementById("mapSummaryMode"),
         localizationStatus: document.getElementById("localizationStatus"),
@@ -1715,12 +1716,37 @@
       function updateMapPoseHud() {
         const point = pointFromPose(state.latestPose);
         const yaw = planarYawFromPose(state.latestPose);
-        setKv(els.mapPoseMeta, [
-          ["X", point ? formatPoseMetric(point.x) : "--"],
-          ["Y", point ? formatPoseMetric(point.y) : "--"],
-          ["Z", point ? formatPoseMetric(point.z) : "--"],
-          ["偏航角", Number.isFinite(yaw) ? `${(yaw * 180 / Math.PI).toFixed(1)}°` : "--"],
-        ]);
+        const envelope = state.lastLocalizationEnvelope;
+        // 位姿常驻地图右下角；定位状态沿用定位帧自身的可用与过期标记。
+        const poseState = !point ? ["missing", "未定位"]
+          : envelope && (envelope.stale === true || statusOf(envelope) === "stale") ? ["stale", "定位过期"]
+          : envelope && statusOf(envelope) !== "available" ? ["warn", "定位不可用"]
+          : ["good", "已定位"];
+        if (els.mapPoseState && els.mapPoseState.dataset.state !== poseState[0]) {
+          els.mapPoseState.dataset.state = poseState[0];
+          els.mapPoseState.textContent = poseState[1];
+        }
+        const values = [
+          ["X", point ? Number(point.x).toFixed(2) : "--"],
+          ["Y", point ? Number(point.y).toFixed(2) : "--"],
+          ["Z", point ? Number(point.z).toFixed(2) : "--"],
+          ["偏航", Number.isFinite(yaw) ? `${(yaw * 180 / Math.PI).toFixed(1)}°` : "--"],
+        ];
+        if (!els.mapPoseMeta) return;
+        if (els.mapPoseMeta.children.length !== values.length) {
+          els.mapPoseMeta.replaceChildren(...values.map(([key]) => {
+            const item = document.createElement("span");
+            const label = document.createElement("span");
+            label.className = "k";
+            label.textContent = key;
+            const value = document.createElement("span");
+            value.className = "v";
+            item.append(label, value);
+            return item;
+          }));
+          els.mapPoseMeta.title = "机器人在地图坐标系中的位置（米）与偏航角";
+        }
+        values.forEach(([, text], index) => setText(els.mapPoseMeta.children[index].lastChild, text));
       }
       function renderMapSummary(options) {
         const detail = options || {};
@@ -2481,6 +2507,7 @@
         const evidence = document.createElement("small");
         const observations = Number.isFinite(inst.observation_count) ? `${inst.observation_count} 次观察 · ` : "";
         evidence.textContent = `${inst.label || "未分类"} · ${observations}最后见于 ${formatLastSeen(inst.last_seen_ts)}`;
+        row.title = evidence.textContent;
         row.append(name, badge, evidence);
         row.addEventListener("click", () => showSemanticInstanceDetail(inst));
         return row;

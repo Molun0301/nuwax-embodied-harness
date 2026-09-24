@@ -416,11 +416,16 @@ impl StartupPreflight {
                 return Err("二维配置坐标必须与Geometry公共坐标绑定一致".into());
             }
         }
-        let correction = correction_coordinator::CorrectionOwnerSpec::preflight(
-            owner_profile.correction(),
-            owner_profile.lio(),
-            &frame_bindings,
-        )?;
+        let correction = if planar.is_some() {
+            // 二维定位由原图拥有方完成，不创建三维匹配来源。
+            correction_coordinator::CorrectionOwnerSpec::None
+        } else {
+            correction_coordinator::CorrectionOwnerSpec::preflight(
+                owner_profile.correction(),
+                owner_profile.lio(),
+                &frame_bindings,
+            )?
+        };
         let correction_provider = match std::env::var("NUWAX_LCM_URL") {
             Ok(provider)
                 if !provider.is_empty()

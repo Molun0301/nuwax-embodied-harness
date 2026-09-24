@@ -3629,6 +3629,10 @@ class PlatformGeometryRuntime:
         else:
             with state_lock:
                 snapshot = self._map_activation_snapshot_locked()
+        # 已封存资产字段不可改写，嵌套可变数据由契约按读取隔离。
+        # 内部查询只需稳定身份和代次，不复制、重新校验整张地图。
+        if snapshot.bundle is None or snapshot.bundle.manifest_sha256 is not None:
+            return snapshot
         return _MapActivationSnapshot(
             bundle=self._clone_contract(snapshot.bundle),
             bundle_root=snapshot.bundle_root,

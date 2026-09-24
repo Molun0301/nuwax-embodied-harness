@@ -1191,7 +1191,13 @@ mod preflight_only_contract {
                 );
             }
             match backend {
-                CorrectionBackend::None => Ok(Self::None),
+                // 不运行自动回环校正时，仍保留旧地图按需重定位的原拥有方。
+                // 只有显式命令才收集匹配来源并提交校正，普通建图不产生候选。
+                CorrectionBackend::None => Ok(Self::Relocalization {
+                    map_frame_id: map_frame_id.to_owned(),
+                    odom_frame_id: odom_frame_id.to_owned(),
+                    body_frame_id: body_frame_id.to_owned(),
+                }),
                 CorrectionBackend::LibraryPgo => {
                     let pipeline = match lio_backend {
                         LioBackend::PointLio => LoopClosurePipelineConfig::for_point_lio(),
@@ -13357,7 +13363,7 @@ mod preflight_only_contract {
         }
 
         #[tokio::test]
-        async fn relocalization_transport_owner_replays_target_unavailable_terminal() {
+        async fn default_profile_relocalization_replays_target_unavailable_terminal() {
             let owner_identity = CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 2,
                 backend_generation: 99,
@@ -13367,11 +13373,13 @@ mod preflight_only_contract {
                 },
             };
             let owner = CorrectionTransportOwner::start(
-                CorrectionOwnerSpec::Relocalization {
-                    map_frame_id: "map".to_owned(),
-                    odom_frame_id: "odom".to_owned(),
-                    body_frame_id: "base_link".to_owned(),
-                },
+                CorrectionOwnerSpec::preflight_for_frames(
+                    CorrectionBackend::None,
+                    LioBackend::PointLio,
+                    "map",
+                    "odom",
+                    "base_link",
+                ).expect("关闭自动回环仍提供按需重定位"),
                 owner_identity,
                 "",
                 Arc::new(FailingStageSink),
@@ -16178,7 +16186,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     "odom",
                     "base_link"
                 ),
-                Ok(CorrectionOwnerSpec::None)
+                Ok(CorrectionOwnerSpec::Relocalization { .. })
             ));
             assert!(matches!(
                 CorrectionOwnerSpec::preflight_for_frames(
@@ -18626,14 +18634,8 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         #[test]
         fn none_is_silent_and_library_owner_emits_only_sealed_loop_candidate() {
             let mut none = CorrectionOwnerHandle::start(
-                CorrectionOwnerSpec::preflight_for_frames(
-                    CorrectionBackend::None,
-                    LioBackend::FastLio2,
-                    "map",
-                    "odom",
-                    "base_link",
-                )
-                .unwrap(),
+                // 这里只验证内部无候选生产器；默认配置已由按需重定位测试覆盖。
+                CorrectionOwnerSpec::None,
                 owner_identity(),
             )
             .unwrap();

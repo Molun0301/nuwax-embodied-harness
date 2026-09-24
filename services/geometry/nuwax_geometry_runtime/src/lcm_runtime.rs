@@ -17010,6 +17010,8 @@ mod mapping_feed_tests {
             (adapter.snapshot(), adapter.map_odom_transform_snapshot().unwrap().base_isometry(),
                 adapter.global_frame_generation())
         };
+        // 与生产开始会话一致，先让点云写入方绑定当前会话代次。
+        handle.cloud_map_writer.lock().as_mut().unwrap().begin_session(session.session_generation);
         let client = mapping.lock().backend_checkpoint_client().unwrap();
         let before = client.export_checkpoint().unwrap().await.unwrap().unwrap();
         assert!(!handoff_registered_lio_cloud(&handle, &[Point3::new(99.0,99.0,1.0)],12,

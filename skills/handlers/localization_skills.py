@@ -111,13 +111,14 @@ def handle_relocalize_active_map(
     requested_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     ctx.ensure_geometry_runtime_for_capability("relocalize_active_map")
-    timeout_sec = params.optional_float(payload, "timeout_sec", 10.0)
     session, workspace = ctx.map_workspace_service.relocalize_active_map(
         map_name=params.optional_str(payload, "map_name"),
         metadata={
             "requested_by": requested_by or "unknown",
             "request_id": params.optional_str(payload, "request_id"),
-            "logical_timeout_ms": int(float(timeout_sec) * 1000.0),
+            # timeout_sec 由外层任务管理器消费；算法沿原默认时限执行。
+            # 冷启动和地图读取耗时不能被转换成超出后端合同的匹配时限。
+            "logical_timeout_ms": 10_000,
             **({"planar_seed": payload["planar_seed"]} if "planar_seed" in payload else {}),
         },
     )
